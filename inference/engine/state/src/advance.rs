@@ -4,12 +4,12 @@ use super::{
     append_ranges, install_commit, ranges_from, BankHandle, Claims, Codec, ComponentDescriptor,
     ComponentRole,
     Error, HistoryDomainId, HistoryValue, KvCodec, LayerRef, PlaneBuffer, SequenceState, StateStore, StoreCopy,
-    Tail, Transaction, VectorKind,
+    Tail, VectorKind,
 };
 use seismic::Tensor;
 use std::{cell::Cell, rc::Rc};
 
-/// A read-only view whose tensors and row claims are owned by the transaction.
+/// A read-only view whose tensors and row claims are owned by the advance.
 /// `recurrent` holds one arena per recurrent component; the advance reads
 /// version (`previous_bank`, `previous_tape`) and writes only bank
 /// `following_bank` of each. It publishes its recurrent state after `stop`
@@ -58,7 +58,6 @@ pub struct OwnedStateAdvance {
     history: Vec<PlaneBuffer>,
     recurrent: Rc<[Tensor]>,
     destinations: Vec<Vec<usize>>,
-    _transaction: Transaction,
 }
 
 /// Tentative copy of one domain's partial last page into a free page, for a
@@ -71,7 +70,6 @@ pub struct OwnedTailRelocation {
     domain: HistoryDomainId,
     destination: Claims,
     copy: StoreCopy,
-    _transaction: Transaction,
 }
 
 /// One semantic vector conversion. A codec can use several physical planes;
@@ -91,7 +89,7 @@ pub struct CodecConversionStep {
     pub to: Vec<usize>,
 }
 
-/// Physical buffers remain pinned by the owned transaction through finish.
+/// Physical buffers remain pinned by the owned conversion through finish.
 /// Recurrent state moves from bank `source_bank` of the source arenas to bank
 /// `destination_bank` of the destination arenas, a successor claimed for the
 /// conversion (never the destination's zero seed).
@@ -120,8 +118,6 @@ pub struct OwnedCodecAdvance {
     source_codec: KvCodec,
     destination_codec: KvCodec,
     rows: usize,
-    _source_transaction: Transaction,
-    _transaction: Transaction,
 }
 
 impl OwnedCodecAdvance {
@@ -152,11 +148,6 @@ impl OwnedCodecAdvance {
                     Err(error) => return Err((source, destination, error)),
                 };
                 let conversions = conversion_steps(&source, &destination, &from, &to);
-                let mut source_transaction = source.store.begin_transaction();
-                source_transaction.track(&source.claims, &source.bank);
-                let mut transaction = destination.store.begin_transaction();
-                transaction.track(&destination.claims, &destination.bank);
-                transaction.track(&claims, &destination_bank);
                 Ok(Self {
                     source_recurrent: source.store.recurrent_arenas(),
                     destination_recurrent: destination.store.recurrent_arenas(),
@@ -170,8 +161,6 @@ impl OwnedCodecAdvance {
                     source_codec,
                     destination_codec,
                     rows,
-                    _source_transaction: source_transaction,
-                    _transaction: transaction,
                 })
             }
             Err(error) => Err((source, destination, error)),
@@ -185,7 +174,7 @@ impl OwnedCodecAdvance {
         destination: &SequenceState,
     ) -> Result<(KvCodec, KvCodec, Vec<Vec<usize>>), Error> {
         if Rc::ptr_eq(&source.store, &destination.store)
-            || !Rc::ptr_eq(&source.store.device, &destination.store.device)
+            || !source.store.device.same_device(&destination.store.device)
             || destination.position != 0
             || destination.claims.iter().any(|claims| !claims.is_empty())
             || destination.history_start != 0
@@ -465,15 +454,11 @@ impl OwnedTailRelocation {
             Ok(copy) => copy,
             Err(error) => return Err((state, error)),
         };
-        let mut transaction = state.store.begin_transaction();
-        transaction.track(&state.claims, &state.bank);
-        transaction.track_history(domain, &destination);
         Ok(Self {
             state,
             domain,
             destination,
             copy,
-            _transaction: transaction,
         })
     }
 
@@ -547,9 +532,6 @@ impl OwnedStateAdvance {
         };
         let destinations = destinations(&claims);
         let recurrent = state.store.recurrent_arenas();
-        let mut transaction = state.store.begin_transaction();
-        transaction.track(&state.claims, &state.bank);
-        transaction.track(&claims, &following);
         Ok(Self {
             state,
             count,
@@ -559,7 +541,6 @@ impl OwnedStateAdvance {
             history,
             recurrent,
             destinations,
-            _transaction: transaction,
         })
     }
 
@@ -609,7 +590,7 @@ impl OwnedStateAdvance {
     }
 
     /// Abort a submission that did not complete successfully and recover its
-    /// unchanged accepted state. Dropping the transaction also releases every
+    /// unchanged accepted state. Dropping the advance also releases every
     /// tentative claim, for terminal teardown that needs no source recovery.
     pub fn abort(self) -> SequenceState {
         self.state
@@ -880,7 +861,6 @@ pub struct OwnedSuccessorAdvance {
     history: Vec<PlaneBuffer>,
     recurrent: Rc<[Tensor]>,
     destinations: Vec<Vec<usize>>,
-    transaction: Transaction,
     /// Per domain, the live history (its arena entry) its rows extend.
     live: Vec<u64>,
     /// Dropped last, after the rows it may return to reserve.
@@ -904,8 +884,6 @@ impl OwnedSuccessorAdvance {
             None => store.successor_bank()?,
         };
         let destinations = destinations(&claims);
-        let mut transaction = store.begin_transaction();
-        transaction.track(&claims, &following);
         Ok(Self {
             store: store.clone(),
             position: predecessor.end,
@@ -920,7 +898,6 @@ impl OwnedSuccessorAdvance {
             history: predecessor.history.to_vec(),
             recurrent: predecessor.recurrent.clone(),
             destinations,
-            transaction,
             live: predecessor.live,
             admission: admission.clone(),
         })
@@ -1022,10 +999,8 @@ impl OwnedSuccessorAdvance {
             history,
             recurrent,
             destinations,
-            mut transaction,
             ..
         } = self;
-        transaction.track(&state.claims, &state.bank);
         Ok(OwnedStateAdvance {
             state,
             count,
@@ -1035,7 +1010,6 @@ impl OwnedSuccessorAdvance {
             history,
             recurrent,
             destinations,
-            _transaction: transaction,
         })
     }
 }
@@ -1389,9 +1363,7 @@ mod tests {
         let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
         assert_eq!(advance.bindings().destinations[0].len(), 2);
         assert_eq!(store.occupied_rows(TOKEN), 2);
-        let in_flight = store.holding_census(&[], &[], &[]).unwrap();
-        assert_eq!(in_flight.in_flight, 2 * store.history_row_bytes(TOKEN));
-        assert_eq!(in_flight.total(), store.committed_bytes());
+        assert_eq!(store.referenced_bytes(), 2 * store.history_row_bytes(TOKEN));
         let state = advance.abort();
         assert_eq!(state.position(), 0);
         assert_eq!(store.occupied_rows(TOKEN), 0);
@@ -1404,29 +1376,12 @@ mod tests {
         assert_eq!(store.occupied_rows(TOKEN), 2);
         let retained = state.checkpoint();
         let advance = OwnedStateAdvance::begin(state, 1).ok().unwrap();
-        let during = store
-            .holding_census(&[], &[crate::Holder::Checkpoint(&retained)], &[])
-            .unwrap();
-        assert_eq!(during.in_flight, 3 * store.history_row_bytes(TOKEN));
-        assert_eq!(during.retained, 0);
-        assert_eq!(during.total(), store.committed_bytes());
+        // The checkpoint shares the committed rows; the advance adds one.
+        assert_eq!(store.referenced_bytes(), 3 * store.history_row_bytes(TOKEN));
         let state = advance.abort();
-        let after = store
-            .holding_census(
-                &[crate::Holder::State(&state)],
-                &[crate::Holder::Checkpoint(&retained)],
-                &[],
-            )
-            .unwrap();
-        assert_eq!(after.in_flight, 0);
-        assert_eq!(after.live, 2 * store.history_row_bytes(TOKEN));
-        let flight = crate::InFlightState::new(state);
-        let held = store
-            .holding_census(&[], &[crate::Holder::Checkpoint(&retained)], &[])
-            .unwrap();
-        assert_eq!(held.in_flight, 2 * store.history_row_bytes(TOKEN));
-        let state = flight.into_state();
         assert_eq!(state.position(), 2);
+        assert_eq!(store.referenced_bytes(), 2 * store.history_row_bytes(TOKEN));
+        drop(retained);
     }
 
     #[test]
@@ -1483,9 +1438,7 @@ mod tests {
             [second.bindings().destinations[0][0] + 1]
         );
         assert_eq!(store.occupied_rows(TOKEN), 4);
-        let submitted = store.holding_census(&[], &[], &[]).unwrap();
-        assert_eq!(submitted.in_flight, 4 * store.history_row_bytes(TOKEN));
-        assert_eq!(submitted.total(), store.committed_bytes());
+        assert_eq!(store.referenced_bytes(), 4 * store.history_row_bytes(TOKEN));
 
         let OwnedAdvanceResolution::Committed(state) = first.commit_all().ok().unwrap() else {
             panic!("full accepted prefix must commit");
@@ -1555,7 +1508,7 @@ mod tests {
             panic!("source rows must commit");
         };
         let destination = destination_store.create().unwrap();
-        let conversion = OwnedCodecAdvance::begin(source, destination).ok().unwrap();
+        let conversion = OwnedCodecAdvance::begin(source, destination).unwrap_or_else(|(_, _, error)| panic!("the conversion begins: {error}"));
         assert_eq!(conversion.rows(), 2);
         assert_eq!(conversion.source_codec(), KvCodec::Dense);
         assert_eq!(conversion.destination_codec(), KvCodec::AffineK8V4);
@@ -1563,26 +1516,19 @@ mod tests {
         // Codes and coefficient planes per vector kind.
         assert_eq!(conversion.bindings().destination_history.len(), 4);
         assert_eq!(destination_store.occupied_rows(TOKEN), 2);
-        let source_flight = source_store.holding_census(&[], &[], &[]).unwrap();
-        let destination_flight = destination_store.holding_census(&[], &[], &[]).unwrap();
         assert_eq!(
-            source_flight.in_flight,
+            source_store.referenced_bytes(),
             2 * source_store.history_row_bytes(TOKEN)
         );
         assert_eq!(
-            destination_flight.in_flight,
+            destination_store.referenced_bytes(),
             2 * destination_store.history_row_bytes(TOKEN)
-        );
-        assert_eq!(source_flight.total(), source_store.committed_bytes());
-        assert_eq!(
-            destination_flight.total(),
-            destination_store.committed_bytes()
         );
         let (source, destination) = conversion.abort();
         assert_eq!(source.position(), 2);
         assert_eq!(destination.position(), 0);
         assert_eq!(destination_store.occupied_rows(TOKEN), 0);
-        let conversion = OwnedCodecAdvance::begin(source, destination).ok().unwrap();
+        let conversion = OwnedCodecAdvance::begin(source, destination).unwrap_or_else(|(_, _, error)| panic!("the conversion begins: {error}"));
         let destination = conversion.commit();
         assert_eq!(destination.position(), 2);
         assert_eq!(
@@ -1632,12 +1578,11 @@ mod tests {
             .ok()
             .unwrap();
         let bank_bytes = store.allocation_trace().unwrap().recurrent_bank_bytes;
-        let first_census = store.holding_census(&[], &[], &[]).unwrap();
         assert_eq!(
-            first_census.in_flight,
+            store.referenced_bytes(),
             4 * store.history_row_bytes(TOKEN) + bank_bytes
         );
-        assert_eq!(first_census.model_seed, bank_bytes);
+        assert_eq!(store.occupied_bytes() - store.referenced_bytes(), bank_bytes, "the model's seed bank");
         let bindings = advance.bindings();
         assert_eq!((bindings.stop, bindings.previous_tape), (1, 0));
         let following = bindings.following_bank;
@@ -1655,12 +1600,9 @@ mod tests {
         assert_eq!(checkpoint.tape_rows(), 2);
         assert_eq!(checkpoint.fork().tape_rows(), 2);
         let advance = OwnedStateAdvance::begin(state, 1).ok().unwrap();
-        let shared_census = store
-            .holding_census(&[], &[crate::Holder::Checkpoint(&checkpoint)], &[])
-            .unwrap();
-        assert_eq!(shared_census.retained, 0);
+        // The checkpoint shares the advance's source rows and bank, counted once.
         assert_eq!(
-            shared_census.in_flight,
+            store.referenced_bytes(),
             4 * store.history_row_bytes(TOKEN) + 2 * bank_bytes
         );
         let bindings = advance.bindings();

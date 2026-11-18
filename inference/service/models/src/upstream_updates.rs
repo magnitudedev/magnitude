@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use magnitude_service_contracts::{InventoryError, ModelSource};
 use magnitude_service_contracts::models::{
-    AddedModel, CustomModel, CustomModelOrigin, InstalledModelPackages as _, ModelFileRole,
+    AddedModel, CatalogPackageRemover, CustomModel, CustomModelOrigin, LoadedPackages, ModelFileRole,
     ModelPackageId, ModelPackageInstallationOrigin, PackageValidation,
 };
 use tokio::sync::Notify;
@@ -273,8 +273,8 @@ impl ModelDomainResolver {
 
 /// Runs the checks and the removal of replaced copies in the background for as long as the
 /// resolver lives: after every configuration or inventory change, and every few minutes so a
-/// result is renewed once it is due.
-pub(crate) fn start(resolver: &Arc<ModelDomainResolver>) {
+/// result is renewed once it is due. `remover` removes them, as it does every package.
+pub(crate) fn start(resolver: &Arc<ModelDomainResolver>, remover: Arc<dyn CatalogPackageRemover>) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
@@ -282,7 +282,7 @@ pub(crate) fn start(resolver: &Arc<ModelDomainResolver>) {
     let resolver = Arc::downgrade(resolver);
     runtime.spawn(async move {
         while let Some(resolver) = Weak::upgrade(&resolver) {
-            sweep(&resolver).await;
+            sweep(&resolver, remover.as_ref()).await;
             drop(resolver);
             tokio::select! {
                 () = wake.notified() => {}
@@ -292,7 +292,7 @@ pub(crate) fn start(resolver: &Arc<ModelDomainResolver>) {
     });
 }
 
-async fn sweep(resolver: &ModelDomainResolver) {
+async fn sweep(resolver: &ModelDomainResolver, remover: &dyn CatalogPackageRemover) {
     let Ok(configuration) = resolver.inventory.local_models_configuration() else {
         return;
     };
@@ -314,10 +314,10 @@ async fn sweep(resolver: &ModelDomainResolver) {
         })
         .unwrap_or_default();
     for package_id in replaced {
-        match resolver.inventory.remove_installed(&package_id).await {
-            Ok(removal) => tracing::info!(
+        match remover.remove_catalog_packages(vec![package_id.clone()], LoadedPackages::Keep).await {
+            Ok(freed_bytes) => tracing::info!(
                 package_id = %package_id.0,
-                freed_bytes = removal.freed_bytes,
+                freed_bytes,
                 "removed the copy an added model's update replaced"
             ),
             Err(error) => tracing::warn!(
@@ -344,6 +344,7 @@ mod tests {
         fn remove_catalog_packages(
             &self,
             _package_ids: Vec<ModelPackageId>,
+            _loaded: magnitude_service_contracts::models::LoadedPackages,
         ) -> futures_util::future::BoxFuture<'_, Result<u64, magnitude_service_contracts::InventoryError>>
         {
             Box::pin(async { Ok(0) })

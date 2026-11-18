@@ -22,7 +22,6 @@
 //! Waiting participants spin for a short, fixed bound and then park. Job
 //! state, counters and scratch are owned by the pool and reused.
 
-use std::any::Any;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -239,10 +238,11 @@ trait Job: Sync {
     fn run(&self, shared: &Shared, ordinal: usize);
 }
 
-/// A job published to the pool's threads. The submitter keeps the pointee
-/// alive until every thread has left it.
+/// A job published to the pool's threads, and its submitter, as whose a
+/// panic of the job ends ([`seismic_threads::Submitter`]). The submitter
+/// keeps the pointee alive until every thread has left it.
 #[derive(Clone, Copy)]
-struct Published(*const (dyn Job + 'static));
+struct Published(*const (dyn Job + 'static), seismic_threads::Submitter);
 
 /// Bits of [`Shared::published`] holding the participant count of the job.
 const PARTICIPANT_BITS: u32 = 16;
@@ -260,7 +260,7 @@ struct Shared {
     /// Pool threads that have not yet left the current job.
     remaining: AtomicUsize,
     cancelled: AtomicBool,
-    panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
+    panic: Mutex<Option<seismic_threads::Panic>>,
     shutdown: AtomicBool,
     /// Whether each participant is parked, or about to park, in `wait_until`.
     parked: Vec<AtomicBool>,
@@ -351,7 +351,7 @@ impl Shared {
     }
 
     /// Records the first panic of the job and makes every participant leave.
-    fn cancel(&self, payload: Box<dyn Any + Send + 'static>) {
+    fn cancel(&self, payload: seismic_threads::Panic) {
         {
             let mut panic = self
                 .panic
@@ -369,15 +369,17 @@ impl Shared {
         self.wake();
     }
 
-    /// Runs participant `ordinal`'s share of `job` in the strict floating
-    /// environment, cancelling the job if it panics.
-    fn participate(&self, job: &dyn Job, ordinal: usize) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    /// Runs participant `ordinal`'s share of `job` for `submitter` in the
+    /// strict floating environment, cancelling the job if it panics: a panic
+    /// its submitter unwinds from, since one whose process ends never
+    /// returns here.
+    fn participate(&self, job: &dyn Job, ordinal: usize, submitter: seismic_threads::Submitter) {
+        let result = submitter.run(|| {
             let _strict_float = StrictFloatEnvironment::enter();
             job.run(self, ordinal);
-        }));
-        if let Err(payload) = result {
-            self.cancel(payload);
+        });
+        if let Err(panic) = result {
+            self.cancel(panic);
         }
     }
 }
@@ -402,8 +404,8 @@ fn work(shared: &Shared, ordinal: usize) {
         // SAFETY: the submitter wrote the job before publishing it and
         // keeps it alive until `remaining`, which counts this thread,
         // reaches zero.
-        let Published(job) = unsafe { *shared.job.get() }.expect("a publication carries a job");
-        shared.participate(unsafe { &*job }, ordinal);
+        let Published(job, submitter) = unsafe { *shared.job.get() }.expect("a publication carries a job");
+        shared.participate(unsafe { &*job }, ordinal, submitter);
         if shared.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
             shared.wake_range(0..1);
         }
@@ -733,9 +735,7 @@ impl Workers {
         let mut threads = Vec::with_capacity(count - 1);
         for ordinal in 1..count {
             let shared = shared.clone();
-            let thread = std::thread::Builder::new()
-                .name(format!("seismic-cpu-{ordinal}"))
-                .spawn(move || work(&shared, ordinal))?;
+            let thread = seismic_threads::spawn(format!("seismic-cpu-{ordinal}"), move || work(&shared, ordinal))?;
             threads.push(thread);
         }
         shared
@@ -778,13 +778,14 @@ impl Workers {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::thread::current());
         let pool = participants > 1;
+        let submitter = seismic_threads::Submitter::here();
         if pool {
             // SAFETY: no pool thread is in a job (`remaining` is zero), and
             // `job` outlives the wait for `remaining` below. Only the
             // lifetime is erased; the pointer is cleared before returning.
             let job: *const (dyn Job + '_) = job;
             let job: *const (dyn Job + 'static) = unsafe { std::mem::transmute(job) };
-            unsafe { *shared.job.get() = Some(Published(job)) };
+            unsafe { *shared.job.get() = Some(Published(job, submitter)) };
             shared.remaining.store(participants - 1, Ordering::SeqCst);
             let epoch =
                 (shared.published.load(Ordering::SeqCst) >> PARTICIPANT_BITS).wrapping_add(1);
@@ -796,7 +797,7 @@ impl Workers {
         }
         {
             let _class = pool.then(SubmitterClass::enter);
-            shared.participate(job, 0);
+            shared.participate(job, 0, submitter);
         }
         if pool {
             shared.wait_until(0, || shared.remaining.load(Ordering::SeqCst) == 0);
@@ -807,8 +808,8 @@ impl Workers {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(payload) = panic {
-            std::panic::resume_unwind(payload);
+        if let Some(panic) = panic {
+            panic.resume();
         }
     }
 
@@ -952,7 +953,7 @@ impl Drop for Workers {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         self.shared.wake();
         for thread in self.threads.drain(..) {
-            let _ = thread.join();
+            thread.join().expect("a pool worker's panic ends the process");
         }
     }
 }

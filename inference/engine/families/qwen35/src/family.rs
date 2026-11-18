@@ -37,7 +37,7 @@ impl ModelFamily for Qwen35Family {
         definition: &ModelDefinition,
         markers: &dyn MarkerTokens,
     ) -> Result<FamilyInputAdapter, FamilyError> {
-        if definition.vision.as_ref().is_some_and(|v| {
+        if definition.vision.as_deref().is_some_and(|v| {
             matches!(
                 v.preprocessing.resize,
                 magnitude_family_contracts::VisionResize::Slices { .. }
@@ -61,7 +61,7 @@ impl ModelFamily for Qwen35Family {
     }
 
     fn media_placeholder(&self, definition: &ModelDefinition) -> Option<&'static str> {
-        definition.vision.as_ref().map(|v| {
+        definition.vision.as_deref().map(|v| {
             if matches!(
                 v.preprocessing.resize,
                 magnitude_family_contracts::VisionResize::Slices { .. }

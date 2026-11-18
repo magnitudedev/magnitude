@@ -1581,19 +1581,20 @@ mod tests {
     /// `steps` not yet begun.
     fn mapped_on(steps: Arc<Steps>, records: u32, layers: usize, members: &[(usize, usize)], resolution: Resolution) -> (HostRecords, Maps) {
         let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+        let charges = seismic::Charges::tally(&cpu);
         let mut maps = vec![None; layers];
         let mut plain = Vec::new();
         let mut stamped = Vec::new();
         for layer in 0..layers {
             match resolution {
                 Resolution::AfterStore => {
-                    let tensor = seismic::Tensor::shared(&cpu, seismic::Element::i32(), &[EXPERTS as u64]).unwrap();
+                    let tensor = seismic::Tensor::shared(&charges, seismic::Element::i32(), &[EXPERTS as u64]).unwrap();
                     let words = Words::new(tensor, EXPERTS as u64, -1).unwrap();
                     plain.push(words.clone());
                     maps[layer] = Some(LandingMap::Tier(words));
                 }
                 Resolution::BeforeStamp => {
-                    let tensor = seismic::Tensor::shared(&cpu, seismic::Element::i32(), &[EXPERTS as u64, MAP_WORDS]).unwrap();
+                    let tensor = seismic::Tensor::shared(&charges, seismic::Element::i32(), &[EXPERTS as u64, MAP_WORDS]).unwrap();
                     let map = StampedMap::new(Words::new(tensor, EXPERTS as u64 * MAP_WORDS, 0).unwrap());
                     stamped.push(map.view().clone());
                     maps[layer] = Some(LandingMap::Bank { map: std::sync::Arc::new(map), steps: steps.clone() });

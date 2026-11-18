@@ -188,39 +188,24 @@ where
             .lock()
             .expect("Opened preparation-cache lock poisoned while mutating private cache state")
     }
-    /// Charge and allocate device storage in a hazard domain of its own.
-    pub(crate) fn allocate_storage(
-        self: &Arc<Self>,
-        bytes: u64,
-        alignment: u64,
-    ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_contract(seismic_topology::Contract::DeviceOnly, bytes, alignment, None)
-    }
-
-    /// Charge and allocate `bytes` of `contract` in the first of the kinds
-    /// it is allocated from now ([`DeviceStores::kinds`]), ordered by
-    /// `access`'s hazard domain where given (a slab its address table's, or
-    /// a table that of the storage its slabs view), otherwise by a domain
-    /// of its own. These backends allocate in exactly the kind asked
-    /// (`DeviceService::allocate`), never moving on to another.
+    /// Charge `bytes` as `charge` says and allocate them in the first of
+    /// its kinds, ordered by `access`'s hazard domain where given (a slab
+    /// its address table's, or a table that of the storage its slabs view),
+    /// otherwise by a domain of its own. These backends allocate in exactly
+    /// the kind asked (`DeviceService::allocate`), never moving on to
+    /// another.
     pub(crate) fn allocate_contract(
         self: &Arc<Self>,
-        contract: seismic_topology::Contract,
+        charge: crate::memory::AllocationCharge<'_>,
         bytes: u64,
         alignment: u64,
         access: Option<Arc<AccessGroup>>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        let kind = self.memory.kinds(contract)?[0];
-        let entry = self.entry(contract);
+        let crate::memory::AllocationCharge { entry, kinds } = charge;
+        let kind = kinds[0];
         allocate_in(self.allocation_limits(), &self.memory, bytes, alignment, access, || {
-            Ok((kind, buffer_storage::<T, E>(&self.service, self.service.allocate(kind, bytes, alignment, &entry)?)))
+            Ok((kind, buffer_storage::<T, E>(&self.service, self.service.allocate(kind, bytes, alignment, entry)?)))
         })
-    }
-
-    /// The ledger entry an allocation of `contract` through this device on
-    /// this thread is charged to ([`crate::memory::DeviceStores::entry`]).
-    pub(crate) fn entry(&self, contract: seismic_topology::Contract) -> Arc<dyn crate::memory::Entry> {
-        self.memory.entry(contract)
     }
 
     /// One block of a granule pool (`crate::pool`) of `bytes` of `kind`,
@@ -266,7 +251,7 @@ where
         make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
         // The mapped memory is the host's, the backend's one kind.
-        let kind = self.memory.kinds(seismic_topology::Contract::DeviceOnly)?[0];
+        let kind = self.memory.kinds(seismic_topology::Contract::DeviceOnly)[0];
         allocate_in(self.allocation_limits(), &self.memory, bytes, alignment, None, || {
             let buffer = make(&self.service)?;
             let storage: Box<dyn Storage> = Box::new(ReadOnlyStorage::<T, E> {
@@ -666,11 +651,12 @@ impl Allocation {
     /// records' addresses in turn. That is the table of records of their
     /// size and phase (`offset % record`), entry `i` record `i`'s; a single
     /// record is also found in any held table with an entry at its address.
-    /// Formed by `form` (given the phase and the records from it) where
-    /// none is held, then held with the storage. So the tables a storage
+    /// Formed through `charges`, those its binder names for it, by `form`
+    /// (given the phase, the records from it and those charges) where none
+    /// is held, then held with the storage. So the tables a storage
     /// holds are those of the record sizes and phases its views are bound
     /// at, and a storage whose first table is of its finest records (a
-    /// streamed table's slots, held from its first by `hold_records`) holds
+    /// streamed table's slots, formed with them: `Tensor::zeros_recorded`) holds
     /// no other for single records at their boundaries. A view formed per
     /// run (a landed read's rows) allocates nothing, and no table outlives
     /// its storage's use: a table a run's view alone held would be freed
@@ -681,7 +667,8 @@ impl Allocation {
         record: u64,
         offset: u64,
         count: u64,
-        form: impl FnOnce(u64, u64) -> Result<Arc<Allocation>, E>,
+        charges: &crate::memory::Charges,
+        form: impl FnOnce(u64, u64, &crate::memory::Charges) -> Result<Arc<Allocation>, E>,
     ) -> Result<(Arc<Allocation>, u64), E> {
         let entry = |held: &ViewTable| {
             seismic_lang::registry::record_table_entry((offset - held.phase) / held.record)
@@ -707,7 +694,7 @@ impl Allocation {
             record,
             phase,
             records,
-            table: form(phase, records)?,
+            table: form(phase, records, charges)?,
         };
         let found = (held.table.clone(), entry(&held));
         tables.push(held);
@@ -1041,7 +1028,7 @@ pub(crate) fn prepare<T, E, C>(
     native_context: &C::Context,
     logical: LogicalEntry,
     bindings: ElementBindings,
-    public_device: &Arc<crate::api::device::DeviceInner>,
+    charges: &crate::memory::Charges,
     options: PreparationOptions,
 ) -> Result<Arc<Prepared<T, E>>, PrepareError>
 where
@@ -1064,7 +1051,7 @@ where
             EvaluationMethod::Analytical => true,
             EvaluationMethod::Feedback(_) => {
                 use seismic_compiler::feedback::ControlledObserver;
-                let environment = feedback::Observer::new(opened.clone(), public_device.clone())
+                let environment = feedback::Observer::new(opened.clone(), charges.clone())
                     .environment()
                     .map_err(|error| {
                         PrepareError::Preparation(
@@ -1134,7 +1121,7 @@ where
                 (kernel, None)
             }
             EvaluationMethod::Feedback(feedback_options) => {
-                let observer = feedback::Observer::new(opened.clone(), public_device.clone());
+                let observer = feedback::Observer::new(opened.clone(), charges.clone());
                 let (campaign, kernel) = FeedbackPreparation::start(
                     logical,
                     opened.device_description(),
@@ -1231,10 +1218,11 @@ where
         module: &CheckedModule,
         entry: EntryId,
         bindings: ElementBindings,
-        public_device: &Arc<crate::api::device::DeviceInner>,
+        charges: &crate::memory::Charges,
         precision: PrecisionPolicy,
         options: seismic_compiler::feedback::FeedbackOptions,
     ) -> Result<(Self, Arc<PreparedHandle<T, E>>), PrepareError> {
+        let public_device = charges.device();
         let logical = module
             .entry(entry, &bindings)
             .map_err(PrepareError::Source)?;
@@ -1243,7 +1231,7 @@ where
             native_compile_wall_time: options.search_time,
             ..Default::default()
         };
-        let observer = feedback::Observer::new(opened.clone(), public_device.clone());
+        let observer = feedback::Observer::new(opened.clone(), charges.clone());
         let (campaign, kernel) = FeedbackPreparation::start(
             logical,
             opened.device_description(),
@@ -1317,7 +1305,7 @@ pub(crate) enum PhysicalBufferBinding {
 
 struct IssuedResources<'a, T: TargetFamily, E: NativeExecutor<T>> {
     owner: &'a mut AdmittedResources,
-    device: &'a Arc<Opened<T, E>>,
+    charges: &'a crate::memory::Charges,
     bindings: &'a [PhysicalBufferBinding],
     buffers: Vec<Option<RuntimeBuffer<Buffer<T, E>>>>,
 }
@@ -1381,9 +1369,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>>
         self.buffers[index] = None;
         self.owner.retire_private(slot);
         self.owner.check_reached_capacity(bytes)?;
-        let backing = self
-            .device
-            .allocate_storage(bytes, alignment.max(planned_alignment))?;
+        let backing = self.charges.allocate(bytes, alignment.max(planned_alignment))?;
         let permit = backing
             .try_acquire(true)
             .expect("fresh private backing cannot have an access owner");
@@ -1495,7 +1481,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedCommand<T, E> {
         submission: &mut E::Submission,
         device: &Service<T, E>,
         resources: &mut AdmittedResources,
-        opened: &Arc<Opened<T, E>>,
+        charges: &crate::memory::Charges,
     ) -> Result<(), ExecutionError> {
         let buffers = self
             .staged
@@ -1535,9 +1521,9 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedCommand<T, E> {
                 }
             })
             .collect();
-        let mut resources = IssuedResources {
+        let mut resources: IssuedResources<'_, T, E> = IssuedResources {
             owner: resources,
-            device: opened,
+            charges,
             bindings: &self.staged.buffers,
             buffers,
         };
@@ -1562,13 +1548,13 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Prepared<T, E> {
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> PreparedHandle<T, E> {
-    pub(crate) fn call(self: &Arc<Self>, args: EncodedArgs) -> Result<DecodedResults, CallError>
+    pub(crate) fn call(self: &Arc<Self>, charges: &crate::memory::Charges, args: EncodedArgs) -> Result<DecodedResults, CallError>
     where
         T: 'static,
     {
         let attributes = self.prepared.attributes();
         let mut span = Timed::start("seismic.call", attributes.clone());
-        let (results, allocated_bytes) = workflow::native::call_one(self.clone(), args)?;
+        let (results, allocated_bytes) = workflow::native::call_one(self.clone(), charges, args)?;
         span.attribute(key_bool("seismic.ok", true));
         telemetry::record_call(span.elapsed_ms(), allocated_bytes, &attributes);
         Ok(results)
@@ -1825,12 +1811,13 @@ mod physical_slot_tests {
         let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
             unreachable!()
         };
+        let charges = crate::memory::Charges::tally(&device);
         let baseline = tally.held();
         let maximum = opened.device_description().limits().max_allocation_bytes;
         // An allocation beyond the target's limit is refused before the
         // backend allocates or charges anything.
-        let error = opened
-            .allocate_storage(maximum.checked_add(1).unwrap(), 4)
+        let error = charges
+            .allocate(maximum.checked_add(1).unwrap(), 4)
             .err()
             .expect("an allocation beyond the target limit is refused before allocating");
         assert!(matches!(
@@ -1840,7 +1827,7 @@ mod physical_slot_tests {
         ));
         assert_eq!(tally.held(), baseline);
         assert!(matches!(
-            opened.allocate_storage(4, 0),
+            charges.allocate(4, 0),
             Err(ExecutionError::ConstructionContradiction(_))
         ));
         assert_eq!(tally.held(), baseline);

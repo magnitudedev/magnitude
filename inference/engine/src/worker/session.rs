@@ -87,22 +87,20 @@ pub(crate) fn spawn_reader(
     mut receiver: impl MessageReceiver<HostMessage>,
     signal: Arc<Signal>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("magnitude-worker-reader".into())
-        .spawn(move || loop {
-            match receiver.receive() {
-                Ok(Some(message)) => signal.push(Inbound::Message(message)),
-                Ok(None) => {
-                    signal.push(Inbound::Disconnected(None));
-                    return;
-                }
-                Err(error) => {
-                    signal.push(Inbound::Disconnected(Some(error)));
-                    return;
-                }
+    seismic::threads::spawn("magnitude-worker-reader", move || loop {
+        match receiver.receive() {
+            Ok(Some(message)) => signal.push(Inbound::Message(message)),
+            Ok(None) => {
+                signal.push(Inbound::Disconnected(None));
+                return;
             }
-        })
-        .expect("spawn the worker reader thread")
+            Err(error) => {
+                signal.push(Inbound::Disconnected(Some(error)));
+                return;
+            }
+        }
+    })
+    .expect("spawn the worker reader thread")
 }
 
 struct PendingAdmission {
@@ -541,11 +539,11 @@ impl Session {
             self.observations.swap_remove(index);
             match reply {
                 Ok(WorkerReply::Observed {
-                    reconciliation,
+                    stores: allocations,
                     readings,
                     serving,
                 }) => {
-                    let census = AllocationCensus::classify(&reconciliation, serving);
+                    let census = AllocationCensus { stores: allocations, serving };
                     let stores = readings
                         .iter()
                         .map(|reading| StoreHeadroom {
@@ -570,8 +568,7 @@ impl Session {
                 })?,
             }
         }
-        if let Some((reconciliation, serving)) = self.loaded.census.take(&self.waker) {
-            let census = AllocationCensus::classify(&reconciliation, serving);
+        if let Some(census) = self.loaded.census.take(&self.waker) {
             self.send(WorkerMessage::Census { census })?;
         }
         self.forward_streams()?;

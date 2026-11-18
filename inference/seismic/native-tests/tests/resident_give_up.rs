@@ -11,14 +11,15 @@ fn a_grid_barrier_that_not_every_threadgroup_reaches_loses_the_device() {
     use std::time::{Duration, Instant};
 
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else { return };
+    let charges = seismic::Charges::tally(&device);
     let kernel = resident_reverse::native_for_device(&device, &NativeSpecialization::new()).unwrap();
-    let skip = Tensor::from_host(&device, Element::i32(), &[1], &1i32.to_le_bytes()).unwrap();
+    let skip = Tensor::from_host(&charges, Element::i32(), &[1], &1i32.to_le_bytes()).unwrap();
     let n = 1u64 << 16;
     let zeros = vec![0u8; 4 * n as usize];
-    let mut x = Tensor::from_host(&device, Element::f32(), &[n], &zeros).unwrap();
-    let mut y = Tensor::from_host(&device, Element::f32(), &[n], &zeros).unwrap();
+    let mut x = Tensor::from_host(&charges, Element::f32(), &[n], &zeros).unwrap();
+    let mut y = Tensor::from_host(&charges, Element::f32(), &[n], &zeros).unwrap();
     let start = Instant::now();
-    let result = kernel.call(resident_reverse::Args { skip: &skip, x: &mut x, y: &mut y }).map(|_| ());
+    let result = kernel.call(&charges, resident_reverse::Args { skip: &skip, x: &mut x, y: &mut y }).map(|_| ());
     let elapsed = start.elapsed();
     println!("MEASURE give-up detected after {elapsed:?}");
     assert!(

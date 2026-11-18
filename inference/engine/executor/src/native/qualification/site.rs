@@ -18,7 +18,7 @@ use magnitude_kernels::cpu_library::cpu::lib::core::functions;
 /// `form` under `requirement`; pending where it has stored none, as without
 /// a `cache` to keep one.
 pub(super) fn site_verdict(
-    device: &Device,
+    charges: &seismic::Charges,
     binding: &BankBinding,
     form: SiteForm,
     requirement: &seismic::NumericalRequirement,
@@ -28,7 +28,7 @@ pub(super) fn site_verdict(
         return Priced::Pending("no kernel cache keeps a CPU site's verdict".into());
     };
     let records = crate::kernel_cache::KernelCache::measurement_records(cache.root());
-    SiteRequest::of(binding, form, requirement.clone()).verdict(device.topology(), device.info(), &records)
+    SiteRequest::of(binding, form, requirement.clone()).verdict(charges.device().topology(), charges.device().info(), &records)
 }
 
 /// Run `request`'s site in the measurement job, on its contained `device`:
@@ -42,7 +42,7 @@ pub(super) fn site_verdict(
 /// second-level scales runs is what is admitted (an unscaled stack's is the
 /// same arithmetic at a scale of one, which is exact); the site's output
 /// `[VERIFY_ROWS, H]` is compared with the reference's.
-pub(crate) fn admit_site(device: &Device, request: &SiteRequest) -> Result<Result<(), String>, String> {
+pub(crate) fn admit_site(charges: &seismic::Charges, request: &SiteRequest) -> Result<Result<(), String>, String> {
     let failed = |error: &dyn fmt::Display| error.to_string();
     let to = |value: u64| usize::try_from(value).map_err(|error| failed(&error));
     let shape = SiteShape::of(&request.form)?;
@@ -56,7 +56,7 @@ pub(crate) fn admit_site(device: &Device, request: &SiteRequest) -> Result<Resul
     let seed = std::cell::Cell::new(0);
     let held = request.form.record.try_map(|_, tensor| {
         seed.set(seed.get() + 1);
-        held_records(device, tensor, records as u64, seed.get())
+        held_records(charges, tensor, records as u64, seed.get())
     })?;
     let tensors = SiteTensors {
         gate: held.gate.as_ref().map(|held| held.records.clone()),
@@ -66,9 +66,9 @@ pub(crate) fn admit_site(device: &Device, request: &SiteRequest) -> Result<Resul
     let shape = SiteShape { experts: records, ..shape };
     let scale = |seed| pattern(records, seed, 0.5).iter().map(|scale| scale.abs() + 0.5).collect::<std::sync::Arc<[f32]>>();
     let scales = SiteScales { gate: held.gate.is_some().then(|| scale(13)), up: Some(scale(17)) };
-    let layer = SiteLayer::owned(device, tensors, scales.clone(), shape).map_err(|error| failed(&error))?;
+    let layer = SiteLayer::owned(charges, tensors, scales.clone(), shape).map_err(|error| failed(&error))?;
     // No file is read beside a qualification: the read engine needs no core.
-    let threads = crate::experts::Machine::discover(device, 0.).and_then(|machine| machine.widest()).map_err(|error| failed(&error))?;
+    let threads = crate::experts::Machine::discover(&charges.device(), 0.).and_then(|machine| machine.widest()).map_err(|error| failed(&error))?;
     let compute = crate::experts::HostCompute::start(vec![layer], &threads).map_err(|error| failed(&error))?;
     let handle = compute.handle();
     let _flight = handle.flight().expect("a site of one layer");
@@ -84,10 +84,7 @@ pub(crate) fn admit_site(device: &Device, request: &SiteRequest) -> Result<Resul
     // A request is answered: every taken one ends in its answer.
     let ready = loop {
         match layer.ready(slot) {
-            0 => match handle.panicked() {
-                Some(reason) => return Err(failed(&reason)),
-                None => std::hint::spin_loop(),
-            },
+            0 => std::hint::spin_loop(),
             ready => break ready,
         }
     };
@@ -157,12 +154,12 @@ struct Held {
 /// `seed`): a dense source's values in `[-1/2, 1/2)`, a packed source's
 /// pseudo-random bytes in its domain with every value finite
 /// (`Element::finite_source`), so the comparison is over numbers.
-fn held_records(device: &Device, tensor: RecordTensor, count: u64, seed: u64) -> Result<Held, String> {
+fn held_records(charges: &seismic::Charges, tensor: RecordTensor, count: u64, seed: u64) -> Result<Held, String> {
     let failed = |error: &dyn fmt::Display| error.to_string();
     let [n, k] = tensor.matrix;
     let record = [1, n, k];
     let stored_bytes = usize::try_from(tensor.stored_bytes().map_err(|error| failed(&error))?).map_err(|error| failed(&error))?;
-    let held = Tensor::shared(device, tensor.resident, &[count, n, k]).map_err(|error| failed(&error))?;
+    let held = Tensor::shared(charges, tensor.resident, &[count, n, k]).map_err(|error| failed(&error))?;
     let placement = held.record_placement().ok_or_else(|| failed(&"tier records the host does not place"))?;
     for index in 0..count {
         let seed = (seed * 131 + index) as u32;

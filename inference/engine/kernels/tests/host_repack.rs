@@ -77,6 +77,7 @@ fn host_landing_conversions_equal_the_device_repack() {
 }
 
 fn conversions_equal_on(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let layout = device.backend().resident_layout();
     let mut compared = Vec::new();
     let mut unreferenced = Vec::new();
@@ -115,8 +116,8 @@ fn conversions_equal_on(device: &Device) {
                 conversion.piece(k, rows, from, &stored, &mut host[to]).unwrap_or_else(|| panic!("{form}: a piece did not convert"));
             }
             // The device's.
-            let tensor = seismic::Tensor::from_host(device, source, &[1, rows as u64, k as u64], &stored).unwrap();
-            let device_bytes = kernel.call(repack_weight::Args { source: &tensor }).unwrap().value.read_to_host().unwrap();
+            let tensor = seismic::Tensor::from_host(&charges, source, &[1, rows as u64, k as u64], &stored).unwrap();
+            let device_bytes = kernel.call(&charges, repack_weight::Args { source: &tensor }).unwrap().value.read_to_host().unwrap();
             assert_eq!(device_bytes.len(), host.len(), "{form}: record bytes");
             if let Some(first) = device_bytes.iter().zip(&host).position(|(device, host)| device != host) {
                 let differing = device_bytes.iter().zip(&host).filter(|(device, host)| device != host).count();

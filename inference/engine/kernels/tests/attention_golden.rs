@@ -415,8 +415,9 @@ impl Family {
         let Geometry { kv, g, p, .. } = case.geometry;
         let (m, w) = (case.rows as u64, case.geometry.w() as u64);
         let heads = (kv * g) as u64;
+        let charges = seismic::Charges::tally(device);
         let empty = |element: Element, shape: &[u64]| {
-            Tensor::from_host(device, element, shape, &[]).unwrap()
+            Tensor::from_host(&charges, element, shape, &[]).unwrap()
         };
         Self {
             query: inputs.query_gate.reshape(&[m, heads, 2 * w]).unwrap(),
@@ -470,6 +471,7 @@ fn run_family(
     history: &mut [Tensor],
     named: &Named,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let charges = seismic::Charges::tally(device);
     let case = &named.case;
     let slab_rows = named.slab_rows as u32;
     let elements = Element::bf16();
@@ -482,7 +484,7 @@ fn run_family(
         specialization.clone().with_static("B", 0)
     };
     let rows = inputs.destinations.extents()[0];
-    let selection = Tensor::from_host(device, Element::u32(), &[rows, 0], &[]).unwrap();
+    let selection = Tensor::from_host(&charges, Element::u32(), &[rows, 0], &[]).unwrap();
     let every_key = block_slots(device, 1);
     {
         // Half-split leading rotary pairs, no output rotary (the dense
@@ -510,7 +512,7 @@ fn run_family(
                     panic!("dense history has two planes")
                 };
                 kernel
-                    .call($module::Args {
+                    .call(&charges, $module::Args {
                         query: &family.query,
                         gate: &family.gate,
                         key: &family.key,
@@ -566,7 +568,7 @@ fn run_family(
                     panic!("affine history has four planes")
                 };
                 kernel
-                    .call($module::Args {
+                    .call(&charges, $module::Args {
                         query: &family.query,
                         gate: &family.gate,
                         key: &family.key,

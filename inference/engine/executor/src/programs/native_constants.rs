@@ -4,7 +4,7 @@
 
 use super::graph::{GraphError, draft::GraphDraft};
 use seismic::{
-    Device, Dim, DimensionExpr, Element, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphStorageBytes,
+    Dim, DimensionExpr, Element, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphStorageBytes,
     NativePort, Reals, Table, TableExpr, Tensor, TraceOutput,
 };
 use std::sync::{Arc, Mutex};
@@ -981,15 +981,16 @@ impl FamilyConstants {
 
 /// Device tensors of bound constants, one per distinct (element, extents,
 /// bytes). Constants are small and few, so a linear search suffices.
-pub(crate) struct ConstantTensors {
-    device: Device,
+pub(crate) struct ConstantTensors<'c> {
+    /// What the constants are uploaded through: the binding's.
+    charges: &'c seismic::Charges,
     uploaded: Vec<(GraphConstant, Tensor)>,
 }
 
-impl ConstantTensors {
-    pub(crate) fn new(device: Device) -> Self {
+impl<'c> ConstantTensors<'c> {
+    pub(crate) fn new(charges: &'c seismic::Charges) -> Self {
         Self {
-            device,
+            charges,
             uploaded: Vec::new(),
         }
     }
@@ -1004,9 +1005,9 @@ impl ConstantTensors {
         }
         let value = constant.value();
         let tensor = match &value.value {
-            ConstantValue::Zero => Tensor::zeros(&self.device, value.element, &value.extents),
+            ConstantValue::Zero => Tensor::zeros(self.charges, value.element, &value.extents),
             ConstantValue::Bytes(bytes) => {
-                Tensor::from_host(&self.device, value.element, &value.extents, bytes)
+                Tensor::from_host(self.charges, value.element, &value.extents, bytes)
             }
         }
         .map_err(|error| format!("graph constant upload failed: {error}"))?;
@@ -1052,7 +1053,8 @@ mod tests {
                 .unwrap();
             let before = device.allocated();
             let lone = charge_of(&device, &[&zero]);
-            let mut uploaded = ConstantTensors::new(device.clone());
+            let charges = seismic::Charges::tally(&device);
+            let mut uploaded = ConstantTensors::new(&charges);
             let tensor = uploaded.tensor(&zero).unwrap();
             assert_eq!(tensor.read_to_host().unwrap(), vec![0; 24]);
             let tied = uploaded.tensor(&explicit).unwrap();
@@ -1072,7 +1074,8 @@ mod tests {
     /// (`seismic_cpu::buffer::Carver`).
     fn charge_of(device: &seismic::Device, constants: &[&GraphConstant]) -> u64 {
         let before = device.allocated();
-        let mut uploaded = ConstantTensors::new(device.clone());
+        let charges = seismic::Charges::tally(&device);
+        let mut uploaded = ConstantTensors::new(&charges);
         for constant in constants {
             uploaded.tensor(constant).unwrap();
         }
@@ -1093,7 +1096,8 @@ mod tests {
         assert_eq!(distinct_storage_bytes([&first, &tied, &other]).unwrap(), 20, "the claim counts each distinct value once");
         let distinct = charge_of(&device, &[&first, &other]);
         let before = device.allocated();
-        let mut uploaded = ConstantTensors::new(device.clone());
+        let charges = seismic::Charges::tally(&device);
+        let mut uploaded = ConstantTensors::new(&charges);
         uploaded.tensor(&first).unwrap();
         uploaded.tensor(&tied).unwrap();
         uploaded.tensor(&other).unwrap();

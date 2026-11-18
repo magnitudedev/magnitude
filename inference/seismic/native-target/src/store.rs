@@ -41,6 +41,35 @@ impl ArtifactKey {
     }
 }
 
+/// The file a store keeps an artifact's bytes in, held
+/// ([`ArtifactStore::held`]): its path names those bytes for as long as this
+/// lives, whatever the store evicts meanwhile, so a platform that opens the
+/// artifact by path ([`Artifact::IN_PLACE`]) finds it there.
+///
+/// [`Artifact::IN_PLACE`]: crate::Artifact::IN_PLACE
+pub struct HeldFile {
+    path: std::path::PathBuf,
+    /// What keeps the file at its path: the store's hold of it.
+    _hold: Box<dyn Send + Sync>,
+}
+
+impl HeldFile {
+    /// The file at `path`, kept there while `hold` lives.
+    pub fn new(path: std::path::PathBuf, hold: Box<dyn Send + Sync>) -> Self {
+        Self { path, _hold: hold }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl std::fmt::Debug for HeldFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HeldFile").field(&self.path).finish()
+    }
+}
+
 /// Storage for compiled artifacts, the entry pointers that name them, and
 /// probe answers. `namespace` separates toolchains and the probes; a store
 /// treats it as an opaque name.
@@ -53,13 +82,14 @@ pub trait ArtifactStore: Send + Sync {
     fn contains(&self, namespace: &str, key: &ArtifactKey) -> bool {
         self.get(namespace, key).is_some()
     }
-    /// The file that holds the bytes for `key`, where the store keeps them
-    /// in one: what a toolchain whose platform opens its artifacts by path
-    /// opens in place ([`Artifact::decode`]). None where the store keeps no
-    /// file for it.
+    /// The stored bytes for `key` and the file that holds them, held, where
+    /// the store keeps them in one: what a toolchain whose platform opens
+    /// its artifacts by path opens in place ([`Artifact::decode`]). The
+    /// bytes are the held file's, read under the hold. None on a miss, any
+    /// failure, or where the store keeps no file for it.
     ///
-    /// [`Artifact::decode`]: seismic_native_target::Artifact::decode
-    fn file(&self, _namespace: &str, _key: &ArtifactKey) -> Option<std::path::PathBuf> {
+    /// [`Artifact::decode`]: crate::Artifact::decode
+    fn held(&self, _namespace: &str, _key: &ArtifactKey) -> Option<(Vec<u8>, HeldFile)> {
         None
     }
     /// Store `bytes` under `key`, replacing what was there. Failures are

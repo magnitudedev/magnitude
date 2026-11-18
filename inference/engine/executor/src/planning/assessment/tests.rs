@@ -2540,7 +2540,7 @@ fn glm_mtp_head_qualifies_on_the_selected_device() {
     .unwrap();
     crate::AttestedPrograms::prepare_draft(
         &draft,
-        &device,
+        &seismic::Charges::tally(&device),
         crate::TuningContext {
             definition: &definition,
             weights: &crate::ZeroTuningWeights,

@@ -715,7 +715,7 @@ mod tests {
         let device = cpu_device();
         let kernel = copy_kernel(&device);
         let storage = (0..4)
-            .map(|_| device.allocate(64, 64).unwrap())
+            .map(|_| crate::memory::Charges::tally(&device).allocate(64, 64).unwrap())
             .collect::<Vec<_>>();
         let [a, b, c, d] = [&*storage[0], &*storage[1], &*storage[2], &*storage[3]];
         let timeline = std::sync::Arc::new(super::super::timeline::TimelineInner::new(&device).unwrap());
@@ -760,7 +760,7 @@ mod tests {
         let device = cpu_device();
         let kernel = copy_kernel(&device);
         let storage = (0..2)
-            .map(|_| device.allocate(64, 64).unwrap())
+            .map(|_| crate::memory::Charges::tally(&device).allocate(64, 64).unwrap())
             .collect::<Vec<_>>();
         let [a, b] = [&*storage[0], &*storage[1]];
         let calls = Calls {
@@ -798,7 +798,7 @@ mod tests {
         let device = cpu_device();
         let kernel = copy_kernel(&device);
         let storage = (0..3)
-            .map(|_| device.allocate(256, 64).unwrap())
+            .map(|_| crate::memory::Charges::tally(&device).allocate(256, 64).unwrap())
             .collect::<Vec<_>>();
         let [a, b, other] = [&*storage[0], &*storage[1], &*storage[2]];
         let placed = |calls: Vec<Option<[(&Allocation, Range<u64>); 2]>>| {

@@ -16,12 +16,12 @@
 //!   the host memory's line ([`PointRequest::HostMemory`]) and a CPU site's
 //!   lines at its reference form ([`PointRequest::CpuSite`]) where a bank can
 //!   have a host tier, which a streamed load's bank is priced by, then the
-//!   rest of the walk. They are measured first, whatever a load asks, in
-//!   one job: they divide [`MEASUREMENT_SECONDS`] from its start among
-//!   them alone ([`JobDeadlines`]), and a point of them the budget cannot
-//!   hold is priced from those read, so no load moves them later or
-//!   earlier; a required figure's, which nothing prices, is left
-//!   unrecorded for the next job.
+//!   rest of the walk. They are measured first, whatever a load asks: their
+//!   samples share [`MEASUREMENT_SECONDS`] of sampling among them alone
+//!   ([`JobDeadlines`]), so no load moves them later or earlier, and
+//!   a point of them the job's time does not reach is left unrecorded for
+//!   the next job, never priced: what is recorded of a figure never follows
+//!   from how busy the host was.
 //! - **The machine's line** (`line_outstanding`, with the `machine-line`
 //!   feature): what the hardware itself reaches, which floors are judged
 //!   against, is a development measurement. Nothing in loading, planning or
@@ -35,12 +35,13 @@
 //!   runtime's: none enters assessment, which waits on its standing
 //!   requests alone.
 //! - **The job** ([`measure`]) measures the outstanding requests in that
-//!   order: assessment's standing points within [`MEASUREMENT_SECONDS`] of
-//!   its start, each sampling for its part of what is left beside the
-//!   fewest passes forecast of those after it; then the loads' within the
-//!   job's time, each an equal part of what is left, stopping where it
-//!   ends: the next job resumes the loads' and any required figure's from
-//!   the records stored. No load measures, and no load waits on the job.
+//!   order: assessment's standing points, each sampling for its part of
+//!   what is left of [`MEASUREMENT_SECONDS`] beside the fewest passes
+//!   forecast of those after it; then the loads', each sampling for an
+//!   equal part of what is left of the job's time. It begins points until
+//!   its time ends, each begun timed to its end, and the next job resumes
+//!   the rest from the records stored. No load measures, and no load waits
+//!   on the job.
 
 use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, Visit, Walks, Whose, MEASUREMENT_SECONDS};
 use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, StorageCosts, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
@@ -49,7 +50,7 @@ use crate::native::SiteForm;
 use crate::planning::BankBinding;
 use magnitude_kernels::constants::VERIFY_ROWS;
 use seismic::measure::{Attempt, JsonFileStore, Reason, Record, RecordStore, StoreError, Timing};
-use seismic::{Device, DeviceTopology, Executor, Identity, Measurer, PointKey};
+use seismic::{DeviceTopology, Executor, Identity, Measurer, PointKey};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -172,7 +173,7 @@ impl PointRequest {
             #[cfg(feature = "machine-line")]
             Self::Line => (super::line::MachineLine::measure(walks).err(), Vec::new()),
             Self::Site(site) => (site.measure(walks).err(), Vec::new()),
-            Self::CpuSite(form) => (CpuCosts::measure(walks.device(), form, walks.store()).err(), Vec::new()),
+            Self::CpuSite(form) => (CpuCosts::measure(walks.charges(), form, walks.store()).err(), Vec::new()),
             Self::Volume { file, urgent } => {
                 let urgent = VolumeCosts::urgent(urgent);
                 (VolumeCosts::measure(walks.device(), file, urgent.as_ref(), walks.store()).err(), Vec::new())
@@ -257,9 +258,9 @@ impl SiteRequest {
     /// request is no verdict: the job's two-job rule ends it.
     fn measure(&self, walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
         let key = self.key(&walks.identity());
-        walks.record(key, |device| {
+        walks.record(key, |charges| {
             let began = std::time::Instant::now();
-            Ok(match crate::native::admit_site(device, self)? {
+            Ok(match crate::native::admit_site(charges, self)? {
                 Ok(()) => Record::Measured(Timing { median: began.elapsed().as_secs_f64(), interval: None, samples: 1 }),
                 Err(refusal) => Record::Unobtainable { reason: Reason::new(refusal) },
             })
@@ -267,7 +268,7 @@ impl SiteRequest {
         let (device, store) = (walks.device(), walks.store());
         let (topology, executor) = (device.topology(), device.info());
         match self.verdict(topology, executor, store).measured().is_some() && self.outstanding(topology, executor, store) {
-            true => CpuCosts::measure(device, &self.form, store),
+            true => CpuCosts::measure(walks.charges(), &self.form, store),
             false => Ok(()),
         }
     }
@@ -289,8 +290,8 @@ fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn 
 /// CPU site's lines at its reference form where a bank can have a host tier
 /// (a discrete device); then the rest of the walk, whose figures are priced
 /// closer without it. Each is of the machine alone, so what is measured is
-/// fixed per backend, and all are measured in one job's
-/// [`MEASUREMENT_SECONDS`] ([`JobDeadlines`]).
+/// fixed per backend, and their samples share [`MEASUREMENT_SECONDS`] of
+/// sampling ([`JobDeadlines`]).
 pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) -> Result<Vec<PointRequest>, String> {
     let tiered = !topology.shared_ranges_lie_in_device_memory(executor);
     let memory = tiered
@@ -315,7 +316,7 @@ pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) 
 /// line, where a point of it no record holds, and no other request (not the
 /// costs, not a load's). The job takes it as the loads' requests, with no
 /// standing one: each point an equal part of the job's time, one the time
-/// ends left unrecorded for the next job, as nothing prices the line.
+/// does not reach left unrecorded for the next job.
 #[cfg(feature = "machine-line")]
 pub fn line_outstanding(
     topology: &DeviceTopology,
@@ -397,17 +398,13 @@ impl PointRequests {
     pub fn request(&self, executor: &Identity, request: PointRequest, waiter: Waiter) -> Result<(), StoreError> {
         let key = (executor, &request);
         let stored = Stored { executor: executor.clone(), request: request.clone(), waiter };
+        // A request held by a waiter as late or later is left as it is.
         self.files
-            .update(&key, LARGEST_REQUEST, |held: Option<Stored>| {
-                Ok::<_, std::convert::Infallible>(match held {
-                    Some(held) if held.waiter >= waiter => held,
-                    _ => stored,
-                })
+            .update(&key, LARGEST_REQUEST, |held: Option<Stored>| match held {
+                Some(held) if held.waiter >= waiter => Err(()),
+                _ => Ok(Some(stored)),
             })
-            .map(|updated| match updated {
-                Ok(()) => (),
-                Err(never) => match never {},
-            })
+            .map(|_written_or_left| ())
     }
 
     /// The requests on `executor` whose points `store`'s records do not all
@@ -434,7 +431,18 @@ impl PointRequests {
             }
             match stored.request.outstanding(topology, executor, store, costs_outstanding) {
                 true => waiting.push(stored),
-                false => self.files.remove::<Stored>(&(&stored.executor, &stored.request)).map_err(|error| error.to_string())?,
+                // Forgotten under the request's lock, and only as it was
+                // judged: a waiter that touched it since keeps it.
+                false => {
+                    let judged = &stored.waiter;
+                    let _forgotten_or_kept = self
+                        .files
+                        .update(&(&stored.executor, &stored.request), LARGEST_REQUEST, |held: Option<Stored>| match held {
+                            Some(held) if held.waiter != *judged => Err(()),
+                            _ => Ok(None),
+                        })
+                        .map_err(|error| error.to_string())?;
+                }
             }
         }
         waiting.sort_by(|first, second| second.waiter.cmp(&first.waiter));
@@ -444,8 +452,8 @@ impl PointRequests {
 }
 
 /// What a measurement job measures, in order ([`measure`]): assessment's
-/// standing requests ([`standing`]), within [`MEASUREMENT_SECONDS`] of its
-/// start, then the loads', within the rest of its time ([`JobDeadlines`]).
+/// standing requests ([`standing`]), then the loads', while its time lasts
+/// ([`JobDeadlines`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Outstanding {
     pub standing: Vec<PointRequest>,
@@ -464,67 +472,59 @@ impl Outstanding {
     }
 }
 
-/// When a measurement job's points end, from its start (discovering the
-/// machine, probing the device and forming kernels among its time):
-/// assessment's standing points ([`standing`]) at [`MEASUREMENT_SECONDS`],
-/// or at the job's time where it is shorter, whatever time the job is
-/// given, so assessment's measurement of a machine is one job's; the
-/// loads' points at the job's time, which their host may lengthen for a
-/// point no job's time held.
+/// A measurement job's time: its host's slot for measuring, from when its
+/// device is open (`started`), so that discovering the machine, probing the
+/// device and opening it take none of it. It decides only whether a point
+/// begins ([`Self::ends`]): a point begun is formed (its kernels' compiles,
+/// however long, kept as they end) and timed to its end, and one not begun
+/// is left unrecorded for the next job. The standing points' samples share
+/// [`MEASUREMENT_SECONDS`] of sampling, which nothing but sampling takes.
+/// So a busy host stretches each sample, and fewer points begin in a job
+/// and fewer samples are read of each, but no point begun expires, none is
+/// priced for want of time, and what is recorded of one never follows from
+/// how busy its host was.
 #[derive(Clone, Copy, Debug)]
 pub struct JobDeadlines {
     started: std::time::Instant,
-    standing: std::time::Instant,
-    loads: std::time::Instant,
+    ends: std::time::Instant,
 }
 
 impl JobDeadlines {
-    /// The deadlines of a job started at `started` and given `time`.
+    /// The time of a job whose device opened at `started`, given `time`.
     pub fn new(started: std::time::Instant, time: std::time::Duration) -> Self {
-        let budget = std::time::Duration::from_secs_f64(MEASUREMENT_SECONDS);
-        Self { started, standing: started + time.min(budget), loads: started + time }
+        Self { started, ends: started + time }
     }
 
-    /// The deadlines of a test's job, whose standing points have all of
-    /// `time`: a machine whose kernels take long to form (CUDA's) would
-    /// otherwise leave them unmeasured ([`MEASUREMENT_SECONDS`]).
-    #[cfg(test)]
-    pub(crate) fn within(time: std::time::Duration) -> Self {
-        let started = std::time::Instant::now();
-        Self { started, standing: started + time, loads: started + time }
-    }
-
-    /// When assessment's points end: what the job measures of the machine
-    /// before them (its device's probes) ends by then too.
-    pub fn standing(&self) -> std::time::Instant {
-        self.standing
-    }
-
-    /// When the loads' points end.
-    pub(super) fn loads(&self) -> std::time::Instant {
-        self.loads
+    /// When the job begins no more points: a point begun by then is formed
+    /// and timed to its end.
+    pub fn ends(&self) -> std::time::Instant {
+        self.ends
     }
 }
 
-/// Measure `requests` on `device`, assessment's standing ones first and
-/// then the loads', each in the order given, each point stored in `store`
-/// as it is taken, by `deadlines`: each point loads from the records or is
-/// reported to `attempting`, then measured for its part of its time left
-/// (or until its median is resolved); `visit` is told what became of each
-/// point as soon as it is known. A standing point the time cannot hold is
-/// priced from those read, unless it reads a required figure; what the
-/// job's time leaves unread of those and of the loads' the next job
-/// measures. The job's split is traced, point by point and whole. Fails
-/// only when `device`'s executor is not of its own topology's revision.
+/// Measure `requests` on the device of `charges`, assessment's standing
+/// ones first and then the loads', each in the order given, each point
+/// stored in `store` as it is taken, by `deadlines`: each point loads from
+/// the records or, reached before the job's time ends, is reported to
+/// `attempting`, then measured to its end, sampling for its part of its
+/// time left (or until its median is resolved); `visit` is told what
+/// became of each point as soon as it is known. What the job's time does
+/// not reach the next job measures. Every point's operands, backings and
+/// kernels are allocated through `charges`: a job's own device's tally
+/// (`Charges::tally`), or a measurement holding of a device's ledgers in
+/// this process (`DeviceLedgers::measurement`). The job's split is
+/// traced, point by point and whole. Fails only when the device's
+/// executor is not of its own topology's revision.
 pub fn measure(
     measurer: &mut Measurer,
-    device: &Device,
+    charges: &seismic::Charges,
     store: &dyn RecordStore<PointKey>,
     requests: &Outstanding,
     deadlines: JobDeadlines,
     attempting: &mut dyn FnMut(&PointKey) -> Attempt,
     visit: &mut Visit<'_>,
 ) -> Result<Measurement, ExecutorCostsError> {
+    let device = &charges.device();
     let (topology, executor) = (device.topology(), device.info());
     let requests = (requests.standing.iter().map(|request| (Whose::Standing, request)))
         .chain(requests.loads.iter().map(|request| (Whose::Loads, request)))
@@ -537,7 +537,7 @@ pub fn measure(
             0
         }))
         .collect::<Vec<_>>();
-    let mut walks = Walks::new(measurer, device, store, deadlines, attempting, visit)?;
+    let mut walks = Walks::new(measurer, device, charges, store, deadlines, attempting, visit)?;
     let mut failures = Vec::new();
     for (index, (whose, request)) in requests.iter().enumerate() {
         // Its points and those after it of the same whose.
@@ -603,28 +603,30 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A job measures assessment's points in their order within
-    /// `MEASUREMENT_SECONDS` of its start, whatever time it is given, and
-    /// leaves a figure nothing prices to the next job when its time cannot
-    /// hold it: on the host's CPU, two host memory lines (standing requests,
-    /// which nothing else prices) are measured in the order requested by a
-    /// job given more than the budget; a job of no time records none of
-    /// them, nor the probe, and the next job measures them; and a later job
-    /// loads every point stored, measuring none again.
+    /// What a job records of a point never follows from how long its host
+    /// took to reach it: on the host's CPU, two host memory lines (standing
+    /// requests) reached after a busy host spent more than their whole
+    /// budget's wall time are each still read, in the order requested, as
+    /// only sampling takes their budget; a job whose time has ended begins
+    /// none of them, nor the probe, and leaves them unrecorded for the next;
+    /// and a later job loads every point stored, measuring none again,
+    /// whatever time it has.
     #[test]
-    fn a_job_measures_assessment_within_its_budget_and_leaves_what_nothing_prices_to_the_next() {
+    fn a_job_reads_every_point_it_begins_however_busy_its_host_and_leaves_the_rest_to_the_next() {
         let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let requests = Outstanding {
             standing: vec![PointRequest::HostMemory { readers: 2 }, PointRequest::HostMemory { readers: 1 }],
             loads: Vec::new(),
         };
-        let job = |store: &JsonFileStore, seconds: f64| {
+        // A job of `seconds` that its host started `spent` seconds ago.
+        let job = |store: &JsonFileStore, spent: u64, seconds: u64| {
             let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
-            let started = std::time::Instant::now();
-            let deadlines = JobDeadlines::new(started, std::time::Duration::from_secs_f64(seconds));
-            assert!(deadlines.standing() <= started + std::time::Duration::from_secs_f64(MEASUREMENT_SECONDS));
+            let started = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(spent))
+                .expect("the host's clock reaches back past the job's start");
+            let deadlines = JobDeadlines::new(started, std::time::Duration::from_secs(seconds));
             let mut visited = Vec::new();
-            measure(&mut measurer, &device, store, &requests, deadlines, &mut |_| Attempt::Proceed, &mut |key, outcome| {
+            measure(&mut measurer, &seismic::Charges::tally(&device), store, &requests, deadlines, &mut |_| Attempt::Proceed, &mut |key, outcome| {
                 let readers = key.configuration["readers"];
                 visited.push((readers, outcome));
             })
@@ -634,32 +636,29 @@ mod tests {
         use seismic::measure::Outcome;
         let topology = device.topology();
         let root = std::env::temp_dir().join(format!("point-requests-job-{}", std::process::id()));
-        // No time: no line is recorded, so the next job measures them.
-        let unheld = JsonFileStore::new(&root.join("unheld"));
-        let none = job(&unheld, 0.);
+        // No time: nothing is begun or recorded, so the next job measures
+        // them.
+        let store = JsonFileStore::new(&root.join("records"));
+        let none = job(&store, 0, 0);
         assert!(none.iter().all(|(_, outcome)| matches!(outcome, Outcome::Expired)), "{none:?}");
-        assert!(matches!(MemoryCosts::stored(topology, device.info(), 2, &unheld), Err(MemoryError::Unrecorded { .. })));
-        let again = job(&unheld, 30.);
-        assert!(again.iter().all(|(_, outcome)| matches!(outcome, Outcome::Measured(_))), "{again:?}");
-        // Nor the probe, a required figure: no record holds it, and the
-        // next job measures it.
+        assert!(matches!(MemoryCosts::stored(topology, device.info(), 2, &store), Err(MemoryError::Unrecorded { .. })));
+        // Nor the probe: no record holds it, and the next job measures it.
         let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
         let deadlines = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::ZERO);
         let costs = Outstanding { standing: vec![PointRequest::Costs(CostWalk::Required)], loads: Vec::new() };
-        measure(&mut measurer, &device, &unheld, &costs, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {}).unwrap();
+        measure(&mut measurer, &seismic::Charges::tally(&device), &store, &costs, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {}).unwrap();
         assert!(matches!(
-            super::super::ExecutorCosts::stored(topology, device.info(), &unheld),
+            super::super::ExecutorCosts::stored(topology, device.info(), &store),
             Ok(super::super::StoredCosts::Missing(_))
         ));
-        // Given more than the budget: measured in order within it.
-        let store = JsonFileStore::new(&root.join("measured"));
-        let started = std::time::Instant::now();
-        let first = job(&store, 30.);
-        assert!(started.elapsed().as_secs_f64() < MEASUREMENT_SECONDS + 1., "within the budget, not the time given");
-        assert_eq!(first.iter().map(|(readers, _)| *readers).collect::<Vec<_>>(), [2, 2, 1, 1], "in the order requested");
-        assert!(first.iter().all(|(_, outcome)| matches!(outcome, Outcome::Measured(_))), "{first:?}");
-        let second = job(&store, 30.);
-        assert!(second.iter().all(|(_, outcome)| matches!(outcome, Outcome::Loaded(_))), "{second:?}");
+        // A busy host spent more than the standing points' budget before
+        // they were reached: each is still read, in the order requested.
+        let spent = MEASUREMENT_SECONDS as u64 + 1;
+        let busy = job(&store, spent, 600);
+        assert_eq!(busy.iter().map(|(readers, _)| *readers).collect::<Vec<_>>(), [2, 2, 1, 1], "in the order requested");
+        assert!(busy.iter().all(|(_, outcome)| matches!(outcome, Outcome::Measured(_))), "{busy:?}");
+        let again = job(&store, 0, 0);
+        assert!(again.iter().all(|(_, outcome)| matches!(outcome, Outcome::Loaded(_))), "{again:?}");
         let records = |readers| MemoryCosts::stored(topology, device.info(), readers, &store);
         assert!(records(1).is_ok() && records(2).is_ok());
         std::fs::remove_dir_all(&root).unwrap();
@@ -703,7 +702,7 @@ mod tests {
         assert!(!requests.is_empty());
         let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
         let deadlines = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::from_secs(60));
-        measure(&mut measurer, &device, &store, &requests, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {})
+        measure(&mut measurer, &seismic::Charges::tally(&device), &store, &requests, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {})
             .unwrap();
         match MachineLine::stored(topology, executor, &store) {
             Ok(line) => {

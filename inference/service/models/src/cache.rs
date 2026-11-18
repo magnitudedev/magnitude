@@ -1,12 +1,11 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::{fs, io};
 
 use getrandom::fill;
 use magnitude_service_contracts::models::{ModelAssessment, ModelCapabilities, ModelId, ParsedModelId};
-use magnitude_service_utils::file_cache::{
-    read_json, read_object, write_json_atomic,
-};
+use seismic_io::{Durability, Privacy, Store};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
@@ -37,7 +36,10 @@ pub struct CachedModelPresentation {
     pub license: Option<String>,
 }
 
-const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The inventory index under the cache root ([`ModelCache::update_inventory`]).
+const INVENTORY: &str = "indexes/inventory.json";
 
 #[derive(Clone, Copy, Debug)]
 pub enum ModelIndexKind {
@@ -76,10 +78,20 @@ impl ModelIndexKind {
     }
 }
 
-/// The sole filesystem namespace owner for recomputable model data.
+/// The sole filesystem namespace owner for recomputable model data: one store
+/// ([`seismic_io::Store`]) under the cache root, private to its owner, which every process that
+/// names the root shares.
+///
+/// Every file it keeps is derived from what it is keyed by, so a read that fails in any way is a
+/// miss its caller computes again, and every write is volatile: a crash that tears one leaves a
+/// file that does not decode, a miss. An index is keyed by the digest of its evidence and holds
+/// what that evidence determines, so each writer writes a whole value any reader accepts: it is
+/// published without a lock, the last to land holding it. The inventory index gathers what
+/// several writers learn, so it changes only under its record's lock, from what it holds then
+/// ([`ModelCache::update_inventory`]).
 #[derive(Clone, Debug)]
 pub struct ModelCache {
-    root: PathBuf,
+    store: Arc<Store>,
     headers: HeaderCache,
 }
 
@@ -113,23 +125,29 @@ impl ModelCache {
     /// it reads until it ends (the release catalog's bundle) bounds them by none.
     #[must_use]
     pub fn with_header_capacity(cache_root: &Path, capacity: u64) -> Self {
+        let store = Arc::new(Store::new(cache_root.to_path_buf(), Privacy::Owner));
         Self {
-            root: cache_root.to_path_buf(),
-            headers: HeaderCache::new(cache_root, capacity, HEADER_EVICTION_GRACE),
+            headers: HeaderCache::new(Arc::clone(&store), capacity, HEADER_EVICTION_GRACE),
+            store,
         }
     }
 
+    /// The inventory index as it is on disk, none where it is absent or is no JSON object.
     pub(crate) fn read_inventory(&self) -> Option<Map<String, Value>> {
-        read_object(&self.inventory_path(), MAX_INDEX_BYTES)
+        decode_object(self.store.read(Path::new(INVENTORY), MAX_INDEX_BYTES).ok().flatten()?)
     }
 
-    pub(crate) fn write_inventory<T: Serialize>(&self, value: &T) {
-        write_json_atomic(
-            &self.inventory_path(),
-            &self.lock_path("inventory"),
-            value,
-            MAX_INDEX_BYTES,
-        );
+    /// Replace the inventory index by `change` of what it holds now (none where it is absent or
+    /// does not decode), its record's lock held from the read to the write, so a change another
+    /// process made meanwhile is never lost to this one. A failure leaves the index as it was.
+    pub(crate) fn update_inventory<T: Serialize>(&self, change: impl FnOnce(Option<Map<String, Value>>) -> T) {
+        let Ok(record) = self.store.lock(Path::new(INVENTORY)) else {
+            return;
+        };
+        let held = record.read(MAX_INDEX_BYTES).ok().flatten().and_then(decode_object);
+        if let Some(bytes) = encoded(&change(held)) {
+            let _ = record.write(&bytes, Durability::Volatile);
+        }
     }
 
     pub fn read_index<T: DeserializeOwned>(
@@ -137,30 +155,18 @@ impl ModelCache {
         kind: ModelIndexKind,
         evidence: &str,
     ) -> Option<T> {
-        read_json(&self.index_path(kind, evidence), MAX_INDEX_BYTES)
+        let bytes = self.store.read(&index_path(kind, &evidence_digest(evidence)), MAX_INDEX_BYTES).ok().flatten()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
+    /// Publish what `evidence` determines of `kind`, without a lock (see [`ModelCache`]). A
+    /// failure, or a value larger than any index is read to, leaves what was there.
     pub fn write_index<T: Serialize>(&self, kind: ModelIndexKind, evidence: &str, value: &T) {
-        let digest = evidence_digest(evidence);
-        write_json_atomic(
-            &self.index_path_for_digest(kind, &digest),
-            &self.lock_path(&format!("index-{digest}")),
-            value,
-            MAX_INDEX_BYTES,
-        );
-    }
-
-    pub fn read_load_timing_store<T: DeserializeOwned>(&self) -> Option<T> {
-        read_json(&self.load_timing_path(), MAX_INDEX_BYTES)
-    }
-
-    pub fn write_load_timing_store<T: Serialize>(&self, value: &T) {
-        write_json_atomic(
-            &self.load_timing_path(),
-            &self.lock_path("load-timings"),
-            value,
-            MAX_INDEX_BYTES,
-        );
+        if let Some(bytes) = encoded(value) {
+            let _ = self.store.publish(&index_path(kind, &evidence_digest(evidence)), Durability::Volatile, |file| {
+                io::Write::write_all(file, &bytes)
+            });
+        }
     }
 
     pub fn read_model_assessment(&self, evidence: &str) -> Option<CachedModelAssessment> {
@@ -207,7 +213,7 @@ impl ModelCache {
     /// The engine's compiled-kernel store, shared by loads and tuning.
     #[must_use]
     pub fn kernel_directory(&self) -> PathBuf {
-        self.root.join("kernels")
+        self.store.root().join("kernels")
     }
 
     /// The GGUF header with this sha256, or `None` when the header cache doesn't hold it (see
@@ -233,10 +239,8 @@ impl ModelCache {
         self.headers.discard_header(digest);
     }
 
-    /// Whether the header cache holds this header, marking it used for the read that follows;
-    /// `read_header` still verifies it.
-    #[must_use]
     /// Cached headers holding a large entry whose fixed part is `head` (see `header_cache`).
+    #[must_use]
     pub(crate) fn sharing_headers(&self, head: &[u8]) -> Vec<Vec<u8>> {
         self.headers.sharing(head)
     }
@@ -247,14 +251,23 @@ impl ModelCache {
         self.headers.lend_or_claim(head).await
     }
 
+    /// Whether the header cache holds this header, marking it used for the read that follows;
+    /// `read_header` still verifies it.
+    #[must_use]
     pub fn has_header(&self, digest: &str) -> bool {
         self.headers.contains(digest)
     }
 
-    /// Stores a GGUF header and returns its sha256. When the header cache has outgrown its
-    /// capacity, `pinned` names the headers it must keep.
-    pub fn write_header(&self, header: &[u8], pinned: impl FnOnce() -> BTreeSet<String>) -> String {
-        self.headers.write(header, pinned)
+    /// Stores a GGUF header and returns its sha256, evicting what no live cache pins once the
+    /// header cache has outgrown its capacity.
+    pub fn write_header(&self, header: &[u8]) -> String {
+        self.headers.write(header)
+    }
+
+    /// Pin `pinned`, the headers this process needs kept, for every process's eviction while
+    /// this cache lives: pinned again whenever they change.
+    pub fn pin_headers(&self, pinned: BTreeSet<String>) {
+        self.headers.pin(pinned);
     }
 
     pub fn workspace(&self) -> io::Result<ModelCacheWorkspace> {
@@ -264,25 +277,14 @@ impl ModelCache {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let path = self.root.join(".work").join(name);
-        if fs::create_dir_all(&path).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).is_err() {
-                    let _ = fs::remove_dir_all(&path);
-                } else {
-                    return Ok(ModelCacheWorkspace {
-                        path,
-                        temporary: None,
-                    });
-                }
+        let path = self.store.root().join(".work").join(name);
+        // A workspace is its owner's alone, as the store is: where it cannot be made so, it is
+        // made in the system's temporary directory.
+        match Privacy::Owner.directory(&path) {
+            Ok(()) => return Ok(ModelCacheWorkspace { path, temporary: None }),
+            Err(_) => {
+                let _ = fs::remove_dir_all(&path);
             }
-            #[cfg(not(unix))]
-            return Ok(ModelCacheWorkspace {
-                path,
-                temporary: None,
-            });
         }
         let temporary = tempfile::Builder::new()
             .prefix("magnitude-model-preview-")
@@ -292,29 +294,25 @@ impl ModelCache {
             temporary: Some(temporary),
         })
     }
+}
 
-    fn inventory_path(&self) -> PathBuf {
-        self.root.join("indexes/inventory.json")
-    }
+/// Where the index of `kind` keyed by the evidence digest `digest` lies under the cache root.
+fn index_path(kind: ModelIndexKind, digest: &str) -> PathBuf {
+    Path::new("indexes").join(kind.relative()).join(format!("{digest}.json"))
+}
 
-    fn load_timing_path(&self) -> PathBuf {
-        self.root.join("indexes/runtime/load-timings.json")
+/// The JSON object `bytes` hold, none where they hold none.
+fn decode_object(bytes: Vec<u8>) -> Option<Map<String, Value>> {
+    match serde_json::from_slice::<Value>(&bytes).ok()? {
+        Value::Object(object) => Some(object),
+        _ => None,
     }
+}
 
-    fn index_path(&self, kind: ModelIndexKind, evidence: &str) -> PathBuf {
-        self.index_path_for_digest(kind, &evidence_digest(evidence))
-    }
-
-    fn index_path_for_digest(&self, kind: ModelIndexKind, digest: &str) -> PathBuf {
-        self.root
-            .join("indexes")
-            .join(kind.relative())
-            .join(format!("{digest}.json"))
-    }
-
-    fn lock_path(&self, name: &str) -> PathBuf {
-        self.root.join(".locks").join(format!("{name}.lock"))
-    }
+/// `value` as an index holds it, none where it does not encode or is larger than any index is
+/// read to.
+fn encoded<T: Serialize>(value: &T) -> Option<Vec<u8>> {
+    serde_json::to_vec_pretty(value).ok().filter(|bytes| bytes.len() as u64 <= MAX_INDEX_BYTES)
 }
 
 fn presentation_evidence(model_id: &ModelId, commit: &str) -> String {
@@ -335,7 +333,6 @@ fn evidence_digest(evidence: &str) -> String {
 fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -386,12 +383,14 @@ mod tests {
             Some(42)
         );
         let bytes = b"header";
-        let digest = cache.write_header(bytes, BTreeSet::new);
+        let digest = cache.write_header(bytes);
         assert_eq!(digest, hex_sha256(bytes));
         assert_eq!(cache.read_header(&digest).as_deref(), Some(bytes.as_slice()));
         assert!(cache.read_header(&"0".repeat(64)).is_none());
 
-        let index_path = cache.index_path(ModelIndexKind::InventoryMetadata, "model evidence");
+        let index_path = directory
+            .path()
+            .join(index_path(ModelIndexKind::InventoryMetadata, &evidence_digest("model evidence")));
         fs::write(&index_path, b"corrupt").unwrap();
         assert_eq!(
             cache.read_index::<u64>(ModelIndexKind::InventoryMetadata, "model evidence"),

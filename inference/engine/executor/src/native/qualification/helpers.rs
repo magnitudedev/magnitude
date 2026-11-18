@@ -83,14 +83,14 @@ impl SublayerRows {
     /// parts of `hidden`, each of ones.
     pub(super) fn input(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         rows: u64,
         hidden: u64,
         entry: &'static str,
         label: &str,
     ) -> Result<Tensor, CatalogFailure> {
         semantic_ones(
-            device,
+            charges,
             Element::f32(),
             &[rows, self.form.parts * hidden],
             entry,
@@ -102,14 +102,14 @@ impl SublayerRows {
     /// normalizes nothing.
     pub(super) fn norm(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         element: Element,
         hidden: u64,
         entry: &'static str,
         label: &str,
     ) -> Result<Tensor, CatalogFailure> {
         semantic_zeros(
-            device,
+            charges,
             element,
             &[self.form.norm_extent(hidden)],
             entry,
@@ -122,7 +122,7 @@ impl SublayerRows {
     /// them, which leaves each stream its own; or none.
     pub(super) fn inject(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         rows: u64,
         entry: &'static str,
         label: &str,
@@ -133,7 +133,7 @@ impl SublayerRows {
             Some(comb) => f32::from(u8::from(comb / s == comb % s)),
         });
         let values = (0..rows).flat_map(|_| row.clone()).collect::<Vec<_>>();
-        semantic_dense_values(device, Element::f32(), &[rows, self.width], &values, entry, label)
+        semantic_dense_values(charges, Element::f32(), &[rows, self.width], &values, entry, label)
     }
 }
 
@@ -143,7 +143,7 @@ impl SublayerRows {
 /// prefill entry. Zero weights make each attention output zero, so the block
 /// returns the residual.
 pub(super) fn qualify_attention(
-    device: &Device,
+    charges: &seismic::Charges,
     kernels: &AttentionKernels,
     binding: AttentionBinding,
     rows: SublayerRows,
@@ -157,16 +157,16 @@ pub(super) fn qualify_attention(
         .map(|index| (index % 7) as f32 - 3.0)
         .collect::<Vec<_>>();
     let residual = semantic_f32(
-        device,
+        charges,
         &[1, rows.residual_width(hidden)],
         &residual_values,
         ENTRY,
         label,
     )?;
-    let input = rows.input(device, 1, hidden, ENTRY, label)?;
-    let inject = rows.inject(device, 1, "attention_output", label)?;
-    let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, ENTRY, label);
-    let input_norm = rows.norm(device, binding.norm, hidden, ENTRY, label)?;
+    let input = rows.input(charges, 1, hidden, ENTRY, label)?;
+    let inject = rows.inject(charges, 1, "attention_output", label)?;
+    let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, ENTRY, label);
+    let input_norm = rows.norm(charges, binding.norm, hidden, ENTRY, label)?;
     // The query segment: the query rows, or a low-rank query's `qr` rows.
     let query = zeros(binding.query_segment(), &[binding.query_segment_rows(), hidden])?;
     let gate = zeros(binding.gate, &[shape.gate_rows(), hidden])?;
@@ -192,18 +192,18 @@ pub(super) fn qualify_attention(
     let rotary_frequencies = zeros(Element::f32(), &pairs)?;
     let rotary_amplitudes = zeros(Element::f32(), &pairs)?;
     let coordinates = zeros(Element::i32(), &[1, 4])?;
-    let visible = semantic_i32(device, &[1, 1, 2], &[0, 1], ENTRY, label)?;
-    let fresh = semantic_i32(device, &[1, 2], &[0, 1], ENTRY, label)?;
-    let destinations = semantic_i32(device, &[1], &[1], ENTRY, label)?;
+    let visible = semantic_i32(charges, &[1, 1, 2], &[0, 1], ENTRY, label)?;
+    let fresh = semantic_i32(charges, &[1, 2], &[0, 1], ENTRY, label)?;
+    let destinations = semantic_i32(charges, &[1], &[1], ENTRY, label)?;
     // The affine prefill kernel of a launch that lists no history row tiles.
-    let history_tiles = semantic_i32(device, &[0, 1], &[], ENTRY, label)?;
+    let history_tiles = semantic_i32(charges, &[0, 1], &[], ENTRY, label)?;
     // The history's prefill reads every visible row: no WorkList bitmap, its
     // blocks of one key.
-    let block_slots = semantic_i32(device, &[0, 1], &[], ENTRY, label)?;
+    let block_slots = semantic_i32(charges, &[0, 1], &[], ENTRY, label)?;
     // The rotary layout, output rotary and stored-key values, carried by an
     // empty table's extents.
     let form = semantic_i32(
-        device,
+        charges,
         &[
             0,
             u64::from(shape.form.rotary_adjacent),
@@ -220,7 +220,7 @@ pub(super) fn qualify_attention(
     // source takes no picks (`[1, KS]`, each -1) of no plane rows.
     let rounding = shape.key_rounding;
     let dense_form = semantic_i32(
-        device,
+        charges,
         &[
             0,
             u64::from(shape.form.rotary_adjacent),
@@ -235,20 +235,20 @@ pub(super) fn qualify_attention(
         label,
     )?;
     let selected_rows = semantic_i32(
-        device,
+        charges,
         &[1, shape.widths.picks],
         &vec![-1; shape.widths.picks as usize],
         ENTRY,
         label,
     )?;
     let selected = zeros(binding.activation, &[0, shape.widths.kv_heads, shape.widths.width])?;
-    let selection = Tensor::from_host(device, Element::u32(), &[1, 0], &[])
+    let selection = Tensor::from_host(charges, Element::u32(), &[1, 0], &[])
         .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-    let scale = |name| unit_scale(device, kernels.project.first(), name, ENTRY, label);
+    let scale = |name| unit_scale(charges, kernels.project.first(), name, ENTRY, label);
     let projected = kernels
         .project
         .first()
-        .call(attention_project::Args {
+        .call(charges, attention_project::Args {
             hidden: &input,
             input_norm: &input_norm,
             query_weight: &query,
@@ -261,10 +261,10 @@ pub(super) fn qualify_attention(
             gate_scale: &scale("GS")?,
             key_scale: &scale("KS")?,
             value_scale: &scale("VS")?,
-            query_bound: &any_row_bound(device, kernels.project.first(), "QB", ENTRY, label)?,
-            gate_bound: &any_row_bound(device, kernels.project.first(), "GB", ENTRY, label)?,
-            key_bound: &any_row_bound(device, kernels.project.first(), "KB", ENTRY, label)?,
-            value_bound: &any_row_bound(device, kernels.project.first(), "VB", ENTRY, label)?,
+            query_bound: &any_row_bound(charges, kernels.project.first(), "QB", ENTRY, label)?,
+            gate_bound: &any_row_bound(charges, kernels.project.first(), "GB", ENTRY, label)?,
+            key_bound: &any_row_bound(charges, kernels.project.first(), "KB", ENTRY, label)?,
+            value_bound: &any_row_bound(charges, kernels.project.first(), "VB", ENTRY, label)?,
         })
         .map_err(|e| qualification_dynamic("attention_project", label, e))?;
     let per_head = |tensor: &Tensor, extents: &[u64]| {
@@ -279,16 +279,16 @@ pub(super) fn qualify_attention(
         (Some(low_rank), Some(low_rank_kernels)) => {
             let qr = low_rank_kernels
                 .widen
-                .call(widen_rows::Args { rows: &projected.r0 })
+                .call(charges, widen_rows::Args { rows: &projected.r0 })
                 .map_err(|e| qualification_dynamic("widen_rows", label, e))?
                 .value;
             let up = zeros(binding.query, &[binding.query_rows(), low_rank.rank])?;
             let empty = zeros(binding.query, &[0, low_rank.rank])?;
             let kernel = low_rank_kernels.project.first();
-            let scale = |name| unit_scale(device, kernel, name, ENTRY, label);
-            let bound = |name| any_row_bound(device, kernel, name, ENTRY, label);
+            let scale = |name| unit_scale(charges, kernel, name, ENTRY, label);
+            let bound = |name| any_row_bound(charges, kernel, name, ENTRY, label);
             kernel
-                .call(attention_project::Args {
+                .call(charges, attention_project::Args {
                     hidden: &qr,
                     input_norm: &zeros(low_rank.norm, &[low_rank.rank])?,
                     query_weight: &up,
@@ -323,11 +323,11 @@ pub(super) fn qualify_attention(
             let shape = absorbed.shape;
             let kernel = kernel.first();
             kernel
-                .call(project_rows::Args {
+                .call(charges, project_rows::Args {
                     source: &per_head(&query_rows, &[1, shape.heads * shape.width])?,
                     weight: &zeros(absorbed.element, &[shape.heads * shape.keys, shape.width])?,
-                    weight_scale: &unit_scale(device, kernel, "WS", "project_rows", label)?,
-                    weight_bound: &any_row_bound(device, kernel, "WB", "project_rows", label)?,
+                    weight_scale: &unit_scale(charges, kernel, "WS", "project_rows", label)?,
+                    weight_bound: &any_row_bound(charges, kernel, "WB", "project_rows", label)?,
                 })
                 .map_err(|e| qualification_dynamic("project_rows", label, e))?
                 .value
@@ -361,7 +361,7 @@ pub(super) fn qualify_attention(
             let mut slabs = Vec::new();
             $(
                 let mut $plane = if $rows > 0 {
-                    let slab = crate::experts::pooled_slabs(device, seismic::Contract::DeviceOnly, 2, 2, &[
+                    let slab = crate::experts::pooled_slabs(charges, seismic::Contract::DeviceOnly, 2, 2, &[
                         seismic::SlabRegion {
                             element: $element,
                             row_shape: vec![kv_heads, $elements],
@@ -380,7 +380,7 @@ pub(super) fn qualify_attention(
                 };
             )*
             $kernel
-                .call($module::Args {
+                .call(charges, $module::Args {
                     query: &mixed_query,
                     gate: &mixed_gate,
                     key: &mixed_key,
@@ -477,13 +477,13 @@ pub(super) fn qualify_attention(
             (Some(kernel), Some(weight)) => Some(
                 kernel
                     .first()
-                    .call(project_rows::Args {
+                    .call(charges, project_rows::Args {
                         source: &gated
                             .reshape(&[1, heads * width])
                             .map_err(|e| qualification_dynamic("project_rows", label, e))?,
                         weight,
-                        weight_scale: &unit_scale(device, kernel.first(), "WS", "project_rows", label)?,
-                        weight_bound: &any_row_bound(device, kernel.first(), "WB", "project_rows", label)?,
+                        weight_scale: &unit_scale(charges, kernel.first(), "WS", "project_rows", label)?,
+                        weight_bound: &any_row_bound(charges, kernel.first(), "WB", "project_rows", label)?,
                     })
                     .map_err(|e| qualification_dynamic("project_rows", label, e))?
                     .value
@@ -502,13 +502,13 @@ pub(super) fn qualify_attention(
             (SublayerOutput::Residual(output_kernel), SublayerTail::Residual) => {
                 let output_kernel = output_kernel.first();
                 output_kernel
-                    .call(attention_output::Args {
+                    .call(charges, attention_output::Args {
                         hidden: &residual,
                         inject: &inject,
                         gated,
                         output_weight: &output,
-                        output_scale: &unit_scale(device, output_kernel, "OS", ENTRY, label)?,
-                        output_bound: &any_row_bound(device, output_kernel, "OB", ENTRY, label)?,
+                        output_scale: &unit_scale(charges, output_kernel, "OS", ENTRY, label)?,
+                        output_bound: &any_row_bound(charges, output_kernel, "OB", ENTRY, label)?,
                     })
                     .map_err(|e| qualification_dynamic("attention_output", label, e))?
                     .value
@@ -517,7 +517,7 @@ pub(super) fn qualify_attention(
                 let source = gated
                     .reshape(&[1, output_q * output_w])
                     .map_err(|e| qualification_dynamic("project_rows", label, e))?;
-                qualify_post_norm(device, tail, &residual, &source, &output, norm, label)?
+                qualify_post_norm(charges, tail, &residual, &source, &output, norm, label)?
             }
             _ => {
                 return Err(qualification_dynamic(
@@ -536,7 +536,7 @@ pub(super) fn qualify_attention(
 /// `weight`, normalized with zero norm weights into `residual`, which it
 /// leaves unchanged.
 pub(super) fn qualify_post_norm(
-    device: &Device,
+    charges: &seismic::Charges,
     kernels: &PostNormKernels,
     residual: &Tensor,
     source: &Tensor,
@@ -548,19 +548,19 @@ pub(super) fn qualify_post_norm(
     let projected = kernels
         .project
         .first()
-        .call(project_rows::Args {
+        .call(charges, project_rows::Args {
             source,
             weight,
-            weight_scale: &unit_scale(device, kernels.project.first(), "WS", "project_rows", label)?,
-            weight_bound: &any_row_bound(device, kernels.project.first(), "WB", "project_rows", label)?,
+            weight_scale: &unit_scale(charges, kernels.project.first(), "WS", "project_rows", label)?,
+            weight_bound: &any_row_bound(charges, kernels.project.first(), "WB", "project_rows", label)?,
         })
         .map_err(|e| qualification_dynamic("project_rows", label, e))?
         .value;
-    let norm = semantic_zeros(device, norm, &[hidden], "post_norm_residual", label)?;
-    let out_rows = semantic_i32(device, &[1], &[0], "post_norm_residual", label)?;
+    let norm = semantic_zeros(charges, norm, &[hidden], "post_norm_residual", label)?;
+    let out_rows = semantic_i32(charges, &[1], &[0], "post_norm_residual", label)?;
     Ok(kernels
         .residual
-        .call(post_norm_residual::Args {
+        .call(charges, post_norm_residual::Args {
             residual,
             projected: &projected,
             norm: &norm,
@@ -582,7 +582,7 @@ pub(super) fn one_bytes(dtype: DType) -> Vec<u8> {
 }
 
 pub(super) fn tensor_f32(
-    device: &Device,
+    charges: &seismic::Charges,
     extents: &[u64],
     values: &[f32],
     entry: &'static str,
@@ -592,7 +592,7 @@ pub(super) fn tensor_f32(
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::f32(), extents, &bytes)
+    Tensor::from_host(charges, Element::f32(), extents, &bytes)
         .map_err(|error| qualification(entry, bindings, error))
 }
 
@@ -617,13 +617,13 @@ pub(super) fn readout_parts(
 }
 
 pub(super) fn semantic_zeros(
-    device: &Device,
+    charges: &seismic::Charges,
     element: Element,
     extents: &[u64],
     entry: &'static str,
     bindings: &str,
 ) -> Result<Tensor, CatalogFailure> {
-    Tensor::zeros(device, element, extents)
+    Tensor::zeros(charges, element, extents)
         .map_err(|error| qualification_dynamic(entry, bindings, error))
 }
 
@@ -632,7 +632,7 @@ pub(super) fn semantic_zeros(
 /// squared run norm any packable format has (32 centred 8-bit codes of
 /// magnitude 128), which bounds whatever weights a qualification binds.
 pub(super) fn any_row_bound<E: seismic::Entry>(
-    device: &Device,
+    charges: &seismic::Charges,
     kernel: &NativeKernel<E>,
     name: &str,
     entry: &'static str,
@@ -640,36 +640,36 @@ pub(super) fn any_row_bound<E: seismic::Entry>(
 ) -> Result<Tensor, CatalogFailure> {
     let extent = kernel.specialization().static_value(name).unwrap_or(0);
     let count = usize::try_from(extent).map_err(|error| qualification_dynamic(entry, bindings, error))?;
-    semantic_f32(device, &[extent], &vec![32.0 * 128.0 * 128.0; count], entry, bindings)
+    semantic_f32(charges, &[extent], &vec![32.0 * 128.0 * 128.0; count], entry, bindings)
 }
 
 /// A gated expansion's host port `glu_limit` for `limit`: no values, at
 /// extents `[0, LB]` (`GluLimit::word`).
 pub(super) fn glu_limit(
-    device: &Device,
+    charges: &seismic::Charges,
     limit: Option<magnitude_family_contracts::GluLimit>,
     entry: &'static str,
     bindings: &str,
 ) -> Result<Tensor, CatalogFailure> {
-    semantic_i32(device, &[0, magnitude_family_contracts::GluLimit::word(limit)], &[], entry, bindings)
+    semantic_i32(charges, &[0, magnitude_family_contracts::GluLimit::word(limit)], &[], entry, bindings)
 }
 
 /// A unit accumulator scale for `kernel`'s scale port whose static is
 /// `name`: ones at its static extent (0, absent, where the native has no
 /// such static), which leave whatever a qualification binds unscaled.
 pub(super) fn unit_scale<E: seismic::Entry>(
-    device: &Device,
+    charges: &seismic::Charges,
     kernel: &NativeKernel<E>,
     name: &str,
     entry: &'static str,
     bindings: &str,
 ) -> Result<Tensor, CatalogFailure> {
     let extent = kernel.specialization().static_value(name).unwrap_or(0);
-    semantic_ones(device, Element::f32(), &[extent], entry, bindings)
+    semantic_ones(charges, Element::f32(), &[extent], entry, bindings)
 }
 
 pub(super) fn semantic_f32(
-    device: &Device,
+    charges: &seismic::Charges,
     extents: &[u64],
     values: &[f32],
     entry: &'static str,
@@ -679,12 +679,12 @@ pub(super) fn semantic_f32(
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::f32(), extents, &bytes)
+    Tensor::from_host(charges, Element::f32(), extents, &bytes)
         .map_err(|error| qualification_dynamic(entry, bindings, error))
 }
 
 pub(super) fn semantic_i32(
-    device: &Device,
+    charges: &seismic::Charges,
     extents: &[u64],
     values: &[i32],
     entry: &'static str,
@@ -694,12 +694,12 @@ pub(super) fn semantic_i32(
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::i32(), extents, &bytes)
+    Tensor::from_host(charges, Element::i32(), extents, &bytes)
         .map_err(|error| qualification_dynamic(entry, bindings, error))
 }
 
 pub(super) fn semantic_dense_values(
-    device: &Device,
+    charges: &seismic::Charges,
     element: Element,
     extents: &[u64],
     values: &[f32],
@@ -727,12 +727,12 @@ pub(super) fn semantic_dense_values(
             ));
         }
     };
-    Tensor::from_host(device, element, extents, &bytes)
+    Tensor::from_host(charges, element, extents, &bytes)
         .map_err(|error| qualification_dynamic(entry, bindings, error))
 }
 
 pub(super) fn semantic_ones(
-    device: &Device,
+    charges: &seismic::Charges,
     element: Element,
     extents: &[u64],
     entry: &'static str,
@@ -742,18 +742,18 @@ pub(super) fn semantic_ones(
         .ok_or_else(|| qualification_dynamic(entry, bindings, "fixture extent overflow"))?;
     let count = usize::try_from(count)
         .map_err(|_| qualification_dynamic(entry, bindings, "fixture extent exceeds usize"))?;
-    semantic_dense_values(device, element, extents, &vec![1.0; count], entry, bindings)
+    semantic_dense_values(charges, element, extents, &vec![1.0; count], entry, bindings)
 }
 
 pub(super) fn semantic_pattern(
-    device: &Device,
+    charges: &seismic::Charges,
     element: Element,
     extents: &[u64],
     entry: &'static str,
     bindings: &str,
 ) -> Result<Tensor, CatalogFailure> {
     if element.dtype().is_some() {
-        return semantic_ones(device, element, extents, entry, bindings);
+        return semantic_ones(charges, element, extents, entry, bindings);
     }
     let (source, packet) = pattern_source(element.representation()).ok_or_else(|| {
         qualification_dynamic(
@@ -770,7 +770,7 @@ pub(super) fn semantic_pattern(
             qualification_dynamic(entry, bindings, "no registered fixture conversion")
         })
     };
-    let mut tensor = semantic_zeros(device, element, extents, entry, bindings)?;
+    let mut tensor = semantic_zeros(charges, element, extents, entry, bindings)?;
     let storage = usize::try_from(tensor.storage_bytes())
         .map_err(|_| qualification_dynamic(entry, bindings, "fixture storage exceeds usize"))?;
     // Every source packet is identical and packed layouts place whole row

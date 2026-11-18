@@ -71,7 +71,7 @@ impl<'a> QualificationView<'a> {
 
     /// Qualify every entry; each sited streamed block's stored site verdict,
     /// by target block index (`BankSite::admitted`).
-    pub(super) fn qualify(&self, device: &Device) -> Result<Vec<(usize, crate::assessment::Priced<()>)>, CatalogFailure> {
+    pub(super) fn qualify(&self, charges: &seismic::Charges) -> Result<Vec<(usize, crate::assessment::Priced<()>)>, CatalogFailure> {
         let began = std::time::Instant::now();
         let mut lap = began;
         let mut laps = Vec::new();
@@ -93,14 +93,14 @@ impl<'a> QualificationView<'a> {
             let bindings = dense_binding_name(*source_dtype, *target_dtype);
             let source_bytes = one_bytes(*source_dtype);
             let source = Tensor::from_host(
-                device,
+                charges,
                 Element::dense(*source_dtype),
                 &[1, 1, 1],
                 &source_bytes,
             )
             .map_err(|error| qualification_dynamic("import_dense", &bindings, error))?;
             let destination = handle
-                .call(import_dense::Args { source: &source })
+                .call(charges, import_dense::Args { source: &source })
                 .map(|results| results.value)
                 .map_err(|error| qualification_dynamic("import_dense", &bindings, error))?;
             let output = destination
@@ -148,10 +148,10 @@ impl<'a> QualificationView<'a> {
                         .collect(),
                 )
                 .ok_or_else(|| failure("no registered conversion for the binding".into()))?;
-            let source = Tensor::from_host(device, *source_element, &shape, &bytes)
+            let source = Tensor::from_host(charges, *source_element, &shape, &bytes)
                 .map_err(|error| failure(error.to_string()))?;
             let result = handle
-                .call(repack_weight::Args { source: &source })
+                .call(charges, repack_weight::Args { source: &source })
                 .map(|results| results.value)
                 .map_err(|error| failure(error.to_string()))?;
             let output = result
@@ -167,19 +167,19 @@ impl<'a> QualificationView<'a> {
             }
         }
         timed("imports");
-        self.qualify_shape_rows(device)?;
-        self.qualify_sample_rows(device)?;
-        self.qualify_conditioning_overlay(device)?;
-        self.qualify_selection_notice(device)?;
-        self.qualify_feature_copy(device)?;
+        self.qualify_shape_rows(charges)?;
+        self.qualify_sample_rows(charges)?;
+        self.qualify_conditioning_overlay(charges)?;
+        self.qualify_selection_notice(charges)?;
+        self.qualify_feature_copy(charges)?;
         timed("glue");
-        let admitted = self.qualify_target(device)?;
+        let admitted = self.qualify_target(charges)?;
         timed("target");
-        self.qualify_streams(device)?;
+        self.qualify_streams(charges)?;
         timed("streams");
-        self.qualify_ngram(device)?;
-        self.qualify_head(device)?;
-        self.qualify_vision(device)?;
+        self.qualify_ngram(charges)?;
+        self.qualify_head(charges)?;
+        self.qualify_vision(charges)?;
         timed("ngram, head and vision");
         for (element, binding) in [
             (Element::f32(), "A=f32"),
@@ -188,7 +188,7 @@ impl<'a> QualificationView<'a> {
             (Element::u32(), "A=u32"),
         ] {
             if self.plan.state().copies().contains(&element) {
-                self.qualify_copy_rows(device, element, binding)?;
+                self.qualify_copy_rows(charges, element, binding)?;
             }
         }
         timed("state copies");

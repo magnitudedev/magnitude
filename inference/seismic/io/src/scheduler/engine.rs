@@ -1,11 +1,9 @@
 use super::queue::{Piece, Queue, Returned};
-use super::Panic;
 use crate::disk::{VolumeReads, LEAST_READ};
 #[cfg(doc)]
 use crate::Reader;
 use crate::{Buffer, Error, Totals, Volume};
 use std::collections::HashMap;
-use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
@@ -217,15 +215,13 @@ impl Engine {
         drop(pool);
         for (index, name) in names.clone().enumerate() {
             let flight = InFlight::default();
-            let started = std::thread::Builder::new()
-                .name(format!("seismic-read-{name}"))
-                .spawn({
-                    let flight = flight.clone();
-                    move || {
-                        crate::waited_on();
-                        work(self, &flight)
-                    }
-                });
+            let started = seismic_threads::spawn(format!("seismic-read-{name}"), {
+                let flight = flight.clone();
+                move || {
+                    crate::waited_on();
+                    work(self, &flight)
+                }
+            });
             if let Err(error) = started {
                 self.pool.lock().expect("read pool").started -= names.len() - index;
                 return Err(Error::ThreadStart(error));
@@ -473,12 +469,13 @@ fn work(engine: &'static Engine, flight: &InFlight) {
             window: if taken.standing.due() { taken.volume.shape.due } else { taken.volume.shape.knee },
             since: Instant::now(),
         });
-        // A panic is the request's, whose observer resumes it: the worker serves
+        // A panic is the request's, ending as one on its submitter would:
+        // where that unwinds, its observer resumes it and the worker serves
         // on. A piece serving several parts that fails may have failed in bytes
         // only some of them need, or in a gap between them none needs: each
         // part's own span is read again, and only those that fail fail.
         let file = &taken.file;
-        let read = std::panic::catch_unwind(AssertUnwindSafe(|| match file.read_piece(piece, &engine.buffers) {
+        let read = taken.state.submitter.run(|| match file.read_piece(piece, &engine.buffers) {
             Ok(()) => Vec::new(),
             Err(error) if piece.parts.len() == 1 => vec![(piece.parts[0].range, Arc::new(error))],
             Err(_) => piece
@@ -488,7 +485,7 @@ fn work(engine: &'static Engine, flight: &InFlight) {
                     file.read_piece(&alone, &engine.buffers).err().map(|error| (range, Arc::new(error)))
                 })
                 .collect(),
-        }));
+        });
         // The piece leaves its link's flight as its read returns, before its
         // request's end runs the request's hook (a landing), which reads
         // nothing: the depths and the book count reads alone, at the instant
@@ -502,7 +499,7 @@ fn work(engine: &'static Engine, flight: &InFlight) {
         *flight.lock().expect("a read worker's flight") = None;
         match read {
             Ok(failed) => taken.state.pieces_ended(1, failed, None),
-            Err(payload) => taken.state.pieces_ended(1, [], Some(Panic::new(payload))),
+            Err(panic) => taken.state.pieces_ended(1, [], Some(panic)),
         }
     }
 }

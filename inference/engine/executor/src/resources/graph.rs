@@ -57,6 +57,7 @@ impl NativeGraphPool {
         family: &NativeGraphFamily,
         charge: &crate::NativeGraphCharge,
         arena: &NativeExecutionArena,
+        charges: &seismic::Charges,
         outputs: Outputs,
     ) -> Result<Self, super::AllocationError> {
         let floor = GraphSlots {
@@ -80,7 +81,7 @@ impl NativeGraphPool {
             workspace: Rc::new(RefCell::new(Vec::new())),
             output: Rc::new(RefCell::new(Vec::new())),
         };
-        pool.grow(floor)?;
+        pool.grow(charges, floor)?;
         Ok(pool)
     }
 
@@ -110,12 +111,12 @@ impl NativeGraphPool {
     /// only by [`Self::hold`]. The caller holds a heap claim for
     /// [`Self::hold_bytes`] across this call. On a failure what was
     /// allocated idles until released.
-    pub(crate) fn grow(&mut self, slots: GraphSlots) -> Result<(), super::AllocationError> {
+    pub(crate) fn grow(&mut self, charges: &seismic::Charges, slots: GraphSlots) -> Result<(), super::AllocationError> {
         let grows = self.allocated.activations < slots.activations;
         while self.allocated.activations < slots.activations {
             let slot = self
                 .family
-                .new_slot_in(&self.arena, &self.upload_regions)
+                .new_slot_in(charges, &self.arena, &self.upload_regions)
                 .map_err(super::AllocationError::Workflow)?;
             self.workspace.borrow_mut().push(Claimed::under_class(slot));
             self.allocated.activations += 1;
@@ -127,7 +128,7 @@ impl NativeGraphPool {
             self.family.record_decode().map_err(super::AllocationError::Tensor)?;
         }
         while self.allocated.output < slots.output {
-            let slot = self.new_output().map_err(super::AllocationError::Tensor)?;
+            let slot = self.new_output(charges).map_err(super::AllocationError::Tensor)?;
             self.push_output(Claimed::under_class(slot));
         }
         Ok(())
@@ -183,16 +184,16 @@ impl NativeGraphPool {
 
     /// Allocate one more output slot under `held`, the claim of its
     /// [`Self::output_slot_bytes`], kept until the slot is released.
-    pub(crate) fn grow_claimed_output(&mut self, held: crate::memory::ledger::Held) -> Result<(), seismic::TensorError> {
-        let slot = Claimed::allocate(held, || self.new_output())?;
+    pub(crate) fn grow_claimed_output(&mut self, device: &seismic::Device, held: crate::memory::ledger::Held) -> Result<(), seismic::TensorError> {
+        let slot = Claimed::allocate(device, held, |charges| self.new_output(charges))?;
         self.push_output(slot);
         Ok(())
     }
 
-    fn new_output(&self) -> Result<NativeGraphFamilyOutputSlot, seismic::TensorError> {
+    fn new_output(&self, charges: &seismic::Charges) -> Result<NativeGraphFamilyOutputSlot, seismic::TensorError> {
         match self.outputs {
-            Outputs::Device => self.family.new_output_slot(),
-            Outputs::Host => self.family.new_host_output_slot(),
+            Outputs::Device => self.family.new_output_slot(charges),
+            Outputs::Host => self.family.new_host_output_slot(charges),
         }
     }
 
@@ -355,9 +356,9 @@ impl VisionGraphPool {
     /// Allocate one more activation of the class of `patch_rows` under
     /// `held`, the claim of its [`Self::activation_bytes`] and graphs, kept
     /// until the activation is released.
-    pub(crate) fn grow_activation(&mut self, patch_rows: u64, held: crate::memory::ledger::Held) -> Result<(), VisionGrowth> {
+    pub(crate) fn grow_activation(&mut self, device: &seismic::Device, patch_rows: u64, held: crate::memory::ledger::Held) -> Result<(), VisionGrowth> {
         let class = self.class_mut(patch_rows).map_err(VisionGrowth::Class)?;
-        let slot = Claimed::allocate(held, || class.family.new_slot(&class.upload_regions()).map_err(VisionGrowth::Device))?;
+        let slot = Claimed::allocate(device, held, |charges| class.family.new_slot(charges, &class.upload_regions()).map_err(VisionGrowth::Device))?;
         class.workspace.borrow_mut().push(slot);
         class.activations += 1;
         Ok(())
@@ -366,9 +367,9 @@ impl VisionGraphPool {
     /// Allocate one more output slot of the class of `patch_rows` under
     /// `held`, the claim of its [`Self::output_bytes`], kept until the slot
     /// is released.
-    pub(crate) fn grow_output(&mut self, patch_rows: u64, held: crate::memory::ledger::Held) -> Result<(), VisionGrowth> {
+    pub(crate) fn grow_output(&mut self, device: &seismic::Device, patch_rows: u64, held: crate::memory::ledger::Held) -> Result<(), VisionGrowth> {
         let class = self.class_mut(patch_rows).map_err(VisionGrowth::Class)?;
-        let slot = Claimed::allocate(held, || class.family.new_output_slot().map_err(VisionGrowth::Device))?;
+        let slot = Claimed::allocate(device, held, |charges| class.family.new_output_slot(charges).map_err(VisionGrowth::Device))?;
         class.output.borrow_mut().push(slot);
         class.outputs += 1;
         Ok(())
@@ -474,8 +475,12 @@ pub(crate) struct Claimed<S> {
 impl<S> Claimed<S> {
     /// A slot allocated by `make` under `held`, as one change with its
     /// record (`memory::ledger::Held::allocate`).
-    fn allocate<E>(mut held: crate::memory::ledger::Held, make: impl FnOnce() -> Result<S, E>) -> Result<Self, E> {
-        let slot = held.allocate(make)?;
+    fn allocate<E>(
+        device: &seismic::Device,
+        mut held: crate::memory::ledger::Held,
+        make: impl FnOnce(&seismic::Charges) -> Result<S, E>,
+    ) -> Result<Self, E> {
+        let slot = held.allocate(device, make)?;
         Ok(Self { slot, claims: held.into_claims() })
     }
 
@@ -679,8 +684,8 @@ mod tests {
         let shape = std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() });
         let (ledgers, _) = DeviceLedgers::open_in(&Ledgers::new(), &device, shape)
             .read_scripted(crate::memory::supply::Reading::device(8 << 30, 8 << 30, crate::domain::fixtures::NO_LAG));
-        let held = ledgers.claim(&device, CommittedKind::GroupClass, ClaimDemand { device: 1 << 20, ..Default::default() }).expect("room");
-        let slot = super::Claimed::allocate(held, || Ok::<_, ()>(())).expect("made");
+        let held = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, CommittedKind::GroupClass, ClaimDemand { device: 1 << 20, ..Default::default() })).expect("room");
+        let slot = super::Claimed::allocate(&device, held, |_| Ok::<_, ()>(())).expect("made");
         assert_eq!(ledgers.device().estimate().committed(), 1 << 20, "the freed slot's claim is held until its release");
         assert_eq!(slot.release(|()| 0), 0);
         assert_eq!(ledgers.device().estimate().committed(), 0, "the released slot's claim is gone");

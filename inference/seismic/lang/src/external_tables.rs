@@ -19,6 +19,26 @@ impl RepackTable {
         }
     }
 
+    /// Every registered table, in a fixed order: a table's position is its
+    /// id where a backend holds the tables (`index`).
+    pub const ALL: [Self; 1 + DIGITS_PER_BYTE as usize] = {
+        let mut tables = [Self::E2m1PositiveZero; 1 + DIGITS_PER_BYTE as usize];
+        let mut place = 0;
+        while place < DIGITS_PER_BYTE {
+            tables[1 + place as usize] = Self::Digit(DigitPlace(place as u8));
+            place += 1;
+        }
+        tables
+    };
+
+    /// The table's position in `ALL`.
+    pub fn index(self) -> usize {
+        match self {
+            Self::E2m1PositiveZero => 0,
+            Self::Digit(DigitPlace(place)) => 1 + place as usize,
+        }
+    }
+
     /// The table as one byte per entry, when it has at most 16 entries and
     /// each is a byte: a vector table instruction looks it up.
     pub fn bytes(self) -> Option<[u8; 16]> {

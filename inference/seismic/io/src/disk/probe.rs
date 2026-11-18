@@ -511,7 +511,7 @@ fn rate(file: &SourceFile, read: u64, depth: usize) -> Result<(f64, f64), Error>
             }
         };
         let spawned = (0..depth as u64)
-            .map(|thread| std::thread::Builder::new().spawn_scoped(scope, reader(thread)))
+            .map(|thread| seismic_threads::spawn_scoped(scope, "disk-probe", reader(thread)))
             .collect::<Result<Vec<_>, _>>();
         let began = Instant::now();
         let until = spawned.as_ref().ok().map(|_| began + std::time::Duration::from_secs_f64(PROBE_SECONDS));
@@ -662,7 +662,7 @@ fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64)
                 Ok(bytes)
             }
         };
-        let spawned = (0..depth).map(|thread| std::thread::Builder::new().spawn_scoped(scope, reader(thread))).collect::<Result<Vec<_>, _>>();
+        let spawned = (0..depth).map(|thread| seismic_threads::spawn_scoped(scope, "disk-probe", reader(thread))).collect::<Result<Vec<_>, _>>();
         let began = Instant::now();
         *start.0.lock().expect("probe start") = Some(spawned.as_ref().ok().map(|_| began + std::time::Duration::from_secs_f64(PROBE_SECONDS)));
         start.1.notify_all();

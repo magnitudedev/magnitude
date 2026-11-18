@@ -1,6 +1,6 @@
 use magnitude_state::{
     BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainId,
-    HistoryDomainLayout, HistoryDomainPlan, Holder, LayerRef, OwnedAdvanceResolution,
+    HistoryDomainLayout, HistoryDomainPlan, LayerRef, OwnedAdvanceResolution,
     NextSteps, OwnedStateAdvance, OwnedTailRelocation, SLAB_ROW_TILE,
     SequenceState, StateStore, StoreBindings,
 };
@@ -31,9 +31,8 @@ fn device() -> (Rc<Device>, Pool) {
     let (device, tally) =
         seismic::testing::open_backend_tallied(&catalog, BackendName::Cpu, Default::default()).unwrap();
     let entry: Arc<dyn seismic::memory::Entry> = Arc::new(tally);
-    let pool = device
-        .pool(seismic::Contract::DeviceOnly, GRANULE, GRANULE, seismic::PoolEntries::one(entry))
-        .unwrap();
+    let charges = seismic::PoolCharges::one(&device.charges_in(seismic::Contract::DeviceOnly, entry));
+    let pool = Pool::open(&charges, seismic::Contract::DeviceOnly, GRANULE, GRANULE).unwrap();
     (Rc::new(device), pool)
 }
 fn write(tensor: &Tensor, bytes: &[u8]) -> Result<(), magnitude_state::Error> {
@@ -68,7 +67,7 @@ fn store(history: bool, values: bool) -> StoreBindings {
 fn store_with(history: bool, values: bool, context: usize, pages: usize) -> StoreBindings {
     let (device, pool) = device();
     StateStore::new(
-        device,
+        &seismic::Charges::tally(&device),
         pool,
         context,
         16,
@@ -167,7 +166,7 @@ fn shared_prefix_private_tail_and_parent_first_drop() {
     assert_eq!(branches[0].position(), 11);
     drop(branches);
     assert_eq!(occupied(&store), 0);
-    assert!(store.idle());
+    assert_eq!(store.referenced_bytes(), 0);
 }
 #[test]
 fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
@@ -404,56 +403,25 @@ fn context_and_anticipation_bounds() {
 }
 
 #[test]
-fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
+fn shared_rows_and_banks_are_released_by_their_last_holder() {
     let store = store(true, true);
-    let reclaimable = |states: &[&SequenceState]| {
-        store
-            .exclusive_bytes(
-                &states
-                    .iter()
-                    .map(|state| Holder::State(state))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
-    };
-    // One history row (32 bytes) and one bank (16 bytes).
+    // One history row (32 bytes) and one bank (16 bytes); the zero seed a
+    // fresh sequence shares is the model's, never a holder's.
     let seed = store.create().unwrap();
-    // The zero seed is shared by every fresh sequence and never reclaimed.
-    assert_eq!(reclaimable(&[&seed]), 0);
+    assert_eq!(store.referenced_bytes(), 0);
     let parent = accept(&store, seed, 1);
+    assert_eq!(store.referenced_bytes(), 48);
     let checkpoint = parent.checkpoint();
     let fork = checkpoint.fork();
-    assert_eq!(reclaimable(&[&parent, &fork]), 0);
+    assert_eq!(store.referenced_bytes(), 48, "a checkpoint and its fork share the row and bank");
     drop(checkpoint);
-    assert_eq!(reclaimable(&[&parent]), 0);
-    assert_eq!(reclaimable(&[&parent, &fork, &parent]), 48);
-    // An in-flight advance from the fork pins the shared row and bank. A
-    // checkpoint holds them with it here: a live parent ending at that row
-    // would make the fork relocate it rather than share it.
-    let pinned = parent.checkpoint();
     drop(parent);
-    let fork = OwnedStateAdvance::begin(fork, 1).ok().unwrap();
-    assert_eq!(store.exclusive_bytes(&[Holder::Checkpoint(&pinned)]).unwrap(), 0);
-    let fork = fork.abort();
-    drop(pinned);
-    assert_eq!(reclaimable(&[&fork]), 48);
-    let (device, pool) = device();
-    let other = StateStore::new(
-        device,
-        pool,
-        16,
-        16,
-        vec![],
-        vec![],
-        BankCapacity {
-            active: 1,
-            in_flight: 1,
-            retained: 0,
-        },
-    )
-    .unwrap()
-    .0;
-    assert!(other.exclusive_bytes(&[Holder::State(&fork)]).is_err());
+    assert_eq!(store.referenced_bytes(), 48, "the fork still holds them");
+    // An advance in flight holds them with its source state.
+    let fork = OwnedStateAdvance::begin(fork, 1).ok().unwrap().abort();
+    assert_eq!(store.referenced_bytes(), 48);
+    drop(fork);
+    assert_eq!(store.referenced_bytes(), 0);
 }
 
 #[test]

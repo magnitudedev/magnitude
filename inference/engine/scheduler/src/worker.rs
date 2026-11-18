@@ -17,11 +17,10 @@ use magnitude_executor::RequestId;
 use std::{
     collections::VecDeque,
     future::Future,
-    panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Waker},
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -123,10 +122,6 @@ impl Rereading {
         }
     }
 }
-
-/// The execution owner panicked: execution stopped without a cause of its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Panicked;
 
 /// Why a dispatched command has no reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -351,8 +346,6 @@ pub enum SpawnError<E> {
     /// The control capacity must be positive.
     Capacity,
     Thread(std::io::Error),
-    /// Construction panicked.
-    Panicked,
     /// The execution factory failed.
     Factory(E),
     /// Host-side construction failed.
@@ -364,7 +357,6 @@ impl<E: std::fmt::Display> std::fmt::Display for SpawnError<E> {
         match self {
             Self::Capacity => formatter.write_str("execution control capacity must be positive"),
             Self::Thread(error) => write!(formatter, "execution thread spawn failed: {error}"),
-            Self::Panicked => formatter.write_str("execution factory panicked"),
             Self::Factory(error) | Self::Host(error) => error.fmt(formatter),
         }
     }
@@ -377,7 +369,7 @@ pub struct Worker<C: Clone + Send + 'static> {
     mailbox: Arc<Mailbox<C>>,
     thread: Option<JoinHandle<()>>,
 }
-impl<C: Clone + Send + From<Panicked> + 'static> Worker<C> {
+impl<C: Clone + Send + 'static> Worker<C> {
     pub fn spawn(
         factory: impl FnOnce(WorkerWakeHandle<C>) -> Result<Owner<C>, String> + Send + 'static,
         capacity: usize,
@@ -420,34 +412,33 @@ impl<C: Clone + Send + From<Panicked> + 'static> Worker<C> {
         });
         let queue = mailbox.clone();
         let (ready, receive) = std::sync::mpsc::sync_channel(1);
-        let thread = thread::Builder::new()
-            .name("magnitude-execution".into())
-            .spawn(move || {
-                let wakes = WorkerWakeHandle {
-                    mailbox: queue.clone(),
-                };
-                let made = catch_unwind(AssertUnwindSafe(|| factory(wakes)))
-                    .map_err(|_| SpawnError::Panicked)
-                    .and_then(|made| made.map_err(SpawnError::Factory));
-                match made {
-                    Ok((mut owner, readiness)) => {
-                        let _ = ready.send(Ok(readiness));
-                        let cause = catch_unwind(AssertUnwindSafe(|| run(owner.as_mut(), &queue)))
-                            .unwrap_or_else(|_| C::from(Panicked));
-                        queue.stop(cause);
-                    }
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                    }
+        let thread = seismic_threads::spawn("magnitude-execution", move || {
+            let wakes = WorkerWakeHandle {
+                mailbox: queue.clone(),
+            };
+            // A panic of the owner, as it is built or as it runs, ends the
+            // process (`seismic_threads::spawn`): nothing drains, drops or
+            // answers from the state it left.
+            match factory(wakes) {
+                Ok((mut owner, readiness)) => {
+                    let _ = ready.send(Ok(readiness));
+                    let cause = run(owner.as_mut(), &queue);
+                    queue.stop(cause);
                 }
-            })
-            .map_err(SpawnError::Thread)?;
+                Err(error) => {
+                    let _ = ready.send(Err(SpawnError::Factory(error)));
+                }
+            }
+        })
+        .map_err(SpawnError::Thread)?;
         let worker = Self {
             mailbox,
             thread: Some(thread),
         };
         let host = host().map_err(SpawnError::Host)?;
-        let readiness = receive.recv().map_err(|_| SpawnError::Panicked)??;
+        let readiness = receive
+            .recv()
+            .expect("invariant violated: the execution thread answers its readiness, since its panic ends the process")?;
         Ok((worker, readiness, host))
     }
     pub fn client(&self) -> Client<C> {
@@ -469,7 +460,7 @@ impl<C: Clone + Send + From<Panicked> + 'static> Worker<C> {
     pub fn close(&mut self) {
         if let Some(thread) = self.thread.take() {
             self.mailbox.push(Event::Close);
-            let _ = thread.join();
+            thread.join().expect("the execution thread's panic ends the process");
         }
     }
 }
@@ -477,7 +468,7 @@ impl<C: Clone + Send + 'static> Drop for Worker<C> {
     fn drop(&mut self) {
         if let Some(thread) = self.thread.take() {
             self.mailbox.push(Event::Close);
-            let _ = thread.join();
+            thread.join().expect("the execution thread's panic ends the process");
         }
     }
 }
@@ -598,12 +589,6 @@ mod tests {
     use std::time::Duration;
 
     const TIMEOUT: Duration = Duration::from_secs(2);
-
-    impl From<Panicked> for String {
-        fn from(_: Panicked) -> Self {
-            "execution owner panicked".into()
-        }
-    }
 
     fn admit_request() -> WorkerCommand {
         let tokens = vec![TokenId(1), TokenId(2)];
@@ -882,7 +867,7 @@ mod tests {
         let deadline = Instant::now() + TIMEOUT;
         while client.stopped().is_none() {
             assert!(Instant::now() < deadline);
-            thread::yield_now();
+            std::thread::yield_now();
         }
         assert_eq!(client.stopped(), Some("device lost".into()));
         assert!(matches!(

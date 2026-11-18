@@ -65,7 +65,7 @@ pub fn load_native_domain(
     Ok(
         match build(catalog, manifest, package, unprepared, Rc::new(|_| {}))? {
             LoadAttempt::Loaded(built) => {
-                LoadAttempt::Loaded((built.domain, built.bindings, built.plan))
+                LoadAttempt::Loaded(Box::new((built.domain, built.bindings, built.plan)))
             }
             LoadAttempt::Unprepared => LoadAttempt::Unprepared,
         },
@@ -79,7 +79,7 @@ pub fn build_native_domain(
     package: Arc<Package>,
 ) -> Result<(ExecutorDomain, StateBindings, ResourcePlan), LoadError> {
     match load_native_domain(manifest, package, UnpreparedUnits::ServeDefaults)? {
-        LoadAttempt::Loaded(built) => Ok(built),
+        LoadAttempt::Loaded(built) => Ok(*built),
         LoadAttempt::Unprepared => Err(internal(
             "a load serving canonical defaults stopped unprepared",
         )),
@@ -354,10 +354,10 @@ pub(crate) fn search(
     let report = tuning_report(manifest, TracedWork::Search, &numerical_profile, opened.device(), progress)?;
     let room = startup.room();
     let tuned = programs_claim
-        .allocate(|| {
+        .allocate(opened.device(), |charges| {
             AttestedPrograms::search_draft(
                 &draft,
-                opened.device(),
+                charges,
                 TuningContext {
                     definition: &manifest.definition,
                     weights: package,
@@ -397,7 +397,7 @@ pub(crate) fn search(
     );
     report_load_memory("searched", opened.device());
     if let Some(cache) = &kernel_cache {
-        cache.store_prepared(&prepared_key(manifest)?);
+        cache.store_prepared(&prepared_key(manifest)?).map_err(internal)?;
     }
     Ok(())
 }
@@ -450,10 +450,13 @@ fn prepared_key(manifest: &ExecutionManifest) -> Result<TuningCacheKey, LoadErro
     )))
 }
 
-/// How an attempt to load ended, short of failing.
+/// How an attempt to load ended, short of failing. What loaded is boxed:
+/// a load's results (its domain, its prepared programs) are tens of
+/// kilobytes, which every frame that passes an attempt on would otherwise
+/// hold again, and an unoptimized build in each of its temporaries.
 #[derive(Debug)]
 pub enum LoadAttempt<L> {
-    Loaded(L),
+    Loaded(Box<L>),
     /// A load asked to report tuning units without a stored record
     /// ([`UnpreparedUnits::Report`]) met one. Nothing of the model was
     /// placed, and nothing of the attempt remains: the host has the model's
@@ -482,7 +485,7 @@ fn prepare(
         if let Some(root) = &manifest.kernel_cache {
             let cache = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES)
                 .map_err(|error| internal(error.to_string()))?;
-            if manifest.tuning.fresh || !cache.prepared(&prepared_key(manifest)?) {
+            if manifest.tuning.fresh || !cache.prepared(&prepared_key(manifest)?).map_err(internal)? {
                 return Ok(LoadAttempt::Unprepared);
             }
         }
@@ -506,9 +509,9 @@ fn prepare(
     let report = tuning_report(manifest, TracedWork::Load, &numerical_profile, opened.device(), progress)?;
     // The programs' storage is made under its claim, one change with its
     // record.
-    let mut programs = match programs_claim.allocate(|| AttestedPrograms::prepare_draft(
+    let mut programs = match programs_claim.allocate(opened.device(), |charges| AttestedPrograms::prepare_draft(
         &draft,
-        opened.device(),
+        charges,
         TuningContext {
             definition: &manifest.definition,
             weights: package,
@@ -567,7 +570,7 @@ fn prepare(
         formed.load_misses,
     );
     report_load_memory("programs prepared", opened.device());
-    Ok(LoadAttempt::Loaded(PreparedPrograms {
+    Ok(LoadAttempt::Loaded(Box::new(PreparedPrograms {
         startup,
         draft,
         resident,
@@ -578,7 +581,7 @@ fn prepare(
         state,
         held_pass,
         workers,
-    }))
+    })))
 }
 
 /// A load: one code path whose `unprepared` decides only what happens at a
@@ -649,7 +652,7 @@ fn build_held(
         held_pass,
         workers,
     } = match prepare(catalog, manifest, &package, unprepared, progress.clone(), holding)? {
-        LoadAttempt::Loaded(prepared) => prepared,
+        LoadAttempt::Loaded(prepared) => *prepared,
         LoadAttempt::Unprepared => return Ok(Built::Attempt(LoadAttempt::Unprepared)),
     };
     let limits = draft.policy().limits();
@@ -840,10 +843,10 @@ fn build_held(
         ClaimDemand { device: plan.bytes().scratch, ..ClaimDemand::default() },
     )?;
     let resources = scratch
-        .allocate(|| {
+        .allocate(&device, |charges| {
             ResourceAllocator::allocate(
                 &execution_plan,
-                &device,
+                charges,
                 resource_identity.clone(),
                 target_graphs,
                 target_readout_graphs,
@@ -882,8 +885,13 @@ fn build_held(
     // opens and grows, the bank yielding them by relief.
     let slot = magnitude_executor::request_slot_bytes(&execution_plan).map_err(internal)?;
     let request_slot = startup
-        .claim_as("one request's opening", CommittedKind::RequestSlot, ClaimDemand { device: slot, ..ClaimDemand::default() })?
-        .into_request_slot();
+        .ledgers
+        .changes()
+        .change(|keeping| {
+            let demand = ClaimDemand { device: slot, ..ClaimDemand::default() };
+            startup.ledgers.claim_request_slot_at(&keeping.claims(), &startup.reading, startup.reader.device(), demand)
+        })
+        .map_err(|short| refused("one request's opening", short))?;
     let constants_claim = startup.claim_as(
         "target binding constants",
         CommittedKind::Arena,
@@ -952,9 +960,10 @@ fn build_held(
     let import_progress = progress.clone();
     // The import and its record, its host tables' row caches with it, are
     // one change: the caches charged to their own claim.
-    let target = weights.allocate(|| {
+    let target = weights.allocate(&device, |charges| {
         residency
             .load_target(
+                charges,
                 &manifest.definition,
                 &package,
                 &host_tables,
@@ -1012,10 +1021,10 @@ fn build_held(
         })
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
-    let target_state = state_tables.allocate(|| plan.allocate_target_state(device.clone(), pools.state.clone())).map_err(internal)?;
+    let target_state = state_tables.allocate(&device, |charges| plan.allocate_target_state(charges, pools.state.clone())).map_err(internal)?;
     let head_state = plan
         .head_state()
-        .map(|state| state_tables.allocate(|| state.allocate(device.clone(), pools.state.clone())).map_err(internal))
+        .map(|state| state_tables.allocate(&device, |charges| state.allocate(charges, pools.state.clone())).map_err(internal))
         .transpose()?;
     startup.recorded.record(state_tables);
     let (mut domain, bindings) = ExecutorDomain::new(
@@ -1050,9 +1059,6 @@ fn build_held(
     // process's report on demand (`magnitude_executor::diagnostics`).
     let phase = magnitude_executor::diagnostics::Phase::new("load", "warm-up forward");
     let mut bindings = warm_up(&mut domain, bindings, primes_drafter)?;
-    // Everything the load allocates is charged: tables formed from here on are
-    // outside it (`seismic::Device::seal_record_tables`).
-    device.seal_record_tables();
     phase.enter("loaded memory report");
     report_loaded_memory(&domain, &device).map_err(internal)?;
     phase.enter("pricing the load: its step, shrink moves and host storage's routes");
@@ -1069,13 +1075,13 @@ fn build_held(
         .measure_load(load_measures(&pricing).map_err(internal)?, &mut bindings)
         .map_err(|error| internal(error.to_string()))?;
     phase.enter("serving");
-    Ok(Built::Attempt(LoadAttempt::Loaded(NativeDomain {
+    Ok(Built::Attempt(LoadAttempt::Loaded(Box::new(NativeDomain {
         domain,
         bindings,
         plan,
         device: device_selector,
         pricing,
-    })))
+    }))))
 }
 
 /// What a load unpriced without a kernel cache lacks: where the executor's
@@ -1086,13 +1092,17 @@ const UNPRICED: &str = "the load keeps no kernel cache, where the executor's cos
 /// which prices it once its warm-up ends and again each time the service's
 /// measurement job stores new records. No load measures: what is not stored
 /// yet a streamed load requests of the job ([`BankPricing::new`]).
+///
+/// Its definition and plans are boxed: a pricing is moved by value through
+/// a load's deep frames, whose stacks hold every by-value copy
+/// (`seismic_threads::STACK_BYTES`).
 pub(crate) struct LoadPricing {
     kernel_cache: Option<std::path::PathBuf>,
-    definition: magnitude_family_contracts::ModelDefinition,
+    definition: Box<magnitude_family_contracts::ModelDefinition>,
     /// The plan before the weight cap: every expert resident.
-    resident: ExecutionPlanDraft,
+    resident: Box<ExecutionPlanDraft>,
     /// The plan the load runs.
-    planned: ExecutionPlanDraft,
+    planned: Box<ExecutionPlanDraft>,
     /// The load's executor's identity.
     executor: seismic::Identity,
     device: seismic::Device,
@@ -1147,9 +1157,9 @@ impl LoadPricing {
         }
         Ok(Self {
             kernel_cache: manifest.kernel_cache.clone(),
-            definition: manifest.definition.clone(),
-            resident,
-            planned,
+            definition: Box::new(manifest.definition.clone()),
+            resident: Box::new(resident),
+            planned: Box::new(planned),
             executor,
             device,
             bank,
@@ -1215,7 +1225,15 @@ impl LoadPricing {
             readers: 1,
             requests: Vec::new(),
         });
-        let pricing = Self { kernel_cache, definition, resident, planned, executor, device: device.clone(), bank };
+        let pricing = Self {
+            kernel_cache,
+            definition: Box::new(definition),
+            resident: Box::new(resident),
+            planned: Box::new(planned),
+            executor,
+            device: device.clone(),
+            bank,
+        };
         (pricing, device)
     }
 }
@@ -1620,30 +1638,25 @@ fn report_load_memory(moment: &str, device: &seismic::Device) {
     tracing::info!(record = %load_memory_record(moment, device), "load memory");
 }
 
-/// The load's end (`loaded`): its memory record with Seismic's charge
-/// split by the domain's holders (`MemoryChargeReconciliation`), each in
-/// the plan's term that charges it, so the plan's terms read beside what
-/// the load holds of each.
+/// The load's end (`loaded`): its memory record with what the ledgers hold
+/// allocated beside the plan's terms that charge it (`LoadCharge`), so the
+/// plan's terms read beside what the load holds of each.
 fn report_loaded_memory(
     domain: &ExecutorDomain,
     device: &seismic::Device,
 ) -> Result<(), String> {
-    let charge = domain.reconcile_memory_charge(&[])?;
+    let charge = domain.load_charge()?;
     let sum = |terms: &[u64]| {
         terms
             .iter()
             .try_fold(0u64, |sum, &term| sum.checked_add(term))
             .ok_or_else(|| format!("the load's charge terms {terms:?} overflow"))
     };
-    let state = sum(&[
-        charge.target_state.total(),
-        charge.head_state.map_or(0, |state| state.total()),
-    ])?;
     let mut record = load_memory_record("loaded", device);
     record["charge"] = serde_json::json!({
         "allocated": charge.allocated,
         "weights": sum(&[charge.target_weights, charge.optional_weights])?,
-        "state": state,
+        "state": charge.state.committed(),
         "graphs": sum(&[charge.graph_pools, charge.bound_constants])?,
         "programs": charge.prepared_programs,
         "owned_features": charge.owned_features,
@@ -1729,7 +1742,8 @@ impl Startup {
     }
 
     /// Claim `demand`, an allocation the load makes and keeps, at the
-    /// load's reading; refused as insufficient memory for `purpose`.
+    /// load's reading, in a change that keeps nothing; refused as
+    /// insufficient memory for `purpose`.
     fn claim(&self, purpose: &str, demand: ClaimDemand) -> Result<Held, LoadError> {
         self.claim_as(purpose, CommittedKind::Load, demand)
     }
@@ -1739,7 +1753,11 @@ impl Startup {
     /// minimum request state's, or one the load frees as it starts (its
     /// qualification fixtures, its upload window).
     fn claim_as(&self, purpose: &str, kind: CommittedKind, demand: ClaimDemand) -> Result<Held, LoadError> {
-        self.ledgers.claim_at(&self.reading, self.reader.device(), kind, demand).map_err(|short| refused(purpose, short))
+        let device = self.reader.device();
+        self.ledgers
+            .changes()
+            .change(|keeping| self.ledgers.claim_at(&keeping.claims(), &self.reading, device, kind, demand))
+            .map_err(|short| refused(purpose, short))
     }
 
     /// [`Self::claim`] of `bytes` of device storage.
@@ -1784,7 +1802,9 @@ impl Startup {
                 (bank.floor(), bank.slots, most)
             }
         };
-        match self.ledgers.admit_most(&self.reading, self.reader.device(), CommittedKind::Load, floor, most, demand)? {
+        let device = self.reader.device();
+        let admitted = self.ledgers.changes().change(|keeping| self.ledgers.admit_most(&keeping.claims(), &self.reading, device, CommittedKind::Load, floor, most, demand))?;
+        match admitted {
             Ok((slots, held)) if slots == planned => Ok(Imported::Planned(held)),
             Ok((slots, held)) => {
                 tracing::info!(
@@ -2278,7 +2298,7 @@ mod tests {
             let selected = crate::planning::select_load_device(&catalog, &manifest).unwrap();
             let read = read_device(catalog.clone(), &manifest, &selected).unwrap_or_else(|error| panic!("{backend:?} opens and is read: {error:?}"));
             let demand = ClaimDemand { device: 1 << 20, ..ClaimDemand::default() };
-            let claim = read.ledgers.claim_at(&read.reading, read.opened.device(), CommittedKind::Qualification, demand);
+            let claim = read.ledgers.changes().back(|claiming| read.ledgers.claim_at(&claiming, &read.reading, read.opened.device(), CommittedKind::Qualification, demand));
             assert!(claim.is_ok(), "{backend:?}: a load claims in the store its open read: {:?}", claim.err());
         }
     }
@@ -2337,6 +2357,6 @@ mod tests {
         store_fixed_costs(&catalog.topology(), &selected.info, cache.path());
         search(catalog, &manifest, &package, Rc::new(|_| ())).unwrap();
         let kernel_cache = KernelCache::open(cache.path().to_owned(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-        assert!(kernel_cache.prepared(&prepared_key(&manifest).unwrap()));
+        assert!(kernel_cache.prepared(&prepared_key(&manifest).unwrap()).unwrap());
     }
 }

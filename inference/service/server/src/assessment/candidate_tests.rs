@@ -3877,6 +3877,7 @@ impl magnitude_service_contracts::models::CatalogPackageRemover for NoCatalogEff
     fn remove_catalog_packages(
         &self,
         _package_ids: Vec<magnitude_service_contracts::models::ModelPackageId>,
+        _loaded: magnitude_service_contracts::models::LoadedPackages,
     ) -> BoxFuture<'_, Result<u64, InventoryError>> {
         Box::pin(async { Err(InventoryError::Unsupported("no removal in tests".into())) })
     }

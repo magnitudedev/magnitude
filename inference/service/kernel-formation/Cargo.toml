@@ -13,6 +13,7 @@ clap.workspace = true
 magnitude-kernels = { path = "../../engine/kernels" }
 magnitude-service-server = { path = "../server" }
 seismic = { workspace = true, features = ["coverage"] }
+seismic-io.workspace = true
 sha2.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]

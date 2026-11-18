@@ -727,8 +727,7 @@ impl From<ExecutionError> for TensorError {
 pub mod device {
     use crate::backends::OpenedKind;
     use crate::driver::Allocation;
-    use seismic_compiler::errors::ExecutionError;
-    use seismic_topology::{Contract, DeviceTopology, Executor, StoreId};
+    use seismic_topology::{Contract, DeviceTopology, Executor, StoreId, StoreIdentity};
     use std::sync::Arc;
 
     /// One opened executor: its immutable description, execution resources
@@ -755,10 +754,6 @@ pub mod device {
         /// What the device's recorded graphs hold for their census,
         /// measured on opening where the driver takes it.
         pub(crate) graph_cost: seismic_compiler::graph_cost::GraphCost,
-        /// Set once the load's charge is final: from then on a record table
-        /// formed outside a lifted scope ([`DeviceInner::lift_table_seal`])
-        /// is memory no claim covers (see `record_table`).
-        pub(crate) tables_sealed: std::sync::atomic::AtomicBool,
         /// Kernels tuning chose and formed, handed to the serving
         /// preparation of the same specialization so nothing is formed twice
         /// (`NativePrepared::hand_off`). Taken on first use.
@@ -769,39 +764,7 @@ pub mod device {
             >,
         >,
     }
-    thread_local! {
-        /// The devices whose table seal this thread has lifted, one entry per
-        /// open scope ([`DeviceInner::lift_table_seal`]).
-        static LIFTED_SEALS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
     impl DeviceInner {
-        /// Declare the load's charge final: forming a record table afterwards,
-        /// outside a lifted scope, is an invariant violation.
-        pub fn seal_record_tables(&self) {
-            self.tables_sealed.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        /// Lift the seal until [`Self::restore_table_seal`], for allocations
-        /// made under a claim after the load (a component's import).
-        ///
-        /// The lift belongs to the calling thread: a table another thread
-        /// forms meanwhile is outside any claim and stops there as it does
-        /// anywhere ([`record_table`]).
-        pub fn lift_table_seal(&self) {
-            LIFTED_SEALS.with(|lifted| lifted.borrow_mut().push(self.seal_key()));
-        }
-        pub fn restore_table_seal(&self) {
-            LIFTED_SEALS.with(|lifted| {
-                let mut lifted = lifted.borrow_mut();
-                let at = lifted.iter().rposition(|key| *key == self.seal_key()).expect("a restored seal lift is this thread's");
-                lifted.remove(at);
-            });
-        }
-        fn seal_key(&self) -> usize {
-            std::ptr::from_ref(self) as usize
-        }
-        pub(crate) fn seal_lifted_here(&self) -> bool {
-            LIFTED_SEALS.with(|lifted| lifted.borrow().contains(&self.seal_key()))
-        }
         pub(crate) fn active_trace(&self) -> Option<Arc<crate::native::trace::TraceSink>> {
             self.trace
                 .lock()
@@ -882,49 +845,6 @@ pub mod device {
                 .get_or_init(|| self.kind.capabilities())
                 .as_slice()
         }
-        pub(crate) fn allocate(
-            self: &Arc<Self>,
-            bytes: u64,
-            alignment: u64,
-        ) -> Result<Arc<Allocation>, ExecutionError> {
-            self.kind.allocate(bytes, alignment)
-        }
-        /// `OpenedKind::allocate_mapped`.
-        pub(crate) fn allocate_mapped(
-            self: &Arc<Self>,
-            contract: Contract,
-            bytes: u64,
-            alignment: u64,
-        ) -> Result<Arc<Allocation>, ExecutionError> {
-            self.kind.allocate_mapped(contract, bytes, alignment)
-        }
-        /// Storage that reads zero, backed; see `OpenedKind::allocate_zeroed`.
-        pub(crate) fn allocate_zeroed(
-            self: &Arc<Self>,
-            bytes: u64,
-            alignment: u64,
-        ) -> Result<Arc<Allocation>, ExecutionError> {
-            self.kind.allocate_zeroed(bytes, alignment)
-        }
-        /// Storage the host fills before each submission; see
-        /// `OpenedKind::allocate_upload`.
-        pub(crate) fn allocate_upload(
-            self: &Arc<Self>,
-            bytes: u64,
-            alignment: u64,
-        ) -> Result<Arc<Allocation>, ExecutionError> {
-            self.kind.allocate_upload(bytes, alignment)
-        }
-        /// Upload storage that reads zero, backed; see
-        /// `OpenedKind::allocate_mapped_zeroed`.
-        pub(crate) fn allocate_mapped_zeroed(
-            self: &Arc<Self>,
-            contract: Contract,
-            bytes: u64,
-            alignment: u64,
-        ) -> Result<Arc<Allocation>, seismic_compiler::errors::ExecutionError> {
-            self.kind.allocate_mapped_zeroed(contract, bytes, alignment)
-        }
         pub(crate) fn map_read_only_host_region(
             self: &Arc<Self>,
             region: super::HostRegion,
@@ -994,29 +914,19 @@ pub mod device {
                 OpenedKind::Vulkan(_) => false,
             }
         }
-        /// The ledger entry an allocation of `contract` made now on this
-        /// thread is charged to: the one its caller names for the store
-        /// ([`crate::memory::charging`]), else the store's sole entry where
-        /// it counts every byte in one ([`crate::memory::Store::sole`]).
+        /// Charges of this device, each store's entry the one `entry_in`
+        /// names for it, called once with the identity of each store the
+        /// device reaches: how the embedder's ledger mints what its holdings
+        /// allocate through ([`crate::memory::Charges`]). Handed no store,
+        /// it cannot name a store's own entry.
         ///
         /// # Panics
-        /// Where neither is: an embedder's ledger has no owner for the bytes.
-        pub fn entry(&self, contract: Contract) -> std::sync::Arc<dyn crate::memory::Entry> {
-            self.memory.entry(contract)
-        }
-        /// Run `allocate`, every allocation it makes on this thread through
-        /// this device landing in `kind` or refused
-        /// ([`crate::memory::DeviceStores::confined`]).
-        ///
-        /// # Panics
-        /// Where `kind` is none of the device's executor's kinds.
-        pub fn in_kind<T>(&self, kind: seismic_topology::NativeKind, allocate: impl FnOnce() -> T) -> T {
-            assert_eq!(
-                kind.backend,
-                self.info.backend(),
-                "invariant violated: allocations confined to a kind of another backend"
-            );
-            self.memory.confined(kind.id, allocate)
+        /// Where `entry_in` names an entry of another store than it was given.
+        pub fn charges(
+            self: &Arc<Self>,
+            entry_in: impl FnMut(&StoreIdentity) -> Arc<dyn crate::memory::Entry>,
+        ) -> crate::memory::Charges {
+            crate::memory::Charges::mint(self, entry_in)
         }
         /// The bytes the embedder's ledger counts the process holding in the
         /// store device storage is placed on ([`crate::memory::Store::allocated`]).
@@ -1079,6 +989,7 @@ pub mod tensor {
         ViewChargeError,
     };
     use crate::driver::Allocation;
+    use crate::memory::Charges;
     use crate::pool::{GranuleHold, Slots};
     use crate::layout;
     use seismic_compiler::errors::ExecutionError;
@@ -1211,12 +1122,12 @@ pub mod tensor {
         /// view of it lives (`crate::pool::GranuleHold`).
         hold: Option<Arc<GranuleHold>>,
         /// This view's records as a native record port binds them, formed
-        /// at its first such binding ([`TensorInner::records`]).
+        /// at its first such binding ([`TensorInner::forming_records`]).
         records: OnceLock<Arc<Records>>,
     }
 
     /// A view's records as a native record port reaches them
-    /// ([`TensorInner::records`]): through a table of their device
+    /// ([`TensorInner::forming_records`]): through a table of their device
     /// addresses.
     pub(crate) struct Records {
         /// The table's allocation, and the byte offset of the view's entry 0.
@@ -1356,31 +1267,23 @@ pub mod tensor {
         Slabs(Vec<Option<Vec<u8>>>),
     }
 
-    /// A record table over `storage` on `device`, entry `i` the device
-    /// address of its `i`th byte offset in `offsets`
+    /// A record table over `storage`, entry `i` the device address of its
+    /// `i`th byte offset in `offsets`
     /// ([`seismic_lang::registry::record_table`]), in `storage`'s hazard
-    /// domain: the one place a record table is formed.
+    /// domain, formed through `charges` as device storage
+    /// ([`Charges::of`]), in the kind they are confined to where they are:
+    /// the one place a record table is formed.
     pub(crate) fn record_table(
-        device: &Arc<DeviceInner>,
+        charges: &Charges,
         storage: &Arc<Allocation>,
         offsets: impl Iterator<Item = u64>,
     ) -> Result<Arc<Allocation>, TensorError> {
-        // A table formed after the load is sealed is device memory no claim
-        // covers: a state that must not exist, so every build stops where it
-        // is formed (every fixed record port's table is formed as its plan is
-        // bound, `bind_static`, and a grown slab's is in its allocation's
-        // charge).
-        assert!(
-            !device.tables_sealed.load(std::sync::atomic::Ordering::SeqCst)
-                || device.seal_lifted_here(),
-            "invariant violated: a record table over {} bytes of storage was formed after the load, outside any claim: {}",
-            storage.bytes(),
-            std::backtrace::Backtrace::force_capture()
-        );
+        let device = charges.device();
         let bytes = seismic_lang::registry::record_table(
             offsets.map(|offset| device.allocation_address(storage, offset)),
         );
-        let table = device.kind.allocate_in(
+        let table = device.kind.allocate_contract(
+            charges.of(Contract::DeviceOnly, bytes.len() as u64)?,
             bytes.len() as u64,
             seismic_lang::registry::RECORD_TABLE_ENTRY_BYTES,
             Some(storage.access_group().clone()),
@@ -1531,9 +1434,10 @@ pub mod tensor {
         /// this one. A slab view's copy has its own slabs and address table.
         /// A copy of a view the host addresses in place ([`Self::shared`])
         /// is host-shared too, so the host reads it as it reads this one (a
-        /// launch condition's word, `native::condition_holds`).
-        pub(crate) fn copy_of(&self, image: &TensorImage) -> Result<Self, TensorError> {
-            let device = &self.device;
+        /// launch condition's word, `native::condition_holds`). Allocated
+        /// through `charges`.
+        pub(crate) fn copy_of(&self, charges: &Charges, image: &TensorImage) -> Result<Self, TensorError> {
+            let device = charges;
             match (image, &self.slabs) {
                 (TensorImage::Whole(bytes), None) => match self.host_address() {
                     Some(_) => {
@@ -1721,21 +1625,27 @@ pub mod tensor {
             })
         }
 
-        /// This canonical view's records as a native record port binds them.
-        /// A slab view of one row a slab binds its region's address table,
+        /// This canonical view's records as a native record port binds them:
+        /// a slab view of one row a slab binds its region's address table,
         /// entry `i` its slot `i`'s record, as its slabs change. Any other
         /// view binds a table its allocation holds of records of its size
         /// and phase, or for a single record any table the allocation holds
-        /// with an entry at its address (`Allocation::view_table`), formed
-        /// at the first such binding and charged with the storage; a view
-        /// formed per run binds the same table and allocates nothing.
-        /// [`Self::hold_records`] forms the table before the first binding.
+        /// with an entry at its address (`Allocation::view_table`); where it
+        /// holds none, one is formed through `charges`, the binder's, and
+        /// held with the storage from then on. A record port binds a tensor
+        /// only through this, as it is bound (`NativeGraphBindings::set`,
+        /// a native call's arguments), so a view bound again, or formed per
+        /// run over storage that holds its table, allocates nothing.
         ///
         /// Device work reaches the records by address alone, so they must
         /// lie in storage the device holds resident (on Metal, its
         /// residency set): a read-only host mapping, which the device makes
         /// resident only where it is bound, is refused.
-        pub(crate) fn records(&self) -> Result<Arc<Records>, TensorError> {
+        ///
+        /// # Panics
+        /// Where `charges` are another device's ([`Charges::of_device`]).
+        pub(crate) fn forming_records(&self, charges: &Charges) -> Result<Arc<Records>, TensorError> {
+            let charges = charges.of_device(&self.device);
             if let Some(records) = self.records.get() {
                 return Ok(records.clone());
             }
@@ -1757,7 +1667,7 @@ pub mod tensor {
                     ))
                 }
                 None => {
-                    let (table, table_offset) = self.form_record_table(record)?;
+                    let (table, table_offset) = self.record_table(record, charges)?;
                     Records {
                         table,
                         table_offset,
@@ -1771,18 +1681,11 @@ pub mod tensor {
             Ok(self.records.get_or_init(|| Arc::new(records)).clone())
         }
 
-        /// Form now the table a native record port binds this view through
-        /// ([`Self::records`]), so no later binding allocates: for a view
-        /// first bound while its device's storage may refuse an allocation
-        /// (memory short).
-        pub fn hold_records(&self) -> Result<(), TensorError> {
-            self.records().map(drop)
-        }
-
         /// The table a record port binds this unslabbed view's
         /// `record`-byte records through, and the byte of its first entry
-        /// ([`Self::records`]).
-        fn form_record_table(&self, record: u64) -> Result<(Arc<Allocation>, u64), TensorError> {
+        /// ([`Self::forming_records`]), formed through `charges` where none
+        /// is held.
+        fn record_table(&self, record: u64, charges: &Charges) -> Result<(Arc<Allocation>, u64), TensorError> {
             if layout::canonical(self.representation, &self.extents)?.strides != self.strides {
                 return Err(TensorError::Region(RegionError::NotContiguous));
             }
@@ -1791,13 +1694,15 @@ pub mod tensor {
                     "a record port's records cannot lie in a read-only host mapping".into(),
                 ));
             }
-            self.allocation.view_table(record, self.byte_offset, self.extents[0], |phase, records| {
-                record_table(
-                    &self.device,
-                    &self.allocation,
-                    (0..records).map(|index| phase + index * record),
-                )
-            })
+            self.allocation.view_table(
+                record,
+                self.byte_offset,
+                self.extents[0],
+                charges,
+                |phase, records, charges| {
+                    record_table(charges, &self.allocation, (0..records).map(|index| phase + index * record))
+                },
+            )
         }
 
         /// Exact canonical storage charge for a representation and logical
@@ -1813,24 +1718,24 @@ pub mod tensor {
         /// place while device work that uses it is queued or running
         /// (`Contract::Shared`).
         pub fn shared(
-            device: &Arc<DeviceInner>,
+            charges: &Charges,
             representation: RepresentationId,
             extents: &[u64],
         ) -> Result<Self, TensorError> {
-            Self::host_visible(device, representation, extents, |bytes, alignment| {
-                device.allocate_mapped_zeroed(Contract::Shared, bytes, alignment)
+            Self::canonical_in(charges, representation, extents, |charges, bytes, alignment| {
+                charges.allocate_mapped_zeroed(Contract::Shared, bytes, alignment)
             })
         }
 
         /// A zero-filled tensor of coherent words the host and device work
         /// load and store while either is running (`Contract::Words`).
         pub fn words(
-            device: &Arc<DeviceInner>,
+            charges: &Charges,
             representation: RepresentationId,
             extents: &[u64],
         ) -> Result<Self, TensorError> {
-            Self::host_visible(device, representation, extents, |bytes, alignment| {
-                device.allocate_mapped_zeroed(Contract::Words, bytes, alignment)
+            Self::canonical_in(charges, representation, extents, |charges, bytes, alignment| {
+                charges.allocate_mapped_zeroed(Contract::Words, bytes, alignment)
             })
         }
 
@@ -1838,11 +1743,11 @@ pub mod tensor {
         /// the work that uses it orders across device queues, not their
         /// fences (`Allocation::order_by_protocol`).
         pub fn protocol_words(
-            device: &Arc<DeviceInner>,
+            charges: &Charges,
             representation: RepresentationId,
             extents: &[u64],
         ) -> Result<Self, TensorError> {
-            let tensor = Self::words(device, representation, extents)?;
+            let tensor = Self::words(charges, representation, extents)?;
             tensor.allocation().order_by_protocol();
             Ok(tensor)
         }
@@ -1851,40 +1756,13 @@ pub mod tensor {
         /// while device work reads it (`Contract::Upload`: a
         /// graph run's inputs' storage, which a large BAR may hold).
         pub fn upload(
-            device: &Arc<DeviceInner>,
+            charges: &Charges,
             representation: RepresentationId,
             extents: &[u64],
         ) -> Result<Self, TensorError> {
-            Self::host_visible(device, representation, extents, |bytes, alignment| {
-                device.allocate_mapped_zeroed(Contract::Upload, bytes, alignment)
+            Self::canonical_in(charges, representation, extents, |charges, bytes, alignment| {
+                charges.allocate_mapped_zeroed(Contract::Upload, bytes, alignment)
             })
-        }
-
-        /// A tensor of `representation` and `extents` in host-visible
-        /// storage `allocate` allocates zeroed.
-        fn host_visible(
-            device: &Arc<DeviceInner>,
-            representation: RepresentationId,
-            extents: &[u64],
-            allocate: impl FnOnce(u64, u64) -> Result<Arc<Allocation>, ExecutionError>,
-        ) -> Result<Self, TensorError> {
-            if !device.supports_representation(representation) {
-                return Err(TensorError::UnsupportedRepresentation {
-                    backend: device.info().backend(),
-                    representation: representation_info(representation).name,
-                });
-            }
-            let layout = layout::canonical(representation, extents)?;
-            let allocation = allocate(layout.byte_len, layout.alignment)?;
-            Ok(Self::new_view(
-                device.clone(),
-                allocation,
-                0,
-                layout.byte_len,
-                representation,
-                extents.to_vec(),
-                layout.strides,
-            ))
         }
 
         /// Write `bytes` at `offset` bytes into this view without waiting
@@ -2057,31 +1935,48 @@ pub mod tensor {
         }
 
         pub fn zeros(
-            device: &Arc<DeviceInner>,
+            charges: &Charges,
             representation: RepresentationId,
             extents: &[u64],
         ) -> Result<Self, TensorError> {
-            Self::canonical_in(device, representation, extents, DeviceInner::allocate_zeroed)
+            Self::canonical_in(charges, representation, extents, Charges::allocate_zeroed)
+        }
+
+        /// A zero-filled tensor whose records' table is formed with it,
+        /// through `charges`, and held with its storage: a record port then
+        /// binds a view of a run of its records (a streamed table's landed
+        /// slots) through that table, allocating no other
+        /// (`Allocation::view_table`).
+        pub fn zeros_recorded(
+            charges: &Charges,
+            representation: RepresentationId,
+            extents: &[u64],
+        ) -> Result<Self, TensorError> {
+            let tensor = Self::zeros(charges, representation, extents)?;
+            tensor.forming_records(charges)?;
+            Ok(tensor)
         }
 
         /// Allocate a canonical tensor without writing its storage. The
         /// caller must fully initialize all bytes, including representation
         /// padding, before any host read or device input use.
         pub unsafe fn uninitialized(
-            device: &Arc<DeviceInner>,
+            charges: &Charges,
             representation: RepresentationId,
             extents: &[u64],
         ) -> Result<Self, TensorError> {
-            Self::canonical_in(device, representation, extents, DeviceInner::allocate)
+            Self::canonical_in(charges, representation, extents, Charges::allocate)
         }
 
-        /// A canonical tensor over the storage `allocate` makes for it.
+        /// A canonical tensor over the storage `allocate` makes for it
+        /// through `charges`.
         fn canonical_in(
-            device: &Arc<DeviceInner>,
+            charges: &Charges,
             representation: RepresentationId,
             extents: &[u64],
-            allocate: impl FnOnce(&Arc<DeviceInner>, u64, u64) -> Result<Arc<Allocation>, ExecutionError>,
+            allocate: impl FnOnce(&Charges, u64, u64) -> Result<Arc<Allocation>, ExecutionError>,
         ) -> Result<Self, TensorError> {
+            let device = charges.device();
             if !device.supports_representation(representation) {
                 return Err(TensorError::UnsupportedRepresentation {
                     backend: device.info().backend(),
@@ -2089,7 +1984,7 @@ pub mod tensor {
                 });
             }
             let layout = layout::canonical(representation, extents)?;
-            let allocation = allocate(device, layout.byte_len, layout.alignment)?;
+            let allocation = allocate(charges, layout.byte_len, layout.alignment)?;
             Ok(Self::new_view(
                 device.clone(),
                 allocation,
@@ -2101,21 +1996,22 @@ pub mod tensor {
             ))
         }
         pub fn from_host(
-            device: &Arc<DeviceInner>,
+            charges: &Charges,
             representation: RepresentationId,
             extents: &[u64],
             bytes: &[u8],
         ) -> Result<Self, TensorError> {
-            Self::from_host_in(device, representation, extents, bytes, None)
+            Self::from_host_in(charges, representation, extents, bytes, None)
         }
 
         pub(crate) fn from_host_in(
-            device: &Arc<DeviceInner>,
+            charges: &Charges,
             representation: RepresentationId,
             extents: &[u64],
             bytes: &[u8],
             access: Option<Arc<crate::driver::AccessGroup>>,
         ) -> Result<Self, TensorError> {
+            let device = charges.device();
             if !device.supports_representation(representation) {
                 return Err(TensorError::UnsupportedRepresentation {
                     backend: device.info().backend(),
@@ -2130,7 +2026,7 @@ pub mod tensor {
                     actual,
                 });
             }
-            let allocation = device.kind.allocate_in(layout.byte_len, layout.alignment, access)?;
+            let allocation = charges.allocate_in(layout.byte_len, layout.alignment, access)?;
             allocation.storage().write(0, bytes)?;
             Ok(Self::new_view(
                 device.clone(),
@@ -2673,7 +2569,7 @@ pub mod tensor {
             let devices = crate::devices::Devices::discover(&[]).unwrap();
             let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
             let count = 3 * 1024 * 1024 / 4 + 5;
-            let tensor = TensorInner::from_host(&device, registry::dense(DType::F32), &[count], &vec![0; count as usize * 4]).unwrap();
+            let tensor = TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &[count], &vec![0; count as usize * 4]).unwrap();
             // Finite elements: a NaN reads out as the registry's one NaN.
             let bytes = (0..count * 4).map(|i| if i % 4 == 3 { 0x3f } else { i as u8 }).collect::<Vec<_>>();
             let half = bytes.len() / 2;
@@ -2710,13 +2606,13 @@ pub mod tensor {
                 let (given, held) = words(dtype, &odd, one, finite);
                 let count = odd.len() as u64 + 1;
                 let representation = registry::dense(dtype);
-                let whole = TensorInner::from_host(&device, representation, &[count], &given).unwrap();
+                let whole = TensorInner::from_host(&crate::memory::Charges::tally(&device), representation, &[count], &given).unwrap();
                 assert_eq!(whole.read_to_host().unwrap(), held, "{dtype:?} from_host");
-                let written = TensorInner::zeros(&device, representation, &[count]).unwrap();
+                let written = TensorInner::zeros(&crate::memory::Charges::tally(&device), representation, &[count]).unwrap();
                 written.write_from_host(&given).unwrap();
                 assert_eq!(written.read_to_host().unwrap(), held, "{dtype:?} write_from_host");
                 for chunk in [1, 3, 5] {
-                    let chunked = TensorInner::zeros(&device, representation, &[count]).unwrap();
+                    let chunked = TensorInner::zeros(&crate::memory::Charges::tally(&device), representation, &[count]).unwrap();
                     chunked
                         .write_chunks(|write| {
                             for (index, bytes) in given.chunks(chunk).enumerate() {
@@ -2745,7 +2641,7 @@ pub mod tensor {
                 (DType::F16, vec![0xfe00, 0x7fff, 0xfc01, 0x7c01], 0x7e00, 0x3c00),
             ] {
                 let width = if dtype == DType::F32 { 4 } else { 2 };
-                let tensor = TensorInner::zeros(&device, registry::dense(dtype), &[left.len() as u64 + 1]).unwrap();
+                let tensor = TensorInner::zeros(&crate::memory::Charges::tally(&device), registry::dense(dtype), &[left.len() as u64 + 1]).unwrap();
                 let raw = left.iter().chain([&finite]).flat_map(|bits| bits.to_le_bytes()[..width].to_vec()).collect::<Vec<_>>();
                 tensor.allocation.storage().write(0, &raw).unwrap();
                 let held = left.iter().map(|_| one).chain([finite]).flat_map(|bits| bits.to_le_bytes()[..width].to_vec()).collect::<Vec<_>>();
@@ -2762,11 +2658,11 @@ pub mod tensor {
                 .unwrap()
                 .open_backend(registry::BackendName::Cpu)
                 .unwrap();
-            let tensor = TensorInner::zeros(&device, registry::dense(DType::U32), &[4, 8]).unwrap();
+            let tensor = TensorInner::zeros(&crate::memory::Charges::tally(&device), registry::dense(DType::U32), &[4, 8]).unwrap();
             let charged = tensor.allocation.charged_bytes();
-            let first = tensor.slice_leading(1, 3).unwrap().records().unwrap();
-            let again = tensor.slice_leading(1, 3).unwrap().records().unwrap();
-            let later = tensor.slice_leading(2, 4).unwrap().records().unwrap();
+            let first = tensor.slice_leading(1, 3).unwrap().forming_records(&crate::memory::Charges::tally(&device)).unwrap();
+            let again = tensor.slice_leading(1, 3).unwrap().forming_records(&crate::memory::Charges::tally(&device)).unwrap();
+            let later = tensor.slice_leading(2, 4).unwrap().forming_records(&crate::memory::Charges::tally(&device)).unwrap();
             assert!(Arc::ptr_eq(&first.table, &again.table));
             assert!(Arc::ptr_eq(&first.table, &later.table));
             assert_eq!((first.table_offset, later.table_offset), (8, 16));
@@ -2792,20 +2688,20 @@ pub mod tensor {
                 .unwrap()
                 .open_backend(registry::BackendName::Cpu)
                 .unwrap();
-            let tensor = TensorInner::zeros(&device, registry::dense(DType::U32), &[4, 8]).unwrap();
-            let rows = tensor.records().unwrap();
+            let tensor = TensorInner::zeros(&crate::memory::Charges::tally(&device), registry::dense(DType::U32), &[4, 8]).unwrap();
+            let rows = tensor.forming_records(&crate::memory::Charges::tally(&device)).unwrap();
             let charged = tensor.allocation.charged_bytes();
             let run = tensor
                 .slice_leading(1, 3)
                 .unwrap()
                 .reshape(&[1, 2, 8])
                 .unwrap()
-                .records()
+                .forming_records(&crate::memory::Charges::tally(&device))
                 .unwrap();
             assert!(Arc::ptr_eq(&rows.table, &run.table));
             assert_eq!(run.table_offset, 8);
             assert_eq!(tensor.allocation.charged_bytes(), charged);
-            let pairs = tensor.reshape(&[2, 2, 8]).unwrap().records().unwrap();
+            let pairs = tensor.reshape(&[2, 2, 8]).unwrap().forming_records(&crate::memory::Charges::tally(&device)).unwrap();
             assert!(!Arc::ptr_eq(&rows.table, &pairs.table));
             assert_eq!(tensor.allocation.charged_bytes(), charged + 2 * 8);
         }
@@ -2816,7 +2712,7 @@ pub mod tensor {
                 .unwrap()
                 .open_backend(registry::BackendName::Cpu)
                 .unwrap();
-            let tensor = TensorInner::zeros(&device, registry::dense(DType::U32), &[4, 8]).unwrap();
+            let tensor = TensorInner::zeros(&crate::memory::Charges::tally(&device), registry::dense(DType::U32), &[4, 8]).unwrap();
             let view = tensor.slice_leading(1, 3).unwrap();
             assert_eq!(
                 view.view_store_charges().unwrap(),
@@ -2834,8 +2730,8 @@ pub mod tensor {
                 .unwrap()
                 .open_backend(registry::BackendName::Cpu)
                 .unwrap();
-            let tensor = TensorInner::zeros(&device, registry::dense(DType::U32), &[4, 8]).unwrap();
-            tensor.records().unwrap();
+            let tensor = TensorInner::zeros(&crate::memory::Charges::tally(&device), registry::dense(DType::U32), &[4, 8]).unwrap();
+            tensor.forming_records(&crate::memory::Charges::tally(&device)).unwrap();
             assert_eq!(tensor.allocation.charged_bytes(), 128 + 4 * 8);
             let mut past = tensor.slice_leading(3, 4).unwrap();
             past.byte_offset += 8;
@@ -2860,7 +2756,7 @@ pub mod tensor {
                 .unwrap();
             for dtype in [DType::F32, DType::BF16, DType::F16] {
                 let repr = registry::dense(dtype);
-                let shared = TensorInner::shared(&device, repr, &[8]).unwrap();
+                let shared = TensorInner::shared(&crate::memory::Charges::tally(&device), repr, &[8]).unwrap();
                 let mut scratch = [0u8; 4];
                 assert!(matches!(
                     unsafe { shared.read_shared(0, &mut scratch) },
@@ -2882,7 +2778,7 @@ pub mod tensor {
                     shared.shared_words(),
                     Err(TensorError::FloatingSharedRead { .. })
                 ));
-                let empty = TensorInner::shared(&device, repr, &[0]).unwrap();
+                let empty = TensorInner::shared(&crate::memory::Charges::tally(&device), repr, &[0]).unwrap();
                 assert!(matches!(
                     empty.shared_words(),
                     Err(TensorError::FloatingSharedRead { .. })
@@ -2894,7 +2790,7 @@ pub mod tensor {
             let i32_repr = registry::dense(DType::I32);
             let bool_repr = registry::dense(DType::Bool);
             let q8_repr = registry::representation("q8g32").unwrap();
-            let float_view = TensorInner::shared(&device, f32_repr, &[64]).unwrap();
+            let float_view = TensorInner::shared(&crate::memory::Charges::tally(&device), f32_repr, &[64]).unwrap();
             assert!(float_view.region(f32_repr, &[16], 0).is_ok());
             for bad in [i32_repr, bool_repr, bf16_repr, q8_repr] {
                 assert!(
@@ -2907,7 +2803,7 @@ pub mod tensor {
                 );
             }
 
-            let carrier = TensorInner::zeros(&device, bf16_repr, &[4, 2048]).unwrap();
+            let carrier = TensorInner::zeros(&crate::memory::Charges::tally(&device), bf16_repr, &[4, 2048]).unwrap();
             assert!(matches!(
                 carrier.region(q8_repr, &[1, 64], 0),
                 Err(TensorError::Region(RegionError::FloatingReinterpret { .. }))
@@ -2975,9 +2871,10 @@ pub mod kernel {
         /// and placed once, as `seismic-measure` times them.
         pub fn point(
             &self,
+            charges: &crate::memory::Charges,
             rotation: Vec<EncodedArgs>,
         ) -> Result<crate::native::KernelPoint, super::CallError> {
-            crate::native::KernelPoint::place(&self.inner, rotation, Vec::new(), None)
+            crate::native::KernelPoint::place(&self.inner, charges, rotation, Vec::new(), None)
         }
         /// The unrounded bytes placed in a standalone call's scratch
         /// regions for `args`: its sync region and its body together.
@@ -3479,10 +3376,13 @@ pub mod kernel {
         inner: crate::backends::AdmittedWorkflowKind,
     }
 
-    pub fn workflow(device: &Arc<DeviceInner>) -> Result<WorkflowDraftAny, super::WorkflowError> {
-        device
+    /// A workflow on `charges`' device, every allocation its runs make
+    /// charged to them.
+    pub fn workflow(charges: &crate::memory::Charges) -> Result<WorkflowDraftAny, super::WorkflowError> {
+        charges
+            .device()
             .kind
-            .workflow()
+            .workflow(charges)
             .map(|inner| WorkflowDraftAny { inner })
     }
 
@@ -3529,31 +3429,36 @@ pub mod kernel {
             self.inner.report()
         }
     }
+    /// Start a feedback preparation on `charges`' device, its trials'
+    /// inputs and runs allocated through `charges`.
     pub fn start_feedback<'a>(
         module: &CheckedModule,
         entry: EntryId,
         bindings: ElementBindings,
-        device: &'a Arc<DeviceInner>,
+        charges: &'a crate::memory::Charges,
         precision: seismic_lang::precision::PrecisionPolicy,
         options: seismic_compiler::feedback::FeedbackOptions,
     ) -> Result<(FeedbackPreparation<'a>, PreparedAny), PrepareError> {
-        device
+        charges
+            .device()
             .kind
-            .start_feedback(module, entry, bindings, device, precision, options)
+            .start_feedback(module, entry, bindings, charges, precision, options)
             .map(|(inner, kernel)| (FeedbackPreparation { inner }, PreparedAny { inner: kernel }))
     }
 
+    /// Prepare `entry` on `charges`' device, a feedback preparation's
+    /// trials allocated through `charges`.
     pub fn prepare(
         module: &CheckedModule,
         entry: EntryId,
         bindings: ElementBindings,
-        device: &Arc<DeviceInner>,
+        charges: &crate::memory::Charges,
         options: seismic_compiler::feedback::PreparationOptions,
     ) -> Result<PreparedAny, PrepareError> {
         let logical = module
             .entry(entry, &bindings)
             .map_err(PrepareError::Source)?;
-        prepare_logical(logical, bindings, device, options)
+        prepare_logical(logical, bindings, charges, options)
     }
 
     /// Prepare an already checked computation through the ordinary compiler,
@@ -3562,16 +3467,18 @@ pub mod kernel {
     pub(crate) fn prepare_logical(
         logical: seismic_lang::entry::LogicalEntry,
         bindings: ElementBindings,
-        device: &Arc<DeviceInner>,
+        charges: &crate::memory::Charges,
         options: seismic_compiler::feedback::PreparationOptions,
     ) -> Result<PreparedAny, PrepareError> {
-        device
+        charges
+            .device()
             .kind
-            .prepare(logical, bindings, device, options)
+            .prepare(logical, bindings, charges, options)
             .map(|inner| PreparedAny { inner })
     }
-    pub fn call(kernel: &Arc<PreparedAny>, args: EncodedArgs) -> Result<DecodedResults, CallError> {
-        kernel.inner.call(args)
+    /// A call of `kernel`, every allocation it makes charged to `charges`.
+    pub fn call(kernel: &Arc<PreparedAny>, charges: &crate::memory::Charges, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+        kernel.inner.call(charges, args)
     }
 
     pub fn prepare_native(
@@ -3588,26 +3495,29 @@ pub mod kernel {
 
     pub fn call_native(
         kernel: &Arc<NativePreparedAny>,
+        charges: &crate::memory::Charges,
         args: EncodedArgs,
     ) -> Result<DecodedResults, CallError> {
-        kernel.inner.call(args)
+        kernel.inner.call(charges, args)
     }
 
     /// [`call_native`] of a call whose awaited words already hold their
     /// answers: valid on every backend (`NativePrepared::call_answered`).
     pub fn call_native_answered(
         kernel: &Arc<NativePreparedAny>,
+        charges: &crate::memory::Charges,
         args: EncodedArgs,
     ) -> Result<DecodedResults, CallError> {
-        kernel.inner.call_answered(args)
+        kernel.inner.call_answered(charges, args)
     }
 
     pub fn call_native_into(
         kernel: &Arc<NativePreparedAny>,
+        charges: &crate::memory::Charges,
         args: EncodedArgs,
         outputs: EncodedOutputs,
     ) -> Result<DecodedResults, CallError> {
-        kernel.inner.call_into(args, outputs)
+        kernel.inner.call_into(charges, args, outputs)
     }
 
     /// Tensor-result calls from different native entries in one ordered
@@ -3621,9 +3531,10 @@ pub mod kernel {
     }
 
     impl NativeTensorBatchAny {
-        pub fn new(device: &Arc<DeviceInner>) -> Self {
+        /// A batch whose calls' scratch is charged to `charges`.
+        pub fn new(charges: &crate::memory::Charges) -> Self {
             Self {
-                inner: crate::native::NativeTensorBatch::new(device.clone()),
+                inner: crate::native::NativeTensorBatch::new(charges.clone()),
             }
         }
 
@@ -3655,10 +3566,11 @@ pub mod kernel {
 
     pub fn call_native_with_commit(
         kernel: &Arc<NativePreparedAny>,
+        charges: &crate::memory::Charges,
         args: EncodedArgs,
         commit: impl FnOnce(),
     ) -> Result<DecodedResults, CallError> {
-        kernel.inner.call_with_commit(args, commit)
+        kernel.inner.call_with_commit(charges, args, commit)
     }
 
     #[cfg(test)]
@@ -3744,11 +3656,10 @@ pub mod kernel {
             let entry: Arc<dyn crate::memory::Entry> =
                 Arc::new(crate::memory::Tally::unbounded(identity));
             let pool = crate::pool::Pool::open(
-                &device,
+                &crate::pool::PoolCharges::one(&crate::memory::Charges::in_store(&device, seismic_topology::Contract::DeviceOnly, entry)),
                 seismic_topology::Contract::DeviceOnly,
                 1 << 16,
                 1 << 18,
-                crate::pool::PoolEntries::one(entry),
             )
             .unwrap();
             let f32_rep = seismic_lang::registry::dense(seismic_lang::types::DType::F32);
@@ -3760,7 +3671,7 @@ pub mod kernel {
                 slab_alignment: crate::pool::BLOCK_ALIGNMENT,
                 regions: vec![(f32_rep, vec![2], 0)],
             };
-            let slabs = crate::pool::SlabStore::in_pool(&pool, geometry, &[]).unwrap();
+            let slabs = crate::pool::SlabStore::in_pool(&crate::memory::Charges::tally(&device), &pool, geometry, &[]).unwrap();
             for _ in 0..4 {
                 slabs.add_slab(crate::pool::SlabFill::Zeroed).unwrap();
             }
@@ -3779,7 +3690,7 @@ pub mod kernel {
             assert_eq!(sub.occupied_bytes(), 2 * (4 * 2 * 4));
 
             let img = sub.image().unwrap();
-            let copy = sub.copy_of(&img).unwrap();
+            let copy = sub.copy_of(&crate::memory::Charges::tally(&device), &img).unwrap();
             assert_eq!(copy.extents(), &[10, 2]);
             assert_eq!(copy.occupied_bytes(), 2 * (4 * 2 * 4));
             assert_eq!(copy.read_to_host().unwrap(), sub.read_to_host().unwrap());
@@ -3790,7 +3701,7 @@ pub mod kernel {
             assert_eq!(empty_reach.table_bytes, 0);
             assert!(empty_reach.regions.is_empty());
             assert_eq!(empty.occupied_bytes(), 0);
-            let empty_copy = empty.copy_of(&empty.image().unwrap()).unwrap();
+            let empty_copy = empty.copy_of(&crate::memory::Charges::tally(&device), &empty.image().unwrap()).unwrap();
             assert_eq!(empty_copy.extents(), &[0, 2]);
             assert!(empty_copy.read_to_host().unwrap().is_empty());
         }
@@ -3816,12 +3727,14 @@ pub mod kernel {
                 crate::memory::Tally::unbounded(identity.clone()),
                 crate::memory::Tally::unbounded(identity),
             );
+            let charges = |tally: &crate::memory::Tally| {
+                crate::memory::Charges::in_store(&device, seismic_topology::Contract::DeviceOnly, Arc::new(tally.clone()))
+            };
             let pool = crate::pool::Pool::open(
-                &device,
+                &crate::pool::PoolCharges::apart(charges(&blocks), charges(&absent)),
                 seismic_topology::Contract::DeviceOnly,
                 1 << 16,
                 1 << 18,
-                crate::pool::PoolEntries { blocks: Arc::new(blocks.clone()), absent: Arc::new(absent.clone()) },
             )
             .unwrap();
             assert_eq!((blocks.held(), absent.held()), (0, 1 << 16), "the open allocates the absent granule alone");
@@ -3846,11 +3759,10 @@ pub mod kernel {
             let tally = crate::memory::Tally::unbounded(identity);
             let entry: Arc<dyn crate::memory::Entry> = Arc::new(tally.clone());
             let pool = crate::pool::Pool::open(
-                &device,
+                &crate::pool::PoolCharges::one(&crate::memory::Charges::in_store(&device, seismic_topology::Contract::DeviceOnly, entry)),
                 seismic_topology::Contract::DeviceOnly,
                 1 << 16,
                 1 << 18,
-                crate::pool::PoolEntries::one(entry),
             )
             .unwrap();
             let absent = tally.held();
@@ -3864,7 +3776,7 @@ pub mod kernel {
                 slab_alignment: crate::pool::BLOCK_ALIGNMENT,
                 regions: vec![(f32_rep, vec![2], 0)],
             };
-            let slabs = crate::pool::SlabStore::in_pool(&pool, geometry, &[]).unwrap();
+            let slabs = crate::pool::SlabStore::in_pool(&crate::memory::Charges::tally(&device), &pool, geometry, &[]).unwrap();
             for _ in 0..4 {
                 slabs.add_slab(crate::pool::SlabFill::Zeroed).unwrap();
             }

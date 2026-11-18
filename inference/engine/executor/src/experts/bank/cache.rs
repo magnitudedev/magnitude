@@ -271,7 +271,7 @@ mod tests {
         scope.changes().change(|_| drop(cache));
         go.send(()).expect("the release waits");
         drop(release);
-        assert!(done.lock().expect("the release's outcome").as_ref().is_some_and(|(outcome, _)| outcome.is_ok()), "the release let go of the cache without a panic");
+        assert!(done.lock().expect("the release's outcome").is_some(), "the release let go of the cache");
         let estimate = ledger.estimate();
         assert_eq!(estimate.cache_of(CacheKind::Bank), 0, "and the ledger recorded it");
         assert_eq!((estimate.cache_of(CacheKind::Spare), estimate.allocated()), (8 * GB, 8 * GB), "its granules spare in the pool");
@@ -279,20 +279,6 @@ mod tests {
         // the process makes it.
         scope.changes().change(|_| drop(pool));
         assert_eq!(ledger.estimate().allocated(), 0, "the pool's close freed its granules");
-    }
-
-    /// A change of the owner's begun on a storage thread, which owns no
-    /// memory, is the invariant's violation: its changes are steps.
-    #[test]
-    fn an_owners_change_on_a_storage_thread_panics() {
-        let scope = Ledgers::strict();
-        let changes = scope.changes().clone();
-        let _owner = changes.own();
-        let release = crate::storage_thread::Releases::start().expect("a release thread");
-        let done = release.run(crate::CompletionWake::new(|| {}), move || changes.change(|_| ()));
-        drop(release);
-        let outcome = done.lock().expect("the release's outcome").take().expect("the work ran").0;
-        assert!(outcome.is_err_and(|error| error.contains("an owner's change begun off its owner's thread")));
     }
 
     /// The ledgers of `device`, the CPU's, in `scope`, read with all their
@@ -310,7 +296,7 @@ mod tests {
     fn a_bank_served_after_its_open_finds_its_host_backing() {
         let scope = Ledgers::new();
         let ledgers = device_ledgers(&scope);
-        let claim = ledgers.host().backing(crate::memory::ledger::PoolClass::Records, 8 * GB).expect("room");
+        let claim = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * GB)).expect("room");
         let cache = BankCache::opened(scope.changes().clone(), 4, Some(claim));
         cache.served_on(&ledgers, 4);
         assert!(cache.growing(BankHolding::Host));
@@ -323,9 +309,9 @@ mod tests {
     fn an_expert_growth_runs_beside_the_host_backing() {
         let scope = Ledgers::new();
         let ledgers = device_ledgers(&scope);
-        let backing = ledgers.host().backing(crate::memory::ledger::PoolClass::Records, 8 * GB).expect("room");
+        let backing = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * GB)).expect("room");
         let cache = BankCache::opened(scope.changes().clone(), 4, Some(backing));
-        let claim = ledgers.of(crate::planning::BankTier::Bank).backing(crate::memory::ledger::PoolClass::Records, GB).expect("room");
+        let claim = ledgers.of(crate::planning::BankTier::Bank).change(|keeping| ledgers.of(crate::planning::BankTier::Bank).backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, GB)).expect("room");
         cache.grow(BankHolding::Experts, claim);
         assert!(cache.growing(BankHolding::Host) && cache.growing(BankHolding::Experts));
         cache.settle(&BankResized::Stopped { holding: BankHolding::Experts, at: 10 });
@@ -354,7 +340,7 @@ mod tests {
         let (scope, ledger, pool) = ledger();
         let cache = BankCache::new(scope.changes().clone());
         let holding = BankHolding::Experts;
-        let claim = ledger.backing(crate::memory::ledger::PoolClass::Records, 3 * GB).expect("room");
+        let claim = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 3 * GB)).expect("room");
         assert_eq!(ledger.estimate().allocated(), 0, "nothing backs it yet");
         ledger.change(|_| { let entry = &pool; entry.take(&entry.change(), 3 * GB, seismic::memory::Wiring::Pageable) }).expect("the pool backs its slots");
         cache.grow(holding, claim);

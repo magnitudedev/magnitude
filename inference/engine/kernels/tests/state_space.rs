@@ -401,6 +401,7 @@ impl Case {
     /// threadgroup; `reuse` places the banks with an interior slab freed and
     /// reused.
     fn native(&self, device: &Device, chunk: bool, rows: u64, reuse: bool) -> Outcome {
+        let charges = seismic::Charges::tally(device);
         let mut bound = self.bind(device, reuse);
         let specialization = self.specialization(device, rows);
         let activation = self.activation();
@@ -411,7 +412,7 @@ impl Case {
                 &specialization,
             )
             .unwrap()
-            .call(bound.chunk_args(self.slab_banks))
+            .call(&charges, bound.chunk_args(self.slab_banks))
             .unwrap()
             .value
         } else {
@@ -421,7 +422,7 @@ impl Case {
                 &specialization,
             )
             .unwrap()
-            .call(bound.step_args(self.slab_banks))
+            .call(&charges, bound.step_args(self.slab_banks))
             .unwrap()
             .value
         };
@@ -954,6 +955,7 @@ impl GateCase {
     }
 
     fn native(&self, device: &Device) -> Vec<f32> {
+        let charges = seismic::Charges::tally(device);
         let heads = (self.groups * self.heads) as u64;
         let mixed = tensor(device, Element::bf16(), &[self.rows as u64, heads, self.width as u64], &self.mixed);
         let projection = tensor(device, Element::bf16(), &[self.rows as u64, self.columns as u64], &self.projection);
@@ -964,7 +966,7 @@ impl GateCase {
             &NativeSpecialization::new(),
         )
         .unwrap()
-        .call(state_space_gate::Args {
+        .call(&charges, state_space_gate::Args {
             mixed: &mixed,
             projection: &projection,
             state_norm: &norm,

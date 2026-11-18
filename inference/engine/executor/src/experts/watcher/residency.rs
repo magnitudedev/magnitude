@@ -29,12 +29,11 @@ use super::prefetch::Prefetch;
 use super::promotions::{Copier, Promotions};
 use super::resize::{Asked, Owed};
 use super::scratch::Scratch;
-use super::{Shared, panic_message};
+use super::Shared;
 use crate::assessment::{ExpertLines, SiteLines};
 use crate::experts::directory::{MissCurve, Point};
 use crate::experts::yielding::Yielding;
 use magnitude_kernels::constants;
-use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
 
@@ -176,8 +175,8 @@ pub(super) type Job<'a> = &'a dyn Fn(&mut Residency, &mut Turn, Option<&Copier>,
 
 impl Residency {
     /// Residency's thread: a turn ([`Self::tend`]) on every event of the
-    /// load, until it stops. Once serving ended (a panic, here or in the
-    /// request service), it does nothing more: the request service refuses
+    /// load, until it stops. Once serving ended (the device lost, a read
+    /// line lost or a promotion's copy failed), it does nothing more: the request service refuses
     /// what the device waits on, and the owner waiting for a resize was
     /// woken with why.
     /// Promotions copy by `copier` (none where the bank has no host tier),
@@ -196,14 +195,9 @@ impl Residency {
                 // ranks by it, and the decode steps' depth curve where a step
                 // was read since (which sizes the promotions' reserve),
                 // outside residency's lock so no request waits on the stack.
-                let fed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    shared.telemetry.feed();
-                    copier.as_ref().and_then(|_| shared.telemetry.decoded_since(&mut decoded_steps))
-                }));
-                match fed {
-                    Ok(decoded) => Self::tend(&residency, copier.as_ref(), decoded.as_ref()),
-                    Err(payload) => shared.end_serving(format!("it panicked: {}", panic_message(payload.as_ref()))),
-                }
+                shared.telemetry.feed();
+                let decoded = copier.as_ref().and_then(|_| shared.telemetry.decoded_since(&mut decoded_steps));
+                Self::tend(&residency, copier.as_ref(), decoded.as_ref());
             }
             events.wait(seen);
         }
@@ -227,8 +221,7 @@ impl Residency {
     /// found running. Each job leaves residency as a turn's end does (what it
     /// moved published as it gives way, [`Held`], and nothing it decided
     /// left for a later job), so a pass
-    /// between two serves from it as from one between turns. A panic
-    /// of a job ends serving before the lock is released.
+    /// between two serves from it as from one between turns.
     fn tend(residency: &Yielding<Self>, copier: Option<&Copier>, decoded: Option<&MissCurve>) {
         Self::turn(residency, &Self::TURN, copier, decoded);
     }
@@ -238,14 +231,10 @@ impl Residency {
         let mut held = Held::new(residency.background(POISONED));
         let mut turn = Turn::default();
         for job in jobs {
-            match std::panic::catch_unwind(AssertUnwindSafe(|| job(&mut held, &mut turn, copier, decoded))) {
-                Ok(true) => held = held.give_way(residency),
-                Ok(false) => return,
-                Err(payload) => {
-                    held.shared.end_serving(format!("it panicked: {}", panic_message(payload.as_ref())));
-                    return;
-                }
+            if !job(&mut held, &mut turn, copier, decoded) {
+                return;
             }
+            held = held.give_way(residency);
         }
     }
 

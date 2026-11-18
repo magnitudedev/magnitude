@@ -125,22 +125,20 @@ fn failed(path: &Path, error: std::io::Error) -> ObservationError {
 }
 
 /// The rate the volume holding the directory `path` takes a sequential
-/// write at, synced, in bytes a second.
+/// write at, synced, in bytes a second. The probe is a temporary file
+/// ([`seismic_io::Temporary`]), removed when timed: one a process killed
+/// while timing leaves is a temporary file every store's sweep removes.
 fn write_rate(path: &Path) -> std::io::Result<f64> {
-    let probe = path.join(format!(".volume-write-probe-{}", std::process::id()));
     let block = vec![0xA5_u8; 8 << 20];
-    let timed = (|| -> std::io::Result<Duration> {
-        let mut file = std::fs::File::create(&probe)?;
-        let started = Instant::now();
-        for _ in 0..WRITE_PROBE_BYTES / block.len() {
-            file.write_all(&block)?;
-        }
-        file.sync_all()?;
-        Ok(started.elapsed())
-    })();
-    let removed = std::fs::remove_file(&probe);
-    let seconds = timed?.as_secs_f64();
-    removed?;
+    let (probe, mut file) = seismic_io::Temporary::create(path, std::ffi::OsStr::new("volume-write-probe"), seismic_io::Privacy::Shared)?;
+    let started = Instant::now();
+    for _ in 0..WRITE_PROBE_BYTES / block.len() {
+        file.write_all(&block)?;
+    }
+    file.sync_all()?;
+    let seconds = started.elapsed().as_secs_f64();
+    drop(file);
+    drop(probe);
     Ok(WRITE_PROBE_BYTES as f64 / seconds.max(f64::MIN_POSITIVE))
 }
 
@@ -249,14 +247,17 @@ mod tests {
 
     /// The volume's write rate is a positive rate, measured once per volume
     /// with a cache: a later reader reads it rather than measuring again.
+    /// The probe leaves no file behind.
     #[test]
     fn a_volume_writes_at_a_measured_rate() {
         let directory = std::env::temp_dir().join(format!("volume-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         let identity = seismic::volume_identity(&directory).unwrap();
         let measured = VolumeReserve::of_volume(&directory, &identity, None).unwrap();
         assert!(measured.write_rate > 0.0 && measured.write_rate.is_finite());
         assert_eq!(measured.fluctuation, 0);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0, "the probe leaves no file behind");
         if let Some(uuid) = &identity.uuid {
             let cache = directory.join("kernels");
             let stored = machine_rate(Some((cache.as_path(), format!("volume-write:{uuid}"))), || Ok::<_, std::convert::Infallible>(7e9));

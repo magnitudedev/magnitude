@@ -468,7 +468,7 @@ impl HostArtifacts {
 
 /// Bound `definition`'s image resize to at most `cells` cells per image.
 fn bound_images(definition: &mut ModelDefinition, cells: usize) -> Result<(), String> {
-    match definition.vision.as_mut() {
+    match definition.vision.as_deref_mut() {
         Some(vision) => vision
             .bound_cells(cells as u64)
             .map_err(|error| error.to_string()),
@@ -729,7 +729,7 @@ mod tests {
         let any_device = image_cell_limit(&resolved, 512, MAX_IMAGE_CELLS).unwrap();
         bound_images(&mut resolved, any_device).unwrap();
         let cell = {
-            let p = &resolved.vision.as_ref().unwrap().preprocessing;
+            let p = &resolved.vision.as_deref().unwrap().preprocessing;
             (p.patch * p.merge) as usize
         };
         let encoded = |definition: &ModelDefinition, height, width| {

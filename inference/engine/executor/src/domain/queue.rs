@@ -6,11 +6,18 @@
 //!   within the load's chain capacity, submitted with it as one chain
 //!   (`TargetProgram::submit`) that runs every block over every chunk in
 //!   chain order, its recurrent state alternating between two banks
-//!   (`OwnedChainedAdvance`). The chain runs on the device as one and
-//!   commits as one: each chunk finishes into it (`HeldChain`) and the last
-//!   publishes it whole. Its holder's next chunks claim it before any other
-//!   work (`chain_holder`), and it is never orphaned: a holder that will
-//!   not claim it (it ended) releases it (`release_chain`, `close`).
+//!   (`OwnedChainedAdvance`). The chain runs on the device as one: each
+//!   chunk joins it as its outcome reconciles (`HeldChain`), so it holds
+//!   exactly the rows its holder accepted. A claimed chunk carries the
+//!   chain's state from its claim until its outcome returns it (`Joined`),
+//!   so that state has one owner, and its outcome is the only way back.
+//!   Its holder's next chunks claim it before any other work
+//!   (`chain_holder`). It ends one way, concluded (`Queue::conclude`): its
+//!   unclaimed chunks are waited for and dropped and what it joined
+//!   commits, its holder's state again (or, carried by a chunk, once that
+//!   chunk's outcome returns it), whether its last chunk reconciled, a
+//!   chunk was aborted (cancelled, interrupted, failed), its holder ended,
+//!   or other work changed bindings.
 //! - Cross-step pipelining ("lookahead"): right after a continuable step N
 //!   is submitted, its successor N+1 is submitted behind it. A decode
 //!   continuation's input token is N's selection read on the device, and its
@@ -25,10 +32,9 @@
 //! behind its own step, chained on the entry before. Queued steps live in the
 //! domain's one queue (`Queue`), with the chain they continue: they are the
 //! only work that holds bindings between flights, so every binding change
-//! resolves them first (`orphan_queue`), which takes the proof that no chain
-//! holds the queue (`Unchained`): a binding change during a chain has no
-//! representation, so the owner defers it to the chain's end. The owner
-//! never sees them. When
+//! resolves them first (`conclude_chain`); the owner defers one during a
+//! chain to the chain's end (`Unchained`), so as not to cut it short. The
+//! owner never sees them. When
 //! the operations it next submits equal the front step's prediction (token
 //! included, known once its predecessor finished) and the accepted states are
 //! the ones the successors follow, the group claims the queued step: nothing
@@ -44,16 +50,27 @@ use magnitude_state::{OwnedSuccessorAdvance, TentativeAdvance};
 use std::collections::VecDeque;
 
 /// A prompt group's chain under way: its holder, whose target state it is,
-/// the chunks that finished, joined in order, and the rest of it, queued.
-/// The last chunk's outcome publishes it whole (`Advance::Chain`). Its
-/// queued chunks read the chain's bindings and are resolved with it, never
-/// orphaned.
+/// the chunks whose outcomes reconciled, joined in order, and the rest of
+/// it, queued. Its queued chunks read the chain's bindings and end with it:
+/// it is only ever concluded ([`Queue::conclude`]), which commits what it
+/// joined.
 pub(super) struct HeldChain<F: ProgramFamily> {
     holder: RequestId,
-    joined: OwnedChainAdvance,
+    joined: Joined,
     /// The rest of the chain, each step behind the one before; empty once
-    /// its last chunk was claimed, until that chunk finishes.
+    /// its last chunk was claimed, until that chunk reconciles.
     steps: VecDeque<QueuedStep<F>>,
+}
+
+/// Where a chain's joined chunks are: the chain's state has one owner.
+enum Joined {
+    /// In the chain, between its chunks.
+    Here(OwnedChainAdvance),
+    /// With its chunk of flight `.0`, which claimed it: on the device, then
+    /// in that chunk's outcome, which returns it as it reconciles or aborts
+    /// (`ExecutorDomain::return_chain`). A chain concluded meanwhile commits
+    /// nothing; its holder's state is the one that outcome returns.
+    Out(u64),
 }
 
 /// What runs behind a submitted target step.
@@ -128,10 +145,10 @@ pub(super) struct QueuedStep<F: ProgramFamily> {
 pub(super) enum Queue<F: ProgramFamily> {
     Empty,
     /// The rest of a chain whose first chunk is in flight, never empty, each
-    /// step behind the one before: that chunk's finish opens it
+    /// step behind the one before: that chunk's reconcile opens it
     /// (`open_chain`).
     Opening(VecDeque<QueuedStep<F>>),
-    /// A chain under way, until its last chunk finishes. It runs on the
+    /// A chain under way, until its last chunk reconciles. It runs on the
     /// device as one, so its holder's claims come before any other work
     /// (`chain_holder`).
     Chain(HeldChain<F>),
@@ -144,8 +161,20 @@ impl<F: ProgramFamily> Queue<F> {
     /// chain's first chunk.
     pub(super) fn opens_chain(&self, flight: u64) -> bool {
         match self {
-            Self::Opening(steps) => steps.front().is_some_and(|step| step.predecessor == flight),
+            Self::Opening(steps) => opened_by(steps, flight),
             Self::Empty | Self::Chain(_) | Self::Successor(_) => false,
+        }
+    }
+
+    /// The rest of the chain flight `flight` opens ([`Self::opens_chain`]),
+    /// taken from the queue; none, the queue unchanged, where it opens none.
+    fn take_opening(&mut self, flight: u64) -> Option<VecDeque<QueuedStep<F>>> {
+        match std::mem::replace(self, Self::Empty) {
+            Self::Opening(steps) if opened_by(&steps, flight) => Some(steps),
+            other => {
+                *self = other;
+                None
+            }
         }
     }
 
@@ -209,33 +238,47 @@ impl<F: ProgramFamily> Queue<F> {
         matches!(self, Self::Empty)
     }
 
-    /// Wait for the queued steps nobody will claim and drop them, in queue
-    /// order ([`ExecutorDomain::orphan_queue`]), by the proof that no chain
-    /// is among them.
-    pub(super) fn orphan(&mut self, experts: Option<&ExpertMeasures>, _unchained: &mut Unchained<'_>) -> Result<(), DomainError> {
-        assert!(self.holder().is_none(), "invariant violated: a chain opened while its queue was proven unchained");
-        self.drain(experts)
-    }
-
-    /// Wait for every queued step and drop it, in queue order, and empty
-    /// the queue; a chain under way goes with them. The first failure is
-    /// reported once every step was waited for.
-    fn drain(&mut self, experts: Option<&ExpertMeasures>) -> Result<(), DomainError> {
-        let steps = match std::mem::replace(self, Self::Empty) {
-            Self::Empty => VecDeque::new(),
-            Self::Successor(step) => VecDeque::from([step]),
-            Self::Opening(steps) | Self::Chain(HeldChain { steps, .. }) => steps,
+    /// Conclude what the queue holds: the one way a queued step or a chain
+    /// leaves it unclaimed. Each queued step is waited for and dropped, in
+    /// order, so its rows, banks and leases return; a chain under way then
+    /// commits the chunks joined to it, every one its holder reconciled,
+    /// into `target`, its holder's state the one they reached, unless a
+    /// chunk carries them, whose outcome returns that state
+    /// ([`ExecutorDomain::return_chain`]). The first failure of the dropped
+    /// steps is reported once the holder's state is back.
+    pub(super) fn conclude(
+        &mut self,
+        target: &mut BTreeMap<RequestId, SequenceState>,
+        experts: Option<&ExpertMeasures>,
+    ) -> Result<(), DomainError> {
+        let (steps, chain) = match std::mem::replace(self, Self::Empty) {
+            Self::Empty => (VecDeque::new(), None),
+            Self::Successor(step) => (VecDeque::from([step]), None),
+            Self::Opening(steps) => (steps, None),
+            Self::Chain(HeldChain { holder, joined: Joined::Here(joined), steps }) => (steps, Some((holder, joined))),
+            Self::Chain(HeldChain { joined: Joined::Out(_), steps, .. }) => (steps, None),
         };
-        drain_steps(steps, experts)
+        let drained = steps.into_iter().fold(Ok(()), |outcome, step| {
+            let orphaned = step.orphan(experts);
+            outcome.and(orphaned)
+        });
+        if let Some((holder, joined)) = chain {
+            target.insert(holder, joined.commit());
+        }
+        drained
     }
 }
 
-/// Proof that no chain holds the queue: the binding right, borrowed only
-/// while the queue is empty or holds steps nobody will claim (a pipelined
-/// successor, or a chain not yet opened), never a chain under way
-/// ([`ExecutorDomain::unchained`]). While it holds the bindings no step is
-/// submitted, so no chain can open: every binding change takes one, and
-/// orphaning the queue through it never meets a chain.
+/// Whether flight `flight` opens the chain of `steps`, the rest of a chain
+/// queued behind its first chunk: that chunk is their front's predecessor.
+fn opened_by<F: ProgramFamily>(steps: &VecDeque<QueuedStep<F>>, flight: u64) -> bool {
+    steps.front().is_some_and(|step| step.predecessor == flight)
+}
+
+/// The binding right while no chain is under way
+/// ([`ExecutorDomain::unchained`]): what changes bindings for other work
+/// than a chain's holder (a request's open, a shrink) takes it, so it waits
+/// for the chain's end rather than cutting the chain short.
 pub struct Unchained<'b> {
     bindings: &'b mut StateBindings,
 }
@@ -245,18 +288,6 @@ impl Unchained<'_> {
     pub(super) fn bindings(&mut self) -> &mut StateBindings {
         self.bindings
     }
-}
-
-/// Wait for each of `steps` and drop it, in order. The first failure is
-/// reported once every step was waited for.
-fn drain_steps<F: ProgramFamily>(
-    steps: VecDeque<QueuedStep<F>>,
-    experts: Option<&ExpertMeasures>,
-) -> Result<(), DomainError> {
-    steps.into_iter().fold(Ok(()), |outcome, step| {
-        let orphaned = step.orphan(experts);
-        outcome.and(orphaned)
-    })
 }
 
 impl<F: ProgramFamily> QueuedStep<F> {
@@ -446,10 +477,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The request whose chain is under way: its target state is the
-    /// chain's until the last chunk publishes it. The chain runs and commits
-    /// as one, so the owner submits that request's claims before any other
-    /// group, and releases nothing (every release changes bindings) until
-    /// it ends; a holder that ended releases it (`release_chain`).
+    /// chain's until the chain concludes. The chain runs as one, so the
+    /// owner submits that request's claims before any other group, and
+    /// releases nothing (every release changes bindings, concluding it)
+    /// until it ends; a holder that ended concludes it (`conclude_chain`).
     pub fn chain_holder(&self) -> Option<RequestId> {
         self.queue.holder()
     }
@@ -458,7 +489,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// way (its holder's state is the chain's), else its accepted state's.
     pub(super) fn target_end(&self, request: RequestId) -> Option<usize> {
         match &self.queue {
-            Queue::Chain(chain) if chain.holder == request => Some(chain.joined.end()),
+            Queue::Chain(HeldChain { holder, joined: Joined::Here(joined), .. }) if *holder == request => {
+                Some(joined.end())
+            }
             Queue::Empty | Queue::Opening(_) | Queue::Chain(_) | Queue::Successor(_) => {
                 self.target.get(&request).map(SequenceState::position)
             }
@@ -477,103 +510,86 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.chain_holder().is_none_or(|holder| holder == request)
     }
 
-    /// Release the chain of a holder that will not claim the rest of it (it
-    /// ended): its queued chunks are waited for and dropped, and its holder's
-    /// state goes with it, as an evicted request's (`release_state`): the
-    /// state the chain started from would trail what its holder took.
-    pub fn release_chain(&mut self) -> Result<(), DomainError> {
-        let HeldChain { holder, joined, steps } = match std::mem::replace(&mut self.queue, Queue::Empty) {
-            Queue::Chain(chain) => chain,
-            other => {
-                self.queue = other;
-                return Ok(());
-            }
-        };
-        let drained = drain_steps(steps, self.measures.as_ref().and_then(|measures| measures.experts.as_ref()));
-        self.target.insert(holder, joined.abort());
-        let released = self.release_state(&[holder]).map_err(DomainError::invariant);
-        // The first failure of all: the drained steps' fault, else the
-        // release's, else the group's close.
-        drained.and(released).and_then(|()| self.close_group())
+    /// Conclude what the queue holds ([`Queue::conclude`]), the chain under
+    /// way with it, whose holder keeps the state its reconciled chunks
+    /// reached, and close the group it ran ([`Self::close_group`]). Every
+    /// binding change does so first, and so does a holder that will not
+    /// claim the rest of its chain (it ended).
+    pub fn conclude_chain(&mut self) -> Result<(), DomainError> {
+        let experts = self.measures.as_ref().and_then(|measures| measures.experts.as_ref());
+        let concluded = self.queue.conclude(&mut self.target, experts);
+        concluded.and_then(|()| self.close_group())
     }
 
-    /// Conclude the chain of `request`, a holder that ended mid-chain and
-    /// keeps what it computed: its queued chunks run on the device whatever
-    /// happens, so each is waited for and joined as a claimed chunk is, and
-    /// the chain publishes whole, its holder's state at the chain's end. A
-    /// chunk that returns no rows (interrupted, or its weights unread)
-    /// releases the chain as such a chunk always does, its holder's state
-    /// with it.
-    pub fn conclude_chain(&mut self, request: RequestId) -> Result<(), DomainError> {
-        while self.chain_holder() == Some(request) {
-            let Some(QueuedStep { mut flight, .. }) = self.queue.pop_front() else {
-                return Err(DomainError::invariant("a chain under way has its last chunk in flight"));
-            };
-            flight.continuation = Some((0..flight.requests.len()).map(|_| None).collect());
-            if let Some(priming) = &mut flight.priming {
-                priming.continuation = Some(self.head.remove(&priming.request).map(InFlightState::new));
-            }
-            for pending in self.finish_target_work(flight)? {
-                match pending.outcome {
-                    Outcome::Forward { .. } => {
-                        let accepted_rows = pending.committed_rows;
-                        self.reconcile(pending, PhysicalDecision { accepted_rows })?;
-                    }
-                    _ => self.abort(pending)?,
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Join `request`'s finished chained chunk to its chain: held while the
-    /// rest of it is queued, published whole with the last chunk.
+    /// Join `request`'s reconciled chained chunk of flight `flight` to the
+    /// chain `joined` it carried, which returns ([`Self::return_chain`]);
+    /// the chain's last chunk concludes it.
     pub(super) fn join_chain(
         &mut self,
         request: RequestId,
+        flight: u64,
+        mut joined: OwnedChainAdvance,
         chunk: magnitude_state::OwnedChainedAdvance,
-    ) -> Result<Advance, DomainError> {
-        let mut chain = match std::mem::replace(&mut self.queue, Queue::Empty) {
-            Queue::Chain(chain) if chain.holder == request => chain,
-            other => {
-                self.queue = other;
-                return Err(DomainError::invariant("a chained chunk finished outside its chain"));
-            }
+    ) -> Result<(), DomainError> {
+        let joins = joined.join(chunk).map_err(|(_, error)| DomainError::from(error));
+        let whole = self.return_chain(request, flight, joined)
+            && matches!(&self.queue, Queue::Chain(chain) if chain.steps.is_empty());
+        // Its last chunk was claimed: the chain is whole.
+        let concluded = match whole {
+            true => self.conclude_chain(),
+            false => Ok(()),
         };
-        let joined = chain.joined.join(chunk).map_err(|(_, error)| DomainError::from(error));
-        if joined.is_err() || !chain.steps.is_empty() {
-            self.queue = Queue::Chain(chain);
-            return joined.map(|()| Advance::Chained);
-        }
-        // The chain's last chunk finished: its group closes.
-        self.close_group()?;
-        Ok(Advance::Chain(chain.joined))
+        joins.and(concluded)
     }
 
-    /// Hold the chain `first` opens, the first chunk of `request`'s prompt
-    /// group, whose flight just finished with the rest queued behind it
-    /// (`Queue::opens_chain`).
+    /// Return the chain state `joined` that `request`'s chunk of flight
+    /// `flight` carried: to its chain, still under way (`true`); otherwise
+    /// that chain was concluded meanwhile, and its holder's state is the one
+    /// `joined` reached.
+    pub(super) fn return_chain(&mut self, request: RequestId, flight: u64, joined: OwnedChainAdvance) -> bool {
+        match &mut self.queue {
+            Queue::Chain(chain) if chain.holder == request && matches!(chain.joined, Joined::Out(out) if out == flight) => {
+                chain.joined = Joined::Here(joined);
+                true
+            }
+            Queue::Empty | Queue::Opening(_) | Queue::Chain(_) | Queue::Successor(_) => {
+                self.target.insert(request, joined.commit());
+                false
+            }
+        }
+    }
+
+    /// Open the chain queued behind `first`, `request`'s reconciled first
+    /// chunk of its prompt group, of flight `flight` (`Queue::opens_chain`).
+    /// Where that queue was concluded meanwhile, the chunk publishes as a
+    /// step.
     pub(super) fn open_chain(
         &mut self,
         request: RequestId,
+        flight: u64,
         first: OwnedStateAdvance,
-    ) -> Result<Advance, DomainError> {
-        let steps = match std::mem::replace(&mut self.queue, Queue::Empty) {
-            Queue::Opening(steps) => steps,
-            other => {
-                self.queue = other;
-                return Err(DomainError::invariant("a chain opens where none is queued"));
-            }
+    ) -> Result<(), DomainError> {
+        let Some(steps) = self.queue.take_opening(flight) else {
+            let rows = first.rows();
+            let (OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) =
+                first.commit(rows).map_err(|(state, error)| {
+                    self.target.insert(request, state);
+                    DomainError::from(error)
+                })?;
+            self.target.insert(request, state);
+            return Ok(());
         };
         match OwnedChainAdvance::begin(first) {
             Ok(joined) => {
-                self.queue = Queue::Chain(HeldChain { holder: request, joined, steps });
-                Ok(Advance::Chained)
+                self.queue = Queue::Chain(HeldChain { holder: request, joined: Joined::Here(joined), steps });
+                Ok(())
             }
             Err((first, error)) => {
+                // The queued chunks follow its rows: they go first.
                 self.queue = Queue::Opening(steps);
+                let concluded = self.conclude_chain();
                 self.target.insert(request, first.abort());
-                Err(DomainError::from(error))
+                concluded.and(Err(DomainError::from(error)))
             }
         }
     }
@@ -582,11 +598,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// function of the round's operations, the chunks the scheduler planned
     /// for it and the load. A lone prompt chunk opens a chain of the planned
     /// chunks continuing it, a place each of the class its group holds
-    /// (`AllocatedResources::group_places`, claimed as it opened,
-    /// `open_group`), that the family runs in a chain; otherwise, with
-    /// pipelining, every slot's successor of one kind queues behind it.
+    /// (`group_places`, claimed as it opened, `open_group`), that the family
+    /// runs in a chain; otherwise, with pipelining, every slot's successor
+    /// of one kind queues behind it.
     pub(super) fn behind(&self, operations: &[Operation]) -> Behind {
-        self.behind_within(operations, self.resources.group_places().get())
+        self.behind_within(operations, self.group_places().get())
     }
 
     /// What runs behind `operations` (`behind`) with prompt groups of up to
@@ -954,10 +970,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // request's accepted state.
             let follows = match advance {
                 TentativeAdvance::Chained(_) => match &self.queue {
-                    Queue::Chain(chain) => {
-                        chain.holder == operation.request() && chain.joined.end() == advance.position()
+                    Queue::Chain(HeldChain { holder, joined: Joined::Here(joined), .. }) => {
+                        *holder == operation.request() && joined.end() == advance.position()
                     }
-                    Queue::Empty | Queue::Opening(_) | Queue::Successor(_) => false,
+                    Queue::Empty | Queue::Opening(_) | Queue::Chain(_) | Queue::Successor(_) => false,
                 },
                 TentativeAdvance::Accepted(_) | TentativeAdvance::Successor(_) => {
                     let state = self.target.get(&operation.request())?;
@@ -992,59 +1008,55 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Hand the front queued step to the owner as the flight of
-    /// `operations`. Each claimed slot takes its request's accepted state,
-    /// which its successor attaches to at finish; unclaimed slots are
-    /// discarded then.
-    pub(super) fn claim_queued(
-        &mut self,
-        operations: &[Operation],
-        slots: Vec<usize>,
-    ) -> Result<TargetWork<F>, DomainError> {
-        if self.claim_slots(operations).as_ref() != Some(&slots) {
-            return Err(DomainError::invariant(
-                "claimed queued step changed after reservation",
-            ));
-        }
-        let Some(QueuedStep { mut flight, .. }) = self.queue.pop_front() else {
-            return Err(DomainError::invariant("claimed queued step is absent"));
-        };
-        let mut sources = (0..flight.requests.len()).map(|_| None).collect::<Vec<_>>();
-        // `claim_slots` found every claimed request's accepted state.
+    /// `operations`, the slots `slots` its reservation found
+    /// ([`Self::claim_slots`]), which nothing changes before the claim. Each
+    /// claimed slot takes its request's accepted state, which its successor
+    /// attaches to at finish, or, a chained chunk, the chain it joins;
+    /// unclaimed slots are discarded then.
+    pub(super) fn claim_queued(&mut self, operations: &[Operation], slots: Vec<usize>) -> TargetWork<F> {
+        assert_eq!(
+            self.claim_slots(operations).as_ref(),
+            Some(&slots),
+            "invariant violated: a claimed queued step changed after its reservation"
+        );
+        let QueuedStep { mut flight, .. } =
+            self.queue.pop_front().expect("invariant violated: a claimable queued step is absent");
+        let mut sources = (0..flight.requests.len()).map(|_| Source::Unclaimed).collect::<Vec<_>>();
+        // `claim_slots` found every claimed request's accepted state, or the
+        // chain a chained chunk joins, which the chunk takes with it.
+        let advances = flight.submission.launch().advances();
         for (operation, slot) in operations.iter().zip(slots) {
-            sources[slot] = self
-                .target
-                .remove(&operation.request())
-                .map(InFlightState::new);
+            sources[slot] = match &advances[slot] {
+                TentativeAdvance::Chained(_) => {
+                    let Queue::Chain(chain) = &mut self.queue else {
+                        panic!("invariant violated: a claimed chained chunk without its chain");
+                    };
+                    let Joined::Here(joined) = std::mem::replace(&mut chain.joined, Joined::Out(flight.id)) else {
+                        panic!("invariant violated: a chain claimed by two chunks at once");
+                    };
+                    Source::Chain(joined)
+                }
+                TentativeAdvance::Accepted(_) | TentativeAdvance::Successor(_) => {
+                    let state = self
+                        .target
+                        .remove(&operation.request())
+                        .expect("invariant violated: a claimed slot's accepted state is absent");
+                    Source::Accepted(state)
+                }
+            };
         }
         flight.continuation = Some(sources);
         if let Some(priming) = &mut flight.priming {
-            priming.continuation = Some(self.head.remove(&priming.request).map(InFlightState::new));
+            priming.continuation = Some(self.head.remove(&priming.request));
         }
-        Ok(flight)
+        flight
     }
 
-    /// The binding right, as proof that no chain holds the queue
+    /// The binding right for work other than a chain's holder's
     /// ([`Unchained`]); none while a chain is under way, whose holder claims
-    /// it to its end or releases it: what changes bindings waits for that.
+    /// it to its end or concludes it: what changes bindings waits for that.
     pub fn unchained<'b>(&self, bindings: &'b mut StateBindings) -> Option<Unchained<'b>> {
         self.queue.holder().is_none().then_some(Unchained { bindings })
-    }
-
-    /// Wait for the queued steps nobody will claim and drop them, in queue
-    /// order: their successors release their rows and banks, their leases
-    /// return to their pools. Every binding change does so first, by the
-    /// proof that no chain is among them. The binding right proves no
-    /// flight is on the device: every queued step waited for is behind
-    /// none. Only the drained steps' own failures are reported.
-    pub(super) fn orphan_queue(&mut self, unchained: &mut Unchained<'_>) -> Result<(), DomainError> {
-        self.queue.orphan(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()), unchained)
-    }
-
-    /// Wait for every queued step and drop it, a chain under way with them
-    /// (`Queue::drain`), and close the group they ran (`close_group`).
-    pub(super) fn drain_queue(&mut self) -> Result<(), DomainError> {
-        self.queue.drain(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()))?;
-        self.close_group()
     }
 
     /// The launch of `predicted` queued behind a step whose advances are

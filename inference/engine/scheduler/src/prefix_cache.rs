@@ -270,11 +270,6 @@ impl<S> PrefixCache<S> {
         self.entries.len()
     }
 
-    /// Every cached state, for a census of the holdings they pin.
-    pub fn states(&self) -> impl Iterator<Item = &S> {
-        self.entries.iter().map(|entry| &entry.state)
-    }
-
     pub fn entry(&self, hit: PrefixHit) -> Result<&CachedPrefix<S>, String> {
         self.entries
             .iter()
@@ -494,16 +489,12 @@ impl<S> PrefixCache<S> {
     /// the plan charges the latest
     /// conversation (see [`Self::conversation_checkpoints`]). Returns how
     /// many entries were dropped.
-    pub fn release_beyond_workload<E>(
-        &mut self,
-        held: &BTreeSet<u64>,
-        mut occupied: impl FnMut(&Self) -> Result<u64, E>,
-    ) -> Result<usize, E> {
+    pub fn release_beyond_workload(&mut self, held: &BTreeSet<u64>, occupied: impl Fn() -> u64) -> usize {
         let mut released = 0;
-        while occupied(self)? > self.capacity.workload_state_bytes && self.release_unspared(held) {
+        while occupied() > self.capacity.workload_state_bytes && self.release_unspared(held) {
             released += 1;
         }
-        Ok(released)
+        released
     }
 
     /// Whether an entry beyond the latest conversation's checkpoints, in no
@@ -1146,14 +1137,14 @@ mod tests {
         const DEPTH: u64 = 2000;
         const THINK: usize = 4;
         let workload = DEPTH + 6 * BANK_ROWS;
-        let occupied = |_: &PrefixCache<Rows>| -> Result<u64, String> {
-            Ok(REFERENCES.with_borrow(|references| {
+        let occupied = || -> u64 {
+            REFERENCES.with_borrow(|references| {
                 references
                     .iter()
                     .filter(|(_, count)| **count > 0)
                     .map(|(&row, _)| if row >= BANK { BANK_ROWS } else { 1 })
                     .sum()
-            }))
+            })
         };
         let mut cache = PrefixCache::new(PrefixCacheCapacity {
             max_entries: 1024,
@@ -1173,7 +1164,7 @@ mod tests {
             assert!(cache
                 .retain(owned.path(), position, point, state, MethodCheckpoint::Plain)
                 .unwrap());
-            cache.release_beyond_workload(&BTreeSet::new(), occupied).unwrap();
+            cache.release_beyond_workload(&BTreeSet::new(), occupied);
         };
         // Each request's prompt, what it resumed at, and its reply.
         let request = |cache: &mut PrefixCache<Rows>, prompt: &[u32], declared: Option<usize>| {
@@ -1213,7 +1204,7 @@ mod tests {
             prompt.extend(fresh(300));
             let (resumed, finished) = request(&mut cache, &prompt, None);
             assert_eq!(resumed, Some(prompt.len() - 300), "turn {turn}'s tool result resumes at the call");
-            let held = occupied(&cache).unwrap();
+            let held = occupied();
             assert!(
                 held <= workload || cache.len() <= CONVERSATION_CHECKPOINTS,
                 "turn {turn}: {} entries occupy {held} of {workload}",

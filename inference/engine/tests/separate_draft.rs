@@ -358,7 +358,6 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     domain.close(source).unwrap();
     drop(before_inject);
     drop(before_draft);
-    domain.reconcile_memory_charge(&[]).unwrap();
 }
 
 #[test]
@@ -443,9 +442,10 @@ fn header_only_assessment_charges_what_a_load_commits() {
         &conditioning,
         resolved.manifest.model.method.proposals(),
     );
-    let held = domain.resume_state(request).unwrap();
+    // The request's state stays held, closed, through the reading.
+    let _held = domain.resume_state(request).unwrap();
     domain.close(request).unwrap();
-    let charge = domain.reconcile_memory_charge(&[&held]).unwrap();
+    let charge = domain.load_charge().unwrap();
     eprintln!("assessed {terms:?} graphs {graphs:?}\nloaded {charge:?}");
     assert_eq!(
         charge.target_weights, terms.target_weights,

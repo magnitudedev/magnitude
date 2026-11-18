@@ -257,6 +257,9 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The checked value of one expression. The functions on its recursion
+    /// hold only the recursion's own locals, so a level's frame stays within
+    /// what MAX_NESTING levels are budgeted (`seismic_threads::PROGRAM_BYTES`).
     pub fn expr_inner(
         &mut self,
         e: &ast::Expr,
@@ -268,20 +271,7 @@ impl<'a> Checker<'a> {
         let context = expected.and_then(operand_dtype);
         match &e.kind {
             A::Int(v) => self.integer_literal(i128::from(*v), expected, context, span),
-            A::Float(_) | A::Inf => {
-                let dtype = context.filter(|d| d.is_float()).unwrap_or(DType::F32);
-                let value = match &e.kind {
-                    A::Float(value) => *value,
-                    A::Inf => f64::INFINITY,
-                    _ => unreachable!(),
-                };
-                Some(self.scalar_expr(
-                    CheckedExprKind::Literal(reference_math::float_literal(dtype, value)),
-                    dtype,
-                    None,
-                    span,
-                ))
-            }
+            A::Float(_) | A::Inf => Some(self.float_literal(&e.kind, context, span)),
             A::Bool(b) => Some(self.scalar_expr(
                 CheckedExprKind::Literal(ReferenceScalar::Bool(*b)),
                 DType::Bool,
@@ -289,108 +279,8 @@ impl<'a> Checker<'a> {
                 span,
             )),
             A::Name(n) => self.name(n, place_context),
-            A::Tuple(items) => {
-                let hints: Vec<Option<&ValueType>> = match expected {
-                    Some(ValueType::Tuple(tys)) if tys.len() == items.len() => {
-                        tys.iter().map(Some).collect()
-                    }
-                    _ => vec![None; items.len()],
-                };
-                let mut out = Vec::new();
-                for (item, hint) in items.iter().zip(hints) {
-                    let item = self.expr(item, hint)?;
-                    if item.ty.is_void() {
-                        self.error(
-                            DiagnosticRule::Type,
-                            item.span,
-                            "`void` is not a tuple component",
-                        );
-                        return None;
-                    }
-                    out.push(item);
-                }
-                if out.is_empty() {
-                    self.error(
-                        DiagnosticRule::Type,
-                        e.span,
-                        "an empty tuple is not a value",
-                    );
-                    return None;
-                }
-                if out.len() == 1 {
-                    return out.pop();
-                }
-                let tys: Vec<ValueType> = out.iter().map(|e| e.ty.clone()).collect();
-                let ty = ValueType::Tuple(
-                    crate::types::NonEmpty::new(tys)
-                        .unwrap_or_else(|| panic!("nonempty checked tuple lost all components")),
-                );
-                Some(self.primitive_expr(PrimitiveId::TuplePack, out, ty, None, span))
-            }
-            A::Range { lo, hi } => {
-                let lo = self.expr(lo, Some(&ValueType::Integer))?;
-                let hi = self.expr(hi, Some(&ValueType::Integer))?;
-                for endpoint in [&lo, &hi] {
-                    if !quantity(&endpoint.ty) && !word(&endpoint.ty) {
-                        self.error(
-                            DiagnosticRule::Type,
-                            endpoint.span,
-                            format!(
-                                "a range endpoint is an integer, found {}",
-                                self.shown(&endpoint.ty)
-                            ),
-                        );
-                        return None;
-                    }
-                }
-                // L31: `0 <= lo <= hi` over the endpoints' one symbol each.
-                let (lo, lo_sym) = self.position_value(lo)?;
-                let (hi, hi_sym) = self.position_value(hi)?;
-                let bound = match expected {
-                    Some(ValueType::Range { bound }) => *bound,
-                    _ => hi_sym,
-                };
-                let order = self.arena.int_sub(hi_sym, lo_sym);
-                let tail = self.arena.int_sub(bound, hi_sym);
-                let mut unproved = Vec::new();
-                if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, lo_sym)
-                    .is_established()
-                {
-                    unproved.push(format!("0 <= {}", self.text(lo.span)));
-                }
-                if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, order)
-                    .is_established()
-                {
-                    unproved.push(format!("{} <= {}", self.text(lo.span), self.text(hi.span)));
-                }
-                if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, tail)
-                    .is_established()
-                {
-                    unproved.push(format!("{} <= {}", self.text(hi.span), self.render(bound)));
-                }
-                if !unproved.is_empty() {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        format!(
-                            "a range needs `0 <= start <= end`; prove {} in scope, e.g. with `if`",
-                            unproved
-                                .iter()
-                                .map(|conjunct| format!("`{conjunct}`"))
-                                .collect::<Vec<_>>()
-                                .join(" and ")
-                        ),
-                    );
-                    return None;
-                }
-                Some(self.primitive_expr(
-                    PrimitiveId::RangeMake,
-                    vec![lo, hi],
-                    ValueType::Range { bound },
-                    None,
-                    span,
-                ))
-            }
+            A::Tuple(items) => self.tuple(items, expected, span),
+            A::Range { lo, hi } => self.range(lo, hi, expected, span),
             A::Tensor { shape, elem } => self.tensor_alloc(shape, elem, span),
             A::Call {
                 callee,
@@ -418,6 +308,139 @@ impl<'a> Checker<'a> {
             A::Unary { op, expr } => self.unary(*op, expr, expected, span),
             A::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, expected, span),
         }
+    }
+
+    /// A float literal (or `inf`), at the float dtype its context supplies.
+    fn float_literal(&mut self, kind: &A, context: Option<DType>, span: Span) -> CheckedExpr {
+        let dtype = context.filter(|d| d.is_float()).unwrap_or(DType::F32);
+        let value = match kind {
+            A::Float(value) => *value,
+            A::Inf => f64::INFINITY,
+            _ => unreachable!(),
+        };
+        self.scalar_expr(
+            CheckedExprKind::Literal(reference_math::float_literal(dtype, value)),
+            dtype,
+            None,
+            span,
+        )
+    }
+
+    /// A tuple of the checked `items`, each hinted by `expected`'s component.
+    fn tuple(
+        &mut self,
+        items: &[ast::Expr],
+        expected: Option<&ValueType>,
+        span: Span,
+    ) -> Option<CheckedExpr> {
+        let hints: Vec<Option<&ValueType>> = match expected {
+            Some(ValueType::Tuple(tys)) if tys.len() == items.len() => {
+                tys.iter().map(Some).collect()
+            }
+            _ => vec![None; items.len()],
+        };
+        let mut out = Vec::new();
+        for (item, hint) in items.iter().zip(hints) {
+            let item = self.expr(item, hint)?;
+            if item.ty.is_void() {
+                self.error(
+                    DiagnosticRule::Type,
+                    item.span,
+                    "`void` is not a tuple component",
+                );
+                return None;
+            }
+            out.push(item);
+        }
+        if out.is_empty() {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                "an empty tuple is not a value",
+            );
+            return None;
+        }
+        if out.len() == 1 {
+            return out.pop();
+        }
+        let tys: Vec<ValueType> = out.iter().map(|e| e.ty.clone()).collect();
+        let ty = ValueType::Tuple(
+            crate::types::NonEmpty::new(tys)
+                .unwrap_or_else(|| panic!("nonempty checked tuple lost all components")),
+        );
+        Some(self.primitive_expr(PrimitiveId::TuplePack, out, ty, None, span))
+    }
+
+    /// `lo..hi`, its `0 <= lo <= hi` proved in scope (L31).
+    fn range(
+        &mut self,
+        lo: &ast::Expr,
+        hi: &ast::Expr,
+        expected: Option<&ValueType>,
+        span: Span,
+    ) -> Option<CheckedExpr> {
+        let lo = self.expr(lo, Some(&ValueType::Integer))?;
+        let hi = self.expr(hi, Some(&ValueType::Integer))?;
+        for endpoint in [&lo, &hi] {
+            if !quantity(&endpoint.ty) && !word(&endpoint.ty) {
+                self.error(
+                    DiagnosticRule::Type,
+                    endpoint.span,
+                    format!(
+                        "a range endpoint is an integer, found {}",
+                        self.shown(&endpoint.ty)
+                    ),
+                );
+                return None;
+            }
+        }
+        // L31: `0 <= lo <= hi` over the endpoints' one symbol each.
+        let (lo, lo_sym) = self.position_value(lo)?;
+        let (hi, hi_sym) = self.position_value(hi)?;
+        let bound = match expected {
+            Some(ValueType::Range { bound }) => *bound,
+            _ => hi_sym,
+        };
+        let order = self.arena.int_sub(hi_sym, lo_sym);
+        let tail = self.arena.int_sub(bound, hi_sym);
+        let mut unproved = Vec::new();
+        if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, lo_sym)
+            .is_established()
+        {
+            unproved.push(format!("0 <= {}", self.text(lo.span)));
+        }
+        if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, order)
+            .is_established()
+        {
+            unproved.push(format!("{} <= {}", self.text(lo.span), self.text(hi.span)));
+        }
+        if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, tail)
+            .is_established()
+        {
+            unproved.push(format!("{} <= {}", self.text(hi.span), self.render(bound)));
+        }
+        if !unproved.is_empty() {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                format!(
+                    "a range needs `0 <= start <= end`; prove {} in scope, e.g. with `if`",
+                    unproved
+                        .iter()
+                        .map(|conjunct| format!("`{conjunct}`"))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                ),
+            );
+            return None;
+        }
+        Some(self.primitive_expr(
+            PrimitiveId::RangeMake,
+            vec![lo, hi],
+            ValueType::Range { bound },
+            None,
+            span,
+        ))
     }
 
     fn integer_literal(
@@ -1133,6 +1156,11 @@ impl<'a> Checker<'a> {
         span: Span,
     ) -> Option<CheckedExpr> {
         let inner = self.expr(inner, expected)?;
+        self.unary_value(op, inner, span)
+    }
+
+    /// `op` applied to its checked operand.
+    fn unary_value(&mut self, op: UnaryOp, inner: CheckedExpr, span: Span) -> Option<CheckedExpr> {
         // L28: one table of operand domains.
         let domain = crate::intrinsics::unary_operand_domain(op);
         let admitted = match &inner.ty {

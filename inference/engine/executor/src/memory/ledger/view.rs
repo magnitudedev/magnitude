@@ -8,7 +8,7 @@ use crate::memory::shortage::{self, Shortage};
 use crate::memory::supply::Reading;
 
 use super::admission::{Admit, Short};
-use super::changes::{Changing, Sampled};
+use super::changes::{Keeping, Sampled};
 use super::estimate::Estimate;
 use super::state::Store;
 use super::vocabulary::{CacheKind, CommittedKind, Entry, Holding, LoadShape, Need, PoolClass, size};
@@ -70,8 +70,9 @@ pub enum Standing {
 
 impl Ledger {
     /// `change`, an OS change of the process's memory and its records in
-    /// the ledgers, run as one change ([`Changes::change`]).
-    pub fn change<R>(&self, change: impl FnOnce(&Changing) -> R) -> R {
+    /// the ledgers, run as one change ([`Changes::change`]), handed in its
+    /// keep phase.
+    pub fn change<R>(&self, change: impl FnOnce(Keeping<'_>) -> R) -> R {
         self.store.changes.change(change)
     }
 

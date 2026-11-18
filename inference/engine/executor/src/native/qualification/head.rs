@@ -3,7 +3,7 @@ use super::*;
 use crate::ReadoutHead;
 
 impl<'a> QualificationView<'a> {
-    pub(super) fn qualify_head(&self, device: &Device) -> Result<(), CatalogFailure> {
+    pub(super) fn qualify_head(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
         let (Some(head_plan), Some(head)) = (self.plan.head(), self.programs.head.as_ref()) else {
             return Ok(());
         };
@@ -19,10 +19,10 @@ impl<'a> QualificationView<'a> {
                 },
             );
             // One (token, status) selection row.
-            let tokens = semantic_zeros(device, Element::i32(), &[1, 2], "head", &label)?;
-            let direct = semantic_zeros(device, Element::i32(), &[0, 1], "head", &label)?;
+            let tokens = semantic_zeros(charges, Element::i32(), &[1, 2], "head", &label)?;
+            let direct = semantic_zeros(charges, Element::i32(), &[0, 1], "head", &label)?;
             let table = semantic_pattern(
-                device,
+                charges,
                 binding.embedding_table,
                 &[1, hidden],
                 "head",
@@ -34,7 +34,7 @@ impl<'a> QualificationView<'a> {
                 .map(|column| [1.0_f32, -2.0, 3.0, -4.0][column as usize % 4])
                 .collect::<Vec<_>>();
             let conditioning = semantic_dense_values(
-                device,
+                charges,
                 binding.conditioning,
                 &[1, hidden * streams],
                 &pattern,
@@ -42,11 +42,11 @@ impl<'a> QualificationView<'a> {
                 &label,
             )?;
             let embedding_norm =
-                semantic_ones(device, binding.embedding_norm, &[hidden], "head", &label)?;
+                semantic_ones(charges, binding.embedding_norm, &[hidden], "head", &label)?;
             let hidden_norm =
-                semantic_ones(device, binding.hidden_norm, &[hidden * streams], "head", &label)?;
+                semantic_ones(charges, binding.hidden_norm, &[hidden * streams], "head", &label)?;
             let combine = semantic_pattern(
-                device,
+                charges,
                 binding.combine,
                 &[hidden, 2 * hidden],
                 "head",
@@ -55,7 +55,7 @@ impl<'a> QualificationView<'a> {
             let features = block
                 .input
                 .first()
-                .call(draft_rows::Args {
+                .call(charges, draft_rows::Args {
                     tokens: &tokens,
                     directory: &direct,
                     table: &table,
@@ -68,7 +68,7 @@ impl<'a> QualificationView<'a> {
                 .map_err(|error| qualification_dynamic("draft_rows", &label, error))?
                 .value;
             qualify_attention(
-                device,
+                charges,
                 &block.attention,
                 binding.attention,
                 form,
@@ -77,7 +77,7 @@ impl<'a> QualificationView<'a> {
             // The attention block keeps its residual (zero weights), so the
             // feed-forward stage continues from the head input.
             let attended = features;
-            let out_rows = semantic_zeros(device, Element::i32(), &[1], "head", &label)?;
+            let out_rows = semantic_zeros(charges, Element::i32(), &[1], "head", &label)?;
             let advanced = match (binding.feed_forward, &block.feed_forward) {
                 (FeedForwardProgramSlot::Dense(binding), AttestedFeedForward::Dense(kernels)) => {
                     let intermediate = self.weight_shape(
@@ -85,23 +85,23 @@ impl<'a> QualificationView<'a> {
                         magnitude_family_contracts::WeightKind::DenseGate,
                         "dense_expand",
                     )?[0];
-                    let norm = semantic_zeros(device, binding.norm, &[hidden], "head", &label)?;
+                    let norm = semantic_zeros(charges, binding.norm, &[hidden], "head", &label)?;
                     let gate = semantic_zeros(
-                        device,
+                        charges,
                         binding.gate,
                         &[intermediate, hidden],
                         "head",
                         &label,
                     )?;
                     let up = semantic_zeros(
-                        device,
+                        charges,
                         binding.up,
                         &[intermediate, hidden],
                         "head",
                         &label,
                     )?;
                     let down = semantic_zeros(
-                        device,
+                        charges,
                         binding.down,
                         &[hidden, intermediate],
                         "head",
@@ -110,7 +110,7 @@ impl<'a> QualificationView<'a> {
                     let product = kernels
                         .expand
                         .first()
-                        .call(dense_expand::Args {
+                        .call(charges, dense_expand::Args {
                             residual: &attended,
                             norm: &norm,
                             gate_weight: &gate,
@@ -119,34 +119,34 @@ impl<'a> QualificationView<'a> {
                             eps: 1.0e-5,
                             activation: 0,
                             gate_scale: &unit_scale(
-                                device,
+                                charges,
                                 kernels.expand.first(),
                                 "GS",
                                 "dense_expand",
                                 &label,
                             )?,
                             up_scale: &unit_scale(
-                                device,
+                                charges,
                                 kernels.expand.first(),
                                 "US",
                                 "dense_expand",
                                 &label,
                             )?,
                             gate_bound: &any_row_bound(
-                                device,
+                                charges,
                                 kernels.expand.first(),
                                 "GB",
                                 "dense_expand",
                                 &label,
                             )?,
                             up_bound: &any_row_bound(
-                                device,
+                                charges,
                                 kernels.expand.first(),
                                 "UB",
                                 "dense_expand",
                                 &label,
                             )?,
-                            glu_limit: &glu_limit(device, binding.limit, "dense_expand", &label)?,
+                            glu_limit: &glu_limit(charges, binding.limit, "dense_expand", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                         .value;
@@ -159,14 +159,14 @@ impl<'a> QualificationView<'a> {
                     };
                     let output = output.first();
                     output
-                        .call(dense_output::Args {
+                        .call(charges, dense_output::Args {
                             residual: &attended,
                             product: &product,
                             down_weight: &down,
                             out_rows: &out_rows,
-                            down_scale: &unit_scale(device, output, "DS", "dense_output", &label)?,
+                            down_scale: &unit_scale(charges, output, "DS", "dense_output", &label)?,
                             down_bound: &any_row_bound(
-                                device,
+                                charges,
                                 output,
                                 "DB",
                                 "dense_output",
@@ -177,16 +177,16 @@ impl<'a> QualificationView<'a> {
                         .value
                 }
                 (FeedForwardProgramSlot::Routed(binding), AttestedFeedForward::Routed(kernels)) => {
-                    let reads = super::target::ExpertReads::routed(device, binding)?;
-                    super::target::qualify_routed(device, binding, kernels, form, &reads)?;
+                    let reads = super::target::ExpertReads::routed(charges, binding)?;
+                    super::target::qualify_routed(charges, binding, kernels, form, &reads)?;
                     attended
                 }
                 (
                     FeedForwardProgramSlot::GeneralRouted(binding),
                     AttestedFeedForward::GeneralRouted(kernels),
                 ) => {
-                    let reads = super::target::ExpertReads::general(device, binding)?;
-                    super::target::qualify_general_routed(device, binding, kernels, &reads)?;
+                    let reads = super::target::ExpertReads::general(charges, binding)?;
+                    super::target::qualify_general_routed(charges, binding, kernels, &reads)?;
                     attended
                 }
                 _ => {
@@ -199,7 +199,7 @@ impl<'a> QualificationView<'a> {
             };
             require_finite_nonzero_f32(&advanced, "head_feed_forward", &label)?;
             let output_norm =
-                semantic_ones(device, binding.output_norm, &[if binding.streams.is_some() { 0 } else { hidden }], "head", &label)?;
+                semantic_ones(charges, binding.output_norm, &[if binding.streams.is_some() { 0 } else { hidden }], "head", &label)?;
             let parts = readout_parts(
                 &advanced,
                 block.features.specialization().statics(),
@@ -208,7 +208,7 @@ impl<'a> QualificationView<'a> {
             )?;
             let projected_features = block
                 .features
-                .call(readout_features_rows::Args {
+                .call(charges, readout_features_rows::Args {
                     hidden: &parts,
                     norm: &output_norm,
                     out_rows: &out_rows,
@@ -223,7 +223,7 @@ impl<'a> QualificationView<'a> {
                     ..
                 } => {
                     super::target::qualify_progressive(
-                        device,
+                        charges,
                         progressive,
                         &advanced,
                         &output_norm,
@@ -249,16 +249,16 @@ impl<'a> QualificationView<'a> {
                     },
                 ) => {
                     let projection =
-                        semantic_pattern(device, element, &[vocabulary, hidden], "head", &label)?;
+                        semantic_pattern(charges, element, &[vocabulary, hidden], "head", &label)?;
                     let token_rows = semantic_zeros(
-                        device,
+                        charges,
                         Element::i32(),
                         &[out_rows.extents()[0], 0, vocabulary],
                         "head",
                         &label,
                     )?;
                     let scale = semantic_ones(
-                        device,
+                        charges,
                         Element::f32(),
                         &[u64::from(weight_scale)],
                         "head",
@@ -266,7 +266,7 @@ impl<'a> QualificationView<'a> {
                     )?;
                     let logits = kernel
                         .first()
-                        .call(readout_project_rows::Args {
+                        .call(charges, readout_project_rows::Args {
                             features: &projected_features,
                             weight: &projection,
                             token_rows: &token_rows,

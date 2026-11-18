@@ -286,7 +286,7 @@ pub fn inspect_components(
         },
         head: None,
         vision: projector
-            .map(|projector| describe_projector(projector, hidden, epsilon))
+            .map(|projector| describe_projector(projector, hidden, epsilon).map(Box::new))
             .transpose()?,
         draft: None,
     };

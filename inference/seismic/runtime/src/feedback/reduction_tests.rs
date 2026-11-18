@@ -33,7 +33,7 @@ fn scalar_reductions(backend: registry::BackendName) {
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -49,11 +49,11 @@ fn scalar_reductions(backend: registry::BackendName) {
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
         let tensor = Arc::new(
-            TensorInner::from_host(&device, registry::dense(DType::F32), &extents, &bytes).unwrap(),
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &extents, &bytes).unwrap(),
         );
         let mut args = EncodedArgs::new();
         args.push_tensor(tensor);
-        let mut output = crate::api::kernel::call(&kernel, args)
+        let mut output = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args)
             .unwrap_or_else(|error| panic!("{backend:?} {name} {extents:?}: {error:?}"));
         let ArgumentValue::F32(actual) = output.take_scalar() else {
             panic!("scalar reduction returned another category")
@@ -89,7 +89,7 @@ fn range_endpoints(backend: registry::BackendName) {
             &module,
             module.entry_named("probe").unwrap(),
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -105,7 +105,7 @@ fn range_endpoints(backend: registry::BackendName) {
         .flat_map(f32::to_le_bytes)
         .collect::<Vec<_>>();
     let tensor = Arc::new(
-        TensorInner::from_host(&device, registry::dense(DType::F32), &[4], &bytes).unwrap(),
+        TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &[4], &bytes).unwrap(),
     );
     for (start, end, expected) in [
         (0, 0, 0.0f32),
@@ -120,7 +120,7 @@ fn range_endpoints(backend: registry::BackendName) {
             start: u64::try_from(start).unwrap().into(),
             end: u64::try_from(end).unwrap().into(),
         });
-        let mut result = crate::api::kernel::call(&kernel, args).unwrap();
+        let mut result = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args).unwrap();
         let ArgumentValue::F32(actual) = result.take_scalar() else {
             panic!("range loop returned non-scalar")
         };

@@ -147,7 +147,6 @@ base64 = "0.22.1"
 bytes = "1.12.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 flate2 = "1.1"
-fs2 = "0.4.3"
 futures-util = "0.3.31"
 getrandom = "0.4.3"
 hf-hub = { version = "1.0.0", features = ["rustls-tls"] }

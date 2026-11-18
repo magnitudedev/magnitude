@@ -186,7 +186,7 @@ fn a_load_imports_what_its_first_reading_keeps() {
     read(1, 0);
     let imported = import_target(&ledger.estimate(), beside, &shape(), &charge);
     assert!(shape().floor_slots() < imported && imported < shape().saturation_slots(), "{imported} slots");
-    let held = ledger.claim_at(None, crate::memory::ledger::CommittedKind::Load, beside).expect("the import's claims fit");
+    let held = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, beside)).expect("the import's claims fit");
     ledger.change(|_| { let entry = held.entry(); entry.take(&entry.change(), beside, seismic::memory::Wiring::Pageable) }).expect("the import's own bytes");
     let cache = charge(imported) - charge(shape().floor_slots());
     let _cache = ledger.cached(CacheKind::Bank, cache).expect("the import's room holds its cache");

@@ -726,7 +726,7 @@ mod tests {
     fn bank() -> (BankRecords, MapView) {
         let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let words = EXPERTS as u64 * MAP_WORDS;
-        let tensor = seismic::Tensor::shared(&cpu, seismic::Element::i32(), &[EXPERTS as u64, MAP_WORDS]).unwrap();
+        let tensor = seismic::Tensor::shared(&seismic::Charges::tally(&cpu), seismic::Element::i32(), &[EXPERTS as u64, MAP_WORDS]).unwrap();
         let map = StampedMap::new(Words::new(tensor, words, 0).unwrap());
         let view = map.view().clone();
         (BankRecords::new(&[4], &[(0, EXPERTS)], Some((vec![map], (0, 2)))), view)

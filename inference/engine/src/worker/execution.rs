@@ -3,31 +3,28 @@
 
 use crate::error::UnloadCause;
 use crate::execution::{LoadPricing, load_measures};
-use magnitude_executor::{MemoryChargeReconciliation, ProgramFamily};
+use crate::census::AllocationCensus;
+use magnitude_executor::ProgramFamily;
 use magnitude_generation::Method;
 use magnitude_scheduler::{
     owner::{AdmissionError, Owner, Ran},
     protocol::{AdmitRequest, RoomGrant, WorkerCommand, WorkerReply},
     publication::{ModelUnloadCause, RequestError},
-    serving::ServingCensus,
     worker::{Driven, Event, Reread},
 };
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
-
-/// What the owner counts of its memory: the census's inputs.
-type Counted = (MemoryChargeReconciliation, ServingCensus);
 
 /// The census the owner counted last and the session has not sent yet:
 /// published by the owner as its count changes after a run, taken by the
 /// session, which sends it to the host. Pushed on change, never sampled.
 #[derive(Default)]
 pub(crate) struct CensusWatch {
-    state: Mutex<(Option<Counted>, Option<Waker>)>,
+    state: Mutex<(Option<AllocationCensus>, Option<Waker>)>,
 }
 
 impl CensusWatch {
-    fn publish(&self, counted: Counted) {
+    fn publish(&self, counted: AllocationCensus) {
         let mut state = self.state.lock().unwrap();
         state.0 = Some(counted);
         if let Some(waker) = state.1.take() {
@@ -37,7 +34,7 @@ impl CensusWatch {
 
     /// The census counted since the last take; otherwise `waker` is woken
     /// once one is.
-    pub(crate) fn take(&self, waker: &Waker) -> Option<Counted> {
+    pub(crate) fn take(&self, waker: &Waker) -> Option<AllocationCensus> {
         let mut state = self.state.lock().unwrap();
         let counted = state.0.take();
         if counted.is_none() {
@@ -68,7 +65,7 @@ pub(crate) struct ExecutionOwner<F: ProgramFamily> {
     pricing: LoadPricing,
     /// Where the census goes as it changes, and what it was last.
     census: Arc<CensusWatch>,
-    counted: Option<Counted>,
+    counted: Option<AllocationCensus>,
     /// What the census was last counted at (`Owner::census_key`): nothing
     /// it counts changes while it stands, and readings never move it.
     counted_at: Option<(u64, Option<magnitude_executor::ExpertCover>)>,
@@ -96,7 +93,7 @@ impl<F: ProgramFamily> ExecutionOwner<F> {
             return Ok(());
         }
         self.counted_at = Some(key);
-        let counted = (owner.reconcile_memory_charge()?, owner.serving_census()?);
+        let counted = AllocationCensus { stores: owner.store_allocations(), serving: owner.serving_census()? };
         if self.counted.as_ref() != Some(&counted) {
             self.counted = Some(counted.clone());
             self.census.publish(counted);
@@ -320,13 +317,17 @@ mod tests {
     }
 
     /// Store the read line of the volume `cache` lies on as the
-    /// measurement job measures it.
-    fn store_read_line(device: &seismic::Device, cache: &std::path::Path) {
+    /// measurement job measures it: on a device of `backend`'s of its own,
+    /// opened outside any ledger as the job's process opens its own, and
+    /// charged to its tallies.
+    fn store_read_line(backend: seismic::BackendName, cache: &std::path::Path) {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let (device, _) = seismic::testing::open_backend_tallied(&catalog, backend, Default::default()).unwrap();
         let mut measurer =
             seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
         magnitude_executor::assessment::requests::measure(
             &mut measurer,
-            device,
+            &seismic::Charges::tally(&device),
             &KernelCache::measurement_records(cache),
             &magnitude_executor::assessment::Outstanding {
                 standing: vec![magnitude_executor::assessment::PointRequest::Storage { directory: cache.to_owned() }],
@@ -380,7 +381,7 @@ mod tests {
         assert_eq!(grown, 4, "the unpriced bank grew to its ceiling");
         assert!(matches!(resize, Some(BankResize::Grew { from: 2, .. })), "{resize:?}");
         // The measurement job stores the store's read line.
-        store_read_line(&device, cache.path());
+        store_read_line(backend, cache.path());
         assert!(matches!(execution.command(WorkerCommand::Reprice, now), Ok(WorkerReply::Acknowledged)));
         observe(&mut execution, now, 100);
         let (repriced, resize) = slots(&mut execution);

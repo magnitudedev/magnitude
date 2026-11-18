@@ -269,6 +269,15 @@ impl State {
 }
 
 impl Ledger {
+    /// A committed entry of `kind` opened at none, which grows as Seismic
+    /// allocates through it, each allocation its own change
+    /// ([`Record`]'s), and is released as it drops: a device's own, a
+    /// measurement job's.
+    pub(super) fn growing(&self, kind: CommittedKind) -> Record {
+        let id = self.state().insert(Holding::Committed(kind), 0);
+        Record::new(self.clone(), id)
+    }
+
     /// The store's granule pool of `class` opened with blocks of `block`
     /// bytes, the unit a shrink returns to the OS, which a pressure event
     /// yields: its entries. The blocks' entry, which the backend charges
@@ -282,14 +291,14 @@ impl Ledger {
     /// # Panics
     /// Where the store's pool of `class` is open already: one pool of each
     /// class per store.
-    pub fn pool_block(&self, class: PoolClass, block: NonZeroU64) -> seismic::PoolEntries {
+    pub fn pool_block(&self, class: PoolClass, block: NonZeroU64) -> super::store::PoolEntries {
         let mut state = self.state();
         assert!(state.pools[class.index()].is_none(), "invariant violated: {:?} opens a second {class:?} pool", self.store.identity);
         let entry = state.insert(Holding::Pool(class), 0);
         state.pools[class.index()] = Some(Pool { entry, block });
         let absent = state.insert(Holding::Committed(CommittedKind::Absent(class)), 0);
         drop(state);
-        seismic::PoolEntries { blocks: Arc::new(Record::new(self.clone(), entry)), absent: Arc::new(Record::new(self.clone(), absent)) }
+        super::store::PoolEntries { blocks: Arc::new(Record::new(self.clone(), entry)), absent: Arc::new(Record::new(self.clone(), absent)) }
     }
 }
 
@@ -302,8 +311,7 @@ impl seismic::memory::Store for Ledger {
     /// committed [`CommittedKind::Device`] entry, which grows as Seismic
     /// allocates through it and lives while the device holds it.
     fn own(&self) -> Arc<dyn seismic::memory::Entry> {
-        let id = self.state().insert(Holding::Committed(CommittedKind::Device), 0);
-        Arc::new(Record::new(self.clone(), id))
+        Arc::new(self.growing(CommittedKind::Device))
     }
 
     fn allocated(&self) -> u64 {

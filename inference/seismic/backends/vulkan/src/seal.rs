@@ -12,12 +12,12 @@
 //!
 //! [`contract`] reports the constructs a formed module may not contain.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Version of these passes and of the emitted contract; part of the
 /// formation identity and SPIR-V cache key, so a kept module was formed
 /// under the current contract.
-pub const SEAL_VERSION: u32 = 5;
+pub const SEAL_VERSION: u32 = 6;
 
 /// The execution modes a sealed module declares beyond the fixed ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,7 +134,7 @@ pub fn seal(module: &[u32], environment: Environment) -> Result<Vec<u32>, Malfor
             instruction.opcode == OP_DECORATE && words(instruction)[2] == DECORATION_NO_CONTRACTION
         })
         .map(|instruction| words(instruction)[1])
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<HashSet<_>>();
 
     let mut wanted_modes = Vec::new();
     if environment.float16 {
@@ -277,9 +277,43 @@ pub fn fma_khr(module: &[u32]) -> Result<Vec<u32>, MalformedModule> {
 
 const OP_NAME: u32 = 5;
 const OP_TYPE_INT: u32 = 21;
+const OP_TYPE_FLOAT: u32 = 22;
 const OP_TYPE_VECTOR: u32 = 23;
+const OP_TYPE_ARRAY: u32 = 28;
+const OP_TYPE_POINTER: u32 = 32;
+const OP_CONSTANT_TRUE: u32 = 41;
+const OP_CONSTANT_FALSE: u32 = 42;
+const OP_CONSTANT: u32 = 43;
+const OP_CONSTANT_COMPOSITE: u32 = 44;
+const OP_CONSTANT_NULL: u32 = 46;
+/// `OpSpecConstantTrue` through `OpSpecConstantOp`.
+const SPEC_CONSTANTS: std::ops::RangeInclusive<u32> = 48..=52;
 const OP_FUNCTION: u32 = 54;
+const OP_FUNCTION_PARAMETER: u32 = 55;
 const OP_FUNCTION_END: u32 = 56;
+const OP_FUNCTION_CALL: u32 = 57;
+const OP_VARIABLE: u32 = 59;
+const OP_STORE: u32 = 62;
+const OP_COMPOSITE_CONSTRUCT: u32 = 80;
+const OP_COMPOSITE_INSERT: u32 = 82;
+const OP_COPY_OBJECT: u32 = 83;
+const OP_SELECT: u32 = 169;
+const OP_PHI: u32 = 245;
+const OP_RETURN_VALUE: u32 = 254;
+const OP_TYPE_COOPERATIVE_MATRIX: u32 = 4456;
+const OP_COOPERATIVE_MATRIX_MUL_ADD: u32 = 4459;
+
+/// Instructions whose result is a pointer a store can address:
+/// `OpFunctionParameter`, `OpVariable`, `OpAccessChain`,
+/// `OpInBoundsAccessChain`, `OpPtrAccessChain`, `OpCopyObject`.
+const POINTERS: [u32; 6] = [
+    OP_FUNCTION_PARAMETER,
+    OP_VARIABLE,
+    65,
+    66,
+    67,
+    OP_COPY_OBJECT,
+];
 
 /// `OpUDiv`, `OpSDiv`, `OpUMod`, `OpSRem`, `OpSMod`.
 const INTEGER_DIVISION: [(u32, &str); 5] = [
@@ -290,29 +324,85 @@ const INTEGER_DIVISION: [(u32, &str); 5] = [
     (139, "OpSMod"),
 ];
 
+/// `OpConvertFToU`, `OpConvertFToS`.
+const FLOAT_TO_INTEGER: [(u32, &str); 2] = [(109, "OpConvertFToU"), (110, "OpConvertFToS")];
+
+const STORAGE_PRIVATE: u32 = 6;
+const STORAGE_FUNCTION: u32 = 7;
+
 /// A construct the emitted contract forbids, with how often and where it
 /// occurs.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Violation(pub String);
 
-/// What [`contract`] reads of a module's declarations.
-struct Declarations {
-    names: HashMap<u32, String>,
-    int_widths: HashMap<u32, u32>,
-    /// Vector type → component type.
-    vectors: HashMap<u32, u32>,
+/// A constant's value: equal values compare equal whatever their ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Value {
+    /// A scalar's type and literal words.
+    Scalar(u32, Vec<u32>),
+    /// A composite's type and constituents.
+    Composite(u32, Vec<Value>),
+    /// Known by id only: a specialization constant, or the zero of an
+    /// array whose length is one.
+    Opaque(u32),
 }
 
-impl Declarations {
-    fn of(module: &[u32], instructions: &[Instruction]) -> Self {
+/// What [`contract`] reads of a module's declarations.
+struct Declarations<'a> {
+    names: HashMap<u32, String>,
+    int_widths: HashMap<u32, u32>,
+    float_widths: HashMap<u32, u32>,
+    /// Vector type → (component type, count).
+    vectors: HashMap<u32, (u32, u32)>,
+    /// Array type → (element type, length id).
+    arrays: HashMap<u32, (u32, u32)>,
+    /// Cooperative-matrix types.
+    matrices: HashSet<u32>,
+    /// Pointer type → storage class.
+    storage: HashMap<u32, u32>,
+    /// Pointer value → its type.
+    pointer_types: HashMap<u32, u32>,
+    /// Constants, copies and constructions, by result id.
+    values: HashMap<u32, &'a [u32]>,
+    /// Function parameter → (function, position).
+    parameters: HashMap<u32, (u32, usize)>,
+    /// (Function, position) → the arguments its calls pass there.
+    arguments: HashMap<(u32, usize), Vec<u32>>,
+}
+
+impl<'a> Declarations<'a> {
+    fn of(module: &'a [u32], instructions: &[Instruction]) -> Self {
         let mut declarations = Self {
             names: HashMap::new(),
             int_widths: HashMap::new(),
+            float_widths: HashMap::new(),
             vectors: HashMap::new(),
+            arrays: HashMap::new(),
+            matrices: HashSet::new(),
+            storage: HashMap::new(),
+            pointer_types: HashMap::new(),
+            values: HashMap::new(),
+            parameters: HashMap::new(),
+            arguments: HashMap::new(),
         };
+        let mut function = (0, 0);
         for instruction in instructions {
             let words = &module[instruction.start..instruction.start + instruction.words];
             match instruction.opcode {
+                OP_FUNCTION => function = (words[2], 0),
+                OP_FUNCTION_PARAMETER => {
+                    declarations.parameters.insert(words[2], function);
+                    function.1 += 1;
+                }
+                OP_FUNCTION_CALL => {
+                    for (position, argument) in words[4..].iter().enumerate() {
+                        declarations
+                            .arguments
+                            .entry((words[3], position))
+                            .or_default()
+                            .push(*argument);
+                    }
+                }
                 OP_NAME => {
                     declarations
                         .names
@@ -321,10 +411,38 @@ impl Declarations {
                 OP_TYPE_INT => {
                     declarations.int_widths.insert(words[1], words[2]);
                 }
+                OP_TYPE_FLOAT => {
+                    declarations.float_widths.insert(words[1], words[2]);
+                }
                 OP_TYPE_VECTOR => {
-                    declarations.vectors.insert(words[1], words[2]);
+                    declarations.vectors.insert(words[1], (words[2], words[3]));
+                }
+                OP_TYPE_ARRAY => {
+                    declarations.arrays.insert(words[1], (words[2], words[3]));
+                }
+                OP_TYPE_COOPERATIVE_MATRIX => {
+                    declarations.matrices.insert(words[1]);
+                }
+                OP_TYPE_POINTER => {
+                    declarations.storage.insert(words[1], words[2]);
                 }
                 _ => {}
+            }
+            if POINTERS.contains(&instruction.opcode) {
+                declarations.pointer_types.insert(words[2], words[1]);
+            }
+            if matches!(
+                instruction.opcode,
+                OP_CONSTANT_TRUE
+                    | OP_CONSTANT_FALSE
+                    | OP_CONSTANT
+                    | OP_CONSTANT_COMPOSITE
+                    | OP_CONSTANT_NULL
+                    | OP_COMPOSITE_CONSTRUCT
+                    | OP_COPY_OBJECT
+            ) || SPEC_CONSTANTS.contains(&instruction.opcode)
+            {
+                declarations.values.insert(words[2], words);
             }
         }
         declarations
@@ -332,47 +450,211 @@ impl Declarations {
 
     /// The integer width of a scalar or vector type.
     fn int_width(&self, ty: u32) -> Option<u32> {
-        let component = self.vectors.get(&ty).copied().unwrap_or(ty);
+        let component = self
+            .vectors
+            .get(&ty)
+            .map_or(ty, |(component, _)| *component);
         self.int_widths.get(&component).copied()
+    }
+
+    /// The value of `id` if it is a constant, through copies and the
+    /// construction of composites from constants.
+    fn value(&self, id: u32) -> Option<Value> {
+        let words = self.values.get(&id)?;
+        match words[0] & 0xffff {
+            OP_CONSTANT_TRUE => Some(Value::Scalar(words[1], vec![1])),
+            OP_CONSTANT_FALSE => Some(Value::Scalar(words[1], vec![0])),
+            OP_CONSTANT => Some(Value::Scalar(words[1], words[3..].to_vec())),
+            OP_CONSTANT_NULL => Some(self.zero(words[1])),
+            OP_CONSTANT_COMPOSITE | OP_COMPOSITE_CONSTRUCT => words[3..]
+                .iter()
+                .map(|constituent| self.value(*constituent))
+                .collect::<Option<_>>()
+                .map(|constituents| Value::Composite(words[1], constituents)),
+            OP_COPY_OBJECT => self.value(words[3]),
+            _ => Some(Value::Opaque(id)),
+        }
+    }
+
+    /// The zero of `ty`, as its explicit constants spell it.
+    fn zero(&self, ty: u32) -> Value {
+        if let Some((component, count)) = self.vectors.get(&ty) {
+            return Value::Composite(ty, vec![self.zero(*component); *count as usize]);
+        }
+        if let Some((element, length)) = self.arrays.get(&ty) {
+            let length = self
+                .values
+                .get(length)
+                .filter(|words| words[0] & 0xffff == OP_CONSTANT)
+                .map(|words| words[3]);
+            return match length {
+                Some(length) => Value::Composite(ty, vec![self.zero(*element); length as usize]),
+                None => Value::Opaque(ty),
+            };
+        }
+        let width = self
+            .int_widths
+            .get(&ty)
+            .or_else(|| self.float_widths.get(&ty));
+        let words = width.map_or(1, |width| width.div_ceil(32));
+        Value::Scalar(ty, vec![0; words as usize])
+    }
+
+    /// Whether every array within `value` is a splat.
+    fn table_free(&self, value: &Value) -> bool {
+        match value {
+            Value::Composite(ty, constituents) => {
+                constituents
+                    .iter()
+                    .all(|constituent| self.table_free(constituent))
+                    && (!self.arrays.contains_key(ty)
+                        || constituents.windows(2).all(|pair| pair[0] == pair[1]))
+            }
+            Value::Scalar(..) | Value::Opaque(_) => true,
+        }
+    }
+
+    /// Whether `id` holds a constant table: is one, copies one, or is a
+    /// parameter some call passes one to.
+    fn table(&self, id: u32) -> bool {
+        let words = self.values.get(&id);
+        if let Some(words) = words.filter(|words| words[0] & 0xffff == OP_COPY_OBJECT) {
+            return self.table(words[3]);
+        }
+        if let Some(parameter) = self.parameters.get(&id) {
+            return self
+                .arguments
+                .get(parameter)
+                .is_some_and(|arguments| arguments.iter().any(|argument| self.table(*argument)));
+        }
+        self.value(id).is_some_and(|value| !self.table_free(&value))
+    }
+
+    /// Whether `pointer` addresses per-invocation (Function or Private)
+    /// storage.
+    fn per_invocation(&self, pointer: u32) -> bool {
+        self.pointer_types
+            .get(&pointer)
+            .and_then(|ty| self.storage.get(ty))
+            .is_some_and(|storage| matches!(*storage, STORAGE_FUNCTION | STORAGE_PRIVATE))
+    }
+
+    /// Whether `id` is a module-scope constant of a cooperative-matrix type.
+    fn matrix_constant(&self, id: u32) -> bool {
+        self.values.get(&id).is_some_and(|words| {
+            let opcode = words[0] & 0xffff;
+            (matches!(opcode, OP_CONSTANT_COMPOSITE | OP_CONSTANT_NULL)
+                || SPEC_CONSTANTS.contains(&opcode))
+                && self.matrices.contains(&words[1])
+        })
+    }
+}
+
+/// The value operands of `words` (an instruction in a function body) that
+/// can carry a whole cooperative matrix: what a stored, initialized,
+/// returned, passed, selected, merged, copied, inserted or multiplied-into
+/// matrix is read from.
+fn matrix_operands(words: &[u32]) -> Vec<u32> {
+    match words[0] & 0xffff {
+        OP_STORE => vec![words[2]],
+        OP_VARIABLE if words.len() > 4 => vec![words[4]],
+        OP_RETURN_VALUE => vec![words[1]],
+        OP_FUNCTION_CALL => words[4..].to_vec(),
+        OP_SELECT => words[4..6].to_vec(),
+        OP_PHI => words[3..].iter().step_by(2).copied().collect(),
+        OP_COPY_OBJECT => vec![words[3]],
+        OP_COMPOSITE_INSERT => words[3..5].to_vec(),
+        OP_COOPERATIVE_MATRIX_MUL_ADD => words[3..6].to_vec(),
+        _ => Vec::new(),
     }
 }
 
 /// The constructs of a formed, cleaned `module` the emitted contract
-/// forbids: a 64-bit integer division or remainder, scalar or vector.
-/// Drivers expand each into a long sequence (Mesa's Intel compiler about
-/// 2,300 instructions), copied by every unrolled loop around it.
-/// Arithmetic on specialization constants is folded at pipeline creation
-/// and is exempt.
+/// forbids:
+///
+/// - a 64-bit integer division or remainder, scalar or vector: drivers
+///   expand each into a long sequence (Mesa's Intel compiler about 2,300
+///   instructions, #159), copied by every unrolled loop around it.
+///   Arithmetic on specialization constants is folded at pipeline creation
+///   and is exempt;
+/// - a constant array that is not a splat (elements equal by value), at
+///   any depth of a constant, materialized in Function or Private storage by
+///   a variable's initializer or a store, directly, through copies, or
+///   through a function parameter: glslang copies a runtime-indexed constant
+///   table into per-invocation memory at every use. Vectors, zero arrays
+///   and splats are working state and stay legal. Lookup data lives in the
+///   device's table buffer;
+/// - a float converted to a 64-bit integer, scalar or vector: NVIDIA's
+///   compiler (580, GB10) converted 2^32 to 2^33 − 1 (`8f4cee7cf2`);
+/// - a cooperative-matrix constant read by more than one function: AMD's
+///   LLPC compiler faults in `vkCreateComputePipelines` on it
+///   (`seismic/hardware/rdna3-vulkan.md`).
+///
+/// The contract is syntactic: it does not infer a table a program computes
+/// element by element.
 pub fn contract(module: &[u32]) -> Result<Vec<Violation>, MalformedModule> {
     let instructions = instructions(module)?;
     let declarations = Declarations::of(module, &instructions);
     let mut found = BTreeMap::<(String, String), usize>::new();
+    let name = |function: u32| {
+        declarations
+            .names
+            .get(&function)
+            .cloned()
+            .unwrap_or_else(|| format!("%{function}"))
+    };
+    // Cooperative-matrix constant → the functions that read it.
+    let mut matrix_readers = BTreeMap::<u32, BTreeSet<u32>>::new();
     let mut function = None;
     for instruction in &instructions {
         let words = &module[instruction.start..instruction.start + instruction.words];
-        match instruction.opcode {
-            OP_FUNCTION => function = Some(words[2]),
-            OP_FUNCTION_END => function = None,
-            opcode => {
-                let Some((_, name)) = INTEGER_DIVISION
-                    .iter()
-                    .find(|(division, _)| *division == opcode)
-                    .filter(|_| declarations.int_width(words[1]) == Some(64))
-                else {
-                    continue;
-                };
-                let holder = function.map_or_else(
-                    || "module scope".to_owned(),
-                    |function| {
-                        declarations
-                            .names
-                            .get(&function)
-                            .cloned()
-                            .unwrap_or_else(|| format!("%{function}"))
-                    },
-                );
-                *found.entry((holder, format!("64-bit {name}"))).or_default() += 1;
+        if let Some(function) = function {
+            for operand in matrix_operands(words) {
+                if declarations.matrix_constant(operand) {
+                    matrix_readers.entry(operand).or_default().insert(function);
+                }
             }
+        }
+        let construct = match instruction.opcode {
+            OP_FUNCTION => {
+                function = Some(words[2]);
+                None
+            }
+            OP_FUNCTION_END => {
+                function = None;
+                None
+            }
+            OP_VARIABLE
+                if words.len() > 4
+                    && matches!(words[3], STORAGE_FUNCTION | STORAGE_PRIVATE)
+                    && declarations.table(words[4]) =>
+            {
+                Some("constant table initializing per-invocation storage".to_owned())
+            }
+            OP_STORE if declarations.per_invocation(words[1]) && declarations.table(words[2]) => {
+                Some("constant table stored to per-invocation storage".to_owned())
+            }
+            opcode => INTEGER_DIVISION
+                .iter()
+                .chain(&FLOAT_TO_INTEGER)
+                .find(|(forbidden, _)| *forbidden == opcode)
+                .filter(|_| declarations.int_width(words[1]) == Some(64))
+                .map(|(_, name)| format!("64-bit {name}")),
+        };
+        if let Some(construct) = construct {
+            let holder = function.map_or_else(|| "module scope".to_owned(), name);
+            *found.entry((holder, construct)).or_default() += 1;
+        }
+    }
+    for (constant, readers) in matrix_readers {
+        if readers.len() > 1 {
+            let holders = readers.into_iter().map(name).collect::<Vec<_>>().join("`, `");
+            *found
+                .entry((
+                    holders,
+                    format!("cooperative-matrix constant %{constant} read by more than one function"),
+                ))
+                .or_default() += 1;
         }
     }
     Ok(found
@@ -397,7 +679,7 @@ pub fn unsealed(module: &[u32], widths: &[u32]) -> Result<(usize, bool), Malform
             instruction.opcode == OP_DECORATE && words(instruction)[2] == DECORATION_NO_CONTRACTION
         })
         .map(|instruction| words(instruction)[1])
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<HashSet<_>>();
     let missing = instructions
         .iter()
         .filter(|instruction| FLOAT_ARITHMETIC.contains(&instruction.opcode))

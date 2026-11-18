@@ -85,10 +85,10 @@ impl Measurer {
     }
 
     /// Measure the points `store` holds no record of, each formed only once
-    /// `attempting` lets it proceed, nothing submitted that is forecast to
-    /// end past `deadline`, and record each but one not formed now, whose
-    /// timing failed or that expired ([`measure::measure_all`], the one
-    /// writer of records).
+    /// `attempting` lets it proceed, none begun once `deadline` has passed
+    /// and each begun timed to its end, and record each but one not formed
+    /// now, whose timing failed or that was not begun
+    /// ([`measure::measure_all`], the one writer of records).
     pub fn measure_all<K, W, G, F>(
         &mut self,
         points: Vec<(K, F)>,

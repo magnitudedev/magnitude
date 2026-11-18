@@ -21,7 +21,7 @@ use crate::{
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
-    InFlightState, OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance,
+    OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance,
     OwnedTailRelocation, RowDemand, SequenceState, StateCheckpoint, StateStore, StoreBindings,
     TentativeAdvance,
 };
@@ -59,9 +59,9 @@ pub use reader::{DeviceReader, LoadRoom, MachineReading, PlanningRoom, StatusRea
 pub use in_flight::{
     HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
 };
-use in_flight::{PrimingFlight, TargetWork, decode_selected};
+use in_flight::{PrimingFlight, Source, TargetWork, decode_selected};
 pub use ownership::OpenRequirements;
-pub use state::{MemoryChargeReconciliation, StoreAllocation};
+pub use state::{LoadCharge, StateBytes, StoreAllocation, StoreStateBytes};
 #[cfg(any(test, feature = "fixtures"))]
 pub use state::{SlotRelease, StateShrink, StateYield};
 pub use target::TargetHostTiming;
@@ -104,12 +104,6 @@ pub enum DomainError {
         growth: u64,
         ceiling: u64,
     },
-    /// A group of a chain's holder that is not the chain's queued chunk
-    /// (its round was lowered at other rows than the chain planned): the
-    /// chain was released, the holder's state with it, as an eviction's
-    /// (`ExecutorDomain::release_chain`). The holder replays from its
-    /// committed history; nothing else changed.
-    ChainReleased(RequestId),
 }
 
 impl DomainError {
@@ -161,7 +155,6 @@ impl std::fmt::Display for DomainError {
                 f,
                 "state growth of {growth} bytes beside {committed} committed exceeds the {ceiling}-byte state ceiling"
             ),
-            Self::ChainReleased(holder) => write!(f, "request {}'s group is not its chain's queued chunk: the chain was released", holder.0),
         }
     }
 }
@@ -237,13 +230,10 @@ pub struct StateBindings {
 
 impl StateBindings {
     /// The binding right of the target store, or of the head store.
-    fn store(&mut self, head: bool) -> Result<&mut StoreBindings, DomainError> {
-        if head {
-            self.head
-                .as_mut()
-                .ok_or_else(|| DomainError::invariant("head state growth without a head store"))
-        } else {
-            Ok(&mut self.target)
+    fn store(&mut self, head: bool) -> &mut StoreBindings {
+        match head {
+            true => self.head.as_mut().expect("invariant violated: head state binding without a head store"),
+            false => &mut self.target,
         }
     }
 }
@@ -367,15 +357,22 @@ impl LaunchDuration {
     }
 }
 
-/// The state an outcome publishes when reconciled.
+/// The rows an outcome owns until it is reconciled or aborted.
 enum Advance {
-    /// Its step's.
+    /// Its step's, published as it reconciles.
     Step(OwnedStateAdvance),
-    /// None of its own: a chunk of a prompt group's chain before its last,
-    /// whose rows the chain publishes with the last chunk's.
-    Chained,
-    /// The last chunk's: the whole chain.
-    Chain(OwnedChainAdvance),
+    /// A prompt group's first chunk, of flight `flight`, the rest of its
+    /// chain queued behind it: reconciled, it opens that chain, which holds
+    /// its rows.
+    Opens { flight: u64, first: OwnedStateAdvance },
+    /// A chunk of a chain, of flight `flight`, with the chain's state it
+    /// carries (`queue::Joined::Out`): reconciled, it joins it, and the
+    /// chain returns to its queue or, concluded meanwhile, its holder.
+    Chained {
+        flight: u64,
+        joined: OwnedChainAdvance,
+        chunk: magnitude_state::OwnedChainedAdvance,
+    },
 }
 
 impl PendingOperationOutcome {
@@ -647,8 +644,8 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// as it unbinds.
     vision_binding: Vec<crate::memory::ledger::Claim>,
     /// The bound optional components held as cache while no request is
-    /// resident (`ExecutorDomain::release_yielded`), committed again as one
-    /// opens (`ExecutorDomain::activate_components`).
+    /// resident (`ExecutorDomain::release_yielded`), kept again as one opens
+    /// (`ExecutorDomain::keep_components`).
     idle_components: Vec<serving_heap::IdleComponent>,
     /// The latest reading's answer ([`MemoryProbe::answer`]): each store's
     /// generation at it, and the response the owner owes.
@@ -679,8 +676,8 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// The service's measurement job's committed claim beside the model
     /// (`ExecutorDomain::claim_measurement_room`).
     measurement_claim: Option<state::MeasurementClaim>,
-    /// The committed claims of the prompt-group class held beyond one
-    /// place (`AllocatedResources::group_places`), from the group's open to
+    /// The places and committed claims of the prompt-group class held
+    /// beyond one place ([`Self::group_places`]), from the group's open to
     /// its close ([`Self::open_group`], [`Self::close_group`]): its
     /// device-side bytes on the device's ledger and its host bytes on host
     /// RAM's. None while groups hold one place.
@@ -692,8 +689,8 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// it begins, and freed with them as it ends
     /// (`AllocatedResources::release_idle_slots`), or let go as a group's
     /// class takes the slots again ([`Self::open_group`]). What claims took
-    /// of it in process releases until then ([`Self::idle_slots_taken`]).
-    idle_class: Vec<crate::memory::ledger::Cached>,
+    /// of it in process releases until then ([`state::IdleClass::taken`]).
+    idle_class: state::IdleClass,
 
     /// Identity of the next target flight.
     next_flight: u64,
@@ -752,7 +749,7 @@ impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
     /// the device is past it either way.
     fn drop(&mut self) {
         self.teardown = crate::memory::ledger::OpenChange::begin(self.resources.ledgers().changes());
-        match self.drain_queue() {
+        match self.conclude_chain() {
             Ok(()) => {}
             Err(DomainError::Device(error)) => {
                 tracing::warn!("a queued step the dropped load never claimed faulted: {error}");
@@ -953,7 +950,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn expert_holding_storage(&self, holding: BankHolding) -> Result<crate::planning::BankTier, DomainError> {
         self.family
             .expert_bank()
-            .ok_or_else(|| DomainError::invariant(format!("{holding:?} of a load without an expert bank")))?
+            .unwrap_or_else(|| panic!("invariant violated: {holding:?} of a load without an expert bank"))
             .holding_storage(holding)
     }
 
@@ -1002,8 +999,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     bank.device_convert(lines);
                 }
             }
-            (None, Some(_)) => return Err(DomainError::invariant("a banked load priced without its experts' measures")),
-            (Some(_), None) => return Err(DomainError::invariant("expert measures of a load without a bank")),
+            (None, Some(_)) => panic!("invariant violated: a banked load priced without its experts' measures"),
+            (Some(_), None) => panic!("invariant violated: expert measures of a load without a bank"),
         }
         tracing::info!(costs = measures.costs.as_ref().err().map_or("measured", String::as_str), "the load is priced");
         self.measures = Some(measures);
@@ -1251,7 +1248,7 @@ impl<'d> MemoryProbe<'d> {
                 // A plan of cache alone is carried out at once; one naming
                 // requests, each evictable now, is the owner's.
                 let owed = match shortage.as_mut().and_then(|shortage| shortage.response.relief.take_if(|plan| plan.preempt().is_empty())) {
-                    Some(plan) => ledger.execute(plan),
+                    Some(plan) => ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)),
                     None => crate::memory::ledger::Owed::default(),
                 };
                 StoreAnswer { ledger, generation, shortage, owed }
@@ -1652,7 +1649,7 @@ impl ExecutorDomain<NativeFamily> {
         if (head_loader.is_some() && definition.head.is_none() && definition.draft.is_none())
             || vision_loader.is_some() != definition.vision.is_some()
         {
-            return Err(DomainError::invariant("component loaders differ from enabled model components"));
+            panic!("invariant violated: component loaders differ from enabled model components");
         }
         // A draft head reading the target's history keeps no state arena.
         let keeps_history = definition.draft.is_some()
@@ -1661,11 +1658,14 @@ impl ExecutorDomain<NativeFamily> {
                 .as_ref()
                 .is_some_and(|head| head.history == magnitude_family_contracts::HeadHistory::Own);
         if head_state.is_some() != (head_loader.is_some() && keeps_history) {
-            return Err(DomainError::invariant("head state arena differs from enabled head component"));
+            panic!("invariant violated: head state arena differs from enabled head component");
         }
         // The family binds the target's constants, the arena's: one change
         // with their record.
-        let family = constants.allocate(|| NativeFamily::new(programs, resident, definition.decoder.clone(), resources.ledgers(), &mut recorded))?;
+        let device = resident.embedding.tensor().device();
+        let family = constants.allocate(&device, |charges| {
+            NativeFamily::new(charges, programs, resident, definition.decoder.clone(), resources.ledgers(), &mut recorded)
+        })?;
         recorded.record(constants);
         Self::with_family(
             execution,
@@ -1696,16 +1696,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The head (drafter) launches graphs were sealed for: the launch row
     /// bound and the span limit of the store its rows read (the head's own,
     /// or the target's for a head that keeps none).
-    fn head_class_limits(&self) -> Result<crate::batching::ClassLimits, DomainError> {
+    /// A load runs drafter launches only with a drafter, whose rows lie in
+    /// one of those stores.
+    fn head_class_limits(&self) -> crate::batching::ClassLimits {
         let store = match &self.head_store {
             Some(store) => store,
             None if self.head_reads_target() => &self.target_store,
-            None => return Err(DomainError::invariant("a head launch without a head store")),
+            None => panic!("invariant violated: a drafter launch on a load without a drafter"),
         };
-        Ok(crate::batching::ClassLimits {
+        crate::batching::ClassLimits {
             rows: self.execution.policy().limits().max_launch_rows,
             segments: store.max_span_limit(),
-        })
+        }
     }
 
     /// Whether the load's drafter is a head that keeps no history and reads
@@ -2070,7 +2072,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let first = operations
             .first()
-            .ok_or_else(|| DomainError::invariant("empty reservation"))?;
+            .expect("invariant violated: an empty group is reserved");
         let lane = ReservationLane::of(first);
         if operations.iter().any(|operation| {
             !matches!(
@@ -2080,9 +2082,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     | (ReservationLane::Vision, Operation::Encode { .. })
             )
         }) {
-            return Err(DomainError::invariant(
-                "reservation crosses numerical lanes",
-            ));
+            panic!("invariant violated: a reserved group crosses numerical lanes");
         }
         let mut priming_demand = Vec::new();
         let mut priming_banks = 0usize;
@@ -2094,9 +2094,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             } = operation
             {
                 if self.head_reads_target() {
-                    return Err(DomainError::invariant(
-                        "a head reading target history keeps no history to prime",
-                    ));
+                    panic!("invariant violated: a head reading target history keeps no history to prime");
                 }
                 if operations.len() != 1 {
                     return Err(DomainError::Input(
@@ -2179,7 +2177,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     }
                     rows = rows
                         .checked_add(operation.row_count())
-                        .ok_or_else(|| DomainError::invariant("reservation row count overflow"))?;
+                        .expect("invariant violated: a reserved group's rows overflow");
                     demand |= operation.demand();
                     let state = match lane {
                         ReservationLane::Target => self.target.get(&operation.request()),
@@ -2202,9 +2200,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             } if tokens.len() == 1 && !proposals.is_empty()
                         )
                     {
-                        return Err(DomainError::invariant(
-                            "a head reading target history drafts proposals from one anchor row",
-                        ));
+                        panic!("invariant violated: a head reading target history drafts proposals from one anchor row");
                     }
                     let position = match operation {
                         Operation::Forward { position, .. } | Operation::Head { position, .. } => {
@@ -2268,7 +2264,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let class_limits = if lane == ReservationLane::Target {
                     self.target_class_limits()
                 } else {
-                    self.head_class_limits()?
+                    self.head_class_limits()
                 };
                 let class = crate::LaunchClass::covering(rows, segments, demand, class_limits)
                     .map_err(|error| error.to_string())?;
@@ -2448,68 +2444,76 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Import and bind the optional component `lane` needs when it is
-    /// unbound, each allocation under its claim (`Self::claim_growth`): the
-    /// import's resident weights held by its loader for the import's life,
-    /// its upload peak only while it runs, and its graph constants for its
-    /// binding's life.
+    /// unbound, each allocation under its claim (`Self::claim_growth`), in
+    /// one change that keeps nothing: the import's resident weights held by
+    /// its loader for the import's life, its upload peak only while it
+    /// runs, and its graph constants for its binding's life.
     fn bind_component(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
-        // Its import and binding allocate under the claims below, tables included.
-        let _lifted = self.domain.device().lift_table_seal();
-        match lane {
-            ReservationLane::Head if !self.family.head_is_bound() => {
-                let loader = self
-                    .head_loader
-                    .as_ref()
-                    .ok_or_else(|| DomainError::Input("head component is disabled".into()))?;
-                let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
-                let resident = self.import_component(
-                    loader,
-                    self.execution.resources().bytes().head_weights,
-                    self.execution.load().head_upload_peak_bytes(),
-                )?;
-                let mut binding = self.claim_growth(
-                    crate::memory::ledger::CommittedKind::Component,
-                    crate::memory::ClaimDemand { device: constants, ..Default::default() },
-                )?;
-                binding.allocate(|| self.family.bind_head(resident, &self.definition))?;
-                self.head_binding = binding.into_claims();
-                self.hold_bound_head()?;
-                Ok(())
+        let changes = self.resources.ledgers().changes().clone();
+        changes.change(|keeping| {
+            let claiming = &keeping.claims();
+            // Its import and binding allocate under the claims below, tables included.
+            let device = self.domain.device().clone();
+            match lane {
+                ReservationLane::Head if !self.family.head_is_bound() => {
+                    let loader = self
+                        .head_loader
+                        .as_ref()
+                        .ok_or_else(|| DomainError::Input("head component is disabled".into()))?;
+                    let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
+                    let resident = self.import_component(
+                        claiming,
+                        loader,
+                        self.execution.resources().bytes().head_weights,
+                        self.execution.load().head_upload_peak_bytes(),
+                    )?;
+                    let mut binding = self.claim_growth(
+                        claiming,
+                        crate::memory::ledger::CommittedKind::Component,
+                        crate::memory::ClaimDemand { device: constants, ..Default::default() },
+                    )?;
+                    binding.allocate(&device, |charges| self.family.bind_head(charges, resident, &self.definition))?;
+                    self.head_binding = binding.into_claims();
+                    self.hold_bound_head(claiming)?;
+                    Ok(())
+                }
+                ReservationLane::Vision if !self.family.vision_is_bound() => {
+                    let loader = self
+                        .vision_loader
+                        .as_ref()
+                        .ok_or_else(|| DomainError::Input("vision component is disabled".into()))?;
+                    let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
+                    let resident = self.import_component(
+                        claiming,
+                        loader,
+                        self.execution.resources().bytes().vision_weights,
+                        self.execution.load().vision_upload_peak_bytes(),
+                    )?;
+                    let mut binding = self.claim_growth(
+                        claiming,
+                        crate::memory::ledger::CommittedKind::Component,
+                        crate::memory::ClaimDemand { device: constants, ..Default::default() },
+                    )?;
+                    binding.allocate(&device, |charges| self.family.bind_vision(charges, resident, &self.definition))?;
+                    self.vision_binding = binding.into_claims();
+                    Ok(())
+                }
+                _ => Ok(()),
             }
-            ReservationLane::Vision if !self.family.vision_is_bound() => {
-                let loader = self
-                    .vision_loader
-                    .as_ref()
-                    .ok_or_else(|| DomainError::Input("vision component is disabled".into()))?;
-                let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
-                let resident = self.import_component(
-                    loader,
-                    self.execution.resources().bytes().vision_weights,
-                    self.execution.load().vision_upload_peak_bytes(),
-                )?;
-                let mut binding = self.claim_growth(
-                    crate::memory::ledger::CommittedKind::Component,
-                    crate::memory::ClaimDemand { device: constants, ..Default::default() },
-                )?;
-                binding.allocate(|| self.family.bind_vision(resident, &self.definition))?;
-                self.vision_binding = binding.into_claims();
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+        })
     }
 
     /// `loader`'s component, imported where it is not yet: its `resident`
     /// bytes claimed for the import's life, kept by the loader, and its
     /// upload `peak` (staged through host RAM where that is a store apart)
-    /// claimed only while the import runs.
-    fn import_component<T: Clone>(&self, loader: &ComponentLoader<T>, resident: u64, peak: u64) -> Result<T, DomainError> {
-        let imported = match loader.imported() {
-            true => loader.load(),
-            false => {
+    /// claimed only while the import runs, each in `claiming`.
+    fn import_component<T: Clone>(&self, claiming: &crate::memory::ledger::Claiming, loader: &ComponentLoader<T>, resident: u64, peak: u64) -> Result<T, DomainError> {
+        let imported = match loader.resident() {
+            Some(resident) => Ok(resident),
+            None => {
                 use crate::memory::{ClaimDemand, ledger::CommittedKind};
-                let weights = self.claim_growth(CommittedKind::Component, ClaimDemand { device: resident, ..Default::default() })?;
-                let _upload = self.claim_growth(CommittedKind::Upload, ClaimDemand { device: peak, staged: peak, ..Default::default() })?;
+                let weights = self.claim_growth(claiming, CommittedKind::Component, ClaimDemand { device: resident, ..Default::default() })?;
+                let _upload = self.claim_growth(claiming, CommittedKind::Upload, ClaimDemand { device: peak, staged: peak, ..Default::default() })?;
                 loader.import(weights)
             }
         };
@@ -2531,9 +2535,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<DomainReservation, DomainError> {
         let requirements = self.requirements(operations)?;
         if requirements.claim {
-            let slots = self
-                .claim_slots(operations)
-                .ok_or_else(|| DomainError::invariant("a claimable group lost its queued step"))?;
+            let slots = self.claim_slots(operations).expect("invariant violated: a claimable group lost its queued step");
             return Ok(DomainReservation {
                 requirements,
                 resources: ReservedResources::Target(TargetGraphReservation::Claim(slots)),
@@ -2547,10 +2549,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.can_reserve(&requirements)
             .map_err(DomainError::Capacity)?;
         let reads_target = requirements.lane == ReservationLane::Head && self.head_reads_target();
-        let invariant = |detail: &str, error: CapacityError| {
-            DomainError::invariant(format!(
-                "{detail} changed after availability check: {error}"
-            ))
+        // Each lease and state was found available above: one missing now
+        // is a broken invariant, which would drop what was taken before it.
+        let invariant = |detail: &str, error: CapacityError| -> ! {
+            panic!("invariant violated: {detail} changed after availability check: {error}")
         };
         let boundary = self.boundary.take();
         let resources = match requirements.lane {
@@ -2558,20 +2560,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let graph = self.resources.target_graph();
                 let graph_workspace = graph
                     .acquire_workspace()
-                    .map_err(|error| invariant("target graph workspace", error))?;
+                    .unwrap_or_else(|error| invariant("target graph workspace", error));
                 let output = || {
                     graph
                         .acquire_output()
-                        .map_err(|error| invariant("target graph output", error))
+                        .unwrap_or_else(|error| invariant("target graph output", error))
                 };
-                let (graph_output, spare_output) = (output()?, output()?);
+                let (graph_output, spare_output) = (output(), output());
                 let readout = self.resources.target_readout_graph(requirements.projected);
                 let readout_workspace = readout
                     .acquire_workspace()
-                    .map_err(|error| invariant("target readout workspace", error))?;
+                    .unwrap_or_else(|error| invariant("target readout workspace", error));
                 let readout_output = readout
                     .acquire_output()
-                    .map_err(|error| invariant("target readout output", error))?;
+                    .unwrap_or_else(|error| invariant("target readout output", error));
                 ReservedResources::Target(TargetGraphReservation::Launch(TargetLaunchReservation {
                     advances: Vec::with_capacity(operations.len()),
                     graph_workspace,
@@ -2588,10 +2590,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 ReservedResources::Head(
                     graph
                         .acquire_workspace()
-                        .map_err(|error| invariant("head graph workspace", error))?,
+                        .unwrap_or_else(|error| invariant("head graph workspace", error)),
                     graph
                         .acquire_output()
-                        .map_err(|error| invariant("head graph output", error))?,
+                        .unwrap_or_else(|error| invariant("head graph output", error)),
                     if reads_target {
                         HeadReservation::TargetReads(Vec::with_capacity(operations.len()))
                     } else {
@@ -2605,10 +2607,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 ReservedResources::Vision(
                     graph
                         .acquire_workspace(class)
-                        .map_err(|error| invariant("vision graph workspace", error))?,
+                        .unwrap_or_else(|error| invariant("vision graph workspace", error)),
                     graph
                         .acquire_output(class)
-                        .map_err(|error| invariant("vision graph output", error))?,
+                        .unwrap_or_else(|error| invariant("vision graph output", error)),
                 )
             }
         };
@@ -2631,10 +2633,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         let graph = self.resources.head_graph().expect("checked head graph");
                         let graph_workspace = graph
                             .acquire_workspace()
-                            .map_err(|error| invariant("drafter entry workspace", error))?;
+                            .unwrap_or_else(|error| invariant("drafter entry workspace", error));
                         let graph_output = graph
                             .acquire_output()
-                            .map_err(|error| invariant("drafter entry output", error))?;
+                            .unwrap_or_else(|error| invariant("drafter entry output", error));
                         let state = self
                             .head
                             .remove(request)
@@ -2648,12 +2650,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                                     graph_output,
                                 })
                             }
-                            Err((state, error)) => {
-                                self.head.insert(*request, state);
-                                return Err(DomainError::invariant(format!(
-                                    "drafter state capacity changed after availability check: {error}"
-                                )));
-                            }
+                            Err((_, error)) => panic!("invariant violated: drafter state capacity changed after availability check: {error}"),
                         }
                     }
                 }
@@ -2669,18 +2666,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         operation.committed_rows(),
                     ) {
                         Ok(advance) => advances.push(advance),
-                        Err((state, error)) => {
-                            self.target.insert(request, state);
-                            for (operation, advance) in operations.iter().zip(advances.drain(..)) {
-                                self.target.insert(operation.request(), advance.abort());
-                            }
-                            if let Some(priming) = priming.take() {
-                                self.head.insert(request, priming.advance.abort());
-                            }
-                            return Err(DomainError::invariant(format!(
-                                "target state capacity changed after availability check: {error}"
-                            )));
-                        }
+                        Err((_, error)) => panic!("invariant violated: target state capacity changed after availability check: {error}"),
                     }
                 }
             }
@@ -2706,15 +2692,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         operation.committed_rows(),
                     ) {
                         Ok(advance) => advances.push(advance),
-                        Err((state, error)) => {
-                            self.head.insert(request, state);
-                            for (operation, advance) in operations.iter().zip(advances.drain(..)) {
-                                self.head.insert(operation.request(), advance.abort());
-                            }
-                            return Err(DomainError::invariant(format!(
-                                "head state capacity changed after availability check: {error}"
-                            )));
-                        }
+                        Err((_, error)) => panic!("invariant violated: head state capacity changed after availability check: {error}"),
                     }
                 }
             }
@@ -2799,7 +2777,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             served: Default::default(),
             measurement_claim: None,
             group_class: None,
-            idle_class: Vec::new(),
+            idle_class: state::IdleClass::default(),
             idle_components: Vec::new(),
             answered: RefCell::default(),
             next_flight: 0,
@@ -2833,6 +2811,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
     pub fn resources(&self) -> &ResourceDomain {
         &self.domain
+    }
+
+    /// Charges of a measurement job run on this domain's device beside it,
+    /// in its process (a tool's): its ledgers' measurement holding
+    /// ([`crate::memory::ledger::DeviceLedgers::measurement`]).
+    pub fn measurement_charges(&self) -> seismic::Charges {
+        self.resources.ledgers().measurement(self.domain.device())
     }
 
     /// The compatibility key of an operation. Keying does not validate;

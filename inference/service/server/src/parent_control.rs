@@ -47,22 +47,20 @@ pub fn install() -> anyhow::Result<watch::Receiver<bool>> {
         "managed ICN must lead its owned process group"
     );
     let (shutdown, receiver) = watch::channel(false);
-    std::thread::Builder::new()
-        .name("icn-parent-channel-watchdog".to_owned())
-        .spawn(move || {
-            let _ = read_commands(std::io::stdin().lock(), || {
-                shutdown.send_replace(true);
-            });
-            // This path is independent of Tokio and remains armed during orderly shutdown.
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-libc::getpid(), libc::SIGKILL);
-                libc::_exit(91);
-            }
-            #[cfg(windows)]
-            std::process::exit(91);
-        })
-        .context("cannot start ICN parent-channel watchdog")?;
+    seismic::threads::spawn("icn-parent-channel-watchdog", move || {
+        let _ = read_commands(std::io::stdin().lock(), || {
+            shutdown.send_replace(true);
+        });
+        // This path is independent of Tokio and remains armed during orderly shutdown.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-libc::getpid(), libc::SIGKILL);
+            libc::_exit(91);
+        }
+        #[cfg(windows)]
+        std::process::exit(91);
+    })
+    .context("cannot start ICN parent-channel watchdog")?;
     Ok(receiver)
 }
 

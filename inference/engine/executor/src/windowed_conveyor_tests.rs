@@ -238,7 +238,7 @@ fn open_domain(
     .unwrap();
     let mut programs = AttestedPrograms::prepare_draft(
         &draft,
-        &device,
+        &seismic::Charges::tally(&device),
         crate::TuningContext {
             definition,
             weights: &crate::ZeroTuningWeights,
@@ -304,10 +304,10 @@ fn open_domain(
         &mut recorded,
         crate::memory::ledger::CommittedKind::Arena,
         scratch,
-        || {
+        |charges| {
             ResourceAllocator::allocate(
                 &execution,
-                &device,
+                charges,
                 identity.clone(),
                 programs.target_graphs().unwrap(),
                 programs.target_readout_graphs().unwrap(),
@@ -325,9 +325,9 @@ fn open_domain(
         None => load.target_weight_demand(),
     }
     .unwrap();
-    let mut weights = ledgers.claim(&device, crate::memory::ledger::CommittedKind::Load, demand).unwrap();
+    let mut weights = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, demand)).unwrap();
     let host_tables = crate::memory::ClaimDemand { host: load.host_table_bytes().unwrap(), ..Default::default() };
-    let host_tables = ledgers.claim(&device, crate::memory::ledger::CommittedKind::Load, host_tables).unwrap();
+    let host_tables = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, host_tables)).unwrap();
     let pools = crate::LoadPools::open(&device, &ledgers, &execution).unwrap();
     let mut residency = ResidencyStore::for_target(
         device.clone(),
@@ -340,17 +340,17 @@ fn open_domain(
     )
     .unwrap();
     let target = weights
-        .allocate(|| residency.load_target(definition, package, &host_tables, Box::new(|_, _| ())))
+        .allocate(&device, |charges| residency.load_target(charges, definition, package, &host_tables, Box::new(|_, _| ())))
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     recorded.record(weights);
     recorded.record(host_tables);
     let plan = execution.resources().clone();
-    let target_state = plan.allocate_target_state(device.clone(), pools.state.clone()).unwrap();
+    let target_state = plan.allocate_target_state(&seismic::Charges::tally(&device), pools.state.clone()).unwrap();
     let constants = crate::memory::ClaimDemand {
         device: programs.target_graphs().unwrap().binding_constant_bytes().unwrap(),
         ..Default::default()
     };
-    let constants = resources.ledgers().claim(&device, crate::memory::ledger::CommittedKind::Load, constants).unwrap();
+    let constants = resources.ledgers().changes().change(|keeping| resources.ledgers().claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, constants)).unwrap();
     let request_slot = crate::domain::fixtures::request_slot(resources.ledgers(), &device, &execution, 0);
     let reader = crate::DeviceReader::open(
         Rc::new(seismic::Devices::discover(&[]).unwrap()),

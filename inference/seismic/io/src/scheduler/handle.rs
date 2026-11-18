@@ -138,6 +138,8 @@ pub(crate) struct RequestState {
     /// Its ranges, which hold their destinations while any piece may write
     /// them.
     _ranges: Vec<Range>,
+    /// Its submitter, as whose a panic reading its pieces ends.
+    pub(crate) submitter: seismic_threads::Submitter,
 }
 
 pub(crate) struct Progress {
@@ -152,6 +154,8 @@ pub(crate) struct Progress {
 }
 
 impl RequestState {
+    /// A request submitted on the calling thread, for which its pieces are
+    /// read ([`Self::submitter`]).
     pub(crate) fn new(pieces: usize, failed: Vec<(usize, Arc<Error>)>, outstanding: Arc<std::sync::atomic::AtomicUsize>, ranges: Vec<Range>) -> Arc<Self> {
         Arc::new(Self {
             progress: Mutex::new(Progress {
@@ -165,6 +169,7 @@ impl RequestState {
             outstanding,
             started: Arc::default(),
             _ranges: ranges,
+            submitter: seismic_threads::Submitter::here(),
         })
     }
 

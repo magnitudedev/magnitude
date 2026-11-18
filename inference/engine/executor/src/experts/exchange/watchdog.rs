@@ -170,13 +170,11 @@ impl Watchdog {
             .collect();
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stopped = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("expert-exchange-watchdog".into())
-            .spawn(move || {
-                let watch = Watch::new(tables, parked, ended, events, reads, witnesses, Instant::now());
-                run(watch, &*bounds, trip, &stopped)
-            })
-            .map_err(|error| format!("the exchange's watchdog: {error}"))?;
+        let thread = seismic::threads::spawn("expert-exchange-watchdog", move || {
+            let watch = Watch::new(tables, parked, ended, events, reads, witnesses, Instant::now());
+            run(watch, &*bounds, trip, &stopped)
+        })
+        .map_err(|error| format!("the exchange's watchdog: {error}"))?;
         Ok(Self { stop, thread: Some(thread), _reports: reports })
     }
 }

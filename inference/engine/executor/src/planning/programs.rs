@@ -992,7 +992,7 @@ pub(super) fn derive_program_plan(
             Ok::<_, PlanError>(HeadProgramPlan::new(slots))
         })
         .transpose()?;
-    let vision_program = match (definition.vision.as_ref(), vision) {
+    let vision_program = match (definition.vision.as_deref(), vision) {
         (Some(description), Some(weights)) => {
             let program = operators::vision::vision_program(description, &|role| {
                 lookup(weights, role.scope, role.kind)

@@ -47,7 +47,7 @@ fn require_f32_near(
 }
 
 fn u64_tensor(
-    device: &Device,
+    charges: &seismic::Charges,
     values: &[u64],
     entry: &'static str,
     bindings: &str,
@@ -56,12 +56,12 @@ fn u64_tensor(
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::u64(), &[values.len() as u64], &bytes)
+    Tensor::from_host(charges, Element::u64(), &[values.len() as u64], &bytes)
         .map_err(|error| qualification_dynamic(entry, bindings, error))
 }
 
 fn u32_tensor(
-    device: &Device,
+    charges: &seismic::Charges,
     values: &[u32],
     entry: &'static str,
     bindings: &str,
@@ -70,7 +70,7 @@ fn u32_tensor(
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::u32(), &[values.len() as u64], &bytes)
+    Tensor::from_host(charges, Element::u32(), &[values.len() as u64], &bytes)
         .map_err(|error| qualification_dynamic(entry, bindings, error))
 }
 
@@ -96,9 +96,9 @@ struct SlotControls {
 }
 
 impl SlotControls {
-    fn new(device: &Device, entry: &'static str, label: &str) -> Result<Self, CatalogFailure> {
+    fn new(charges: &seismic::Charges, entry: &'static str, label: &str) -> Result<Self, CatalogFailure> {
         let i32s =
-            |extents: &[u64], values: &[i32]| semantic_i32(device, extents, values, entry, label);
+            |extents: &[u64], values: &[i32]| semantic_i32(charges, extents, values, entry, label);
         Ok(Self {
             segments: i32s(&[2, 2], &[0, 1, 1, 1])?,
             stop: i32s(&[1], &[1])?,
@@ -116,7 +116,7 @@ impl<'a> QualificationView<'a> {
     /// stream's inverse `rsqrt(1 + epsilon)`, and its partials
     /// `sigmoid(0) · inverse / S`; the widening copies its row into each
     /// stream.
-    pub(super) fn qualify_streams(&self, device: &Device) -> Result<(), CatalogFailure> {
+    pub(super) fn qualify_streams(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
         let mut qualified = QualifiedSites::default();
         let mut sinkhorn = std::collections::HashSet::new();
         let mut widened = false;
@@ -130,26 +130,26 @@ impl<'a> QualificationView<'a> {
         {
             let (hidden, streams) = match binding {
                 BlockStreams::LowRank(binding) => {
-                    qualify_stream_binding(device, binding, kernels, &mut qualified)?;
+                    qualify_stream_binding(charges, binding, kernels, &mut qualified)?;
                     (binding.geometry.hidden, binding.geometry.streams)
                 }
                 BlockStreams::Sinkhorn(binding) => {
                     if sinkhorn.insert(binding) {
-                        qualify_sinkhorn_binding(device, binding, kernels)?;
+                        qualify_sinkhorn_binding(charges, binding, kernels)?;
                     }
                     (binding.hidden, binding.streams)
                 }
             };
             if !widened {
-                qualify_widening(device, hidden, streams, kernels, &format!("{binding:?}"))?;
+                qualify_widening(charges, hidden, streams, kernels, &format!("{binding:?}"))?;
                 widened = true;
             }
         }
         for block in self.programs.head.iter().flat_map(|head| &head.blocks) {
             if let Some((binding, kernels)) = block.binding.streams.zip(block.streams.as_ref()) {
-                qualify_stream_binding(device, binding, kernels, &mut QualifiedSites::default())?;
+                qualify_stream_binding(charges, binding, kernels, &mut QualifiedSites::default())?;
                 let label = format!("{binding:?}");
-                qualify_widening(device, binding.geometry.hidden, binding.geometry.streams, kernels, &label)?;
+                qualify_widening(charges, binding.geometry.hidden, binding.geometry.streams, kernels, &label)?;
             }
         }
         Ok(())
@@ -162,7 +162,7 @@ impl<'a> QualificationView<'a> {
     /// zero key is `sigmoid(0) = 1/2` with a zero value's inverse
     /// `rsqrt(epsilon)`; and `ngram_add` of a zero value, or `ngram_inject`
     /// of one through zero taps, leaves the streams unchanged.
-    pub(super) fn qualify_ngram(&self, device: &Device) -> Result<(), CatalogFailure> {
+    pub(super) fn qualify_ngram(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
         let mut qualified = std::collections::HashSet::new();
         for ((index, slot), (attested, block)) in
             self.plan.target().blocks().iter().enumerate().zip(
@@ -202,14 +202,14 @@ impl<'a> QualificationView<'a> {
                 sublayer: u32::try_from(sublayer)
                     .map_err(|_| qualification_dynamic("target_ngram", &label, "sublayer index"))?,
             });
-            self.qualify_ngram_input(device, binding, kernels, hash, scope, &label)?;
+            self.qualify_ngram_input(charges, binding, kernels, hash, scope, &label)?;
         }
         Ok(())
     }
 
     fn qualify_ngram_input(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         binding: crate::NGramBinding,
         kernels: &NGramKernels,
         hash: &NGramHash,
@@ -221,8 +221,8 @@ impl<'a> QualificationView<'a> {
         let (s, h) = (binding.streams, binding.hidden);
         let heads = binding.heads();
         let zeros =
-            |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, label);
-        let controls = SlotControls::new(device, entry, label)?;
+            |element, extents: &[u64]| semantic_zeros(charges, element, extents, entry, label);
+        let controls = SlotControls::new(charges, entry, label)?;
         // One tape row, the least a bank holds, in each window: a
         // convolution's window, then the token window.
         let window_region = binding.convolution.map(|taps| seismic::SlabRegion {
@@ -237,7 +237,7 @@ impl<'a> QualificationView<'a> {
             }])
             .collect::<Vec<_>>();
         let token_region = regions.len() - 1;
-        let banks = crate::experts::pooled_slabs(device, seismic::Contract::DeviceOnly, 2, 2, &regions, 1)
+        let banks = crate::experts::pooled_slabs(charges, seismic::Contract::DeviceOnly, 2, 2, &regions, 1)
             .map_err(|error| qualification_dynamic(entry, label, error))?;
         banks
             .add_slab(seismic::SlabFill::Zeroed)
@@ -253,7 +253,7 @@ impl<'a> QualificationView<'a> {
         // A fresh sequence's first token: every predecessor reads as the
         // fill.
         const TOKEN: i32 = 5;
-        let tokens = semantic_i32(device, &[1, 2], &[TOKEN, 0], "ngram_rows", label)?;
+        let tokens = semantic_i32(charges, &[1, 2], &[TOKEN, 0], "ngram_rows", label)?;
         let word = |value: u64, what: &str| {
             i32::try_from(value)
                 .map_err(|_| qualification_dynamic("ngram_rows", label, format!("{what} exceeds i32")))
@@ -268,13 +268,13 @@ impl<'a> QualificationView<'a> {
         let map = hash.token_map.as_deref().unwrap_or(&[]);
         let rows = kernels
             .rows
-            .call(ngram_rows::Args {
+            .call(charges, ngram_rows::Args {
                 tokens: &tokens,
-                multipliers: &u64_tensor(device, &hash.multipliers, "ngram_rows", label)?,
-                sizes: &u64_tensor(device, &hash.sizes, "ngram_rows", label)?,
-                offsets: &u64_tensor(device, &hash.offsets, "ngram_rows", label)?,
-                map: &u32_tensor(device, map, "ngram_rows", label)?,
-                boundary: &semantic_i32(device, &[boundary.len() as u64], &boundary, "ngram_rows", label)?,
+                multipliers: &u64_tensor(charges, &hash.multipliers, "ngram_rows", label)?,
+                sizes: &u64_tensor(charges, &hash.sizes, "ngram_rows", label)?,
+                offsets: &u64_tensor(charges, &hash.offsets, "ngram_rows", label)?,
+                map: &u32_tensor(charges, map, "ngram_rows", label)?,
+                boundary: &semantic_i32(charges, &[boundary.len() as u64], &boundary, "ngram_rows", label)?,
                 segments: &controls.segments,
                 stop: &controls.stop,
                 previous_bank: &controls.previous_bank,
@@ -308,7 +308,7 @@ impl<'a> QualificationView<'a> {
         let slots = zeros(binding.table, &[1, 1, binding.width])?;
         let decoded = kernels
             .stored
-            .call(stored_rows::Args {
+            .call(charges, stored_rows::Args {
                 slots: &slots,
                 tokens: &zeros(Element::i32(), &[heads, 2])?,
                 directory: &zeros(Element::i32(), &[0, 1])?,
@@ -340,10 +340,10 @@ impl<'a> QualificationView<'a> {
                 })?;
             let extent = weight_plan.scale_extent();
             let result = kernel
-                .call(project_rows::Args {
+                .call(charges, project_rows::Args {
                     source: &decoded,
                     weight_bound: &semantic_ones(
-                        device,
+                        charges,
                         Element::f32(),
                         &[weight_plan.bound],
                         "project_rows",
@@ -351,7 +351,7 @@ impl<'a> QualificationView<'a> {
                     )?,
                     weight: &zeros(element, &[outputs, binding.embedding()])?,
                     weight_scale: &semantic_ones(
-                        device,
+                        charges,
                         Element::f32(),
                         &[extent],
                         "project_rows",
@@ -367,12 +367,12 @@ impl<'a> QualificationView<'a> {
         let value = project(kernels.value.first(), WeightKind::NGramValue, binding.value, h)?;
 
         let streams_values = vec![1.0_f32; (s * h) as usize];
-        let streams = semantic_f32(device, &[1, s * h], &streams_values, entry, label)?;
-        let norm = semantic_ones(device, binding.norm, &[s, h], entry, label)?;
+        let streams = semantic_f32(charges, &[1, s * h], &streams_values, entry, label)?;
+        let norm = semantic_ones(charges, binding.norm, &[s, h], entry, label)?;
         let product = binding.gate.product();
         let scales = kernels
             .gate
-            .call(ngram_gate::Args {
+            .call(charges, ngram_gate::Args {
                 hidden: &view(&streams, &[1, s, h], "ngram_gate", label)?,
                 key: &view(&key, &[1, s, h], "ngram_gate", label)?,
                 value: &value,
@@ -391,7 +391,7 @@ impl<'a> QualificationView<'a> {
         let (injected, name) = match (&kernels.output, binding.convolution, window.as_mut()) {
             (NGramOutputKernel::Add(kernel), None, None) => (
                 kernel
-                    .call(ngram_add::Args {
+                    .call(charges, ngram_add::Args {
                         hidden: &streams,
                         scales: &scales,
                         value: &value,
@@ -402,7 +402,7 @@ impl<'a> QualificationView<'a> {
             ),
             (NGramOutputKernel::Inject(kernel), Some(taps), Some(window)) => (
                 kernel
-                    .call(ngram_inject::Args {
+                    .call(charges, ngram_inject::Args {
                         hidden: &streams,
                         scales: &scales,
                         value: &value,
@@ -443,7 +443,7 @@ struct QualifiedSites {
 
 /// The entries of `binding`'s low-rank sites that `qualified` lacks.
 fn qualify_stream_binding(
-    device: &Device,
+    charges: &seismic::Charges,
     binding: StreamsBinding,
     kernels: &StreamsKernels,
     qualified: &mut QualifiedSites,
@@ -456,7 +456,7 @@ fn qualify_stream_binding(
     let (h, s, r) = (geometry.hidden, geometry.streams, geometry.rank);
     let entry = "target_streams";
     const EPSILON: f32 = 1.0e-5;
-    let streams = semantic_ones(device, Element::f32(), &[1, s * h], entry, &label)?;
+    let streams = semantic_ones(charges, Element::f32(), &[1, s * h], entry, &label)?;
     let hidden = view(&streams, &[1, s, h], entry, &label)?;
     let inverse = 1.0 / (1.0 + EPSILON).sqrt();
     let inverses = vec![inverse; s as usize];
@@ -469,12 +469,12 @@ fn qualify_stream_binding(
         if !qualified.down.insert(site.down) && !up_pending {
             continue;
         }
-        let norm = semantic_ones(device, site.down.norm, &[s, h], entry, &label)?;
-        let down = semantic_zeros(device, site.down.down, &[r, s * h], entry, &label)?;
+        let norm = semantic_ones(charges, site.down.norm, &[s, h], entry, &label)?;
+        let down = semantic_zeros(charges, site.down.down, &[r, s * h], entry, &label)?;
         // An exit site injects into nothing: its inject weights are a
         // zero-row view of its down weights.
         let inject = match site.down.inject {
-            Some(element) => semantic_zeros(device, element, &[s, s * h], entry, &label)?,
+            Some(element) => semantic_zeros(charges, element, &[s, s * h], entry, &label)?,
             None => down
                 .slice_leading(0, 0)
                 .map_err(|error| qualification_dynamic("stream_mix_down", &label, error))?,
@@ -482,7 +482,7 @@ fn qualify_stream_binding(
         let mixed = kernels
             .down
             .first()
-            .call(stream_mix_down::Args {
+            .call(charges, stream_mix_down::Args {
                 hidden: &hidden,
                 norm: &norm,
                 down_weight: &down,
@@ -498,11 +498,11 @@ fn qualify_stream_binding(
         if !up_pending {
             continue;
         }
-        let up = semantic_zeros(device, site.up.up, &[s * h, r], entry, &label)?;
+        let up = semantic_zeros(charges, site.up.up, &[s * h, r], entry, &label)?;
         let partials = kernels
             .up
             .first()
-            .call(stream_mix_up::Args {
+            .call(charges, stream_mix_up::Args {
                 low: &mixed.r0,
                 up_weight: &up,
                 hidden: &hidden,
@@ -532,7 +532,7 @@ fn qualify_stream_binding(
 /// collapse of ones streams by unit pre is `S` and their mean 1, and the
 /// join of ones streams and output with unit post and comb `S + 1`.
 fn qualify_sinkhorn_binding(
-    device: &Device,
+    charges: &seismic::Charges,
     binding: SinkhornBinding,
     kernels: &StreamsKernels,
 ) -> Result<(), CatalogFailure> {
@@ -542,16 +542,16 @@ fn qualify_sinkhorn_binding(
         unreachable!("preparation gives Sinkhorn streams their entries: {label}")
     };
     let SinkhornBinding { hidden: h, streams: s, mixing, .. } = binding;
-    let ones = |extents: &[u64]| semantic_ones(device, Element::f32(), extents, entry, &label);
-    let zeros = |extents: &[u64]| semantic_zeros(device, Element::f32(), extents, entry, &label);
+    let ones = |extents: &[u64]| semantic_ones(charges, Element::f32(), extents, entry, &label);
+    let zeros = |extents: &[u64]| semantic_zeros(charges, Element::f32(), extents, entry, &label);
     let streams = ones(&[1, s * h])?;
     let carried = binding.carried();
     let one_hot = (0..carried * s).map(|at| if at == 0 { 1.0 } else { 0.0 }).collect::<Vec<_>>();
     let site = sinkhorn
         .site
-        .call(stream_mix_sinkhorn::Args {
+        .call(charges, stream_mix_sinkhorn::Args {
             hidden: &view(&streams, &[1, s, h], entry, &label)?,
-            previous: &semantic_f32(device, &[1, carried * s], &one_hot, entry, &label)?,
+            previous: &semantic_f32(charges, &[1, carried * s], &one_hot, entry, &label)?,
             function: &zeros(&[(2 + s) * s, s * h])?,
             base: &zeros(&[(2 + s) * s])?,
             scale: &ones(&[3])?,
@@ -577,7 +577,7 @@ fn qualify_sinkhorn_binding(
     let previous = binding.exit.previous();
     let collapsed = sinkhorn
         .collapse
-        .call(stream_collapse::Args {
+        .call(charges, stream_collapse::Args {
             hidden: &view(&streams, &[1, s, h], entry, &label)?,
             pre: &ones(&[1, previous * s])?,
         })
@@ -587,7 +587,7 @@ fn qualify_sinkhorn_binding(
     require_f32_near(&collapsed, &vec![collapse; h as usize], "stream_collapse", &label)?;
     let joined = sinkhorn
         .join
-        .call(stream_join::Args {
+        .call(charges, stream_join::Args {
             residual: &streams,
             y: &ones(&[1, h])?,
             inject: &ones(&[1, s + s * s])?,
@@ -599,7 +599,7 @@ fn qualify_sinkhorn_binding(
 
 /// The widening of embedded rows into `streams` streams of `hidden`.
 fn qualify_widening(
-    device: &Device,
+    charges: &seismic::Charges,
     h: u64,
     s: u64,
     kernels: &StreamsKernels,
@@ -608,12 +608,12 @@ fn qualify_widening(
     let row_values = (0..h)
         .map(|index| (index % 7) as f32 - 3.0)
         .collect::<Vec<_>>();
-    let row = semantic_f32(device, &[1, h], &row_values, "repeat_rows", &label)?;
+    let row = semantic_f32(charges, &[1, h], &row_values, "repeat_rows", &label)?;
     let widened = kernels
         .repeat
-        .call(repeat_rows::Args {
+        .call(charges, repeat_rows::Args {
             rows: &row,
-            scales: &semantic_ones(device, Element::f32(), &[s], "repeat_rows", &label)?,
+            scales: &semantic_ones(charges, Element::f32(), &[s], "repeat_rows", &label)?,
         })
         .map_err(|error| qualification_dynamic("repeat_rows", &label, error))?
         .value;

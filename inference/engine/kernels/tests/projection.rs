@@ -296,7 +296,7 @@ impl Weight {
             &NativeSpecialization::new(),
         )
         .unwrap()
-        .call(packing_bound::Args {
+        .call(&seismic::Charges::tally(device), packing_bound::Args {
             weight: &self.tensor(device),
             bound: &mut bound,
         })
@@ -312,7 +312,7 @@ impl Weight {
     /// registry's packet form.
     fn tensor_in(&self, device: &Device, layout: registry::Layout) -> Tensor {
         let shape = [self.rows as u64, self.k as u64];
-        Tensor::from_host(device, self.repr.element_in(layout), &shape, &self.bytes_in(layout)).unwrap()
+        Tensor::from_host(&seismic::Charges::tally(device), self.repr.element_in(layout), &shape, &self.bytes_in(layout)).unwrap()
     }
     /// The host-built `rows16` bytes in `layout`.
     fn bytes_in(&self, layout: registry::Layout) -> std::borrow::Cow<'_, [u8]> {
@@ -575,7 +575,7 @@ fn f32_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::f32(), &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::f32(), &shape, &bytes).unwrap()
 }
 
 fn i32_tensor(device: &Device, shape: &[usize], values: &[i32]) -> Tensor {
@@ -584,12 +584,12 @@ fn i32_tensor(device: &Device, shape: &[usize], values: &[i32]) -> Tensor {
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::i32(), &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::i32(), &shape, &bytes).unwrap()
 }
 
 fn act_tensor(device: &Device, act: Act, shape: &[usize], values: &[f32]) -> Tensor {
     let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
-    Tensor::from_host(device, act.element(), &shape, &act.bytes(values)).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), act.element(), &shape, &act.bytes(values)).unwrap()
 }
 
 fn read_f32(tensor: &Tensor) -> Vec<f32> {
@@ -1566,6 +1566,7 @@ fn dense_expand_native_arithmetic(
     mapping: Mapping,
     int8: bool,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let (h, f) = (gate.k, gate.rows);
     let word = limit.map_or(0, |limit| u64::from(limit.to_bits()));
     let mut specialization =
@@ -1595,7 +1596,7 @@ fn dense_expand_native_arithmetic(
     )
     .unwrap();
     let out = kernel
-        .call(dense_expand::Args {
+        .call(&charges, dense_expand::Args {
             residual: &f32_tensor(device, &[rows, h], residual),
             norm: &bf16_norm(device, norm),
             gate_weight: &gate.tensor(device),
@@ -2136,6 +2137,7 @@ fn metal_attention_project_matrix_gemv_matches_the_batched_rows() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let act = Act::Bf16;
     let mapping = gemm_mapping(64, 64, 1);
     let (kv, g, w) = (1, 3, 40);
@@ -2191,7 +2193,7 @@ fn metal_attention_project_matrix_gemv_matches_the_batched_rows() {
                         &specialization,
                     )
                     .unwrap()
-                    .call(attention_project::Args {
+                    .call(&charges, attention_project::Args {
                         hidden: &f32_tensor(&device, &[rows, d], &hidden),
                         input_norm: &bf16_norm(&device, &norm),
                         query_weight: &weights[0].tensor(&device),
@@ -2248,6 +2250,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let act = Act::Bf16;
     let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits());
     let staged = gemm_mapping(64, 64, 1);
@@ -2294,7 +2297,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                 ),
             )
             .unwrap()
-            .call(attention_project::Args {
+            .call(&charges, attention_project::Args {
                 hidden: &f32_tensor(&device, &[rows, d], &hidden),
                 input_norm: &bf16_norm(&device, &norm),
                 query_weight: &weights[0].tensor(&device),
@@ -2337,7 +2340,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                 ),
             )
             .unwrap()
-            .call(attention_output::Args {
+            .call(&charges, attention_output::Args {
                 hidden: &f32_tensor(&device, &[rows, outputs], &narrow),
                 inject: &no_inject(&device, rows as u64),
                 gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
@@ -2368,7 +2371,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                 ),
             )
             .unwrap()
-            .call(gated_delta_project::Args {
+            .call(&charges, gated_delta_project::Args {
                 hidden: &f32_tensor(&device, &[rows, d], &hidden),
                 input_norm: &bf16_norm(&device, &norm),
                 qkv_weight: &recurrent_weights[0].tensor(&device),
@@ -2438,6 +2441,7 @@ fn dense_output_native_arithmetic(
     mapping: Mapping,
     int8: bool,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let (h, f) = (down.rows, down.k);
     let mut specialization = dense_output_specialization_on(device, &[("H", h), ("F", f)], mapping);
     if is_cpu(device) || device.backend() == BackendName::Metal {
@@ -2463,6 +2467,7 @@ fn dense_output_call(
     specialization: &NativeSpecialization,
     bound: &Tensor,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let (h, f) = (down.rows, down.k);
     let kernel = declared::prepared(
         device,
@@ -2474,7 +2479,7 @@ fn dense_output_call(
     )
     .unwrap();
     let out = kernel
-        .call(dense_output::Args {
+        .call(&charges, dense_output::Args {
             residual: &f32_tensor(device, &[rows, h], residual),
             product: &act_tensor(device, act, &[out_rows.len(), f], product),
             down_weight: &down.tensor(device),
@@ -2718,6 +2723,7 @@ fn project_rows_native(
     mapping: Mapping,
     pack: Option<Pack>,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let (n, k) = (weight.rows, weight.k);
     let rows = source.len() / k;
     let (bound, bound_extent) = weight.bound(device);
@@ -2760,7 +2766,7 @@ fn project_rows_native(
     )
     .unwrap();
     let out = kernel
-        .call(project_rows::Args {
+        .call(&charges, project_rows::Args {
             source: &act_tensor(device, act, &[rows, k], source),
             weight: &weight.tensor(device),
             weight_scale: &f32_tensor(device, &[0], &[]),
@@ -2877,6 +2883,7 @@ fn dense_output_packed(
     out_rows: &[i32],
     pack: Pack,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let (h, f) = (down.rows, down.k);
     let (bound, bound_extent) = down.bound(device);
     let specialization = with_pack::<dense_output::Entry>(
@@ -3109,6 +3116,7 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let act = Act::Bf16;
     let staged = gemm_mapping(64, 64, 1);
     let library = Library::of(BackendName::Metal);
@@ -3170,7 +3178,7 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
             Some(read_act(
                 act,
                 &kernel
-                    .call(dense_expand::Args {
+                    .call(&charges, dense_expand::Args {
                         residual: &f32_tensor(&device, &[rows, h], residual),
                         norm: &bf16_norm(&device, &norm),
                         gate_weight: &gate.tensor(&device),
@@ -3289,6 +3297,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let act = Act::Bf16;
     let staged = gemm_mapping(64, 64, 1);
     let d = 512;
@@ -3394,7 +3403,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                     },
                 )
                 .unwrap()
-                .call(attention_project::Args {
+                .call(&charges, attention_project::Args {
                     hidden: &f32_tensor(&device, &[rows, d], &hidden),
                     input_norm: &bf16_norm(&device, &norm),
                     query_weight: &project_weights[0].tensor(&device),
@@ -3448,7 +3457,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                     },
                 )
                 .unwrap()
-                .call(attention_output::Args {
+                .call(&charges, attention_output::Args {
                     hidden: &f32_tensor(&device, &[rows, outputs], &narrow),
                     inject: &no_inject(&device, rows as u64),
                     gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
@@ -3486,7 +3495,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                     },
                 )
                 .unwrap()
-                .call(gated_delta_project::Args {
+                .call(&charges, gated_delta_project::Args {
                     hidden: &f32_tensor(&device, &[rows, d], &hidden),
                     input_norm: &bf16_norm(&device, &norm),
                     qkv_weight: &recurrent_weights[0].tensor(&device),
@@ -3600,6 +3609,7 @@ fn metal_packed_attention_project_agrees_with_the_staged_tiles_over_low_bit_weig
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let act = Act::Bf16;
     let staged = gemm_mapping(64, 64, 1);
     let d = 512;
@@ -3642,7 +3652,7 @@ fn metal_packed_attention_project_agrees_with_the_staged_tiles_over_low_bit_weig
                     },
                 )
                 .unwrap()
-                .call(attention_project::Args {
+                .call(&charges, attention_project::Args {
                     hidden: &f32_tensor(&device, &[rows, d], hidden),
                     input_norm: &bf16_norm(&device, &norm),
                     query_weight: &weights[0].tensor(&device),
@@ -3815,6 +3825,7 @@ fn residual_output(act: Act, acc: f32, residual: f32) -> (f32, f32) {
 fn packing_bound_matches_its_portable_body(format: Format) {
     let module = crate::common::kernels();
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         if device.backend() != BackendName::Metal {
             continue;
         }
@@ -3845,7 +3856,7 @@ fn packing_bound_matches_its_portable_body(format: Format) {
                 &NativeSpecialization::new(),
             )
             .unwrap()
-            .call(packing_bound::Args {
+            .call(&charges, packing_bound::Args {
                 weight: &w.tensor(&device),
                 bound: &mut bound,
             })
@@ -3963,6 +3974,7 @@ fn dense_up_gguf_formats_match_their_portable_body() {
                 bound
             };
             for device in devices() {
+                let charges = seismic::Charges::tally(&device);
                 let entry = dense_up::native_entry_with(dense_up::Elements {
                     NW: Element::bf16(),
                     UW: repr.resident(&device),
@@ -3982,7 +3994,7 @@ fn dense_up_gguf_formats_match_their_portable_body() {
                     _ => panic!("unexpected static {name}"),
                 }, exact).unwrap();
                 let native = entry.prepare(&device, &specialization).unwrap()
-                .call(dense_up::Args {
+                .call(&charges, dense_up::Args {
                     residual: &f32_tensor(&device, &[rows, h], &residual),
                     norm: &bf16_norm(&device, &norm),
                     up_weight: &up.tensor(&device),
@@ -4416,6 +4428,7 @@ fn recurrent_project_matches_its_portable_body_and_the_host_reference_on(device:
 }
 
 fn recurrent_project_cases_on(device: &Device, cases: Cases) {
+    let charges = seismic::Charges::tally(device);
     let module = crate::common::kernels();
     let act = Act::Bf16;
     let scoped = cases == Cases::Scoped;
@@ -4515,7 +4528,7 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
             )
             .unwrap();
             let out = kernel
-                .call(gated_delta_project::Args {
+                .call(&charges, gated_delta_project::Args {
                     hidden: &f32_tensor(&device, &[rows, h], hidden),
                     input_norm: &bf16_norm(&device, &norm),
                     qkv_weight: &weights[0].tensor(&device),
@@ -4622,6 +4635,7 @@ fn recurrent_output_matches_its_portable_body_and_the_host_reference_on(device: 
 }
 
 fn recurrent_output_cases_on(device: &Device, scoped: bool) {
+    let charges = seismic::Charges::tally(device);
     let module = crate::common::kernels();
     let act = Act::Bf16;
     // A small geometry over every representation and mapping, then the pinned
@@ -4682,7 +4696,7 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                 )
                 .unwrap();
                 let out = kernel
-                    .call(attention_output::Args {
+                    .call(&charges, attention_output::Args {
                         hidden: &f32_tensor(&device, &[rows, h], hidden),
                         inject: &no_inject(&device, rows as u64),
                         gated: &act_tensor(&device, act, &[rows, nv, w], gated),
@@ -4831,6 +4845,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
     device: &Device,
     cases: Cases,
 ) {
+    let charges = seismic::Charges::tally(device);
     let module = crate::common::kernels();
     let act = Act::Bf16;
     let scoped = cases == Cases::Scoped;
@@ -4890,7 +4905,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             )
             .unwrap();
             let out = kernel
-                .call(attention_project::Args {
+                .call(&charges, attention_project::Args {
                     hidden: &f32_tensor(&device, &[rows, d], hidden),
                     input_norm: &bf16_norm(&device, &norm),
                     query_weight: &weights[0].tensor(&device),
@@ -5056,7 +5071,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 )
                 .unwrap();
                 let out = kernel
-                    .call(attention_output::Args {
+                    .call(&charges, attention_output::Args {
                         hidden: &f32_tensor(&device, &[rows, d_out], hidden),
                         inject: &no_inject(&device, rows as u64),
                         gated: &act_tensor(&device, act, &[rows, q, w], gated),
@@ -5159,6 +5174,7 @@ fn scaled_projections_on_backend(backend: BackendName) {
 }
 
 fn scaled_projections_on(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     /// The segments' second-level scales, query, gate, key, value: none a
     /// power of two, each distinct, so a scale bound to the wrong segment
     /// fails.
@@ -5226,7 +5242,7 @@ fn scaled_projections_on(device: &Device) {
                 },
             )
             .unwrap()
-            .call(attention_project::Args {
+            .call(&charges, attention_project::Args {
                 hidden: &f32_tensor(device, &[rows, d], hidden),
                 input_norm: &bf16_norm(device, &norm),
                 query_weight: &weights[0],
@@ -5273,7 +5289,7 @@ fn scaled_projections_on(device: &Device) {
                     },
                 )
                 .unwrap()
-                .call(attention_output::Args {
+                .call(&charges, attention_output::Args {
                     hidden: &f32_tensor(device, &[rows, d], hidden),
                     inject: &no_inject(device, rows as u64),
                     gated: &act_tensor(device, act, &[rows, heads, width], gated),
@@ -5596,6 +5612,7 @@ fn head_logits_match_the_host(
     row_classes: &[usize],
     mappings: &[Mapping],
 ) {
+    let charges = seismic::Charges::tally(device);
     let act = Act::Bf16;
     let head = weight(repr, v, d, 81, 1.0);
     for &rows in row_classes {
@@ -5632,12 +5649,12 @@ fn head_logits_match_the_host(
             )
             .unwrap();
             let logits = kernel
-                .call(readout_project_rows::Args {
+                .call(&charges, readout_project_rows::Args {
                     features: &act_tensor(device, act, &[rows, d], &features),
                     weight: &head.tensor(device),
-                    token_rows: &Tensor::zeros(device, Element::i32(), &[rows as u64, 0, v as u64])
+                    token_rows: &Tensor::zeros(&charges, Element::i32(), &[rows as u64, 0, v as u64])
                         .unwrap(),
-                    weight_scale: &Tensor::zeros(device, Element::f32(), &[0]).unwrap(),
+                    weight_scale: &Tensor::zeros(&charges, Element::f32(), &[0]).unwrap(),
                     softcap: 0.0,
                 })
                 .unwrap()
@@ -5659,6 +5676,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
     device: &Device,
     check: &ReadoutCheck,
 ) {
+    let charges = seismic::Charges::tally(device);
     let module = crate::common::kernels();
     let act = Act::Bf16;
     let (v, d, cap) = (check.v, check.d, check.softcap);
@@ -5714,7 +5732,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                 &formed(device, statics_on(device, &[("D", d)]), d),
             )
             .unwrap()
-            .call(readout_features_rows::Args {
+            .call(&charges, readout_features_rows::Args {
                 hidden: &one_part(&hidden_tensor),
                 norm: &bf16_norm(&device, &norm),
                 out_rows: &rows_tensor,
@@ -5784,7 +5802,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     &specialization,
                 )
                 .unwrap()
-                .call(readout_head_rows::Args {
+                .call(&charges, readout_head_rows::Args {
                     hidden: &hidden_tensor,
                     norm: &bf16_norm(&device, &norm),
                     weight: &head.tensor(&device),
@@ -5814,7 +5832,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     &readout_selected_specialization_on(device, &[("V", v), ("D", d)], mapping),
                 )
                 .unwrap()
-                .call(readout_selected_rows::Args {
+                .call(&charges, readout_selected_rows::Args {
                     hidden: &hidden_tensor,
                     norm: &bf16_norm(&device, &norm),
                     weight: &head.tensor(&device),
@@ -5932,6 +5950,7 @@ fn embedding_rows_read_the_slots_their_directory_names() {
         .collect::<Vec<_>>();
     for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Vulkan, BackendName::Cpu]) {
         let backend = device.backend();
+        let charges = seismic::Charges::tally(&device);
         eprintln!("gathered rows: testing {backend:?}");
         let directory = i32_tensor(&device, &[logical, 1], &directory_values);
         let direct = i32_tensor(&device, &[0, 1], &[]);
@@ -5964,7 +5983,7 @@ fn embedding_rows_read_the_slots_their_directory_names() {
                     .collect::<Vec<_>>();
                 let read = |pairs: &[i32], directory: &Tensor| {
                     let out = kernel
-                        .call(embedding_rows::Args {
+                        .call(&charges, embedding_rows::Args {
                             table: &resident,
                             tokens: &i32_tensor(&device, &[rows, 2], pairs),
                             directory,
@@ -6030,6 +6049,7 @@ fn bf16_embedding_rows_decode_exactly_as_the_portable_body() {
 
 /// A gather of `repr` rows decodes them exactly as the portable body.
 fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device, repr: Repr) {
+    let charges = seismic::Charges::tally(device);
     let module = crate::common::kernels();
     let act = Act::Bf16;
     let (v, d) = (300usize, 2560usize);
@@ -6052,7 +6072,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device, repr: 
             &statics_on(device, &[("D", d)]),
         )
         .unwrap()
-        .call(embedding_rows::Args {
+        .call(&charges, embedding_rows::Args {
             table: &table.tensor(&device),
             tokens: &i32_tensor(&device, &[rows, 2], &pairs),
             directory: &i32_tensor(&device, &[0, 1], &[]),
@@ -6077,7 +6097,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device, repr: 
                 &statics_on(device, &[("D", d)]),
             )
             .unwrap()
-            .call(embedding_rows::Args {
+            .call(&charges, embedding_rows::Args {
                 table: &table.tensor(&device),
                 tokens: &i32_tensor(&device, &[rows, 2], &pairs),
                 directory: &i32_tensor(&device, &[0, 1], &[]),
@@ -6285,6 +6305,7 @@ fn mxfp8_attention_output_decode_row_at_deepseek_v41_wo_b_times() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let act = Act::Bf16;
     let (d, q, w) = (5120usize, 8usize, 1024usize);
     let weight = periodic_weight(Repr::Gguf(Format::F8_E4M3), d, q * w, 82);
@@ -6322,7 +6343,7 @@ fn mxfp8_attention_output_decode_row_at_deepseek_v41_wo_b_times() {
             spec.with_static(name, value as u64)
         });
     let result = attention_output::native_tune_with(
-        &device,
+        &charges,
         attention_output::Elements {
             OW: weight.repr.resident(&device),
             A: act.element(),
@@ -6393,6 +6414,7 @@ fn query_key_project(
     epsilon: f32,
     mapping: Mapping,
 ) -> (Tensor, Vec<f32>) {
+    let charges = seismic::Charges::tally(device);
     let d = query.k;
     let element = query.repr.resident(device);
     let kernel = declared::prepared(
@@ -6419,10 +6441,10 @@ fn query_key_project(
         ),
     )
     .unwrap();
-    let empty = Tensor::from_host(device, element, &[0, d as u64], &[]).unwrap();
+    let empty = Tensor::from_host(&charges, element, &[0, d as u64], &[]).unwrap();
     let key_weight = key.map_or_else(|| empty.clone(), |key| key.tensor(device));
     let out = kernel
-        .call(attention_project::Args {
+        .call(&charges, attention_project::Args {
             hidden,
             input_norm: &bf16_norm(device, norm),
             query_weight: &query.tensor(device),
@@ -6502,6 +6524,7 @@ fn grouped_project_rows_native(
     split: u64,
     tall: Option<u64>,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let (k, n) = (weight.k, weight.rows / groups);
     let rows = source.len() / (groups * k);
     let elements = || project_rows::Elements {
@@ -6532,7 +6555,7 @@ fn grouped_project_rows_native(
         .unwrap_or_else(|error| panic!("{:?} grouped default: {error:?}", device.backend()));
     let kernel = declared::prepared(device, &project_rows::native_entry_with(elements()), &specialization).unwrap();
     let out = kernel
-        .call(project_rows::Args {
+        .call(&charges, project_rows::Args {
             source: &act_tensor(device, act, &[rows, groups * k], source),
             weight: &weight.tensor(device),
             weight_scale: &no_scale(device),
@@ -6590,6 +6613,7 @@ fn low_rank_query_at_deepseek_v41_shapes_matches_the_host_reference() {
                 .map(|_| rng.symmetric() * 2.0)
                 .collect::<Vec<_>>();
             for device in devices() {
+                let charges = seismic::Charges::tally(&device);
                 let (qr_expected, qr_bound) =
                     normed_projection_reference(device.backend(), act, &x, rows, &input_norm, EPSILON, &down);
                 let (key_expected, key_bound) =
@@ -6624,7 +6648,7 @@ fn low_rank_query_at_deepseek_v41_shapes_matches_the_host_reference() {
                     &implementation.default_specialization(&fixed).unwrap(),
                 )
                 .unwrap();
-                let widened = widen.call(widen_rows::Args { rows: &qr }).unwrap().value;
+                let widened = widen.call(&charges, widen_rows::Args { rows: &qr }).unwrap().value;
                 assert_eq!(read_f32(&widened), qr_values, "widened qr {label}");
                 let (query, _) = query_key_project(
                     &device, act, &widened, &query_norm, &up, None, EPSILON, MAPPINGS[0],
@@ -6787,6 +6811,7 @@ fn metal_convolved_matrix_columns_match_host() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let act = Act::Bf16;
     let (h, nk, nv, w, c, banks, tape) =
         (512usize, 1usize, 2usize, 33usize, 4usize, 5usize, 3usize);
@@ -6917,7 +6942,7 @@ fn metal_convolved_matrix_columns_match_host() {
                     &spec,
                 )
                 .unwrap()
-                .call(gated_delta_project_convolved::Args {
+                .call(&charges, gated_delta_project_convolved::Args {
                     hidden: &f32_tensor(&device, &[rows, h], &hidden),
                     input_norm: &bf16_norm(&device, &norm),
                     qkv_weight: &tensors[0],
@@ -7005,6 +7030,7 @@ fn metal_absent_query_projection_preserves_key_value() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (d, q, kv) = (256usize, 256usize, 64usize);
     for rows in [1usize, 2, 7, 128] {
         let mut rng = Rng::new(776);
@@ -7042,7 +7068,7 @@ fn metal_absent_query_projection_preserves_key_value() {
             )
             .unwrap();
             let out = kernel
-                .call(attention_project::Args {
+                .call(&charges, attention_project::Args {
                     hidden: &hidden,
                     input_norm: &norm,
                     query_weight: if absent { &empty } else { &query },
@@ -7080,6 +7106,7 @@ fn metal_attention_output_matrix_matches_host() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (d, q, w) = (131usize, 4usize, 128usize);
     let k = q * w;
     for act in [Act::Bf16, Act::F16] {
@@ -7124,7 +7151,7 @@ fn metal_attention_output_matrix_matches_host() {
                     )
                     .unwrap();
                     let output = kernel
-                        .call(attention_output::Args {
+                        .call(&charges, attention_output::Args {
                             hidden: &f32_tensor(&device, &[rows, d], &hidden),
                             inject: &no_inject(&device, rows as u64),
                             gated: &act_tensor(&device, act, &[rows, q, w], &gated),
@@ -7214,6 +7241,7 @@ fn metal_normalize_prepass_matches_small_row_tree() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let h = 3840usize;
     let mut identity = Weight {
         repr: Repr::Bf16,
@@ -7266,7 +7294,7 @@ fn metal_normalize_prepass_matches_small_row_tree() {
             ),
         )
         .unwrap()
-        .call(readout_features_rows::Args {
+        .call(&charges, readout_features_rows::Args {
             hidden: &one_part(&hidden),
             norm: &nt,
             out_rows: &selected,
@@ -7292,7 +7320,7 @@ fn metal_normalize_prepass_matches_small_row_tree() {
             ),
         )
         .unwrap()
-        .call(readout_head_rows::Args {
+        .call(&charges, readout_head_rows::Args {
             hidden: &hidden,
             norm: &nt,
             weight: &identity.tensor(&device),
@@ -7346,7 +7374,7 @@ fn metal_normalize_prepass_matches_small_row_tree() {
 
 /// The inject port of a single residual stream: no columns.
 fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
-    seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
+    seismic::Tensor::zeros(&seismic::Charges::tally(device), seismic::Element::f32(), &[rows, 0]).unwrap()
 }
 
 /// The time of `project_rows` on Metal at DeepSeek V4.1 Flash's prefill
@@ -7366,6 +7394,7 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let act = Act::Bf16;
     let (m, groups, n, k) = (2048usize, 8usize, 1024usize, 4096usize);
     let weight = periodic_weight(Repr::Gguf(Format::F8_E4M3), groups * n, k, 84);
@@ -7429,7 +7458,7 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
             written: Default::default(),
         };
         let result = project_rows::native_tune_with(
-            &device,
+            &charges,
             elements(),
             &configuration,
             vec![point],
@@ -7510,7 +7539,7 @@ fn time_dense_output(
         written: Default::default(),
     };
     let result = dense_output::native_tune_with(
-        device,
+        &seismic::Charges::tally(device),
         dense_output::Elements { A: act.element(), DW: repr.resident(device) },
         &specialization,
         vec![point],
@@ -7560,7 +7589,7 @@ fn timing_weight(device: &Device, format: Format, (h, f): (usize, usize), unifor
     let external = format.external(&mut Rng::new(91), &shape, 2.0 / (f as f32).sqrt());
     let external = if uniform { vec![0; external.len()] } else { external };
     let bytes = repr.element().repack_host(format.source(), &shape, &external).unwrap();
-    Tensor::from_host(device, repr.resident(device), &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), repr.resident(device), &shape, &bytes).unwrap()
 }
 
 /// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
@@ -7601,6 +7630,7 @@ fn dense_output_timing_at_shape() {
     .map(|format| (format, false))
     .chain([Encoding::Iq1S, Encoding::Iq2Xxs, Encoding::Iq3Xxs].map(|encoding| (Format::rounded(encoding), true)));
     for device in devices().into_iter().filter(|device| !is_cpu(device)) {
+        let charges = seismic::Charges::tally(&device);
         for (format, uniform) in formats.clone() {
             let weight = timing_weight(&device, format, (h, f), uniform);
             for rows in [1usize, 512] {

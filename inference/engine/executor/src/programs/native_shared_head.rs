@@ -1267,9 +1267,10 @@ impl PreparedSharedHeadGraphs {
 
     pub(crate) fn bind_weights(
         self: &Rc<Self>,
+        charges: &seismic::Charges,
         resident: &ResidentHead,
     ) -> Result<BoundSharedHeadGraphs, SubmitError> {
-        let mut uploaded = ConstantTensors::new(resident.embedding.tensor().device());
+        let mut uploaded = ConstantTensors::new(charges);
         let mut bound = BTreeMap::new();
         for (class, graph) in &self.classes {
             let constants = graph
@@ -1286,7 +1287,7 @@ impl PreparedSharedHeadGraphs {
                 })
                 .chain(constants.iter().map(|(port, tensor)| Ok((*port, tensor))))
                 .collect::<Result<Vec<_>, SubmitError>>()?;
-            bound.insert(*class, graph.plan.bind_static(&fixed).map_err(device)?);
+            bound.insert(*class, graph.plan.bind_static(charges, &fixed).map_err(device)?);
         }
         Ok(BoundSharedHeadGraphs {
             prepared: self.clone(),
@@ -1401,6 +1402,10 @@ impl PassControls {
 pub struct NativeSharedHeadProgram {
     geometry: Decoder,
     graphs: BoundSharedHeadGraphs,
+    /// What a step binds its tensors through: charges that allocate
+    /// nothing, as every storage a step binds is a load's, which formed any
+    /// record table it needs (`seismic::NativeGraphBindings::set`).
+    unallocating: seismic::Charges,
     waiter: CompletionWaiter,
 }
 
@@ -1410,14 +1415,18 @@ impl NativeSharedHeadProgram {
     }
 
     /// `geometry` is the target decoder.
+    /// `unallocating`: charges of its device that allocate nothing
+    /// (`seismic::Charges::none`).
     pub(crate) fn new(
         geometry: Decoder,
         graphs: BoundSharedHeadGraphs,
+        unallocating: seismic::Charges,
     ) -> Result<Self, SubmitError> {
         let waiter = CompletionWaiter::spawn().map_err(device)?;
         Ok(Self {
             geometry,
             graphs,
+            unallocating,
             waiter,
         })
     }
@@ -1464,7 +1473,7 @@ impl NativeSharedHeadProgram {
                     ));
                 }
                 for (port, plane) in block.planes.iter().zip(&read.planes) {
-                    bindings.set(port, plane).map_err(device)?;
+                    bindings.set(&self.unallocating, port, plane).map_err(device)?;
                 }
             }
         }
@@ -1507,7 +1516,7 @@ impl NativeSharedHeadProgram {
             .passes
             .iter()
             .filter_map(|pass| pass.landed.as_ref())
-            .map(|ports| ports.queue(&self.graphs.embedding, &mut bindings))
+            .map(|ports| ports.queue(&self.graphs.embedding, &self.unallocating, &mut bindings))
             .collect::<Result<Vec<_>, _>>()
             .map_err(invalid)?;
         active

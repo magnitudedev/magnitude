@@ -820,7 +820,7 @@ fn devices() -> Vec<Device> {
 
 fn tensor(device: &Device, element: Element, shape: &[usize], bytes: Vec<u8>) -> Tensor {
     let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
-    Tensor::from_host(device, element, &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), element, &shape, &bytes).unwrap()
 }
 
 fn bf16_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
@@ -895,6 +895,7 @@ struct Bound {
 
 impl Bound {
     fn new(device: &Device, case: &Case) -> Self {
+        let charges = seismic::Charges::tally(device);
         let form = case.form;
         let (m, w, t, kv, heads) = (
             case.rows,
@@ -927,7 +928,7 @@ impl Bound {
             layouts.push(SlabLayout::for_regions(per, selected_rows_total, &[region()]).unwrap());
         }
         let pool = crate::common::slab_pool(device, &layouts);
-        let slabs = SlabTensor::in_pool(&pool, slab_rows, t as u64, &history_regions).unwrap();
+        let slabs = SlabTensor::in_pool(&charges, &pool, slab_rows, t as u64, &history_regions).unwrap();
         let row_bytes = kv * w * 2;
         let planes = stored.iter().map(|values| {
             values
@@ -965,7 +966,7 @@ impl Bound {
         let (selected_slabs, selected) = if selected_rows_total == 0 {
             (None, bf16_tensor(device, &[0, kv, w], &[]))
         } else {
-            let slabs = SlabTensor::in_pool(&pool, per, selected_rows_total, &[region()]).unwrap();
+            let slabs = SlabTensor::in_pool(&charges, &pool, per, selected_rows_total, &[region()]).unwrap();
             let bytes = case.selected.iter().flat_map(|v| bf16_bits(*v).to_le_bytes()).collect::<Vec<_>>();
             for index in 0..selected_rows_total.div_ceil(per) {
                 slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
@@ -997,18 +998,18 @@ impl Bound {
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
             selection: Tensor::from_host(
-                device,
+                &charges,
                 Element::u32(),
                 &[m as u64, case.selection_words as u64],
                 &case.selection.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>(),
             )
             .unwrap(),
-            block_slots: Tensor::from_host(device, Element::i32(), &[0, case.block_rows as u64], &[]).unwrap(),
+            block_slots: Tensor::from_host(&charges, Element::i32(), &[0, case.block_rows as u64], &[]).unwrap(),
             selected_rows: i32_tensor(device, &[m, case.picks], &case.selected_rows),
             selected,
             _selected_slabs: selected_slabs,
             form: Tensor::from_host(
-                device,
+                &charges,
                 Element::i32(),
                 &case.extents().map(|extent| extent as u64),
                 &[],
@@ -1526,11 +1527,12 @@ impl Attend {
     /// Runs the entry on `case`: the result and final histories.
     fn run(&self, device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
         let mut bound = Bound::new(device, case);
+        let charges = seismic::Charges::tally(device);
         let rounding = case.rounding_scalars();
         macro_rules! call {
             ($kernel:expr, $module:ident $(, $extra:ident: $value:expr)*) => {{
                 $kernel
-                    .call($module::Args {
+                    .call(&charges, $module::Args {
                         $($extra: $value,)*
                         query: &bound.query,
                         gate: &bound.gate,
@@ -1590,15 +1592,16 @@ impl Attend {
             return self.run(device, case);
         };
         let mut earlier_bound = Bound::new(device, earlier);
+        let charges = seismic::Charges::tally(device);
         let mut bound = Bound::new(device, case);
         let earlier_rounding = earlier.rounding_scalars();
         let rounding = case.rounding_scalars();
         let shape = |c: &Case| [c.rows as u64, c.form.heads() as u64, c.form.w() as u64];
-        let mut earlier_out = Tensor::zeros(device, Element::bf16(), &shape(earlier))
+        let mut earlier_out = Tensor::zeros(&charges, Element::bf16(), &shape(earlier))
             .map_err(|error| format!("{error:?}"))?;
-        let mut result = Tensor::zeros(device, Element::bf16(), &shape(case))
+        let mut result = Tensor::zeros(&charges, Element::bf16(), &shape(case))
             .map_err(|error| format!("{error:?}"))?;
-        let mut batch = seismic::NativeTensorBatch::new(device);
+        let mut batch = seismic::NativeTensorBatch::new(&charges);
         macro_rules! push {
             ($kernel:expr, $module:ident, $c:expr, $b:expr, $r:expr, $out:expr $(, $extra:ident: $value:expr)*) => {{
                 batch
@@ -1853,6 +1856,7 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
         return;
     };
     let device = &device;
+    let charges = seismic::Charges::tally(device);
     let case = Case::new(QWEN_SMALL, 64, decode_rows(5)[..1].to_vec(), 16, 1.0, 1.0 / (32f32).sqrt(), 11);
     let (heads, w, d) = (case.form.heads(), case.form.w(), 64usize);
     let q8 = Element::stored("q8g32s", device.backend().resident_layout()).unwrap();
@@ -1863,20 +1867,20 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
             bytes.extend_from_slice(&seismic_lang::registry::f16_bits(1.0 / 64.0).to_le_bytes());
             bytes.extend((0..32).map(|value| ((((block * 32 + value) * 29 + 7) % 61) as i8 - 30) as u8));
         }
-        let source = Tensor::from_host(device, external, &[1, d as u64, (heads * w) as u64], &bytes).unwrap();
+        let source = Tensor::from_host(&charges, external, &[1, d as u64, (heads * w) as u64], &bytes).unwrap();
         let entry = repack_weight::native_entry_with(repack_weight::Elements { E: external, U: q8 });
         let specialization = declared::declared(device, &entry, |name| panic!("unexpected static {name}"), &[]).unwrap();
         entry
             .prepare(device, &specialization)
             .unwrap()
-            .call(repack_weight::Args { source: &source })
+            .call(&charges, repack_weight::Args { source: &source })
             .unwrap()
             .value
             .reshape(&[d as u64, (heads * w) as u64])
             .unwrap()
     };
     let hidden = f32_tensor(device, &[1, d], &(0..d).map(|index| index as f32 / 32.0 - 1.0).collect::<Vec<_>>());
-    let inject = Tensor::zeros(device, Element::f32(), &[1, 0]).unwrap();
+    let inject = Tensor::zeros(&charges, Element::f32(), &[1, 0]).unwrap();
     let absent = f32_tensor(device, &[0], &[]);
     let output = {
         let entry = attention_output::native_entry_with(attention_output::Elements { OW: q8, A: Element::bf16() });
@@ -1912,7 +1916,7 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
         // Alone, the output forms its own operand.
         let mut bound = Bound::new(device, &case);
         let attended = decode
-            .call(attention_decode::Args {
+            .call(&charges, attention_decode::Args {
                 query: &bound.query,
                 gate: &bound.gate,
                 key: &bound.key,
@@ -1946,7 +1950,7 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
             .unwrap()
             .value;
         let alone = output
-            .call(attention_output::Args {
+            .call(&charges, attention_output::Args {
                 hidden: &hidden,
                 inject: &inject,
                 gated: &attended,
@@ -1989,8 +1993,8 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
         ];
         let mut ports = inputs.map(&mut port);
         let stored = [
-            Tensor::zeros(device, attended.element(), &attended.extents()).unwrap(),
-            Tensor::zeros(device, alone.element(), &alone.extents()).unwrap(),
+            Tensor::zeros(&charges, attended.element(), &attended.extents()).unwrap(),
+            Tensor::zeros(&charges, alone.element(), &alone.extents()).unwrap(),
         ];
         let stored_ports = [&stored[0], &stored[1]].map(&mut port);
         let [
@@ -2076,10 +2080,10 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
         let plan = graph.seal().unwrap();
         let mut bindings = plan.bindings();
         for (port, tensor) in ports.iter().zip(inputs).chain(stored_ports.iter().zip(&stored)) {
-            bindings.set(port, tensor).unwrap();
+            bindings.set(&charges, port, tensor).unwrap();
         }
         let (_, completion) =
-            plan.new_slot().unwrap().attach(bindings, plan.new_outputs().unwrap()).unwrap().submit().unwrap();
+            plan.new_slot(&charges).unwrap().attach(bindings, plan.new_outputs(&charges).unwrap()).unwrap().submit().unwrap();
         completion.wait().unwrap();
         let bytes = |tensor: &Tensor| tensor.read_to_host().unwrap();
         assert_eq!(bytes(&stored[0]), bytes(&attended), "{label} attended row");
@@ -3350,11 +3354,12 @@ fn cross_form_bounds(case: &Case, vector: &[f32]) -> Vec<f32> {
 
 /// The dense append of `case` on `device`: its final key and value planes.
 fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let charges = seismic::Charges::tally(device);
     let mut bound = Bound::new(device, case);
     let form = case.form;
     let [_, ra, rt, _, vk, kr, _] = case.extents();
     let append_form = Tensor::from_host(
-        device,
+        &charges,
         Element::i32(),
         &[0, ra as u64, rt as u64, vk as u64, kr as u64],
         &[],
@@ -3378,7 +3383,7 @@ fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), Stri
     )
     .map_err(|error| error.to_string())?;
     kernel
-        .call(attention_append_dense::Args {
+        .call(&charges, attention_append_dense::Args {
             key: &bound.key,
             value: &bound.value,
             key_norm: &bound.key_norm,
@@ -4064,6 +4069,7 @@ fn attention_decode_at_deepseek_v41_decode_shape_times() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (context, window, picks, pooled) = (32768usize, 128usize, 512usize, 32768 / 4);
     let row = Row {
         spans: vec![((context - window) as i32, context as i32)],
@@ -4164,7 +4170,7 @@ fn attention_decode_at_deepseek_v41_decode_shape_times() {
             written: Default::default(),
         };
         let result = attention_decode::native_tune_with(
-            &device,
+            &charges,
             attention_decode::Elements { A: Element::bf16() },
             &configuration,
             vec![point],
@@ -4215,6 +4221,7 @@ fn attention_prefill_with_picks_at_deepseek_v41_prefill_shape_times() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (rows, window, picks, pooled) = (2048usize, 128i32, 512usize, 2048usize);
     let case = Case::new(V41, 64 + rows, window_rows(rows, 0, window), 4096, 1.0, 1.0 / (512f32).sqrt(), 110)
         .with_theta(1.0e4)
@@ -4290,7 +4297,7 @@ fn attention_prefill_with_picks_at_deepseek_v41_prefill_shape_times() {
         written: Default::default(),
     };
     let result = attention_prefill::native_tune_with(
-        &device,
+        &charges,
         attention_prefill::Elements { A: Element::bf16() },
         &configuration,
         vec![point],
@@ -4345,6 +4352,7 @@ fn attention_at_deepseek_v41_decode_shape_times_on_vulkan() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (context, window, picks, pooled) = (32768usize, 128usize, 512usize, 32768 / 4);
     let row = Row {
         spans: vec![((context - window) as i32, context as i32)],
@@ -4417,7 +4425,7 @@ fn attention_at_deepseek_v41_decode_shape_times_on_vulkan() {
                     written: Default::default(),
                 };
                 let result = $module::native_tune_with(
-                    &device,
+                    &charges,
                     $module::Elements { A: Element::bf16() },
                     &configuration,
                     vec![point],
@@ -4608,6 +4616,7 @@ fn native_grouped_rows(
     inputs: usize,
     outputs: usize,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let rows = source.len() / (groups * inputs);
     let statics = NativeSpecialization::new().with_static("WS", 0);
     // Each backend's declared statics: the CPU's WS alone, Metal's with
@@ -4637,7 +4646,7 @@ fn native_grouped_rows(
     )
     .unwrap();
     let out = kernel
-        .call(project_rows::Args {
+        .call(&charges, project_rows::Args {
             source: &bf16_tensor(device, &[rows, groups * inputs], source),
             weight: &bf16_tensor(device, &[groups * outputs, inputs], weight),
             weight_scale: &f32_tensor(device, &[0], &[]),

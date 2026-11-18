@@ -167,7 +167,7 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
                 bytes,
                 ..
             } => Value::Tensor(
-                Tensor::from_host(&device, element.clone(), shape, bytes)
+                Tensor::from_host(&seismic::Charges::tally(&device), element.clone(), shape, bytes)
                     .unwrap_or_else(|e| panic!("{entry}: {e}")),
             ),
             Input::I32(value) => Value::Scalar(Scalar::I32(*value)),

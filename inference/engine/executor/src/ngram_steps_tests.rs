@@ -2127,7 +2127,7 @@ fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
         let (reference, returned) = run(&mut domain, bindings, operation(unstarved), false, backend);
         let (pending, returned) = starved_step(&mut domain, returned, operation(starved), PATIENCE_BOUND, backend);
         assert!(
-            matches!(pending.outcome(), Outcome::Interrupted { resident: true, .. }),
+            matches!(pending.outcome(), Outcome::Interrupted { .. }),
             "{backend:?}: a starved step is interrupted: {:?}",
             pending.outcome()
         );
@@ -2181,14 +2181,14 @@ fn starved_step(
 }
 
 /// A prompt chain whose host starves past every wait's patience while its
-/// chunks run is interrupted at the chunk that launched it, the chain
-/// released with its holder's state (`Outcome::Interrupted` not resident),
-/// so the sequence re-prefills, as an evicted one. The chain's later chunks
-/// run in its launch (layer-major), so the first chunk's flight is the one
-/// their waits fall in. Re-opened and prefilled again, it decodes bit for
-/// bit as a sequence whose prompt was never starved.
+/// chunks run is interrupted at the chunk that launched it: aborted, the
+/// chain concludes with no chunk reconciled, and its holder's state is the
+/// one it opened with. The chain's later chunks run in its launch
+/// (layer-major), so the first chunk's flight is the one their waits fall
+/// in. Prefilled again from that state, it decodes bit for bit as a
+/// sequence whose prompt was never starved.
 #[test]
-fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
+fn a_starved_chunk_of_a_chain_concludes_it_and_the_rerun_scores_as_unstarved() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     // At the kl's shape, where a banked load's prompt runs as one chain
@@ -2222,17 +2222,15 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
         let (pending, returned) =
             starved_step(&mut domain, bindings, prompt_chunk(request, 0, chunks, rows), PATIENCE_BOUND, backend);
         assert!(
-            matches!(pending.outcome(), Outcome::Interrupted { resident: false, .. }),
-            "{backend:?}: a starved chunk of a chain is interrupted, its state released: {:?}",
+            matches!(pending.outcome(), Outcome::Interrupted { .. }),
+            "{backend:?}: a starved chunk of a chain is interrupted: {:?}",
             pending.outcome()
         );
         domain.abort(pending).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-        assert_eq!(domain.chain_holder(), None, "{backend:?}: the chain was released");
-        assert!(domain.resume_state(request).is_err(), "{backend:?}: the holder's state was released");
-        // Re-opened, it re-prefills and decodes as the unstarved sequence.
-        let mut bindings = returned;
-        domain.open_served(&mut bindings, request, None).unwrap();
-        let (rerun, returned) = prompt_then_decode(&mut domain, bindings, request, chunks, rows, backend);
+        assert_eq!(domain.chain_holder(), None, "{backend:?}: the chain concluded");
+        assert_eq!(domain.resume_state(request).unwrap().position(), 0, "{backend:?}: at the state it opened with");
+        // It prefills again and decodes as the unstarved sequence.
+        let (rerun, returned) = prompt_then_decode(&mut domain, returned, request, chunks, rows, backend);
         assert!(rerun == reference, "{backend:?}: the re-prefilled sequence decodes as unstarved: {}", first_difference(&reference, &rerun));
         drop(returned);
     }
@@ -2859,7 +2857,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
     .unwrap();
     let mut programs = AttestedPrograms::prepare_draft(
         &base_draft,
-        &device,
+        &seismic::Charges::tally(&device),
         crate::TuningContext {
             definition: &definition,
             weights: &crate::ZeroTuningWeights,
@@ -2929,14 +2927,16 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         }
         .unwrap();
         let mut weights = ledgers
-            .claim(&device, crate::memory::ledger::CommittedKind::Load, demand)
+            .changes()
+            .change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, demand))
             .unwrap();
         let host_tables = crate::memory::ClaimDemand {
             host: load.host_table_bytes().unwrap(),
             ..Default::default()
         };
         let host_tables = ledgers
-            .claim(&device, crate::memory::ledger::CommittedKind::Load, host_tables)
+            .changes()
+            .change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, host_tables))
             .unwrap();
         // On CPU both `DeviceOnly` and `Shared` lie in `HostRam` at the bank's
         // one uniform granule, so a tier-placed CPU fixture shares that single
@@ -2978,7 +2978,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         )
         .unwrap();
         let target = weights
-            .allocate(|| residency.load_target(&definition, &package, &host_tables, Box::new(|_, _| ())))
+            .allocate(&device, |charges| residency.load_target(charges, &definition, &package, &host_tables, Box::new(|_, _| ())))
             .unwrap();
         recorded.record(weights);
         recorded.record(host_tables);
@@ -3062,10 +3062,8 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
             .unwrap();
         let empty_tier = tier_up.slice_leading(0, 0).unwrap();
         assert_eq!(empty_tier.extents()[0], 0);
-        empty_tier.hold_record_table().unwrap();
         let sub_tier = tier_up.slice_leading(0, 2).unwrap();
         assert_eq!(sub_tier.extents()[0], 2);
-        sub_tier.hold_record_table().unwrap();
         assert_eq!(bank.host_tier(), Some((bank.host_slots(), 8)));
         let _served = crate::experts::ServedBank::new(
             bank.clone(),

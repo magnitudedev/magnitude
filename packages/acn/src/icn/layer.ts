@@ -1,6 +1,7 @@
+import { writeFileAtomic } from "@magnitudedev/utils/atomic-file";
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups";
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native";
-import { FetchHttpClient, FileSystem } from "@effect/platform";
+import { FetchHttpClient } from "@effect/platform";
 import { ModelAssessmentsSnapshot } from "@magnitudedev/icn-protocol/schemas";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -68,7 +69,6 @@ const AcceptanceAssessmentDiagnostics = Schema.Struct({
 const acceptanceAssessmentDiagnostics = Layer.scopedDiscard(Effect.gen(function* () {
   const path = process.env.MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS;
   if (!path) return;
-  const fs = yield* FileSystem.FileSystem;
   const assessments = yield* IcnModelAssessments;
   const icnProcess = yield* IcnProcess;
   yield* Effect.gen(function* () {
@@ -80,8 +80,7 @@ const acceptanceAssessmentDiagnostics = Layer.scopedDiscard(Effect.gen(function*
           assessments: snapshot,
           inferenceDiagnosticTail,
         });
-        yield* fs.writeFileString(`${path}.pending`, report);
-        yield* fs.rename(`${path}.pending`, path);
+        yield* writeFileAtomic(path, report);
       }).pipe(Effect.catchAll(() => Effect.void));
       yield* Effect.sleep("5 seconds");
     }

@@ -301,7 +301,7 @@ fn parallel(items: usize, work: impl Fn(usize, usize) + Sync) {
     std::thread::scope(|scope| {
         for first in (0..items).step_by(part.max(1)) {
             let work = &work;
-            scope.spawn(move || work(first, (first + part).min(items)));
+            seismic_threads::spawn_scoped(scope, "memory-split", move || work(first, (first + part).min(items))).expect("invariant violated: the host starts a thread");
         }
     });
 }

@@ -84,12 +84,11 @@ impl std::fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
-/// Elapsed native work measured per request from submission through completion.
-/// A request in a packed batch receives that batch's wall duration.
-/// Deferred work retains its originating prompt/generation phase; work solely
-/// for post-terminal prefix retention is excluded from these throughput fields.
+/// A completed request's wall-clock timing, as llama.cpp's server reports a
+/// slot's: `prompt_ns` from its first service to its first accepted output
+/// token, `predicted_ns` from there to its last.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PhysicalTimings {
+pub struct RequestTimings {
     pub prompt_ns: u64,
     pub predicted_ns: u64,
 }
@@ -101,7 +100,7 @@ pub enum Publication {
         finish: FinishReason,
         usage: DetailedUsage,
         method: String,
-        timings: PhysicalTimings,
+        timings: RequestTimings,
     },
     Failed(RequestError),
 }
@@ -359,7 +358,7 @@ impl PublicationSender {
         finish: FinishReason,
         usage: DetailedUsage,
         method: String,
-        timings: PhysicalTimings,
+        timings: RequestTimings,
     ) {
         self.record_terminal(Publication::Completed {
             finish,
@@ -577,7 +576,7 @@ mod tests {
                 draft_n_accepted: 0,
             },
             "plain".into(),
-            PhysicalTimings::default(),
+            RequestTimings::default(),
         );
         assert_eq!(
             next(&mut receiver),

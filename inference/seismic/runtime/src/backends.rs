@@ -16,7 +16,7 @@ use crate::api::{
 use crate::devices::OpenError;
 use crate::driver::{self, Opened, PreparedHandle};
 use crate::formation::ProgramFormer;
-use crate::memory::DeviceStores;
+use crate::memory::{AllocationCharge, Charges, DeviceStores};
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::NativeExecutor;
 use seismic_compiler::feedback::PreparationOptions;
@@ -136,12 +136,12 @@ impl PreparedKind {
         }
     }
 
-    pub(crate) fn call(&self, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+    pub(crate) fn call(&self, charges: &Charges, args: EncodedArgs) -> Result<DecodedResults, CallError> {
         match self {
-            Self::Cpu(kernel) => kernel.call(args),
+            Self::Cpu(kernel) => kernel.call(charges, args),
             #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.call(args),
-            Self::Cuda(kernel) => kernel.call(args),
+            Self::Metal(kernel) => kernel.call(charges, args),
+            Self::Cuda(kernel) => kernel.call(charges, args),
         }
     }
 }
@@ -404,7 +404,6 @@ pub(crate) fn open(
         artifacts: store,
         native: crate::native::NativeState::default(),
         graph_cost,
-        tables_sealed: std::sync::atomic::AtomicBool::new(false),
         chosen: std::sync::Mutex::new(std::collections::HashMap::new()),
     }))
 }
@@ -651,17 +650,17 @@ impl OpenedKind {
         }
     }
 
-    pub(crate) fn workflow(&self) -> Result<WorkflowDraftKind, WorkflowError> {
+    pub(crate) fn workflow(&self, charges: &Charges) -> Result<WorkflowDraftKind, WorkflowError> {
         Ok(match self {
             Self::Cpu(device) => {
-                WorkflowDraftKind::Cpu(driver::WorkflowGraphDraft::new(device.clone()))
+                WorkflowDraftKind::Cpu(driver::WorkflowGraphDraft::new(device.clone(), charges.clone()))
             }
             #[cfg(target_os = "macos")]
             Self::Metal(device) => {
-                WorkflowDraftKind::Metal(driver::WorkflowGraphDraft::new(device.clone()))
+                WorkflowDraftKind::Metal(driver::WorkflowGraphDraft::new(device.clone(), charges.clone()))
             }
             Self::Cuda(device) => {
-                WorkflowDraftKind::Cuda(driver::WorkflowGraphDraft::new(device.clone()))
+                WorkflowDraftKind::Cuda(driver::WorkflowGraphDraft::new(device.clone(), charges.clone()))
             }
             #[cfg(not(target_os = "macos"))]
             Self::Vulkan(_) => {
@@ -785,72 +784,24 @@ impl OpenedKind {
         }
     }
 
-    pub(crate) fn allocate(
-        &self,
-        bytes: u64,
-        alignment: u64,
-    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
-        self.allocate_in(bytes, alignment, None)
-    }
-
-    pub(crate) fn allocate_in(
-        &self,
-        bytes: u64,
-        alignment: u64,
-        access: Option<Arc<driver::AccessGroup>>,
-    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
-        self.allocate_contract(Contract::DeviceOnly, bytes, alignment, access)
-    }
-
-    /// Storage that reads zero, backed ([`Self::zeroed`]).
-    pub(crate) fn allocate_zeroed(
-        &self,
-        bytes: u64,
-        alignment: u64,
-    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
-        self.zeroed(self.allocate(bytes, alignment)?, bytes)
-    }
-
-    /// A fixed buffer of a mapped `contract` ([`Self::allocate_mapped`]) that
-    /// reads zero, backed as [`Self::zeroed`] says.
-    pub(crate) fn allocate_mapped_zeroed(
-        &self,
-        contract: Contract,
-        bytes: u64,
-        alignment: u64,
-    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
-        self.zeroed(self.allocate_mapped(contract, bytes, alignment)?, bytes)
-    }
-
-    /// A fixed buffer of `contract`, which the host reaches in place, in the
-    /// kinds its placement names, charged to it. CPU and Metal have one kind.
-    pub(crate) fn allocate_mapped(
-        &self,
-        contract: Contract,
-        bytes: u64,
-        alignment: u64,
-    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
-        self.allocate_contract(contract, bytes, alignment, None)
-    }
-
-    /// A fixed buffer of `contract`, in the kinds it is allocated from now
-    /// (`crate::memory::DeviceStores::kinds`), charged to it and lying along
-    /// the path of the kind it landed in, ordered by `access`'s hazard
-    /// domain where given (a slab store's address table, its pool's).
+    /// A fixed buffer charged as `charge` says, landing in the first of its
+    /// kinds with room and lying along that kind's path, ordered by
+    /// `access`'s hazard domain where given (a slab store's address table,
+    /// its pool's).
     pub(crate) fn allocate_contract(
         &self,
-        contract: Contract,
+        charge: AllocationCharge<'_>,
         bytes: u64,
         alignment: u64,
         access: Option<Arc<driver::AccessGroup>>,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
         match self {
-            Self::Cpu(device) => device.allocate_contract(contract, bytes, alignment, access),
+            Self::Cpu(device) => device.allocate_contract(charge, bytes, alignment, access),
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.allocate_contract(contract, bytes, alignment, access),
-            Self::Cuda(device) => device.allocate_contract(contract, bytes, alignment, access),
+            Self::Metal(device) => device.allocate_contract(charge, bytes, alignment, access),
+            Self::Cuda(device) => device.allocate_contract(charge, bytes, alignment, access),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.allocate_contract(contract, bytes, alignment, access),
+            Self::Vulkan(device) => device.allocate_contract(charge, bytes, alignment, access),
         }
     }
 
@@ -914,17 +865,6 @@ impl OpenedKind {
         Ok(allocation)
     }
 
-    /// Storage for inputs the host only writes before each submission. Host
-    /// writes to it are plain memory writes that never wait for queued
-    /// device work. The host never reads it: what it reads is `Shared`.
-    pub(crate) fn allocate_upload(
-        &self,
-        bytes: u64,
-        alignment: u64,
-    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
-        self.allocate_mapped(Contract::Upload, bytes, alignment)
-    }
-
     pub(crate) fn map_read_only_host_region(
         &self,
         region: crate::api::HostRegion,
@@ -979,9 +919,10 @@ impl OpenedKind {
         &self,
         logical: LogicalEntry,
         bindings: ElementBindings,
-        public_device: &Arc<DeviceInner>,
+        charges: &Charges,
         options: PreparationOptions,
     ) -> Result<PreparedKind, crate::api::kernel::PrepareError> {
+        let public_device = charges.device();
         match self {
             Self::Cpu(device) => prepare(
                 device,
@@ -989,7 +930,7 @@ impl OpenedKind {
                 public_device.programs.cpu_programs(),
                 logical,
                 bindings,
-                public_device,
+                charges,
                 options,
             )
             .map(PreparedKind::Cpu),
@@ -1000,7 +941,7 @@ impl OpenedKind {
                 public_device.programs.metal_programs(),
                 logical,
                 bindings,
-                public_device,
+                charges,
                 options,
             )
             .map(PreparedKind::Metal),
@@ -1010,7 +951,7 @@ impl OpenedKind {
                 public_device.programs.cuda_ptx_programs(),
                 logical,
                 bindings,
-                public_device,
+                charges,
                 options,
             )
             .map(PreparedKind::Cuda),
@@ -1024,10 +965,11 @@ impl OpenedKind {
         module: &CheckedModule,
         entry: EntryId,
         bindings: ElementBindings,
-        public_device: &'a Arc<DeviceInner>,
+        charges: &'a Charges,
         precision: seismic_lang::precision::PrecisionPolicy,
         options: seismic_compiler::feedback::FeedbackOptions,
     ) -> Result<(FeedbackKind<'a>, PreparedKind), crate::api::kernel::PrepareError> {
+        let public_device = charges.device();
         match self {
             Self::Cpu(device) => driver::FeedbackCampaign::start(
                 device,
@@ -1036,7 +978,7 @@ impl OpenedKind {
                 module,
                 entry,
                 bindings,
-                public_device,
+                charges,
                 precision,
                 options,
             )
@@ -1049,7 +991,7 @@ impl OpenedKind {
                 module,
                 entry,
                 bindings,
-                public_device,
+                charges,
                 precision,
                 options,
             )
@@ -1061,7 +1003,7 @@ impl OpenedKind {
                 module,
                 entry,
                 bindings,
-                public_device,
+                charges,
                 precision,
                 options,
             )
@@ -1089,7 +1031,7 @@ fn prepare<T, E, C>(
     native_context: &C::Context,
     logical: LogicalEntry,
     bindings: ElementBindings,
-    public_device: &Arc<DeviceInner>,
+    charges: &Charges,
     options: PreparationOptions,
 ) -> Result<Arc<PreparedHandle<T, E>>, crate::api::kernel::PrepareError>
 where
@@ -1103,12 +1045,12 @@ where
         native_context,
         logical,
         bindings,
-        public_device,
+        charges,
         options,
     )?;
     Ok(Arc::new(PreparedHandle {
         prepared,
-        device: public_device.clone(),
+        device: charges.device().clone(),
     }))
 }
 

@@ -20,6 +20,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
 }
 
 fn packed_stages_on(device: &seismic::Device) {
+    let charges = seismic::Charges::tally(device);
     let q8 = q8_element(device);
     let bf16 = seismic::Element::bf16();
     let resident = |shape: &[u64]| q8_weight(device, shape, 1.0, |_| 0);
@@ -62,7 +63,7 @@ fn packed_stages_on(device: &seismic::Device) {
         }),
         &[],
     )
-    .call(gated_delta_project::Args {
+    .call(&charges, gated_delta_project::Args {
         hidden: &hidden,
         input_norm: &input_norm,
         qkv_weight: &qkv_weight,
@@ -80,7 +81,7 @@ fn packed_stages_on(device: &seismic::Device) {
         gated_delta_step::native_entry_with(gated_delta_step::Elements { RN: bf16, A: bf16 }),
         &[],
     )
-    .call(gated_delta_step::Args {
+    .call(&charges, gated_delta_step::Args {
         projection: &projection,
         convolution: &convolution,
         rate: &rate,
@@ -107,7 +108,7 @@ fn packed_stages_on(device: &seismic::Device) {
         attention_output::native_entry_with(attention_output::Elements { OW: q8, A: bf16 }),
         &[],
     )
-    .call(attention_output::Args {
+    .call(&charges, attention_output::Args {
         hidden: &hidden,
         inject: &no_inject(&device, hidden.extents()[0]),
         gated: &gated,
@@ -129,6 +130,7 @@ fn packed_stages_on(device: &seismic::Device) {
 fn cpu_output_reads_the_operand_the_recurrent_step_emits() {
     let Some(device) = seismic_native_tests::fresh_device(seismic::BackendName::Cpu) else { return };
     let device = &device;
+    let charges = seismic::Charges::tally(device);
     let (q8, bf16) = (q8_element(device), seismic::Element::bf16());
     let epsilon = 1e-5;
     let (hidden_width, width, keys, values) = (HIDDEN as usize, WIDTH as usize, KEYS as usize, VALUES as usize);
@@ -165,7 +167,7 @@ fn cpu_output_reads_the_operand_the_recurrent_step_emits() {
         }),
         &[],
     )
-    .call(gated_delta_project::Args {
+    .call(&charges, gated_delta_project::Args {
         hidden: &hidden,
         input_norm: &input_norm,
         qkv_weight: &weight(&[channels as u64, HIDDEN], 1),
@@ -192,7 +194,7 @@ fn cpu_output_reads_the_operand_the_recurrent_step_emits() {
     // Alone, the output forms its own operand.
     let mut state = RecurrentState::new(device);
     let gated = step
-        .call(gated_delta_step::Args {
+        .call(&charges, gated_delta_step::Args {
             projection: &projection,
             convolution: &convolution,
             rate: &rate,
@@ -215,7 +217,7 @@ fn cpu_output_reads_the_operand_the_recurrent_step_emits() {
         .unwrap()
         .value;
     let alone = output
-        .call(attention_output::Args {
+        .call(&charges, attention_output::Args {
             hidden: &hidden,
             inject: &inject,
             gated: &gated,
@@ -264,8 +266,8 @@ fn cpu_output_reads_the_operand_the_recurrent_step_emits() {
     ] = inputs.map(&mut port);
     let mut states = [&state.window, &state.delta, &state.tape].map(&mut port);
     let stored = [
-        seismic::Tensor::zeros(device, gated.element(), &gated.extents()).unwrap(),
-        seismic::Tensor::zeros(device, alone.element(), &alone.extents()).unwrap(),
+        seismic::Tensor::zeros(&charges, gated.element(), &gated.extents()).unwrap(),
+        seismic::Tensor::zeros(&charges, alone.element(), &alone.extents()).unwrap(),
     ];
     let stored_ports = [&stored[0], &stored[1]].map(&mut port);
     let [window_port, delta_port, tape_port] = &mut states;
@@ -334,9 +336,9 @@ fn cpu_output_reads_the_operand_the_recurrent_step_emits() {
         (&states[2], &state.tape),
     ];
     for (port, tensor) in bound.into_iter().chain(stored_ports.iter().zip(&stored)) {
-        bindings.set(port, tensor).unwrap();
+        bindings.set(&charges, port, tensor).unwrap();
     }
-    let (_, completion) = plan.new_slot().unwrap().attach(bindings, plan.new_outputs().unwrap()).unwrap().submit().unwrap();
+    let (_, completion) = plan.new_slot(&charges).unwrap().attach(bindings, plan.new_outputs(&charges).unwrap()).unwrap().submit().unwrap();
     completion.wait().unwrap();
     let bytes = |tensor: &seismic::Tensor| tensor.read_to_host().unwrap();
     assert_eq!(bytes(&stored[0]), bytes(&gated), "gated row");
@@ -391,6 +393,7 @@ fn q8_element(device: &seismic::Device) -> seismic::Element {
 /// A `shape` Q8 weight in `device`'s resident form, repacked from GGUF
 /// Q8_0 blocks of scale `scale` whose value `index` is `code(index)`.
 fn q8_weight(device: &seismic::Device, shape: &[u64], scale: f32, code: impl Fn(usize) -> i8) -> seismic::Tensor {
+    let charges = seismic::Charges::tally(device);
     let q8_external = seismic::Element::named("gguf_q8_0").unwrap();
     let values = shape.iter().product::<u64>() as usize;
     assert_eq!(values % 32, 0);
@@ -400,7 +403,7 @@ fn q8_weight(device: &seismic::Device, shape: &[u64], scale: f32, code: impl Fn(
         bytes.extend((0..32).map(|value| code(block * 32 + value) as u8));
     }
     let external =
-        seismic::Tensor::from_host(device, q8_external, &[1, shape[0], shape[1]], &bytes).unwrap();
+        seismic::Tensor::from_host(&charges, q8_external, &[1, shape[0], shape[1]], &bytes).unwrap();
     at_defaults(
         device,
         repack_weight::native_entry_with(repack_weight::Elements {
@@ -409,7 +412,7 @@ fn q8_weight(device: &seismic::Device, shape: &[u64], scale: f32, code: impl Fn(
         }),
         &[],
     )
-    .call(repack_weight::Args { source: &external })
+    .call(&charges, repack_weight::Args { source: &external })
     .unwrap()
     .value
     .reshape(shape)
@@ -453,20 +456,23 @@ fn i32_bytes(values: &[i32]) -> Vec<u8> {
 }
 
 fn tensor(device: &seismic::Device, shape: &[u64], values: &[f32]) -> seismic::Tensor {
-    seismic::Tensor::from_host(device, seismic::Element::f32(), shape, &f32_bytes(values)).unwrap()
+    let charges = seismic::Charges::tally(device);
+    seismic::Tensor::from_host(&charges, seismic::Element::f32(), shape, &f32_bytes(values)).unwrap()
 }
 
 /// `values` rounded to BF16 by truncation.
 fn bf16_tensor(device: &seismic::Device, shape: &[u64], values: &[f32]) -> seismic::Tensor {
+    let charges = seismic::Charges::tally(device);
     let bytes = values
         .iter()
         .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
         .collect::<Vec<_>>();
-    seismic::Tensor::from_host(device, seismic::Element::bf16(), shape, &bytes).unwrap()
+    seismic::Tensor::from_host(&charges, seismic::Element::bf16(), shape, &bytes).unwrap()
 }
 
 fn indices(device: &seismic::Device, shape: &[u64], values: &[i32]) -> seismic::Tensor {
-    seismic::Tensor::from_host(device, seismic::Element::i32(), shape, &i32_bytes(values)).unwrap()
+    let charges = seismic::Charges::tally(device);
+    seismic::Tensor::from_host(&charges, seismic::Element::i32(), shape, &i32_bytes(values)).unwrap()
 }
 
 fn read_f32(tensor: &seismic::Tensor) -> Vec<f32> {
@@ -523,5 +529,6 @@ fn packed_entries_are_the_only_generated_target_surface() {
 
 /// The inject port of a single residual stream: no columns.
 fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
-    seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
+    let charges = seismic::Charges::tally(device);
+    seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[rows, 0]).unwrap()
 }

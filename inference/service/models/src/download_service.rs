@@ -144,7 +144,7 @@ impl ManagedModelDownloads {
         drop(downloads);
         drop(attempts);
         if changed {
-            self.persist_requests(&requests);
+            self.persist_requests(&mut requests);
         }
     }
 
@@ -154,11 +154,12 @@ impl ManagedModelDownloads {
             return;
         };
         if change(&mut requests) {
-            self.persist_requests(&requests);
+            self.persist_requests(&mut requests);
         }
     }
 
-    fn persist_requests(&self, requests: &RequestedDownloads) {
+    /// Persist what this process changed of the requests; a failure keeps it for the next change.
+    fn persist_requests(&self, requests: &mut RequestedDownloads) {
         if let Err(error) = requests.persist(self.manager.root()) {
             tracing::warn!(%error, "failed to persist requested downloads");
         }

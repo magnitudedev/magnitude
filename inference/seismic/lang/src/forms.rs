@@ -1239,6 +1239,13 @@ mod tests {
         assert!(undecoded.is_empty(), "rows16 weights Vulkan's producers do not decode (`vulkan/producers.decl`): {undecoded:?}");
     }
 
+    /// The suffixes of a Vulkan projection's launches that decode its weights:
+    /// `dense`'s GEMVs and GEMMs, `routed`'s grouped GEMMs (`expand`, `down`).
+    const DECODING: [&str; 13] = [
+        "gemv1", "gemv2", "gemv4", "gemv8", "gemm", "ordered_gemv", "ordered_gemv1", "ordered_gemv2",
+        "ordered_gemv4", "ordered_gemv8", "ordered_gemm", "expand", "down",
+    ];
+
     /// The parameter prefix a native source line binds a packet decoder
     /// slot to (`#define KERNEL_W<n> SEISMIC_<PARAMETER>`, `packets.glsl`).
     fn slot_binding(line: &str) -> Option<&str> {
@@ -1356,10 +1363,6 @@ mod tests {
     /// fewer packets at once to hold it; iq2_xxs's 2 KiB grid by both.
     #[test]
     fn vulkan_tables_are_held_where_every_device_holds_them() {
-        const DECODING: [&str; 11] = [
-            "gemv1", "gemv2", "gemv4", "gemv8", "gemm", "ordered_gemv", "ordered_gemv1", "ordered_gemv2",
-            "ordered_gemv4", "ordered_gemv8", "ordered_gemm",
-        ];
         let floor = crate::device::VULKAN_FLOOR_SHARED_BYTES;
         let module = crate::analysis::tests::kernels();
         let id = |name: &str| registry::representation(name).expect("a registered representation");
@@ -1368,11 +1371,13 @@ mod tests {
             let entry = module.entries().iter().find(|candidate| candidate.name == entry).expect("the entry");
             let native = module.native_implementation(entry.id, BackendName::Vulkan).expect("a Vulkan native");
             let bound = native.at_elements(&bindings).expect("the weights form");
-            let independent = bound.device_independent().expect("the declaration reads no device");
             let specialization = statics
                 .iter()
                 .fold(crate::checked::NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value));
-            let configuration = independent.default_specialization(&specialization).expect("the statics are admissible");
+            let configuration = bound
+                .default_specialization_without_device(&specialization)
+                .expect("the declaration's defaults read no device")
+                .expect("the statics are admissible");
             let mut regions = Vec::new();
             for rows in [1u64, 512] {
                 let dimension = |name: &str| match name {
@@ -1437,10 +1442,6 @@ mod tests {
     /// table once at the region's end.
     #[test]
     fn vulkan_staged_tables_are_in_their_launches_shared_regions() {
-        const DECODING: [&str; 11] = [
-            "gemv1", "gemv2", "gemv4", "gemv8", "gemm", "ordered_gemv", "ordered_gemv1", "ordered_gemv2",
-            "ordered_gemv4", "ordered_gemv8", "ordered_gemm",
-        ];
         fn reads(expression: &NativeNatExpr, element: &str, form: Form) -> bool {
             match expression {
                 NativeNatExpr::Element(read, ElementQuery::Form(read_form)) => read == element && *read_form == form,

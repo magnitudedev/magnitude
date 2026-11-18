@@ -17,6 +17,10 @@ const USAGE: &str = "usage:
 `entries` prints the generated-binding surface of that checked module.";
 
 fn main() -> ExitCode {
+    seismic_threads::main("seismic", start)
+}
+
+fn start() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
         eprintln!("{USAGE}");

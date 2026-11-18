@@ -21,7 +21,7 @@ fn expected(path: &Path, name: &str) -> Vec<f32> {
 
 fn f32_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
     Tensor::from_host(
-        device,
+        &seismic::Charges::tally(device),
         Element::f32(),
         shape,
         &values
@@ -34,7 +34,7 @@ fn f32_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
 
 fn bf16_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
     Tensor::from_host(
-        device,
+        &seismic::Charges::tally(device),
         Element::bf16(),
         shape,
         &values
@@ -53,11 +53,12 @@ fn repacked(
     resident: &str,
     shape: &[u64],
 ) -> Tensor {
+    let charges = seismic::Charges::tally(device);
     let source_element = Element::named(source).unwrap();
     let resident_element = Element::named(resident).unwrap();
     let wire = bytes(path, name, "wire");
     let logical = shape.iter().product::<u64>();
-    let input = Tensor::from_host(device, source_element, &[1, 1, logical], &wire).unwrap();
+    let input = Tensor::from_host(&charges, source_element, &[1, 1, logical], &wire).unwrap();
     declared::prepared(
         device,
         &repack_weight::native_entry_with(repack_weight::Elements {
@@ -67,7 +68,7 @@ fn repacked(
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
-    .call(repack_weight::Args { source: &input })
+    .call(&charges, repack_weight::Args { source: &input })
     .unwrap()
     .value
     .reshape(shape)
@@ -169,6 +170,7 @@ fn step_specialization(device: &Device) -> seismic::NativeSpecialization {
 }
 
 fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &Path) {
+    let charges = seismic::Charges::tally(device);
     println!("{}:", device.backend().as_str());
     let f32e = Element::f32();
     let bf16 = Element::bf16();
@@ -188,7 +190,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
     let recurrent_norm = f32_tensor(&device, &[128], &expected(path, "recurrent_norm"));
     let indices = |shape: &[u64], values: &[i32]| {
         Tensor::from_host(
-            &device,
+            &charges,
             Element::i32(),
             shape,
             &values
@@ -252,7 +254,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
-    .call(gated_delta_project::Args {
+    .call(&charges, gated_delta_project::Args {
         hidden: &hidden,
         input_norm: &norm,
         qkv_weight: &qkv,
@@ -274,7 +276,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         &step_specialization(device),
     )
     .unwrap()
-    .call(gated_delta_step::Args {
+    .call(&charges, gated_delta_step::Args {
         projection: &projection,
         convolution: &convolution,
         rate: &rate,
@@ -303,7 +305,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
-    .call(attention_output::Args {
+    .call(&charges, attention_output::Args {
         hidden: &hidden,
         inject: &no_inject(&device, hidden.extents()[0]),
         gated: &gated,
@@ -318,5 +320,5 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
 
 /// The inject port of a single residual stream: no columns.
 fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
-    seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
+    seismic::Tensor::zeros(&seismic::Charges::tally(device), seismic::Element::f32(), &[rows, 0]).unwrap()
 }

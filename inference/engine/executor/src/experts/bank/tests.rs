@@ -3,36 +3,9 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use crate::experts::watcher::Join;
 use super::resize::{Cut, Joining, RecordsAt, Stores, grow_by_slots};
-use crate::storage_thread::{Done, StorageThread};
+use crate::storage_thread::StorageThread;
 
 use super::*;
-
-/// A resize step that panics is reported to its holding, its wake
-/// completed, and the resize thread runs the next step: a panic never
-/// leaves a resize running forever nor the bank's thread gone.
-#[test]
-fn a_resize_step_that_panics_is_reported_and_the_thread_runs_on() {
-    let resize_thread = StorageThread::start("bank-test").unwrap();
-    let waited = |done: &Done<u32>| loop {
-        if let Some((outcome, _)) = done.lock().unwrap().take() {
-            return outcome;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    };
-    let woken = Arc::new(AtomicBool::new(false));
-    let wake = { let woken = woken.clone(); CompletionWake::new(move || woken.store(true, Ordering::Release)) };
-    let panicked = resize_thread.run(wake, || -> u32 { panic!("a step's fault") });
-    assert!(waited(&panicked).is_err_and(|why| why.contains("a step's fault")));
-    // The outcome lands before the wake completes, so the owner it wakes
-    // finds it.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !woken.load(Ordering::Acquire) {
-        assert!(Instant::now() < deadline, "the holding's owner is woken to learn it");
-        std::thread::yield_now();
-    }
-    let next = resize_thread.run(CompletionWake::new(|| {}), || 7);
-    assert_eq!(waited(&next), Ok(7));
-}
 
 /// A growth joins slot by slot, each only once every group holds its
 /// records, its pool's blocks charged to the store's pool entry within the
@@ -56,8 +29,9 @@ fn a_growth_joins_each_slot_as_every_group_holds_it() {
     let changes = scope.changes().clone();
     // A slot is a block: a granule of each group.
     let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(2 * granule).expect("a slot's block"));
-    let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, entries).unwrap();
-    let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&pool, 1, 8, &regions).unwrap(), 0, vec![64])).collect();
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
+    let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&charges, &pool, 1, 8, &regions).unwrap(), 0, vec![64])).collect();
     let stores = Stores::new(pool, groups);
     let opened = ledger.estimate().allocated();
     let records: RecordsAt = Arc::new(|_, at| at);
@@ -67,7 +41,7 @@ fn a_growth_joins_each_slot_as_every_group_holds_it() {
     let block = ledger.estimate().allocated() - opened;
     assert!(block >= 2 * granule, "a block is charged its granules at least: {block} bytes");
     let blocks = |slots: u64| opened + slots * block;
-    let claim = ledger.backing(crate::memory::ledger::PoolClass::Records, 6 * 2 * granule).expect("the slots fit");
+    let claim = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 6 * 2 * granule)).expect("the slots fit");
     let (slots, stop, rises) = (AtomicU64::new(1), AtomicBool::new(false), Mutex::new(()));
     let posted = Mutex::new(Vec::new());
     let grown = grow_by_slots(
@@ -131,15 +105,16 @@ fn a_pools_absent_granule_is_committed_never_spare() {
     ledger.read(ledger.sampled(Instant::now()), crate::memory::supply::Reading::device(1 << 40, 1 << 40, crate::domain::fixtures::NO_LAG));
     let changes = scope.changes().clone();
     let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(2 * granule).expect("a block"));
-    let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, entries).unwrap();
-    let groups = vec![(seismic::SlabTensor::in_pool(&pool, 1, 2, &regions).unwrap(), 0, vec![64])];
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
+    let groups = vec![(seismic::SlabTensor::in_pool(&charges, &pool, 1, 2, &regions).unwrap(), 0, vec![64])];
     let stores = Stores::new(pool, groups);
     let opened = ledger.estimate();
     assert!(opened.allocated() >= granule, "the pool allocated its absent granule as it opened");
     assert_eq!((opened.cache(), opened.committed()), (0, opened.allocated()), "committed, none of it spare");
     // A growth's first record takes a block: its other granule and the
     // block's rounding are spare.
-    let claim = ledger.backing(crate::memory::ledger::PoolClass::Records, granule).expect("room");
+    let claim = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, granule)).expect("room");
     changes.change(|_| assert_eq!(stores.claim_to(0, 1).unwrap(), [0]));
     let one = ledger.estimate();
     let block = one.allocated() - opened.allocated();
@@ -214,16 +189,17 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
     assert_eq!(supply, SUPPLY as i64);
     let changes = scope.changes().clone();
     let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(2 * granule).expect("a slot's block"));
-    let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, entries).unwrap();
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
     // A store of a slot for each of the ninety.
-    let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&pool, 1, SLOTS, &regions).unwrap(), 0, vec![64])).collect();
+    let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&charges, &pool, 1, SLOTS, &regions).unwrap(), 0, vec![64])).collect();
     let stores = Arc::new(Stores::new(pool, groups));
     let opened = ledger.estimate().allocated();
     let records: RecordsAt = Arc::new(|_, at| at);
     changes.change(|_| (0..2).for_each(|group| assert_eq!(stores.claim_to(group, 1).unwrap(), [0])));
     // What the backend charges a block (whole host pages at least).
     let block = ledger.estimate().allocated() - opened;
-    let claim = ledger.backing(crate::memory::ledger::PoolClass::Records, SLOTS * 2 * granule).expect("the slots fit");
+    let claim = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, SLOTS * 2 * granule)).expect("the slots fit");
     let (slots, stop, rises, joined) = (Arc::new(AtomicU64::new(1)), Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(())), Arc::new(AtomicU64::new(0)));
     // The growth runs on the resize thread as the bank's does.
     let resize_thread = StorageThread::start("bank-test-growth").unwrap();
@@ -264,8 +240,7 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
             std::thread::sleep(Duration::from_micros(50));
         }
     }
-    let (outcome, _) = done.lock().unwrap().take().expect("the growth ended");
-    let grown = outcome.expect("the growth did not panic");
+    let (grown, _) = done.lock().unwrap().take().expect("the growth ended");
     assert!(samples >= 3 && seen.len() >= 3, "samples were taken while slots were joining: {samples} samples saw {seen:?}");
     assert!(matches!(grown.cut, Cut::None) && grown.joined.is_some());
     assert_eq!(joined.load(Ordering::Acquire), SLOTS - 1, "every slot after the first joined");
@@ -299,12 +274,12 @@ fn growing_ended_reads_reached_slots_and_charge_after_done_is_taken() {
     );
     let now = Instant::now();
     *done.lock().unwrap() = Some((
-        Ok(Grown {
+        Grown {
             at: 40,
             joined: Some((now, now)),
             cut: Cut::None,
             spent: Spent::default(),
-        }),
+        },
         now,
     ));
     let (resized, _) = growing

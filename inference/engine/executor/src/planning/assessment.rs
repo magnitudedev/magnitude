@@ -686,7 +686,7 @@ impl AssessmentGraphResourceBounds {
         limits: super::ResourceLimits,
         backend: BackendName,
     ) -> Result<Option<VisionGraphBounds>, GraphError> {
-        match (plan.vision(), definition.vision.as_ref()) {
+        match (plan.vision(), definition.vision.as_deref()) {
             (Some(vision_plan), Some(vision_definition)) => {
                 let patch_rows = crate::programs::native_vision::image_patch_classes(
                     limits.max_image_cells,

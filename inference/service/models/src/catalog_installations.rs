@@ -12,7 +12,7 @@ use magnitude_service_contracts::models::{
     CatalogInstallationOperationState, CatalogInstallationProgress, CatalogInstallationRemoval,
     CatalogInstallationRetentionReason, CatalogInstallations, CatalogInstallationsInvalidation,
     CatalogInstallationsResponse, CatalogModelOptimizer, CatalogOptimizationProgress,
-    CatalogPackageRemover, CustomModelPart, ModelDownload, ModelDownloadId, ModelDownloadState,
+    CatalogPackageRemover, CustomModelPart, LoadedPackages, ModelDownload, ModelDownloadId, ModelDownloadState,
     ModelDownloads, ModelId, ParsedModelId, ServableModelBundle,
 };
 
@@ -194,7 +194,7 @@ impl ManagedCatalogInstallations {
     pub(crate) async fn cleanup_model(&self, model_id: &ModelId) -> Result<(), InventoryError> {
         let package_ids = self.resolver.catalog_cleanup_package_ids(model_id)?;
         if !package_ids.is_empty() {
-            self.remover.remove_catalog_packages(package_ids).await?;
+            self.remover.remove_catalog_packages(package_ids, LoadedPackages::Keep).await?;
         }
         Ok(())
     }
@@ -353,7 +353,7 @@ impl ManagedCatalogInstallations {
         }
         let reclaimed_bytes = self
             .remover
-            .remove_catalog_packages(plan.package_ids)
+            .remove_catalog_packages(plan.package_ids, LoadedPackages::Stop)
             .await?;
         Ok(CatalogInstallationRemoval::Removed {
             reclaimed_bytes,

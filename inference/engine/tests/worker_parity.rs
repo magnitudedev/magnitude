@@ -246,7 +246,7 @@ fn worker_process(arguments: &Arguments) -> Result<(Vec<TokenId>, FinishReason),
         return Err("a load serving canonical defaults stopped unprepared".into());
     };
     let engine =
-        ReadyEngine::new(Arc::new(resolved.host), connection).map_err(|error| error.to_string())?;
+        ReadyEngine::new(Arc::new(resolved.host), *connection).map_err(|error| error.to_string())?;
     eprintln!(
         "worker process: ready in {:.2} s",
         started.elapsed().as_secs_f64()
@@ -270,6 +270,10 @@ fn worker_process(arguments: &Arguments) -> Result<(Vec<TokenId>, FinishReason),
 }
 
 fn main() {
+    magnitude_executor::main("magnitude-main", start)
+}
+
+fn start() {
     if std::env::args().nth(1).as_deref() == Some("--worker") {
         let served = serve_worker(stdio_worker_transport());
         eprintln!("worker process: exited: {:?}", served.exit);

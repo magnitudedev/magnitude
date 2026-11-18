@@ -58,7 +58,7 @@ pub fn weight(device: &Device, format: Format, rows: usize, k: usize, rng: &mut 
         .repack_host(format.source(), &shape, &external)
         .expect("registered GGUF -> mma16 conversion");
     let values = resident.decode_host(&shape, &bytes).unwrap();
-    let tensor = Tensor::from_host(device, resident, &shape, &bytes).unwrap();
+    let tensor = Tensor::from_host(&seismic::Charges::tally(device), resident, &shape, &bytes).unwrap();
     Weight {
         tensor,
         values,
@@ -86,28 +86,28 @@ pub fn f32_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::f32(), shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::f32(), shape, &bytes).unwrap()
 }
 pub fn bf16_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
     let bytes = values
         .iter()
         .flat_map(|v| ((bf16_round(*v).to_bits() >> 16) as u16).to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::bf16(), shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::bf16(), shape, &bytes).unwrap()
 }
 pub fn i32_tensor(device: &Device, shape: &[u64], values: &[i32]) -> Tensor {
     let bytes = values
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::i32(), shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::i32(), shape, &bytes).unwrap()
 }
 pub fn u32_tensor(device: &Device, shape: &[u64], values: &[u32]) -> Tensor {
     let bytes = values
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::u32(), shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::u32(), shape, &bytes).unwrap()
 }
 pub fn read_f32(tensor: &Tensor) -> Vec<f32> {
     tensor

@@ -9,7 +9,7 @@
 
 use super::{BankHolding, BankStep, DomainError, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
 use crate::experts::derived::BankMove;
-use crate::memory::ledger::{CacheKind, Cached, CommittedKind, Value};
+use crate::memory::ledger::{CacheKind, Cached, Claim, CommittedKind, Keeping, Value};
 use crate::workload::WorkloadRates;
 use std::time::Instant;
 
@@ -65,7 +65,30 @@ pub(super) struct Served {
     vision: u64,
 }
 
+/// An idle optional component kept for a request that opens
+/// ([`ExecutorDomain::keep_components`]): its weights' and binding's
+/// claims, committed again in place, until the open stands
+/// ([`ExecutorDomain::activate_components`]) or is refused
+/// ([`ExecutorDomain::idle_kept`]).
+pub(super) struct KeptComponent {
+    component: OptionalComponent,
+    weights: Vec<Claim>,
+    binding: Vec<Claim>,
+}
+
 impl IdleComponent {
+    /// `component` idling as cache: its weights' and binding's claims
+    /// turned in place, so the ledger may take them; none where it holds
+    /// neither.
+    fn of(component: OptionalComponent, weights: Vec<Claim>, binding: Vec<Claim>) -> Option<Self> {
+        let kind = match component {
+            OptionalComponent::Drafter => CacheKind::Drafter,
+            OptionalComponent::Vision => CacheKind::Vision,
+        };
+        let cache = |claims: Vec<Claim>| claims.into_iter().map(|claim| claim.into_cache(kind)).collect::<Vec<_>>();
+        (!weights.is_empty() || !binding.is_empty()).then(|| Self { component, weights: cache(weights), binding: cache(binding) })
+    }
+
     /// Its bytes on the ledger.
     fn bytes(&self) -> u64 {
         self.weights.iter().chain(&self.binding).map(Cached::bytes).sum()
@@ -140,8 +163,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let step = match self.unchained(bindings) {
             None => BankStep::Deferred,
-            Some(mut unchained) => {
-                bank.shrink(holding, to, &mut || self.queue.orphan(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()), &mut unchained), wake)?
+            Some(_) => {
+                let experts = self.measures.as_ref().and_then(|measures| measures.experts.as_ref());
+                bank.shrink(holding, to, &mut || self.queue.conclude(&mut self.target, experts), wake)?
             }
         };
         match step {
@@ -174,9 +198,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(None);
         };
-        let count = |value: u64| usize::try_from(value).map_err(|_| DomainError::invariant("bank slots exceed the host"));
+        let count = |value: u64| usize::try_from(value).expect("invariant violated: a bank's slots exceed the host's");
         let host = bank.residency()?.host.map_or(0, |host| host.slots);
-        Ok(Some(crate::assessment::HeldSlots { slots: count(bank.slots())?, host: count(host)? }))
+        Ok(Some(crate::assessment::HeldSlots { slots: count(bank.slots()), host: count(host) }))
     }
 
     /// The workload prior of the load's planned context and limits
@@ -202,7 +226,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn value_cache(&mut self, prefix: Option<(u64, u64)>) -> Result<(), DomainError> {
         let price = self.decode_price()?;
         if let (Some(bank), Some(price), Some(held), Some(plan)) = (self.family.expert_bank(), price.as_ref(), self.held_slots()?, self.expert_bank_plan()) {
-            let floor = usize::try_from(plan.floor()).map_err(|_| DomainError::invariant("bank slots exceed the host"))?;
+            let floor = usize::try_from(plan.floor()).expect("invariant violated: a bank's slots exceed the host's");
             let saved = price.step(crate::assessment::HeldSlots { slots: floor.min(held.slots), ..held }).total_seconds - price.step(held).total_seconds;
             // A bank at its floor holds no cache to value.
             if let Some(bytes) = std::num::NonZeroU64::new(self.resources.ledgers().device().estimate().cache_of(CacheKind::Bank)) {
@@ -261,10 +285,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.resources.releasing_slots() {
             return Ok(Yielded::Pending);
         }
-        if self.idle_slots_taken() {
+        if self.idle_class.taken() {
             // The slots' cache goes with their release, freed as it ends;
             // with no slot idling any more, their cache is let go at once.
-            return Ok(match self.resources.release_idle_slots(std::mem::take(&mut self.idle_class), wake) {
+            return Ok(match self.resources.release_idle_slots(self.idle_class.release(), wake) {
                 true => Yielded::Pending,
                 false => Yielded::Released { released: 0, returned: 0 },
             });
@@ -282,7 +306,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The device's ledger settled with the slabs the stores hold now: what
     /// an evicted prefix's rows gave back is freed.
     pub fn settle_state(&mut self) {
-        self.change_state(|_| ());
+        self.change_state(|_, _| ());
     }
 
     /// Where no request is resident, hold the bound optional components as
@@ -294,52 +318,58 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if !self.optional_idle() {
             return;
         }
-        let cache = |claims: Vec<crate::memory::ledger::Claim>, kind: CacheKind| claims.into_iter().map(|claim| claim.into_cache(kind)).collect::<Vec<_>>();
         if let Some(loader) = self.head_loader.as_ref().filter(|loader| loader.imported()) {
-            let weights = cache(loader.take_claims(), CacheKind::Drafter);
-            let binding = cache(std::mem::take(&mut self.head_binding), CacheKind::Drafter);
-            if !weights.is_empty() || !binding.is_empty() {
-                self.idle_components.push(IdleComponent { component: OptionalComponent::Drafter, weights, binding });
-            }
+            let binding = std::mem::take(&mut self.head_binding);
+            self.idle_components.extend(IdleComponent::of(OptionalComponent::Drafter, loader.take_claims(), binding));
         }
         if let Some(loader) = self.vision_loader.as_ref().filter(|loader| loader.imported()) {
-            let weights = cache(loader.take_claims(), CacheKind::Vision);
-            let binding = cache(std::mem::take(&mut self.vision_binding), CacheKind::Vision);
-            if !weights.is_empty() || !binding.is_empty() {
-                self.idle_components.push(IdleComponent { component: OptionalComponent::Vision, weights, binding });
+            let binding = std::mem::take(&mut self.vision_binding);
+            self.idle_components.extend(IdleComponent::of(OptionalComponent::Vision, loader.take_claims(), binding));
+        }
+    }
+
+    /// As a request opens, in its change's keep phase, before its
+    /// reservation claims: the idle optional components committed again in
+    /// place ([`Keeping::keep`]), each whole where an earlier claim took
+    /// none of it; one it took any of is unloaded whole, and its next use
+    /// loads it again.
+    pub(super) fn keep_components(&mut self, keeping: &Keeping) -> Vec<KeptComponent> {
+        let mut kept = Vec::new();
+        for IdleComponent { component, weights, binding } in std::mem::take(&mut self.idle_components) {
+            let split = weights.len();
+            match keeping.keep(weights.into_iter().chain(binding).collect(), CommittedKind::Component) {
+                Ok(mut weights) => {
+                    let binding = weights.split_off(split);
+                    kept.push(KeptComponent { component, weights, binding });
+                }
+                Err(taken) => self.unload_component(component, taken),
+            }
+        }
+        kept
+    }
+
+    /// The open stands: the kept components are its loaders' and
+    /// bindings' again, to draft and encode with.
+    pub(super) fn activate_components(&mut self, kept: Vec<KeptComponent>) {
+        for KeptComponent { component, weights, binding } in kept {
+            match component {
+                OptionalComponent::Drafter => {
+                    self.head_loader.as_ref().expect("an idle drafter has its loader").restore_claims(weights);
+                    self.head_binding = binding;
+                }
+                OptionalComponent::Vision => {
+                    self.vision_loader.as_ref().expect("an idle vision encoder has its loader").restore_claims(weights);
+                    self.vision_binding = binding;
+                }
             }
         }
     }
 
-    /// As a request opens, commit the idle optional components again
-    /// (`Cached::into_claim`), each whole where the ledger took none of it;
-    /// one it took any of is unloaded whole, and its next use loads it
-    /// again.
-    pub(super) fn activate_components(&mut self) {
-        for idle in std::mem::take(&mut self.idle_components) {
-            let IdleComponent { component, weights, binding } = idle;
-            let commit = |cached: Vec<Cached>| {
-                cached.into_iter().map(|cached| cached.into_claim(CommittedKind::Component)).collect::<Vec<_>>()
-            };
-            let (weights, binding) = (commit(weights), commit(binding));
-            if weights.iter().chain(&binding).all(Result::is_ok) {
-                let claims = |claims: Vec<Result<crate::memory::ledger::Claim, Cached>>| claims.into_iter().flatten().collect::<Vec<_>>();
-                let (weights, binding) = (claims(weights), claims(binding));
-                match component {
-                    OptionalComponent::Drafter => {
-                        self.head_loader.as_ref().expect("an idle drafter has its loader").restore_claims(weights);
-                        self.head_binding = binding;
-                    }
-                    OptionalComponent::Vision => {
-                        self.vision_loader.as_ref().expect("an idle vision encoder has its loader").restore_claims(weights);
-                        self.vision_binding = binding;
-                    }
-                }
-                continue;
-            }
-            // What was committed again is let go with the rest: the
-            // component is unloaded whole.
-            self.unload_component(component, (weights, binding));
+    /// The open is refused: the kept components idle as cache again, as
+    /// they were, values and all.
+    pub(super) fn idle_kept(&mut self, kept: Vec<KeptComponent>) {
+        for KeptComponent { component, weights, binding } in kept {
+            self.idle_components.extend(IdleComponent::of(component, weights, binding));
         }
     }
 

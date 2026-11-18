@@ -403,6 +403,7 @@ fn stored_cpu_choice_accepts_device_owned_parameters() {
 fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
     let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
+    let charges = seismic::Charges::tally(&device);
     let mut spec =
         crate::native::specialization::Specializer::count_untuned(&device, Default::default());
     for (element, bindings) in [
@@ -425,7 +426,7 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
     };
     let recorder = Recorder::default();
     let tuner = Tuner::count(
-        &device,
+        &charges,
         TuningContext {
             definition: &definition,
             weights: &ZeroTuningWeights,
@@ -435,7 +436,7 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
             settings: TuningSettings::STANDARD,
         },
         LIMITS,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
         Default::default(),
     );
     let tuner = tuner.census(untuned).unwrap();
@@ -769,6 +770,7 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -804,10 +806,10 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
     fixture_add(&mut invocations, &dependant, &statics, limits);
     let key = unit_key("dense_output", prerequisite.bindings(), &statics);
     let mut tuner = Tuner::count(
-        &device,
+        &charges,
         context,
         limits,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
         invocations,
     );
     let walk = |tuner: &mut Tuner<'_>| {
@@ -1007,7 +1009,7 @@ impl EntryTuning for FakeCase {
     #[cfg(feature = "tuning-survey")]
     fn tune(
         &self,
-        _device: &Device,
+        _charges: &seismic::Charges,
         _statics: &NativeSpecialization,
         _points: &mut dyn seismic::PointSource<'_, Self::Entry>,
         _validation: seismic::NumericalRequirement,
@@ -1018,7 +1020,7 @@ impl EntryTuning for FakeCase {
 
     fn open(
         &self,
-        _device: &Device,
+        _charges: &seismic::Charges,
         statics: &NativeSpecialization,
         validation: seismic::NumericalRequirement,
     ) -> Result<Box<dyn EntrySearch<Self::Entry>>, TuneError> {
@@ -1384,6 +1386,7 @@ fn a_prepare_abandoned_mid_search_is_searched_again_by_the_next_prepare() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -1452,14 +1455,14 @@ fn a_prepare_abandoned_mid_search_is_searched_again_by_the_next_prepare() {
             stages: Cell::new(0),
         };
         let mut tuner = Tuner::count(
-            &device,
+            &charges,
             TuningContext {
                 observer: &abandoning,
                 cache: Some(&cache),
                 ..context
             },
             limits,
-            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
             fixture_invocations(&case, &statics, limits),
         );
         tuner.tune(&case, &implementation, &statics).unwrap();
@@ -1482,13 +1485,13 @@ fn a_prepare_abandoned_mid_search_is_searched_again_by_the_next_prepare() {
         // promoted.
         let prepare = |case: &FakeCase| {
             let mut tuner = Tuner::count(
-                &device,
+                &charges,
                 TuningContext {
                     cache: Some(&cache),
                     ..context
                 },
                 limits,
-                TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+                TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
                 fixture_invocations(case, &statics, limits),
             );
             tuner.tune(case, &implementation, &statics).unwrap();
@@ -1652,6 +1655,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -1729,7 +1733,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
         let mut case = FakeCase::new(&implementation, &statics, "published");
         case.unqualified = unqualified;
         let mut tuner = Tuner::count(
-            &device,
+            &charges,
             TuningContext {
                 definition: &definition,
                 weights: &ZeroTuningWeights,
@@ -1739,7 +1743,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
                 settings: TuningSettings::STANDARD,
             },
             limits,
-            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
             fixture_invocations(&case, &statics, limits),
         );
         tuner.tune(&case, &implementation, &statics).unwrap();
@@ -1785,6 +1789,7 @@ fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -1803,7 +1808,7 @@ fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
         case.launches = launches;
         let observer = LateObserver(Cell::new(false));
         let mut tuner = Tuner::count(
-            &device,
+            &charges,
             TuningContext {
                 definition: &definition,
                 weights: &ZeroTuningWeights,
@@ -1816,7 +1821,7 @@ fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
                 },
             },
             LIMITS,
-            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
             fixture_invocations(&case, &statics, LIMITS),
         );
         tuner.tune(&case, &implementation, &statics).unwrap();
@@ -1844,6 +1849,7 @@ fn a_record_made_without_demand_is_read_without_demand_and_searched_with_it() {
         BackendName::Cpu,
     )
     .unwrap();
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -1880,7 +1886,7 @@ fn a_record_made_without_demand_is_read_without_demand_and_searched_with_it() {
     let recorder = Recorder::default();
     let prepare = |case: &FakeCase| {
         let mut tuner = Tuner::count(
-            &device,
+            &charges,
             TuningContext {
                 definition: &definition,
                 weights: &ZeroTuningWeights,
@@ -1890,7 +1896,7 @@ fn a_record_made_without_demand_is_read_without_demand_and_searched_with_it() {
                 settings: TuningSettings::STANDARD,
             },
             limits,
-            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
             fixture_invocations(case, &statics, limits),
         );
         tuner.tune(case, &implementation, &statics).unwrap();
@@ -1908,6 +1914,7 @@ fn a_record_made_without_demand_is_read_without_demand_and_searched_with_it() {
     let stored = |slot: &TuningCacheKey| {
         cache
             .tuning::<super::record::StoredChoice>(slot)
+            .expect("the unit's record reads")
             .expect("the unit's record is stored")
             .0
     };
@@ -1969,6 +1976,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -2008,10 +2016,10 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     let case = FakeCase::new(&implementation, &statics, "fake");
     // The count records the unit without forming or measuring anything.
     let mut tuner = Tuner::count(
-        &device,
+        &charges,
         context,
         limits,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
         fixture_invocations(&case, &statics, limits),
     );
     let defaults = implementation.default_specialization(&statics).unwrap();
@@ -2156,6 +2164,7 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     eprintln!(
         "terminal-cache reload qualification backend: {:?}",
         device.backend()
@@ -2205,9 +2214,9 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
             numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
             settings,
         };
-        let weights = || TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
+        let weights = || TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import);
         let mut tuner = Tuner::count(
-            &device,
+            &charges,
             context,
             limits,
             weights(),
@@ -2379,6 +2388,7 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -2429,10 +2439,10 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
             settings: TuningSettings::STANDARD,
         };
         let mut tuner = Tuner::count(
-            &device,
+            &charges,
             context,
             limits,
-            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
             fixture_invocations(&case, &statics, limits),
         );
         tuner.tune(&case, &implementation, &statics).unwrap();
@@ -2529,6 +2539,7 @@ fn unqualified_terminal_choices_are_reused_with_their_disposition_and_without_se
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -2570,9 +2581,9 @@ fn unqualified_terminal_choices_are_reused_with_their_disposition_and_without_se
             numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
             settings: TuningSettings::STANDARD,
         };
-        let weights = || TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
+        let weights = || TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import);
         let mut tuner = Tuner::count(
-            &device,
+            &charges,
             context,
             limits,
             weights(),
@@ -2627,6 +2638,7 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -2659,10 +2671,10 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
         },
     };
     let mut tuner = Tuner::count(
-        &device,
+        &charges,
         context(STANDARD_TUNING_BUDGET),
         LIMITS,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
         invocations.clone(),
     );
     for case in [&first, &last] {
@@ -2693,10 +2705,10 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
     // A budget already spent starts nothing optional and fails nothing:
     // the mandatory phase still forms and publishes the unit's default.
     let mut spent = Tuner::count(
-        &device,
+        &charges,
         context(Duration::ZERO),
         LIMITS,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
         invocations,
     );
     spent.tune(&last, &implementation, &statics).unwrap();
@@ -2730,6 +2742,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -2760,7 +2773,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
         .resolve()
         .unwrap();
     let mut tuner = Tuner::count(
-        &device,
+        &charges,
         TuningContext {
             definition: &definition,
             weights: &ZeroTuningWeights,
@@ -2770,7 +2783,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
             settings: TuningSettings::STANDARD,
         },
         LIMITS,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
         fixture_invocations(&case, &statics, LIMITS),
     );
     // The count walk forms nothing. Entering census first forms all canonical
@@ -2801,7 +2814,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
         *demand = demand.scaled(0);
     }
     let mut tuner = Tuner::count(
-        &device,
+        &charges,
         TuningContext {
             definition: &definition,
             weights: &ZeroTuningWeights,
@@ -2811,7 +2824,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
             settings: TuningSettings::STANDARD,
         },
         LIMITS,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
         invocations,
     );
     let formed = device.programs_formed().programs;
@@ -2841,13 +2854,14 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
         packing_bound: HashMap::new(),
     };
-    let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
+    let mut weights = TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
     let noise = Noise::default();
     let mut inputs = TuningInputs {
@@ -2856,7 +2870,7 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
             limits: LIMITS,
             load: &load,
         },
-        device: &device,
+        charges: &charges,
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,
@@ -2944,13 +2958,14 @@ fn case_state_restores_its_written_rows() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
         packing_bound: HashMap::new(),
     };
-    let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
+    let mut weights = TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
     let noise = Noise::default();
     let inputs = TuningInputs {
@@ -2959,7 +2974,7 @@ fn case_state_restores_its_written_rows() {
             limits: LIMITS,
             load: &load,
         },
-        device: &device,
+        charges: &charges,
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,
@@ -3001,6 +3016,7 @@ fn units_measure_baselines_before_search() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -3035,7 +3051,7 @@ fn units_measure_baselines_before_search() {
         context_tokens: 256,
     };
     let mut tuner = Tuner::count(
-        &device,
+        &charges,
         TuningContext {
             definition: &definition,
             weights: &ZeroTuningWeights,
@@ -3045,7 +3061,7 @@ fn units_measure_baselines_before_search() {
             settings: TuningSettings::STANDARD,
         },
         limits,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
         {
             let mut demand = fixture_invocations(&small, &statics, limits);
             fixture_add(&mut demand, &large, &statics, limits);
@@ -3108,6 +3124,7 @@ fn units_measure_baselines_before_search() {
 fn stored_attention_choice_must_admit_every_served_span_class() {
     use super::attention::{AttentionMix, AttentionPrefillK8V4Tuning, PrefillListing};
     let Some(device) = metal() else { return };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -3199,10 +3216,10 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         settings: TuningSettings::STANDARD,
     };
     let tuner = Tuner::count(
-        &device,
+        &charges,
         context,
         limits,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
         fixture_invocations(&case, &statics, limits),
     );
     let points = case.points(limits);
@@ -3237,9 +3254,9 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         coverage: None,
         default_launches: Vec::new(),
     };
-    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record);
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record).unwrap();
     assert!(
-        cache.tuning::<StoredChoice>(&key).is_some(),
+        cache.tuning::<StoredChoice>(&key).unwrap().is_some(),
         "the stored choice parses"
     );
     assert!(
@@ -3251,7 +3268,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         "an invalid terminal choice must fail without another tuning allowance"
     );
     record.overall = configuration(&defaults);
-    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record);
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record).unwrap();
     assert!(
         tuner
             .stored(&case, &statics, &points)
@@ -3280,7 +3297,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
     );
     // A record whose search stopped for want of room is the machine's
     // moment, not the unit's: a search searches the unit again.
-    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO).without_room(), &record);
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO).without_room(), &record).unwrap();
     assert!(
         tuner.stored(&case, &statics, &inactive_points).unwrap().unwrap().2.is_none(),
         "a record stopped for want of room is no cache hit"
@@ -3334,6 +3351,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
     let Some(device) = metal() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
@@ -3390,7 +3408,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
                    fresh: bool| {
         let recorder = Recorder::default();
         let mut tuner = Tuner::serve(
-            &device,
+            &charges,
             TuningContext {
                 definition: &definition,
                 weights: &ZeroTuningWeights,
@@ -3403,7 +3421,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
                 },
             },
             limits,
-            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
             invocations(cases),
             unprepared,
         );
@@ -3424,7 +3442,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
     // The search of `case`: what a Prepare runs.
     let search = |case: &FakeCase| {
         let mut tuner = Tuner::count(
-            &device,
+            &charges,
             TuningContext {
                 definition: &definition,
                 weights: &ZeroTuningWeights,
@@ -3434,7 +3452,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
                 settings: TuningSettings::STANDARD,
             },
             limits,
-            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import),
             invocations(&[case]),
         );
         tuner.tune(case, &implementation, &statics).unwrap();
@@ -3704,12 +3722,12 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
 
         fn import_source(
             &self,
-            device: &seismic::Device,
+            charges: &seismic::Charges,
             weight: &crate::WeightPlan,
             leading: bool,
         ) -> Result<seismic::Tensor, seismic::BuildError> {
             self.0.borrow_mut().push((weight.role, weight.shape.first().copied(), leading));
-            crate::ZeroTuningWeights.import_source(device, weight, leading)
+            crate::ZeroTuningWeights.import_source(charges, weight, leading)
         }
     }
     // Its search qualifies the bank's entries, a CPU site's among them,
@@ -3721,6 +3739,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         return;
     }
     let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap();
+    let charges = seismic::Charges::tally(&device);
     // The planning fixture (an attention block, which every backend runs)
     // three times, the later ones its first's mixer (tied), each with its
     // feed-forward routed over experts of its own: by a softmax score
@@ -3868,7 +3887,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         let weights = Imports(RefCell::new(Vec::new()));
         let import = crate::native::preparation::imports(&mut crate::native::specialization::Specializer::new(&device), draft.programs())
             .unwrap_or_else(|error| panic!("{streamed}: {error:?}"));
-        let mut decode = TuningWeights::new(&device, draft.load(), &weights, &import);
+        let mut decode = TuningWeights::new(&charges, draft.load(), &weights, &import);
         for layer in bank.layers() {
             for kind in [WeightKind::ExpertGate, WeightKind::ExpertUp, WeightKind::ExpertDown] {
                 let role = magnitude_family_contracts::WeightRole { scope: layer.scope, kind };
@@ -3893,7 +3912,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         let observer = Finished(RefCell::new(Vec::new()));
         crate::AttestedPrograms::search_draft(
             &draft,
-            &device,
+            &charges,
             crate::TuningContext {
                 definition: &definition,
                 weights: &crate::ZeroTuningWeights,
@@ -4018,6 +4037,7 @@ fn a_compressed_load_searches_its_attention_cases_on_the_device() {
         return;
     }
     let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap();
+    let charges = seismic::Charges::tally(&device);
     let (definition, manifest) = compressed(CompressedForm::FullAndReuse);
     let draft = crate::ExecutionPlanner::prepare(
         &selected,
@@ -4033,7 +4053,7 @@ fn a_compressed_load_searches_its_attention_cases_on_the_device() {
     let observer = Finished(RefCell::new(Vec::new()));
     crate::AttestedPrograms::search_draft(
         &draft,
-        &device,
+        &charges,
         crate::TuningContext {
             definition: &definition,
             weights: &crate::ZeroTuningWeights,

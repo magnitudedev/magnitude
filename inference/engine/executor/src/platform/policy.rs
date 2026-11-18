@@ -119,20 +119,40 @@ const MACHINE_RATE_RECORD_BYTES: u64 = 4096;
 /// A generic figure of the machine, measured once: where `figure` names a
 /// kernel cache and the figure's key there, the rate its machine figures
 /// (`KernelCache::machine_figures`) keep under that key, `measure`d and
-/// stored there when they keep none; elsewhere, `measure`d.
+/// stored there when they keep none, the key's lock held from the read to
+/// the store, so a process asking meanwhile waits and takes this one's
+/// figure, never measuring it again; elsewhere, `measure`d. A figure that
+/// cannot be read is reported, and the rate `measure`d and stored over it;
+/// one that cannot be stored, or a lock that cannot be taken, is reported.
+/// `measure` reaches no machine figure: it would wait for itself.
 pub(super) fn machine_rate<E>(
     figure: Option<(&std::path::Path, String)>,
     measure: impl FnOnce() -> Result<f64, E>,
 ) -> Result<f64, E> {
     let Some((cache, key)) = figure else { return measure() };
     let figures = crate::kernel_cache::KernelCache::machine_figures(cache);
-    match figures.load::<MachineRate>(&key, MACHINE_RATE_RECORD_BYTES) {
-        Ok(Some(MachineRate { bytes_per_second })) if bytes_per_second.is_finite() && bytes_per_second > 0.0 => {
-            return Ok(bytes_per_second);
+    let mut measure = Some(measure);
+    let mut found = None;
+    let kept = figures.update(&key, MACHINE_RATE_RECORD_BYTES, |held: Option<MachineRate>| {
+        if let Some(MachineRate { bytes_per_second }) = held.filter(|held| held.bytes_per_second.is_finite() && held.bytes_per_second > 0.0) {
+            found = Some(Ok(bytes_per_second));
+            return Err(());
         }
-        Ok(_) => {}
-        Err(error) => tracing::warn!("machine figures: the {key} rate stored is unreadable: {error}"),
+        let measured = measure.take().expect("an update runs its change once")();
+        let stored = measured.as_ref().ok().map(|&bytes_per_second| MachineRate { bytes_per_second });
+        found = Some(measured);
+        stored.map(Some).ok_or(())
+    });
+    if let Err(error) = kept {
+        tracing::warn!("machine figures: the {key} rate cannot be kept: {error}");
     }
+    let measure = match (found, measure) {
+        (Some(found), _) => return found,
+        (None, Some(measure)) => measure,
+        (None, None) => unreachable!("a change that ran found its rate"),
+    };
+    // The update ended before its change ran: the figure kept does not
+    // read, and is stored over, unless its lock cannot be taken either.
     let bytes_per_second = measure()?;
     if let Err(error) = figures.store(&key, &MachineRate { bytes_per_second }, MACHINE_RATE_RECORD_BYTES) {
         tracing::warn!("machine figures: the {key} rate could not be stored: {error}");

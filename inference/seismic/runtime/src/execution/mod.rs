@@ -85,6 +85,8 @@ pub(crate) struct AdmittedRun<T: TargetFamily, E: NativeExecutor<T>> {
     retained: AdmittedResources,
     submission: Submission<T, E>,
     continuation: Option<crate::driver::workflow::native::WorkflowContinuation<T, E>>,
+    /// What every allocation the run makes is charged to.
+    charges: crate::memory::Charges,
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
@@ -95,6 +97,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
         nodes: Vec<AdmittedNode<T, E>>,
         retained: AdmittedResources,
         submission: Submission<T, E>,
+        charges: crate::memory::Charges,
     ) -> Self {
         Self {
             identity,
@@ -104,6 +107,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
             retained,
             submission,
             continuation: None,
+            charges,
         }
     }
 
@@ -137,7 +141,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
                 &mut self.submission,
                 &self.device,
                 &mut self.retained,
-                &self.opened,
+                &self.charges,
             ) {
                 match error {
                     ExecutionError::DataCheckFailed(failure) => {
@@ -185,7 +189,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
                     deferred_error = Some(error);
                     break;
                 }
-                match continuation.next(&self.opened, &mut self.retained) {
+                match continuation.next(&mut self.retained, &self.charges) {
                     Ok(Some(next)) => self.nodes.push(next),
                     Ok(None) => {}
                     Err(error) => {

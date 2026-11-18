@@ -52,6 +52,7 @@ impl CatalogPackageRemover for NoCatalogEffects {
     fn remove_catalog_packages(
         &self,
         _package_ids: Vec<ModelPackageId>,
+        _loaded: magnitude_service_contracts::models::LoadedPackages,
     ) -> BoxFuture<'_, Result<u64, InventoryError>> {
         Box::pin(async {
             Err(InventoryError::Unsupported(
@@ -90,12 +91,11 @@ fn required(arguments: &[String], name: &str) -> PathBuf {
 
 fn main() -> anyhow::Result<()> {
     let process_started = Instant::now();
-    magnitude_engine::telemetry::log_to_stderr().map_err(anyhow::Error::msg)?;
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(assess_catalog(arguments, process_started))
+    magnitude_executor::main("magnitude-main", move || {
+        magnitude_engine::telemetry::log_to_stderr().map_err(anyhow::Error::msg)?;
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        seismic_threads::runtime()?.block_on(assess_catalog(arguments, process_started))
+    })
 }
 
 async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> anyhow::Result<()> {

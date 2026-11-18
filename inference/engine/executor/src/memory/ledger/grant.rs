@@ -3,6 +3,7 @@
 //! read as others' (§3.1).
 
 use super::admission::Short;
+use super::changes::Claiming;
 use super::claims::Claim;
 use super::state::{EntryId, State};
 use super::view::Ledger;
@@ -54,11 +55,13 @@ pub struct Grant {
 }
 
 impl Ledger {
-    /// Hold `bytes` for a process's growth as `role`: free room beside the
+    /// Hold `bytes` for a process's growth as `role`, in `claiming`, a
+    /// change's claim phase: free room beside the
     /// guarantee within the boundary, and the cache worth nothing; never
     /// the bank's or the retained prefixes' (`State::take_beside`). Short,
     /// nothing is held, and the claim waits for the next reading.
-    pub fn grant(&self, role: GrantRole, bytes: u64) -> Result<Grant, Short> {
+    pub fn grant(&self, claiming: &Claiming, role: GrantRole, bytes: u64) -> Result<Grant, Short> {
+        claiming.of_scope(&self.store.changes);
         let need = Need::Grant { role, bytes };
         let (kind, bytes) = (need.kind(), size(&self.shape, &need));
         let mut state = self.state();
@@ -100,13 +103,14 @@ impl Grant {
     }
 
     /// Hold what its process has grown by since it was named, where that
-    /// is more than the grant holds: growth that already happened, so never
-    /// refused, the cache worth nothing (spare granules, idle graph slots)
-    /// yielding what it took of the guarantee's room (a search's heap,
-    /// which no claim of its own admits). A grant never takes the bank or
+    /// is more than the grant holds, in `claiming`: growth that already
+    /// happened, so never refused, the cache worth nothing (spare granules,
+    /// idle graph slots) yielding what it took of the guarantee's room (a
+    /// search's heap, which no claim of its own admits). A grant never takes the bank or
     /// the retained prefixes: they yield only to a relief plan.
-    pub fn hold_growth(&self) {
+    pub fn hold_growth(&self, claiming: &Claiming) {
         let ledger = self.claim.ledger();
+        claiming.of_scope(&ledger.store.changes);
         let footprints = ledger.footprints();
         let mut state = ledger.state();
         let Some(grown) = state.grown(&ledger.store.identity, self.claim.id(), &footprints) else {

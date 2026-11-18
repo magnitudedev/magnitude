@@ -127,7 +127,7 @@ pub fn install() {
         }
         WAKE.store(fds[1] as u64, Ordering::Relaxed);
         let reader = fds[0];
-        std::thread::Builder::new().name("diagnostics".into()).spawn(move || {
+        seismic::threads::spawn("diagnostics", move || {
             let mut byte = 0u8;
             // SAFETY: reading one byte into a local from the pipe's read end.
             while unsafe { libc::read(reader, (&mut byte as *mut u8).cast(), 1) } == 1 {
@@ -138,6 +138,12 @@ pub fn install() {
                 };
                 stacks::write(out, fault.as_ref());
                 write_all(out, format!("{}\n", report()).as_bytes());
+                // A fault report closes with why the process ends, where a
+                // panic ended it: a reader of its last lines (the service's
+                // tail of a worker's stderr) learns the panic.
+                if let Some(ending) = fault.as_ref().and(seismic::threads::ending()) {
+                    write_all(out, format!("{ending}\n").as_bytes());
+                }
                 if fault.is_some() {
                     REPORTED.store(true, Ordering::Release);
                 }

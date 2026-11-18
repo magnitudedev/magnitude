@@ -58,7 +58,7 @@ const RECORDS: u64 = 2;
 /// else none.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn qualify_bank(
-    device: &Device,
+    charges: &seismic::Charges,
     banked: BankedFeedForward,
     binding: BankBinding,
     kernels: &ExpertBankKernels,
@@ -83,21 +83,21 @@ pub(super) fn qualify_bank(
     let served = Served::of(banked, route, feed_forward, label)?;
     let mut records = binding
         .record
-        .try_map(|_, tensor| RecordFixture::new(device, tensor, binding.experts, label))?;
+        .try_map(|_, tensor| RecordFixture::new(charges, tensor, binding.experts, label))?;
     let selected = word(binding.selected, "routed_bank", label)?;
-    let words = |extents: &[u64], set: &[(u64, i32)], entry| shared_words(device, extents, set, entry, label);
+    let words = |extents: &[u64], set: &[(u64, i32)], entry| shared_words(charges, extents, set, entry, label);
 
     // The step's sequence.
     let mut step = words(&[STEP_WORDS], &[], "routed_step")?;
     step_kernel
-        .call(routed_step::Args {
+        .call(charges, routed_step::Args {
             step: &mut step,
             sequence: &words(&[STEP_WORDS], &[(STEP_LOW, SEQUENCE)], "routed_step")?,
         })
         .map_err(|error| qualification_dynamic("routed_step", label, error))?;
     require_words(&step, &[(STEP_LOW, SEQUENCE), (STEP_HIGH, 0)], "routed_step", label)?;
 
-    served.qualify_routes(device, binding, rows, &step, label)?;
+    served.qualify_routes(charges, binding, rows, &step, label)?;
 
     // The decode landing launch of one absent choice, expert 0 (one row's
     // first choice of its `selected`, its sources naming no record), which
@@ -137,7 +137,7 @@ pub(super) fn qualify_bank(
     // Its sources: none for the GPU, none the CPU's, so the landed choice
     // is the GPU's, served in place.
     let mut sources =
-        semantic_i32(device, &[SOURCE_ROWS, 1, count], &vec![-1; (SOURCE_ROWS * count) as usize], entry, label)?;
+        semantic_i32(charges, &[SOURCE_ROWS, 1, count], &vec![-1; (SOURCE_ROWS * count) as usize], entry, label)?;
     let policy = words(&[POLICY_WORDS], &[], entry)?;
     let mut landing = words(&[landing_extent(binding.selected)], &landing_list(appended, 0), entry)?;
     // Where the tier places, staging and records views of none.
@@ -150,7 +150,7 @@ pub(super) fn qualify_bank(
     let mut bank = records.as_ref().try_map(|_, fixture| views(&fixture.records.records))?;
     let staging_gate = staging.gate.clone().map_or_else(|| none(&staging.up), Ok)?;
     let mut gate = bank.gate.take().map_or_else(|| none(&bank.up), Ok)?;
-    land.call_answered(routed_land::Args {
+    land.call_answered(charges, routed_land::Args {
         step: &step,
         file: &mut file,
         sources: &mut sources,
@@ -187,8 +187,8 @@ pub(super) fn qualify_bank(
     )?;
     let mut flags = words(&[binding.widest], &[], "routed_scratch_request")?;
     scratch_request
-        .call(routed_scratch_request::Args {
-            routes: &semantic_i32(device, &[1, binding.selected], &(0..selected).collect::<Vec<_>>(), "routed_scratch_request", label)?,
+        .call(charges, routed_scratch_request::Args {
+            routes: &semantic_i32(charges, &[1, binding.selected], &(0..selected).collect::<Vec<_>>(), "routed_scratch_request", label)?,
             step: &step,
             flags: &mut flags,
             scratch: &mut scratch_table,
@@ -202,14 +202,14 @@ pub(super) fn qualify_bank(
     // The seeds: scratch slot 0, which holds expert 0, into record 1.
     let seeds = words(&[list_extent(binding.window_slots)], &list(0, 1), "routed_copy")?;
     let entry = "routed_round";
-    let window = semantic_i32(device, &[1], &[0], entry, label)?;
+    let window = semantic_i32(charges, &[1], &[0], entry, label)?;
     let window_rounds = word(binding.window_rounds, entry, label)?;
     let mut round_list = words(&[landing_extent(binding.round_records)], &landing_list(1, 0), entry)?;
     let gate_conveyor = gate_or_empty(&records, |fixture| &fixture.conveyor, label)?;
     let mut scratch = records.as_ref().map(|_, fixture| fixture.scratch.clone());
     let mut gate = scratch.gate.take().map_or_else(|| none(&scratch.up), Ok)?;
     round
-        .call_answered(routed_round::Args {
+        .call_answered(charges, routed_round::Args {
             step: &step,
             scratch: &mut scratch_table,
             window: &window,
@@ -226,7 +226,7 @@ pub(super) fn qualify_bank(
             seeds: &seeds,
             map: &words(&[binding.experts, MAP_WORDS], &[], entry)?,
             // Round 0 always launches.
-            grid: &semantic_i32(device, &[3], &[magnitude_kernels::constants::LAND_GROUPS as i32, 1, 1], entry, label)?,
+            grid: &semantic_i32(charges, &[3], &[magnitude_kernels::constants::LAND_GROUPS as i32, 1, 1], entry, label)?,
         })
         .map_err(|error| qualification_dynamic(entry, label, error))?;
     require_words(&scratch_table, &[(first + SLOT_REQUEST, SEQUENCE)], entry, label)?;
@@ -236,9 +236,9 @@ pub(super) fn qualify_bank(
     }
     let entry = "routed_scratch_grids";
     let rounds = binding.window_rounds;
-    let mut grids = semantic_i32(device, &[rounds, 3], &vec![0; (rounds * 3) as usize], entry, label)?;
+    let mut grids = semantic_i32(charges, &[rounds, 3], &vec![0; (rounds * 3) as usize], entry, label)?;
     scratch_grids
-        .call(routed_scratch_grids::Args {
+        .call(charges, routed_scratch_grids::Args {
             step: &step,
             scratch: &scratch_table,
             window: &window,
@@ -257,10 +257,10 @@ pub(super) fn qualify_bank(
             // kernel keeps; and the list staged beside it.
             let grid_of = |listed: &Tensor, entry| {
                 let blocks = magnitude_kernels::LIST_BLOCKS as i32;
-                let mut grid = semantic_i32(device, &[3], &[blocks, 0, 0], entry, label)?;
+                let mut grid = semantic_i32(charges, &[3], &[blocks, 0, 0], entry, label)?;
                 let mut staged = words(&[list_extent(binding.window_slots)], &[], entry)?;
                 list_grid
-                    .call(routed_list_grid::Args { list: listed, step: &step, grid: &mut grid, staged: &mut staged })
+                    .call(charges, routed_list_grid::Args { list: listed, step: &step, grid: &mut grid, staged: &mut staged })
                     .map_err(|error| qualification_dynamic("routed_list_grid", label, error))?;
                 require_words(&grid, &[(0, blocks), (1, 1), (2, 1)], "routed_list_grid", label)?;
                 require_words(&staged, &list(0, 1), "routed_list_grid", label)?;
@@ -273,7 +273,7 @@ pub(super) fn qualify_bank(
             for (kernel, fixture) in seed.as_ref().zip(records.as_mut()) {
                 fixture.mark().map_err(|error| qualification_dynamic(entry, label, error))?;
                 kernel
-                    .call(routed_copy::Args {
+                    .call(charges, routed_copy::Args {
                         source: &fixture.scratch,
                         list: &staged,
                         step: &step,
@@ -287,7 +287,7 @@ pub(super) fn qualify_bank(
             let entry = "routed_seed_commit";
             let mut commits = words(&[RECORDS], &[], entry)?;
             seed_commit
-                .call(routed_seed_commit::Args {
+                .call(charges, routed_seed_commit::Args {
                     list: &seeds,
                     step: &step,
                     scratch: &scratch_table,
@@ -312,11 +312,11 @@ pub(super) fn qualify_bank(
             _ => -1,
         })
         .collect::<Vec<_>>();
-    let pass_window = semantic_i32(device, &[binding.experts], &window_codes, entry, label)?;
+    let pass_window = semantic_i32(charges, &[binding.experts], &window_codes, entry, label)?;
     let mut resolved = words(&[binding.experts, MAP_WORDS], &[], entry)?;
     let mut pass_step = words(&[STEP_WORDS], &[], entry)?;
     pass_map
-        .call(routed_pass_map::Args { map: &map, window: &pass_window, step: &step, resolved: &mut resolved, pass_step: &mut pass_step })
+        .call(charges, routed_pass_map::Args { map: &map, window: &pass_window, step: &step, resolved: &mut resolved, pass_step: &mut pass_step })
         .map_err(|error| qualification_dynamic(entry, label, error))?;
     require_words(&pass_step, &[(STEP_LOW, SEQUENCE), (STEP_HIGH, 0)], entry, label)?;
     let from = |expert: u64, record: i32| {
@@ -347,9 +347,9 @@ pub(super) fn qualify_bank(
     let tier = (binding.tier > 0)
         .then(|| {
             // A tier is pooled `Shared`, on a link or in unified memory.
-            let kind = crate::planning::BankTier::Host.contract_on(device);
+            let kind = crate::planning::BankTier::Host.contract_on(&charges.device());
             binding.record.try_map(|_, tensor| {
-                pooled_records(device, kind, tensor.resident, &tensor.matrix, binding.tier, 1)
+                pooled_records(charges, kind, tensor.resident, &tensor.matrix, binding.tier, 1)
                     .map_err(|error| qualification_dynamic("routed_bank", label, error))
             })
         })
@@ -363,12 +363,12 @@ pub(super) fn qualify_bank(
         tier: tier.as_ref().map(|tier| tier.as_ref().map(|_, tier| tier.records.clone())),
     };
     match &served {
-        Served::Fused { binding, kernels, .. } => qualify_routed(device, *binding, kernels, rows, &reads)?,
-        Served::General { binding, kernels, .. } => qualify_general_routed(device, *binding, kernels, &reads)?,
+        Served::Fused { binding, kernels, .. } => qualify_routed(charges, *binding, kernels, rows, &reads)?,
+        Served::General { binding, kernels, .. } => qualify_general_routed(charges, *binding, kernels, &reads)?,
     }
 
     Ok(site.as_ref().map(|site| match requirement {
-        Some(requirement) => super::site::site_verdict(device, &binding, site.form, requirement, cache),
+        Some(requirement) => super::site::site_verdict(charges, &binding, site.form, requirement, cache),
         None => crate::assessment::Priced::Unavailable("the numerical profile approves no CPU site".into()),
     }))
 }
@@ -431,7 +431,7 @@ impl<'a> Served<'a> {
     /// launch at each resolved word of the next layer.
     fn qualify_routes(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         binding: BankBinding,
         rows: SublayerRows,
         step: &Tensor,
@@ -441,8 +441,8 @@ impl<'a> Served<'a> {
             Self::Fused { .. } => "routed_route_streamed",
             Self::General { .. } => "routed_select_streamed",
         };
-        let words = |extents: &[u64], set: &[(u64, i32)], entry| shared_words(device, extents, set, entry, label);
-        let zeros = |element, extents: &[u64], entry| semantic_zeros(device, element, extents, entry, label);
+        let words = |extents: &[u64], set: &[(u64, i32)], entry| shared_words(charges, extents, set, entry, label);
+        let zeros = |element, extents: &[u64], entry| semantic_zeros(charges, element, extents, entry, label);
         let (experts, next, selected) = (binding.experts, binding.next_experts, binding.selected);
         let (ring, flight) = (binding.words.ring_words(), binding.words.flight);
         let choices = word(selected, entry, label)?;
@@ -469,10 +469,10 @@ impl<'a> Served<'a> {
                 Self::Fused { binding: b, route, .. } => {
                     let kernel = route.first();
                     let (h, e) = (b.hidden, b.experts);
-                    let norm = rows.norm(device, b.norm, h, entry, label)?;
+                    let norm = rows.norm(charges, b.norm, h, entry, label)?;
                     kernel
-                        .call(routed_route_streamed::Args {
-                            residual: &rows.input(device, 1, h, entry, label)?,
+                        .call(charges, routed_route_streamed::Args {
+                            residual: &rows.input(charges, 1, h, entry, label)?,
                             norm: &norm,
                             router: &zeros(b.router, &[e, h], entry)?,
                             shared_router: &zeros(Element::f32(), &[h], entry)?,
@@ -482,7 +482,7 @@ impl<'a> Served<'a> {
                             scores: &mut zeros(Element::f32(), &[1, selected], entry)?,
                             eps: 1.0e-5,
                             normalize: 1,
-                            expert_scale: &unit_scale(device, kernel, "ES", entry, label)?,
+                            expert_scale: &unit_scale(charges, kernel, "ES", entry, label)?,
                             map: &map,
                             tier: &tier,
                             policy: &policy,
@@ -499,13 +499,13 @@ impl<'a> Served<'a> {
                     let (h, e) = (shape.hidden, shape.experts);
                     let router_norm = zeros(b.router_norm, &[h], entry)?;
                     kernel
-                        .call(routed_select_streamed::Args {
-                            residual: &semantic_ones(device, Element::f32(), &[1, h], entry, label)?,
+                        .call(charges, routed_select_streamed::Args {
+                            residual: &semantic_ones(charges, Element::f32(), &[1, h], entry, label)?,
                             norm: &zeros(b.norm, &[h], entry)?,
                             router_norm: &router_norm,
                             router: &zeros(b.router, &[e, h], entry)?,
                             bias: &zeros(Element::f32(), &[e], entry)?,
-                            expert_scale: &unit_scale(device, kernel, "ES", entry, label)?,
+                            expert_scale: &unit_scale(charges, kernel, "ES", entry, label)?,
                             routes: &mut routes,
                             weights: &mut zeros(Element::f32(), &[1, selected], entry)?,
                             epsilon: 1.0e-5,
@@ -549,7 +549,7 @@ impl<'a> Served<'a> {
             Self::Fused { binding: b, hints, .. } => {
                 let hint_entry = "routed_hint_route";
                 let h = b.hidden;
-                let norm = rows.norm(device, b.norm, h, hint_entry, label)?;
+                let norm = rows.norm(charges, b.norm, h, hint_entry, label)?;
                 let activation = zeros(b.activation, &[0, b.selected], hint_entry)?;
                 for (index, kernel) in hints.iter().enumerate() {
                     let Some(kernel) = kernel.as_ref() else { continue };
@@ -558,8 +558,8 @@ impl<'a> Served<'a> {
                         let next_policy = words(&[POLICY_WORDS], &[(POLICY_RESOLVED, next_resolved)], hint_entry)?;
                         let mut rings = words(&[ahead, ring], &[], hint_entry)?;
                         kernel
-                            .call(routed_hint_route::Args {
-                                residual: &rows.input(device, 1, h, hint_entry, label)?,
+                            .call(charges, routed_hint_route::Args {
+                                residual: &rows.input(charges, 1, h, hint_entry, label)?,
                                 activation: &activation,
                                 next_norm: &norm,
                                 next_router: &zeros(b.router, &[next, h], hint_entry)?,
@@ -592,8 +592,8 @@ impl<'a> Served<'a> {
                         let next_policy = words(&[POLICY_WORDS], &[(POLICY_RESOLVED, next_resolved)], hint_entry)?;
                         let mut rings = words(&[ahead, ring], &[], hint_entry)?;
                         kernel
-                            .call(routed_hint_select::Args {
-                                residual: &semantic_ones(device, Element::f32(), &[1, h], hint_entry, label)?,
+                            .call(charges, routed_hint_select::Args {
+                                residual: &semantic_ones(charges, Element::f32(), &[1, h], hint_entry, label)?,
                                 activation: &activation,
                                 next_router_norm: &router_norm,
                                 next_router: &zeros(b.router, &[next, h], hint_entry)?,
@@ -644,7 +644,7 @@ struct RecordFixture {
 }
 
 impl RecordFixture {
-    fn new(device: &Device, tensor: RecordTensor, experts: u64, label: &str) -> Result<Self, CatalogFailure> {
+    fn new(charges: &seismic::Charges, tensor: RecordTensor, experts: u64, label: &str) -> Result<Self, CatalogFailure> {
         let entry = "routed_bank";
         let failed = |error: &dyn fmt::Display| qualification_dynamic(entry, label, error);
         let [n, k] = tensor.matrix;
@@ -657,11 +657,11 @@ impl RecordFixture {
             .ok_or_else(|| failed(&"the stored record has no conversion into its resident form"))?;
         // Distinct at every byte from `converted` while keeping dense floats finite (`0x0000` -> `0x5555`).
         let marker = converted.iter().map(|byte| byte ^ 0x55).collect::<Vec<_>>();
-        let shared = |extents: &[u64]| Tensor::shared(device, tensor.source, extents).map_err(|error| failed(&error));
-        let mut scratch = Tensor::zeros(device, tensor.resident, &record).map_err(|error| failed(&error))?;
+        let shared = |extents: &[u64]| Tensor::shared(charges, tensor.source, extents).map_err(|error| failed(&error));
+        let mut scratch = Tensor::zeros(charges, tensor.resident, &record).map_err(|error| failed(&error))?;
         scratch.write_from_host(&marker).map_err(|error| failed(&error))?;
-        let bank = crate::planning::BankTier::Bank.contract_on(device);
-        let pooled = |records, held| pooled_records(device, bank, tensor.resident, &tensor.matrix, records, held).map_err(|error| failed(&error));
+        let bank = crate::planning::BankTier::Bank.contract_on(&charges.device());
+        let pooled = |records, held| pooled_records(charges, bank, tensor.resident, &tensor.matrix, records, held).map_err(|error| failed(&error));
         let stacks = pooled(experts, 1)?;
         let records = pooled(RECORDS, RECORDS)?;
         let mut fixture = Self {
@@ -739,13 +739,13 @@ fn word(value: u64, entry: &'static str, label: &str) -> Result<i32, CatalogFail
 /// A host-shared i32 tensor of `extents` (`Tensor::shared`, as the bank
 /// holds its words), zero but for each `(index, value)` of `set`.
 fn shared_words(
-    device: &Device,
+    charges: &seismic::Charges,
     extents: &[u64],
     set: &[(u64, i32)],
     entry: &'static str,
     label: &str,
 ) -> Result<Tensor, CatalogFailure> {
-    let tensor = Tensor::shared(device, Element::i32(), extents)
+    let tensor = Tensor::shared(charges, Element::i32(), extents)
         .map_err(|error| qualification_dynamic(entry, label, error))?;
     set_words(&tensor, set, entry, label)?;
     Ok(tensor)
@@ -1076,7 +1076,7 @@ mod tests {
         });
         let kernels = bank_kernels(&device, bank, BankRouteKernels::Fused { activation: bf16, route, hints });
         qualify_bank(
-            &device,
+            &seismic::Charges::tally(&device),
             BankedFeedForward::Routed(binding),
             bank,
             &kernels,
@@ -1117,6 +1117,7 @@ mod tests {
     fn general_up_only_bank(device: &Device, requirement: Option<&seismic::NumericalRequirement>) -> bool {
         let sited = requirement.is_some();
         let device = device.clone();
+        let charges = seismic::Charges::tally(&device);
         let tier = if sited { 6 } else { 0 };
         let bank = BankBinding { tier, placer: Placer::Tier, ..bank(false, Down::Q8) };
         let (bf16, f32, q8) = (Element::bf16(), Element::f32(), bank.record.up.resident);
@@ -1208,7 +1209,7 @@ mod tests {
         }
         let site = kernels.site.as_ref().map(|site| site.form);
         let verdict = qualify_bank(
-            &device,
+            &charges,
             BankedFeedForward::GeneralRouted(binding),
             bank,
             &kernels,
@@ -1222,7 +1223,7 @@ mod tests {
         assert!(matches!(verdict, None | Some(crate::assessment::Priced::Pending(_))));
         site.zip(requirement).is_some_and(|(form, requirement)| {
             let request = crate::assessment::SiteRequest::of(&bank, form, requirement.clone());
-            super::super::site::admit_site(&device, &request).unwrap().is_ok()
+            super::super::site::admit_site(&charges, &request).unwrap().is_ok()
         })
     }
 }

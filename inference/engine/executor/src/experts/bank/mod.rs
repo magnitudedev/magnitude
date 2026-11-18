@@ -658,10 +658,10 @@ impl ExpertBank {
     /// once installed (`Self::hold_places`): none of one place, which the
     /// floor's serve. Why the device could not hold them, which leaves
     /// what is held now.
-    pub fn place(&self, places: std::num::NonZeroU64) -> Result<Places, crate::resources::AllocationError> {
+    pub fn place(&self, charges: &seismic::Charges, places: std::num::NonZeroU64) -> Result<Places, crate::resources::AllocationError> {
         Ok(Places(match places.get() {
             1 => None,
-            _ => Some(allocate_placed(&self.device, &self.plan, places)?),
+            _ => Some(allocate_placed(charges, &self.plan, places)?),
         }))
     }
 
@@ -720,12 +720,16 @@ impl ExpertBank {
 
 /// The granule pool a fixture's slab stores of `regions` (`rows_per_slab`
 /// rows a slab over `logical_rows`) lie in: one of the store `contract`
-/// places in on `device`, in blocks of `block_granules` granules, charged to
-/// the entry the device charges for that store now ([`Device::entry`]): the
-/// claim a qualification or a measurement allocates under, else the store's
-/// own. Each is a pool of its own, beside the device's others.
+/// places in on `charges`' device, in blocks of `block_granules` granules,
+/// charged to their entry of that store: the claim a qualification or a
+/// measurement allocates under. Each is a pool of its own, beside the
+/// device's others.
+///
+/// # Panics
+/// Through charges that allocate nothing ([`seismic::Charges::none`]): a
+/// pool's blocks are bytes, which such charges never allocate.
 pub(crate) fn fixture_pool(
-    device: &Device,
+    charges: &seismic::Charges,
     contract: seismic::Contract,
     rows_per_slab: u64,
     logical_rows: u64,
@@ -734,21 +738,21 @@ pub(crate) fn fixture_pool(
 ) -> Result<seismic::Pool, seismic::TensorError> {
     let slab = seismic::SlabLayout::for_regions(rows_per_slab, logical_rows, regions)?;
     let granule = slab.slab_bytes.next_multiple_of(slab.slab_alignment);
-    device.pool(contract, granule, block_granules.max(1) * granule, seismic::PoolEntries::one(device.entry(contract)))
+    seismic::Pool::open(&seismic::PoolCharges::one(charges), contract, granule, block_granules.max(1) * granule)
 }
 
 /// A slab store of `regions` in a fixture's pool ([`fixture_pool`]), every
 /// slot free.
 pub(crate) fn pooled_slabs(
-    device: &Device,
+    charges: &seismic::Charges,
     contract: seismic::Contract,
     rows_per_slab: u64,
     logical_rows: u64,
     regions: &[seismic::SlabRegion],
     block_granules: u64,
 ) -> Result<seismic::SlabTensor, seismic::TensorError> {
-    let pool = fixture_pool(device, contract, rows_per_slab, logical_rows, regions, block_granules)?;
-    seismic::SlabTensor::in_pool(&pool, rows_per_slab, logical_rows, regions)
+    let pool = fixture_pool(charges, contract, rows_per_slab, logical_rows, regions, block_granules)?;
+    seismic::SlabTensor::in_pool(charges, &pool, rows_per_slab, logical_rows, regions)
 }
 
 /// A fixture's records as a load's bank holds a group's: a slab store of a
@@ -768,7 +772,7 @@ pub(crate) struct PooledRecords {
 /// `records` records of `element` rows of `row_shape`, the first `held`
 /// claimed ([`PooledRecords`]).
 pub(crate) fn pooled_records(
-    device: &Device,
+    charges: &seismic::Charges,
     contract: seismic::Contract,
     element: seismic::Element,
     row_shape: &[u64],
@@ -776,7 +780,7 @@ pub(crate) fn pooled_records(
     held: u64,
 ) -> Result<PooledRecords, seismic::TensorError> {
     let regions = [seismic::SlabRegion { element, row_shape: row_shape.to_vec() }];
-    let store = pooled_slabs(device, contract, 1, records, &regions, held)?;
+    let store = pooled_slabs(charges, contract, 1, records, &regions, held)?;
     let views = (0..held)
         .map(|_| {
             let record = store.add_slab(seismic::SlabFill::Zeroed)?;
@@ -804,10 +808,18 @@ fn place_words(plan: &ExpertBankPlan, layer: usize, part: BankPart, tensor: &Ten
 /// floor's where none: what `ExpertBank::hold_places` holds.
 pub(crate) struct Places(Option<PlacedAllocations<Tensor>>);
 
+impl Places {
+    /// The floor's one place, whose words the bank always holds: nothing
+    /// allocated.
+    pub(crate) fn floor() -> Self {
+        Self(None)
+    }
+}
+
 /// The placed parts' words of `places` chain places on `device`, zeroed,
 /// host-shared (`ExpertBankPlan::placed`).
 fn allocate_placed(
-    device: &Device,
+    charges: &seismic::Charges,
     plan: &ExpertBankPlan,
     places: std::num::NonZeroU64,
 ) -> Result<PlacedAllocations<Tensor>, crate::resources::AllocationError> {
@@ -815,7 +827,7 @@ fn allocate_placed(
         crate::resources::AllocationError::Plan(crate::error::InvariantError { context: "expert bank places", detail })
     })?;
     planned.try_map(|(element, extents)| {
-        Tensor::words(device, *element, extents).map_err(crate::resources::AllocationError::Tensor)
+        Tensor::words(charges, *element, extents).map_err(crate::resources::AllocationError::Tensor)
     })
 }
 

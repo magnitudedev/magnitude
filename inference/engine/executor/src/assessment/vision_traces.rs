@@ -48,7 +48,7 @@ fn every_served_projector_outlines_its_vision_graphs_from_traces(backend: Backen
             .expect("a family recognizes the served target")
             .inspect(&target, Some(&projector), identity)
             .unwrap_or_else(|error| panic!("{name}: its family inspects it with its projector: {error}"));
-        let description = definition.vision.as_ref().expect("a projector's definition has vision");
+        let description = definition.vision.as_deref().expect("a projector's definition has vision");
         let manifest = PackageManifest {
             identity,
             projector: Some(ComponentManifest {

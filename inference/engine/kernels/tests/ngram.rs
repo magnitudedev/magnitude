@@ -210,6 +210,7 @@ impl GateCase {
     }
 
     fn native(&self, device: &Device) -> Vec<f32> {
+        let charges = seismic::Charges::tally(device);
         let (m, s, h) = (self.rows as u64, self.streams as u64, self.hidden as u64);
         let pr = self.form() as u64;
         let kernel = at_defaults(
@@ -219,7 +220,7 @@ impl GateCase {
         )
         .unwrap();
         let result = kernel
-            .call(ngram_gate::Args {
+            .call(&charges, ngram_gate::Args {
                 hidden: &tensor(device, Element::f32(), &[m, s, h], &self.x),
                 key: &tensor(device, Element::f32(), &[m, s, h], &self.key),
                 value: &tensor(device, Element::f32(), &[m, h], &self.value),
@@ -278,10 +279,11 @@ fn add_natives_match_the_portable_body() {
         );
         let (m, s, h) = (rows as u64, streams as u64, hidden as u64);
         for device in devices() {
+            let charges = seismic::Charges::tally(&device);
             let backend = device.backend().as_str();
             let kernel = at_defaults(&device, ngram_add::native_entry(), &[("H", h), ("S", s)]).unwrap();
             let result = kernel
-                .call(ngram_add::Args {
+                .call(&charges, ngram_add::Args {
                     hidden: &tensor(&device, Element::f32(), &[m, s * h], &x),
                     scales: &tensor(&device, Element::f32(), &[m, 2 * s], &scales),
                     value: &tensor(&device, Element::f32(), &[m, h], &value),
@@ -335,6 +337,7 @@ fn product_gate_then_add_equal_the_reference_engram_at_v41s_shape() {
     }
     let (m, s, h) = (rows as u64, streams as u64, hidden as u64);
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend().as_str();
         if backend == "vulkan" {
             continue;
@@ -348,7 +351,7 @@ fn product_gate_then_add_equal_the_reference_engram_at_v41s_shape() {
         let hidden_rows = tensor(&device, Element::f32(), &[m, s, h], &x);
         let value_rows = tensor(&device, Element::f32(), &[m, h], &value);
         let scales = gate
-            .call(ngram_gate::Args {
+            .call(&charges, ngram_gate::Args {
                 hidden: &hidden_rows,
                 key: &tensor(&device, Element::f32(), &[m, s, h], &key),
                 value: &value_rows,
@@ -366,7 +369,7 @@ fn product_gate_then_add_equal_the_reference_engram_at_v41s_shape() {
         check_close(&format!("{backend} engram gates at V4.1's shape"), &natives, &gates);
         let add = at_defaults(&device, ngram_add::native_entry(), &[("H", h), ("S", s)]).unwrap();
         let result = add
-            .call(ngram_add::Args {
+            .call(&charges, ngram_add::Args {
                 hidden: &tensor(&device, Element::f32(), &[m, s * h], &x),
                 scales: &scales,
                 value: &value_rows,
@@ -495,6 +498,7 @@ impl Case {
     }
 
     fn native(&self, device: &Device, reuse: bool) -> Outcome {
+        let charges = seismic::Charges::tally(device);
         let mut bound = self.bind(device, reuse);
         let kernel = at_defaults(
             device,
@@ -502,7 +506,7 @@ impl Case {
             &self.geometry.statics(),
         )
         .unwrap();
-        let result = kernel.call(bound.args(self.slab_banks)).unwrap().value;
+        let result = kernel.call(&charges, bound.args(self.slab_banks)).unwrap().value;
         Outcome {
             result: read(&result),
             window: read(&bound.window),
@@ -1016,10 +1020,11 @@ impl RowsCase {
     }
 
     fn native(&self, device: &Device, reuse: bool) -> RowsOutcome {
+        let charges = seismic::Charges::tally(device);
         let rows = self.rows() as u64;
         let words = |values: &[u64]| {
             Tensor::from_host(
-                device,
+                &charges,
                 Element::u64(),
                 &[values.len() as u64],
                 &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
@@ -1045,7 +1050,7 @@ impl RowsCase {
         let mut window = arenas.remove(0);
         let slots = SlotTensors::new(device, &self.slots, self.rows());
         let map = Tensor::from_host(
-            device,
+            &charges,
             Element::u32(),
             &[self.rule.map.len() as u64],
             &self.rule.map.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>(),
@@ -1059,7 +1064,7 @@ impl RowsCase {
         )
         .unwrap();
         let result = kernel
-            .call(ngram_rows::Args {
+            .call(&charges, ngram_rows::Args {
                 tokens: &ints(device, &[rows, 2], &self.tokens),
                 multipliers: &words(&self.rule.multipliers),
                 sizes: &words(&self.rule.sizes),
@@ -1255,7 +1260,7 @@ fn u64_tensors_round_trip() {
     let values = [0, 1, u64::from(u32::MAX) + 1, u64::MAX - 1, u64::MAX, 0x0123_4567_89ab_cdef];
     let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
     for device in devices() {
-        let tensor = Tensor::from_host(&device, Element::u64(), &[values.len() as u64], &bytes).unwrap();
+        let tensor = Tensor::from_host(&seismic::Charges::tally(&device), Element::u64(), &[values.len() as u64], &bytes).unwrap();
         assert_eq!(tensor.read_to_host().unwrap(), bytes, "{}", device.backend().as_str());
     }
 }

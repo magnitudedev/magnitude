@@ -117,12 +117,14 @@ pub fn bytes(element: Element, values: &[f32]) -> Vec<u8> {
 }
 
 pub fn tensor(device: &Device, element: Element, shape: &[u64], values: &[f32]) -> Tensor {
-    Tensor::from_host(device, element, shape, &bytes(element, values)).unwrap()
+    let charges = seismic::Charges::tally(device);
+    Tensor::from_host(&charges, element, shape, &bytes(element, values)).unwrap()
 }
 
 pub fn ints(device: &Device, shape: &[u64], values: &[i32]) -> Tensor {
+    let charges = seismic::Charges::tally(device);
     Tensor::from_host(
-        device,
+        &charges,
         Element::i32(),
         shape,
         &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),

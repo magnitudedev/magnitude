@@ -201,7 +201,8 @@ pub fn load(load: Load) -> Result<(), String> {
     let rooms = Arc::new(Mutex::new(HashMap::new()));
     let forwarding = {
         let rooms = Arc::clone(&rooms);
-        std::thread::spawn(move || forward(diagnostics, &rooms))
+        seismic::threads::spawn("memory-forward", move || forward(diagnostics, &rooms))
+        .expect("invariant violated: the host starts a thread")
     };
     let mut pressure = pressure
         .zip(pressed)
@@ -211,7 +212,7 @@ pub fn load(load: Load) -> Result<(), String> {
     let LoadAttempt::Loaded(connection) = loaded else {
         return Err("a load serving canonical defaults stopped unprepared".into());
     };
-    let engine = ReadyEngine::new(host, connection).map_err(|error| error.to_string())?;
+    let engine = ReadyEngine::new(host, *connection).map_err(|error| error.to_string())?;
     // The experts' pages the file cache holds once loaded, then once the
     // load has decoded a rendered fixture.
     let (residency, decoded) = match decode {
@@ -274,7 +275,7 @@ pub fn load(load: Load) -> Result<(), String> {
     // passed on once its stream closes.
     drop(engine);
     retire(WorkerReport::Reported)?;
-    forwarding.join().map_err(|_| "the worker's diagnostics reader panicked")?
+    forwarding.join().expect("the worker's diagnostics reader's panic ends the process")
 }
 
 /// What a store's latest memory reading says a press must take past the
@@ -474,24 +475,19 @@ pub fn occupy(backend: BackendName, selected: PressureStore) -> Result<(), Strin
 /// before any press.
 fn written(bytes: u64, seed: usize) -> Result<Vec<u64>, String> {
     let mut held = vec![0u64; usize::try_from(bytes.div_ceil(8)).map_err(|error| error.to_string())?];
-    std::thread::scope(|scope| {
-        let words = &mut held;
-        scope
-            .spawn(move || {
-                yielding()?;
-                // xorshift64 from a seed of its own (an odd multiple, never
-                // zero): every word differs, so no page compresses.
-                let mut word = 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(2 * seed as u64 + 1);
-                for slot in words.iter_mut() {
-                    word ^= word << 13;
-                    word ^= word >> 7;
-                    word ^= word << 17;
-                    *slot = word;
-                }
-                Ok::<(), String>(())
-            })
-            .join()
-            .expect("the writer panicked")
+    let words = &mut held;
+    seismic::threads::run("memory-writer", move || {
+        yielding()?;
+        // xorshift64 from a seed of its own (an odd multiple, never
+        // zero): every word differs, so no page compresses.
+        let mut word = 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(2 * seed as u64 + 1);
+        for slot in words.iter_mut() {
+            word ^= word << 13;
+            word ^= word >> 7;
+            word ^= word << 17;
+            *slot = word;
+        }
+        Ok::<(), String>(())
     })?;
     Ok(held)
 }
@@ -955,7 +951,7 @@ impl Pressure {
         std::io::Write::write_all(&mut input, format!("{guarantee}\n").as_bytes()).map_err(text)?;
         let output = std::io::BufReader::new(child.stdout.take().expect("piped"));
         let (sender, reports) = std::sync::mpsc::channel();
-        let reader = std::thread::spawn(move || {
+        let reader = seismic::threads::spawn("occupant-reports", move || {
             for line in std::io::BufRead::lines(output) {
                 let report = line.map_err(|error| error.to_string()).and_then(|line| {
                     serde_json::from_str(&line)
@@ -965,7 +961,8 @@ impl Pressure {
                     return;
                 }
             }
-        });
+        })
+        .expect("invariant violated: the host starts a thread");
         let approached = match reports.recv() {
             Ok(report) => report?,
             Err(_) => return Err(format!("the occupying process ended before it approached: {}", child.wait().map_err(text)?)),
@@ -1058,7 +1055,7 @@ impl Pressure {
             if !status.success() {
                 return Err(format!("the occupying process failed: {status}"));
             }
-            reader.join().map_err(|_| "the occupying process's reader panicked")?;
+            reader.join().expect("the occupying process's reader's panic ends the process");
             self.recorded(reports.try_iter().collect())?;
             if self.record.contains_key("started") {
                 self.record.insert("freed".into(), json!({ "at": unix_seconds() }));

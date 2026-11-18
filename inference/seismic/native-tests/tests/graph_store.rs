@@ -30,6 +30,7 @@ fn a_stored_result_is_written_into_the_bound_tensor() {
     let (m, n) = (2u64, 8u64);
     for device in seismic_native_tests::every_device() {
         let backend = device.backend();
+        let charges = seismic::Charges::tally(&device);
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
                 .unwrap();
@@ -62,24 +63,24 @@ fn a_stored_result_is_written_into_the_bound_tensor() {
         // Only the exported result has storage of its own.
         assert_eq!(plan.output_bytes(), m * n * 4, "{backend:?}");
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
 
         let values = (0..m * n).map(|value| value as f32).collect::<Vec<_>>();
-        let source = Tensor::from_host(&device, Element::f32(), &[m, n], &f32_bytes(&values))
+        let source = Tensor::from_host(&charges, Element::f32(), &[m, n], &f32_bytes(&values))
             .unwrap();
         // The bound rows are rows 1 and 2 of four; the others are untouched.
         let whole = Tensor::from_host(
-            &device,
+            &charges,
             Element::f32(),
             &[4, n],
             &f32_bytes(&vec![-1.0; 4 * n as usize]),
         )
         .unwrap();
-        let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+        let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
         let mut bindings = plan.bindings();
-        bindings.set(&input, &source).unwrap();
+        bindings.set(&charges, &input, &source).unwrap();
         bindings
-            .set(&landing, &whole.slice_leading(1, 3).unwrap())
+            .set(&charges, &landing, &whole.slice_leading(1, 3).unwrap())
             .unwrap();
         let mut active = slot.activate(&plan).unwrap();
         let (outputs, completion) = active.attach(bindings, outputs).unwrap().submit().unwrap();
@@ -107,6 +108,7 @@ fn a_templates_classes_seal_their_store_into_its_layout() {
     let n = 8u64;
     for device in seismic_native_tests::every_device() {
         let backend = device.backend();
+        let charges = seismic::Charges::tally(&device);
         let mut template = NativeGraphMetadata::new_template(backend);
         let input = template
             .port_with_class_extent(Element::f32(), &[4, n], 0, "M")
@@ -154,14 +156,14 @@ fn a_templates_classes_seal_their_store_into_its_layout() {
                 .unwrap_or_else(|error| panic!("{backend:?} M = {m}: {error:?}"));
             let values = (0..m * n).map(|value| value as f32).collect::<Vec<_>>();
             let source =
-                Tensor::from_host(&device, Element::f32(), &[m, n], &f32_bytes(&values)).unwrap();
-            let stored = Tensor::zeros(&device, Element::f32(), &[m, n]).unwrap();
+                Tensor::from_host(&charges, Element::f32(), &[m, n], &f32_bytes(&values)).unwrap();
+            let stored = Tensor::zeros(&charges, Element::f32(), &[m, n]).unwrap();
             let mut bindings = plan.bindings();
-            bindings.set(&input, &source).unwrap();
-            bindings.set(&landing, &stored).unwrap();
-            let mut slot = plan.new_slot().unwrap();
+            bindings.set(&charges, &input, &source).unwrap();
+            bindings.set(&charges, &landing, &stored).unwrap();
+            let mut slot = plan.new_slot(&charges).unwrap();
             let (_, completion) = slot
-                .attach(bindings, plan.new_outputs().unwrap())
+                .attach(bindings, plan.new_outputs(&charges).unwrap())
                 .unwrap()
                 .submit()
                 .unwrap();

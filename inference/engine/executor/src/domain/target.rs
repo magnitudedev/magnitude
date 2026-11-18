@@ -88,9 +88,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         reservation: TargetGraphReservation,
     ) -> Result<TargetFlight<F>, SubmitFailure> {
         let work = match reservation {
-            TargetGraphReservation::Claim(slots) => self
-                .claim_queued(operations, slots)
-                .map_err(SubmitFailure::Failed)?,
+            TargetGraphReservation::Claim(slots) => self.claim_queued(operations, slots),
             TargetGraphReservation::Launch(reservation) => {
                 match self.launch_target(operations, reservation) {
                     Ok(work) => work,
@@ -101,8 +99,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // The step is on the device: any failure from here drops it. Its
         // tokens, now known whether launched or claimed, follow the
         // sequences' accepted ones.
-        self.feed_tokens(operations)
-            .map_err(|error| SubmitFailure::Failed(DomainError::invariant(error)))?;
+        if let Err(error) = self.feed_tokens(operations) {
+            panic!("invariant violated: a reserved group's tokens do not follow its input: {error}");
+        }
         self.queue_successor(&work, operations)
             .map_err(SubmitFailure::Failed)?;
         // This launch was the round's verification: the next round's
@@ -250,9 +249,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             },
         ] = operations
         else {
-            return Err(Unsubmitted::Failed(DomainError::invariant(
-                "a drafter entry was reserved for an unprimed group",
-            )));
+            panic!("invariant violated: a drafter entry was reserved for an unprimed group");
         };
         self.launch_priming(
             work,
@@ -289,13 +286,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .readout
             .as_ref()
             .map(|readout| readout.features.clone())
-            .ok_or_else(|| DomainError::invariant("a primed prompt chunk publishes no features"))?;
-        let store = self
-            .head_store
-            .clone()
-            .ok_or_else(|| DomainError::invariant("a drafter entry without a drafter store"))?;
+            .expect("invariant violated: a primed prompt chunk publishes no features");
+        let store = self.head_store.clone().expect("invariant violated: a drafter entry without a drafter store");
         let vocabulary = self.definition.decoder.vocabulary as usize;
-        let class_limits = self.head_class_limits()?;
+        let class_limits = self.head_class_limits();
         let batch = match self.execution.policy().method().draft_form() {
             Some(crate::DraftForm::Block) => self
                 .block_slot(&prime.tokens, prime.position, &[], &advance, 0)
@@ -388,12 +382,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map(TentativeAdvance::Accepted)
             .collect::<Vec<_>>();
         // Reservation checked the group and moved its states into the
-        // advances: a mismatch now is a broken domain invariant.
-        let broken = |detail: String| Unsubmitted::Failed(DomainError::invariant(detail));
+        // advances: a mismatch now is a broken domain invariant, which would
+        // drop those states.
+        let broken = |detail: &str| -> ! { panic!("invariant violated: a reserved target group {detail}") };
         if operations.len() != advances.len() {
-            return Err(broken(
-                "target reservation advance count differs from operations".into(),
-            ));
+            broken("has other advances than operations");
         }
         if operations.is_empty() {
             return Err(Unsubmitted::Refused("target group is empty".into()));
@@ -403,9 +396,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut demand = crate::batching::Demand::NONE;
         let mut segments = 1usize;
         for (operation, advance) in operations.iter().zip(&advances) {
-            operation
-                .validate()
-                .map_err(|error| broken(error.to_string()))?;
+            if let Err(error) = operation.validate() {
+                broken(&format!("holds an invalid operation: {error}"));
+            }
             let Operation::Forward {
                 request,
                 position,
@@ -415,26 +408,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 ..
             } = operation
             else {
-                return Err(broken(
-                    "target group contains another operation kind".into(),
-                ));
+                broken("holds another operation kind");
             };
             if !seen.insert(*request) {
-                return Err(broken("target group repeats a request".into()));
+                broken("repeats a request");
             }
             if advance.position() != *position || advance.rows() != tokens.len() {
-                return Err(broken("target position differs from accepted state".into()));
+                broken("holds a position or rows other than its accepted state's");
             }
             if conditioning.as_ref().is_some_and(|lease| {
                 lease.domain() != self.domain.id() || lease.allocation().rows() != tokens.len()
             }) {
-                return Err(broken(
-                    "target conditioning differs from physical rows or resource domain".into(),
-                ));
+                broken("holds conditioning of other rows or another resource domain");
             }
-            rows = rows
-                .checked_add(tokens.len())
-                .ok_or_else(|| broken("target row count overflow".into()))?;
+            let Some(grown) = rows.checked_add(tokens.len()) else {
+                broken("overflows its row count");
+            };
+            rows = grown;
             demand |= *next;
             segments = segments.max(reserved_segments(
                 &self.target_store,
@@ -444,8 +434,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let class_limits = self.target_class_limits();
         let class = crate::LaunchClass::covering(rows, segments, demand, class_limits)
-            .map_err(|error| broken(error.to_string()))?;
-        let preceding = self.target_preceding(operations, &[]).map_err(broken)?;
+            .unwrap_or_else(|error| broken(&format!("covers no launch class: {error}")));
+        let preceding = self
+            .target_preceding(operations, &[])
+            .unwrap_or_else(|error| broken(&format!("reads no preceding rows: {error}")));
         let mut metadata = Vec::with_capacity(operations.len());
         for operation in operations {
             let request = operation.request();
@@ -486,12 +478,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             segments,
         ) {
             Ok(batch) if batch.class() == class => batch,
-            Ok(_) => {
-                self.restore_advances(metadata, advances);
-                return Err(broken(
-                    "target packed class changed after reservation".into(),
-                ));
-            }
+            Ok(_) => broken("packs into another class than its reservation's"),
             Err(error) => {
                 self.restore_advances(metadata, advances);
                 return Err(Unsubmitted::Refused(error.to_string().into()));
@@ -591,6 +578,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .collect()
     }
 
+    /// Finish a target flight: its outcomes, each owning its advance (and
+    /// a chain a claimed chunk carries) until reconciled or aborted, and the
+    /// binding right. A fault (the device's, or a read of its outputs) is
+    /// the load's end: the binding right goes with it, so no later work runs
+    /// on this domain, and the flight's states go with its work.
     pub fn finish_target(
         &mut self,
         flight: TargetFlight<F>,
@@ -600,7 +592,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok((pending, bindings))
     }
 
-    pub(super) fn finish_target_work(
+    fn finish_target_work(
         &mut self,
         flight: TargetWork<F>,
     ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
@@ -690,9 +682,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let (core, output) = completed.into_parts();
         let batch = core.batch();
-        if batch.actual_slots() != flight.requests.len() {
-            return Err("completed target slot count differs from submitted requests".into());
-        }
+        assert_eq!(
+            batch.actual_slots(),
+            flight.requests.len(),
+            "invariant violated: a completed target flight's slots differ from its requests"
+        );
         // A sequence whose weights (stored-table rows, landed rows or a
         // streamed layer's experts) could not be read in this step read
         // others: it is poisoned, and this outcome and every later one of
@@ -726,7 +720,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let tensor = output
                 .as_ref()
                 .and_then(|result| result.selected.as_ref())
-                .ok_or("completed target has no selection tensor")?
+                .expect("invariant violated: completed target has no selection tensor")
                 .slice_leading(0, upload.select_rows.len() as u64)
                 .map_err(|error| error.to_string())?;
             let bytes = tensor.tensor().read_to_host().map_err(|error| {
@@ -746,18 +740,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let row = *upload
                 .out_rows
                 .get(output_index)
-                .ok_or("projected output row exceeds output rows")?;
-            let row = usize::try_from(row).map_err(|_| "negative target output row")?;
+                .expect("invariant violated: projected output row exceeds output rows");
+            let row = usize::try_from(row).expect("invariant violated: negative target output row");
             let result = physical
                 .get_mut(row)
-                .ok_or("target output row exceeds actual batch")?;
+                .expect("invariant violated: target output row exceeds actual batch");
             let demand = crate::batching::Demand::from_bits(upload.demand[row])
-                .ok_or("target output demand is invalid")?;
+                .expect("invariant violated: target output demand is invalid");
             if demand.contains(crate::batching::Demand::LOGITS) {
                 let view = output
                     .as_ref()
                     .and_then(|result| result.logits.as_ref())
-                    .ok_or("target logits output is absent")?
+                    .expect("invariant violated: target logits output is absent")
                     .slice_leading(projected_index as u64, projected_index as u64 + 1)
                     .map_err(|error| error.to_string())?;
                 result.logits = Some(
@@ -769,26 +763,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         for (index, &output_index) in upload.select_rows.iter().enumerate() {
             let output_index = usize::try_from(output_index)
-                .map_err(|_| "negative target selection output index")?;
+                .expect("invariant violated: negative target selection output index");
             let row = *upload
                 .out_rows
                 .get(output_index)
-                .ok_or("target selection output index exceeds output rows")?;
-            let row = usize::try_from(row).map_err(|_| "negative target selection row")?;
+                .expect("invariant violated: target selection output index exceeds output rows");
+            let row = usize::try_from(row).expect("invariant violated: negative target selection row");
             let result = physical
                 .get_mut(row)
-                .ok_or("target selection row exceeds actual batch")?;
+                .expect("invariant violated: target selection row exceeds actual batch");
             result.selected = Some(
                 *selected
                     .get(index)
-                    .ok_or("target selection count differs")?,
+                    .expect("invariant violated: target selection count differs"),
             );
         }
         let mut request_start = 0usize;
         for (_, request_rows, _, _, _) in &flight.requests {
             let request_end = request_start
                 .checked_add(*request_rows)
-                .ok_or("request row range overflows")?;
+                .expect("invariant violated: request row range overflows");
             let feature_outputs = upload
                 .out_rows
                 .iter()
@@ -808,12 +802,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .enumerate()
                     .any(|(offset, (index, _))| *index != first + offset)
                 {
-                    return Err("request feature rows are not contiguous in physical output".into());
+                    panic!("invariant violated: request feature rows are not contiguous in physical output");
                 }
                 let view = output
                     .as_ref()
                     .map(|result| &result.features)
-                    .ok_or("target feature output is absent")?
+                    .expect("invariant violated: target feature output is absent")
                     .slice_leading(first as u64, (first + feature_outputs.len()) as u64)
                     .map_err(|error| error.to_string())?;
                 let aggregate = self
@@ -838,82 +832,57 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut continuation = flight.continuation;
         // A flight the rest of a chain is queued behind opens that chain.
         let opens_chain = self.queue.opens_chain(flight.id);
-        // The chain an interrupted chunk releases, once every outcome is in.
-        let mut released_chain = None;
+        // From here each request's advance, and a chain a claimed chunk
+        // carries, is owned by its outcome alone: what the flight was
+        // submitted with is believed to hold, and a path that broke it would
+        // drop states no other owner holds, so it is an invariant violation.
         for (index, ((request, rows, _, kind, committed_rows), advance)) in
             flight.requests.into_iter().zip(advances).enumerate()
         {
-            let end = offset
-                .checked_add(rows)
-                .ok_or("target request row count overflow")?;
+            let end = offset.checked_add(rows).expect("invariant violated: a target request's rows overflow");
             let result = physical
                 .get(offset..end)
-                .ok_or("target request row slice exceeds batch")?
+                .expect("invariant violated: a target request's rows exceed its batch")
                 .to_vec();
             offset = end;
-            let source = continuation.as_mut().map(|sources| sources[index].take());
+            let source = continuation
+                .as_mut()
+                .map(|sources| std::mem::replace(&mut sources[index], Source::Unclaimed));
+            // The outcome owns its rows until reconciled or aborted: a
+            // chain's chunks join it only as they reconcile.
             let advance = match (advance, source) {
-                (TentativeAdvance::Accepted(advance), None) if opens_chain => {
-                    self.open_chain(request, advance)?
+                (TentativeAdvance::Accepted(first), None) if opens_chain => {
+                    Advance::Opens { flight: flight.id, first }
                 }
                 (TentativeAdvance::Accepted(advance), None) => Advance::Step(advance),
-                // A claimed chunk of the chain its holder's state is in.
-                (TentativeAdvance::Chained(chunk), Some(None)) => {
-                    self.join_chain(request, chunk)?
+                // A claimed chunk of a chain, with the chain it carries.
+                (TentativeAdvance::Chained(chunk), Some(Source::Chain(joined))) => {
+                    Advance::Chained { flight: flight.id, joined, chunk }
                 }
-                (TentativeAdvance::Successor(successor), Some(Some(state))) => {
-                    match successor.attach(state.into_state()) {
+                // `claim_slots` found the state the successor follows.
+                (TentativeAdvance::Successor(successor), Some(Source::Accepted(state))) => {
+                    match successor.attach(state) {
                         Ok(advance) => Advance::Step(advance),
-                        Err((state, error)) => {
-                            self.target.insert(request, state);
-                            return Err(DomainError::invariant(format!(
-                                "claimed queued slot no longer follows its state: {error}"
-                            )));
-                        }
+                        Err((_, error)) => panic!("invariant violated: a claimed queued slot no longer follows its state: {error}"),
                     }
                 }
                 // Nobody claimed this slot: its rows are discarded.
-                (TentativeAdvance::Successor(_), Some(None)) => continue,
-                _ => {
-                    return Err(DomainError::invariant(
-                        "target flight advances differ from its continuation",
-                    ));
-                }
+                (TentativeAdvance::Successor(_), Some(Source::Unclaimed)) => continue,
+                _ => panic!("invariant violated: a target flight's advances differ from its continuation"),
             };
-            let mut primed_here = primed.take_if(|(primed, _)| *primed == request).map(|(_, advance)| advance);
-            let (outcome, advance) = match (self.poisoned.get(&request), &interrupted) {
-                (Some(error), _) if matches!(advance, Advance::Step(_)) => {
-                    (Outcome::WeightReadFailed(error.clone()), Some(advance))
-                }
-                // A chunk of a chain that read weights it could not: its
-                // holder fails and claims no more of the chain, so the chain
-                // is released whole now, its holder's state with it, as an
-                // interrupted chain's is. Held on, the next request's work
-                // would orphan a chain under way.
-                (Some(error), _) => {
-                    let outcome = Outcome::WeightReadFailed(error.clone());
-                    released_chain = Some(self.release_chunk_chain(request, advance, primed_here.take()));
-                    (outcome, None)
-                }
-                (None, None) => (Outcome::Forward { rows: result }, Some(advance)),
-                // Its accepted state returns as its outcome is aborted: it is
-                // re-run from there.
-                (None, Some(reason)) if matches!(advance, Advance::Step(_)) => {
-                    (Outcome::Interrupted { reason: reason.clone(), resident: true }, Some(advance))
-                }
-                // A chunk of a chain: the chain held what its earlier chunks
-                // computed, which their rounds already reconciled, and holds
-                // this chunk's now. It is released whole, and its holder's
-                // state with it: the request re-prefills, as an evicted one.
-                (None, Some(reason)) => {
-                    released_chain = Some(self.release_chunk_chain(request, advance, primed_here.take()));
-                    (Outcome::Interrupted { reason: reason.clone(), resident: false }, None)
-                }
+            let primed_here = primed.take_if(|(primed, _)| *primed == request).map(|(_, advance)| advance);
+            // A chunk of a chain that failed or was interrupted is aborted as
+            // any step's outcome is: its chain concludes with the chunks
+            // reconciled before it, its holder's state again.
+            let outcome = match (self.poisoned.get(&request), &interrupted) {
+                (Some(error), _) => Outcome::WeightReadFailed(error.clone()),
+                (None, None) => Outcome::Forward { rows: result },
+                (None, Some(reason)) => Outcome::Interrupted { reason: reason.clone() },
             };
             pending.push(PendingOperationOutcome {
                 request,
                 outcome,
-                advance,
+                advance: Some(advance),
                 primed: primed_here,
                 rows,
                 committed_rows,
@@ -923,18 +892,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 image: None,
             });
         }
-        if primed.is_some() {
-            return Err(DomainError::invariant(
-                "a drafter entry's chunk is absent from its flight",
-            ));
-        }
-        match released_chain {
-            Some(Released::Held) => self.release_chain()?,
-            Some(Released::Whole(holder)) => {
-                self.release_state(&[holder]).map_err(DomainError::invariant)?;
-            }
-            None => {}
-        }
+        assert!(primed.is_none(), "invariant violated: a drafter entry's chunk is absent from its flight");
         let finished = Instant::now();
         let timing = TargetHostTiming {
             launch: commits.first.saturating_duration_since(flight.started),
@@ -970,24 +928,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(pending)
     }
 
-    /// Release whole the chain `request`'s chunk was of, `advance` (a chunk's, never a step's),
-    /// its holder's state with it, and the drafter state `primed` beside the chunk: the request
-    /// claims no more of the chain. What is released, once every outcome is in.
-    fn release_chunk_chain(&mut self, request: RequestId, advance: Advance, primed: Option<OwnedStateAdvance>) -> Released {
-        let released = match advance {
-            Advance::Chain(chain) => {
-                self.target.insert(request, chain.abort());
-                Released::Whole(request)
-            }
-            Advance::Chained => Released::Held,
-            Advance::Step(_) => unreachable!("a step's advance is of no chain"),
-        };
-        if let Some(primed) = primed {
-            self.head.insert(request, primed.abort());
-        }
-        released
-    }
-
     fn finish_priming_work(
         &mut self,
         priming: PrimingFlight<F::HeadSubmission>,
@@ -995,28 +935,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let completed = priming.submission.finish().map_err(DomainError::Device)?;
         let (core, _) = completed.into_parts();
         let (_, advances, _) = core.into_parts();
-        let [advance]: [TentativeAdvance; 1] = advances
-            .try_into()
-            .map_err(|_| DomainError::invariant("a drafter entry has other than one slot"))?;
+        let Ok([advance]) = <[TentativeAdvance; 1]>::try_from(advances) else {
+            panic!("invariant violated: a drafter entry has other than one slot");
+        };
         match (advance, priming.continuation) {
             (TentativeAdvance::Accepted(advance), None) => Ok(Some((priming.request, advance))),
-            (TentativeAdvance::Successor(successor), Some(Some(state))) => {
-                match successor.attach(state.into_state()) {
-                    Ok(advance) => Ok(Some((priming.request, advance))),
-                    Err((state, error)) => {
-                        self.head.insert(priming.request, state);
-                        return Err(DomainError::invariant(format!(
-                            "claimed drafter entry no longer follows its state: {error}"
-                        )));
-                    }
-                }
-            }
+            // `claim_slots` found the state the successor follows.
+            (TentativeAdvance::Successor(successor), Some(Some(state))) => match successor.attach(state) {
+                Ok(advance) => Ok(Some((priming.request, advance))),
+                Err((_, error)) => panic!("invariant violated: a claimed drafter entry no longer follows its state: {error}"),
+            },
             (TentativeAdvance::Successor(_), Some(None)) => Ok(None),
-            _ => {
-                return Err(DomainError::invariant(
-                    "drafter entry advance differs from its continuation",
-                ));
-            }
+            _ => panic!("invariant violated: a drafter entry's advance differs from its continuation"),
         }
     }
 
@@ -1038,7 +968,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 work,
                 target_end,
                 bindings,
-                started: Instant::now(),
             }),
         };
         Ok((outcomes, continuation))
@@ -1047,14 +976,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn finish_priming(
         &mut self,
         flight: PrimingCompletionFlight<F>,
-    ) -> Result<(RequestId, Duration, StateBindings), DomainError> {
+    ) -> Result<(RequestId, StateBindings), DomainError> {
         let request = flight.work.request;
         if let Some((_, advance)) = self.finish_priming_work(flight.work)? {
-            if self.head.contains_key(&request) {
-                return Err(DomainError::invariant(
-                    "deferred entry has another head owner",
-                ));
-            }
+            assert!(!self.head.contains_key(&request), "invariant violated: a deferred drafter entry's state has another owner");
             // The entry commits with its chunk: in the request's accepted
             // state, or in the chain under way that holds it.
             let accepted = self.target_end(request) == Some(flight.target_end);
@@ -1072,7 +997,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             };
             self.head.insert(request, state);
         }
-        Ok((request, flight.started.elapsed(), flight.bindings))
+        Ok((request, flight.bindings))
     }
 
     fn restore_advances(
@@ -1856,10 +1781,11 @@ mod causal_cache_tests {
         let granule = 64 << 20;
         let entry: std::sync::Arc<dyn seismic::memory::Entry> =
             std::sync::Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
-        let pool = device.pool(seismic::Contract::DeviceOnly, granule, granule, seismic::PoolEntries::one(entry)).expect("the CPU opens its pool");
+        let pool = seismic::Pool::open(&seismic::PoolCharges::one(&device.charges_in(seismic::Contract::DeviceOnly, entry)), seismic::Contract::DeviceOnly, granule, granule).expect("the CPU opens its pool");
+        let charges = seismic::Charges::tally(&device);
         for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
             let (store, mut bindings) = StateStore::new(
-                Rc::clone(&device),
+                &charges,
                 pool.clone(),
                 16,
                 16,
@@ -2042,10 +1968,3 @@ mod appended_runs_tests {
     }
 }
 
-/// The chain an interrupted chunk releases, with its holder's state: one
-/// still held behind queued chunks (`release_chain`), or one its last chunk
-/// completed, whose state is the holder's again.
-enum Released {
-    Held,
-    Whole(RequestId),
-}

@@ -2,7 +2,7 @@ use super::super::*;
 use super::*;
 
 impl<'a> QualificationView<'a> {
-    pub(super) fn qualify_feature_copy(&self, device: &Device) -> Result<(), CatalogFailure> {
+    pub(super) fn qualify_feature_copy(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
         let failure = |error: String| qualification("feature_copy", "activation", error);
         let element = match self.geometry.activation_dtype {
             magnitude_family_contracts::ActivationDType::F16 => Element::f16(),
@@ -11,10 +11,10 @@ impl<'a> QualificationView<'a> {
         let element = self.plan.head().and_then(|head| head.blocks().first()).map_or(element, |head| head.conditioning);
         let row_bytes = if element == Element::f32() { 64 } else { 32 };
         let bytes = (0..4 * row_bytes).map(|i| i as u8).collect::<Vec<_>>();
-        let source = Tensor::from_host(device, element, &[4, 16], &bytes)
+        let source = Tensor::from_host(charges, element, &[4, 16], &bytes)
             .map_err(|error| failure(error.to_string()))?;
         let destination =
-            Tensor::zeros(device, element, &[4, 16]).map_err(|error| failure(error.to_string()))?;
+            Tensor::zeros(charges, element, &[4, 16]).map_err(|error| failure(error.to_string()))?;
         let source = source
             .slice_leading(1, 3)
             .map_err(|error| failure(error.to_string()))?;
@@ -24,7 +24,7 @@ impl<'a> QualificationView<'a> {
         self.programs
             .state
             .feature_copy
-            .call(feature_copy::Args {
+            .call(charges, feature_copy::Args {
                 input: &source,
                 out: &mut slice,
             })
@@ -40,7 +40,7 @@ impl<'a> QualificationView<'a> {
         Ok(())
     }
 
-    pub(super) fn qualify_shape_rows(&self, device: &Device) -> Result<(), CatalogFailure> {
+    pub(super) fn qualify_shape_rows(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
         // Exercise both cuts together, across the vocabulary's first and last
         // tokens. Equal peaks test the stable tie cutoff; unequal peaks test
         // that the maximum's fixed-point mass is exactly one unit.
@@ -59,23 +59,23 @@ impl<'a> QualificationView<'a> {
                 .collect::<Vec<_>>();
             let params = [1.0_f32, 2.0, top_p, 0.0, 1.0, 0.0, 0.0, 0.0];
             let history = [-1_i32; 64];
-            let mut logits = tensor_f32(device, &[1, vocabulary], &values, "shape_rows", "fixed")?;
-            let params = tensor_f32(device, &[1, 8], &params, "shape_rows", "fixed")?;
+            let mut logits = tensor_f32(charges, &[1, vocabulary], &values, "shape_rows", "fixed")?;
+            let params = tensor_f32(charges, &[1, 8], &params, "shape_rows", "fixed")?;
             let history_bytes = history
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>();
-            let history = Tensor::from_host(device, Element::i32(), &[1, 64], &history_bytes)
+            let history = Tensor::from_host(charges, Element::i32(), &[1, 64], &history_bytes)
                 .map_err(|error| qualification("shape_rows", "fixed", error))?;
             // The row is unconstrained, so its empty mask is never read.
-            let mask = Tensor::zeros(device, Element::u32(), &[1, vocabulary.div_ceil(32)])
+            let mask = Tensor::zeros(charges, Element::u32(), &[1, vocabulary.div_ceil(32)])
                 .map_err(|error| qualification("shape_rows", "fixed", error))?;
-            let constrained = Tensor::zeros(device, Element::i32(), &[1])
+            let constrained = Tensor::zeros(charges, Element::i32(), &[1])
                 .map_err(|error| qualification("shape_rows", "fixed", error))?;
             self.programs
                 .target
                 .shape
-                .call(shape_rows::Args {
+                .call(charges, shape_rows::Args {
                     logits: &mut logits,
                     mask: &mask,
                     constrained: &constrained,
@@ -109,7 +109,7 @@ impl<'a> QualificationView<'a> {
         Ok(())
     }
 
-    pub(super) fn qualify_sample_rows(&self, device: &Device) -> Result<(), CatalogFailure> {
+    pub(super) fn qualify_sample_rows(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
         // Logits ascend with the token. Row 0 is unconstrained (its empty
         // mask is ignored) and selects the last token; row 1 admits only
         // token 0.
@@ -118,27 +118,27 @@ impl<'a> QualificationView<'a> {
         let values = (0..2 * vocabulary)
             .map(|index| (index % vocabulary) as f32)
             .collect::<Vec<_>>();
-        let logits = tensor_f32(device, &[2, vocabulary], &values, "sample_rows", "fixed")?;
+        let logits = tensor_f32(charges, &[2, vocabulary], &values, "sample_rows", "fixed")?;
         let mask_words = (0..2 * words)
             .map(|index| u32::from(index == words))
             .flat_map(|word| word.to_le_bytes())
             .collect::<Vec<_>>();
-        let mask = Tensor::from_host(device, Element::u32(), &[2, words], &mask_words)
+        let mask = Tensor::from_host(charges, Element::u32(), &[2, words], &mask_words)
             .map_err(|error| qualification("sample_rows", "fixed", error))?;
         let flags = [0_i32, 1_i32]
             .iter()
             .flat_map(|flag| flag.to_le_bytes())
             .collect::<Vec<_>>();
-        let constrained = Tensor::from_host(device, Element::i32(), &[2], &flags)
+        let constrained = Tensor::from_host(charges, Element::i32(), &[2], &flags)
             .map_err(|error| qualification("sample_rows", "fixed", error))?;
-        let draws = Tensor::zeros(device, Element::u32(), &[2, 6])
+        let draws = Tensor::zeros(charges, Element::u32(), &[2, 6])
             .map_err(|error| qualification("sample_rows", "fixed", error))?;
-        let mut result = Tensor::zeros(device, Element::i32(), &[2, 2])
+        let mut result = Tensor::zeros(charges, Element::i32(), &[2, 2])
             .map_err(|error| qualification("sample_rows", "fixed", error))?;
         self.programs
             .target
             .sample
-            .call(sample_rows::Args {
+            .call(charges, sample_rows::Args {
                 logits: &logits,
                 mask: &mask,
                 constrained: &constrained,
@@ -168,23 +168,23 @@ impl<'a> QualificationView<'a> {
 
     pub(super) fn qualify_conditioning_overlay(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
     ) -> Result<(), CatalogFailure> {
         let input = tensor_f32(
-            device,
+            charges,
             &[1, 2],
             &[1.0, -2.0],
             "conditioning_overlay",
             "fixed",
         )?;
-        let mut out = Tensor::zeros(device, Element::f32(), &[1, 2])
+        let mut out = Tensor::zeros(charges, Element::f32(), &[1, 2])
             .map_err(|error| qualification("conditioning_overlay", "fixed", error))?;
         self.programs
             .state
             .conditioning
             .as_ref()
             .expect("attested conditioning slot")
-            .call(conditioning_overlay::Args {
+            .call(charges, conditioning_overlay::Args {
                 input: &input,
                 out: &mut out,
             })
@@ -205,7 +205,7 @@ impl<'a> QualificationView<'a> {
 
     /// The selection notice copies (token, status) rows as they are, of a
     /// load that has one (`ProgramPlan::notices_selection`).
-    pub(super) fn qualify_selection_notice(&self, device: &Device) -> Result<(), CatalogFailure> {
+    pub(super) fn qualify_selection_notice(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
         let Some(notice) = &self.programs.notice else {
             return Ok(());
         };
@@ -218,12 +218,12 @@ impl<'a> QualificationView<'a> {
             .flatten()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        let selection = Tensor::from_host(device, Element::i32(), &[2, 2], &bytes)
+        let selection = Tensor::from_host(charges, Element::i32(), &[2, 2], &bytes)
             .map_err(|error| failure(&error))?;
         let mut copied =
-            Tensor::zeros(device, Element::i32(), &[2, 2]).map_err(|error| failure(&error))?;
+            Tensor::zeros(charges, Element::i32(), &[2, 2]).map_err(|error| failure(&error))?;
         notice
-            .call(magnitude_kernels::selection_notice::Args {
+            .call(charges, magnitude_kernels::selection_notice::Args {
                 selection: &selection,
                 notice: &mut copied,
             })
@@ -236,7 +236,7 @@ impl<'a> QualificationView<'a> {
 
     pub(super) fn qualify_copy_rows(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         element: Element,
         binding: &'static str,
     ) -> Result<(), CatalogFailure> {
@@ -244,7 +244,7 @@ impl<'a> QualificationView<'a> {
         let source = (0..4 * width).map(|byte| byte as u8).collect::<Vec<_>>();
         let make_store = |initial: &[u8]| -> Result<seismic::SlabTensor, CatalogFailure> {
             let store = crate::experts::pooled_slabs(
-                device,
+                charges,
                 seismic::Contract::DeviceOnly,
                 1,
                 2,
@@ -273,9 +273,9 @@ impl<'a> QualificationView<'a> {
         let mut rows = rows_store
             .logical_region(0)
             .map_err(|error| qualification("copy_rows", binding, error))?;
-        let from = Tensor::from_host(device, Element::i32(), &[1], &1_i32.to_le_bytes())
+        let from = Tensor::from_host(charges, Element::i32(), &[1], &1_i32.to_le_bytes())
             .map_err(|error| qualification("copy_rows", binding, error))?;
-        let to = Tensor::from_host(device, Element::i32(), &[1], &0_i32.to_le_bytes())
+        let to = Tensor::from_host(charges, Element::i32(), &[1], &0_i32.to_le_bytes())
             .map_err(|error| qualification("copy_rows", binding, error))?;
         let (_, copy) = self
             .programs
@@ -284,7 +284,7 @@ impl<'a> QualificationView<'a> {
             .iter()
             .find(|(available, _)| *available == element)
             .expect("attested copy slot");
-        copy.call(copy_rows::Args {
+        copy.call(charges, copy_rows::Args {
             rows: &mut rows,
             from: &from,
             to: &to,

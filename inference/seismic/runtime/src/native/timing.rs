@@ -33,13 +33,36 @@ pub(crate) struct PointTiming<'a> {
 /// observation clears that storage before each candidate's first invocation.
 /// Points are named by label, so any subset of a run's points finds its own
 /// storage.
-#[derive(Default)]
-pub(crate) struct OutputPool(HashMap<String, Vec<Vec<Arc<TensorInner>>>>);
+pub(crate) struct OutputPool {
+    /// What the results and scratch of its placements are charged to.
+    charges: crate::memory::Charges,
+    /// The result storage of each point's argument sets, by point label.
+    sets: HashMap<String, Vec<Vec<Arc<TensorInner>>>>,
+}
 
 impl OutputPool {
-    /// The storage of the argument sets of the point labeled `point`.
-    pub(crate) fn at(&mut self, point: &str) -> &mut Vec<Vec<Arc<TensorInner>>> {
-        self.0.entry(point.to_owned()).or_default()
+    /// An empty pool of placements charged to `charges`.
+    pub(crate) fn new(charges: crate::memory::Charges) -> Self {
+        Self { charges, sets: HashMap::new() }
+    }
+
+    /// Place a configuration of `kernel` at the point labeled `point`,
+    /// against its shared result storage: [`PointTiming::new`]'s placement,
+    /// its results those of every other configuration placed there.
+    pub(crate) fn timing<'a>(
+        &mut self,
+        kernel: &Arc<NativePrepared>,
+        point: &str,
+        rotation: Vec<EncodedArgs>,
+        copies: Vec<EncodedArgs>,
+    ) -> Result<PointTiming<'a>, CallError> {
+        let outputs = self.sets.entry(point.to_owned()).or_default();
+        PointTiming::place(kernel, &self.charges, rotation, copies, Some(outputs))
+    }
+
+    /// Give up every point's result storage.
+    pub(crate) fn release(&mut self) {
+        self.sets.clear();
     }
 }
 
@@ -73,31 +96,22 @@ impl<'a> PointTiming<'a> {
     /// one scratch arena, held while the timing is.
     pub(crate) fn new(
         kernel: &Arc<NativePrepared>,
+        charges: &crate::memory::Charges,
         rotation: Vec<EncodedArgs>,
         copies: Vec<EncodedArgs>,
     ) -> Result<Self, CallError> {
-        Self::place(kernel, rotation, copies, None)
-    }
-
-    /// Place a configuration against a point's shared result storage
-    /// ([`OutputPool`]).
-    pub(crate) fn reusing_outputs(
-        kernel: &Arc<NativePrepared>,
-        rotation: Vec<EncodedArgs>,
-        copies: Vec<EncodedArgs>,
-        outputs: &mut Vec<Vec<Arc<TensorInner>>>,
-    ) -> Result<Self, CallError> {
-        Self::place(kernel, rotation, copies, Some(outputs))
+        Self::place(kernel, charges, rotation, copies, None)
     }
 
     fn place(
         kernel: &Arc<NativePrepared>,
+        charges: &crate::memory::Charges,
         rotation: Vec<EncodedArgs>,
         copies: Vec<EncodedArgs>,
         outputs: Option<&mut Vec<Vec<Arc<TensorInner>>>>,
     ) -> Result<Self, CallError> {
         let began = Instant::now();
-        let point = KernelPoint::place(kernel, rotation, copies, outputs)?;
+        let point = KernelPoint::place(kernel, charges, rotation, copies, outputs)?;
         Ok(Self {
             slot: Slot::new(point),
             initialize: None,

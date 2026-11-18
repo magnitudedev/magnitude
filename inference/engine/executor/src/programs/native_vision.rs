@@ -1517,7 +1517,6 @@ struct PreparedVisionGraph {
 }
 
 pub struct PreparedVisionGraphs {
-    device: Device,
     variants: Vec<PreparedVisionGraph>,
     family: NativeGraphFamily,
     /// Register rows ahead of each image's patch rows.
@@ -1608,7 +1607,6 @@ impl PreparedVisionGraphs {
         let plans = variants.iter().map(|variant| (false, variant.plan.clone()));
         let family = super::graph::serial_family("vision", plans, &family_graphs).map_err(device)?;
         Ok(Self {
-            device: target_device.clone(),
             variants,
             family,
             registers: program.registers,
@@ -1644,9 +1642,10 @@ impl PreparedVisionGraphs {
 
     pub(crate) fn bind_weights(
         self: &Rc<Self>,
+        charges: &seismic::Charges,
         resident: &ResidentVision,
     ) -> Result<BoundVisionGraphs, SubmitError> {
-        let mut uploaded = ConstantTensors::new(self.device.clone());
+        let mut uploaded = ConstantTensors::new(charges);
         let mut variants = Vec::with_capacity(self.variants.len());
         for variant in &self.variants {
             let constants = variant
@@ -1660,7 +1659,7 @@ impl PreparedVisionGraphs {
                 fixed.push((port, resident.weights.get(*role).map_err(invalid)?.tensor()));
             }
             fixed.extend(constants.iter().map(|(port, tensor)| (*port, tensor)));
-            variants.push(variant.plan.bind_static(&fixed).map_err(device)?);
+            variants.push(variant.plan.bind_static(charges, &fixed).map_err(device)?);
         }
         Ok(BoundVisionGraphs {
             prepared: self.clone(),

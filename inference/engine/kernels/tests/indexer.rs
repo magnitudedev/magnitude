@@ -610,6 +610,7 @@ fn pool_entry(case: &Case) -> (seismic::BoundEntry<pool_rows::Entry>, Vec<(&'sta
 }
 
 fn native(device: &Device, case: &Case) -> Outcome {
+    let charges = seismic::Charges::tally(device);
     let m = case.rows as u64;
     let (h, w) = (case.heads as u64, W as u64);
     let gt = u64::from(case.gated());
@@ -643,7 +644,7 @@ fn native(device: &Device, case: &Case) -> Outcome {
     let components = ints(device, &[P as u64], &case.components);
     let frequencies = tensor(device, Element::f32(), &[P as u64], &case.frequencies);
     let amplitudes = tensor(device, Element::f32(), &[P as u64], &vec![1.0; P]);
-    pool.call(pool_rows::Args {
+    pool.call(&charges, pool_rows::Args {
         u: &tensor(device, Element::f32(), &[m, w], &case.key),
         g: &tensor(device, Element::f32(), &[m, gt * w], &case.gate),
         position: &tensor(device, Element::f32(), &[pr, w], &case.places),
@@ -681,7 +682,7 @@ fn native(device: &Device, case: &Case) -> Outcome {
     );
     let n = case.nb as u64;
     let scores = score
-        .call(indexer_score::Args {
+        .call(&charges, indexer_score::Args {
             query: &tensor(device, case.element, &[m, h, w], &case.query),
             query_norm: &tensor(device, Element::f32(), &[nq, w], &case.query_norm),
             head_weights: &tensor(device, case.element, &[m, hw], &case.head_weights),
@@ -706,7 +707,7 @@ fn native(device: &Device, case: &Case) -> Outcome {
     let complete = ints(device, &[m], &case.complete());
     let units = ints(device, &[m, 1, 2], &case.complete().iter().flat_map(|&c| [0, c]).collect::<Vec<_>>());
     let picks = kernel!(device, rows_topk::native_entry(), &[])
-        .call(rows_topk::Args {
+        .call(&charges, rows_topk::Args {
             scores: &scores,
             complete: &complete,
             spans: &units,
@@ -715,10 +716,10 @@ fn native(device: &Device, case: &Case) -> Outcome {
         .unwrap()
         .value;
     let reads = kernel!(device, unit_reads::native_entry(), &[])
-        .call(unit_reads::Args {
+        .call(&charges, unit_reads::Args {
             picks: &picks,
             complete: &complete,
-            bitmap_words: &Tensor::from_host(device, Element::u32(), &[0, case.words as u64], &[]).unwrap(),
+            bitmap_words: &Tensor::from_host(&charges, Element::u32(), &[0, case.words as u64], &[]).unwrap(),
         })
         .unwrap();
     let segments = match case.decode {
@@ -727,7 +728,7 @@ fn native(device: &Device, case: &Case) -> Outcome {
             let token = case.token_runs();
             let visible = (0..case.rows).map(|_| token.clone()).collect::<Vec<_>>();
             let table = kernel!(device, candidate_rows::native_entry(), &[])
-                .call(candidate_rows::Args {
+                .call(&charges, candidate_rows::Args {
                     blocks: &reads.r1,
                     spans: &ints(device, &[m, r, 2], &case.pad(&visible)),
                     form: &ints(device, &[0, SB as u64, 0], &[]),

@@ -9,6 +9,8 @@
 // An L3 invocation owns 8 consecutive columns of one row: it reads each
 // choice's position and score once and the choice's 8 expert outputs as one
 // 16-byte load, so the gather moves whole rows of expert output.
+// The grouped projection's GEMMs stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #define KERNEL_W0 SEISMIC_SHARED_GATE
 #define KERNEL_W1 SEISMIC_SHARED_UP
 #define KERNEL_W2 SEISMIC_SHARED_DOWN
@@ -34,6 +36,7 @@
 #define COMBINE_THREADS 256u
 
 void routed_combine_expand() {
+    packets_stage_tables();
     const uint hidden = uint(SEISMIC_DIM_H);
     const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
@@ -46,6 +49,7 @@ void routed_combine_expand() {
 }
 
 void routed_combine_down() {
+    packets_stage_tables();
     const uint shared_features = uint(SEISMIC_DIM_S);
     const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT),
         SEISMIC_DIM_S, 1ul, shared_features, 0ul);

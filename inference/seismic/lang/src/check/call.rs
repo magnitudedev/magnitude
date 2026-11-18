@@ -261,17 +261,6 @@ impl<'a> Checker<'a> {
         if let Some(op) = MathOp::parse(&name.name) {
             return self.math(op, &name.name, args, expected, span);
         }
-        let positional = |c: &mut Checker, n: usize| -> bool {
-            let ok = args.len() == n && args.iter().all(|a| a.name.is_none());
-            if !ok {
-                c.error(
-                    DiagnosticRule::Type,
-                    span,
-                    format!("`{}` takes {n} positional argument(s)", name.name),
-                );
-            }
-            ok
-        };
         match name.name.as_str() {
             "quantized_code"
             | "quantized_code_value"
@@ -285,96 +274,8 @@ impl<'a> Checker<'a> {
             | "quantized_scale_factor"
             | "quantized_bias_factor"
             | "quantized_coefficient_code_max"
-            | "quantized_bias_present" => {
-                if args.len() < 2 || args.iter().any(|arg| arg.name.is_some()) {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        "a quantized component takes a tensor followed by logical point indices",
-                    );
-                    return None;
-                }
-                let indexed = ast::Expr {
-                    span,
-                    kind: A::Index {
-                        base: Box::new(args[0].value.clone()),
-                        indices: args[1..]
-                            .iter()
-                            .map(|arg| ast::Index::Expr(arg.value.clone()))
-                            .collect(),
-                    },
-                };
-                let mut read = self.expr(&indexed, None)?;
-                let component = match name.name.as_str() {
-                    "quantized_code" => crate::registry::QuantizedComponent::Code,
-                    "quantized_code_value" => crate::registry::QuantizedComponent::CodeValue,
-                    "quantized_scale_code" => crate::registry::QuantizedComponent::ScaleCode,
-                    "quantized_bias_code" => crate::registry::QuantizedComponent::BiasCode,
-                    "quantized_scale" => crate::registry::QuantizedComponent::Scale,
-                    "quantized_bias" => crate::registry::QuantizedComponent::Bias,
-                    "quantized_group_size" => crate::registry::QuantizedComponent::GroupSize,
-                    "quantized_code_min" => crate::registry::QuantizedComponent::CodeMin,
-                    "quantized_code_max" => crate::registry::QuantizedComponent::CodeMax,
-                    "quantized_scale_factor" => crate::registry::QuantizedComponent::ScaleFactor,
-                    "quantized_bias_factor" => crate::registry::QuantizedComponent::BiasFactor,
-                    "quantized_coefficient_code_max" => {
-                        crate::registry::QuantizedComponent::CoefficientCodeMax
-                    }
-                    _ => crate::registry::QuantizedComponent::BiasPresent,
-                };
-                let CheckedExprKind::Primitive { id, operands, .. } = &mut read.kind else {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        "a quantized component requires logical point indices",
-                    );
-                    return None;
-                };
-                let PrimitiveId::ElementRead { checks } = id else {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        "a quantized component requires logical point indices",
-                    );
-                    return None;
-                };
-                let ValueType::Tensor(tensor) = &operands[0].ty else {
-                    unreachable!("element read takes a tensor");
-                };
-                self.elements.component_read(&tensor.elem, component);
-                *id = PrimitiveId::QuantizedComponentRead {
-                    component,
-                    checks: checks.clone(),
-                };
-                read.ty = ValueType::Scalar(component.dtype());
-                read.value = super::ir::SourceValue::Untracked;
-                Some(read)
-            }
-            "bitcast_f32" | "bitcast_u32" => {
-                if !positional(self, 1) {
-                    return None;
-                }
-                let (from, to) = if name.name == "bitcast_f32" {
-                    (DType::U32, DType::F32)
-                } else {
-                    (DType::F32, DType::U32)
-                };
-                let input = self.expr(&args[0].value, Some(&ValueType::Scalar(from)))?;
-                let id = PrimitiveId::Bitcast(to);
-                if !primitive(&id).accepts(&[input.ty.clone()]) {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        format!("`{}` requires scalar or dense tensor {from}", name.name),
-                    );
-                    return None;
-                }
-                let axes = match &input.ty {
-                    ValueType::Tensor(t) => Some(t.axes.clone()),
-                    _ => None,
-                };
-                self.elementwise_primitive(id, vec![input], axes, span)
-            }
+            | "quantized_bias_present" => self.quantized_component(&name.name, args, span),
+            "bitcast_f32" | "bitcast_u32" => self.bitcast(&name.name, args, span),
             "index" => {
                 self.error(
                     DiagnosticRule::Type,
@@ -392,53 +293,19 @@ impl<'a> Checker<'a> {
                 None
             }
             "repack" => {
-                if !positional(self, 1) {
+                if !self.positional(&name.name, args, 1, span) {
                     return None;
                 }
                 self.repack(bindings, &args[0].value, expected, span)
             }
             "to_owned" => {
-                if !positional(self, 1) {
+                if !self.positional(&name.name, args, 1, span) {
                     return None;
                 }
                 self.to_owned(&args[0].value, span)
             }
             "zeros_like" | "ones_like" => self.fill(&name.name, args, span),
-            "select" => {
-                if !positional(self, 3) {
-                    return None;
-                }
-                let cond = self.expr(&args[0].value, None)?;
-                let then = self.expr(&args[1].value, expected)?;
-                let els = self.expr(&args[2].value, Some(&then.ty))?;
-                let (axes, dtypes) = self.broadcast(&[&cond, &then, &els], "`select`", span)?;
-                if dtypes[0] != DType::Bool {
-                    self.error(
-                        DiagnosticRule::Type,
-                        cond.span,
-                        format!(
-                            "the first operand of `select` is a mask (`bool`), found {}",
-                            dtypes[0].name()
-                        ),
-                    );
-                    return None;
-                }
-                let Some(target) = DType::promote(dtypes[1], dtypes[2]) else {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        format!(
-                            "`select` between {} and {} needs an explicit cast",
-                            dtypes[1].name(),
-                            dtypes[2].name()
-                        ),
-                    );
-                    return None;
-                };
-                let mut branches = self.promote_operands(vec![then, els], target).into_iter();
-                let (then, els) = (branches.next()?, branches.next()?);
-                self.elementwise_primitive(PrimitiveId::Select, vec![cond, then, els], axes, span)
-            }
+            "select" => self.select(args, expected, span),
             "reduce" => {
                 let unordered = match args.get(3) {
                     Some(ast::Arg {
@@ -461,60 +328,210 @@ impl<'a> Checker<'a> {
                 self.reduce(args, unordered, span)
             }
             "reshape" => {
-                if !positional(self, 2) {
+                if !self.positional(&name.name, args, 2, span) {
                     return None;
                 }
                 self.reshape(args, span)
             }
-            "extent" => {
-                if !positional(self, 2) {
-                    return None;
-                }
-                let base = self.expr_inner(&args[0].value, None, true)?;
-                let Some(s) = base.ty.shaped().cloned() else {
-                    let shown = self.shown(&base.ty);
-                    self.error(
-                        DiagnosticRule::Type,
-                        base.span,
-                        format!("`extent` needs a tensor, view or tile, found {shown}"),
-                    );
-                    return None;
-                };
-                let axis = self.constant_axis(&args[1].value, s.rank())?;
-                let sym = self.arena.int_to_word(s.axes[axis], DType::I32);
-                Some(self.primitive_expr(
-                    PrimitiveId::Extent { axis: axis as u32 },
-                    vec![base],
-                    ValueType::Scalar(DType::I32),
-                    Some(sym),
-                    span,
-                ))
-            }
-            "operands" => {
-                if !positional(self, 1) {
-                    return None;
-                }
-                let base = self.expr_inner(&args[0].value, None, true)?;
-                if !matches!(base.ty, ValueType::Tensor(_)) {
-                    let shown = self.shown(&base.ty);
-                    self.error(
-                        DiagnosticRule::Type,
-                        base.span,
-                        format!("`operands` needs a tensor, found {shown}"),
-                    );
-                    return None;
-                }
-                Some(self.primitive_expr(
-                    PrimitiveId::Operands,
-                    vec![base],
-                    ValueType::Scalar(DType::I32),
-                    None,
-                    span,
-                ))
-            }
+            "extent" => self.extent(args, span),
+            "operands" => self.operands_code(args, span),
             "atomic" => self.atomic(args, span),
             _ => self.user_call(name, bindings, args, span),
         }
+    }
+
+    /// A quantized component read: `name(tensor, points...)`.
+    fn quantized_component(&mut self, name: &str, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
+        if args.len() < 2 || args.iter().any(|arg| arg.name.is_some()) {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                "a quantized component takes a tensor followed by logical point indices",
+            );
+            return None;
+        }
+        let indexed = ast::Expr {
+            span,
+            kind: A::Index {
+                base: Box::new(args[0].value.clone()),
+                indices: args[1..]
+                    .iter()
+                    .map(|arg| ast::Index::Expr(arg.value.clone()))
+                    .collect(),
+            },
+        };
+        let mut read = self.expr(&indexed, None)?;
+        let component = match name {
+            "quantized_code" => crate::registry::QuantizedComponent::Code,
+            "quantized_code_value" => crate::registry::QuantizedComponent::CodeValue,
+            "quantized_scale_code" => crate::registry::QuantizedComponent::ScaleCode,
+            "quantized_bias_code" => crate::registry::QuantizedComponent::BiasCode,
+            "quantized_scale" => crate::registry::QuantizedComponent::Scale,
+            "quantized_bias" => crate::registry::QuantizedComponent::Bias,
+            "quantized_group_size" => crate::registry::QuantizedComponent::GroupSize,
+            "quantized_code_min" => crate::registry::QuantizedComponent::CodeMin,
+            "quantized_code_max" => crate::registry::QuantizedComponent::CodeMax,
+            "quantized_scale_factor" => crate::registry::QuantizedComponent::ScaleFactor,
+            "quantized_bias_factor" => crate::registry::QuantizedComponent::BiasFactor,
+            "quantized_coefficient_code_max" => {
+                crate::registry::QuantizedComponent::CoefficientCodeMax
+            }
+            _ => crate::registry::QuantizedComponent::BiasPresent,
+        };
+        let CheckedExprKind::Primitive { id, operands, .. } = &mut read.kind else {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                "a quantized component requires logical point indices",
+            );
+            return None;
+        };
+        let PrimitiveId::ElementRead { checks } = id else {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                "a quantized component requires logical point indices",
+            );
+            return None;
+        };
+        let ValueType::Tensor(tensor) = &operands[0].ty else {
+            unreachable!("element read takes a tensor");
+        };
+        self.elements.component_read(&tensor.elem, component);
+        *id = PrimitiveId::QuantizedComponentRead {
+            component,
+            checks: checks.clone(),
+        };
+        read.ty = ValueType::Scalar(component.dtype());
+        read.value = super::ir::SourceValue::Untracked;
+        Some(read)
+    }
+
+    /// `bitcast_f32(x)` or `bitcast_u32(x)`.
+    fn bitcast(&mut self, name: &str, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
+        if !self.positional(name, args, 1, span) {
+            return None;
+        }
+        let (from, to) = if name == "bitcast_f32" {
+            (DType::U32, DType::F32)
+        } else {
+            (DType::F32, DType::U32)
+        };
+        let input = self.expr(&args[0].value, Some(&ValueType::Scalar(from)))?;
+        let id = PrimitiveId::Bitcast(to);
+        if !primitive(&id).accepts(&[input.ty.clone()]) {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                format!("`{}` requires scalar or dense tensor {from}", name),
+            );
+            return None;
+        }
+        let axes = match &input.ty {
+            ValueType::Tensor(t) => Some(t.axes.clone()),
+            _ => None,
+        };
+        self.elementwise_primitive(id, vec![input], axes, span)
+    }
+
+    /// `select(mask, then, else)`.
+    fn select(&mut self, args: &[ast::Arg], expected: Option<&ValueType>, span: Span) -> Option<CheckedExpr> {
+        if !self.positional("select", args, 3, span) {
+            return None;
+        }
+        let cond = self.expr(&args[0].value, None)?;
+        let then = self.expr(&args[1].value, expected)?;
+        let els = self.expr(&args[2].value, Some(&then.ty))?;
+        let (axes, dtypes) = self.broadcast(&[&cond, &then, &els], "`select`", span)?;
+        if dtypes[0] != DType::Bool {
+            self.error(
+                DiagnosticRule::Type,
+                cond.span,
+                format!(
+                    "the first operand of `select` is a mask (`bool`), found {}",
+                    dtypes[0].name()
+                ),
+            );
+            return None;
+        }
+        let Some(target) = DType::promote(dtypes[1], dtypes[2]) else {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                format!(
+                    "`select` between {} and {} needs an explicit cast",
+                    dtypes[1].name(),
+                    dtypes[2].name()
+                ),
+            );
+            return None;
+        };
+        let mut branches = self.promote_operands(vec![then, els], target).into_iter();
+        let (then, els) = (branches.next()?, branches.next()?);
+        self.elementwise_primitive(PrimitiveId::Select, vec![cond, then, els], axes, span)
+    }
+
+    /// `extent(tensor, axis)`.
+    fn extent(&mut self, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
+        if !self.positional("extent", args, 2, span) {
+            return None;
+        }
+        let base = self.expr_inner(&args[0].value, None, true)?;
+        let Some(s) = base.ty.shaped().cloned() else {
+            let shown = self.shown(&base.ty);
+            self.error(
+                DiagnosticRule::Type,
+                base.span,
+                format!("`extent` needs a tensor, view or tile, found {shown}"),
+            );
+            return None;
+        };
+        let axis = self.constant_axis(&args[1].value, s.rank())?;
+        let sym = self.arena.int_to_word(s.axes[axis], DType::I32);
+        Some(self.primitive_expr(
+            PrimitiveId::Extent { axis: axis as u32 },
+            vec![base],
+            ValueType::Scalar(DType::I32),
+            Some(sym),
+            span,
+        ))
+    }
+
+    /// `operands(tensor)`: its representation's operand recipe code.
+    fn operands_code(&mut self, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
+        if !self.positional("operands", args, 1, span) {
+            return None;
+        }
+        let base = self.expr_inner(&args[0].value, None, true)?;
+        if !matches!(base.ty, ValueType::Tensor(_)) {
+            let shown = self.shown(&base.ty);
+            self.error(
+                DiagnosticRule::Type,
+                base.span,
+                format!("`operands` needs a tensor, found {shown}"),
+            );
+            return None;
+        }
+        Some(self.primitive_expr(
+            PrimitiveId::Operands,
+            vec![base],
+            ValueType::Scalar(DType::I32),
+            None,
+            span,
+        ))
+    }
+
+    /// Whether `args` are `n` positional arguments, reported against `name` if not.
+    fn positional(&mut self, name: &str, args: &[ast::Arg], n: usize, span: Span) -> bool {
+        let ok = args.len() == n && args.iter().all(|a| a.name.is_none());
+        if !ok {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                format!("`{name}` takes {n} positional argument(s)"),
+            );
+        }
+        ok
     }
 
     /// L31: `index[B](w)` converts a word (or quantity) proved in
@@ -927,13 +944,7 @@ impl<'a> Checker<'a> {
         expected: Option<&ValueType>,
         span: Span,
     ) -> Option<CheckedExpr> {
-        let arity = op.arity();
-        if args.len() != arity || args.iter().any(|a| a.name.is_some()) {
-            self.error(
-                DiagnosticRule::Type,
-                span,
-                format!("`{name}` takes {arity} positional argument(s)"),
-            );
+        if !self.positional(name, args, op.arity(), span) {
             return None;
         }
         let float_only = !op.numeric_operands();

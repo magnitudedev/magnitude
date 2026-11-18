@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use crate::operation::RequestId;
 
 use super::admission::Frees;
+use super::changes::Claiming;
 use super::state::{EntryId, State};
 use super::view::Ledger;
 use super::vocabulary::{CacheKind, Holding, Value};
@@ -103,7 +104,8 @@ impl Ledger {
         self.state().plan_relief(&self.store.identity, need, allow, frees)
     }
 
-    /// Carry out `plan` whole: its cache yields now, each holder freeing
+    /// Carry out `plan` whole, in `claiming`, a change's claim phase: its
+    /// cache yields now, each holder freeing
     /// what was taken of it by its own rule; its requests are the holder's
     /// to preempt. The only way cache yields to anything but a claim. An
     /// entry its holder let go since the plan was made freed its bytes
@@ -111,7 +113,8 @@ impl Ledger {
     ///
     /// # Panics
     /// For a plan of another store.
-    pub fn execute(&self, plan: ReliefPlan) -> Owed {
+    pub fn execute(&self, claiming: &Claiming, plan: ReliefPlan) -> Owed {
+        claiming.of_scope(&self.store.changes);
         assert_eq!(plan.store, self.store.identity, "invariant violated: a relief plan executes in its own store");
         let mut state = self.state();
         let mut yielded = 0u64;

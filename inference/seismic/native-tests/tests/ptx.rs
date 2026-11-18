@@ -34,8 +34,8 @@ fn formed<E: seismic::Entry>(
     kernel
 }
 
-fn tensor(device: &Device, element: Element, extents: &[u64], bytes: Vec<u8>) -> Tensor {
-    Tensor::from_host(device, element, extents, &bytes).expect("host tensor")
+fn tensor(charges: &seismic::Charges, element: Element, extents: &[u64], bytes: Vec<u8>) -> Tensor {
+    Tensor::from_host(charges, element, extents, &bytes).expect("host tensor")
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -169,6 +169,7 @@ fn bf16_value(bits: u16) -> f32 {
 #[test]
 fn mma_m16n8k16_matches_the_f32_reference_for_f16_and_bf16() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         let k = 64usize;
         // Small halves: every product and partial sum is exact in f32.
         let a = (0..16 * k)
@@ -189,8 +190,8 @@ fn mma_m16n8k16_matches_the_f32_reference_for_f16_and_bf16() {
         ] {
             let encoded =
                 |values: &[f32]| u16_bytes(&values.iter().map(|v| encode(*v)).collect::<Vec<_>>());
-            let a_tensor = tensor(&device, element, &[16, k as u64], encoded(&a));
-            let b_tensor = tensor(&device, element, &[8, k as u64], encoded(&b));
+            let a_tensor = tensor(&charges, element, &[16, k as u64], encoded(&a));
+            let b_tensor = tensor(&charges, element, &[8, k as u64], encoded(&b));
             let kernel = formed(&format!("ptx_mma_m16n8k16 {name}"), || {
                 ptx_mma_m16n8k16::native_for_device_with(
                     &device,
@@ -202,7 +203,7 @@ fn mma_m16n8k16_matches_the_f32_reference_for_f16_and_bf16() {
             assert!(artifact.contains("nvrtc 12."), "{artifact}");
             assert!(artifact.contains("--fmad=false"), "{artifact}");
             let result = kernel
-                .call(ptx_mma_m16n8k16::Args {
+                .call(&charges, ptx_mma_m16n8k16::Args {
                     a: &a_tensor,
                     b: &b_tensor,
                 })
@@ -215,6 +216,7 @@ fn mma_m16n8k16_matches_the_f32_reference_for_f16_and_bf16() {
 #[test]
 fn mma_m16n8k32_s8_matches_the_integer_reference() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         let k = 96usize;
         let mut sequence = Sequence(7);
         let a = (0..16 * k)
@@ -236,9 +238,9 @@ fn mma_m16n8k32_s8_matches_the_integer_reference() {
             )
         });
         let result = kernel
-            .call(ptx_mma_m16n8k32_s8::Args {
-                a: &tensor(&device, Element::i32(), &[16, k as u64], i32_bytes(&a)),
-                b: &tensor(&device, Element::i32(), &[8, k as u64], i32_bytes(&b)),
+            .call(&charges, ptx_mma_m16n8k32_s8::Args {
+                a: &tensor(&charges, Element::i32(), &[16, k as u64], i32_bytes(&a)),
+                b: &tensor(&charges, Element::i32(), &[8, k as u64], i32_bytes(&b)),
             })
             .expect("call");
         assert_eq!(read_i32(&result.value), expected);
@@ -248,11 +250,12 @@ fn mma_m16n8k32_s8_matches_the_integer_reference() {
 #[test]
 fn ldmatrix_fragments_reproduce_and_transpose_every_matrix() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         // 256 distinct exactly representable values.
         let values = (0..256)
             .map(|index| f16_bits(index as f32))
             .collect::<Vec<_>>();
-        let x = tensor(&device, Element::f16(), &[4, 8, 8], u16_bytes(&values));
+        let x = tensor(&charges, Element::f16(), &[4, 8, 8], u16_bytes(&values));
         let transposed = (0..256)
             .map(|index| {
                 let (m, r, c) = (index / 64, index / 8 % 8, index % 8);
@@ -265,7 +268,7 @@ fn ldmatrix_fragments_reproduce_and_transpose_every_matrix() {
             let plain = formed(&format!("ptx_ldmatrix x{count}"), || {
                 ptx_ldmatrix::native_for_device_with(&device, elements(), &specialization)
             });
-            let result = plain.call(ptx_ldmatrix::Args { x: &x }).expect("call");
+            let result = plain.call(&charges, ptx_ldmatrix::Args { x: &x }).expect("call");
             assert_eq!(read_u16(&result.value), values, "x{count}");
             let trans = formed(&format!("ptx_ldmatrix_trans x{count}"), || {
                 ptx_ldmatrix_trans::native_for_device_with(
@@ -275,7 +278,7 @@ fn ldmatrix_fragments_reproduce_and_transpose_every_matrix() {
                 )
             });
             let result = trans
-                .call(ptx_ldmatrix_trans::Args { x: &x })
+                .call(&charges, ptx_ldmatrix_trans::Args { x: &x })
                 .expect("call");
             assert_eq!(read_u16(&result.value), transposed, "x{count}.trans");
         }
@@ -285,11 +288,12 @@ fn ldmatrix_fragments_reproduce_and_transpose_every_matrix() {
 #[test]
 fn cp_async_pipelines_copy_with_a_zero_filled_tail() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         for n in [5003usize, 1000, 3] {
             let values = (0..n)
                 .map(|index| index as f32 * 0.5 - 7.0)
                 .collect::<Vec<_>>();
-            let x = tensor(&device, Element::f32(), &[n as u64], f32_bytes(&values));
+            let x = tensor(&charges, Element::f32(), &[n as u64], f32_bytes(&values));
             for stages in [1u64, 2, 3] {
                 let kernel = formed(&format!("ptx_cp_async stages {stages} n {n}"), || {
                     ptx_cp_async::native_for_device(
@@ -297,7 +301,7 @@ fn cp_async_pipelines_copy_with_a_zero_filled_tail() {
                         &NativeSpecialization::new().with_param("STAGES", stages),
                     )
                 });
-                let result = kernel.call(ptx_cp_async::Args { x: &x }).expect("call");
+                let result = kernel.call(&charges, ptx_cp_async::Args { x: &x }).expect("call");
                 let copied = read_f32(&result.value);
                 assert!(
                     !copied[0].is_nan(),
@@ -312,11 +316,12 @@ fn cp_async_pipelines_copy_with_a_zero_filled_tail() {
 #[test]
 fn non_coherent_loads_and_prefetch_copy_every_element() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         for n in [5003usize, 4096, 2, 1] {
             let values = (0..n)
                 .map(|index| (index as f32).sqrt())
                 .collect::<Vec<_>>();
-            let x = tensor(&device, Element::f32(), &[n as u64], f32_bytes(&values));
+            let x = tensor(&charges, Element::f32(), &[n as u64], f32_bytes(&values));
             for no_allocate in [0u64, 1] {
                 let kernel = formed(
                     &format!("ptx_load_nc no_allocate {no_allocate} n {n}"),
@@ -327,7 +332,7 @@ fn non_coherent_loads_and_prefetch_copy_every_element() {
                         )
                     },
                 );
-                let result = kernel.call(ptx_load_nc::Args { x: &x }).expect("call");
+                let result = kernel.call(&charges, ptx_load_nc::Args { x: &x }).expect("call");
                 assert_eq!(
                     read_f32(&result.value),
                     values,
@@ -341,6 +346,7 @@ fn non_coherent_loads_and_prefetch_copy_every_element() {
 #[test]
 fn shuffles_and_butterfly_reductions_match_the_lane_reference() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         let w = 3usize;
         let values = (0..w * 32)
             .map(|index| ((index * 11) % 13) as f32 * 0.25 - 1.5)
@@ -363,8 +369,8 @@ fn shuffles_and_butterfly_reductions_match_the_lane_reference() {
             ptx_shuffle::native_for_device(&device, &NativeSpecialization::new())
         });
         let result = kernel
-            .call(ptx_shuffle::Args {
-                x: &tensor(&device, Element::f32(), &[w as u64, 32], f32_bytes(&values)),
+            .call(&charges, ptx_shuffle::Args {
+                x: &tensor(&charges, Element::f32(), &[w as u64, 32], f32_bytes(&values)),
             })
             .expect("call");
         assert_eq!(read_f32(&result.value), expected);
@@ -374,6 +380,7 @@ fn shuffles_and_butterfly_reductions_match_the_lane_reference() {
 #[test]
 fn redux_matches_the_integer_reference_for_signed_and_unsigned() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         let w = 4usize;
         let mut sequence = Sequence(11);
         let signed = (0..w * 32)
@@ -397,8 +404,8 @@ fn redux_matches_the_integer_reference_for_signed_and_unsigned() {
         let s32 = formed("ptx_redux_s32", || {
             ptx_redux_s32::native_for_device(&device, &NativeSpecialization::new())
         })
-        .call(ptx_redux_s32::Args {
-            x: &tensor(&device, Element::i32(), &[w as u64, 32], i32_bytes(&signed)),
+        .call(&charges, ptx_redux_s32::Args {
+            x: &tensor(&charges, Element::i32(), &[w as u64, 32], i32_bytes(&signed)),
         })
         .expect("call");
         assert_eq!(read_i32(&s32.value), expected(&signed));
@@ -406,9 +413,9 @@ fn redux_matches_the_integer_reference_for_signed_and_unsigned() {
         let u32 = formed("ptx_redux_u32", || {
             ptx_redux_u32::native_for_device(&device, &NativeSpecialization::new())
         })
-        .call(ptx_redux_u32::Args {
+        .call(&charges, ptx_redux_u32::Args {
             x: &tensor(
-                &device,
+                &charges,
                 Element::u32(),
                 &[w as u64, 32],
                 i32_bytes(&unsigned),
@@ -422,6 +429,7 @@ fn redux_matches_the_integer_reference_for_signed_and_unsigned() {
 #[test]
 fn dp4a_matches_the_byte_dot_product_reference() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         let n = 1000usize;
         let mut sequence = Sequence(3);
         let signed = (0..n * 4)
@@ -441,13 +449,13 @@ fn dp4a_matches_the_byte_dot_product_reference() {
                 .map(|i| acc[i] + (0..4).map(|j| a[i * 4 + j] * b[i * 4 + j]).sum::<i32>())
                 .collect::<Vec<_>>()
         };
-        let b_tensor = tensor(&device, Element::i32(), &[n as u64, 4], i32_bytes(&b));
-        let acc_tensor = tensor(&device, Element::i32(), &[n as u64], i32_bytes(&acc));
+        let b_tensor = tensor(&charges, Element::i32(), &[n as u64, 4], i32_bytes(&b));
+        let acc_tensor = tensor(&charges, Element::i32(), &[n as u64], i32_bytes(&acc));
         let s8 = formed("ptx_dp4a_s8", || {
             ptx_dp4a_s8::native_for_device(&device, &NativeSpecialization::new())
         })
-        .call(ptx_dp4a_s8::Args {
-            a: &tensor(&device, Element::i32(), &[n as u64, 4], i32_bytes(&signed)),
+        .call(&charges, ptx_dp4a_s8::Args {
+            a: &tensor(&charges, Element::i32(), &[n as u64, 4], i32_bytes(&signed)),
             b: &b_tensor,
             acc: &acc_tensor,
         })
@@ -456,9 +464,9 @@ fn dp4a_matches_the_byte_dot_product_reference() {
         let u8s8 = formed("ptx_dp4a_u8s8", || {
             ptx_dp4a_u8s8::native_for_device(&device, &NativeSpecialization::new())
         })
-        .call(ptx_dp4a_u8s8::Args {
+        .call(&charges, ptx_dp4a_u8s8::Args {
             a: &tensor(
-                &device,
+                &charges,
                 Element::i32(),
                 &[n as u64, 4],
                 i32_bytes(&unsigned),
@@ -474,6 +482,7 @@ fn dp4a_matches_the_byte_dot_product_reference() {
 #[test]
 fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         let mut sequence = Sequence(5);
         // Wide magnitudes (f16 overflow and subnormals included), exact ties
         // for both formats, and signed zeros.
@@ -496,7 +505,7 @@ fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
             -0.0,
         ]);
         let x = tensor(
-            &device,
+            &charges,
             Element::f32(),
             &[values.len() as u64],
             f32_bytes(&values),
@@ -512,7 +521,7 @@ fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
                     &NativeSpecialization::new(),
                 )
             });
-            let result = kernel.call(ptx_pack::Args { x: &x }).expect("call");
+            let result = kernel.call(&charges, ptx_pack::Args { x: &x }).expect("call");
             let expected = values
                 .iter()
                 .map(|value| encode(*value))
@@ -548,9 +557,9 @@ fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
                 )
             });
             let result = kernel
-                .call(ptx_unpack::Args {
+                .call(&charges, ptx_unpack::Args {
                     x: &tensor(
-                        &device,
+                        &charges,
                         element,
                         &[patterns.len() as u64],
                         u16_bytes(&patterns),
@@ -572,6 +581,7 @@ fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
 #[test]
 fn rounded_arithmetic_is_correctly_rounded_including_subnormals() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         let n = 4096usize;
         let mut sequence = Sequence(13);
         let mut draw = || {
@@ -589,10 +599,10 @@ fn rounded_arithmetic_is_correctly_rounded_including_subnormals() {
             ptx_rounded::native_for_device(&device, &NativeSpecialization::new())
         });
         let result = kernel
-            .call(ptx_rounded::Args {
-                a: &tensor(&device, Element::f32(), &[n as u64], f32_bytes(&a)),
-                b: &tensor(&device, Element::f32(), &[n as u64], f32_bytes(&b)),
-                c: &tensor(&device, Element::f32(), &[n as u64], f32_bytes(&c)),
+            .call(&charges, ptx_rounded::Args {
+                a: &tensor(&charges, Element::f32(), &[n as u64], f32_bytes(&a)),
+                b: &tensor(&charges, Element::f32(), &[n as u64], f32_bytes(&b)),
+                c: &tensor(&charges, Element::f32(), &[n as u64], f32_bytes(&c)),
             })
             .expect("call");
         let values = read_f32(&result.value);
@@ -615,6 +625,7 @@ fn rounded_arithmetic_is_correctly_rounded_including_subnormals() {
 #[test]
 fn approximate_functions_stay_within_their_documented_error() {
     for device in cuda_devices() {
+        let charges = seismic::Charges::tally(&device);
         let n = 4096usize;
         let mut sequence = Sequence(17);
         let x = (0..n)
@@ -624,8 +635,8 @@ fn approximate_functions_stay_within_their_documented_error() {
             ptx_approximate::native_for_device(&device, &NativeSpecialization::new())
         });
         let result = kernel
-            .call(ptx_approximate::Args {
-                x: &tensor(&device, Element::f32(), &[n as u64], f32_bytes(&x)),
+            .call(&charges, ptx_approximate::Args {
+                x: &tensor(&charges, Element::f32(), &[n as u64], f32_bytes(&x)),
             })
             .expect("call");
         let values = read_f32(&result.value);

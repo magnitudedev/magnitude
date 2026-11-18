@@ -560,7 +560,7 @@ impl AttestedPrograms {
             )));
         }
         if let (Some(handles), Some(vision), Some(_)) =
-            (&self.vision, definition.vision.as_ref(), vision_plan)
+            (&self.vision, definition.vision.as_deref(), vision_plan)
         {
             let patch_rows = crate::programs::native_vision::image_patch_classes(
                 limits.max_image_cells,
@@ -697,8 +697,8 @@ impl AttestedPrograms {
 
     /// The prepared programs' device identity owner, retained with every
     /// prepared group: the one word [`Self::DEVICE_BYTES`] charges.
-    pub(super) fn owner(device: &Device) -> Result<Tensor, CatalogFailure> {
-        Tensor::zeros(device, Element::u32(), &[1]).map_err(|error| {
+    pub(super) fn owner(charges: &seismic::Charges) -> Result<Tensor, CatalogFailure> {
+        Tensor::zeros(charges, Element::u32(), &[1]).map_err(|error| {
             CatalogFailure::Preparation {
                 entry: "catalog_owner",
                 bindings: "A=u32".into(),
@@ -715,7 +715,7 @@ impl AttestedPrograms {
     /// loaded, and holds no more than `room`. Returns every unit's outcome.
     pub fn search_draft(
         plan: &ExecutionPlanDraft,
-        device: &Device,
+        charges: &seismic::Charges,
         tuning: TuningContext<'_>,
         room: Option<&'_ dyn super::tuning::TuningRoom>,
     ) -> Result<Vec<TunedEntry>, CatalogError> {
@@ -728,12 +728,12 @@ impl AttestedPrograms {
             limits,
             plan.policy().limits(),
             plan.policy().method(),
-            device,
+            charges,
             tuning,
             room,
         )
         .and_then(NativePreparationCache::search_programs)
-        .map_err(|failure| CatalogError::native(device.backend(), failure))
+        .map_err(|failure| CatalogError::native(charges.device().backend(), failure))
     }
 
     /// What a walk of `topology` on `device` reads, once the plan and the
@@ -747,7 +747,7 @@ impl AttestedPrograms {
         limits: TuningLimits,
         selection_limits: crate::ResourceLimits,
         method: crate::PlannedMethod,
-        device: &'a Device,
+        charges: &'a seismic::Charges,
         tuning: TuningContext<'a>,
         room: Option<&'a dyn super::tuning::TuningRoom>,
     ) -> Result<PreparationInputs<'a>, CatalogFailure> {
@@ -758,7 +758,7 @@ impl AttestedPrograms {
                 outcome: format!("the native program factory cannot serve the {path} path"),
             });
         }
-        if planned_device.selector() != device.info().selector() {
+        if planned_device.selector() != charges.device().info().selector() {
             return Err(CatalogFailure::Preparation {
                 entry: "program_factory",
                 bindings: "selected device".into(),
@@ -766,7 +766,7 @@ impl AttestedPrograms {
             });
         }
         Ok(PreparationInputs {
-            device,
+            charges,
             plan: topology,
             load,
             limits,
@@ -793,7 +793,7 @@ impl AttestedPrograms {
     /// that backend are reported together.
     pub fn prepare_draft(
         plan: &ExecutionPlanDraft,
-        device: &Device,
+        charges: &seismic::Charges,
         tuning: TuningContext<'_>,
         unprepared: super::tuning::UnpreparedUnits,
     ) -> Result<Self, CatalogError> {
@@ -805,11 +805,11 @@ impl AttestedPrograms {
             TuningLimits::of(plan.policy().limits(), tuning.definition),
             plan.policy().limits(),
             plan.policy().method(),
-            device,
+            charges,
             tuning,
             unprepared,
         )
-        .map_err(|failure| CatalogError::native(device.backend(), failure))
+        .map_err(|failure| CatalogError::native(charges.device().backend(), failure))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -821,7 +821,7 @@ impl AttestedPrograms {
         limits: TuningLimits,
         selection_limits: crate::ResourceLimits,
         method: crate::PlannedMethod,
-        device: &Device,
+        charges: &seismic::Charges,
         tuning: TuningContext<'_>,
         unprepared: super::tuning::UnpreparedUnits,
     ) -> Result<Self, CatalogFailure> {
@@ -835,7 +835,7 @@ impl AttestedPrograms {
                 limits,
                 selection_limits,
                 method,
-                device,
+                charges,
                 tuning,
                 None,
             )?,
@@ -1388,7 +1388,7 @@ impl AttestedPrograms {
             imports.push((binding, handle));
         }
         let mut attested = Self {
-            backend: device.backend(),
+            backend: charges.device().backend(),
             readout_choices: prepared.readout_choices.clone(),
             tuned,
             unprepared: prepared.unprepared,
@@ -1412,12 +1412,12 @@ impl AttestedPrograms {
             &attested,
             topology,
             &definition.decoder,
-            definition.vision.as_ref(),
+            definition.vision.as_deref(),
             load,
             tuning.numerical_profile,
             tuning.cache,
         )
-        .qualify(device)?;
+        .qualify(charges)?;
         // A layer whose site's arithmetic the precision system refuses, or
         // whose profile approves no CPU site, has no CPU site: nothing of it
         // is served, encoded or charged, and its refusal is kept
@@ -1542,6 +1542,7 @@ impl AttestedPrograms {
     }
     pub(crate) fn bind_target(
         &self,
+        charges: &seismic::Charges,
         model: crate::ResidentTarget,
         geometry: magnitude_family_contracts::Decoder,
     ) -> Result<crate::programs::native_target::NativeTargetProgram, CatalogError> {
@@ -1553,7 +1554,7 @@ impl AttestedPrograms {
                 .target_graphs
                 .as_ref()
                 .ok_or_else(|| missing("target", "prepared graphs"))?
-                .bind_weights(&model)
+                .bind_weights(charges, &model)
                 .map_err(|error| CatalogFailure::Preparation {
                     entry: "target_graph",
                     bindings: "resident decoder weights".into(),
@@ -1563,7 +1564,7 @@ impl AttestedPrograms {
                 .target_readout_graphs
                 .as_ref()
                 .ok_or_else(|| missing("target", "prepared readout graphs"))?
-                .bind_weights(&model)
+                .bind_weights(charges, &model)
                 .map_err(|error| CatalogFailure::Preparation {
                     entry: "target_readout_graph",
                     bindings: "resident readout weights".into(),
@@ -1586,6 +1587,7 @@ impl AttestedPrograms {
     }
     pub(crate) fn bind_head(
         &self,
+        charges: &seismic::Charges,
         resident: crate::ResidentHead,
         definition: &magnitude_family_contracts::ModelDefinition,
     ) -> Result<crate::programs::native_drafter::NativeDrafterProgram, CatalogError> {
@@ -1611,11 +1613,12 @@ impl AttestedPrograms {
                         return Err(missing("head", "native single-block topology"));
                     }
                     let graphs = graphs
-                        .bind_weights(&resident)
+                        .bind_weights(charges, &resident)
                         .map_err(|error| missing("head", error))?;
                     crate::programs::native_head::NativeHeadProgram::new(
                         definition.decoder.clone(),
                         graphs,
+                        seismic::Charges::none(&charges.device()),
                     )
                     .map(NativeDrafterProgram::Head)
                     .map_err(|error| missing("head", error))
@@ -1628,11 +1631,12 @@ impl AttestedPrograms {
                         return Err(missing("head", "native single-head topology"));
                     }
                     let graphs = graphs
-                        .bind_weights(&resident)
+                        .bind_weights(charges, &resident)
                         .map_err(|error| missing("head", error))?;
                     crate::programs::native_shared_head::NativeSharedHeadProgram::new(
                         definition.decoder.clone(),
                         graphs,
+                        seismic::Charges::none(&charges.device()),
                     )
                     .map(NativeDrafterProgram::SharedHead)
                     .map_err(|error| missing("head", error))
@@ -1648,11 +1652,12 @@ impl AttestedPrograms {
                         return Err(missing("draft", "resident layers"));
                     }
                     let graphs = graphs
-                        .bind_weights(&resident)
+                        .bind_weights(charges, &resident)
                         .map_err(|error| missing("draft", error))?;
                     crate::programs::native_draft::NativeDraftProgram::new(
                         definition.clone(),
                         graphs,
+                        seismic::Charges::none(&charges.device()),
                     )
                     .map(NativeDrafterProgram::Draft)
                     .map_err(|error| missing("draft", error))
@@ -1663,6 +1668,7 @@ impl AttestedPrograms {
     }
     pub(crate) fn bind_vision(
         &self,
+        charges: &seismic::Charges,
         resident: crate::ResidentVision,
         definition: &magnitude_family_contracts::ModelDefinition,
     ) -> Result<crate::programs::native_vision::NativeVisionProgram, CatalogError> {
@@ -1686,7 +1692,7 @@ impl AttestedPrograms {
                 .as_ref()
                 .ok_or_else(|| missing("vision", "prepared native graphs"))?
                 .clone()
-                .bind_weights(&resident)
+                .bind_weights(charges, &resident)
                 .map_err(|error| missing("vision", error))?;
             Ok(crate::programs::native_vision::NativeVisionProgram::new(
                 graphs,
@@ -1694,12 +1700,13 @@ impl AttestedPrograms {
         })()
         .map_err(|failure| CatalogError::native(self.backend, failure))
     }
-    pub(crate) fn bind_state(&self) -> crate::programs::native_state::NativeStateProgram {
+    pub(crate) fn bind_state(&self, device: &Device) -> crate::programs::native_state::NativeStateProgram {
         crate::programs::native_state::NativeStateProgram::new(
             self.state_graphs
                 .as_ref()
                 .expect("state graphs prepared before binding")
                 .clone(),
+            device,
         )
     }
     /// The import entry that converts `weight`'s uploaded rows into its
@@ -1747,10 +1754,7 @@ impl AttestedPrograms {
         &self,
         weight: &crate::WeightPlan,
     ) -> Result<crate::programs::native_import::NativeImportProgram, CatalogError> {
-        Ok(crate::programs::native_import::NativeImportProgram::new(
-            weight.storage_identity(),
-            self.import_entry(weight)?,
-        ))
+        Ok(crate::programs::native_import::NativeImportProgram::new(weight.storage_identity(), self.import_entry(weight)?))
     }
     /// The device storage the prepared programs hold, as charged: their
     /// owner's ([`Self::DEVICE_BYTES`]).

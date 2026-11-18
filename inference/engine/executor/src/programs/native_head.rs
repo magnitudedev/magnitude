@@ -1759,11 +1759,12 @@ impl PreparedHeadGraphs {
 
     pub(crate) fn bind_weights(
         self: &Rc<Self>,
+        charges: &seismic::Charges,
         resident: &ResidentHead,
     ) -> Result<BoundHeadGraphs, SubmitError> {
-        let mut uploaded = ConstantTensors::new(resident.embedding.tensor().device());
+        let mut uploaded = ConstantTensors::new(charges);
         let absent_scale =
-            Tensor::zeros(&resident.embedding.tensor().device(), Element::f32(), &[0])
+            Tensor::zeros(charges, Element::f32(), &[0])
                 .map_err(device)?;
         let projection = match &resident.output {
             ResidentOutput::Packed(weight) => vec![(None, weight.tensor())],
@@ -1813,7 +1814,7 @@ impl PreparedHeadGraphs {
                         .collect(),
                 })
                 .collect::<Result<Vec<_>, SubmitError>>()?;
-            bound.insert(*class, graph.plan.bind_static(&fixed).map_err(device)?);
+            bound.insert(*class, graph.plan.bind_static(charges, &fixed).map_err(device)?);
         }
         Ok(BoundHeadGraphs {
             prepared: self.clone(),
@@ -1991,6 +1992,10 @@ impl PassControls {
 pub struct NativeHeadProgram {
     geometry: Decoder,
     graphs: BoundHeadGraphs,
+    /// What a step binds its tensors through: charges that allocate
+    /// nothing, as every storage a step binds is a load's, which formed any
+    /// record table it needs (`seismic::NativeGraphBindings::set`).
+    unallocating: seismic::Charges,
     waiter: CompletionWaiter,
 }
 
@@ -1999,11 +2004,14 @@ impl NativeHeadProgram {
         self.graphs.constant_bytes()
     }
 
-    pub(crate) fn new(geometry: Decoder, graphs: BoundHeadGraphs) -> Result<Self, SubmitError> {
+    /// `unallocating`: charges of its device that allocate nothing
+    /// (`seismic::Charges::none`).
+    pub(crate) fn new(geometry: Decoder, graphs: BoundHeadGraphs, unallocating: seismic::Charges) -> Result<Self, SubmitError> {
         let waiter = CompletionWaiter::spawn().map_err(device)?;
         Ok(Self {
             geometry,
             graphs,
+            unallocating,
             waiter,
         })
     }
@@ -2098,7 +2106,7 @@ impl NativeHeadProgram {
                 ));
             }
             for (port, plane) in pass.planes.iter().zip(&planes) {
-                bindings.set(port, plane).map_err(device)?;
+                bindings.set(&self.unallocating, port, plane).map_err(device)?;
             }
             match (&pass.indexer, &keys) {
                 (Some(ports), Some([window, blocks])) => {
@@ -2110,7 +2118,7 @@ impl NativeHeadProgram {
                         (&ports.planes.window_coordinates, window_coordinates),
                         (&ports.planes.block_keys, block_keys),
                     ] {
-                        bindings.set(port, plane).map_err(device)?;
+                        bindings.set(&self.unallocating, port, plane).map_err(device)?;
                     }
                 }
                 (None, None) => {}
@@ -2151,7 +2159,7 @@ impl NativeHeadProgram {
             } => {
                 if let (Some(port), Some(previous)) = (&graph.previous, previous) {
                     bindings
-                        .set(port, previous.allocation().tensor().map_err(device)?)
+                        .set(&self.unallocating, port, previous.allocation().tensor().map_err(device)?)
                         .map_err(device)?;
                 }
                 if let Some(port) = &graph.conditioning {
@@ -2159,7 +2167,7 @@ impl NativeHeadProgram {
                         .tensor()
                         .slice_leading(0, entry_rows as u64)
                         .map_err(|error| invalid(format!("head conditioning features: {error}")))?;
-                    bindings.set(port, &features).map_err(device)?;
+                    bindings.set(&self.unallocating, port, &features).map_err(device)?;
                 }
             }
         }
@@ -2174,7 +2182,7 @@ impl NativeHeadProgram {
             .passes
             .iter()
             .filter_map(|pass| pass.landed.as_ref())
-            .map(|ports| ports.queue(&self.graphs.embedding, &mut bindings))
+            .map(|ports| ports.queue(&self.graphs.embedding, &self.unallocating, &mut bindings))
             .collect::<Result<Vec<_>, _>>()
             .map_err(invalid)?;
         active

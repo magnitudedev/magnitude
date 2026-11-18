@@ -23,7 +23,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary, MTLPipelineOption,
 };
 use seismic_native_target::{
-    Artifact, Declined, NativeCompilationError, ProgramEntry, ProgramSource, ProgramStatistic,
+    Artifact, Declined, HeldFile, NativeCompilationError, ProgramEntry, ProgramSource, ProgramStatistic,
     Toolchain, ToolchainIdentity,
 };
 
@@ -88,14 +88,15 @@ impl Artifact for MetalArchive {
 
     /// Any bytes: whether they are an archive that serves the program is
     /// learned by loading them, and bytes that are not are a miss. The
-    /// store's file of them is opened in place; without one, they are
-    /// written to a file of their own.
-    fn decode(bytes: &[u8], file: Option<&std::path::Path>) -> Option<Self> {
-        if let Some(path) = file {
-            return Some(Self(ArchiveFile { path: path.to_owned(), temporary: false }));
+    /// store's file of them is opened in place, held while the archive
+    /// lives, so Metal finds it at its path whenever it opens it; without
+    /// one, they are written to a file of their own.
+    fn decode(bytes: &[u8], file: Option<HeldFile>) -> Option<Self> {
+        if let Some(held) = file {
+            return Some(Self(ArchiveFile::Stored(held)));
         }
         let file = ArchiveFile::temporary();
-        std::fs::write(&file.path, bytes).ok()?;
+        std::fs::write(file.path(), bytes).ok()?;
         Some(Self(file))
     }
 }
@@ -158,7 +159,7 @@ impl Toolchain for MetalToolchain {
             }
             let file = ArchiveFile::temporary();
             archive.serializeToURL_error(&file.url()).map_err(failure)?;
-            std::fs::read(&file.path).map_err(|error| {
+            std::fs::read(file.path()).map_err(|error| {
                 NativeCompilationError::ToolchainFailure(format!("reading the serialized archive: {error}"))
             })
         })
@@ -222,33 +223,40 @@ fn pipeline_descriptor(function: &ProtocolObject<dyn MTLFunction>, threads: Opti
 }
 
 /// A file a binary archive is serialized to or opened from, which Metal
-/// names by URL alone: the store's own, or a temporary one, removed when
-/// dropped.
-struct ArchiveFile {
-    path: std::path::PathBuf,
-    temporary: bool,
+/// names by URL alone.
+enum ArchiveFile {
+    /// The store's own, held while this lives.
+    Stored(HeldFile),
+    /// One of its own, removed when dropped.
+    Temporary(std::path::PathBuf),
 }
 
 impl ArchiveFile {
     fn temporary() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
+        Self::Temporary(std::env::temp_dir().join(format!(
             "seismic-metal-{}-{}.metallib",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        Self { path, temporary: true }
+        )))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Stored(held) => held.path(),
+            Self::Temporary(path) => path,
+        }
     }
 
     fn url(&self) -> Retained<NSURL> {
-        NSURL::fileURLWithPath(&NSString::from_str(&self.path.to_string_lossy()))
+        NSURL::fileURLWithPath(&NSString::from_str(&self.path().to_string_lossy()))
     }
 }
 
 impl Drop for ArchiveFile {
     fn drop(&mut self) {
-        if self.temporary {
-            let _ = std::fs::remove_file(&self.path);
+        if let Self::Temporary(path) = self {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -441,7 +449,7 @@ mod tests {
         // A store's file serves in place, and stays the store's.
         let kept = std::env::temp_dir().join(format!("seismic-metal-kept-{}.metallib", std::process::id()));
         std::fs::write(&kept, &stored).unwrap();
-        let opened = MetalArchive::decode(&stored, Some(&kept)).unwrap();
+        let opened = MetalArchive::decode(&stored, Some(HeldFile::new(kept.clone(), Box::new(())))).unwrap();
         assert_eq!(toolchain.load(&opened, wanted).expect("the file serves in place").len(), 1);
         drop(opened);
         std::fs::remove_file(kept).expect("opening in place leaves the store's file");

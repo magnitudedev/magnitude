@@ -45,6 +45,8 @@ struct Bound {
     history_key: Tensor,
     history_value: Tensor,
     slab_rows: u32,
+    /// What the case's kernel calls allocate through.
+    charges: seismic::Charges,
 }
 
 /// Slab-stored key and value history. The two tensors' slabs are allocated
@@ -123,6 +125,7 @@ impl Bound {
     /// The case's tensors with its activations and history stored in
     /// `element`.
     fn new_with_options(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool, element: Element) -> Self {
+        let charges = seismic::Charges::tally(device);
         let Geometry { kv, g, p, .. } = case.geometry;
         let (m, w) = (case.rows, case.geometry.w());
         let [
@@ -132,7 +135,7 @@ impl Bound {
         let (selected_rows, _) = no_picks(device, m, kv, w);
         let stored = |shape: &[usize], values: &[f32]| {
             let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
-            Tensor::from_host(device, element, &shape, &stored_bytes(element, values)).unwrap()
+            Tensor::from_host(&charges, element, &shape, &stored_bytes(element, values)).unwrap()
         };
         let selected = stored(&[0, kv, w], &[]);
         Self {
@@ -162,6 +165,7 @@ impl Bound {
             history_key,
             history_value,
             slab_rows,
+            charges,
         }
     }
 }
@@ -500,7 +504,7 @@ fn run_decode(
     case: &Case,
 ) -> Tensor {
     kernel
-        .call(args!(attention_decode, bound, case))
+        .call(&bound.charges, args!(attention_decode, bound, case))
         .unwrap()
         .value
 }
@@ -511,7 +515,7 @@ fn run_prefill(
     case: &Case,
 ) -> Tensor {
     kernel
-        .call(args!(attention_prefill, bound, case))
+        .call(&bound.charges, args!(attention_prefill, bound, case))
         .unwrap()
         .value
 }
@@ -1144,7 +1148,7 @@ fn dense_append_publishes_only_the_same_history_as_prefill() {
         .unwrap();
         let mut appended = Bound::new_with_slab_rows(&device, &case, 32);
         append
-            .call(args!(attention_append_dense, appended, case))
+            .call(&appended.charges, args!(attention_append_dense, appended, case))
             .unwrap();
         let mut full = Bound::new_with_slab_rows(&device, &case, 32);
         let prefill = prefill_specializations_on(&device, SMALL, &[(16, 1)])
@@ -1294,7 +1298,7 @@ fn cpu_prefill_shared_blocks_match_each_row_alone() {
     let mut alone = Bound::new(&device, &case);
     // Sixteen words a row: 512 one-key blocks, past every row's keys.
     let every = vec![u32::MAX; rows * 16].iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-    alone.selection = Tensor::from_host(&device, Element::u32(), &[rows as u64, 16], &every).unwrap();
+    alone.selection = Tensor::from_host(&alone.charges, Element::u32(), &[rows as u64, 16], &every).unwrap();
     let shared = run_prefill(&kernel, &mut shared, &case).read_to_host().unwrap();
     let alone = run_prefill(&kernel, &mut alone, &case).read_to_host().unwrap();
     assert!(shared == alone, "shared key blocks change the result bits");

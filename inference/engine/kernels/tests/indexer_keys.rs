@@ -91,6 +91,7 @@ fn portable(case: &Case) -> Vec<f32> {
 }
 
 fn native(device: &seismic::Device, case: &Case) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let m = case.rows as u64;
     let statics = [("P", P as u64), ("S", S as u64), ("RA", case.layout.ra as u64), ("RT", case.layout.rt as u64)];
     let specialization = statics.iter().fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value));
@@ -99,7 +100,7 @@ fn native(device: &seismic::Device, case: &Case) -> Vec<f32> {
     let kernel = entry.prepare(device, &specialization).unwrap();
     let (_slabs, mut keys) = plane(device, Element::f32(), case.plane_rows, &vec![SENTINEL; case.plane_rows * W]);
     kernel
-        .call(indexer_keys::Args {
+        .call(&charges, indexer_keys::Args {
             key: &tensor(device, Element::bf16(), &[m, W as u64], &case.key),
             key_norm: &tensor(device, Element::f32(), &[1, W as u64], &case.key_norm),
             latent_rows: &ints(device, &[m], &case.latent_rows),
@@ -108,7 +109,7 @@ fn native(device: &seismic::Device, case: &Case) -> Vec<f32> {
             rotary_amplitudes: &tensor(device, Element::f32(), &[P as u64], &[1.0; P]),
             coordinates: &ints(device, &[m, 4], &case.coordinates()),
             keys: &mut keys,
-            form: &Tensor::from_host(device, Element::i32(), &[0, case.layout.ra as u64, case.layout.rt as u64], &[]).unwrap(),
+            form: &Tensor::from_host(&charges, Element::i32(), &[0, case.layout.ra as u64, case.layout.rt as u64], &[]).unwrap(),
             epsilon: EPSILON,
             block: case.rounding.block,
             element: case.rounding.element,

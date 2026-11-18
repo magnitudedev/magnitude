@@ -849,22 +849,26 @@ pub(crate) struct LandedReadPorts {
 }
 
 impl LandedReadPorts {
-    /// Queue the read a run makes of `table` and bind its ports.
+    /// Queue the read a run makes of `table` and bind its ports through
+    /// `charges` (`seismic::NativeGraphBindings::set`): its staging and
+    /// landing slots bind through the record table the table's slots hold.
     pub(crate) fn queue(
         &self,
         table: &crate::device_table::ResidentTable,
+        charges: &seismic::Charges,
         bindings: &mut seismic::NativeGraphBindings,
     ) -> Result<crate::device_table::SelectedRead, String> {
         let read = table
             .device()
             .ok_or("a landed read of a table held whole")?
             .read_selected(self.rows.fixed())?;
-        self.bind(bindings, &read)?;
+        self.bind(charges, bindings, &read)?;
         Ok(read)
     }
 
     fn bind(
         &self,
+        charges: &seismic::Charges,
         bindings: &mut seismic::NativeGraphBindings,
         read: &crate::device_table::SelectedRead,
     ) -> Result<(), String> {
@@ -876,12 +880,12 @@ impl LandedReadPorts {
                 .collect::<Vec<_>>();
             tensor.reshape(&extents).map_err(|error| text(&error))
         };
-        bindings.set(&self.notice, &read.notice).map_err(|error| text(&error))?;
+        bindings.set(charges, &self.notice, &read.notice).map_err(|error| text(&error))?;
         bindings
-            .set(&self.staging, &view(&read.staging)?)
+            .set(charges, &self.staging, &view(&read.staging)?)
             .map_err(|error| text(&error))?;
         bindings
-            .set(&self.landing, &view(&read.landing)?)
+            .set(charges, &self.landing, &view(&read.landing)?)
             .map_err(|error| text(&error))?;
         bindings
             .set_timeline(self.noticed, &read.noticed, read.value)

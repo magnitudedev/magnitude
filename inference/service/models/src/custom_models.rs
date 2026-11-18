@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_service_contracts::models::{
-    AddedModel, AttachedDrafter, AttachedDrafterState, CatalogPackageRemover, CatalogPackageRole,
+    AddedModel, AttachedDrafter, AttachedDrafterState, CatalogPackageRemover, CatalogPackageRole, LoadedPackages,
     CustomModel, CustomModelCatalogAttribution, CustomModelFile, CustomModelOrigin,
     CustomModelState, DrafterCandidate, DrafterChoice, DrafterPruning, DrafterReference,
     DrafterVerdict, EffectiveModel, FoundSource, HuggingFaceArtifactSelector,
@@ -2015,7 +2015,6 @@ impl LocalModels for ManagedLocalModels {
     ) -> BoxFuture<'_, Result<LocalModelRemoval, InventoryError>> {
         let model_id = model_id.clone();
         Box::pin(async move {
-            use magnitude_service_contracts::models::InstalledModelPackages as _;
             let projection = self.resolver.local_projection()?;
             let projected = projection
                 .models
@@ -2028,13 +2027,14 @@ impl LocalModels for ManagedLocalModels {
                     "{model_id} is not an added model; its files belong to their location"
                 )));
             }
-            let mut removed = false;
-            let mut freed_bytes = 0_u64;
-            for package_id in &projected.managed_packages {
-                let removal = self.inventory().remove_installed(package_id).await?;
-                removed |= removal.removed;
-                freed_bytes = freed_bytes.saturating_add(removal.freed_bytes);
-            }
+            // Through the residency's remover, as every removal: it refuses a package a resident
+            // model has loaded, and lets go of the configurations it keeps of them first.
+            let packages = projected.managed_packages.clone();
+            let removed = !packages.is_empty();
+            let freed_bytes = match removed {
+                true => self.remover.remove_catalog_packages(packages, LoadedPackages::Stop).await?,
+                false => 0,
+            };
             Ok(LocalModelRemoval {
                 model_id,
                 removed,
@@ -2054,7 +2054,7 @@ impl LocalModels for ManagedLocalModels {
                     tracing::warn!(package_id = %package_id.0, reason, "drafter pruning kept a package it may not delete");
                     continue;
                 }
-                match self.remover.remove_catalog_packages(vec![package_id.clone()]).await {
+                match self.remover.remove_catalog_packages(vec![package_id.clone()], LoadedPackages::Keep).await {
                     Ok(freed) => {
                         freed_bytes = freed_bytes.saturating_add(freed);
                         removed.push(package_id);
@@ -2503,7 +2503,6 @@ mod tests {
             snapshot.join("Shared-Q4_K_M.gguf")
         );
         assert!(!inventory.plan_delete(&model.id).await.unwrap().supported);
-        assert!(inventory.delete(&model.id).await.is_err());
         assert!(snapshot.join("Shared-Q4_K_M.gguf").is_file());
     }
 
@@ -2928,7 +2927,6 @@ mod tests {
         let resolved = inventory.resolve_ready(&model.id).await.unwrap();
         assert_eq!(resolved.components[0].path, blob);
         assert!(!inventory.plan_delete(&model.id).await.unwrap().supported);
-        assert!(inventory.delete(&model.id).await.is_err());
         assert!(fs::symlink_metadata(&blob).unwrap().file_type().is_symlink());
         assert_eq!(fs::read(&elsewhere).unwrap(), linked);
     }
@@ -4329,9 +4327,10 @@ mod tests {
         fn remove_catalog_packages(
             &self,
             package_ids: Vec<ModelPackageId>,
+            _loaded: magnitude_service_contracts::models::LoadedPackages,
         ) -> futures_util::future::BoxFuture<'_, Result<u64, InventoryError>> {
             use magnitude_service_contracts::models::InstalledModelPackages as _;
-            Box::pin(async move { self.0.remove_installed_packages(&package_ids).await })
+            Box::pin(async move { self.0.remove_installed_packages(&package_ids, Box::pin(async { Ok(()) })).await })
         }
     }
 
@@ -4890,6 +4889,8 @@ mod tests {
         assert!(paths.iter().any(|(role, path)| {
             *role == magnitude_service_contracts::ComponentRole::Projector && path.starts_with(&fixture.store)
         }), "{paths:?}");
+        // A resolution is a reader of the model's files: holding it would refuse their removal.
+        drop(resolved);
 
         installations
             .install_component(&model_id, CatalogComponent::Drafter)
@@ -4903,6 +4904,7 @@ mod tests {
             stored_files(&fixture.store).iter().map(|(_, size)| size).sum::<u64>(),
             (projector.len() + drafter.len()) as u64
         );
+        drop(resolved);
 
         let CatalogModelState::Installed {
             installation,
@@ -5321,16 +5323,11 @@ mod tests {
 
         /// Holds both repositories' locks, so admitted package work stays queued, as behind other
         /// downloads on a slow link, and never reaches the network.
-        fn queue(&self) -> Vec<std::fs::File> {
+        fn queue(&self) -> Vec<seismic_io::OwnedRecord> {
+            let store = crate::store_fs::model_store(&self.fixture.store);
             ["owner/Model-GGUF", "owner/Model-DFlash-GGUF"]
                 .into_iter()
-                .map(|repository| {
-                    crate::store_fs::acquire_exclusive_lock(&crate::inventory::repository_lock_path(
-                        &self.fixture.store,
-                        repository,
-                    ))
-                    .unwrap()
-                })
+                .map(|repository| store.lock_owned(&crate::store_fs::repository_record(repository)).unwrap())
                 .collect()
         }
     }
@@ -6377,6 +6374,63 @@ mod tests {
         assert_eq!(resolved.components[0].path, link);
     }
 
+    /// A remover as the residency's: it lets go of the resolutions it keeps of the packages (the
+    /// configurations the server cached, which outlive a load), then removes them.
+    struct CachingRemover {
+        store: Arc<ManagedModelStore>,
+        cached: std::sync::Mutex<Vec<magnitude_service_contracts::models::ResolvedServableModelBundle>>,
+    }
+
+    impl CatalogPackageRemover for CachingRemover {
+        fn remove_catalog_packages(
+            &self,
+            package_ids: Vec<ModelPackageId>,
+            _loaded: magnitude_service_contracts::models::LoadedPackages,
+        ) -> futures_util::future::BoxFuture<'_, Result<u64, InventoryError>> {
+            use magnitude_service_contracts::models::InstalledModelPackages as _;
+            Box::pin(async move {
+                self.cached.lock().unwrap().clear();
+                self.store.remove_installed_packages(&package_ids, Box::pin(async { Ok(()) })).await
+            })
+        }
+    }
+
+    /// Removing an added model's files goes through the residency's remover, which lets go of the
+    /// configuration it cached of the model before removing: the model's own resolution, kept
+    /// after its last load, never refuses its removal.
+    #[tokio::test]
+    async fn removing_an_added_model_lets_go_of_its_cached_resolution_first() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+
+        let fixture = Fixture::new().await;
+        let (repository, commit) = ("owner/Added-GGUF", "c".repeat(40));
+        publish_managed(&fixture.store, repository, &commit, &[("Added-Q4_K_M.gguf", model_bytes("added"))]);
+        let id: ModelId = "hf:owner/Added-GGUF/Added-Q4_K_M.gguf".parse().unwrap();
+        let remover = Arc::new(CachingRemover {
+            store: fixture.resolver.inventory.clone(),
+            cached: std::sync::Mutex::new(Vec::new()),
+        });
+        let local = ManagedLocalModels::new(fixture.resolver.clone(), remover.clone());
+        local
+            .configure(LocalModelsConfiguration {
+                added: vec![added(repository, "Added-Q4_K_M.gguf", &commit)],
+                ..LocalModelsConfiguration::default()
+            })
+            .await
+            .unwrap();
+        local.refresh_local().await.unwrap();
+        let configuration = fixture.resolver.custom_serving_configuration(&id).unwrap();
+        let resolved = fixture
+            .inventory()
+            .resolve_bundle(installed_bundle_input(&configuration.bundle))
+            .await
+            .unwrap();
+        remover.cached.lock().unwrap().push(resolved);
+        let removal = local.remove_local(&id).await.unwrap();
+        assert!(removal.removed && removal.freed_bytes > 0, "{removal:?}");
+        assert!(remover.cached.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn added_models_survive_rescans_pair_declared_projectors_and_remove_only_their_copy() {
         let fixture = Fixture::new().await;
@@ -6758,10 +6812,6 @@ mod tests {
             ));
         }
         for entry in fixture.inventory().list().await.unwrap() {
-            assert!(matches!(
-                fixture.inventory().delete(&entry.id).await,
-                Err(InventoryError::Unsupported(_))
-            ));
             assert!(
                 !fixture
                     .inventory()
@@ -8072,6 +8122,7 @@ mod tests {
         fn remove_catalog_packages(
             &self,
             package_ids: Vec<ModelPackageId>,
+            _loaded: magnitude_service_contracts::models::LoadedPackages,
         ) -> futures_util::future::BoxFuture<'_, Result<u64, InventoryError>> {
             Box::pin(async move { Err(InventoryError::Loaded(package_ids[0].0.clone())) })
         }

@@ -2,7 +2,7 @@
 //! granule of a store's pool ([`crate::Pool`]), bound through an address
 //! table that device work reads as it runs.
 
-use crate::{Element, Pool, Tensor, TensorError};
+use crate::{Charges, Element, Pool, Tensor, TensorError};
 pub use seismic_runtime::pool::SlabFill;
 use seismic_runtime::pool::{SlabGeometry, SlabStore};
 
@@ -105,14 +105,16 @@ pub struct SlabTensor {
 impl SlabTensor {
     /// A store of `regions`, `rows_per_slab` rows a slab over
     /// `logical_rows`, its slabs granules of `pool`, every slot free. Refused
-    /// where a slab exceeds the pool's granule.
+    /// where a slab exceeds the pool's granule. Its address table is
+    /// allocated through `charges`.
     pub fn in_pool(
+        charges: &Charges,
         pool: &Pool,
         rows_per_slab: u64,
         logical_rows: u64,
         regions: &[SlabRegion],
     ) -> Result<Self, TensorError> {
-        Self::in_pool_over(pool, rows_per_slab, logical_rows, regions, Vec::new())
+        Self::in_pool_over(charges, pool, rows_per_slab, logical_rows, regions, Vec::new())
     }
 
     /// [`Self::in_pool`] whose leading slots are lent: `leading` holds one
@@ -122,6 +124,7 @@ impl SlabTensor {
     /// store's life and are never freed ([`Self::free_slab`] refuses them);
     /// device work bound to the store orders against that storage too.
     pub fn in_pool_over(
+        charges: &Charges,
         pool: &Pool,
         rows_per_slab: u64,
         logical_rows: u64,
@@ -143,7 +146,7 @@ impl SlabTensor {
                 .collect(),
         };
         let lent = leading.iter().map(|tensor| tensor.inner().clone()).collect::<Vec<_>>();
-        let store = SlabStore::in_pool(pool.inner(), geometry, &lent)?;
+        let store = SlabStore::in_pool(charges.inner(), pool.inner(), geometry, &lent)?;
         Ok(Self { pool: pool.clone(), store })
     }
 
@@ -268,7 +271,8 @@ mod tests {
         let store = topology.first_store(device.info(), Contract::DeviceOnly).unwrap();
         let identity = topology.store_identity(store).unwrap();
         let entry: Arc<dyn crate::memory::Entry> = Arc::new(crate::memory::Tally::unbounded(identity));
-        device.pool(Contract::DeviceOnly, GRANULE, 4 * GRANULE, crate::PoolEntries::one(entry)).unwrap()
+        let charges = crate::PoolCharges::one(&device.charges_in(Contract::DeviceOnly, entry));
+        Pool::open(&charges, Contract::DeviceOnly, GRANULE, 4 * GRANULE).unwrap()
     }
 
     fn cpu() -> Device {
@@ -308,7 +312,7 @@ mod tests {
             SlabRegion { element: Element::f16(), row_shape: vec![3] },
         ];
         let layout = SlabLayout::for_regions(256, 768, &regions).unwrap();
-        let tensor = SlabTensor::in_pool(&pool(&device), 256, 768, &regions).unwrap();
+        let tensor = SlabTensor::in_pool(&crate::Charges::tally(&device), &pool(&device), 256, 768, &regions).unwrap();
         assert_eq!(layout.slab_bytes, tensor.slab_bytes());
         assert_eq!(layout.address_table_bytes, tensor.address_table_bytes());
         let free = entry(&tensor, 0, 0);
@@ -377,7 +381,7 @@ mod tests {
     #[test]
     fn typed_regions_work_on_every_available_backend() {
         for device in available() {
-            let tensor = SlabTensor::in_pool(
+            let tensor = SlabTensor::in_pool(&crate::Charges::tally(&device), 
                 &pool(&device),
                 256,
                 512,
@@ -399,7 +403,7 @@ mod tests {
     #[test]
     fn a_zeroed_slab_reads_zero_whatever_its_granule_held() {
         for device in available() {
-            let store = SlabTensor::in_pool(
+            let store = SlabTensor::in_pool(&crate::Charges::tally(&device), 
                 &pool(&device),
                 256,
                 256,
@@ -420,7 +424,7 @@ mod tests {
     #[test]
     fn final_slab_can_exceed_the_logical_extent() {
         let device = cpu();
-        let tensor = SlabTensor::in_pool(
+        let tensor = SlabTensor::in_pool(&crate::Charges::tally(&device), 
             &pool(&device),
             256,
             300,
@@ -445,16 +449,16 @@ mod tests {
     fn lent_slots_view_the_callers_rows_and_are_never_freed() {
         let device = cpu();
         let regions = [SlabRegion { element: Element::f32(), row_shape: vec![2] }];
-        let leading = Tensor::zeros(&device, Element::f32(), &[2 * 256, 2]).unwrap();
+        let leading = Tensor::zeros(&crate::Charges::tally(&device), Element::f32(), &[2 * 256, 2]).unwrap();
         let tensor =
-            SlabTensor::in_pool_over(&pool(&device), 256, 4 * 256, &regions, vec![leading.clone()]).unwrap();
+            SlabTensor::in_pool_over(&crate::Charges::tally(&device), &pool(&device), 256, 4 * 256, &regions, vec![leading.clone()]).unwrap();
         assert_eq!(tensor.lent(), 2);
         assert_eq!(tensor.backed(), [0, 1]);
         assert_eq!(entry(&tensor, 0, 0), leading.device_address());
         assert_eq!(entry(&tensor, 0, 1), leading.device_address() + 256 * 2 * 4);
         assert!(tensor.free_slab(1).is_err());
         assert_eq!(tensor.add_slab(SlabFill::Zeroed).unwrap(), 2);
-        let wrong = Tensor::zeros(&device, Element::f32(), &[255, 2]).unwrap();
-        assert!(SlabTensor::in_pool_over(&pool(&device), 256, 4 * 256, &regions, vec![wrong]).is_err());
+        let wrong = Tensor::zeros(&crate::Charges::tally(&device), Element::f32(), &[255, 2]).unwrap();
+        assert!(SlabTensor::in_pool_over(&crate::Charges::tally(&device), &pool(&device), 256, 4 * 256, &regions, vec![wrong]).is_err());
     }
 }

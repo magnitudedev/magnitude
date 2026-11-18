@@ -131,7 +131,7 @@ impl Host {
             .iter()
             .map(|extent| *extent as u64)
             .collect::<Vec<_>>();
-        Tensor::from_host(device, Element::dense(self.dtype), &shape, &bytes).unwrap()
+        Tensor::from_host(&seismic::Charges::tally(device), Element::dense(self.dtype), &shape, &bytes).unwrap()
     }
     fn oracle(&self) -> TensorData {
         TensorData::dense(
@@ -288,6 +288,7 @@ fn patch_stem_matches_its_portable_body() {
     let module = crate::common::kernels();
     let (rows, channels, table_rows) = (5usize, 3usize, 49usize);
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for (frames, biased, patch, weights, positioned, hidden) in [
             (2usize, true, 16usize, DType::F16, true, 64usize),
             (1, false, 16, DType::F32, true, 64),
@@ -371,7 +372,7 @@ fn patch_stem_matches_its_portable_body() {
                 .unwrap();
                 let t = |host: &Host| host.tensor(&device);
                 let result = kernel
-                    .call(vision_patch_stem::Args {
+                    .call(&charges, vision_patch_stem::Args {
                         pixels: &t(&pixels),
                         frame_weight: &t(&frame),
                         next_frame_weight: &t(&next),
@@ -417,6 +418,7 @@ fn norm_matches_its_portable_body() {
         (1, true, true, true, false, false, 5, DType::F32, 96),
     ];
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for (g, centered, weighted, biased, gathered, interleave, activation, output, h) in forms {
             let (nw, nb, no) = (
                 usize::from(weighted),
@@ -459,7 +461,7 @@ fn norm_matches_its_portable_body() {
             .unwrap();
             let t = |host: &Host| host.tensor(&device);
             let result = kernel
-                .call(vision_norm::Args {
+                .call(&charges, vision_norm::Args {
                     source: &t(&source),
                     weight: &t(&weight),
                     bias: &t(&bias),
@@ -630,6 +632,7 @@ fn linear_matches_its_portable_body() {
         (true, true, false, false, 0, DType::F32, DType::BF16, 200, 300, 64),
     ];
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for (biased, residual, gated, clamped, activation, output, weights, m, n, k) in forms {
             // CUDA's form stages its activation rows in whole 16-byte chunks
             // and stores output pairs (its `K % 8 == 0` and `N % 2 == 0`): a
@@ -711,7 +714,7 @@ fn linear_matches_its_portable_body() {
                 .unwrap();
                 let t = |host: &Host| host.tensor(&device);
                 let result = kernel
-                    .call(vision_linear::Args {
+                    .call(&charges, vision_linear::Args {
                         x: &t(&x),
                         weight: &t(&weight),
                         bias: &t(&bias),
@@ -742,6 +745,7 @@ fn clamp_matches_its_portable_body() {
     let module = crate::common::kernels();
     let (m, n) = (5usize, 300usize);
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         let mut rng = Rng::new(24);
         let x = Host::random(DType::F16, &[m, n], 3.0, &mut rng);
         let minimum = Host::new(DType::F32, &[1], vec![-2.0]);
@@ -764,7 +768,7 @@ fn clamp_matches_its_portable_body() {
         .unwrap();
         let t = |host: &Host| host.tensor(&device);
         let result = kernel
-            .call(vision_clamp::Args {
+            .call(&charges, vision_clamp::Args {
                 x: &t(&x),
                 minimum: &t(&minimum),
                 maximum: &t(&maximum),
@@ -818,6 +822,7 @@ fn learned_position_attention_matches_its_portable_body() {
 fn check_attention_forms(forms: &[(usize, usize, usize, bool, bool, bool, bool, bool, usize)]) {
     let module = crate::common::kernels();
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for &(kv_heads, group, quarter, head_norms, value_norm, windows, unit_scale, rotary, rows) in
             forms
         {
@@ -883,7 +888,7 @@ fn check_attention_forms(forms: &[(usize, usize, usize, bool, bool, bool, bool, 
             .unwrap();
             let t = |host: &Host| host.tensor(&device);
             let result = kernel
-                .call(vision_attention::Args {
+                .call(&charges, vision_attention::Args {
                     query: &t(&query),
                     key: &t(&key),
                     value: &t(&value),
@@ -950,6 +955,7 @@ fn gated_convolution_matches_its_portable_body() {
         neighbors.into_iter().map(|value| value as f32).collect(),
     );
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for weights in [DType::F32, DType::F16] {
             let mut rng = Rng::new(31);
             let value = Host::random(DType::F16, &[rows, hidden], 1.0, &mut rng);
@@ -977,7 +983,7 @@ fn gated_convolution_matches_its_portable_body() {
             .unwrap();
             let t = |host: &Host| host.tensor(&device);
             let result = kernel
-                .call(vision_gated_convolution::Args {
+                .call(&charges, vision_gated_convolution::Args {
                     value: &t(&value),
                     gate: &t(&gate),
                     weight: &t(&kernel_weights),
@@ -1001,6 +1007,7 @@ fn pool_matches_its_portable_body() {
     let module = crate::common::kernels();
     let (cells, g, h) = (4usize, 9usize, 80usize);
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for ns in [0usize, 1] {
             let mut rng = Rng::new(26);
             let source = Host::random(DType::F32, &[cells, g, h], 2.0, &mut rng);
@@ -1030,7 +1037,7 @@ fn pool_matches_its_portable_body() {
             .unwrap();
             let t = |host: &Host| host.tensor(&device);
             let result = kernel
-                .call(vision_pool::Args {
+                .call(&charges, vision_pool::Args {
                     source: &t(&source),
                     standard_bias: &t(&standard_bias),
                     standard_scale: &t(&standard_scale),
@@ -1055,6 +1062,7 @@ fn position_matches_its_portable_body() {
     let module = crate::common::kernels();
     let (rows, h, table_rows) = (6usize, 80usize, 25usize);
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         let mut rng = Rng::new(27);
         let source = Host::random(DType::F32, &[rows, h], 2.0, &mut rng);
         let table = Host::random(DType::F16, &[table_rows, h], 0.5, &mut rng);
@@ -1087,7 +1095,7 @@ fn position_matches_its_portable_body() {
         .unwrap();
         let t = |host: &Host| host.tensor(&device);
         let result = kernel
-            .call(vision_position::Args {
+            .call(&charges, vision_position::Args {
                 source: &t(&source),
                 table: &t(&table),
                 indices: &t(&indices),

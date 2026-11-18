@@ -1137,16 +1137,6 @@ pub struct DeletePlan {
     pub paths: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeletedModel {
-    pub id: InventoryEntryId,
-    pub deleted: bool,
-    pub freed_bytes: u64,
-    pub retained_shared_bytes: u64,
-    pub plan: DeletePlan,
-}
-
 pub type DownloadEventStream = BoxStream<'static, ModelDownloadEvent>;
 
 /// Model inventory boundary consumed by the HTTP API and server composition root.
@@ -1157,7 +1147,6 @@ pub trait ModelInventory: Send + Sync + 'static {
         &self,
         id: &InventoryEntryId,
     ) -> BoxFuture<'_, Result<DeletePlan, InventoryError>>;
-    fn delete(&self, id: &InventoryEntryId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>>;
     fn resolve_ready(
         &self,
         id: &InventoryEntryId,

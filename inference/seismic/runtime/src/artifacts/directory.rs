@@ -3,7 +3,10 @@
 //! ([`super::ProgramStore::user`], laid out by [`programs`]), and the
 //! engine's kernel cache of tuning records, laid out by its own.
 //!
-//! Layout under the root:
+//! Its files are a [`seismic_io::Store`], which owns how they are
+//! published, locked, read and evicted; a directory store is what Seismic
+//! keeps there: the programs, as an [`ArtifactStore`], and when the store
+//! evicts. Layout under the root:
 //!
 //! ```text
 //! artifacts/<namespace>/<key>   what a device's program former stores
@@ -11,66 +14,48 @@
 //!                               and each entry's pointer, one namespace per
 //!                               toolchain; `artifacts/probes` holds the
 //!                               devices' probe answers
-//! <directory>/<name>            an embedder's own entries ([`DirectoryStore::write`])
+//! <directory>/<name>            an embedder's own records ([`DirectoryStore::writing`])
 //! ```
 //!
-//! Writes go to a temporary file in the same directory and are renamed into
-//! place, so concurrent processes never see a partial file; a temporary file
-//! older than [`ABANDONED_WRITE`] belongs to a writer that died and is
-//! removed. Reading a file refreshes its modification time, its use time.
+//! beside the files the store itself keeps ([`seismic_io::store`]).
+//!
+//! An embedder's records are reached only through the store's lock: held
+//! shared to read them ([`DirectoryStore::reading`]), exclusively to write
+//! or remove them ([`DirectoryStore::writing`]), in this process or another.
+//! The artifacts take no lock to be read or written: each is a content
+//! address, never written again, and every reader checks the one it reads
+//! whole. One a platform opens by path is held ([`ArtifactStore::held`]):
+//! eviction leaves a held file at its path while the hold lives, so the
+//! platform finds it there for as long as it reads it.
 //!
 //! Opening the store, and every quarter of its capacity written after,
-//! removes the least recently used entries beyond its capacity, on a thread
-//! of its own, off the path that opened or wrote it. Each artifact is an
-//! entry of its own; what the embedder keeps beside them is read by its
-//! layout ([`Layout`]): a file may be part of an entry with others, which
-//! is as large as its files together, used when the latest of them was, and
-//! removed whole in the order its layout gives, so a reader finds it whole
-//! or not at all. What the layout keeps is no entry and is never removed:
-//! eviction walks it only for the abandoned temporary files of writes into
-//! it, its own and any other writer's that writes the same way.
+//! begins an eviction ([`seismic_io::Store::evict`]) of the least recently
+//! used entries beyond its capacity, on a thread of its own, off the path
+//! that opened or wrote it. Each artifact is an entry of its own; what the
+//! embedder keeps beside them is placed by its layout ([`Eviction`]).
 //!
 //! Every artifact key is a content address, so an artifact is never
-//! invalidated; any file that cannot be read is a miss.
+//! invalidated; any artifact that cannot be read is a miss.
 
 use super::{ArtifactKey, ArtifactStore};
+use seismic_io::{Durability, Eviction, Examining, Exclusive, Privacy, Shared, Store};
+use seismic_native_target::HeldFile;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Bytes a store keeps unless its opener states otherwise.
 pub const DEFAULT_CAPACITY: u64 = 1 << 30;
 
-/// Temporary files older than this belong to a writer that died.
-const ABANDONED_WRITE: Duration = Duration::from_secs(60 * 60);
-
 /// The directory under the root that holds the artifacts.
 const ARTIFACTS: &str = "artifacts";
-
-/// How eviction reads a path the embedder keeps beside the artifacts.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Eviction {
-    /// Never removed; a directory so read holds no entry, and only its
-    /// abandoned temporary files are.
-    Kept,
-    /// An entry of its own.
-    Alone,
-    /// Part of the entry named `entry`, with every other file so named,
-    /// removed in `order`, lowest first: the file that names the others
-    /// goes first.
-    Part { entry: String, order: u8 },
-}
-
-/// The embedder's layout: how eviction reads each path under the root, a
-/// directory before it walks it and each file in one it walks.
-pub type Layout = fn(&Path) -> Eviction;
 
 /// The layout of a store of programs: each artifact and pointer an entry of
 /// its own, and the probe answers (`artifacts/probes`) kept, as forming one
 /// again runs its probes.
-pub fn programs(path: &Path) -> Eviction {
+pub fn programs(path: &Path, _: &Examining<'_>) -> Eviction {
     if path == Path::new(ARTIFACTS).join(crate::probes::NAMESPACE) {
         Eviction::Kept
     } else {
@@ -81,29 +66,52 @@ pub fn programs(path: &Path) -> Eviction {
 /// A store in files under one directory.
 #[derive(Debug)]
 pub struct DirectoryStore {
-    root: PathBuf,
+    store: Arc<Store>,
     capacity: u64,
-    layout: Layout,
-    /// Distinguishes this process's concurrent temporary files.
-    writes: AtomicU64,
-    /// Bytes written since eviction last began.
-    written: AtomicU64,
+    layout: fn(&Path, &Examining<'_>) -> Eviction,
     /// The eviction under way, if one is.
     eviction: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// The embedder's records of a store, its lock held exclusively
+/// ([`seismic_io::Exclusive`], which it derefs to): no reader, other writer
+/// or eviction is among them until it is dropped. Dropped, the lock
+/// released, it begins an eviction if what the store has written since the
+/// last one is a quarter of its capacity.
+#[must_use = "the records are held only while this lives"]
+#[derive(Debug)]
+pub struct Writing<'a> {
+    directory: &'a DirectoryStore,
+    /// The lock, held until this is dropped.
+    held: Option<Exclusive<'a>>,
+}
+
+impl<'a> std::ops::Deref for Writing<'a> {
+    type Target = Exclusive<'a>;
+
+    fn deref(&self) -> &Exclusive<'a> {
+        self.held.as_ref().expect("the lock is held until the records are dropped")
+    }
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        // Released first: the eviction it begins takes the lock.
+        drop(self.held.take());
+        self.directory.evict_if_outgrown();
+    }
+}
+
 impl DirectoryStore {
     /// The store at `root`, created if absent, keeping `capacity` bytes of
-    /// entries, the embedder's files read by `layout`; it begins removing
+    /// entries, the embedder's files placed by `layout`; it begins removing
     /// the least recently used beyond them.
-    pub fn open(root: PathBuf, capacity: u64, layout: Layout) -> std::io::Result<Self> {
+    pub fn open(root: PathBuf, capacity: u64, layout: fn(&Path, &Examining<'_>) -> Eviction) -> std::io::Result<Self> {
         fs::create_dir_all(&root)?;
         let store = Self {
-            root,
+            store: Arc::new(Store::new(root, Privacy::Shared)),
             capacity,
             layout,
-            writes: AtomicU64::new(0),
-            written: AtomicU64::new(0),
             eviction: std::sync::Mutex::new(None),
         };
         store.evict();
@@ -111,91 +119,75 @@ impl DirectoryStore {
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        self.store.root()
     }
 
-    /// The bytes at `path` under the root, refreshing its use time; none on
-    /// any failure.
-    pub fn read(&self, path: &Path) -> Option<Vec<u8>> {
-        let path = self.root.join(path);
-        let bytes = fs::read(&path).ok()?;
-        used(&path);
-        Some(bytes)
+    /// The records, read under the store's lock held shared, waiting until
+    /// no writer or eviction holds it.
+    pub fn reading(&self) -> std::io::Result<Shared<'_>> {
+        self.store.shared()
     }
 
-    /// Whether a file is at `path` under the root, read from its metadata.
-    pub fn contains(&self, path: &Path) -> bool {
-        self.root.join(path).is_file()
-    }
-
-    /// Write `bytes` to `path` under the root through a temporary file in
-    /// the same directory, synced before it is renamed into place. A
-    /// failure is reported as a warning event, which the embedder's
-    /// subscriber carries to its telemetry, and leaves no partial file.
-    /// Returns whether the file was written.
-    pub fn write(&self, path: &Path, bytes: &[u8]) -> bool {
-        self.written(path, bytes, true)
-    }
-
-    /// [`DirectoryStore::write`], the file synced first where `synced`.
-    fn written(&self, path: &Path, bytes: &[u8], synced: bool) -> bool {
-        let path = self.root.join(path);
-        let directory = path.parent().expect("a stored file lives in a directory");
-        if let Err(error) = fs::create_dir_all(directory) {
-            tracing::warn!("artifact store: cannot create {}: {error}", directory.display());
-            return false;
-        }
-        let temporary = directory.join(format!(
-            ".{}.{}.{}.tmp",
-            path.file_name().expect("a stored file has a name").to_string_lossy(),
-            std::process::id(),
-            self.writes.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = fs::File::create(&temporary)
-            .and_then(|mut file| file.write_all(bytes).and_then(|()| if synced { file.sync_all() } else { Ok(()) }))
-            .and_then(|()| fs::rename(&temporary, &path));
-        if let Err(error) = &written {
-            let _ = fs::remove_file(&temporary);
-            tracing::warn!("artifact store: cannot write {}: {error}", path.display());
-            return false;
-        }
-        let length = bytes.len() as u64;
-        if self.written.fetch_add(length, Ordering::Relaxed) + length >= self.capacity / 4 {
-            self.evict();
-        }
-        true
-    }
-
-    /// Remove the file at `path` under the root, if there is one.
-    pub fn remove(&self, path: &Path) {
-        let _ = fs::remove_file(self.root.join(path));
+    /// The records, read, written and removed under the store's lock held
+    /// exclusively, waiting until no other holder holds it. A thread holding
+    /// the lock takes it again only to wait for itself.
+    pub fn writing(&self) -> std::io::Result<Writing<'_>> {
+        Ok(Writing { directory: self, held: Some(self.store.exclusive()?) })
     }
 
     /// Write `bytes` under `key` of `namespace`, synced, as [`ArtifactStore::put`]
     /// does; whether they were written, which a put only reports.
     pub(crate) fn put_synced(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) -> bool {
-        self.written(&Self::artifact(namespace, key), bytes, true)
+        self.put_reported(namespace, key, bytes, Durability::Durable)
+    }
+
+    /// Publish an artifact, without the lock, reporting a failure as a
+    /// warning event, which the embedder's subscriber carries to its
+    /// telemetry: a missing artifact costs its compile again.
+    fn put_reported(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8], durability: Durability) -> bool {
+        let path = Self::artifact(namespace, key);
+        let published = self.store.publish(&path, durability, |file| file.write_all(bytes));
+        self.evict_if_outgrown();
+        match published {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!("artifact store: cannot write {}: {error}", self.root().join(path).display());
+                false
+            }
+        }
     }
 
     fn artifact(namespace: &str, key: &ArtifactKey) -> PathBuf {
         Path::new(ARTIFACTS).join(namespace).join(key.as_str())
     }
 
+    /// Begin an eviction if what the store wrote since the last one is a
+    /// quarter of its capacity.
+    fn evict_if_outgrown(&self) {
+        if self.store.written() >= self.capacity / 4 {
+            self.evict();
+        }
+    }
+
     /// Begin removing the least recently used entries beyond the capacity,
-    /// on a thread of its own, unless an eviction is under way.
+    /// on a thread of its own, unless an eviction is under way. Eviction has
+    /// no caller to answer: one that finds the store held passes, and the
+    /// store stays beyond its capacity until the next, a quarter of its
+    /// capacity written later; a failure is reported as an error event.
     fn evict(&self) {
         let mut eviction = self.eviction.lock().expect("no eviction panics starting");
         if eviction.as_ref().is_some_and(|under_way| !under_way.is_finished()) {
             return;
         }
-        self.written.store(0, Ordering::Relaxed);
-        let (root, capacity, layout) = (self.root.clone(), self.capacity, self.layout);
-        match std::thread::Builder::new()
-            .name("seismic-evict".into())
-            .spawn(move || evict(&root, capacity, layout))
-        {
+        let (store, capacity, layout) = (self.store.clone(), self.capacity, self.layout);
+        let evicting = move || {
+            if let Err(error) = store.evict(capacity, Duration::ZERO, &layout) {
+                tracing::error!("artifact store: the eviction of {} failed: {error}", store.root().display());
+            }
+        };
+        match seismic_threads::spawn("seismic-evict", evicting) {
             Ok(under_way) => *eviction = Some(under_way),
-            Err(error) => tracing::warn!("artifact store: the eviction of {} does not start: {error}", self.root.display()),
+            Err(error) => tracing::warn!("artifact store: the eviction of {} does not start: {error}", self.root().display()),
         }
     }
 
@@ -208,95 +200,34 @@ impl DirectoryStore {
     }
 }
 
-/// Refresh the use time of the file at `path`: a stale one only makes its
-/// entry an earlier eviction candidate.
-fn used(path: &Path) {
-    if let Ok(file) = fs::File::options().write(true).open(path) {
-        let _ = file.set_modified(SystemTime::now());
-    }
-}
-
-/// An entry eviction removes whole.
-#[derive(PartialEq, Eq, Hash)]
-enum Entry {
-    /// A file of its own, by its path.
-    Alone(PathBuf),
-    /// The files the layout names one entry.
-    Named(String),
-}
-
-/// Remove the abandoned temporary files under `root`, in what the layout
-/// keeps too, then the least recently used entries until the rest fit
-/// `capacity`.
-fn evict(root: &Path, capacity: u64, layout: Layout) {
-    let now = SystemTime::now();
-    // How eviction reads `path`, under the root.
-    let read = |path: &Path| layout(path.strip_prefix(root).expect("eviction walks under its root"));
-    let mut entries = std::collections::HashMap::<Entry, (SystemTime, u64, Vec<(u8, PathBuf)>)>::new();
-    // Each directory to walk, and whether the layout keeps it: a kept
-    // directory holds no entry, and is walked only for abandoned writes.
-    let mut directories = vec![(root.to_path_buf(), false)];
-    while let Some((directory, kept)) = directories.pop() {
-        let Ok(listing) = fs::read_dir(&directory) else {
-            continue;
-        };
-        for item in listing.flatten() {
-            let Ok(metadata) = item.metadata() else {
-                continue;
-            };
-            let path = item.path();
-            if metadata.is_dir() {
-                let kept = kept || read(&path) == Eviction::Kept;
-                directories.push((path, kept));
-                continue;
-            }
-            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            if item.file_name().to_string_lossy().starts_with('.') {
-                if now.duration_since(modified).unwrap_or_default() > ABANDONED_WRITE {
-                    let _ = fs::remove_file(&path);
-                }
-                continue;
-            }
-            if kept {
-                continue;
-            }
-            let (entry, order) = match read(&path) {
-                Eviction::Kept => continue,
-                Eviction::Alone => (Entry::Alone(path.clone()), 0),
-                Eviction::Part { entry, order } => (Entry::Named(entry), order),
-            };
-            let entry = entries.entry(entry).or_insert((SystemTime::UNIX_EPOCH, 0, Vec::new()));
-            entry.0 = entry.0.max(modified);
-            entry.1 += metadata.len();
-            entry.2.push((order, path));
-        }
-    }
-    let mut entries = entries.into_values().collect::<Vec<_>>();
-    entries.sort_by(|left, right| right.0.cmp(&left.0));
-    let mut held = 0u64;
-    for (_, bytes, mut paths) in entries {
-        held += bytes;
-        if held > capacity {
-            paths.sort();
-            for (_, path) in paths {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-}
-
 impl ArtifactStore for DirectoryStore {
+    /// Read without a lock, marked used: an artifact is a content address
+    /// and a pointer is checked whole by its reader.
     fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
-        self.read(&Self::artifact(namespace, key))
+        self.store.fetch(&Self::artifact(namespace, key)).ok().flatten()
     }
 
     fn contains(&self, namespace: &str, key: &ArtifactKey) -> bool {
-        DirectoryStore::contains(self, &Self::artifact(namespace, key))
+        self.root().join(Self::artifact(namespace, key)).is_file()
     }
 
-    fn file(&self, namespace: &str, key: &ArtifactKey) -> Option<PathBuf> {
-        let path = self.root.join(Self::artifact(namespace, key));
-        path.is_file().then_some(path)
+    fn held(&self, namespace: &str, key: &ArtifactKey) -> Option<(Vec<u8>, HeldFile)> {
+        let path = Self::artifact(namespace, key);
+        let held = match self.store.hold(&path) {
+            Ok(held) => held?,
+            Err(error) => {
+                tracing::warn!("artifact store: cannot hold {}: {error}", self.root().join(path).display());
+                return None;
+            }
+        };
+        let bytes = match held.bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!("artifact store: cannot read {}: {error}", held.path().display());
+                return None;
+            }
+        };
+        Some((bytes, HeldFile::new(held.path().to_owned(), Box::new(held))))
     }
 
     /// A program's entries are unsynced: every reader checks them whole (an
@@ -305,13 +236,18 @@ impl ArtifactStore for DirectoryStore {
     /// is synced: it is kept from eviction, rare to write, and costly to
     /// form again.
     fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
-        self.written(&Self::artifact(namespace, key), bytes, namespace == crate::probes::NAMESPACE);
+        let durability = if namespace == crate::probes::NAMESPACE { Durability::Durable } else { Durability::Volatile };
+        self.put_reported(namespace, key, bytes, durability);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
+
+    /// The store's lock, as [`seismic_io::store`] names it.
+    const LOCK: &str = ".lock";
 
     fn scratch(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("seismic-directory-store-{name}-{}", std::process::id()));
@@ -319,13 +255,18 @@ mod tests {
         root
     }
 
-    fn alone(_: &Path) -> Eviction {
+    fn alone(_: &Path, _: &Examining<'_>) -> Eviction {
         Eviction::Alone
     }
 
     fn aged(path: &Path, seconds: u64) {
         let file = fs::File::options().write(true).open(path).unwrap();
         file.set_modified(SystemTime::now() - Duration::from_secs(seconds)).unwrap();
+    }
+
+    /// Write one record under the store's lock, released again at once.
+    fn write(store: &DirectoryStore, path: &Path, bytes: &[u8]) {
+        store.writing().unwrap().write(path, bytes, Durability::Durable).unwrap();
     }
 
     /// What one process stores, another opening the same directory reads.
@@ -337,35 +278,95 @@ mod tests {
         let store = DirectoryStore::open(root.clone(), DEFAULT_CAPACITY, alone).unwrap();
         assert!(ArtifactStore::contains(&store, "metal", &key));
         assert_eq!(store.get("metal", &key).unwrap(), b"compiled");
-        let file = store.file("metal", &key).expect("a directory store keeps each artifact in a file");
-        assert_eq!(fs::read(file).unwrap(), b"compiled");
+        let (bytes, file) = store.held("metal", &key).expect("a directory store keeps each artifact in a file");
+        assert_eq!((bytes.as_slice(), fs::read(file.path()).unwrap().as_slice()), (&b"compiled"[..], &b"compiled"[..]));
+        drop(file);
         assert!(store.get("cuda", &key).is_none());
-        let leftovers = fs::read_dir(root.join(ARTIFACTS).join("metal"))
-            .unwrap()
-            .flatten()
-            .filter(|item| item.file_name().to_string_lossy().starts_with('.'))
-            .count();
-        assert_eq!(leftovers, 0, "no temporary file remains");
+        let held = fs::read_dir(root.join(ARTIFACTS).join("metal")).unwrap().flatten().count();
+        assert_eq!(held, 1, "no temporary file remains");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An artifact held through the store stays at its path while the hold
+    /// lives, whatever an eviction over the same directory, as another
+    /// process's, finds no room for; released, the next eviction removes it.
+    #[test]
+    fn a_held_artifact_stays_until_it_is_released() {
+        let root = scratch("held");
+        let store = DirectoryStore::open(root.clone(), DEFAULT_CAPACITY, alone).unwrap();
+        store.evicted();
+        let key = ArtifactKey::of(&[b"archive"]);
+        store.put("metal", &key, b"archive");
+        let (bytes, held) = store.held("metal", &key).expect("the artifact is kept in a file");
+        assert_eq!(bytes, b"archive");
+        // Room for nothing: its eviction runs, and passes over the hold.
+        DirectoryStore::open(root.clone(), 0, alone).unwrap().evicted();
+        assert_eq!(fs::read(held.path()).unwrap(), b"archive", "eviction leaves a held file at its path");
+        let path = held.path().to_owned();
+        drop(held);
+        DirectoryStore::open(root.clone(), 0, alone).unwrap().evicted();
+        assert!(!path.exists(), "released, the artifact is evicted");
+        assert!(store.get("metal", &key).is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
     /// A layout of records, each a choice and the evidence it names, one
     /// entry by their stem, the choice first; and of measurements kept.
-    fn records(path: &Path) -> Eviction {
+    fn records(path: &Path, examining: &Examining<'_>) -> Eviction {
         let name = path.file_name().unwrap().to_string_lossy();
         let stem = name.split('.').next().unwrap().to_owned();
         match path.iter().next().unwrap().to_str().unwrap() {
             "measured" => Eviction::Kept,
             "choice" => Eviction::Part { entry: stem, order: 0 },
             "evidence" => Eviction::Part { entry: stem, order: 1 },
-            _ => programs(path),
+            _ => programs(path, examining),
         }
+    }
+
+    /// [`records`], with evidence its key's choice does not name, by the
+    /// evidence's file name, unreachable.
+    fn named(path: &Path, examining: &Examining<'_>) -> Eviction {
+        let name = path.file_name().unwrap().to_string_lossy();
+        match (path.iter().next().unwrap().to_str().unwrap(), name.split_once('.')) {
+            ("evidence", Some((stem, _))) => {
+                let choice = examining.examine(&Path::new("choice").join(format!("{stem}.json")), u64::MAX).unwrap();
+                if choice.as_deref() == Some(name.as_bytes()) {
+                    records(path, examining)
+                } else {
+                    Eviction::Unreachable
+                }
+            }
+            _ => records(path, examining),
+        }
+    }
+
+    /// Eviction's walk removes every file the layout reads as unreachable,
+    /// evidence a live record's choice does not name and evidence no choice
+    /// names, however much room there is, and keeps the reachable record.
+    #[test]
+    fn eviction_removes_what_the_layout_reads_unreachable() {
+        let root = scratch("unreachable");
+        let store = DirectoryStore::open(root.clone(), DEFAULT_CAPACITY, named).unwrap();
+        store.evicted();
+        let (choice, evidence) = (Path::new("choice/live.json"), Path::new("evidence/live.1.json"));
+        let replaced = Path::new("evidence/live.0.json");
+        let dead = Path::new("evidence/dead.0.json");
+        write(&store, choice, b"live.1.json");
+        for path in [evidence, replaced, dead] {
+            write(&store, path, b"evidence");
+        }
+        store.evicted();
+        DirectoryStore::open(root.clone(), DEFAULT_CAPACITY, named).unwrap().evicted();
+        assert!(root.join(choice).exists() && root.join(evidence).exists(), "a reachable record stays");
+        assert!(!root.join(replaced).exists(), "evidence its live key's choice does not name is removed");
+        assert!(!root.join(dead).exists(), "evidence no choice names is removed");
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Opening evicts the least recently used entries beyond capacity,
     /// each as its layout groups it, whole; it leaves what the layout
-    /// keeps and the probe results however old, and files that share a
-    /// stem in directories the layout does not group.
+    /// keeps, the probe results however old, the store's lock, and files
+    /// that share a stem in directories the layout does not group.
     #[test]
     fn opening_evicts_least_recently_used_entries_whole() {
         let root = scratch("evict");
@@ -377,7 +378,7 @@ mod tests {
         let kept = Path::new("measured/point.json");
         let apart = Path::new("prepared/used.json");
         for path in [&old, &probe, head, tail, idle_head, idle_tail, kept, apart] {
-            assert!(store.write(path, &[0; 400]));
+            write(&store, path, &[0; 400]);
         }
         store.evicted();
         // The record in use: its head read now, its tail older than the
@@ -386,7 +387,7 @@ mod tests {
         aged(&root.join(tail), 3600);
         aged(&root.join(&old), 1800);
         aged(&root.join(apart), 5400);
-        for path in [idle_head, idle_tail, kept, &probe] {
+        for path in [idle_head, idle_tail, kept, &probe, Path::new(LOCK)] {
             aged(&root.join(path), 7200);
         }
         let store = DirectoryStore::open(root.clone(), 1000, records).unwrap();
@@ -395,6 +396,59 @@ mod tests {
         assert!(!root.join(&old).exists() && !root.join(apart).exists());
         assert!(!root.join(idle_head).exists() && !root.join(idle_tail).exists());
         assert!(root.join(kept).exists() && root.join(&probe).exists());
+        assert!(root.join(LOCK).exists(), "eviction never removes the lock it holds");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Eviction lists and removes under the store's lock, as one step:
+    /// while a writer holds the lock an eviction passes, neither listing nor
+    /// removing nor waiting, and the next lists what was written meanwhile
+    /// and keeps the newest that fits.
+    #[test]
+    fn eviction_lists_and_removes_under_the_stores_lock() {
+        let root = scratch("locked");
+        let store = DirectoryStore::open(root.clone(), DEFAULT_CAPACITY, records).unwrap();
+        let idle = [Path::new("choice/idle.json"), Path::new("evidence/idle.0.json")];
+        for path in idle {
+            write(&store, path, &[0; 400]);
+            aged(&root.join(path), 3600);
+        }
+        store.evicted();
+        let writing = store.writing().unwrap();
+        // Room for one record: the idle one fits alone.
+        DirectoryStore::open(root.clone(), 900, records).unwrap().evicted();
+        let fresh = [Path::new("choice/fresh.json"), Path::new("evidence/fresh.0.json")];
+        for path in fresh {
+            writing.write(path, &[1; 400], Durability::Durable).unwrap();
+        }
+        assert!(idle.iter().all(|path| root.join(path).exists()), "eviction removes nothing while a writer holds the lock");
+        drop(writing);
+        let tight = DirectoryStore::open(root.clone(), 900, records).unwrap();
+        tight.evicted();
+        assert!(fresh.iter().all(|path| root.join(path).exists()), "the record written meanwhile is listed, and kept as the newest");
+        assert!(idle.iter().all(|path| !root.join(path).exists()), "the older record is evicted whole");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A record is read and listed through the lock; an absent one is
+    /// none, and a lock that cannot be taken is an error, not an absent
+    /// record.
+    #[test]
+    fn records_are_reached_through_the_lock_or_not_at_all() {
+        let root = scratch("unlockable");
+        let store = DirectoryStore::open(root.clone(), DEFAULT_CAPACITY, records).unwrap();
+        store.evicted();
+        let record = Path::new("choice/kept.json");
+        write(&store, record, b"record");
+        assert_eq!(store.reading().unwrap().read(record, u64::MAX).unwrap().unwrap(), b"record");
+        assert_eq!(store.reading().unwrap().read(Path::new("choice/absent.json"), u64::MAX).unwrap(), None);
+        assert_eq!(store.writing().unwrap().list(Path::new("choice")).unwrap(), ["kept.json"]);
+        store.writing().unwrap().remove(record).unwrap();
+        assert_eq!(store.reading().unwrap().read(record, u64::MAX).unwrap(), None);
+        // A directory where the lock is: no file to lock.
+        fs::remove_file(root.join(LOCK)).unwrap();
+        fs::create_dir(root.join(LOCK)).unwrap();
+        assert!(store.reading().is_err() && store.writing().is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -405,10 +459,10 @@ mod tests {
         let store = DirectoryStore::open(root.clone(), 1000, alone).unwrap();
         store.evicted();
         let (old, new) = (Path::new("old"), Path::new("new"));
-        assert!(store.write(old, &[0; 600]));
+        write(&store, old, &[0; 600]);
         store.evicted();
         aged(&root.join(old), 3600);
-        assert!(store.write(new, &[0; 600]));
+        write(&store, new, &[0; 600]);
         store.evicted();
         assert!(!root.join(old).exists() && root.join(new).exists());
         fs::remove_dir_all(root).unwrap();
@@ -429,7 +483,7 @@ mod tests {
             fs::write(file, b"").unwrap();
         }
         for file in [&abandoned, &answers, &abandoned_answers] {
-            aged(file, 2 * ABANDONED_WRITE.as_secs());
+            aged(file, 2 * seismic_io::ABANDONED.as_secs());
         }
         DirectoryStore::open(root.clone(), DEFAULT_CAPACITY, programs).unwrap().evicted();
         assert!(fresh.exists() && !abandoned.exists());

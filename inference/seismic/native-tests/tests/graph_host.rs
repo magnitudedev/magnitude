@@ -131,6 +131,7 @@ fn median(values: &mut [f64]) -> f64 {
 #[ignore = "host-time micro-benchmark; run explicitly with --ignored --nocapture"]
 fn host_time_per_run_of_a_300_node_graph() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let (m, n) = (1u64, 8u64);
         let kernel = scale_rows::native_for_device(
             &device,
@@ -165,14 +166,14 @@ fn host_time_per_run_of_a_300_node_graph() {
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         // The plan writes no input, so the slot holds no upload region.
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
-        let mut output_slot = Some(family.new_output_slot().unwrap());
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
+        let mut output_slot = Some(family.new_output_slot(&charges).unwrap());
         let inputs = (0..2)
             .map(|index| {
                 let bytes = (0..m * n)
                     .flat_map(|element| ((element + index * 100) as f32).to_le_bytes())
                     .collect::<Vec<_>>();
-                Tensor::from_host(&device, Element::f32(), &[m, n], &bytes).unwrap()
+                Tensor::from_host(&charges, Element::f32(), &[m, n], &bytes).unwrap()
             })
             .collect::<Vec<_>>();
         let mut attach_seconds = Vec::with_capacity(RUNS);
@@ -182,7 +183,7 @@ fn host_time_per_run_of_a_300_node_graph() {
             let started = Instant::now();
             let outputs = output_slot.take().unwrap().activate(&plan).unwrap();
             let mut bindings = plan.bindings();
-            bindings.set(&input, &inputs[run % 2]).unwrap();
+            bindings.set(&charges, &input, &inputs[run % 2]).unwrap();
             let mut active = slot.activate(&plan).unwrap();
             let ready = active.attach(bindings, outputs).unwrap();
             let attached = Instant::now();
@@ -216,6 +217,7 @@ fn host_time_per_run_of_a_300_node_graph() {
 #[test]
 fn graph_completion_retains_inputs_until_its_outcome_is_taken() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let kernel = scale_rows::native_for_device(
             &device, &NativeSpecialization::new().with_param("ROWS", 1),
         ).unwrap();
@@ -227,14 +229,14 @@ fn graph_completion_retains_inputs_until_its_outcome_is_taken() {
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
-        let source = Tensor::from_host(&device, Element::f32(), &[1, 8], &[0; 32]).unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
+        let source = Tensor::from_host(&charges, Element::f32(), &[1, 8], &[0; 32]).unwrap();
         let observer = source.observe_storage();
         let mut bindings = plan.bindings();
-        bindings.set(&input, &source).unwrap();
+        bindings.set(&charges, &input, &source).unwrap();
         drop(source);
         let mut active = slot.activate(&plan).unwrap();
-        let ready = active.attach(bindings, plan.new_outputs().unwrap()).unwrap();
+        let ready = active.attach(bindings, plan.new_outputs(&charges).unwrap()).unwrap();
         let (outputs, completion) = ready.submit().unwrap();
         assert_eq!(observer.charged_bytes(), Some(32));
         completion.wait().unwrap();

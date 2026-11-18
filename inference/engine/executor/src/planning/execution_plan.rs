@@ -1750,14 +1750,18 @@ fn refusal(no: NoBank, capacity: u64) -> PlanError {
 /// load prepares); every slot count, context and verdict is arithmetic over
 /// it (`assessment::assess_execution_fit`). `T` is what else a form's
 /// outline gives (a drafted plan's target alone).
+///
+/// Each form is boxed: a form carries a whole execution plan draft, and a
+/// load passes its forms by value through deep frames, whose stacks hold
+/// every by-value copy (`seismic_threads::STACK_BYTES`).
 pub enum FloorForms<T = ()> {
     /// The experts streamed through a bank of every expert at the floor
     /// pass, at the most slots the load's own bound holds, and held whole
     /// as their own allocations at groups of one launch where that bound
     /// holds them so.
-    Banked { bank: BankForm<T>, resident: Option<HeldForm<T>> },
+    Banked { bank: Box<BankForm<T>>, resident: Option<Box<HeldForm<T>>> },
     /// Experts that cannot stream, held whole as their own allocations.
-    Resident(HeldForm<T>),
+    Resident(Box<HeldForm<T>>),
 }
 
 /// One way of holding a draft's experts and its charge's structure.
@@ -1842,10 +1846,14 @@ impl<T> FloorForms<T> {
     pub fn structures(self) -> FloorForms {
         let form = |HeldForm { draft, structure, .. }: HeldForm<T>| HeldForm { draft, structure, more: () };
         match self {
-            Self::Banked { bank: BankForm { form: held, experts, points, windowed }, resident } => {
-                FloorForms::Banked { bank: BankForm { form: form(held), experts, points, windowed }, resident: resident.map(form) }
+            Self::Banked { bank, resident } => {
+                let BankForm { form: held, experts, points, windowed } = *bank;
+                FloorForms::Banked {
+                    bank: Box::new(BankForm { form: form(held), experts, points, windowed }),
+                    resident: resident.map(|resident| Box::new(form(*resident))),
+                }
             }
-            Self::Resident(resident) => FloorForms::Resident(form(resident)),
+            Self::Resident(resident) => FloorForms::Resident(Box::new(form(*resident))),
         }
     }
 
@@ -1854,14 +1862,14 @@ impl<T> FloorForms<T> {
     pub fn primary(&self) -> &HeldForm<T> {
         match self {
             Self::Banked { bank, .. } => &bank.form,
-            Self::Resident(resident) => resident,
+            Self::Resident(resident) => &**resident,
         }
     }
 
     /// The bank form, where the experts stream.
     pub fn bank(&self) -> Option<&BankForm<T>> {
         match self {
-            Self::Banked { bank, .. } => Some(bank),
+            Self::Banked { bank, .. } => Some(&**bank),
             Self::Resident(_) => None,
         }
     }
@@ -1870,8 +1878,8 @@ impl<T> FloorForms<T> {
     /// own bound holds them so.
     pub fn resident(&self) -> Option<&HeldForm<T>> {
         match self {
-            Self::Banked { resident, .. } => resident.as_ref(),
-            Self::Resident(resident) => Some(resident),
+            Self::Banked { resident, .. } => resident.as_deref(),
+            Self::Resident(resident) => Some(&**resident),
         }
     }
 }
@@ -1932,8 +1940,8 @@ impl ExecutionPlanDraft {
             None => None,
         };
         match (bank, resident) {
-            (Ok(bank), resident) => Ok(FloorForms::Banked { bank, resident }),
-            (Err(_), Some(resident)) => Ok(FloorForms::Resident(resident)),
+            (Ok(bank), resident) => Ok(FloorForms::Banked { bank: Box::new(bank), resident: resident.map(Box::new) }),
+            (Err(_), Some(resident)) => Ok(FloorForms::Resident(Box::new(resident))),
             (Err(reason), None) => Err(PlanError::Unstreamed(reason).into()),
         }
     }
@@ -2861,7 +2869,7 @@ mod tests {
         let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).expect("the CPU backend opens");
         let (ledgers, _) = DeviceLedgers::open_in(&scope, &device, std::sync::Arc::new(LoadShape { stores: Vec::new() }))
             .read_scripted(crate::memory::supply::Reading::device(64 << 30, 64 << 30, crate::domain::fixtures::NO_LAG));
-        let mut weights = ledgers.claim(&device, CommittedKind::Load, crate::memory::ClaimDemand::default()).expect("nothing to claim");
+        let mut weights = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, CommittedKind::Load, crate::memory::ClaimDemand::default())).expect("nothing to claim");
         // The claim `BankCache::opened` requires of a bank with host slots.
         let backing = ledgers.host_backing(&mut weights, &load).unwrap();
         assert_eq!(backing.as_ref().map(crate::memory::ledger::Claim::bytes), Some(0), "a tier of host slots is claimed at no bytes");
@@ -3143,10 +3151,10 @@ mod tests {
             .read_scripted(crate::memory::supply::Reading::device(2 * whole_bytes, target, crate::domain::fixtures::NO_LAG));
         // The whole plan is refused for room ...
         let load = crate::memory::ledger::CommittedKind::Load;
-        assert!(ledgers.admit_most(&reading, &host, load, 0, 0, |_| Ok::<_, std::convert::Infallible>(import(whole.load()))).unwrap().is_err());
+        assert!(ledgers.changes().change(|keeping| ledgers.admit_most(&keeping.claims(), &reading, &host, load, 0, 0, |_| Ok::<_, std::convert::Infallible>(import(whole.load())))).unwrap().is_err());
         // ... and the streamed plan's bank is fitted into it: the most slots
         // that fit, and no more.
-        let (slots, _held) = ledgers.admit_most(&reading, &host, load, bank.floor(), bank.slots, &at).unwrap().unwrap();
+        let (slots, _held) = ledgers.changes().change(|keeping| ledgers.admit_most(&keeping.claims(), &reading, &host, load, bank.floor(), bank.slots, &at)).unwrap().unwrap();
         assert!(at(slots).unwrap().device <= target, "{slots} slots of {} fit the {target} bytes left", bank.slots);
         assert!(slots == bank.slots || at(slots + 1).unwrap().device > target, "{slots} slots are the most that fit");
     }

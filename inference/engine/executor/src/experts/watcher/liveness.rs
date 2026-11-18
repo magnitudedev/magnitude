@@ -159,18 +159,11 @@ fn held<'a, T: 'a>(try_lock: impl Fn() -> std::sync::TryLockResult<std::sync::Mu
     }
 }
 
-pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    match (payload.downcast_ref::<&str>(), payload.downcast_ref::<String>()) {
-        (Some(message), _) => (*message).to_owned(),
-        (_, Some(message)) => message.clone(),
-        _ => "a panic without a message".to_owned(),
-    }
-}
-
 /// Whether serving goes on: why it ended, and whether the load stops.
 pub(super) struct Life {
-    /// Why the watcher's serving ended: it panicked, or a demand read left
-    /// the served file with no read line. Recorded before any request is
+    /// Why the watcher's serving ended: a fault of the device, a demand
+    /// read that left the served file with no read line, or a copy into the
+    /// bank that failed. Recorded before any request is
     /// refused for it.
     ended: Mutex<Option<String>>,
     stopping: AtomicBool,
@@ -264,10 +257,10 @@ impl Shared {
         }
     }
 
-    /// Why serving ends that no serving thread met itself: a panic of the
-    /// executor's work, or the device lost under the parks.
+    /// Why serving ends that no serving thread met itself: the device lost
+    /// under the parks.
     pub(super) fn fault(&self) -> Option<String> {
-        self.compute.panicked().or_else(|| self.parks.lost())
+        self.parks.lost()
     }
 
     /// The served file's reads make no read line (`error`): serving ends,

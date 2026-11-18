@@ -68,7 +68,7 @@ fn last_round() -> u64 {
 /// `slots`' table of the exchange on the CPU device, beating with `steps`'
 /// pulse.
 fn cpu_slots(table: magnitude_kernels::SlotTable, steps: &Steps) -> ExchangeTable {
-    ExchangeTable::new(Tensor::shared(&cpu(), Element::i32(), &[table.words()]).unwrap(), table, steps.pulse()).unwrap()
+    ExchangeTable::new(Tensor::shared(&seismic::Charges::tally(&cpu()), Element::i32(), &[table.words()]).unwrap(), table, steps.pulse()).unwrap()
 }
 
 /// Spin until lane `lane` of `step`'s slot of `slots` is answered, by the
@@ -306,7 +306,7 @@ pub(super) fn cpu() -> seismic::Device {
 
 /// `count` words on `device`, each `initial`.
 pub(super) fn cpu_words(device: &seismic::Device, count: u64, initial: i32) -> Words {
-    Words::new(Tensor::shared(device, Element::i32(), &[count]).unwrap(), count, initial).unwrap()
+    Words::new(Tensor::shared(&seismic::Charges::tally(device), Element::i32(), &[count]).unwrap(), count, initial).unwrap()
 }
 
 /// [`layered`], its conveyor carried as `conveying` says, beside a host
@@ -371,6 +371,7 @@ pub(super) fn lending_windowed(
     assert_eq!(window_count * window_rounds, WORDS.rounds, "window lanes match WORDS.rounds");
     let device = cpu();
     let words = |count: u64, initial| cpu_words(&device, count, initial);
+    let charges = seismic::Charges::tally(&device);
     let file =
         std::env::temp_dir().join(format!("expert-watcher-{name}-{}", std::process::id()));
     // Tensor `kind`'s expert `e` holds bytes 100 kind + e.
@@ -381,7 +382,7 @@ pub(super) fn lending_windowed(
         .collect::<Vec<_>>();
     std::fs::write(&file, bytes).unwrap();
     let staging =
-        Tensor::shared(&device, Element::i32(), &[u64::from(staging_records) * 3 * 4]).unwrap();
+        Tensor::shared(&charges, Element::i32(), &[u64::from(staging_records) * 3 * 4]).unwrap();
     let stored_tensor = |kind: usize| StoredTensor {
         parts: vec![StoredPart { file: 0, base: kind as u64 * stored as u64 * RECORD, pitch: RECORD, bytes: RECORD }],
         pool: kind,
@@ -431,7 +432,7 @@ pub(super) fn lending_windowed(
     // bank's resident form, which here is the stored one; each layer's tier
     // map, none kept; and each tensor's bank records.
     let extent = u64::from(tier).max(EXPERTS as u64 * layers as u64);
-    let shared_rows = |records: u64| Tensor::shared(&device, Element::i32(), &[records, RECORD / 4]).unwrap();
+    let shared_rows = |records: u64| Tensor::shared(&charges, Element::i32(), &[records, RECORD / 4]).unwrap();
     let host = HostWords {
         tier: (0..3).map(|_| shared_rows(extent)).collect(),
         maps: (0..layers).map(|_| words(EXPERTS as u64, -1)).collect(),
@@ -469,7 +470,7 @@ pub(super) fn lending_windowed(
         .collect::<Vec<_>>();
     // Each tensor's conveyor: the bytes of the lent records it lies on,
     // which the harness addresses apart from the tier's.
-    let conveyor = Tensor::shared(&device, Element::i32(), &[conveyor_records * 3 * 4]).unwrap();
+    let conveyor = Tensor::shared(&charges, Element::i32(), &[conveyor_records * 3 * 4]).unwrap();
     let view = |tensor: &Tensor, kind: u64, records: u64| {
         let view = tensor
             .region(Element::i32(), &[records, RECORD / 4], kind * records * RECORD)
@@ -492,7 +493,7 @@ pub(super) fn lending_windowed(
     };
     // Each tensor's experts as the device's pass reads them, by window slot:
     // the scratch slots the harness's tier copy plays into.
-    let scratch = (0..3).map(|_| Tensor::shared(&device, Element::i32(), &[window_slots as u64, RECORD / 4]).unwrap()).collect::<Vec<_>>();
+    let scratch = (0..3).map(|_| Tensor::shared(&charges, Element::i32(), &[window_slots as u64, RECORD / 4]).unwrap()).collect::<Vec<_>>();
     let conveyors = conveyed();
     let carrier = Carrier {
         records: conveyor_records as usize,
@@ -827,7 +828,7 @@ impl Ahead {
         let path = std::env::temp_dir().join(format!("expert-watcher-{name}-{}", std::process::id()));
         std::fs::write(&path, vec![0u8; Self::FILE as usize]).unwrap();
         let source = ExpertSource::open(std::slice::from_ref(&path), &urgent()).unwrap();
-        let sink = Tensor::shared(&cpu(), Element::i32(), &[1, Self::FILE / 4]).unwrap();
+        let sink = Tensor::shared(&seismic::Charges::tally(&cpu()), Element::i32(), &[1, Self::FILE / 4]).unwrap();
         let records = Records::rows(&sink, Self::FILE, 1).unwrap();
         let shape = seismic_io::link_shape(&seismic_io::OpenFile::open(&path).unwrap(), Some(&urgent())).unwrap();
         let bytes = shape.due_read.min(Self::FILE);

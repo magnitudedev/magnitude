@@ -73,7 +73,7 @@ pub use site::{SITE_TERM_NAMES, SiteServed};
 #[cfg(test)]
 pub(crate) use site::{Answered, ExpertValues, reference as site_reference};
 pub(crate) use exchange::ExchangeTable;
-pub(crate) use watcher::{ParkKind, ParkSite, Parks, panic_message};
+pub(crate) use watcher::{ParkKind, ParkSite, Parks};
 pub(crate) use bank::ChainServing;
 pub(crate) use bank::{cache, derived};
 pub(crate) use source::Records;
@@ -81,6 +81,7 @@ pub use directory::{LayerCurve, MissCurve, RoutedRead};
 #[cfg(feature = "expert-routing")]
 pub use directory::{Recency, replay};
 pub use bank::LoadPools;
+pub(crate) use bank::Places;
 pub(crate) use bank::{ExpertBank, ExpertStep, HeldTable, PooledRecords, Recording, ServedBank, StepFailure, StepRoute, fixture_pool, pooled_records, pooled_slabs};
 
 use magnitude_kernels::{constants, list_extent};

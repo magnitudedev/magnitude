@@ -323,6 +323,8 @@ struct Variant {
 
 struct Ctx {
     device: Device,
+    /// What its tensors and kernels allocate through: the device's tallies.
+    charges: seismic::Charges,
     backend: BackendName,
     gguf: Option<Gguf>,
     /// Resident real weights by (tensor name, rows).
@@ -334,7 +336,7 @@ impl Ctx {
         self.backend.resident_layout()
     }
     fn tensor(&self, element: Element, shape: &[u64], bytes: &[u8]) -> Tensor {
-        Tensor::from_host(&self.device, element, shape, bytes)
+        Tensor::from_host(&self.charges, element, shape, bytes)
             .unwrap_or_else(|e| panic!("upload {} {shape:?}: {e}", element.name()))
     }
     fn dense(&self, element: Element, shape: &[u64], values: &[f32]) -> Arg {
@@ -2478,18 +2480,25 @@ fn configurations(
 ) -> Vec<Vec<(String, u64)>> {
     let params = &parameters(native);
     let total = params.iter().map(|p| p.values.len()).product::<usize>();
-    // Each parameter's declared default at the statics, in `parameters`' order.
-    let dimension = |name: &str| {
-        statics
-            .iter()
-            .find(|(static_name, _)| *static_name == name)
-            .map(|(_, value)| *value)
-    };
-    let default = native
-        .device_independent()
+    // The declaration's default at the statics, the one device-free
+    // default, each parameter's value in `parameters`' order.
+    let at = statics
+        .iter()
+        .fold(NativeSpecialization::new(), |at, (name, value)| at.with_static(*name, *value));
+    let defaults = native
+        .default_specialization_without_device(&at)
         .expect("a golden declaration's defaults read no device property")
-        .parameter_defaults(&dimension)
-        .expect("a declared default has a listed value at the case's statics");
+        .expect("the case's statics admit a default");
+    let defaults = &defaults;
+    let valued = |value: Option<u64>| value.expect("a default values every parameter");
+    let default = native
+        .params
+        .iter()
+        .map(|p| valued(defaults.param(&p.name)))
+        .chain(native.launches.iter().enumerate().flat_map(|(launch, declared)| {
+            declared.params.iter().map(move |p| valued(defaults.launch_param(launch, &p.name)))
+        }))
+        .collect::<Vec<u64>>();
     let mut chosen: Vec<Vec<u64>> = Vec::new();
     let push = |config: Vec<u64>, chosen: &mut Vec<Vec<u64>>| {
         if !chosen.contains(&config) {
@@ -2751,7 +2760,7 @@ fn run_entry(
                 .join(",");
             let prefix = format!("{}|{}", variant.label, config_label);
             let kernel = match function.prepare_native(
-                &ctx.device,
+                &ctx.charges,
                 elements.clone(),
                 specialization(&statics, config),
             ) {
@@ -2896,6 +2905,7 @@ fn golden() {
         .map(|list| list.split(',').map(str::trim).collect::<Vec<_>>());
     let gguf = std::env::var_os("GOLDEN_GGUF").map(|path| Gguf::open(Path::new(&path)));
     let ctx = Ctx {
+        charges: seismic::Charges::tally(&device),
         device,
         backend,
         gguf,

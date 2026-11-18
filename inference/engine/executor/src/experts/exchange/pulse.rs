@@ -285,9 +285,7 @@ impl Pulse {
             let (inner, generation) = (self.inner.clone(), beating.generation);
             // A thread its last table's drop ended is joined by that drop,
             // which no longer needs it here.
-            let spawned = std::thread::Builder::new()
-                .name("expert-exchange-pulse".into())
-                .spawn(move || beat(&inner, generation));
+            let spawned = seismic::threads::spawn("expert-exchange-pulse", move || beat(&inner, generation));
             match spawned {
                 Ok(thread) => beating.thread = Some(thread),
                 Err(error) => {

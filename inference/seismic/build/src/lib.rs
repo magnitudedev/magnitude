@@ -39,9 +39,9 @@
 //!     }
 //!     pub struct Elements { pub <ELEM>: seismic::Element, .. }   // polymorphic entries only
 //!     pub struct Entry;                   // impl seismic::Entry
-//!     pub fn for_device(device: &seismic::Device, options: seismic::PreparationOptions)
+//!     pub fn for_device(charges: &seismic::Charges, options: seismic::PreparationOptions)
 //!         -> Result<seismic::Kernel<Entry>, seismic::LoadError>;                 // monomorphic
-//!     pub fn for_device_with(device: &seismic::Device, options: seismic::PreparationOptions, elements: Elements)
+//!     pub fn for_device_with(charges: &seismic::Charges, options: seismic::PreparationOptions, elements: Elements)
 //!         -> Result<seismic::Kernel<Entry>, seismic::LoadError>;                 // polymorphic
 //!     pub fn native_for_device(device: &seismic::Device)
 //!         -> Result<seismic::NativeKernel<Entry>, seismic::LoadError>;           // when declared
@@ -1643,10 +1643,10 @@ mod internals {
         render_invocation_scope(out, entry);
 
         if entry.element_parameters.is_empty() {
-            out.push_str("  pub fn for_device(device: &seismic::Device, options: seismic::PreparationOptions) -> Result<seismic::Kernel<Entry>, seismic::LoadError> { seismic::generated::prepare::<Entry>(device, options, &[]) }\n");
+            out.push_str("  pub fn for_device(charges: &seismic::Charges, options: seismic::PreparationOptions) -> Result<seismic::Kernel<Entry>, seismic::LoadError> { seismic::generated::prepare::<Entry>(charges, options, &[]) }\n");
         } else {
-            out.push_str("  pub fn for_device_with(device: &seismic::Device, options: seismic::PreparationOptions, elements: Elements) -> Result<seismic::Kernel<Entry>, seismic::LoadError> {\n");
-            out.push_str("    seismic::generated::prepare::<Entry>(device, options, &[\n");
+            out.push_str("  pub fn for_device_with(charges: &seismic::Charges, options: seismic::PreparationOptions, elements: Elements) -> Result<seismic::Kernel<Entry>, seismic::LoadError> {\n");
+            out.push_str("    seismic::generated::prepare::<Entry>(charges, options, &[\n");
             for parameter in &entry.element_parameters {
                 out.push_str(&format!(
                     "      ({:?}, elements.{}),\n",
@@ -1657,11 +1657,11 @@ mod internals {
             out.push_str("    ])\n  }\n");
         }
         if entry.element_parameters.is_empty() {
-            out.push_str("  pub fn start_feedback(device: &seismic::Device, precision: seismic::PrecisionPolicy, options: seismic::FeedbackOptions) -> Result<(seismic::FeedbackPreparation<'_, Entry>, seismic::Kernel<Entry>), seismic::LoadError> { seismic::generated::start_feedback::<Entry>(device, precision, options, &[]) }\n");
+            out.push_str("  pub fn start_feedback(charges: &seismic::Charges, precision: seismic::PrecisionPolicy, options: seismic::FeedbackOptions) -> Result<(seismic::FeedbackPreparation<'_, Entry>, seismic::Kernel<Entry>), seismic::LoadError> { seismic::generated::start_feedback::<Entry>(charges, precision, options, &[]) }\n");
         } else {
-            out.push_str("  pub fn start_feedback_with(device: &seismic::Device, precision: seismic::PrecisionPolicy, options: seismic::FeedbackOptions, elements: Elements) -> Result<(seismic::FeedbackPreparation<'_, Entry>, seismic::Kernel<Entry>), seismic::LoadError> {\n");
+            out.push_str("  pub fn start_feedback_with(charges: &seismic::Charges, precision: seismic::PrecisionPolicy, options: seismic::FeedbackOptions, elements: Elements) -> Result<(seismic::FeedbackPreparation<'_, Entry>, seismic::Kernel<Entry>), seismic::LoadError> {\n");
             out.push_str(
-                "    seismic::generated::start_feedback::<Entry>(device, precision, options, &[\n",
+                "    seismic::generated::start_feedback::<Entry>(charges, precision, options, &[\n",
             );
             for parameter in &entry.element_parameters {
                 out.push_str(&format!(
@@ -1720,14 +1720,14 @@ mod internals {
             out.push_str("    seismic::generated::bound_entry::<Entry>(&[\n");
             element_list(out);
             out.push_str(&format!("    ], {cpu})\n  }}\n"));
-            out.push_str("  pub fn native_tune_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
-            out.push_str("    seismic::generated::tune_native::<Entry>(device, statics, &[\n");
+            out.push_str("  pub fn native_tune_with<'a>(charges: &seismic::Charges, elements: Elements, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
+            out.push_str("    seismic::generated::tune_native::<Entry>(charges, statics, &[\n");
             element_list(out);
             out.push_str(&format!(
                 "    ], {cpu}, &mut points, validation, strategy)\n  }}\n"
             ));
-            out.push_str("  pub fn native_search_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {\n");
-            out.push_str("    seismic::generated::search_native::<Entry>(device, statics, &[\n");
+            out.push_str("  pub fn native_search_with<'a>(charges: &seismic::Charges, elements: Elements, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {\n");
+            out.push_str("    seismic::generated::search_native::<Entry>(charges, statics, &[\n");
             element_list(out);
             out.push_str(&format!("    ], {cpu}, validation)\n  }}\n"));
             out.push_str("  pub fn native_digest_with(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {\n");
@@ -1739,8 +1739,8 @@ mod internals {
             out.push_str("  /// Whether preparation on a `backend` device takes `specialization`, decided without a device.\n");
             out.push_str(&format!("  pub fn native_admission(backend: seismic::BackendName, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeAdmission, seismic::CheckedBundleError> {{ seismic::generated::admit_native::<Entry>(backend, specialization, &[], {cpu}) }}\n"));
             out.push_str(&format!("  pub fn native_entry() -> seismic::BoundEntry<Entry> {{ seismic::generated::bound_entry::<Entry>(&[], {cpu}) }}\n"));
-            out.push_str(&format!("  pub fn native_tune<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, &mut points, validation, strategy) }}\n"));
-            out.push_str(&format!("  pub fn native_search<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {{ seismic::generated::search_native::<Entry>(device, statics, &[], {cpu}, validation) }}\n"));
+            out.push_str(&format!("  pub fn native_tune<'a>(charges: &seismic::Charges, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(charges, statics, &[], {cpu}, &mut points, validation, strategy) }}\n"));
+            out.push_str(&format!("  pub fn native_search<'a>(charges: &seismic::Charges, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {{ seismic::generated::search_native::<Entry>(charges, statics, &[], {cpu}, validation) }}\n"));
             out.push_str(&format!("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {{ seismic::generated::digest_native::<Entry>(device, statics, &[], {cpu}) }}\n"));
         }
         out.push_str("  /// The checked native implementation for the device's backend.\n");

@@ -103,6 +103,7 @@ fn table_weight(
     scale: f32,
     random: &mut Rng,
 ) -> (Tensor, Vec<f32>) {
+    let charges = seismic::Charges::tally(device);
     let Some(GgufBlocks {
         external,
         resident,
@@ -142,7 +143,7 @@ fn table_weight(
         .map(|value| value as f32)
         .collect::<Vec<_>>();
     let source =
-        Tensor::from_host(device, external, &[1, rows as u64, columns as u64], &bytes).unwrap();
+        Tensor::from_host(&charges, external, &[1, rows as u64, columns as u64], &bytes).unwrap();
     let table = at_defaults(
         device,
         repack_weight::native_entry_with(repack_weight::Elements {
@@ -150,7 +151,7 @@ fn table_weight(
             U: Element::stored(resident, layout).unwrap(),
         }),
     )
-    .call(repack_weight::Args { source: &source })
+    .call(&charges, repack_weight::Args { source: &source })
     .unwrap()
     .value
     .reshape(&shape)
@@ -167,6 +168,7 @@ fn q8_weight(
     scale: f32,
     random: &mut Rng,
 ) -> (Tensor, Vec<f32>) {
+    let charges = seismic::Charges::tally(device);
     assert_eq!(columns % 32, 0);
     let scale_bits = f16_bits(scale);
     let scale = half_to_f32(scale_bits);
@@ -182,7 +184,7 @@ fn q8_weight(
     }
     let external = Element::named("gguf_q8_0").unwrap();
     let source =
-        Tensor::from_host(device, external, &[1, rows as u64, columns as u64], &bytes).unwrap();
+        Tensor::from_host(&charges, external, &[1, rows as u64, columns as u64], &bytes).unwrap();
     // Declared parameters (the CPU's rows per work item) take their defaults.
     let weight = at_defaults(
         device,
@@ -191,7 +193,7 @@ fn q8_weight(
             U: resident_q8(device),
         }),
     )
-    .call(repack_weight::Args { source: &source })
+    .call(&charges, repack_weight::Args { source: &source })
     .unwrap()
     .value
     .reshape(&[rows as u64, columns as u64])
@@ -237,19 +239,21 @@ fn half_to_f32(bits: u16) -> f32 {
 }
 
 fn i32_tensor(device: &Device, shape: &[u64], values: &[i32]) -> Tensor {
+    let charges = seismic::Charges::tally(device);
     let bytes = values
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::i32(), shape, &bytes).unwrap()
+    Tensor::from_host(&charges, Element::i32(), shape, &bytes).unwrap()
 }
 
 fn bf16_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
+    let charges = seismic::Charges::tally(device);
     let bytes = values
         .iter()
         .flat_map(|value| ((bf16_round(*value).to_bits() >> 16) as u16).to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::bf16(), shape, &bytes).unwrap()
+    Tensor::from_host(&charges, Element::bf16(), shape, &bytes).unwrap()
 }
 
 /// The entry's contract on the host: both RMS norms rounded to bf16, then the
@@ -313,6 +317,7 @@ fn draft_rows_match_the_host_model_over_resident_weights() {
 }
 
 fn draft_rows_match_on(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     // Vulkan fixes the width D at preparation (it sizes the shared joined
     // row); the other backends declare no statics. Declared parameters (the
     // CPU's weight rows per work item) take their defaults.
@@ -374,14 +379,14 @@ fn draft_rows_match_on(device: &Device) {
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
         let tokens =
-            Tensor::from_host(&device, Element::i32(), &[rows as u64, 2], &token_bytes).unwrap();
+            Tensor::from_host(&charges, Element::i32(), &[rows as u64, 2], &token_bytes).unwrap();
         let conditioning = bf16_tensor(&device, &[rows as u64, width as u64], &conditioning_values);
         let embedding_norm = bf16_tensor(&device, &[width as u64], &embedding_norm_values);
         let hidden_norm = bf16_tensor(&device, &[width as u64], &hidden_norm_values);
         // An empty directory: the selections are the table's rows.
         let direct = i32_tensor(device, &[0, 1], &[]);
         let result = kernel
-            .call(draft_rows::Args {
+            .call(&charges, draft_rows::Args {
                 tokens: &tokens,
                 directory: &direct,
                 table: &table,
@@ -450,7 +455,7 @@ fn draft_rows_match_on(device: &Device) {
             .collect::<Vec<_>>();
         let read = |tokens: &[[i32; 2]], directory: &Tensor| {
             kernel
-                .call(draft_rows::Args {
+                .call(&charges, draft_rows::Args {
                     tokens: &i32_tensor(device, &[rows as u64, 2], tokens.as_flattened()),
                     directory,
                     table: &table,
@@ -476,7 +481,7 @@ fn draft_rows_match_on(device: &Device) {
         );
         if device.backend() == seismic::BackendName::Cpu {
             let quantized = prepare(width, true)
-                .call(draft_rows::Args {
+                .call(&charges, draft_rows::Args {
                     tokens: &tokens,
                     directory: &direct,
                     table: &table,
@@ -512,6 +517,7 @@ fn draft_rows_match_on(device: &Device) {
 fn draft_rows_preserve_distinct_f32_streams() {
     for device in seismic_native_tests::devices(&[seismic::BackendName::Cuda, seismic::BackendName::Metal, seismic::BackendName::Cpu, seismic::BackendName::Vulkan]) {
         let backend = device.backend();
+        let charges = seismic::Charges::tally(&device);
         let width = 64;
         let streams = 4;
         for rows in [1, 4, 5, 16, 17, 65] {
@@ -533,7 +539,7 @@ fn draft_rows_preserve_distinct_f32_streams() {
                     .collect::<Vec<_>>(),
             );
             let conditioning = Tensor::from_host(
-                &device,
+                &charges,
                 Element::f32(),
                 &[rows as u64, (streams * width) as u64],
                 &hv.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
@@ -556,7 +562,7 @@ fn draft_rows_preserve_distinct_f32_streams() {
                 false,
             );
             let result = kernel
-                .call(draft_rows::Args {
+                .call(&charges, draft_rows::Args {
                     tokens: &tokens,
                     directory: &direct,
                     table: &table,
@@ -632,6 +638,7 @@ fn draft_rows_match_with_table(
     vocabulary: usize,
     rows: usize,
 ) {
+    let charges = seismic::Charges::tally(device);
     let mut random = Rng(width as u64 * 131 + rows as u64 * 7 + form as u64);
     let (table, table_values) =
         table_weight(device, form, layout, vocabulary, width, 1.0, &mut random);
@@ -675,7 +682,7 @@ fn draft_rows_match_with_table(
             .collect::<Vec<_>>(),
     );
     let actual = kernel
-        .call(draft_rows::Args {
+        .call(&charges, draft_rows::Args {
             tokens: &tokens,
             directory: &i32_tensor(device, &[0, 1], &[]),
             table: &table,

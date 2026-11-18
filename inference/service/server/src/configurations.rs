@@ -57,8 +57,23 @@ pub struct ResolvedConfiguration {
     pub manifest: ExecutionManifest,
     /// The installed packages the configuration reads.
     pub package_ids: Vec<ModelPackageId>,
-    /// Keeps the resolved material alive while the configuration is in use.
+}
+
+/// A configuration as one user of it holds it: the shared configuration, and that user's own
+/// resolution of the material it reads, which holds the material's files for as long as the user
+/// does. The cache keeps configurations only, never a file: a removal of the files waits for no
+/// cached configuration.
+pub struct HeldConfiguration {
+    pub configuration: Arc<ResolvedConfiguration>,
     _material: ResolvedServableModelBundle,
+}
+
+impl std::ops::Deref for HeldConfiguration {
+    type Target = ResolvedConfiguration;
+
+    fn deref(&self) -> &ResolvedConfiguration {
+        &self.configuration
+    }
 }
 
 /// The shared resolved-configuration cache.
@@ -89,16 +104,16 @@ impl ResolvedConfigurations {
         }
     }
 
-    /// The configuration's resolution at its profile's context, resolving it once for concurrent
-    /// callers. A resolution is kept by its bundle, its context and the files its packages are at
+    /// The configuration's resolution at its profile's context, held by the caller, resolving the
+    /// configuration once for concurrent callers. A resolution is kept by its bundle, its context and the files its packages are at
     /// now: a package is named by its content, which may be in several places or move, so a file
     /// moved, or the copy that served it gone, resolves afresh from where the package is, never
     /// from where it was.
     pub async fn resolve(
         &self,
         configuration: &ModelServingConfiguration,
-    ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
-        let (input, package_ids) = installed_bundle(&configuration.bundle);
+    ) -> Result<HeldConfiguration, InventoryError> {
+        let (input, package_ids) = (installed_bundle(&configuration.bundle), configuration.bundle.package_ids());
         let material = self.models.resolve_bundle(input).await?;
         let paths = engine_material(&material)?;
         let context_tokens = configuration.profile.context_length;
@@ -110,27 +125,15 @@ impl ResolvedConfigurations {
                 .chain(paths.draft.clone())
                 .collect(),
         };
-        self.cache
-            .resolve(key, || {
-                self.resolve_material(material, paths, package_ids, context_tokens)
-            })
-            .await
-    }
-
-    /// Forget every configuration reading one of `package_ids`, before those packages are
-    /// removed.
-    pub fn evict_packages(&self, package_ids: &[ModelPackageId]) {
-        self.cache.forget_where(|resolved| {
-            resolved
-                .package_ids
-                .iter()
-                .any(|package_id| package_ids.contains(package_id))
-        });
+        let configuration = self
+            .cache
+            .resolve(key, || self.resolve_material(paths, package_ids, context_tokens))
+            .await?;
+        Ok(HeldConfiguration { configuration, _material: material })
     }
 
     async fn resolve_material(
         &self,
-        material: ResolvedServableModelBundle,
         paths: ModelPackagePaths,
         package_ids: Vec<ModelPackageId>,
         context_tokens: u32,
@@ -150,7 +153,6 @@ impl ResolvedConfigurations {
             host: Arc::new(resolved.host),
             manifest: resolved.manifest,
             package_ids,
-            _material: material,
         }))
     }
 }
@@ -192,43 +194,29 @@ fn engine_configuration(
     }
 }
 
-/// The bundle over its installed packages, and the packages it reads.
-fn installed_bundle(bundle: &ServableModelBundle) -> (ModelBundleInput, Vec<ModelPackageId>) {
+/// The bundle over its installed packages.
+fn installed_bundle(bundle: &ServableModelBundle) -> ModelBundleInput {
     let installed = |package_id: &ModelPackageId| ModelPackageOperand::Installed {
         package_id: package_id.clone(),
     };
     match bundle {
-        ServableModelBundle::Standalone { package } => (
-            ModelBundleInput::Standalone {
-                package: installed(&package.id),
-            },
-            vec![package.id.clone()],
-        ),
+        ServableModelBundle::Standalone { package } => ModelBundleInput::Standalone {
+            package: installed(&package.id),
+        },
         ServableModelBundle::SpeculativeDecoding {
             target,
             draft_source,
             method,
-        } => {
-            let (draft_source, package_ids) = match draft_source {
-                SpeculativeDraftSource::Embedded => {
-                    (SpeculativeDraftSourceInput::Embedded, vec![target.id.clone()])
-                }
-                SpeculativeDraftSource::Separate { draft } => (
-                    SpeculativeDraftSourceInput::Separate {
-                        draft: installed(&draft.id),
-                    },
-                    vec![target.id.clone(), draft.id.clone()],
-                ),
-            };
-            (
-                ModelBundleInput::SpeculativeDecoding {
-                    target: installed(&target.id),
-                    draft_source,
-                    method: method.clone(),
+        } => ModelBundleInput::SpeculativeDecoding {
+            target: installed(&target.id),
+            draft_source: match draft_source {
+                SpeculativeDraftSource::Embedded => SpeculativeDraftSourceInput::Embedded,
+                SpeculativeDraftSource::Separate { draft } => SpeculativeDraftSourceInput::Separate {
+                    draft: installed(&draft.id),
                 },
-                package_ids,
-            )
-        }
+            },
+            method: method.clone(),
+        },
     }
 }
 
@@ -294,21 +282,6 @@ impl<T, K: Clone + Ord> ResolutionCache<T, K> {
             Err(_) => self.forget(&key, &entry),
         }
         resolved
-    }
-
-    fn forget_where(&self, matches: impl Fn(&T) -> bool) {
-        self.recent
-            .lock()
-            .expect("resolution cache lock")
-            .retain(|(_, entry)| entry.get().is_none_or(|resolved| !matches(resolved)));
-        self.held
-            .lock()
-            .expect("resolution cache lock")
-            .retain(|_, resolved| {
-                resolved
-                    .upgrade()
-                    .is_some_and(|resolved| !matches(&resolved))
-            });
     }
 
     fn entry(&self, key: &K) -> Entry<T> {
@@ -506,22 +479,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forgetting_drops_recent_and_held_resolutions_and_a_failure_is_not_kept() {
+    async fn a_failure_is_not_kept() {
         let cache =
             ResolutionCache::<String, ServableModelBundleKey>::new(RETAINED_CONFIGURATIONS);
         let resolutions = std::sync::atomic::AtomicUsize::new(0);
-        let held = resolve_counting(&cache, 1, &resolutions).await;
-        resolve_counting(&cache, 2, &resolutions).await;
-        cache.forget_where(|resolved| resolved.as_str() == "model 1");
-        resolve_counting(&cache, 1, &resolutions).await;
-        assert_eq!(resolutions.load(std::sync::atomic::Ordering::Relaxed), 3);
-        drop(held);
-
         let failed = cache
             .resolve(key(9), || async { Err::<Arc<String>, _>("unreadable") })
             .await;
         assert_eq!(failed, Err("unreadable"));
         resolve_counting(&cache, 9, &resolutions).await;
-        assert_eq!(resolutions.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(resolutions.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

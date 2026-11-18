@@ -1131,7 +1131,10 @@ pub struct ModelDefinition {
     pub inputs: InputSemantics,
     pub decoder: Decoder,
     pub head: Option<Head>,
-    pub vision: Option<VisionDescription>,
+    /// Boxed: three fifths of a definition's bytes, which every plan,
+    /// program and assessment holding a definition by value would carry
+    /// for a model without it too.
+    pub vision: Option<Box<VisionDescription>>,
     /// The package's separate draft component.
     pub draft: Option<DraftDefinition>,
 }

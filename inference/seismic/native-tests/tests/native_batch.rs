@@ -6,6 +6,7 @@ fn different_native_entries_complete_in_one_metal_batch() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let rows =
         scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();
@@ -24,14 +25,14 @@ fn different_native_entries_complete_in_one_metal_batch() {
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>()
     };
-    let first = Tensor::from_host(&device, Element::f32(), &[2, 2], &bytes(&first_values)).unwrap();
-    let second = Tensor::from_host(&device, Element::f32(), &[7], &bytes(&second_values)).unwrap();
+    let first = Tensor::from_host(&charges, Element::f32(), &[2, 2], &bytes(&first_values)).unwrap();
+    let second = Tensor::from_host(&charges, Element::f32(), &[7], &bytes(&second_values)).unwrap();
     // SAFETY: both authored entries write every f32 result element.
     let mut first_result =
-        unsafe { Tensor::uninitialized(&device, Element::f32(), &[2, 2]) }.unwrap();
+        unsafe { Tensor::uninitialized(&charges, Element::f32(), &[2, 2]) }.unwrap();
     let mut second_result =
-        unsafe { Tensor::uninitialized(&device, Element::f32(), &[7]) }.unwrap();
-    let mut batch = NativeTensorBatch::new(&device);
+        unsafe { Tensor::uninitialized(&charges, Element::f32(), &[7]) }.unwrap();
+    let mut batch = NativeTensorBatch::new(&charges);
     batch
         .push(
             &rows,
@@ -91,12 +92,13 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     // Both a demanded case and a zero-demand required witness have no evidence
     // merely because their canonical program can be formed.
     for weight in [1., 0.] {
         let mut points = UnbuiltPoints { weight };
         let unprepared = scoped_scale::native_search(
-            &device,
+            &charges,
             &NativeSpecialization::new(),
             NumericalRequirement::BitExact,
         )
@@ -109,7 +111,7 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
             "a record cannot compile a missing default"
         );
         let mut search = scoped_scale::native_search(
-            &device,
+            &charges,
             &NativeSpecialization::new(),
             NumericalRequirement::BitExact,
         )
@@ -152,18 +154,19 @@ fn time_batches(batches: usize, launches: usize) {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let rows =
         scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();
     let values = [1.0f32, -2.0, 3.0, 4.0];
     let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
-    let input = Tensor::from_host(&device, Element::f32(), &[2, 2], &bytes).unwrap();
+    let input = Tensor::from_host(&charges, Element::f32(), &[2, 2], &bytes).unwrap();
     // SAFETY: the authored entry writes every f32 result element.
-    let mut result = unsafe { Tensor::uninitialized(&device, Element::f32(), &[2, 2]) }.unwrap();
+    let mut result = unsafe { Tensor::uninitialized(&charges, Element::f32(), &[2, 2]) }.unwrap();
     let trace = device.trace_submissions(seismic::TraceDetail::Launches).unwrap();
     let mut completions = Vec::new();
     for _ in 0..batches {
-        let mut batch = NativeTensorBatch::new(&device);
+        let mut batch = NativeTensorBatch::new(&charges);
         for _ in 0..launches {
             batch
                 .push(

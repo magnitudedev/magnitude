@@ -755,13 +755,14 @@ impl PreparedTargetReadoutGraphs {
 
     pub(crate) fn bind_weights(
         self: &std::sync::Arc<Self>,
+        charges: &seismic::Charges,
         resident: &ResidentTarget,
     ) -> Result<BoundTargetReadoutGraphs, String> {
         let mut bound = BTreeMap::new();
         for ((fuses, class), graph) in &self.classes {
             let mut fixed = Vec::new();
             let absent_scale = seismic::Tensor::from_host(
-                &resident.embedding.tensor().device(),
+                charges,
                 Element::f32(),
                 &[0],
                 &[],
@@ -814,7 +815,7 @@ impl PreparedTargetReadoutGraphs {
                 (*fuses, *class),
                 graph
                     .plan
-                    .bind_static(&fixed)
+                    .bind_static(charges, &fixed)
                     .map_err(|error| format!("readout graph class {class:?}: {error}"))?,
             );
         }
@@ -3095,8 +3096,9 @@ mod select_tests {
         GraphDraft::export(&mut graph, confidence_port.tensor()).unwrap();
         let plan = GraphDraft::seal(graph).unwrap();
 
+        let charges = seismic::Charges::tally(&device);
         let tensor = |element: Element, extents: &[u64], bytes: Vec<u8>| {
-            Tensor::from_host(&device, element, extents, &bytes).unwrap()
+            Tensor::from_host(&charges, element, extents, &bytes).unwrap()
         };
         let mask_words = vocabulary.div_ceil(32);
         let mut bindings = plan.bindings();
@@ -3108,16 +3110,16 @@ mod select_tests {
             ),
         ];
         for (port, tensor) in &bound {
-            bindings.set(port, tensor).unwrap();
+            bindings.set(&charges, port, tensor).unwrap();
         }
         // The sampler's inputs are written into the run's slot, as a
         // drafter's are: no row constrained, zero draws select greedily.
-        let mut slot = plan.new_slot().unwrap();
+        let mut slot = plan.new_slot(&charges).unwrap();
         slot.write_input(&mask, &vec![0; (rows * mask_words * 4) as usize]).unwrap();
         slot.write_input(&constrained, &vec![0; (rows * 4) as usize]).unwrap();
         slot.write_input(&draws, &vec![0; (rows * 6 * 4) as usize]).unwrap();
         let (outputs, completion) = slot
-            .attach(bindings, plan.new_outputs().unwrap())
+            .attach(bindings, plan.new_outputs(&charges).unwrap())
             .unwrap()
             .submit()
             .unwrap();

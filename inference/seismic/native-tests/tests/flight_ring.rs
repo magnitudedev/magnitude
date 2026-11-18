@@ -30,9 +30,10 @@ fn an_entry_is_rewritten_only_after_its_batch_completed(backend: BackendName) {
     let kernel =
         scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();
+    let charges = seismic::Charges::tally(&device);
     for depth in 1..=3 {
         let mut ring = FlightRing::<Tensor, NativeTensorBatchCompletion>::default();
-        ring.resize(depth, || Tensor::shared(&device, Element::f32(), &[ROWS, COLUMNS]))
+        ring.resize(depth, || Tensor::shared(&charges, Element::f32(), &[ROWS, COLUMNS]))
             .unwrap();
         let mut flying: VecDeque<(Tensor, Vec<f32>)> = VecDeque::new();
         let observe = |(result, expected): (Tensor, Vec<f32>)| {
@@ -51,8 +52,8 @@ fn an_entry_is_rewritten_only_after_its_batch_completed(backend: BackendName) {
             unsafe { entry.value().write_shared(0, &bytes(&values)) }.unwrap();
             // SAFETY: the entry writes every f32 result element.
             let mut result =
-                unsafe { Tensor::uninitialized(&device, Element::f32(), &[ROWS, COLUMNS]) }.unwrap();
-            let mut batch = NativeTensorBatch::new(&device);
+                unsafe { Tensor::uninitialized(&charges, Element::f32(), &[ROWS, COLUMNS]) }.unwrap();
+            let mut batch = NativeTensorBatch::new(&charges);
             batch
                 .push(
                     &kernel,

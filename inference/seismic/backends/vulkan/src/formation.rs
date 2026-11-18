@@ -468,8 +468,11 @@ mod tests {
         let source = format!(
             "#version 460\n\
              #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n\
+             #extension GL_KHR_cooperative_matrix : require\n\
+             #extension GL_KHR_memory_scope_semantics : require\n\
              layout(local_size_x = 32) in;\n\
              layout(set = 0, binding = 0, std430) buffer Output {{ uint64_t x[]; }} data;\n\
+             layout(set = 0, binding = 1, std430) buffer Floats {{ float x[]; }} floats;\n\
              {globals}\n\
              void probe() {{ {body} }}\n\
              void main() {{ SEISMIC_KERNEL(); }}\n"
@@ -533,6 +536,170 @@ mod tests {
         formed(
             "",
             &format!("{OUT} = uint64_t(uint(data.x[0]) / uint(data.x[1]) + uint(data.x[2]) % 7u);"),
+        );
+    }
+
+    #[test]
+    fn a_constant_table_in_per_invocation_storage_is_refused() {
+        let table = "const uint64_t t[4] = uint64_t[4](3, 5, 7, 11);";
+        refused(
+            "",
+            &format!("{table} {OUT} = t[uint(data.x[0]) & 3u];"),
+            "constant table",
+        );
+        let large = (0..256)
+            .map(|value| (value * value + 3).to_string())
+            .collect::<Vec<_>>();
+        refused(
+            "",
+            &format!(
+                "const uint64_t t[256] = uint64_t[256]({}); {OUT} = t[uint(data.x[0]) & 255u];",
+                large.join(", ")
+            ),
+            "constant table",
+        );
+        refused(
+            "",
+            &format!(
+                "const uint64_t t[2][2] = uint64_t[2][2](uint64_t[2](3, 5), uint64_t[2](7, 11)); uint i = uint(data.x[0]); {OUT} = t[i & 1u][(i >> 1) & 1u];"
+            ),
+            "constant table",
+        );
+        // Rows equal to each other are still tables.
+        refused(
+            "",
+            &format!(
+                "const uint64_t t[2][2] = uint64_t[2][2](uint64_t[2](3, 5), uint64_t[2](3, 5)); uint i = uint(data.x[0]); {OUT} = t[i & 1u][(i >> 1) & 1u];"
+            ),
+            "constant table",
+        );
+        refused(
+            "",
+            &format!("{table} uint64_t u[4] = t; {OUT} = u[uint(data.x[0]) & 3u];"),
+            "constant table",
+        );
+        // A table passed to a function is copied into its parameter.
+        refused(
+            "const uint64_t T[4] = uint64_t[4](3, 5, 7, 11);\n\
+             uint64_t pick(const uint64_t t[4], uint i) { return t[i]; }",
+            &format!("{OUT} = pick(T, uint(data.x[0]) & 3u);"),
+            "constant table",
+        );
+    }
+
+    #[test]
+    fn working_state_and_vectors_form() {
+        formed(
+            "",
+            &format!("uint64_t t[4] = uint64_t[4](0, 0, 0, 0); t[uint(data.x[0]) & 3u] = data.x[1]; {OUT} = t[uint(data.x[2]) & 3u];"),
+        );
+        formed(
+            "",
+            &format!("uint64_t t[4] = uint64_t[4](7, 7, 7, 7); t[uint(data.x[1]) & 3u] = data.x[2]; {OUT} = t[uint(data.x[0]) & 3u];"),
+        );
+        formed(
+            "",
+            &format!("float t[8]; for (uint i = 0u; i < 8u; i++) t[i] = 0.0; t[uint(data.x[1]) & 7u] = 1.0; {OUT} = uint64_t(uint(t[uint(data.x[0]) & 7u]));"),
+        );
+        formed(
+            "",
+            &format!("uvec4 t = uvec4(0); t[uint(data.x[0]) & 3u] = uint(data.x[1]); {OUT} = t[uint(data.x[2]) & 3u];"),
+        );
+        formed(
+            "",
+            &format!("u64vec4 t = u64vec4(3, 5, 7, 11); {OUT} = t[uint(data.x[0]) & 3u];"),
+        );
+        // Constant indexing folds the table away.
+        formed(
+            "",
+            &format!("const uint64_t t[4] = uint64_t[4](3, 5, 7, 11); {OUT} = t[2] + data.x[0];"),
+        );
+    }
+
+    /// A splat whose equal elements are distinct constants is still a splat:
+    /// equality is of values, not ids.
+    #[test]
+    fn splats_compare_by_value() {
+        let module = form(
+            "",
+            &format!("uint64_t t[4] = uint64_t[4](7, 7, 7, 7); t[uint(data.x[1]) & 3u] = data.x[2]; {OUT} = t[uint(data.x[0]) & 3u];"),
+        )
+        .expect("a splat forms");
+        // Give the composite's first element a fresh constant of equal value.
+        let mut at = 5;
+        let (mut seven, mut composite) = (None, None);
+        while at < module.len() {
+            let (words, opcode) = ((module[at] >> 16) as usize, module[at] & 0xffff);
+            if opcode == 43 && module[at + 3] == 7 && words == 5 {
+                seven = Some(at);
+            }
+            if opcode == 44 && seven.is_some_and(|seven| module[at + 3] == module[seven + 2]) {
+                composite = Some(at);
+            }
+            at += words;
+        }
+        let (seven, composite) = (
+            seven.expect("the constant 7"),
+            composite.expect("the splat"),
+        );
+        let fresh = module[3];
+        let mut patched = module.clone();
+        patched[3] += 1;
+        patched[composite + 3 + 1] = fresh;
+        let copy = [
+            module[seven],
+            module[seven + 1],
+            fresh,
+            module[seven + 3],
+            module[seven + 4],
+        ];
+        let after = seven + 5;
+        patched.splice(after..after, copy);
+        assert_eq!(seal::contract(&patched), Ok(vec![]));
+        // An unequal element makes it a table.
+        let mut unequal = patched.clone();
+        unequal[after + 3] = 8;
+        assert_eq!(seal::contract(&unequal).expect("parses").len(), 1);
+    }
+
+    #[test]
+    fn a_float_converted_to_a_64_bit_integer_is_refused() {
+        let value = "uintBitsToFloat(uint(data.x[0]))";
+        refused("", &format!("{OUT} = uint64_t({value});"), "64-bit OpConvertFToU");
+        refused(
+            "",
+            &format!("{OUT} = uint64_t(int64_t({value}));"),
+            "64-bit OpConvertFToS",
+        );
+        refused(
+            "",
+            &format!("{OUT} = u64vec2({value}, 1.0).x;"),
+            "64-bit OpConvertFToU",
+        );
+        formed("", &format!("{OUT} = uint64_t(uint({value}));"));
+        formed("", &format!("{OUT} = uint64_t(int({value}));"));
+    }
+
+    const ACCUMULATOR: &str = "coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>";
+
+    #[test]
+    fn a_cooperative_matrix_constant_two_functions_read_is_refused() {
+        let store = "coopMatStore(c, floats.x, 0, 16, gl_CooperativeMatrixLayoutRowMajor);";
+        refused(
+            &format!(
+                "{ACCUMULATOR} zero_a() {{ return {ACCUMULATOR}(0.0); }}\n\
+                 {ACCUMULATOR} zero_b() {{ return {ACCUMULATOR}(0.0); }}"
+            ),
+            &format!("{ACCUMULATOR} c = data.x[0] == 0ul ? zero_a() : zero_b(); {store}"),
+            "cooperative-matrix constant",
+        );
+        // One function holds the constant; its callers read its result.
+        formed(
+            &format!(
+                "{ACCUMULATOR} zero() {{ return {ACCUMULATOR}(0.0); }}\n\
+                 {ACCUMULATOR} cleared() {{ return zero(); }}"
+            ),
+            &format!("{ACCUMULATOR} c = data.x[0] == 0ul ? zero() : cleared(); {store}"),
         );
     }
 }

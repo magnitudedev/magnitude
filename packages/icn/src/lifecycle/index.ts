@@ -12,6 +12,7 @@ import {
 } from "@magnitudedev/icn-protocol";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
 import { FSM } from "@magnitudedev/utils";
+import { writeFileAtomic } from "@magnitudedev/utils/atomic-file";
 import { openLogFile, type LogFile } from "@magnitudedev/utils/log-file";
 import { dirname, join } from "node:path";
 import { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schemas";
@@ -382,12 +383,9 @@ export const renderIcnArguments = (
 /** ICN's first scan reads this snapshot, so it must exist before the child starts. */
 export const writeLocalModelsConfiguration = (storage: IcnStorageConfig) =>
   Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const file = storage.localModelsConfigurationFile;
     const encoded = yield* Schema.encode(Schema.parseJson(LocalModelsConfiguration))(storage.localModels);
-    yield* fs.makeDirectory(dirname(file), { recursive: true });
-    yield* fs.writeFileString(`${file}.pending`, encoded);
-    yield* fs.rename(`${file}.pending`, file);
+    // A temporary name of this writer's own, then a rename: two writers at once never tear it.
+    yield* writeFileAtomic(storage.localModelsConfigurationFile, encoded);
   });
 
 /**

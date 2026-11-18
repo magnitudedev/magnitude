@@ -130,22 +130,22 @@ fn idle_slots_a_claim_takes_are_released_with_what_yielded() {
         assert_eq!(places, 3, "{backend:?}");
         domain.close_group().unwrap();
         assert!(idle_cache(&domain) > 0, "{backend:?}: the closed class idles as cache");
-        assert!(!domain.idle_slots_taken(), "{backend:?}");
+        assert!(!domain.idle_class.taken(), "{backend:?}");
         // A claim takes every byte that yields, the idle slots' cache among
         // it (it yields before the bank's).
         let ledger = domain.resources.ledgers().device().clone();
-        let (_all, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
-        assert!(domain.idle_slots_taken(), "{backend:?}: the claim took the idle slots' cache");
+        let (_all, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX));
+        assert!(domain.idle_class.taken(), "{backend:?}: the claim took the idle slots' cache");
         assert_eq!(
             domain.release_yielded(&mut bindings, crate::CompletionWake::new(|| {})).unwrap(),
             crate::domain::Yielded::Pending,
             "{backend:?}: the slots' release begins"
         );
-        while domain.advance_slot_release().unwrap().is_none() {
+        while domain.advance_slot_release().is_none() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(idle_cache(&domain), 0, "{backend:?}: the released slots' cache is gone");
-        assert!(!domain.idle_slots_taken(), "{backend:?}");
+        assert!(!domain.idle_class.taken(), "{backend:?}");
     }
 }
 
@@ -165,14 +165,14 @@ fn a_taken_idle_cache_with_no_slot_left_goes_in_a_change() {
         assert_eq!(places, 3, "{backend:?}");
         domain.close_group().unwrap();
         let ledger = domain.resources.ledgers().device().clone();
-        let (all, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
-        assert!(domain.idle_slots_taken(), "{backend:?}: the claim took the idle slots' cache");
+        let (all, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX));
+        assert!(domain.idle_class.taken(), "{backend:?}: the claim took the idle slots' cache");
         // The slots are released apart from their cache, which stays taken.
         assert!(domain.resources.release_idle_slots(Vec::new(), crate::CompletionWake::new(|| {})), "{backend:?}");
-        while domain.advance_slot_release().unwrap().is_none() {
+        while domain.advance_slot_release().is_none() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let lent = domain.idle_slots_taken();
+        let lent = domain.idle_class.taken();
         assert!(lent || idle_cache(&domain) == 0, "{backend:?}: no slot idles, and its cache lends nothing and holds nothing");
         let changes = domain.resources.ledgers().changes().clone();
         changes.strict();
@@ -208,7 +208,7 @@ fn a_group_opening_during_a_slot_release_claims_its_whole_class() {
         let idle = idle_cache(&domain);
         assert!(idle > 0, "{backend:?}");
         let ledger = domain.resources.ledgers().device().clone();
-        let (all, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
+        let (all, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX));
         assert_eq!(
             domain.release_yielded(&mut bindings, crate::CompletionWake::new(|| {})).unwrap(),
             crate::domain::Yielded::Pending,
@@ -219,10 +219,63 @@ fn a_group_opening_during_a_slot_release_claims_its_whole_class() {
         let (places, claims) = opened(&mut domain, 2);
         assert_eq!(places, 3, "{backend:?}");
         assert_eq!(claims, first, "{backend:?}: the class claims every slot it grows again");
-        while domain.advance_slot_release().unwrap().is_none() {
+        while domain.advance_slot_release().is_none() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(graph_slots(&domain), 0, "{backend:?}: freed with the release");
+    }
+}
+
+/// A group whose class takes a closed group's idle slots up again and
+/// grows past them, where free room is short of that growth: its claim
+/// yields cache, and the idle slots, worth nothing, would yield first. They
+/// are the class's own: committed before its growth is claimed, the claim
+/// never takes them (it panicked as the class turned them committed, "idle
+/// slots' cache taken in process as their class opens"). The group runs
+/// with what yields beside them, and the slots stay whole, idle again where
+/// it gets nothing.
+#[test]
+fn a_class_opening_short_of_room_never_takes_its_own_idle_slots() {
+    use crate::memory::ledger::PoolClass;
+    for backend in bank_backends() {
+        let (mut domain, _bindings) = banked_chain(backend, 4, 3);
+        let (places, _) = opened(&mut domain, 1);
+        assert_eq!(places, 2, "{backend:?}");
+        domain.close_group().unwrap();
+        let idle = idle_cache(&domain);
+        assert!(idle > 0, "{backend:?}: the closed class idles as cache");
+        // A class of three places grows a place's slots past the idle two.
+        let device = domain.domain.device().clone();
+        let demand = super::class_demand(&domain.execution, &mut domain.resources, &domain.family, &device, 3).unwrap();
+        let (grows, _) = domain.resources.ledgers().placed(&device, demand);
+        assert!(grows > 0, "{backend:?}: a third place grows slots");
+        // Another holding takes every byte of free room, none of the cache:
+        // the most the ledger backs from free room alone.
+        let ledger = domain.resources.ledgers().device().clone();
+        let backs = |bytes| ledger.change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, bytes)).is_ok();
+        let (mut low, mut high) = (0u64, 1u64 << 50);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if backs(mid) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let room = ledger.change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, low)).unwrap();
+        // And the spare granules, which yield before the idle slots: the
+        // growth's claim then yields the idle slots, worth nothing, before
+        // the bank.
+        let spare = ledger.estimate().cache_of(CacheKind::Spare);
+        let (granules, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), crate::memory::ledger::CommittedKind::Scratch, std::num::NonZeroU64::MIN, spare));
+        assert_eq!(idle_cache(&domain), idle, "{backend:?}: the room and spare granules alone were taken");
+        let (places, claims) = opened(&mut domain, 2);
+        assert!(!domain.idle_class.taken(), "{backend:?}: the class's claim took none of its own slots");
+        match places {
+            1 => assert_eq!(idle_cache(&domain), idle, "{backend:?}: unopened, the slots idle whole"),
+            _ => assert!(idle_cache(&domain) == 0 && !claims.is_empty(), "{backend:?}: opened, the class holds its slots: {claims:?}"),
+        }
+        drop((room, granules));
     }
 }
 
@@ -235,7 +288,7 @@ fn a_group_opens_with_one_place_where_nothing_yields() {
         let (mut domain, _bindings) = banked_chain(backend, 4, 3);
         let ledger = domain.resources.ledgers().device().clone();
         // Another holding takes every byte that yields at once.
-        let (_all, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
+        let (_all, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX));
         let (held, claims) = opened(&mut domain, 2);
         assert_eq!(held, 1, "{backend:?}: no room, one place");
         assert!(claims.is_empty(), "{backend:?}: {claims:?}");
@@ -351,7 +404,7 @@ fn an_open_refused_short_keeps_the_prefix_cache() {
     assert!(domain.open_served(&mut bindings, holder, None).unwrap().is_empty());
     let ledger = domain.resources.ledgers().device().clone();
     let _prefix = ledger.cache(CacheKind::Prefix, 4096).expect("the prefix fits");
-    let (room, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
+    let (room, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX));
     assert!(
         matches!(domain.open_served(&mut bindings, refused, None), Err(crate::domain::DomainError::Capacity(_))),
         "nothing is left for a second request"
@@ -386,8 +439,9 @@ fn an_imports_bytes_are_never_others_memory() {
         read(2);
         assert_eq!(ledger.estimate().cache(), ledger.estimate().cache_of(CacheKind::Spare), "{backend:?}: the bank is at its floor");
         let guarantee = ledger.estimate().guarantee();
-        let import = domain
-            .claim_growth(CommittedKind::Component, ClaimDemand { device: GB, ..Default::default() })
+        let changes = domain.resources.ledgers().changes().clone();
+        let import = changes
+            .change(|keeping| domain.claim_growth(&keeping.claims(), CommittedKind::Component, ClaimDemand { device: GB, ..Default::default() }))
             .expect("the import fits");
         import.made();
         read(3);
@@ -442,14 +496,14 @@ fn grown_rows() -> (
     read_at(&ledger, epoch, 2 * GIB, 0);
     let records = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(GIB).expect("a block")).blocks;
     let pool = ledger.pool_block(crate::memory::ledger::PoolClass::State, std::num::NonZeroU64::new(GIB).expect("a block")).blocks;
-    let floor = ledger.claim(Need::BankFloor { bytes: GIB }).expect("the floor fits");
+    let floor = ledger.change(|keeping| ledger.claim(&keeping.claims(), Need::BankFloor { bytes: GIB })).expect("the floor fits");
     ledger.change(|_| { let entry = &records; entry.take(&entry.change(), GIB, seismic::memory::Wiring::Pageable) }).expect("the pool backs the floor");
     read_at(&ledger, epoch, GIB, 1);
     assert_eq!(ledger.estimate().free(), GIB, "1 GiB free beside the bank at its floor");
     let sequence = crate::RequestId(1);
     let rows = (1..).map(|pages: u64| pages * 1024).find(|rows| ledger.bytes(&Need::Request { sequence, rows: *rows }) >= 800 * MIB).expect("a history past 800 MiB");
-    let slot = ledger.claim(Need::RequestSlot { bytes: ledger.bytes(&Need::Request { sequence, rows }) }).expect("the slot fits");
-    let reservation = ledger.reserve(&slot, sequence, rows).expect("the request draws its slot");
+    let slot = ledger.change(|keeping| ledger.claim(&keeping.claims(), Need::RequestSlot { bytes: ledger.bytes(&Need::Request { sequence, rows }) })).expect("the slot fits");
+    let reservation = ledger.change(|keeping| ledger.reserve(&keeping.claims(), &slot, sequence, rows)).expect("the request draws its slot");
     (scope, ledger, (floor, records, pool), (slot, reservation), super::StateSlabs::default(), epoch)
 }
 
@@ -464,13 +518,13 @@ fn a_state_growth_is_not_admitted_beside_its_own_rows() {
     let committed = slot.bytes() + rows.bytes();
     ledger.change(|_| slabs.settle(&ledger, 0, 0, 0, committed));
     let growth = rows.bytes() + 16 * MIB;
-    slabs.reserve(&ledger, growth).expect("the growth past the rows fits free room");
+    ledger.change(|keeping| slabs.reserve(&keeping.claims(), &ledger, growth)).expect("the growth past the rows fits free room");
     ledger.change(|_| { let entry = &pool; entry.take(&entry.change(), growth, seismic::memory::Wiring::Pageable) }).expect("the pool backs the growth");
     ledger.change(|_| slabs.settle(&ledger, growth, rows.bytes(), rows.bytes(), committed));
     assert_eq!(ledger.estimate().cache_of(CacheKind::Spare), 16 * MIB, "only the slab's excess is held anew");
     // A second growth past rows already backed is all spare, and refused
     // past free room.
-    assert!(slabs.reserve(&ledger, GIB).is_err());
+    assert!(ledger.change(|keeping| slabs.reserve(&keeping.claims(), &ledger, GIB)).is_err());
 }
 
 /// After a reading, a request's state bytes are the process's own, never
@@ -482,7 +536,7 @@ fn a_sequences_state_is_never_read_as_others_memory() {
     let committed = slot.bytes() + rows.bytes();
     ledger.change(|_| slabs.settle(&ledger, 0, 0, 0, committed));
     let growth = rows.bytes() + 16 * MIB;
-    slabs.reserve(&ledger, growth).expect("the growth fits");
+    ledger.change(|keeping| slabs.reserve(&keeping.claims(), &ledger, growth)).expect("the growth fits");
     ledger.change(|_| { let entry = &pool; entry.take(&entry.change(), growth, seismic::memory::Wiring::Pageable) }).expect("the pool backs the growth");
     ledger.change(|_| slabs.settle(&ledger, growth, rows.bytes(), rows.bytes(), committed));
     read_at(&ledger, epoch, GIB - growth, 2);

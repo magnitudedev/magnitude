@@ -703,7 +703,7 @@ pub fn inspect_components(
         inputs,
         decoder,
         head: None,
-        vision,
+        vision: vision.map(Box::new),
         draft: None,
     };
     definition.validate()?;

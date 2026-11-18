@@ -207,25 +207,7 @@ fn checkpoints_share_the_window_rows_without_copying() {
         checkpoint.history_ranges(WINDOW)[0].0 + 1
     );
     assert_eq!(store.occupied_rows(WINDOW), 5);
-    let row = store.history_row_bytes(WINDOW) + store.history_row_bytes(TOKEN);
-    // The fork alone owns its new row in each domain; the checkpoint alone
-    // owns the window row the fork trimmed.
-    assert_eq!(store.exclusive_bytes(&[Holder::State(&fork)]).unwrap(), row);
-    assert_eq!(
-        store
-            .exclusive_bytes(&[Holder::Checkpoint(&checkpoint)])
-            .unwrap(),
-        store.history_row_bytes(WINDOW)
-    );
-    let census = store
-        .holding_census(
-            &[Holder::State(&fork)],
-            &[Holder::Checkpoint(&checkpoint)],
-            &[],
-        )
-        .unwrap();
-    assert_eq!(census.total(), store.committed_bytes());
-    assert_eq!(census.retained, store.history_row_bytes(WINDOW));
+    // The checkpoint alone holds the window row the fork trimmed.
     drop(checkpoint);
     assert_eq!(store.occupied_rows(WINDOW), 4);
     assert_eq!(store.occupied_rows(TOKEN), 7);
@@ -527,7 +509,7 @@ fn sibling_forks_ending_together_relocate_all_but_one() {
     drop((only, sibling, checkpoint));
 }
 #[test]
-fn shrink_and_census_cover_every_domain() {
+fn shrink_covers_every_domain() {
     let device = cpu_device();
     let mut store = windowed_store(device.clone(), 8192, 16, 4, 8192, 4096);
     let window_slab = store.history_slab_rows(WINDOW);
@@ -543,15 +525,8 @@ fn shrink_and_census_cover_every_domain() {
     );
     store.provision(&demand, 0).unwrap();
     let state = commit(store.create().unwrap(), 40);
-    let census = store
-        .holding_census(&[Holder::State(&state)], &[], &[])
-        .unwrap();
-    assert_eq!(census.total(), store.committed_bytes());
     device.assert_holds(&store);
-    assert_eq!(
-        census.live,
-        40 * store.history_row_bytes(TOKEN) + 16 * store.history_row_bytes(WINDOW)
-    );
+    assert_eq!((store.occupied_rows(TOKEN), store.occupied_rows(WINDOW)), (40, 16));
     let charged = device.tally.held();
     // A shrink keeping no room keeps each domain's occupied slabs alone:
     // the window's two added slabs are freed, and the pool returns them.
@@ -561,13 +536,8 @@ fn shrink_and_census_cover_every_domain() {
     assert_eq!(device.tally.held(), charged - released);
     assert_eq!(store.domains[TOKEN.0].arena.borrow().backed.len(), 1);
     assert_eq!(store.domains[WINDOW.0].arena.borrow().backed.len(), 1);
-    assert_eq!(
-        store
-            .holding_census(&[Holder::State(&state)], &[], &[])
-            .unwrap()
-            .total(),
-        store.committed_bytes()
-    );
+    assert_eq!((store.occupied_rows(TOKEN), store.occupied_rows(WINDOW)), (40, 16), "the state's rows stay");
+    drop(state);
 }
 
 #[test]

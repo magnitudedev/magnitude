@@ -305,7 +305,7 @@ fn probe(file: &std::path::Path, bytes: u64, slots: u64, depth: usize) -> Result
         .zip(opened)
         .map(|(thread, handle)| {
             let (start, file) = (start.clone(), file.to_owned());
-            std::thread::spawn(move || -> Result<(u64, Instant), String> {
+            seismic::threads::spawn("machine-reader", move || -> Result<(u64, Instant), String> {
                 let mut buffer = vec![0u8; (bytes + ALIGN) as usize];
                 let offset = buffer.as_ptr().align_offset(ALIGN as usize);
                 let buffer = &mut buffer[offset..offset + bytes as usize];
@@ -323,6 +323,7 @@ fn probe(file: &std::path::Path, bytes: u64, slots: u64, depth: usize) -> Result
                 }
                 Ok((reads, Instant::now()))
             })
+            .expect("invariant violated: the host starts a thread")
         })
         .collect::<Vec<_>>();
     start.wait();
@@ -330,7 +331,7 @@ fn probe(file: &std::path::Path, bytes: u64, slots: u64, depth: usize) -> Result
     let mut total = 0;
     let mut ended = began;
     for handle in handles {
-        let (reads, end) = handle.join().map_err(|_| "a probing thread panicked".to_owned())??;
+        let (reads, end) = handle.join().expect("a probing thread's panic ends the process")?;
         total += reads;
         ended = ended.max(end);
     }
@@ -425,7 +426,7 @@ impl ReadStream {
         let handles = (0..depth as u64)
             .map(|thread| {
                 let (stop, reads, file) = (stop.clone(), reads.clone(), file.to_owned());
-                std::thread::spawn(move || -> Result<(), String> {
+                seismic::threads::spawn("machine-reader", move || -> Result<(), String> {
                     let handle = uncached(&file)?;
                     let mut buffer = vec![0u8; (bytes + ALIGN) as usize];
                     let offset = buffer.as_ptr().align_offset(ALIGN as usize);
@@ -441,6 +442,7 @@ impl ReadStream {
                     }
                     Ok(())
                 })
+                .expect("invariant violated: the host starts a thread")
             })
             .collect();
         Ok(Self { stop, reads, began: Instant::now(), bytes, handles })
@@ -455,7 +457,7 @@ impl ReadStream {
     pub fn stop(self) -> Result<f64, String> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for handle in self.handles {
-            handle.join().map_err(|_| "a streaming thread panicked".to_owned())??;
+            handle.join().expect("a streaming thread's panic ends the process")?;
         }
         Ok((self.reads.load(std::sync::atomic::Ordering::Relaxed) * self.bytes) as f64 / self.began.elapsed().as_secs_f64())
     }

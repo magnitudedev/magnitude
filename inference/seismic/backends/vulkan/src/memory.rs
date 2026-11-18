@@ -69,7 +69,7 @@ impl MemoryStores {
     /// whose heaps it lies, and what the backend's own probes allocate
     /// with.
     pub(crate) fn own(&self, memory: &Memory) -> Arc<dyn Entry> {
-        self.kind(memory.device_kinds[0]).own()
+        self.kind(memory.device_kind()).own()
     }
 }
 
@@ -87,12 +87,56 @@ pub(crate) struct Block {
     mapped: *mut u8,
     dedicated: bool,
     free: Mutex<FreeRanges>,
-    /// The block's memory's exact bytes, charged before it was allocated:
-    /// to its store's own entry for a pool's block, whose ranges are carved
-    /// from it; to its allocation's entry for a block of its own
-    /// ([`Memory::block`]). Freed as the block is ([`Memory::free`]), in the
-    /// change that destroys it.
-    charge: Mutex<Charge>,
+    held: Held,
+}
+
+/// What a block's memory is held as.
+enum Held {
+    /// Its exact bytes, charged before it was allocated: to its store's own
+    /// entry for a pool's block, whose ranges are carved from it; to its
+    /// allocation's entry for a block of its own ([`Memory::block`]). Freed
+    /// as the block is ([`Memory::free`]), in the change that destroys it.
+    Charged(Mutex<Charge>),
+    /// The logical device's own ([`Memory::driver_block`]): uncounted among
+    /// the blocks, so each reconciliation charges it as the driver's memory
+    /// ([`DriverMemory`]) to every live open's own entry, like the logical
+    /// device itself.
+    Driver,
+}
+
+/// What a new block's memory is to be held as ([`create_block`]): charged
+/// exactly in `Change`, admitted before its memory is allocated, or the
+/// driver's, of these bytes, admitted by none.
+enum Holding<'c> {
+    Charged(&'c Change, Charge),
+    Driver(u64),
+}
+
+impl Holding<'_> {
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Charged(_, charge) => charge.bytes(),
+            Self::Driver(bytes) => *bytes,
+        }
+    }
+
+    /// Take `bytes` more.
+    fn grow(&mut self, bytes: u64) -> Result<(), ExecutionError> {
+        match self {
+            Self::Charged(change, charge) => charge.grow(*change, bytes).map_err(ExecutionError::from),
+            Self::Driver(held) => {
+                *held += bytes;
+                Ok(())
+            }
+        }
+    }
+
+    fn held(self) -> Held {
+        match self {
+            Self::Charged(_, charge) => Held::Charged(Mutex::new(charge)),
+            Self::Driver(_) => Held::Driver,
+        }
+    }
 }
 
 // The mapping is plain host memory; ranges are handed out exclusively.
@@ -112,9 +156,14 @@ impl PackedBlock for Block {
 }
 
 impl Block {
-    /// The entry its memory's bytes are charged to.
-    fn entry(&self) -> Arc<dyn Entry> {
-        self.charge.lock().expect("block charge lock poisoned").entry().clone()
+    /// What the block adds to the blocks counted on `heaps`: what it takes
+    /// of them ([`Self::heap_bytes`]) where it is charged; none where the
+    /// driver's memory holds it ([`Held::Driver`]).
+    fn counted_bytes(&self, heaps: &[u32]) -> u64 {
+        match self.held {
+            Held::Charged(_) => self.heap_bytes(heaps),
+            Held::Driver => 0,
+        }
     }
 
     /// What the block takes of `heaps`: its whole allocation, padding
@@ -173,7 +222,6 @@ struct PoolType {
 
 impl Pool {
     /// The memory types it allocates in, in order.
-    #[cfg(test)]
     pub(crate) fn kinds(&self) -> &[u32] {
         &self.kinds
     }
@@ -305,7 +353,8 @@ pub(crate) struct Memory {
 
 /// Device memory the driver holds for the device outside every block: the
 /// logical device itself, pipelines, command and query memory, shader
-/// scratch, staging and second-queue objects.
+/// scratch, staging and second-queue objects, and the blocks it holds
+/// itself (`Memory::driver_block`: the tables buffer).
 ///
 /// It is one charge on the own entry of the device's store
 /// ([`MemoryStores::own`]), settled to what the driver holds at each
@@ -418,6 +467,12 @@ pub(crate) fn least_object(facts: &crate::Facts) -> Result<u64, String> {
 }
 
 impl Memory {
+    /// The first kind of the backend's own device storage: the kind of the
+    /// store whose own entry the device's own memory is charged to.
+    pub(crate) fn device_kind(&self) -> u32 {
+        self.device_kinds[0]
+    }
+
     /// The backend's own device and upload storage, on the kinds the
     /// placement rule gives them, and staging on `facts.allocation`'s type.
     pub(crate) fn new(
@@ -487,22 +542,29 @@ impl Memory {
     /// bytes on the device heaps within its creation's transition.
     fn count(&self, block: &Block) {
         self.objects.fetch_add(1, Ordering::SeqCst);
-        self.device_blocks.fetch_add(block.heap_bytes(&self.device_heaps), Ordering::SeqCst);
+        self.device_blocks.fetch_add(block.counted_bytes(&self.device_heaps), Ordering::SeqCst);
     }
 
     /// Free `block` (no allocation is in it) and uncount it, within one
     /// transition.
     pub(crate) fn free(&self, device: &ash::Device, block: &Block) {
         // The memory's destruction and the free of its bytes are one change.
-        let change = block.entry().change();
+        let charged = match &block.held {
+            Held::Charged(charge) => {
+                let charge = charge.lock().expect("block charge lock poisoned");
+                Some((charge.entry().change(), charge))
+            }
+            Held::Driver => None,
+        };
         let _transition = self.transition();
-        self.device_blocks.fetch_sub(block.heap_bytes(&self.device_heaps), Ordering::SeqCst);
+        self.device_blocks.fetch_sub(block.counted_bytes(&self.device_heaps), Ordering::SeqCst);
         destroy_block(device, block);
         self.objects.fetch_sub(1, Ordering::SeqCst);
-        let mut charge = block.charge.lock().expect("block charge lock poisoned");
-        let bytes = charge.bytes();
-        if bytes > 0 {
-            charge.shrink(&change, bytes);
+        if let Some((change, mut charge)) = charged {
+            let bytes = charge.bytes();
+            if bytes > 0 {
+                charge.shrink(&change, bytes);
+            }
         }
     }
 
@@ -655,13 +717,13 @@ impl Memory {
             if charged.bytes() > room {
                 charged.shrink(&change, charged.bytes().saturating_sub(least));
             }
-            match create_block(self, device, &change, *candidate, dedicated, charged) {
+            match create_block(self, device, *candidate, dedicated, Holding::Charged(&change, charged)) {
                 Ok(block) => return Ok(block),
                 Err(error) if error.capacity_refusal().is_some() => {}
                 Err(error) => return Err(error),
             }
         }
-        create_block(self, device, &change, pool.last, dedicated, charge(&pool.last)?)
+        create_block(self, device, pool.last, dedicated, Holding::Charged(&change, charge(&pool.last)?))
     }
 
     /// A block of its own of `bytes` of memory type `kind`, charged exactly
@@ -674,7 +736,27 @@ impl Memory {
         bytes: u64,
         entry: &Arc<dyn Entry>,
     ) -> Result<Range, ExecutionError> {
-        // Whole words, which a fill zeroes (`vkCmdFillBuffer`).
+        let (bytes, pool) = self.own_block(kind, bytes)?;
+        // The charge, the memory and the record of it are one change.
+        let change = entry.change();
+        let charge = Charge::take(&change, entry, bytes, Wiring::Pageable)?;
+        let block = create_block(self, device, pool, true, Holding::Charged(&change, charge))?;
+        Ok(Range { pool: None, block, offset: 0, bytes })
+    }
+
+    /// A block of its own of `bytes` of memory type `kind` that the logical
+    /// device itself holds, as it holds its pipelines: charged to no entry
+    /// and admitted by no ledger, its memory counted as the driver's
+    /// ([`Held::Driver`]), freed when its range is released.
+    pub(crate) fn driver_block(&self, device: &ash::Device, kind: u32, bytes: u64) -> Result<Range, ExecutionError> {
+        let (bytes, pool) = self.own_block(kind, bytes)?;
+        let block = create_block(self, device, pool, true, Holding::Driver(bytes))?;
+        Ok(Range { pool: None, block, offset: 0, bytes })
+    }
+
+    /// The bytes, as whole words (which a fill zeroes, `vkCmdFillBuffer`),
+    /// and the type of a block of its own of `bytes` of memory type `kind`.
+    fn own_block(&self, kind: u32, bytes: u64) -> Result<(u64, PoolType), ExecutionError> {
         let bytes = bytes.max(1).next_multiple_of(4);
         if bytes > self.max_allocation {
             return Err(ExecutionError::AllocationCapacity {
@@ -685,11 +767,7 @@ impl Memory {
         if kind as usize >= self.layout.types.len() {
             return Err(ExecutionError::AllocationFailed(format!("Vulkan allocates no block of kind {kind}")));
         }
-        // The charge, the memory and the record of it are one change.
-        let change = entry.change();
-        let charge = Charge::take(&change, entry, bytes, Wiring::Pageable)?;
-        let block = create_block(self, device, &change, pool_type(&self.layout, kind), true, charge)?;
-        Ok(Range { pool: None, block, offset: 0, bytes })
+        Ok((bytes, pool_type(&self.layout, kind)))
     }
 
     /// Return `range` to its block, and free the block once it holds no
@@ -747,10 +825,9 @@ fn destroy_block(device: &ash::Device, block: &Block) {
 fn create_block(
     memory_owner: &Memory,
     device: &ash::Device,
-    change: &Change,
     pool: PoolType,
     dedicated: bool,
-    mut charge: Charge,
+    mut holding: Holding<'_>,
 ) -> Result<Arc<Block>, ExecutionError> {
     let allocation = |error: ExecutionError| match error {
         ExecutionError::SubmissionFailed(message) => ExecutionError::AllocationFailed(message),
@@ -759,10 +836,10 @@ fn create_block(
     // Every memory object holds at least the device's least
     // (`Memory::least_object`), its free space a pool block's to use and
     // a block of its own's to strand.
-    if let Some(short) = memory_owner.least_object.checked_sub(charge.bytes()).filter(|&short| short > 0) {
-        charge.grow(change, short).map_err(ExecutionError::from)?;
+    if let Some(short) = memory_owner.least_object.checked_sub(holding.bytes()).filter(|&short| short > 0) {
+        holding.grow(short)?;
     }
-    let bytes = charge.bytes();
+    let bytes = holding.bytes();
     let families = memory_owner.families.as_slice();
     let info = vk::BufferCreateInfo::default()
         .size(bytes)
@@ -789,8 +866,8 @@ fn create_block(
         )));
     }
     let allocated_bytes = requirements.size.max(bytes);
-    if let Err(refused) = charge.grow(change, allocated_bytes - bytes) {
-        return refuse(refused.into());
+    if let Err(refused) = holding.grow(allocated_bytes - bytes) {
+        return refuse(refused);
     }
     // The charge taken, the block's memory joins the heap within one
     // transition, until it is counted.
@@ -872,7 +949,7 @@ fn create_block(
         mapped,
         dedicated,
         free: Mutex::new(FreeRanges::new(bytes)),
-        charge: Mutex::new(charge),
+        held: holding.held(),
     });
     memory_owner.count(&block);
     Ok(block)
@@ -905,7 +982,10 @@ impl Range {
     /// The range's bytes carved for `entry` from its pool block's, which
     /// its store's own entry holds.
     pub(crate) fn carve(&self, entry: &Arc<dyn Entry>) -> Carved {
-        Charge::carve(&self.block.charge.lock().expect("block charge lock poisoned"), entry, self.bytes)
+        let Held::Charged(charge) = &self.block.held else {
+            panic!("a range carved from a block the driver holds: only a pool's ranges are carved");
+        };
+        Charge::carve(&charge.lock().expect("block charge lock poisoned"), entry, self.bytes)
     }
 
     /// Offset of the range in its block's `VkBuffer`.
@@ -1064,10 +1144,10 @@ mod tests {
             mapped: std::ptr::null_mut(),
             dedicated: false,
             free: Mutex::new(FreeRanges::new(bytes)),
-            charge: Mutex::new({
+            held: Held::Charged(Mutex::new({
                 let entry = tally();
                 Charge::took(&entry.change(), &entry, bytes, Wiring::Pageable)
-            }),
+            })),
         })
     }
 

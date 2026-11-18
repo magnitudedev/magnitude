@@ -102,9 +102,16 @@ GET /api/ai/calls                            AI SDK call inspector
 
 Full OpenAPI spec at `http://127.0.0.1:27686/openapi.json`.
 
-## Client State Patterns
+## Area guides
 
-When working with client-side state (CLI, web, or client-common), read `packages/client-common/AGENTS.md` for the reactive state policy — which patterns to use and when.
+Some areas have their own `AGENTS.md`. Read it before working in that area, even if your tool did not load it automatically.
+
+- Client-side state (CLI, web, client-common): `packages/client-common/AGENTS.md`, the reactive state policy.
+- CLI: `cli/AGENTS.md`.
+- Desktop: `desktop/src/AGENTS.md`.
+- Providers: `packages/providers/AGENTS.md`.
+- Inference engine: `inference/AGENTS.md`.
+- Vulkan kernels (`inference/engine/kernels/kernels/vulkan/`, the Vulkan prelude and native library): `inference/engine/kernels/AGENTS.md`, the rules that keep kernels forming and computing the same answers on every driver.
 
 ## Effect Language Service
 

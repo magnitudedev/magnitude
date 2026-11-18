@@ -515,21 +515,21 @@ impl<T: EntryTuning> EntryTuning for Ranged<T> {
     #[cfg(feature = "tuning-survey")]
     fn tune(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         statics: &NativeSpecialization,
         points: &mut dyn seismic::PointSource<'_, Self::Entry>,
         validation: seismic::NumericalRequirement,
         strategy: Strategy,
     ) -> Result<TuningResult, TuneError> {
-        self.case.tune(device, statics, points, validation, strategy)
+        self.case.tune(charges, statics, points, validation, strategy)
     }
     fn open(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         statics: &NativeSpecialization,
         validation: seismic::NumericalRequirement,
     ) -> Result<Box<dyn EntrySearch<Self::Entry>>, TuneError> {
-        self.case.open(device, statics, validation)
+        self.case.open(charges, statics, validation)
     }
     fn digest(&self, device: &Device, statics: &NativeSpecialization) -> Result<String, TuneError> {
         self.case.digest(device, statics)

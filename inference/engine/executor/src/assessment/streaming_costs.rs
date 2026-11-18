@@ -439,7 +439,7 @@ impl ConvertForm {
 /// zero and in the device's own memory, every entry landed and the step's
 /// file slot answered before it, so it waits for no host.
 fn convert_point(
-    device: &Device,
+    charges: &seismic::Charges,
     kernel: &NativeKernel<routed_land::Entry>,
     form: &ConvertForm,
     converted: u64,
@@ -448,7 +448,7 @@ fn convert_point(
     let records = CONVERTED_RECORDS;
     let sequence = 1;
     let shared = |extents: &[u64], set: &[(u64, i32)]| {
-        let tensor = Tensor::shared(device, Element::i32(), extents).map_err(|cause| error(&cause))?;
+        let tensor = Tensor::shared(charges, Element::i32(), extents).map_err(|cause| error(&cause))?;
         for &(index, value) in set {
             tensor.store_release(4 * index, u32::from_ne_bytes(value.to_ne_bytes())).map_err(|cause| error(&cause))?;
         }
@@ -466,7 +466,7 @@ fn convert_point(
             [(at + constants::LANDING_FROM, entry as i32), (at + constants::LANDING_TO, entry as i32)]
         }))
         .collect::<Vec<_>>();
-    let mut graph = device.native_graph();
+    let mut graph = charges.device().native_graph();
     let mut port = |element, extents: &[u64]| graph.port(element, extents).map_err(|cause| error(&cause));
     let step = port(Element::i32(), &[constants::STEP_WORDS])?;
     let mut file_port = port(Element::i32(), &table.extents())?;
@@ -516,7 +516,7 @@ fn convert_point(
         (policy, shared(&[constants::POLICY_WORDS], &[])?),
         (list, shared(&[magnitude_kernels::landing_extent(records)], &landing)?),
     ];
-    let zeros = |(element, extents): (Element, [u64; 3])| Tensor::zeros(device, element, &extents).map_err(|cause| error(&cause));
+    let zeros = |(element, extents): (Element, [u64; 3])| Tensor::zeros(charges, element, &extents).map_err(|cause| error(&cause));
     for ((staging, records), (tensor, held)) in staging.into_iter().zip([gate_records, up_records, down_records]).zip(tensors) {
         bound.push((staging, zeros(tensor.stored_tensor(held))?));
         bound.push((records, zeros(tensor.resident_tensor(held))?));
@@ -524,10 +524,10 @@ fn convert_point(
     let plan = graph.seal().map_err(|cause| error(&cause))?;
     let mut bindings = plan.bindings();
     for (port, tensor) in &bound {
-        bindings.set(port, tensor).map_err(|cause| error(&cause))?;
+        bindings.set(charges, port, tensor).map_err(|cause| error(&cause))?;
     }
     bindings.set_answered(park).map_err(|cause| error(&cause))?;
-    plan.point(bindings, GraphTiming::Device).map(Point::Graph).map_err(|cause| error(&cause))
+    plan.point(charges, bindings, GraphTiming::Device).map(Point::Graph).map_err(|cause| error(&cause))
 }
 
 /// The convert's ceiling on an executor, per bank group: a record of the
@@ -605,7 +605,8 @@ impl ConvertForm {
     /// launches of one record and of [`CONVERTED_RECORDS`], the kernel
     /// formed with the first attempted.
     pub(super) fn measure(&self, walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
-        let device = walks.device();
+        let (device, charges) = (walks.device(), walks.charges().clone());
+        let charges = &charges;
         type Formed = Result<NativeKernel<routed_land::Entry>, ExecutorCostsError>;
         let formed = OnceCell::<Formed>::new();
         for converted in [1, CONVERTED_RECORDS] {
@@ -616,7 +617,7 @@ impl ConvertForm {
                     .get_or_init(|| self.land().form(device, None))
                     .as_ref()
                     .map_err(|error| Unformed::Never(error.clone()))?;
-                convert_point(device, kernel, self, converted).map_err(Unformed::Now)
+                convert_point(charges, kernel, self, converted).map_err(Unformed::Now)
             });
         }
         Ok(())
@@ -830,7 +831,8 @@ impl TierCopyCosts {
     /// transfer queue runs throughout ([`Self::stall_share`]). Why the
     /// device has no transfer queue fails it.
     pub(super) fn measure(walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
-        let device = walks.device();
+        let (device, charges) = (walks.device(), walks.charges().clone());
+        let charges = &charges;
         let formed = OnceCell::<Result<NativeKernel<routed_copy::Entry>, ExecutorCostsError>>::new();
         for blocks in [1, magnitude_kernels::LIST_BLOCKS] {
             let key = Self::key(&walks.identity(), device.backend(), blocks)?;
@@ -840,7 +842,7 @@ impl TierCopyCosts {
                     .get_or_init(|| Self::formation().form(device, None))
                     .as_ref()
                     .map_err(|error| Unformed::Never(error.clone()))?;
-                tier_copy_point(device, kernel, blocks, Source::Host).map_err(Unformed::Now)
+                tier_copy_point(charges, kernel, blocks, Source::Host).map_err(Unformed::Now)
             });
         }
         // The device's work queued alone, then beside a copy the transfer
@@ -849,8 +851,8 @@ impl TierCopyCosts {
         let transfer = seismic::Transfer::new(device).map_err(|cause| error(&cause))?;
         let (records, bytes) = TIER_COPY_PROBE;
         let shape = [records, 1, bytes];
-        let copied = Tensor::shared(device, Element::bool(), &shape).map_err(|cause| error(&cause))?;
-        let into = Tensor::zeros(device, Element::bool(), &shape).map_err(|cause| error(&cause))?;
+        let copied = Tensor::shared(charges, Element::bool(), &shape).map_err(|cause| error(&cause))?;
+        let into = Tensor::zeros(charges, Element::bool(), &shape).map_err(|cause| error(&cause))?;
         for beside in [Beside::Alone, Beside::Copy] {
             let key = Self::stall_key(&walks.identity(), device.backend(), beside)?;
             let formed = &formed;
@@ -859,7 +861,7 @@ impl TierCopyCosts {
                     .get_or_init(|| Self::formation().form(device, None))
                     .as_ref()
                     .map_err(|error| Unformed::Never(error.clone()))?;
-                tier_copy_point(device, kernel, magnitude_kernels::LIST_BLOCKS, Source::Device).map_err(Unformed::Now)
+                tier_copy_point(charges, kernel, magnitude_kernels::LIST_BLOCKS, Source::Device).map_err(Unformed::Now)
             };
             // Timed with no compile beside it; beside a copy, its record kept
             // only where the copy ran throughout ([`Copying`]).
@@ -898,14 +900,15 @@ impl<'s> Copying<'s> {
     fn start(transfer: &seismic::Transfer, copied: &Tensor, into: &Tensor, store: &'s dyn RecordStore<PointKey>) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (transfer, copied, into, stopping) = (transfer.clone(), copied.clone(), into.clone(), stop.clone());
-        let thread = std::thread::spawn(move || {
+        let thread = seismic::threads::spawn("measurement-copies", move || {
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
                 let run = seismic::TransferRun { source: &copied, source_offset: 0, destination: &into, destination_offset: 0, bytes: copied.byte_len() };
                 let value = transfer.copy(&[seismic::TransferItem::Run(run)]).map_err(|error| error.to_string())?;
                 while !transfer.wait(value, std::time::Duration::from_secs(1)).map_err(|error| error.to_string())? {}
             }
             Ok(())
-        });
+        })
+        .expect("invariant violated: the host starts a thread");
         Self { stop, thread: std::sync::Mutex::new(Some(thread)), store }
     }
 
@@ -914,7 +917,7 @@ impl<'s> Copying<'s> {
     fn stop(&self) -> Result<(), String> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         match self.thread.lock().expect("the copier").take() {
-            Some(thread) => thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Some(thread) => thread.join().expect("the copier's panic ends the process"),
             None => Ok(()),
         }
     }
@@ -943,7 +946,7 @@ enum Source {
 /// A copy of [`TIER_COPY_PROBE`]'s records from host-shared memory, read in
 /// place over the link as a tier's records are, into device memory on
 /// `blocks` blocks, its list staged in device memory as the copy reads it.
-fn tier_copy_point(device: &Device, kernel: &NativeKernel<routed_copy::Entry>, blocks: u32, source: Source) -> Result<Point, ExecutorCostsError> {
+fn tier_copy_point(charges: &seismic::Charges, kernel: &NativeKernel<routed_copy::Entry>, blocks: u32, source: Source) -> Result<Point, ExecutorCostsError> {
     let error = failed("tier copy point");
     let (records, bytes) = TIER_COPY_PROBE;
     let byte = Element::bool();
@@ -962,16 +965,16 @@ fn tier_copy_point(device: &Device, kernel: &NativeKernel<routed_copy::Entry>, b
     let tensors = [
         match source {
             // Host memory the device reads in place over the link, as a tier's.
-            Source::Host => Tensor::shared(device, byte, &shape),
-            Source::Device => Tensor::zeros(device, byte, &shape),
+            Source::Host => Tensor::shared(charges, byte, &shape),
+            Source::Device => Tensor::zeros(charges, byte, &shape),
         }
         .map_err(|cause| error(&cause))?,
-        Tensor::from_host(device, Element::i32(), &[words], &i32_bytes(&list)).map_err(|cause| error(&cause))?,
-        Tensor::from_host(device, Element::i32(), &[constants::STEP_WORDS], &i32_bytes(&[sequence, 0])).map_err(|cause| error(&cause))?,
-        Tensor::zeros(device, byte, &shape).map_err(|cause| error(&cause))?,
-        Tensor::from_host(device, Element::i32(), &[3], &i32_bytes(&[blocks as i32, 1, 1])).map_err(|cause| error(&cause))?,
+        Tensor::from_host(charges, Element::i32(), &[words], &i32_bytes(&list)).map_err(|cause| error(&cause))?,
+        Tensor::from_host(charges, Element::i32(), &[constants::STEP_WORDS], &i32_bytes(&[sequence, 0])).map_err(|cause| error(&cause))?,
+        Tensor::zeros(charges, byte, &shape).map_err(|cause| error(&cause))?,
+        Tensor::from_host(charges, Element::i32(), &[3], &i32_bytes(&[blocks as i32, 1, 1])).map_err(|cause| error(&cause))?,
     ];
-    let mut graph = device.native_graph();
+    let mut graph = charges.device().native_graph();
     let mut ports = Vec::with_capacity(tensors.len());
     for tensor in &tensors {
         ports.push(graph.port(tensor.element(), &tensor.extents()).map_err(|cause| error(&cause))?);
@@ -994,7 +997,7 @@ fn tier_copy_point(device: &Device, kernel: &NativeKernel<routed_copy::Entry>, b
     let plan = graph.seal().map_err(|cause| error(&cause))?;
     let mut bindings = plan.bindings();
     for (port, tensor) in ports.iter().zip(&tensors) {
-        bindings.set(port, tensor).map_err(|cause| error(&cause))?;
+        bindings.set(charges, port, tensor).map_err(|cause| error(&cause))?;
     }
     // The stall probe's runs are submitted back to back, each its own
     // submission, as a step's are: a copy beside them delays each.
@@ -1002,7 +1005,7 @@ fn tier_copy_point(device: &Device, kernel: &NativeKernel<routed_copy::Entry>, b
         Source::Host => GraphTiming::Device,
         Source::Device => GraphTiming::Queued,
     };
-    plan.point(bindings, timing).map(Point::Graph).map_err(|cause| error(&cause))
+    plan.point(charges, bindings, timing).map(Point::Graph).map_err(|cause| error(&cause))
 }
 
 /// The value `store` records measured at `key`, none while unrecorded. The
@@ -1506,11 +1509,11 @@ impl CpuCosts {
     }
 
     /// Size `form`'s pool and measure its lines in the job, stored.
-    pub(super) fn measure(device: &Device, form: &CpuForm, store: &dyn RecordStore<PointKey>) -> Result<(), ExecutorCostsError> {
+    pub(super) fn measure(charges: &seismic::Charges, form: &CpuForm, store: &dyn RecordStore<PointKey>) -> Result<(), ExecutorCostsError> {
         use super::cost::RowCost;
         let error = failed("CPU site");
-        let identity = executor_identity(device.topology(), device.info())?;
-        let (workers, lines) = crate::experts::measure_cpu_site(device, form).map_err(|cause| error(&cause))?;
+        let identity = executor_identity(charges.device().topology(), charges.device().info())?;
+        let (workers, lines) = crate::experts::measure_cpu_site(charges, form).map_err(|cause| error(&cause))?;
         let seconds = |nanoseconds: f64| nanoseconds * 1e-9;
         let (row, row_term) = match lines.expert.row {
             RowCost::Measured(row) => (row, "row"),
@@ -1597,7 +1600,8 @@ impl Sweeps<'_> {
                 let range = Self::share(length, readers, reader);
                 let (share, after) = rest.split_at_mut(range.len());
                 rest = after;
-                scope.spawn(move || share.iter_mut().zip(range).for_each(|(word, index)| *word = index as u64));
+                seismic::threads::spawn_scoped(scope, "measurement-writer", move || share.iter_mut().zip(range).for_each(|(word, index)| *word = index as u64))
+                    .expect("invariant violated: the host starts a thread");
             }
         });
         words
@@ -1608,7 +1612,8 @@ impl Sweeps<'_> {
         std::thread::scope(|scope| {
             for reader in 0..self.readers {
                 let share = &self.words[Self::share(length, self.readers, reader)];
-                scope.spawn(move || std::hint::black_box(share.iter().fold(0u64, |sum, &word| sum.wrapping_add(word))));
+                seismic::threads::spawn_scoped(scope, "measurement-reader", move || std::hint::black_box(share.iter().fold(0u64, |sum, &word| sum.wrapping_add(word))))
+                    .expect("invariant violated: the host starts a thread");
             }
         });
     }
@@ -1812,7 +1817,7 @@ mod tests {
             let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
             let deadline = super::super::requests::JobDeadlines::new(std::time::Instant::now(), std::time::Duration::from_secs(30));
             let requests = super::super::Outstanding { standing: Vec::new(), loads: vec![super::super::requests::PointRequest::TierCopy] };
-            super::super::requests::measure(&mut measurer, &device, &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |_, _| ()).unwrap();
+            super::super::requests::measure(&mut measurer, &seismic::Charges::tally(&device), &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |_, _| ()).unwrap();
             let costs = TierCopyCosts::stored(device.topology(), device.info(), &store).unwrap();
             let rate = 1. / costs.link_byte_seconds();
             eprintln!("{backend:?}: link ceiling {:.2} GB/s on {} blocks, a copy stalls {:.0}% of the work beside it", rate / 1e9, costs.blocks, costs.stall_share * 100.);
@@ -1837,7 +1842,7 @@ mod tests {
         };
         let store = seismic::measure::HeldStore::default();
         assert_eq!(CpuCosts::stored(device.topology(), device.info(), &form, &store).unwrap(), None);
-        CpuCosts::measure(&device, &form, &store).unwrap();
+        CpuCosts::measure(&seismic::Charges::tally(&device), &form, &store).unwrap();
         let stored = CpuCosts::stored(device.topology(), device.info(), &form, &store).unwrap().expect("stored");
         assert!(stored.workers > 0 && stored.lines.expert.one.get() > 0., "{stored:?}");
     }
@@ -1892,17 +1897,18 @@ mod tests {
         let error_rate = crate::SEARCH_SETTINGS.error_rate;
         let how = Measure { stop: Stop::Resolved { error_rate }, min_sample_seconds: crate::MIN_SAMPLE_SECONDS };
         let step_words = (0..constants::STEP_WORDS).map(|word| i32::from(word == 0)).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
-        let step = Tensor::from_host(&device, Element::i32(), &[constants::STEP_WORDS], &step_words).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let step = Tensor::from_host(&charges, Element::i32(), &[constants::STEP_WORDS], &step_words).unwrap();
         let (sources, destinations) = (256u64, 512u64);
         // Each side either the device's own memory or pooled as the bank's
         // records are.
         let tensor = |pooled: bool, records: u64| match pooled {
             true => {
                 let contract = crate::planning::BankTier::Bank.contract_on(&device);
-                let pooled = crate::experts::pooled_records(&device, contract, byte, &[1, per], records, records).unwrap();
+                let pooled = crate::experts::pooled_records(&charges, contract, byte, &[1, per], records, records).unwrap();
                 (pooled.records.clone(), Some(pooled))
             }
-            false => (Tensor::zeros(&device, byte, &[records, 1, per]).unwrap(), None),
+            false => (Tensor::zeros(&charges, byte, &[records, 1, per]).unwrap(), None),
         };
         for (source_pooled, destination_pooled) in [(false, true), (false, false), (true, false), (true, true)] {
             let (source, _source_store) = tensor(source_pooled, sources);
@@ -1918,7 +1924,7 @@ mod tests {
                     list[at + constants::LIST_FROM as usize] = entry as i32;
                     list[at + constants::LIST_TO as usize] = entry as i32;
                 }
-                let list_tensor = Tensor::shared(&device, Element::i32(), &[words]).unwrap();
+                let list_tensor = Tensor::shared(&charges, Element::i32(), &[words]).unwrap();
                 let bytes = list.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
                 // SAFETY: no device work uses the list yet.
                 unsafe { list_tensor.write_shared(0, &bytes).unwrap() };
@@ -1960,8 +1966,8 @@ mod tests {
                     // A seed copy's blocks, the grid's first word, which
                     // its host writes (`ExpertBank::open`).
                     let blocks = (magnitude_kernels::LIST_BLOCKS as i32).to_le_bytes().into_iter().chain([0; 8]).collect::<Vec<_>>();
-                    let grid = Tensor::from_host(&device, Element::i32(), &[3], &blocks).map_err(|cause| Unformed::Now(cause.to_string()))?;
-                    let staged = Tensor::zeros(&device, Element::i32(), &[words]).map_err(|cause| Unformed::Now(cause.to_string()))?;
+                    let grid = Tensor::from_host(&charges, Element::i32(), &[3], &blocks).map_err(|cause| Unformed::Now(cause.to_string()))?;
+                    let staged = Tensor::zeros(&charges, Element::i32(), &[words]).map_err(|cause| Unformed::Now(cause.to_string()))?;
                     for (port, tensor) in [
                         (&source_port, &source),
                         (&list_port, &list_tensor),
@@ -1970,9 +1976,9 @@ mod tests {
                         (&grid_port, &grid),
                         (&staged_port, &staged),
                     ] {
-                        bindings.set(port, tensor).map_err(|cause| Unformed::Now(cause.to_string()))?;
+                        bindings.set(&charges, port, tensor).map_err(|cause| Unformed::Now(cause.to_string()))?;
                     }
-                    plan.point(bindings, GraphTiming::Device).map(Point::Graph).map_err(|cause| Unformed::Now(cause.to_string()))
+                    plan.point(&charges, bindings, GraphTiming::Device).map(Point::Graph).map_err(|cause| Unformed::Now(cause.to_string()))
                 };
                 let key = PointKey {
                     executor: identity.clone(),
@@ -2025,10 +2031,10 @@ mod tests {
             let records = std::env::temp_dir().join(format!("convert-line-{}-{backend:?}", std::process::id()));
             let store = seismic::measure::JsonFileStore::new(&records);
             let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
-            let deadline = super::super::requests::JobDeadlines::within(std::time::Duration::from_secs(300));
+            let deadline = super::super::requests::JobDeadlines::new(std::time::Instant::now(), std::time::Duration::from_secs(300));
             let requests = super::super::Outstanding { standing: vec![super::super::PointRequest::Convert(form)], loads: Vec::new() };
             let mut visited = Vec::new();
-            let ended = super::super::requests::measure(&mut measurer, &device, &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |key, outcome| {
+            let ended = super::super::requests::measure(&mut measurer, &seismic::Charges::tally(&device), &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |key, outcome| {
                 visited.push(format!("{}: {outcome:?}", key.point["converted"]));
             })
             .unwrap();

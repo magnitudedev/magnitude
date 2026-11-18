@@ -3363,9 +3363,10 @@ impl PreparedDraftGraphs {
 
     pub(crate) fn bind_weights(
         self: &Rc<Self>,
+        charges: &seismic::Charges,
         resident: &ResidentHead,
     ) -> Result<BoundDraftGraphs, SubmitError> {
-        let mut uploaded = ConstantTensors::new(resident.embedding.tensor().device());
+        let mut uploaded = ConstantTensors::new(charges);
         let mut bound = BTreeMap::new();
         for (class, graph) in &self.classes {
             let constants = graph
@@ -3397,7 +3398,7 @@ impl PreparedDraftGraphs {
                 .chain(constants.iter().map(|(port, tensor)| Ok((*port, tensor))))
                 .chain(leading.iter().map(|(port, tensor)| Ok((*port, tensor))))
                 .collect::<Result<Vec<_>, SubmitError>>()?;
-            bound.insert(*class, graph.plan.bind_static(&fixed).map_err(device)?);
+            bound.insert(*class, graph.plan.bind_static(charges, &fixed).map_err(device)?);
         }
         Ok(BoundDraftGraphs {
             prepared: self.clone(),
@@ -3576,6 +3577,10 @@ pub struct NativeDraftProgram {
     /// Immutable normalized per-layer window bounds, resolved once at load.
     windows: Vec<Option<u64>>,
     graphs: BoundDraftGraphs,
+    /// What a step binds its tensors through: charges that allocate
+    /// nothing, as every storage a step binds is a load's, which formed any
+    /// record table it needs (`seismic::NativeGraphBindings::set`).
+    unallocating: seismic::Charges,
     waiter: CompletionWaiter,
 }
 
@@ -3584,9 +3589,12 @@ impl NativeDraftProgram {
         self.graphs.constant_bytes()
     }
 
+    /// `unallocating`: charges of its device that allocate nothing
+    /// (`seismic::Charges::none`).
     pub(crate) fn new(
         definition: ModelDefinition,
         graphs: BoundDraftGraphs,
+        unallocating: seismic::Charges,
     ) -> Result<Self, SubmitError> {
         let draft = definition
             .draft
@@ -3615,6 +3623,7 @@ impl NativeDraftProgram {
             definition,
             windows,
             graphs,
+            unallocating,
             waiter,
         })
     }
@@ -3687,7 +3696,7 @@ impl NativeDraftProgram {
                     ));
                 }
                 for (port, plane) in ports.planes.iter().zip(&layer_planes) {
-                    bindings.set(port, &plane.buffer).map_err(device)?;
+                    bindings.set(&self.unallocating, port, &plane.buffer).map_err(device)?;
                 }
             }
         }
@@ -3721,7 +3730,7 @@ impl NativeDraftProgram {
                     .tensor()
                     .slice_leading(0, entry_rows as u64)
                     .map_err(|error| invalid(format!("draft conditioning features: {error}")))?;
-                bindings.set(port, &features).map_err(device)?;
+                bindings.set(&self.unallocating, port, &features).map_err(device)?;
             }
             _ => return Err(invalid("draft conditioning differs from its graph class")),
         }
@@ -3867,7 +3876,7 @@ impl NativeDraftProgram {
             .block
             .as_ref()
             .and_then(|block| block.landed.as_ref())
-            .map(|ports| ports.queue(&self.graphs.embedding, &mut bindings))
+            .map(|ports| ports.queue(&self.graphs.embedding, &self.unallocating, &mut bindings))
             .transpose()
             .map_err(invalid)?;
         let mut output = output;

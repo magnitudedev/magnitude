@@ -317,8 +317,10 @@ async fn memory(State(identity): State<Identity>) -> Response {
 const WORKER_ARGUMENT: &str = "--worker";
 
 fn main() {
-    magnitude_executor::diagnostics::install();
-    magnitude_executor::platform::relax_gpu_watchdog();
+    magnitude_executor::main("magnitude-main", start)
+}
+
+fn start() {
     if std::env::args().nth(1).as_deref() == Some(WORKER_ARGUMENT) {
         if let Err(error) = log_to_stderr() {
             eprintln!("magnitude-engine: {error}");
@@ -436,10 +438,7 @@ fn run() -> Result<(), String> {
                 .with_state(serving.clone()),
         )
         .merge(magnitude_serving::router(serving));
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
+    let runtime = seismic_threads::runtime().map_err(|error| error.to_string())?;
     runtime.block_on(async move {
         let address = format!("{}:{}", options.host, options.port);
         let listener = tokio::net::TcpListener::bind(&address)

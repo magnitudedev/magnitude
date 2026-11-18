@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::Path;
 
 use magnitude_service_contracts::models::{
@@ -10,9 +9,23 @@ use serde_json::Value;
 
 use crate::catalog::{valid_identity_component, valid_variant_id};
 
+/// Which installed packages are which catalog models', kept in the store.
+///
+/// Every service process over one store holds them in memory, and each persist applies what this
+/// process changed to what the file holds then, under the file's record lock
+/// (`seismic_io::Store::lock`), and takes what that leaves: no process drops another's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CatalogAffiliations {
     entries: BTreeSet<CatalogPackageAffiliation>,
+    pending: Pending,
+}
+
+/// What this process changed since its last persist: the packages it forgot, applied first, and
+/// the affiliations it added.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Pending {
+    forgotten: BTreeSet<ModelPackageId>,
+    added: BTreeSet<CatalogPackageAffiliation>,
 }
 
 #[derive(Serialize)]
@@ -21,24 +34,39 @@ struct StoredCatalogAffiliations<'a> {
     affiliations: Vec<&'a CatalogPackageAffiliation>,
 }
 
+const FILE_NAME: &str = "catalog-affiliations.json";
+
+/// The most bytes the file is read as.
+const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The affiliations a file's `bytes` hold; an entry that does not read is dropped, a file that
+/// does not is none.
+fn decode(bytes: &[u8]) -> BTreeSet<CatalogPackageAffiliation> {
+    let Ok(Value::Object(document)) = serde_json::from_slice::<Value>(bytes) else {
+        tracing::warn!("discarding malformed catalog affiliation cache");
+        return BTreeSet::new();
+    };
+    let Some(Value::Array(entries)) = document.get("affiliations") else {
+        tracing::warn!("discarding catalog affiliation cache with an invalid shape");
+        return BTreeSet::new();
+    };
+    entries.iter().filter_map(decode_entry).collect()
+}
+
 impl CatalogAffiliations {
     pub(crate) fn load(root: &Path) -> Self {
-        let Ok(bytes) = fs::read(path(root)) else {
-            return Self::default();
+        let entries = match crate::store_fs::model_store(root).read(Path::new(FILE_NAME), MAX_FILE_BYTES) {
+            Ok(Some(bytes)) => decode(&bytes),
+            Ok(None) => BTreeSet::new(),
+            Err(error) => {
+                tracing::warn!(%error, "discarding an unreadable catalog affiliation cache");
+                BTreeSet::new()
+            }
         };
-        let Ok(Value::Object(document)) = serde_json::from_slice::<Value>(&bytes) else {
-            tracing::warn!("discarding malformed catalog affiliation cache");
-            return Self::default();
-        };
-        let Some(Value::Array(entries)) = document.get("affiliations") else {
-            tracing::warn!("discarding catalog affiliation cache with an invalid shape");
-            return Self::default();
-        };
-        let entries = entries
-            .iter()
-            .filter_map(decode_entry)
-            .collect::<BTreeSet<_>>();
-        Self { entries }
+        Self {
+            entries,
+            pending: Pending::default(),
+        }
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = &CatalogPackageAffiliation> {
@@ -46,10 +74,11 @@ impl CatalogAffiliations {
     }
 
     pub(crate) fn add(&mut self, affiliation: CatalogPackageAffiliation) -> bool {
-        if !valid_affiliation(&affiliation) {
+        if !valid_affiliation(&affiliation) || !self.entries.insert(affiliation.clone()) {
             return false;
         }
-        self.entries.insert(affiliation)
+        self.pending.added.insert(affiliation);
+        true
     }
 
     /// Forgets every affiliation of `package_id`; whether there was one.
@@ -57,15 +86,36 @@ impl CatalogAffiliations {
         let before = self.entries.len();
         self.entries
             .retain(|affiliation| &affiliation.package_id != package_id);
-        self.entries.len() != before
+        if self.entries.len() == before {
+            return false;
+        }
+        self.pending
+            .added
+            .retain(|affiliation| &affiliation.package_id != package_id);
+        self.pending.forgotten.insert(package_id.clone());
+        true
     }
 
-    pub(crate) fn persist(&self, root: &Path) -> std::io::Result<()> {
+    /// Apply what this process changed since its last persist to what the file holds, under the
+    /// file's record lock, and hold what that leaves, every other process's changes among it. A
+    /// failure keeps the change for the next persist.
+    pub(crate) fn persist(&mut self, root: &Path) -> std::io::Result<()> {
+        if self.pending == Pending::default() {
+            return Ok(());
+        }
+        let store = crate::store_fs::model_store(root);
+        let record = store.lock(Path::new(FILE_NAME))?;
+        let mut entries = record.read(MAX_FILE_BYTES)?.map(|bytes| decode(&bytes)).unwrap_or_default();
+        entries.retain(|affiliation| !self.pending.forgotten.contains(&affiliation.package_id));
+        entries.extend(self.pending.added.iter().cloned());
         let bytes = serde_json::to_vec_pretty(&StoredCatalogAffiliations {
-            affiliations: self.entries.iter().collect(),
+            affiliations: entries.iter().collect(),
         })
         .map_err(std::io::Error::other)?;
-        crate::store_fs::replace_file_sync(root, "catalog-affiliations.json", &bytes)
+        record.write(&bytes, seismic_io::Durability::Durable)?;
+        self.entries = entries;
+        self.pending = Pending::default();
+        Ok(())
     }
 }
 
@@ -93,10 +143,6 @@ fn valid_affiliation(affiliation: &CatalogPackageAffiliation) -> bool {
         && valid_repository(&affiliation.repository)
 }
 
-fn path(root: &Path) -> std::path::PathBuf {
-    root.join("catalog-affiliations.json")
-}
-
 fn valid_repository(value: &str) -> bool {
     let Some((owner, name)) = value.split_once('/') else {
         return false;
@@ -115,6 +161,42 @@ fn valid_repository_component(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn path(root: &Path) -> std::path::PathBuf {
+        root.join(FILE_NAME)
+    }
+
+    fn affiliation(package: &str) -> CatalogPackageAffiliation {
+        CatalogPackageAffiliation {
+            model_id: CatalogBaseId::new("model".to_owned()).unwrap(),
+            variant_id: CatalogVariantId::new("gguf:q4".to_owned()).unwrap(),
+            package_id: ModelPackageId(package.to_owned()),
+            repository: "owner/repo".to_owned(),
+            role: CatalogPackageRole::Target,
+        }
+    }
+
+    /// Two service processes over one store, each adding and forgetting packages of its own: the
+    /// file holds what both changed, and each then holds what the other added.
+    #[test]
+    fn two_processes_keep_each_others_affiliations() {
+        let root = tempfile::tempdir().expect("temporary store");
+        let mut first = CatalogAffiliations::load(root.path());
+        let mut second = CatalogAffiliations::load(root.path());
+        assert!(first.add(affiliation("kept")));
+        assert!(first.add(affiliation("forgotten")));
+        first.persist(root.path()).expect("persist");
+        assert!(second.add(affiliation("theirs")));
+        second.persist(root.path()).expect("persist");
+        assert!(first.forget_package(&ModelPackageId("forgotten".to_owned())));
+        first.persist(root.path()).expect("persist");
+        let held = |affiliations: &CatalogAffiliations| {
+            affiliations.entries().map(|affiliation| affiliation.package_id.0.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(held(&CatalogAffiliations::load(root.path())), ["kept", "theirs"]);
+        assert_eq!(held(&first), ["kept", "theirs"], "a persist takes what the others changed");
+    }
 
     #[test]
     fn malformed_entries_are_isolated_and_round_trip_deterministically() {
@@ -133,9 +215,12 @@ mod tests {
         )
         .expect("affiliations");
 
-        let affiliations = CatalogAffiliations::load(root.path());
+        let mut affiliations = CatalogAffiliations::load(root.path());
         assert_eq!(affiliations.entries.len(), 1);
+        // A persist writes only a change: one rewrites the file from what it held.
+        assert!(affiliations.add(affiliation("added")));
         affiliations.persist(root.path()).expect("persist");
+        assert_eq!(affiliations.entries.len(), 2);
         assert_eq!(CatalogAffiliations::load(root.path()), affiliations);
     }
 }

@@ -17,7 +17,7 @@ use crate::{
     streamed_table::StreamedTable,
 };
 use magnitude_family_contracts::{WeightRole, WeightScope};
-use seismic::{BoundNativeGraphPlan, Device, HostHeap, NativePort};
+use seismic::{BoundNativeGraphPlan, HostHeap, NativePort};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 pub(crate) struct BoundTargetGraphs {
@@ -36,7 +36,6 @@ pub(crate) struct BoundTargetGraphs {
     /// The buffers of the group of more places held now, if any: kept while
     /// memory is Normal, released at Reclaim's surplus rung.
     pub(super) held: RefCell<Option<Rc<GroupBuffers>>>,
-    pub(super) device: Device,
     /// The token embedding as the entries gather it.
     pub embedding: ResidentTable,
     /// The stored tables the blocks read (`stored_table_rows`), by block.
@@ -68,16 +67,18 @@ impl BankRun {
     /// Bind `graph`'s bank parts for this run as block `index` at chain
     /// place `place` (`placed_banks`), and its park and publication nodes
     /// to the bank's park timeline (`crate::experts::Parks`); the run takes
-    /// their values when queued ([`Self::register_parks`]).
+    /// their values when queued ([`Self::register_parks`]). The parts bind
+    /// through `charges` (`seismic::NativeGraphBindings::set`).
     pub(crate) fn bind<P>(
         &self,
         graph: &PreparedTargetBlockGraph<P>,
         index: usize,
         place: usize,
+        charges: &seismic::Charges,
         bindings: &mut seismic::NativeGraphBindings,
     ) -> Result<(), String> {
         for (port, words) in placed_banks(&self.bank, graph, index, place)? {
-            bindings.set(port, &words).map_err(|error| error.to_string())?;
+            bindings.set(charges, port, &words).map_err(|error| error.to_string())?;
         }
         for &(_, port) in &graph.parks {
             bindings.set_park(port, self.bank.parks().timeline()).map_err(|error| error.to_string())?;
@@ -90,10 +91,11 @@ impl BankRun {
         graph: &PreparedTargetBlockGraph<P>,
         index: usize,
         window: u64,
+        charges: &seismic::Charges,
         bindings: &mut seismic::NativeGraphBindings,
     ) -> Result<(), String> {
         for (port, words) in windowed_banks(&self.bank, graph, index, window)? {
-            bindings.set(port, &words).map_err(|error| error.to_string())?;
+            bindings.set(charges, port, &words).map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -232,8 +234,8 @@ pub(crate) struct PassBuffers {
     pub(super) layers: super::SplitLayers,
 }
 
-pub(super) fn zeros(device: &Device, (element, extents): &Extents) -> Result<seismic::Tensor, AllocationError> {
-    seismic::Tensor::zeros(device, *element, extents).map_err(AllocationError::Tensor)
+pub(super) fn zeros(charges: &seismic::Charges, (element, extents): &Extents) -> Result<seismic::Tensor, AllocationError> {
+    seismic::Tensor::zeros(charges, *element, extents).map_err(AllocationError::Tensor)
 }
 
 /// The buffers a prompt group of `places` places holds (`GroupExtents`),
@@ -271,17 +273,17 @@ pub(crate) struct GroupBuffers {
 impl GroupBuffers {
     /// A group of `places` places' buffers, beside the load's `pass`
     /// buffers, which a load holds exactly where its blocks split.
-    pub(super) fn new(prepared: &PreparedTargetGraphs, device: &Device, places: usize, pass: Option<&PassBuffers>) -> Result<Self, AllocationError> {
+    pub(super) fn new(prepared: &PreparedTargetGraphs, charges: &seismic::Charges, places: usize, pass: Option<&PassBuffers>) -> Result<Self, AllocationError> {
         let invariant = |detail: String| AllocationError::Plan(crate::InvariantError { context: "group buffers", detail });
         let extents = prepared.group_extents(places);
         let split = pass
             .map(|pass| {
                 let values = pass.layers.at_rows(prepared.region_start(places));
                 Ok::<_, AllocationError>(SplitValues {
-                    crossing: values.crossing.try_map(|value| zeros(device, value))?,
+                    crossing: values.crossing.try_map(|value| zeros(charges, value))?,
                     merged: Merged {
                         experts: pass.experts.clone(),
-                        inverse: zeros(device, &values.merged.inverse)?,
+                        inverse: zeros(charges, &values.merged.inverse)?,
                         table: pass.table.clone(),
                     },
                 })
@@ -300,12 +302,12 @@ impl GroupBuffers {
             // No block splits.
             None => Vec::new(),
         };
-        let allocate = |value: &Option<Extents>| value.as_ref().map(|value| zeros(device, value)).transpose();
+        let allocate = |value: &Option<Extents>| value.as_ref().map(|value| zeros(charges, value)).transpose();
         let operands = match prepared.operand_carry() {
             None => Vec::new(),
             Some(carry) => (0..places)
                 .map(|_| {
-                    let pair = || carry.allocate(device).map_err(AllocationError::Tensor);
+                    let pair = || carry.allocate(charges).map_err(AllocationError::Tensor);
                     Ok::<_, AllocationError>([pair()?, pair()?])
                 })
                 .collect::<Result<_, _>>()?,
@@ -351,7 +353,7 @@ impl GroupBuffers {
 impl BoundTargetGraphs {
     /// The buffers of a chain of `launches` launches: the floor's alone,
     /// the held group's otherwise, held with the class whose places bound
-    /// a chain (`AllocatedResources::group_places`).
+    /// a chain (`ExecutorDomain::group_places`).
     pub(crate) fn group(&self, launches: usize) -> Result<Rc<GroupBuffers>, String> {
         match launches {
             1 => Ok(self.floor.clone()),
@@ -372,12 +374,17 @@ impl BoundTargetGraphs {
     /// Hold a group of `places` places' buffers in place of any held now
     /// (`group_bytes`); the floor serves a group of one. A failure keeps
     /// the buffers held before.
-    pub(crate) fn hold_group(&self, places: usize) -> Result<(), AllocationError> {
-        let held = (places > 1)
-            .then(|| GroupBuffers::new(&self.prepared, &self.device, places, self.pass.as_ref()).map(Rc::new))
+    pub(crate) fn hold_group(&self, charges: &seismic::Charges, places: std::num::NonZeroUsize) -> Result<(), AllocationError> {
+        let held = (places.get() > 1)
+            .then(|| GroupBuffers::new(&self.prepared, charges, places.get(), self.pass.as_ref()).map(Rc::new))
             .transpose()?;
         *self.held.borrow_mut() = held;
         Ok(())
+    }
+
+    /// The floor's buffers alone held again: a group's released.
+    pub(crate) fn release_group(&self) {
+        *self.held.borrow_mut() = None;
     }
 
     /// Visit the graph constants and buffers the bindings hold.
@@ -439,6 +446,7 @@ pub(super) fn bind_block_graphs<K: Copy + std::fmt::Debug, P>(
     graphs: &[(K, Arc<PreparedTargetBlockGraph<P>>)],
     index: usize,
     resident: &ResidentTarget,
+    charges: &seismic::Charges,
     constants: &mut ConstantTensors,
 ) -> Result<Vec<(K, BoundNativeGraphPlan)>, String> {
     let mut bound = Vec::with_capacity(graphs.len());
@@ -469,7 +477,7 @@ pub(super) fn bind_block_graphs<K: Copy + std::fmt::Debug, P>(
             .collect::<Result<Vec<_>, String>>()?;
         bound.push((
             *class,
-            graph.plan.bind_static(&fixed).map_err(|error| {
+            graph.plan.bind_static(charges, &fixed).map_err(|error| {
                 format!("target graph static binding class {class:?} block {index}: {error}")
             })?,
         ));

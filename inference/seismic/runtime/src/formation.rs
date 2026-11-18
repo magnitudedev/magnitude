@@ -89,39 +89,16 @@ pub(crate) enum FormationClass {
     Compiled,
 }
 
-/// The stack of each thread a toolchain call runs on. A call hands its
-/// program to the platform's compiler (NVRTC, or a Vulkan or Metal driver's
-/// shader compiler), whose recursion depth follows the program and the
-/// driver, neither of which the caller chose, so no toolchain call runs on
-/// its caller's stack ([`on_compiler_stack`]).
-///
-/// Measured on an RTX 3090, driver 570.211.01, with its pipeline cache off
-/// (2026-11-07): forming `attention_decode_k8v4` (kv 1, g 16, s 512) drove
-/// NVIDIA's SPIR-V compiler (`libnvidia-glvkspirv`) through two functions
-/// recursing in turn, 640 B and about 390 B a frame. On a 2 MiB libtest
-/// thread it overflowed about 4,050 frames in; on a compiler thread it
-/// touched 2,260,992 B of stack at its peak, of which Seismic's frames
-/// above the driver were at most 9,136 B. The stack is 16 MiB: seven
-/// times that peak, so a program several times deeper than the deepest
-/// measured still forms. It is address space reserved for the thread's
-/// life; only the pages a compile touches are committed.
-const COMPILER_STACK_BYTES: usize = 16 << 20;
-
-/// `call` on a thread of the former's, with [`COMPILER_STACK_BYTES`] of
-/// stack, while the caller waits: what a platform compiler needs of its
-/// stack is never what the calling thread happens to have. A thread is
-/// started for each call, which costs microseconds beside a compile or a
-/// platform load, and the callers that wait bound how many run at once.
+/// `call` on a thread of the former's ([`seismic_threads::run`]) while the
+/// caller waits. A call hands its program to the platform's compiler (NVRTC,
+/// or a Vulkan or Metal driver's shader compiler), whose recursion depth
+/// follows the program and the driver, neither of which the caller chose,
+/// so no toolchain call runs on its caller's stack, whoever started that
+/// thread. A thread is started for each call, which costs microseconds
+/// beside a compile or a platform load, and the callers that wait bound how
+/// many run at once.
 fn on_compiler_stack<R: Send>(call: impl FnOnce() -> R + Send) -> R {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name(COMPILER_THREAD.into())
-            .stack_size(COMPILER_STACK_BYTES)
-            .spawn_scoped(scope, call)
-            .expect("the host starts a compiler thread")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    })
+    seismic_threads::run(COMPILER_THREAD, call)
 }
 
 /// The name of every thread a toolchain call runs on.
@@ -554,20 +531,23 @@ impl<T: Toolchain> ProgramFormer<T> {
     }
 
     /// The artifact `kept` names, its bytes checked against the pointer's
-    /// digest and decoded, opened in place where the store keeps them in a
-    /// file ([`ArtifactStore::file`]); none when the store has dropped it,
-    /// or keeps bytes that do not match the digest or do not decode
-    /// (damaged), which are reported, counted as a load miss and compiled
-    /// again: the store is a cache, and the compile rewrites them.
+    /// digest and decoded, opened in place where it opens so and the store
+    /// keeps them in a file: bytes and file both read under the store's
+    /// hold ([`ArtifactStore::held`]), which the artifact keeps while it
+    /// lives, so no eviction removes the file before its platform opens it.
+    /// None when the store has dropped it, or keeps bytes that do not match
+    /// the digest or do not decode (damaged), which are reported, counted as
+    /// a load miss and compiled again: the store is a cache, and the compile
+    /// rewrites them.
     fn artifact(&self, kept: &Pointer) -> Option<T::Artifact> {
         let namespace = self.toolchain.identity().namespace;
-        let bytes = self.store.get(namespace, &kept.artifact)?;
+        let (bytes, held) = match T::Artifact::IN_PLACE.then(|| self.store.held(namespace, &kept.artifact)).flatten() {
+            Some((bytes, held)) => (bytes, Some(held)),
+            None => (self.store.get(namespace, &kept.artifact)?, None),
+        };
         let damage = match kept.holds(&bytes) {
             false => "does not match the digest its pointer names",
-            true => match T::Artifact::decode(
-                &bytes,
-                T::Artifact::IN_PLACE.then(|| self.store.file(namespace, &kept.artifact)).flatten().as_deref(),
-            ) {
+            true => match T::Artifact::decode(&bytes, held) {
                 Some(artifact) => return Some(artifact),
                 None => "does not decode",
             },
@@ -721,7 +701,7 @@ mod tests {
 
     impl Artifact for Names {
         const ENCODING: u32 = 1;
-        fn decode(bytes: &[u8], _: Option<&std::path::Path>) -> Option<Self> {
+        fn decode(bytes: &[u8], _: Option<seismic_native_target::HeldFile>) -> Option<Self> {
             let (names, _) = std::str::from_utf8(bytes).ok()?.split_once('#')?;
             Some(Self(names.split(',').map(str::to_owned).collect()))
         }
@@ -740,9 +720,9 @@ mod tests {
         ) -> Result<(Names, Vec<String>), NativeCompilationError> {
             self.ran();
             if source.text == "deep" {
-                // 8 MiB of stack: four times a libtest thread's.
+                // Half the owner's stack: more than twice a libtest thread's.
                 let start = std::hint::black_box(0u8);
-                std::hint::black_box(deep(&start as *const u8 as usize, 8 << 20));
+                std::hint::black_box(deep(&start as *const u8 as usize, seismic_threads::STACK_BYTES / 2));
             }
             self.compiles.fetch_add(1, Ordering::SeqCst);
             self.entries.fetch_add(source.entries.len(), Ordering::SeqCst);
@@ -867,7 +847,7 @@ mod tests {
     fn every_toolchain_call_runs_on_a_compiler_thread_whatever_its_caller_holds() {
         let store = Arc::new(Held::default());
         let first = former(Some(store.clone()));
-        // A caller with 1 MiB of stack forms a compile that takes 8.
+        // A caller with 1 MiB of stack forms a compile that takes several.
         std::thread::Builder::new()
             .stack_size(1 << 20)
             .spawn(move || {
@@ -1034,8 +1014,8 @@ mod tests {
     /// matches, and a later process loads the entry and compiles nothing.
     #[test]
     fn processes_compiling_at_once_leave_every_pointer_whole() {
-        use crate::artifacts::{DirectoryStore, Eviction, DEFAULT_CAPACITY};
-        fn alone(_: &std::path::Path) -> Eviction {
+        use crate::artifacts::{DirectoryStore, Eviction, Examining, DEFAULT_CAPACITY};
+        fn alone(_: &std::path::Path, _: &Examining<'_>) -> Eviction {
             Eviction::Alone
         }
         let root = std::env::temp_dir().join(format!("seismic-formation-race-{}", std::process::id()));
@@ -1083,10 +1063,11 @@ mod tests {
             }
         });
         assert_eq!(racing.iter().map(compiles).collect::<Vec<_>>(), [1, 1], "each process read a miss and compiled");
-        let pointer = reader.file("echo", &entry).expect("a pointer landed");
-        let held = std::fs::read_dir(pointer.parent().unwrap()).unwrap().flatten().count();
+        let (bytes, pointer) = reader.held("echo", &entry).expect("a pointer landed");
+        let held = std::fs::read_dir(pointer.path().parent().unwrap()).unwrap().flatten().count();
         assert_eq!(held, 3, "the pointer and each process's own artifact, no temporary file");
-        whole(&std::fs::read(&pointer).unwrap());
+        whole(&bytes);
+        drop(pointer);
         let later = process(2, None);
         drop(later.form(&[launch]).unwrap());
         assert_eq!((compiles(&later), later.programs_formed().load_misses), (0, 0));

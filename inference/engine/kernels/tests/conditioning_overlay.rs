@@ -20,6 +20,7 @@ fn devices() -> Vec<seismic::Device> {
 #[test]
 fn native_overlay_publishes_conditioned_rows_value_exactly() {
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for (rows, width) in [(1usize, 2usize), (5, 37), (3, 2560)] {
             let special = [
                 0x7fc0_1234u32,
@@ -44,14 +45,14 @@ fn native_overlay_publishes_conditioned_rows_value_exactly() {
             };
             let shape = [rows as u64, width as u64];
             let source = seismic::Tensor::from_host(
-                &device,
+                &charges,
                 seismic::Element::f32(),
                 &shape,
                 &bytes(&input),
             )
             .unwrap();
             let mut out = seismic::Tensor::from_host(
-                &device,
+                &charges,
                 seismic::Element::f32(),
                 &shape,
                 &bytes(&vec![0xdead_beef; rows * width]),
@@ -59,7 +60,7 @@ fn native_overlay_publishes_conditioned_rows_value_exactly() {
             .unwrap();
             declared::prepared(&device, &conditioning_overlay::native_entry(), &seismic::NativeSpecialization::new())
                 .unwrap()
-                .call(conditioning_overlay::Args {
+                .call(&charges, conditioning_overlay::Args {
                     input: &source,
                     out: &mut out,
                 })

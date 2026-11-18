@@ -5,7 +5,7 @@ use magnitude_executor::memory::ledger::own_lag;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-use seismic::{Device, DeviceTopology, Element, StoreId, StoreIdentity, StoreKind, Tensor};
+use seismic::{Charges, Device, DeviceTopology, Element, StoreId, StoreIdentity, StoreKind, Tensor};
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum PressureStore { Host, Device }
@@ -51,6 +51,9 @@ const PRESS_LEAST: u64 = 1 << 20;
 pub struct Target {
     devices: Devices,
     device: Device,
+    /// What the press holds is charged to: the tallies its device was
+    /// opened on (`Devices::open`, outside any embedder's ledger).
+    charges: Charges,
     store: StoreId,
     /// When the latest holding [`Self::take`] made was in place.
     taken: Option<Instant>,
@@ -65,7 +68,8 @@ impl Target {
         // Opened as a load opens its device.
         let device = devices.open(id).map_err(|error| error.to_string())?;
         let store = pressed(device.topology(), device.info(), selected)?;
-        Ok(Self { devices, device, store, taken: None })
+        let charges = Charges::tally(&device);
+        Ok(Self { devices, device, charges, store, taken: None })
     }
 
     pub fn reading(&self) -> Result<magnitude_executor::platform::DomainReading, String> {
@@ -111,7 +115,7 @@ impl Target {
         let mut tensors = Vec::new();
         let (mut taken, mut chunk) = (0u64, self.largest()?.min(headroom.max(PRESS_LEAST)));
         while chunk >= PRESS_LEAST {
-            match Tensor::zeros(&self.device, Element::bool(), &[chunk]) {
+            match Tensor::zeros(&self.charges, Element::bool(), &[chunk]) {
                 Ok(tensor) => {
                     tensors.push(tensor);
                     taken += chunk;
@@ -151,7 +155,7 @@ impl Target {
             let mut left = bytes;
             while left > 0 {
                 let chunk = left.min(largest);
-                tensors.push(Tensor::zeros(&self.device, Element::bool(), &[chunk]).map_err(|error| error.to_string())?);
+                tensors.push(Tensor::zeros(&self.charges, Element::bool(), &[chunk]).map_err(|error| error.to_string())?);
                 left -= chunk;
             }
             Ok(Held::Device { _tensors: tensors })
@@ -184,7 +188,7 @@ impl Hot {
         let words = Arc::new(words);
         let stop = Arc::new(AtomicBool::new(false));
         let (classed, class) = std::sync::mpsc::sync_channel(1);
-        let reader = std::thread::spawn({
+        let reader = seismic::threads::spawn("store-reader", {
             let (words, stop) = (words.clone(), stop.clone());
             move || {
                 let yields = yielding();
@@ -203,7 +207,8 @@ impl Hot {
                     }
                 }
             }
-        });
+        })
+        .expect("invariant violated: the host starts a thread");
         let held = Self { words, stop, reader: Some(reader) };
         class.recv().map_err(|_| "the reading thread ended before taking its class".to_owned())??;
         Ok(held)

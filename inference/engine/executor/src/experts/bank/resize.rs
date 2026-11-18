@@ -387,14 +387,10 @@ pub(super) fn grow_by_slots<S>(
 impl Growing {
     /// Its end, once the resize thread finished it: what it came to for
     /// `holding`, its records' charge read by `charged` after the outcome is
-    /// acquired, and where its time went; or why the store is broken (its
-    /// step panicked, or a slot claimed could not join).
+    /// acquired, and where its time went; or why the store is broken (a
+    /// slot claimed could not join).
     pub(super) fn ended(&self, holding: BankHolding, charged: impl FnOnce() -> u64) -> Option<Result<(BankResized, Spent), String>> {
-        let (outcome, released) = self.done.lock().expect("bank growth outcome").take()?;
-        let Grown { at, joined, cut, spent } = match outcome {
-            Ok(grown) => grown,
-            Err(panicked) => return Some(Err(panicked)),
-        };
+        let (Grown { at, joined, cut, spent }, released) = self.done.lock().expect("bank growth outcome").take()?;
         let refused = match cut {
             Cut::None => None,
             Cut::Refused(refusal) => Some(refusal),

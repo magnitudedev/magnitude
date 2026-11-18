@@ -407,7 +407,8 @@ impl ElasticBank for ServedBank {
         // again.
         let from = self.holding_charge(holding, at)?;
         let bytes = self.holding_charge(holding, to)? - from;
-        let Ok(claim) = ledgers.of(self.storage(holding)?).backing(crate::memory::ledger::PoolClass::Records, bytes) else {
+        let ledger = ledgers.of(self.storage(holding)?);
+        let Ok(claim) = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, bytes)) else {
             return Ok(BankStep::Deferred);
         };
         // Held before the growth begins: each slot's backing is charged to

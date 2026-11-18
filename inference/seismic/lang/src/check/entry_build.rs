@@ -4044,6 +4044,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         );
     }
 
+    /// The semantic value of one expression. The functions on its recursion
+    /// hold only the recursion's own locals, so a level's frame stays within
+    /// what MAX_NESTING levels are budgeted (`seismic_threads::PROGRAM_BYTES`).
     fn lower_expr(
         &mut self,
         region: RegionId,
@@ -4102,174 +4105,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 indices,
                 value,
                 authority,
-            } => {
-                let ir::Place::Element {
-                    root: expected_root,
-                    indices: expected_indices,
-                } = authority.region()
-                else {
-                    panic!("checked atomic authority is not bound to an element region")
-                };
-                assert_eq!(
-                    expected_indices, indices,
-                    "checked atomic authority names a different element"
-                );
-                let actual = self.local_place(region, place, expression.span);
-                let expected = self.local_place(region, expected_root, expression.span);
-                if self.region_storage_origin(region, actual, &mut BTreeSet::new())
-                    != self.region_storage_origin(region, expected, &mut BTreeSet::new())
-                    && actual != expected
-                {
-                    panic!("checked atomic authority is bound to different storage")
-                }
-                let checked_participants = authority
-                    .participants()
-                    .iter()
-                    .map(|participant| {
-                        *self
-                            .participant_bindings
-                            .get(participant)
-                            .unwrap_or_else(|| {
-                                panic!("checked atomic authority names an inactive participant")
-                            })
-                    })
-                    .collect::<Vec<_>>();
-                assert!(
-                    checked_participants
-                        .iter()
-                        .all(|participant| self.parallel_participants.contains(participant))
-                );
-                assert!(matches!(authority.order(), ir::CheckedAtomicOrder::Relaxed));
-                match authority.scope() {
-                    ir::CheckedAtomicScope::Participant => {
-                        assert!(checked_participants.is_empty())
-                    }
-                    ir::CheckedAtomicScope::Participants(participants) => {
-                        let scope = participants
-                            .iter()
-                            .map(|participant| {
-                                *self
-                                    .participant_bindings
-                                    .get(participant)
-                                    .unwrap_or_else(|| {
-                                        panic!("checked atomic scope names an inactive participant")
-                                    })
-                            })
-                            .collect::<Vec<_>>();
-                        assert_eq!(scope, checked_participants);
-                    }
-                }
-                assert!(matches!(
-                    authority.publication(),
-                    ir::CheckedAtomicPublication::CommandCompletion
-                ));
-                let representation = match &self.values[actual.index()].ty {
-                    SemanticType::Tensor(tensor) => tensor.representation,
-                    _ => panic!("checked atomic place is not a tensor"),
-                };
-                let dtype = crate::registry::representation_info(representation).decoded;
-                let semantic_outcome = match authority.outcome() {
-                    ir::CheckedAssociationOutcome::Exact => AssociationOutcome::Exact,
-                    ir::CheckedAssociationOutcome::Reassociated { accumulator } => {
-                        assert_eq!(accumulator, dtype);
-                        AssociationOutcome::Reassociated { accumulator }
-                    }
-                };
-                let expected_outcome = match op {
-                    crate::intrinsics::AtomicOp::Add if dtype.is_float() => {
-                        AssociationOutcome::Reassociated { accumulator: dtype }
-                    }
-                    crate::intrinsics::AtomicOp::Add
-                    | crate::intrinsics::AtomicOp::Max
-                    | crate::intrinsics::AtomicOp::Min => AssociationOutcome::Exact,
-                };
-                assert_eq!(semantic_outcome, expected_outcome);
-                let participants = if checked_participants.is_empty() {
-                    ParticipantDomain::Single
-                } else {
-                    ParticipantDomain::Parallel(checked_participants.into_boxed_slice())
-                };
-                let mut inputs = vec![actual];
-                let mut semantic_indices = Vec::with_capacity(indices.len());
-                for (axis, index) in indices.iter().enumerate() {
-                    let ir::Index::Point {
-                        value: point,
-                        runtime_check,
-                    } = index
-                    else {
-                        panic!("checked atomic place selects a range")
-                    };
-                    let point = self.lower_expr(region, point)?;
-                    if *runtime_check {
-                        self.emit_point_check(region, actual, axis, point, expression.span);
-                    }
-                    semantic_indices.push(point);
-                    inputs.push(point);
-                }
-                let capability = AtomicCapability::checked(
-                    actual,
-                    semantic_indices,
-                    participants,
-                    semantic_outcome,
-                );
-                inputs.push(self.lower_expr(region, value)?);
-                let ty = self.semantic_type(&expression.ty);
-                Ok(self.emit(
-                    region,
-                    NodeKind::Atomic {
-                        op: *op,
-                        capability,
-                    },
-                    inputs,
-                    vec![ty],
-                    expression.span,
-                )[0])
-            }
+            } => self.lower_atomic(region, op, place, indices, value, authority, expression),
             ir::ExprKind::Intrinsic { overload, args } => {
-                let mut inputs = Vec::new();
-                for argument in args {
-                    inputs.push(self.lower_expr(region, argument)?);
-                }
-                let id = self.resolve_intrinsic(overload, &inputs);
-                let signature = crate::registry::intrinsic_signature(id);
-                match signature.execution {
-                    crate::registry::IntrinsicExecution::WithinEnclosingParallel
-                        if self.parallel_depth == 0 =>
-                    {
-                        return Err(SourceDiagnostic::new(
-                            &self.module.sources.files()[self.definition.file],
-                            expression.span,
-                            crate::checked::DiagnosticRule::Type,
-                            format!(
-                                "intrinsic `{}` requires an enclosing parallel loop",
-                                signature.name
-                            ),
-                        ));
-                    }
-                    crate::registry::IntrinsicExecution::WholeTensor { .. }
-                        if self.parallel_depth != 0 =>
-                    {
-                        return Err(SourceDiagnostic::new(
-                            &self.module.sources.files()[self.definition.file],
-                            expression.span,
-                            crate::checked::DiagnosticRule::Type,
-                            format!(
-                                "whole-tensor intrinsic `{}` cannot be nested in a parallel loop",
-                                signature.name
-                            ),
-                        ));
-                    }
-                    crate::registry::IntrinsicExecution::WithinEnclosingParallel
-                    | crate::registry::IntrinsicExecution::WholeTensor { .. } => {}
-                }
-                let ty = self.semantic_type(&expression.ty);
-                Ok(self.emit(
-                    region,
-                    NodeKind::Intrinsic(id),
-                    inputs,
-                    vec![ty],
-                    expression.span,
-                )[0])
+                self.lower_intrinsic(region, overload, args, expression)
             }
             ir::ExprKind::Call { call, args } => self.lower_call(region, call, args, expression),
             ir::ExprKind::IndexPosition(word) => {
@@ -4282,6 +4120,206 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         // its exact meaning is represented or simplified by the checker.
         self.bind_source_product(region, &expression.value, value, expression.span);
         Ok(value)
+    }
+
+    /// An atomic read-modify-write of one checked element.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_atomic(
+        &mut self,
+        region: RegionId,
+        op: &crate::intrinsics::AtomicOp,
+        place: &super::ownership::LocalPlace,
+        indices: &[ir::Index],
+        value: &ir::Expr,
+        authority: &ir::AtomicCapability,
+        expression: &ir::Expr,
+    ) -> Result<SemanticValueId, SourceDiagnostic> {
+        let ir::Place::Element {
+            root: expected_root,
+            indices: expected_indices,
+        } = authority.region()
+        else {
+            panic!("checked atomic authority is not bound to an element region")
+        };
+        assert_eq!(
+            expected_indices, indices,
+            "checked atomic authority names a different element"
+        );
+        let actual = self.local_place(region, place, expression.span);
+        let expected = self.local_place(region, expected_root, expression.span);
+        if self.region_storage_origin(region, actual, &mut BTreeSet::new())
+            != self.region_storage_origin(region, expected, &mut BTreeSet::new())
+            && actual != expected
+        {
+            panic!("checked atomic authority is bound to different storage")
+        }
+        let checked_participants = authority
+            .participants()
+            .iter()
+            .map(|participant| {
+                *self
+                    .participant_bindings
+                    .get(participant)
+                    .unwrap_or_else(|| {
+                        panic!("checked atomic authority names an inactive participant")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            checked_participants
+                .iter()
+                .all(|participant| self.parallel_participants.contains(participant))
+        );
+        assert!(matches!(authority.order(), ir::CheckedAtomicOrder::Relaxed));
+        match authority.scope() {
+            ir::CheckedAtomicScope::Participant => {
+                assert!(checked_participants.is_empty())
+            }
+            ir::CheckedAtomicScope::Participants(participants) => {
+                let scope = participants
+                    .iter()
+                    .map(|participant| {
+                        *self
+                            .participant_bindings
+                            .get(participant)
+                            .unwrap_or_else(|| {
+                                panic!("checked atomic scope names an inactive participant")
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(scope, checked_participants);
+            }
+        }
+        assert!(matches!(
+            authority.publication(),
+            ir::CheckedAtomicPublication::CommandCompletion
+        ));
+        let representation = match &self.values[actual.index()].ty {
+            SemanticType::Tensor(tensor) => tensor.representation,
+            _ => panic!("checked atomic place is not a tensor"),
+        };
+        let dtype = crate::registry::representation_info(representation).decoded;
+        let semantic_outcome = match authority.outcome() {
+            ir::CheckedAssociationOutcome::Exact => AssociationOutcome::Exact,
+            ir::CheckedAssociationOutcome::Reassociated { accumulator } => {
+                assert_eq!(accumulator, dtype);
+                AssociationOutcome::Reassociated { accumulator }
+            }
+        };
+        let expected_outcome = match op {
+            crate::intrinsics::AtomicOp::Add if dtype.is_float() => {
+                AssociationOutcome::Reassociated { accumulator: dtype }
+            }
+            crate::intrinsics::AtomicOp::Add
+            | crate::intrinsics::AtomicOp::Max
+            | crate::intrinsics::AtomicOp::Min => AssociationOutcome::Exact,
+        };
+        assert_eq!(semantic_outcome, expected_outcome);
+        let participants = if checked_participants.is_empty() {
+            ParticipantDomain::Single
+        } else {
+            ParticipantDomain::Parallel(checked_participants.into_boxed_slice())
+        };
+        let mut inputs = vec![actual];
+        let mut semantic_indices = Vec::with_capacity(indices.len());
+        for (axis, index) in indices.iter().enumerate() {
+            let ir::Index::Point {
+                value: point,
+                runtime_check,
+            } = index
+            else {
+                panic!("checked atomic place selects a range")
+            };
+            let point = self.lower_expr(region, point)?;
+            if *runtime_check {
+                self.emit_point_check(region, actual, axis, point, expression.span);
+            }
+            semantic_indices.push(point);
+            inputs.push(point);
+        }
+        let capability = AtomicCapability::checked(
+            actual,
+            semantic_indices,
+            participants,
+            semantic_outcome,
+        );
+        inputs.push(self.lower_expr(region, value)?);
+        let ty = self.semantic_type(&expression.ty);
+        Ok(self.emit(
+            region,
+            NodeKind::Atomic {
+                op: *op,
+                capability,
+            },
+            inputs,
+            vec![ty],
+            expression.span,
+        )[0])
+    }
+
+    /// An intrinsic call: its arguments are lowered, then its node is built.
+    fn lower_intrinsic(
+        &mut self,
+        region: RegionId,
+        overload: &ir::IntrinsicOverload,
+        args: &[ir::Expr],
+        expression: &ir::Expr,
+    ) -> Result<SemanticValueId, SourceDiagnostic> {
+        let mut inputs = Vec::new();
+        for argument in args {
+            inputs.push(self.lower_expr(region, argument)?);
+        }
+        self.intrinsic_node(region, overload, inputs, expression)
+    }
+
+    /// The node of an intrinsic whose arguments are lowered.
+    fn intrinsic_node(
+        &mut self,
+        region: RegionId,
+        overload: &ir::IntrinsicOverload,
+        inputs: Vec<SemanticValueId>,
+        expression: &ir::Expr,
+    ) -> Result<SemanticValueId, SourceDiagnostic> {
+        let id = self.resolve_intrinsic(overload, &inputs);
+        let signature = crate::registry::intrinsic_signature(id);
+        match signature.execution {
+            crate::registry::IntrinsicExecution::WithinEnclosingParallel
+                if self.parallel_depth == 0 =>
+            {
+                return Err(SourceDiagnostic::new(
+                    &self.module.sources.files()[self.definition.file],
+                    expression.span,
+                    crate::checked::DiagnosticRule::Type,
+                    format!(
+                        "intrinsic `{}` requires an enclosing parallel loop",
+                        signature.name
+                    ),
+                ));
+            }
+            crate::registry::IntrinsicExecution::WholeTensor { .. }
+                if self.parallel_depth != 0 =>
+            {
+                return Err(SourceDiagnostic::new(
+                    &self.module.sources.files()[self.definition.file],
+                    expression.span,
+                    crate::checked::DiagnosticRule::Type,
+                    format!(
+                        "whole-tensor intrinsic `{}` cannot be nested in a parallel loop",
+                        signature.name
+                    ),
+                ));
+            }
+            crate::registry::IntrinsicExecution::WithinEnclosingParallel
+            | crate::registry::IntrinsicExecution::WholeTensor { .. } => {}
+        }
+        let ty = self.semantic_type(&expression.ty);
+        Ok(self.emit(
+            region,
+            NodeKind::Intrinsic(id),
+            inputs,
+            vec![ty],
+            expression.span,
+        )[0])
     }
 
     /// The one row of a checked intrinsic overload whose operand categories
@@ -4345,6 +4383,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         row
     }
 
+    /// A primitive: its operands are lowered, then its node is built.
     fn lower_primitive(
         &mut self,
         region: RegionId,
@@ -4356,6 +4395,17 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         for operand in operands {
             inputs.push(self.lower_expr(region, operand)?);
         }
+        self.primitive_node(region, primitive, inputs, expression)
+    }
+
+    /// The node of a primitive whose operands are lowered.
+    fn primitive_node(
+        &mut self,
+        region: RegionId,
+        primitive: &PrimitiveId,
+        inputs: Vec<SemanticValueId>,
+        expression: &ir::Expr,
+    ) -> Result<SemanticValueId, SourceDiagnostic> {
         // Exact quantity min/max evaluates its actual operands before creating
         // the symbolic value. No source call, check, or dynamic symbol binding
         // is erased by the quantity representation.
@@ -4891,6 +4941,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         Ok(value)
     }
 
+    /// A call: its seeds and arguments are evaluated, then its node is built.
     fn lower_call(
         &mut self,
         region: RegionId,
@@ -4922,6 +4973,19 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         for argument in args {
             evaluated.push(self.lower_expr(region, argument)?);
         }
+        self.call_node(region, call, args, expression, seeds, evaluated)
+    }
+
+    /// The call node of a call whose seeds and arguments are evaluated.
+    fn call_node(
+        &mut self,
+        region: RegionId,
+        call: &ir::Call,
+        args: &[ir::Expr],
+        expression: &ir::Expr,
+        seeds: HashMap<u32, SemanticValueId>,
+        evaluated: Vec<SemanticValueId>,
+    ) -> Result<SemanticValueId, SourceDiagnostic> {
         let order = &call.arg_order;
         let source_family = &self.module.families[call.family.index()];
         let contract = &self.module.definitions[source_family.contract.index()];

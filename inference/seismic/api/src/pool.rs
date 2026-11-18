@@ -1,39 +1,64 @@
 //! A store's granule pool on a device: the storage slab stores
 //! ([`crate::SlabTensor::in_pool`]) take their slabs from, one granule each.
 
-use crate::{Contract, Device, TensorError};
+use crate::{Charges, Contract, Device, TensorError};
 
-pub use seismic_runtime::pool::{block_bytes, BlockSize, BlockSizing, NativeAllocations, PoolEntries, SizingError, BLOCK_ALIGNMENT};
+pub use seismic_runtime::pool::{block_bytes, BlockSize, BlockSizing, NativeAllocations, SizingError, BLOCK_ALIGNMENT};
 
 /// One store's granule pool on a device: blocks of the backend's plain
 /// allocations, each charged to the pool's ledger entry, cut into granules
 /// that slabs claim and release in process, beside the absent granule every
-/// free slot names, charged to an entry of its own ([`PoolEntries`]).
+/// free slot names, charged to an entry of its own ([`PoolCharges`]).
 /// Clones name the same pool.
 #[derive(Clone)]
 pub struct Pool {
     inner: seismic_runtime::pool::Pool,
 }
 
-impl Device {
-    /// The granule pool of the store `contract` places in, of
-    /// `granule`-byte granules (a multiple of 256) in `block_bytes`-byte
-    /// blocks ([`block_bytes`]), charged to `entries`, entries of that store
-    /// (its blocks to one, its absent granule to the other): a new pool,
-    /// holding no block until it grows, which its
-    /// clones share. A load opens one per store it places in; a fixture
-    /// opens its own beside it.
-    pub fn pool(
-        &self,
-        contract: Contract,
-        granule: u64,
-        block_bytes: u64,
-        entries: PoolEntries,
-    ) -> Result<Pool, TensorError> {
-        seismic_runtime::pool::Pool::open(self.inner(), contract, granule, block_bytes, entries)
-            .map(|inner| Pool { inner })
+/// The charges a pool's memory is made through, of one device: its blocks
+/// through one, its absent granule through the other.
+#[derive(Clone)]
+pub struct PoolCharges {
+    inner: seismic_runtime::pool::PoolCharges,
+}
+
+impl PoolCharges {
+    /// Every byte of the pool made through `charges`: a tally's or a
+    /// fixture's, which counts what the pool holds without telling its
+    /// granules apart.
+    pub fn one(charges: &Charges) -> Self {
+        Self { inner: seismic_runtime::pool::PoolCharges::one(charges.inner()) }
     }
 
+    /// The pool's blocks made through `blocks`, its absent granule through
+    /// `absent`: a ledger's, which holds the absent granule apart from the
+    /// granules a claim can take.
+    ///
+    /// # Panics
+    /// Where they are charges of two devices.
+    pub fn apart(blocks: &Charges, absent: &Charges) -> Self {
+        Self { inner: seismic_runtime::pool::PoolCharges::apart(blocks.inner().clone(), absent.inner().clone()) }
+    }
+}
+
+impl Pool {
+    /// The granule pool of the store `contract` places in on `charges`'
+    /// device, of `granule`-byte granules (a multiple of 256) in
+    /// `block_bytes`-byte blocks ([`block_bytes`]), made through `charges`
+    /// as every allocation is (their entries of that store, the kind they
+    /// are confined to): a new pool, holding no block until it grows, which
+    /// its clones share. A load opens one per store it places in; a fixture
+    /// opens its own beside it.
+    ///
+    /// # Panics
+    /// Through charges that allocate nothing in that store
+    /// ([`Charges::none`], [`Device::charges_in`] of another store).
+    pub fn open(charges: &PoolCharges, contract: Contract, granule: u64, block_bytes: u64) -> Result<Pool, TensorError> {
+        seismic_runtime::pool::Pool::open(&charges.inner, contract, granule, block_bytes).map(|inner| Pool { inner })
+    }
+}
+
+impl Device {
     /// How the device's backend makes its native allocations
     /// ([`BlockSizing::allocations`]), what a pool's blocks are sized by.
     pub fn native_allocations(&self) -> NativeAllocations {
@@ -120,9 +145,10 @@ mod tests {
             let allocations = NativeAllocations { least: allocations.least.max(2 * GRANULE), ..allocations };
             let block = block_bytes(BlockSizing { granule: GRANULE, allocations }).unwrap().bytes;
             let per_block = block / GRANULE;
-            let pool = device.pool(Contract::DeviceOnly, GRANULE, block, PoolEntries::one(Arc::new(tally.clone()))).unwrap();
+            let charges = PoolCharges::one(&device.charges_in(Contract::DeviceOnly, Arc::new(tally.clone())));
+            let pool = Pool::open(&charges, Contract::DeviceOnly, GRANULE, block).unwrap();
             let regions = [SlabRegion { element: Element::f32(), row_shape: vec![GRANULE / 4] }];
-            let slabs = SlabTensor::in_pool(&pool, 1, 2 * per_block, &regions).unwrap();
+            let slabs = SlabTensor::in_pool(&crate::Charges::tally(&device), &pool, 1, 2 * per_block, &regions).unwrap();
             for _ in 0..2 * per_block {
                 slabs.add_slab(SlabFill::Zeroed).unwrap();
             }

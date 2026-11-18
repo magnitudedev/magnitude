@@ -428,7 +428,7 @@ mod tests {
         let bytes = (0..64 * 1024).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         std::fs::write(&path, &bytes).unwrap();
         let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![128], records: 2 }).unwrap();
-        let staging = Tensor::shared(&device, Element::i32(), &[2, 32]).unwrap();
+        let staging = Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[2, 32]).unwrap();
         let records = Records::rows(&staging, 128, 2).unwrap();
         let read = |offset: u64, record: u64| Read::new(0, offset, 128, &records, record, 0);
         let demand = Want::now();
@@ -567,7 +567,7 @@ mod tests {
     /// (`experts::pooled_records`), each its slab's view.
     fn pooled(device: &seismic::Device, records: u64, bytes: u64) -> crate::experts::PooledRecords {
         let contract = crate::planning::BankTier::Bank.contract_on(device);
-        crate::experts::pooled_records(device, contract, Element::i32(), &[bytes / 4], records, records).unwrap()
+        crate::experts::pooled_records(&seismic::Charges::tally(device), contract, Element::i32(), &[bytes / 4], records, records).unwrap()
     }
 
     /// Memory a test frees only once every job reading into it has ended.

@@ -51,17 +51,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// `from`'s state at its position. Features `from` holds for an image
     /// with a span straddling that position are adopted; every image placed
     /// after it that still lacks features is returned as an encode. Opening
-    /// into free banks changes no bindings; growing one orphans the queued
-    /// steps first, by `unchained`'s proof that no chain holds them: an open
-    /// during another request's chain waits for its end. Admission is new
+    /// into free banks changes no bindings; growing one concludes the queued
+    /// steps first (`conclude_chain`): an open during another request's
+    /// chain waits for its end (`unchained`), so as not to cut it short. Admission is new
     /// work's: refused, changing nothing, where the device's ledger cannot
     /// reserve the rows it is about to write, its `rows` (its prompt, or the
     /// history it replays), with its drafter's rows past them and a launch's
     /// rows ahead (`RequestRows::opening`, `Ledger::reserve`), so no prompt
     /// row waits on memory. Its later rows are reserved ahead at its steps'
-    /// boundaries ([`Self::provision`]). Opened, the request holds its
-    /// reservation, backed, and the idle optional components are committed
-    /// again for it to draft and encode with.
+    /// boundaries ([`Self::provision`]). The idle optional components are
+    /// kept for it to draft and encode with in the same change, before its
+    /// reservation claims (`Self::keep_components`), so the reservation
+    /// cannot take them; refused, they idle again as they were. Opened, the
+    /// request holds its reservation, backed.
     pub fn open_state(
         &mut self,
         mut unchained: Unchained<'_>,
@@ -69,41 +71,39 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         from: Option<&ResumeState>,
         rows: u64,
     ) -> Result<Vec<Operation>, DomainError> {
-        let installed = self
-            .input
-            .get(&request)
-            .ok_or_else(|| DomainError::invariant("request has no installed input"))?;
-        if installed.resident
-            || self.target.contains_key(&request)
-            || self.head.contains_key(&request)
-        {
-            return Err(DomainError::invariant(format!(
-                "request {} is already resident",
-                request.0
-            )));
-        }
+        let installed = self.input.get(&request).expect("invariant violated: an opened request has no installed input");
+        assert!(
+            !installed.resident && !self.target.contains_key(&request) && !self.head.contains_key(&request),
+            "invariant violated: request {} opens already resident",
+            request.0
+        );
         let resumes = from.map_or(0, ResumeState::position) as u64;
-        if resumes > rows {
-            return Err(DomainError::invariant(format!(
-                "request {} resumes at row {resumes}, past the {rows} rows it opens with",
-                request.0
-            )));
-        }
-        let ledgers = self.resources.ledgers();
+        assert!(
+            resumes <= rows,
+            "invariant violated: request {} resumes at row {resumes}, past the {rows} rows it opens with",
+            request.0
+        );
         let reserved = crate::memory::ledger::RequestRows::of(&self.execution).opening(rows);
-        let mut reservation = ledgers
-            .device()
-            .reserve(&self.request_slot, request, reserved)
+        let changes = self.resources.ledgers().changes().clone();
+        let mut reservation = changes
+            .change(|keeping| {
+                let kept = self.keep_components(&keeping);
+                let reservation = self.resources.ledgers().device().reserve(&keeping.claims(), &self.request_slot, request, reserved);
+                match reservation {
+                    Ok(_) => self.activate_components(kept),
+                    Err(_) => self.idle_kept(kept),
+                }
+                reservation
+            })
             .map_err(DomainError::request_short)?;
-        self.activate_components();
-        self.orphan_queue(&mut unchained)?;
+        self.conclude_chain()?;
         let (target, head) = match from {
-            Some(from) => self.fork_resume_state(from)?,
+            Some(from) => self.fork_resume_state(from),
             None => self.fresh_state(&mut unchained)?,
         };
         let position = target.position();
         reservation.grow(position as u64);
-        self.change_state(|this| this.state_claims.insert(request, reservation));
+        self.change_state(|this, _| this.state_claims.insert(request, reservation));
         self.target.insert(request, target);
         if let Some(head) = head {
             self.head.insert(request, head);
@@ -111,7 +111,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if let Err(error) = self.back_reservation(unchained.bindings(), request) {
             self.target.remove(&request);
             self.head.remove(&request);
-            self.change_state(|this| this.drop_state_claim(request));
+            self.change_state(|this, _| this.drop_state_claim(request));
             return Err(error);
         }
         let installed = self.input.get_mut(&request).expect("input checked above");
@@ -156,7 +156,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         from: Option<&ResumeState>,
     ) -> Result<Vec<Operation>, DomainError> {
         let rows = self.execution.resources().target_state().context_rows as u64;
-        let unchained = self.unchained(bindings).ok_or_else(|| DomainError::invariant("a test opens a request beside a chain"))?;
+        let unchained = self.unchained(bindings).expect("invariant violated: a test opens a request beside a chain");
         self.open_state(unchained, request, from, rows)
     }
 
@@ -189,27 +189,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn fork_resume_state(
         &self,
         from: &ResumeState,
-    ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
+    ) -> (SequenceState, Option<SequenceState>) {
         let target = from.target.fork();
-        if !target.belongs_to(&self.target_store)
-            || from.head.is_some() != self.head_store.is_some()
-        {
-            return Err(DomainError::invariant(
-                "resume state differs from domain state arenas",
-            ));
-        }
+        assert!(
+            target.belongs_to(&self.target_store) && from.head.is_some() == self.head_store.is_some(),
+            "invariant violated: a resume state differs from the domain's state arenas"
+        );
         let head = from.head.as_ref().map(StateCheckpoint::fork);
-        if head.as_ref().is_some_and(|state| {
-            !self
-                .head_store
-                .as_ref()
-                .is_some_and(|store| state.belongs_to(store))
-        }) {
-            return Err(DomainError::invariant(
-                "resume state head belongs to another state arena",
-            ));
-        }
-        Ok((target, head))
+        assert!(
+            head.as_ref().is_none_or(|state| self.head_store.as_ref().is_some_and(|store| state.belongs_to(store))),
+            "invariant violated: a resume state's head belongs to another state arena"
+        );
+        (target, head)
     }
 
     /// The request's reconciled state as a resume state: both lanes and the
@@ -254,20 +245,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Drop a request's input and any numerical state. A resident request's
-    /// state must not be in flight; a chain holder's is its chain's, dropped
-    /// with it once its queued chunks, which still read the chain's rows,
-    /// are waited for.
+    /// state must not be in flight; a chain holder's chain concludes first
+    /// ([`Self::conclude_chain`]), its queued chunks, which still read the
+    /// chain's rows, waited for.
     pub fn close(&mut self, request: RequestId) -> Result<(), String> {
+        if self.chain_holder() == Some(request) {
+            self.conclude_chain().map_err(|error| error.to_string())?;
+        }
         let installed = self.input.get(&request).ok_or("request is not open")?;
-        let holds_chain = self.chain_holder() == Some(request);
         if installed.resident
-            && ((!holds_chain && !self.target.contains_key(&request))
+            && (!self.target.contains_key(&request)
                 || (self.head_store.is_some() && !self.head.contains_key(&request)))
         {
             return Err("request has unresolved work".into());
-        }
-        if holds_chain {
-            self.drain_queue().map_err(|error| error.to_string())?;
         }
         self.release_prefetches(&[request])?;
         self.head.remove(&request);
@@ -275,16 +265,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.publishing.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
-        self.change_state(|this| this.drop_state_claim(request));
+        self.change_state(|this, _| this.drop_state_claim(request));
         self.poisoned.remove(&request);
         Ok(())
     }
 
     /// Evict these requests: release their numerical state and encoded
     /// features. Their input stays installed for when they are resident
-    /// again. Refused, releasing nothing, where one holds no resolved
-    /// state (a head priming not yet completed).
+    /// again. A chain one holds concludes first ([`Self::conclude_chain`]),
+    /// its state then the holder's. Refused, releasing nothing, where one
+    /// holds no resolved state (a head priming not yet completed).
     pub fn release_state(&mut self, requests: &[RequestId]) -> Result<(), String> {
+        if self.chain_holder().is_some_and(|holder| requests.contains(&holder)) {
+            self.conclude_chain().map_err(|error| error.to_string())?;
+        }
         if !requests.iter().all(|request| self.target.contains_key(request)) {
             return Err("an evicted request has unresolved or absent target state".into());
         }
@@ -307,7 +301,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.target.remove(request);
             self.head.remove(request);
         }
-        self.change_state(|this| requests.iter().for_each(|request| this.drop_state_claim(*request)));
+        self.change_state(|this, _| requests.iter().for_each(|request| this.drop_state_claim(*request)));
         Ok(())
     }
 }

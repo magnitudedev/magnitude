@@ -412,11 +412,13 @@ pub trait ProgramFamily: 'static {
 
     fn bind_head(
         &mut self,
+        charges: &seismic::Charges,
         resident: ResidentHead,
         definition: &ModelDefinition,
     ) -> Result<(), String>;
     fn bind_vision(
         &mut self,
+        charges: &seismic::Charges,
         resident: ResidentVision,
         definition: &ModelDefinition,
     ) -> Result<(), String>;
@@ -475,7 +477,18 @@ pub trait ProgramFamily: 'static {
     /// heap claim for `group_demand`; a failure keeps the buffers held
     /// before. Only in a gap between flights (`quiet`): the expert bank
     /// takes a group's places only while none of its steps runs.
-    fn hold_group(&self, _places: usize, _quiet: super::Quiet) -> Result<(), crate::resources::AllocationError> {
+    fn hold_group(
+        &self,
+        _charges: &seismic::Charges,
+        _places: std::num::NonZeroUsize,
+        _quiet: super::Quiet,
+    ) -> Result<(), crate::resources::AllocationError> {
+        Ok(())
+    }
+
+    /// Hold the floor's buffers alone again, a group's released: only
+    /// between flights, as [`Self::hold_group`]. Allocates nothing.
+    fn release_group(&self, _quiet: super::Quiet) -> Result<(), String> {
         Ok(())
     }
 
@@ -488,7 +501,7 @@ pub trait ProgramFamily: 'static {
 
     /// Hold the bound head's storage for a class of `places` places, under a
     /// heap claim for `bound_head_demand`.
-    fn hold_bound_head(&self, _places: usize) -> Result<(), String> {
+    fn hold_bound_head(&self, _charges: &seismic::Charges, _places: usize) -> Result<(), String> {
         Ok(())
     }
 
@@ -581,6 +594,7 @@ impl NativeFamily {
     /// The family of `resident`, its bank's memory carved from what the
     /// load recorded allocating as it started (`ServedBank::new`).
     pub(crate) fn new(
+        charges: &seismic::Charges,
         programs: Rc<AttestedPrograms>,
         resident: ResidentTarget,
         geometry: Decoder,
@@ -590,16 +604,18 @@ impl NativeFamily {
         let invariant = |detail: String| super::DomainError::invariant(detail);
         let binding_constants = programs
             .target_graphs()
-            .ok_or_else(|| invariant("target graph family was not prepared".into()))?
+            .expect("invariant violated: a target graph family bound before it was prepared")
             .binding_constant_bytes()
             .map_err(invariant)?;
         let target = programs
-            .bind_target(resident.clone(), geometry)
+            .bind_target(charges, resident.clone(), geometry)
             .map_err(|error| invariant(error.to_string()))?;
-        if target.constant_bytes().map_err(|error| invariant(error.into()))? != binding_constants {
-            return Err(invariant("bound target graph constants differ from the claimed charge".into()));
-        }
-        let state = programs.bind_state();
+        assert_eq!(
+            target.constant_bytes().map_err(|error| invariant(error.into()))?,
+            binding_constants,
+            "invariant violated: a bound target graph's constants differ from the claimed charge"
+        );
+        let state = programs.bind_state(&charges.device());
         let bank = resident
             .bank
             .clone()
@@ -614,10 +630,10 @@ impl NativeFamily {
                             .sublayers
                             .stored_tables()
                             .find_map(|(role, table)| (role == plan.role).then(|| table.clone()))
-                            .ok_or_else(|| invariant(format!("the bank's table {:?} was not imported", plan.role)))?;
-                        Ok(crate::experts::HeldTable { plan: plan.clone(), table, last_resize: std::sync::Mutex::new(None) })
+                            .unwrap_or_else(|| panic!("invariant violated: the bank's table {:?} was not imported", plan.role));
+                        crate::experts::HeldTable { plan: plan.clone(), table, last_resize: std::sync::Mutex::new(None) }
                     })
-                    .collect::<Result<Vec<_>, super::DomainError>>()?;
+                    .collect::<Vec<_>>();
                 crate::experts::ServedBank::new(bank, tables, ledgers, recorded)
             })
             .transpose()?;
@@ -673,6 +689,7 @@ impl ProgramFamily for NativeFamily {
 
     fn bind_head(
         &mut self,
+        charges: &seismic::Charges,
         resident: ResidentHead,
         definition: &ModelDefinition,
     ) -> Result<(), String> {
@@ -694,7 +711,7 @@ impl ProgramFamily for NativeFamily {
                 .cloned();
             let head = self
                 .programs
-                .bind_head(resident, definition)
+                .bind_head(charges, resident, definition)
                 .map_err(|error| error.to_string())?;
             if head.constant_bytes()? != binding_constants {
                 return Err("bound head graph constants differ from the claimed charge".into());
@@ -708,6 +725,7 @@ impl ProgramFamily for NativeFamily {
     }
     fn bind_vision(
         &mut self,
+        charges: &seismic::Charges,
         resident: ResidentVision,
         definition: &ModelDefinition,
     ) -> Result<(), String> {
@@ -719,7 +737,7 @@ impl ProgramFamily for NativeFamily {
                 .binding_constant_bytes()?;
             let vision = self
                 .programs
-                .bind_vision(resident, definition)
+                .bind_vision(charges, resident, definition)
                 .map_err(|error| error.to_string())?;
             if vision.constant_bytes()? != binding_constants {
                 return Err("bound vision graph constants differ from the claimed charge".into());
@@ -754,8 +772,8 @@ impl ProgramFamily for NativeFamily {
         Ok(crate::memory::ClaimDemand { device, ..Default::default() })
     }
 
-    fn hold_bound_head(&self, places: usize) -> Result<(), String> {
-        self.head_tables.iter().try_for_each(|table| table.hold_places(places))
+    fn hold_bound_head(&self, charges: &seismic::Charges, places: usize) -> Result<(), String> {
+        self.head_tables.iter().try_for_each(|table| table.hold_places(charges, places))
     }
 
     fn unbind_optional(&mut self, component: OptionalComponent) {
@@ -811,20 +829,36 @@ impl ProgramFamily for NativeFamily {
     /// Hold a group's graph buffers and its places' bank words, each
     /// allocated first, so a failure of either keeps both held before; the
     /// bank's words are the steps' once the buffers are held.
-    fn hold_group(&self, places: usize, _quiet: super::Quiet) -> Result<(), crate::resources::AllocationError> {
+    fn hold_group(
+        &self,
+        charges: &seismic::Charges,
+        places: std::num::NonZeroUsize,
+        _quiet: super::Quiet,
+    ) -> Result<(), crate::resources::AllocationError> {
         let invariant = |detail: String| {
             crate::resources::AllocationError::Plan(crate::error::InvariantError { context: "a group's places", detail })
         };
         let placed = match &self.resident.bank {
-            Some(bank) => Some((bank, bank.place(places_of(places).map_err(invariant)?)?)),
+            Some(bank) => Some((bank, bank.place(charges, places_of(places.get()).map_err(invariant)?)?)),
             None => None,
         };
-        self.target.hold_group(places)?;
+        self.target.hold_group(charges, places)?;
         for table in self.device_tables() {
-            table.hold_places(places).map_err(invariant)?;
+            table.hold_places(charges, places.get()).map_err(invariant)?;
         }
         if let Some((bank, placed)) = placed {
             bank.hold_places(placed).map_err(invariant)?;
+        }
+        Ok(())
+    }
+
+    fn release_group(&self, _quiet: super::Quiet) -> Result<(), String> {
+        self.target.release_group();
+        for table in self.device_tables() {
+            table.release_places();
+        }
+        if let Some(bank) = &self.resident.bank {
+            bank.hold_places(crate::experts::Places::floor())?;
         }
         Ok(())
     }

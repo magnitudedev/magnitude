@@ -93,7 +93,7 @@ mod store;
 pub use store::*;
 
 pub use admission::{Admit, Frees, Over, Short};
-pub use changes::{Changes, Changing, OpenChange, Owner, Sample, Sampled};
+pub use changes::{Changes, Changing, Claiming, Keeping, OpenChange, Owner, Sample, Sampled};
 pub use claims::{ArenaClaim, Cached, Claim};
 pub use estimate::Estimate;
 pub use grant::{Footprints, Grant, SystemFootprints};

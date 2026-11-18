@@ -5,7 +5,8 @@
 //!
 //! Every launch reads its arguments from an argument block in upload
 //! storage: its buffer addresses, the scalar-result address, then its words.
-//! The launch's only push constant is the block's address.
+//! The launch's push constants are the block's address and the device's
+//! tables buffer's.
 
 use crate::device::{
     barrier, call, Device, Handed, Recording, Retired, RetiredCommand, ARGUMENT_CHUNK_BYTES,
@@ -142,8 +143,17 @@ pub(crate) const fn argument_block_bytes(buffers: u64, words: u64) -> u64 {
     seismic_compiler::graph_cost::argument_bytes(seismic_lang::registry::BackendName::Vulkan, buffers, words)
 }
 
+/// A launch's push constants: its argument block's address, then the
+/// device's tables buffer's.
+fn push_constants(arguments: u64, tables: u64) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&arguments.to_le_bytes());
+    bytes[8..].copy_from_slice(&tables.to_le_bytes());
+    bytes
+}
+
 /// Record one launch: its barrier after the previous launch's writes, the
-/// pipeline, the argument block address, the dispatch.
+/// pipeline, the argument block and tables addresses, the dispatch.
 unsafe fn record_launch(
     device: &Device,
     command: vk::CommandBuffer,
@@ -166,7 +176,7 @@ unsafe fn record_launch(
         device.inner.layout,
         vk::ShaderStageFlags::COMPUTE,
         0,
-        &address.to_le_bytes(),
+        &push_constants(address, device.tables()),
     );
     match launch.grid {
         Some((buffer, offset)) => {

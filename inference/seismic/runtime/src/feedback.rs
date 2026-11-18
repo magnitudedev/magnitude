@@ -14,17 +14,13 @@ use std::time::{Duration, Instant};
 
 pub(super) struct Observer<T: TargetFamily, E: NativeExecutor<T>> {
     device: Arc<Opened<T, E>>,
-    public_device: Arc<crate::api::device::DeviceInner>,
+    /// What the trials' inputs and runs are charged to: the charges the
+    /// preparation was asked through, its caller's.
+    charges: crate::memory::Charges,
 }
 impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
-    pub(super) fn new(
-        device: Arc<Opened<T, E>>,
-        public_device: Arc<crate::api::device::DeviceInner>,
-    ) -> Self {
-        Self {
-            device,
-            public_device,
-        }
+    pub(super) fn new(device: Arc<Opened<T, E>>, charges: crate::memory::Charges) -> Self {
+        Self { device, charges }
     }
 }
 
@@ -221,7 +217,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                         reference_args.push(Arg::Tensor(reference.add_tensor(data)));
                         let tensor = Arc::new(
                             TensorInner::from_host(
-                                &self.public_device,
+                                &self.charges,
                                 *representation,
                                 extents,
                                 &bytes,
@@ -266,7 +262,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                     reference_args.push(Arg::Tensor(reference.add_tensor(data)));
                     let tensor = Arc::new(
                         TensorInner::from_host(
-                            &self.public_device,
+                            &self.charges,
                             *representation,
                             extents,
                             &bytes,
@@ -316,7 +312,6 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
             }
             let admitted = workflow::native::admit_trial(
                 &self.device,
-                &self.public_device,
                 request.executable,
                 args,
                 request
@@ -328,6 +323,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                             .map(|o| o.retained_payload_bytes())
                             .unwrap_or(reference_input_bytes),
                     ),
+                &self.charges,
             )
             .map_err(call_error)?;
             {
@@ -1081,7 +1077,7 @@ mod tests {
             &module,
             entry,
             ElementBindings::new(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -1095,7 +1091,7 @@ mod tests {
             panic!()
         };
         let prepared = &prepared.prepared;
-        let mut observer = Observer::new(prepared.device.clone(), device.clone());
+        let mut observer = Observer::new(prepared.device.clone(), crate::memory::Charges::tally(&device));
         let mut values = seismic_lang::expr::compiled::InvocationValues::new();
         values.bind(
             prepared.kernel.schema().dimensions()[0].symbol,
@@ -1221,7 +1217,7 @@ mod tests {
             &module,
             entry,
             bindings,
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -1247,6 +1243,7 @@ mod tests {
     fn metal_feedback_shares_status_storage_without_dropping_checks() {
         let devices = crate::devices::Devices::discover(&[]).unwrap();
         let device = devices.open_backend(registry::BackendName::Metal).unwrap();
+        let charges = crate::memory::Charges::tally(&device);
         let mut source = "fn checked_sum[N,W](x: &tensor[N,W] f32, indices: &tensor[N] i32) -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    parallel for row in 0..N:\n        let mut total = f32(0.0)\n".to_string();
         for offset in 0..40 {
             source.push_str(&format!(
@@ -1275,7 +1272,7 @@ mod tests {
                 &module,
                 entry,
                 bindings,
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -1297,7 +1294,7 @@ mod tests {
         );
         let x = Arc::new(
             TensorInner::from_host(
-                &device,
+                &charges,
                 registry::dense(DType::F32),
                 &[2, 64],
                 &vec![0u8; 2 * 64 * 4],
@@ -1307,7 +1304,7 @@ mod tests {
         // The early indexed reads fit. Later checks must still reject the call.
         let indices = Arc::new(
             TensorInner::from_host(
-                &device,
+                &charges,
                 registry::dense(DType::I32),
                 &[2],
                 &[32i32.to_le_bytes(), 32i32.to_le_bytes()].concat(),
@@ -1317,7 +1314,7 @@ mod tests {
         let mut args = EncodedArgs::new();
         args.push_tensor(x);
         args.push_tensor(indices);
-        assert!(crate::api::kernel::call(&kernel, args).is_err());
+        assert!(crate::api::kernel::call(&kernel, &charges, args).is_err());
     }
 
     #[test]
@@ -1344,7 +1341,7 @@ mod tests {
             &module,
             entry,
             bindings,
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -1385,6 +1382,7 @@ mod tests {
             .open_backend(registry::BackendName::Cpu)
             .unwrap();
         assert_ne!(device.kind.identity(), foreign.kind.identity());
+        let charges = crate::memory::Charges::tally(&device);
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "binding-device.seismic".into(),
             text: "fn double[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut result = zeros_like(x)\n    parallel for i in 0..N:\n        result[i] = x[i] + x[i]\n    return result\n".into(),
@@ -1394,7 +1392,7 @@ mod tests {
             &module,
             module.entry_named("double").unwrap(),
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -1410,7 +1408,7 @@ mod tests {
         };
         let tensor = Arc::new(
             TensorInner::from_host(
-                &foreign,
+                &crate::memory::Charges::tally(&foreign),
                 registry::dense(DType::F32),
                 &[1],
                 &3.0f32.to_le_bytes(),
@@ -1422,7 +1420,7 @@ mod tests {
             args.push_tensor(tensor.clone());
             args
         };
-        let error = crate::api::kernel::call(&kernel, arguments())
+        let error = crate::api::kernel::call(&kernel, &charges, arguments())
             .err()
             .expect("foreign tensor rejected");
         assert!(
@@ -1430,12 +1428,12 @@ mod tests {
             "{error:?}"
         );
         assert!(matches!(workflow::native::admit_trial(
-            &prepared.prepared.device, &device, prepared.prepared.kernel.variants().as_slice().first().unwrap(),
-            arguments(), u64::MAX),
+            &prepared.prepared.device, prepared.prepared.kernel.variants().as_slice().first().unwrap(),
+            arguments(), u64::MAX, &charges),
             Err(CallError::Invocation(InvocationError::WrongDevice { parameter })) if parameter == "x"));
         let local = Arc::new(
             TensorInner::from_host(
-                &device,
+                &charges,
                 registry::dense(DType::F32),
                 &[1],
                 &3.0f32.to_le_bytes(),
@@ -1444,7 +1442,7 @@ mod tests {
         );
         let mut args = EncodedArgs::new();
         args.push_tensor(local);
-        let result = crate::api::kernel::call(&kernel, args)
+        let result = crate::api::kernel::call(&kernel, &charges, args)
             .unwrap()
             .take_tensor();
         assert_eq!(result.read_to_host().unwrap(), 6.0f32.to_le_bytes());
@@ -1455,6 +1453,7 @@ mod tests {
         let device = devices
             .open_backend(backend)
             .expect("hardware qualification needs the requested backend");
+        let charges = crate::memory::Charges::tally(&device);
         let profile_is_absent = || match &device.kind {
             crate::backends::OpenedKind::Metal(opened) => opened.analytical.get().is_none(),
             crate::backends::OpenedKind::Cpu(opened) => opened.analytical.get().is_none(),
@@ -1485,7 +1484,7 @@ mod tests {
                 &module,
                 entry,
                 bindings,
-                &device,
+                &charges,
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
                     search_time: Duration::ZERO,
@@ -1510,7 +1509,7 @@ mod tests {
                     &module,
                     entry,
                     bindings,
-                    &device,
+                    &crate::memory::Charges::tally(&device),
                     PreparationOptions::feedback(PrecisionPolicy::Exact, options),
                 )
                 .unwrap(),
@@ -1530,13 +1529,13 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>();
             let tensor = Arc::new(
-                TensorInner::from_host(&device, registry::dense(DType::F32), &[n], &bytes).unwrap(),
+                TensorInner::from_host(&charges, registry::dense(DType::F32), &[n], &bytes).unwrap(),
             );
             for kernel in &snapshots {
                 let mut args = EncodedArgs::new();
                 args.push_tensor(tensor.clone());
                 args.push_tensor(tensor.clone());
-                let output = crate::api::kernel::call(kernel, args)
+                let output = crate::api::kernel::call(kernel, &charges, args)
                     .unwrap()
                     .take_tensor();
                 let actual = output.read_to_host().unwrap();

@@ -145,8 +145,8 @@ pub enum ProbeFailure {
     /// or panicked, or ended before it began probing), or its process wrote
     /// no result.
     Failed { probe: &'static str, reason: String },
-    /// The probe had not ended within its limit ([`PROBE_LIMIT`], or the
-    /// job's deadline where that came first) and was stopped.
+    /// The probe had not ended within its limit ([`PROBE_LIMIT`]) and was
+    /// stopped.
     Stopped { probe: &'static str, after: Duration },
     /// The job's deadline had passed before the probe was started.
     Unstarted { probe: &'static str },
@@ -190,7 +190,8 @@ pub struct ProbeRun {
 /// nothing of the device, and a kill (the system's, out of memory, or ours at
 /// the probe's limit) or termination says nothing of the probe. Each runs at
 /// most [`PROBE_LIMIT`]; none is started at or past `deadline`, and one
-/// running at it is stopped.
+/// started runs to its end: how busy its host was decides whether a probe
+/// runs in this job, never what it keeps.
 pub(crate) fn run<P: Probes>(
     store: &dyn ArtifactStore,
     identity: &Identity,
@@ -207,7 +208,7 @@ pub(crate) fn run<P: Probes>(
             continue;
         }
         JOB_PROBES_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (result, report) = match process(program, device, probe, deadline) {
+        let (result, report) = match process(program, device, probe) {
             Ok(kept) => kept,
             Err(failure) => {
                 run.failures.push(failure);
@@ -229,7 +230,6 @@ fn process(
     program: &Path,
     device: &[&str],
     probe: &'static str,
-    deadline: Instant,
 ) -> Result<(ProbeResult<u64>, String), ProbeFailure> {
     let failed = |reason: String| ProbeFailure::Failed { probe, reason };
     let mut child = Command::new(program)
@@ -244,7 +244,7 @@ fn process(
     let output = drain(child.stdout.take().expect("stdout is piped"));
     let report = drain(child.stderr.take().expect("stderr is piped"));
     let started = Instant::now();
-    let limit = deadline.min(started + PROBE_LIMIT);
+    let limit = started + PROBE_LIMIT;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -326,16 +326,18 @@ fn crash(status: ExitStatus) -> Option<&'static str> {
 /// Read all of `source` on a thread of its own, so neither of a process's
 /// pipes fills while the other is read.
 fn drain(mut source: impl Read + Send + 'static) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
-    std::thread::spawn(move || {
+    seismic_threads::spawn("probe-drain", move || {
         let mut bytes = Vec::new();
         source.read_to_end(&mut bytes).map(|_| bytes)
     })
+    .expect("invariant violated: the host starts a thread")
 }
 
 /// Serve one probe and exit, where this process was started as a probe
 /// process (its first argument is [`PROBE_COMMAND`]); return at once
 /// otherwise. Every executable that runs the measurement job calls it first
-/// thing in `main`. An executable that does not starts again as itself,
+/// thing in its program (the engine's process entry does, for every engine
+/// binary). An executable that does not starts again as itself,
 /// never writes [`PROBING`], and so keeps nothing ([`run`]).
 pub fn serve_probe_if_asked() {
     let mut arguments = std::env::args_os().skip(1);
@@ -358,12 +360,9 @@ pub fn serve_probe_if_asked() {
 /// its reason on standard error. A probe that crashes the driver ends the
 /// process otherwise, which its spawner keeps as the probe's finding.
 fn serve(arguments: &[String]) -> i32 {
-    // A panic is this program's failure, not the device's: it keeps nothing.
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("{info}");
-        std::process::exit(1);
-    }));
-    let outcome = (|| -> Result<ProbeResult<u64>, String> {
+    // A panic is this program's failure, not the device's: it keeps
+    // nothing, so it ends as the probe's failure.
+    let outcome = seismic_threads::recoverable(|| -> Result<ProbeResult<u64>, String> {
         let [backend, device, probe] = arguments else {
             return Err(format!("usage: EXECUTABLE {PROBE_COMMAND} BACKEND DEVICE PROBE"));
         };
@@ -381,7 +380,8 @@ fn serve(arguments: &[String]) -> i32 {
                 Err(format!("this build has no probes of backend `{other}`"))
             }
         }
-    })();
+    })
+    .unwrap_or_else(|panic| Err(format!("the probe panicked: {panic}")));
     match outcome {
         Ok(result) => {
             println!("{}", result.line());

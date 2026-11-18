@@ -28,9 +28,10 @@
 
 mod directory;
 
-pub use directory::{DirectoryStore, Eviction, Layout, DEFAULT_CAPACITY};
+pub use directory::{DirectoryStore, Writing, DEFAULT_CAPACITY};
+pub use seismic_io::{Eviction, Examining, Layout};
 
-pub use seismic_native_target::{ArtifactKey, ArtifactStore, MemoryStore};
+pub use seismic_native_target::{ArtifactKey, ArtifactStore, HeldFile, MemoryStore};
 use std::sync::Arc;
 
 /// The store every device forms its programs through: `bytes`, where
@@ -196,9 +197,7 @@ impl ProgramStore {
     fn run(&self, store: Store) {
         let worker = self.worker.get_or_init(|| {
             let (sender, stores) = std::sync::mpsc::channel::<Store>();
-            match std::thread::Builder::new()
-                .name("seismic-store".into())
-                .spawn(move || stores.into_iter().for_each(|store| store()))
+            match seismic_threads::spawn("seismic-store", move || stores.into_iter().for_each(|store| store()))
             {
                 Ok(_) => Some(sender),
                 Err(error) => {
@@ -286,16 +285,13 @@ impl Claim {
         // in flight until the store ends.
         drop(self);
         let mut stored = Stored { store: program_store.clone(), keys: storing, former: former.clone(), panicked: None };
+        // A store's panic ends as one on the former that compiled it would.
+        let former_thread = seismic_threads::Submitter::here();
         program_store.run(Box::new(move || {
-            // A store's panic ends the store, not the thread: it is carried
-            // to every wait for it ([`Stores::settle`]).
-            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(store)) {
-                let message = panic
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| panic.downcast_ref::<&str>().map(|message| (*message).to_owned()))
-                    .unwrap_or_else(|| "a panic without a message".into());
-                stored.panicked = Some(message);
+            // A store's panic it unwinds from ends the store, not the
+            // thread: it is carried to every wait for it ([`Stores::settle`]).
+            if let Err(panic) = former_thread.run(store) {
+                stored.panicked = Some(panic.message().to_owned());
             }
         }));
     }
@@ -353,8 +349,8 @@ impl ArtifactStore for ProgramStore {
         self.bytes.contains(namespace, key)
     }
 
-    fn file(&self, namespace: &str, key: &ArtifactKey) -> Option<std::path::PathBuf> {
-        self.bytes.file(namespace, key)
+    fn held(&self, namespace: &str, key: &ArtifactKey) -> Option<(Vec<u8>, HeldFile)> {
+        self.bytes.held(namespace, key)
     }
 
     fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {

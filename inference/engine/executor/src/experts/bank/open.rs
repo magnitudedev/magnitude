@@ -56,7 +56,7 @@ impl ExpertBank {
     /// admitted CPU site (`sites`) served by its host compute executor, its
     /// lines those the job stored (`cpu`).
     pub(crate) fn open(
-        device: &Device,
+        charges: &seismic::Charges,
         plan: &ExpertBankPlan,
         artifact: &GgufArtifact,
         sites: &[Option<crate::native::BankSite>],
@@ -87,16 +87,16 @@ impl ExpertBank {
                 tensor.map(|tensor| (allocation.clone(), Some(tensor))).map_err(|error| WeightImportError::allocating(contract, &error))
             };
             match allocation {
-                BankAllocation::Shared { element, extents } => held(seismic::Contract::Shared, Tensor::shared(device, *element, extents)),
-                BankAllocation::Words { element, extents } => held(seismic::Contract::Words, Tensor::words(device, *element, extents)),
-                BankAllocation::Protocol { element, extents } => held(seismic::Contract::Words, Tensor::protocol_words(device, *element, extents)),
-                BankAllocation::Device { element, extents } => held(seismic::Contract::DeviceOnly, Tensor::zeros(device, *element, extents)),
+                BankAllocation::Shared { element, extents } => held(seismic::Contract::Shared, Tensor::shared(charges, *element, extents)),
+                BankAllocation::Words { element, extents } => held(seismic::Contract::Words, Tensor::words(charges, *element, extents)),
+                BankAllocation::Protocol { element, extents } => held(seismic::Contract::Words, Tensor::protocol_words(charges, *element, extents)),
+                BankAllocation::Device { element, extents } => held(seismic::Contract::DeviceOnly, Tensor::zeros(charges, *element, extents)),
                 BankAllocation::Lent { tier, element, extents, .. } => match plan.host().contract(*tier) {
-                    seismic::Contract::DeviceOnly => held(seismic::Contract::DeviceOnly, Tensor::zeros(device, *element, extents)),
-                    contract => held(contract, Tensor::shared(device, *element, extents)),
+                    seismic::Contract::DeviceOnly => held(seismic::Contract::DeviceOnly, Tensor::zeros(charges, *element, extents)),
+                    contract => held(contract, Tensor::shared(charges, *element, extents)),
                 },
                 BankAllocation::Records { .. } => Ok((allocation.clone(), None)),
-                BankAllocation::Imported(scale) => crate::residency::import_scale(device, artifact, scale).map(|tensor| (allocation.clone(), Some(tensor))),
+                BankAllocation::Imported(scale) => crate::residency::import_scale(charges, artifact, scale).map(|tensor| (allocation.clone(), Some(tensor))),
             }
         })?;
         // Each lender's lent records, by the tier and group lending them.
@@ -133,14 +133,14 @@ impl ExpertBank {
                         .map(|&kind| record.get(kind).ok_or("a region of a tensor the record lacks")?.record_bytes())
                         .collect::<Result<Vec<_>, String>>()?;
                     let store = match lent {
-                        0 => SlabTensor::in_pool(&pool, 1, extent, &regions),
+                        0 => SlabTensor::in_pool(charges, &pool, 1, extent, &regions),
                         _ => {
                             let tensors = lent_of(tier, group).ok_or("a group's lent records beside no lent allocation")?;
                             let views = kinds
                                 .iter()
                                 .map(|&kind| tensors.get(kind).cloned().ok_or("lent records of a tensor the record lacks"))
                                 .collect::<Result<Vec<_>, _>>()?;
-                            SlabTensor::in_pool_over(&pool, 1, extent, &regions, views)
+                            SlabTensor::in_pool_over(charges, &pool, 1, extent, &regions, views)
                         }
                     }
                     .map_err(|error| WeightImportError::allocating(plan.host().contract(tier), &error))?;
@@ -249,7 +249,7 @@ impl ExpertBank {
             .collect::<Result<Vec<_>, String>>()?;
         let homes = plan.resident.then(|| homes(plan, &layout)).transpose()?;
         let slot_maps = slot_maps(plan, &layout)?;
-        let floor = allocate_placed(device, plan, std::num::NonZeroU64::MIN)
+        let floor = allocate_placed(charges, plan, std::num::NonZeroU64::MIN)
             .map_err(|error| crate::residency::WeightImportError::of_allocation(seismic::Contract::Words, error))?;
         // The slots the bank commits, which its watcher's telemetry reads.
         let slots = Arc::new(AtomicU64::new(plan.slots));
@@ -276,7 +276,7 @@ impl ExpertBank {
             layout,
             floor,
             held: Mutex::new(None),
-            device: device.clone(),
+            device: charges.device(),
             pool_of,
             conveyors,
             scratch,

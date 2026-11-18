@@ -100,7 +100,7 @@ pub(super) struct PrimingFlight<H> {
     /// For a claimed queued step: the accepted head state its successor
     /// advance attaches to at finish, or `None` when nobody claimed it (its
     /// rows are discarded). `None` for an ordinary flight.
-    pub(super) continuation: Option<Option<InFlightState>>,
+    pub(super) continuation: Option<Option<SequenceState>>,
 }
 
 /// One submitted target step: a group's flight, or a step queued behind one
@@ -129,10 +129,20 @@ pub(super) struct TargetWork<F: ProgramFamily> {
     pub(super) previous_selection: Option<Instant>,
     /// Identifies the step a queued step follows.
     pub(super) id: u64,
-    /// For a claimed queued step, per slot: the accepted state its successor
-    /// advance attaches to at finish, or `None` for a slot nobody claimed
-    /// (its rows are discarded). `None` for an ordinary step.
-    pub(super) continuation: Option<Vec<Option<InFlightState>>>,
+    /// For a claimed queued step, per slot, what its advance continues at
+    /// finish. `None` for an ordinary step.
+    pub(super) continuation: Option<Vec<Source>>,
+}
+
+/// What a claimed queued step's slot continues at finish.
+pub(super) enum Source {
+    /// Nothing: nobody claimed the slot, and its rows are discarded.
+    Unclaimed,
+    /// The accepted state its successor advance attaches to.
+    Accepted(SequenceState),
+    /// The chain its chained chunk joins, which the chunk carries until its
+    /// outcome reconciles or aborts.
+    Chain(OwnedChainAdvance),
 }
 
 pub struct TargetFlight<F: ProgramFamily = NativeFamily> {
@@ -185,7 +195,6 @@ pub struct PrimingCompletionFlight<F: ProgramFamily> {
     pub(super) work: PrimingFlight<F::HeadSubmission>,
     pub(super) target_end: usize,
     pub(super) bindings: StateBindings,
-    pub(super) started: Instant,
 }
 
 impl<F: ProgramFamily> PrimingCompletionFlight<F> {

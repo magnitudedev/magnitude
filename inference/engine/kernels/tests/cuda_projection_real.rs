@@ -153,7 +153,7 @@ fn real_weight(
         .repack_host(format.source(), &shape, external)
         .unwrap();
     let values = resident.decode_host(&shape, &bytes).unwrap();
-    let tensor = Tensor::from_host(device, resident, &shape, &bytes).unwrap();
+    let tensor = Tensor::from_host(&seismic::Charges::tally(device), resident, &shape, &bytes).unwrap();
     Weight {
         tensor,
         values,
@@ -228,6 +228,7 @@ fn real_4b_projections_match_their_operand_emulation() {
         return;
     };
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let gguf = Gguf::open(&path);
     let norm_values = gguf.f32s("blk.0.post_attention_norm.weight");
     let h = norm_values.len();
@@ -295,7 +296,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                     let kernel = expand.kernel(&device, mapping);
                     let actual: Vec<f64> = read_bf16(
                         &kernel
-                            .call(dense_expand::Args {
+                            .call(&charges, dense_expand::Args {
                                 residual: &residual_tensor,
                                 norm: &norm,
                                 gate_weight: &gate.tensor,
@@ -304,13 +305,13 @@ fn real_4b_projections_match_their_operand_emulation() {
                                 eps: EPSILON,
                                 activation: 0,
                                 glu_limit: &i32_tensor(&device, &[0, 0], &[]),
-                                gate_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[])
+                                gate_scale: &Tensor::from_host(&charges, Element::f32(), &[0], &[])
                                     .unwrap(),
-                                up_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[])
+                                up_scale: &Tensor::from_host(&charges, Element::f32(), &[0], &[])
                                     .unwrap(),
-                                gate_bound: &Tensor::from_host(&device, Element::f32(), &[0], &[])
+                                gate_bound: &Tensor::from_host(&charges, Element::f32(), &[0], &[])
                                     .unwrap(),
-                                up_bound: &Tensor::from_host(&device, Element::f32(), &[0], &[])
+                                up_bound: &Tensor::from_host(&charges, Element::f32(), &[0], &[])
                                     .unwrap(),
                             })
                             .unwrap()
@@ -359,6 +360,7 @@ fn real_4b_projections_match_their_operand_emulation() {
 #[test]
 fn real_12b_physical_f16_projection_operands() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let Ok(path) = std::env::var("MAGNITUDE_GGUF_12B") else {
         return;
     };
@@ -372,7 +374,7 @@ fn real_12b_physical_f16_projection_operands() {
         let packed = resident
             .repack_host(format.source(), &shape, &bytes)
             .unwrap();
-        Tensor::from_host(&device, resident, &shape, &packed).unwrap()
+        Tensor::from_host(&charges, resident, &shape, &packed).unwrap()
     };
     let gate = load("blk.0.ffn_gate.weight");
     let up = load("blk.0.ffn_up.weight");
@@ -435,8 +437,8 @@ fn real_12b_physical_f16_projection_operands() {
     };
     let baseline = kernel(0);
     let physical = kernel(1);
-    let reference = read_bf16(&baseline.call(args()).unwrap().value);
-    let actual = read_bf16(&physical.call(args()).unwrap().value);
+    let reference = read_bf16(&baseline.call(&charges, args()).unwrap().value);
+    let actual = read_bf16(&physical.call(&charges, args()).unwrap().value);
     assert!(reference
         .iter()
         .chain(&actual)
@@ -490,8 +492,8 @@ fn real_12b_physical_f16_projection_operands() {
     let packed = resident
         .repack_host(format.source(), &shape, &bytes)
         .unwrap();
-    let down = Tensor::from_host(&device, resident, &shape, &packed).unwrap();
-    let product = baseline.call(args()).unwrap().value;
+    let down = Tensor::from_host(&charges, resident, &shape, &packed).unwrap();
+    let product = baseline.call(&charges, args()).unwrap().value;
     let down_kernel = |operand| {
         declared::prepared(
             &device,
@@ -520,8 +522,8 @@ fn real_12b_physical_f16_projection_operands() {
     };
     let exact_down = down_kernel(0);
     let physical_down = down_kernel(1);
-    let expected = read_f32(&exact_down.call(down_args()).unwrap().value);
-    let got = read_f32(&physical_down.call(down_args()).unwrap().value);
+    let expected = read_f32(&exact_down.call(&charges, down_args()).unwrap().value);
+    let got = read_f32(&physical_down.call(&charges, down_args()).unwrap().value);
     assert!(expected.iter().chain(&got).all(|x| x.is_finite()));
     let rms_scale =
         (expected.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / expected.len() as f64).sqrt();
@@ -550,7 +552,7 @@ fn real_12b_physical_f16_projection_operands() {
             .flat_map(|&x| seismic_lang::registry::f16_bits(x).to_le_bytes())
             .collect::<Vec<_>>();
         let input = Tensor::from_host(
-            &device,
+            &charges,
             Element::f16(),
             &[count as u64, intermediate as u64],
             &bytes,
@@ -582,8 +584,8 @@ fn real_12b_physical_f16_projection_operands() {
             weight_scale: &absent,
             weight_bound: &absent,
         };
-        let left = read_f32(&form(0).call(args()).unwrap().value);
-        let right = read_f32(&form(1).call(args()).unwrap().value);
+        let left = read_f32(&form(0).call(&charges, args()).unwrap().value);
+        let right = read_f32(&form(1).call(&charges, args()).unwrap().value);
         if count == 1 {
             assert_eq!(left, right, "operand policy must preserve exact decode");
         } else {
@@ -611,6 +613,7 @@ fn real_12b_physical_f16_projection_operands() {
 #[test]
 fn real_26b_grouped_physical_f16_operands() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let Ok(path) = std::env::var("MAGNITUDE_GGUF_26B") else {
         return;
     };
@@ -631,7 +634,7 @@ fn real_26b_grouped_physical_f16_operands() {
         let bytes = resident
             .repack_host(format.source(), &shape, &external)
             .unwrap();
-        Tensor::from_host(&device, resident, &shape, &bytes).unwrap()
+        Tensor::from_host(&charges, resident, &shape, &bytes).unwrap()
     };
     let gate = load("blk.0.ffn_gate_up_exps.weight", h, f, 0, f * 2);
     let up = load("blk.0.ffn_gate_up_exps.weight", h, f, f, f * 2);
@@ -666,15 +669,15 @@ fn real_26b_grouped_physical_f16_operands() {
         .unwrap()
     };
     // The GGUF's experts are unscaled: the scale ports are absent.
-    let unscaled = Tensor::zeros(&device, Element::f32(), &[0]).unwrap();
+    let unscaled = Tensor::zeros(&charges, Element::f32(), &[0]).unwrap();
     // Every block used, over every row; no map.
     let (rows, used) = (i32_tensor(&device, &[1], &[m as i32]), i32_tensor(&device, &[1], &[e as i32]));
     let (map, step) = (
-        Tensor::zeros(&device, Element::i32(), &[0, magnitude_kernels::constants::MAP_WORDS]).unwrap(),
-        Tensor::zeros(&device, Element::i32(), &[0]).unwrap(),
+        Tensor::zeros(&charges, Element::i32(), &[0, magnitude_kernels::constants::MAP_WORDS]).unwrap(),
+        Tensor::zeros(&charges, Element::i32(), &[0]).unwrap(),
     );
-    let first = Tensor::zeros(&device, Element::i32(), &[1]).unwrap();
-    let no_limit = Tensor::zeros(&device, Element::i32(), &[0, 0]).unwrap();
+    let first = Tensor::zeros(&charges, Element::i32(), &[1]).unwrap();
+    let no_limit = Tensor::zeros(&charges, Element::i32(), &[0, 0]).unwrap();
     let args = || magnitude_kernels::routed_experts::Args {
         first: &first,
         rows: &rows,
@@ -697,8 +700,8 @@ fn real_26b_grouped_physical_f16_operands() {
     };
     let baseline = form(0);
     let physical = form(1);
-    let left = read_bf16(&baseline.call(args()).unwrap().value);
-    let right = read_bf16(&physical.call(args()).unwrap().value);
+    let left = read_bf16(&baseline.call(&charges, args()).unwrap().value);
+    let right = read_bf16(&physical.call(&charges, args()).unwrap().value);
     assert!(left.iter().chain(&right).all(|x| x.is_finite()));
     let scale = (left.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / left.len() as f64).sqrt();
     let rms = (left

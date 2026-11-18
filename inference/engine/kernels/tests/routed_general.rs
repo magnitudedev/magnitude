@@ -153,7 +153,7 @@ fn tensor(
         other => panic!("unsupported element {other:?}"),
     };
     let shape = shape.iter().map(|d| *d as u64).collect::<Vec<_>>();
-    seismic::Tensor::from_host(device, element(dtype), &shape, &bytes).unwrap()
+    seismic::Tensor::from_host(&seismic::Charges::tally(device), element(dtype), &shape, &bytes).unwrap()
 }
 
 fn i32_tensor(device: &seismic::Device, shape: &[usize], values: &[i32]) -> seismic::Tensor {
@@ -162,7 +162,7 @@ fn i32_tensor(device: &seismic::Device, shape: &[usize], values: &[i32]) -> seis
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<_>>();
     let shape = shape.iter().map(|d| *d as u64).collect::<Vec<_>>();
-    seismic::Tensor::from_host(device, seismic::Element::i32(), &shape, &bytes).unwrap()
+    seismic::Tensor::from_host(&seismic::Charges::tally(device), seismic::Element::i32(), &shape, &bytes).unwrap()
 }
 
 fn read_f32(tensor: &seismic::Tensor) -> Vec<f32> {
@@ -716,6 +716,7 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
         })
         .collect::<Vec<_>>();
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         let started = std::time::Instant::now();
         for (routing, case, reference) in &cases {
             let (h, e, k, rows) = (routing.hidden, routing.experts, routing.selected, case.rows);
@@ -743,7 +744,7 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
                 let mut routes = i32_tensor(&device, &[rows, k], &vec![-7; rows * k]);
                 let mut weights = tensor(&device, DType::F32, &[rows, k], &vec![-7.0; rows * k]);
                 let outcome = kernel
-                    .call(routed_select::Args {
+                    .call(&charges, routed_select::Args {
                         residual: &tensor(&device, DType::F32, &[rows, h], &case.residual),
                         norm: &tensor(&device, DType::F32, &[h], &case.norm),
                         router_norm: &tensor(&device, DType::F32, &[h], &case.router_norm),
@@ -1981,6 +1982,7 @@ impl DecodeExpansion {
     /// with `experts`' scales.
     fn product(
         &self,
+        charges: &seismic::Charges,
         normalized: &seismic::Tensor,
         routes: &seismic::Tensor,
         reads: DecodeReads<'_>,
@@ -1992,7 +1994,7 @@ impl DecodeExpansion {
         match (self, gate, tier_gate) {
             (Self::Gated(native), Some(gate), Some(tier_gate)) => {
                 native
-                    .call(routed_gate_up::Args {
+                    .call(charges, routed_gate_up::Args {
                         normalized,
                         routes,
                         sources,
@@ -2010,7 +2012,7 @@ impl DecodeExpansion {
             }
             (Self::Up(native), None, None) => {
                 native
-                    .call(routed_up::Args {
+                    .call(charges, routed_up::Args {
                         normalized,
                         routes,
                         sources,
@@ -2054,6 +2056,7 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
         let (h, f, k) = (shape.hidden, shape.features, shape.selected);
         let statics = [("H", h), ("K", k), ("F", f)];
         for device in &devices {
+            let charges = seismic::Charges::tally(device);
             let started = std::time::Instant::now();
             let experts = DeviceExperts::new(device, &block);
             let bf16 = seismic::Element::bf16();
@@ -2096,7 +2099,7 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                         let glu_limit = i32_tensor(device, &[0, shape.limit_word()], &[]);
                         let expand = |reads: DecodeReads<'_>| {
                             read_activation(
-                                &expansion.product(&normalized, &routes, reads, &experts, shape.activation, &glu_limit),
+                                &expansion.product(&charges, &normalized, &routes, reads, &experts, shape.activation, &glu_limit),
                                 DType::BF16,
                             )
                         };
@@ -2131,7 +2134,7 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                                        expert_down: &seismic::Tensor,
                                        tier_down: &seismic::Tensor| {
                             native
-                                .call(routed_down::Args {
+                                .call(&charges, routed_down::Args {
                                     base: &tensor(device, DType::F32, &[m, h], base),
                                     product: &tensor(device, DType::BF16, &[m, k, f], &case.products),
                                     routes: &routes,
@@ -2258,6 +2261,7 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
         let b = case.blocks(&block, TILE);
         let (order, inverse, table) = host_group(&case.routes, k, e, TILE, b);
         for device in &devices {
+            let charges = seismic::Charges::tally(device);
             let started = std::time::Instant::now();
             let experts = DeviceExperts::new(device, &block);
             let placed = PlacedExperts::new(device, &block);
@@ -2280,7 +2284,7 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
             let first = i32_tensor(device, &[1], &[0]);
             declared::prepared(device, &routed_group::native_entry(), &group)
                 .unwrap()
-                .call(routed_group::Args {
+                .call(&charges, routed_group::Args {
                     first: &first,
                     rows: &grouped_rows,
                     routes: &routes,
@@ -2355,6 +2359,7 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                         gated_entry
                         .kernel(device, configuration)
                         .call_into(
+                            &charges,
                             routed_experts::Args {
                                 first: &first,
                                 rows: &grouped_rows,
@@ -2383,6 +2388,7 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                         up_entry
                         .kernel(device, configuration)
                         .call_into(
+                            &charges,
                             routed_experts_up::Args {
                                 first: &first,
                                 rows: &grouped_rows,
@@ -2456,7 +2462,7 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                         &seismic::NativeSpecialization::new(),
                     )
                     .unwrap()
-                    .call(routed_scatter::Args {
+                    .call(&charges, routed_scatter::Args {
                         base: &tensor(device, DType::F32, &[m, h], &base),
                         expert_output: &grouped,
                         inverse: &native_inverse,
@@ -2589,6 +2595,7 @@ fn glu_clamps_adversarial_sums_as_the_reference() {
         let portable = result(&portable, 0).into_iter().map(|value| value as f32).collect::<Vec<_>>();
         check(&format!("portable L {limit}"), &portable, &expected);
         for device in &devices() {
+            let charges = seismic::Charges::tally(device);
             let bf16 = seismic::Element::bf16();
             let entry = routed_gate_up::native_entry_with(routed_gate_up::Elements { A: bf16, EGW: bf16, EUW: bf16 });
             let statics = [("H", H), ("K", 1), ("F", f), ("GS", 0), ("US", 0), ("LB", word)];
@@ -2599,7 +2606,7 @@ fn glu_clamps_adversarial_sums_as_the_reference() {
                 let (gate_stack, up_stack) =
                     (tensor(device, DType::BF16, &[1, f, H], &gate), tensor(device, DType::BF16, &[1, f, H], &up));
                 let product = native
-                    .call(routed_gate_up::Args {
+                    .call(&charges, routed_gate_up::Args {
                         normalized: &tensor(device, DType::BF16, &[1, H], &x),
                         routes: &i32_tensor(device, &[1, 1], &[0]),
                         sources: &i32_tensor(device, &[0, 1, 1], &[]),

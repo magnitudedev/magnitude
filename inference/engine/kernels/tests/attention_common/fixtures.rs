@@ -346,7 +346,7 @@ fn bf16_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
         .iter()
         .flat_map(|value| bf16_bits(*value).to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::bf16(), &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::bf16(), &shape, &bytes).unwrap()
 }
 
 fn f32_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
@@ -355,7 +355,7 @@ fn f32_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::f32(), &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::f32(), &shape, &bytes).unwrap()
 }
 
 /// The history row tiles (256 rows) holding a row of any of the `visible`
@@ -380,7 +380,7 @@ fn i32_tensor(device: &Device, shape: &[usize], values: &[i32]) -> Tensor {
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::i32(), &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::i32(), &shape, &bytes).unwrap()
 }
 
 fn bf16_values(tensor: &Tensor) -> Vec<f32> {
@@ -404,14 +404,14 @@ fn visible_prefill(device: &Device, specialization: NativeSpecialization) -> Nat
 
 /// A prefill's absent WorkList bitmap: `rows` rows of no words.
 fn no_selection(device: &Device, rows: usize) -> Tensor {
-    Tensor::from_host(device, Element::u32(), &[rows as u64, 0], &[]).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::u32(), &[rows as u64, 0], &[]).unwrap()
 }
 
 /// A prefill's WorkList block keys `keys` (`BR`), carried by the extent of
 /// an empty table: 1 for a read of every visible row.
 #[allow(dead_code)]
 fn block_slots(device: &Device, keys: usize) -> Tensor {
-    Tensor::from_host(device, Element::i32(), &[0, keys as u64], &[]).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::i32(), &[0, keys as u64], &[]).unwrap()
 }
 
 /// The mix entries' `form` (`RA`, `RT`, `RO`, `VK`), carried by the extents
@@ -419,14 +419,14 @@ fn block_slots(device: &Device, keys: usize) -> Tensor {
 /// rotary, values of their own.
 #[allow(dead_code)]
 fn half_split_layout(device: &Device) -> Tensor {
-    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0], &[]).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::i32(), &[0, 0, 0, 0, 0], &[]).unwrap()
 }
 
 /// The appends' `form` (`RA`, `RT`, `VK`): half-split leading, values of
 /// their own.
 #[allow(dead_code)]
 fn half_split_append_layout(device: &Device) -> Tensor {
-    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0], &[]).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::i32(), &[0, 0, 0, 0], &[]).unwrap()
 }
 
 /// The dense entries' `form` (`RA`, `RT`, `RO`, `VK`, `KR`, `AB`): half-split
@@ -434,14 +434,14 @@ fn half_split_append_layout(device: &Device) -> Tensor {
 /// absorbed latent read.
 #[allow(dead_code)]
 fn dense_layout(device: &Device) -> Tensor {
-    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0, 0, 0], &[]).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::i32(), &[0, 0, 0, 0, 0, 0, 0], &[]).unwrap()
 }
 
 /// The dense append's `form` (`RA`, `RT`, `VK`, `KR`): half-split leading,
 /// values of their own, no key rounding.
 #[allow(dead_code)]
 fn dense_append_layout(device: &Device) -> Tensor {
-    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0], &[]).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::i32(), &[0, 0, 0, 0, 0], &[]).unwrap()
 }
 
 /// The dense mix entries' statics `specialization` with no key rounding
@@ -456,8 +456,8 @@ fn dense_statics(specialization: NativeSpecialization) -> NativeSpecialization {
 #[allow(dead_code)]
 fn no_picks(device: &Device, rows: usize, kv: usize, w: usize) -> (Tensor, Tensor) {
     (
-        Tensor::from_host(device, Element::i32(), &[rows as u64, 0], &[]).unwrap(),
-        Tensor::from_host(device, Element::bf16(), &[0, kv as u64, w as u64], &[]).unwrap(),
+        Tensor::from_host(&seismic::Charges::tally(device), Element::i32(), &[rows as u64, 0], &[]).unwrap(),
+        Tensor::from_host(&seismic::Charges::tally(device), Element::bf16(), &[0, kv as u64, w as u64], &[]).unwrap(),
     )
 }
 

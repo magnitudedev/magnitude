@@ -9,8 +9,8 @@ use magnitude_state::{
     HistoryDomainLayout, HistoryDomainPlan, HistoryDomainTrace, KvCodec, LayerRef,
     ModelStateLayout, StateStore, StoreBindings,
 };
-use seismic::{BackendName, Device, Pool, SlabLayout};
-use std::{num::NonZeroUsize, rc::Rc};
+use seismic::{BackendName, Pool, SlabLayout};
+use std::num::NonZeroUsize;
 
 /// Rows of one prefill forward in the evaluation harness's loads, as the
 /// service bounds them.
@@ -1105,10 +1105,10 @@ impl StateStorePlan {
         self.block.charge(self.granule, slab_bytes.div_ceil(self.granule)).ok_or_else(|| "state slab charge overflows".into())
     }
 
-    /// The planned store and its one binding right, its slabs granules of
-    /// `pool`, the granule pool of the store on `device` the state lies in,
-    /// whose granule is the plan's.
-    pub fn allocate(&self, device: Rc<Device>, pool: Pool) -> Result<StoreBindings, String> {
+    /// The planned store and its one binding right, its tables allocated
+    /// through `charges`, its slabs granules of `pool`, the granule pool of
+    /// the store the state lies in, whose granule is the plan's.
+    pub fn allocate(&self, charges: &seismic::Charges, pool: Pool) -> Result<StoreBindings, String> {
         if pool.granule() != self.granule {
             return Err(format!(
                 "state planned in {}-byte granules given a pool of {}-byte granules",
@@ -1117,7 +1117,7 @@ impl StateStorePlan {
             ));
         }
         let (store, bindings) = StateStore::new(
-            device,
+            charges,
             pool,
             self.context_rows,
             self.max_advance,
@@ -1257,8 +1257,8 @@ impl ResourcePlan {
         &self.state_graph
     }
 
-    pub fn allocate_target_state(&self, device: Rc<Device>, pool: Pool) -> Result<StoreBindings, String> {
-        self.target_state.allocate(device, pool)
+    pub fn allocate_target_state(&self, charges: &seismic::Charges, pool: Pool) -> Result<StoreBindings, String> {
+        self.target_state.allocate(charges, pool)
     }
 }
 
@@ -1981,13 +1981,10 @@ mod slab_plan_tests {
             plan.initial_committed_bytes().unwrap(),
             history.address_table_bytes + granule + banks.address_table_bytes + granule
         );
-        let device = Rc::new(
-            crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
-                .unwrap(),
-        );
-        let entry = device.entry(seismic::Contract::DeviceOnly);
-        let pool = device.pool(seismic::Contract::DeviceOnly, granule, granule, seismic::PoolEntries::one(entry)).unwrap();
-        let store = plan.allocate(device, pool).unwrap();
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let pool = seismic::Pool::open(&seismic::PoolCharges::one(&charges), seismic::Contract::DeviceOnly, granule, granule).unwrap();
+        let store = plan.allocate(&charges, pool).unwrap();
         assert_eq!(
             store.committed_bytes(),
             plan.initial_committed_bytes().unwrap()

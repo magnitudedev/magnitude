@@ -467,9 +467,10 @@ impl<E: Probe> Plan<E> {
         &self,
         walks: &mut Walks<'_, '_>,
         operands: &OnceCell<Result<Operands, ExecutorCostsError>>,
-        make: impl Fn(&Device) -> Result<Operands, ExecutorCostsError>,
+        make: impl Fn(&seismic::Charges) -> Result<Operands, ExecutorCostsError>,
     ) -> Result<(), ExecutorCostsError> {
-        let device = walks.device();
+        let (device, charges) = (walks.device(), walks.charges().clone());
+        let charges = &charges;
         let identity = walks.identity();
         let kernels = OnceCell::<Vec<Result<NativeKernel<E>, ExecutorCostsError>>>::new();
         for (index, &unroll) in self.unrolls.iter().enumerate() {
@@ -486,17 +487,18 @@ impl<E: Probe> Plan<E> {
                     .as_ref()
                     .map_err(|error| Unformed::Never(error.clone()))?;
                 let operands = operands
-                    .get_or_init(|| make(device))
+                    .get_or_init(|| make(charges))
                     .as_ref()
                     .map_err(|error| Unformed::Now(error.clone()))?;
                 let mut outs = operands
                     .inputs
                     .iter()
-                    .map(|_| Tensor::zeros(device, Element::f32(), &[operands.outputs]))
+                    .map(|_| Tensor::zeros(charges, Element::f32(), &[operands.outputs]))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| Unformed::Now(failed("a probe's output")(&error)))?;
                 kernel
                     .point(
+                        charges,
                         operands
                             .inputs
                             .iter()
@@ -619,11 +621,11 @@ impl<E: Probe> Ladder<E> {
     fn measure(&self, walks: &mut Walks<'_, '_>, shape: Shape, operand: Operand) -> Result<(), ExecutorCostsError> {
         for (plan, multiple) in self.plans.iter().zip(MULTIPLES) {
             let steps = shape.steps(operand) * multiple;
-            plan.measure(walks, &OnceCell::new(), |device: &Device| {
+            plan.measure(walks, &OnceCell::new(), |charges: &seismic::Charges| {
                 let bytes = (0..shape.lanes).flat_map(|_| SEED.to_le_bytes()).collect::<Vec<_>>();
-                let input = Tensor::from_host(device, Element::f32(), &[shape.lanes], &bytes)
+                let input = Tensor::from_host(charges, Element::f32(), &[shape.lanes], &bytes)
                     .map_err(|error| failed("a peak's seeds")(&error))?;
-                let steps = Tensor::zeros(device, Element::i32(), &[0, steps])
+                let steps = Tensor::zeros(charges, Element::i32(), &[0, steps])
                     .map_err(|error| failed("a peak's steps")(&error))?;
                 Ok(Operands {
                     inputs: vec![input],
@@ -832,9 +834,9 @@ impl MachineLine {
         }
         for (plan, columns) in stream.iter().flatten().zip(ROW_VALUES) {
             let rows = shape.rows(columns);
-            plan.measure(walks, &OnceCell::new(), |device| {
+            plan.measure(walks, &OnceCell::new(), |charges| {
                 let inputs = (0..shape.sets)
-                    .map(|_| Tensor::zeros(device, Element::f32(), &[rows, columns]))
+                    .map(|_| Tensor::zeros(charges, Element::f32(), &[rows, columns]))
                     .collect::<Result<_, _>>()
                     .map_err(|error| failed("the stream's rows")(&error))?;
                 Ok(Operands { inputs, steps: None, outputs: rows })

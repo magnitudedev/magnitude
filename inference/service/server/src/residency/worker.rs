@@ -268,7 +268,7 @@ impl SpawnedWorker {
                     .client
                     .set(connection.client.clone())
                     .unwrap_or_else(|_| unreachable!("a worker connects once"));
-                Ok(LoadAttempt::Loaded((self.worker, connection)))
+                Ok(LoadAttempt::Loaded(Box::new((self.worker, *connection))))
             }
             Ok(LoadAttempt::Unprepared) => match self.worker.retire_reported() {
                 Ok(_) => Ok(LoadAttempt::Unprepared),
@@ -404,6 +404,14 @@ impl ResidencyWorker for EngineWorker {
         }
     }
 
+    fn loss(&self, error: &dyn std::fmt::Display) -> String {
+        let exit = self.ended_status().map_or_else(String::new, |status| format!("; worker {status}"));
+        match self.diagnostics() {
+            diagnostics if diagnostics.is_empty() => format!("{error}{exit}"),
+            diagnostics => format!("{error}{exit}; worker diagnostics: {diagnostics}"),
+        }
+    }
+
     fn terminate(&self, code: &str, reason: &str) -> std::io::Result<()> {
         tracing::info!(worker.pid = self.pid(), code, reason, "terminating inference worker");
         let mut state = self.process.lock().expect("worker process lock");
@@ -459,22 +467,20 @@ impl Drop for EngineWorker {
             ProcessState::Retiring { .. } => unreachable!("{ONE_RETIRER}"),
         };
         let pid = process_id(&process);
-        std::thread::Builder::new()
-            .name(format!("inference-worker-reap-{pid}"))
-            .spawn(move || {
-                let status = loop {
-                    match stop(&mut process) {
-                        Ok(status) => break status,
-                        Err(error) => {
-                            tracing::error!(worker.pid = pid, %error, "an ownerless inference worker could not be shown to have ended; trying again");
-                            std::thread::sleep(RETIREMENT_RETRY);
-                        }
+        seismic::threads::spawn(format!("inference-worker-reap-{pid}"), move || {
+            let status = loop {
+                match stop(&mut process) {
+                    Ok(status) => break status,
+                    Err(error) => {
+                        tracing::error!(worker.pid = pid, %error, "an ownerless inference worker could not be shown to have ended; trying again");
+                        std::thread::sleep(RETIREMENT_RETRY);
                     }
-                };
-                log_exit(pid, status);
-                drop(device);
-            })
-            .expect("a thread to reap an ownerless inference worker");
+                }
+            };
+            log_exit(pid, status);
+            drop(device);
+        })
+        .expect("a thread to reap an ownerless inference worker");
     }
 }
 
@@ -484,31 +490,29 @@ fn drain_diagnostics(
     tail: Arc<Mutex<DiagnosticTail>>,
     pid: u32,
 ) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name(format!("inference-worker-stderr-{pid}"))
-        .spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            let mut lines = DiagnosticLines::default();
-            let log = |line: &[u8]| {
-                let text = String::from_utf8_lossy(line);
-                let text = text.trim_end();
-                if !text.is_empty() {
-                    tracing::warn!(worker.pid = pid, message = %text, "inference worker");
-                }
-            };
-            loop {
-                match stderr.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(length) => {
-                        let bytes = &buffer[..length];
-                        lines.push(bytes, log);
-                        tail.lock().expect("diagnostic tail lock").append(bytes);
-                    }
+    seismic::threads::spawn(format!("inference-worker-stderr-{pid}"), move || {
+        let mut buffer = [0_u8; 4096];
+        let mut lines = DiagnosticLines::default();
+        let log = |line: &[u8]| {
+            let text = String::from_utf8_lossy(line);
+            let text = text.trim_end();
+            if !text.is_empty() {
+                tracing::warn!(worker.pid = pid, message = %text, "inference worker");
+            }
+        };
+        loop {
+            match stderr.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(length) => {
+                    let bytes = &buffer[..length];
+                    lines.push(bytes, log);
+                    tail.lock().expect("diagnostic tail lock").append(bytes);
                 }
             }
-            lines.finish(log);
-        })
-        .map(drop)
+        }
+        lines.finish(log);
+    })
+    .map(drop)
 }
 
 /// The longest diagnostic line logged as one record; longer output is logged in pieces.

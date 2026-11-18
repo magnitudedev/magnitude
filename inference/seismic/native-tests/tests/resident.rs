@@ -10,8 +10,9 @@ fn a_resident_launchs_phases_meet_at_grid_barriers_launch_after_launch() {
     use seismic_native_tests::resident_reverse;
 
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else { return };
+    let charges = seismic::Charges::tally(&device);
     let kernel = resident_reverse::native_for_device(&device, &NativeSpecialization::new()).unwrap();
-    let skip = Tensor::from_host(&device, Element::i32(), &[1], &0i32.to_le_bytes()).unwrap();
+    let skip = Tensor::from_host(&charges, Element::i32(), &[1], &0i32.to_le_bytes()).unwrap();
     let read = |tensor: &Tensor| {
         tensor
             .read_to_host()
@@ -25,10 +26,10 @@ fn a_resident_launchs_phases_meet_at_grid_barriers_launch_after_launch() {
     // the barrier the one before restored.
     for n in [1u64, 64, 1000, 1 << 20, 1 << 20] {
         let zeros = vec![0u8; 4 * n as usize];
-        let mut x = Tensor::from_host(&device, Element::f32(), &[n], &zeros).unwrap();
-        let mut y = Tensor::from_host(&device, Element::f32(), &[n], &zeros).unwrap();
+        let mut x = Tensor::from_host(&charges, Element::f32(), &[n], &zeros).unwrap();
+        let mut y = Tensor::from_host(&charges, Element::f32(), &[n], &zeros).unwrap();
         kernel
-            .call(resident_reverse::Args { skip: &skip, x: &mut x, y: &mut y })
+            .call(&charges, resident_reverse::Args { skip: &skip, x: &mut x, y: &mut y })
             .unwrap_or_else(|error| panic!("N {n}: {error}"));
         let (x, y) = (read(&x), read(&y));
         for i in 0..n as usize {

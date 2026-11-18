@@ -21,9 +21,9 @@ use super::{
     },
     protocol::{RequestSnapshot, RoomGrant, RoomRefusal, WorkerReply},
     publication::{
-        CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationQueue,
+        CapacityResource, ModelUnloadCause, PublicationPermit, PublicationQueue,
         PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
-        RequestError, ServiceCapacityError,
+        RequestError, RequestTimings, ServiceCapacityError,
     },
     round_driver::{RoundError, lower_round, reconcile_forward},
     serving::ServingCensus,
@@ -31,7 +31,7 @@ use super::{
 };
 use magnitude_executor::{
     BankResize, BankResized, BankStep, BankTier, DomainError, Followed, LoadMeasures, InvariantError,
-    MemoryChargeReconciliation, MemoryReading, NativeFamily, SizingTerm, SizingTerms,
+    MemoryReading, StateBytes, StoreAllocation, NativeFamily, SizingTerm, SizingTerms,
     Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
     ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
     SubmitFailure, WorkKind, Yielded,
@@ -39,13 +39,14 @@ use magnitude_executor::{
 use magnitude_executor::memory::ledger::Relief;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{
-    FinishReason, Generation, OutputToken, RoundStart, StartedRound, TimedLaunch,
+    FinishReason, Generation, InputLayout, MethodCheckpoint, OutputToken, RoundStart, StartedRound,
+    TimedLaunch,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     num::NonZeroU64,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Where a newly admitted request stops its prefill to retain branch
@@ -128,18 +129,13 @@ fn prompt_boundary(record: &Record, generation: &Generation) -> Option<usize> {
     .then_some(boundary)
 }
 
-/// The state every holder occupies, cached prefixes included: what the
-/// prefix cache holds within the state the memory plan charges.
-fn occupied_state<F: ProgramFamily>(
-    domain: &ExecutorDomain<F>,
-    cache: &PrefixCache<ResumeState>,
-) -> Result<u64, String> {
-    let cached = cache.states().collect::<Vec<_>>();
-    let (target, head) = domain.state_holding_census(&cached)?;
-    target
-        .occupied()
-        .checked_add(head.map_or(0, |head| head.occupied()))
-        .ok_or_else(|| "occupied state overflows".to_owned())
+/// Whether a stopped request's work is retained at `position`, the rows its
+/// state reached. A stop lands anywhere in a round, so it is retained only
+/// where a request can resume from it: deep enough to be a hit, at an exact
+/// input boundary of `layout` (never inside an indivisible media span), and
+/// beside a method checkpoint that accounts for the same rows.
+fn resumes_from_stop(layout: &InputLayout, position: usize, method: &MethodCheckpoint) -> bool {
+    position >= MIN_PREFIX_HIT && layout.boundary(position) && method.accounts_for(position)
 }
 
 /// The first position after `position` where the request's prefill stops
@@ -277,9 +273,7 @@ fn ended(generation: &Generation) -> bool {
 struct Record {
     waiting_since: u64,
     service_ns: u64,
-    physical_timings: PhysicalTimings,
-    /// Purpose of the current operation chain, retained across pending/parked work.
-    timing_phase: TimingPhase,
+    clock: RequestClock,
     error: Option<RequestError>,
     preemption_debt: u32,
     /// Whether the request resumes from and contributes to the prefix cache.
@@ -301,47 +295,55 @@ struct Record {
     publication_permits: VecDeque<PublicationPermit>,
 }
 
-/// Request service purpose, independent of target/head lane and replay geometry.
+/// A request's wall-clock timing, kept as llama.cpp's server keeps a slot's:
+/// its prompt from the first service it receives to its first accepted output
+/// token, its generation from there to its latest accepted token. Everything in
+/// between counts, whatever the engine spent it on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TimingPhase {
-    Prompt,
-    Generation,
-    Retention,
+enum RequestClock {
+    /// Admitted, never served.
+    Waiting,
+    /// Served since `started`, no output accepted yet.
+    Prompt { started: Instant },
+    /// Output accepted: the first token at `first`, the latest at `latest`.
+    Generating { started: Instant, first: Instant, latest: Instant },
 }
 
-impl TimingPhase {
-    fn add(self, timings: &mut PhysicalTimings, duration: Duration) {
-        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-        let bucket = match self {
-            Self::Prompt => &mut timings.prompt_ns,
-            Self::Generation => &mut timings.predicted_ns,
-            Self::Retention => return,
+impl RequestClock {
+    /// The request receives service at `now`: its prompt starts at its first.
+    fn serve(&mut self, now: Instant) {
+        if let Self::Waiting = self {
+            *self = Self::Prompt { started: now };
+        }
+    }
+
+    /// The request's generation accepted output at `now`.
+    fn accepted(&mut self, now: Instant) {
+        *self = match *self {
+            Self::Waiting => panic!("output accepted for a request never served"),
+            Self::Prompt { started } => Self::Generating { started, first: now, latest: now },
+            Self::Generating { started, first, .. } => Self::Generating { started, first, latest: now },
         };
-        *bucket = bucket.saturating_add(nanos);
+    }
+
+    /// The timings of a request that completes at `now`.
+    fn timings(self, now: Instant) -> RequestTimings {
+        let nanos = |duration: Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        match self {
+            Self::Waiting => RequestTimings::default(),
+            Self::Prompt { started } => RequestTimings {
+                prompt_ns: nanos(now - started),
+                predicted_ns: 0,
+            },
+            Self::Generating { started, first, latest } => RequestTimings {
+                prompt_ns: nanos(first - started),
+                predicted_ns: nanos(latest - first),
+            },
+        }
     }
 }
 
 impl Record {
-    fn begin_service(&mut self, candidate: &Candidate) {
-        // A newly started chain owns its accounting purpose. Follow-up priming
-        // inherits it even after the target publishes its first token. Resuming
-        // pending/parked operations must not reclassify that existing chain.
-        if candidate.composed().is_none() {
-            let generation = candidate.generation();
-            self.timing_phase = if owes_reconciliation(self, generation) {
-                TimingPhase::Retention
-            } else if generation.generated().is_empty() {
-                TimingPhase::Prompt
-            } else {
-                TimingPhase::Generation
-            };
-        }
-    }
-
-    fn add_physical_duration(&mut self, duration: Duration) {
-        self.timing_phase.add(&mut self.physical_timings, duration);
-    }
-
     /// Drop everything the host would still receive.
     fn release_publication(&mut self) {
         self.pending_publication = None;
@@ -554,7 +556,7 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             RequestError::Invariant(error)
         }
         DomainError::WeightRead(error) => RequestError::WeightRead(error),
-        error @ (DomainError::StateCeiling { .. } | DomainError::ChainReleased(_)) => RequestError::Invariant(InvariantError {
+        error @ DomainError::StateCeiling { .. } => RequestError::Invariant(InvariantError {
             context: "state ceiling",
             detail: error.to_string(),
         }),
@@ -729,15 +731,13 @@ enum Provisioned {
     /// Over budget once every release was tried and it holds one operation:
     /// its requests fail at once with the typed capacity error.
     Refused(OperationGroup, RequestError),
-    /// Its chain's holder's group was not the chain's queued chunk: the
-    /// chain was released with the holder's state, which replays
-    /// (`DomainError::ChainReleased`).
-    Replay(OperationGroup, RequestId),
 }
 
 /// Everything the owner holds except its pipeline.
 struct Service<F: ProgramFamily> {
-    domain: ExecutorDomain<F>,
+    /// Boxed: a domain is tens of kilobytes, which every owner, and every
+    /// frame that builds or moves one, would otherwise hold by value.
+    domain: Box<ExecutorDomain<F>>,
     scheduler: Scheduler,
     /// Requests outside the pipeline.
     requests: BTreeMap<RequestId, Request>,
@@ -874,7 +874,7 @@ impl<F: ProgramFamily> Owner<F> {
         domain.watch_pressure(wakes.pressure());
         Ok(Self {
             service: Service {
-                domain,
+                domain: Box::new(domain),
                 scheduler: Scheduler::new(limits)?,
                 requests: BTreeMap::new(),
                 epoch: AvailabilityEpoch::default(),
@@ -981,12 +981,12 @@ impl<F: ProgramFamily> Owner<F> {
         ))
     }
 
-    /// A fresh reading of every memory domain, then Seismic's charge
-    /// classified by every holder the owner keeps.
+    /// A fresh reading of every memory domain, then what each store's
+    /// ledger holds allocated, by class.
     pub fn observe(&self) -> Result<WorkerReply, String> {
         Ok(WorkerReply::Observed {
             readings: self.service.domain.observe_memory(),
-            reconciliation: self.reconcile_memory_charge()?,
+            stores: self.store_allocations(),
             serving: self.serving_census()?,
         })
     }
@@ -1002,12 +1002,15 @@ impl<F: ProgramFamily> Owner<F> {
         })
     }
 
-    /// Seismic's charge reconciled against every state holder the owner
-    /// keeps: resident requests and cached prefixes; submitted work is
-    /// counted through its stores' claims.
-    pub fn reconcile_memory_charge(&self) -> Result<MemoryChargeReconciliation, String> {
-        let cached = self.service.prefix_cache.states().collect::<Vec<_>>();
-        self.service.domain.reconcile_memory_charge(&cached)
+    /// What each store's ledger holds allocated, by class.
+    pub fn store_allocations(&self) -> Vec<StoreAllocation> {
+        self.service.domain.store_allocations()
+    }
+
+    /// The state stores' bytes, every holder's (cached prefixes included)
+    /// read from the stores' own records.
+    pub fn state_bytes(&self) -> StateBytes {
+        self.service.domain.state_bytes()
     }
 
     pub fn completed_service_ns(&self) -> u128 {
@@ -1205,8 +1208,7 @@ impl<F: ProgramFamily> Service<F> {
                 record: Record {
                     waiting_since: now,
                     service_ns: 0,
-                    physical_timings: PhysicalTimings::default(),
-                    timing_phase: TimingPhase::Prompt,
+                    clock: RequestClock::Waiting,
                     error: None,
                     preemption_debt: 0,
                     prefix_cache,
@@ -1450,7 +1452,7 @@ impl<F: ProgramFamily> Service<F> {
                         finish,
                         generation.detailed_usage(),
                         generation.method_identity().to_owned(),
-                        record.physical_timings,
+                        record.clock.timings(Instant::now()),
                     ),
                 }
             }
@@ -1649,7 +1651,7 @@ trait MemoryStep: MemoryHost + Sized {
                 completed = true;
             }
             completed |= self.advance_expert_bank()?;
-            completed |= self.advance_slot_release()?;
+            completed |= self.advance_slot_release();
             let prefix = self.prefix_value();
             self.domain().value_cache(prefix).map_err(classify_domain_error)?;
             self.domain().value_state().map_err(classify_domain_error)?;
@@ -1808,9 +1810,9 @@ trait MemoryStep: MemoryHost + Sized {
     /// submitting thread (`ExecutorDomain::advance_slot_release`), recorded
     /// with the slots and how long the release thread took. It freed
     /// memory, so what waited on memory may retry. Whether one finished.
-    fn advance_slot_release(&mut self) -> Result<bool, RequestError> {
-        let Some(released) = self.domain().advance_slot_release().map_err(classify_domain_error)? else {
-            return Ok(false);
+    fn advance_slot_release(&mut self) -> bool {
+        let Some(released) = self.domain().advance_slot_release() else {
+            return false;
         };
         tracing::info!(
             slots = released.slots,
@@ -1820,7 +1822,7 @@ trait MemoryStep: MemoryHost + Sized {
             "graph slots released"
         );
         self.advance_epoch();
-        Ok(true)
+        true
     }
 
     /// At a flight boundary, advance the expert bank's resize
@@ -2126,11 +2128,11 @@ impl<F: ProgramFamily> Service<F> {
     fn select(&mut self, bindings: &mut StateBindings) -> Result<Selected, Fatal> {
         let mut candidates = self.candidates();
         let mut holder = self.domain.chain_holder();
-        // A holder that is no longer scheduled ended mid-chain: its chain is
-        // released, and its state with it.
+        // A holder that is no longer scheduled ended mid-chain: its chain
+        // concludes, its state the one its reconciled chunks reached.
         if holder.is_some_and(|holder| !candidates.contains_key(&holder)) {
             self.domain
-                .release_chain()
+                .conclude_chain()
                 .map_err(|error| (None, classify_domain_error(error)))?;
             holder = None;
         }
@@ -2315,7 +2317,7 @@ impl<F: ProgramFamily> Service<F> {
         selections: usize,
         bindings: &mut StateBindings,
     ) -> Result<Start, Fatal> {
-        record.begin_service(&candidate);
+        record.clock.serve(Instant::now());
         let generation = match candidate {
             Candidate::Parked(round, work) => {
                 return Ok(Start::Joined(
@@ -2665,10 +2667,6 @@ impl<F: ProgramFamily> Service<F> {
                     self.refuse(&mut round, &group_, error);
                     continue;
                 }
-                Ok(Provisioned::Replay(group_, holder)) => {
-                    self.replay(&mut round, &group_, holder).map_err(|error| (None, classify_domain_error(error)))?;
-                    continue;
-                }
                 Err(error) => return Err((Some(round.members), error)),
             };
             match submit_group(&mut self.domain, bindings, &group_, self.wakes.completion()) {
@@ -2775,7 +2773,6 @@ impl<F: ProgramFamily> Service<F> {
             Ok(()) => Ok(Provisioned::Fits(group_)),
             Err(DomainError::Capacity(_)) if pending || self.others_stand(&group_) => Ok(Provisioned::Short(group_, Wait { at: self.epoch, on: WaitsOn::Memory })),
             Err(error @ (DomainError::Capacity(_) | DomainError::Input(_))) => Ok(Provisioned::Refused(group_, refused_alone(error))),
-            Err(DomainError::ChainReleased(holder)) => Ok(Provisioned::Replay(group_, holder)),
             Err(error) => Err(classify_domain_error(error)),
         }
     }
@@ -2810,18 +2807,6 @@ impl<F: ProgramFamily> Service<F> {
             Self::fail_member(round, request, error.clone());
         }
         self.epoch.advance();
-    }
-
-    /// Move a group that cannot proceed out of the round: each of its
-    /// requests takes all of its remaining work with it and waits alone.
-    /// `group_`'s requests leave the round between rounds, and `holder`,
-    /// whose state its chain's release took, replays from its committed
-    /// history, as an evicted request does.
-    fn replay(&mut self, round: &mut Round, group_: &OperationGroup, holder: RequestId) -> Result<(), DomainError> {
-        tracing::info!(?holder, "a chain holder's group is not its queued chunk: the chain is released and the holder replays");
-        let requests = group_.operations().iter().map(Operation::request).collect::<BTreeSet<_>>();
-        self.withdraw(round, &requests);
-        self.evicted(&[holder])
     }
 
     /// Take `requests` out of `round`, their work in its later groups with
@@ -2913,12 +2898,7 @@ impl<F: ProgramFamily> Service<F> {
             FlightOutcomes::Target(pending) => self.reconcile_target(&mut round, pending, &operations),
             FlightOutcomes::Head(pending) => self.reconcile_method(&mut round, pending, &operations),
             FlightOutcomes::Vision(item) => self.reconcile_vision(&mut round, item, &operations),
-            FlightOutcomes::Priming(request, duration) => {
-                if let Some(member) = round.members.get_mut(&request) {
-                    member.record.add_physical_duration(duration);
-                }
-                Ok(())
-            }
+            FlightOutcomes::Priming(_) => Ok(()),
         };
         if let Err(error) = reconciled {
             return Err((Some(round.members), error));
@@ -2991,15 +2971,18 @@ impl<F: ProgramFamily> Service<F> {
                 self.domain.abort(item).map_err(classify_domain_error)?;
                 continue;
             };
-            record.add_physical_duration(item.physical_duration());
             // The member returns to the round before any fatal error is
             // returned: the owner terminates the round's members with it, and
             // a member held here would be dropped without its outcome.
             let (state, fatal) = match state {
                 Membership::Started(mut started) if !ended(started.generation()) => {
                     started.timed(TimedLaunch::Target, item.launch_duration(), sequences, rows);
+                    let output = started.generation().generated().len();
                     match reconcile_forward(started, &mut self.domain, request, item) {
                         Ok((generation, effects)) => {
+                            if generation.generated().len() > output {
+                                record.clock.accepted(Instant::now());
+                            }
                             followups.extend(effects.operations);
                             (Membership::Generation(generation), None)
                         }
@@ -3078,7 +3061,6 @@ impl<F: ProgramFamily> Service<F> {
                 self.domain.abort(item).map_err(classify_domain_error)?;
                 continue;
             };
-            member.record.add_physical_duration(item.physical_duration());
             let Membership::Generation(generation) = &mut member.state else {
                 return Err(invariant("service method flight")(
                     "drafter work reached a request with a started target round".into(),
@@ -3155,9 +3137,6 @@ impl<F: ProgramFamily> Service<F> {
         let Some(member) = round.members.get_mut(&request) else {
             return self.domain.abort(item).map_err(classify_domain_error);
         };
-        member
-            .record
-            .add_physical_duration(item.physical_duration());
         if ended(member.state.generation()) {
             return self.domain.abort(item).map_err(classify_domain_error);
         }
@@ -3282,28 +3261,25 @@ impl<F: ProgramFamily> Service<F> {
             branches.clear();
         }
         if reached {
-            self.cache_prefix(id, resident, CachePoint::Branch)?;
+            self.cache_prefix(id, CachePoint::Branch)?;
         }
         Ok(())
     }
 
     /// Cache the request's reconciled state as the prefix of its path ending
-    /// at `position`, where it is resident.
-    fn cache_prefix(
-        &mut self,
-        id: RequestId,
-        position: usize,
-        point: CachePoint,
-    ) -> Result<(), RequestError> {
+    /// where that state does: a chain it holds concludes first, its state
+    /// the one its reconciled chunks reached, and the prefix's position is
+    /// read from the state then. The generation's resident position, which
+    /// advanced as those chunks reconciled, is the same.
+    fn cache_prefix(&mut self, id: RequestId, point: CachePoint) -> Result<(), RequestError> {
+        if self.domain.chain_holder() == Some(id) {
+            self.domain.conclude_chain().map_err(classify_domain_error)?;
+        }
         let state = self
             .domain
             .resume_state(id)
             .map_err(invariant("prefix retention"))?;
-        if state.position() != position {
-            return Err(invariant("prefix retention")(
-                "cached prefix state differs from its path position".into(),
-            ));
-        }
+        let position = state.position();
         let Some(Request {
             state: State::Between(generation, _),
             ..
@@ -3311,6 +3287,11 @@ impl<F: ProgramFamily> Service<F> {
         else {
             return Ok(());
         };
+        if generation.resident_position() != position {
+            return Err(invariant("prefix retention")(
+                "cached prefix state differs from its path position".into(),
+            ));
+        }
         let method = generation
             .method_checkpoint()
             .map_err(invariant("prefix retention"))?;
@@ -3321,9 +3302,9 @@ impl<F: ProgramFamily> Service<F> {
         if retained {
             let held = self.held_entries(None);
             let domain = &self.domain;
-            self.prefix_cache
-                .release_beyond_workload(&held, |cache| occupied_state(domain, cache))
-                .map_err(invariant("prefix retention"))?;
+            // The state every holder occupies, the cached prefixes included,
+            // read from the stores as each release drops its entry.
+            self.prefix_cache.release_beyond_workload(&held, || domain.state_bytes().occupied());
         }
         Ok(())
     }
@@ -3344,79 +3325,50 @@ impl<F: ProgramFamily> Service<F> {
         {
             return Ok(());
         }
-        self.cache_prefix(id, boundary, CachePoint::PromptBoundary)?;
+        self.cache_prefix(id, CachePoint::PromptBoundary)?;
         self.requests.get_mut(&id).unwrap().record.prefill_retained = true;
         Ok(())
     }
 
-    /// Cache a finished request's whole path, prompt and reply: the next turn
-    /// of a conversation extends it.
+    /// Cache a finished request's whole path, prompt and reply, or a stopped
+    /// one's as far as its state reached: the next turn of a conversation
+    /// extends it, and a client that stops a request and sends the
+    /// conversation again resumes where it stopped.
     fn retain_terminal(&mut self, id: RequestId) -> Result<(), RequestError> {
         let Some((record, generation)) = self.between(id) else {
             return Ok(());
         };
-        if record.terminal_retained
-            || !record.prefix_cache
-            || !generation.is_resident()
-            || !matches!(
-                generation.finish_reason(),
-                Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
-            )
-        {
+        if record.terminal_retained || !record.prefix_cache || !generation.is_resident() {
             return Ok(());
         }
-        let end = generation.reconciled_position();
-        if generation.resident_position() != end {
-            if generation.pending_reconciliation().is_some() {
-                return Ok(());
+        match generation.finish_reason() {
+            // A completed request's whole path, once its state is reconciled
+            // to it (`owes_reconciliation`).
+            Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context) => {
+                if generation.resident_position() != generation.reconciled_position() {
+                    if generation.pending_reconciliation().is_some() {
+                        return Ok(());
+                    }
+                    return Err(invariant("prefix retention")(
+                        "terminal numerical state is not reconciled at the accepted boundary".into(),
+                    ));
+                }
             }
-            return Err(invariant("prefix retention")(
-                "terminal numerical state is not reconciled at the accepted boundary".into(),
-            ));
+            // A stopped request's work is the rows its state holds, cached
+            // where it reached without computing more, where a request can
+            // resume from it (`resumes_from_stop`).
+            Some(FinishReason::Cancelled) => {
+                let position = generation.resident_position();
+                let resumable = generation
+                    .method_checkpoint()
+                    .is_ok_and(|method| resumes_from_stop(generation.layout(), position, &method));
+                if !resumable {
+                    return Ok(());
+                }
+            }
+            _ => return Ok(()),
         }
-        self.cache_prefix(id, end, CachePoint::Terminal)?;
-        self.requests.get_mut(&id).unwrap().record.terminal_retained = true;
-        Ok(())
-    }
-
-    /// Cache a cancelled request's path where its computed state ends,
-    /// mid-prompt or mid-reply: a client that stops a request keeps what it
-    /// saw and sends the conversation again, which resumes there instead of
-    /// computing it anew. A prompt group's chain under way runs on the
-    /// device whatever happens, so it is concluded and kept whole first. A
-    /// stop lands anywhere in a round, so the state is cached only where it
-    /// is settled and the method's checkpoint accounts for the same rows.
-    fn retain_cancelled(&mut self, id: RequestId) -> Result<(), RequestError> {
-        let Some((record, generation)) = self.between(id) else {
-            return Ok(());
-        };
-        if record.terminal_retained
-            || !record.prefix_cache
-            || !generation.is_resident()
-            || generation.finish_reason() != Some(FinishReason::Cancelled)
-        {
-            return Ok(());
-        }
-        if self.domain.chain_holder() == Some(id) {
-            self.domain.conclude_chain(id).map_err(classify_domain_error)?;
-        }
-        let Ok(state) = self.domain.resume_state(id) else {
-            return Ok(());
-        };
-        let position = state.position();
-        drop(state);
-        let Some((_, generation)) = self.between(id) else {
-            return Ok(());
-        };
-        if position < MIN_PREFIX_HIT
-            || !PrefixPath::of(generation).exact_boundary(position)
-            || !generation
-                .method_checkpoint()
-                .is_ok_and(|method| method.accounts_for(position))
-        {
-            return Ok(());
-        }
-        self.cache_prefix(id, position, CachePoint::Terminal)?;
+        self.cache_prefix(id, CachePoint::Terminal)?;
         self.requests.get_mut(&id).unwrap().record.terminal_retained = true;
         Ok(())
     }
@@ -3518,7 +3470,6 @@ impl<F: ProgramFamily> Service<F> {
                 continue;
             }
             self.retain_terminal(id)?;
-            self.retain_cancelled(id)?;
             let request = self.requests.get_mut(&id).expect("listed request");
             let State::Between(generation, _) = &request.state else {
                 continue;
@@ -3536,7 +3487,7 @@ impl<F: ProgramFamily> Service<F> {
                         finish,
                         generation.detailed_usage(),
                         generation.method_identity().to_owned(),
-                        record.physical_timings,
+                        record.clock.timings(Instant::now()),
                     ),
                 }
             }
@@ -3688,8 +3639,9 @@ impl<F: ProgramFamily> MemoryHost for Service<F> {
     }
 
     /// Those that can be evicted now ([`Self::can_evict`]); a chain's
-    /// holder between its chunks is resident and ready, but its state is
-    /// the chain's until the chain ends: never evicted.
+    /// holder between its chunks is kept: its eviction would conclude the
+    /// chain (`ExecutorDomain::release_state`), dropping the chunks it has
+    /// already launched.
     fn evictable(&self) -> BTreeSet<RequestId> {
         let holder = self.domain.chain_holder();
         self.requests.iter().filter(|(id, request)| Some(**id) != holder && Self::can_evict(request)).map(|(id, _)| *id).collect()
@@ -3897,16 +3849,6 @@ mod termination_tests {
 #[cfg(test)]
 mod timing_tests {
     use super::*;
-    use magnitude_executor::{FeatureReader, FeatureRows, FeatureSpan};
-    use magnitude_generation::{RoundStart, TokenId};
-    use std::time::Duration;
-
-    struct NoFeatures;
-    impl FeatureReader for NoFeatures {
-        fn read(&mut self, _: &FeatureSpan) -> Result<FeatureRows, String> {
-            panic!("plain prompt needs no features")
-        }
-    }
 
     /// A lone prefill group queues its next chunk only when nothing outside
     /// the round competes for the device: another live request's work would
@@ -3914,8 +3856,7 @@ mod timing_tests {
     #[test]
     fn only_live_work_outside_the_round_competes_with_a_queued_chunk() {
         let record = || Record {
-            waiting_since: 0, service_ns: 0, physical_timings: PhysicalTimings::default(),
-            timing_phase: TimingPhase::Prompt, error: None, preemption_debt: 0,
+            waiting_since: 0, service_ns: 0, clock: RequestClock::Waiting, error: None, preemption_debt: 0,
             prefix_cache: true, prefix_source: None,
             prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
             publication: None, publication_batch_limit: 4, pending_publication: None,
@@ -3960,89 +3901,44 @@ mod timing_tests {
         assert!(!computes_toward(&State::Between(cancelled, Stage::NonResident(None)), 1, |_| 0));
     }
 
+    /// The prompt runs from the request's first service to its first
+    /// accepted token, the generation from there to its latest: later
+    /// service (a round resumed, a recovery) restarts neither.
     #[test]
-    fn published_prompt_token_does_not_reclassify_parked_or_pending_work() {
-        let mut record = Record {
-            waiting_since: 0, service_ns: 0, physical_timings: PhysicalTimings::default(),
-            timing_phase: TimingPhase::Prompt, error: None, preemption_debt: 0,
-            prefix_cache: true, prefix_source: None,
-            prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
-            publication: None, publication_batch_limit: 4, pending_publication: None,
-            publication_permits: VecDeque::new(),
-        };
-        let candidate = Candidate::Ready(super::termination_tests::generation());
-        record.begin_service(&candidate);
-        let Candidate::Ready(generation) = candidate else { unreachable!() };
-        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4) else {
-            panic!("prompt round")
-        };
-        let work = lower_round(&round, RequestId(1), 0, None).unwrap();
-        let candidate = Candidate::Parked(round, Work(vec![work.clone()]));
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Prompt);
-        let Candidate::Parked(round, _) = candidate else { unreachable!() };
-        let transition = round.prepare_round_transition(
-            RequestId(1), &[TokenId(3)], None, &mut NoFeatures,
-        ).unwrap();
-        let (generation, _) = round.commit(transition);
-        assert_eq!(generation.generated(), &[TokenId(3)]);
-        // Pending operations retain the origin even though publication changed
-        // generation state. The operation's lane/kind is irrelevant here.
-        let candidate = Candidate::Pending(generation, Work(vec![work]));
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Prompt);
-        let Candidate::Pending(mut generation, _) = candidate else { unreachable!() };
-        generation.evicted().unwrap();
-        let candidate = Candidate::NonResident(generation);
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Generation);
+    fn the_clock_times_the_prompt_to_the_first_token_and_generation_to_the_latest() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut clock = RequestClock::Waiting;
+        clock.serve(at(0));
+        clock.serve(at(5));
+        clock.accepted(at(100));
+        clock.serve(at(150));
+        clock.accepted(at(160));
+        clock.accepted(at(400));
+        assert_eq!(
+            clock.timings(at(1000)),
+            RequestTimings { prompt_ns: 100_000_000, predicted_ns: 300_000_000 }
+        );
+    }
 
-        let generation = super::termination_tests::generation_with_limit(1);
-        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4) else {
-            panic!("terminal prompt round")
-        };
-        let transition = round.prepare_round_transition(
-            RequestId(1), &[TokenId(3)], None, &mut NoFeatures,
-        ).unwrap();
-        let (generation, _) = round.commit(transition);
-        assert!(owes_reconciliation(&record, &generation));
-        let candidate = Candidate::Ready(generation);
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Retention);
-        let Candidate::Ready(generation) = candidate else { unreachable!() };
-        let round = generation.start_reconciliation(4).unwrap_or_else(|(_, e)| panic!("{e}"));
-        let work = lower_round(&round, RequestId(1), round.generation().resident_position(), None).unwrap();
-        let candidate = Candidate::Parked(round, Work(vec![work]));
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Retention);
+    /// A request that ends before any output spent its whole service on
+    /// its prompt; one never served spent nothing.
+    #[test]
+    fn a_request_without_output_times_only_its_prompt() {
+        let start = Instant::now();
+        let mut clock = RequestClock::Waiting;
+        assert_eq!(clock.timings(start), RequestTimings::default());
+        clock.serve(start);
+        assert_eq!(
+            clock.timings(start + Duration::from_millis(7)),
+            RequestTimings { prompt_ns: 7_000_000, predicted_ns: 0 }
+        );
     }
 
     #[test]
-    fn history_work_follows_its_origin_and_retention_is_excluded() {
-        let mut timings = PhysicalTimings::default();
-        // The final target prompt publishes a token before its head priming
-        // completes. Both completions keep the prompt chain's phase.
-        let prompt_chain = TimingPhase::Prompt;
-        prompt_chain.add(&mut timings, Duration::from_millis(100));
-        prompt_chain.add(&mut timings, Duration::from_millis(3));
-        // Recovery can replay prompt rows after output has begun; it is still
-        // generation service, including its deferred head preparation.
-        let recovery_chain = TimingPhase::Generation;
-        recovery_chain.add(&mut timings, Duration::from_millis(7));
-        recovery_chain.add(&mut timings, Duration::from_millis(2));
-        // Retaining finished output does not change either throughput field.
-        TimingPhase::Retention.add(&mut timings, Duration::from_millis(20));
-        TimingPhase::Retention.add(&mut timings, Duration::from_millis(1));
-        assert_eq!(timings.prompt_ns, 103_000_000);
-        assert_eq!(timings.predicted_ns, 9_000_000);
-    }
-
-    #[test]
-    fn measured_duration_accumulation_saturates() {
-        let mut timings = PhysicalTimings { prompt_ns: u64::MAX - 1, predicted_ns: 0 };
-        TimingPhase::Prompt.add(&mut timings, Duration::from_nanos(2));
-        assert_eq!(timings.prompt_ns, u64::MAX);
-        assert_eq!(timings.predicted_ns, 0);
+    #[should_panic(expected = "never served")]
+    fn output_for_a_request_never_served_is_an_invariant_violation() {
+        RequestClock::Waiting.accepted(Instant::now());
     }
 }
 
@@ -4394,6 +4290,115 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         assert!(matches!(serve(&mut owner, &mut next), Publication::Completed { .. }), "the owner serves the next request");
         drop(owner);
         std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+    }
+
+    /// A request stopped part way through its prompt, while it holds a
+    /// chain of prompt chunks, keeps the prompt work its rounds reconciled:
+    /// its chain concludes there, and that state is cached as its path's
+    /// prefix, as a completed request's whole path is, at the position the
+    /// state holds; a request sharing the prompt resumes from it.
+    #[test]
+    fn a_request_stopped_mid_prompt_caches_the_prompt_it_reached() {
+        use crate::prefix_cache::{PrefixCacheCapacity, PrefixPath};
+        use std::task::{Context, Poll, Waker};
+        const PROMPT: usize = 2 * MIN_PREFIX_HIT;
+        let (directory, definition, domain, bindings) = fixtures::loaded::chaining("stopped-mid-prompt", 2 * PROMPT as u64, 3);
+        let vocabulary = definition.decoder.vocabulary as usize;
+        let prompt = || {
+            let options = Options {
+                max_tokens: 2,
+                output_capacity: 4,
+                context_limit: 2 * PROMPT,
+                vocabulary,
+                stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
+                sampling: Sampling::Greedy,
+                shaping: Shaping { temperature: 0.0, ..Default::default() },
+                seed: 0,
+                forced_quantum: 0,
+                method: MethodChoice::Plain,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: None,
+            };
+            let tokens = (0..PROMPT as u32).map(|token| TokenId(1 + token % 7)).collect::<Vec<_>>();
+            Generation::new(tokens, InputLayout::new(PROMPT, vec![]).unwrap(), options, None).unwrap()
+        };
+        let capacity = PrefixCacheCapacity { max_entries: 4, workload_state_bytes: u64::MAX };
+        let mut owner = Some(Owner::with_prefix_cache_capacity(domain, bindings, limits(), capacity, Arc::new(NoWakes)).unwrap());
+        let retain = PrefixRetention::Retain { cache_points: Vec::new() };
+        let (id, mut receiver) = owner.as_mut().unwrap().admit(prompt(), PreparedModelInput::continuation_only(), retain, 4, 0).unwrap();
+        let mut now = 0u64;
+        let mut run = |owner: &mut Option<Owner<magnitude_executor::NativeFamily>>| {
+            let (ran, _) = owner.take().expect("the owner is between runs").run(now).unwrap_or_else(|error| panic!("the owner stopped: {error}"));
+            *owner = Some(ran);
+            now += 1_000_000;
+        };
+        // Past the least prefix a lookup resumes from, between chunks of a
+        // chain it holds, it is stopped.
+        let stoppable = |owner: &Option<Owner<magnitude_executor::NativeFamily>>| {
+            let owner = owner.as_ref().unwrap();
+            owner.snapshot(id).unwrap().resident_position > MIN_PREFIX_HIT && owner.service.domain.chain_holder() == Some(id)
+        };
+        while !stoppable(&owner) {
+            assert!(owner.as_ref().unwrap().snapshot(id).unwrap().resident_position < PROMPT, "its prompt chains before it ends");
+            run(&mut owner);
+        }
+        let reached = owner.as_ref().unwrap().snapshot(id).unwrap().resident_position;
+        assert!(reached < PROMPT, "stopped mid-prompt, at {reached}");
+        owner.as_mut().unwrap().stop(id);
+        let finish = loop {
+            run(&mut owner);
+            match receiver.poll_next(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Some(Publication::Completed { finish, .. })) => break finish,
+                Poll::Ready(Some(Publication::Output(_))) | Poll::Pending => {}
+                other => panic!("a stopped request completes, not {other:?}"),
+            }
+        };
+        assert_eq!(finish, FinishReason::Cancelled);
+        let served = owner.as_mut().unwrap();
+        assert!(served.snapshot(id).is_none(), "the stopped request is retired");
+        let sharing = prompt();
+        let hit = served.service.prefix_cache.lookup(PrefixPath::of(&sharing), PROMPT).unwrap().expect("its prompt work is cached");
+        assert_eq!(hit.position(), reached, "cached where it reached");
+        let cached = served.service.prefix_cache.entry(hit).unwrap().state().position();
+        assert_eq!(cached, hit.position(), "the cached state holds exactly the prefix it is cached as");
+        drop(owner);
+        std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+    }
+
+    /// A request stopped short of the least prefix a lookup resumes from
+    /// leaves nothing cached; one stopped at it is cached there.
+    #[test]
+    fn a_stop_short_of_a_hit_is_not_retained() {
+        let layout = InputLayout::new(2 * MIN_PREFIX_HIT, vec![]).unwrap();
+        let plain = super::MethodCheckpoint::Plain;
+        assert!(!super::resumes_from_stop(&layout, MIN_PREFIX_HIT - 1, &plain));
+        assert!(super::resumes_from_stop(&layout, MIN_PREFIX_HIT, &plain));
+    }
+
+    /// A request stopped inside an indivisible media span leaves nothing
+    /// cached, since no request resumes there; one stopped at the span's
+    /// end or inside a causal span is cached where it stopped.
+    #[test]
+    fn a_stop_inside_an_indivisible_span_is_not_retained() {
+        use magnitude_generation::{BoundaryRule, InputSpan};
+        let span = |start, end, boundaries| InputSpan {
+            start,
+            end,
+            identity: format!("media-{start}"),
+            boundaries,
+            language_history: false,
+        };
+        let (image, causal) = (MIN_PREFIX_HIT + 2..MIN_PREFIX_HIT + 10, MIN_PREFIX_HIT + 12..MIN_PREFIX_HIT + 20);
+        let layout = InputLayout::new(
+            2 * MIN_PREFIX_HIT,
+            vec![span(image.start, image.end, BoundaryRule::Indivisible), span(causal.start, causal.end, BoundaryRule::Causal)],
+        )
+        .unwrap();
+        let plain = super::MethodCheckpoint::Plain;
+        assert!(!super::resumes_from_stop(&layout, image.start + 3, &plain), "inside the image");
+        assert!(super::resumes_from_stop(&layout, image.end, &plain), "at the image's end");
+        assert!(super::resumes_from_stop(&layout, causal.start + 3, &plain), "inside a causal span");
     }
 
     /// Two loads in one process, each with its own owner, admit in turn:

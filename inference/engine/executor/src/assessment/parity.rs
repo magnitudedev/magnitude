@@ -433,7 +433,7 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it(backend: B
     let mut rows: Vec<Row> = std::thread::scope(|scope| {
         let workers = (0..threads)
             .map(|_| {
-                scope.spawn(|| {
+                seismic::threads::spawn_scoped(scope, "parity-rows", || {
                     let mut rows = Vec::new();
                     while let Some(&(target, machine)) = jobs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                         let (name, definition, manifest) = (&target.0, &target.1, &target.2);
@@ -443,20 +443,16 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it(backend: B
                             for workload in workloads(backend, definition) {
                                 // A row that panics is reported as its own failure, so
                                 // the rest of the sweep still prints.
-                                let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let computed = seismic::threads::recoverable(|| {
                                     row(name, definition, manifest, machine, topology, &status, executor, workload)
-                                }))
+                                })
                                 .unwrap_or_else(|panic| Row {
                                     line: format!(
                                         "{name} | {machine}:{} | {}@{} | panics: {}",
                                         executor.backend().as_str(),
                                         workload.label,
                                         workload.context,
-                                        panic
-                                            .downcast_ref::<String>()
-                                            .map(String::as_str)
-                                            .or_else(|| panic.downcast_ref::<&str>().copied())
-                                            .unwrap_or("a panic without a message")
+                                        panic.message()
                                     ),
                                     regression: false,
                                     diverged: false,
@@ -475,7 +471,7 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it(backend: B
                         }
                     }
                     rows
-                })
+                }).expect("invariant violated: the host starts a thread")
             })
             .collect::<Vec<_>>();
         workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect::<Vec<_>>()

@@ -317,8 +317,20 @@ impl State {
 
 /// The rows steps named, kept in a file for the next time the table is
 /// served. An optimization: a file that cannot be read or written keeps
-/// none.
-pub struct KeptRows(PathBuf);
+/// none. The file is published whole without a lock ([`seismic_io::Store::publish`]):
+/// every writer of one table's rows writes rows any reader may seed from,
+/// and the last to land is kept. It states its count of rows and ends in a
+/// newline, so a file a crash left torn reads as none, never as fewer rows.
+///
+/// The directory lies in the kernel cache (`table-rows`), whose eviction
+/// places each file as an entry of its own; its writes are not counted
+/// toward the cache's eviction trigger: a table's rows are kilobytes against
+/// the quarter of its capacity the trigger waits for, and every opening of
+/// the cache evicts.
+pub struct KeptRows {
+    store: seismic_io::Store,
+    name: PathBuf,
+}
 
 impl KeptRows {
     /// The file in `directory` of the table `table` describes: everything
@@ -328,29 +340,39 @@ impl KeptRows {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        Self(directory.join(format!("{name}.rows")))
+        Self { store: seismic_io::Store::new(directory.to_owned(), seismic_io::Privacy::Shared), name: PathBuf::from(format!("{name}.rows")) }
+    }
+
+    /// Where the rows are kept.
+    #[cfg(test)]
+    fn path(&self) -> PathBuf {
+        self.store.root().join(&self.name)
     }
 
     pub(crate) fn read(&self) -> Vec<u64> {
-        std::fs::read_to_string(&self.0)
+        self.store
+            .read(&self.name, KEPT_ROWS_BYTES)
             .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|text| {
-                text.split_whitespace()
-                    .map(|row| row.parse().ok())
-                    .collect::<Option<Vec<_>>>()
+                let mut fields = text.strip_suffix('\n')?.split(' ');
+                let count = fields.next()?.parse::<usize>().ok()?;
+                let rows = fields.map(|row| row.parse().ok()).collect::<Option<Vec<_>>>()?;
+                (rows.len() == count).then_some(rows)
             })
             .unwrap_or_default()
     }
 
     pub(crate) fn write(&self, rows: &[u64]) {
-        let text = rows.iter().map(u64::to_string).collect::<Vec<_>>().join(" ");
-        let _ = self
-            .0
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&self.0, text));
+        let text = std::iter::once(rows.len()).map(|count| count.to_string()).chain(rows.iter().map(u64::to_string)).collect::<Vec<_>>().join(" ") + "\n";
+        let _ = self.store.publish(&self.name, seismic_io::Durability::Volatile, |file| std::io::Write::write_all(file, text.as_bytes()));
     }
 }
+
+/// The most bytes a table's kept rows are read as: a row's index is at most
+/// twenty digits and a space, and no table keeps more than its slots.
+const KEPT_ROWS_BYTES: u64 = 64 << 20;
 
 /// A read of rows the device selects, queued but not yet submitted: what
 /// its step binds. Dropped unsubmitted, it is abandoned: its filler opens its
@@ -424,7 +446,7 @@ impl Drop for DeviceTable {
     fn drop(&mut self) {
         drop(self.reads.lock().expect("device table reads lock").take());
         if let Some(filler) = self.filler.take() {
-            let _ = filler.join();
+            filler.join().expect("the filler's panic ends the process");
         }
         crate::settle::Owed::settle(self);
     }
@@ -454,7 +476,7 @@ impl DeviceTable {
     /// slots are empty (`seed`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        device: &seismic::Device,
+        charges: &seismic::Charges,
         element: seismic::Element,
         stored: seismic::Element,
         rows: u64,
@@ -468,6 +490,7 @@ impl DeviceTable {
         kept: Option<KeptRows>,
     ) -> Result<Self, String> {
         let failed = |error: &dyn std::fmt::Display| format!("device table: {error}");
+        let device = &charges.device();
         let tile = element.tile_rows();
         if rows % tile != 0
             || slots % tile != 0
@@ -488,22 +511,19 @@ impl DeviceTable {
         // The directory addresses every slot; the clock takes regular ones
         // only.
         let mut tiles = SlotDirectory::new(rows, slots + landing, tile, form);
-        let slots_tensor = seismic::Tensor::zeros(device, element, &shape(slots + landing))
-            .map_err(|error| failed(&error))?;
         // Every import into the slots (a run of tiles, a landed read) binds
         // one record of whole tiles from a tile's boundary: the table of the
-        // slots' tiles, held from now, serves every one of them
+        // slots' tiles, formed with them, serves every one of them
         // (`WeightPlan::record_table_entries`).
         let tiled = [(slots + landing) / tile, tile]
             .into_iter()
             .chain(row_shape.iter().copied())
             .collect::<Vec<_>>();
-        slots_tensor
-            .reshape(&tiled)
-            .and_then(|tiles| tiles.hold_record_table())
+        let slots_tensor = seismic::Tensor::zeros_recorded(charges, element, &tiled)
+            .and_then(|tiles| tiles.reshape(&shape(slots + landing)))
             .map_err(|error| failed(&error))?;
         let directory = seismic::Tensor::words(
-            device,
+            charges,
             seismic::Element::i32(),
             &[form.entries(rows, slots + landing), form.fields()],
         )
@@ -513,9 +533,9 @@ impl DeviceTable {
         let shared = Arc::new(Shared {
             directory,
             fields: form.fields(),
-            landing_staging: seismic::Tensor::shared(device, stored, &shape(landing))
+            landing_staging: seismic::Tensor::shared(charges, stored, &shape(landing))
                 .map_err(|error| failed(&error))?,
-            notice: seismic::Tensor::words(device, seismic::Element::i32(), &[landing, 2])
+            notice: seismic::Tensor::words(charges, seismic::Element::i32(), &[landing, 2])
                 .map_err(|error| failed(&error))?,
             noticed: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
             gate: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
@@ -542,10 +562,8 @@ impl DeviceTable {
         let (reads, taken) = mpsc::channel();
         let filler = {
             let shared = shared.clone();
-            std::thread::Builder::new()
-                .name("device-table-filler".into())
-                .spawn(move || shared.fill_reads(taken))
-                .map_err(|error| failed(&error))?
+            seismic::threads::spawn("device-table-filler", move || shared.fill_reads(taken))
+            .map_err(|error| failed(&error))?
         };
         let table = Self {
             settled: Default::default(),
@@ -560,17 +578,28 @@ impl DeviceTable {
             reads: Mutex::new(Some(reads)),
             filler: Some(filler),
         };
-        table.hold_places(1)?;
+        table.hold_places(charges, 1)?;
         Ok(table)
     }
 
     /// Hold the stagings a class of `places` places has in flight
     /// (`TableFlights::stagings`): grown for a larger class, the least
     /// recently used released for a smaller once their conversions complete.
-    pub fn hold_places(&self, places: usize) -> Result<(), String> {
+    pub fn hold_places(&self, charges: &seismic::Charges, places: usize) -> Result<(), String> {
         self.staging
             .borrow_mut()
-            .resize(self.flights.stagings(places), || staging(&self.slots, self.stored, self.staging_rows))
+            .resize(self.flights.stagings(places), || staging(charges, &self.slots, self.stored, self.staging_rows))
+    }
+
+    /// The floor's stagings alone held again, a class's released: the
+    /// floor's are held from the table's start, so none is made.
+    pub fn release_places(&self) {
+        self.staging
+            .borrow_mut()
+            .resize(self.flights.stagings(1), || -> Result<seismic::Tensor, String> {
+                panic!("invariant violated: a table's floor stagings made as its class is released")
+            })
+            .expect("a release makes no staging");
     }
 
     /// The bytes of the stagings a class of `places` places holds
@@ -601,10 +630,10 @@ impl DeviceTable {
     /// first: the rows steps named when the table was last served, then the
     /// table's first rows. The clock reaches the last slots first, so the
     /// least valuable rows are the first replaced.
-    pub fn seed(&self) -> Result<(), String> {
+    pub fn seed(&self, charges: &seismic::Charges) -> Result<(), String> {
         let kept = self.kept.as_ref().map_or_else(Vec::new, KeptRows::read);
-        self.hold(kept, true)?;
-        self.hold(0..self.shared.slot_tiles as u64 * self.tile_rows(), false)
+        self.hold(charges, kept, true)?;
+        self.hold(charges, 0..self.shared.slot_tiles as u64 * self.tile_rows(), false)
     }
 
     /// Bring the tiles of `rows` the device does not hold into the slots no
@@ -612,7 +641,7 @@ impl DeviceTable {
     /// table's first step finds the device idle. Rows outside the table name
     /// none. `served`: steps named these rows when the table was last
     /// served.
-    fn hold(&self, rows: impl IntoIterator<Item = u64>, served: bool) -> Result<(), String> {
+    fn hold(&self, charges: &seismic::Charges, rows: impl IntoIterator<Item = u64>, served: bool) -> Result<(), String> {
         let tile = self.tile_rows();
         let (absent, taken) = {
             let mut state = self.state();
@@ -640,7 +669,7 @@ impl DeviceTable {
         let rows = absent.len() as u64 * tile;
         let mut seeding = match rows {
             0 => return Ok(()),
-            rows => staging(&self.slots, self.stored, rows)?,
+            rows => staging(charges, &self.slots, self.stored, rows)?,
         };
         match self.bring(&absent, &taken, served, &mut seeding)? {
             Some(converted) => converted.wait().map_err(|error| format!("device table: {error}")),
@@ -1065,6 +1094,7 @@ impl Shared {
 
 /// A staging tensor of `rows` rows of the table of `slots`, as `stored`.
 fn staging(
+    charges: &seismic::Charges,
     slots: &seismic::Tensor,
     stored: seismic::Element,
     rows: u64,
@@ -1074,7 +1104,7 @@ fn staging(
         .collect::<Vec<_>>();
     // SAFETY: a fill writes every row of its staging before the device
     // reads them.
-    unsafe { seismic::Tensor::uninitialized(&slots.device(), stored, &extents) }
+    unsafe { seismic::Tensor::uninitialized(charges, stored, &extents) }
         .map_err(|error| format!("device table staging: {error}"))
 }
 
@@ -1139,8 +1169,9 @@ mod tests {
     fn device_table(kept: Option<&Path>) -> Rc<DeviceTable> {
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = crate::test_support::open_backend(&catalog, seismic::testing::requested_backend().unwrap_or(BackendName::Cpu)).unwrap();
+        let charges = seismic::Charges::tally(&device);
         let table = DeviceTable::new(
-            &device,
+            &charges,
             Element::f32(),
             Element::f32(),
             8,
@@ -1154,7 +1185,7 @@ mod tests {
             kept.map(|directory| KeptRows::of(directory, "table")),
         )
         .unwrap();
-        table.seed().unwrap();
+        table.seed(&charges).unwrap();
         Rc::new(table)
     }
 
@@ -1320,7 +1351,7 @@ mod tests {
             "magnitude-device-table-{}",
             std::process::id()
         ));
-        let file = KeptRows::of(&kept, "table").0;
+        let file = KeptRows::of(&kept, "table").path();
         let table = device_table(Some(&kept));
         crate::settle::owe(Rc::downgrade(&table));
         let table = ResidentTable::streamed(table);
@@ -1331,11 +1362,20 @@ mod tests {
         for _ in 1..DeviceTable::KEPT_AFTER_STEPS {
             table.indices(&[1]).unwrap();
         }
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "1 6");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "2 1 6\n");
         table.indices(&[3]).unwrap();
         crate::settle::settle();
         drop(table);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "1 3 6");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "3 1 3 6\n");
+        // A file torn short, or of rows another count than it states, keeps
+        // none.
+        let kept_rows = KeptRows::of(&kept, "table");
+        for torn in ["3 1 3 6", "3 1 3\n", "1 3 6"] {
+            std::fs::write(&file, torn).unwrap();
+            assert_eq!(kept_rows.read(), Vec::<u64>::new(), "{torn:?}");
+        }
+        std::fs::write(&file, "3 1 3 6\n").unwrap();
+        assert_eq!(kept_rows.read(), [1, 3, 6]);
 
         // The kept rows take the first slots.
         let table = ResidentTable::streamed(device_table(Some(&kept)));

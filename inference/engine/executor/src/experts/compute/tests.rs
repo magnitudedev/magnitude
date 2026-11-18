@@ -228,33 +228,6 @@ fn jobs_run_each_piece_once_then_end_once() {
     }
 }
 
-/// A panicking piece is recorded, which ends serving, and the worker serves
-/// on.
-#[test]
-fn a_panicking_piece_is_recorded_and_the_worker_serves_on() {
-    struct Panics;
-    impl Job for Panics {
-        fn pieces(&self) -> usize {
-            1
-        }
-        fn piece(&self, _: usize) {
-            panic!("a piece's defect");
-        }
-        fn end(&self) {}
-        fn want(&self) -> Want {
-            Want::now()
-        }
-    }
-    let compute = HostCompute::start(Vec::new(), &ComputeThreads::placeable(1)).unwrap();
-    let handle = compute.handle();
-    handle.submit(Arc::new(Panics));
-    until(|| handle.panicked().is_some());
-    assert!(handle.panicked().unwrap().contains("a piece's defect"));
-    let after = Counted::new(3);
-    handle.submit(after.clone());
-    until(|| after.ended.load(Ordering::Acquire) == 1);
-}
-
 /// A worker takes the most urgent job's pieces first, a job hastened while
 /// it waits among them, and the equally urgent in submission order: on one
 /// worker, held busy while the queue fills, the jobs end due first by

@@ -692,7 +692,7 @@ mod tests {
         let domain = ResourceDomain::new(ResourceDomainId::new("census").unwrap(), Rc::new(device));
         let feature = domain
             .publish_features(
-                Tensor::zeros(domain.device(), seismic::Element::bf16(), &[1, 32]).unwrap(),
+                Tensor::zeros(&seismic::Charges::tally(domain.device()), seismic::Element::bf16(), &[1, 32]).unwrap(),
                 Vec::new(),
             )
             .unwrap();

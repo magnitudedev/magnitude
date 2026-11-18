@@ -7,6 +7,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   realpath,
   rm,
   writeFile,
@@ -126,6 +127,35 @@ describe("ICN managed launch", () => {
         hidden: ["hf:owner/repo/model.gguf"],
         drafters: [],
       });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("lands every one of many writers of the local-models snapshot whole", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "icn-local-models-config-"));
+    try {
+      const file = join(directory, "local-models.json");
+      const snapshot = (index: number) => ({
+        roots: [],
+        added: [],
+        hidden: [`hf:owner/repo/model-${index}.gguf`],
+        drafters: [],
+      });
+      // Before, every writer staged at `${file}.pending`: one renamed another's half-written file
+      // or found its own gone.
+      await Effect.runPromise(Effect.all(
+        Array.from({ length: 16 }, (_, index) => writeLocalModelsConfiguration(new IcnStorageConfig({
+          modelStore: Option.none(),
+          cacheRoot: Option.none(),
+          localModelsConfigurationFile: file,
+          localModels: snapshot(index),
+        }))),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.provide(BunContext.layer)));
+      const landed = JSON.parse(await Bun.file(file).text());
+      expect(Array.from({ length: 16 }, (_, index) => snapshot(index))).toContainEqual(landed);
+      expect(await readdir(directory)).toEqual(["local-models.json"]);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

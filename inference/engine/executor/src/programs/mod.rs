@@ -326,8 +326,11 @@ pub trait StateProgram {
 pub trait ImportProgram {
     type Submission: ProgramSubmission<CompletedWork = CompletedImportWork>;
 
+    /// Submit `launch`, its calls allocating through `charges`, the
+    /// import's, handed at the call so the program holds none of its own.
     fn submit(
         &mut self,
+        charges: &seismic::Charges,
         launch: ValidatedImportLaunch,
     ) -> Result<Self::Submission, (SubmitError, ValidatedImportLaunch)>;
 }

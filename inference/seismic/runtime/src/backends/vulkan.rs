@@ -61,30 +61,24 @@ impl VulkanOpened {
         VulkanFeatures::of(&self.service.formation())
     }
 
-    /// A buffer of `contract` in the kinds it is allocated from now
-    /// ([`DeviceStores::kinds`]), landing on the first with room, ordered by
+    /// A buffer charged as `charge` says, landing on the first of its kinds
+    /// with room, ordered by
     /// `access`'s hazard domain where given; it lies along the path of the
     /// kind it landed in ([`seismic_vulkan::Buffer::kind`]).
     pub(crate) fn allocate_contract(
         &self,
-        contract: seismic_topology::Contract,
+        charge: crate::memory::AllocationCharge<'_>,
         bytes: u64,
         alignment: u64,
         access: Option<Arc<driver::AccessGroup>>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        let (kinds, entry) = (self.memory.kinds(contract)?, self.entry(contract));
+        let crate::memory::AllocationCharge { entry, kinds } = charge;
         driver::allocate_in(self.allocation_limits(), &self.memory, bytes, alignment, access, || {
-            let buffer = self.service.allocate_kinds(kinds, bytes, alignment, &entry)?;
+            let buffer = self.service.allocate_kinds(kinds, bytes, alignment, entry)?;
             let kind = buffer.kind();
             let storage: Box<dyn Storage> = Box::new(VulkanStorage { service: self.service.clone(), buffer: Arc::new(buffer) });
             Ok((kind, storage))
         })
-    }
-
-    /// The ledger entry an allocation of `contract` through this device is
-    /// charged on this thread (`driver::Opened::entry`).
-    pub(crate) fn entry(&self, contract: seismic_topology::Contract) -> Arc<dyn crate::memory::Entry> {
-        self.memory.entry(contract)
     }
 
     /// One block of a granule pool, one memory object of `kind` and the

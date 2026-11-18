@@ -111,7 +111,9 @@ const EXTENSIONS: [&str; 22] = [
     "GL_EXT_shader_atomic_int64",
 ];
 
-/// `#version`, the extensions, the device feature macros and the prelude.
+/// `#version`, the extensions, the device feature macros, the prelude, and
+/// the push constants (the argument block's address and the device's tables
+/// buffer's) with the tables buffer's layout (`seismic_lang::source::VULKAN_TABLES_LAYOUT`).
 pub(super) fn header(features: VulkanFeatures) -> String {
     let mut header = String::from("#version 460\n");
     let gated = [
@@ -144,6 +146,12 @@ pub(super) fn header(features: VulkanFeatures) -> String {
         header.push_str(&format!("#define SEISMIC_HAS_{name} {}\n", u8::from(on)));
     }
     header.push_str(PRELUDE);
+    // Fixed for every program, ahead of the generated code that reads the
+    // tables buffer (`conversion::render_lookups`).
+    header.push_str(
+        "layout(push_constant, scalar) uniform seismic_push_t { uint64_t seismic_arguments; uint64_t seismic_tables; };\n",
+    );
+    header.push_str(seismic_lang::source::VULKAN_TABLES_LAYOUT);
     header
 }
 
@@ -155,8 +163,7 @@ pub(super) fn tail(read_only: impl Iterator<Item = bool>, absent: &[bool]) -> St
     let buffers = absent.len();
     let mut tail = format!("#define SEISMIC_BUFFER_SCALAR_RESULTS {buffers}\n");
     tail.push_str(
-        "layout(push_constant, scalar) uniform seismic_push_t { uint64_t seismic_arguments; };\n\
-         layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer seismic_argument_block_t { uint64_t w[]; };\n",
+        "layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer seismic_argument_block_t { uint64_t w[]; };\n",
     );
     tail.push_str(&super::addresses(
         absent,
@@ -216,7 +223,6 @@ mod tests {
 
     const KERNEL: &str = "
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
-layout(push_constant, scalar) uniform seismic_push_t { uint64_t seismic_arguments; };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer words_t { uint64_t w[]; };
 void numerics() {
     // The scalar-result slot carries the data buffer: [cases][count * 3 in][count * 4 out].
@@ -433,7 +439,6 @@ void main() {
 
     const HALVES: &str = "
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
-layout(push_constant, scalar) uniform seismic_push_t { uint64_t seismic_arguments; };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer words_t { uint64_t w[]; };
 void halves() {
     // [count][count f32 in][count * 2 out]: the f16 of input i, and the f32

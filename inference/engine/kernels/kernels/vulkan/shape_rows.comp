@@ -69,8 +69,10 @@ uint64_t shape_logits_at(uint64_t row, uint token) {
 }
 
 // ---------------------------------------------------------------------------
-// shape_rows_prepare. Shared: the row's history (Hn i32), then one u32 per
-// subgroup.
+// shape_rows_prepare. Shared: the row's history (Hn i32), then the partition
+// maximum (u32). Invocations combine through shared atomics and barriers, never
+// subgroup operations after the divergent token loop: Vulkan does not promise
+// the lanes reconverge there.
 
 void shape_rows_prepare() {
     const uint64_t params = SEISMIC_PTR(SEISMIC_BUFFER_PARAMS);
@@ -81,6 +83,8 @@ void shape_rows_prepare() {
     const uint recent_count = uint(SEISMIC_DIM_HN);
     for (uint h = thread; h < recent_count; h += gl_WorkGroupSize.x)
         seismic_shared_i32[h] = element_i32_index(history, row * SEISMIC_HISTORY_STRIDE_0 + uint64_t(h) * SEISMIC_HISTORY_STRIDE_1);
+    if (thread == 0u)
+        seismic_shared_u32[recent_count] = 0u;
     barrier();
     const float temperature = shape_parameter(params, row, 0u);
     const float repetition = shape_parameter(params, row, 4u);
@@ -112,16 +116,10 @@ void shape_rows_prepare() {
         else if (value != -SHAPE_INF)
             maximum = SHAPE_UNSHAPED;
     }
-    maximum = seismic_subgroup_max(maximum);
-    if (SEISMIC_LANE == 0u)
-        seismic_shared_u32[recent_count + SEISMIC_SUBGROUP] = maximum;
+    atomicMax(seismic_shared_u32[recent_count], maximum);
     barrier();
-    if (SEISMIC_SUBGROUP == 0u) {
-        maximum = SEISMIC_LANE < SEISMIC_SUBGROUPS ? seismic_shared_u32[recent_count + SEISMIC_LANE] : 0u;
-        maximum = seismic_subgroup_max(maximum);
-        if (SEISMIC_LANE == 0u)
-            element_u32_put(shape_row_scratch(row) + uint64_t(part) * 4ul, maximum);
-    }
+    if (thread == 0u)
+        element_u32_put(shape_row_scratch(row) + uint64_t(part) * 4ul, seismic_shared_u32[recent_count]);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,11 +129,11 @@ void shape_rows_prepare() {
 #define SHAPE_HIST_LO 0u
 #define SHAPE_HIST_HI 2048u
 #define SHAPE_LANE_TOTALS 4096u   // 32 u64 as (low, high) pairs
-#define SHAPE_REDUCE 4160u        // 32 u64
-#define SHAPE_CHUNK_COUNTS 4224u  // one u32 per invocation (1024)
-#define SHAPE_DIGIT 5248u
-#define SHAPE_BASE 5250u          // one u64
-// shared_bytes = 5252 * 4 = 21008
+#define SHAPE_TOTAL 4160u         // one u64 as (low, high)
+#define SHAPE_CHUNK_COUNTS 4162u  // one u32 per invocation (1024)
+#define SHAPE_DIGIT 5186u
+#define SHAPE_BASE 5188u          // one u64
+// shared_bytes = 5190 * 4 = 20760
 
 uint64_t shape_shared_u64(uint at) { return packUint2x32(uvec2(seismic_shared_u32[at], seismic_shared_u32[at + 1u])); }
 
@@ -149,23 +147,19 @@ uint64_t shape_histogram(uint bin) {
     return packUint2x32(uvec2(seismic_shared_u32[SHAPE_HIST_LO + bin], seismic_shared_u32[SHAPE_HIST_HI + bin]));
 }
 
-// Exact subgroup sum of 64-bit integers over 32-bit shuffles (the prefix
-// enables no 64-bit subgroup types): every lane receives the sum.
-uint64_t shape_subgroup_sum_u64(uint64_t value) {
-    [[unroll]] for (uint mask = 16u; mask > 0u; mask >>= 1) {
-        const uvec2 words = unpackUint2x32(value);
-        value += packUint2x32(uvec2(subgroupShuffleXor(words.x, mask), subgroupShuffleXor(words.y, mask)));
-    }
-    return value;
+// Exact 64-bit accumulation into the shared words `low` and `high`: an
+// atomic add to the low word carries into the high word when it wraps.
+void shape_shared_add_u64(uint low, uint high, uint64_t value) {
+    const uvec2 words = unpackUint2x32(value);
+    const uint before = atomicAdd(seismic_shared_u32[low], words.x);
+    const uint carry = before + words.x < before ? 1u : 0u;
+    if (words.y + carry != 0u)
+        atomicAdd(seismic_shared_u32[high], words.y + carry);
 }
 
 // Exact 64-bit accumulation into histogram bin `bin`.
 void shape_histogram_add(uint bin, uint64_t weight) {
-    const uvec2 words = unpackUint2x32(weight);
-    const uint before = atomicAdd(seismic_shared_u32[SHAPE_HIST_LO + bin], words.x);
-    const uint carry = before + words.x < before ? 1u : 0u;
-    if (words.y + carry != 0u)
-        atomicAdd(seismic_shared_u32[SHAPE_HIST_HI + bin], words.y + carry);
+    shape_shared_add_u64(SHAPE_HIST_LO + bin, SHAPE_HIST_HI + bin, weight);
 }
 
 // The finite value at `token` when it survives top-k and min-p.
@@ -294,7 +288,9 @@ uint64_t shape_top_p_target(float top_p, uint64_t total) {
         return 0ul;
     int exponent;
     const float fraction = frexp(top_p, exponent);
-    const uint64_t m = uint64_t(ldexp(fraction, 24));
+    // Below 2^24: a 32-bit conversion, as formation admits no float
+    // converted to a 64-bit integer.
+    const uint64_t m = uint64_t(uint(ldexp(fraction, 24)));
     const int shift = 24 - exponent;
     const uint64_t low_part = m * (total & 0xffffffffUL);
     const uint64_t mid = m * (total >> 32);
@@ -346,6 +342,9 @@ void shape_rows_select() {
     survivor.min_p = shape_parameter(params, row, 3u);
     uint mode = 0u, top_p_key = 0u;
     if (top_p < 1.0 && maximum != 0u) {
+        if (thread == 0u)
+            shape_shared_u64_put(SHAPE_TOTAL, 0ul);
+        barrier();
         uint64_t total = 0ul;
         for (uint token = thread; token < uint(SEISMIC_DIM_V); token += gl_WorkGroupSize.x) {
             float value;
@@ -353,13 +352,11 @@ void shape_rows_select() {
             if (shape_survives(survivor, token, value, key))
                 total += shape_mass(survivor, value);
         }
-        total = shape_subgroup_sum_u64(total);
-        if (SEISMIC_LANE == 0u)
-            shape_shared_u64_put(SHAPE_REDUCE + 2u * SEISMIC_SUBGROUP, total);
+        // The total combines through shared atomics, not a subgroup sum: the
+        // lanes need not reconverge after the token loop.
+        shape_shared_add_u64(SHAPE_TOTAL, SHAPE_TOTAL + 1u, total);
         barrier();
-        total = 0ul;
-        for (uint s = 0u; s < SEISMIC_SUBGROUPS; ++s)
-            total += shape_shared_u64(SHAPE_REDUCE + 2u * s);
+        total = shape_shared_u64(SHAPE_TOTAL);
         const uint64_t target = shape_top_p_target(top_p, total);
         if (target == 0ul) {
             mode = 2u;

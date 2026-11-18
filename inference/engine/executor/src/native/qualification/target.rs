@@ -34,12 +34,12 @@ impl<'a> QualificationView<'a> {
 
     /// Qualify the target's entries; each sited streamed block's site
     /// admission, by block index.
-    pub(super) fn qualify_target(&self, device: &Device) -> Result<Vec<(usize, crate::assessment::Priced<()>)>, CatalogFailure> {
-        let out_rows = semantic_i32(device, &[1], &[0], "target", "out_rows")?;
+    pub(super) fn qualify_target(&self, charges: &seismic::Charges) -> Result<Vec<(usize, crate::assessment::Priced<()>)>, CatalogFailure> {
+        let out_rows = semantic_i32(charges, &[1], &[0], "target", "out_rows")?;
         let hidden = self.geometry.hidden;
         let hidden_values = vec![1.0_f32; hidden as usize];
         let hidden_residual = semantic_f32(
-            device,
+            charges,
             &[1, hidden],
             &hidden_values,
             "target",
@@ -49,19 +49,19 @@ impl<'a> QualificationView<'a> {
         for binding in [self.plan.target().embedding()] {
             let label = format!("{binding:?}");
             let table = semantic_pattern(
-                device,
+                charges,
                 binding.table,
                 &[1, hidden],
                 "embedding_rows",
                 &label,
             )?;
-            let tokens = semantic_i32(device, &[1, 2], &[0, 0], "embedding_rows", &label)?;
-            let direct = semantic_i32(device, &[0, 1], &[], "embedding_rows", &label)?;
+            let tokens = semantic_i32(charges, &[1, 2], &[0, 0], "embedding_rows", &label)?;
+            let direct = semantic_i32(charges, &[0, 1], &[], "embedding_rows", &label)?;
             let result = self
                 .programs
                 .target
                 .embedding
-                .call(embedding_rows::Args {
+                .call(charges, embedding_rows::Args {
                     table: &table,
                     tokens: &tokens,
                     directory: &direct,
@@ -88,7 +88,7 @@ impl<'a> QualificationView<'a> {
             };
             let label = format!("{binding:?}");
             let rows = self.mixer_rows(block, &label)?;
-            qualify_attention(device, kernel, binding, rows, &label)?;
+            qualify_attention(charges, kernel, binding, rows, &label)?;
         }
 
         let mut qualified = std::collections::HashSet::new();
@@ -120,17 +120,17 @@ impl<'a> QualificationView<'a> {
             let taps = binding.convolution_width;
             let channels = (2 * key_heads + value_heads) * w;
             let entry = "target_recurrent";
-            let norm = rows.norm(device, binding.norm, hidden, entry, &label)?;
-            let input = rows.input(device, 1, hidden, entry, &label)?;
+            let norm = rows.norm(charges, binding.norm, hidden, entry, &label)?;
+            let input = rows.input(charges, 1, hidden, entry, &label)?;
             let residual_values = vec![1.0_f32; rows.residual_width(hidden) as usize];
             let residual = semantic_f32(
-                device,
+                charges,
                 &[1, rows.residual_width(hidden)],
                 &residual_values,
                 entry,
                 &label,
             )?;
-            let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
+            let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, entry, &label);
             let qkv = zeros(binding.qkv, &[channels, hidden])?;
             let beta = zeros(binding.beta, &[value_heads, hidden])?;
             let convolution = zeros(Element::f32(), &[channels, taps])?;
@@ -138,15 +138,15 @@ impl<'a> QualificationView<'a> {
             let recurrent_norm = zeros(binding.recurrent_norm, &[w])?;
             let output = zeros(binding.output, &[hidden, value_heads * w])?;
             let segments =
-                semantic_i32(device, &[2, 2], &[0, 1, 1, 1], "target_recurrent", &label)?;
-            let stop = semantic_i32(device, &[1], &[1], "target_recurrent", &label)?;
-            let previous_bank = semantic_i32(device, &[1], &[0], "target_recurrent", &label)?;
-            let previous_tape = semantic_i32(device, &[1], &[0], "target_recurrent", &label)?;
-            let following_bank = semantic_i32(device, &[1], &[1], "target_recurrent", &label)?;
+                semantic_i32(charges, &[2, 2], &[0, 1, 1, 1], "target_recurrent", &label)?;
+            let stop = semantic_i32(charges, &[1], &[1], "target_recurrent", &label)?;
+            let previous_bank = semantic_i32(charges, &[1], &[0], "target_recurrent", &label)?;
+            let previous_tape = semantic_i32(charges, &[1], &[0], "target_recurrent", &label)?;
+            let following_bank = semantic_i32(charges, &[1], &[1], "target_recurrent", &label)?;
             let decays = value_heads * binding.decay_width;
             // One tape row, the least a bank holds.
             let banks = crate::experts::pooled_slabs(
-                device,
+                charges,
                 seismic::Contract::DeviceOnly,
                 2,
                 2,
@@ -190,7 +190,7 @@ impl<'a> QualificationView<'a> {
                     let time_bias = zeros(Element::f32(), &[value_heads])?;
                     let project = project.first();
                     let projection = project
-                        .call(gated_delta_project::Args {
+                        .call(charges, gated_delta_project::Args {
                             hidden: &input,
                             input_norm: &norm,
                             qkv_weight: &qkv,
@@ -198,14 +198,14 @@ impl<'a> QualificationView<'a> {
                             alpha_weight: &alpha,
                             beta_weight: &beta,
                             epsilon: 1.0e-5,
-                            qkv_bound: &any_row_bound(device, project, "QB", "gated_delta_project", &label)?,
-                            gate_bound: &any_row_bound(device, project, "ZB", "gated_delta_project", &label)?,
+                            qkv_bound: &any_row_bound(charges, project, "QB", "gated_delta_project", &label)?,
+                            gate_bound: &any_row_bound(charges, project, "ZB", "gated_delta_project", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("gated_delta_project", &label, error))?
                         .value;
                     let gated = match step {
                         RecurrentStepKernels::Step(step) => {
-                            step.call(gated_delta_step::Args {
+                            step.call(charges, gated_delta_step::Args {
                                 projection: &projection,
                                 convolution: &convolution,
                                 rate: &rate,
@@ -231,7 +231,7 @@ impl<'a> QualificationView<'a> {
                         RecurrentStepKernels::Convolved { project, step } => {
                             let projected = project
                                 .first()
-                                .call(gated_delta_project_convolved::Args {
+                                .call(charges, gated_delta_project_convolved::Args {
                                     hidden: &input,
                                     input_norm: &norm,
                                     qkv_weight: &qkv,
@@ -251,7 +251,7 @@ impl<'a> QualificationView<'a> {
                                 .map_err(|error| {
                                     qualification_dynamic("gated_delta_project_convolved", &label, error)
                                 })?;
-                            step.call(gated_delta_step_convolved::Args {
+                            step.call(charges, gated_delta_step_convolved::Args {
                                 projection: &projected.r0,
                                 convolved: &projected.r1,
                                 rate: &rate,
@@ -277,7 +277,7 @@ impl<'a> QualificationView<'a> {
                         }
                     };
                     chunk
-                        .call(gated_delta_chunk::Args {
+                        .call(charges, gated_delta_chunk::Args {
                             projection: &projection,
                             convolution: &convolution,
                             rate: &rate,
@@ -310,10 +310,10 @@ impl<'a> QualificationView<'a> {
                     let alpha = zeros(binding.alpha, &[alpha_rank, hidden])?;
                     let time_bias = zeros(Element::f32(), &[value_heads * w])?;
                     let project = kimi.project.first();
-                    let scale = |name| unit_scale(device, project, name, "attention_project", &label);
-                    let bound = |name| any_row_bound(device, project, name, "attention_project", &label);
+                    let scale = |name| unit_scale(charges, project, name, "attention_project", &label);
+                    let bound = |name| any_row_bound(charges, project, name, "attention_project", &label);
                     let projected = project
-                        .call(attention_project::Args {
+                        .call(charges, attention_project::Args {
                             hidden: &input,
                             input_norm: &norm,
                             query_weight: &qkv,
@@ -337,11 +337,11 @@ impl<'a> QualificationView<'a> {
                     let expand = |kernel: &crate::native::RangedKernels<project_rows::Entry>, source: &Tensor, element, rank| {
                         let kernel = kernel.first();
                         kernel
-                            .call(project_rows::Args {
+                            .call(charges, project_rows::Args {
                                 source,
                                 weight: &zeros(element, &[value_heads * w, rank])?,
-                                weight_scale: &unit_scale(device, kernel, "WS", "project_rows", &label)?,
-                                weight_bound: &any_row_bound(device, kernel, "WB", "project_rows", &label)?,
+                                weight_scale: &unit_scale(charges, kernel, "WS", "project_rows", &label)?,
+                                weight_bound: &any_row_bound(charges, kernel, "WB", "project_rows", &label)?,
                             })
                             .map(|expanded| expanded.value)
                             .map_err(|error| qualification_dynamic("project_rows", &label, error))
@@ -350,7 +350,7 @@ impl<'a> QualificationView<'a> {
                     let decay_input = expand(&kimi.alpha_up, &projected.r2, alpha_up, alpha_rank)?;
                     let gated = kimi
                         .step
-                        .call(kimi_delta_step::Args {
+                        .call(charges, kimi_delta_step::Args {
                             projection: &projected.r0,
                             beta: &projected.r3,
                             gate: &gate_input,
@@ -377,7 +377,7 @@ impl<'a> QualificationView<'a> {
                         .map_err(|error| qualification_dynamic("kimi_delta_step", &label, error))?
                         .value;
                     kimi.chunk
-                        .call(kimi_delta_chunk::Args {
+                        .call(charges, kimi_delta_chunk::Args {
                             projection: &projected.r0,
                             beta: &projected.r3,
                             gate: &gate_input,
@@ -408,13 +408,13 @@ impl<'a> QualificationView<'a> {
             let result = kernels
                 .output
                 .first()
-                .call(attention_output::Args {
+                .call(charges, attention_output::Args {
                     hidden: &residual,
-                    inject: &rows.inject(device, 1, "attention_output", &label)?,
+                    inject: &rows.inject(charges, 1, "attention_output", &label)?,
                     gated: &gated,
                     output_weight: &output,
-                    output_scale: &unit_scale(device, kernels.output.first(), "OS", "attention_output", &label)?,
-                    output_bound: &any_row_bound(device, kernels.output.first(), "OB", "attention_output", &label)?,
+                    output_scale: &unit_scale(charges, kernels.output.first(), "OS", "attention_output", &label)?,
+                    output_bound: &any_row_bound(charges, kernels.output.first(), "OB", "attention_output", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("attention_output", &label, error))?
                 .value;
@@ -435,7 +435,7 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             if qualified.insert(binding) {
-                qualify_state_space(device, kernels, binding, &hidden_residual, &hidden_values)?;
+                qualify_state_space(charges, kernels, binding, &hidden_residual, &hidden_values)?;
             }
         }
 
@@ -453,7 +453,7 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             if qualified.insert(binding) {
-                qualify_short_conv(device, kernels, binding, &hidden_residual, &hidden_values)?;
+                qualify_short_conv(charges, kernels, binding, &hidden_residual, &hidden_values)?;
             }
         }
 
@@ -491,16 +491,16 @@ impl<'a> QualificationView<'a> {
             }
             let label = format!("{binding:?}");
             let f = *intermediate;
-            let norm = semantic_zeros(device, binding.norm, &[hidden], "target_dense", &label)?;
-            let gate = semantic_zeros(device, binding.gate, &[f, hidden], "target_dense", &label)?;
-            let up = semantic_zeros(device, binding.up, &[f, hidden], "target_dense", &label)?;
-            let down = semantic_zeros(device, binding.down, &[hidden, f], "target_dense", &label)?;
+            let norm = semantic_zeros(charges, binding.norm, &[hidden], "target_dense", &label)?;
+            let gate = semantic_zeros(charges, binding.gate, &[f, hidden], "target_dense", &label)?;
+            let up = semantic_zeros(charges, binding.up, &[f, hidden], "target_dense", &label)?;
+            let down = semantic_zeros(charges, binding.down, &[hidden, f], "target_dense", &label)?;
             let scale =
-                |extent| semantic_ones(device, Element::f32(), &[extent], "target_dense", &label);
+                |extent| semantic_ones(charges, Element::f32(), &[extent], "target_dense", &label);
             let product = kernels
                 .expand
                 .first()
-                .call(dense_expand::Args {
+                .call(charges, dense_expand::Args {
                     residual: &hidden_residual,
                     norm: &norm,
                     gate_weight: &gate,
@@ -510,9 +510,9 @@ impl<'a> QualificationView<'a> {
                     activation: 0,
                     gate_scale: &scale(binding.scales.gate)?,
                     up_scale: &scale(binding.scales.up)?,
-                    gate_bound: &any_row_bound(device, kernels.expand.first(), "GB", "dense_expand", &label)?,
-                    up_bound: &any_row_bound(device, kernels.expand.first(), "UB", "dense_expand", &label)?,
-                    glu_limit: &glu_limit(device, binding.limit, "dense_expand", &label)?,
+                    gate_bound: &any_row_bound(charges, kernels.expand.first(), "GB", "dense_expand", &label)?,
+                    up_bound: &any_row_bound(charges, kernels.expand.first(), "UB", "dense_expand", &label)?,
+                    glu_limit: &glu_limit(charges, binding.limit, "dense_expand", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                 .value;
@@ -520,20 +520,20 @@ impl<'a> QualificationView<'a> {
                 (SublayerOutput::Residual(output), SublayerTail::Residual) => {
                     let output = output.first();
                     output
-                        .call(dense_output::Args {
+                        .call(charges, dense_output::Args {
                             residual: &hidden_residual,
                             product: &product,
                             down_weight: &down,
                             out_rows: &out_rows,
                             down_scale: &scale(binding.scales.down)?,
-                            down_bound: &any_row_bound(device, output, "DB", "dense_output", &label)?,
+                            down_bound: &any_row_bound(charges, output, "DB", "dense_output", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("dense_output", &label, error))?
                         .value
                 }
                 (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
                     qualify_post_norm(
-                        device,
+                        charges,
                         tail,
                         &hidden_residual,
                         &product,
@@ -553,7 +553,7 @@ impl<'a> QualificationView<'a> {
             require_f32_values(&result, &hidden_values, "dense_output", &label)?;
         }
 
-        self.qualify_per_layer(device, &hidden_residual, &hidden_values)?;
+        self.qualify_per_layer(charges, &hidden_residual, &hidden_values)?;
 
         let mut qualified = std::collections::HashSet::new();
         for ((slot, attested), block) in self
@@ -573,7 +573,7 @@ impl<'a> QualificationView<'a> {
             };
             let rows = self.feed_forward_rows(block, &format!("{binding:?}"))?;
             if qualified.insert((binding, rows)) {
-                qualify_routed(device, binding, kernels, rows, &ExpertReads::routed(device, binding)?)?;
+                qualify_routed(charges, binding, kernels, rows, &ExpertReads::routed(charges, binding)?)?;
             }
         }
 
@@ -593,7 +593,7 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             if qualified.insert(binding) {
-                qualify_general_routed(device, binding, kernels, &ExpertReads::general(device, binding)?)?;
+                qualify_general_routed(charges, binding, kernels, &ExpertReads::general(charges, binding)?)?;
             }
         }
 
@@ -613,7 +613,7 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             if qualified.insert(binding) {
-                qualify_parallel(device, binding, kernels, &hidden_residual, &hidden_values)?;
+                qualify_parallel(charges, binding, kernels, &hidden_residual, &hidden_values)?;
             }
         }
 
@@ -642,7 +642,7 @@ impl<'a> QualificationView<'a> {
                 std::collections::hash_map::Entry::Occupied(admission) => admission.get().clone(),
                 std::collections::hash_map::Entry::Vacant(vacant) => {
                     let requirement = self.profile.site_requirement(bank.site.as_ref().and_then(|site| site.form.activation.dtype()));
-                    let admission = super::bank::qualify_bank(device, banked, binding, bank, feed_forward, rows, requirement.as_ref(), self.cache)?;
+                    let admission = super::bank::qualify_bank(charges, banked, binding, bank, feed_forward, rows, requirement.as_ref(), self.cache)?;
                     vacant.insert(admission).clone()
                 }
             };
@@ -660,7 +660,7 @@ impl<'a> QualificationView<'a> {
         // norm, or the exit site's partials, unnormalized.
         let exit = crate::operators::InputForm::exit(self.geometry);
         let exit_rows = semantic_ones(
-            device,
+            charges,
             Element::f32(),
             &[1, exit.parts * hidden],
             "target_readout",
@@ -669,7 +669,7 @@ impl<'a> QualificationView<'a> {
         for binding in [self.plan.target().readout()] {
             let label = format!("{binding:?}");
             let norm = semantic_ones(
-                device,
+                charges,
                 binding.norm,
                 &[exit.norm_extent(hidden)],
                 "target_readout",
@@ -683,7 +683,7 @@ impl<'a> QualificationView<'a> {
                 &label,
             )?;
             let features = kernel
-                .call(readout_features_rows::Args {
+                .call(charges, readout_features_rows::Args {
                     hidden: &parts,
                     norm: &norm,
                     out_rows: &out_rows,
@@ -700,7 +700,7 @@ impl<'a> QualificationView<'a> {
                     ..
                 } => {
                     qualify_progressive(
-                        device,
+                        charges,
                         progressive,
                         &exit_rows,
                         &norm,
@@ -726,7 +726,7 @@ impl<'a> QualificationView<'a> {
                     },
                 ) => {
                     let weight = semantic_zeros(
-                        device,
+                        charges,
                         element,
                         &[vocabulary, hidden],
                         "target_readout",
@@ -734,7 +734,7 @@ impl<'a> QualificationView<'a> {
                     )?;
                     let logits = head
                         .first()
-                        .call(readout_head_rows::Args {
+                        .call(charges, readout_head_rows::Args {
                             hidden: &exit_rows,
                             norm: &norm,
                             weight: &weight,
@@ -742,7 +742,7 @@ impl<'a> QualificationView<'a> {
                             epsilon: 1.0e-5,
                             softcap: 0.0,
                             weight_scale: &semantic_ones(
-                                device,
+                                charges,
                                 Element::f32(),
                                 &[weight_scale],
                                 "target_readout",
@@ -752,10 +752,10 @@ impl<'a> QualificationView<'a> {
                         .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
                         .value;
                     require_zero_result(&logits, "readout_head_rows", &label)?;
-                    let rows = semantic_i32(device, &[1], &[0], "readout_selected_rows", &label)?;
+                    let rows = semantic_i32(charges, &[1], &[0], "readout_selected_rows", &label)?;
                     let selected_result = selected
                         .first()
-                        .call(readout_selected_rows::Args {
+                        .call(charges, readout_selected_rows::Args {
                             hidden: &exit_rows,
                             norm: &norm,
                             weight: &weight,
@@ -786,7 +786,7 @@ impl<'a> QualificationView<'a> {
         ) {
             let label = format!("{binding:?}");
             let norm = semantic_ones(
-                device,
+                charges,
                 binding.norm,
                 &[exit.norm_extent(hidden)],
                 "target_features",
@@ -799,7 +799,7 @@ impl<'a> QualificationView<'a> {
                 &label,
             )?;
             let result = kernel
-                .call(readout_features_rows::Args {
+                .call(charges, readout_features_rows::Args {
                     hidden: &parts,
                     norm: &norm,
                     out_rows: &out_rows,
@@ -838,16 +838,16 @@ impl ExpertReads {
     /// The resident shape: zero one-expert stacks of each routed tensor's
     /// element and matrix `[N, K]`, read by index through an empty slot map.
     fn resident(
-        device: &Device,
+        charges: &seismic::Charges,
         record: RecordTensors<(Element, [u64; 2])>,
         label: &str,
     ) -> Result<Self, CatalogFailure> {
         let stacks = record.try_map(|_, (element, [n, k])| {
-            semantic_zeros(device, element, &[1, n, k], "target_routed", label)
+            semantic_zeros(charges, element, &[1, n, k], "target_routed", label)
         })?;
         Ok(Self {
-            map: semantic_zeros(device, Element::i32(), &[0, magnitude_kernels::constants::MAP_WORDS], "target_routed", label)?,
-            step: semantic_zeros(device, Element::i32(), &[0], "target_routed", label)?,
+            map: semantic_zeros(charges, Element::i32(), &[0, magnitude_kernels::constants::MAP_WORDS], "target_routed", label)?,
+            step: semantic_zeros(charges, Element::i32(), &[0], "target_routed", label)?,
             decode_record: None,
             records: stacks.clone(),
             stacks,
@@ -859,15 +859,15 @@ impl ExpertReads {
     /// none (`[0, rows, selected]`) without a decode record, else each
     /// choice's the decode record as the resolve writes it
     /// (`magnitude_kernels::source_words`; none the CPU's).
-    fn sources(&self, device: &Device, rows: u64, selected: u64, label: &str) -> Result<Tensor, CatalogFailure> {
+    fn sources(&self, charges: &seismic::Charges, rows: u64, selected: u64, label: &str) -> Result<Tensor, CatalogFailure> {
         use magnitude_kernels::constants::SOURCE_ROWS;
         let entry = "target_routed";
         let Some(record) = self.decode_record else {
-            return semantic_zeros(device, Element::i32(), &[0, rows, selected], entry, label);
+            return semantic_zeros(charges, Element::i32(), &[0, rows, selected], entry, label);
         };
         let choices = usize::try_from(rows * selected).map_err(|error| qualification_dynamic(entry, label, error))?;
         let words = magnitude_kernels::source_words(&vec![record; choices], &vec![-1; choices]);
-        semantic_i32(device, &[SOURCE_ROWS, rows, selected], &words, entry, label)
+        semantic_i32(charges, &[SOURCE_ROWS, rows, selected], &words, entry, label)
     }
 
     /// The decode entries' host tier records: the bank's (`Self::tier`),
@@ -882,19 +882,19 @@ impl ExpertReads {
     }
 
     /// A fused routed binding's resident shape.
-    pub(super) fn routed(device: &Device, binding: RoutedBinding) -> Result<Self, CatalogFailure> {
+    pub(super) fn routed(charges: &seismic::Charges, binding: RoutedBinding) -> Result<Self, CatalogFailure> {
         let (h, f) = (binding.hidden, binding.features);
         let record = RecordTensors {
             gate: Some((binding.expert_gate, [f, h])),
             up: (binding.expert_up, [f, h]),
             down: (binding.expert_down, [h, f]),
         };
-        Self::resident(device, record, &format!("{binding:?}"))
+        Self::resident(charges, record, &format!("{binding:?}"))
     }
 
     /// A general routed binding's resident shape, in the experts' width.
     pub(super) fn general(
-        device: &Device,
+        charges: &seismic::Charges,
         binding: crate::GeneralRoutedBinding,
     ) -> Result<Self, CatalogFailure> {
         let (f, x) = (binding.shape.intermediate, binding.shape.expert_hidden);
@@ -903,7 +903,7 @@ impl ExpertReads {
             up: (binding.expert_up, [f, x]),
             down: (binding.expert_down, [x, f]),
         };
-        Self::resident(device, record, &format!("{binding:?}"))
+        Self::resident(charges, record, &format!("{binding:?}"))
     }
 }
 
@@ -912,7 +912,7 @@ impl ExpertReads {
 /// The route runs over the full expert range; the projections read expert 0
 /// through all-zero routes where `reads` places it.
 pub(super) fn qualify_routed(
-    device: &Device,
+    charges: &seismic::Charges,
     binding: RoutedBinding,
     kernels: &RoutedKernels,
     sublayer: SublayerRows,
@@ -921,7 +921,7 @@ pub(super) fn qualify_routed(
     let label = format!("{binding:?}");
     let (h, e, k, s) = (binding.hidden, binding.experts, binding.selected, binding.shared);
     let zeros = |element: Element, extents: &[u64]| {
-        semantic_zeros(device, element, extents, "target_routed", &label)
+        semantic_zeros(charges, element, extents, "target_routed", &label)
     };
     let gate = |record: &RecordTensors<Tensor>| {
         record
@@ -932,7 +932,7 @@ pub(super) fn qualify_routed(
     let (records_gate, stacks_gate) = (gate(&reads.records)?, gate(&reads.stacks)?);
     let tier = reads.tier_records(&label)?;
     let tier_gate = gate(&tier)?;
-    let norm = sublayer.norm(device, binding.norm, h, "target_routed", &label)?;
+    let norm = sublayer.norm(charges, binding.norm, h, "target_routed", &label)?;
     let router = zeros(binding.router, &[e, h])?;
     let shared_router = zeros(Element::f32(), &[h])?;
     let shared_gate = zeros(binding.shared_gate, &[s, h])?;
@@ -944,15 +944,15 @@ pub(super) fn qualify_routed(
         let at = seismic::Dim::from(rows);
         let width = sublayer.residual_width(h);
         let values = vec![1.0_f32; (rows * width) as usize];
-        let residual = semantic_f32(device, &[rows, width], &values, "target_routed", &label)?;
-        let input = sublayer.input(device, rows, h, "target_routed", &label)?;
-        let inject = sublayer.inject(device, rows, "target_routed", &label)?;
+        let residual = semantic_f32(charges, &[rows, width], &values, "target_routed", &label)?;
+        let input = sublayer.input(charges, rows, h, "target_routed", &label)?;
+        let inject = sublayer.inject(charges, rows, "target_routed", &label)?;
         let mut routes = zeros(Element::i32(), &[rows, k])?;
         let mut scores = zeros(Element::f32(), &[rows, k])?;
         let route = |routes: &mut Tensor, scores: &mut Tensor| {
             kernels
                 .route
-                .call(routed_route::Args {
+                .call(charges, routed_route::Args {
                     residual: &input,
                     norm: &norm,
                     router: &router,
@@ -961,28 +961,28 @@ pub(super) fn qualify_routed(
                     scores,
                     eps: 1.0e-5,
                     normalize: 1,
-                    expert_scale: &unit_scale(device, &kernels.route, "ES", "routed_route", &label)?,
+                    expert_scale: &unit_scale(charges, &kernels.route, "ES", "routed_route", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("routed_route", &label, error))
         };
         let first = zeros(Element::i32(), &[rows, k])?;
         let (map, step) = (&reads.map, &reads.step);
         let result = if rows <= VERIFY_ROWS {
-            let sources = reads.sources(device, rows, k, &label)?;
+            let sources = reads.sources(charges, rows, k, &label)?;
             let (expert_product, shared_product, coefficient) = match &kernels.decode {
                 RoutedDecodeKernels::Expand(expand) => {
                     let expand = expand.for_rows(&at);
                     let routed = route(&mut routes, &mut scores)?;
                     let expanded = expand
-                        .call(routed_expand::Args {
+                        .call(charges, routed_expand::Args {
                             normalized: &routed.r0,
                             routes: &first,
                             expert_gate: &records_gate,
                             expert_up: &reads.records.up,
                             shared_gate: &shared_gate,
                             shared_up: &shared_up,
-                            gate_scale: &unit_scale(device, expand, "GS", "routed_expand", &label)?,
-                            up_scale: &unit_scale(device, expand, "US", "routed_expand", &label)?,
+                            gate_scale: &unit_scale(charges, expand, "GS", "routed_expand", &label)?,
+                            up_scale: &unit_scale(charges, expand, "US", "routed_expand", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("routed_expand", &label, error))?;
                     (expanded.r0, expanded.r1, routed.r1)
@@ -990,7 +990,7 @@ pub(super) fn qualify_routed(
                 RoutedDecodeKernels::SharedRoute { route, choices } => {
                     let route = route.for_rows(&at);
                     let routed = route
-                        .call(routed_route_shared::Args {
+                        .call(charges, routed_route_shared::Args {
                             residual: &input,
                             norm: &norm,
                             router: &router,
@@ -1001,14 +1001,14 @@ pub(super) fn qualify_routed(
                             scores: &mut scores,
                             eps: 1.0e-5,
                             normalize: 1,
-                            expert_scale: &unit_scale(device, route, "ES", "routed_route_shared", &label)?,
+                            expert_scale: &unit_scale(charges, route, "ES", "routed_route_shared", &label)?,
                         })
                         .map_err(|error| {
                             qualification_dynamic("routed_route_shared", &label, error)
                         })?;
                     let choices = choices.for_rows(&at);
                     let product = choices
-                        .call(routed_gate_up::Args {
+                        .call(charges, routed_gate_up::Args {
                             normalized: &routed.r0,
                             routes: &first,
                             sources: &sources,
@@ -1017,9 +1017,9 @@ pub(super) fn qualify_routed(
                             tier_gate: &tier_gate,
                             tier_up: &tier.up,
                             activation: 0,
-                            gate_scale: &unit_scale(device, choices, "GS", "routed_gate_up", &label)?,
-                            up_scale: &unit_scale(device, choices, "US", "routed_gate_up", &label)?,
-                            glu_limit: &glu_limit(device, None, "routed_gate_up", &label)?,
+                            gate_scale: &unit_scale(charges, choices, "GS", "routed_gate_up", &label)?,
+                            up_scale: &unit_scale(charges, choices, "US", "routed_gate_up", &label)?,
+                            glu_limit: &glu_limit(charges, None, "routed_gate_up", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("routed_gate_up", &label, error))?
                         .value;
@@ -1029,7 +1029,7 @@ pub(super) fn qualify_routed(
             kernels
                 .output
                 .for_rows(&at)
-                .call(routed_output::Args {
+                .call(charges, routed_output::Args {
                     residual: &residual,
                     inject: &inject,
                     expert_product: &expert_product,
@@ -1041,7 +1041,7 @@ pub(super) fn qualify_routed(
                     expert_down: &reads.records.down,
                     tier_down: &tier.down,
                     shared_down: &shared_down,
-                    operand_norm: &seismic::Tensor::from_host(device, binding.norm, &[0], &[])
+                    operand_norm: &seismic::Tensor::from_host(charges, binding.norm, &[0], &[])
                         .map_err(|error| qualification_dynamic("routed_output", &label, error))?,
                     operand_epsilon: 0.0,
                 })
@@ -1052,8 +1052,8 @@ pub(super) fn qualify_routed(
             let blocks = grouped_blocks(rows, e, k)
                 .map_err(|error| qualification_dynamic("routed_group", &label, error))?
                 .fixed();
-            let grouped = semantic_i32(device, &[1], &[rows as i32], "routed_group", &label)?;
-            let from_row = semantic_i32(device, &[1], &[0], "routed_group", &label)?;
+            let grouped = semantic_i32(charges, &[1], &[rows as i32], "routed_group", &label)?;
+            let from_row = semantic_i32(charges, &[1], &[0], "routed_group", &label)?;
             let mut counts = zeros(Element::i32(), &[e])?;
             let mut order = zeros(Element::i32(), &[blocks, TILE_ROWS])?;
             let mut inverse = zeros(Element::i32(), &[rows, k])?;
@@ -1061,7 +1061,7 @@ pub(super) fn qualify_routed(
             let mut used = zeros(Element::i32(), &[1])?;
             kernels
                 .group
-                .call(routed_group::Args {
+                .call(charges, routed_group::Args {
                     first: &from_row,
                     rows: &grouped,
                     routes: &first,
@@ -1075,7 +1075,7 @@ pub(super) fn qualify_routed(
             let experts = kernels
                 .experts
                 .for_rows(&at)
-                .call(routed_experts::Args {
+                .call(charges, routed_experts::Args {
                     first: &from_row,
                     rows: &grouped,
                     normalized: &routed.r0,
@@ -1091,16 +1091,16 @@ pub(super) fn qualify_routed(
                     records_up: &reads.records.up,
                     records_down: &reads.records.down,
                     activation: 0,
-                    gate_scale: &unit_scale(device, kernels.experts.for_rows(&at), "GS", "routed_experts", &label)?,
-                    up_scale: &unit_scale(device, kernels.experts.for_rows(&at), "US", "routed_experts", &label)?,
-                    glu_limit: &glu_limit(device, None, "routed_experts", &label)?,
+                    gate_scale: &unit_scale(charges, kernels.experts.for_rows(&at), "GS", "routed_experts", &label)?,
+                    up_scale: &unit_scale(charges, kernels.experts.for_rows(&at), "US", "routed_experts", &label)?,
+                    glu_limit: &glu_limit(charges, None, "routed_experts", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("routed_experts", &label, error))?
                 .value;
             kernels
                 .combine
                 .for_rows(&at)
-                .call(routed_combine::Args {
+                .call(charges, routed_combine::Args {
                     residual: &residual,
                     inject: &inject,
                     expert_output: &experts,
@@ -1124,30 +1124,30 @@ pub(super) fn qualify_routed(
 /// the dense branch over zero weights and `moe_tail` over zero branch
 /// outputs, which leaves the residual unchanged.
 fn qualify_parallel(
-    device: &Device,
+    charges: &seismic::Charges,
     binding: crate::ParallelBinding,
     kernels: &ParallelKernels,
     hidden_residual: &Tensor,
     hidden_values: &[f32],
 ) -> Result<(), CatalogFailure> {
     qualify_general_routed(
-        device,
+        charges,
         binding.routed,
         &kernels.routed,
-        &ExpertReads::general(device, binding.routed)?,
+        &ExpertReads::general(charges, binding.routed)?,
     )?;
     let label = format!("{binding:?}");
     let hidden = binding.hidden;
     let dense = binding.dense;
     let zeros = |element: Element, extents: &[u64], entry: &'static str| {
-        semantic_zeros(device, element, extents, entry, &label)
+        semantic_zeros(charges, element, extents, entry, &label)
     };
     let features = dense.features;
-    let out_rows = semantic_i32(device, &[1], &[0], "dense_expand", &label)?;
+    let out_rows = semantic_i32(charges, &[1], &[0], "dense_expand", &label)?;
     let product = kernels
         .expand
         .first()
-        .call(dense_expand::Args {
+        .call(charges, dense_expand::Args {
             residual: hidden_residual,
             norm: &zeros(dense.norm, &[hidden], "dense_expand")?,
             gate_weight: &zeros(dense.gate, &[features, hidden], "dense_expand")?,
@@ -1155,22 +1155,22 @@ fn qualify_parallel(
             out_rows: &out_rows,
             eps: 1.0e-5,
             activation: 0,
-            gate_scale: &unit_scale(device, kernels.expand.first(), "GS", "dense_expand", &label)?,
-            up_scale: &unit_scale(device, kernels.expand.first(), "US", "dense_expand", &label)?,
-            gate_bound: &any_row_bound(device, kernels.expand.first(), "GB", "dense_expand", &label)?,
-            up_bound: &any_row_bound(device, kernels.expand.first(), "UB", "dense_expand", &label)?,
-            glu_limit: &glu_limit(device, dense.limit, "dense_expand", &label)?,
+            gate_scale: &unit_scale(charges, kernels.expand.first(), "GS", "dense_expand", &label)?,
+            up_scale: &unit_scale(charges, kernels.expand.first(), "US", "dense_expand", &label)?,
+            gate_bound: &any_row_bound(charges, kernels.expand.first(), "GB", "dense_expand", &label)?,
+            up_bound: &any_row_bound(charges, kernels.expand.first(), "UB", "dense_expand", &label)?,
+            glu_limit: &glu_limit(charges, dense.limit, "dense_expand", &label)?,
         })
         .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
         .value;
     let projected = kernels
         .down
         .first()
-        .call(project_rows::Args {
+        .call(charges, project_rows::Args {
             source: &product,
             weight: &zeros(dense.down, &[hidden, features], "project_rows")?,
-            weight_scale: &unit_scale(device, kernels.down.first(), "WS", "project_rows", &label)?,
-            weight_bound: &any_row_bound(device, kernels.down.first(), "WB", "project_rows", &label)?,
+            weight_scale: &unit_scale(charges, kernels.down.first(), "WS", "project_rows", &label)?,
+            weight_bound: &any_row_bound(charges, kernels.down.first(), "WB", "project_rows", &label)?,
         })
         .map_err(|error| qualification_dynamic("project_rows", &label, error))?
         .value;
@@ -1178,7 +1178,7 @@ fn qualify_parallel(
     let norm = zeros(binding.norm, &[hidden], "moe_tail")?;
     let result = kernels
         .tail
-        .call(moe_tail::Args {
+        .call(charges, moe_tail::Args {
             residual: hidden_residual,
             dense: &projected,
             routed: &branch,
@@ -1198,7 +1198,7 @@ fn qualify_parallel(
 /// 0, read where `reads` places it, the shared expert and latent
 /// projections are zero, so the residual comes back unchanged.
 pub(super) fn qualify_general_routed(
-    device: &Device,
+    charges: &seismic::Charges,
     binding: crate::GeneralRoutedBinding,
     kernels: &GeneralRoutedKernels,
     reads: &ExpertReads,
@@ -1206,12 +1206,12 @@ pub(super) fn qualify_general_routed(
     let label = format!("{binding:?}");
     let entry = "target_general_routed";
     // Each dense entry's scale ports at their bound extents.
-    let scale = |extent| semantic_ones(device, Element::f32(), &[extent], entry, &label);
+    let scale = |extent| semantic_ones(charges, Element::f32(), &[extent], entry, &label);
     let scales = binding.scales;
     let shape = binding.shape;
     let (h, e, k, x) = (shape.hidden, shape.experts, shape.selected, shape.expert_hidden);
     let zeros =
-        |element: Element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
+        |element: Element, extents: &[u64]| semantic_zeros(charges, element, extents, entry, &label);
     macro_rules! failed {
         ($name:literal) => {
             |error| qualification_dynamic($name, &label, error)
@@ -1231,9 +1231,9 @@ pub(super) fn qualify_general_routed(
         // Each projection's kernel of the range these rows lie in.
         let at = seismic::Dim::from(rows);
         let values = vec![1.0_f32; (rows * h) as usize];
-        let residual = semantic_f32(device, &[rows, h], &values, entry, &label)?;
+        let residual = semantic_f32(charges, &[rows, h], &values, entry, &label)?;
         let out_rows = semantic_i32(
-            device,
+            charges,
             &[rows],
             &(0..rows as i32).collect::<Vec<_>>(),
             entry,
@@ -1246,7 +1246,7 @@ pub(super) fn qualify_general_routed(
                     (DenseExpansionKernel::Gated(kernel), Some(gate)) => {
                         let kernel = kernel.for_rows(&at);
                         kernel
-                            .call(dense_expand::Args {
+                            .call(charges, dense_expand::Args {
                                 residual: &residual,
                                 norm: &norm,
                                 gate_weight: &zeros(gate, &[s, h])?,
@@ -1256,9 +1256,9 @@ pub(super) fn qualify_general_routed(
                                 activation: expansion_shape.activation,
                                 gate_scale: &scale(scales.shared.gate)?,
                                 up_scale: &scale(scales.shared.up)?,
-                                gate_bound: &any_row_bound(device, kernel, "GB", "dense_expand", &label)?,
-                                up_bound: &any_row_bound(device, kernel, "UB", "dense_expand", &label)?,
-                                glu_limit: &glu_limit(device, expansion_shape.limit, "dense_expand", &label)?,
+                                gate_bound: &any_row_bound(charges, kernel, "GB", "dense_expand", &label)?,
+                                up_bound: &any_row_bound(charges, kernel, "UB", "dense_expand", &label)?,
+                                glu_limit: &glu_limit(charges, expansion_shape.limit, "dense_expand", &label)?,
                             })
                             .map_err(failed!("dense_expand"))?
                             .value
@@ -1266,7 +1266,7 @@ pub(super) fn qualify_general_routed(
                     (DenseExpansionKernel::Plain(kernel), None) => {
                         kernel
                             .for_rows(&at)
-                            .call(dense_up::Args {
+                            .call(charges, dense_up::Args {
                                 residual: &residual,
                                 norm: &norm,
                                 up_weight: &up,
@@ -1288,13 +1288,13 @@ pub(super) fn qualify_general_routed(
                 };
                 let output = output.for_rows(&at);
                 output
-                    .call(dense_output::Args {
+                    .call(charges, dense_output::Args {
                         residual: &residual,
                         product: &product,
                         down_weight: &zeros(down, &[h, s])?,
                         out_rows: &out_rows,
                         down_scale: &scale(scales.shared.down)?,
-                        down_bound: &any_row_bound(device, output, "DB", "dense_output", &label)?,
+                        down_bound: &any_row_bound(charges, output, "DB", "dense_output", &label)?,
                     })
                     .map_err(failed!("dense_output"))?
                     .value
@@ -1312,13 +1312,13 @@ pub(super) fn qualify_general_routed(
         let mut weights = zeros(Element::f32(), &[rows, k])?;
         let normalized = kernels
             .select
-            .call(routed_select::Args {
+            .call(charges, routed_select::Args {
                 residual: &residual,
                 norm: &norm,
                 router_norm: &router_norm,
                 router: &router,
                 bias: &bias,
-                expert_scale: &unit_scale(device, &kernels.select, "ES", "routed_select", &label)?,
+                expert_scale: &unit_scale(charges, &kernels.select, "ES", "routed_select", &label)?,
                 routes: &mut routes,
                 weights: &mut weights,
                 epsilon: 1.0e-5,
@@ -1333,11 +1333,11 @@ pub(super) fn qualify_general_routed(
             (Some((project, _)), Some((down, _))) => (
                 project
                     .for_rows(&at)
-                    .call(project_rows::Args {
+                    .call(charges, project_rows::Args {
                         source: &normalized,
                         weight: &zeros(down, &[x, h])?,
                         weight_scale: &scale(scales.latent.0)?,
-                        weight_bound: &any_row_bound(device, project.for_rows(&at), "WB", "project_rows", &label)?,
+                        weight_bound: &any_row_bound(charges, project.for_rows(&at), "WB", "project_rows", &label)?,
                     })
                     .map_err(failed!("project_rows"))?
                     .value,
@@ -1348,12 +1348,12 @@ pub(super) fn qualify_general_routed(
         // Every choice routes to expert 0.
         let first = zeros(Element::i32(), &[rows, k])?;
         let routed = if rows <= VERIFY_ROWS {
-            let sources = reads.sources(device, rows, k, &label)?;
+            let sources = reads.sources(charges, rows, k, &label)?;
             let product = match &kernels.experts {
                 ExpertKernels::Gated { decode, .. } => {
                     let decode = decode.for_rows(&at);
                     decode
-                        .call(routed_gate_up::Args {
+                        .call(charges, routed_gate_up::Args {
                             normalized: &input,
                             routes: &first,
                             sources: &sources,
@@ -1362,9 +1362,9 @@ pub(super) fn qualify_general_routed(
                             tier_gate: &tier_gate,
                             tier_up: &tier.up,
                             activation: shape.experts_expansion.activation,
-                            gate_scale: &unit_scale(device, decode, "GS", "routed_gate_up", &label)?,
-                            up_scale: &unit_scale(device, decode, "US", "routed_gate_up", &label)?,
-                            glu_limit: &glu_limit(device, shape.experts_expansion.limit, "routed_gate_up", &label)?,
+                            gate_scale: &unit_scale(charges, decode, "GS", "routed_gate_up", &label)?,
+                            up_scale: &unit_scale(charges, decode, "US", "routed_gate_up", &label)?,
+                            glu_limit: &glu_limit(charges, shape.experts_expansion.limit, "routed_gate_up", &label)?,
                         })
                         .map_err(failed!("routed_gate_up"))?
                         .value
@@ -1372,13 +1372,13 @@ pub(super) fn qualify_general_routed(
                 ExpertKernels::Plain { decode, .. } => {
                     let decode = decode.for_rows(&at);
                     decode
-                        .call(routed_up::Args {
+                        .call(charges, routed_up::Args {
                             normalized: &input,
                             routes: &first,
                             sources: &sources,
                             expert_up: &reads.records.up,
                             tier_up: &tier.up,
-                            up_scale: &unit_scale(device, decode, "US", "routed_up", &label)?,
+                            up_scale: &unit_scale(charges, decode, "US", "routed_up", &label)?,
                             activation: shape.experts_expansion.activation,
                         })
                         .map_err(failed!("routed_up"))?
@@ -1388,7 +1388,7 @@ pub(super) fn qualify_general_routed(
             kernels
                 .down
                 .for_rows(&at)
-                .call(routed_down::Args {
+                .call(charges, routed_down::Args {
                     base: &sum_base,
                     product: &product,
                     routes: &first,
@@ -1397,7 +1397,7 @@ pub(super) fn qualify_general_routed(
                     expert_down: &reads.records.down,
                     tier_down: &tier.down,
                     policy: &semantic_i32(
-                        device,
+                        charges,
                         &[magnitude_kernels::constants::POLICY_WORDS],
                         &[0; magnitude_kernels::constants::POLICY_WORDS as usize],
                         "routed_down",
@@ -1408,8 +1408,8 @@ pub(super) fn qualify_general_routed(
                 .value
         } else {
             let blocks = grouped_blocks(rows, e, k).map_err(failed!("routed_group"))?.fixed();
-            let grouped_rows = semantic_i32(device, &[1], &[rows as i32], "routed_group", &label)?;
-            let from_row = semantic_i32(device, &[1], &[0], "routed_group", &label)?;
+            let grouped_rows = semantic_i32(charges, &[1], &[rows as i32], "routed_group", &label)?;
+            let from_row = semantic_i32(charges, &[1], &[0], "routed_group", &label)?;
             let mut counts = zeros(Element::i32(), &[e])?;
             let mut order = zeros(Element::i32(), &[blocks, TILE_ROWS])?;
             let mut inverse = zeros(Element::i32(), &[rows, k])?;
@@ -1417,7 +1417,7 @@ pub(super) fn qualify_general_routed(
             let mut used = zeros(Element::i32(), &[1])?;
             kernels
                 .group
-                .call(routed_group::Args {
+                .call(charges, routed_group::Args {
                     first: &from_row,
                     rows: &grouped_rows,
                     routes: &first,
@@ -1432,7 +1432,7 @@ pub(super) fn qualify_general_routed(
                 ExpertKernels::Gated { grouped, .. } => {
                     let grouped = grouped.for_rows(&at);
                     grouped
-                        .call(routed_experts::Args {
+                        .call(charges, routed_experts::Args {
                             first: &from_row,
                             rows: &grouped_rows,
                             normalized: &input,
@@ -1448,9 +1448,9 @@ pub(super) fn qualify_general_routed(
                             records_up: &reads.records.up,
                             records_down: &reads.records.down,
                             activation: shape.experts_expansion.activation,
-                            gate_scale: &unit_scale(device, grouped, "GS", "routed_experts", &label)?,
-                            up_scale: &unit_scale(device, grouped, "US", "routed_experts", &label)?,
-                            glu_limit: &glu_limit(device, shape.experts_expansion.limit, "routed_experts", &label)?,
+                            gate_scale: &unit_scale(charges, grouped, "GS", "routed_experts", &label)?,
+                            up_scale: &unit_scale(charges, grouped, "US", "routed_experts", &label)?,
+                            glu_limit: &glu_limit(charges, shape.experts_expansion.limit, "routed_experts", &label)?,
                         })
                         .map_err(failed!("routed_experts"))?
                         .value
@@ -1458,7 +1458,7 @@ pub(super) fn qualify_general_routed(
                 ExpertKernels::Plain { grouped, .. } => {
                     let grouped = grouped.for_rows(&at);
                     grouped
-                        .call(routed_experts_up::Args {
+                        .call(charges, routed_experts_up::Args {
                             first: &from_row,
                             rows: &grouped_rows,
                             normalized: &input,
@@ -1471,7 +1471,7 @@ pub(super) fn qualify_general_routed(
                             step,
                             records_up: &reads.records.up,
                             records_down: &reads.records.down,
-                            up_scale: &unit_scale(device, grouped, "US", "routed_experts_up", &label)?,
+                            up_scale: &unit_scale(charges, grouped, "US", "routed_experts_up", &label)?,
                             activation: shape.experts_expansion.activation,
                         })
                         .map_err(failed!("routed_experts_up"))?
@@ -1480,7 +1480,7 @@ pub(super) fn qualify_general_routed(
             };
             kernels
                 .scatter
-                .call(routed_scatter::Args {
+                .call(charges, routed_scatter::Args {
                     base: &sum_base,
                     expert_output: &expert_output,
                     inverse: &inverse,
@@ -1493,13 +1493,13 @@ pub(super) fn qualify_general_routed(
             (Some((_, up_kernel)), Some((_, up))) => {
                 let up_kernel = up_kernel.for_rows(&at);
                 up_kernel
-                    .call(dense_output::Args {
+                    .call(charges, dense_output::Args {
                         residual: &base,
                         product: &routed,
                         down_weight: &zeros(up, &[h, x])?,
                         out_rows: &out_rows,
                         down_scale: &scale(scales.latent.1)?,
-                        down_bound: &any_row_bound(device, up_kernel, "DB", "dense_output", &label)?,
+                        down_bound: &any_row_bound(charges, up_kernel, "DB", "dense_output", &label)?,
                     })
                     .map_err(failed!("dense_output"))?
                     .value
@@ -1515,7 +1515,7 @@ pub(super) fn qualify_general_routed(
 /// two-bank window arena: bank 0 is the zero seed the row reads, bank 1 its
 /// successor. Zero weights leave the residual unchanged.
 fn qualify_short_conv(
-    device: &Device,
+    charges: &seismic::Charges,
     kernels: &ShortConvKernels,
     binding: crate::ShortConvBinding,
     hidden_residual: &Tensor,
@@ -1524,21 +1524,21 @@ fn qualify_short_conv(
     let label = format!("{binding:?}");
     let entry = "target_short_conv";
     let shape = binding.shape;
-    let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
+    let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, entry, &label);
     let norm = zeros(binding.norm, &[shape.hidden])?;
     let input_gate = zeros(binding.input_gate, &[shape.channels, shape.hidden])?;
     let output_gate = zeros(binding.output_gate, &[shape.channels, shape.hidden])?;
     let value = zeros(binding.value, &[shape.channels, shape.hidden])?;
     let convolution = zeros(Element::f32(), &[shape.channels, shape.convolution_width])?;
     let output = zeros(binding.output, &[shape.hidden, shape.channels])?;
-    let segments = semantic_i32(device, &[2, 2], &[0, 1, 1, 1], entry, &label)?;
-    let stop = semantic_i32(device, &[1], &[1], entry, &label)?;
-    let previous_bank = semantic_i32(device, &[1], &[0], entry, &label)?;
-    let previous_tape = semantic_i32(device, &[1], &[0], entry, &label)?;
-    let following_bank = semantic_i32(device, &[1], &[1], entry, &label)?;
+    let segments = semantic_i32(charges, &[2, 2], &[0, 1, 1, 1], entry, &label)?;
+    let stop = semantic_i32(charges, &[1], &[1], entry, &label)?;
+    let previous_bank = semantic_i32(charges, &[1], &[0], entry, &label)?;
+    let previous_tape = semantic_i32(charges, &[1], &[0], entry, &label)?;
+    let following_bank = semantic_i32(charges, &[1], &[1], entry, &label)?;
     // One tape row, the least a bank holds.
     let banks = crate::experts::pooled_slabs(
-        device,
+        charges,
         seismic::Contract::DeviceOnly,
         2,
         2,
@@ -1558,22 +1558,22 @@ fn qualify_short_conv(
     let projection = kernels
         .project
         .first()
-        .call(short_conv_project::Args {
+        .call(charges, short_conv_project::Args {
             residual: hidden_residual,
             norm: &norm,
             b_weight: &input_gate,
             c_weight: &output_gate,
             x_weight: &value,
             eps: 1.0e-5,
-            b_scale: &unit_scale(device, kernels.project.first(), "BS", entry, &label)?,
-            c_scale: &unit_scale(device, kernels.project.first(), "CS", entry, &label)?,
-            x_scale: &unit_scale(device, kernels.project.first(), "XS", entry, &label)?,
+            b_scale: &unit_scale(charges, kernels.project.first(), "BS", entry, &label)?,
+            c_scale: &unit_scale(charges, kernels.project.first(), "CS", entry, &label)?,
+            x_scale: &unit_scale(charges, kernels.project.first(), "XS", entry, &label)?,
         })
         .map_err(|error| qualification_dynamic("short_conv_project", &label, error))?
         .value;
     let gated = kernels
         .rows
-        .call(short_conv_rows::Args {
+        .call(charges, short_conv_rows::Args {
             projection: &projection,
             convolution: &convolution,
             segments: &segments,
@@ -1589,20 +1589,20 @@ fn qualify_short_conv(
     let result = match (&kernels.output, binding.tail) {
         (SublayerOutput::Residual(output_kernel), SublayerTail::Residual) => output_kernel
             .first()
-            .call(attention_output::Args {
+            .call(charges, attention_output::Args {
                 hidden: hidden_residual,
-                inject: &semantic_zeros(device, Element::f32(), &[1, 0], "attention_output", &label)?,
+                inject: &semantic_zeros(charges, Element::f32(), &[1, 0], "attention_output", &label)?,
                 gated: &gated
                     .reshape(&[1, 1, shape.channels])
                     .map_err(|error| qualification_dynamic("short_conv_rows", &label, error))?,
                 output_weight: &output,
-                output_scale: &unit_scale(device, output_kernel.first(), "OS", "attention_output", &label)?,
-                output_bound: &any_row_bound(device, output_kernel.first(), "OB", "attention_output", &label)?,
+                output_scale: &unit_scale(charges, output_kernel.first(), "OS", "attention_output", &label)?,
+                output_bound: &any_row_bound(charges, output_kernel.first(), "OB", "attention_output", &label)?,
             })
             .map_err(|error| qualification_dynamic("attention_output", &label, error))?
             .value,
         (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
-            qualify_post_norm(device, tail, hidden_residual, &gated, &output, norm, &label)?
+            qualify_post_norm(charges, tail, hidden_residual, &gated, &output, norm, &label)?
         }
         _ => {
             return Err(qualification_dynamic(
@@ -1619,7 +1619,7 @@ fn qualify_short_conv(
 /// it statically) over a two-bank arena: bank 0 is the zero seed the advance
 /// reads, bank 1 its successor. Zero weights leave the residual unchanged.
 fn qualify_state_space(
-    device: &Device,
+    charges: &seismic::Charges,
     kernels: &StateSpaceKernels,
     binding: crate::StateSpaceBinding,
     hidden_residual: &Tensor,
@@ -1628,10 +1628,10 @@ fn qualify_state_space(
     let label = format!("{binding:?}");
     let entry = "target_state_space";
     let shape = binding.shape;
-    let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
+    let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, entry, &label);
     let f32 = Element::f32();
     // A unit accumulator scale of the port's extent (absent at 0).
-    let scale = |extent| semantic_ones(device, f32, &[extent], entry, &label);
+    let scale = |extent| semantic_ones(charges, f32, &[extent], entry, &label);
     let norm = zeros(binding.norm, &[shape.hidden])?;
     let projection_weight = zeros(
         binding.projection,
@@ -1650,14 +1650,14 @@ fn qualify_state_space(
         &[shape.norm_groups(), shape.norm_heads, shape.head_width],
     )?;
     let output = zeros(binding.output, &[shape.hidden, shape.inner()])?;
-    let segments = semantic_i32(device, &[2, 2], &[0, 1, 1, 1], entry, &label)?;
-    let stop = semantic_i32(device, &[1], &[1], entry, &label)?;
-    let previous_bank = semantic_i32(device, &[1], &[0], entry, &label)?;
-    let previous_tape = semantic_i32(device, &[1], &[0], entry, &label)?;
-    let following_bank = semantic_i32(device, &[1], &[1], entry, &label)?;
+    let segments = semantic_i32(charges, &[2, 2], &[0, 1, 1, 1], entry, &label)?;
+    let stop = semantic_i32(charges, &[1], &[1], entry, &label)?;
+    let previous_bank = semantic_i32(charges, &[1], &[0], entry, &label)?;
+    let previous_tape = semantic_i32(charges, &[1], &[0], entry, &label)?;
+    let following_bank = semantic_i32(charges, &[1], &[1], entry, &label)?;
     // One tape row, the least a bank holds.
     let banks = crate::experts::pooled_slabs(
-        device,
+        charges,
         seismic::Contract::DeviceOnly,
         2,
         2,
@@ -1690,7 +1690,7 @@ fn qualify_state_space(
     let projection = kernels
         .project
         .first()
-        .call(attention_project::Args {
+        .call(charges, attention_project::Args {
             hidden: hidden_residual,
             input_norm: &norm,
             query_weight: &projection_weight,
@@ -1703,17 +1703,17 @@ fn qualify_state_space(
             gate_scale: &scale(0)?,
             key_scale: &scale(0)?,
             value_scale: &scale(0)?,
-            query_bound: &any_row_bound(device, kernels.project.first(), "QB", "attention_project", &label)?,
-            gate_bound: &any_row_bound(device, kernels.project.first(), "GB", "attention_project", &label)?,
-            key_bound: &any_row_bound(device, kernels.project.first(), "KB", "attention_project", &label)?,
-            value_bound: &any_row_bound(device, kernels.project.first(), "VB", "attention_project", &label)?,
+            query_bound: &any_row_bound(charges, kernels.project.first(), "QB", "attention_project", &label)?,
+            gate_bound: &any_row_bound(charges, kernels.project.first(), "GB", "attention_project", &label)?,
+            key_bound: &any_row_bound(charges, kernels.project.first(), "KB", "attention_project", &label)?,
+            value_bound: &any_row_bound(charges, kernels.project.first(), "VB", "attention_project", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_project", &label, error))?
         .r0;
     macro_rules! advance {
         ($module:ident, $kernel:expr) => {
             $kernel
-                .call($module::Args {
+                .call(charges, $module::Args {
                     projection: &projection,
                     convolution: &convolution,
                     convolution_bias: &convolution_bias,
@@ -1738,7 +1738,7 @@ fn qualify_state_space(
     advance!(state_space_chunk, kernels.chunk);
     let gated = kernels
         .gate
-        .call(state_space_gate::Args {
+        .call(charges, state_space_gate::Args {
             mixed: &mixed,
             projection: &projection,
             state_norm: &state_norm,
@@ -1749,13 +1749,13 @@ fn qualify_state_space(
     let result = kernels
         .output
         .first()
-        .call(attention_output::Args {
+        .call(charges, attention_output::Args {
             hidden: hidden_residual,
-            inject: &semantic_zeros(device, Element::f32(), &[1, 0], "attention_output", &label)?,
+            inject: &semantic_zeros(charges, Element::f32(), &[1, 0], "attention_output", &label)?,
             gated: &gated,
             output_weight: &output,
             output_scale: &scale(binding.scales.output)?,
-            output_bound: &any_row_bound(device, kernels.output.first(), "OB", "attention_output", &label)?,
+            output_bound: &any_row_bound(charges, kernels.output.first(), "OB", "attention_output", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_output", &label, error))?
         .value;
@@ -1768,7 +1768,7 @@ impl QualificationView<'_> {
     /// the residual unchanged.
     fn qualify_per_layer(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         hidden_residual: &Tensor,
         hidden_values: &[f32],
     ) -> Result<(), CatalogFailure> {
@@ -1781,7 +1781,7 @@ impl QualificationView<'_> {
             let label = format!("{binding:?}");
             let channels = binding.layers * binding.width;
             let embedded = semantic_f32(
-                device,
+                charges,
                 &[1, 1, hidden],
                 hidden_values,
                 "per_layer_entry",
@@ -1789,11 +1789,11 @@ impl QualificationView<'_> {
             )?;
             let rounded = kernels
                 .round
-                .call(import_dense::Args { source: &embedded })
+                .call(charges, import_dense::Args { source: &embedded })
                 .map_err(|error| qualification_dynamic("import_dense", &label, error))?
                 .value;
             let projection = semantic_zeros(
-                device,
+                charges,
                 binding.projection,
                 &[channels, hidden],
                 "per_layer_entry",
@@ -1802,18 +1802,18 @@ impl QualificationView<'_> {
             let projected = kernels
                 .project
                 .first()
-                .call(project_rows::Args {
+                .call(charges, project_rows::Args {
                     source: &rounded
                         .reshape(&[1, hidden])
                         .map_err(|error| qualification_dynamic("project_rows", &label, error))?,
                     weight: &projection,
-                    weight_scale: &unit_scale(device, kernels.project.first(), "WS", "project_rows", &label)?,
-                    weight_bound: &any_row_bound(device, kernels.project.first(), "WB", "project_rows", &label)?,
+                    weight_scale: &unit_scale(charges, kernels.project.first(), "WS", "project_rows", &label)?,
+                    weight_bound: &any_row_bound(charges, kernels.project.first(), "WB", "project_rows", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("project_rows", &label, error))?
                 .value;
             let source = semantic_zeros(
-                device,
+                charges,
                 binding.table_source,
                 &[1, 1, channels],
                 "per_layer_entry",
@@ -1822,19 +1822,19 @@ impl QualificationView<'_> {
             let table = match &kernels.table {
                 TableConversion::Dense(kernel) => {
                     kernel
-                        .call(import_dense::Args { source: &source })
+                        .call(charges, import_dense::Args { source: &source })
                         .map_err(|error| qualification_dynamic("import_dense", &label, error))?
                         .value
                 }
                 TableConversion::Repack(kernel) => {
                     kernel
-                        .call(repack_weight::Args { source: &source })
+                        .call(charges, repack_weight::Args { source: &source })
                         .map_err(|error| qualification_dynamic("repack_weight", &label, error))?
                         .value
                 }
             };
             let norm = semantic_zeros(
-                device,
+                charges,
                 binding.norm,
                 &[binding.width],
                 "per_layer_inputs",
@@ -1842,7 +1842,7 @@ impl QualificationView<'_> {
             )?;
             let combined = kernels
                 .inputs
-                .call(per_layer_inputs::Args {
+                .call(charges, per_layer_inputs::Args {
                     gathered: &table.reshape(&[1, channels]).map_err(|error| {
                         qualification_dynamic("per_layer_inputs", &label, error)
                     })?,
@@ -1887,14 +1887,14 @@ impl QualificationView<'_> {
             };
             let (layers, width) = (binding.layers, binding.width);
             let gate = semantic_zeros(
-                device,
+                charges,
                 binding.gate,
                 &[width, hidden],
                 "per_layer_gate",
                 &label,
             )?;
             let inputs = semantic_zeros(
-                device,
+                charges,
                 Element::f32(),
                 &[1, layers, width],
                 "per_layer_gate",
@@ -1903,25 +1903,25 @@ impl QualificationView<'_> {
             let gated = kernels
                 .gate
                 .first()
-                .call(per_layer_gate::Args {
+                .call(charges, per_layer_gate::Args {
                     hidden: hidden_residual,
                     gate_weight: &gate,
                     inputs: &inputs,
                     layer: 0,
                     activation: 1,
-                    gate_scale: &unit_scale(device, kernels.gate.first(), "GS", "per_layer_gate", &label)?,
+                    gate_scale: &unit_scale(charges, kernels.gate.first(), "GS", "per_layer_gate", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("per_layer_gate", &label, error))?
                 .value;
             let projection = semantic_zeros(
-                device,
+                charges,
                 binding.projection,
                 &[hidden, width],
                 "per_layer_gate",
                 &label,
             )?;
             let result = qualify_post_norm(
-                device,
+                charges,
                 &kernels.output,
                 hidden_residual,
                 &gated,
@@ -1940,7 +1940,7 @@ impl QualificationView<'_> {
 /// reaches the zero threshold, and the exact level keeps them.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn qualify_progressive(
-    device: &Device,
+    charges: &seismic::Charges,
     kernels: &ProgressiveReadoutKernels,
     hidden_residual: &Tensor,
     norm: &Tensor,
@@ -1970,7 +1970,7 @@ pub(super) fn qualify_progressive(
     };
     let plane = |plane: ProgressivePlane| {
         semantic_zeros(
-            device,
+            charges,
             crate::progressive::element(plane),
             &plane.shape(vocabulary, hidden, depth),
             context,
@@ -1982,19 +1982,19 @@ pub(super) fn qualify_progressive(
     let rest = plane(ProgressivePlane::Rest)?;
     let scales = plane(ProgressivePlane::Scales)?;
     let radius = plane(ProgressivePlane::Radius)?;
-    let draws = semantic_zeros(device, Element::u32(), &[1, 6], context, &label)?;
-    let temperature = semantic_ones(device, Element::f32(), &[1], context, &label)?;
+    let draws = semantic_zeros(charges, Element::u32(), &[1, 6], context, &label)?;
+    let temperature = semantic_ones(charges, Element::f32(), &[1], context, &label)?;
     let mask = semantic_zeros(
-        device,
+        charges,
         Element::u32(),
         &[1, vocabulary.div_ceil(32)],
         context,
         &label,
     )?;
-    let constrained = semantic_i32(device, &[1], &[0], context, &label)?;
+    let constrained = semantic_i32(charges, &[1], &[0], context, &label)?;
     let first = kernels
         .top
-        .call(readout_top_rows::Args {
+        .call(charges, readout_top_rows::Args {
             softcap: 0.0,
             hidden: hidden_residual,
             norm,
@@ -2014,7 +2014,7 @@ pub(super) fn qualify_progressive(
     require_zero_result(&first.r0, "readout_top_rows", &label)?;
     let second = kernels
         .refine
-        .call(readout_refine_rows::Args {
+        .call(charges, readout_refine_rows::Args {
             softcap: 0.0,
             features: &first.r2,
             top: &top,
@@ -2034,7 +2034,7 @@ pub(super) fn qualify_progressive(
     require_zero_result(&second.r0, "readout_refine_rows", &label)?;
     let exact = kernels
         .exact
-        .call(readout_exact_rows::Args {
+        .call(charges, readout_exact_rows::Args {
             softcap: 0.0,
             features: &first.r2,
             top: &top,
@@ -2055,7 +2055,7 @@ pub(super) fn qualify_progressive(
     require_zero_result(&exact, "readout_exact_rows", &label)?;
     let planes = kernels
         .planes
-        .call(readout_planes_rows::Args {
+        .call(charges, readout_planes_rows::Args {
             softcap: 0.0,
             hidden: hidden_residual,
             norm,

@@ -156,7 +156,7 @@ pub struct Served {
 enum Held {
     Load { _load: Loaded },
     /// The points' storage and programs, and the thread forming them,
-    /// whose drop waits for the compiles it began before the job's deadline.
+    /// whose drop waits for the compiles it began.
     Measurement { _points: magnitude_executor::assessment::Held },
 }
 
@@ -263,7 +263,8 @@ fn serve(
     // Host messages that arrive during the load wait in the session inbox.
     let _reader = session::spawn_reader(receiver, signal.clone());
     match load(manifest, unprepared, &outbound) {
-        Ok(LoadAttempt::Loaded((loaded, ready))) => {
+        Ok(LoadAttempt::Loaded(attempt)) => {
+            let (loaded, ready) = *attempt;
             if let Err(error) = outbound.lock().unwrap().send(WorkerMessage::Ready { ready }) {
                 return WorkerExit::TransportFailed(error.to_string()).into();
             }
@@ -365,7 +366,7 @@ fn load(
                     .send(WorkerMessage::LoadProgress { progress });
             }),
         )? {
-            LoadAttempt::Loaded(built) => built,
+            LoadAttempt::Loaded(built) => *built,
             LoadAttempt::Unprepared => return Err(Stopped::Unprepared),
         };
         let model = manifest.model.clone();
@@ -387,10 +388,7 @@ fn load(
             Arc::new(wakes) as Arc<dyn Wakes>,
         )
         .map_err(internal)?;
-        let census = owner
-            .reconcile_memory_charge()
-            .and_then(|charge| owner.serving_census().map(|serving| AllocationCensus::classify(&charge, serving)))
-            .map_err(internal)?;
+        let census = AllocationCensus { stores: owner.store_allocations(), serving: owner.serving_census().map_err(internal)? };
         let ready = ExecutionReady {
             model,
             resources,
@@ -448,7 +446,7 @@ fn load(
         Err(
             SpawnError::Factory(Stopped::Failed(error)) | SpawnError::Host(Stopped::Failed(error)),
         ) => return Err(error),
-        Err(error @ (SpawnError::Capacity | SpawnError::Thread(_) | SpawnError::Panicked)) => {
+        Err(error @ (SpawnError::Capacity | SpawnError::Thread(_))) => {
             return Err(internal(error.to_string()))
         }
     };
@@ -464,7 +462,7 @@ fn load(
         backend: execution_ready.backend,
         census: execution_ready.census,
     };
-    Ok(LoadAttempt::Loaded((
+    Ok(LoadAttempt::Loaded(Box::new((
         Loaded {
             execution,
             binding,
@@ -472,5 +470,5 @@ fn load(
             census,
         },
         ready,
-    )))
+    ))))
 }

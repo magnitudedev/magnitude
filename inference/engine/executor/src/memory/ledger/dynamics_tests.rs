@@ -303,13 +303,13 @@ impl Machine {
         };
         let at = *now.lock().expect("the clock");
         read(&ledger, &mut os, at);
-        let claim = ledger.claim_at(None, CommittedKind::Load, weights).expect("the weights fit");
+        let claim = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, weights)).expect("the weights fit");
         ledger.change(|_| { let entry = claim.entry(); entry.take(&entry.change(), weights, wiring) }).expect("the weights' own bytes");
         os.grow(at, weights, wiring);
-        let slot = ledger.claim(Need::RequestSlot { bytes: request }).expect("the slot fits");
+        let slot = ledger.change(|keeping| ledger.claim(&keeping.claims(), Need::RequestSlot { bytes: request })).expect("the slot fits");
         let serving = serving.then(|| {
             let rows = request / page_bytes(&ledger) * super::tests::page_rows();
-            (ledger.reserve(&slot, RequestId(1), rows).expect("the request draws the slot"), 0)
+            (ledger.change(|keeping| ledger.reserve(&keeping.claims(), &slot, RequestId(1), rows)).expect("the request draws the slot"), 0)
         });
         if let Some((request, _)) = &serving {
             // Its slabs are allocated as it opens: the OS holds its whole
@@ -701,7 +701,7 @@ fn a_device_store_shows_the_process_after_its_own_lag() {
     };
     read_both(&mut os, &mut driver);
     let charged = |ledger: &Ledger, bytes: u64| {
-        let claim = ledger.claim_at(None, CommittedKind::Load, bytes).expect("room");
+        let claim = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, bytes)).expect("room");
         ledger.change(|_| { let entry = claim.entry(); entry.take(&entry.change(), bytes, Wiring::Pageable) }).expect("the claim's own bytes");
         claim
     };
@@ -845,7 +845,7 @@ fn only_wired_memory_is_the_processs_in_the_wire_count() {
     let mut machine = Machine::load(os, 20 * GB, 0);
     assert_eq!(wired(&machine), (Some(6 * GB), Some(34 * GB)));
     machine.tick(100);
-    let anonymous = machine.ledger.claim_at(None, CommittedKind::Load, 4 * GB).expect("room");
+    let anonymous = machine.ledger.change(|keeping| machine.ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 4 * GB)).expect("room");
     machine.ledger.change(|_| { let entry = anonymous.entry(); entry.take(&entry.change(), 4 * GB, Wiring::Pageable) }).expect("the claim's own bytes");
     let at = machine.at();
     machine.os.grow(at, 4 * GB, Wiring::Pageable);
@@ -1086,11 +1086,11 @@ fn an_idle_load_under_pressure_never_unloads() {
     let estimate = machine.ledger.estimate();
     assert!(estimate.cap().is_some_and(|cap| cap >= estimate.committed()), "B never falls below what is committed");
     let rows = super::tests::page_rows();
-    let _first = machine.ledger.reserve(&machine.slot, RequestId(1), rows).expect("the slot holds the first request");
+    let _first = machine.ledger.change(|keeping| machine.ledger.reserve(&keeping.claims(), &machine.slot, RequestId(1), rows)).expect("the slot holds the first request");
     // The slot's room left, and a request needing more than it.
     let left = machine.slot.bytes();
     let past = (1..).map(|pages| pages * rows).find(|rows| machine.ledger.bytes(&Need::Request { sequence: RequestId(2), rows: *rows }) > left).expect("a request past the slot");
-    assert!(machine.ledger.reserve(&machine.slot, RequestId(2), past).is_err(), "a request past the slot is refused under B");
+    assert!(machine.ledger.change(|keeping| machine.ledger.reserve(&keeping.claims(), &machine.slot, RequestId(2), past)).is_err(), "a request past the slot is refused under B");
 }
 
 /// An idle load whose bank holds cache above its floor yields just the harm's
@@ -1116,7 +1116,7 @@ fn an_idle_load_with_cache_above_its_floor_admits_new_work_when_cache_meets_harm
     assert_eq!(shortage.cause, shortage::Cause::Harm { bytes: 8 * PAGE });
     assert!(!shortage.response.admission_waits, "cache meets the harm above its floor");
     let plan = shortage.response.relief.expect("the bank covers the harm");
-    assert_eq!(machine.ledger.execute(plan).yielded, 8 * PAGE);
-    let admitted = machine.ledger.reserve(&machine.slot, RequestId(1), 2 * super::tests::page_rows());
+    assert_eq!(machine.ledger.change(|keeping| machine.ledger.execute(&keeping.claims(), plan)).yielded, 8 * PAGE);
+    let admitted = machine.ledger.change(|keeping| machine.ledger.reserve(&keeping.claims(), &machine.slot, RequestId(1), 2 * super::tests::page_rows()));
     assert!(admitted.is_ok(), "the first request is admitted once cache meets the shortage: {:?}", admitted.err());
 }

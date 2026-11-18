@@ -16,7 +16,7 @@ use super::file::SourceFile;
 use super::platform::{evict, uncached};
 use super::probe::{LEAST_READ, WIDEST_WINDOW};
 use super::ALIGNMENT;
-use crate::{Buffer, Error};
+use crate::{Buffer, Durability, Error, Privacy, Store};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -59,23 +59,24 @@ impl StorageProbe {
     }
 
     /// Write the probe file: bytes no volume stores as a hole or compresses
-    /// (a xorshift stream), into a file beside it renamed into place, so a
-    /// job killed while writing leaves no short probe file.
+    /// (a xorshift stream), published through the directory's store
+    /// ([`Store::publish`]), so a job killed while writing, or two writing at
+    /// once, leave no short probe file, and the temporary file of one killed
+    /// is the store's to sweep.
     fn write(directory: &Path, path: &Path) -> Result<(), Error> {
-        std::fs::create_dir_all(directory)?;
-        let partial = path.with_extension("partial");
-        let mut file = std::fs::File::create(&partial)?;
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let mut chunk = vec![0u8; 8 << 20];
-        for _ in 0..STORAGE_PROBE_BYTES / chunk.len() as u64 {
-            for word in chunk.chunks_exact_mut(8) {
-                state = next(state);
-                word.copy_from_slice(&state.to_le_bytes());
+        let store = Store::new(directory.to_owned(), Privacy::Shared);
+        store.publish(Path::new(path.file_name().expect("the probe file has a name")), Durability::Durable, |file| {
+            let mut state = 0x2545_f491_4f6c_dd1du64;
+            let mut chunk = vec![0u8; 8 << 20];
+            for _ in 0..STORAGE_PROBE_BYTES / chunk.len() as u64 {
+                for word in chunk.chunks_exact_mut(8) {
+                    state = next(state);
+                    word.copy_from_slice(&state.to_le_bytes());
+                }
+                file.write_all(&chunk)?;
             }
-            file.write_all(&chunk)?;
-        }
-        file.sync_all()?;
-        std::fs::rename(&partial, path)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -97,7 +98,7 @@ impl StorageProbe {
             let readers = offsets
                 .iter()
                 .map(|offsets| {
-                    std::thread::Builder::new().spawn_scoped(scope, move || {
+                    seismic_threads::spawn_scoped(scope, "seismic-storage", move || {
                         let mut buffer = Buffer::new(FULL_READ as usize);
                         offsets.iter().try_for_each(|&at| self.file.read_block(at, buffer.bytes_mut()))
                     })

@@ -89,6 +89,7 @@ fn tensor_key(tensor: &TensorInner) -> TensorKey {
 /// every tensor argument, read or written, over storage of its own
 /// ([`TensorInner::copy_of`]; the scalars are the rotation's).
 pub(crate) fn cold_copies(
+    charges: &crate::memory::Charges,
     rotation: &[EncodedArgs],
     cold: u64,
 ) -> Result<Vec<EncodedArgs>, crate::api::TensorError> {
@@ -124,7 +125,7 @@ pub(crate) fn cold_copies(
                     std::collections::hash_map::Entry::Occupied(image) => image.into_mut(),
                     std::collections::hash_map::Entry::Vacant(slot) => slot.insert(tensor.image()?),
                 };
-                let copy = Arc::new(tensor.copy_of(image)?);
+                let copy = Arc::new(tensor.copy_of(charges, image)?);
                 copied.insert(key, copy.clone());
                 Ok::<_, crate::api::TensorError>(copy)
             })?);
@@ -138,6 +139,8 @@ pub(crate) fn cold_copies(
 /// cold pass then calls the rotation's copies ([`cold_copies`]).
 pub struct KernelPoint {
     kernel: Arc<NativePrepared>,
+    /// What its calls' results and scratch are charged to.
+    charges: crate::memory::Charges,
     /// The rotation's calls, then its copies'.
     calls: Vec<NativeBoundCall>,
     /// The leading calls that are the rotation's own.
@@ -155,6 +158,7 @@ impl KernelPoint {
     /// the point is.
     pub(crate) fn place(
         kernel: &Arc<NativePrepared>,
+        charges: &crate::memory::Charges,
         rotation: Vec<EncodedArgs>,
         copies: Vec<EncodedArgs>,
         mut outputs: Option<&mut Vec<Vec<Arc<TensorInner>>>>,
@@ -172,7 +176,7 @@ impl KernelPoint {
             encoded
         };
         let mut calls: Vec<NativeBoundCall> = Vec::with_capacity(own + copies.len());
-        let mut scratch = ScratchArena::default();
+        let mut scratch = ScratchArena::new(charges.clone());
         for (index, args) in rotation.into_iter().chain(copies).enumerate() {
             let supplied = if index < own {
                 outputs
@@ -198,6 +202,7 @@ impl KernelPoint {
         }
         Ok(Self {
             kernel: kernel.clone(),
+            charges: charges.clone(),
             calls,
             rotation: own,
             arguments,
@@ -282,7 +287,7 @@ impl Work for KernelPoint {
     /// The rotation's calls placed again, with results of their own: a
     /// gauge submits passes alone.
     fn gauge(&self) -> Result<Box<dyn Gauge<CallError>>, CallError> {
-        Ok(Box::new(Self::place(&self.kernel, self.arguments.clone(), Vec::new(), None)?))
+        Ok(Box::new(Self::place(&self.kernel, &self.charges, self.arguments.clone(), Vec::new(), None)?))
     }
 }
 
@@ -328,6 +333,8 @@ pub enum GraphTiming {
 /// session's sample queued behind the one before it, or behind a lead,
 /// makes no graph and takes no other share of the device's graph budget.
 pub struct GraphPoint {
+    /// What its slot and outputs are allocated through.
+    charges: crate::memory::Charges,
     plan: Arc<NativeGraphPlan>,
     bindings: NativeGraphBindings,
     slot: RefCell<NativeGraphSlot>,
@@ -351,9 +358,11 @@ impl GraphPoint {
     /// Runs of `plan` with `bindings`, timed as `timing` says. A plan with
     /// timeline nodes is refused, unless every one is a park bound answered
     /// (`NativeGraphBindings::set_answered`): its runs wait on or signal a
-    /// timeline and are not the same work twice.
+    /// timeline and are not the same work twice. Its slot and outputs are
+    /// allocated through `charges`.
     pub(crate) fn new(
         plan: &Arc<NativeGraphPlan>,
+        charges: &crate::memory::Charges,
         bindings: NativeGraphBindings,
         timing: GraphTiming,
     ) -> Result<Self, CallError> {
@@ -364,9 +373,10 @@ impl GraphPoint {
         }
         Ok(Self {
             plan: plan.clone(),
+            charges: charges.clone(),
             bindings,
-            slot: RefCell::new(plan.new_slot().map_err(super::tensor_error)?),
-            exports: plan.output_arena().map_err(super::tensor_error)?,
+            slot: RefCell::new(plan.new_slot(charges).map_err(super::tensor_error)?),
+            exports: plan.output_arena(charges).map_err(super::tensor_error)?,
             timing,
         })
     }
@@ -495,6 +505,7 @@ impl Work for GraphPoint {
     fn gauge(&self) -> Result<Box<dyn Gauge<CallError>>, CallError> {
         Ok(Box::new(Self::new(
             &self.plan,
+            &self.charges,
             self.bindings.clone(),
             GraphTiming::Device,
         )?))

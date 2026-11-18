@@ -35,14 +35,13 @@
 //! and a worker exits only once every request issued is answered, so none
 //! is left with units no worker runs. A stuck host is caught by the
 //! exchange's watchdog (`exchange::Watchdog`), which reports the site's
-//! state ([`Compute::report`]). A panic in a unit or piece ends serving
-//! ([`Compute::panicked`]).
+//! state ([`Compute::report`]). A panic in a unit or piece ends the
+//! process (`seismic::threads`).
 
 use super::site::{WorkerTurn, Site, SiteLayer};
 use super::source::Records;
 use seismic_io::Want;
 use std::collections::VecDeque;
-use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -315,7 +314,6 @@ struct Inner {
     rest: Mutex<()>,
     wake: Condvar,
     stop: AtomicBool,
-    panicked: Mutex<Option<String>>,
 }
 
 /// The executor: its workers, which serve until it drops.
@@ -360,7 +358,6 @@ impl HostCompute {
             rest: Mutex::new(()),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
-            panicked: Mutex::new(None),
         });
         let mut compute = Self { inner, workers: Vec::with_capacity(count), placed: None };
         // Each worker's placement, before it serves: a failed one fails the
@@ -368,7 +365,7 @@ impl HostCompute {
         let (placed, placements) = std::sync::mpsc::channel();
         for (worker, cpu) in threads.nodes.iter().flatten().copied().enumerate() {
             let (shared, placed) = (compute.inner.clone(), placed.clone());
-            let spawned = std::thread::Builder::new().name(format!("expert-compute-{cpu}")).spawn(move || {
+            let spawned = seismic::threads::spawn(format!("expert-compute-{cpu}"), move || {
                 seismic_io::waited_on();
                 let placement = seismic::pin(&[cpu]);
                 let serves = placement.is_ok();
@@ -430,17 +427,11 @@ impl Drop for HostCompute {
             self.inner.stop.store(true, Ordering::Release);
             self.inner.wake.notify_all();
         }
-        // Every worker is joined before a worker's panic is raised again.
-        let panicked = self
-            .workers
-            .drain(..)
-            .filter_map(|worker| worker.join().err())
-            .reduce(|first, _| first);
+        for worker in self.workers.drain(..) {
+            worker.join().expect("a compute worker's panic ends the process");
+        }
         self.inner.jobs.lock().expect("compute jobs").clear();
         self.inner.queued.store(0, Ordering::Release);
-        if let Some(panic) = panicked.filter(|_| !std::thread::panicking()) {
-            std::panic::resume_unwind(panic);
-        }
         // The placement drops after this, the workers joined: the process's
         // threads go back on every CPU.
     }
@@ -471,7 +462,7 @@ impl Compute {
     /// wake stands before its first piece.
     pub(in crate::experts) fn run(&self, job: Arc<dyn Job>) {
         if let Some(running) = self.enqueue(job) {
-            while guarded(&self.inner, || own_piece(&self.inner, &running)) && running.next.load(Ordering::Acquire) < running.pieces {}
+            while own_piece(&self.inner, &running) && running.next.load(Ordering::Acquire) < running.pieces {}
         }
     }
 
@@ -492,11 +483,6 @@ impl Compute {
         self.inner.queued.fetch_add(1, Ordering::AcqRel);
         self.inner.wake.notify_all();
         Some(running)
-    }
-
-    /// Why a worker's unit or piece panicked, where one did: serving ends.
-    pub(crate) fn panicked(&self) -> Option<String> {
-        self.inner.panicked.lock().expect("compute panic").clone()
     }
 
     /// Each group's tier records `views` address from now (a shrink's,
@@ -548,15 +534,14 @@ impl Compute {
     }
 
     /// The site's state as the exchange's watchdog reports it: each request
-    /// issued and not yet answered with its stages' progress, the flights,
-    /// the jobs queued and a panic, where one was recorded.
+    /// issued and not yet answered with its stages' progress, the flights
+    /// and the jobs queued.
     pub(in crate::experts) fn report(&self) -> String {
         format!(
-            "issued (site layer, step, each stage's units done of its units) {:?}; flights {}; jobs queued {}; panicked: {:?}",
+            "issued (site layer, step, each stage's units done of its units) {:?}; flights {}; jobs queued {}",
             self.inner.site.progress(),
             self.inner.flights.load(Ordering::Acquire),
             self.inner.queued.load(Ordering::Acquire),
-            self.inner.panicked.lock().expect("compute panic"),
         )
     }
 
@@ -599,7 +584,7 @@ fn work(inner: &Inner, worker: usize) {
             WorkerTurn::Idle | WorkerTurn::Waiting => {}
         }
         let flying = inner.flights.load(Ordering::Acquire) > 0;
-        if flying && inner.site.notice(worker) && guarded(inner, || inner.site.take()) {
+        if flying && inner.site.notice(worker) && inner.site.take() {
             continue;
         }
         if served == WorkerTurn::Waiting {
@@ -609,7 +594,7 @@ fn work(inner: &Inner, worker: usize) {
         if inner.queued.load(Ordering::Acquire) > 0 {
             inner.site.release(worker);
         }
-        if guarded(inner, || piece(inner)) {
+        if piece(inner) {
             continue;
         }
         if flying {
@@ -625,19 +610,6 @@ fn work(inner: &Inner, worker: usize) {
                 && !inner.site.busy()
         };
         drop(inner.wake.wait_while(rest, idle).expect("compute rest"));
-    }
-}
-
-/// Run `serve`, recording a panic of it (serving ends) instead of ending
-/// the worker. Whether it served anything.
-fn guarded(inner: &Inner, serve: impl FnOnce() -> bool) -> bool {
-    match std::panic::catch_unwind(AssertUnwindSafe(serve)) {
-        Ok(served) => served,
-        Err(payload) => {
-            let message = super::watcher::panic_message(payload.as_ref());
-            inner.panicked.lock().expect("compute panic").get_or_insert(format!("expert compute panicked: {message}"));
-            true
-        }
     }
 }
 

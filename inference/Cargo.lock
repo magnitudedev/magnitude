@@ -1234,16 +1234,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2303,6 +2293,7 @@ dependencies = [
  "magnitude-serving",
  "magnitude-state",
  "seismic",
+ "seismic-threads",
  "serde_json",
  "tokio",
 ]
@@ -2553,6 +2544,7 @@ dependencies = [
  "magnitude-service-server",
  "magnitude-source-identity",
  "seismic",
+ "seismic-io",
  "sha2 0.10.9",
 ]
 
@@ -2578,6 +2570,7 @@ dependencies = [
  "magnitude-family-contracts",
  "magnitude-generation",
  "magnitude-state",
+ "seismic-threads",
  "serde",
  "serde_json",
  "tracing",
@@ -2616,6 +2609,8 @@ dependencies = [
  "magnitude-executor",
  "magnitude-service-contracts",
  "magnitude-service-models",
+ "seismic-io",
+ "seismic-threads",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
@@ -2642,7 +2637,6 @@ dependencies = [
  "bytes",
  "clap",
  "flate2",
- "fs2",
  "futures-util",
  "getrandom 0.4.3",
  "hf-hub",
@@ -2654,7 +2648,9 @@ dependencies = [
  "notify",
  "reqwest",
  "same-file",
+ "seismic-io",
  "seismic-lang",
+ "seismic-threads",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2694,6 +2690,7 @@ dependencies = [
  "opentelemetry_sdk 0.32.1",
  "reqwest",
  "seismic",
+ "seismic-threads",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2712,8 +2709,8 @@ dependencies = [
 name = "magnitude-service-utils"
 version = "0.1.0"
 dependencies = [
- "fs2",
  "libc",
+ "seismic-threads",
  "serde",
  "serde_json",
  "tempfile",
@@ -4189,6 +4186,7 @@ version = "0.1.0"
 dependencies = [
  "seismic-lang",
  "seismic-std",
+ "seismic-threads",
 ]
 
 [[package]]
@@ -4232,6 +4230,7 @@ dependencies = [
  "seismic-lang",
  "seismic-memory",
  "seismic-native-target",
+ "seismic-threads",
  "seismic-topology",
  "sha2 0.11.0",
  "windows-sys 0.61.2",
@@ -4301,7 +4300,10 @@ name = "seismic-io"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "same-file",
+ "seismic-threads",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -4322,6 +4324,7 @@ dependencies = [
  "num-traits",
  "postcard",
  "seismic-cpu-tiers",
+ "seismic-threads",
  "serde",
  "sha2 0.11.0",
 ]
@@ -4330,6 +4333,7 @@ dependencies = [
 name = "seismic-measure"
 version = "0.1.0"
 dependencies = [
+ "seismic-io",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4421,6 +4425,7 @@ dependencies = [
  "seismic-cpu",
  "seismic-cuda",
  "seismic-discovery",
+ "seismic-io",
  "seismic-ir",
  "seismic-lang",
  "seismic-measure",
@@ -4449,6 +4454,9 @@ dependencies = [
 [[package]]
 name = "seismic-threads"
 version = "0.1.0"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "seismic-topology"

@@ -355,16 +355,12 @@ struct RedactingHttpClient(reqwest::blocking::Client);
 impl RedactingHttpClient {
     fn new() -> Self {
         // The blocking client can't be built on a runtime thread.
-        Self(
-            std::thread::spawn(|| {
-                reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(10))
-                    .build()
-                    .unwrap_or_else(|_| reqwest::blocking::Client::new())
-            })
-            .join()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new()),
-        )
+        Self(seismic::threads::run("telemetry-client", || {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        }))
     }
 }
 

@@ -3,7 +3,7 @@
 //! first work. Test-only: what tests of real steps, and an owner over a
 //! real domain, run on.
 // Most of it is the executor's own tests'; the `fixtures` feature serves
-// only [`drafted`] and [`plain`] above.
+// only [`drafted`], [`plain`] and [`chaining`] above.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::planning::fixtures::{qwen4exp_fixture_definition, stored_table_manifest};
@@ -38,12 +38,17 @@ pub fn drafted(test: &str) -> (std::path::PathBuf, Rc<ModelDefinition>, Executor
 /// directory its GGUF was written to, the definition, the domain and its
 /// bindings, as [`drafted`] gives them.
 pub fn plain(test: &str, context: u64) -> (std::path::PathBuf, Rc<ModelDefinition>, ExecutorDomain, crate::StateBindings) {
+    chaining(test, context, 1)
+}
+
+/// [`plain`], its prompt groups chaining up to `chain_capacity` chunks.
+pub fn chaining(test: &str, context: u64, chain_capacity: usize) -> (std::path::PathBuf, Rc<ModelDefinition>, ExecutorDomain, crate::StateBindings) {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mut definition = crate::planning::fixtures::fixture_definition();
     definition.decoder.context_limit = context;
     let (directory, definition, package) = fixture_with(test, definition, crate::planning::fixtures::fixture_manifest);
     let (domain, bindings, _, _) =
-        load_read(&catalog, &definition, &package, seismic::BackendName::Cpu, limits(4, false, 1, 0), Banked::Resident, PlannedMethod::Plain, KvCodec::Dense, Machine::Still);
+        load_read(&catalog, &definition, &package, seismic::BackendName::Cpu, limits(4, false, chain_capacity, 0), Banked::Resident, PlannedMethod::Plain, KvCodec::Dense, Machine::Still);
     (directory, definition, domain, bindings)
 }
 
@@ -404,9 +409,11 @@ pub(crate) fn load_read(
         capacity,
     )
     .unwrap();
+    // What the load allocates outside its claims: each store's own entry.
+    let charges = seismic::Charges::tally(&device);
     let mut programs = AttestedPrograms::prepare_draft(
         &draft,
-        &device,
+        &charges,
         crate::TuningContext {
             definition,
             weights: &crate::ZeroTuningWeights,
@@ -490,10 +497,10 @@ pub(crate) fn load_read(
         &mut recorded,
         crate::memory::ledger::CommittedKind::Arena,
         scratch,
-        || {
+        |charges| {
             ResourceAllocator::allocate(
                 &execution,
-                &device,
+                charges,
                 identity.clone(),
                 programs.target_graphs().unwrap(),
                 programs.target_readout_graphs().unwrap(),
@@ -513,10 +520,10 @@ pub(crate) fn load_read(
         None => load.target_weight_demand(),
     }
     .unwrap();
-    let mut weights = ledgers.claim(&device, crate::memory::ledger::CommittedKind::Load, demand).unwrap();
+    let mut weights = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, demand)).unwrap();
     // As the engine's load claims them: its host tables' row caches.
     let host_tables = crate::memory::ClaimDemand { host: load.host_table_bytes().unwrap(), ..Default::default() };
-    let host_tables = ledgers.claim(&device, crate::memory::ledger::CommittedKind::Load, host_tables).unwrap();
+    let host_tables = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, host_tables)).unwrap();
     // As the engine's load opens them: the state's pool, and the bank's
     // records pool where it has a bank.
     let pools = crate::LoadPools::open(&device, &ledgers, &execution).unwrap();
@@ -531,7 +538,7 @@ pub(crate) fn load_read(
     )
     .unwrap();
     let target = weights
-        .allocate(|| residency.load_target(definition, package, &host_tables, Box::new(|_, _| ())))
+        .allocate(&device, |charges| residency.load_target(charges, definition, package, &host_tables, Box::new(|_, _| ())))
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     recorded.record(weights);
     recorded.record(host_tables);
@@ -545,14 +552,18 @@ pub(crate) fn load_read(
         false => None,
     };
     let plan = execution.resources().clone();
-    let target_state = plan.allocate_target_state(device.clone(), pools.state.clone()).unwrap();
-    let head_state = plan.head_state().map(|state| state.allocate(device.clone(), pools.state.clone()).unwrap());
+    let target_state = plan.allocate_target_state(&charges, pools.state.clone()).unwrap();
+    let head_state = plan.head_state().map(|state| state.allocate(&charges, pools.state.clone()).unwrap());
     // The constants its domain binds, as the engine's load claims them.
     let constants = crate::memory::ClaimDemand {
         device: programs.target_graphs().unwrap().binding_constant_bytes().unwrap(),
         ..Default::default()
     };
-    let constants = resources.ledgers().claim(&device, crate::memory::ledger::CommittedKind::Load, constants).unwrap();
+    let constants = resources
+        .ledgers()
+        .changes()
+        .change(|keeping| resources.ledgers().claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, constants))
+        .unwrap();
     let request_slot = crate::domain::fixtures::request_slot(resources.ledgers(), &device, &execution, 0);
     let reader = crate::DeviceReader::open(reading.clone(), release, device).unwrap();
     let (mut domain, mut bindings) = ExecutorDomain::new(

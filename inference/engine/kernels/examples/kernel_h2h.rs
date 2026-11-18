@@ -210,7 +210,7 @@ fn arguments() -> std::collections::HashMap<String, String> {
 }
 
 fn f32_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
-    Tensor::from_host(device, Element::f32(), shape, &values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
+    Tensor::from_host(&seismic::Charges::tally(device), Element::f32(), shape, &values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
         .expect("an F32 tensor")
 }
 
@@ -220,6 +220,10 @@ fn quantiles(mut ms: Vec<f64>) -> [f64; 3] {
 }
 
 fn main() {
+    seismic::threads::main("kernel-h2h", start)
+}
+
+fn start() {
     let options = arguments();
     let selected = |name: &str, all: Vec<String>| match options.get(name) {
         Some(list) => list.split(',').map(str::to_owned).collect::<Vec<_>>(),
@@ -246,6 +250,7 @@ fn main() {
     let pool = seismic_cpu::open_host(threads, host).expect("the host pool");
     assert_eq!(pool.executor.workers(), threads.get(), "the pool has the asked participants");
     let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).expect("the CPU device");
+    let charges = seismic::Charges::tally(&device);
     let rotation: usize = option("rotation-bytes").parse().expect("--rotation-bytes is a byte count");
     let data = std::path::PathBuf::from(option("data"));
     // `--search`: `full` (the default) searches every ROWS x INT8; `forms`
@@ -269,7 +274,7 @@ fn main() {
             let element = source(encoding).converted(device.backend().resident_layout(), OperandRecipe::Rounded).expect("a CPU layout");
             let packed = element.repack_host(source(encoding), &[n as u64, k as u64], &gguf).expect("repack");
             let copies = rotation.div_ceil(gguf.len()).max(1);
-            let weights = (0..copies).map(|_| Tensor::from_host(&device, element, &[n as u64, k as u64], &packed).unwrap()).collect::<Vec<_>>();
+            let weights = (0..copies).map(|_| Tensor::from_host(&charges, element, &[n as u64, k as u64], &packed).unwrap()).collect::<Vec<_>>();
             let check = Check::new(element, encoding, &gguf, &x, n, k);
             let elements = || project_rows::Elements { A: Element::f32(), W: element, Y: Element::f32() };
             let offered = seismic::generated::native_offered::<project_rows::Entry>(&device, project_rows::native_entry_with(elements()).elements())
@@ -297,7 +302,7 @@ fn main() {
                 let args = |weight| project_rows::Args { source: &activations, weight, weight_scale: &empty, weight_bound: &empty };
                 let points = configurations
                     .iter()
-                    .map(|(config, kernel)| (*config, kernel.point(weights[..calls].iter().map(args).collect()).expect("a placed rotation")))
+                    .map(|(config, kernel)| (*config, kernel.point(&charges, weights[..calls].iter().map(args).collect()).expect("a placed rotation")))
                     .collect::<std::collections::BTreeMap<_, _>>();
                 let pass = |config| {
                     let pending = Work::submit(&points[&config], 1).expect("a pass");
@@ -318,7 +323,7 @@ fn main() {
                         taken.push(pass(config));
                     }
                     let [median, p10, p90] = quantiles(taken.clone());
-                    let y = configurations[&config].call(args(&weights[0])).expect("a checked call").value.read_to_host().unwrap();
+                    let y = configurations[&config].call(&charges, args(&weights[0])).expect("a checked call").value.read_to_host().unwrap();
                     let y = y.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
                     let (rel_err, within) = check.judge(&y, n);
                     println!(

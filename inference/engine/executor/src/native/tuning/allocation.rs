@@ -1677,8 +1677,8 @@ pub(crate) struct Threads<U: Unit> {
     needs: fn(&U::Forming) -> usize,
     /// The threads of each compile in flight, by its unit.
     taken: Vec<(usize, usize)>,
-    sender: std::sync::mpsc::Sender<(usize, std::thread::Result<U::Formed>, Duration)>,
-    receiver: std::sync::mpsc::Receiver<(usize, std::thread::Result<U::Formed>, Duration)>,
+    sender: std::sync::mpsc::Sender<(usize, Result<U::Formed, seismic::threads::Panic>, Duration)>,
+    receiver: std::sync::mpsc::Receiver<(usize, Result<U::Formed, seismic::threads::Panic>, Duration)>,
     /// The burst of compiles in flight, from the first started with none
     /// running to the last to end.
     burst: Option<Burst>,
@@ -1736,7 +1736,7 @@ impl<U: Unit> Threads<U> {
     /// panics the load here, where its end is read.
     fn joined(
         &mut self,
-        (unit, formed, took): (usize, std::thread::Result<U::Formed>, Duration),
+        (unit, formed, took): (usize, Result<U::Formed, seismic::threads::Panic>, Duration),
     ) -> (usize, U::Formed, Duration) {
         self.taken.retain(|(compiling, _)| *compiling != unit);
         // Each compile's end reads the host's room: the burst's least is
@@ -1764,7 +1764,7 @@ impl<U: Unit> Threads<U> {
         }
         match formed {
             Ok(formed) => (unit, formed, took),
-            Err(panic) => std::panic::resume_unwind(panic),
+            Err(panic) => panic.resume(),
         }
     }
 }
@@ -1803,13 +1803,23 @@ where
                 .max(self.taken.iter().map(|(_, threads)| threads).sum());
         }
         let (run, sender) = (self.run, self.sender.clone());
-        self.workers.spawn(move || {
-            let began = std::time::Instant::now();
-            let formed =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || run(forming)));
+        // A compile's panic ends as one on the allocator would: the
+        // allocator resumes it ([`Self::joined`]), so no time is read of it.
+        self.workers.spawn(
+            move || {
+                let began = std::time::Instant::now();
+                let formed = run(forming);
+                (formed, began.elapsed())
+            },
             // The allocator reads every compile it started before it ends.
-            let _ = sender.send((unit, formed, began.elapsed()));
-        });
+            move |ended| {
+                let (formed, took) = match ended {
+                    Ok((formed, took)) => (Ok(formed), took),
+                    Err(panic) => (Err(panic), Duration::ZERO),
+                };
+                let _ = sender.send((unit, formed, took));
+            },
+        );
     }
 
     fn ended(&mut self) -> Vec<(usize, U::Formed, Duration)> {

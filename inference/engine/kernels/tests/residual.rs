@@ -85,6 +85,7 @@ fn element(dtype: DType) -> seismic::Element {
 }
 
 fn tensor(device: &seismic::Device, dtype: DType, shape: &[u64], values: &[f32]) -> seismic::Tensor {
+    let charges = seismic::Charges::tally(device);
     let bytes = match dtype {
         DType::F32 => values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
         DType::BF16 => values
@@ -93,12 +94,13 @@ fn tensor(device: &seismic::Device, dtype: DType, shape: &[u64], values: &[f32])
             .collect(),
         other => panic!("unsupported element {other:?}"),
     };
-    seismic::Tensor::from_host(device, element(dtype), shape, &bytes).unwrap()
+    seismic::Tensor::from_host(&charges, element(dtype), shape, &bytes).unwrap()
 }
 
 fn i32_tensor(device: &seismic::Device, shape: &[u64], values: &[i32]) -> seismic::Tensor {
+    let charges = seismic::Charges::tally(device);
     let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-    seismic::Tensor::from_host(device, seismic::Element::i32(), shape, &bytes).unwrap()
+    seismic::Tensor::from_host(&charges, seismic::Element::i32(), shape, &bytes).unwrap()
 }
 
 fn read_f32(tensor: &seismic::Tensor) -> Vec<f32> {
@@ -165,6 +167,7 @@ const WIDTHS: [usize; 4] = [1536, 2816, 5376, 6656];
 fn native_post_norm_residual_matches_portable_body() {
     let module = crate::common::kernels();
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for (width, (rows, outputs), norm_dtype) in [
             (WIDTHS[0], (1, 1), DType::F32),
             (WIDTHS[1], (9, 5), DType::BF16),
@@ -198,7 +201,7 @@ fn native_post_norm_residual_matches_portable_body() {
                 )
                 .unwrap();
                 let outcome = kernel
-                    .call(post_norm_residual::Args {
+                    .call(&charges, post_norm_residual::Args {
                         residual: &tensor(&device, DType::F32, &[rows as u64, width as u64], &residual),
                         projected: &tensor(&device, DType::F32, &[outputs as u64, width as u64], &projected),
                         norm: &tensor(&device, norm_dtype, &[width as u64], &norm),
@@ -231,6 +234,7 @@ fn native_post_norm_residual_matches_portable_body() {
 fn native_moe_tail_matches_portable_body() {
     let module = crate::common::kernels();
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         // Gemma 4 26B-A4B (D 2816), and a wider row.
         for (width, rows) in [(2816usize, 1usize), (2816, 9), (2816, 40), (5376, 3)] {
             let residual = pattern(rows * width, 11, 30.0);
@@ -262,7 +266,7 @@ fn native_moe_tail_matches_portable_body() {
                 &seismic::NativeSpecialization::new(),
             )
             .unwrap()
-            .call(moe_tail::Args {
+            .call(&charges, moe_tail::Args {
                 residual: &tensor(&device, DType::F32, &shape, &residual),
                 dense: &tensor(&device, DType::F32, &shape, &dense),
                 routed: &tensor(&device, DType::F32, &shape, &routed),
@@ -307,6 +311,7 @@ fn native_moe_tail_matches_portable_body() {
 fn native_per_layer_inputs_match_portable_body() {
     let module = crate::common::kernels();
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         // Gemma 4 E2B (35 layers) and E4B (42 layers), P = 256; the table rows
         // as F32 and as BF16.
         for (layers, rows, table) in [(35usize, 1usize, DType::F32), (35, 5, DType::BF16), (42, 17, DType::F32)] {
@@ -338,7 +343,7 @@ fn native_per_layer_inputs_match_portable_body() {
                 &statics_on(&device, &[("L", layers as u64), ("P", chunk as u64)]),
             )
             .unwrap()
-            .call(per_layer_inputs::Args {
+            .call(&charges, per_layer_inputs::Args {
                 gathered: &tensor(&device, table, &shape, &gathered),
                 projected: &tensor(&device, DType::F32, &shape, &projected),
                 norm: &tensor(&device, DType::F32, &[chunk as u64], &norm),

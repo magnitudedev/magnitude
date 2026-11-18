@@ -2257,7 +2257,7 @@ impl ModelLoadPlan {
 
         let vision = selection
             .vision
-            .then_some(definition.vision.as_ref())
+            .then_some(definition.vision.as_deref())
             .flatten()
             .map(|vision| {
                 let (projector_identity, projector_tensors) =
@@ -4663,7 +4663,7 @@ mod scale_grid_tests {
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
         // SAFETY: nothing reads the tensor.
-        let upload = unsafe { crate::resources::import_upload(&planned, &device) }.unwrap();
+        let upload = unsafe { crate::resources::import_upload(&planned, &seismic::Charges::tally(&device)) }.unwrap();
         assert_eq!((upload.extents(), upload.byte_len()), (&planned.shape[..], canonical));
     }
 

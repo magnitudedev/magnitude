@@ -64,7 +64,7 @@ fn packed_reads(backend: registry::BackendName) {
             &module,
             entry_id,
             bindings,
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -75,12 +75,12 @@ fn packed_reads(backend: registry::BackendName) {
         )
         .unwrap();
         let input = Arc::new(
-            TensorInner::from_host(&device, representation, &[u64::from(layout.group)], &bytes)
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), representation, &[u64::from(layout.group)], &bytes)
                 .unwrap(),
         );
         let mut args = EncodedArgs::new();
         args.push_tensor(input.clone());
-        let mut actual = crate::api::kernel::call(&Arc::new(prepared), args).unwrap();
+        let mut actual = crate::api::kernel::call(&Arc::new(prepared), &crate::memory::Charges::tally(&device), args).unwrap();
         assert_eq!(
             actual.take_tensor().read_to_host().unwrap(),
             expected,

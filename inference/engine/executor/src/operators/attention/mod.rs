@@ -2238,7 +2238,7 @@ pub(crate) mod tests {
             .unwrap();
             let programs = crate::AttestedPrograms::prepare_draft(
                 &draft,
-                &device,
+                &seismic::Charges::tally(&device),
                 crate::TuningContext {
                     definition: &definition,
                     weights: &crate::ZeroTuningWeights,
@@ -2317,7 +2317,7 @@ pub(crate) mod tests {
             .unwrap();
             let programs = crate::AttestedPrograms::prepare_draft(
                 &draft,
-                &device,
+                &seismic::Charges::tally(&device),
                 crate::TuningContext {
                     definition: &definition,
                     weights: &crate::ZeroTuningWeights,

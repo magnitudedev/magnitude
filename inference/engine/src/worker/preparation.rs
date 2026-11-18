@@ -125,7 +125,7 @@ where
         return Ok((serve_defaults(&mut load)?, Preparation::Unneeded));
     }
     if let LoadAttempt::Loaded(loaded) = load(UnpreparedUnits::Report)? {
-        return Ok((loaded, Preparation::Unneeded));
+        return Ok((*loaded, Preparation::Unneeded));
     }
     let preparation = prepare(manifest, start_prepare, prepare_progress)?;
     Ok((serve_defaults(&mut load)?, preparation))
@@ -182,7 +182,7 @@ fn serve_defaults<L>(
     load: &mut impl FnMut(UnpreparedUnits) -> Result<LoadAttempt<L>, LoadError>,
 ) -> Result<L, LoadError> {
     match load(UnpreparedUnits::ServeDefaults)? {
-        LoadAttempt::Loaded(loaded) => Ok(loaded),
+        LoadAttempt::Loaded(loaded) => Ok(*loaded),
         LoadAttempt::Unprepared => Err(LoadError::Internal {
             reason: "a load serving canonical defaults stopped unprepared".into(),
         }),
@@ -346,15 +346,15 @@ mod tests {
                 }
                 (UnpreparedUnits::Report, false) => {
                     events.borrow_mut().push("load (reporting) loaded");
-                    LoadAttempt::Loaded("stored records")
+                    LoadAttempt::Loaded(Box::new("stored records"))
                 }
                 (UnpreparedUnits::ServeDefaults, true) => {
                     events.borrow_mut().push("load (defaults) loaded");
-                    LoadAttempt::Loaded("canonical defaults")
+                    LoadAttempt::Loaded(Box::new("canonical defaults"))
                 }
                 (UnpreparedUnits::ServeDefaults, false) => {
                     events.borrow_mut().push("load (defaults) loaded");
-                    LoadAttempt::Loaded("stored records")
+                    LoadAttempt::Loaded(Box::new("stored records"))
                 }
             })
         }
