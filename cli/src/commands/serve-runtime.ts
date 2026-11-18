@@ -7,7 +7,7 @@ import { Deferred, Effect, Option, Ref, Runtime, Schema } from "effect"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, holdContainerData, makeUnixProcessContinuation, nativeHostLayer, resolveApplicationProfile,
-  isLegacyServerMarked, resolveInstalledApplicationRuntime, runHeadlessApplication, servicePortBound, servicePortLingering, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
+  isLegacyServerMarked, NativeHost, resolveInstalledApplicationRuntime, runHeadlessApplication, servicePortBound, servicePortLingering, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { containerImage } from "@magnitudedev/daemon-management/application-update"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { CLI_VERSION } from "../version"
@@ -30,7 +30,8 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const runtime: ApplicationRuntime = isDevelopmentBuild()
     ? { _tag: "Development", repository: resolve(dirname(fileURLToPath(import.meta.url)), "../../..") }
     : yield* resolveInstalledApplicationRuntime(process.execPath, process.platform)
-  const owner = yield* resolveServeOwner
+  const owner = yield* resolveServeOwner(NativeHost.pipe(Effect.flatMap(native => native.isServiceSession),
+    Effect.provide(bundledWindowsNative.host), Effect.orElseSucceed(() => false)))
   // A server set up before the CLI-only install is converted by its service's next start; until then nothing serves.
   if (yield* isLegacyServerMarked(process.platform)) return yield* new ServeRefused({ message: "This machine's Magnitude server is being converted into a CLI-only install. "
     + "Its service converts it when it next starts: `sudo systemctl restart magnitude`." })
