@@ -11,7 +11,7 @@ import { renderUnixInstallationScript } from "./installation-scripts"
 
 const which = (tool: string) => spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
 const python = which("python3"), setsid = which("setsid")
-const tools = ["awk", "date", "cat", "chmod", "cp", "cut", "getconf", "id", "kill", "ln", "mkdir", "mktemp", "mv", "openssl", "python3", "readlink", "rm", "sha256sum", "sh", "sleep", "tr", "uname", "wc"]
+const tools = ["awk", "date", "cat", "chmod", "cp", "cut", "getconf", "grep", "id", "kill", "ln", "mkdir", "mktemp", "mv", "openssl", "python3", "readlink", "rm", "sed", "sha256sum", "sh", "sleep", "tr", "uname", "wc"]
 // Runs the installer in a new session whose controlling terminal is a pty, with the script on stdin as `curl | sh` does.
 const driver = `
 import json, os, pty, select, sys

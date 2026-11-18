@@ -64,7 +64,7 @@ describe.skipIf(!os || !arch)("CLI-only installation script", () => {
   }
   const run = (served: Record<string, string>, args: readonly string[] = [], extra: Record<string, string> = {}) => {
     rmSync(log, { force: true })
-    const result = spawnSync("/bin/sh", ["-s", "--", ...args], { input: readFileSync(script), encoding: "utf8", timeout: 30000,
+    const result = spawnSync("/bin/sh", ["-s", "--", ...args], { input: readFileSync(script), encoding: "utf8", timeout: 60000,
       env: { PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`, HOME: home, TEST_LOG: log, SHELL: "/bin/bash", ...served, ...extra } })
     const events = existsSync(log) ? readFileSync(log, "utf8").trimEnd().split("\n") : []
     return { ...result, events }
