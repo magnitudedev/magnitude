@@ -290,8 +290,8 @@ sha256_of() {
 verify_download() {
   start_progress 'Verifying download checksum'
   actual_bytes=$(wc -c < "$1" | tr -d ' ')
-  [ "$actual_bytes" = "$bytes" ] || fail 'The application download is incomplete.'
-  [ "$(sha256_of "$1")" = "$digest" ] || fail 'The application checksum does not match.'
+  [ "$actual_bytes" = "$bytes" ] || fail 'The download is incomplete.'
+  [ "$(sha256_of "$1")" = "$digest" ] || fail 'The download checksum does not match.'
   finish_progress 'Verified download checksum'
 }
 # Replaces a symlink in one rename. Plain `mv` would move the new link into the directory an old link names.
@@ -339,7 +339,7 @@ check_cli_signatures() {
 # Installs into ~/.magnitude/cli/<version>, with `current` naming the version and ~/.magnitude/bin/magnitude
 # linking through it. Everything is in the account's own folders: no sudo and no package manager.
 install_cli() {
-  printf '%s\n' 'Installing the Magnitude CLI only (for servers and headless use). For the desktop app, press Ctrl-C and rerun with --desktop.' >&2
+  printf 'Installing the Magnitude CLI only (for servers and headless use). For the desktop app, press Ctrl-C and run: curl -fsSL %s/install.sh | sh -s -- --desktop\n' "$origin" >&2
   printf '\nInstalling the Magnitude CLI\n%s · %s\n\n' "$2" "$arch" >&2
   [ -n "${HOME:-}" ] && [ -d "$HOME" ] || fail 'HOME is not set to an existing directory.'
   if desktop_installed "$1"; then

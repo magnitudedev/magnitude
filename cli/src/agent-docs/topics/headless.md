@@ -306,7 +306,7 @@ app is first opened; then `~/.magnitude/bin/magnitude` points at `/usr/bin/magni
    macOS and Linux:
 
    ```sh
-   rm -rf ~/.magnitude/cli ~/.magnitude/bin/magnitude
+   rm -rf ~/.magnitude/cli ~/.magnitude/bin/magnitude && rmdir ~/.magnitude/bin 2>/dev/null
    for f in ~/.zprofile ~/.zshrc ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc ~/.config/fish/config.fish; do
      [ -f "$f" ] && sed -i.bak '/# >>> Magnitude CLI PATH >>>/,/# <<< Magnitude CLI PATH <<</d' "$f"
    done
