@@ -68,11 +68,10 @@
           "installation/macos",
           "installation/windows",
           "installation/linux",
+          "installation/cli-only",
           "installation/docker",
-          "remote-server",
           "hardware",
-          "models",
-          "settings"
+          "models"
         ]
       },
       {
@@ -111,6 +110,14 @@
     ]
   },
   "redirects": [
+    {
+      "source": "/settings",
+      "destination": "/introduction"
+    },
+    {
+      "source": "/remote-server",
+      "destination": "/installation/cli-only"
+    },
     {
       "source": "/api/other-apps",
       "destination": "/integrations/other-agents"

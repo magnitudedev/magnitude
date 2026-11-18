@@ -37,12 +37,12 @@ For a machine that serves other computers or apps without the desktop app:
 irm https://magnitude.dev/install.ps1 | iex
 ```
 
-This installs only the CLI, into `%USERPROFILE%\.magnitude\cli`, with the `magnitude` command in `%LOCALAPPDATA%\Programs\Magnitude CLI`. It needs no administrator rights and updates itself while `magnitude serve` runs. Run `magnitude serve` to serve; to keep it running in the background, see [Remote server](/remote-server). Installing the desktop app later replaces the CLI-only install.
+This installs only the CLI, into `%USERPROFILE%\.magnitude\cli`, with the `magnitude` command in `%LOCALAPPDATA%\Programs\Magnitude CLI`. It needs no administrator rights and updates itself while `magnitude serve` runs. Run `magnitude serve` to serve; to keep it running in the background, see [CLI only](/installation/cli-only#keep-it-running-in-the-background). Installing the desktop app later replaces the CLI-only install.
 
 ## Updates and removal
 
-Use **Settings → Application updates** to check for updates. **Restart to update** stops local inference while the application is replaced.
+Use **Settings → About** to check for updates. **Restart to update** stops local inference while the application is replaced.
 
-Uninstall Magnitude through Windows **Settings → Apps**. To remove a CLI-only install, see [Remote server](/remote-server#remove-the-cli-only-install). Downloaded models and settings are stored separately in `%USERPROFILE%\.magnitude`; keep them if you intend to reinstall.
+Uninstall Magnitude through Windows **Settings → Apps**. To remove a CLI-only install, see [CLI only](/installation/cli-only#uninstall). Downloaded models and settings are stored separately in `%USERPROFILE%\.magnitude`; keep them if you intend to reinstall.
 
 Agents installed inside WSL need a small amount of configuration; see [Windows and WSL](/api/windows-wsl).

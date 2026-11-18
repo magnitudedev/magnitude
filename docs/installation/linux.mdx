@@ -52,7 +52,7 @@ To install the desktop app from a terminal:
 curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop
 ```
 
-The script detects your architecture, selects the package for `apt`, `dnf`, or `pacman`, verifies the download, and installs it with its dependencies. It requires `curl`, Python 3, `openssl`, and `timeout`, and asks for administrator authorization when needed. Open **Magnitude** from your applications menu and follow [Quick start](/get-started).
+The script detects your architecture, selects the package for `apt`, `dnf`, or `pacman`, verifies the download, and installs it with its dependencies. It requires `curl` and `openssl`, and asks for administrator authorization when needed. Open **Magnitude** from your applications menu and follow [Quick start](/get-started).
 
 ## Install the CLI only
 
@@ -62,10 +62,10 @@ For a server, or any machine that serves without the desktop app:
 curl -fsSL https://magnitude.dev/install.sh | sh
 ```
 
-This installs only the CLI, into `~/.magnitude/cli`, with the `magnitude` command in `~/.magnitude/bin`. It needs no `sudo`, no package manager and no graphical session, and updates itself while `magnitude serve` runs. Open a new shell, then run `magnitude serve`. To keep it running in the background, see [Remote server](/remote-server).
+This installs only the CLI, into `~/.magnitude/cli`, with the `magnitude` command in `~/.magnitude/bin`. It needs no `sudo`, no package manager and no graphical session, and updates itself while `magnitude serve` runs. Open a new shell, then run `magnitude serve`. To keep it running in the background, see [CLI only](/installation/cli-only#keep-it-running-in-the-background).
 
 ## Updates and removal
 
-App updates use your system package manager. Click **Restart** to install a downloaded update; at your desktop it installs without a password, while over SSH it asks for administrator authentication. Use **Settings → Application updates** for the available actions. A CLI-only install updates itself while `magnitude serve` runs; see [Remote server](/remote-server#updates).
+App updates use your system package manager. Click **Restart to update** to install a downloaded update; at your desktop it installs without a password, while over SSH it asks for administrator authentication. Use **Settings → About** for the available actions. A CLI-only install updates itself while `magnitude serve` runs; see [CLI only](/installation/cli-only#updates).
 
-Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package. To remove a CLI-only install, see [Remote server](/remote-server#remove-the-cli-only-install).
+Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package. To remove a CLI-only install, see [CLI only](/installation/cli-only#uninstall).

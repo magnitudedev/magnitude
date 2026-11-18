@@ -14,6 +14,8 @@ For apps and agents that are not listed, see [Other agents](/integrations/other-
 3. Select a downloaded model on the connected card.
 4. Click the displayed command to copy it, then paste it into your terminal from your project folder. On Windows, use PowerShell.
 
+From a terminal, `magnitude connections connect HARNESS` connects an agent, with `--set-model MODEL_ID` to choose its model. In a browser, such as with the [CLI only](/installation/cli-only), **Connections** shows **Copy setup prompt** instead of **Connect**: paste it into your agent and it configures itself.
+
 Connecting configures the agent; it does not launch it. The copied command starts the agent with your selected model. OpenClaw uses a separate `/model` command inside its TUI; its card shows both commands. Keep Magnitude running while you use its local models.
 
 ## Connection states
@@ -24,7 +26,7 @@ Connecting configures the agent; it does not launch it. The copied command start
 | Not connected | Click Connect. |
 | Connected | Select a model, copy the command, and run it in your terminal. |
 | Connection needs repair | Click Repair connection, then reload the agent. |
-| Could not verify connection | Check the reported problem, such as an inaccessible configuration file, before trying again. |
+| Status unavailable | Check the reported problem, such as an inaccessible configuration file, before trying again. |
 
 Connected means the configuration is present and valid. It does not mean a model is currently loaded or that an inference request has succeeded.
 

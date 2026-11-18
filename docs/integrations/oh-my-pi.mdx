@@ -11,6 +11,8 @@ description: "Connect Oh My Pi to your downloaded Magnitude models."
 4. Select a downloaded model on the connected card, then click the command to copy it.
 5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
 
+From a terminal, `magnitude connections connect oh-my-pi` does the same. In a browser, such as with the [CLI only](/installation/cli-only), **Connections** shows **Copy setup prompt** instead of **Connect**: paste it into your agent.
+
 Restart Oh My Pi and choose a Magnitude model. If you use named profiles, connect the profile you actually run: check the paths shown in Connections rather than editing a different profile.
 
 ## Run Oh My Pi
@@ -25,11 +27,11 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e4b-it-qat:gguf:q4`
 
 ## Configuration
 
-**Connect** writes `~/.omp/agent/models.yml` and `~/.omp/agent/config.yml`. Location overrides: `OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_DIR`, and `PI_CODING_AGENT_DIR`.
+**Connect** writes `~/.omp/agent/models.yml`. `magnitude connections connect oh-my-pi --set-model MODEL_ID` also sets the default model in `~/.omp/agent/config.yml`. Location overrides: `OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_DIR`, and `PI_CODING_AGENT_DIR`.
 
 ### On another computer
 
-1. In Magnitude, turn on **Settings → Network access**.
+1. In Magnitude, turn on **Settings → Network → Network access**, then restart Magnitude.
 2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
 3. In **Connections**, click **Copy setup prompt** on Oh My Pi and send it to your agent.
 

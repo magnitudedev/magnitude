@@ -24,30 +24,21 @@ Magnitude is an open source inference engine that tunes its kernels on your hard
 
 ## Get started
 
-[Download Magnitude](https://magnitude.dev/download) for your computer:
+Download the installer:
 
 - **macOS:** [Apple silicon](https://magnitude.dev/api/installer?os=darwin&arch=arm64&package=dmg) · [Intel](https://magnitude.dev/api/installer?os=darwin&arch=x64&package=dmg)
 - **Windows:** [x64](https://magnitude.dev/api/installer?os=windows&arch=x64&package=windows-exe)
 - **Linux x64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm) · [.pkg.tar.zst](https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman)
 - **Linux ARM64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=rpm)
 
-The desktop app includes the `magnitude` CLI. Or install from your terminal:
-
-macOS / Linux:
+Setting up a server? Install the CLI only:
 
 ```sh
-curl -fsSL https://magnitude.dev/install.sh | sh
+curl -fsSL https://magnitude.dev/install.sh | sh     # macOS / Linux
+irm https://magnitude.dev/install.ps1 | iex          # Windows PowerShell
 ```
 
-Windows PowerShell:
-
-```powershell
-irm https://magnitude.dev/install.ps1 | iex
-```
-
-Installs the CLI only, for servers and headless use. For the desktop app, use the download links above, or run `curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop` (Windows PowerShell: `& ([scriptblock]::Create((irm https://magnitude.dev/install.ps1))) -Desktop`).
-
-To run Magnitude as a service other computers can use, see [Remote server](https://docs.magnitude.dev/remote-server). To run it in a container, see [Docker](https://docs.magnitude.dev/installation/docker).
+For more info, see [CLI only](https://docs.magnitude.dev/installation/cli-only). For Docker container installs, see [Docker](https://docs.magnitude.dev/installation/docker).
 
 ## Why Magnitude?
 

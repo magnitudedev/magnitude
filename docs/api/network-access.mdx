@@ -5,23 +5,23 @@ description: "Connect to Magnitude over your network or an SSH tunnel."
 
 By default the API is available only on the computer running Magnitude. Network access makes it available to other devices for inference, and lets you open the Magnitude app in a browser on another device.
 
-To set up a dedicated machine that serves other computers, see [Remote server](/remote-server).
+To set up a dedicated machine that serves other computers, install the [CLI only](/installation/cli-only) on it.
 
 ## Enable network access
 
-### Desktop Settings
+### In the app
 
-1. Open **Settings → Network access** and turn it on.
+1. Open **Settings → Network** and turn on **Network access**.
 2. Choose an **Address**. **All interfaces** serves every network this computer is on. Choosing one address serves only that network.
 3. Copy the **API key**. Other devices send it with every request.
-4. Copy the **Reachable at** URL.
-5. Restart Magnitude when the **Restart required** notice appears.
+4. Restart Magnitude when the **Restart to apply your changes** notice appears.
+5. Copy the **Reachable at** URL, which appears once Magnitude serves the network.
 
 The first time the service listens on a network, macOS or Windows may ask whether to allow incoming connections. Allow them.
 
 ### Configuration file
 
-Without Desktop, add a `network` object to `~/.magnitude/config.json` (`%USERPROFILE%\.magnitude\config.json` on Windows) with a long, randomly generated key, then restart Magnitude:
+Or add a `network` object to `~/.magnitude/config.json` (`%USERPROFILE%\.magnitude\config.json` on Windows) with a long, randomly generated key, then restart Magnitude:
 
 ```json
 {
@@ -47,7 +47,7 @@ Select that address in Settings or use it as `network.bind`. Use `http://ADDRESS
 
 With network access on, open `http://ADDRESS:10100` in a browser on the other device, using the same address as the base URL. Sign in with the **API key**. The app works as it does on the server: download and load models, watch usage, and change Settings. In a browser, **Connections** doesn't change any computer's agents itself: each agent has **Copy setup prompt**, which you paste into that agent, or any coding agent, on the computer you're using.
 
-- A browser stays signed in until it goes 30 days unused. **Settings → This browser → Sign out** ends it sooner.
+- A browser stays signed in until it goes 30 days unused. **Settings → About → Sign out** ends it sooner.
 - Browsers stay signed in when Magnitude restarts or updates. Changes to network settings apply when Magnitude restarts, so a regenerated key takes effect then and signs every browser out.
 - Turning network access off, regenerating the key, changing the address, or restarting from that browser asks first, because it disconnects the browser.
 - After five wrong keys, each further attempt waits longer, up to one minute.
@@ -80,7 +80,7 @@ See [Windows and WSL](/api/windows-wsl) for mirrored and NAT networking.
 
 Use the server URL as the base URL and its API key as the key. For an app that is not a supported agent, the settings are the same as in [Other agents](/integrations/other-agents) with the network address in place of `127.0.0.1`.
 
-**Connections** cannot configure a supported agent on another device, so write its configuration yourself. Each agent page shows the exact block under **Configuration**. Replace `ADDRESS` with the server address, `API_KEY` with the API key, and `MODEL_ID` with the model's exact ID; take the context window and output limit from the model's **Details**.
+To configure a supported agent on another device, use **Copy setup prompt** in **Connections** from a browser on that device, or write its configuration yourself. Each agent page shows the block under **Configuration**. Replace `ADDRESS` with the server address, `API_KEY` with the API key, and `MODEL_ID` with the model's exact ID; take the context window from `magnitude models show MODEL_ID`.
 
 - [Pi](/integrations/pi#configuration)
 - [OpenCode](/integrations/opencode#configuration)

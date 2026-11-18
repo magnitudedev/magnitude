@@ -1,13 +1,9 @@
 ---
-title: "Remote server"
-description: "Run models on a dedicated machine and use them from another computer."
+title: "CLI only"
+description: "Install Magnitude without the desktop app."
 ---
 
-Use a machine such as a Mac Studio, a DGX Spark or a Linux box with a GPU for inference while your agent runs on your laptop. The server needs to be reachable from your laptop, through your local network or a private network such as Tailscale.
-
-On the server, install the CLI only, turn on network access, and run `magnitude serve`, by hand or as a background service that starts at login or at boot.
-
-## Install on the server
+## Install
 
 <Tabs>
 <Tab title="macOS / Linux">
@@ -22,43 +18,9 @@ irm https://magnitude.dev/install.ps1 | iex
 </Tab>
 </Tabs>
 
-This installs only the CLI, without the desktop app and without a graphical session. It installs into your own home folder (`~/.magnitude/cli`, or `%USERPROFILE%\.magnitude\cli` on Windows), so it needs no `sudo` or administrator rights. The `magnitude` command is `~/.magnitude/bin/magnitude` on macOS and Linux, and `%LOCALAPPDATA%\Programs\Magnitude CLI\magnitude.exe` on Windows. Open a new terminal or SSH session to use it.
+It installs into your home folder (`~/.magnitude/cli`, or `%USERPROFILE%\.magnitude\cli` on Windows) and needs no `sudo` or administrator rights. Open a new terminal or SSH session to use `magnitude`.
 
-If the server also has the desktop app, you already have the CLI; skip this step.
-
-To run the server in a container instead, see [Docker](/installation/docker).
-
-## Turn on network access
-
-Create a long, random key:
-
-<Tabs>
-<Tab title="macOS / Linux">
-```sh
-openssl rand -hex 32
-```
-</Tab>
-<Tab title="Windows PowerShell">
-```powershell
-$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); ($b | % { $_.ToString("x2") }) -join ""
-```
-</Tab>
-</Tabs>
-
-Add a `network` object with it to `~/.magnitude/config.json` (`%USERPROFILE%\.magnitude\config.json` on Windows), creating the file if needed and keeping any other fields:
-
-```json
-{
-  "network": {
-    "enabled": true,
-    "apiKey": "YOUR_LONG_RANDOM_KEY"
-  }
-}
-```
-
-This serves every network the server is on. To serve only one, such as Tailscale, add `"bind"` with the server's address on it. See [Network access](/api/network-access) for addresses, hostnames and an SSH tunnel that needs no key, and [Configuration file](/reference/configuration-file) for every field.
-
-If the server runs a firewall, allow inbound TCP port `10100`: for example `sudo ufw allow 10100/tcp`, or `sudo firewall-cmd --permanent --add-port=10100/tcp && sudo firewall-cmd --reload`. On Windows, see [Windows](#windows).
+To run Magnitude in a container instead, see [Docker](/installation/docker).
 
 ## Serve
 
@@ -66,13 +28,23 @@ If the server runs a firewall, allow inbound TCP port `10100`: for example `sudo
 magnitude serve
 ```
 
-It serves until you press Ctrl+C. Check on it from another terminal:
+It serves until you press Ctrl+C. Check on it from another terminal with `magnitude status`.
 
-```sh
-magnitude status
+## Open the app
+
+Without the desktop app, you can still use Magnitude's app in your browser. While `serve` runs, run `magnitude app open`, or open [http://127.0.0.1:10100](http://127.0.0.1:10100) on the same machine. To open it from another computer, see [Serve other computers](#serve-other-computers).
+
+## Serve other computers
+
+Turn on network access with a key, as described in [Network access](/api/network-access#configuration-file). Then open `http://SERVER_IP:10100` in a browser on another computer and sign in with the key to use the app there, or [connect your agent](/api/network-access#configure-the-app-or-agent) with the base URL `http://SERVER_IP:10100/inference/v1` and the key.
+
+If the machine runs a firewall, allow inbound TCP port `10100`: for example `sudo ufw allow 10100/tcp`, or `sudo firewall-cmd --permanent --add-port=10100/tcp && sudo firewall-cmd --reload`. On Windows, from an administrator PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "Magnitude" -Direction Inbound -Protocol TCP -LocalPort 10100 -Action Allow -Profile Private
 ```
 
-It shows each address other devices can use, without the key.
+This allows connections on networks Windows treats as private. If the server's network is set to Public, change its profile to Private in Settings, or use `-Profile Private,Public` only if you trust that network.
 
 ## Keep it running in the background
 
@@ -229,45 +201,6 @@ Unregister-ScheduledTask -TaskName "Magnitude" -Confirm:$false
 </Tab>
 </Tabs>
 
-## Download a model
-
-On the server:
-
-```sh
-magnitude hardware
-magnitude models recommend --limit 5
-magnitude models pull "MODEL_ID"
-magnitude models show "MODEL_ID"
-```
-
-If recommendations are not ready, run `magnitude models list` to check assessment progress, then request recommendations again. Magnitude loads the model on the first inference request. To load it ahead of time, run `magnitude models load "MODEL_ID"`.
-
-Or do all of this from the browser app on your laptop.
-
-## Use the app from your laptop
-
-Open `http://SERVER_IP:10100` in a browser on your laptop and sign in with the network access key. From there you can browse recommendations, download and load models, watch usage, and change settings. See [Open the app from another device](/api/network-access#open-the-app-from-another-device).
-
-## Connect from your laptop
-
-Use these settings in your agent or app:
-
-| Setting | Value |
-| --- | --- |
-| OpenAI-compatible base URL | `http://SERVER_IP:10100/inference/v1` |
-| API key | The network access key |
-| Model | The exact model ID you downloaded |
-
-Use your agent's [configuration instructions](/api/network-access#configure-the-app-or-agent), then [check the connection](/api/network-access#check-the-connection) from your laptop.
-
-To use an agent on the server itself, connect it from your own terminal there:
-
-```sh
-magnitude connections connect pi
-```
-
-This writes the agent's configuration into your home folder, pointing at the server on `localhost`.
-
 ## Updates
 
 While `magnitude serve` runs, it checks for updates, downloads them, and installs them when no inference request is running, then restarts in place. Clients reconnect after a short pause, and a background service keeps running through the update. If a new version fails, it is held back and the current one keeps serving.
@@ -280,7 +213,7 @@ The desktop app always takes priority. While it is open, it serves, and `magnitu
 
 Installing the desktop app, from [Download](https://magnitude.dev/download) or with `--desktop` (`-Desktop` on Windows), replaces the CLI-only install. Your models and settings stay. A background service keeps working on every OS, because it runs the `magnitude` command, which becomes the app's CLI. On Linux, `~/.magnitude/bin/magnitude` points at the package's `/usr/bin/magnitude` once the app has been opened.
 
-## Remove the CLI-only install
+## Uninstall
 
 1. Stop and remove the background service, if you set one up, with the commands under [Keep it running in the background](#keep-it-running-in-the-background).
 2. Delete the CLI:
@@ -289,7 +222,7 @@ Installing the desktop app, from [Download](https://magnitude.dev/download) or w
 <Tab title="macOS / Linux">
 ```sh
 rm -rf ~/.magnitude/cli ~/.magnitude/bin/magnitude && rmdir ~/.magnitude/bin 2>/dev/null
-for f in ~/.zprofile ~/.zshrc ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc ~/.config/fish/config.fish; do
+for f in "${ZDOTDIR:-$HOME}/.zprofile" "${ZDOTDIR:-$HOME}/.zshrc" ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc "${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"; do
   [ -f "$f" ] && sed -i.bak '/# >>> Magnitude CLI PATH >>>/,/# <<< Magnitude CLI PATH <<</d' "$f"
 done
 ```
@@ -312,16 +245,6 @@ $key.Close()
 </Tabs>
 
 Your models, settings and keys stay in `~/.magnitude` (`%USERPROFILE%\.magnitude` on Windows). Delete that folder too if you don't want them.
-
-## Windows
-
-If other computers need to reach the server, allow inbound TCP port 10100 in Windows Defender Firewall from an administrator PowerShell:
-
-```powershell
-New-NetFirewallRule -DisplayName "Magnitude" -Direction Inbound -Protocol TCP -LocalPort 10100 -Action Allow -Profile Private
-```
-
-This allows connections on networks Windows treats as private. If the server's network is set to Public, change its profile to Private in Settings, or use `-Profile Private,Public` only if you trust that network.
 
 ## Servers set up by earlier versions
 
