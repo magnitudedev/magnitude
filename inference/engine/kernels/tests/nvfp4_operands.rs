@@ -47,8 +47,12 @@ fn nearest_even(values: &[f32], n: f32, d: f32) -> f32 {
     values[best]
 }
 
-/// The recipe of one row, by search.
+/// The recipe of one row, by search. The row is its global scale's group: a
+/// NaN or ±Inf in it makes that scale NaN, so every operand of the row NaN.
 fn reference_row(row: &[f32]) -> Vec<f32> {
+    if row.iter().any(|value| !value.is_finite()) {
+        return vec![f32::NAN; row.len()];
+    }
     let scales = ue4m3_values();
     let amax = row.iter().fold(0f32, |held, value| held.max(value.abs()));
     let mut g = 2f32.powi(-126);
@@ -159,21 +163,45 @@ fn rows() -> Vec<Vec<f32>> {
         .collect()
 }
 
-#[test]
-fn nvfp4_operand_rows_round_by_the_recipe() {
-    let rows = rows();
-    let quantized = portable(&rows, 1);
+/// Asserts `operand_rows` gives `rows` the recipe's operands: bit for bit,
+/// and NaN where the recipe's is.
+fn assert_recipe(rows: &[Vec<f32>]) {
+    let quantized = portable(rows, 1);
     for (row, (input, output)) in rows.iter().zip(&quantized).enumerate() {
         let expected = reference_row(input);
         for (k, (got, want)) in output.iter().zip(&expected).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
+            assert!(
+                if want.is_nan() { got.is_nan() } else { got.to_bits() == want.to_bits() },
                 "row {row} column {k}: x {} gave {got}, the recipe {want}",
                 input[k]
             );
         }
     }
+}
+
+#[test]
+fn nvfp4_operand_rows_round_by_the_recipe() {
+    assert_recipe(&rows());
+}
+
+/// A NaN or ±Inf anywhere in a row (among values, or alone among zeros)
+/// makes every operand of its row NaN, and only of its row.
+#[test]
+fn non_finite_values_make_their_row_nan() {
+    let finite = rows();
+    let mut rows = vec![finite[1].clone()];
+    for (at, non_finite) in [(3, f32::NAN), (40, f32::INFINITY), (86, f32::NEG_INFINITY)] {
+        let mut alone = vec![0.0f32; finite[0].len()];
+        let mut among = finite[0].clone();
+        among[at] = non_finite;
+        rows.push(among);
+        alone[at] = non_finite;
+        rows.push(alone);
+    }
+    rows.push(finite[2].clone());
+    assert_recipe(&rows);
+    let quantized = portable(&rows, 1);
+    assert!(quantized[1..rows.len() - 1].iter().all(|row| row.iter().all(|value| value.is_nan())));
 }
 
 #[test]

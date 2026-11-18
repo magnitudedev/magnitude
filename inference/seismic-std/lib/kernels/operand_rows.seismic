@@ -20,12 +20,14 @@ fn operand_row[K](x: &tensor[K] T, recipe: i32, y: &mut tensor[K] V):
 # E2M1, saturating at 6 (zero where s is). g * s and q * g * s are exact in F32, and q * g * s
 # has at most six significant bits. Each rounded quotient equals the exact quotient rounded
 # (docs/precision.md): no F32 quotient lands on a midpoint of either grid, or on a power of
-# two, that the exact quotient is not at.
+# two, that the exact quotient is not at. A NaN or ±Inf in the row makes g NaN, and so every
+# value of y. amax is the maximum of the magnitudes' bits, whose integer order is the
+# magnitudes' with every NaN above +Inf, so a NaN wins.
 fn nvfp4_row[K](x: &tensor[K] T, y: &mut tensor[K] V):
-    let mut amax = f32(0.0)
+    let mut amax = u32(0)
     for k in 0..K:
-        amax = max(amax, abs(f32(x[k])))
-    let g = nvfp4_global(amax)
+        amax = max(amax, bitcast_u32(f32(x[k])) & 2147483647)
+    let g = nvfp4_global(bitcast_f32(amax))
     parallel for k in 0..K:
         let first = k - k % 16
         let mut block = f32(0.0)
@@ -35,11 +37,12 @@ fn nvfp4_row[K](x: &tensor[K] T, y: &mut tensor[K] V):
         let d = g * ue4m3(block / (6.0 * g))
         y[k] = select(d == 0.0, 0.0, e2m1(f32(x[k]) / d) * d)
 
-# The least power of two at or above amax / 2688, within F32's normal binades.
+# The least power of two at or above amax / 2688, within F32's normal binades; NaN where amax
+# is NaN or +Inf.
 fn nvfp4_global(amax: f32) -> f32:
     let bits = bitcast_u32(amax / 2688.0)
     let exponent = (bits >> 23) + select((bits & 8388607) != 0, 1, 0)
-    return bitcast_f32(min(max(exponent, 1), 254) << 23)
+    return select(bitcast_u32(amax) >= 2139095040, bitcast_f32(u32(2143289344)), bitcast_f32(min(max(exponent, 1), 254) << 23))
 
 # v >= 0 rounded to nearest even onto UE4M3 (E4M3 without its sign: exponent bias 7, three
 # mantissa bits, subnormal quantum 2^-9), saturating at 448.

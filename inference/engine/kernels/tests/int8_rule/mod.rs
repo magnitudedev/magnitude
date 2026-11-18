@@ -4,7 +4,9 @@
 //! `quant.rs`): a scale `d` of `max|x| / 127` rounded to nearest, or where
 //! that is subnormal rounded up onto the subnormal grid (so every code lies
 //! in [-127, 127] and only an all-zero group has a zero scale), and each code
-//! the exact quotient `x / d` rounded once, half away from zero, NaN coding 0.
+//! the exact quotient `x / d` rounded once, half away from zero. A NaN or
+//! ±Inf in a group makes its scale NaN and its codes 0, so its products are
+//! NaN, as the dense product's would be.
 //!
 //! A test runs [`blocks`] through its backend's INT8 projection against
 //! weights that read one column each (`probe_blocks`), so an output is its
@@ -48,7 +50,8 @@ pub fn by_rule(values: &[f32; GROUP], grid: Grid) -> (f32, [i8; GROUP]) {
 }
 
 /// The fixture groups, every value BF16 (the activations' element): zero
-/// groups and a group of NaN and signed zeros; exact ties (`127 2^k` the
+/// groups; groups holding a NaN or ±Inf, alone among zeros or among values
+/// (the rule's scale NaN); exact ties (`127 2^k` the
 /// maximum, `(n + 1/2) 2^k` the values, which half-to-even coding takes to
 /// even codes), each with its BF16 neighbours; groups whose scale is
 /// subnormal on F32 (maxima down to BF16's least subnormal, which the CPU
@@ -56,14 +59,15 @@ pub fn by_rule(values: &[f32; GROUP], grid: Grid) -> (f32, [i8; GROUP]) {
 /// below 2^-24); and random groups of random scale.
 pub fn blocks() -> Vec<[f32; GROUP]> {
     let mut groups: Vec<[f32; GROUP]> = vec![[0.0; GROUP], [-0.0; GROUP]];
-    let mut mixed = [0.0f32; GROUP];
-    mixed[3] = f32::NAN;
-    mixed[4] = -0.0;
-    mixed[9] = f32::NAN;
-    groups.push(mixed);
-    mixed[0] = 0.75;
-    mixed[5] = -f32::from_bits(0x0001_0000);
-    groups.push(mixed);
+    for (at, non_finite) in [(3, f32::NAN), (31, f32::INFINITY), (0, f32::NEG_INFINITY)] {
+        let mut alone = [0.0f32; GROUP];
+        alone[4] = -0.0;
+        alone[at] = non_finite;
+        groups.push(alone);
+        let mut among: [f32; GROUP] = std::array::from_fn(|i| bf16_round((i as f32 - 15.5) * 0.37));
+        among[at] = non_finite;
+        groups.push(among);
+    }
 
     for exponent in [-100, -12, -3, 0, 5, 10] {
         let step = 2f32.powi(exponent);
@@ -119,7 +123,6 @@ pub fn blocks() -> Vec<[f32; GROUP]> {
             *value = bf16_round(maximum * fraction);
         }
         group[0] = maximum;
-        group[5] = f32::NAN;
         group[6] = -0.0;
         group[7] = -least.min(maximum);
         groups.push(group);
@@ -161,12 +164,22 @@ pub fn probe_blocks(rows: usize, k: usize) -> Vec<u8> {
 /// Checks that `outputs` (row `r`'s `stride` values, the first group's
 /// columns `0..32` its `d * code`) are those of `groups[r]` under the rule
 /// on `grid`: each output within `slack` (relative) of `d * code`, and so
-/// its code, since a code one off is a scale `d` away.
+/// its code, since a code one off is a scale `d` away; for a group with a
+/// NaN or ±Inf, the rule's scale NaN and its codes 0, every output NaN.
 pub fn assert_codes(label: &str, groups: &[[f32; GROUP]], outputs: &[f32], stride: usize, grid: Grid, slack: f64) {
     assert_eq!(outputs.len(), groups.len() * stride, "{label}: outputs");
     let mut failures = Vec::new();
     for (row, group) in groups.iter().enumerate() {
         let (scale, codes) = by_rule(group, grid);
+        if group.iter().any(|value| !value.is_finite()) {
+            assert!(scale.is_nan() && codes.iter().all(|code| *code == 0), "{label}: the rule of row {row}");
+            for column in 0..GROUP {
+                if !outputs[row * stride + column].is_nan() {
+                    failures.push((row, column, group[column], scale, 0, f64::from(outputs[row * stride + column])));
+                }
+            }
+            continue;
+        }
         for (column, code) in codes.iter().enumerate() {
             let actual = f64::from(outputs[row * stride + column]);
             let expected = f64::from(scale) * f64::from(*code);

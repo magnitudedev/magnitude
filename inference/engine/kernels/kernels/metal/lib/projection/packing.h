@@ -756,7 +756,7 @@ inline float packing_lane_scale(uint l, float3 norms, float squares, uint centre
 // bits (`packing_scale_bits`): its fraction rounded up to 8 bits, so that
 // the gain, the reciprocal of what is held, is at most the one admitted.
 inline float packing_held(float scale) { return as_type<float>((as_type<uint>(scale) + 0x7fffu) & 0xffff8000u); }
-// The gain of a held scale.
+// The gain of a held scale: zero for a zero or NaN scale.
 inline float packing_gain(float scale) { return scale > 0.0f ? 64.0f / scale : 0.0f; }
 
 // A token's norms of a run from its eight columns of a chunk, joined over
@@ -910,6 +910,8 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
         const float bound = BOUNDS != 0 ? bounds.at(chunk * FOLDS / 4u) : 0.0f;
         float4 even[TOKENS], odd[TOKENS];
         float3 norms[TOKENS];
+        bool finite[TOKENS];
+        bool all_finite = true;
         PROJECTION_UNROLL
         for (uint t = 0; t < TOKENS; ++t) {
             even[t] = float4(0.0f);
@@ -917,6 +919,27 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
             if (TOKENS * index + t < m_rows)
                 in.load8(TOKENS * index + t, chunk * 8u, 1.0f, even[t], odd[t]);
             norms[t] = packing_norms(even[t], odd[t], FOLDS);
+            finite[t] = norms[t].x < INFINITY;
+            all_finite = all_finite && finite[t];
+        }
+        // A token's run holding a NaN or ±Inf (its sum of magnitudes then
+        // NaN or +Inf, as past F32's range, where its scale would be
+        // infinite; the same on every lane of the run) is coded as a zero
+        // run: its codes and code sum are 0, and the tokens it shares
+        // elements with take the codes they take beside a zero run. Its
+        // scale is then NaN (below), so its products are NaN, as the dense
+        // product's would be. Only a chunk holding such a run takes this
+        // branch: a finite one pays a comparison a token and a select a
+        // lane's scale, nothing a value.
+        if (!all_finite) {
+            PROJECTION_UNROLL
+            for (uint t = 0; t < TOKENS; ++t) {
+                if (!finite[t]) {
+                    even[t] = float4(0.0f);
+                    odd[t] = float4(0.0f);
+                    norms[t] = float3(0.0f);
+                }
+            }
         }
         float4 packed_even[2], packed_odd[2];
         PROJECTION_UNROLL
@@ -933,6 +956,9 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
             PROJECTION_UNROLL
             for (uint l = 0; l < packing_gemm_lanes; ++l) {
                 const uint t = packing_gemm_lanes * p + packing_role(l, phase);
+                // A non-finite run's scale: NaN, whose gain is 0
+                // (`packing_gain`), coding its zero run 0.
+                scales[l] = finite[t] ? scales[l] : NAN;
                 sums[l] = packing_code(even[t], odd[t], scales[l], l == 0 ? step : 1.0f, FOLDS, codes_even[l],
                     codes_odd[l]);
             }

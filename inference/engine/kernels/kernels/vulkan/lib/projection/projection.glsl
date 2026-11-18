@@ -374,18 +374,19 @@ packets_packet projection_packet(const int kind, projection_weights w, uint n, u
 // ---------------------------------------------------------------------------
 // The stage pre-pass of the GEMM class.
 
-// The largest magnitude of row m's prologue output under its norm inverse,
-// reduced across the workgroup (shared: one float per subgroup at float 0,
-// which every invocation may still be reading: a normalization's squares).
+// The largest magnitude of row m's prologue output under its norm inverse
+// (NaN wins: `magnitude_peak`), reduced across the workgroup (shared: one
+// float per subgroup at float 0, which every invocation may still be
+// reading: a normalization's squares).
 float projection_row_maximum(projection_prologue in_, uint m, float inverse) {
     const uint thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
-    float amax = 0.0;
+    uint amax = 0u;
     for (uint i = 8u * thread; i < in_.columns; i += 8u * threads) {
         vec4 even, odd;
         projection_load8(in_, m, i, inverse, even, odd);
-        amax = max(amax, nvfp4_magnitude(even, odd));
+        amax = magnitude_peak(amax, even, odd);
     }
-    return reduce_group_max(amax, 0u);
+    return uintBitsToFloat(reduce_group_max_u32(amax, 0u));
 }
 
 // Workgroup `m` stores row m's prologue output (an Rms prologue's normalized
@@ -621,15 +622,15 @@ void projection_gemv_globals(projection_prologue in_, const int norm, uint m_row
     barrier();
     for (uint m = SEISMIC_SUBGROUP; m < m_rows; m += SEISMIC_SUBGROUPS) {
         const float inverse = projection_gemv_norm_inverse(in_, norm, m);
-        float amax = 0.0;
+        uint amax = 0u;
         for (uint k = 8u * SEISMIC_LANE; k < in_.columns; k += 8u * SEISMIC_SUBGROUP_LANES) {
             vec4 even, odd;
             projection_load8(in_, m, k, inverse, even, odd);
-            amax = max(amax, nvfp4_magnitude(even, odd));
+            amax = magnitude_peak(amax, even, odd);
         }
-        amax = seismic_subgroup_max(amax);
+        amax = seismic_redux_max_u32(amax);
         if (SEISMIC_LANE == 0u)
-            seismic_shared_f32[PROJECTION_GEMV_GLOBALS + m] = nvfp4_global_scale(amax);
+            seismic_shared_f32[PROJECTION_GEMV_GLOBALS + m] = nvfp4_global_scale(uintBitsToFloat(amax));
     }
 }
 

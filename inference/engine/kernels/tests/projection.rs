@@ -2539,8 +2539,8 @@ fn cpu_int8_dense_output_agrees_with_exact_projection() {
 /// grid, which its scales are stored in (`int8_rule`): weights that read one
 /// column each (`int8_rule::probe_blocks`) make each output its column's
 /// `d * code` (rounded to BF16 by the projection's store), which matches the
-/// rule's on ties, their BF16 neighbours, subnormal scales, zero and NaN
-/// groups. Groups with F32 subnormal values are left out: Metal's F32
+/// rule's on ties, their BF16 neighbours, subnormal scales, zero groups and
+/// groups with a NaN or ±Inf (every output NaN). Groups with F32 subnormal values are left out: Metal's F32
 /// arithmetic flushes them. Devices without tensor operations run no INT8
 /// quantization.
 #[test]
@@ -2953,6 +2953,64 @@ fn metal_packed_dense_output_agrees_with_the_staged_form(format: Format) {
                     eprintln!("{label}: relative RMS difference from the staged form {relative:.2e}");
                 }
             }
+        }
+    }
+}
+
+/// Metal's PACK form of the plain projection over a format the form admits
+/// (a generated test a format), on rows where some tokens' runs hold a NaN,
+/// +Inf or -Inf, alone among zeros or among values, beside finite partners
+/// and beside each other: each such token's products are all NaN, and every
+/// other token's are bit for bit those of the same rows with each such run
+/// zero, so a non-finite run touches no token it shares elements with.
+fn metal_packed_non_finite_runs_make_only_their_tokens_nan(format: Format) {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let repr = Repr::of(format);
+    if repr.resident(&device).metal_packing().is_none() {
+        return;
+    }
+    let (outputs, k, rows) = (192, 1024, 128);
+    let weight = weight(repr, outputs, k, 93, 1.0);
+    let run = packed_operand(&device, repr, PACK_DEFAULT).run();
+    let mut rng = Rng::new(94);
+    let drawn = (0..rows * k).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>();
+    // (token, column, value, alone): tokens 2 e and 2 e + 1 share element e;
+    // 20 and 21 share their run's elements.
+    let cases = [
+        (5, 3, f32::NAN, false),
+        (6, 40, f32::INFINITY, true),
+        (9, 1000, f32::NEG_INFINITY, false),
+        (12, 517, f32::NAN, true),
+        (20, 64, f32::INFINITY, false),
+        (21, 70, f32::NAN, false),
+        (127, 1023, f32::NAN, false),
+    ];
+    let (mut x, mut zeroed) = (drawn.clone(), drawn);
+    for &(token, column, value, alone) in &cases {
+        let first = token * k + column / run * run;
+        zeroed[first..first + run].fill(0.0);
+        if alone {
+            x[first..first + run].fill(0.0);
+        }
+        x[token * k + column] = value;
+    }
+    let packed = project_rows_native(&device, act, &weight, &x, pack_mapping(), Some(PACK_DEFAULT));
+    let reference = project_rows_native(&device, act, &weight, &zeroed, pack_mapping(), Some(PACK_DEFAULT));
+    for token in 0..rows {
+        let (got, want) = (&packed[token * outputs..][..outputs], &reference[token * outputs..][..outputs]);
+        if cases.iter().any(|case| case.0 == token) {
+            assert!(got.iter().all(|value| value.is_nan()), "{repr:?}: token {token}'s products are not all NaN");
+        } else {
+            assert!(
+                got.iter().zip(want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{repr:?}: token {token} differs from its rows with the non-finite runs zero"
+            );
         }
     }
 }
@@ -6087,6 +6145,7 @@ gguf_format_tests! {
         embedding_rows_decode_exactly_as_the_portable_body
         metal_tall_and_packed_project_rows_agree_with_the_staged_form
         metal_packed_dense_output_agrees_with_the_staged_form
+        metal_packed_non_finite_runs_make_only_their_tokens_nan
         packing_bound_matches_its_portable_body
     ];
 }

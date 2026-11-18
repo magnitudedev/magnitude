@@ -823,15 +823,15 @@ struct operands<true> {
         uint simdgroups, uint sg, uint lane) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint m = sg; m < m_rows; m += simdgroups) {
-            float amax = 0.0f;
+            uint amax = 0u;
             for (uint k = 8u * lane; k < columns; k += 256u) {
                 float4 even, odd;
                 in.load8(m, k, 0.0f, even, odd);
-                amax = metal::max(amax, nvfp4::magnitude(even, odd));
+                amax = magnitude_peak(amax, even, odd);
             }
             amax = simd_max(amax);
             if (lane == 0)
-                globals[m] = nvfp4::global_scale(amax);
+                globals[m] = nvfp4::global_scale(as_type<float>(amax));
         }
         return Nvfp4Rows<In, RowGlobals>{in, {globals}};
     }
@@ -840,13 +840,13 @@ struct operands<true> {
     // (the decode down projections, `routed::project_channels`).
     template <typename In>
     static Nvfp4Rows<In, OneGlobal> lone_row(In in, uint columns, uint lane) {
-        float amax = 0.0f;
+        uint amax = 0u;
         for (uint k = 8u * lane; k < columns; k += 256u) {
             float4 even, odd;
             in.load8(0, k, 0.0f, even, odd);
-            amax = metal::max(amax, nvfp4::magnitude(even, odd));
+            amax = magnitude_peak(amax, even, odd);
         }
-        return Nvfp4Rows<In, OneGlobal>{in, {nvfp4::global_scale(simd_max(amax))}};
+        return Nvfp4Rows<In, OneGlobal>{in, {nvfp4::global_scale(as_type<float>(simd_max(amax)))}};
     }
     template <uint THREADS, typename In>
     static void normalize(thread const In &in, uint item, device uchar *x, uint columns,
@@ -885,27 +885,28 @@ struct operands<true> {
     }
 
 private:
-    // Row m's largest magnitude under its norm inverse, reduced across the
-    // threadgroup through `partials` (whose previous contents every thread
-    // has read: a normalization's square sums).
+    // Row m's largest magnitude under its norm inverse (NaN wins:
+    // `magnitude_peak`), reduced across the threadgroup through `partials`
+    // (whose previous contents every thread has read: a normalization's
+    // square sums).
     template <uint THREADS, typename In>
     static float row_maximum(thread const In &in, uint m, float inverse, threadgroup float *partials,
         uint thread_index) {
         static_assert(THREADS % 32u == 0 && THREADS / 32u <= 32u, "whole simdgroups, one partial each");
-        float amax = 0.0f;
+        uint amax = 0u;
         for (uint k = 8u * thread_index; k < in.width(); k += 8u * THREADS) {
             float4 even, odd;
             in.load8(m, k, inverse, even, odd);
-            amax = metal::max(amax, nvfp4::magnitude(even, odd));
+            amax = magnitude_peak(amax, even, odd);
         }
         amax = simd_max(amax);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (thread_index % 32u == 0)
-            partials[thread_index / 32u] = amax;
+            partials[thread_index / 32u] = as_type<float>(amax);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint s = 0; s < THREADS / 32u; ++s)
-            amax = metal::max(amax, partials[s]);
-        return amax;
+            amax = metal::max(amax, as_type<uint>(partials[s]));
+        return as_type<float>(amax);
     }
     // Row m under its norm inverse, formed into x.
     template <uint THREADS, typename Order, typename In>
@@ -3940,8 +3941,11 @@ inline ulong int8_scale_at(uint m, uint g, uint groups) {
 // A 32-column block's scale: its largest magnitude / 127 rounded to nearest
 // F16 (the scale the fold stores), or where that is subnormal (below 2^-14),
 // rounded up onto the F16 grid, so `peak / d <= 127` and `d` is zero only for
-// an all-zero block. The CPU's rule on F16's grid (`quant.rs`).
+// an all-zero block; NaN where `peak` is NaN or +Inf. The CPU's rule on F16's
+// grid (`quant.rs`).
 inline float int8_scale_of(float peak) {
+    if (!(peak < INFINITY))
+        return NAN;
     const half stored = half(peak / 127.0f);
     const float d = float(stored);
     // `d * 127` is exact: 18 bits.
@@ -3951,7 +3955,7 @@ inline float int8_scale_of(float peak) {
 }
 
 // The code of `x` under `d`, a scale of `int8_scale_of`: the exact quotient
-// rounded once, half away from zero; NaN and a zero scale code 0. The
+// rounded once, half away from zero; a NaN scale and a zero one code 0. The
 // quotient picks the candidate and the code's two boundaries decide it
 // exactly: (2n +- 1) d / 2 is at most 19 bits, so exact in F32.
 inline int int8_code_of(float x, float d) {
@@ -3969,7 +3973,7 @@ inline int int8_code_of(float x, float d) {
 
 // The activation pass: one threadgroup of 256 threads per row; a thread takes
 // 8 columns at a time, four neighbouring lanes one 32-column block. The block
-// is scaled by `int8_scale_of` of its largest magnitude, coded by
+// is scaled by `int8_scale_of` of its peak (`magnitude_peak`), coded by
 // `int8_code_of` and stored in fragment order. Rows at or past `m_rows` are
 // zero.
 template <bool INTERLEAVED, typename In>
@@ -3983,11 +3987,10 @@ inline void int8_quantize(thread const In &in, thread const int8_scratch &s, uin
             in.load8(m, chunk * 8u, inverse, even, odd);
         const float4 a = float4(even.x, odd.x, even.y, odd.y), b = float4(even.z, odd.z, even.w, odd.w);
         const uint g = chunk / 4u, first = (chunk % 4u) * 8u;
-        const float4 peaks = metal::max(metal::abs(a), metal::abs(b));
-        float peak = metal::max(metal::max(peaks.x, peaks.y), metal::max(peaks.z, peaks.w));
+        uint peak = magnitude_peak(0u, even, odd);
         peak = metal::max(peak, simd_shuffle_xor(peak, ushort(1)));
         peak = metal::max(peak, simd_shuffle_xor(peak, ushort(2)));
-        const float scale = int8_scale_of(peak);
+        const float scale = int8_scale_of(as_type<float>(peak));
         const int4 qa = int4(int8_code_of(a.x, scale), int8_code_of(a.y, scale), int8_code_of(a.z, scale),
             int8_code_of(a.w, scale));
         const int4 qb = int4(int8_code_of(b.x, scale), int8_code_of(b.y, scale), int8_code_of(b.z, scale),

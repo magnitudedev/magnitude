@@ -9,7 +9,8 @@
 //! (`max|x| < 127 · 2^-126`) it is rounded up onto the subnormal grid
 //! instead, so that every `|x / d| ≤ 127` and `d` is zero only when the block
 //! is. Each code is the stored scale's exact quotient rounded once, half away
-//! from zero, and NaN codes 0. Every step is scalar-exact, so every tier
+//! from zero. A NaN or ±Inf value makes its block's scale NaN and every code
+//! 0, so the product is NaN. Every step is scalar-exact, so every tier
 //! produces the same block, and CUDA's and Metal's INT8 staging (over groups
 //! of 32, Metal's scale on F16's grid) follow the same rule, which
 //! `tests/int8_rule` in `magnitude-kernels` checks against this quantizer.
@@ -236,52 +237,71 @@ pub fn scale_on<G: ScaleGrid>(maximum: f32) -> f32 {
 
 /// The code of `value` under `scale`: the exact quotient (an F64 quotient of
 /// two F32 values rounds like it) rounded once, half away from zero; 0 / 0
-/// and NaN code 0.
+/// and a NaN scale code 0.
 #[inline(always)]
 pub fn code(value: f32, scale: f32) -> i8 {
     (f64::from(value) / f64::from(scale)).round() as i8
 }
 
 /// Quantizes a group on grid `G`: its scale, and its codes into `codes`
-/// (`values.len()` of them).
+/// (`values.len()` of them). A NaN or ±Inf value makes the group's scale
+/// NaN and every code 0, so the product is NaN. The codes are taken under
+/// the scale of the group's [`largest`] magnitude as it is, NaN or +Inf for
+/// such a group, under either of which every code is 0 (a finite value over
+/// +Inf rounds to 0, and ±Inf over +Inf is NaN, which codes 0); only the
+/// returned scale is then made NaN, off the codes' path.
 #[inline(always)]
 pub fn quantize_group<G: ScaleGrid>(values: &[f32], codes: &mut [i8]) -> f32 {
-    let d = scale_on::<G>(largest(values));
+    let maximum = largest(values);
+    let d = scale_on::<G>(maximum);
     for (code_out, value) in codes.iter_mut().zip(values) {
         *code_out = code(*value, d);
     }
-    d
+    if maximum.is_finite() { d } else { f32::NAN }
 }
 
-/// The largest magnitude of `values`, ignoring NaN (as `fmaxnm` does).
+/// The largest magnitude of `values`: NaN where any value is NaN, else
+/// +Inf where any is ±Inf. The maximum is over the magnitudes' bits, whose
+/// integer order is the magnitudes' with every NaN above +Inf, so a NaN
+/// wins for the instructions of a float maximum (an AND and an integer
+/// maximum in place of an absolute value and a float maximum).
 #[inline(always)]
 pub fn largest(values: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
-    if let Ok(values) = <&[f32; Q8_BLOCK]>::try_from(values) {
-        return neon::largest(values);
-    }
-    values
-        .iter()
-        .fold(0.0f32, |maximum, value| maximum.max(value.abs()))
+    let bits = neon::magnitudes(values);
+    #[cfg(not(target_arch = "aarch64"))]
+    let bits = magnitudes(values);
+    f32::from_bits(bits)
 }
 
-/// A whole block's largest magnitude by `fmaxnm`, which ignores NaN as
-/// `f32::max` does.
+/// The bits of an F32's magnitude.
+const MAGNITUDE: u32 = 0x7fff_ffff;
+
+/// The integer maximum of the magnitudes' bits of `values` (0 for none).
+#[inline(always)]
+fn magnitudes(values: &[f32]) -> u32 {
+    values.iter().fold(0, |maximum, value| maximum.max(value.to_bits() & MAGNITUDE))
+}
+
+/// [`magnitudes`] by vectors of four, the values past the last whole
+/// vector seeding the maximum: one path for every length, so the maximum
+/// stays in the vector register the scale's division reads.
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::Q8_BLOCK;
+    use super::MAGNITUDE;
     use std::arch::aarch64::*;
 
     #[inline(always)]
-    pub(super) fn largest(values: &[f32; Q8_BLOCK]) -> f32 {
-        // SAFETY: every load stays inside `values`.
+    pub(super) fn magnitudes(values: &[f32]) -> u32 {
+        let vectors = values.chunks_exact(4);
+        // SAFETY: each load reads one whole chunk of four.
         unsafe {
-            let input = values.as_ptr();
-            let mut maximum = vdupq_n_f32(0.0);
-            for quarter in 0..Q8_BLOCK / 4 {
-                maximum = vmaxnmq_f32(maximum, vabsq_f32(vld1q_f32(input.add(4 * quarter))));
+            let magnitude = vdupq_n_u32(MAGNITUDE);
+            let mut maximum = vdupq_n_u32(super::magnitudes(vectors.remainder()));
+            for vector in vectors {
+                maximum = vmaxq_u32(maximum, vandq_u32(vld1q_u32(vector.as_ptr().cast()), magnitude));
             }
-            vmaxnmvq_f32(maximum)
+            vmaxvq_u32(maximum)
         }
     }
 }
@@ -290,29 +310,51 @@ mod neon {
 pub(crate) mod tests {
     use super::*;
 
-    /// The vector block maximum matches the scalar fold bit for bit,
-    /// including zeros and NaN.
+    /// The vector maximum matches the scalar fold bit for bit at a whole
+    /// block, a group of 32 and a length past whole vectors, including
+    /// zeros; it is NaN where a NaN is among the values, and +Inf where
+    /// ±Inf is without one.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn vector_maxima_match_the_scalar_fold() {
         let mut values = (0..Q8_BLOCK)
             .map(|i| ((i * 7919 % 509) as f32 - 254.0) * 0.0371)
             .collect::<Vec<_>>();
-        values[9] = f32::NAN;
         values[17] = -0.0;
-        for scale in [1.0f32, 1e-30, 1e-42, 0.0, 3.0e6] {
-            let x = values.iter().map(|v| v * scale).collect::<Vec<_>>();
-            let maximum = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            assert_eq!(neon::largest(x.as_slice().try_into().unwrap()).to_bits(), maximum.to_bits(), "scale {scale}");
+        for len in [Q8_BLOCK, 32, 39] {
+            for scale in [1.0f32, 1e-30, 1e-42, 0.0, 3.0e6] {
+                let x = values[..len].iter().map(|v| v * scale).collect::<Vec<_>>();
+                let maximum = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                assert_eq!(magnitudes(&x), maximum.to_bits(), "{len} values, scale {scale}");
+                assert_eq!(neon::magnitudes(&x), maximum.to_bits(), "{len} values, scale {scale}");
+            }
+            for (non_finite, nan) in [(f32::NAN, true), (-f32::NAN, true), (f32::INFINITY, false), (f32::NEG_INFINITY, false)] {
+                for at in [0, 9, len - 1] {
+                    let mut x = values[..len].to_vec();
+                    x[at] = non_finite;
+                    for bits in [magnitudes(&x), neon::magnitudes(&x)] {
+                        let maximum = f32::from_bits(bits);
+                        assert!(if nan { maximum.is_nan() } else { maximum == f32::INFINITY }, "{non_finite} at {at} of {len}");
+                    }
+                    x[(at + 1) % len] = f32::NAN;
+                    assert!(f32::from_bits(neon::magnitudes(&x)).is_nan(), "NaN with {non_finite} at {at} of {len}");
+                }
+            }
         }
     }
 
     /// Asserts each of `blocks` is `x`'s exactly: the scale rule, every code
     /// the exact quotient by the stored scale rounded half away from zero
     /// (checked in F64, whose quotient of F32 values rounds the same), and
-    /// the code sums.
+    /// the code sums. A block with a NaN or ±Inf has a NaN scale and zero
+    /// codes.
     pub(crate) fn assert_exact(x: &[f32], blocks: &[Q8Block]) {
         for (b, (values, block)) in x.chunks(Q8_BLOCK).zip(blocks).enumerate() {
+            if values.iter().any(|value| !value.is_finite()) {
+                assert!(block.d.is_nan(), "block {b}: scale {:e} of a non-finite block", block.d);
+                assert!(block.codes.iter().all(|code| *code == 0) && block.sums.iter().all(|sum| *sum == 0), "block {b}");
+                continue;
+            }
             let maximum = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let (d, top) = (f64::from(block.d), f64::from(maximum));
             assert_eq!(block.d == 0.0, maximum == 0.0, "block {b}: scale {:e} of maximum {maximum:e}", block.d);
@@ -325,7 +367,7 @@ pub(crate) mod tests {
                 assert_eq!(block.d.to_bits(), (maximum / 127.0).to_bits(), "block {b}");
             }
             for (i, code) in block.codes.iter().enumerate() {
-                // NaN, and 0 / 0, code 0.
+                // 0 / 0 codes 0.
                 let quotient = values.get(i).map_or(0.0, |x| (f64::from(*x) / d).round());
                 let expected = if quotient.is_nan() { 0.0 } else { quotient };
                 assert!(expected.abs() <= 127.0, "block {b} code {i}");
@@ -334,6 +376,20 @@ pub(crate) mod tests {
             for (j, sum) in block.sums.iter().enumerate() {
                 assert_eq!(*sum, block.codes[16 * j..16 * j + 16].iter().map(|c| i16::from(*c)).sum::<i16>());
             }
+        }
+    }
+
+    /// A NaN or ±Inf value makes its block's scale NaN and every code 0, so
+    /// the product is NaN; the row's other blocks are unaffected.
+    #[test]
+    fn non_finite_values_make_their_block_nan() {
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut x = (0..3 * Q8_BLOCK).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013).collect::<Vec<_>>();
+            x[Q8_BLOCK + 70] = non_finite;
+            let mut blocks = vec![Q8Block::ZERO; blocks(x.len())];
+            quantize(&x, &mut blocks);
+            assert!(blocks[1].d.is_nan() && blocks[0].d.is_finite() && blocks[2].d.is_finite(), "{non_finite}");
+            assert_exact(&x, &blocks);
         }
     }
 
@@ -370,8 +426,8 @@ pub(crate) mod tests {
     /// Blocks whose scales are subnormal, from just under the normal range
     /// to maxima below 64 · 2^-149 (where `maximum / 127` rounds to zero),
     /// code every value by the stored scale within [-127, 127], and no
-    /// nonzero block stores a zero scale. Each block also carries NaN, ±0
-    /// and the least subnormal.
+    /// nonzero block stores a zero scale. Each block also carries ±0 and the
+    /// least subnormal.
     #[test]
     fn subnormal_scales_code_by_the_stored_scale() {
         let mut x = Vec::new();
@@ -380,7 +436,6 @@ pub(crate) mod tests {
                 .map(|i| maximum * (((i * 7919 % 509) as f32 - 254.0) / 254.0))
                 .collect::<Vec<_>>();
             block[0] = maximum;
-            block[5] = f32::NAN;
             block[6] = -0.0;
             block[7] = -f32::from_bits(1);
             x.extend(block);

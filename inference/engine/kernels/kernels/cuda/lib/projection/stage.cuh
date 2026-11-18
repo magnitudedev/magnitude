@@ -161,28 +161,54 @@ template <class NORM, class Rows, u64 NORM_EXTENT, u64 PARTS>
 using Input = typename InputOf<NORM, Rows, NORM_EXTENT, PARTS>::type;
 
 // ---------------------------------------------------------------------------
+// Non-finite activations (`seismic-native-cpu` `quant.rs`): a NaN or ±Inf in
+// a group makes its scale NaN and its codes 0, so its products are NaN, as
+// the dense product's would be. A group's peak takes the NaN-propagating
+// maximum (`max.NaN`: one FMNMX, as `fmaxf`), and its scale maps a +Inf peak
+// to NaN once per group.
+
+// The larger of `peak` and |x|, NaN if either is.
+__device__ __forceinline__ float peak_with(float peak, float x) {
+    float result;
+    asm("max.NaN.f32 %0, %1, %2;" : "=f"(result) : "f"(peak), "f"(fabsf(x)));
+    return result;
+}
+
+// The smaller of a and b, NaN if either is.
+__device__ __forceinline__ float min_nan(float a, float b) {
+    float result;
+    asm("min.NaN.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // NVFP4 operands (docs/precision.md, "NVFP4 operands"; the portable
 // `nvfp4_row`): a product over NVFP4 weights takes each row x as
 // q * g * s, which A holds exactly. g, the row's global scale, is the least
 // power of two at or above amax(|x|) / (6 * 448); s, a 16-value block's
 // scale, is amax(|block|) / (6 * g) rounded to nearest even onto UE4M3; q
 // is x / (g * s) rounded to nearest even onto E2M1, saturating at 6 (zero
-// where s is). Every operation rounds once, to nearest even.
+// where s is). Every operation rounds once, to nearest even. The row is g's
+// group: a NaN or ±Inf in the row makes g NaN, so every block's s is NaN
+// (UE4M3's NaN, 0x7F) and every code 0.
 
 namespace nvfp4 {
 
+// NaN where amax is NaN or +Inf.
 __device__ __forceinline__ float global_scale(float amax) {
+    if (!(amax < __int_as_float(0x7f800000)))
+        return __int_as_float(0x7fffffff);
     const u32 bits = __float_as_uint(__fdiv_rn(amax, 2688.0f));
     const u32 exponent = (bits >> 23) + ((bits & 0x7fffffu) != 0u ? 1u : 0u);
     return __uint_as_float(min(max(exponent, 1u), 254u) << 23);
 }
 
 // v >= 0 onto UE4M3 (exponent bias 7, three mantissa bits, subnormal
-// quantum 2^-9), saturating at 448.
+// quantum 2^-9), saturating at 448; NaN stays NaN.
 __device__ __forceinline__ float ue4m3(float v) {
     const u32 exponent = max((__float_as_uint(v) >> 23) & 255u, 121u);
     const float quantum = __uint_as_float((exponent - 3u) << 23);
-    return fminf(__fmul_rn(rintf(__fdiv_rn(v, quantum)), quantum), 448.0f);
+    return min_nan(__fmul_rn(rintf(__fdiv_rn(v, quantum)), quantum), 448.0f);
 }
 
 // v onto E2M1's magnitudes 0, 0.5, 1, 1.5, 2, 3, 4 and 6 with v's sign,
@@ -202,10 +228,11 @@ __device__ __forceinline__ float e2m1(float v) {
 }
 
 // The field of s, a UE4M3 value (`ue4m3`'s): exponent bias 7 above the
-// subnormal quantum 2^-9.
+// subnormal quantum 2^-9; a normal s's F32 exponent and three mantissa bits
+// rebiased, and NaN's 0x7F (whose F32 exponent field exceeds every finite
+// s's).
 __device__ __forceinline__ u32 ue4m3_field(float s) {
-    const u32 bits = __float_as_uint(s);
-    return s < 0.015625f ? (u32)__fmul_rn(s, 512.0f) : (((bits >> 23) - 120u) << 3) | ((bits >> 20) & 7u);
+    return s < 0.015625f ? (u32)__fmul_rn(s, 512.0f) : min((__float_as_uint(s) >> 20) - (120u << 3), 0x7fu);
 }
 
 // The code of q, an E2M1 value (`e2m1`'s): the magnitude's index among 0,
@@ -221,12 +248,13 @@ template <class Pro>
 __device__ __forceinline__ float row_global(const Pro &pro, const float *factors, u32 m, u64 K, float *scratch) {
     float amax = 0.0f;
     for (u64 k = threadIdx.x; k < K; k += blockDim.x)
-        amax = fmaxf(amax, fabsf(pro.value(factors, m, k)));
-    return global_scale(reduce::group_max(amax, scratch));
+        amax = peak_with(amax, pro.value(factors, m, k));
+    return global_scale(reduce::group_peak(amax, scratch));
 }
 
 // The 16-value block `block` of row m under global scale g: its UE4M3
-// scale s and each value's E2M1 code value q, the operand q * g * s.
+// scale s and each value's E2M1 code value q, the operand q * g * s; s NaN
+// and every q 0 under a NaN g (the block's own peak need not carry NaN).
 template <class Pro>
 __device__ __forceinline__ void block_operands(const Pro &pro, const float *factors, u32 m, u64 block, float g,
                                                float &s, float (&q)[16]) {
@@ -240,7 +268,7 @@ __device__ __forceinline__ void block_operands(const Pro &pro, const float *fact
     const float d = __fmul_rn(g, s);
 #pragma unroll
     for (int j = 0; j < 16; ++j)
-        q[j] = d == 0.0f ? 0.0f : e2m1(__fdiv_rn(q[j], d));
+        q[j] = d > 0.0f ? e2m1(__fdiv_rn(q[j], d)) : 0.0f;
 }
 
 // The packed form of a block's codes (value j in nibble j % 8 of word
@@ -422,11 +450,13 @@ template <bool ENTRIES> __device__ __forceinline__ u32 s8_real_offset(u32 v) {
         return half * 16 + 2 * t + (j % 2) + 8 * (j / 2);
 }
 
-// The scale of a group whose largest magnitude is `maximum` (NaN ignored):
+// The scale of a group whose largest magnitude is `maximum` (`peak_with`'s):
 // `maximum / 127` rounded to nearest, or where that is subnormal, rounded up
 // onto the subnormal grid, so `maximum / d <= 127` and `d` is zero only for
-// an all-zero group.
+// an all-zero group; NaN where `maximum` is NaN or +Inf.
 __device__ __forceinline__ float s8_scale(float maximum) {
+    if (!(maximum < __int_as_float(0x7f800000)))
+        return __int_as_float(0x7fffffff);
     const float least_normal = __uint_as_float(0x00800000u);
     float d = __fdiv_rn(maximum, 127.0f);
     // F64 holds `d * 127` exactly.
@@ -436,7 +466,7 @@ __device__ __forceinline__ float s8_scale(float maximum) {
 }
 
 // The code of `x` under the scale `d` (`s8_scale`): the exact quotient
-// rounded once, half away from zero; NaN, and a zero scale, code 0. Where
+// rounded once, half away from zero; a NaN scale, and a zero one, code 0. Where
 // `d` is normal the F32 quotient is within half an ulp of the exact one, so
 // only a quotient that lands on a half decides by the sign of its remainder;
 // where `d` is subnormal the F64 quotient of two F32 values rounds like the
@@ -479,7 +509,7 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
             values[j] = pro.value(factors, m, group * 32 + j);
-            maximum = fmaxf(maximum, fabsf(values[j]));
+            maximum = peak_with(maximum, values[j]);
         }
         const float d = s8_scale(maximum);
         int total = 0;

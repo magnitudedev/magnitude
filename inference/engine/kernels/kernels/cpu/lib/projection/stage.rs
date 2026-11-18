@@ -153,12 +153,17 @@ pub fn operand_row<W: Recipe + ?Sized>(weights: &[&W], row: &mut [f32]) {
 /// amax(|row|) / (6 * 448); per 16-value block s, amax(|block|) / (6 * g)
 /// onto UE4M3; each value q * g * s with q, x / (g * s) onto E2M1, saturating
 /// at 6 (zero where s is). Every step rounds to nearest even, and q * g * s
-/// is exact in F32.
+/// is exact in F32. A NaN or ±Inf in the row makes amax NaN or +Inf
+/// (`quant::largest`), and so g NaN: every value of the row is then NaN.
 #[inline(always)]
 pub fn nvfp4_row(row: &mut [f32]) {
-    let amax = row.iter().fold(0.0f32, |held, value| held.max(value.abs()));
+    let amax = quant::largest(row);
     let bits = (amax / 2688.0).to_bits();
-    let g = f32::from_bits(((bits >> 23) + u32::from(bits & 0x7f_ffff != 0)).clamp(1, 254) << 23);
+    let g = if amax.is_finite() {
+        f32::from_bits(((bits >> 23) + u32::from(bits & 0x7f_ffff != 0)).clamp(1, 254) << 23)
+    } else {
+        f32::NAN
+    };
     for block in row.chunks_mut(16) {
         let maximum = block.iter().fold(0.0f32, |held, value| held.max(value.abs()));
         let d = g * ue4m3(maximum / (6.0 * g));

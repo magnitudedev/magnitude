@@ -278,7 +278,8 @@ fn grouped_project_rows_match_host_model(format: Format) {
 /// CUDA's INT8 staging (`stage_row_s8`) codes every activation group by the
 /// CPU's rule: weights that read one column each (`int8_rule::probe_blocks`)
 /// make each output its column's `d * code`, which matches the CPU's on
-/// ties, their BF16 neighbours, subnormal scales, zero and NaN groups.
+/// ties, their BF16 neighbours, subnormal scales, zero groups and groups
+/// with a NaN or ±Inf (every output NaN).
 #[test]
 fn cuda_int8_activations_follow_the_cpu_rule() {
     let Some(device) = cuda() else { return };
