@@ -248,15 +248,16 @@ function Initialize-CommandDirectory {
 function Install-Launcher([string]$Source) {
   Initialize-CommandDirectory
   $target = Join-Path $commandDirectory 'magnitude.exe'
-  Get-ChildItem -LiteralPath $commandDirectory -Force | Where-Object { $_.Name -like 'magnitude.exe.new-*' -or $_.Name -like 'magnitude.exe.old-*' } |
+  # Leftovers use the desktop installer's names, so whichever installer runs next removes them.
+  Get-ChildItem -LiteralPath $commandDirectory -Force | Where-Object { $_.Name -like 'magnitude-incoming-*.exe' -or $_.Name -like 'magnitude-retired-*.exe' } |
     Remove-Item -Force -ErrorAction SilentlyContinue
   if ((Test-Path -LiteralPath $target -PathType Leaf) -and
       (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash) { return }
-  $suffix = [Guid]::NewGuid().ToString('N')
-  $incoming = "$target.new-$suffix"
+  $suffix = [Guid]::NewGuid().ToString('B').ToUpperInvariant()
+  $incoming = Join-Path $commandDirectory "magnitude-incoming-$suffix.exe"
   Copy-Item -LiteralPath $Source -Destination $incoming
   if (Test-Path -LiteralPath $target) {
-    $retired = "$target.old-$suffix"
+    $retired = Join-Path $commandDirectory "magnitude-retired-$suffix.exe"
     Move-Item -LiteralPath $target -Destination $retired
     Remove-Item -LiteralPath $retired -Force -ErrorAction SilentlyContinue
   }
