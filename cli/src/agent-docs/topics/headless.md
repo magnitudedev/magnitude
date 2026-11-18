@@ -218,14 +218,18 @@ A scheduled task runs `serve` as the user when they sign in. In the user's own P
 ```powershell
 $action = New-ScheduledTaskAction -Execute "$env:LOCALAPPDATA\Programs\Magnitude CLI\magnitude.exe" -Argument "serve"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+# Checks every minute and starts serve again if it has exited; a running serve is left alone.
+$restart = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger, $restart -Settings $settings -Principal $principal
 Start-ScheduledTask -TaskName "Magnitude"
 ```
 
 It runs in the user's session, so a console window for `magnitude.exe` stays open while it serves;
-closing that window stops serving until the next sign-in or `Start-ScheduledTask -TaskName "Magnitude"`.
+closing that window stops serving only until the task's next check, within a minute. To stop serving
+for a while, `Disable-ScheduledTask -TaskName "Magnitude"`, then `Stop-ScheduledTask -TaskName "Magnitude"`;
+`Enable-ScheduledTask -TaskName "Magnitude"` turns it back on.
 If Windows refuses to register the task with "Access is denied", run the same commands in an
 administrator PowerShell; the task still runs as the user.
 
@@ -242,9 +246,11 @@ $userProfile = "C:\Users\alice"
 Add-LocalGroupMember -Group "Performance Log Users" -Member $account -ErrorAction SilentlyContinue
 $action = New-ScheduledTaskAction -Execute "$userProfile\AppData\Local\Programs\Magnitude CLI\magnitude.exe" -Argument "serve"
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+# Checks every minute and starts serve again if it has exited; a running serve is left alone.
+$restart = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 $password = (Get-Credential $account).GetNetworkCredential().Password
-Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -User $account -Password $password -RunLevel Limited
+Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger, $restart -Settings $settings -User $account -Password $password -RunLevel Limited
 Start-ScheduledTask -TaskName "Magnitude"
 ```
 
@@ -254,10 +260,11 @@ account also needs the right to log on as a batch job; the group above grants it
 batch job" in Local Security Policy). After the account's password changes, register the task again.
 
 If other computers need to reach it, allow inbound TCP port 10100 in Windows Defender Firewall from an
-administrator PowerShell:
+administrator PowerShell. Cloud servers usually have a Public network profile, so the rule covers every
+profile; set `-RemoteAddress` to the addresses of your clients to admit only them:
 
 ```powershell
-New-NetFirewallRule -DisplayName "Magnitude" -Direction Inbound -Protocol TCP -LocalPort 10100 -Action Allow -Profile Private
+New-NetFirewallRule -DisplayName "Magnitude" -Direction Inbound -Protocol TCP -LocalPort 10100 -Action Allow -Profile Any -RemoteAddress Any
 ```
 
 ### Windows: status, logs and removal
