@@ -6,7 +6,7 @@ import { BunContext } from "@effect/platform-bun"
 import { Deferred, Effect, Option, Ref, Runtime, Schema } from "effect"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
-import { applicationNativeHostPath, applicationStateDirectory, holdContainerData, nativeHostLayer, resolveApplicationProfile,
+import { applicationNativeHostPath, applicationStateDirectory, holdContainerData, makeUnixProcessContinuation, nativeHostLayer, resolveApplicationProfile,
   isLegacyServerMarked, resolveInstalledApplicationRuntime, runHeadlessApplication, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { containerImage } from "@magnitudedev/daemon-management/application-update"
 import { isDevelopmentBuild } from "../runtime/environment"
@@ -62,6 +62,21 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     ? FileSystem.FileSystem.pipe(Effect.flatMap(fs => fs.exists(join(runtime.resourcesDirectory,
       process.platform === "win32" ? "magnitude-service.exe" : "magnitude-service"))), Effect.map(exists => !exists), Effect.orElseSucceed(() => false))
     : Effect.succeed(false)
+  /**
+   * Restarts this command as the desktop's once the desktop has replaced the CLI-only install: Unix execs the
+   * `magnitude` command in place, which absorption pointed at the desktop's CLI; Windows exits for its launcher,
+   * which re-resolves to the desktop. The native module is loaded now, before absorption deletes its folder.
+   */
+  const commandLink = join(homedir(), ".magnitude", "bin", "magnitude")
+  const continuation = runtime._tag === "Installed" && runtime.layout === "Standalone" && process.platform !== "win32"
+    ? yield* makeUnixProcessContinuation(addon).pipe(Effect.option)
+    : Option.none()
+  const restartAsDesktop = Effect.gen(function* () {
+    if (Option.isSome(continuation) && (yield* fs.exists(commandLink).pipe(Effect.orElseSucceed(() => false)))) {
+      yield* continuation.value.replace(commandLink, process.argv.slice(2), process.env).pipe(Effect.ignore)
+    }
+    return yield* Effect.sync(() => process.exit(process.platform === "win32" ? 75 : 1))
+  })
   const blocker = servingBlocker(stateDirectory, profile.port).pipe(Effect.provide(native))
   /** Waits while the desktop app or another Magnitude serves; resolves once this server may start. */
   const awaitTurn = Effect.gen(function* () {
@@ -92,8 +107,7 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     if (!(yield* awaitTurn)) return
     if (yield* replacedByDesktop) {
       yield* notify("The desktop app replaced this CLI-only installation. Restarting with its command.")
-      // A service manager restarts the `magnitude` command, now the desktop's; the Windows launcher re-resolves it.
-      return yield* Effect.sync(() => process.exit(process.platform === "win32" ? 75 : 1))
+      return yield* restartAsDesktop
     }
     const attempt = yield* Effect.either(runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
     prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
