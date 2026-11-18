@@ -19,7 +19,8 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::{
-    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, HeldBound, PlanError, PlanPrices, PlanRoom, StableRoom, WeightBound,
+    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, ExpertBankPlan, HeldBound, PlanError, PlanPrices, PlanRoom, StableRoom,
+    WeightBound,
     assessment::{AssessmentError, ColdSource, ExecutionFit, ExpertShares, Priced, Residency, execution_memory_charge, synthetic},
     platform::{DeviceRequest, DomainRole, ReleaseRate},
 };
@@ -594,7 +595,7 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
             .load()
             .clone()
             .unbanked()
-            .with_expert_bank(&definition, slots, bank.places, bank.flights, bank.substrate())
+            .with_expert_bank(&definition, slots, Some(bank.window_slots()), bank.places, bank.flights, bank.substrate())
             .unwrap()
             .weight_bytes()
             .unwrap()
@@ -645,11 +646,15 @@ fn a_capped_streamed_load_fits_with_its_graphs_priced() {
     }
 }
 
-/// A weight cap grants the largest expert bank its weights hold, each
-/// bank's weights the plan's own at its slots: a cap of them grants that
-/// bank, a byte fewer the bank a slot smaller, and a byte below the floor's
-/// none, a configuration refusal. Qwen3.6 35B on the M4 Pro's Metal, at the floor and at 128 and
-/// 240 slots.
+/// A weight cap grants the largest expert bank its weights hold at any
+/// scratch window of the bank's ladder, each bank's weights the plan's own
+/// at its slots and window: the granted bank holds at least its window's
+/// floor and its weights are within the cap, and no rung holds a slot more
+/// within it (a rung whose floor is above that, or a bank of every expert,
+/// holds none); a byte below the floor's weights grants none, a
+/// configuration refusal. Qwen3.6 35B on the M4 Pro's Metal, under caps of
+/// the floor bank's weights at the floor and at 128 and 240 slots, and a
+/// byte fewer.
 #[test]
 fn a_weight_cap_grants_the_largest_bank_it_holds() {
     let scratch = Scratch::new("qwen36-weight-cap");
@@ -686,22 +691,32 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     let floor = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(floor_weights)), &synthetic_prices()).unwrap().into_draft();
     let bank = floor.load().expert_bank().unwrap().clone();
     assert_eq!(bank.slots, bank.floor());
-    // A bank's weights at `slots`, its record tensors reserved as the
-    // device reserves.
-    let weights = |slots: u64| {
+    // The load with `bank`'s structure at `slots` and `window_slots`, its
+    // record tensors reserved as the device reserves, and its weights.
+    let banked = |bank: &ExpertBankPlan, slots: u64, window_slots: u64| {
         draft
             .load()
             .clone()
             .unbanked()
-            .with_expert_bank(&definition, slots, bank.places, bank.flights, bank.substrate())
-            .unwrap()
-            .weight_bytes()
+            .with_expert_bank(&definition, slots, Some(window_slots), bank.places, bank.flights, bank.substrate())
             .unwrap()
     };
-    assert_eq!(weights(bank.floor()), floor_weights);
+    let weights = |bank: &ExpertBankPlan, slots: u64, window_slots: u64| banked(bank, slots, window_slots).weight_bytes().unwrap();
+    // Every rung of the ladder the plan walks, from the window of a bank of
+    // every expert, with that rung's floor.
+    let experts = bank.widest().get();
+    let rungs = banked(&bank, experts, experts)
+        .expert_bank()
+        .unwrap()
+        .window_ladder()
+        .into_iter()
+        .map(|window| (window, banked(&bank, experts, window).expert_bank().unwrap().floor()))
+        .collect::<Vec<_>>();
+    assert_eq!(weights(&bank, bank.floor(), bank.window_slots()), floor_weights);
+    // The bank a cap grants, at the window the plan settles on for it.
     let granted = |cap: u64| match prepare(Some(cap)) {
         PreparedModelAssessment::Planned { execution, .. } => {
-            execution.draft().load().expert_bank().expect("a capped load streams").slots
+            execution.draft().load().expert_bank().expect("a capped load streams").clone()
         }
         PreparedModelAssessment::Unsupported { unsupported, .. } => {
             panic!("a cap of {cap} bytes: {unsupported:?}")
@@ -714,10 +729,25 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
         Err(ModelAssessmentError::WeightBound(error)) if error.needed == floor_weights
     ));
     for slots in [bank.floor(), 128, 240] {
-        let cap = weights(slots);
-        assert_eq!(granted(cap), slots, "a cap of {cap} bytes");
-        if slots > bank.floor() {
-            assert_eq!(granted(cap - 1), slots - 1, "a cap of {} bytes", cap - 1);
+        let cap = weights(&bank, slots, bank.window_slots());
+        for cap in [cap, cap - 1].into_iter().filter(|&cap| cap >= floor_weights) {
+            let grant = granted(cap);
+            let (held, window) = (grant.slots, grant.window_slots());
+            assert!(rungs.iter().any(|&(rung, _)| rung == window), "a cap of {cap} bytes settles on window {window}, a rung");
+            assert!(grant.floor() <= held && held <= grant.ceiling, "a cap of {cap} bytes grants {held} slots");
+            assert!(weights(&grant, held, window) <= cap, "a cap of {cap} bytes grants {held} slots beyond it");
+            for &(rung, rung_floor) in &rungs {
+                let more = held + 1;
+                // A bank of every expert holds no slot more, and a rung
+                // whose floor is above it holds none of that size.
+                if more > experts || more < rung_floor {
+                    continue;
+                }
+                assert!(
+                    weights(&grant, more, rung) > cap,
+                    "a cap of {cap} bytes grants {held} slots at window {window}, but window {rung} holds {more}"
+                );
+            }
         }
     }
 }

@@ -170,11 +170,6 @@ impl Structured {
         Ok(Self { selected, host, groups, layers, window_slots, lending, granule })
     }
 
-    /// This structure with `window_slots` scratch slots and its lending derived again.
-    pub(super) fn with_window_slots(&self, window_slots: u64) -> Result<Self, String> {
-        Self::new(self.selected, self.host, self.groups.clone(), self.layers.clone(), Some(window_slots))
-    }
-
     /// [`ExpertBankPlan::granule`].
     pub(super) fn granule(&self) -> u64 {
         self.granule

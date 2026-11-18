@@ -571,9 +571,7 @@ impl ExecutionPlanDraft {
     ) -> Result<Result<(Self, C, T), NoBank>, E> {
         let mut settled = Self::settle_bank(&ceiling, definition, prices, held, room, confirm)?;
         if matches!(settled, Err(NoBank::Short { .. })) {
-            let w_hi = ceiling.whole.bank().window_slots();
-            let w_lo = ceiling.whole.bank().round_records();
-            for &w in &window_ladder(w_hi, w_lo)[1..] {
+            for &w in &ceiling.whole.bank().window_ladder()[1..] {
                 let candidate = match self.with_window(&ceiling.whole, definition, bound, w)? {
                     Ok(c) => Self::settle_bank(&c, definition, prices, held, room, confirm)?,
                     Err(no) => Err(no),
@@ -637,6 +635,7 @@ impl ExecutionPlanDraft {
             let load = self.load.clone().unbanked().with_expert_bank(
                 definition,
                 experts,
+                None,
                 places,
                 self.policy.limits.flights(),
                 substrate,
@@ -676,7 +675,7 @@ impl ExecutionPlanDraft {
     /// under `bound`, keeping its target program plan in sync.
     fn with_window(&self, whole: &Self, definition: &ModelDefinition, bound: HeldBound, window_slots: u64) -> Result<Result<BankCeiling, NoBank>, PlanError> {
         let places = whole.bank().places;
-        let load = whole.load.clone().with_window_slots(window_slots)?;
+        let load = whole.load.clone().banked_as(definition, whole.bank(), window_slots)?;
         let programs = load.program_plan(definition, whole.policy.codec)?;
         let rebuilt = Self {
             load: Box::new(load),
@@ -1019,17 +1018,7 @@ impl ExecutionPlanDraft {
         let draft = match held.load.bank.as_ref() {
             None => self.held_whole_at(definition, held.policy.limits.chain_capacity.get() as u64)?,
             Some(bank) => {
-                let mut load = self
-                    .load
-                    .clone()
-                    .unbanked()
-                    .with_expert_bank(definition, bank.slots, bank.places, bank.flights, bank.substrate())?;
-                if bank.window_slots() != bank.widest().get() {
-                    load = load.with_window_slots(bank.window_slots())?;
-                }
-                load = load.with_bank_slots(bank.slots, bank.ceiling)?;
-                let built = load.bank.as_mut().expect("the load was just banked");
-                (built.host_slots, built.pass, built.resident) = (bank.host_slots, bank.pass, bank.resident);
+                let load = self.load.clone().banked_as(definition, bank, bank.window_slots())?;
                 let programs = load.program_plan(definition, self.policy.codec)?;
                 Self {
                     load: Box::new(load),
@@ -1078,7 +1067,7 @@ impl ExecutionPlanDraft {
             .load
             .clone()
             .unbanked()
-            .with_expert_bank(definition, ceiling, 1, self.policy.limits.flights(), substrate)?
+            .with_expert_bank(definition, ceiling, None, 1, self.policy.limits.flights(), substrate)?
             .with_bank_slots(slots, ceiling)?;
         let bank = load.bank.as_mut().expect("the load was just banked");
         bank.host_slots = host_slots;
@@ -1952,10 +1941,9 @@ impl ExecutionPlanDraft {
                 let reserved = |slots| bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
                 let points = rising(bank.floor(), ceiling, &reserved)?;
                 let experts = bank.slots;
-                let (w_hi, w_lo) = (bank.window_slots(), bank.round_records());
                 let draft = whole.resized(ceiling, ceiling, PassLaunches::FLOOR)?;
                 let mut windowed = Vec::new();
-                for &w in &window_ladder(w_hi, w_lo)[1..] {
+                for &w in &bank.window_ladder()[1..] {
                     if let Ok(BankCeiling { whole: win_whole, ceiling: win_ceiling, .. }) = self.with_window(&whole, definition, bound, w)? {
                         let win_bank = win_whole.bank();
                         let win_reserved = |slots| win_bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
@@ -2012,6 +2000,15 @@ fn window_ladder(widest: u64, floor: u64) -> Vec<u64> {
         p = p.saturating_mul(2);
     }
     ladder
+}
+
+impl super::ExpertBankPlan {
+    /// The scratch-window ladder (`window_ladder`) from the bank's window
+    /// down to its round's records: the rungs a load and its assessment
+    /// walk below the bank, its own window first.
+    pub fn window_ladder(&self) -> Vec<u64> {
+        window_ladder(self.window_slots(), self.round_records())
+    }
 }
 
 /// The sizes of `from..=to` a holding steps through: the most of each
@@ -3244,7 +3241,7 @@ mod tests {
         };
         let full_floor_alloc = full_floor_draft.allocation_bytes(&definition).unwrap();
 
-        let min_load = full.load().clone().with_window_slots(round).unwrap();
+        let min_load = full.load().clone().banked_as(&definition, full_bank, round).unwrap();
         let min_floor_load = min_load
             .clone()
             .with_load_slots(min_load.expert_bank().unwrap().floor())

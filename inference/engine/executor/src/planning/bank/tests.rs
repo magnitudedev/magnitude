@@ -10,7 +10,7 @@ impl ModelLoadPlan {
     /// The plan at its bank's least slots, of one chain place.
     pub(crate) fn with_expert_bank_at_floor(self, definition: &ModelDefinition, substrate: BankSubstrate) -> Result<Self, PlanError> {
         let floor = self.bank_floor(definition, 1, FlightDepth::PIPELINED, substrate)?;
-        self.with_expert_bank(definition, floor, 1, FlightDepth::PIPELINED, substrate)
+        self.with_expert_bank(definition, floor, None, 1, FlightDepth::PIPELINED, substrate)
     }
 }
 
@@ -37,7 +37,7 @@ fn a_fixture_of_more_experts_admits_a_partial_bank() {
         let substrate = BankSubstrate { backend, allocations: seismic::NativeAllocations::EXACT, host };
         let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, substrate).unwrap();
         let [floor, half, whole] = [floor, 64, 128].map(|slots| {
-            resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, substrate).unwrap().weight_bytes().unwrap()
+            resident.clone().with_expert_bank(&definition, slots, None, 1, FlightDepth::PIPELINED, substrate).unwrap().weight_bytes().unwrap()
         });
         assert!(floor < half && half < whole, "{backend:?}: {floor} {half} {whole}");
     }
@@ -185,6 +185,14 @@ fn restructured(
     })
     .unwrap();
     ExpertBankPlan { structured, block, ..plan }
+}
+
+/// `plan` with its scratch bounded to `window_slots` experts of a layer,
+/// and its structure's lending derived again; or why it cannot be.
+fn windowed(plan: &ExpertBankPlan, window_slots: u64) -> Result<ExpertBankPlan, String> {
+    let (selected, host, groups, layers) = plan.structured.clone().into_parts();
+    let structured = conveyor::Structured::new(selected, host, groups, layers, Some(window_slots))?;
+    Ok(ExpertBankPlan { structured, ..plan.clone() })
 }
 
 /// `plan` beside `host`.
@@ -785,7 +793,7 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
     assert!(dense.with_expert_bank_at_floor(&definition, cuda(HostTier::Linked)).is_ok());
     let resident =
         ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
-    let banked = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).unwrap();
+    let banked = |slots| resident.clone().with_expert_bank(&definition, slots, None, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).unwrap();
     let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).unwrap();
     let (three, four) = (banked(floor), banked(floor + 1));
     let bank = three.expert_bank().unwrap();
@@ -831,11 +839,11 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
     // From its floor to every expert: a bank of every expert is whole,
     // its layers' homes its records end to end. On unified memory a
     // bank below its floor is refused.
-    assert!(resident.clone().with_expert_bank(&definition, 33, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).is_err());
-    let unified = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, cuda(HostTier::Unified(Parking::InKernels)));
+    assert!(resident.clone().with_expert_bank(&definition, 33, None, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).is_err());
+    let unified = |slots| resident.clone().with_expert_bank(&definition, slots, None, 1, FlightDepth::PIPELINED, cuda(HostTier::Unified(Parking::InKernels)));
     let floor = unified(32).unwrap().expert_bank().unwrap().floor();
     assert!(floor > 0 && unified(floor).is_ok() && unified(floor - 1).is_err(), "unified floor {floor}");
-    let whole = resident.clone().with_expert_bank(&definition, 32, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).unwrap();
+    let whole = resident.clone().with_expert_bank(&definition, 32, None, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).unwrap();
     let bank = whole.expert_bank().unwrap();
     assert!(bank.whole() && !three.expert_bank().unwrap().whole());
     assert_eq!((bank.home(0), bank.home(1)), (0, 32));
@@ -1242,13 +1250,13 @@ fn windowed_scratch_bounds_lending_and_layout() {
     assert_eq!(full.rounds(), full.window_rounds());
     assert_eq!(full.layer_window(0), widest);
     assert_eq!(full.expert_list_words(), list_extent(widest));
-    assert_eq!(full.clone().with_window_slots(widest).unwrap(), full);
+    assert_eq!(windowed(&full, widest).unwrap(), full);
 
-    assert!(full.clone().with_window_slots(round - 1).is_err());
-    assert!(full.clone().with_window_slots(widest + 1).is_err());
+    assert!(windowed(&full, round - 1).is_err());
+    assert!(windowed(&full, widest + 1).is_err());
 
     let w = round;
-    let win = full.clone().with_window_slots(w).unwrap();
+    let win = windowed(&full, w).unwrap();
     let p = widest.div_ceil(w);
     assert_eq!(win.window_slots(), w);
     assert_eq!(win.windows(), p);

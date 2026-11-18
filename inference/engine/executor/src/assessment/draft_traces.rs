@@ -60,7 +60,7 @@ fn every_served_draft_outlines_its_graphs_from_traces(backend: BackendName) {
             for &codec in &served_codecs {
                 let banked = recorded_substrate(&definition, backend).ok().map(|substrate| {
                     load.bank_floor(&definition, 1, LIMITS.flights(), substrate).and_then(|floor| {
-                        load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate)
+                        load.clone().with_expert_bank(&definition, floor, None, 1, LIMITS.flights(), substrate)
                     })
                 });
                 let loads = std::iter::once(("resident", Ok(load.clone()))).chain(banked.map(|banked| ("banked", banked)));

@@ -220,8 +220,8 @@ fn open_domain(
                 .with_bank::<crate::AssessmentMemoryCharge>(definition, None, &prices)
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
                 .into_draft();
-            let round_records = whole.load().expert_bank().expect("whole bank").round_records();
-            let windowed_load = whole.load().clone().with_window_slots(round_records).unwrap();
+            let bank = whole.load().expert_bank().expect("whole bank");
+            let windowed_load = whole.load().clone().banked_as(definition, bank, bank.round_records()).unwrap();
             let floor = windowed_load.expert_bank().unwrap().floor();
             let floor_load = windowed_load.with_bank_slots(floor, floor).unwrap();
             let cap = floor_load.weight_bytes().unwrap();

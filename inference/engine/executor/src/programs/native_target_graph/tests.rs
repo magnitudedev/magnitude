@@ -1162,7 +1162,7 @@ mod resource_template_tests {
         let host = crate::planning::HostTier::Unified(crate::planning::Parking::of(backend));
         let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
         let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
-        let whole = derived.with_expert_bank(&definition, floor, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
+        let whole = derived.with_expert_bank(&definition, floor, None, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
         let capacity = ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
         let state = ResourcePlanner::state_plan(&definition, &whole, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
         let plan = whole.program_plan(&definition, KvCodec::Dense).unwrap();
