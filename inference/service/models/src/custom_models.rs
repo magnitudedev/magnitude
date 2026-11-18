@@ -4666,11 +4666,7 @@ mod tests {
     /// disappear, the model is not installed and its full download reuses the stored projector.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_found_catalog_target_stores_only_its_missing_components() {
-        use magnitude_service_contracts::models::{
-            CatalogComponent, CatalogInstallationRemoval, CatalogMissingComponent,
-            CatalogModelState, CatalogModelUpdate, InstalledModelPackages as _, ModelFileRole,
-            ModelPackageInstallationOrigin, SpeculativeDraftSource, SpeculativeMethod,
-        };
+        use magnitude_service_contracts::models::{InstalledModelPackages as _, ModelFileRole};
 
         let fixture = Fixture::new().await;
         let cache = fixture.root.join("hf");
@@ -4716,6 +4712,59 @@ mod tests {
         // The cache then holds only the target's weights, as `hf download` of the one GGUF leaves it.
         fs::remove_file(snapshot.join("mmproj-F16.gguf")).unwrap();
         fs::remove_dir_all(cache.join(hf_repo_dir("owner/Model-DFlash-GGUF"))).unwrap();
+        let catalog = found_target_catalog(&target, &draft);
+        let model_id = catalog_id(&catalog[0]);
+        let (endpoint, requests) = serve_files(vec![
+            (
+                "owner/Model-GGUF",
+                commit.clone(),
+                vec![
+                    ("Model-Q4_K_M.gguf", weights.clone()),
+                    ("mmproj-F16.gguf", projector.clone()),
+                ],
+            ),
+            (
+                "owner/Model-DFlash-GGUF",
+                draft_commit,
+                vec![("Model-DFlash.gguf", drafter.clone())],
+            ),
+        ]);
+        let fixture = fixture.restart_with_hub(endpoint, catalog.clone()).await;
+        fixture.apply(shown.clone()).await;
+        let downloads = crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+            .await
+            .unwrap();
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            Arc::new(downloads),
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+        let scenario = FoundCatalogTarget {
+            fixture: &fixture,
+            installations: &installations,
+            model_id: &model_id,
+        };
+        scenario
+            .fetch_missing_parts(
+                &projector, &drafter, &target, &snapshot, &catalog, &requests,
+            )
+            .await;
+        scenario
+            .remove_and_reinstall(&cache, &snapshot, &weights, &target, &requests)
+            .await;
+    }
+
+    /// [`a_found_catalog_target_stores_only_its_missing_components`]'s catalog: the found target
+    /// with its drafter, and another variant of the repository sharing both, not installed.
+    fn found_target_catalog(
+        target: &ModelPackage,
+        draft: &ModelPackage,
+    ) -> Vec<RecommendableModel> {
+        use magnitude_service_contracts::models::{
+            ModelFileRole, SpeculativeDraftSource, SpeculativeMethod,
+        };
+
         let mut definition = catalog_definition(target.clone());
         definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
             target: target.clone(),
@@ -4765,227 +4814,314 @@ mod tests {
             },
             method: SpeculativeMethod::DFlash,
         };
-        let catalog = vec![definition, other];
-        let model_id = catalog_id(&catalog[0]);
-        let (endpoint, requests) = serve_files(vec![
-            (
-                "owner/Model-GGUF",
-                commit.clone(),
-                vec![
-                    ("Model-Q4_K_M.gguf", weights.clone()),
-                    ("mmproj-F16.gguf", projector.clone()),
-                ],
-            ),
-            (
-                "owner/Model-DFlash-GGUF",
-                draft_commit,
-                vec![("Model-DFlash.gguf", drafter.clone())],
-            ),
-        ]);
-        let fixture = fixture.restart_with_hub(endpoint, catalog.clone()).await;
-        fixture.apply(shown.clone()).await;
-        let downloads = crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
-            .await
-            .unwrap();
-        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
-            fixture.resolver.clone(),
-            Arc::new(downloads),
-            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
-            Arc::new(NoOptimizer),
-        );
-        let state = || {
-            fixture
+        vec![definition, other]
+    }
+
+    /// The Hub requests of a served repository that fetched a file.
+    fn fetched(requests: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("GET ") && request.contains("/resolve/"))
+            .cloned()
+            .collect()
+    }
+
+    /// A found catalog target's installation, checked in phases
+    /// ([`a_found_catalog_target_stores_only_its_missing_components`]): each phase is a frame of
+    /// its own, where the scenario as one test body held every phase's temporaries in one frame,
+    /// past the frame bound.
+    struct FoundCatalogTarget<'a> {
+        fixture: &'a Fixture,
+        installations: &'a crate::catalog_installations::ManagedCatalogInstallations,
+        model_id: &'a ModelId,
+    }
+
+    impl FoundCatalogTarget<'_> {
+        fn state(&self) -> magnitude_service_contracts::models::CatalogModelState {
+            self.fixture
                 .resolver
                 .catalog_snapshot()
                 .unwrap()
                 .models
                 .into_iter()
-                .find(|model| model.id == model_id)
+                .find(|model| model.id == *self.model_id)
                 .unwrap()
                 .local_state
-        };
-        let missing = |state: &CatalogModelState| match state {
-            CatalogModelState::Installed {
-                update_state,
-                missing_components,
-                ..
-            } => {
-                assert_eq!(*update_state, CatalogModelUpdate::Current, "{state:?}");
-                missing_components.clone()
+        }
+
+        fn missing(
+            state: &magnitude_service_contracts::models::CatalogModelState,
+        ) -> Vec<magnitude_service_contracts::models::CatalogMissingComponent> {
+            use magnitude_service_contracts::models::{CatalogModelState, CatalogModelUpdate};
+            match state {
+                CatalogModelState::Installed {
+                    update_state,
+                    missing_components,
+                    ..
+                } => {
+                    assert_eq!(*update_state, CatalogModelUpdate::Current, "{state:?}");
+                    missing_components.clone()
+                }
+                CatalogModelState::NotInstalled => {
+                    panic!("the found target installs the catalog model")
+                }
             }
-            CatalogModelState::NotInstalled => panic!("the found target installs the catalog model"),
-        };
-        let settle = |expected: usize| async move {
+        }
+
+        /// The components still missing once `expected` are, or after ten seconds.
+        async fn settle(
+            &self,
+            expected: usize,
+        ) -> Vec<magnitude_service_contracts::models::CatalogMissingComponent> {
             for _ in 0..200 {
-                if missing(&state()).len() == expected {
+                if Self::missing(&self.state()).len() == expected {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            missing(&state())
-        };
-        let projector_component = CatalogMissingComponent {
-            component: CatalogComponent::Projector,
-            download_bytes: projector.len() as u64,
-        };
-        let drafter_component = CatalogMissingComponent {
-            component: CatalogComponent::Drafter,
-            download_bytes: drafter.len() as u64,
-        };
-        assert_eq!(missing(&state()), vec![projector_component, drafter_component.clone()]);
+            Self::missing(&self.state())
+        }
 
-        installations
-            .install_component(&model_id, CatalogComponent::Projector)
-            .await
-            .unwrap();
-        assert_eq!(settle(1).await, vec![drafter_component]);
-        let stored = stored_files(&fixture.store);
-        assert_eq!(
-            stored.iter().map(|(_, size)| size).sum::<u64>(),
-            projector.len() as u64,
-            "only the projector is stored, never a second copy of the target: {stored:?}"
-        );
-        assert!(stored.iter().all(|(path, _)| !path.ends_with("Model-Q4_K_M.gguf")));
-        let fetched = |requests: &Arc<Mutex<Vec<String>>>| {
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|request| request.starts_with("GET ") && request.contains("/resolve/"))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        assert!(
-            fetched(&requests).iter().all(|request| request.contains("mmproj-F16.gguf")),
-            "{:?}",
-            fetched(&requests)
-        );
-
-        // The catalog's target is served composed of the found weights and the stored projector.
+        /// The catalog model's bundle as the service would serve it, and its resolution.
         async fn serving(
-            fixture: &Fixture,
-            model_id: &ModelId,
-        ) -> (ServableModelBundle, magnitude_service_contracts::models::ResolvedServableModelBundle) {
-            let configuration = fixture.resolver.serving_configuration(model_id).unwrap();
-            let resolved = fixture
+            &self,
+        ) -> (
+            ServableModelBundle,
+            magnitude_service_contracts::models::ResolvedServableModelBundle,
+        ) {
+            use magnitude_service_contracts::models::InstalledModelPackages as _;
+
+            let configuration = self
+                .fixture
+                .resolver
+                .serving_configuration(self.model_id)
+                .unwrap();
+            let resolved = self
+                .fixture
                 .inventory()
                 .resolve_bundle(installed_bundle_input(&configuration.bundle))
                 .await
                 .unwrap();
             (configuration.bundle, resolved)
         }
-        let (bundle, resolved) = serving(&fixture, &model_id).await;
-        assert_eq!(bundle, ServableModelBundle::Standalone { package: target.clone() });
-        let paths = resolved
-            .target_model
-            .components
-            .iter()
-            .map(|component| (component.role.clone(), component.path.clone()))
-            .collect::<Vec<_>>();
-        assert!(paths.contains(&(
-            magnitude_service_contracts::ComponentRole::Weights,
-            snapshot.join("Model-Q4_K_M.gguf")
-        )), "{paths:?}");
-        assert!(paths.iter().any(|(role, path)| {
-            *role == magnitude_service_contracts::ComponentRole::Projector && path.starts_with(&fixture.store)
-        }), "{paths:?}");
-        // A resolution is a reader of the model's files: holding it would refuse their removal.
-        drop(resolved);
 
-        installations
-            .install_component(&model_id, CatalogComponent::Drafter)
-            .await
-            .unwrap();
-        assert!(settle(0).await.is_empty());
-        let (bundle, resolved) = serving(&fixture, &model_id).await;
-        assert_eq!(bundle, catalog[0].configuration.bundle, "found weights, stored projector and drafter");
-        assert!(resolved.draft_model.is_some());
-        assert_eq!(
-            stored_files(&fixture.store).iter().map(|(_, size)| size).sum::<u64>(),
-            (projector.len() + drafter.len()) as u64
-        );
-        drop(resolved);
+        /// The projector, then the drafter, fetched as the found target's missing parts.
+        async fn fetch_missing_parts(
+            &self,
+            projector: &[u8],
+            drafter: &[u8],
+            target: &ModelPackage,
+            snapshot: &Path,
+            catalog: &[RecommendableModel],
+            requests: &Arc<Mutex<Vec<String>>>,
+        ) {
+            use magnitude_service_contracts::models::{
+                CatalogComponent, CatalogMissingComponent, CatalogModelState,
+            };
 
-        let CatalogModelState::Installed {
-            installation,
-            stored_components,
-            ..
-        } = state()
-        else {
-            panic!("installed");
-        };
-        assert!(
-            matches!(
-                installation,
-                magnitude_service_contracts::models::ModelInstallation::Resolved {
-                    ownership: magnitude_service_contracts::models::ModelInstallationOwnership::External,
-                    ..
+            let projector_component = CatalogMissingComponent {
+                component: CatalogComponent::Projector,
+                download_bytes: projector.len() as u64,
+            };
+            let drafter_component = CatalogMissingComponent {
+                component: CatalogComponent::Drafter,
+                download_bytes: drafter.len() as u64,
+            };
+            assert_eq!(
+                Self::missing(&self.state()),
+                vec![projector_component, drafter_component.clone()]
+            );
+
+            self.installations
+                .install_component(self.model_id, CatalogComponent::Projector)
+                .await
+                .unwrap();
+            assert_eq!(self.settle(1).await, vec![drafter_component]);
+            let stored = stored_files(&self.fixture.store);
+            assert_eq!(
+                stored.iter().map(|(_, size)| size).sum::<u64>(),
+                projector.len() as u64,
+                "only the projector is stored, never a second copy of the target: {stored:?}"
+            );
+            assert!(
+                stored
+                    .iter()
+                    .all(|(path, _)| !path.ends_with("Model-Q4_K_M.gguf"))
+            );
+            assert!(
+                fetched(requests)
+                    .iter()
+                    .all(|request| request.contains("mmproj-F16.gguf")),
+                "{:?}",
+                fetched(requests)
+            );
+
+            // The catalog's target is served composed of the found weights and the stored projector.
+            let (bundle, resolved) = self.serving().await;
+            assert_eq!(
+                bundle,
+                ServableModelBundle::Standalone {
+                    package: target.clone()
                 }
-            ),
-            "the model's weights are only in the Hugging Face cache"
-        );
-        assert_eq!(
-            stored_components,
-            vec![CatalogComponent::Projector, CatalogComponent::Drafter],
-            "Magnitude's own parts, which Remove deletes"
-        );
+            );
+            let paths = resolved
+                .target_model
+                .components
+                .iter()
+                .map(|component| (component.role.clone(), component.path.clone()))
+                .collect::<Vec<_>>();
+            assert!(
+                paths.contains(&(
+                    magnitude_service_contracts::ComponentRole::Weights,
+                    snapshot.join("Model-Q4_K_M.gguf")
+                )),
+                "{paths:?}"
+            );
+            assert!(
+                paths.iter().any(|(role, path)| {
+                    *role == magnitude_service_contracts::ComponentRole::Projector
+                        && path.starts_with(&self.fixture.store)
+                }),
+                "{paths:?}"
+            );
+            // A resolution is a reader of the model's files: holding it would refuse their removal.
+            drop(resolved);
 
-        // Removal removes Magnitude's projector and drafter; the found weights stay and still serve.
-        let removed = installations.remove(&model_id).await.unwrap();
-        assert!(matches!(removed, CatalogInstallationRemoval::Removed { .. }), "{removed:?}");
-        fixture.inventory().ensure_installed_model_inventory().await.unwrap();
-        assert!(stored_files(&fixture.store).is_empty());
-        assert_eq!(fs::read(snapshot.join("Model-Q4_K_M.gguf")).unwrap(), weights);
-        assert_eq!(missing(&state()).len(), 2);
-        assert!(matches!(
-            state(),
-            CatalogModelState::Installed { stored_components, .. } if stored_components.is_empty()
-        ));
-        assert!(
-            matches!(
-                installations.remove(&model_id).await.unwrap(),
-                CatalogInstallationRemoval::Retained { .. }
-            ),
-            "with nothing of Magnitude's left, the found model is hidden instead"
-        );
+            self.installations
+                .install_component(self.model_id, CatalogComponent::Drafter)
+                .await
+                .unwrap();
+            assert!(self.settle(0).await.is_empty());
+            let (bundle, resolved) = self.serving().await;
+            assert_eq!(
+                bundle, catalog[0].configuration.bundle,
+                "found weights, stored projector and drafter"
+            );
+            assert!(resolved.draft_model.is_some());
+            assert_eq!(
+                stored_files(&self.fixture.store)
+                    .iter()
+                    .map(|(_, size)| size)
+                    .sum::<u64>(),
+                (projector.len() + drafter.len()) as u64
+            );
+            drop(resolved);
 
-        // With the projector stored again, the found weights disappearing leave the model not
-        // installed, and its full download takes the stored projector instead of fetching it.
-        installations
-            .install_component(&model_id, CatalogComponent::Projector)
-            .await
-            .unwrap();
-        assert_eq!(settle(1).await.len(), 1);
-        fs::remove_dir_all(cache.join(hf_repo_dir("owner/Model-GGUF"))).unwrap();
-        fixture.local.refresh_local().await.unwrap();
-        assert_eq!(state(), CatalogModelState::NotInstalled);
-        requests.lock().unwrap().clear();
-        installations.install(&model_id).await.unwrap();
-        for _ in 0..200 {
-            if matches!(state(), CatalogModelState::Installed { missing_components, .. } if missing_components.is_empty()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let CatalogModelState::Installed {
+                installation,
+                stored_components,
+                ..
+            } = self.state()
+            else {
+                panic!("installed");
+            };
+            assert!(
+                matches!(
+                    installation,
+                    magnitude_service_contracts::models::ModelInstallation::Resolved {
+                        ownership: magnitude_service_contracts::models::ModelInstallationOwnership::External,
+                        ..
+                    }
+                ),
+                "the model's weights are only in the Hugging Face cache"
+            );
+            assert_eq!(
+                stored_components,
+                vec![CatalogComponent::Projector, CatalogComponent::Drafter],
+                "Magnitude's own parts, which Remove deletes"
+            );
         }
-        assert!(matches!(
-            state(),
-            CatalogModelState::Installed { missing_components, .. } if missing_components.is_empty()
-        ));
-        assert!(
-            fetched(&requests).iter().all(|request| !request.contains("mmproj-F16.gguf")),
-            "the stored projector is reused: {:?}",
-            fetched(&requests)
-        );
-        let target_owner = fixture
-            .inventory()
-            .list_installed()
-            .await
-            .unwrap()
-            .packages
-            .into_iter()
-            .find(|installed| installed.package.id == target.id)
-            .map(|installed| installed.origin);
-        assert_eq!(target_owner, Some(ModelPackageInstallationOrigin::Magnitude));
+
+        /// Removal of Magnitude's parts, then a reinstall once the found weights are gone.
+        async fn remove_and_reinstall(
+            &self,
+            cache: &Path,
+            snapshot: &Path,
+            weights: &[u8],
+            target: &ModelPackage,
+            requests: &Arc<Mutex<Vec<String>>>,
+        ) {
+            use magnitude_service_contracts::models::{
+                CatalogComponent, CatalogInstallationRemoval, CatalogModelState,
+                InstalledModelPackages as _, ModelPackageInstallationOrigin,
+            };
+
+            // Removal removes Magnitude's projector and drafter; the found weights stay and still serve.
+            let removed = self.installations.remove(self.model_id).await.unwrap();
+            assert!(
+                matches!(removed, CatalogInstallationRemoval::Removed { .. }),
+                "{removed:?}"
+            );
+            self.fixture
+                .inventory()
+                .ensure_installed_model_inventory()
+                .await
+                .unwrap();
+            assert!(stored_files(&self.fixture.store).is_empty());
+            assert_eq!(
+                fs::read(snapshot.join("Model-Q4_K_M.gguf")).unwrap(),
+                weights
+            );
+            assert_eq!(Self::missing(&self.state()).len(), 2);
+            assert!(matches!(
+                self.state(),
+                CatalogModelState::Installed { stored_components, .. } if stored_components.is_empty()
+            ));
+            assert!(
+                matches!(
+                    self.installations.remove(self.model_id).await.unwrap(),
+                    CatalogInstallationRemoval::Retained { .. }
+                ),
+                "with nothing of Magnitude's left, the found model is hidden instead"
+            );
+
+            // With the projector stored again, the found weights disappearing leave the model not
+            // installed, and its full download takes the stored projector instead of fetching it.
+            self.installations
+                .install_component(self.model_id, CatalogComponent::Projector)
+                .await
+                .unwrap();
+            assert_eq!(self.settle(1).await.len(), 1);
+            fs::remove_dir_all(cache.join(hf_repo_dir("owner/Model-GGUF"))).unwrap();
+            self.fixture.local.refresh_local().await.unwrap();
+            assert_eq!(self.state(), CatalogModelState::NotInstalled);
+            requests.lock().unwrap().clear();
+            self.installations.install(self.model_id).await.unwrap();
+            for _ in 0..200 {
+                if matches!(self.state(), CatalogModelState::Installed { missing_components, .. } if missing_components.is_empty())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(matches!(
+                self.state(),
+                CatalogModelState::Installed { missing_components, .. } if missing_components.is_empty()
+            ));
+            assert!(
+                fetched(requests)
+                    .iter()
+                    .all(|request| !request.contains("mmproj-F16.gguf")),
+                "the stored projector is reused: {:?}",
+                fetched(requests)
+            );
+            let target_owner = self
+                .fixture
+                .inventory()
+                .list_installed()
+                .await
+                .unwrap()
+                .packages
+                .into_iter()
+                .find(|installed| installed.package.id == target.id)
+                .map(|installed| installed.origin);
+            assert_eq!(
+                target_owner,
+                Some(ModelPackageInstallationOrigin::Magnitude)
+            );
+        }
     }
 
     /// Enrichment that hasn't worked out any model's drafters yet, as for a model whose enrichment
