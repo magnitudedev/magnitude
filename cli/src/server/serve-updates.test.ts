@@ -5,7 +5,7 @@ import type { UpdateOutcome } from "@magnitudedev/release/hosted-update"
 import type { ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
 import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { CLI_VERSION } from "../version"
-import { IdleInstallationSystem, makeDownloadedNotice, makeIdleInstallation } from "./serve-updates"
+import { announceAvailableUpdates, IdleInstallationSystem, makeAvailableNotice, makeDownloadedNotice, makeIdleInstallation } from "./serve-updates"
 
 const release = { version: "99.0.0", bytes: 1, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" }
 const updatesIn = (...transfers: ApplicationUpdateState["transfer"][]) => ({
@@ -78,13 +78,13 @@ describe("install when idle", () => {
     }))
     expect(h.events).toEqual(["busy", "busy", "idle"])
   })
-  it("keeps serving with one notice and no outcome when it cannot install without a password", async () => {
+  it("keeps serving with one notice and no outcome when it may not install unattended", async () => {
     const h = harness({ authorized: false })
     await h.run(machine => Effect.gen(function* () {
       expect(yield* machine.installWhenIdle(release.version)).toBe(false)
       expect(yield* machine.installWhenIdle(release.version)).toBe(false)
     }))
-    expect(h.notices).toEqual([`Magnitude ${release.version} is downloaded. Install it with \`magnitude update install\`.`])
+    expect(h.notices).toEqual([`Magnitude ${release.version} is downloaded. To install it, stop \`magnitude serve\` and run \`magnitude update install\`.`])
     expect(h.events).toEqual([])
     expect(Option.isNone(h.outcome())).toBe(true)
   })
@@ -201,8 +201,29 @@ describe("downloaded notice", () => {
       yield* notice("2.1.0")
     }))
     expect(lines).toEqual([
-      "Magnitude 2.0.0 is downloaded. Install it with `magnitude update install`.",
-      "Magnitude 2.1.0 is downloaded. Install it with `magnitude update install`.",
+      "Magnitude 2.0.0 is downloaded. To install it, stop `magnitude serve` and run `magnitude update install`.",
+      "Magnitude 2.1.0 is downloaded. To install it, stop `magnitude serve` and run `magnitude update install`.",
+    ])
+  })
+})
+
+describe("available notice", () => {
+  it("prints once per version offered while automatic downloads are off, with the command that gets it", async () => {
+    const lines: string[] = []
+    const offer = (version: string, autoDownload: boolean): ApplicationUpdateState => ({ transfer: { _tag: "Available", version, bytes: 1, failed: Option.none() },
+      check: { _tag: "Succeeded", at: 0 }, preference: { _tag: "Known", autoDownload } })
+    const states = [offer("2.0.0", false), offer("2.0.0", false), offer("2.1.0", true), offer("2.2.0", false)]
+    const updates = { changes: Stream.fromIterable(states) } as unknown as ApplicationUpdate
+    await Effect.runPromise(Effect.gen(function* () {
+      const notify = (line: string) => Effect.sync(() => { lines.push(line) })
+      yield* announceAvailableUpdates(updates, yield* makeAvailableNotice(notify, true))
+      yield* announceAvailableUpdates(updates, yield* makeAvailableNotice(notify, false))
+    }))
+    expect(lines).toEqual([
+      "Magnitude 2.0.0 is available. Install it with `magnitude update install`.",
+      "Magnitude 2.2.0 is available. Install it with `magnitude update install`.",
+      "Magnitude 2.0.0 is available. Download it with `magnitude update download`.",
+      "Magnitude 2.2.0 is available. Download it with `magnitude update download`.",
     ])
   })
 })

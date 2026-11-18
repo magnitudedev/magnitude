@@ -90,7 +90,22 @@ const makeVersionNotice = (notify: (line: string) => Effect.Effect<void>, line: 
 
 /** The one line a server that cannot install by itself prints for each downloaded version. */
 export const makeDownloadedNotice = (notify: (line: string) => Effect.Effect<void>) =>
-  makeVersionNotice(notify, version => `Magnitude ${version} is downloaded. Install it with \`magnitude update install\`.`)
+  makeVersionNotice(notify, version => `Magnitude ${version} is downloaded. To install it, stop \`magnitude serve\` and run \`magnitude update install\`.`)
+
+/**
+ * The line printed once per version a newer release is available while automatic downloads are off:
+ * a CLI-only installation installs it on request, any other installation downloads it first.
+ */
+export const makeAvailableNotice = (notify: (line: string) => Effect.Effect<void>, standalone: boolean) =>
+  makeVersionNotice(notify, version => standalone
+    ? `Magnitude ${version} is available. Install it with \`magnitude update install\`.`
+    : `Magnitude ${version} is available. Download it with \`magnitude update download\`.`)
+
+/** Gives `notice` each version offered while automatic downloads are off. */
+export const announceAvailableUpdates = (updates: ApplicationUpdate, notice: (version: string) => Effect.Effect<void>) => updates.changes.pipe(
+  Stream.filterMap(state => state.transfer._tag === "Available" && state.preference._tag === "Known" && !state.preference.autoDownload
+    ? Option.some(state.transfer.version) : Option.none()),
+  Stream.runForEach(notice))
 
 /** The one line a container prints for each newer release, which a newer image provides. */
 export const makeImageNotice = (notify: (line: string) => Effect.Effect<void>) =>
@@ -99,8 +114,8 @@ export const makeImageNotice = (notify: (line: string) => Effect.Effect<void>) =
 /** The machine an idle installation acts on; replaced by fakes to exercise the decisions. */
 export interface IdleInstallationSystem {
   /**
-   * Whether this server may install without asking anyone: on Linux, sudo admits the installer
-   * without a password (the service's sudoers rule, or the person's own); on macOS, a writable app folder.
+   * Whether this server may install without asking anyone: a CLI-only installation whose folder it may
+   * write; for the Linux package, sudo admitting its installer without a password; on macOS, a writable app folder.
    */
   readonly canInstallUnattended: Effect.Effect<boolean>
   readonly isIdle: Effect.Effect<boolean>
@@ -114,9 +129,9 @@ export interface IdleInstallationSystem {
 export const IdleInstallationSystem = Context.GenericTag<IdleInstallationSystem>("@magnitudedev/cli/IdleInstallationSystem")
 
 /**
- * Install when idle: a server, the system service or `serve` run by hand, installs a downloaded
- * update only between turns whenever it can without a password. Otherwise it keeps serving and says
- * how to install; a held installation lock defers. A failed attempt, or an installed version that
+ * Install when idle: `serve` installs a downloaded update only between turns, whenever it may install
+ * unattended (see `canInstallUnattended`). Otherwise it keeps serving and says how to install; a held
+ * installation lock defers. A failed attempt, or an installed version that
  * never starts, holds back unattended installation for `failureBackoff`, and the version that failed
  * is not downloaded or installed unattended again (see `UnattendedHold`), so restarts never loop.
  */
