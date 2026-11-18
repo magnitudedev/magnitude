@@ -252,7 +252,9 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
         version: Option.flatMapNullable(installation, ({ version }) => version),
         managed: entry !== undefined,
         inspection,
-        configurationFiles: connector.configurationFiles,
+        // Only the files it has actually written: Pi, for one, writes its settings only once a model is chosen.
+        configurationFiles: yield* Effect.filter(connector.configurationFiles, (file) => FileSystem.FileSystem.pipe(
+          Effect.flatMap((fs) => fs.exists(file)), Effect.orElseSucceed(() => false))),
         plugin: Option.fromNullable(connector.companion).pipe(Option.map(({ description }) => ({ name: description.name, source: description.source }))),
       } satisfies HarnessConnectionStatus
     }))

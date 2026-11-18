@@ -37,7 +37,7 @@ const preparation = (runtime: Extract<ApplicationRuntime, { _tag: "Installed" }>
 
 /** Acquired by the headless owner after native admission, before it starts service work. */
 export const initializeServeUpdates = (runtime: ApplicationRuntime, profile: ApplicationProfile, addon: string, owner: UpdateOwner) => Effect.gen(function* () {
-  if (runtime._tag === "Development") return unavailableApplicationUpdate("Application updates require an installed Magnitude application.")
+  if (runtime._tag === "Development") return unavailableApplicationUpdate("NotInThisBuild", "Application updates require an installed Magnitude application.")
   const privateFiles = (process.platform === "win32" ? windowsPrivateFilePermissions(addon) : unixPrivateFilePermissions).pipe(Layer.provideMerge(BunContext.layer))
   return yield* Effect.gen(function* () {
     if (process.platform === "win32") yield* recoverWindowsUpdateDirectory(addon, profile.dataDirectory)
@@ -47,7 +47,7 @@ export const initializeServeUpdates = (runtime: ApplicationRuntime, profile: App
     return yield* makeApplicationUpdate(pending).pipe(Effect.provideService(ApplicationUpdateSource, source),
       Effect.provideService(PreparedUpdateStore, prepared.store), Effect.provideService(UpdatePreferences, prepared.preferences))
   }).pipe(Effect.provide(privateFiles))
-}).pipe(Effect.provide(BunContext.layer), Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))))
+}).pipe(Effect.provide(BunContext.layer), Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("SetupFailed", "Application update setup could not be read."))))
 
 /**
  * A container's updates: the same checks as any installation, which also report an upgrade to the
@@ -63,7 +63,7 @@ export const initializeContainerUpdates = (runtime: Extract<ApplicationRuntime, 
     Effect.provideService(FileSystem.FileSystem, yield* FileSystem.FileSystem), Effect.catchAll(error => Effect.logWarning(error.message)))
   return { ...updates, check: reason => (reason === "launch" ? recordUpgrade : Effect.void).pipe(Effect.zipRight(updates.check(reason))) } satisfies ApplicationUpdate
 }).pipe(Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer))),
-  Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))))
+  Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("SetupFailed", "Application update setup could not be read."))))
 
 /** Startup only completes an interrupted macOS transaction; downloaded updates install at an idle point. */
 export const prepareServeStartup = (runtime: ApplicationRuntime, profile: ApplicationProfile, stateDirectory: string) => Effect.gen(function* () {

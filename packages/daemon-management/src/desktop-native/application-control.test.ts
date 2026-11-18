@@ -39,7 +39,7 @@ describe("local application control", () => {
         const result = await Effect.runPromise(Effect.either(request))
         expect(result._tag).toBe("Left")
         if (result._tag === "Left") {
-          expect(result.left._tag).toBe("ApplicationControlFailed")
+          expect(result.left._tag).toBe("DataFolderUnusable")
           expect(result.left.message).toContain("Use a shorter application state directory")
         }
       }

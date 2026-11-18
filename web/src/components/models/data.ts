@@ -1,10 +1,10 @@
 import { Option } from "effect"
-import type { CustomLocalModel, DrafterTarget, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { fitPlacementPhrase, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
+import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type ModelTransferProgress, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
+import { describeModelLoadFailure, fitPlacementPhrase, modelDownloadFailureMessage, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelQuantName, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
-import type { RunnableFamily } from "./explore-modal"
+import type { RunnableFamily } from "./explore-view"
 import type { OwnedModel, UnrunnableFile } from "./your-models"
 import type { PlacementPhrase, PlacementTier, QuantView } from "./view"
 
@@ -25,7 +25,7 @@ const repositoryOf = (model: LocalModel): string | null => {
   return model.catalogData.quant.repository
 }
 
-const quantNameOf = (model: LocalModel): string => model._tag === "Catalog" ? model.catalogData.quant.name : model.presentation.variantLabel
+const quantNameOf = localModelQuantName
 
 const assessmentOf = (model: LocalModel): LocalModelAssessment | null =>
   model.servingState._tag === "Assessed" ? model.servingState.assessment : null
@@ -68,6 +68,7 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
     placement: fits ? tiersOf(fits, memory) : [],
     servedContext: fits?.served.contextLength ?? null,
     quality: null,
+    missingDiskBytes: 0,
   }
 }
 
@@ -85,6 +86,18 @@ export const downloadContents = (model: Pick<OfferedModel, "drafter">, quant: Pi
 }
 
 /** A transfer in progress for a model: its first download or an update. */
+const transferStage = { queued: "Queued", resolving: "Preparing", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying", publishing: "Finishing" } as const
+
+/**
+ * A transfer as its row says it: a percentage only while bytes are downloading against a known total; before that
+ * (queued, preparing, or resuming after a restart until the service reports the bytes already here) only its stage,
+ * never a 0% that isn't so.
+ */
+export const transferLabel = (progress: ModelTransferProgress): { readonly text: string; readonly fraction: number | null } =>
+  progress.stage === "downloading" && progress.totalBytes > 0
+    ? { text: `Downloading ${Math.round(progress.completedBytes / progress.totalBytes * 100)}%`, fraction: progress.completedBytes / progress.totalBytes }
+    : { text: `${transferStage[progress.stage]}…`, fraction: null }
+
 export const transferOf = (model: LocalModel) => {
   const state = model.acquisitionState
   return state._tag === "Installing" || state._tag === "Updating" ? state.progress : undefined
@@ -123,6 +136,12 @@ const drafterOf = (model: LocalModel): OwnedModel["drafter"] => {
 }
 
 /** A model on this computer as the Your models list shows it. */
+/** How the model last failed, named for what its code says happened, in a sentence from it, with the engine's own report kept for Details. */
+const failureOf = (model: LocalModel): OwnedModel["failure"] => Option.match(localModelResidency(model), {
+  onNone: () => null,
+  onSome: residency => residency._tag === "Failed" ? { label: modelFailureLabel(residency.failure), summary: describeModelLoadFailure(residency.failure), detail: residency.failure.message } : null,
+})
+
 export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel => {
   const developer = Option.getOrNull(developerOf(model))
   const assessment = assessmentOf(model)
@@ -141,6 +160,8 @@ export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel
     drafter: drafterOf(model),
     drafterChoosable: model._tag === "Custom",
     searchText: `${model.presentation.displayName} ${quant.repository ?? ""} ${quant.name}`,
+    failure: failureOf(model),
+    downloadFailure: model.acquisitionState._tag === "InstallFailed" || model.acquisitionState._tag === "UpdateFailed" ? modelDownloadFailureMessage(model.acquisitionState.failure) : null,
   }
 }
 
@@ -171,7 +192,16 @@ export const unrunnableFile = (model: UnsupportedLocalModel): UnrunnableFile => 
 }
 
 /** A recommended tested model as an offered model: its ladder's rungs as this machine would run them, the chosen one marked. */
-export const offeredFromRecommendation = (recommendation: RecommendedModel, models: ReadonlyMap<string, LocalModel>, memory: ServingMemory): OfferedModel | null => {
+/**
+ * The free disk a catalog rung still lacks to download, as the service counts room when it chooses a rung: its stored
+ * bytes, unless it is here already. None when free disk is unknown.
+ */
+const missingDiskBytes = (model: LocalModel, freeDiskBytes: number | null): number => {
+  const remaining = model.acquisitionState._tag === "NotInstalled" || model.acquisitionState._tag === "InstallFailed" ? model.storageBytes : 0
+  return freeDiskBytes === null ? 0 : Math.max(0, remaining - freeDiskBytes)
+}
+
+export const offeredFromRecommendation = (recommendation: RecommendedModel, models: ReadonlyMap<string, LocalModel>, memory: ServingMemory, freeDiskBytes: number | null = null): OfferedModel | null => {
   const rungs = recommendation.rungs.flatMap(id => { const model = models.get(id); return model ? [model] : [] })
   const first = rungs[0]
   if (!first || first._tag !== "Catalog") return null
@@ -186,7 +216,7 @@ export const offeredFromRecommendation = (recommendation: RecommendedModel, mode
     fineTuneOf: null,
     drafter: drafter ? { method: methodName[drafter.method._tag], sizeBytes: drafter.sizeBytes } : null,
     contextLimit: assessment?._tag === "Fits" ? assessment.profile.contextLength : null,
-    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, memory), drafterBytes: model._tag === "Catalog" && !model.drafterWithheld ? drafter?.sizeBytes ?? 0 : 0 }))),
+    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, memory), drafterBytes: model._tag === "Catalog" && !model.drafterWithheld ? drafter?.sizeBytes ?? 0 : 0, missingDiskBytes: missingDiskBytes(model, freeDiskBytes) }))),
     recommended: Option.getOrNull(recommendation.chosen),
     checking: false,
   }

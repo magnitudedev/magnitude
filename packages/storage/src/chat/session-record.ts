@@ -8,8 +8,14 @@ import type { ChatRenameOutcome, ChatSessionRecord } from "./store"
 
 const titleLength = 80
 
-/** A message's text as a title: whitespace collapsed, at most 80 code points. */
-const titleOf = (text: string) => Array.take([...text.replace(/\s+/g, " ").trim()], titleLength).join("")
+/** A message's text as a title: whitespace collapsed, at most 80 code points, a longer one cut at a word with an ellipsis. */
+export const titleOf = (text: string) => {
+  const characters = [...text.replace(/\s+/g, " ").trim()]
+  if (characters.length <= titleLength) return characters.join("")
+  const head = Array.take(characters, titleLength - 1).join("")
+  const word = head.lastIndexOf(" ")
+  return `${(word > titleLength / 2 ? head.slice(0, word) : head).replace(/[\s,.;:–—-]+$/, "")}…`
+}
 
 const isMessage = (event: SessionEvent): event is MessageSent => event._tag === "message_sent"
 

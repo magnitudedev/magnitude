@@ -35,7 +35,7 @@ it("states how a loaded model serves, and where its bank's experts are only when
   expect(html).toContain('data-model-fact="Cold experts in System memory">210 MB, 50% of its most')
   expect(html).toContain('data-model-fact="Experts on disk">300 MB')
   expect(html).toContain('data-model-fact="N-gram table in memory">126 MB, 50% of its most, floor 25%')
-  expect(html).toContain('data-model-fact="Last resize">Experts shrank from 50% to 40% to make room for a request on ')
+  expect(html).toContain('data-model-fact="Last resize">Experts shrank from 50% to 40% as memory grew short on ')
   const resident = renderToStaticMarkup(<MemoryFigures allocation={Option.some(allocation)} hardware={hardware} />)
   expect(resident).toContain('data-model-fact="Prompt group places">1 of 8')
   expect(resident).not.toContain("Experts in")

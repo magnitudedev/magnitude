@@ -11,6 +11,7 @@ import type {
   ModelResidency,
 } from "@magnitudedev/sdk"
 import { Option } from "effect"
+import { engineFailureSentence } from "@magnitudedev/sdk"
 import { formatMemorySize } from "./format-bytes"
 
 export const MEMORY_SHORTAGE_TITLE = "Not enough memory right now"
@@ -19,11 +20,26 @@ export const MEMORY_SHORTAGE_TITLE = "Not enough memory right now"
 export const describeMemoryShortage = (shortage: MemoryShortage): string =>
   `This model needs ${formatMemorySize(shortage.requiredBytes, { rounding: "up" })} and ${formatMemorySize(shortage.availableBytes)} is available. Quit apps you aren’t using, or choose a smaller model.`
 
-/** A load failure in the user's terms: a shortage is described, anything else is the service's message. */
+/** The failure codes only loading a model can end in: its files, its fit, its memory or its worker's start. */
+const LOAD_ONLY_FAILURES: ReadonlySet<string> = new Set([
+  "model_load_failed", "invalid_model_package", "invalid_model_configuration", "unsupported_model", "integrity_failed",
+  "model_does_not_fit", "insufficient_memory", "memory_observation_unavailable", "prices_pending", "worker_spawn_failed",
+  "device_unavailable",
+])
+
+/**
+ * What a model's failed state says happened, as its status names it. A failure only a load can end in couldn't load;
+ * one a loaded model can also meet while answering (its engine exiting, the device lost) carries no phase, so it is
+ * said without claiming one.
+ */
+export const modelFailureLabel = (failure: ModelInstanceFailure): string =>
+  "_tag" in failure || LOAD_ONLY_FAILURES.has(failure.code) ? "Couldn’t load" : "Stopped unexpectedly"
+
+/** A load failure in the user's terms: a shortage is described, anything else in a sentence from its code; the service's message is diagnostic text for reports. */
 export const describeModelLoadFailure = (failure: ModelInstanceFailure): string =>
   "_tag" in failure
     ? `${MEMORY_SHORTAGE_TITLE}. ${describeMemoryShortage(failure.shortage)}`
-    : failure.message
+    : engineFailureSentence(failure.code)
 
 /** Whether the model was loaded and the machine running low on memory stopped it. */
 export const modelStoppedForMemory = (residency: ModelResidency): boolean =>

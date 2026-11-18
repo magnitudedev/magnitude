@@ -30,7 +30,11 @@ export const NetworkInterfaceAddress = Schema.Struct({
 })
 export type NetworkInterfaceAddress = typeof NetworkInterfaceAddress.Type
 
-/** `container`: a container runs the service, and its environment and config.json set network access, not Settings. */
+/**
+ * The saved network access settings beside what the running service serves. `reachableAddresses` are the
+ * addresses other devices can use now; `pending` means the saved settings apply only after a restart.
+ * `container`: a container runs the service, and its environment and config.json set network access, not Settings.
+ */
 export const NetworkAccessSettings = Schema.Struct({
   enabled: Schema.Boolean,
   bind: optional(Schema.String),
@@ -38,6 +42,7 @@ export const NetworkAccessSettings = Schema.Struct({
   apiKey: optional(Schema.String),
   interfaces: Schema.Array(NetworkInterfaceAddress),
   port: Schema.Int,
+  reachableAddresses: Schema.Array(Schema.String),
   pending: Schema.Boolean,
   warning: optional(Schema.String),
   container: Schema.Boolean,

@@ -82,12 +82,28 @@ export const ModelCommandsLive: Layer.Layer<
   }))
   /**
    * A catalog model not yet on this computer that needs more memory than it can provide is refused before ICN is
-   * asked to download it. An installed one still updates, and one not yet assessed is never refused.
+   * asked to download it. An installed one still updates, and one not yet assessed is never refused. Once every model
+   * here has been assessed, one the catalog has but no longer lists here (its assessment failed, so it can't run here)
+   * is refused too: it would download and then appear nowhere. An ID the catalog doesn't have is refused as such.
    */
-  const downloadable = (modelId: CatalogFormModelId) => localModels.state.pipe(Effect.flatMap(({ models }) => {
+  const downloadable = (modelId: CatalogFormModelId) => Effect.all([localModels.state, catalogSync.listed(modelId)]).pipe(Effect.flatMap(([{ models, preparation }, inCatalog]): Effect.Effect<CatalogFormModelId, ModelVersionNotRunnable | LocalModelMutationFailed> => {
+    if (!inCatalog) return Effect.fail(new LocalModelMutationFailed({
+      code: "catalog_model_not_found",
+      message: `There’s no model ${modelId} in the catalog.`,
+      retryable: false,
+    }))
     const model = models.find((candidate) => candidate.modelId === modelId)
-    const serving = model?.servingState
-    return model === undefined || serving?._tag !== "Assessed" || serving.assessment._tag !== "DoesNotFit"
+    if (model === undefined) {
+      return preparation.discovery.complete && preparation.assessment.complete
+        ? Effect.fail(new LocalModelMutationFailed({
+            code: "catalog_model_not_offered",
+            message: `${modelId} isn't offered on this computer: Magnitude's check of how it runs here failed, so it can't run here. The service log says why.`,
+            retryable: false,
+          }))
+        : Effect.succeed(modelId)
+    }
+    const serving = model.servingState
+    return serving._tag !== "Assessed" || serving.assessment._tag !== "DoesNotFit"
       || localModelIsInstalled(model)
       ? Effect.succeed(modelId)
       : Effect.fail(new ModelVersionNotRunnable({

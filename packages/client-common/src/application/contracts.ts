@@ -3,6 +3,8 @@ import { HuggingFaceArtifactSelectorSchema, HuggingFaceRepositoryIdSchema } from
 
 export const ApplicationPage = Schema.Literal("models", "chat", "connections", "usage", "settings")
 export type ApplicationPage = typeof ApplicationPage.Type
+/** The pages shown in the main area; the others open Settings over it. */
+export type MainPage = Extract<ApplicationPage, "chat" | "models" | "connections">
 /** A message raised outside the renderer, shown in the app while its window exists. */
 export const HostNotice = Schema.Struct({ title: Schema.String, description: Schema.String })
 export type HostNotice = typeof HostNotice.Type

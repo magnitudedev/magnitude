@@ -1,14 +1,15 @@
 import { renderToStaticMarkup } from "react-dom/server"
-import { Option } from "effect"
+import { Cause, Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { SidebarUpdatePill, sidebarUpdate, UpdatePill, type SidebarUpdate, type UpdateTransfer } from "./application-update"
+import { Result } from "@effect-atom/atom-react"
+import { SidebarUpdatePill, automaticUpdates, sidebarUpdate, UpdatePill, type SidebarUpdate, type UpdateTransfer } from "./application-update"
 
 const noop = () => {}
 const render = (update: SidebarUpdate) => renderToStaticMarkup(<UpdatePill update={update} busy={false} onDownload={noop} onRestart={noop} onOpenSettings={noop} />)
 
 describe("sidebar update", () => {
   it("offers nothing while up to date, checking fails, or updates can't happen here", () => {
-    const quiet: Array<UpdateTransfer | undefined> = [undefined, { _tag: "Idle" }, { _tag: "Cancelling" }, { _tag: "Failed", message: "offline" }, { _tag: "Unavailable", message: "dev build" }, { _tag: "Closed" }]
+    const quiet: Array<UpdateTransfer | undefined> = [undefined, { _tag: "Idle" }, { _tag: "Cancelling" }, { _tag: "Failed", message: "offline" }, { _tag: "Unavailable", kind: "NotInThisBuild", message: "dev build" }, { _tag: "Closed" }]
     for (const transfer of quiet) {
       expect(sidebarUpdate(transfer)).toEqual({ _tag: "None" })
       expect(render(sidebarUpdate(transfer))).toBe("")
@@ -52,5 +53,30 @@ describe("sidebar update", () => {
 
   it("leaves the boot skeleton's sidebar, which renders before any client exists, without an update row", () => {
     expect(renderToStaticMarkup(<SidebarUpdatePill />)).toBe("")
+  })
+})
+
+describe("automatic updates preference", () => {
+  const state = (transfer: UpdateTransfer, preference: { readonly _tag: "Known"; readonly autoDownload: boolean } | { readonly _tag: "Unavailable"; readonly message: string }) =>
+    Result.success({ transfer, check: { _tag: "Idle" as const }, preference })
+
+  it("says a build without updates doesn't update itself, with its reason, rather than calling it a failure to read", () => {
+    const reason = "Application update recovery is unavailable in this build."
+    expect(automaticUpdates(state({ _tag: "Unavailable", kind: "NotInThisBuild", message: reason }, { _tag: "Unavailable", message: reason }))).toEqual({ _tag: "NotInThisBuild", reason })
+  })
+
+  it("says update setup failed, with its reason, rather than calling the build one without updates", () => {
+    const reason = "The Windows update publisher is missing."
+    expect(automaticUpdates(state({ _tag: "Unavailable", kind: "SetupFailed", message: reason }, { _tag: "Unavailable", message: reason }))).toEqual({ _tag: "SetupFailed", reason })
+  })
+
+  it("is a failure only when the preference can't be read beside working updates, or the owner can't be asked", () => {
+    expect(automaticUpdates(state({ _tag: "Idle" }, { _tag: "Unavailable", message: "EACCES" }))).toEqual({ _tag: "ReadFailed" })
+    expect(automaticUpdates(Result.failure(Cause.fail("unreachable")))).toEqual({ _tag: "ReadFailed" })
+  })
+
+  it("is known when read, and reading until the owner answers", () => {
+    expect(automaticUpdates(state({ _tag: "Idle" }, { _tag: "Known", autoDownload: true }))).toEqual({ _tag: "Known", autoDownload: true })
+    expect(automaticUpdates(Result.initial())).toEqual({ _tag: "Reading" })
   })
 })

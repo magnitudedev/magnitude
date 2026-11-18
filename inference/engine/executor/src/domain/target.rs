@@ -600,7 +600,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok((pending, bindings))
     }
 
-    fn finish_target_work(
+    pub(super) fn finish_target_work(
         &mut self,
         flight: TargetWork<F>,
     ) -> Result<Vec<PendingOperationOutcome>, DomainError> {

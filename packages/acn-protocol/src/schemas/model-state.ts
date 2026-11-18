@@ -2031,16 +2031,28 @@ export const RecommendedModelSchema = Schema.Struct({
 }), { message: () => "a recommendation's chosen rung is one of its rungs, and only a chosen rung meets a speed" }))
 export type RecommendedModel = typeof RecommendedModelSchema.Type
 
+/** A rung that would lead the recommendations if the disk had room for it, and the bytes it lacks. */
+export const RoomShortfallSchema = Schema.Struct({
+  base: CatalogBaseIdSchema,
+  name: NonEmptyString,
+  rung: CatalogFormModelIdSchema,
+  missingBytes: Schema.Positive,
+})
+export type RoomShortfall = typeof RoomShortfallSchema.Type
+
 /**
  * The tested models in recommendation order, and the families Magnitude runs. The order and chosen rungs are final
  * only once `complete`: every rung of a listed model has been measured on this machine (`measured` of `rungs`), so
- * none is still counted as not fitting. Catalog entries no recommendation lists never hold it back.
+ * none is still counted as not fitting. Catalog entries no recommendation lists never hold it back. A rung is chosen
+ * only with room to download it; `roomShortfall` names the first model that reaches the onboarding floor that would
+ * lead instead, given more free disk.
  */
 export const RecommendationsSchema = Schema.Struct({
   complete: Schema.Boolean,
   measured: Schema.NonNegativeInt,
   rungs: Schema.NonNegativeInt,
   models: Schema.Array(RecommendedModelSchema),
+  roomShortfall: Schema.optionalWith(RoomShortfallSchema, { as: "Option", exact: true }),
   families: Schema.Array(LocalModelFamilySchema),
 })
 export type Recommendations = typeof RecommendationsSchema.Type

@@ -6,6 +6,30 @@
 #include <stdio.h>
 #include <wchar.h>
 
+DWORD magnitude_extended_from_full(const WCHAR *full, WCHAR **extended) {
+  *extended = NULL;
+  BOOL device = !wcsncmp(full, L"\\\\?\\", 4) || !wcsncmp(full, L"\\\\.\\", 4);
+  BOOL unc = !device && full[0] == L'\\' && full[1] == L'\\';
+  const WCHAR *prefix = device ? L"" : unc ? L"\\\\?\\UNC\\" : L"\\\\?\\";
+  const WCHAR *rest = unc ? full + 2 : full;
+  size_t size = wcslen(prefix) + wcslen(rest) + 1;
+  *extended = calloc(size, sizeof(WCHAR));
+  if (!*extended) return ERROR_NOT_ENOUGH_MEMORY;
+  wcscpy(*extended, prefix); wcscat(*extended, rest);
+  return ERROR_SUCCESS;
+}
+/* `path` resolved against the current directory and in extended-length form; see the header. Caller frees. */
+static DWORD extended_path(const WCHAR *path, WCHAR **extended) {
+  *extended = NULL;
+  if (!wcsncmp(path, L"\\\\?\\", 4) || !wcsncmp(path, L"\\\\.\\", 4)) return magnitude_extended_from_full(path, extended);
+  DWORD needed = GetFullPathNameW(path, 0, NULL, NULL);
+  if (!needed) return GetLastError();
+  WCHAR *full = calloc(needed, sizeof(WCHAR));
+  if (!full) return ERROR_NOT_ENOUGH_MEMORY;
+  DWORD length = GetFullPathNameW(path, needed, full, NULL);
+  DWORD error = !length ? GetLastError() : length >= needed ? ERROR_INVALID_NAME : magnitude_extended_from_full(full, extended);
+  free(full); return error;
+}
 static DWORD current_user(TOKEN_USER **user) {
   HANDLE token; DWORD bytes = 0;
   *user = NULL;
@@ -60,7 +84,7 @@ DWORD magnitude_validate_private_directory(HANDLE directory) {
       !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) return ERROR_ACCESS_DENIED;
   return private_handle(directory, TRUE);
 }
-DWORD magnitude_prepare_private_directory(const WCHAR *path) {
+static DWORD prepare_private_directory(const WCHAR *path) {
   PSECURITY_DESCRIPTOR descriptor = NULL;
   DWORD error = magnitude_private_descriptor(TRUE, &descriptor);
   if (error) return error;
@@ -123,9 +147,9 @@ static BOOL update_cache_entry(const WCHAR *name, DWORD attributes) {
   }
   return TRUE;
 }
-DWORD magnitude_recover_update_directory(const WCHAR *path, BOOL *retired) {
+static DWORD recover_update_directory(const WCHAR *path, BOOL *retired) {
   *retired = FALSE;
-  DWORD error = magnitude_prepare_private_directory(path);
+  DWORD error = prepare_private_directory(path);
   if (!error) return ERROR_SUCCESS;
   HANDLE directory = CreateFileW(path, READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | DELETE,
     FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
@@ -179,10 +203,10 @@ DWORD magnitude_recover_update_directory(const WCHAR *path, BOOL *retired) {
   free(rename); free(destination);
 cleanup:
   CloseHandle(directory);
-  if (!error) error = magnitude_prepare_private_directory(path);
+  if (!error) error = prepare_private_directory(path);
   return error;
 }
-DWORD magnitude_create_private_content(const WCHAR *path) {
+static DWORD create_private_content(const WCHAR *path) {
   PSECURITY_DESCRIPTOR descriptor = NULL;
   DWORD error = magnitude_private_descriptor(FALSE, &descriptor);
   if (error) return error;
@@ -193,7 +217,7 @@ DWORD magnitude_create_private_content(const WCHAR *path) {
   if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
   LocalFree(descriptor); return error;
 }
-DWORD magnitude_validate_private_content(const WCHAR *path) {
+static DWORD validate_private_content(const WCHAR *path) {
   HANDLE file = CreateFileW(path, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, NULL,
     OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
   if (file == INVALID_HANDLE_VALUE) return GetLastError();
@@ -238,7 +262,7 @@ DWORD magnitude_directory_endpoint(HANDLE directory, WCHAR endpoint[128]) {
   file[32] = 0;
   return swprintf(endpoint, 128, L"\\\\.\\pipe\\magnitude-app-%ls-%ls", volume, file) > 0 ? ERROR_SUCCESS : ERROR_INVALID_DATA;
 }
-DWORD magnitude_inspect_application_endpoint(const WCHAR *path, WCHAR endpoint[128], BOOL *missing) {
+static DWORD inspect_application_endpoint(const WCHAR *path, WCHAR endpoint[128], BOOL *missing) {
   *missing = FALSE; endpoint[0] = 0;
   HANDLE directory = CreateFileW(path, READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE,
     NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -250,7 +274,7 @@ DWORD magnitude_inspect_application_endpoint(const WCHAR *path, WCHAR endpoint[1
   DWORD error = magnitude_directory_endpoint(directory, endpoint);
   CloseHandle(directory); return error;
 }
-DWORD magnitude_open_private_lock(const WCHAR *path, HANDLE *file, HANDLE *directory) {
+static DWORD open_private_lock(const WCHAR *path, HANDLE *file, HANDLE *directory) {
   *file = INVALID_HANDLE_VALUE; *directory = INVALID_HANDLE_VALUE;
   size_t length = wcslen(path);
   WCHAR *parent = calloc(length + 1, sizeof(WCHAR));
@@ -292,3 +316,20 @@ cleanup:
   }
   if (descriptor) LocalFree(descriptor); free(parent); return error;
 }
+#define WITH_EXTENDED_PATH(call) \
+  WCHAR *extended = NULL; \
+  DWORD error = extended_path(path, &extended); \
+  if (error) return error; \
+  error = call; \
+  free(extended); return error;
+DWORD magnitude_prepare_private_directory(const WCHAR *path) { WITH_EXTENDED_PATH(prepare_private_directory(extended)) }
+DWORD magnitude_recover_update_directory(const WCHAR *path, BOOL *retired) { *retired = FALSE; WITH_EXTENDED_PATH(recover_update_directory(extended, retired)) }
+DWORD magnitude_create_private_content(const WCHAR *path) { WITH_EXTENDED_PATH(create_private_content(extended)) }
+DWORD magnitude_validate_private_content(const WCHAR *path) { WITH_EXTENDED_PATH(validate_private_content(extended)) }
+DWORD magnitude_inspect_application_endpoint(const WCHAR *path, WCHAR endpoint[128], BOOL *missing) {
+  *missing = FALSE; endpoint[0] = 0; WITH_EXTENDED_PATH(inspect_application_endpoint(extended, endpoint, missing))
+}
+DWORD magnitude_open_private_lock(const WCHAR *path, HANDLE *file, HANDLE *directory) {
+  *file = INVALID_HANDLE_VALUE; *directory = INVALID_HANDLE_VALUE; WITH_EXTENDED_PATH(open_private_lock(extended, file, directory))
+}
+#undef WITH_EXTENDED_PATH

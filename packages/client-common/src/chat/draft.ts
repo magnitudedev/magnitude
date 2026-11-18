@@ -10,6 +10,7 @@ import {
   type MessageId,
   RequestedResponseSettings,
   type ResponseReasoningEffort,
+  responseExceedsContext,
   responseStatus,
   type ServingModelId,
   type SessionId,
@@ -94,7 +95,11 @@ export const completeChatSubmission = (
   submitted: { id, text },
 })
 
-/** A failed response restores its captured input only while the next draft is still empty. */
+/**
+ * A failed response restores its captured input only while the next draft is still empty, so it can be edited and sent
+ * again. One that outgrew the context is not: sending into the same chat can't succeed, so the input goes to the new
+ * chat its response offers instead.
+ */
 export const chatComposerText = (draft: ChatDraft, last: ChatAssistantMessage | undefined): string =>
   draft.text ||
-  (last !== undefined && responseStatus(last) === "failed" && last.id === draft.submitted?.id ? draft.submitted.text : "")
+  (last !== undefined && responseStatus(last) === "failed" && !responseExceedsContext(last) && last.id === draft.submitted?.id ? draft.submitted.text : "")

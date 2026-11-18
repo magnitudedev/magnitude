@@ -39,6 +39,14 @@ export function ContextText({ quant, limit, modelName }: { quant: QuantView; lim
   return <span className="whitespace-nowrap">{formatContext(quant.servedContext)} context</span>
 }
 
+/** A repository's page on Hugging Face as an icon alone, beside a name that does something else when clicked. */
+export function RepositoryIconLink({ repository }: { repository: string }) {
+  return <a href={`https://huggingface.co/${repository}`} target="_blank" rel="noreferrer" title={repository} aria-label={`Open ${repository} on Hugging Face`}
+    className="relative z-10 inline-flex shrink-0 items-center rounded p-0.5 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-blue-400">
+    <ArrowSquareOutIcon className="size-3" />
+  </a>
+}
+
 export function RepositoryLink({ repository, children }: { repository: string; children?: ReactNode }) {
   return <a href={`https://huggingface.co/${repository}`} target="_blank" rel="noreferrer" title={repository} onClick={event => event.stopPropagation()}
     className="inline-flex min-w-0 items-center gap-0.5 hover:text-blue-700 hover:underline dark:hover:text-blue-400">
@@ -97,14 +105,15 @@ export function QuantLadder({ quants, selected, recommended, owned, limit, onSel
   return <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${quants.length}, minmax(0, 1fr))` }}>
     {quants.map(quant => {
       const active = selected === quant.key
-      return <button key={quant.key} type="button" disabled={!quant.fits || quant.measuring} onClick={() => onSelect(quant.key)} title={quant.quality ?? undefined}
-        className={cn("flex flex-col items-start rounded-lg border px-3 py-2.5 text-left", !quant.fits && !quant.measuring && "opacity-40", active ? "border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30 dark:border-blue-400 dark:bg-slate-800" : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-750 dark:bg-slate-850")}>
+      const noRoom = quant.missingDiskBytes > 0
+      return <button key={quant.key} type="button" disabled={!quant.fits || quant.measuring || noRoom} onClick={() => onSelect(quant.key)} title={quant.quality ?? undefined}
+        className={cn("flex flex-col items-start rounded-lg border px-3 py-2.5 text-left", ((!quant.fits && !quant.measuring) || noRoom) && "opacity-40", active ? "border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30 dark:border-blue-400 dark:bg-slate-800" : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-750 dark:bg-slate-850")}>
         <span className="flex w-full items-center justify-between gap-1 text-[13px] font-medium">{quant.bits}-bit
           {owned.has(quant.key) ? <Badge>Downloaded</Badge> : recommended === quant.key && <Badge tone="blue">Best</Badge>}</span>
         <span className="w-full truncate text-[11px] text-slate-500">{quantSource(quant)}</span>
         {quant.fits && quant.servedContext !== null && limit !== null && quant.servedContext < limit && <span className="text-[11px] text-orange-700 dark:text-orange-300">{formatContext(quant.servedContext)} context</span>}
         <span className="mt-2.5 flex w-full items-baseline justify-between gap-2 tabular-nums">
-          <span className={cn("text-[13px] font-medium", quant.measuring && "font-normal text-slate-500")}>{quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)}</span>
+          <span className={cn("text-[13px] font-medium", (quant.measuring || noRoom) && "font-normal text-slate-500")}>{noRoom ? `Needs ${formatStorageSize(quant.missingDiskBytes)} more disk` : quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)}</span>
           <span className="text-xs text-slate-500">{formatStorageSize(quant.sizeBytes)}</span>
         </span>
       </button>
@@ -119,14 +128,16 @@ export function QuantList({ quants, selected, recommended, owned, onSelect }: {
   return <div className="divide-y divide-slate-200 overflow-hidden rounded-lg border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
     {quants.map(quant => {
       const active = selected === quant.key
-      return <button key={quant.key} type="button" disabled={!quant.fits || quant.measuring} onClick={() => onSelect(quant.key)}
-        className={cn("grid w-full grid-cols-[52px_minmax(0,1fr)_auto_72px_64px] items-center gap-3 px-3 py-2 text-left text-[13px]", active ? "bg-blue-50/60 dark:bg-slate-800" : "hover:bg-slate-50 dark:hover:bg-slate-800/50", !quant.fits && !quant.measuring && "opacity-40")}>
+      // The whole row chooses the size, from a button laid over it; only the icon beside the name opens Hugging Face.
+      return <div key={quant.key} className={cn("relative grid w-full grid-cols-[52px_minmax(0,1fr)_auto_72px_64px] items-center gap-3 px-3 py-2 text-left text-[13px]", active ? "bg-blue-50/60 dark:bg-slate-800" : "hover:bg-slate-50 dark:hover:bg-slate-800/50", !quant.fits && !quant.measuring && "opacity-40")}>
+        <button type="button" aria-label={`${quant.bits}-bit ${quantSource(quant)}`} aria-pressed={active} disabled={!quant.fits || quant.measuring} onClick={() => onSelect(quant.key)}
+          className="absolute inset-0 cursor-pointer focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-default" />
         <span className={cn("font-medium", active && "text-blue-700 dark:text-blue-400")}>{quant.bits}-bit</span>
-        <span className="min-w-0 truncate text-xs text-slate-500">{quant.repository ? <RepositoryLink repository={quant.repository}>{quantSource(quant)}</RepositoryLink> : quantSource(quant)}</span>
+        <span className="flex min-w-0 items-center gap-1 text-xs text-slate-500"><span className="truncate">{quantSource(quant)}</span>{quant.repository && <RepositoryIconLink repository={quant.repository} />}</span>
         <span>{owned.has(quant.key) ? <Badge>Downloaded</Badge> : recommended === quant.key && <Badge tone="blue">Best</Badge>}</span>
         <span className="text-right text-xs tabular-nums text-slate-700 dark:text-slate-300">{quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)}</span>
         <span className="text-right text-xs tabular-nums text-slate-500">{formatStorageSize(quant.sizeBytes)}</span>
-      </button>
+      </div>
     })}
   </div>
 }
@@ -195,10 +206,12 @@ export function ModelCardShell({ lab, title, note, detail, quant, active, onSele
   lab: ModelLab | undefined; title: string; note?: string | undefined; detail: ReactNode; quant: QuantView; active: boolean; onSelect: () => void; children?: ReactNode
 }) {
   return <div className={cn("overflow-hidden rounded-xl border bg-white dark:bg-slate-850", active ? "border-blue-600 ring-1 ring-blue-600/30 dark:border-blue-400" : "border-slate-200 hover:border-slate-300 dark:border-slate-750 dark:hover:border-slate-700")}>
-    <div role="button" tabIndex={0} aria-expanded={active} onClick={onSelect} onKeyDown={event => { if (event.key === "Enter") onSelect() }} className="grid w-full cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 px-4 py-3 text-left">
+    {/* The card opens from a button laid over it, so the repository link in its line is beside the button, not inside it. */}
+    <div className="relative grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 px-4 py-3 text-left [&_a]:relative [&_a]:z-10">
+      <button type="button" aria-expanded={active} aria-label={title} onClick={onSelect} className="absolute inset-0 cursor-pointer rounded-[inherit] focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-blue-500" />
       <LabMark lab={lab} className="size-10" />
       <span className="min-w-0">
-        <span className="flex items-center gap-2 text-[14px] font-medium"><span className="truncate">{title}</span>{note && <span className="shrink-0 text-xs font-normal text-slate-500">{note}</span>}</span>
+        <span className="flex items-center gap-2 text-[14px] font-medium"><span className="max-w-full shrink-0 truncate">{title}</span>{note && <span className="min-w-0 truncate text-xs font-normal text-slate-500">{note}</span>}</span>
         <span className="mt-0.5 block min-w-0 truncate text-xs text-slate-500">{detail}</span>
       </span>
       <span className="flex items-center gap-4">

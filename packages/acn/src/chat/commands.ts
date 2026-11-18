@@ -9,12 +9,13 @@ import {
   type ChatMessage,
   InvalidChatRequest,
   latestResponse,
+  runningResponse,
   type MessageId,
   type MessageSent,
   type ResponseStarted,
   type SessionEvent,
 } from "@magnitudedev/acn-protocol"
-import { runningResponse, Seen, type SeenId, type SeenState, Transcript } from "./folds"
+import { Seen, type SeenId, type SeenState, Transcript } from "./folds"
 import { Generation } from "./generation"
 
 // The chat commands (spec section 5), as transaction bodies: each reads settled state, decides, and
@@ -174,7 +175,7 @@ export const stop = ({ chatId, responseId }: ChatStopPayload): Command<ChatNotFo
   decided<ChatNotFound | InvalidChatRequest>((states) => {
     if (!states.exists) return reject(new ChatNotFound({ chatId }))
     if (Option.isNone(answered(states, responseId))) return reject(new InvalidChatRequest({ reason: "no_such_response" }))
-    return Option.contains(runningResponse(states.transcript), responseId)
+    return Option.exists(runningResponse(states.transcript), (response) => response.id === responseId)
       ? { events: [], interrupts: [Generation], result: Either.void }
       : accept([])
   })

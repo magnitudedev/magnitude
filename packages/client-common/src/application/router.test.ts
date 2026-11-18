@@ -8,7 +8,7 @@ describe("application routes", () => {
     for (const page of ApplicationPage.literals) expect(pageFromPath(pagePath(page))).toEqual(Option.some(page))
   })
   it("treats the root and trailing slashes as the same route", () => {
-    expect(pageFromPath("/")).toEqual(Option.some("models"))
+    expect(pageFromPath("/")).toEqual(Option.some("chat"))
     expect(pageFromPath("/chat/")).toEqual(Option.some("chat"))
   })
   it("rejects paths that are not pages", () => {

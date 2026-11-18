@@ -14,7 +14,7 @@ import {
   type ChatSummary,
   type ChatUpdate,
   InvalidChatRequest,
-  latestResponse,
+  runningResponse,
   type LiveResponse,
   type ServableModelsUnavailable,
   type SessionEvent,
@@ -24,7 +24,7 @@ import { ChatStore, type ChatSessionRecord, type ChatStoreError, committedRecord
 import { AcnChanges } from "../changes"
 import * as Commands from "./commands"
 import { ChatEngine, settled, storageFailed } from "./engine"
-import { lastObserved, Live, runningResponse, Seen, Transcript } from "./folds"
+import { lastObserved, Live, Seen, Transcript } from "./folds"
 import { Generation } from "./generation"
 import { ChatInference } from "./inference"
 import { makeInstances } from "./instances"
@@ -64,7 +64,7 @@ const summaryOf = (record: ChatSessionRecord, transcript: ReadonlyArray<ChatMess
  */
 const recover = ({ read, emit }: { readonly read: ProjectionReader; readonly emit: Emit<SessionEvent, ChatStoreError> }) =>
   Effect.flatMap(read.get(Transcript), (transcript) =>
-    Option.match(Option.filter(latestResponse(transcript), (response) => Option.isNone(response.end)), {
+    Option.match(runningResponse(transcript), {
       onNone: () => Effect.succeed(false),
       onSome: (response) => Effect.as(emit({
         _tag: "response_ended",

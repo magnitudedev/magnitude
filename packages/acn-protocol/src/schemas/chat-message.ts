@@ -11,6 +11,7 @@ import {
   ResponseUsage,
 } from "./session-event"
 import { ServingModelId } from "./serving-usage"
+import { engineFailureSentence } from "./engine-failure"
 
 // A chat's transcript as folded from its session's log (spec section 4), and its running response's
 // live state. These shapes are derived: a change to them is a change to the fold, never to stored
@@ -67,6 +68,13 @@ export type ChatMessage = typeof ChatMessage.Type
 /** The transcript's latest response: the only one a retry may replace, and the one that may be running. */
 export const latestResponse = (messages: ReadonlyArray<ChatMessage>): Option.Option<ChatAssistantMessage> =>
   Arr.findLast(messages, (message): message is ChatAssistantMessage => message._tag === "assistant")
+
+/**
+ * The chat's running response: its latest, until that ends. It runs from the moment it starts, through waiting, the
+ * model loading and preparing, thinking and streaming, and stopping, until its end is recorded however it ended.
+ */
+export const runningResponse = (messages: ReadonlyArray<ChatMessage>): Option.Option<ChatAssistantMessage> =>
+  Option.filter(latestResponse(messages), (response) => Option.isNone(response.end))
 
 export const ModelLoadingStage = Schema.Literal("queued", "preparing", "optimizing", "loading_weights", "finalizing")
 export type ModelLoadingStage = typeof ModelLoadingStage.Type
@@ -146,14 +154,13 @@ const statusLabels: { readonly [Status in ResponseStatus]: Option.Option<string>
 
 /**
  * What a failure tells the reader. Each message but the inference service's is a sentence written
- * where the failure was found; the service's own message is shown as its report.
+ * where the failure was found; the service's is written from its code, since its message is
+ * diagnostic text ([`failureDetail`]).
  */
-const failureText = (error: ResponseFailure): string => {
+export const failureText = (error: ResponseFailure): string => {
   switch (error._tag) {
     case "inference":
-      return error.code === CONTEXT_LENGTH_EXCEEDED
-        ? "This chat is longer than the context this computer serves this model at. Start a new chat to continue."
-        : `The inference service failed: ${error.message}`
+      return engineFailureSentence(error.code)
     case "unreachable":
     case "rejected":
     case "storage":
@@ -161,6 +168,10 @@ const failureText = (error: ResponseFailure): string => {
       return error.message
   }
 }
+
+/** The inference service's own message about a failure, for a bug report: shown collapsed, never as the summary. */
+export const failureDetail = (error: ResponseFailure): Option.Option<string> =>
+  error._tag === "inference" && error.message.trim() !== "" ? Option.some(error.message) : Option.none()
 
 const CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
 
@@ -175,13 +186,14 @@ export const responseExceedsContext = (message: ChatAssistantMessage): boolean =
     && outcome.error.code === CONTEXT_LENGTH_EXCEEDED,
 )
 
-/** How a response's status is labelled, and what went wrong with it, if anything. */
+/** How a response's status is labelled, what went wrong with it, if anything, and the service's own report of it. */
 export const responseStatusText = (
   message: ChatAssistantMessage
-): { readonly label: Option.Option<string>; readonly problem: Option.Option<string> } => {
+): { readonly label: Option.Option<string>; readonly problem: Option.Option<string>; readonly detail: Option.Option<string> } => {
   const status = responseStatus(message)
   return {
     label: statusLabels[status],
+    detail: Option.flatMap(message.end, ({ outcome }) => outcome._tag === "failed" ? failureDetail(outcome.error) : Option.none()),
     problem: Option.flatMap(message.end, ({ outcome }) => {
       switch (outcome._tag) {
         case "failed":
@@ -233,9 +245,14 @@ export interface EngineReport {
   readonly timings: Option.Option<ResponseTimings>
 }
 
-/** Output tokens a second, from the engine's report: final, or the latest while a response runs. */
+/**
+ * Output tokens a second, from the engine's report: final, or the latest while a response runs. The engine's
+ * `predicted_ms` is its decode work after the first token, which the prompt's processing produces, so it spans the
+ * tokens after the first; a response of one token decoded nothing and has no speed.
+ */
 export const tokensPerSecond = ({ usage, timings }: EngineReport) =>
-  Option.flatMap(Option.all([usage, timings]), ([u, t]) => rate(u.completionTokens, t.predictedMs))
+  Option.flatMap(Option.all([usage, timings]), ([u, t]) =>
+    u.completionTokens >= 2 ? rate(u.completionTokens - 1, t.predictedMs) : Option.none())
 
 /** What the engine measured of a response, read from its report. */
 export const engineMetrics = (report: EngineReport): EngineMetrics => {

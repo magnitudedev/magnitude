@@ -53,12 +53,35 @@ describe("Chat presentation", () => {
     expect(html).toContain('aria-label="JavaScript code"')
     expect(html).toContain('aria-label="Copy code"')
     expect(html).toContain('class="hljs-keyword"')
-    expect(html).toContain("40 tok/s")
+    expect(html).toContain("38 tok/s")
     expect(html).toContain("TTFT 0.25s")
     expect(html).toContain("20 tokens")
     expect(html).toContain("Retry response")
     expect(html).not.toContain("model logo")
     expect(html).not.toContain("Response details")
+  })
+
+  it("shows every measurement on one line under a finished response, with nothing to expand", () => {
+    const html = renderToStaticMarkup(<ChatResponse response={response()} retry={() => {}} notify={() => {}} />)
+    expect(html).toContain(">Prefill 20 tokens at 400 tok/s (40 cached) · Decode 20 tokens at 38 tok/s · TTFT 0.25s · 1.0s total</p>")
+    expect(html).not.toContain("Response metrics")
+    expect(html).not.toContain('aria-expanded="')
+    expect(html).not.toContain("<dl")
+    expect(html).not.toContain("First answer")
+  })
+
+  it("rounds speeds to whole numbers, separates thousands, and leaves out a cached count of none", () => {
+    const html = renderToStaticMarkup(<ChatResponse response={response({ content: [{ type: "text", text: answer, time: { started: 4_100, ended: 62_000 } }], end: {
+      time: 62_700, outcome: { type: "finished", finishReason: "stop" },
+      usage: { promptTokens: 54, cachedTokens: 0, completionTokens: 11_435 },
+      timings: { promptMs: 30.6, predictedMs: 46_030, samplerMs: 1, parserMs: 1, timeToFirstTokenMs: 4_000 },
+    } })} notify={() => {}} />)
+    expect(html).toContain(">Prefill 54 tokens at 1,765 tok/s · Decode 11,435 tokens at 248 tok/s · TTFT 4.0s · 62.6s total</p>")
+  })
+
+  it("puts Retry after the time and copy button, revealed on hover with them", () => {
+    const html = renderToStaticMarkup(<ChatResponse response={response()} retry={() => {}} notify={() => {}} />)
+    expect(html).toMatch(/<span class="chat-message-actions"><time[^>]*>[^<]*<\/time><button[^>]*aria-label="Copy response"[^>]*>.*?<\/button><button type="button" class="chat-message-action" aria-label="Retry response"/)
   })
   it("does not execute model HTML, unsafe links or remote images", () => {
     const html = renderToStaticMarkup(
@@ -97,14 +120,33 @@ describe("Chat presentation", () => {
       expect(html).not.toContain("tok/s")
     }
   })
-  it("shows Thinking while a running response has only reasoned", () => {
+  it("counts how long a running response has been thinking while it reasons", () => {
+    const started = Date.now() - 12_400
     const html = renderToStaticMarkup(
       <ChatResponse
-        response={running({ content: [{ type: "reasoning", text: "Hm", time: { started: 200, ended: 300 } }] })}
+        response={running({ content: [{ type: "reasoning", text: "Hm", time: { started, ended: started + 100 } }] })}
         notify={() => {}}
       />
     )
-    expect(html).toContain(">Thinking</summary>")
+    expect(html).toMatch(/>Thinking for 1[23]s<\/summary>/)
+  })
+  it("shows how long it thought once the answer has begun", () => {
+    const html = renderToStaticMarkup(
+      <ChatResponse
+        response={running({ content: [
+          { type: "reasoning", text: "Hm", time: { started: 200, ended: 1_200 } },
+          { type: "text", text: "Yes", time: { started: 1_300, ended: 1_400 } },
+        ] })}
+        notify={() => {}}
+      />
+    )
+    expect(html).not.toContain("Thinking")
+  })
+  it("shows a message's copy and the time its response ended, revealed on hover", () => {
+    const html = renderToStaticMarkup(<ChatResponse response={response()} notify={() => {}} />)
+    expect(html).toContain("chat-hover-group")
+    expect(html).toContain('aria-label="Copy response"')
+    expect(html).toContain(`dateTime="${new Date(1_100).toISOString()}"`)
   })
 
   const statuses = [
@@ -192,6 +234,13 @@ describe("Chat presentation", () => {
 })
 
 import { submitsChatMessage } from "./chat/keyboard"
+it("makes room in a numbered list for its widest number, so 138 isn't cut to 38", () => {
+  const list = (markdown: string) => renderToStaticMarkup(<ChatResponse response={response({ content: [{ type: "text", text: markdown, time: { started: 350, ended: 1_000 } }] })} notify={() => {}} />)
+  expect(list("137. One\n138. Two")).toContain('<ol start="137" style="padding-left:calc(3ch + 1em)">')
+  expect(list("1. One\n2. Two")).toContain('style="padding-left:calc(1ch + 1em)"')
+  expect(list("9. One\n10. Two")).toContain('style="padding-left:calc(2ch + 1em)"')
+})
+
 it("keeps IME composition and Shift-Enter out of message submission", () => {
   expect(submitsChatMessage("Enter", false, false, 13)).toBe(true)
   expect(submitsChatMessage("Enter", true, false, 13)).toBe(false)
@@ -212,7 +261,7 @@ it("labels responses with no token measurements instead of showing an empty metr
     renderToStaticMarkup(<ChatResponse response={ended(outcome)} notify={() => {}} />)
   const reported = failed({ type: "failed", error: { type: "inference", code: "server_error", message: "The engine stopped." } })
   expect(reported).toContain("Failed")
-  expect(reported).toContain("The engine stopped.")
+  expect(reported).toContain("The inference engine reported an error (server_error).")
   expect(reported).not.toContain("tok/s")
   const unfinished = failed({ type: "finished", finishReason: "tool_calls" })
   expect(unfinished).toContain("The model ended with tool_calls. This chat has no tools.")
@@ -227,6 +276,22 @@ it("labels a response a shutdown ended as interrupted, and one the user ended as
   const stopped = render("user")
   expect(stopped).toContain("Stopped")
   expect(stopped).not.toContain("Retry to continue")
+})
+
+it("shows no speed for a failed reply of one token, and counts it as one token", () => {
+  const html = renderToStaticMarkup(
+    <ChatResponse
+      response={ended({ type: "failed", error: { type: "inference", code: "worker_exited", message: "x" } }, {
+        end: { time: 1_100, outcome: { type: "failed", error: { type: "inference", code: "worker_exited", message: "x" } },
+          usage: { ...encoded.end.usage, completionTokens: 1 }, timings: { ...encoded.end.timings, predictedMs: 0.02 } },
+      })}
+      notify={() => {}}
+    />
+  )
+  // No decode speed; the prompt's prefill speed is its own figure.
+  expect(html).toContain("Decode 1 token ·")
+  expect(html).toContain("Prefill 20 tokens at 400 tok/s (40 cached)")
+  expect(html).not.toContain("1 tokens")
 })
 
 it("shows a stopped response's token count from the engine's report", () => {
@@ -262,4 +327,16 @@ it("offers a new chat instead of a retry when the chat outgrew the model's serve
     />
   )
   expect(other).toContain('aria-label="Retry response"')
+})
+
+it("says what an engine failure means, and keeps the engine's report collapsed under Details with a copy button", () => {
+  const report = `worker lost during load: the worker ended before it was ready; worker diagnostics: ${"0x5a620e5e9763 - std::sys::backtrace at /home/ubuntu/inference/engine/scheduler/src/worker.rs:429:28 ".repeat(150)}`
+  const html = renderToStaticMarkup(
+    <ChatResponse response={ended({ type: "failed", error: { type: "inference", code: "worker_exited", message: report } })} notify={() => {}} />
+  )
+  const alert = html.match(/<p role="alert"[^>]*>(.*?)<\/p>/)?.[1]
+  expect(alert).toBe("The model’s engine stopped unexpectedly. Try again, or choose another model.")
+  expect(html).toMatch(/<details[^>]*><summary[^>]*>Details<\/summary>/)
+  expect(html.indexOf("worker diagnostics")).toBeGreaterThan(html.indexOf("<details"))
+  expect(html).toContain('aria-label="Copy details"')
 })

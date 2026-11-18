@@ -16,8 +16,10 @@ import {
   type ServerMachine,
 } from "@magnitudedev/acn-protocol"
 import {
+  ALL_INTERFACES_BIND,
   GlobalStorage,
   LOOPBACK_ONLY,
+  isLoopbackAddress,
   MagnitudeConfigSchema,
   generateApiKey,
   makeConfigStorage,
@@ -75,6 +77,12 @@ export const listNetworkInterfaces = (interfaces: ReturnType<typeof networkInter
     .filter(entry => entry.family === "IPv4" && !entry.internal && !entry.address.startsWith("169.254."))
     .map(entry => ({ name, address: entry.address, kind: isTailscaleAddress(entry.address) ? "tailscale" as const : VIRTUAL_INTERFACE.test(name) ? "virtual" as const : "lan" as const })))
     .sort((a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind])
+
+/** The addresses other devices can reach the running service at; loopback, which always listens, is not one. */
+export const servedAddresses = (active: NetworkAccess, interfaces: ReadonlyArray<NetworkInterfaceAddress>): ReadonlyArray<string> =>
+  !active.enabled ? []
+    : active.bind === ALL_INTERFACES_BIND ? interfaces.map(entry => entry.address)
+    : isLoopbackAddress(active.bind) ? [] : [active.bind]
 
 const nativeHostPath = () => process.env.MAGNITUDE_NATIVE_HOST ?? join(dirname(process.execPath), "desktop-host.node")
 
@@ -168,13 +176,15 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
         const effective = containerNetworkConfig(host.container, saved)
         const resolved = Option.isNone(effective) ? LOOPBACK_ONLY : resolveNetworkAccess(effective)
         const current = networkBase(effective)
+        const interfaces = listNetworkInterfaces()
         return {
           enabled: current.enabled,
           bind: Option.fromNullable(current.bind),
           requireApiKey: current.requireApiKey,
           apiKey: Option.fromNullable(current.apiKey),
-          interfaces: listNetworkInterfaces(),
+          interfaces,
           port: host.port,
+          reachableAddresses: servedAddresses(host.activeNetwork, interfaces),
           pending: !networkAccessEquals(resolved, host.activeNetwork),
           warning: resolved.warning,
           container: Option.isSome(host.container),

@@ -66,7 +66,7 @@ export function UsageActivity({ days }: { days: Activity | null }) {
               const cell = "block aspect-square w-full rounded-[3px]"
               if (!days) return <td key={column}><Skeleton className={cell} /></td>
               if (!day) return <td key={column}><span aria-hidden="true" className={`${cell} invisible`} /></td>
-              const label = `${day.totalTokens.toLocaleString()} tokens on ${dateLabel(day.date)}`
+              const label = `${day.totalTokens.toLocaleString()} ${day.totalTokens === 1 ? "token" : "tokens"} on ${dateLabel(day.date)}`
               return <td key={column}><ActionTooltip label={label} trigger={<button type="button" aria-label={label} data-day-index={column * 7 + row} data-activity-level={activityLevel(day.totalTokens, maximum)} tabIndex={day.date === focusDate ? 0 : -1}
                 onFocus={() => setFocusedDate(day.date)} onKeyDown={event => navigate(event, column * 7 + row)}
                 className={`${cell} ${colors[activityLevel(day.totalTokens, maximum)]} outline-offset-2 focus-visible:outline-2 focus-visible:outline-blue-500`} />} /></td>

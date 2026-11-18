@@ -444,10 +444,12 @@ describe("Chat commands", () => {
     const first = payload(chatId)
     await f.run(Effect.gen(function* () {
       const service = yield* ChatService
-      // Told when the chat starts, not only once its first response ends.
+      // Told when the chat starts, not only once its first response ends, and again when it ends, so a list showing it
+      // in progress stops doing so.
       yield* tells(f.changes, service.start(first))
-      yield* service.stop({ chatId, responseId: first.responseId })
-      yield* ended(service, chatId)
+      expect(yield* Effect.map(service.list(0, 10), ({ chats }) => chats.find((chat) => chat.id === chatId)?.running)).toBe(true)
+      yield* tells(f.changes, Effect.zipRight(service.stop({ chatId, responseId: first.responseId }), ended(service, chatId)))
+      expect(yield* Effect.map(service.list(0, 10), ({ chats }) => chats.find((chat) => chat.id === chatId)?.running)).toBe(false)
     }))
     const renamed = await fixture(endless, f.memory)
     await renamed.run(Effect.gen(function* () {

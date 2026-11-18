@@ -1,23 +1,18 @@
-import { memo, useMemo, useState } from "react"
-import { Option } from "effect"
+import { memo, useMemo } from "react"
+import { DateTime, Option } from "effect"
 import {
   type ChatAssistantMessage,
   responseExceedsContext,
   responseMetrics,
   responseStatusText,
 } from "@magnitudedev/sdk"
-import {
-  ArrowCounterClockwiseIcon,
-  CaretDownIcon,
-  PlusIcon,
-  CaretRightIcon,
-  CopyIcon,
-  CheckIcon,
-} from "@phosphor-icons/react"
+import { ArrowCounterClockwiseIcon, PlusIcon } from "@phosphor-icons/react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
-import { IconButton, number, seconds } from "./shared"
+import { CopyText, SentAt, ThinkingFor, number, seconds, tokens } from "./shared"
 import { ChatCodeBlock } from "./code-block"
+import { rehypeLongTokens } from "./long-tokens"
+import { FailureDetails } from "../failure-details"
 /** A response's parts of one kind, joined in order. */
 const partsText = (response: ChatAssistantMessage, part: "text" | "reasoning") =>
   response.content.flatMap((p) => (p._tag === part ? [p.text] : [])).join("")
@@ -33,34 +28,35 @@ export function ChatResponse({
   newChat?: () => void
   notify: (text: string) => void
 }) {
-  const [details, setDetails] = useState(false)
-  const [copied, setCopied] = useState(false)
   const m = responseMetrics(g)
   const content = partsText(g, "text")
   const reasoning = partsText(g, "reasoning")
   const running = Option.isNone(g.end)
-  const { label, problem: failure } = responseStatusText(g)
+  const thinkingSince = running && g.content.at(-1)?._tag === "reasoning"
+    ? g.content.find((part) => part._tag === "reasoning")?.time.started
+    : undefined
+  const { label, problem: failure, detail } = responseStatusText(g)
+  // Every measurement the engine reported, condensed onto one line; a bare number gets a word only where it'd be ambiguous.
+  const at = (speed: Option.Option<number>) => Option.match(speed, { onNone: () => "", onSome: (n) => ` at ${Math.round(n).toLocaleString()} tok/s` })
   const metrics = [
-    Option.map(m.tokensPerSecond, (n) => `${number(n)} tok/s`),
+    // Prefill counts the tokens it computed, the ones its speed covers; those the cache already held follow.
+    Option.map(m.inputTokens, (n) => {
+      const cached = Option.getOrElse(m.cachedTokens, () => 0)
+      return `Prefill ${tokens(n - cached)}${at(m.prefillTokensPerSecond)}${cached > 0 ? ` (${number(cached)} cached)` : ""}`
+    }),
+    Option.map(m.outputTokens, (n) => `Decode ${tokens(n)}${at(m.tokensPerSecond)}`),
     Option.map(m.ttftMs, (n) => `TTFT ${seconds(n)}`),
-    Option.map(m.outputTokens, (n) => `${number(n)} tokens`),
+    Option.map(m.totalMs, (n) => `${seconds(n)} total`),
+    label,
   ].flatMap(Option.toArray)
-  const labels: [string, Option.Option<string>][] = [
-    ["Input", Option.map(m.inputTokens, (n) => `${number(n)} tokens`)],
-    ["Cached", Option.map(m.cachedTokens, (n) => `${number(n)} tokens`)],
-    [
-      "Prefill",
-      Option.map(m.prefillTokensPerSecond, (n) => `${number(n)} tok/s`),
-    ],
-    ["First answer", Option.map(m.firstAnswerMs, seconds)],
-    ["Total", Option.map(m.totalMs, seconds)],
-  ]
   return (
-    <article aria-label="Assistant response">
+    <article aria-label="Assistant response" className="chat-hover-group">
       {reasoning && (
         <details className="mb-3">
           <summary className="cursor-pointer py-1 text-xs text-slate-500 dark:text-slate-400">
-            {running && !content
+            {thinkingSince !== undefined
+              ? <ThinkingFor started={DateTime.toEpochMillis(thinkingSince)} />
+              : running && !content
               ? "Thinking"
               : Option.match(m.thoughtForMs, {
                   onNone: () => "Thought process",
@@ -83,74 +79,29 @@ export function ChatResponse({
               {failure.value}
             </p>
           )}
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
-            <button
-              type="button"
-              aria-label="Response metrics"
-              aria-expanded={details}
-              onClick={() => setDetails(!details)}
-              className="flex flex-wrap items-center gap-2 rounded py-1 text-xs tabular-nums text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200"
-            >
-              {[
-                ...metrics,
-                ...Option.toArray(label),
-              ].map((metric, i) => (
-                <span key={metric} className="inline-flex items-center gap-2">
-                  {i > 0 && (
-                    <span className="text-slate-300 dark:text-slate-700">
-                      ·
-                    </span>
-                  )}
-                  {metric}
-                </span>
-              ))}
-              {details ? <CaretDownIcon /> : <CaretRightIcon />}
-            </button>
-            <div className="flex items-center">
-              <IconButton
-                label={copied ? "Copied" : "Copy response"}
-                disabled={!content}
-                onClick={() => {
-                  void navigator.clipboard.writeText(content).then(
-                    () => setCopied(true),
-                    () => notify("Copy is unavailable in this browser.")
-                  )
-                }}
-              >
-                {copied ? <CheckIcon /> : <CopyIcon />}
-              </IconButton>
+          {Option.isSome(detail) && (
+            <FailureDetails text={detail.value} notify={notify} />
+          )}
+          {metrics.length > 0 && (
+            <p className="mt-4 text-xs tabular-nums text-slate-500 dark:text-slate-400">{metrics.join(" · ")}</p>
+          )}
+          <div className="mt-1 flex items-center">
+            <span className="chat-message-actions">
+              {Option.match(g.end, { onNone: () => null, onSome: (end) => <SentAt time={DateTime.toEpochMillis(end.time)} /> })}
+              {content && <CopyText text={content} label="Copy response" notify={notify} />}
               {retry && responseExceedsContext(g) && newChat ? (
-                <IconButton label="New chat" onClick={newChat}>
+                <button type="button" className="chat-message-action" aria-label="New chat" title="New chat" onClick={newChat}>
                   <PlusIcon />
-                </IconButton>
+                </button>
               ) : (
                 retry && (
-                  <IconButton label="Retry response" onClick={retry}>
+                  <button type="button" className="chat-message-action" aria-label="Retry response" title="Retry response" onClick={retry}>
                     <ArrowCounterClockwiseIcon />
-                  </IconButton>
+                  </button>
                 )
               )}
-            </div>
+            </span>
           </div>
-          {details && (
-            <dl className="mt-1 flex flex-wrap gap-x-5 gap-y-2 pb-1 text-xs leading-5 tabular-nums text-slate-500 dark:text-slate-400">
-              {labels.flatMap(([label, item]) =>
-                Option.isSome(item)
-                  ? [
-                      <div
-                        key={label}
-                        className="inline-flex items-baseline gap-1.5"
-                      >
-                        <dt>{label}</dt>
-                        <dd className="text-slate-700 dark:text-slate-300">
-                          {item.value}
-                        </dd>
-                      </div>,
-                    ]
-                  : []
-              )}
-            </dl>
-          )}
         </>
       )}
     </article>
@@ -186,6 +137,12 @@ const ChatMarkdown = memo(function ChatMarkdown({
           : ""
         return <ChatCodeBlock code={text} language={language} notify={notify} />
       },
+      // A list's numbers sit in its own padding, so it is as wide as its widest number ("138.") and never cut off.
+      ol: ({ node, children, start }) => {
+        const items = node?.children.filter((child) => child.type === "element" && child.tagName === "li").length ?? 0
+        const digits = String(Math.max(1, (start ?? 1) + items - 1)).length
+        return <ol start={start} style={{ paddingLeft: `calc(${digits}ch + 1em)` }}>{children}</ol>
+      },
       a: ({ children, href }) => (
         <a href={href} target="_blank" rel="noreferrer noopener">
           {children}
@@ -201,7 +158,7 @@ const ChatMarkdown = memo(function ChatMarkdown({
   )
   return (
     <div className="chat-prose text-sm leading-6">
-      <Markdown remarkPlugins={[remarkGfm]} components={components}>
+      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeLongTokens]} components={components}>
         {content}
       </Markdown>
     </div>

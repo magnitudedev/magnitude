@@ -11,6 +11,7 @@ import {
   modelServingFacts,
 } from "@magnitudedev/client-common"
 import {
+  CatalogBaseIdSchema,
   CountryCodeSchema,
   LocalModelFamilySchema,
   ModelIdSchema,
@@ -65,6 +66,7 @@ import {
   modelAssessment,
   modelQuant,
   renderQuantLadder,
+  residencyFailureReason,
   residencyLabel,
 } from "./model-format"
 export * from "./hugging-face-runtime"
@@ -321,7 +323,9 @@ export const showModel = (input: string, options: JsonOption = {}) => commandEff
       }))
     }
     if (Option.isNone(parseHuggingFaceReference(reference))) {
-      // A catalog model named without its quant (`lfm3-1.7b`) is shown at the quant chosen for this computer.
+      // A catalog model named without its quant (`lfm3-1.7b`) is shown at the quant chosen for this computer. Only the
+      // catalog knows which names it has, but text that can't be a catalog name is refused without asking the service.
+      if (!Schema.is(CatalogBaseIdSchema)(reference)) return yield* new ModelCommandError({ message: `${SHOW_REFERENCE}: ${reference}` })
       const rung = yield* withClient((client) => readRecommendations(client, Option.none())).pipe(
         Effect.map(({ models }) => Option.fromNullable(models.find(({ base }) => base === reference.toLowerCase())).pipe(
           Option.flatMap(({ chosen, rungs }) => Option.orElse(chosen, () => Option.fromNullable(rungs[0])))),
@@ -384,6 +388,7 @@ export const renderHardware = ({ hardware, models }: HardwareView): string => {
     "Current model",
     ...(current === undefined ? ["  None"] : [
       `  ${formatLocalModelDisplayName(current)} - ${residencyLabel(current)}`,
+      ...Option.match(residencyFailureReason(current), { onNone: () => [], onSome: (reason) => [`  Reason: ${reason}`] }),
       ...Option.match(allocation, {
         onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)}`],
         onNone: () => Option.match(plan, {

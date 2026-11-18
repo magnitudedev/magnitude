@@ -33,7 +33,7 @@ export function HarnessSetupList({ defaultModel, origin, remote, platform }: {
   remote: boolean
   platform: HarnessSetupPlatform
 }) {
-  return <section aria-label="Agents" className="mt-7">
+  return <section aria-label="Agents">
     <p className="mb-4 text-sm text-slate-500">Copy an agent’s setup prompt and paste it into that agent, or any coding agent, on the computer you’re using now.</p>
     <div className={pageLayout.harnessGrid}>
       {HARNESS_PRIORITY.map(harness => {

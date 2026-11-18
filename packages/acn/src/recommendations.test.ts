@@ -8,7 +8,7 @@ import {
   type LocalModelFamily,
 } from "@magnitudedev/acn-protocol"
 import type { CatalogModelSource } from "./local-model-sources"
-import { projectRecommendations } from "./recommendations"
+import { projectRecommendations, recommendationViews, sameRecommendationViews } from "./recommendations"
 
 const GB = 1_000_000_000
 
@@ -19,6 +19,8 @@ interface RungFixture {
   readonly fits?: boolean
   readonly assessing?: boolean
   readonly installed?: boolean
+  readonly tools?: boolean
+  readonly speedUnavailable?: boolean
   readonly support?: "Supported" | "Disabled"
   readonly country?: string
   readonly intelligence?: number
@@ -47,12 +49,15 @@ const rung = (fixture: RungFixture): LocalModel => {
       : fits
       ? {
           _tag: "Assessed",
+          capabilities: { vision: false, tools: fixture.tools ?? true, structuredOutput: true, reasoning: { supported: false, efforts: [], defaultEffort: Option.none() } },
           assessment: {
             _tag: "Fits",
             served: { contextLength: 131_072 },
             residency: {
               _tag: "Resident",
-              performance: fixture.tokensPerSecond === undefined
+              performance: fixture.speedUnavailable
+                ? { _tag: "Unavailable", failure: { code: "performance_unavailable", message: "cannot be measured", retryable: false } }
+                : fixture.tokensPerSecond === undefined
                 ? { _tag: "Pending", measurement: { _tag: "Measuring" } }
                 : {
                     _tag: "Estimated",
@@ -64,7 +69,7 @@ const rung = (fixture: RungFixture): LocalModel => {
             },
           },
         }
-      : { _tag: "Assessed", assessment: { _tag: "DoesNotFit" } },
+      : { _tag: "Assessed", capabilities: { vision: false, tools: fixture.tools ?? true, structuredOutput: true, reasoning: { supported: false, efforts: [], defaultEffort: Option.none() } }, assessment: { _tag: "DoesNotFit" } },
   } as unknown as LocalModel
 }
 
@@ -120,6 +125,53 @@ describe("recommendations", () => {
     expect(project(ladder(true), { freeBytes: 15 * GB }).models[0]?.chosen).toEqual(Option.some("big:gguf:q4"))
   })
 
+  it("chooses no rung without room on disk, even when none reaches 20 tok/s, and none still being measured", () => {
+    const slow = [
+      rung({ id: "big:gguf:q2", storageBytes: 100 * GB, tokensPerSecond: 12 }),
+      rung({ id: "big:gguf:q4", storageBytes: 173 * GB, tokensPerSecond: 12 }),
+    ]
+    expect(project(slow, { freeBytes: 16 * GB }).models[0]?.chosen).toEqual(Option.none())
+    const unmeasured = [rung({ id: "big:gguf:q2", storageBytes: 100 * GB }), rung({ id: "small:gguf:q4", storageBytes: 1 * GB })]
+    expect(project(unmeasured, { freeBytes: 16 * GB }).models.map(({ base, chosen }) => [base, Option.getOrNull(chosen)]))
+      .toEqual([["big", null], ["small", null]])
+  })
+
+  it("offers the best measured rung while another stays measuring, and never the one still measuring", () => {
+    const stuck = [
+      rung({ id: "qwen:gguf:q2", storageBytes: 5 * GB, tokensPerSecond: 30 }),
+      rung({ id: "qwen:gguf:q4", storageBytes: 10 * GB }),
+    ]
+    const recommendations = project(stuck, { freeBytes: 100 * GB })
+    expect(recommendations.complete).toBe(false)
+    expect(recommendations.models[0]?.chosen).toEqual(Option.some("qwen:gguf:q2"))
+    expect(project([rung({ id: "lfm:gguf:q4", storageBytes: 1 * GB })]).models[0]?.chosen).toEqual(Option.none())
+  })
+
+  it("offers the smallest fitting rung where no speed can be measured, such as on a CPU, without claiming a speed", () => {
+    const cpu = [
+      rung({ id: "lfm:gguf:q4", storageBytes: 1 * GB, speedUnavailable: true }),
+      rung({ id: "lfm:gguf:q8", storageBytes: 2 * GB, speedUnavailable: true }),
+    ]
+    const [model] = project(cpu).models
+    expect(model?.chosen).toEqual(Option.some("lfm:gguf:q4"))
+    expect([model?.meetsTarget, model?.meetsOnboardingFloor]).toEqual([false, false])
+  })
+
+  it("names the model that would lead with more free disk, and how much more it needs", () => {
+    const models = [
+      rung({ id: "big:gguf:q2", storageBytes: 100 * GB, tokensPerSecond: 30, intelligence: 90 }),
+      rung({ id: "big:gguf:q4", storageBytes: 173 * GB, tokensPerSecond: 25, intelligence: 90 }),
+      rung({ id: "small:gguf:q4", storageBytes: 2 * GB, tokensPerSecond: 60, intelligence: 40 }),
+    ]
+    const short = project(models, { freeBytes: 16 * GB })
+    expect(short.models[0]?.base).toBe("small")
+    expect(short.roomShortfall).toEqual(Option.some({ base: "big", name: "big", rung: "big:gguf:q4", missingBytes: 157 * GB }))
+    expect(project(models, { freeBytes: 200 * GB }).roomShortfall).toEqual(Option.none())
+    expect(project(models).roomShortfall).toEqual(Option.none())
+    const larger = project([rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 40 }), ...models.slice(1, 2)], { freeBytes: 16 * GB })
+    expect(larger.roomShortfall).toEqual(Option.none())
+  })
+
   it("falls back to the highest fitting rung near the fastest when none reaches 20 tok/s", () => {
     const { models: [model] } = project([
       rung({ id: "slow:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 12 }),
@@ -165,5 +217,34 @@ describe("recommendations", () => {
     ], { country: "US" })
     expect(models.map(({ base }) => base)).toEqual(["us"])
     expect(listed).toEqual(families)
+  })
+
+  it("never recommends a model that cannot use tools", () => {
+    const { models } = project([
+      rung({ id: "agentic:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 50 }),
+      rung({ id: "chatonly:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 50, intelligence: 90, tools: false }),
+    ])
+    expect(models.map(({ base }) => base)).toEqual(["agentic"])
+  })
+})
+
+describe("republishing recommendations", () => {
+  const ladder = [
+    rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 40 }),
+    rung({ id: "big:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 25, country: "US" }),
+  ]
+  const views = (freeBytes: number) => recommendationViews({
+    models: ladder,
+    catalog: ladder.map((model) => source(model.modelId, "qwen35")),
+    families,
+    hardware: hardware(freeBytes),
+  })
+
+  it("doesn't happen when free disk moves by a few KiB without changing any offer", () => {
+    expect(sameRecommendationViews(views(109_362_847_744), views(109_362_839_552))).toBe(true)
+  })
+
+  it("happens when free disk changes which size has room to download", () => {
+    expect(sameRecommendationViews(views(25 * GB), views(15 * GB))).toBe(false)
   })
 })

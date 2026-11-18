@@ -4,7 +4,6 @@ import {
   appendOutput,
   type ChatAssistantMessage,
   ChatMessage,
-  latestResponse,
   LiveResponse,
   MessageId,
   type ResponseEnded,
@@ -119,10 +118,6 @@ export const Transcript = ChatEngine.Projection.singleton({
       updateResponse(state, event.responseId, (message) => withEnd(message, event))),
   ],
 })
-
-/** The chat's running response, if one is running. */
-export const runningResponse = (transcript: ReadonlyArray<ChatMessage>): Option.Option<MessageId> =>
-  Option.flatMap(latestResponse(transcript), (response) => Option.isNone(response.end) ? Option.some(response.id) : Option.none())
 
 const updateLive = (
   state: Option.Option<LiveResponse>,

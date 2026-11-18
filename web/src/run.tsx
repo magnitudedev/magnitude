@@ -4,9 +4,9 @@ import { useMemo } from "react"
 import { RegistryProvider, Result, useAtomValue } from "@effect-atom/atom-react"
 import { Deferred, Effect, Either, Exit, Layer, Option, Runtime, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { MagnitudeClient, readRemoteAccess } from "@magnitudedev/sdk"
+import { readRemoteAccess } from "@magnitudedev/sdk"
 import {
-  AgentClientProvider, ApplicationSession, createAgentClient, makeFirstPartyConnection, useAgentClient,
+  AgentClientProvider, ApplicationSession, applicationClientLayer, createAgentClient, makeFirstPartyConnection, useAgentClient,
   type ApplicationHost,
 } from "@magnitudedev/client-common"
 import { initializeAppearance } from "./stores/appearance-store"
@@ -14,7 +14,6 @@ import { appearanceReadError } from "./appearance"
 import { SessionProvider } from "./session"
 import { ServiceConnectionProvider } from "./service-view"
 import { App, AppShell } from "./app"
-import { ModelsSkeleton } from "./components/models/skeletons"
 import { OnboardingStarting } from "./components/models/onboarding"
 import { onboardingCompletedHere } from "./components/models/onboarding-record"
 import { ErrorNotice } from "./components/error-notice"
@@ -31,9 +30,9 @@ export interface ApplicationEntry<E> {
   readonly reconnect: "Automatic" | "OnConnect"
 }
 
-/** The app before it has reached the service, with onboarding already open when this window hasn't finished it. */
+/** The app before it has reached the service, which decides the page: an empty main area, with onboarding already open when this window hasn’t finished it. */
 function BootShell({ platform }: { platform: string | undefined }) {
-  return <><AppShell page="models" platform={platform}><ModelsSkeleton /></AppShell>{!onboardingCompletedHere() && <OnboardingStarting />}</>
+  return <><AppShell page="chat" platform={platform}>{null}</AppShell>{!onboardingCompletedHere() && <OnboardingStarting />}</>
 }
 
 function SessionGate({ platform }: { platform: string | undefined }) {
@@ -68,7 +67,7 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
     const runtime = yield* Effect.runtime<never>()
     // A blocked navigation still fires beforeunload. Close only when the page actually leaves.
     window.addEventListener("pagehide", event => { if (!event.persisted) Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) })
-    const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false, reconnect: entry.reconnect }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
+    const connection = yield* makeFirstPartyConnection(applicationClientLayer({ origin, host: entry.host, reconnect: entry.reconnect }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
     const client = createAgentClient(connection.client, { host: entry.host, navigation: entry.navigation })
     const readError = Either.isLeft(appearance) ? "The saved appearance could not be read. Using System appearance." : null
     root.render(<RegistryProvider initialValues={[[appearanceReadError, readError]]}><AgentClientProvider tag={client}><ServiceConnectionProvider connection={connection.client.connection}><RemoteAccessProvider access={{ origin, canSignIn: entry.canSignIn, remote }}><SessionGate platform={platform} /></RemoteAccessProvider></ServiceConnectionProvider></AgentClientProvider></RegistryProvider>)

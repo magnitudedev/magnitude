@@ -6,6 +6,13 @@ import { Schema } from "effect"
  * held back from unattended download until a person downloads it explicitly. A container never
  * installs updates; a newer release becomes `ImageAvailable`, which a newer image provides.
  */
+/**
+ * Why application updates are unavailable: this build doesn't update itself (a development or isolated build), an
+ * update is being installed as the application starts, or update setup failed here.
+ */
+export const ApplicationUpdateUnavailableKind = Schema.Literal("NotInThisBuild", "Installing", "SetupFailed")
+export type ApplicationUpdateUnavailableKind = typeof ApplicationUpdateUnavailableKind.Type
+
 const Transfer = Schema.Union(
   Schema.TaggedStruct("Idle", {}),
   Schema.TaggedStruct("Available", {
@@ -19,7 +26,7 @@ const Transfer = Schema.Union(
   Schema.TaggedStruct("Ready", { version: Schema.String }),
   Schema.TaggedStruct("InstallationFailed", { version: Schema.String, message: Schema.String }),
   Schema.TaggedStruct("Failed", { message: Schema.String }),
-  Schema.TaggedStruct("Unavailable", { message: Schema.String }),
+  Schema.TaggedStruct("Unavailable", { kind: ApplicationUpdateUnavailableKind, message: Schema.String }),
   Schema.TaggedStruct("ImageAvailable", { version: Schema.String, image: Schema.String }),
   Schema.TaggedStruct("Closed", {}),
 )

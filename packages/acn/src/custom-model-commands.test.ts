@@ -304,6 +304,7 @@ const harness = (options: {
       }),
       Layer.succeed(CatalogModelSync, {
         installed: (modelId) => Effect.succeed((options.catalogInstalled ?? []).includes(modelId)),
+        listed: () => Effect.succeed(true),
         sync: (modelId) => Effect.sync(() => {
           recorded.catalogSyncs.push(modelId)
           return { outcome: "Installing" as const }
@@ -1164,6 +1165,24 @@ describe("drafter and download recovery", () => {
     await run((commands) => commands.cancelSync(foundId).pipe(Effect.zipRight(commands.acknowledgeSyncFailure(foundId))))
     expect(recorded.cancelled).toEqual(["running"])
     expect(recorded.acknowledged).toEqual(["failed"])
+  })
+
+  it("removes a model added from Hugging Face entirely when its first download is cancelled", async () => {
+    const { run, recorded } = harness({
+      config: customModelsConfig({ drafters: { [addedId]: drafterSetting, [foundId]: drafterSetting } }),
+      customModels: [nativeCustomModel({
+        modelId: addedId,
+        origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+        state: { _tag: "NotInstalled" },
+      })],
+      downloads: [targetDownload("first", { _tag: "Downloading", completedBytes: 1, totalBytes: 2, stage: "downloading" })],
+    })
+    const config = await run((commands, models) => commands.cancelSync(addedId).pipe(Effect.zipRight(models.get)))
+    expect(recorded.cancelled).toEqual(["first"])
+    expect(recorded.removedFiles).toEqual([addedId])
+    expect(config.added).toEqual({})
+    expect(Object.keys(config.drafters)).toEqual([foundId])
+    expect(config.hidden).toEqual([])
   })
 
   it("restarts a missing added model's download", async () => {

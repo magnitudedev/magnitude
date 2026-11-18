@@ -8,7 +8,7 @@ import {
   BunPath,
   BunCommandExecutor,
 } from "@effect/platform-bun"
-import { FetchHttpClient, FileSystem, HttpServerResponse, Socket as PlatformSocket } from "@effect/platform"
+import { Error as PlatformError, FetchHttpClient, FileSystem, HttpServerResponse, Socket as PlatformSocket } from "@effect/platform"
 import { join } from "node:path"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpServer from "@effect/platform/HttpServer"
@@ -185,7 +185,9 @@ const boundedShutdownStep = (
 
 export const acnStartupFailureDetail = (cause: Cause.Cause<unknown>): string => {
   const failure = Cause.failureOption(cause)
-  if (Option.isSome(failure) && failure.value instanceof Error) {
+  // A platform failure (such as reading the exit code of an engine killed by a signal) names its command line, so
+  // it stays in the log.
+  if (Option.isSome(failure) && failure.value instanceof Error && !PlatformError.isPlatformError(failure.value)) {
     const message = failure.value.message.split(/\r?\n/, 1)[0]?.trim()
     if (message) return message.slice(0, 500)
   }
@@ -831,7 +833,10 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     yield* lifecycle.changes.pipe(
       Stream.takeUntil(state => state._tag === "Stopping"),
       Stream.runForEach(state => owner.reportHealth(makeHealthResponse(ACN_VERSION, state))),
-      Effect.tapError(error => lifecycle.beginStopping({ reason: "fatal", detail: error.message })),
+      Effect.tapError(error => Effect.logError("ACN could not report its health to its owner").pipe(
+        Effect.annotateLogs({ cause: error.message }),
+        Effect.zipRight(lifecycle.beginStopping({ reason: "fatal" })),
+      )),
       Effect.intoDeferred(healthReportingFinished),
       Effect.forkScoped,
     )
@@ -868,7 +873,10 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     }
     yield* owner.awaitShutdown.pipe(
       Effect.zipRight(lifecycle.beginStopping({ reason: "administrative" })),
-      Effect.catchAll(error => lifecycle.beginStopping({ reason: "fatal", detail: error.message })),
+      Effect.catchAll(error => Effect.logError("ACN lost its owner's shutdown channel").pipe(
+        Effect.annotateLogs({ cause: error.message }),
+        Effect.zipRight(lifecycle.beginStopping({ reason: "fatal" })),
+      )),
       Effect.forkIn(applicationScope),
     )
 

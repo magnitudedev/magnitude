@@ -58,6 +58,15 @@ impl MethodCheckpoint {
         )
     }
 
+    /// Whether the checkpoint accounts for exactly `rows` target rows, so it
+    /// resumes beside a target state of that position.
+    pub fn accounts_for(&self, rows: usize) -> bool {
+        match self {
+            Self::Plain => true,
+            Self::Mtp(checkpoint) | Self::DFlash(checkpoint) => checkpoint.target_rows() == rows,
+        }
+    }
+
     /// Host bytes the checkpoint keeps.
     pub fn retained_bytes(&self) -> u64 {
         match self {

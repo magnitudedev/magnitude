@@ -274,7 +274,7 @@ impl ImageProcessor {
             let mut image = image::DynamicImage::from_decoder(decoder)
                 .map_err(|error| format!("image decode failed: {error}"))?;
             image.apply_orientation(orientation);
-            let source = image.to_rgb32f();
+            let source = opaque_rgb(&image);
             let crops = match self.config.resize {
                 ImageResize::Slices {
                     resolution,
@@ -450,6 +450,19 @@ fn padded_canvas(
     Ok(Target {
         canvas: (canvas_height, canvas_width),
         content: (content(height, canvas_height), content(width, canvas_width)),
+    })
+}
+
+/// The image as RGB, with any transparency composited over white as the reference processors'
+/// `convert_to_rgb` does; dropping alpha instead turns transparent pixels black.
+fn opaque_rgb(image: &image::DynamicImage) -> image::Rgb32FImage {
+    if !image.color().has_alpha() {
+        return image.to_rgb32f();
+    }
+    let rgba = image.to_rgba32f();
+    image::Rgb32FImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        image::Rgb([r * a + 1.0 - a, g * a + 1.0 - a, b * a + 1.0 - a])
     })
 }
 

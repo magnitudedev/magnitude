@@ -1,36 +1,44 @@
 import { ChatPage } from "./components/chat"
 import { ErrorNotice, NoticeAction } from "./components/error-notice"
+import { RestartNotice, reachableAt, restartReason } from "./components/restart-notice"
 import { SkeletonLine, ConnectionsSkeleton } from "./components/page-skeletons"
-import { ModelsSkeleton } from "./components/models/skeletons"
+import { MachineCardSkeleton, ModelsSkeleton } from "./components/models/skeletons"
+import { Skeleton } from "./components/ui/skeleton"
 import { pageLayout } from "./components/page-layout"
 import { ServingUsage } from "./components/serving-usage"
 import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
-import { Button, buttonVariants } from "./components/ui/button"
+import { Button } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select"
 import { MagnitudeMark } from "./components/magnitude-mark"
 import {
+  ArrowLeftIcon,
   ChatCircleIcon,
   SidebarSimpleIcon,
   ArrowUpRightIcon,
   CubeIcon,
   PlugIcon,
   ChartBarIcon,
+  GearSixIcon,
+  HardDrivesIcon,
   SlidersIcon,
+  WifiHighIcon,
+  InfoIcon,
   XIcon,
   MonitorIcon,
   SunIcon,
   MoonIcon,
   FolderOpenIcon,
   BookOpenIcon,
+  type Icon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
 import { useEffect, useMemo, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
-import { Cause, Effect, Option } from "effect"
-import { type ProviderModelId } from "@magnitudedev/sdk"
+import { Cause, Effect, Equivalence, Option } from "effect"
+import { type LocalModelsState, type ProviderModelId } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
-import { ServerSettingsFailed, type NetworkAccessChange, type NetworkBind } from "@magnitudedev/sdk"
+import { ServerSettingsFailed, type ModelStorageSettings, type NetworkAccessChange, type NetworkAccessSettings, type NetworkBind } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
 import {
@@ -38,31 +46,42 @@ import {
   deriveHardwareRoles,
   useAgentClient,
   type ApplicationPage,
+  type MainPage,
   useLocalModels,
+  useLocalModelsSelector,
   useLocalInferenceHardware,
   formatStorageSize,
   localModelConnectionOptions,
 } from "@magnitudedev/client-common"
 import { appearanceReadError } from "./appearance"
 import { useNavigate, useServerPlatform, useSession } from "./session"
-import { useReconnectAttempt, useServiceObservation, type ServiceObservation } from "./service-view"
+import { useReconnectAttempt, useServiceObservation, type ServiceObservation, type ServiceView } from "./service-view"
 import { signOut, useDisconnectWarning, useRemoteAccess, viewerPlatform } from "./remote-access"
 import { useNarrowViewport } from "./lib/viewport"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
+import { ActionTooltip } from "./components/ui/tooltip"
+import { AppModal, ModalBody } from "./components/app-modal"
 import { SettingsStatus } from "./components/settings-status"
 import { HarnessConnections, type CommandModel } from "./components/harness-connections"
 import { HarnessSetupList } from "./components/harness-setup"
 import { OtherApps } from "./components/other-apps"
-import { ModelLocationsRow } from "./components/model-locations"
+import { ModelLocationsRow, ModelLocationsView } from "./components/model-locations"
 import { HuggingFaceRow } from "./components/hugging-face"
 import { HostNotices } from "./components/host-notices"
 import { ModelsScreen } from "./components/models/models-screen"
-import { Explore } from "./components/models/explore"
+import { NoModelsYet } from "./components/models/no-models"
+import { MachineCard } from "./components/models/parts"
+import { machineView } from "./components/models/machine"
+import { Explore, exploreFirst } from "./components/models/explore"
+import { WhatRuns } from "./components/models/explore-view"
+import { ExploreModelsButton } from "./components/models/your-models"
 import { OnboardingScreen } from "./components/models/onboarding-screen"
 import { onThisComputer } from "./components/models/data"
 import { onboardingCompletedHere, recordOnboardingCompleted } from "./components/models/onboarding-record"
 import { useRecommendations } from "./components/models/recommendations"
-import { SidebarUpdatePill, SidebarUpdateProvider, useApplicationOwner, useApplicationUpdateActions, useApplicationUpdateObservation, useSidebarUpdate, type UpdateTransfer } from "./components/application-update"
+import { ChatModelSettings } from "./components/chat/model-settings"
+import { ChatTabStatus, SidebarChats } from "./components/chat/sidebar-list"
+import { SidebarUpdatePill, SidebarUpdateProvider, automaticUpdates, useApplicationOwner, useApplicationUpdateActions, useApplicationUpdateObservation, useSidebarUpdate, type UpdateTransfer } from "./components/application-update"
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -70,29 +89,61 @@ const inferenceUrl = (address: string, port: number) => `http://${address}:${por
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
-const pageNames: Record<ApplicationPage, string> = { chat: "Chat", models: "Models", connections: "Connections", usage: "Usage", settings: "Settings" }
-const pageIcons = { models: CubeIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, settings: SlidersIcon }
 
-/** The Models page and its Explore models modal; a Hugging Face link opens Explore on that repository. */
-function ModelsPage() {
+/** The computer Magnitude runs on: its photo, name, memory and free disk. */
+function ThisMachine() {
+  const client = useAgentClient()
+  const hardware = useLocalInferenceHardware()
+  const machine = useAtomValue(client.Configuration.GetServerMachine({})).result
+  return Result.isSuccess(hardware) ? <MachineCard machine={machineView(hardware.value, Result.isSuccess(machine) ? machine.value.identity : null)} /> : <MachineCardSkeleton />
+}
+
+/**
+ * The Models page: the user's models, or what is recommended for this machine until there are any, with Explore models
+ * beside its title. Explore models takes the page's place with a back arrow; a Hugging Face link opens it on that
+ * repository.
+ */
+function ModelsPage({ observation }: { observation: ServiceObservation }) {
   const session = useSession()
   const linked = useAtomValue(session.addModelRequest)
   const clearLinked = useAtomSet(useMemo(() => Atom.fn((_: void) => session.clearAddModelRequest), [session]))
   const hardware = useLocalInferenceHardware()
   const models = useLocalModels()
-  const [explore, setExplore] = useState<{ readonly open: boolean; readonly query: string }>({ open: false, query: "" })
-  const linkedQuery = Option.map(linked, request => request._tag === "HuggingFace" ? request.repository : request.query)
-  const open = explore.open || Option.isSome(linkedQuery)
-  const query = Option.getOrElse(linkedQuery, () => explore.query)
+  const [exploring, setExploring] = useState(false)
+  const [typed, setTyped] = useState("")
+  const [first, setFirst] = useState<{ readonly query: string; readonly repository: string } | null>(null)
   const memory = Result.isSuccess(hardware) ? deriveHardwareRoles(hardware.value).servingMemory : "Device"
-  const machine = Result.isSuccess(hardware) ? [...Option.toArray(hardware.value.productName), ...Option.toArray(hardware.value.processor)].join(" · ") : ""
   const recommendations = useRecommendations(false, memory)
-  const owned = new Set(Result.isSuccess(models) ? models.value.models.filter(onThisComputer).map(model => String(model.modelId)) : [])
+  const service = Result.isSuccess(observation.service) ? observation.service.value : null
+  const ready = service?._tag === "Ready"
+  const linkedQuery = Option.map(linked, request => request._tag === "HuggingFace" ? request.repository : request.query)
+  const back = () => { if (Option.isSome(linked)) clearLinked(); setExploring(false) }
+  const explore = ({ query, first }: { readonly query: string; readonly first: string | null }) => {
+    setTyped(query)
+    setFirst(first === null ? null : { query, repository: first })
+    setExploring(true)
+  }
+  if ((ready && Option.isSome(linkedQuery)) || exploring) return <>
+    <div className="mb-5 flex min-w-0 items-center gap-2">
+      <Button variant="ghost" size="icon-lg" aria-label="Back" className="-ml-2.5 shrink-0" onClick={back}><ArrowLeftIcon className="size-5" /></Button>
+      <h1 className={`${pageLayout.pageTitle} min-w-0 flex-1 truncate`}>Explore models</h1>
+      <div className="shrink-0"><WhatRuns families={recommendations.families} /></div>
+    </div>
+    <Explore query={Option.getOrElse(linkedQuery, () => typed)} memory={memory} families={recommendations.families}
+      first={Option.isNone(linkedQuery) && first !== null && first.query === typed ? exploreFirst(first.repository, recommendations.offered) : null}
+      owned={new Set(Result.isSuccess(models) ? models.value.models.filter(onThisComputer).map(model => String(model.modelId)) : [])}
+      setQuery={next => { if (Option.isSome(linked)) clearLinked(); setTyped(next) }} />
+  </>
   return <>
-    <ModelsScreen onExplore={next => setExplore({ open: true, query: next })} />
-    <Explore open={open} query={query} memory={memory} machine={machine} recommended={recommendations.offered.slice(0, 3).map(entry => entry.model)} measuring={recommendations.ready ? recommendations.measuring : { settled: 0, total: 0 }} families={recommendations.families} owned={owned}
-      setOpen={value => { setExplore(current => ({ ...current, open: value })); if (!value && Option.isSome(linked)) clearLinked() }}
-      setQuery={next => { if (Option.isSome(linked)) clearLinked(); setExplore({ open: true, query: next }) }} />
+    <div className="mb-5 flex items-center justify-between gap-3">
+      <h1 className={pageLayout.pageTitle}>Models</h1>
+      {ready ? <ExploreModelsButton onClick={() => explore({ query: "", first: null })} /> : <Skeleton aria-hidden="true" className="h-8 w-40" />}
+    </div>
+    <div>
+      {ready ? <ModelsScreen onExplore={explore} empty={<NoModelsYet memory={memory} />} />
+        : Result.isFailure(observation.service) ? <ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." />
+        : <ModelsSkeleton startingService />}
+    </div>
   </>
 }
 function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
@@ -115,14 +166,15 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
   const defaultModel = commandModels.find(model => model.id === active)?.id ?? commandModels[0]?.id
-  return <>
-    {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? "Configuration checks are available. Check the service in Settings before connecting a harness." : "Check the service in Settings before setting up an agent."}</p>}
-    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service in Settings." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("models")}>Open Models</NoticeAction>} />}
+  // One rhythm for the page's blocks, whichever are shown: each is separated from the next by the same gap.
+  return <div className="flex flex-col gap-6">
+    {!serviceReady && <p className="text-sm text-slate-500">{desktop ? "Configuration checks are available. Check the service in Settings before connecting a harness." : "Check the service in Settings before setting up an agent."}</p>}
+    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service in Settings." : "Choose a compatible model. It doesn’t need to be loaded."} actions={!Result.isFailure(models) && <Button variant="outline" size="sm" className="mt-1" onClick={() => navigate("models")}>Open Models</Button>} />}
     {desktop
       ? <DesktopHarnessConnections canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} selectedModel={selectedModel} />
       : Option.isSome(apiOrigin) && <HarnessSetupList defaultModel={defaultModel} origin={apiOrigin.value} remote={remote} platform={viewerPlatform()} />}
     {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={remote ? viewerPlatform() : platform} remote={remote} networkAccess={Result.isSuccess(network) && network.value.enabled} onOpenSettings={() => navigate("settings")} />}
-  </>
+  </div>
 }
 /** One-click connections, for the desktop app only: it runs where the agents run. */
 function DesktopHarnessConnections({ canConnect, models, defaultModel, platform, selectedModel }: { canConnect: boolean; models: readonly CommandModel[]; defaultModel: ProviderModelId | undefined; platform: string; selectedModel: Option.Option<ProviderModelId> }) {
@@ -135,10 +187,10 @@ function DesktopHarnessConnections({ canConnect, models, defaultModel, platform,
   const busy = connecting.waiting || disconnecting.waiting
   const error = !busy && firstFailure([connecting, disconnecting])
   return <>
-    {error && Result.isFailure(error) && <ErrorNotice title={Result.isFailure(disconnecting) ? "Couldn’t disconnect this agent" : "Couldn’t connect this agent"} description="Check the agent’s configuration before trying again. Some changes may not have completed." className="mt-5" />}
-    {Result.isFailure(rows) ? <ErrorNotice title="Couldn’t check your connections" description="Connection status is unavailable. Magnitude will check again automatically." className="mt-5" />
+    {error && Result.isFailure(error) && <ErrorNotice title={Result.isFailure(disconnecting) ? "Couldn’t disconnect this agent" : "Couldn’t connect this agent"} description="Check the agent’s configuration before trying again. Some changes may not have completed." />}
+    {Result.isFailure(rows) ? <ErrorNotice title="Couldn’t check your connections" description="Connection status is unavailable. Magnitude will check again automatically." />
       : !Result.isSuccess(rows) ? <ConnectionsSkeleton />
-      : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." className="mt-5" />
+      : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." />
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={models} defaultModel={defaultModel} platform={platform}
           onConnect={harness => connect({ harness, model: selectedModel, installSkill: true })} onDisconnect={harness => disconnect({ harness })} />}
   </>
@@ -196,7 +248,9 @@ function ModelStorageRow() {
       control={<>
         {(current?.source === "Configured" || (current && Option.isSome(current.warning))) && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}>Use default</Button>}
         <Button size="sm" variant="outline" disabled={!current || busy} onClick={chooseFolder}><FolderOpenIcon />Change…</Button>
-      </>} />
+      </>}>
+      {current && current.path !== current.active && <div className="mt-2"><RestartRequired storage={Option.some(current)} network={Option.none()} /></div>}
+    </SettingsRow>
   </>
 }
 function useRestartPending() {
@@ -204,33 +258,35 @@ function useRestartPending() {
   const storage = useAtomValue(client.Configuration.GetModelStorage({})).result
   const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const storageValue = Result.isSuccess(storage) ? storage.value : null
-  return { storageValue, storagePending: storageValue !== null && storageValue.path !== storageValue.active, networkPending: Result.isSuccess(network) && network.value.pending }
+  return { storageValue, storagePending: storageValue !== null && storageValue.path !== storageValue.active, network: Result.isSuccess(network) && network.value.pending ? Option.some(network.value) : Option.none() }
 }
-function RestartRequiredToast() {
-  const session = useSession()
+/** Restarts Magnitude where its owner can, telling remote viewers first that they will be disconnected. */
+function RestartRequired({ storage, network }: { storage: Option.Option<ModelStorageSettings>; network: Option.Option<NetworkAccessSettings> }) {
   const client = useAgentClient()
   const platform = useServerPlatform()
-  const { storageValue, storagePending, networkPending } = useRestartPending()
   const { supports } = useApplicationOwner()
   const restartApplication = useAtomSet(client.Application.RestartApplication)
   const disconnect = useDisconnectWarning()
-  const relaunch = () => disconnect.warn("Restart", () => restartApplication({}))
   const relaunching = useAtomValue(client.Application.RestartApplication)
-  if (!storagePending && !networkPending) return null
-  const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
-    : storagePending ? "Magnitude is still using the previous model folder." : "Magnitude is still using the previous network settings."
-  return <div className="fixed bottom-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)] rounded-lg bg-white shadow-md dark:bg-slate-850">
+  return <>
     {disconnect.dialog}
-    <ErrorNotice severity={Result.isFailure(relaunching) && !relaunching.waiting ? "error" : "info"}
-      title={Result.isFailure(relaunching) && !relaunching.waiting ? "Magnitude couldn’t restart" : "Restart to apply your changes"}
-      description={supports("RestartService") ? reason : `${reason} Restart the Magnitude server to apply them.`}
-      actions={supports("RestartService") ? <NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}>Restart Magnitude</NoticeAction> : undefined}>
-      {storagePending && storageValue && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
+    <RestartNotice reason={restartReason({ storage: Option.isSome(storage), network })} canRestart={supports("RestartService")}
+      failed={Result.isFailure(relaunching) && !relaunching.waiting} restarting={relaunching.waiting}
+      onRestart={() => disconnect.warn("Restart", () => restartApplication({}))}>
+      {Option.isSome(storage) && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
         <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500">Moving existing models</summary>
         <p className="my-2">Existing downloads stay in the previous folder. To move them, quit Magnitude, run this command, then open Magnitude again.</p>
-        <CopyCommand command={moveModelsCommand(platform, storageValue.active, storageValue.path)} label="Copy move command" />
+        <CopyCommand command={moveModelsCommand(platform, storage.value.active, storage.value.path)} label="Copy move command" />
       </details>}
-    </ErrorNotice>
+    </RestartNotice>
+  </>
+}
+/** Below the page, in its own space, so the page's content scrolls above it rather than under it. */
+function RestartRequiredBar() {
+  const { storageValue, storagePending, network } = useRestartPending()
+  if (!storagePending && Option.isNone(network)) return null
+  return <div className="shrink-0 border-t border-slate-200 px-4 py-3 dark:border-slate-750 md:px-10">
+    <div className="mx-auto max-w-[min(100%,72rem)]"><RestartRequired storage={storagePending ? Option.fromNullable(storageValue) : Option.none()} network={network} /></div>
   </div>
 }
 
@@ -248,12 +304,14 @@ function NetworkAccessRows() {
   const managed = current?.container === true
   const busy = updating.waiting || regenerating.waiting || managed
   const failure = firstFailure([updating, regenerating])
-  const reachable = current?.enabled ? Option.getOrElse(current.bind, () => current.interfaces[0]?.address) : undefined
+  const reachable = current ? Option.getOrUndefined(reachableAt(current)) : undefined
   return <>
     {disconnect.dialog}
     <SettingsRow label="Network access" hint={current ? <>{managed ? "Set by the container: it accepts connections on every interface with an API key. MAGNITUDE_NETWORK_KEY sets the key and MAGNITUDE_ALLOWED_HOSTS adds host names. " : "Let other devices on your network use Magnitude for inference. "}<a href={managed ? "https://docs.magnitude.dev/installation/docker" : "https://docs.magnitude.dev/remote-server"} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">{managed ? "Docker guide" : "Remote server guide"}<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
       alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
-      control={current && <Switch aria-label="Network access" checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
+      control={current && <Switch aria-label="Network access" checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />}>
+      {current?.pending && !managed && <div className="mt-2"><RestartRequired storage={Option.none()} network={Option.some(current)} /></div>}
+    </SettingsRow>
     {current?.enabled && <>
       {!managed && <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
         control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
@@ -278,12 +336,17 @@ function AutomaticUpdatesRow() {
   const setAutoDownload = (enabled: boolean) => saveAutoDownload({ enabled })
   const saving = useAtomValue(client.Application.SetApplicationAutoDownload)
   if (Result.isSuccess(owner) && !supports("Updates")) return null
-  const preference = snapshot?.preference
+  const status = automaticUpdates(observation)
   const closed = snapshot?.transfer._tag === "Closed"
   return <SettingsRow label="Automatic updates"
-    hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : preference?._tag === "Known" ? "Download updates in the background when they are available." : undefined}
-    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title="Update preferences weren’t saved" description="Your previous preference is still in use." /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." /> : undefined}
-    control={snapshot && <Switch aria-label="Automatic updates" checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
+    hint={status._tag === "Reading" ? <SkeletonLine className="h-4 text-xs" width="200px" />
+      : status._tag === "Known" ? "Download updates in the background when they are available."
+      : status._tag === "NotInThisBuild" ? `Automatic updates aren’t available in this build. ${status.reason}`
+      : undefined}
+    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title="Update preferences weren’t saved" description="Your previous preference is still in use." /> : status._tag === "ReadFailed" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." />
+      : status._tag === "SetupFailed" ? <ErrorNotice title="Automatic updates couldn’t be set up" description={status.reason} />
+      : undefined}
+    control={snapshot && <Switch aria-label="Automatic updates" checked={status._tag === "Known" && status.autoDownload} disabled={status._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
 }
 const failedUpdatePhrase = { verify: "couldn’t be verified", install: "failed to install", authorization: "wasn’t authorized to install", startup: "failed to start" } as const
 
@@ -340,46 +403,113 @@ function SignOutRow() {
     alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title="Couldn’t sign out" description="Check that this device can still reach Magnitude, then try again." /> : undefined}
     control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>Sign out</Button>} />
 }
-function SettingsPage({ observation }: { observation: ServiceObservation }) {
+type SettingsTab = "general" | "chat" | "storage" | "network" | "usage" | "about"
+const settingsTabs: ReadonlyArray<{ readonly key: SettingsTab; readonly label: string; readonly icon: Icon }> = [
+  { key: "general", label: "General", icon: SlidersIcon },
+  { key: "chat", label: "Chat", icon: ChatCircleIcon },
+  { key: "storage", label: "Storage", icon: HardDrivesIcon },
+  { key: "network", label: "Network", icon: WifiHighIcon },
+  { key: "usage", label: "Usage", icon: ChartBarIcon },
+  { key: "about", label: "About", icon: InfoIcon },
+]
+const settingsTabFor = (page: ApplicationPage): SettingsTab => page === "usage" ? page : "general"
+
+/**
+ * Settings in its modal: its sections listed on the left, or in a menu above them in a narrow window, and the chosen
+ * one beside them. Model locations replaces the section, with a back arrow over it.
+ */
+function SettingsModal({ observation, initial, onClose }: { observation: ServiceObservation; initial: SettingsTab; onClose: () => void }) {
   // A fresh mount observes hand edits; writes refresh in their own Effect actions.
   const client = useAgentClient()
   const { remote } = useRemoteAccess()
-  const { storagePending, networkPending } = useRestartPending()
+  const narrow = useNarrowViewport()
+  const [tab, setTab] = useState(initial)
+  const [locations, setLocations] = useState(false)
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({})), Atom.refresh(client.Models.ListModelLocations({}))], { discard: true })), [client]))
-  return <>
-    <SettingsStatus observation={observation} />
-    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><HuggingFaceRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
-    <SettingsGroup label="About"><AboutRow /></SettingsGroup>
-    {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
-    {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}
-  </>
+  const choose = (next: SettingsTab) => { setLocations(false); setTab(next) }
+  return <AppModal title="Settings" onClose={onClose}>
+    <div className={narrow ? "flex min-h-0 flex-1 flex-col" : "flex min-h-0 flex-1"}>
+      {narrow
+        ? <div className="shrink-0 border-b border-slate-200 px-6 py-3 dark:border-slate-750">
+            <Select items={settingsTabs.map(({ key, label }) => ({ value: key, label }))} value={tab} onValueChange={next => { if (next) choose(next as SettingsTab) }}>
+              <SelectTrigger aria-label="Settings section" className="w-full text-[13px]"><SelectValue /></SelectTrigger>
+              <SelectContent>{settingsTabs.map(({ key, label }) => <SelectItem key={key} value={key}>{label}</SelectItem>)}</SelectContent>
+            </Select>
+          </div>
+        : <nav aria-label="Settings sections" className="flex w-44 shrink-0 flex-col gap-0.5 border-r border-slate-200 p-3 dark:border-slate-750">
+            {settingsTabs.map(({ key, label, icon: TabIcon }) =>
+              <button key={key} type="button" aria-current={tab === key ? "page" : undefined} onClick={() => choose(key)}
+                className={`flex h-8 items-center gap-2.5 rounded-md px-2.5 text-left text-[13px] font-medium ${tab === key ? "bg-slate-100 text-slate-900 dark:bg-slate-800 dark:text-slate-100" : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"}`}>
+                <TabIcon className="size-4 shrink-0" />{label}
+              </button>)}
+          </nav>}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {locations ? <>
+          <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 px-6 py-3 dark:border-slate-750">
+            <Button variant="ghost" size="icon-sm" aria-label="Back" className="-ml-2" onClick={() => setLocations(false)}><ArrowLeftIcon /></Button>
+            <h2 className="truncate text-sm font-semibold">Model locations</h2>
+          </div>
+          <ModalBody><ModelLocationsView /></ModalBody>
+        </> : <ModalBody>
+          {tab === "general" && <><ThisMachine /><div className="mt-4" /><SettingsStatus observation={observation} /><SettingsGroup><ThemeRow /><LaunchAtLoginRow /><AutomaticUpdatesRow /><HuggingFaceRow /></SettingsGroup></>}
+          {tab === "chat" && <ChatModelSettings />}
+          {tab === "storage" && <SettingsGroup><ModelStorageRow /><ModelLocationsRow onManage={() => setLocations(true)} /></SettingsGroup>}
+          {tab === "network" && <SettingsGroup><NetworkAccessRows /></SettingsGroup>}
+          {tab === "usage" && <ServingUsage />}
+          {tab === "about" && <><SettingsGroup><AboutRow /></SettingsGroup>{remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}</>}
+        </ModalBody>}
+      </div>
+    </div>
+  </AppModal>
 }
 export function App() {
   const session = useSession()
   const observation = useServiceObservation()
   const page = useAtomValue(session.page)
+  const main = useAtomValue(session.mainPage)
+  const visit = useAtomValue(session.visit)
   const known = useAtomValue(session.onboardingPending)
   useEffect(() => { if (Option.isSome(known)) recordOnboardingCompleted(!known.value) }, [known])
   const onboarding = Option.getOrElse(known, () => !onboardingCompletedHere())
   const navigate = useNavigate()
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
-  return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<SidebarUpdateProvider><AppShell page={page} navigate={navigate} platform={platform}>
-      {page === "settings" ? <SettingsPage observation={observation} />
-      : service?._tag === "Unreachable" ? <CannotReachMagnitude />
+  return <><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<SidebarUpdateProvider><AppShell page={main} navigate={navigate} platform={platform} footer={<RestartRequiredBar />}>
+      {service?._tag === "Unreachable" ? <CannotReachMagnitude />
       : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
-      : page === "chat" ? <ChatPage />
-      : page === "usage" ? <ServingUsage />
-      : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <><h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1><ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("settings")}>Open Settings</NoticeAction>} /></> : <ModelsSkeleton startingService />)
-      : page === "models" ? <ModelsPage />
-      : null}
-  </AppShell></SidebarUpdateProvider></>
+      : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? <MagnitudeCouldNotStart service={service} canRetry={observation.canRetry} onOpenStatus={() => navigate("settings")} />
+      : main === "chat" ? <ChatPage />
+      : main === "connections" ? <><h1 className={`${pageLayout.pageTitle} mb-6`}>Connections</h1><Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} /></>
+      : <ModelsPage key={visit} observation={observation} />}
+    </AppShell>
+    {page !== main && <SettingsModal key={page} observation={observation} initial={settingsTabFor(page)} onClose={() => navigate(main)} />}
+  </SidebarUpdateProvider></>
 }
 /** Shown while a browser's own retries run after its connection drops, as it does when Magnitude restarts. */
 function ReconnectingToMagnitude() {
   return <ErrorNotice className="mt-8" severity="info" title="Reconnecting to Magnitude…"
     description="The connection to the Magnitude service was interrupted, as it is when Magnitude restarts." />
+}
+/**
+ * In place of the page when the desktop's service failed to start: every request would fail the same way, so one
+ * notice says why, with the first line of the failure (Settings → General shows all of it), and offers a retry.
+ */
+function MagnitudeCouldNotStart({ service, canRetry, onOpenStatus }: {
+  service: Extract<ServiceView, { readonly _tag: "Failed" | "CleanupFailed" }>
+  canRetry: boolean
+  onOpenStatus: () => void
+}) {
+  const session = useSession()
+  const retry = useAtomSet(session.retryService)
+  const retrying = useAtomValue(session.retryService)
+  const reason = service.message.split("\n").map(line => line.trim()).find(line => line !== "") ?? ""
+  return <ErrorNotice className="mt-8"
+    title={service._tag === "CleanupFailed" ? "Magnitude couldn’t confirm its service stopped" : "Magnitude’s service couldn’t start"}
+    description={service._tag === "CleanupFailed" ? "Some background work may still be running. Quit Magnitude to retry cleanup." : reason.length > 240 ? `${reason.slice(0, 240)}…` : reason || undefined}
+    actions={<>
+      {service._tag === "Failed" && canRetry && <NoticeAction disabled={retrying.waiting} onClick={() => retry()}>{retrying.waiting ? "Retrying…" : "Retry"}</NoticeAction>}
+      <NoticeAction onClick={onOpenStatus}>See status</NoticeAction>
+    </>} />
 }
 /** A browser cannot restart the service; it keeps retrying in the background, and Reconnect tries at once. */
 function CannotReachMagnitude() {
@@ -391,7 +521,6 @@ function CannotReachMagnitude() {
     description="This page can’t connect to the Magnitude service and keeps trying. Check that Magnitude is running on that computer and that this device can reach it."
     actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}>Reconnect</NoticeAction>} />
 }
-/** Messages raised by Electron main while this window exists, such as a link that couldn't open. */
 /** Electron main couldn't confirm background work stopped while quitting; the user decides what happens next. */
 function QuitFailureDialog() {
   const session = useSession()
@@ -412,37 +541,82 @@ function QuitFailureDialog() {
     </AlertDialogContent>
   </AlertDialog>
 }
-export function AppShell({ page, navigate, platform, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+export function AppShell({ page, navigate, platform, footer, children }: { page: MainPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; footer?: ReactNode; children: ReactNode }) {
   const narrow = useNarrowViewport()
   const [open, setOpen] = useState(false)
   // Only the navigation chrome changes across `md`; the page stays mounted, so resizing keeps its state.
   return <div className={narrow ? "relative flex h-screen flex-col bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200" : "relative flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200"}>
     {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} />}
-    <main key={page} className="min-w-0 flex-1 overflow-y-auto" inert={narrow && open}>
-      <div data-page-content className={page === "chat" ? `mx-auto flex h-full w-full max-w-[min(100%,72rem)] flex-col px-4 pb-0 pt-5 md:px-10 ${platform === "win32" ? "md:pt-14" : "md:pt-9"}` : narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
-        {page !== "models" && page !== "chat" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
-        {children}
-      </div>
-    </main>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col" inert={narrow && open}>
+      <main key={page} className="min-h-0 flex-1 overflow-y-auto">
+        <div data-page-content className={page === "chat" ? `mx-auto flex h-full w-full max-w-[min(100%,72rem)] flex-col px-4 pb-0 pt-5 md:px-10 ${platform === "win32" ? "md:pt-14" : "md:pt-9"}` : narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
+          {children}
+        </div>
+      </main>
+      {footer}
+    </div>
     {narrow && open && <NavigationDrawer page={page} navigate={navigate} onClose={() => setOpen(false)} />}
   </div>
 }
-function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
-  const pageButton = (key: ApplicationPage) => {
-    const Icon = pageIcons[key]
-    const current = page === key
-    return <Button key={key} variant="ghost" disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={current ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${current ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
-      <Icon className="size-4 shrink-0" />{pageNames[key]}
-    </Button>
-  }
-  return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
-    {(["models", "chat", "connections", "usage"] as const).map(pageButton)}
-    <div className="mt-auto flex flex-col gap-2">
-      <SidebarUpdatePill navigate={navigate} onNavigate={onNavigate} />
-      <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate} className={`${buttonVariants({ variant: "ghost" })} h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start hover:bg-slate-100 dark:hover:bg-slate-800`}>
-        <BookOpenIcon className="size-4 shrink-0" />Docs<ArrowUpRightIcon aria-hidden="true" className="ml-auto size-3.5 shrink-0 text-slate-400" />
-      </a>
-      {pageButton("settings")}
+/** Models on this computer: the user's own, and catalog models installed or on their way. */
+const modelsOnComputer = (state: LocalModelsState) =>
+  state.models.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled").length
+/** A page tab at the top of the sidebar, as main's sidebar drew them: icon and name, highlighted while its page shows. */
+function NavTab({ label, name, icon, current, onClick, status }: { label: string; name?: string; icon: ReactNode; current: boolean; onClick?: () => void; status?: ReactNode }) {
+  return <Button variant="ghost" disabled={!onClick} onClick={onClick} aria-label={name} aria-current={current ? "page" : undefined}
+    className={`group h-10 justify-start gap-3 rounded-lg px-3 text-left text-sm font-medium ${current ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+    {icon}{label}
+    {status !== undefined && <span className="ml-auto inline-flex size-4 shrink-0 items-center justify-center text-blue-500">{status}</span>}
+  </Button>
+}
+/** The Chat tab, with room at its end for its status; before the window reaches the service it shows none. */
+function ChatTab({ page, onClick }: { page: MainPage; onClick?: (() => void) | undefined }) {
+  return <NavTab label="Chat" icon={<ChatCircleIcon className="size-4 shrink-0" />} current={page === "chat"} {...(onClick ? { onClick } : {})}
+    status={onClick ? <ChatTabStatus page={page} /> : null} />
+}
+/** The Models tab, with how many models are on this computer; before the window reaches the service it shows without a count and can't be opened yet. */
+function ModelsTab({ current, onClick }: { current: boolean; onClick?: () => void }) {
+  return onClick ? <CountedModelsTab current={current} onClick={onClick} /> : <ModelsTabView current={current} count={Option.none()} />
+}
+function CountedModelsTab({ current, onClick }: { current: boolean; onClick: () => void }) {
+  return <ModelsTabView current={current} count={useLocalModelsSelector(modelsOnComputer, Equivalence.number)} onClick={onClick} />
+}
+function ModelsTabView({ current, count, onClick }: { current: boolean; count: Option.Option<number>; onClick?: () => void }) {
+  return <NavTab label="Models" name={Option.match(count, { onNone: () => "Models", onSome: value => value > 0 ? `Models, ${value} on this computer` : "Models" })} current={current} onClick={onClick} icon={
+    <span className="relative inline-flex">
+      <CubeIcon className="size-4 shrink-0" />
+      {Option.isSome(count) && count.value > 0 && <span aria-hidden="true" className={`absolute -top-1.5 -right-2 min-w-4 rounded-full bg-slate-200 px-1 text-center text-[10px] leading-4 font-semibold tabular-nums text-slate-700 ring-2 dark:bg-slate-700 dark:text-slate-100 ${current ? "ring-blue-50 dark:ring-slate-800" : "ring-slate-50 group-hover:ring-slate-100 dark:ring-slate-925 dark:group-hover:ring-slate-800"}`}>{count.value}</span>}
+    </span>} />
+}
+function BarButton({ label, icon: BarIcon, onClick }: { label: string; icon: Icon; onClick?: () => void }) {
+  return <ActionTooltip label={label} trigger={
+    <button type="button" aria-label={label} disabled={!onClick} onClick={onClick}
+      className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:opacity-50 dark:hover:bg-slate-800 dark:hover:text-slate-100">
+      <BarIcon className="size-[18px]" />
+    </button>} />
+}
+/** Docs, a plain link in the sidebar's bar: hovering changes its text's colour and underlines it. */
+function DocsLink({ onNavigate }: { onNavigate?: () => void }) {
+  return <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate}
+    className="group inline-flex items-center gap-2 rounded-sm px-2 text-[13px] font-medium focus-visible:outline-2 focus-visible:outline-blue-500">
+    <BookOpenIcon className="size-4 shrink-0 text-slate-500 dark:text-slate-400" />
+    <span className="inline-flex items-center gap-1 border-b border-transparent text-slate-600 group-hover:border-current group-hover:text-slate-400 dark:text-slate-300 dark:group-hover:text-slate-100">Docs<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></span>
+  </a>
+}
+/** The sidebar: the Models, Connections and Chat tabs, the recent chats, the update when there is one, then a bar with Docs and Settings. */
+function Navigation({ page, navigate, onNavigate }: { page: MainPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
+  const open = navigate && ((target: ApplicationPage) => () => { navigate(target); onNavigate?.() })
+  return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col">
+    <div className="flex shrink-0 flex-col gap-2 px-4">
+      <ModelsTab current={page === "models"} onClick={open?.("models")} />
+      <NavTab label="Connections" icon={<PlugIcon className="size-4 shrink-0" />} current={page === "connections"} onClick={open?.("connections")} />
+      <ChatTab page={page} onClick={open?.("chat")} />
+    </div>
+    <div className="mt-2 flex min-h-0 flex-1 flex-col px-4">{navigate && <SidebarChats page={page} navigate={navigate} onNavigate={onNavigate} />}</div>
+    <div className="shrink-0 px-4 pb-2.5 empty:hidden"><SidebarUpdatePill navigate={navigate} onNavigate={onNavigate} /></div>
+    <div className="flex shrink-0 items-center justify-between gap-1 border-t border-slate-200 px-3 pt-2.5 dark:border-slate-750">
+      <DocsLink onNavigate={onNavigate} />
+      <BarButton label="Settings" icon={GearSixIcon} onClick={open?.("settings")} />
     </div>
   </nav>
 }
@@ -455,10 +629,10 @@ function NarrowBar({ open, onOpen }: { open: boolean; onOpen: () => void }) {
     <span className="flex items-center gap-2 font-heading text-base font-semibold"><MagnitudeMark className="h-7 w-7 shrink-0" />Magnitude</span>
   </header>
 }
-function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onClose: () => void }) {
+function NavigationDrawer({ page, navigate, onClose }: { page: MainPage; navigate?: (page: ApplicationPage) => void; onClose: () => void }) {
   return <div className="fixed inset-0 z-50 flex" onKeyDown={event => { if (event.key === "Escape") onClose() }}>
     <button type="button" aria-label="Close navigation" className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={onClose} />
-    <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
+    <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-3 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
       <div className="mb-6 flex h-10 items-center justify-between px-4">
         <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
         <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={onClose}><XIcon className="size-5" /></button>
@@ -468,7 +642,7 @@ function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; 
   </div>
 }
 /** From `md` up: the collapsible sidebar with the window's integrated controls and drag regions. */
-function DockedSidebar({ page, navigate, platform }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined }) {
+function DockedSidebar({ page, navigate, platform }: { page: MainPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined }) {
   const [collapsed, setCollapsed] = useState(false)
   const updatePending = useSidebarUpdate().update._tag !== "None"
   const integratedControls = platform === "darwin" || platform === "win32"
@@ -482,8 +656,8 @@ function DockedSidebar({ page, navigate, platform }: { page: ApplicationPage; na
       </button>
     </div>
     <aside aria-hidden={collapsed} inert={collapsed} style={{ width: sidebarWidth }} className="shrink-0 overflow-hidden transition-[width] duration-250 ease-in-out motion-reduce:transition-none">
-      <div className={`flex h-full w-56 flex-col border-r border-slate-200 pt-10 pb-8 transition-transform duration-250 ease-in-out motion-reduce:transition-none dark:border-slate-750 ${collapsed ? "-translate-x-full" : "translate-x-0"}`}>
-      <div className="mb-10 mt-4 flex h-8 shrink-0 items-center gap-3 px-7 font-heading text-base font-semibold">
+      <div className={`flex h-full w-56 flex-col border-r border-slate-200 pt-10 pb-3 transition-transform duration-250 ease-in-out motion-reduce:transition-none dark:border-slate-750 ${collapsed ? "-translate-x-full" : "translate-x-0"}`}>
+      <div className="mb-8 mt-4 flex h-8 shrink-0 items-center gap-3 px-7 font-heading text-base font-semibold">
         <MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude
       </div>
       <Navigation page={page} navigate={navigate} />
@@ -491,4 +665,3 @@ function DockedSidebar({ page, navigate, platform }: { page: ApplicationPage; na
     </aside>
   </>
 }
-

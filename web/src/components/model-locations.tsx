@@ -8,7 +8,6 @@ import { Button } from "./ui/button"
 import { Switch } from "./ui/switch"
 import { ErrorNotice, type NoticeContent } from "./error-notice"
 import { SettingsRow } from "./settings-row"
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "./ui/dialog"
 import { SkeletonLine } from "./page-skeletons"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./folder-picker"
 import { modelLocationErrorNotice } from "./candidate-errors"
@@ -100,8 +99,20 @@ export function ModelLocationsManager({ locations, busy, notice, onToggle, onRem
   </div>
 }
 
-/** Settings → Model locations: one row summarizing where Magnitude looks, with Manage… for the details. */
-export function ModelLocationsRow() {
+/** Settings → Storage: one row summarizing where Magnitude looks, with Manage… opening the details as a view of Settings. */
+export function ModelLocationsRow({ onManage }: { onManage: () => void }) {
+  const client = useAgentClient()
+  const locations = useAtomValue(client.Models.ListModelLocations({})).result
+  return <SettingsRow label="Model locations"
+    hint={Result.isSuccess(locations) ? modelLocationsSummary(locations.value.locations)
+      : Result.isFailure(locations) ? undefined
+      : <SkeletonLine className="h-4 text-xs" width="220px" />}
+    alert={Result.isFailure(locations) ? <ErrorNotice title="Couldn’t read model locations" description="Magnitude keeps looking in the locations it already uses." /> : undefined}
+    control={<Button size="sm" variant="outline" disabled={!Result.isSuccess(locations)} onClick={onManage}>Manage…</Button>} />
+}
+
+/** Model locations as a view of Settings: where Magnitude looks for GGUF files, which it reads and never changes. */
+export function ModelLocationsView() {
   const client = useAgentClient()
   const locations = useAtomValue(client.Models.ListModelLocations({})).result
   const setEnabled = useAtomSet(client.Models.SetModelLocationEnabled)
@@ -110,7 +121,6 @@ export function ModelLocationsRow() {
   const toggling = useAtomValue(client.Models.SetModelLocationEnabled)
   const adding = useAtomValue(client.Models.AddModelFolder)
   const removing = useAtomValue(client.Models.RemoveModelFolder)
-  const [managing, setManaging] = useState(false)
   const [choosing, setChoosing] = useState(false)
   const native = useNativeOpenPath()
   const chooseFolder = choosePath(native, { title: "Add a folder of models", defaultPath: Option.none() }, path => addFolder({ path }), () => setChoosing(true))
@@ -120,24 +130,14 @@ export function ModelLocationsRow() {
     : Result.isFailure(removing) ? Option.match(Cause.failureOption(removing.cause), { onNone: () => ({ title: "The folder wasn’t removed" }), onSome: modelLocationErrorNotice })
     : Result.isFailure(toggling) ? { title: "The location wasn’t changed", description: "Try again." }
     : undefined
-  return <SettingsRow label="Model locations"
-    hint={Result.isSuccess(locations) ? modelLocationsSummary(locations.value.locations)
-      : Result.isFailure(locations) ? undefined
+  return <>
+    <p className="mb-5 text-[13px] text-slate-600 dark:text-slate-400">Where Magnitude looks for GGUF files. It reads them and never changes them.</p>
+    {Result.isFailure(locations) ? <ErrorNotice title="Couldn’t read model locations" description="Magnitude keeps looking in the locations it already uses." />
+      : Result.isSuccess(locations) ? <ModelLocationsManager locations={locations.value.locations} busy={busy} notice={notice}
+        onToggle={(kind, enabled) => setEnabled({ kind, enabled })} onRemove={path => removeFolder({ path })} onAdd={chooseFolder} />
       : <SkeletonLine className="h-4 text-xs" width="220px" />}
-    alert={Result.isFailure(locations) ? <ErrorNotice title="Couldn’t read model locations" description="Magnitude keeps looking in the locations it already uses." /> : undefined}
-    control={<Button size="sm" variant="outline" disabled={!Result.isSuccess(locations)} onClick={() => setManaging(true)}>Manage…</Button>}>
-    <Dialog open={managing} onOpenChange={setManaging}>
-      <DialogContent className="max-h-[85vh] grid-cols-[minmax(0,1fr)] overflow-y-auto sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Model locations</DialogTitle>
-          <DialogDescription>Where Magnitude looks for GGUF files. It reads them and never changes them.</DialogDescription>
-        </DialogHeader>
-        {Result.isSuccess(locations) && <ModelLocationsManager locations={locations.value.locations} busy={busy} notice={notice}
-          onToggle={(kind, enabled) => setEnabled({ kind, enabled })} onRemove={path => removeFolder({ path })} onAdd={chooseFolder} />}
-      </DialogContent>
-    </Dialog>
     <FolderPicker open={choosing} onOpenChange={setChoosing} initialPath={Option.none()} title="Add a folder of models"
       description="Folders on the computer running Magnitude. Magnitude reads GGUF files there and never changes them." confirmLabel="Add this folder"
       onChoose={path => addFolder({ path })} />
-  </SettingsRow>
+  </>
 }

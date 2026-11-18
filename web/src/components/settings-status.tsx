@@ -14,6 +14,7 @@ import { ErrorNotice } from "./error-notice"
 import { ModelLogo } from "./model-logo"
 import { SkeletonLine } from "./page-skeletons"
 import { MemoryFigures } from "./memory-breakdown"
+import { serviceIndicator } from "./service-indicator"
 
 const loadLabels: Record<ModelLoadStage, string> = {
   queued: "Waiting for memory",
@@ -46,6 +47,7 @@ export function SettingsStatus({ observation }: { observation: ServiceObservatio
     : residency?._tag === "Loading" ? loadLabels[residency.stage]
     : residency?._tag === "Stopping" ? "Stopping model" : null
   const fraction = residency?._tag === "Loading" && isMeasuredModelLoadStage(residency.stage) ? residency.fraction : null
+  const indicator = serviceIndicator({ ready, unavailable, modelActive: active !== undefined })
   const serviceLabel = ready ? "Magnitude service running" : unavailable ? "Magnitude service unavailable"
     : service?._tag === "Reconnecting" ? "Reconnecting to Magnitude" : "Magnitude service starting"
   const title = active ? formatLocalModelDisplayName(active.model)
@@ -67,9 +69,9 @@ export function SettingsStatus({ observation }: { observation: ServiceObservatio
           {reading ? <SkeletonLine className="h-5 w-52" /> : <span className="settings-status-name" title={title}>
             {active && <ModelLogo model={active.model} className="settings-status-logo" />}{title}
           </span>}
-          <span role="img" aria-label={serviceLabel} title={serviceLabel} className={`settings-service-indicator ${unavailable ? "is-failed" : ready ? "is-ready" : "is-starting"}`}>
-            {unavailable ? <XIcon weight="bold" /> : ready ? <span /> : <CircleNotchIcon className="motion-safe:animate-spin" />}
-          </span>
+          {indicator && <span role="img" aria-label={serviceLabel} title={serviceLabel} className={`settings-service-indicator is-${indicator}`}>
+            {indicator === "failed" ? <XIcon weight="bold" /> : indicator === "ready" ? <span /> : <CircleNotchIcon className="motion-safe:animate-spin" />}
+          </span>}
         </div>
         <div className="settings-status-controls">
           {activity && <span className="settings-status-activity" role="status"><CircleNotchIcon aria-hidden="true" className="motion-safe:animate-spin" /><span>{activity}</span>{fraction !== null && <strong>{formatModelLoadPercentage(fraction)}</strong>}</span>}

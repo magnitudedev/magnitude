@@ -1,7 +1,7 @@
 import { Clock, Context, Effect, ExecutionStrategy, Exit, Fiber, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
 import { isNewerVersion } from "@magnitudedev/release"
 import { UpdateFailureReason, UpdateRelease, type UpdateCheckReason } from "@magnitudedev/release/hosted-update"
-import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
+import type { ApplicationUpdateState, ApplicationUpdateUnavailableKind } from "@magnitudedev/sdk/desktop-host"
 import { UpdatePreferences } from "../desktop-native/update-preferences"
 import { PreparedUpdateStore, type PreparedUpdate } from "../desktop-native/prepared-update"
 
@@ -186,8 +186,8 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
   })
 })
 
-export const unavailableApplicationUpdate = (message: string): ApplicationUpdate => {
-  const state: ApplicationUpdateState = { transfer: { _tag: "Unavailable", message }, check: { _tag: "Idle" }, preference: { _tag: "Unavailable", message } }
+export const unavailableApplicationUpdate = (kind: ApplicationUpdateUnavailableKind, message: string): ApplicationUpdate => {
+  const state: ApplicationUpdateState = { transfer: { _tag: "Unavailable", kind, message }, check: { _tag: "Idle" }, preference: { _tag: "Unavailable", message } }
   return { state: Effect.succeed(state), changes: Stream.succeed(state), check: () => new ApplicationUpdateFailed({ message }),
     download: new ApplicationUpdateFailed({ message }), discard: new ApplicationUpdateFailed({ message }), setAutoDownload: () => new ApplicationUpdateFailed({ message }),
     requireReady: new ApplicationUpdateFailed({ message }), close: Effect.void }

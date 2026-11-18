@@ -92,7 +92,7 @@ export const runHeadlessApplication = (options: {
   }
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   const serviceState = yield* Ref.make<Option.Option<OwnedServiceState>>(Option.none())
-  const updates = yield* (options.initializeUpdates ?? Effect.succeed(unavailableApplicationUpdate("Application updates require an installed Magnitude application."))).pipe(
+  const updates = yield* (options.initializeUpdates ?? Effect.succeed(unavailableApplicationUpdate("NotInThisBuild", "Application updates require an installed Magnitude application."))).pipe(
     Effect.provideService(UpdateHardwareSource, { current: Ref.get(serviceState).pipe(Effect.map(Option.flatMap(updateHardwareFromService))) }))
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   // Update checks start once the service is ready, so a new version reports `applied` only after it starts.

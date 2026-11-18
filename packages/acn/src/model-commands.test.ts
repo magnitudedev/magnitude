@@ -8,7 +8,7 @@ import { LocalModels } from "./local-models"
 const UPGRADED_ALIAS = "hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
 const localModels = {
   state: Effect.succeed({
-    models: [{ _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] }, storedComponents: [] }],
+    models: [{ _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] }, storedComponents: [], servingState: { _tag: "Assessing" } }],
     unsupported: [],
     hidden: [],
   }),
@@ -299,7 +299,7 @@ it("reports whether a catalog sync installs, updates, or finds the model current
 })
 
 /** `models pull` and the desktop's Download agree: ACN refuses a catalog model that doesn't fit before anything downloads (QA mac-m4). */
-it("refuses to download a catalog model that does not fit, and still updates an installed one or starts an unassessed one", async () => {
+it("refuses to download a catalog model that does not fit or that the catalog dropped, and still updates an installed one or starts an unassessed one", async () => {
   const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
   const { ModelIdSchema, ModelVersionNotRunnable } = await import("@magnitudedev/acn-protocol")
   const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
@@ -329,9 +329,11 @@ it("refuses to download a catalog model that does not fit, and still updates an 
         catalogModel("installed-too-large:gguf:q4", doesNotFit, { ...installed, _tag: "UpdateAvailable" }),
         catalogModel("assessing:gguf:q4", { _tag: "Assessing", profile: {} }, { _tag: "NotInstalled" }),
         catalogModel("fits:gguf:q4", { _tag: "Assessed", assessment: { _tag: "Fits" } }, { _tag: "NotInstalled" }),
+        { ...catalogModel("disabled:gguf:q4", { _tag: "Assessed", assessment: { _tag: "Fits" } }, { _tag: "NotInstalled" }), catalogData: { aliases: [], support: { _tag: "Disabled" } } },
       ],
       unsupported: [],
       hidden: [],
+      preparation: { discovery: { complete: true, modelsFound: 0 }, assessment: { complete: true, settledModels: 5, totalModels: 5 } },
     }) } as never),
     Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
     Effect.provideService(IcnClient, {
@@ -341,7 +343,10 @@ it("refuses to download a catalog model that does not fit, and still updates an 
       }) },
     } as never),
     Effect.provideService(IcnCatalog, {
-      get: Effect.succeed({ revision: 1, state: { models: [{ id: "installed-too-large:gguf:q4", localState: { _tag: "Installed" } }] } }),
+      get: Effect.succeed({ revision: 1, state: { models: [
+        { id: "installed-too-large:gguf:q4", localState: { _tag: "Installed" } },
+        ...["too-large:gguf:q4", "too-large-partial:gguf:q4", "assessing:gguf:q4", "fits:gguf:q4", "disabled:gguf:q4", "dropped:gguf:q4"].map((id) => ({ id, localState: { _tag: "NotInstalled" } })),
+      ] } }),
       refresh: Effect.void,
     } as never),
     Effect.provideService(IcnCatalogInstallations, { refresh: Effect.void } as never),
@@ -359,6 +364,16 @@ it("refuses to download a catalog model that does not fit, and still updates an 
   expect(await Effect.runPromise(sync("assessing:gguf:q4"))).toMatchObject({ _tag: "Right", right: "Installing" })
   expect(await Effect.runPromise(sync("fits:gguf:q4"))).toMatchObject({ _tag: "Right", right: "Installing" })
   expect(installs).toEqual(["installed-too-large:gguf:q4", "assessing:gguf:q4", "fits:gguf:q4"])
+  // Dropped by its assessment: the catalog has it but no longer lists it here, so it would download and appear nowhere.
+  const dropped = await Effect.runPromise(sync("dropped:gguf:q4"))
+  expect(dropped).toMatchObject({ _tag: "Left", left: { _tag: "LocalModelMutationFailed", code: "catalog_model_not_offered" } })
+  // An ID the catalog never had is said to be no model, not one whose check failed.
+  const unknown = await Effect.runPromise(sync("lfm3-1.7b:gguf:q5"))
+  expect(unknown).toMatchObject({ _tag: "Left", left: { _tag: "LocalModelMutationFailed", code: "catalog_model_not_found", message: "There’s no model lfm3-1.7b:gguf:q5 in the catalog." } })
+  expect(installs).toEqual(["installed-too-large:gguf:q4", "assessing:gguf:q4", "fits:gguf:q4"])
+  // A disabled model is listed: ICN answers it with its own reason, so it is passed on, not refused here.
+  await Effect.runPromise(sync("disabled:gguf:q4"))
+  expect(installs).toEqual(["installed-too-large:gguf:q4", "assessing:gguf:q4", "fits:gguf:q4", "disabled:gguf:q4"])
 })
 
 it("downloads only the named component of a catalog model and refuses custom models", async () => {

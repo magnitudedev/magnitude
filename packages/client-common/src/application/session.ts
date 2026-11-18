@@ -1,7 +1,7 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option, Stream } from "effect"
 import { Mutation } from "@magnitudedev/effect-query"
-import { localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
+import { localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelId, type ModelResidency } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { LocalModels } from "../local-models/service"
 import { ClientEffectQuery } from "../state/client-effect-query"
@@ -9,10 +9,11 @@ import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { formatModelLoadPercentage, formatModelLoadStage, formatModelMemory, isMeasuredModelLoadStage } from "../utils/model-load"
 import { ApplicationHost, ApplicationHostFailed } from "./host"
 import { ApplicationRouter } from "./router"
+import { landingPage, readyToChat } from "./landing"
 import type { AddModelRequest, ApplicationPage, HostNotice, QuitFailureDecision } from "./contracts"
 import { ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
-export { AddModelRequest, ApplicationPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus } from "./contracts"
+export { AddModelRequest, ApplicationPage, type MainPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
 export const activeLocalModel = (models: LocalModelsState) => {
   for (const model of models.models) {
@@ -82,17 +83,48 @@ const makeApplicationSession = Effect.gen(function* () {
     return Result.isInitial(state) ? Option.none() : Option.some(Result.isSuccess(state) && state.value.onboarding === "Pending")
   }))
   const navigate = router.navigate
-  const completeOnboarding = Atom.fn((_: void) => Mutation.execute(effectQuery.Configuration.CompleteOnboarding, {}).pipe(
+  const landing = (result: Result.Result<LocalModelsState, unknown>) => Result.isSuccess(result) ? landingPage(result.value) : Option.none()
+  // The app opens on the page the first full answer about this computer's models calls for, unless it has moved on.
+  yield* Registry.toStream(registry, models.state).pipe(
+    Stream.filterMap(landing),
+    Stream.take(1),
+    Stream.runForEach(router.land),
+    Effect.forkScoped,
+  )
+  // The model onboarding's download fetches: once it is ready it is loaded and Chat opens, so onboarding ends in a chat.
+  const onboardingDownload = Atom.keepAlive(Atom.make(Option.none<ModelId>()))
+  const completeOnboarding = Atom.fn((download: Option.Option<ModelId>) => Mutation.execute(effectQuery.Configuration.CompleteOnboarding, {}).pipe(
     provideRegistry,
-    Effect.zipRight(router.navigate("models")),
+    Effect.zipRight(Effect.sync(() => registry.set(onboardingDownload, download))),
+    Effect.zipRight(Effect.suspend(() => navigate(Option.getOrElse(landing(registry.get(models.state)), (): ApplicationPage => "chat")))),
   ))
+  yield* Registry.toStream(registry, onboardingDownload).pipe(
+    Stream.filterMap((download) => download),
+    Stream.flatMap((modelId) => Registry.toStream(registry, models.state).pipe(
+      Stream.filterMap((result): Option.Option<boolean> => {
+        if (!Result.isSuccess(result)) return Option.none()
+        const model = result.value.models.find((candidate) => candidate.modelId === modelId)
+        // Ready, it is loaded; gone (cancelled) or failed, onboarding has nothing more to do.
+        return model === undefined || model.acquisitionState._tag === "InstallFailed" ? Option.some(false)
+          : readyToChat(model) ? Option.some(true) : Option.none()
+      }),
+      Stream.take(1),
+      Stream.mapEffect((ready) => Effect.sync(() => registry.set(onboardingDownload, Option.none())).pipe(
+        Effect.zipRight(ready ? models.load(modelId).pipe(Effect.zipRight(navigate("chat")), Effect.catchAll(Effect.logError)) : Effect.void))),
+    ), { switch: true }),
+    Stream.runDrain,
+    Effect.forkScoped,
+  )
   const notices = Atom.keepAlive(Atom.make<ReadonlyArray<HostNotice>>([]))
   const dismissNotice = (notice: HostNotice) => Effect.sync(() => registry.set(notices, registry.get(notices).filter(entry => entry !== notice)))
   const quitFailed = Atom.keepAlive(Atom.make(false))
-  const addModelRequest = Atom.keepAlive(Atom.make(Option.none<AddModelRequest>()))
+  // A request to add a model belongs to the visit to Models it opened, so opening Models again drops it.
+  const addModelRequested = Atom.keepAlive(Atom.make(Option.none<{ readonly visit: number; readonly request: AddModelRequest }>()))
+  const addModelRequest = Atom.keepAlive(Atom.make(get => Option.flatMap(get(addModelRequested),
+    entry => entry.visit === get(router.visit) ? Option.some(entry.request) : Option.none())))
   const requestAddModel = (request: AddModelRequest) => navigate("models").pipe(
-    Effect.zipRight(Effect.sync(() => registry.set(addModelRequest, Option.some(request)))))
-  const clearAddModelRequest = Effect.sync(() => registry.set(addModelRequest, Option.none()))
+    Effect.zipRight(Effect.sync(() => registry.set(addModelRequested, Option.some({ visit: registry.get(router.visit), request })))))
+  const clearAddModelRequest = Effect.sync(() => registry.set(addModelRequested, Option.none()))
 
   if (Option.isSome(host.shell)) {
     const shell = host.shell.value
@@ -126,6 +158,8 @@ const makeApplicationSession = Effect.gen(function* () {
 
   return {
     page: router.page,
+    mainPage: router.mainPage,
+    visit: router.visit,
     onboardingPending: onboardingPending as Atom.Atom<Option.Option<boolean>>,
     navigate,
     completeOnboarding,

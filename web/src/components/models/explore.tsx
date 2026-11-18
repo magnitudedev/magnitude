@@ -1,16 +1,16 @@
 import { useContext, useEffect, useMemo, useState } from "react"
-import { Option } from "effect"
+import { Equal, Option } from "effect"
 import { Atom, RegistryContext, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon, LightningIcon } from "@phosphor-icons/react"
-import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type CustomFormModelId, type DrafterChoice, type HuggingFaceRepositoryCheck, type HuggingFaceRepositoryId, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
-import { drafterCandidateDownloadBytes, formatStorageSize, readSearchChecks, useAgentClient, useLocalModelMutations, useLocalModels, type QuickSearchCheck, type ServingMemory } from "@magnitudedev/client-common"
+import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type CustomFormModelId, type DrafterChoice, type HuggingFaceRepositoryCheck, type HuggingFaceRepositoryId, type HuggingFaceSearchResponse, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
+import { drafterCandidateDownloadBytes, formatStorageSize, readSearchChecks, useAgentClient, useLocalModelMutations, useLocalModels, type AgentClient, type QuickSearchCheck, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
-import { downloadContents, methodName, onThisComputer, quantView, transferOf } from "./data"
+import { downloadContents, transferLabel, methodName, onThisComputer, quantView, transferOf } from "./data"
 import { AUTO_DRAFTER, DrafterSection, drafterChoice, useDrafters, type DrafterSelection } from "./drafter-picker"
 import type { QuantView } from "./view"
 import type { OfferedModel } from "./expanding-model"
-import { ExploreModal, type ExploreResults, type ExploreRow, type RunnableFamily } from "./explore-modal"
+import { ExploreView, type ExploreResults, type ExploreRow, type RunnableFamily } from "./explore-view"
 
 function useDebounced<A>(value: A, delay: number): A {
   const [settled, setSettled] = useState(value)
@@ -46,6 +46,52 @@ const quickState = (check: Result.Result<HuggingFaceRepositoryCheck, unknown>): 
  * repository offering the quant it recommends for this machine until it is opened, fully checked in the background
  * when `prefetched`.
  */
+/** What a search's schedule has read: each listed repository's quick check it has read, and those it fully checked. */
+export interface SearchSchedule {
+  readonly checks: ReadonlyMap<string, Result.Result<HuggingFaceRepositoryCheck, unknown>>
+  readonly full: ReadonlySet<string>
+}
+
+/**
+ * Whether two passes of a search's schedule read the same checks to the same results and fully checked the same
+ * repositories. A pass runs whenever any check it reads changes at all (its staleness, a full check's progress); only
+ * a pass that found something new is a new schedule, so the list is drawn again only then.
+ */
+export const sameSchedule = (previous: SearchSchedule, next: SearchSchedule): boolean =>
+  previous.checks.size === next.checks.size
+  && [...next.checks].every(([key, check]) => previous.checks.has(key) && Equal.equals(previous.checks.get(key), check))
+  && previous.full.size === next.full.size
+  && [...next.full].every(key => previous.full.has(key))
+
+/**
+ * A search's schedule over its `listed` repositories, `visible` being those on screen: each pass reads the checks
+ * `readSearchChecks` runs, and stays the same schedule unless it found something new.
+ */
+export const searchSchedule = (client: Pick<AgentClient, "Models">, listed: readonly HuggingFaceSearchResult[], visible: Atom.Atom<ReadonlySet<string>>) =>
+  Atom.make((get): SearchSchedule => {
+    const byKey = new Map<string, HuggingFaceSearchResult>(listed.map(result => [result.repository, result]))
+    const checks = new Map<string, Result.Result<HuggingFaceRepositoryCheck, unknown>>()
+    const full = new Set<string>()
+    const previous = get.self<SearchSchedule>()
+    readSearchChecks({
+      listed: listed.map(result => result.repository),
+      visible: get(visible),
+      read: new Set(Option.match(previous, { onNone: () => [], onSome: value => [...value.checks.keys()] })),
+      quick: (key) => {
+        const check = get(client.Models.CheckHuggingFaceRepository(checkInput(byKey.get(key)!))).result
+        checks.set(key, check)
+        return quickState(check)
+      },
+      full: (key) => {
+        full.add(key)
+        const inspected = get(client.Models.InspectModelCandidate({ reference: key })).result
+        return !Result.isInitial(inspected) && !inspected.waiting
+      },
+    })
+    const next = { checks, full }
+    return Option.match(previous, { onNone: () => next, onSome: value => sameSchedule(value, next) ? value : next })
+  })
+
 const searchRow = (result: HuggingFaceSearchResult, check: Result.Result<HuggingFaceRepositoryCheck, unknown>, prefetched: boolean, retry: () => void, memory: ServingMemory): ExploreRow | null => {
   const developer = Option.getOrNull(result.developer)
   const named = { key: result.repository, name: result.displayName, lab: developer ? labForDeveloper(developer.lab) : undefined }
@@ -111,15 +157,24 @@ const useRepositoryQuants = (memory: ServingMemory) => function useOpened(model:
   }
 }
 
+/** What leads Explore's results: a recommended model, offered from its ladder, or a repository looked up by name. */
+export type ExploreFirst = { readonly _tag: "Offered"; readonly model: OfferedModel } | { readonly _tag: "Repository"; readonly repository: string }
+
+/**
+ * What a search for a model's quants leads with: the recommended model published in `repository`, offered from its
+ * ladder as it is recommended, since Hugging Face search leaves recommended models' repositories out; else the
+ * repository, looked up by name.
+ */
+export const exploreFirst = (repository: string, offered: readonly { readonly model: OfferedModel }[]): ExploreFirst => {
+  const model = offered.find(entry => entry.model.quants.some(quant => quant.repository === repository))?.model
+  return model ? { _tag: "Offered", model } : { _tag: "Repository", repository }
+}
+
 interface ExploreProps {
-  readonly open: boolean
-  readonly setOpen: (open: boolean) => void
   readonly query: string
+  readonly first: ExploreFirst | null
   readonly setQuery: (value: string) => void
   readonly memory: ServingMemory
-  readonly machine: string
-  readonly recommended: readonly OfferedModel[]
-  readonly measuring: { readonly settled: number; readonly total: number } | null
   readonly families: readonly RunnableFamily[]
   readonly owned: ReadonlySet<string>
 }
@@ -154,7 +209,7 @@ function HuggingFaceDownload({ quant, repository, selection, start }: {
 }
 
 /** The footer of an opened model: its quant's Download, or how far that download is, or that it's here. */
-function useDownload(selections: Readonly<Record<string, DrafterSelection>>) {
+export function useDownload(selections: Readonly<Record<string, DrafterSelection>>) {
   const client = useAgentClient()
   const add = useAtomSet(client.Models.AddHuggingFaceModel)
   const { install } = useLocalModelMutations()
@@ -163,12 +218,9 @@ function useDownload(selections: Readonly<Record<string, DrafterSelection>>) {
   return (model: OfferedModel, quant: QuantView) => {
     const existing = byId.get(quant.key)
     const transfer = existing ? transferOf(existing) : undefined
-    if (transfer) {
-      const percent = transfer.totalBytes > 0 ? Math.round(transfer.completedBytes / transfer.totalBytes * 100) : 0
-      return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />Downloading {percent}%</Button>
-    }
+    if (transfer) return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />{transferLabel(transfer).text}</Button>
     if (existing && onThisComputer(existing)) return <Button disabled variant="outline"><CheckIcon />Downloaded</Button>
-    if (model.catalog) return <DownloadButton key={quant.key} size={quant.downloadBytes} contents={downloadContents({ drafter: null }, quant)} disabled={!quant.fits} start={() => install(quant.key as CatalogFormModelId)} />
+    if (model.catalog) return <DownloadButton key={quant.key} size={quant.downloadBytes} contents={downloadContents({ drafter: null }, quant)} disabled={!quant.fits || quant.missingDiskBytes > 0} start={() => install(quant.key as CatalogFormModelId)} />
     if (quant.repository === null) return null
     const repository = quant.repository as HuggingFaceRepositoryId
     return <HuggingFaceDownload key={quant.key} quant={quant} repository={repository} selection={selections[quant.key] ?? AUTO_DRAFTER}
@@ -178,7 +230,7 @@ function useDownload(selections: Readonly<Record<string, DrafterSelection>>) {
 
 /** A catalog model's drafter, which comes with it: named beside its download, with the bytes it adds. */
 function CatalogDrafter({ drafter }: { drafter: NonNullable<OfferedModel["drafter"]> }) {
-  return <span className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-400" title="A drafter is a small model that guesses ahead, so this one writes several tokens per step">
+  return <span className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-400" title="A drafter is a small model that drafts tokens ahead to speed up replies.">
     <LightningIcon weight="fill" className="size-3.5 text-amber-500" />
     <span>Using <span className="font-medium text-slate-800 dark:text-slate-200">{drafter.method} drafter</span></span>
     {drafter.sizeBytes > 0 && <span className="text-slate-500">· {formatStorageSize(drafter.sizeBytes)}</span>}
@@ -196,6 +248,26 @@ const drafterFor = (selections: Readonly<Record<string, DrafterSelection>>, sele
       ? <DrafterSection key={quant.key} target={quant.drafterTarget} selection={selections[quant.key] ?? AUTO_DRAFTER} onSelect={selection => select(quant.key, selection)} />
       : <span role="status" className="flex items-center gap-1.5 text-xs text-slate-500"><CircleNotchIcon aria-hidden="true" className="size-3.5 motion-safe:animate-spin" />Finding a drafter…</span>
 
+/**
+ * Search results under `first`, a repository looked up on its own, so it leads whether or not the search found it;
+ * the rest follow in their order, without it again.
+ */
+export const listedFirst = (results: readonly HuggingFaceSearchResult[], first: HuggingFaceSearchResult | undefined): readonly HuggingFaceSearchResult[] =>
+  first === undefined ? results : [first, ...results.filter(result => result.repository !== first.repository)]
+
+/**
+ * A repository looked up by its own name: a search for exactly it, which Hugging Face answers with it, so a model's
+ * own repository can lead a search for its other quants even where that search would rank it out of reach.
+ */
+const useRepositoryResult = (repository: string | null, settled: string): HuggingFaceSearchResult | undefined => {
+  const client = useAgentClient()
+  const found = useAtomValue(useMemo(() => Atom.make((get) => repository === null || settled === ""
+    ? Result.initial<HuggingFaceSearchResponse>()
+    : get(client.Models.SearchHuggingFaceModels({ query: repository, limit: Option.some(5), cursor: Option.none() })).result),
+  [client, repository, settled]))
+  return Result.isSuccess(found) ? found.value.results.find(result => result.repository === repository) : undefined
+}
+
 /** No results yet: one list, so what is derived from a search's results doesn't change before they do. */
 const NO_RESULTS: readonly HuggingFaceSearchResult[] = []
 
@@ -204,7 +276,7 @@ const NO_RESULTS: readonly HuggingFaceSearchResult[] = []
  * reaching the end of the list asks for it. An empty query asks for nothing. Its repositories are checked in the order
  * `readSearchChecks` runs them, `visible` being those on screen.
  */
-function useSearchResults(settled: string, query: string, memory: ServingMemory, visible: Atom.Writable<ReadonlySet<string>>): ExploreResults {
+function useSearchResults(settled: string, query: string, first: ExploreFirst | null, memory: ServingMemory, visible: Atom.Writable<ReadonlySet<string>>): ExploreResults {
   const client = useAgentClient()
   const [pages, setPages] = useState<{ readonly query: string; readonly cursor: Option.Option<string>; readonly shown: readonly HuggingFaceSearchResult[] }>(
     { query: settled, cursor: Option.none(), shown: [] })
@@ -220,58 +292,37 @@ function useSearchResults(settled: string, query: string, memory: ServingMemory,
     if (!listed || Option.isNone(next)) return
     setPages({ query: settled, cursor: next, shown: [...current.shown, ...listed.results] })
   }
-  const listedResults = useMemo(() => [...current.shown, ...(listed?.results ?? [])], [current.shown, listed])
-  const schedule = useAtomValue(useMemo(() => Atom.make((get) => {
-    const byKey = new Map<string, HuggingFaceSearchResult>(listedResults.map(result => [result.repository, result]))
-    const checks = new Map<string, Result.Result<HuggingFaceRepositoryCheck, unknown>>()
-    const full = new Set<string>()
-    readSearchChecks({
-      listed: listedResults.map(result => result.repository),
-      visible: get(visible),
-      quick: (key) => {
-        const check = get(client.Models.CheckHuggingFaceRepository(checkInput(byKey.get(key)!))).result
-        checks.set(key, check)
-        return quickState(check)
-      },
-      full: (key) => {
-        full.add(key)
-        const inspected = get(client.Models.InspectModelCandidate({ reference: key })).result
-        return !Result.isInitial(inspected) && !inspected.waiting
-      },
-    })
-    return { checks, full }
-  }), [client, listedResults, visible]))
+  const pinned = useRepositoryResult(first?._tag === "Repository" ? first.repository : null, settled)
+  const listedResults = useMemo(() => listedFirst([...current.shown, ...(listed?.results ?? [])], pinned), [current.shown, listed, pinned])
+  const schedule = useAtomValue(useMemo(() => searchSchedule(client, listedResults, visible), [client, listedResults, visible]))
   const registry = useContext(RegistryContext)
   return query !== settled || (loading && current.shown.length === 0) ? { _tag: "Searching" }
     : Result.isFailure(page) && current.shown.length === 0 ? { _tag: "Failed", message: "Hugging Face search failed. Check your connection and try again." }
     : {
         _tag: "Results",
-        rows: listedResults.flatMap((result) => {
+        rows: [...(first?._tag === "Offered" ? [{ _tag: "Offered" as const, model: first.model, prefetched: false }] : []), ...listedResults.flatMap((result) => {
           const retry = () => registry.refresh(client.Models.CheckHuggingFaceRepository(checkInput(result)))
           const row = searchRow(result, schedule.checks.get(result.repository) ?? Result.initial(), schedule.full.has(result.repository), retry, memory)
           return row ? [row] : []
-        }),
+        })],
         more: loading ? "Loading" : Option.isSome(next) ? more : null,
       }
 }
 
-/**
- * The Explore models modal on the service's data: Hugging Face search, and the recommendations it is given. One modal
- * whatever it shows, so typing a search changes its contents, never the modal itself.
- */
+/** Explore models on the service's data: a Hugging Face search, and what to show before one. */
 export function Explore(props: ExploreProps) {
   const settled = useDebounced(props.query.trim(), 350)
   const tooLong = new TextEncoder().encode(settled).length > HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES
   const visible = useMemo(() => Atom.make<ReadonlySet<string>>(new Set<string>()), [])
   const setVisible = useAtomSet(visible)
-  const searched = useSearchResults(tooLong ? "" : settled, props.query.trim(), props.memory, visible)
+  const searched = useSearchResults(tooLong ? "" : settled, props.query.trim(), props.first, props.memory, visible)
   const [selections, setSelections] = useState<Readonly<Record<string, DrafterSelection>>>({})
   const download = useDownload(selections)
   const drafters = drafterFor(selections, (key, selection) => setSelections(current => ({ ...current, [key]: selection })))
   const results: ExploreResults = props.query.trim() === ""
-    ? { _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }
+    ? { _tag: "Idle" }
     : tooLong ? { _tag: "Failed", message: "This search is longer than Hugging Face accepts. Shorten it." }
     : searched
   const useOpened = useMemo(() => useRepositoryQuants(props.memory), [props.memory])
-  return <ExploreModal {...props} results={results} download={download} drafters={drafters} useOpened={useOpened} onSeen={setVisible} />
+  return <ExploreView {...props} results={results} download={download} drafters={drafters} useOpened={useOpened} onSeen={setVisible} />
 }

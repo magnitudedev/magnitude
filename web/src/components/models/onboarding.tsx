@@ -1,13 +1,15 @@
 import { useRef, useState } from "react"
-import { CaretDownIcon, CaretRightIcon, CheckIcon, CircleNotchIcon, DownloadSimpleIcon, FolderSimpleIcon, WarningCircleIcon } from "@phosphor-icons/react"
+import { CaretDownIcon, CaretRightIcon, CheckIcon, CircleNotchIcon, DownloadSimpleIcon, FolderSimpleIcon, InfoIcon, WarningCircleIcon } from "@phosphor-icons/react"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { HuggingFaceLogo, type ModelLab } from "../model-logo"
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
 import { cn } from "@/lib/utils"
-import { cardClass, LabMark, MachineCard, Section } from "./parts"
+import { cardClass, LabMark, MachineCard } from "./parts"
 import { MachineCardSkeleton, OfferedModelsSkeleton } from "./skeletons"
-import { ExpandingModel, type OfferedModel } from "./expanding-model"
+import type { OfferedModel } from "./expanding-model"
+import { RecommendedForYourMachine, useRecommendedSelection } from "./recommended-for-your-machine"
+import type { Recommendation } from "./recommendations"
 import { downloadContents } from "./data"
 import type { UnrunnableFile } from "./your-models"
 import type { MachineView, QuantView } from "./view"
@@ -21,12 +23,6 @@ export interface DiscoveredModel {
   readonly source: string
   readonly fromHuggingFaceCache: boolean
   readonly warning: string | null
-}
-
-/** One offered model with what onboarding says beside its name. */
-export interface Recommendation {
-  readonly model: OfferedModel
-  readonly note: string | undefined
 }
 
 /** One thing the service does before it can recommend: done, under way (with how far, when it knows), or still to come. */
@@ -68,25 +64,22 @@ function PreparationProgress({ steps }: { steps: readonly PreparationStep[] }) {
 
 /** Onboarding before the app has reached the service: the first step under way, the rest to come. */
 export function OnboardingStarting() {
-  return <Onboarding machine={null} discovered={[]} unrunnable={[]} recommendations={[]} usOnly={false} setUsOnly={() => {}} owned={new Set()}
+  return <Onboarding machine={null} discovered={[]} unrunnable={[]} recommendations={[]} roomNote={null} usOnly={false} setUsOnly={() => {}} owned={new Set()}
     preparation={preparationLabels.map((label, index) => ({ label, detail: null, fraction: null, state: index === 0 ? "active" : "pending" }))}
     onDownload={() => {}} onFinish={() => {}} />
 }
 
 /** First run, in a modal over the app: what's already here, and one recommended model to download. */
-export function Onboarding({ machine, preparation, discovered, unrunnable, recommendations, usOnly, setUsOnly, owned, onDownload, onFinish }: {
+export function Onboarding({ machine, preparation, discovered, unrunnable, recommendations, roomNote, usOnly, setUsOnly, owned, onDownload, onFinish }: {
   machine: MachineView | null; preparation: readonly PreparationStep[] | null; discovered: readonly DiscoveredModel[]; unrunnable: readonly UnrunnableFile[]
-  recommendations: readonly Recommendation[]; usOnly: boolean; setUsOnly: (value: boolean) => void; owned: ReadonlySet<string>
+  recommendations: readonly Recommendation[]; roomNote: string | null; usOnly: boolean; setUsOnly: (value: boolean) => void; owned: ReadonlySet<string>
   onDownload: (model: OfferedModel, quant: QuantView) => void; onFinish: () => void
 }) {
   const measuring = preparation !== null
   const body = useRef<HTMLDivElement>(null)
-  const [selection, setSelection] = useState<string | null | undefined>(undefined)
-  const [quantChoice, setQuantChoice] = useState<string | null>(null)
+  const selection = useRecommendedSelection(recommendations)
   const [showUnrunnable, setShowUnrunnable] = useState(false)
-  const selected = selection === undefined ? recommendations[0]?.model.key ?? null : selection
-  const picked = recommendations.find(entry => entry.model.key === selected)?.model
-  const pickedQuant = picked ? picked.quants.find(quant => quant.key === quantChoice) ?? picked.quants.find(quant => quant.key === picked.recommended) : undefined
+  const { picked, pickedQuant } = selection
   return <Dialog open onOpenChange={open => { if (!open) onFinish() }} disablePointerDismissal>
     <DialogContent showCloseButton={false} initialFocus={body} className="flex h-[88vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
     <div className="flex items-center justify-between gap-4 border-b border-slate-200 px-6 py-4 dark:border-slate-750">
@@ -95,6 +88,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
     </div>
     <div ref={body} tabIndex={-1} className="min-h-0 flex-1 overflow-y-auto bg-slate-50 px-6 pb-6 pt-5 outline-none dark:bg-slate-900/40">
       <div>{machine ? <MachineCard machine={machine} /> : <MachineCardSkeleton />}</div>
+      {roomNote && <p className="mt-3 flex items-center gap-2 px-1 text-sm text-slate-600 dark:text-slate-400"><InfoIcon className="size-4 shrink-0" />{roomNote}</p>}
       {preparation && <PreparationProgress steps={preparation} />}
 
       {discovered.length > 0 && <div className={`${cardClass} mt-4 px-4 py-3`}>
@@ -119,14 +113,8 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
         </div>}
       </div>}
 
-      <Section title="Recommended for your machine" aside={<label className="flex cursor-pointer items-center gap-2 text-xs text-slate-600 dark:text-slate-400"><input type="checkbox" checked={usOnly} onChange={event => { setUsOnly(event.target.checked); setSelection(undefined); setQuantChoice(null) }} className="accent-blue-600" />Only models from US developers</label>}>
-        {measuring ? <OfferedModelsSkeleton firstOpened /> : <div className="space-y-2">
-            {recommendations.map(({ model, note }) => <ExpandingModel key={model.key} model={model} note={note} expanded={selected === model.key} owned={owned}
-              onToggle={() => { setSelection(selected === model.key ? null : model.key); setQuantChoice(null) }}
-              quantChoice={selected === model.key ? quantChoice : null} onQuantChoice={setQuantChoice} />)}
-            {recommendations.length === 0 && <p className="text-[13px] text-slate-500">No model runs well on this computer yet.</p>}
-          </div>}
-      </Section>
+      <RecommendedForYourMachine recommendations={recommendations} placeholder={measuring ? <OfferedModelsSkeleton firstOpened /> : null} measuring={null}
+        usOnly={usOnly} setUsOnly={setUsOnly} owned={owned} selection={selection} className={roomNote && !preparation && discovered.length === 0 ? "mt-5" : "mt-8"} />
 
     </div>
     <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-6 py-4 dark:border-slate-750">
@@ -135,7 +123,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
         {picked && pickedQuant
           ? <>
             {downloadContents(picked, pickedQuant) && <span className="mr-1 text-xs text-slate-500">{downloadContents(picked, pickedQuant)}</span>}
-            <Button disabled={!pickedQuant.fits} onClick={() => { onDownload(picked, pickedQuant); onFinish() }}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
+            <Button disabled={!pickedQuant.fits || pickedQuant.missingDiskBytes > 0} onClick={() => onDownload(picked, pickedQuant)}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
           </>
           : <Button onClick={onFinish}>Continue</Button>}
       </>}
