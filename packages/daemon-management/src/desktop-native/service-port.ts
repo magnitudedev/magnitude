@@ -41,6 +41,9 @@ const probePort = (port: number) => Effect.scoped(Effect.gen(function* () {
 export const portServedByOtherMagnitude = (port: number) => probePort(port).pipe(
   Effect.flatMap(failure => Option.exists(failure, occupied) ? servedByMagnitude(port) : Effect.succeed(false)))
 
+/** Whether anything holds `port` on loopback, including a server that is still shutting down. */
+export const servicePortBound = (port: number) => probePort(port).pipe(Effect.map(failure => Option.exists(failure, occupied)))
+
 /**
  * The desktop always serves. A Magnitude it cannot reach through its own lock (another account's, or a
  * service with another data folder) is asked to quit with the `QuitApplication` request, which every

@@ -7,7 +7,7 @@ import { Deferred, Effect, Option, Ref, Runtime, Schema } from "effect"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, holdContainerData, makeUnixProcessContinuation, nativeHostLayer, resolveApplicationProfile,
-  isLegacyServerMarked, resolveInstalledApplicationRuntime, runHeadlessApplication, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
+  isLegacyServerMarked, resolveInstalledApplicationRuntime, runHeadlessApplication, servicePortBound, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { containerImage } from "@magnitudedev/daemon-management/application-update"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { CLI_VERSION } from "../version"
@@ -79,25 +79,27 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   })
   const blocker = servingBlocker(stateDirectory, profile.port).pipe(Effect.provide(native))
   /** Waits while the desktop app or another Magnitude serves; resolves once this server may start. */
+  const waited = yield* Ref.make(false)
   const awaitTurn = Effect.gen(function* () {
     let announced = false
     while (Option.isSome(yield* blocker)) {
       if (!announced) yield* notify("Another Magnitude app is serving on this machine; this server will resume when it stops.")
       announced = true
+      yield* Ref.set(waited, true)
       if (yield* Deferred.isDone(stopped)) return false
       yield* Effect.raceFirst(Effect.sleep("2 seconds"), Deferred.await(stopped))
     }
     return !(yield* Deferred.isDone(stopped))
   })
   /**
-   * After yielding, the desktop still has to take the ownership lock this server just released; until it has,
-   * nothing appears to serve. Wait for the desktop to own the folder (or a minute, if it never does) so this
-   * server does not take the lock straight back.
+   * After yielding, the desktop still has to take the ownership lock (or, from another account, the port) this server
+   * just released; until it has, nothing appears to serve. Wait for it to (or a minute, if it never does) so this
+   * server does not take them straight back.
    */
   const awaitDesktop = Effect.gen(function* () {
     const deadline = Date.now() + 60_000
     while (Date.now() < deadline && !(yield* Deferred.isDone(stopped))) {
-      if (Option.contains(yield* blocker, "Desktop")) return
+      if (Option.isSome(yield* blocker)) return
       yield* Effect.raceFirst(Effect.sleep("250 millis"), Deferred.await(stopped))
     }
   })
@@ -131,6 +133,12 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     // Another Magnitude may have started between the wait and admission; wait for it rather than fail.
     if (attempt._tag === "Left") {
       if (Option.isSome(yield* blocker)) continue
+      // A Magnitude this server waited on stops answering before it releases the port; give it time to.
+      if ((yield* Ref.get(waited)) && (yield* servicePortBound(profile.port))) {
+        for (let second = 0; second < 30 && (yield* servicePortBound(profile.port)); second++) yield* Effect.sleep("1 second")
+        yield* Ref.set(waited, false)
+        continue
+      }
       return yield* Effect.fail(attempt.left)
     }
     const stop = attempt.right
