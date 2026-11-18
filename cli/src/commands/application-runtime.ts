@@ -1,18 +1,23 @@
 import { Command, CommandExecutor } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { Data, Effect, Option } from "effect"
-import { resolveInstalledApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
+import { NativeHost, resolveInstalledApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
+import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { desktopApplication, desktopServiceOrigin } from "../server/application"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { runCommand } from "./output"
 
 class AppNotServing extends Data.TaggedError("AppNotServing")<{ readonly message: string }> {}
 
-const browserCommand = (url: string): Option.Option<Command.Command> =>
-  process.platform === "darwin" ? Option.some(Command.make("/usr/bin/open", url))
-    : process.platform === "win32" ? Option.some(Command.make("rundll32.exe", "url.dll,FileProtocolHandler", url))
-      : process.env.DISPLAY || process.env.WAYLAND_DISPLAY ? Option.some(Command.make("xdg-open", url))
-        : Option.none()
+/** Windows reports a URL handler as run even without an interactive desktop, as over SSH, so that is checked first. */
+const interactiveWindowsDesktop = Effect.flatMap(NativeHost, native => native.requireInteractiveDesktop).pipe(
+  Effect.provide(bundledWindowsNative.host), Effect.as(true), Effect.orElseSucceed(() => false))
+
+const browserCommand = (url: string): Effect.Effect<Option.Option<Command.Command>> =>
+  process.platform === "darwin" ? Effect.succeed(Option.some(Command.make("/usr/bin/open", url)))
+    : process.platform === "win32" ? interactiveWindowsDesktop.pipe(Effect.map(desktop =>
+      desktop ? Option.some(Command.make("rundll32.exe", "url.dll,FileProtocolHandler", url)) : Option.none()))
+      : Effect.succeed(process.env.DISPLAY || process.env.WAYLAND_DISPLAY ? Option.some(Command.make("xdg-open", url)) : Option.none())
 
 /**
  * A CLI-only installation has no desktop window to show: its app is the one `magnitude serve` serves to
@@ -24,7 +29,7 @@ const openInBrowser = Effect.gen(function* () {
     Effect.orElseSucceed(() => false))
   if (!running) return yield* new AppNotServing({ message: `Magnitude isn't running. Start \`magnitude serve\`, then open ${desktopServiceOrigin} in a browser or run \`magnitude app open\` again.` })
   const executor = yield* CommandExecutor.CommandExecutor
-  const opened = yield* Option.match(browserCommand(desktopServiceOrigin), {
+  const opened = yield* Option.match(yield* browserCommand(desktopServiceOrigin), {
     onNone: () => Effect.succeed(false),
     onSome: command => executor.exitCode(command).pipe(Effect.map(code => code === 0), Effect.orElseSucceed(() => false)),
   })
