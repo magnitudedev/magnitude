@@ -20,6 +20,15 @@ const UnitState = Schema.Struct({
 const missing = (error: unknown) => error instanceof Error && "code" in error && error.code === "ENOENT"
 const failed = (message: string) => new LegacyStartupFailed({ message })
 
+const GENERATED_DESCRIPTION = "Magnitude local inference service"
+
+/**
+ * Whether a unit claims to be the historical generated one. The person's own service under the same name (such as
+ * the `magnitude serve` unit `magnitude docs` describes) is not legacy startup and is left alone.
+ */
+const claimsGenerated = (source: string) =>
+  source.split(/\r?\n/).some(line => line.trim() === `Description=${GENERATED_DESCRIPTION}`)
+
 /** Recognize the historical generated unit, not arbitrary user service commands or hooks. */
 const verifySource = (source: string) => Effect.gen(function* () {
   const fields = new Map<string, string>()
@@ -34,7 +43,7 @@ const verifySource = (source: string) => Effect.gen(function* () {
     fields.set(key, line.slice(index + 1))
   }
   const fixed = new Map([
-    ["Unit.Description", "Magnitude local inference service"], ["Unit.After", "network.target"],
+    ["Unit.Description", GENERATED_DESCRIPTION], ["Unit.After", "network.target"],
     ["Service.Type", "simple"], ["Service.Restart", "on-failure"], ["Service.RestartSec", "2"],
     ["Install.WantedBy", "default.target"],
   ])
@@ -101,7 +110,9 @@ export const makeLinuxLegacyStartup = (options: {
       ["enabled", "enabled-runtime", "disabled"].includes(value.UnitFileState)
     ? verifyDropIns(value.DropInPaths) : Effect.fail(failed("Legacy user service has an unverified source, override, or enablement state"))
   const inspect = Effect.gen(function* () {
-    const source = yield* document
+    const read = yield* document
+    const source = Option.filter(read, value => claimsGenerated(value.text))
+    if (Option.isSome(read) && Option.isNone(source)) return Option.none<LegacyLinuxStartup>()
     if (!(yield* manager)) {
       if (Option.isSome(source)) return yield* failed("The legacy user service exists but its systemd user manager is unavailable")
       return Option.none<LegacyLinuxStartup>()

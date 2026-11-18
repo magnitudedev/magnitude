@@ -238,19 +238,20 @@ at startup from an administrator PowerShell. Set `$account` to the account that 
 ```powershell
 $account = "$env:COMPUTERNAME\alice"
 $userProfile = "C:\Users\alice"
+# A task that runs before sign-in logs on as a batch job; Performance Log Users holds that right by default.
+Add-LocalGroupMember -Group "Performance Log Users" -Member $account -ErrorAction SilentlyContinue
 $action = New-ScheduledTaskAction -Execute "$userProfile\AppData\Local\Programs\Magnitude CLI\magnitude.exe" -Argument "serve"
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-$principal = New-ScheduledTaskPrincipal -UserId $account -LogonType S4U -RunLevel Limited
-Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+$password = (Get-Credential $account).GetNetworkCredential().Password
+Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -User $account -Password $password -RunLevel Limited
 Start-ScheduledTask -TaskName "Magnitude"
 ```
 
-`S4U` runs the task as that account without storing its password and without a window. It cannot use
-network shares; if models are stored on one, register with the account's password instead, entered in a
-prompt rather than typed on the command line: replace `-Principal $principal` with
-`-User $account -Password (Get-Credential $account).GetNetworkCredential().Password`, and add
-`-RunLevel Limited`.
+The task keeps the account's password, entered in a prompt rather than typed on the command line,
+because Windows runs a task as another account before anyone signs in only with its password. A standard
+account also needs the right to log on as a batch job; the group above grants it (or grant "Log on as a
+batch job" in Local Security Policy). After the account's password changes, register the task again.
 
 If other computers need to reach it, allow inbound TCP port 10100 in Windows Defender Firewall from an
 administrator PowerShell:

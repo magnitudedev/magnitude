@@ -206,15 +206,17 @@ It runs in your session with a console window; closing the window stops serving 
 ```powershell
 $account = "$env:COMPUTERNAME\alice"
 $userProfile = "C:\Users\alice"
+# A task that runs before sign-in logs on as a batch job; Performance Log Users holds that right by default.
+Add-LocalGroupMember -Group "Performance Log Users" -Member $account -ErrorAction SilentlyContinue
 $action = New-ScheduledTaskAction -Execute "$userProfile\AppData\Local\Programs\Magnitude CLI\magnitude.exe" -Argument "serve"
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-$principal = New-ScheduledTaskPrincipal -UserId $account -LogonType S4U -RunLevel Limited
-Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+$password = (Get-Credential $account).GetNetworkCredential().Password
+Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -User $account -Password $password -RunLevel Limited
 Start-ScheduledTask -TaskName "Magnitude"
 ```
 
-`S4U` runs it as that account without storing a password and without a window, but without access to network shares. If your models are on a network share, register with the account's password instead: replace `-Principal $principal` with `-User $account -Password (Get-Credential $account).GetNetworkCredential().Password -RunLevel Limited`.
+Windows runs a task as another account before anyone signs in only with that account's password, so the task keeps it (entered in a prompt, never on the command line). A standard account also needs the right to log on as a batch job, which the group above grants; you can instead grant "Log on as a batch job" in Local Security Policy. Register the task again after the account's password changes.
 
 Logs: `%USERPROFILE%\.magnitude\logs\service.log`
 
