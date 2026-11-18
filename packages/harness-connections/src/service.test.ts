@@ -2014,6 +2014,27 @@ describe("HarnessConnection model-set behavior", () => {
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })
 
+  it("writes through a symlinked configuration file instead of replacing the link", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-symlink-" })
+      const paths = fixturePaths(root)
+      const dotfile = `${root}/dotfiles/opencode.json`
+      yield* writeFixtures({ [dotfile]: initialFiles(paths)[paths.opencode]! })
+      yield* fs.makeDirectory(dirname(paths.opencode), { recursive: true })
+      yield* fs.symlink(dotfile, paths.opencode)
+      const service = yield* installedService(paths)
+
+      yield* service.connect(HarnessIdSchema.make("opencode"), { model: Option.some(model) })
+      expect(yield* fs.readLink(paths.opencode)).toBe(dotfile)
+      expect(readJson(yield* fs.readFileString(dotfile))).toMatchObject({ model: `magnitude/${model}` })
+
+      yield* service.disconnect(HarnessIdSchema.make("opencode"))
+      expect(yield* fs.readLink(paths.opencode)).toBe(dotfile)
+      expect(readJson(yield* fs.readFileString(dotfile))).toEqual({ theme: "dark", provider: {}, model: "user/model" })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
   it("sync refreshes Cline's custom Magnitude catalog", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
