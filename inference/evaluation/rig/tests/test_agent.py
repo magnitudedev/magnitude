@@ -598,6 +598,20 @@ def test_room_is_made_from_the_rigs_own_stale_checkouts_least_recently_used_firs
     end(building)
 
 
+def test_the_room_a_run_is_placed_by_is_what_its_eviction_can_free(tmp_path, monkeypatch):
+    """The room a host reports for a new run counts the unheld checkouts that run may evict,
+    never the one it would claim: its eviction keeps that one, so placement never ranks a host
+    by room the run cannot free."""
+    gb = 10**9
+    _stale(tmp_path, "warm", 24 * gb, 1000)
+    (tmp_path / "checkouts" / "warm" / agent.SOURCE).write_text("source")  # the run's warm checkout
+    _stale(tmp_path, "cold", 5 * gb, 1001)
+    _volume(monkeypatch, tmp_path, others=42 * gb)  # 13 GB free beside the rig's 29 GB
+    found = agent.report(str(tmp_path), [("source", "source-tree", BUILD)])
+    assert found["checkouts"][0]["name"] == "warm"
+    assert found["room"]["available"] == 13 * gb + 5 * gb
+
+
 def test_a_build_is_refused_only_when_what_the_rig_does_not_own_leaves_no_room(tmp_path, monkeypatch):
     """Every stale checkout taken, a live run's held one kept: the build is refused when that
     room, and the held checkout once its run ends, still fall short of its need."""

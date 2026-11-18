@@ -819,7 +819,7 @@ class Session:
             building = {key for key, runs in holders.items() if key not in mine and not runs <= later}
             others = {key: runs for key, runs in holders.items() if key in building and not runs & later}
             needed = sum(growth(key) for key in mine | building)
-            removed = _remove_least_recent(self.rig.root, live, keep, needed)
+            removed = _remove_least_recent(self.rig.root, live, {keep}, needed)
             return {
                 "removed": removed,
                 "free_bytes": shutil.disk_usage(self.rig.root).free,
@@ -913,14 +913,16 @@ def _remove_tree(path: str) -> None:
     shutil.rmtree(path, **({"onexc": gone} if sys.version_info >= (3, 12) else {"onerror": gone}))
 
 
-def _least_recent(root: str, live: list, keep) -> list:
-    """The checkouts no live run holds (but `keep`) and the directories of gone runs, never an
-    ended one not yet fetched, least recently used first: each as `(kind, name)`. Call guarded."""
+def _least_recent(root: str, live: list, keep: set) -> list:
+    """What a run whose checkouts are `keep` may evict, the one owner of it (its eviction,
+    `_remove_least_recent`, and the room placement counts it to find, `room`): the checkouts
+    no live run holds, but its own, and the directories of gone runs, never an ended one not
+    yet fetched, least recently used first: each as `(kind, name)`. Call guarded."""
     base, runs = os.path.join(root, "checkouts"), os.path.join(root, "runs")
     held, running = held_checkouts(live), {e["run"] for e in live}
     candidates = [
         (_mtime(os.path.join(base, key, "used")), "checkouts", key)
-        for key in _directories(base) if key not in held and key != keep
+        for key in _directories(base) if key not in held and key not in keep
     ] + [
         (_mtime(os.path.join(runs, run)), "runs", run)
         for run in _directories(runs) if run not in running
@@ -942,7 +944,7 @@ def _unheld_outputs(root: str, live: list) -> list:
     return [key for key in _directories(os.path.join(root, OUTPUTS)) if key not in held]
 
 
-def _remove_least_recent(root: str, live: list, keep, wanted: float) -> list:
+def _remove_least_recent(root: str, live: list, keep: set, wanted: float) -> list:
     """Remove the least recently used of `_least_recent` until the volume has `wanted` bytes
     free: the paths removed, relative to the root. Call guarded."""
     removed = []
@@ -957,7 +959,7 @@ def _remove_least_recent(root: str, live: list, keep, wanted: float) -> list:
 def _move_least_recent(root: str, live: list, trash: str):
     """Move the least recently used checkout no live run holds into `trash` (no run takes it
     from there): its name and where it was moved, or None when there is none. Call guarded."""
-    for kind, name in _least_recent(root, live, None):
+    for kind, name in _least_recent(root, live, set()):
         if kind == "checkouts":
             os.makedirs(trash, exist_ok=True)
             aside = os.path.join(trash, "%s-%d-%d" % (name, os.getpid(), time.time_ns()))
@@ -2195,9 +2197,12 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
                          need(rig.directory, None if name is None else os.path.join(base, name), build, None))
         # Only this protocol's runs record their waits.
         waited = {run: _waited(rig, run) for run in {e["run"] for e in live if e.get("protocol") == PROTOCOL}}
-        return live, live_runs, checkouts, needs, waited
+        # What its eviction could take: never the checkouts it would claim.
+        evictable = [name for kind, name in _least_recent(root, live, {c["name"] for c in checkouts if c})
+                     if kind == "checkouts"]
+        return live, live_runs, checkouts, needs, waited, evictable
 
-    entries, live_runs, checkouts, needs, waited = rig.guarded(read)
+    entries, live_runs, checkouts, needs, waited, evictable = rig.guarded(read)
     now = time.time()
     runs = {}  # run -> (remaining, over, queued, held), from any of its entries: each carries its run's info
     for e in entries:
@@ -2228,7 +2233,7 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
                     for e in entries],
         "waits": waits,
         "building": [owed for owed in (owing(entries, run, seconds, now) for run in live_runs) if owed > 0],
-        "room": room(root, entries, {run: left for run, (left, *_) in runs.items()}),
+        "room": room(root, entries, {run: left for run, (left, *_) in runs.items()}, evictable),
         "device_lock_held_elsewhere": legacy,
         "free_bytes": shutil.disk_usage(root).free,
         "checkouts": checkouts,
@@ -2240,9 +2245,10 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
     return found
 
 
-def room(root: str, live: list, left: dict) -> dict:
+def room(root: str, live: list, left: dict, evictable: list) -> dict:
     """The room a new run's builds would find (`evict`), by the time each live run is expected
-    to take still (`left`, by run): the bytes free and in unheld checkouts (`available`), what
+    to take still (`left`, by run): the bytes free and in the checkouts it may evict
+    (`available`: `evictable`, `_least_recent`'s for it, never its own), what
     the live checkouts' builds still owe (`owed`), and, the first ending first, each
     live checkout's run's end with the bytes that frees and the debt it ends (`ending`: each is
     evictable and owes nothing then). From the recorded sizes and needs, measuring nothing."""
@@ -2253,7 +2259,7 @@ def room(root: str, live: list, left: dict) -> dict:
     debt = lambda name: max(owed(entry, fallback) for entry in held[name])
     ends = lambda name: max(left[entry["run"]] for entry in held[name])  # once every holder has ended
     return {
-        "available": shutil.disk_usage(root).free + sum(size(name) for name in _directories(base) if name not in held),
+        "available": shutil.disk_usage(root).free + sum(size(name) for name in evictable),
         "owed": sum(debt(name) for name in held),
         "ending": [[end, size(name), owes] for end, name, owes in sorted((ends(name), name, debt(name)) for name in held)],
     }
