@@ -3,7 +3,7 @@
 use crate::reference_math::{ReferenceScalar, float_literal};
 
 use crate::ids::RepresentationId;
-use crate::registry::{self, DecodeStep, PlaneEncoding, RepresentationKind};
+use crate::registry::{self, PlaneEncoding, RepresentationKind};
 use crate::types::DType;
 
 #[derive(Clone, Debug)]
@@ -349,10 +349,12 @@ fn decode(
     component: Option<registry::QuantizedComponent>,
 ) -> ReferenceScalar {
     let info = registry::representation_info(representation);
-    if let Some(registry::DecodeComponent::Constant(value)) = component.and_then(|role| {
-        registry::decode_recipe(representation, info.decoded)
-            .and_then(|recipe| recipe.component(role))
-    }) {
+    let recipe = registry::decode_recipe(representation, info.decoded)
+        .unwrap_or_else(|| unreachable!("registered packed representation has no decode recipe"));
+    let target = recipe
+        .target(component)
+        .expect("checked representation supports role");
+    if let registry::DecodeComponent::Constant(value) = target {
         return value;
     }
     let storage = match &info.kind {
@@ -395,92 +397,154 @@ fn decode(
     let group = storage.packet().group as usize;
     let packet = column / group;
     let local = (column % group) as u64;
-    let recipe = registry::decode_recipe(representation, info.decoded)
-        .unwrap_or_else(|| unreachable!("registered packed representation has no decode recipe"));
-    let mut temporaries = vec![ReferenceScalar::U32(0); recipe.temporary_count()];
-    for step in recipe.steps() {
-        let value = match step {
-            DecodeStep::ReadPlaneField { plane, field, .. } => {
-                let schema = &recipe.planes()[*plane as usize];
-                let entry = schema.entry(local, *field);
-                storage.read_plane(bytes, row, packet, *plane as usize, entry)
-            }
-            DecodeStep::InterpretCode {
-                raw,
-                bits,
-                interpretation,
-                ..
-            } => ReferenceScalar::I32(
-                interpretation.decode(temporaries[recipe.ordinal(*raw)].bits() as u32, *bits),
-            ),
-            DecodeStep::SignedCode { code, raw, bit, .. } => crate::reference_math::evaluate(
-                &crate::reference_math::signed_code_recipe(*bit),
-                &[
-                    temporaries[recipe.ordinal(*code)],
-                    temporaries[recipe.ordinal(*raw)],
-                ],
-            )
-            .expect("a signed code is total"),
-            DecodeStep::ReadPlaneLane { plane, .. } => {
-                ReferenceScalar::U32(recipe.planes()[*plane as usize].lane(local))
-            }
-            DecodeStep::InterpretGridCode {
-                raw, lane, grid, ..
-            } => ReferenceScalar::I32(grid.code(
-                temporaries[recipe.ordinal(*raw)].bits() as u32,
-                temporaries[recipe.ordinal(*lane)].bits() as u32,
-            )),
-            DecodeStep::DecodeFloatCode { raw, format, .. } => {
-                let scalar = crate::reference_math::float_code_recipe(*format);
-                crate::reference_math::evaluate(&scalar, &[temporaries[recipe.ordinal(*raw)]])
-                    .expect("floating code interpretation is total")
-            }
-            DecodeStep::ConvertToF32 { from, .. } => {
-                super::scalar::cast(DType::F32, temporaries[recipe.ordinal(*from)])
-            }
-            DecodeStep::Constant { value, .. } => *value,
-            DecodeStep::Multiply { left, right, .. } => super::scalar::binary(
-                crate::syntax::ast::BinaryOp::Mul,
-                temporaries[recipe.ordinal(*left)],
-                temporaries[recipe.ordinal(*right)],
-                Some(DType::F32),
-            )
-            .expect("registered packed decode arithmetic is total"),
-            DecodeStep::Negate { from, .. } => super::scalar::unary(
-                crate::syntax::ast::UnaryOp::Neg,
-                temporaries[recipe.ordinal(*from)],
-            )
-            .expect("registered packed decode arithmetic is total"),
-            DecodeStep::MultiplyAdd {
-                factor,
-                multiplicand,
-                addend,
-                ..
-            } => super::scalar::math(
-                crate::intrinsics::MathOp::Fma,
-                &[
-                    temporaries[recipe.ordinal(*factor)],
-                    temporaries[recipe.ordinal(*multiplicand)],
-                    temporaries[recipe.ordinal(*addend)],
-                ],
-            )
-            .expect("registered packed decode arithmetic is total"),
-            DecodeStep::Cast { from, to, .. } => {
-                super::scalar::cast(*to, temporaries[recipe.ordinal(*from)])
-            }
-        };
-        let into = step.defines();
-        temporaries[recipe.ordinal(into)] = value;
-    }
-    match component {
-        None => temporaries[recipe.ordinal(recipe.output())],
-        Some(role) => match recipe
-            .component(role)
-            .expect("checked representation supports role")
-        {
-            registry::DecodeComponent::Temporary(temp) => temporaries[recipe.ordinal(temp)],
-            registry::DecodeComponent::Constant(value) => value,
+    let Ok(value) = recipe.decode(
+        &mut ReferenceDecode {
+            storage: &storage,
+            bytes,
+            row,
+            packet,
+            local,
         },
+        target,
+    );
+    value
+}
+
+/// The reference decode of logical value `local` of packet `packet` of
+/// logical row `row`.
+struct ReferenceDecode<'a> {
+    storage: &'a PlaneStorage<'a>,
+    bytes: &'a [u8],
+    row: usize,
+    packet: usize,
+    local: u64,
+}
+
+impl registry::DecodeDomain for ReferenceDecode<'_> {
+    type Value = ReferenceScalar;
+    type Error = std::convert::Infallible;
+
+    fn read_plane_field(
+        &mut self,
+        plane: &registry::PlaneSchema,
+        field: u32,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        let entry = plane.entry(self.local, field);
+        Ok(self.storage.read_plane(
+            self.bytes,
+            self.row,
+            self.packet,
+            plane.ordinal as usize,
+            entry,
+        ))
+    }
+
+    fn read_plane_lane(
+        &mut self,
+        plane: &registry::PlaneSchema,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        Ok(ReferenceScalar::U32(plane.lane(self.local)))
+    }
+
+    fn interpret_code(
+        &mut self,
+        raw: &ReferenceScalar,
+        _: u32,
+        bits: u32,
+        interpretation: &registry::CodeInterpretation,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        Ok(ReferenceScalar::I32(
+            interpretation.decode(raw.bits() as u32, bits),
+        ))
+    }
+
+    fn signed_code(
+        &mut self,
+        code: &ReferenceScalar,
+        raw: &ReferenceScalar,
+        bit: u32,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        Ok(crate::reference_math::evaluate(
+            &crate::reference_math::signed_code_recipe(bit),
+            &[*code, *raw],
+        )
+        .expect("a signed code is total"))
+    }
+
+    fn interpret_grid_code(
+        &mut self,
+        raw: &ReferenceScalar,
+        lane: &ReferenceScalar,
+        grid: &'static registry::GridCodes,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        Ok(ReferenceScalar::I32(
+            grid.code(raw.bits() as u32, lane.bits() as u32),
+        ))
+    }
+
+    fn decode_float_code(
+        &mut self,
+        raw: &ReferenceScalar,
+        format: registry::FloatCodeFormat,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        let scalar = crate::reference_math::float_code_recipe(format);
+        Ok(crate::reference_math::evaluate(&scalar, &[*raw])
+            .expect("floating code interpretation is total"))
+    }
+
+    fn convert_to_f32(
+        &mut self,
+        from: &ReferenceScalar,
+        _: DType,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        Ok(super::scalar::cast(DType::F32, *from))
+    }
+
+    fn constant(&mut self, value: ReferenceScalar) -> Result<ReferenceScalar, Self::Error> {
+        Ok(value)
+    }
+
+    fn multiply(
+        &mut self,
+        left: &ReferenceScalar,
+        right: &ReferenceScalar,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        Ok(super::scalar::binary(
+            crate::syntax::ast::BinaryOp::Mul,
+            *left,
+            *right,
+            Some(DType::F32),
+        )
+        .expect("registered packed decode arithmetic is total"))
+    }
+
+    fn negate(&mut self, from: &ReferenceScalar) -> Result<ReferenceScalar, Self::Error> {
+        Ok(
+            super::scalar::unary(crate::syntax::ast::UnaryOp::Neg, *from)
+                .expect("registered packed decode arithmetic is total"),
+        )
+    }
+
+    fn multiply_add(
+        &mut self,
+        factor: &ReferenceScalar,
+        multiplicand: &ReferenceScalar,
+        addend: &ReferenceScalar,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        Ok(super::scalar::math(
+            crate::intrinsics::MathOp::Fma,
+            &[*factor, *multiplicand, *addend],
+        )
+        .expect("registered packed decode arithmetic is total"))
+    }
+
+    fn cast(
+        &mut self,
+        from: &ReferenceScalar,
+        _: DType,
+        to: DType,
+    ) -> Result<ReferenceScalar, Self::Error> {
+        Ok(super::scalar::cast(to, *from))
     }
 }
 

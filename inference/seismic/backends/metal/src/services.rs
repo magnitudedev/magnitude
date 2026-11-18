@@ -1989,7 +1989,7 @@ fn probe_source(include_bfloat: bool, include_matrix: bool) -> String {
          {matrix}",
         format!(
             "{}\n{}",
-            crate::render::LIBRARY_PRELUDE,
+            crate::render::library_prelude(),
             include_str!("softfloat.metal")
         )
     )

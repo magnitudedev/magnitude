@@ -14,8 +14,9 @@ use seismic_ir::physical_target::{
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
-    PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr,
+    CodeInterpretation, DecodeDomain, DecodeStep, FloatCodeFields, FloatCodeFormat, GridCodes,
+    GridSigns, LookupTable, Minifloat, PackedPacketLayout, PlaneEncoding, PlaneInfo,
+    PlaneRepackRecipe, PlaneSchema, RepackExpr,
 };
 use seismic_lang::types::DType;
 use seismic_native_target::{DeviceDescription, NativeCompilationError};
@@ -1554,148 +1555,20 @@ impl<'a> Emitter<'a> {
                 self.load_to(destination, out_type, &address, dense.dtype)
             }
             ReadableRepresentationGeometry::Packed(packed) => {
-                let layout = &packed.layout;
                 let recipe = &packed.decode;
-                let mut temps: Vec<String> = Vec::with_capacity(recipe.temporary_count());
-                for step in recipe.steps() {
-                    let value = match step {
-                        DecodeStep::ReadPlaneField { into, plane, field } => self
-                            .numeric_plane_field(
-                                &address,
-                                &logical,
-                                layout.group,
-                                &layout.planes[*plane as usize],
-                                *field,
-                                recipe.dtype(*into),
-                            ),
-                        DecodeStep::InterpretCode {
-                            raw,
-                            bits,
-                            interpretation,
-                            ..
-                        } => {
-                            // The low `bits` bits of a wider read.
-                            let read = &temps[recipe.ordinal(*raw)];
-                            let low = if *bits < recipe.read_bits(*raw) {
-                                let low = self.t32();
-                                self.line(format!(
-                                    "and.b32 {low}, {read}, {};",
-                                    u32::MAX >> (32 - bits)
-                                ));
-                                low
-                            } else {
-                                read.clone()
-                            };
-                            self.interpret(&low, *bits, interpretation)
-                        }
-                        DecodeStep::SignedCode { code, raw, bit, .. } => {
-                            let code = &temps[recipe.ordinal(*code)];
-                            let sign = self.t32();
-                            self.line(format!(
-                                "shr.b32 {sign}, {}, {bit};",
-                                temps[recipe.ordinal(*raw)]
-                            ));
-                            self.line(format!("and.b32 {sign}, {sign}, 1;"));
-                            let negated = self.t32();
-                            self.line(format!("neg.s32 {negated}, {code};"));
-                            let negative = self.pred();
-                            self.line(format!("setp.ne.u32 {negative}, {sign}, 0;"));
-                            let value = self.t32();
-                            self.line(format!("selp.s32 {value}, {negated}, {code}, {negative};"));
-                            value
-                        }
-                        DecodeStep::ReadPlaneLane { plane, .. } => {
-                            self.plane_lane(&logical, layout.planes[*plane as usize].group)
-                        }
-                        DecodeStep::InterpretGridCode {
-                            raw, lane, grid, ..
-                        } => self.grid_code(
-                            &temps[recipe.ordinal(*raw)],
-                            &temps[recipe.ordinal(*lane)],
-                            grid,
-                        ),
-                        DecodeStep::DecodeFloatCode { raw, format, .. } => {
-                            self.decode_float_code(&temps[recipe.ordinal(*raw)], *format)
-                        }
-                        DecodeStep::ConvertToF32 { from, .. } => {
-                            let value = self.f32();
-                            let from_dtype = recipe.dtype(*from);
-                            if from_dtype.is_float() {
-                                self.line(format!(
-                                    "mov.f32 {value}, {};",
-                                    temps[recipe.ordinal(*from)]
-                                ));
-                            } else {
-                                self.line(format!(
-                                    "cvt.rn.f32{} {value}, {};",
-                                    dtype_suffix(from_dtype),
-                                    temps[recipe.ordinal(*from)]
-                                ));
-                            }
-                            value
-                        }
-                        DecodeStep::Constant { value, .. } => {
-                            let constant = self.f32();
-                            let bits = match value {
-                                seismic_lang::reference_math::ReferenceScalar::F32(bits) => *bits,
-                                other => unreachable!("a decode constant is f32, not {other:?}"),
-                            };
-                            self.line(format!("mov.f32 {constant}, 0f{bits:08X};"));
-                            constant
-                        }
-                        DecodeStep::Multiply { left, right, .. } => {
-                            let value = self.f32();
-                            self.line(format!(
-                                "mul.rn.f32 {value}, {}, {};",
-                                temps[recipe.ordinal(*left)],
-                                temps[recipe.ordinal(*right)]
-                            ));
-                            value
-                        }
-                        DecodeStep::Negate { from, .. } => {
-                            let value = self.f32();
-                            self.line(format!(
-                                "neg.f32 {value}, {};",
-                                temps[recipe.ordinal(*from)]
-                            ));
-                            value
-                        }
-                        DecodeStep::MultiplyAdd {
-                            factor,
-                            multiplicand,
-                            addend,
-                            ..
-                        } => {
-                            let value = self.f32();
-                            self.line(format!(
-                                "fma.rn.f32 {value}, {}, {}, {};",
-                                temps[recipe.ordinal(*factor)],
-                                temps[recipe.ordinal(*multiplicand)],
-                                temps[recipe.ordinal(*addend)]
-                            ));
-                            value
-                        }
-                        DecodeStep::Cast { from, to, .. } => {
-                            let value = if to.is_float() {
-                                self.f32()
-                            } else {
-                                self.t32()
-                            };
-                            self.line(format!(
-                                "cvt{}{} {value}, {};",
-                                dtype_suffix(*to),
-                                dtype_suffix(recipe.dtype(*from)),
-                                temps[recipe.ordinal(*from)]
-                            ));
-                            value
-                        }
-                    };
-                    temps.push(value);
-                }
+                let Ok(value) = recipe.decode(
+                    &mut PtxDecode {
+                        emitter: self,
+                        address: &address,
+                        logical: &logical,
+                        layout: &packed.layout,
+                    },
+                    seismic_lang::registry::DecodeComponent::Temporary(recipe.output()),
+                );
                 let ValueType::Scalar(dtype) = out_type else {
                     unreachable!("decoder result is scalar")
                 };
-                self.publish_numeric(dtype, destination, &temps[recipe.ordinal(recipe.output())]);
+                self.publish_numeric(dtype, destination, &value);
             }
         }
     }
@@ -2167,16 +2040,25 @@ impl<'a> Emitter<'a> {
         self.line(format!("add.s32 {out}, {out}, {step};"));
         out
     }
-    /// E8M0: the exponent byte is the F32 exponent field (2^(raw - 127));
-    /// raw 0 is the F32 subnormal 2^-127 and raw 255 is NaN.
-    fn decode_e8m0(&mut self, raw: &str) -> String {
+    fn decode_float_code(&mut self, raw: &str, format: FloatCodeFormat) -> String {
+        match format.fields() {
+            FloatCodeFields::Exponent => self.decode_exponent_code(raw),
+            FloatCodeFields::Minifloat(fields) => self.decode_minifloat(raw, fields),
+        }
+    }
+    /// An E8M0 byte is the F32 exponent field (2^(raw - 127)); raw 0 is the
+    /// F32 subnormal 2^-127 and raw 255 is NaN.
+    fn decode_exponent_code(&mut self, raw: &str) -> String {
         let exponent = self.t32();
         self.line(format!("and.b32 {exponent}, {raw}, 255;"));
         let bits = self.t32();
         self.line(format!("shl.b32 {bits}, {exponent}, 23;"));
         let zero = self.pred();
         self.line(format!("setp.eq.u32 {zero}, {exponent}, 0;"));
-        self.line(format!("selp.b32 {bits}, 0x00400000, {bits}, {zero};"));
+        self.line(format!(
+            "selp.b32 {bits}, {:#010x}, {bits}, {zero};",
+            FloatCodeFields::EXPONENT_ZERO_BITS
+        ));
         let nan = self.pred();
         self.line(format!("setp.eq.u32 {nan}, {exponent}, 255;"));
         self.line(format!("selp.b32 {bits}, 0x7fc00000, {bits}, {nan};"));
@@ -2184,52 +2066,31 @@ impl<'a> Emitter<'a> {
         self.line(format!("mov.b32 {out}, {bits};"));
         out
     }
-    fn decode_float_code(&mut self, raw: &str, format: FloatCodeFormat) -> String {
-        if format == FloatCodeFormat::E8M0 {
-            return self.decode_e8m0(raw);
-        }
-        let sign_shift = match format {
-            FloatCodeFormat::E2M1 => 3,
-            FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => 7,
-            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
-        };
-        let exponent_bits = match format {
-            FloatCodeFormat::E2M1 => 2,
-            FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => 4,
-            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
-        };
-        let mantissa_bits = match format {
-            FloatCodeFormat::E2M1 => 1,
-            FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => 3,
-            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
-        };
+    fn decode_minifloat(&mut self, raw: &str, fields: Minifloat) -> String {
+        let mantissa_bits = fields.mantissa_bits;
         let sign = self.t32();
-        if format == FloatCodeFormat::UE4M3 {
-            self.line(format!("mov.u32 {sign}, 0;"));
-        } else {
-            self.line(format!("shr.u32 {sign}, {raw}, {sign_shift};"));
+        if fields.signed {
+            self.line(format!("shr.u32 {sign}, {raw}, {};", fields.sign_bit()));
             self.line(format!("shl.b32 {sign}, {sign}, 31;"));
+        } else {
+            self.line(format!("mov.u32 {sign}, 0;"));
         }
         let exponent = self.t32();
         self.line(format!("shr.u32 {exponent}, {raw}, {mantissa_bits};"));
         self.line(format!(
             "and.b32 {exponent}, {exponent}, {};",
-            (1u32 << exponent_bits) - 1
+            fields.exponent_mask()
         ));
         let mantissa = self.t32();
         self.line(format!(
             "and.b32 {mantissa}, {raw}, {};",
-            (1u32 << mantissa_bits) - 1
+            fields.mantissa_mask()
         ));
 
         let normal_exponent = self.t32();
-        let exponent_bias = match format {
-            FloatCodeFormat::E2M1 => 126,
-            FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => 120,
-            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
-        };
         self.line(format!(
-            "add.u32 {normal_exponent}, {exponent}, {exponent_bias};"
+            "add.u32 {normal_exponent}, {exponent}, {};",
+            fields.f32_exponent_offset()
         ));
         self.line(format!("shl.b32 {normal_exponent}, {normal_exponent}, 23;"));
         let normal_bits = self.t32();
@@ -2243,13 +2104,9 @@ impl<'a> Emitter<'a> {
 
         let subnormal = self.f32();
         self.line(format!("cvt.rn.f32.u32 {subnormal}, {mantissa};"));
-        let subnormal_scale = match format {
-            FloatCodeFormat::E2M1 => "0f3f000000", // 2^-1
-            FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => "0f3b000000", // 2^-9
-            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
-        };
         self.line(format!(
-            "mul.rn.f32 {subnormal}, {subnormal}, {subnormal_scale};"
+            "mul.rn.f32 {subnormal}, {subnormal}, 0f{:08x};",
+            fields.subnormal_scale().to_bits()
         ));
         let subnormal_bits = self.t32();
         self.line(format!("mov.b32 {subnormal_bits}, {subnormal};"));
@@ -2261,12 +2118,18 @@ impl<'a> Emitter<'a> {
             "selp.b32 {magnitude}, {subnormal_bits}, {normal_bits}, {exponent_zero};"
         ));
 
-        if matches!(format, FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3) {
+        if fields.nan {
             let exponent_all_ones = self.pred();
             let mantissa_all_ones = self.pred();
             let nan = self.pred();
-            self.line(format!("setp.eq.u32 {exponent_all_ones}, {exponent}, 15;"));
-            self.line(format!("setp.eq.u32 {mantissa_all_ones}, {mantissa}, 7;"));
+            self.line(format!(
+                "setp.eq.u32 {exponent_all_ones}, {exponent}, {};",
+                fields.exponent_mask()
+            ));
+            self.line(format!(
+                "setp.eq.u32 {mantissa_all_ones}, {mantissa}, {};",
+                fields.mantissa_mask()
+            ));
             self.line(format!(
                 "and.pred {nan}, {exponent_all_ones}, {mantissa_all_ones};"
             ));
@@ -3736,6 +3599,163 @@ fn vector_shape(ty: ValueType) -> (DType, u16) {
         _ => panic!("typed CUDA vector operation carries a non-vector value"),
     }
 }
+/// A decode's PTX: each step's instructions, its value the register they
+/// leave it in. Plane reads address the packet at `address`, the logical
+/// value `logical`.
+struct PtxDecode<'e, 'a> {
+    emitter: &'e mut Emitter<'a>,
+    address: &'e str,
+    logical: &'e str,
+    layout: &'e PackedPacketLayout,
+}
+
+impl DecodeDomain for PtxDecode<'_, '_> {
+    type Value = String;
+    type Error = std::convert::Infallible;
+
+    fn read_plane_field(&mut self, plane: &PlaneSchema, field: u32) -> Result<String, Self::Error> {
+        Ok(self.emitter.numeric_plane_field(
+            self.address,
+            self.logical,
+            self.layout.group,
+            &self.layout.planes[plane.ordinal as usize],
+            field,
+            plane.storage_dtype,
+        ))
+    }
+
+    fn read_plane_lane(&mut self, plane: &PlaneSchema) -> Result<String, Self::Error> {
+        Ok(self.emitter.plane_lane(
+            self.logical,
+            self.layout.planes[plane.ordinal as usize].group,
+        ))
+    }
+
+    fn interpret_code(
+        &mut self,
+        raw: &String,
+        raw_bits: u32,
+        bits: u32,
+        interpretation: &CodeInterpretation,
+    ) -> Result<String, Self::Error> {
+        // The low `bits` bits of a wider read.
+        let low = if bits < raw_bits {
+            let low = self.emitter.t32();
+            self.emitter.line(format!(
+                "and.b32 {low}, {raw}, {};",
+                u32::MAX >> (32 - bits)
+            ));
+            low
+        } else {
+            raw.clone()
+        };
+        Ok(self.emitter.interpret(&low, bits, interpretation))
+    }
+
+    fn signed_code(
+        &mut self,
+        code: &String,
+        raw: &String,
+        bit: u32,
+    ) -> Result<String, Self::Error> {
+        let emitter = &mut *self.emitter;
+        let sign = emitter.t32();
+        emitter.line(format!("shr.b32 {sign}, {raw}, {bit};"));
+        emitter.line(format!("and.b32 {sign}, {sign}, 1;"));
+        let negated = emitter.t32();
+        emitter.line(format!("neg.s32 {negated}, {code};"));
+        let negative = emitter.pred();
+        emitter.line(format!("setp.ne.u32 {negative}, {sign}, 0;"));
+        let value = emitter.t32();
+        emitter.line(format!("selp.s32 {value}, {negated}, {code}, {negative};"));
+        Ok(value)
+    }
+
+    fn interpret_grid_code(
+        &mut self,
+        raw: &String,
+        lane: &String,
+        grid: &'static GridCodes,
+    ) -> Result<String, Self::Error> {
+        Ok(self.emitter.grid_code(raw, lane, grid))
+    }
+
+    fn decode_float_code(
+        &mut self,
+        raw: &String,
+        format: FloatCodeFormat,
+    ) -> Result<String, Self::Error> {
+        Ok(self.emitter.decode_float_code(raw, format))
+    }
+
+    fn convert_to_f32(&mut self, from: &String, from_dtype: DType) -> Result<String, Self::Error> {
+        let value = self.emitter.f32();
+        if from_dtype.is_float() {
+            self.emitter.line(format!("mov.f32 {value}, {from};"));
+        } else {
+            self.emitter.line(format!(
+                "cvt.rn.f32{} {value}, {from};",
+                dtype_suffix(from_dtype)
+            ));
+        }
+        Ok(value)
+    }
+
+    fn constant(
+        &mut self,
+        value: seismic_lang::reference_math::ReferenceScalar,
+    ) -> Result<String, Self::Error> {
+        let constant = self.emitter.f32();
+        let bits = match value {
+            seismic_lang::reference_math::ReferenceScalar::F32(bits) => bits,
+            other => unreachable!("a decode constant is f32, not {other:?}"),
+        };
+        self.emitter
+            .line(format!("mov.f32 {constant}, 0f{bits:08X};"));
+        Ok(constant)
+    }
+
+    fn multiply(&mut self, left: &String, right: &String) -> Result<String, Self::Error> {
+        let value = self.emitter.f32();
+        self.emitter
+            .line(format!("mul.rn.f32 {value}, {left}, {right};"));
+        Ok(value)
+    }
+
+    fn negate(&mut self, from: &String) -> Result<String, Self::Error> {
+        let value = self.emitter.f32();
+        self.emitter.line(format!("neg.f32 {value}, {from};"));
+        Ok(value)
+    }
+
+    fn multiply_add(
+        &mut self,
+        factor: &String,
+        multiplicand: &String,
+        addend: &String,
+    ) -> Result<String, Self::Error> {
+        let value = self.emitter.f32();
+        self.emitter.line(format!(
+            "fma.rn.f32 {value}, {factor}, {multiplicand}, {addend};"
+        ));
+        Ok(value)
+    }
+
+    fn cast(&mut self, from: &String, from_dtype: DType, to: DType) -> Result<String, Self::Error> {
+        let value = if to.is_float() {
+            self.emitter.f32()
+        } else {
+            self.emitter.t32()
+        };
+        self.emitter.line(format!(
+            "cvt{}{} {value}, {from};",
+            dtype_suffix(to),
+            dtype_suffix(from_dtype)
+        ));
+        Ok(value)
+    }
+}
+
 fn suffix(ty: ValueType) -> &'static str {
     match ty {
         ValueType::Scalar(DType::F32) => ".f32",

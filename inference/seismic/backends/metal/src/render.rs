@@ -27,46 +27,92 @@ use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
-    PlaneEncoding, PlaneRepackRecipe, RepackExpr, RepresentationKind,
+    CodeInterpretation, DecodeDomain, FloatCodeFields, FloatCodeFormat, GridCodes, GridSigns,
+    LookupTable, PlaneEncoding, PlaneRepackRecipe, PlaneSchema, RepackExpr, RepresentationKind,
 };
 use seismic_lang::types::DType;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// The library prelude every kernel shares (fast math contract).
-pub(crate) const LIBRARY_PRELUDE: &str = r#"#include <metal_stdlib>
+/// The library prelude every kernel shares (fast math contract), with one
+/// decode function per closed floating code (`float_code_function`).
+pub(crate) fn library_prelude() -> &'static str {
+    static PRELUDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PRELUDE.get_or_init(|| {
+        let mut prelude = String::from(PRELUDE_HEAD);
+        for format in FloatCodeFormat::ALL {
+            prelude.push_str(&float_code_definition(format));
+        }
+        prelude.push_str(PRELUDE_TAIL);
+        prelude
+    })
+}
+
+/// The decode function of `format` codes, from its fields: an `Exponent`
+/// byte is the F32 exponent; a minifloat's normal value is its fields
+/// moved into F32 position, its subnormal value its mantissa scaled.
+fn float_code_definition(format: FloatCodeFormat) -> String {
+    let mut source = format!(
+        "inline float {}(uint raw) {{\n",
+        float_code_function(format)
+    );
+    match format.fields() {
+        FloatCodeFields::Exponent => {
+            source.push_str("  uint exponent = raw & 255u;\n");
+            let _ = writeln!(
+                source,
+                "  return as_type<float>(exponent == 0u ? {:#010x}u : exponent == 255u ? 0x7fc00000u : exponent << 23u);",
+                FloatCodeFields::EXPONENT_ZERO_BITS
+            );
+        }
+        FloatCodeFields::Minifloat(fields) => {
+            let (exponent, mantissa) = (fields.exponent_mask(), fields.mantissa_mask());
+            let _ = writeln!(
+                source,
+                "  uint exponent = (raw >> {}u) & {exponent}u;",
+                fields.mantissa_bits
+            );
+            let _ = writeln!(source, "  uint mantissa = raw & {mantissa}u;");
+            let _ = writeln!(
+                source,
+                "  uint normal = (mantissa << {}u) | ((exponent + {}u) << 23u);",
+                23 - fields.mantissa_bits,
+                fields.f32_exponent_offset()
+            );
+            let _ = writeln!(
+                source,
+                "  uint subnormal = as_type<uint>(f32_mul(float(mantissa), as_type<float>({:#010x}u)));",
+                fields.subnormal_scale().to_bits()
+            );
+            source.push_str("  uint magnitude = exponent == 0u ? subnormal : normal;\n");
+            if fields.nan {
+                let _ = writeln!(
+                    source,
+                    "  if (exponent == {exponent}u && mantissa == {mantissa}u) magnitude = 0x7fc00000u;"
+                );
+            }
+            if fields.signed {
+                let _ = writeln!(
+                    source,
+                    "  return as_type<float>(magnitude ^ ((raw >> {}u) << 31));",
+                    fields.sign_bit()
+                );
+            } else {
+                source.push_str("  return as_type<float>(magnitude);\n");
+            }
+        }
+    }
+    source.push_str("}\n");
+    source
+}
+
+const PRELUDE_HEAD: &str = r#"#include <metal_stdlib>
 #pragma clang fp contract(off)
 using namespace metal;
 float f32_mul(float, float);
-inline float seismic_decode_float_code(uint raw, uint sign_shift, uint exponent_bits,
-                                        uint mantissa_bits, uint exponent_bias,
-                                        float subnormal_scale, bool unsigned_code,
-                                        bool finite_nan) {
-  uint sign = unsigned_code ? 0u : ((raw >> sign_shift) << 31);
-  uint exponent = (raw >> mantissa_bits) & ((1u << exponent_bits) - 1u);
-  uint mantissa = raw & ((1u << mantissa_bits) - 1u);
-  uint normal = (mantissa << (23u - mantissa_bits)) | ((exponent + exponent_bias) << 23u);
-  uint subnormal = as_type<uint>(f32_mul(float(mantissa), subnormal_scale));
-  uint magnitude = exponent == 0u ? subnormal : normal;
-  if (finite_nan && exponent == ((1u << exponent_bits) - 1u) &&
-      mantissa == ((1u << mantissa_bits) - 1u)) magnitude = 0x7fc00000u;
-  return as_type<float>(magnitude ^ sign);
-}
-inline float seismic_decode_e2m1(uint raw) {
-  return seismic_decode_float_code(raw, 3u, 2u, 1u, 126u, 0.5f, false, false);
-}
-inline float seismic_decode_e4m3(uint raw) {
-  return seismic_decode_float_code(raw, 7u, 4u, 3u, 120u, 0.001953125f, false, true);
-}
-inline float seismic_decode_ue4m3(uint raw) {
-  return seismic_decode_float_code(raw, 7u, 4u, 3u, 120u, 0.001953125f, true, true);
-}
-inline float seismic_decode_e8m0(uint raw) {
-  uint exponent = raw & 255u;
-  return as_type<float>(exponent == 0u ? 0x00400000u : exponent == 255u ? 0x7fc00000u : exponent << 23u);
-}
-inline bool seismic_f32_nan(float value) {
+"#;
+
+const PRELUDE_TAIL: &str = r#"inline bool seismic_f32_nan(float value) {
   return (as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u;
 }
 inline bool seismic_f32_zero(float value) {
@@ -784,104 +830,16 @@ impl<'a> Renderer<'a> {
                 let recipe = geometry
                     .decode()
                     .expect("packed geometry has a registry decode recipe");
-                let mut temps: Vec<String> = Vec::with_capacity(recipe.temporary_count());
-                for step in recipe.steps() {
-                    let expression = match step {
-                        DecodeStep::ReadPlaneField { plane, field, .. } => self
-                            .read_plane_expression(place, layout, *plane as usize, coords, *field),
-                        DecodeStep::InterpretCode {
-                            raw,
-                            bits,
-                            interpretation,
-                            ..
-                        } => {
-                            // The low `bits` bits of a wider read.
-                            let read = &temps[recipe.ordinal(*raw)];
-                            let low = if *bits < recipe.read_bits(*raw) {
-                                format!("(uint({read}) & {}u)", u32::MAX >> (32 - bits))
-                            } else {
-                                read.clone()
-                            };
-                            interpret_code(&low, *bits, interpretation)
-                        }
-                        DecodeStep::SignedCode { code, raw, bit, .. } => {
-                            let code = &temps[recipe.ordinal(*code)];
-                            format!(
-                                "(((uint({}) >> {bit}u) & 1u) != 0u ? -int({code}) : int({code}))",
-                                temps[recipe.ordinal(*raw)]
-                            )
-                        }
-                        DecodeStep::ReadPlaneLane { plane, .. } => {
-                            plane_lane(coords, layout.planes[*plane as usize].group)
-                        }
-                        DecodeStep::InterpretGridCode {
-                            raw, lane, grid, ..
-                        } => {
-                            let table = self.lookups.borrow_mut().name(LookupTable::Grid(grid));
-                            grid_code(
-                                &temps[recipe.ordinal(*raw)],
-                                &temps[recipe.ordinal(*lane)],
-                                grid,
-                                &table,
-                            )
-                        }
-                        DecodeStep::DecodeFloatCode { raw, format, .. } => format!(
-                            "{}({})",
-                            float_code_function(*format),
-                            temps[recipe.ordinal(*raw)]
-                        ),
-                        DecodeStep::ConvertToF32 { from, .. } => match recipe.dtype(*from) {
-                            DType::F32 => temps[recipe.ordinal(*from)].clone(),
-                            DType::F16 => {
-                                format!("f16_to_f32({})", temps[recipe.ordinal(*from)])
-                            }
-                            DType::BF16 => {
-                                format!("seismic_bf16_widen({})", temps[recipe.ordinal(*from)])
-                            }
-                            _ => format!("float({})", temps[recipe.ordinal(*from)]),
-                        },
-                        DecodeStep::Constant { value, .. } => match value {
-                            seismic_lang::reference_math::ReferenceScalar::F32(bits) => {
-                                format!("as_type<float>({bits:#010x}u)")
-                            }
-                            other => unreachable!("a decode constant is f32, not {other:?}"),
-                        },
-                        DecodeStep::Multiply { left, right, .. } => format!(
-                            "f32_mul(float({}), float({}))",
-                            temps[recipe.ordinal(*left)],
-                            temps[recipe.ordinal(*right)]
-                        ),
-                        DecodeStep::Negate { from, .. } => {
-                            format!(
-                                "as_type<float>(as_type<uint>(float({})) ^ 0x80000000u)",
-                                temps[recipe.ordinal(*from)]
-                            )
-                        }
-                        DecodeStep::MultiplyAdd {
-                            factor,
-                            multiplicand,
-                            addend,
-                            ..
-                        } => format!(
-                            "f32_mulAdd(float({}), float({}), float({}))",
-                            temps[recipe.ordinal(*factor)],
-                            temps[recipe.ordinal(*multiplicand)],
-                            temps[recipe.ordinal(*addend)]
-                        ),
-                        DecodeStep::Cast { from, to, .. } => match to {
-                            DType::F32 => temps[recipe.ordinal(*from)].clone(),
-                            DType::F16 => {
-                                format!("f32_to_f16({})", temps[recipe.ordinal(*from)])
-                            }
-                            DType::BF16 => {
-                                format!("seismic_bf16_narrow({})", temps[recipe.ordinal(*from)])
-                            }
-                            _ => format!("{}({})", dtype_name(*to), temps[recipe.ordinal(*from)]),
-                        },
-                    };
-                    temps.push(format!("({expression})"));
-                }
-                temps[recipe.ordinal(recipe.output())].clone()
+                let Ok(value) = recipe.decode(
+                    &mut MslDecode {
+                        renderer: self,
+                        place,
+                        layout,
+                        coords,
+                    },
+                    seismic_lang::registry::DecodeComponent::Temporary(recipe.output()),
+                );
+                value
             }
             RepresentationKind::External(_) => {
                 panic!("external packets are consumed only by registered conversion ops")
@@ -1723,6 +1681,141 @@ impl<'a> Renderer<'a> {
                 ));
             }
         }
+    }
+}
+
+/// A decode's MSL: one parenthesized expression per step, each step's
+/// operands substituted, so the decode fuses into its consumer.
+struct MslDecode<'r, 'a, G> {
+    renderer: &'r Renderer<'a>,
+    place: &'r ClosedPlace<G>,
+    layout: &'r seismic_lang::registry::PackedPacketLayout,
+    coords: &'r [String],
+}
+
+fn parenthesized(expression: String) -> Result<String, std::convert::Infallible> {
+    Ok(format!("({expression})"))
+}
+
+impl<G: MetalGeometry> DecodeDomain for MslDecode<'_, '_, G> {
+    type Value = String;
+    type Error = std::convert::Infallible;
+
+    fn read_plane_field(&mut self, plane: &PlaneSchema, field: u32) -> Result<String, Self::Error> {
+        parenthesized(self.renderer.read_plane_expression(
+            self.place,
+            self.layout,
+            plane.ordinal as usize,
+            self.coords,
+            field,
+        ))
+    }
+
+    fn read_plane_lane(&mut self, plane: &PlaneSchema) -> Result<String, Self::Error> {
+        parenthesized(plane_lane(
+            self.coords,
+            self.layout.planes[plane.ordinal as usize].group,
+        ))
+    }
+
+    fn interpret_code(
+        &mut self,
+        raw: &String,
+        raw_bits: u32,
+        bits: u32,
+        interpretation: &CodeInterpretation,
+    ) -> Result<String, Self::Error> {
+        // The low `bits` bits of a wider read.
+        let low = if bits < raw_bits {
+            format!("(uint({raw}) & {}u)", u32::MAX >> (32 - bits))
+        } else {
+            raw.clone()
+        };
+        parenthesized(interpret_code(&low, bits, interpretation))
+    }
+
+    fn signed_code(
+        &mut self,
+        code: &String,
+        raw: &String,
+        bit: u32,
+    ) -> Result<String, Self::Error> {
+        parenthesized(format!(
+            "(((uint({raw}) >> {bit}u) & 1u) != 0u ? -int({code}) : int({code}))"
+        ))
+    }
+
+    fn interpret_grid_code(
+        &mut self,
+        raw: &String,
+        lane: &String,
+        grid: &'static GridCodes,
+    ) -> Result<String, Self::Error> {
+        let table = self
+            .renderer
+            .lookups
+            .borrow_mut()
+            .name(LookupTable::Grid(grid));
+        parenthesized(grid_code(raw, lane, grid, &table))
+    }
+
+    fn decode_float_code(
+        &mut self,
+        raw: &String,
+        format: FloatCodeFormat,
+    ) -> Result<String, Self::Error> {
+        parenthesized(format!("{}({raw})", float_code_function(format)))
+    }
+
+    fn convert_to_f32(&mut self, from: &String, from_dtype: DType) -> Result<String, Self::Error> {
+        parenthesized(match from_dtype {
+            DType::F32 => from.clone(),
+            DType::F16 => format!("f16_to_f32({from})"),
+            DType::BF16 => format!("seismic_bf16_widen({from})"),
+            _ => format!("float({from})"),
+        })
+    }
+
+    fn constant(
+        &mut self,
+        value: seismic_lang::reference_math::ReferenceScalar,
+    ) -> Result<String, Self::Error> {
+        parenthesized(match value {
+            seismic_lang::reference_math::ReferenceScalar::F32(bits) => {
+                format!("as_type<float>({bits:#010x}u)")
+            }
+            other => unreachable!("a decode constant is f32, not {other:?}"),
+        })
+    }
+
+    fn multiply(&mut self, left: &String, right: &String) -> Result<String, Self::Error> {
+        parenthesized(format!("f32_mul(float({left}), float({right}))"))
+    }
+
+    fn negate(&mut self, from: &String) -> Result<String, Self::Error> {
+        parenthesized(format!(
+            "as_type<float>(as_type<uint>(float({from})) ^ 0x80000000u)"
+        ))
+    }
+
+    fn multiply_add(
+        &mut self,
+        factor: &String,
+        multiplicand: &String,
+        addend: &String,
+    ) -> Result<String, Self::Error> {
+        parenthesized(format!(
+            "f32_mulAdd(float({factor}), float({multiplicand}), float({addend}))"
+        ))
+    }
+
+    fn cast(&mut self, from: &String, _: DType, to: DType) -> Result<String, Self::Error> {
+        parenthesized(match to {
+            DType::F32 => from.clone(),
+            DType::F16 => format!("f32_to_f16({from})"),
+            DType::BF16 => format!("seismic_bf16_narrow({from})"),
+            _ => format!("{}({from})", dtype_name(to)),
+        })
     }
 }
 

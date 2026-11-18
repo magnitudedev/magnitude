@@ -14,10 +14,11 @@ use crate::types::DType;
 use magnitude_ggml::Encoding;
 
 pub use crate::repr::{
-    BiasKind, CodeInterpretation, CodeKind, CodingAxes, CoefficientKind, DecodeAxes, DecodeComponent,
-    DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat, GridCodes, GridSigns, LocalBias,
-    LocalCodes, LookupTable, MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneRead,
-    PlaneSchema, QuantizedComponent, ScaleEncoding, ScaledCodes, ValueCodes, GRID_VALUES,
+    BiasKind, CodeInterpretation, CodeKind, CodingAxes, CoefficientKind, DecodeAxes,
+    DecodeComponent, DecodeDomain, DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFields,
+    FloatCodeFormat, GridCodes, GridSigns, LocalBias, LocalCodes, LookupTable, Minifloat,
+    MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneRead, PlaneSchema,
+    QuantizedComponent, ScaleEncoding, ScaledCodes, ValueCodes, GRID_VALUES,
 };
 
 /// A weight's arithmetic (`DecodeAxes::profile`), what consumer forms state
