@@ -1042,7 +1042,7 @@ fn sampling_statuses_ties_masks_and_winners_on(device: &seismic::Device) {
 #[test]
 fn cpu_flattened_spans_match_the_host_references_at_every_split() {
     use seismic::device::DeviceValues;
-    let device = devices().into_iter().find(is_cpu).expect("every host opens the CPU");
+    let device = seismic_native_tests::cpu();
     let units = device.properties().value("units") as usize;
     let shaping = [0.7f32, 3.0, 0.9, 0.05, 1.1, 0.2, 0.1, 0.0];
     for (rows, vocabulary) in [

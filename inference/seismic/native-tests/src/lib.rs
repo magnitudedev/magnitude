@@ -184,6 +184,16 @@ pub fn fresh_device(backend: seismic::BackendName) -> Option<seismic::Device> {
     tallied_device(backend).map(|(device, _)| device)
 }
 
+/// The host's CPU, whatever backend the runner requests: the device of a
+/// test of the CPU's own forms, which every host opens, so no request
+/// skips it.
+pub fn cpu() -> seismic::Device {
+    let discovery = seismic::Devices::discover(&[]).expect("test device discovery");
+    seismic::testing::open_backend_tallied(&discovery, seismic::BackendName::Cpu, seismic::DeviceOptions::default())
+        .unwrap_or_else(|error| panic!("the CPU test device must open: {error}"))
+        .0
+}
+
 /// [`fresh_device`] with its device store's tally, which the test reads and
 /// bounds.
 pub fn tallied_device(backend: seismic::BackendName) -> Option<(seismic::Device, seismic::memory::Tally)> {

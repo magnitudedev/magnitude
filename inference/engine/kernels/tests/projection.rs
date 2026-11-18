@@ -2494,9 +2494,7 @@ fn dense_output_call(
 
 #[test]
 fn cpu_int8_dense_output_agrees_with_exact_projection() {
-    let Some(device) = devices().into_iter().find(is_cpu) else {
-        return;
-    };
+    let device = seismic_native_tests::cpu();
     let (h, f, rows) = (37, 512, 9);
     let down = weight(Repr::Q4k, h, f, 313, 1.0);
     let mut random = Rng::new(314);
@@ -4829,12 +4827,7 @@ fn vulkan_attention_scoped_launches_match_the_host() {
 
 #[test]
 fn cpu_attention_scoped_launches_match_the_host() {
-    let Some(device) = devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Cpu)
-    else {
-        return;
-    };
+    let device = seismic_native_tests::cpu();
     attention_projections_match_their_portable_bodies_and_the_host_reference_on(
         &device,
         Cases::Scoped,
