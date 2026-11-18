@@ -33,6 +33,7 @@ reaches; `mrig test --stale` runs it.
 from __future__ import annotations
 
 import fcntl
+import functools
 import json
 import os
 import subprocess
@@ -191,15 +192,22 @@ class Binary:
         return ("--lib",) if self.kind in ("lib", DOC) else (f"--{self.kind}", self.name)
 
 
-def binaries(tree: Path) -> dict[str, Binary]:
-    """The test executables of the workspace at `tree` (its `inference/`), by key: every target
-    `cargo test` builds tests of, and the documentation tests of each library that has them."""
+@functools.cache
+def metadata(tree: Path) -> dict:
+    """The workspace at `tree` (its `inference/`) as `cargo metadata --no-deps` describes it:
+    its packages, their targets and their declared dependencies."""
     listed = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline",
                              "--manifest-path", str(tree / "Cargo.toml")], capture_output=True, text=True)
     if listed.returncode != 0:
         raise SystemExit(f"mrig: cargo metadata of {tree}: {listed.stderr.strip()}")
+    return json.loads(listed.stdout)
+
+
+def binaries(tree: Path) -> dict[str, Binary]:
+    """The test executables of the workspace at `tree` (its `inference/`), by key: every target
+    `cargo test` builds tests of, and the documentation tests of each library that has them."""
     found = {}
-    for package in json.loads(listed.stdout)["packages"]:
+    for package in metadata(tree)["packages"]:
         directory = os.path.relpath(os.path.dirname(package["manifest_path"]), tree)
         for target in package["targets"]:
             kind = target_kind(target["kind"])

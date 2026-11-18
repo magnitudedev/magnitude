@@ -9,9 +9,10 @@ keeps until its job ends (`Step.checkout`). With
 `--model`, the catalog model is acquired first and its acquisition object is
 `MAGNITUDE_ARTIFACTS` for the tests that check against a real model's files (every suite has the
 host's model store as `MAGNITUDE_MODELS`, for the files a conversion leaves there); otherwise a cargo
-suite has the catalog's header export as `{catalog}`, its headers `MAGNITUDE_CATALOG_HEADERS`
-(as the family and assessment tests read the release catalog), so a test of the suite never
-lacks its inputs; a host keeps the export of each catalog (`engine.catalog_key`), so only a
+suite whose tests declare they read catalog models (`reads_catalog`: as the family and
+assessment tests read the release catalog) has the catalog's header export as `{catalog}`, its
+headers `MAGNITUDE_CATALOG_HEADERS`, so a test of the suite never lacks its inputs, and no other
+run resolves the catalog; a host keeps the export of each catalog (`engine.catalog_key`), so only a
 catalog's first run there builds the catalog tool and exports it. The suite's arguments take
 the run's tokens (`{catalog}`, `{models}`, `{root}`, and `{checkout}` for a suite run in it).
 A run names its backend to the tests (`SEISMIC_TEST_BACKEND`), the CPU's too: they run on it
@@ -30,6 +31,7 @@ arguments build: the executables, tests and documentation tests the sources reac
 you."""
 
 import argparse
+import dataclasses
 import functools
 import hashlib
 import json
@@ -99,10 +101,10 @@ def stale_selection(found: ledger.Ledger, own: list[str], source, backend: str,
     return found.stale(source.directory, backend, hardware, cargo.configuration(own), universe)
 
 
-def _stale(arguments, source, host: str, runner: tuple, env: tuple) -> tuple[tuple[Step, ...], tuple, tuple]:
-    """A `--stale` run's builds on `host`, one per package, its jobs in `env` (`runner` on the
-    selection, and the documentation tests of the packages whose are stale) and the selection's
-    file: what the ledger finds stale on the backend at `host`'s hardware."""
+def _stale(arguments, source, host: str, runner: tuple) -> tuple[tuple[Step, ...], tuple, tuple, set[str]]:
+    """A `--stale` run's builds on `host`, one per package, its jobs (`runner` on the selection,
+    and the documentation tests of the packages whose are stale), the selection's file and its
+    packages: what the ledger finds stale on the backend at `host`'s hardware."""
     if arguments.suite != "cargo":
         raise SystemExit("--stale selects cargo tests")
     own, binary = cargo.split(_given(arguments))
@@ -125,13 +127,13 @@ def _stale(arguments, source, host: str, runner: tuple, env: tuple) -> tuple[tup
         staged = path.with_suffix(".tmp")
         staged.write_text(content)
         staged.replace(path)
-    jobs = (("test", Step("test", (*runner, "--selection", "{inputs}/" + path.name, "--", *binary), env)),)
+    jobs = (("test", Step("test", (*runner, "--selection", "{inputs}/" + path.name, "--", *binary))),)
     documented = sorted({item.binary.package for item in stale if item.binary.kind == ledger.DOC})
     if documented:  # each package's whole: they compile from the source when they run, in the checkout
         doc = ("cargo", "test", "--doc", *kept, *(argument for package in documented for argument in ("-p", package)),
                "--", *binary)
-        jobs += (("doc", Step("doc", doc, env, checkout=True)),)
-    return builds, jobs, (path,)
+        jobs += (("doc", Step("doc", doc, checkout=True)),)
+    return builds, jobs, (path,), set(by_package)
 
 
 def _documentation(own: list[str]) -> bool:
@@ -139,6 +141,35 @@ def _documentation(own: list[str]) -> bool:
     target): nothing to build without running."""
     selected = {argument.split("=", 1)[0] for argument in own}
     return "--doc" in selected and not selected & cargo.TARGETS
+
+
+# The crate whose `catalog-headers` feature reads the catalog's header export
+# (`MAGNITUDE_CATALOG_HEADERS`): a test declares it reads catalog models by depending on it so.
+CATALOG_READER, CATALOG_FEATURE = "magnitude-family-common", "catalog-headers"
+
+
+def reads_catalog(tree, packages: set[str]) -> bool:
+    """Whether a test of `packages` (every workspace package where it names none) of the
+    workspace at `tree` can read catalog models: one of them, by its dependencies or its
+    dev-dependencies, or a workspace package its dependencies reach, declares the header
+    reader (`CATALOG_READER` with `CATALOG_FEATURE`)."""
+    workspace = {package["name"]: package for package in ledger.metadata(tree)["packages"]}
+    unknown = packages - set(workspace)
+    if unknown:
+        raise SystemExit(f"test: no workspace package {sorted(unknown)}")
+
+    @functools.cache
+    def reaches(name: str, tests: bool) -> bool:  # `tests`: its dev-dependencies too, as its tests have
+        for dependency in workspace[name]["dependencies"]:
+            if dependency["kind"] == "build" or (dependency["kind"] == "dev" and not tests):
+                continue
+            if dependency["name"] == CATALOG_READER and CATALOG_FEATURE in dependency["features"]:
+                return True
+            if dependency["name"] in workspace and dependency["name"] != name and reaches(dependency["name"], False):
+                return True
+        return False
+
+    return any(reaches(name, True) for name in packages or set(workspace))
 
 
 def plan(arguments, source, host) -> Plan:
@@ -149,29 +180,32 @@ def plan(arguments, source, host) -> Plan:
     env += (("MAGNITUDE_MODELS", "{models}"),)
     if arguments.model is not None:
         env += (("MAGNITUDE_ARTIFACTS", "{artifacts}"),)
-    # A cargo suite reads the release catalog's headers unless it reads one model's files.
-    catalog = arguments.suite == "cargo" and arguments.model is None
-    if catalog:
-        env += (("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"),)
     files = ()
     runner = ("{python}", "-m", "magnitude_rig.host", "tests", "--list", TESTS, "--ran", RAN)
     if arguments.suite == "cargo" and arguments.stale:
-        builds, jobs, files = _stale(arguments, source, host, runner, env)
+        builds, jobs, files, packages = _stale(arguments, source, host, runner)
     elif arguments.suite == "cargo":
         own, binary = cargo.split(_given(arguments))
+        packages = cargo.packages(own)
         builds, jobs = (), ()
         if not _documentation(own):
             # Each executable gets what cargo would pass it: its test name filter, then what follows `--`.
             built = [argument for argument in own if argument != "--doc"]
             builds = (Step("test build", ("cargo", "test", "--message-format=short", "--no-run", *built)),)
-            jobs += (("test", Step("test", (*runner, "--", *cargo.test_name(own), *binary), env)),)
+            jobs += (("test", Step("test", (*runner, "--", *cargo.test_name(own), *binary))),)
         if cargo.runs_doc_tests(own):  # they compile from the source when they run: in the checkout, kept for them
             doc = ("cargo", "test", "--doc", *cargo.without_targets(own), "--", *cargo.test_name(own), *binary)
-            jobs += (("doc", Step("doc", doc, env, checkout=True)),)
+            jobs += (("doc", Step("doc", doc, checkout=True)),)
     else:
-        builds = (environment("environment", "--all-packages", "--all-extras"),)
+        builds, packages = (environment("environment", "--all-packages", "--all-extras"),), set()
         # Quiet comes from the project's pytest settings; a second -q would drop the summary line.
-        jobs = (("test", Step("test", (PYTEST, "-rfE", *_given(arguments)), env)),)
+        jobs = (("test", Step("test", (PYTEST, "-rfE", *_given(arguments)))),)
+    # A cargo suite has the release catalog's headers where a test of it declares it reads them
+    # (`reads_catalog`), unless it reads one model's files; no other run resolves the catalog.
+    catalog = arguments.suite == "cargo" and arguments.model is None and reads_catalog(source.directory, packages)
+    if catalog:
+        env += (("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"),)
+    jobs = tuple((name, dataclasses.replace(step, env=env)) for name, step in jobs)
     acquires = Weights(arguments.model) if arguments.model else Headers(None) if catalog else None
     device = "timed" if arguments.timed else None if arguments.backend == "cpu" else "device"
     return Plan(builds=builds, jobs=jobs, device=device, acquires=acquires, files=files)

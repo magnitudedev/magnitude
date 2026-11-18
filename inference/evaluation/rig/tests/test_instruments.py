@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import numpy
 import pytest
 
-from magnitude_rig import ab, cli, engine, selectors, store
+from magnitude_rig import ab, cli, engine, selectors, sources, store
 from magnitude_rig.build import BuildIdentity
 from magnitude_rig.host import memory
 from magnitude_rig.instruments import REGISTRY, WORKSPACE, JobResult, Measure, device, harness
@@ -26,6 +26,10 @@ def parse(*argv: str) -> argparse.Namespace:
 
 COMMON = ("--backend", "cuda", "--purpose", "p", "--estimate", "2m")
 MODEL = "qwen3.5-4b:gguf:q4"  # a catalog model
+# The tree a test plan reads (the suite's checkout), and a package of it whose tests read the
+# catalog's headers.
+SOURCE = SimpleNamespace(directory=sources.checkout())
+LLAMA = "magnitude-family-llama"
 
 
 def test_durations():
@@ -50,51 +54,67 @@ def test_a_model_must_be_in_the_catalog():
 
 def test_test_builds_without_running_then_runs_its_executables_from_the_output_on_the_device():
     arguments = parse("test", *COMMON, "--", "-p", "magnitude-kernels", "--test", "routed", "--", "general")
-    plan = REGISTRY["test"].plan(arguments, None, "alpha")
+    plan = REGISTRY["test"].plan(arguments, SOURCE, "alpha")
     (build,) = plan.builds  # it names its target, so no documentation tests
     assert build.argv == ("cargo", "test", "--message-format=short", "--no-run", "-p", "magnitude-kernels", "--test", "routed")
     ((_, job),) = plan.jobs
     assert job.argv == ("{python}", "-m", "magnitude_rig.host", "tests", "--list", "{output}/tests.json",
                         "--ran", "{run_dir}/ran.json", "--", "general")
-    # A cargo suite has the release catalog's headers, so no test of it lacks its inputs; the
-    # host package is on PYTHONPATH from the job's `record`, not set again.
-    assert plan.device == "device" and job.env == (("SEISMIC_TEST_BACKEND", "cuda"), ("MAGNITUDE_MODELS", "{models}"),
-                                                   ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
+    # The kernels' tests declare no catalog models, so the run resolves none; the host package
+    # is on PYTHONPATH from the job's `record`, not set again.
+    assert plan.device == "device" and job.env == (("SEISMIC_TEST_BACKEND", "cuda"), ("MAGNITUDE_MODELS", "{models}"))
+    assert plan.acquires is None
     # Each executable gets cargo test's name filter first, then what follows `--`, as cargo passes them.
-    for given, passed in ((("-p", "x", "--test", "routed", "general", "--", "--exact"), ("general", "--exact")),
-                          (("--lib", "general", "-p", "x"), ("general",)),
+    for given, passed in ((("-p", LLAMA, "--test", "routed", "general", "--", "--exact"), ("general", "--exact")),
+                          (("--lib", "general", "-p", LLAMA), ("general",)),
                           (("--features=a", "-F", "b", "--test", "--lib", "general"), ("general",))):
-        ((_, filtered),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", *given), None, "alpha").jobs
+        ((_, filtered),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", *given), SOURCE, "alpha").jobs
         assert filtered.argv[filtered.argv.index("--") + 1:] == passed
     assert not job.checkout
     # One that runs documentation tests (names no target, or `--doc`) also runs them by cargo in
     # its checkout, which it keeps for that job; its executables run from the output as any.
-    for given, built in ((("-p", "x"), ("-p", "x")), (("-p", "x", "--doc"), None),
-                         (("-p", "x", "--lib", "--doc"), ("-p", "x", "--lib"))):
-        planned = REGISTRY["test"].plan(parse("test", *COMMON, "--", *given, "f", "--", "--exact"), None, "alpha")
+    for given, built in ((("-p", LLAMA), ("-p", LLAMA)), (("-p", LLAMA, "--doc"), None),
+                         (("-p", LLAMA, "--lib", "--doc"), ("-p", LLAMA, "--lib"))):
+        planned = REGISTRY["test"].plan(parse("test", *COMMON, "--", *given, "f", "--", "--exact"), SOURCE, "alpha")
         jobs = dict(planned.jobs)
-        assert jobs["doc"].argv == ("cargo", "test", "--doc", "-p", "x", "--", "f", "--exact") and jobs["doc"].checkout
+        assert jobs["doc"].argv == ("cargo", "test", "--doc", "-p", LLAMA, "--", "f", "--exact") and jobs["doc"].checkout
         if built is None:
             assert planned.builds == () and "test" not in jobs
         else:
             assert planned.builds[0].argv[-len(built) - 1:] == (*built, "f")
             assert jobs["test"].argv[-3:] == ("--", "f", "--exact") and not jobs["test"].checkout
-    ((_, named),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", "-p", "x", "--test=routed"), None, "alpha").jobs
+    ((_, named),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", "-p", LLAMA, "--test=routed"), SOURCE, "alpha").jobs
     assert not named.checkout
-    assert plan.acquires == engine.Headers(None)
+    # A family's tests read the release catalog's headers (they depend on its header reader), as
+    # may a run of every package: those have them, so no test of it lacks its inputs.
+    reading = REGISTRY["test"].plan(parse("test", *COMMON, "--", "-p", LLAMA, "--test=inputs"), SOURCE, "alpha")
+    assert reading.acquires == engine.Headers(None)
+    assert dict(reading.jobs[0][1].env)["MAGNITUDE_CATALOG_HEADERS"] == "{catalog}/headers"
+    assert REGISTRY["test"].plan(parse("test", *COMMON, "--", "--lib"), SOURCE, "alpha").acquires == engine.Headers(None)
     for backend in ("cuda", "metal", "vulkan"):
-        named = parse("test", "--backend", backend, "--purpose", "p", "--estimate", "1m", "--", "-p", "x")
-        assert REGISTRY["test"].plan(named, None, "alpha").jobs[0][1].env[:3] == (
+        named = parse("test", "--backend", backend, "--purpose", "p", "--estimate", "1m", "--", "-p", LLAMA)
+        assert REGISTRY["test"].plan(named, SOURCE, "alpha").jobs[0][1].env[:3] == (
             ("SEISMIC_TEST_BACKEND", backend), ("MAGNITUDE_MODELS", "{models}"),
             ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
-    cpu = parse("test", "--backend", "cpu", "--purpose", "p", "--estimate", "1m", "--", "-p", "x")
-    assert dict(REGISTRY["test"].plan(cpu, None, "alpha").jobs[0][1].env)["SEISMIC_TEST_BACKEND"] == "cpu"
+    cpu = parse("test", "--backend", "cpu", "--purpose", "p", "--estimate", "1m", "--", "-p", LLAMA)
+    assert dict(REGISTRY["test"].plan(cpu, SOURCE, "alpha").jobs[0][1].env)["SEISMIC_TEST_BACKEND"] == "cpu"
     # One that reads a model's files has the model, not the catalog.
-    model = REGISTRY["test"].plan(parse("test", *COMMON, "--model", MODEL, "--", "-p", "x"), None, "alpha")
+    model = REGISTRY["test"].plan(parse("test", *COMMON, "--model", MODEL, "--", "-p", LLAMA), SOURCE, "alpha")
     assert model.acquires == engine.Weights(MODEL)
     assert "MAGNITUDE_CATALOG_HEADERS" not in dict(model.jobs[0][1].env)
-    timed = parse("test", *COMMON, "--timed", "--", "-p", "x")
-    assert REGISTRY["test"].plan(timed, None, "alpha").device == "timed"
+    timed = parse("test", *COMMON, "--timed", "--", "-p", LLAMA)
+    assert REGISTRY["test"].plan(timed, SOURCE, "alpha").device == "timed"
+
+
+def test_a_crate_test_that_declares_no_catalog_models_resolves_none():
+    """A crate whose tests do not depend on the catalog's header reader neither acquires the
+    catalog's headers nor is handed them, so its run never pays for, or fails on, resolving the
+    catalog; a package unknown to the workspace is refused before anything queues."""
+    discovery = REGISTRY["test"].plan(parse("test", *COMMON, "--", "-p", "seismic-discovery", "--lib"), SOURCE, "alpha")
+    assert discovery.acquires is None
+    assert "MAGNITUDE_CATALOG_HEADERS" not in dict(discovery.jobs[0][1].env)
+    with pytest.raises(SystemExit, match="no workspace package"):
+        REGISTRY["test"].plan(parse("test", *COMMON, "--", "-p", "no-such-crate"), SOURCE, "alpha")
 
 
 def test_python_tests_run_in_the_checkouts_environment_with_the_model_they_check():
