@@ -4,6 +4,7 @@
 // `metal/state_space_gate.metal`: a block of 256 threads per (row, group),
 // strided lane chains, a warp reduction, then the warp sums in order.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 
 namespace state_space_gate_detail {
@@ -14,9 +15,9 @@ typedef unsigned long long u64;
 __device__ __forceinline__ float gated_value(const element::u8 *mixed, const element::u8 *projection, u64 row,
                                              u64 channel, const seismic_words_t &seismic_words_value) {
     const u64 head = channel / SEISMIC_DIM_P;
-    const float gate = element::at<element::Act>(projection, row * SEISMIC_PROJECTION_STRIDE_0 +
+    const float gate = element::at<activation::Act>(projection, row * SEISMIC_PROJECTION_STRIDE_0 +
                                                                  channel * SEISMIC_PROJECTION_STRIDE_1);
-    const float value = element::at<element::Act>(mixed, row * SEISMIC_MIXED_STRIDE_0 + head * SEISMIC_MIXED_STRIDE_1 +
+    const float value = element::at<activation::Act>(mixed, row * SEISMIC_MIXED_STRIDE_0 + head * SEISMIC_MIXED_STRIDE_1 +
                                                              (channel % SEISMIC_DIM_P) * SEISMIC_MIXED_STRIDE_2);
     return seismic_mul_rn(value, gate / (1.0f + expf(-gate)));
 }
@@ -28,7 +29,7 @@ extern "C" __global__ void state_space_gate(SEISMIC_KERNEL_PARAMS) {
     const element::u8 *mixed = SEISMIC_PTR(SEISMIC_BUFFER_MIXED);
     const element::u8 *projection = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION);
     const float *state_norm = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_STATE_NORM));
-    const element::Out<element::Act> normalized = SEISMIC_RESULT_0_OUT;
+    const element::Out<activation::Act> normalized = SEISMIC_RESULT_0_OUT;
     __shared__ float partials[32];
     const u64 row = blockIdx.x;
     const u64 width = SEISMIC_DIM_U * SEISMIC_DIM_P;

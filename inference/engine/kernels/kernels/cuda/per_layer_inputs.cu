@@ -1,15 +1,13 @@
 // per_layer_inputs: the per-layer input rows (PLE). Block (chunk, row), one
 // thread per chunk column. The chunk's gathered values are decoded first into
-// shared memory (packed rows: mma16 lane chunks of 16 values per work item,
-// as `embedding_rows`; dense rows read in place), then each thread forms
+// shared memory (<seismic/gather.cuh>, as `embedding_rows`), then each
+// thread forms
 //   (p * rms_inverse * norm + gathered * gathered_scale) * scale
 // with p the scaled projection value and the chunk's square sum.
-#if defined(SEISMIC_GATHERED_KIND_PACKED)
-#define KERNEL_W0 SEISMIC_GATHERED
-#endif
+#define KERNEL_T SEISMIC_GATHERED
 #include "lib/core/activation.cuh"
 #include "lib/core/reduce.cuh"
-#include <seismic/packets.cuh>
+#include <seismic/gather.cuh>
 
 using element::u32;
 using element::u64;
@@ -23,25 +21,8 @@ extern "C" __global__ void per_layer_inputs(SEISMIC_KERNEL_PARAMS) {
     const u64 layer = blockIdx.x, row = blockIdx.y;
     const u32 i = threadIdx.x;
     const u64 first = layer * chunk;
-#if defined(SEISMIC_GATHERED_KIND_PACKED)
-    const auto table = KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATHERED));
-    // Work item (k-block, column pair t) decodes 16 values of the chunk.
-    for (u32 item = i; item < chunk / 64 * 4; item += blockDim.x) {
-        const u32 kb = item / 4, t = item % 4;
-        float values[16];
-        packets::row_values16(table, row, first / 64 + kb, t, values);
-        const u32 offsets[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
-#pragma unroll
-        for (int s = 0; s < 4; ++s)
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                tokens[kb * 64 + 16 * s + offsets[j]] = values[4 * s + j];
-    }
-#else
-    using Table = ELEMENT_OF(SEISMIC_GATHERED);
-    tokens[i] = element::at<Table>(SEISMIC_PTR(SEISMIC_BUFFER_GATHERED),
-        row * SEISMIC_GATHERED_STRIDE_0 + (first + i) * SEISMIC_GATHERED_STRIDE_1);
-#endif
+    packets::gather_row(KERNEL_T_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATHERED)), row, first, chunk,
+                        [&](u64 column, float value) { tokens[column] = value; });
     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
     const float gathered_scale = __uint_as_float((unsigned)SEISMIC_PARAM_GATHERED_SCALE);
     const float projected_scale = __uint_as_float((unsigned)SEISMIC_PARAM_PROJECTED_SCALE);

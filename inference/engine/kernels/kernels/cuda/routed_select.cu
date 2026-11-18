@@ -1,6 +1,7 @@
 // General expert selection (`routed_select`) on the `dense` projection
 // operator, single over `router` in the CPU 8-lane reference order; `norm` and
 // `router_norm` share the row's RMS inverse.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #include "lib/projection/operator.cuh"
 #include "lib/routed/selection.cuh"
@@ -20,7 +21,7 @@ extern "C" __global__ void routed_select_ordered_stage(SEISMIC_KERNEL_PARAMS) {
     const NormRaw norm_raw{reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)),
                            SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_NORM), eps, SEISMIC_DIM_H,
                            projection::AllRows{}, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_NORM_STRIDE_0};
-    const element::Out<element::Act> staged_out = element::out_over_scratch<element::Act>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED));
+    const element::Out<activation::Act> staged_out = element::out_over_scratch<activation::Act>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED));
     const float inv =
         projection::ordered_stage_row(router_raw, blockIdx.x, SEISMIC_DIM_H, staged_out, SEISMIC_DIM_H, 1);
     const auto pub_out = SEISMIC_RESULT_0_OUT;

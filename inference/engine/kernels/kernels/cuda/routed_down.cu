@@ -1,9 +1,10 @@
 // Decode output of the general routed feed-forward (M <= VERIFY_ROWS): the
 // down projections (`lib/routed/down.cuh`) into scratch and their sum
 // (`lib/routed/down_sum.cuh`), without a CPU site.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
-#define ROUTED_PROJECTED_OUT element::out_over_scratch<element::Act>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PUBLISHED))
-#define ROUTED_PROJECTED reinterpret_cast<const element::Act::storage *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PUBLISHED))
+#define ROUTED_PROJECTED_OUT element::out_over_scratch<activation::Act>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PUBLISHED))
+#define ROUTED_PROJECTED reinterpret_cast<const activation::Act::storage *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PUBLISHED))
 #define ROUTED_SITE_AWAIT(m)
 #define ROUTED_SITE_ADD(m, n, selected)
 #include "lib/routed/down.cuh"

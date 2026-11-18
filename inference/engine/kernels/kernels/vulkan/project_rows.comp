@@ -4,23 +4,23 @@
 // weight (G > 1) runs group g at grid z (z = g in the GEMV and finalize
 // launches, z = g * SPLIT + part in the GEMM) over its K source columns, its
 // N weight rows and output columns, and its own G-th of the split partials.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 // The projection's decoding launches stage their weights' tables (`packets.glsl`).
-#define PACKETS_STAGED_TABLES 1
+#define PACKETS_CONFIG_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_WS != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define PROJECT_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "project_rows requires a bf16 or f16 activation"
 #endif
+#define PROJECT_ACT ACTIVATION_A
 // The weight's operand rows (the source rows, or NVFP4 operands): the GEMV
 // forms them while staging, the stage launch into the scratch the GEMM reads.
-#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_WEIGHT)
 #define PROJECT_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define PROJECT_OPERANDS PROJECTION_OPERANDS_ROUNDED
@@ -51,7 +51,7 @@ projection_prologue projected_input(uint g) { return projection_operands(project
 // The rows the GEMM reads: the source rows, or the operands the stage launch
 // formed (one group).
 projection_prologue projected_rows(uint g) {
-#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_WEIGHT)
     return projection_plain(PROJECT_ACT, PROJECTION_STAGED, SEISMIC_DIM_K, 1ul, uint(SEISMIC_DIM_K), 0ul);
 #else
     return project_rows_source(g);
@@ -69,7 +69,7 @@ projection_epilogue projected_output(uint g) {
 projection_weights projected_weight(uint g) {
     projection_weights w =
         projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS, uint(SEISMIC_DIM_K), 0ul, 1ul, 0u);
-    w.base += uint64_t(g) * SEISMIC_DIM_N * w.geometry.stride;
+    w.base = packets_row(w.base, w.geometry, uint64_t(g) * SEISMIC_DIM_N);
     return w;
 }
 

@@ -3,6 +3,7 @@
 // projection (single). The GEMV row classes normalize while staging; from
 // BATCH_FROM rows `normalize` normalizes once into `normalized`, which every
 // other form reads.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_UP_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
@@ -11,7 +12,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 // The weight's operand rows (the normalized rows, or NVFP4 operands).
 constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
@@ -44,15 +45,15 @@ typedef projection::operands<NVFP4> Operands;
 // normalized rows every form past the GEMV reads.
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_F), k = uint(SEISMIC_DIM_H); \
-    projection::Rms<activation, norm_element, projection::SelectedRows> raw{residual,   \
+    projection::Rms<activation_element, norm_element, projection::SelectedRows> raw{residual,   \
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0, \
         as_type<float>(uint(SEISMIC_PARAM_EPS)), k, {out_rows}};                        \
-    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    const projection::Plain<activation_element, projection::AllRows> in{normalized, k, 1, k, {}}; \
     const auto out = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(                  \
-        projection::Activated<activation>{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
+        projection::Activated<activation_element>{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
             SEISMIC_RESULT_0_STRIDE_1, int(SEISMIC_PARAM_ACTIVATION)},                  \
         projection::scale_factor(up_scale, SEISMIC_DIM_US, 0, 0), 1.0f);                \
-    projection::Weights<packets::W0> w{up_weight, KERNEL_W0_LAYOUT(k), k}
+    projection::Weights<packets::W0> w{{up_weight, KERNEL_W0_LAYOUT(k), k}}
 
 // The GEMV's rows: the norm applied as they stage, from their sums of
 // squares over the threadgroup.

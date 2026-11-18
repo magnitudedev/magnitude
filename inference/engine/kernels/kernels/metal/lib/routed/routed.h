@@ -20,7 +20,7 @@
 
 namespace routed {
 
-typedef element::Act Act;
+typedef activation::Act Act;
 static_assert(Act::bytes == 2, "the Metal routed family requires a bf16 or f16 activation element");
 
 // An expert-stacked weight's record tables, in the bound weights' space.
@@ -68,7 +68,7 @@ inline void expert_grids(uint rows, uint used, uint tile_rows, uint subtiles, ui
 // Rows of weight tensor `base` starting at row `first`.
 template <typename W>
 inline projection::Weights<W> weights(packets::weight_bytes base, packets::Rows16 layout, ulong first, uint k) {
-    return projection::Weights<W>{base, layout, k, nullptr, first};
+    return projection::Weights<W>{{base, layout, k}, nullptr, first};
 }
 
 // The weights of record `record` of an expert-stacked weight's record table

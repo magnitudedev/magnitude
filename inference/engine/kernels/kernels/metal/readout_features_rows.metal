@@ -1,9 +1,10 @@
 // readout_features_rows: the final RMS normalization of the `out_rows` hidden
 // rows, published in the activation type. One threadgroup per output row.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/projection/projection.h"
 
-typedef element::Act activation;
-static_assert(activation::bytes == 2, "readout_features_rows requires a bf16 or f16 activation");
+typedef activation::Act activation_element;
+static_assert(activation_element::bytes == 2, "readout_features_rows requires a bf16 or f16 activation");
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 
 kernel void readout_features_rows(
@@ -18,12 +19,12 @@ kernel void readout_features_rows(
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[8];
     const uint width = uint(SEISMIC_DIM_D);
-    projection::InputOf<activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type
+    projection::InputOf<activation_element, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type
         in{hidden, SEISMIC_HIDDEN_STRIDE_0,
         SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0,
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), width, {out_rows}};
     const float inverse = projection::normalization_inverse<256>(in, row, 0, partials, thread_index);
-    const element::Out<activation> out(features);
+    const element::Out<activation_element> out(features);
     for (uint i = thread_index; i < width; i += 256u)
         out.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(i) * SEISMIC_RESULT_0_STRIDE_1, in.value(row, i, inverse));
 }

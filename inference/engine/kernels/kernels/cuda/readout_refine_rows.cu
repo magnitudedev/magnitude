@@ -2,6 +2,7 @@
 // One warp per 32 vocabulary rows keeps the rows level one leaves (`coarse`,
 // `floor`), adds bit 3 to their logits (the 5-bit view) and publishes the
 // raised threshold (`lib/readout/progressive.cuh`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/readout/progressive.cuh"
 
 #define F32_IN(buffer) reinterpret_cast<const float *>(SEISMIC_PTR(buffer))

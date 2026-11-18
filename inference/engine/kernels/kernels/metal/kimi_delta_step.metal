@@ -12,6 +12,7 @@
 // gate, decay and window rows and the columns of the delta arena's rows must
 // be contiguous (unit stride).
 // State rows per simdgroup.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define RST_LANE_ROWS (SEISMIC_TUNE_ROWS / 4)
 // Rows whose prologue is staged at once: 8 KiB each of q, k and the decay
 // factors.
@@ -59,7 +60,7 @@ kernel void kimi_delta_step(
             seismic_words);
     recurrent::step<RST_LANE_ROWS, RST_BLOCK>(recurrent::Convolving{projection, window, convolution, slot},
         kimi::channel_rule(beta, decay, rate, time_bias, seismic_words), kimi::gate_input(gate, seismic_words),
-        recurrent_norm, element::Out<element::Act>(gated), mixed, arrivals, delta, tape, slot,
+        recurrent_norm, element::Out<activation::Act>(gated), mixed, arrivals, delta, tape, slot,
         versions::covered_end(segments, seismic_words), group, query_block,
         key_block, value_block, beta_block, decay_block, &last, thread_index, threadgroup_shape.x, simdgroup, lane,
         seismic_words);

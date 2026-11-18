@@ -10,7 +10,7 @@ extern "C" __global__ void ptx_pack(SEISMIC_KERNEL_PARAMS) {
     }
     const float lo = x[2 * pair * SEISMIC_X_STRIDE_0];
     const float hi = x[(2 * pair + 1) * SEISMIC_X_STRIDE_0];
-#if !defined(SEISMIC_ELEMENT_E_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_E_REPRESENTATION_F16)
+#if ELEMENT_KIND(SEISMIC_ELEMENT_E) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_E) != ELEMENT_F16
 #error "ptx_pack binds E to f16 or bf16"
 #endif
     // The pair is one packed conversion (`seismic_pack_bf16x2` / `seismic_pack_f16x2`), the owner's.
@@ -24,9 +24,9 @@ extern "C" __global__ void ptx_unpack(SEISMIC_KERNEL_PARAMS) {
     if (2 * pair >= SEISMIC_DIM_N) {
         return;
     }
-#if defined(SEISMIC_ELEMENT_E_REPRESENTATION_BF16)
+#if ELEMENT_KIND(SEISMIC_ELEMENT_E) == ELEMENT_BF16
     const float2 values = seismic_unpack_bf16x2(seismic_ld_nc_u32(pairs + pair));
-#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_F16)
+#elif ELEMENT_KIND(SEISMIC_ELEMENT_E) == ELEMENT_F16
     const float2 values = seismic_unpack_f16x2(seismic_ld_nc_u32(pairs + pair));
 #else
 #error "ptx_unpack binds E to f16 or bf16"

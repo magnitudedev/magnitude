@@ -1,15 +1,10 @@
-// `ELEMENT_ACT`: the element kind of the activation element A, for entries
-// that bind A (the counterpart of `element::Act` in `metal/lib/core/activation.h`
-// and `cuda/lib/core/activation.cuh`). Its ladder names A's ABI symbols, which
-// the build admits only in entries with an element parameter A.
+// `ACTIVATION_A`: the element kind of the activation element `A`, for
+// entries that bind one with `#define KERNEL_A SEISMIC_ELEMENT_A` before their
+// first include, so a header names only symbols every including entry has
+// (the counterpart of `activation::Act` in `metal/lib/core/activation.h` and
+// `cuda/lib/core/activation.cuh`).
 #include <seismic/element.glsl>
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
-#define ELEMENT_ACT ELEMENT_BF16
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define ELEMENT_ACT ELEMENT_F16
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
-#define ELEMENT_ACT ELEMENT_F32
-#else
-#error "the activation element A must be dense f32, bf16 or f16"
+#if defined(KERNEL_A)
+#define ACTIVATION_A ELEMENT_OF(KERNEL_A)
 #endif

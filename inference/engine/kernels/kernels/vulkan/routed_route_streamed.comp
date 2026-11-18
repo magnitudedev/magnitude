@@ -1,6 +1,7 @@
 // Expert streaming's decode routing (`routed_route_streamed`) on the `dense`
 // projection operator, segmented over `(router, shared_router, (shared_gate, shared_up))`,
 // followed by selection and resolve.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #define KERNEL_W1 SEISMIC_SHARED_ROUTER
 #define KERNEL_W2 SEISMIC_SHARED_GATE
@@ -12,17 +13,9 @@
 #include "lib/routed/route.glsl"
 #include "lib/routed/streamed.glsl"
 
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define ROUTE_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define ROUTE_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define ROUTE_NORM ELEMENT_BF16
-#else
-#error "routed norm must be dense"
-#endif
+#define ROUTE_NORM ELEMENT_OF(SEISMIC_NORM)
 
-#if defined(SEISMIC_SHARED_GATE_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_SHARED_GATE)
 #define SHARED_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define SHARED_OPERANDS PROJECTION_OPERANDS_ROUNDED
@@ -31,14 +24,14 @@
 #define ROUTE_H uint(SEISMIC_DIM_H)
 
 projection_prologue projected_input(uint g) {
-    return projection_ordered_input(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+    return projection_ordered_input(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
         SEISMIC_NORM_STRIDE_0, ROUTE_NORM, element_word_f32(SEISMIC_PARAM_EPS), ROUTE_H, 0ul,
         uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT));
 }
 
 projection_prologue projected_rows(uint g) {
-    return projection_plain(ELEMENT_ACT, out_stored(SEISMIC_RESULT_0_OUT, 0ul),
+    return projection_plain(ACTIVATION_A, out_stored(SEISMIC_RESULT_0_OUT, 0ul),
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, ROUTE_H, 0ul);
 }
 
@@ -65,7 +58,7 @@ projection_prologue routed_segment_input(const uint s) {
 #define PROJECTION_WEIGHT2 projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), PACKETS_W2_ROWS, ROUTE_H, 0ul, 1ul, 0u)
 #define PROJECTION_OUTPUT0 projection_store(out_over_scratch(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)), SEISMIC_DIM_E + 1ul, 1ul, 0ul)
 #define PROJECTION_OUTPUT1 projection_store(out_over_scratch(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)), SEISMIC_DIM_E + 1ul, 1ul, SEISMIC_DIM_E)
-#define PROJECTION_OUTPUT2 projection_silu_mul(ELEMENT_ACT, SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1)
+#define PROJECTION_OUTPUT2 projection_silu_mul(ACTIVATION_A, SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1)
 #include "lib/projection/ordered.glsl"
 
 void routed_route_streamed_ordered_gemv1() { projection_segmented_ordered_gemv_mixed(1u, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES); }

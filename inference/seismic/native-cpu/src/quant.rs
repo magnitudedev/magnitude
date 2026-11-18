@@ -1,4 +1,5 @@
-//! Activations quantized for integer dot products.
+//! The per-group activation rules: activations quantized for integer dot
+//! products (below), and rows as NVFP4 operands ([`nvfp4`]).
 //!
 //! A row of activations is quantized once per call into blocks of
 //! [`Q8_BLOCK`] values: an `f32` scale `d`, the codes `round(x / d)` in
@@ -20,6 +21,8 @@
 
 use crate::element::{f16_to_f32, f32_to_f16};
 use seismic_lang::cpu::{CPU_Q8_ALIGNMENT, CPU_Q8_BYTES, CPU_Q8_ROWS, CPU_Q8_VALUES};
+
+pub mod nvfp4;
 
 /// Values per quantized activation block (the k-quant super block).
 pub const Q8_BLOCK: usize = CPU_Q8_VALUES as usize;

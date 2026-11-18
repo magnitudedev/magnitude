@@ -5,6 +5,7 @@
 // `normalized` for the matrix GEMV and every form past 16 rows, and
 // `stage_tall` in the tall GEMM's order. Each segment's result is scaled by
 // its present scale port; in mode 1 the query and gate segments are zeros.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_QUERY_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT
@@ -16,7 +17,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 // The results' element Y (A, or F32 for a pooled source's projections).
 typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) published;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
@@ -68,14 +69,14 @@ typedef projection::operands<NVFP4> Operands;
 // rows every form past the GEMV reads.
 #define PROJECTION_OPERANDS                                                             \
     const uint m = uint(SEISMIC_DIM_M), k = uint(SEISMIC_DIM_D);                        \
-    projection::InputOf<activation, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+    projection::InputOf<activation_element, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
         raw{hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, input_norm,        \
         SEISMIC_INPUT_NORM_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}}; \
-    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
-    projection::Weights<packets::W0> w0{query_weight, KERNEL_W0_LAYOUT(k), k};          \
-    projection::Weights<packets::W1> w1{gate_weight, KERNEL_W1_LAYOUT(k), k};           \
-    projection::Weights<packets::W2> w2{key_weight, KERNEL_W2_LAYOUT(k), k};            \
-    projection::Weights<packets::W3> w3{value_weight, KERNEL_W3_LAYOUT(k), k};          \
+    const projection::Plain<activation_element, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    projection::Weights<packets::W0> w0{{query_weight, KERNEL_W0_LAYOUT(k), k}};        \
+    projection::Weights<packets::W1> w1{{gate_weight, KERNEL_W1_LAYOUT(k), k}};         \
+    projection::Weights<packets::W2> w2{{key_weight, KERNEL_W2_LAYOUT(k), k}};          \
+    projection::Weights<packets::W3> w3{{value_weight, KERNEL_W3_LAYOUT(k), k}};        \
     const auto out0 = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_QS, query_scale, element::Out<published>(query_cells),      \
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);                          \
     const auto out1 = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_GS, gate_scale, element::Out<published>(gate_cells),        \
@@ -121,7 +122,7 @@ kernel void attention_project_stage_tall(PROJECTION_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     PROJECTION_OPERANDS;
-    Operands::normalize<256, projection::TallOrder<activation>>(raw, item, normalized, k, norms, thread_index);
+    Operands::normalize<256, projection::TallOrder<activation_element>>(raw, item, normalized, k, norms, thread_index);
 }
 #endif
 

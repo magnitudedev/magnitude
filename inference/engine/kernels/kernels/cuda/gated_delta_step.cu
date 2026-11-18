@@ -2,6 +2,7 @@
 // row-sequential gated delta rule with its preparation fused
 // (`recurrent::step` over `recurrent::HeadGates`).
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/recurrent.cuh"
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_STEP

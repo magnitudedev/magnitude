@@ -1,5 +1,6 @@
 // attention_output: the output projection of the gated attention rows
 // plus the F32 residual.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
@@ -8,7 +9,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 // The output weight's operand rows (the gated rows, or NVFP4 operands): the
 // GEMV row classes form them while staging, the stage launch into the
 // scratch every other form reads.
@@ -43,18 +44,18 @@ typedef projection::operands<NVFP4> Operands;
 // `raw` is the gated rows; `in` the rows every form past the GEMV reads.
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_D), k = uint(SEISMIC_DIM_Q * SEISMIC_DIM_W); \
-    const projection::Plain<activation, projection::AllRows> raw{gated, SEISMIC_GATED_STRIDE_0, \
+    const projection::Plain<activation_element, projection::AllRows> raw{gated, SEISMIC_GATED_STRIDE_0, \
         SEISMIC_GATED_STRIDE_2, k, {}};                                                 \
-    const projection::Plain<activation, projection::AllRows> in = NVFP4                 \
-        ? projection::Plain<activation, projection::AllRows>{staged, k, 1, k, {}}       \
+    const projection::Plain<activation_element, projection::AllRows> in = NVFP4         \
+        ? projection::Plain<activation_element, projection::AllRows>{staged, k, 1, k, {}}       \
         : raw;                                                                          \
     ATTENTION_OUTPUT_EPILOGUE;                                                          \
-    projection::Weights<packets::W0> w{output_weight, KERNEL_W0_LAYOUT(k), k}
+    projection::Weights<packets::W0> w{{output_weight, KERNEL_W0_LAYOUT(k), k}}
 
 // The residual join: a plain residual, or the scatter into each
 // hyper-connection stream (`scatter`, with its comb when the inject row
 // carries one), after the weight's second-level scale where it has one.
-typedef projection::OutputOf<activation, projection::AllRows, SEISMIC_DIM_SN, SEISMIC_DIM_IN != 0,
+typedef projection::OutputOf<activation_element, projection::AllRows, SEISMIC_DIM_SN, SEISMIC_DIM_IN != 0,
     (SEISMIC_DIM_IN > SEISMIC_DIM_SN)> output_join;
 #define ATTENTION_OUTPUT_EPILOGUE                                                       \
     const auto out = projection::scaling<(SEISMIC_DIM_OS != 0)>::wrap(                  \

@@ -7,13 +7,14 @@
 //   quantize each product row's s8 row and groups (INT8);
 //   down     shared down GEMM whose epilogue unpermutes the grouped expert
 //            outputs in slot order: residual + selected + round_A(shared) * c.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_SHARED_DOWN
 #define KERNEL_W1 SEISMIC_SHARED_GATE
 #define KERNEL_W2 SEISMIC_SHARED_UP
 #include "lib/projection/projection.cuh"
 
 using GShape = projection::GemmShape<64, 2, 4, 3>;
-using element::Act;
+using activation::Act;
 // Whether both GEMMs run on the int8 path (INT8 = 1, which the declaration
 // admits where every weight is admitted to it).
 #define GROUPED_S8                                                                                         \

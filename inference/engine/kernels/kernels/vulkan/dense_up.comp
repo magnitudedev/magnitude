@@ -1,32 +1,24 @@
 // dense_up: RMS prologue over the `out_rows` residual rows, the up
 // projection, and A(act(A(scale * up)) * product_scale). The Vulkan form of `metal/dense_up.metal`
 // on the `dense` projection (`lib/projection/operator.glsl`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_UP_WEIGHT
 // The projection's decoding launches stage their weights' tables (`packets.glsl`).
-#define PACKETS_STAGED_TABLES 1
+#define PACKETS_CONFIG_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define DENSE_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "dense_up requires a bf16 or f16 activation"
 #endif
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define DENSE_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define DENSE_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define DENSE_NORM ELEMENT_BF16
-#else
-#error "dense_up requires a dense norm"
-#endif
+#define DENSE_ACT ACTIVATION_A
+#define DENSE_NORM ELEMENT_OF(SEISMIC_NORM)
 // The up weight's operand rows (the normalized rows, or NVFP4 operands): the
 // GEMV forms them while staging, the stage launch into the GEMM's scratch.
-#if defined(SEISMIC_UP_WEIGHT_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_UP_WEIGHT)
 #define DENSE_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define DENSE_OPERANDS PROJECTION_OPERANDS_ROUNDED

@@ -26,7 +26,7 @@
 // Every dense operand is bound canonically (row-major, unit innermost stride),
 // so rows are addressed from their logical offsets. Activations are addressed
 // as the element's MSL scalar. Preparation is rounded explicitly by
-// element::Act before conversion to the history's physical operand type.
+// activation::Act before conversion to the history's physical operand type.
 
 #include "../core/activation.h"
 #include "../core/head.h"
@@ -72,7 +72,7 @@ inline rounding::Rounding key_rounding(bool kr, uint block, uint element, uint s
 }
 
 // The activation element's MSL scalar.
-typedef element::Act::native Scalar;
+typedef activation::Act::native Scalar;
 
 // The entry's head rows and their rotary pairs (`rotary::layout`).
 typedef rotary::layout<ATTENTION_W, SEISMIC_DIM_P, ATTENTION_ROTARY_FIRST, ATTENTION_ROTARY_ADJACENT> head_layout;
@@ -81,7 +81,7 @@ typedef head_layout::table rotary_table;
 // Appends lane `lane`'s columns of one kv head row at history row
 // `destination` (the caller skips rows without a destination). The history's
 // owner handle owns publication rounding and its storage payload.
-inline void append(element::Out<element::Act> history, int destination, uint kv_head, uint lane,
+inline void append(element::Out<activation::Act> history, int destination, uint kv_head, uint lane,
     thread const float (&x)[ATTENTION_E]) {
     const ulong target = (ulong(destination) * SEISMIC_DIM_KV + kv_head) * ATTENTION_W + lane * ATTENTION_E;
     ATTENTION_UNROLL
@@ -91,7 +91,7 @@ inline void append(element::Out<element::Act> history, int destination, uint kv_
 
 // A dense plane as its owner's slab table, typed by the activation element: only the write path
 // (`dense_planes`) holds it; reads take its plain address table (`slab::reads`).
-typedef slab::Table<element::Act> history_plane;
+typedef slab::Table<activation::Act> history_plane;
 
 // Keys per decode partition for a row seeing `total` keys: at least `span`,
 // and few enough that `parts` partitions cover the row. Never zero.
@@ -277,9 +277,9 @@ template <bool NORM>
 inline void rounded_head_rotary(device const Scalar *raw, device const float *norm, thread const rotary_table &table,
     float epsilon, rounding::Rounding key_rounding, uint lane, thread float (&x)[ATTENTION_E]) {
     head_norm<NORM>(raw, norm, epsilon, lane, x);
-    rounding::hold_lanes<element::Act>(x, key_rounding);
+    rounding::hold_lanes<activation::Act>(x, key_rounding);
     head_layout::rotate(table, lane, x);
-    rounding::hold_lanes<element::Act>(x, key_rounding);
+    rounding::hold_lanes<activation::Act>(x, key_rounding);
     rounding::round_lanes<ATTENTION_E>(x, key_rounding);
 }
 
@@ -287,7 +287,7 @@ inline void rounded_head_rotary(device const Scalar *raw, device const float *no
 // its own launch after the entry has stored every query head's ungated
 // output: threadgroup (row, query head), thread p turns pair p back by the
 // row's negated angles (`output_rotary`), in F32, and publishes it again.
-inline void output_rotary(element::Out<element::Act> result, device const int *coordinates,
+inline void output_rotary(element::Out<activation::Act> result, device const int *coordinates,
     device const int *components, device const float *frequencies, device const float *amplitudes, ulong row,
     ulong head, uint pair) {
     if (pair >= SEISMIC_DIM_P)
@@ -297,7 +297,7 @@ inline void output_rotary(element::Out<element::Act> result, device const int *c
     float c;
     const float s = -rotary::sincos(float(coordinates[row * 4 + components[pair]]) * frequencies[pair], c);
     const float cosine = c * amplitudes[pair], sine = s * amplitudes[pair];
-    const element::Out<element::Act> out =
+    const element::Out<activation::Act> out =
         result.offset((row * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + head) * ATTENTION_W);
     const float low = out.at(lo), high = out.at(hi);
     out.put(lo, low * cosine - high * sine);
@@ -633,7 +633,7 @@ inline float turned_back(float attended, float other, uint column, ulong row, de
 // consume them.
 template <uint SPAN, uint PARTS, uint GRID_KEYS, uint PICKS = 0, bool ROTATED = false>
 inline void decode_output(device const Scalar *query, device const Scalar *gate, device const int *visible,
-    device const int *fresh, element::Out<element::Act> result, device const float *partials,
+    device const int *fresh, element::Out<activation::Act> result, device const float *partials,
     device const float *statistics, threadgroup float *weights, ulong spans, ulong head, ulong row,
     uint column, uint lane, bool softplus, device const float *sinks = nullptr, bool writer = true,
     threadgroup float *row_values = nullptr, device const int *coordinates = nullptr,
@@ -941,7 +941,7 @@ struct dense_history {
     static inline void held(thread float (&x)[ATTENTION_E], uint lane) {
         ATTENTION_UNROLL
         for (uint i = 0; i < ATTENTION_E; ++i)
-            x[i] = element::Act::round(x[i]);
+            x[i] = activation::Act::round(x[i]);
     }
 
     template <uint THREADS, uint KEYS = PREFILL_KEYS>
@@ -1603,7 +1603,7 @@ inline void prefill_prepare(Planes planes, device const Scalar *query,
             const ulong head = row * KV * G + kv_head * G + g;
             head_rotary<ATTENTION_QUERY_NORM>(query + head * ATTENTION_QUERY_STRIDE, query_norm, table, epsilon, lane, x);
             for (uint i = 0; i < E; ++i)
-                queries[head * W + lane * E + i] = Operand(element::Act::round(x[i]));
+                queries[head * W + lane * E + i] = Operand(activation::Act::round(x[i]));
         }
     }
     if (!ATTENTION_FRESH)
@@ -1808,7 +1808,7 @@ struct prefill_fragments {
     // partition; an unsplit one its gated output (with the head's sink, if
     // any).
     static inline void store(device const Scalar *query, device const Scalar *gate,
-        element::Out<element::Act> result, device float *partials, device float *statistics, ulong first_token,
+        element::Out<activation::Act> result, device float *partials, device float *statistics, ulong first_token,
         ulong M, uint head, uint partition, uint active, uint window_first, bool softplus, device const float *sinks,
         thread prefill_fragments &self) {
         constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
@@ -1910,7 +1910,7 @@ struct prefill_tensors {
     }
 
     static inline void windows(History history, device const Scalar *query, device const Scalar *gate,
-        device const int *visible, device const int *fresh, element::Out<element::Act> result,
+        device const int *visible, device const int *fresh, element::Out<activation::Act> result,
         device const Operand *keys, device const Operand *values, device float *partials, device float *statistics,
         ulong M, ulong R, float scale, bool softplus, threadgroup Operand *staged,
         threadgroup const prefill_interval *intervals,
@@ -2179,7 +2179,7 @@ struct prefill_direct {
     }
 
     static inline void windows(History history, device const Scalar *query, device const Scalar *gate,
-        device const int *visible, device const int *fresh, element::Out<element::Act> result,
+        device const int *visible, device const int *fresh, element::Out<activation::Act> result,
         device const Operand *keys, device const Operand *values, device float *partials, device float *statistics,
         ulong M, ulong R, float scale, bool softplus, threadgroup const prefill_interval *intervals,
         threadgroup const prefill_run *runs, uint kv_head, uint partition, device const Operand *query_rows,
@@ -2378,7 +2378,7 @@ struct prefill_direct {
 // scheduled apart).
 template <uint QT, class History>
 inline void prefill_windows(History history, device const Scalar *query, device const Scalar *gate,
-    device const int *visible, device const int *fresh, element::Out<element::Act> result,
+    device const int *visible, device const int *fresh, element::Out<activation::Act> result,
     device const typename History::Operand *keys, device const typename History::Operand *values,
     device float *partials, device float *statistics, ulong M, ulong R, float scale, bool softplus,
     threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,
@@ -2491,7 +2491,7 @@ struct prefill_owner {
 // L2's arguments shared by both forms' entries.
 #define PREFILL_OWNED_PARAMETERS                                                                          \
     History history, device const Scalar *query, device const Scalar *gate, device const int *visible,     \
-    device const int *fresh, element::Out<element::Act> result,                                           \
+    device const int *fresh, element::Out<activation::Act> result,                                         \
     device const typename History::Operand *queries,                                                       \
     device const typename History::Operand *keys, device const typename History::Operand *values,          \
     device float *partials, device float *statistics, ulong M, ulong R, float scale, bool softplus,        \
@@ -3063,7 +3063,7 @@ struct prefill_coissue {
     // After both roles: the product lanes store the rows they own, in their
     // window's columns.
     static inline void store(device const Scalar *query, device const Scalar *gate,
-        element::Out<element::Act> result, device float *partials, ulong M, bool softplus,
+        element::Out<activation::Act> result, device float *partials, ulong M, bool softplus,
         threadgroup const prefill_run *runs, threadgroup const pair *mine, uint partition, uint window, uint head,
         ulong first_token, uint lane) {
         constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
@@ -3093,7 +3093,7 @@ struct prefill_coissue {
     }
 
     static inline void attend(History history, device const Scalar *query, device const Scalar *gate,
-        device const int *visible, device const int *fresh, element::Out<element::Act> result,
+        device const int *visible, device const int *fresh, element::Out<activation::Act> result,
         device const half *queries, device const half *keys, device const half *values, device float *partials,
         device float *statistics, ulong M, ulong R, float scale, bool softplus,
         threadgroup const prefill_interval *intervals, threadgroup const prefill_run *runs,
@@ -3141,7 +3141,7 @@ struct prefill_coissue {
     // as a masked step of the roles does. A pair of a head of two windows
     // forms the whole head's scores and its window's output.
     static inline void recompute(History history, device const Scalar *query, device const Scalar *gate,
-        device const int *visible, device const int *fresh, element::Out<element::Act> result,
+        device const int *visible, device const int *fresh, element::Out<activation::Act> result,
         device const half *keys, device const half *values, device float *partials, device float *statistics,
         ulong M, ulong R, float scale, bool softplus, threadgroup const prefill_interval *intervals,
         threadgroup const prefill_run *runs, uint kv_head, uint partition, uint window,
@@ -3310,7 +3310,7 @@ inline void prefill_list(device const int *visible, device const int *fresh, dev
 // does (the split records stay unnormalized; the merge adds the sink).
 template <uint QT, class History>
 inline void prefill_attend(History history, device const Scalar *query, device const Scalar *gate,
-    device const int *visible, device const int *fresh, element::Out<element::Act> result,
+    device const int *visible, device const int *fresh, element::Out<activation::Act> result,
     device const typename History::Operand *queries, device const typename History::Operand *keys,
     device const typename History::Operand *values, device float *partials,
     device float *statistics, device uint *counts, ulong M, ulong R, float scale, bool softplus,
@@ -3450,7 +3450,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
 // launch leaves such a call alone.
 template <uint QT>
 inline void prefill_fold(history_window window, prefill_held held, uint round, device const Scalar *query,
-    device const Scalar *gate, element::Out<element::Act> result, device const float *partials,
+    device const Scalar *gate, element::Out<activation::Act> result, device const float *partials,
     device const float *statistics, device const uint *counts, ulong M, uint tile, ulong head, uint column,
     bool softplus, device const float *sinks = nullptr) {
     constexpr uint W = ATTENTION_W;
@@ -3503,7 +3503,7 @@ inline void prefill_fold(history_window window, prefill_held held, uint round, d
 // that took several key partitions merges each of its rows' partitions in
 // partition order and applies the gate; other tiles were stored by L2.
 template <uint QT>
-inline void prefill_merge(device const Scalar *query, device const Scalar *gate, element::Out<element::Act> result,
+inline void prefill_merge(device const Scalar *query, device const Scalar *gate, element::Out<activation::Act> result,
     device const float *partials, device const float *statistics, device const uint *counts,
     ulong M, uint tile, ulong head, uint column, bool softplus, device const float *sinks = nullptr) {
     constexpr uint W = ATTENTION_W;
@@ -3564,18 +3564,14 @@ struct decode_picks {
     ulong rows_per_slab;
 };
 
-// The ABI prefix of `selected`. It is pasted, not written out: entries
-// without picks include this file too, and a header may name only ABI symbols
-// every including entry has.
-#define ATTENTION_SELECTED ELEMENT_CAT(SEISMIC, _SELECTED)
-
 // The picked rows as a dense history plane (key and value alike): rows of
 // `selected`, read as the activation element.
 template <uint PICKS>
 inline dense_history picks_plane(decode_picks picks) {
     // The `PICKS == 0 ||` term makes the assert depend on PICKS, so an entry
-    // without picks, which binds no `selected`, never evaluates it.
-    static_assert(PICKS == 0 || ELEMENT_KIND(ATTENTION_SELECTED) == ELEMENT_KIND(ELEMENT_A),
+    // without picks, which binds no `selected` (`KERNEL_SELECTED`, defined by
+    // the entries with picks), never evaluates it.
+    static_assert(PICKS == 0 || ELEMENT_KIND(KERNEL_SELECTED) == ELEMENT_KIND(KERNEL_A),
         "the picked rows read as the activation element");
     return dense_history{picks.selected, picks.selected, picks.rows_per_slab};
 }
@@ -3900,7 +3896,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         ATTENTION_UNROLL
         for (uint i = 0; i < E; ++i)
             if (!PACKED || slice == 0)
-                queries[global_g * W + lane * E + i] = KeyOperand(element::Act::round(x[i]));
+                queries[global_g * W + lane * E + i] = KeyOperand(activation::Act::round(x[i]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -4412,7 +4408,7 @@ struct shared_result {
     device const Scalar *query;
     device const Scalar *gate;
     device const float *sinks;
-    element::Out<element::Act> result;
+    element::Out<activation::Act> result;
     bool softplus;
 };
 
@@ -4502,7 +4498,7 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
                 }
                 ATTENTION_UNROLL
                 for (uint i = 0; i < E; ++i)
-                    staged[g * W + lane * E + i] = KeyOperand(element::Act::round(x[i]));
+                    staged[g * W + lane * E + i] = KeyOperand(activation::Act::round(x[i]));
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (block * 8 >= chunk && block * 8 < chunk + CHUNK) {

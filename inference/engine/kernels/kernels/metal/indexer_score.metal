@@ -15,6 +15,7 @@
 //
 // Dynamic extents and parameters read `seismic_words`.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/head.h"
 #include "lib/core/rotary.h"
@@ -26,7 +27,7 @@
 #define SCORE_E (SCORE_W / 32)
 #define SCORE_H uint(SEISMIC_DIM_H)
 
-typedef element::Act::native Scalar;
+typedef activation::Act::native Scalar;
 typedef rotary::layout<SCORE_W, SEISMIC_DIM_P, (SEISMIC_DIM_RT != 0 ? SEISMIC_DIM_S : 0), (SEISMIC_DIM_RA != 0)>
     query_layout;
 
@@ -78,10 +79,10 @@ kernel void indexer_score(
         // A rounded query is rounded from its norm and rotation held in A.
         if (SEISMIC_DIM_NQ != 0) {
             head::rms_norm(x, query_norm, epsilon, lane);
-            rounding::hold_lanes<element::Act>(x, trained);
+            rounding::hold_lanes<activation::Act>(x, trained);
         }
         query_layout::rotate(table, lane, x);
-        rounding::hold_lanes<element::Act>(x, trained);
+        rounding::hold_lanes<activation::Act>(x, trained);
         rounding::round_lanes<SCORE_E>(x, trained);
         for (uint i = 0; i < SCORE_E; ++i)
             prepared[head * SCORE_W + lane * SCORE_E + i] = x[i];

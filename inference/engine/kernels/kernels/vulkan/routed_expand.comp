@@ -16,6 +16,7 @@
 #if SEISMIC_STATIC_GS + SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
 #endif
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #define KERNEL_W2 SEISMIC_SHARED_GATE
@@ -23,20 +24,19 @@
 #include "lib/core/activation.glsl"
 #include "lib/routed/routed.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define ROUTED_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "routed_expand requires a bf16 or f16 activation"
 #endif
+#define ROUTED_ACT ACTIVATION_A
 // The rows the experts' and the shared expert's weights take (the
 // normalized rows, or NVFP4 operands), each pair's own, formed while its
 // GEMV stages them.
-#if defined(SEISMIC_EXPERT_GATE_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_EXPERT_GATE)
 #define EXPERT_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define EXPERT_OPERANDS PROJECTION_OPERANDS_ROUNDED
 #endif
-#if defined(SEISMIC_SHARED_GATE_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_SHARED_GATE)
 #define SHARED_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define SHARED_OPERANDS PROJECTION_OPERANDS_ROUNDED

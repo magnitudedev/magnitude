@@ -35,15 +35,17 @@ using element::u8;
 using element::u16;
 using element::u32;
 using element::u64;
+using element::Same;
+using element::Select;
 
-template <class A, class B> struct Same {
-    static constexpr bool value = false;
-};
-template <class A> struct Same<A, A> {
-    static constexpr bool value = true;
-};
-template <bool C, class T, class F> struct Select { typedef T type; };
-template <class T, class F> struct Select<false, T, F> { typedef F type; };
+// Everything below `detail` is how the built-in formats are laid out and
+// decoded: kernels name only the surface outside it (the slot bindings, the
+// decoders' members, and the functions and types declared in `packets`
+// itself). No free function in `detail` takes a parameter of class type
+// (such helpers are static members), so a kernel's unqualified call whose
+// arguments are decoder values never finds one by argument-dependent lookup.
+namespace detail {
+
 // A member a configuration has no use for.
 struct None {};
 
@@ -53,9 +55,12 @@ __device__ __forceinline__ u32 prmt(u32 a, u32 b, u32 selector) {
     return value;
 }
 
-__device__ __forceinline__ u32 word_of(const uint4 &value, int index) {
-    return index == 0 ? value.x : index == 1 ? value.y : index == 2 ? value.z : value.w;
-}
+// Word `index` of a 16-byte vector.
+struct Vector {
+    __device__ static __forceinline__ u32 word(const uint4 &value, int index) {
+        return index == 0 ? value.x : index == 1 ? value.y : index == 2 ? value.z : value.w;
+    }
+};
 
 // int8 fragments. Within a 32-code group (k16 steps 2h and 2h+1) the s8 MMA's
 // virtual k 4t..4t+3 is real k {2t, 2t+1, 2t+8, 2t+9} of step 2h and virtual
@@ -77,13 +82,19 @@ template <u32 OFFSET> __device__ __forceinline__ u32 s8_less(u32 bytes) {
     static_assert(OFFSET <= 128, "an offset within s8");
     return ((bytes | 0x80808080u) - OFFSET * 0x01010101u) ^ 0x80808080u;
 }
+
+} // namespace detail
+
 // Each s8 byte times `factor` modulo 256 (`factor` below 256, the
 // multiplier's low byte): even and odd bytes multiply in the 16-bit halves of
 // a word, where a product of two bytes carries into no other half, and each
 // product's low byte is the s8 product wherever that is of s8.
 __device__ __forceinline__ u32 s8_times(u32 bytes, u32 factor) {
-    return prmt((bytes & 0x00FF00FFu) * factor, ((bytes >> 8) & 0x00FF00FFu) * factor, 0x6240u);
+    return detail::prmt((bytes & 0x00FF00FFu) * factor, ((bytes >> 8) & 0x00FF00FFu) * factor, 0x6240u);
 }
+
+namespace detail {
+
 // Two's complement 8-bit codes in a step's slots 0..3 (`low`) and 4..7
 // (`high`), the form every byte code reaches: the four A registers (exact
 // 16-bit operands, `O::bytes`), the s8 fragments of rows g and g+8, and
@@ -99,6 +110,8 @@ __device__ __forceinline__ S8Pair slot_s8(u32 low, u32 high) {
 __device__ __forceinline__ u32 slot_code(u32 low, u32 high, u32 slot) {
     return ((slot < 4 ? low : high) >> (8 * (slot % 4))) & 0xFFu;
 }
+
+} // namespace detail
 
 // ---------------------------------------------------------------------------
 // MMA operand types. Codes are small integers, exact in both 16-bit formats;
@@ -122,7 +135,7 @@ struct OpBF16 {
     // binade [128, 256), minus 128 or 256, the powers whose exponents differ
     // in their low bit, which is b's sign bit where the byte sits.
     __device__ static __forceinline__ u32 bytes(u32 slots_low, u32 slots_high, int i) {
-        const u32 pair = prmt(slots_low, slots_high, (u32)i | ((u32)(4 + i) << 8));
+        const u32 pair = detail::prmt(slots_low, slots_high, (u32)i | ((u32)(4 + i) << 8));
         const u32 biased = (pair & 0x007F007Fu) | 0x43004300u;   // 128 + (b & 127)
         const u32 negative = (pair & 0x00800080u) | 0xC300C300u; // -128, or -256 where b < 0
         u32 value;
@@ -160,8 +173,8 @@ struct OpF16 {
     __device__ static __forceinline__ u32 bytes(u32 slots_low, u32 slots_high, int i) {
         // 1024 + (code + 128) in each half, then subtract 1152.
         const u32 pair =
-            prmt(slots_low ^ 0x80808080u, slots_high ^ 0x80808080u, (u32)i | ((u32)(4 + i) << 4));
-        const u32 biased = prmt(pair, 0x64646464u, 0x4140u);
+            detail::prmt(slots_low ^ 0x80808080u, slots_high ^ 0x80808080u, (u32)i | ((u32)(4 + i) << 4));
+        const u32 biased = detail::prmt(pair, 0x64646464u, 0x4140u);
         u32 value;
         asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(value) : "r"(biased), "r"(0x3C003C00u), "r"(0xE480E480u));
         return value;
@@ -189,6 +202,8 @@ template <> struct OperandOf<element::Bf16> {
 template <> struct OperandOf<element::F16> {
     using type = OpF16;
 };
+namespace detail {
+
 // Whether O is element E's own operand type (E's values enter it exactly).
 template <class O, class E> struct NativeOperand {
     static constexpr bool value = false;
@@ -258,11 +273,15 @@ struct Rows {
     __device__ __forceinline__ const u8 *tile_base(u64 tile) const { return base + 16 * tile * stride; }
 };
 
+} // namespace detail
+
 // Coefficients of one k-block for the fragment rows g and g+8, per group.
 template <int GROUPS> struct Coefficients {
     float scale[2][GROUPS];
     float bias[2][GROUPS];
 };
+
+namespace detail {
 
 __device__ __forceinline__ float f16_at(const u8 *address) {
     return seismic_f16_to_f32(*reinterpret_cast<const u16 *>(address));
@@ -282,18 +301,19 @@ __device__ __forceinline__ float f16_at(const u8 *address) {
 // (lane 4 (a % 8) + t of a's tile, its slots of parity `ua`, a's half of
 // the tile) and the same word of row b's (parity `ub`), each moved to its
 // parity: a shift and a mask a word (2B divides 32).
-template <int B> __device__ __forceinline__ u32 rows_word(u32 a, u32 ua, u32 b, u32 ub) {
+template <int B> struct RowsWord {
     static_assert(B == 1 || B == 2 || B == 4 || B == 8, "slots of 1, 2, 4 or 8 bits");
-    constexpr u32 EVEN = B == 1 ? 0x55555555u : B == 2 ? 0x33333333u : B == 4 ? 0x0F0F0F0Fu : 0x00FF00FFu;
-    return ((ua != 0 ? a >> B : a) & EVEN) | ((ub != 0 ? b : b << B) & ~EVEN);
-}
-template <int B> __device__ __forceinline__ uint2 rows_word(uint2 a, u32 ua, uint2 b, u32 ub) {
-    return make_uint2(rows_word<B>(a.x, ua, b.x, ub), rows_word<B>(a.y, ua, b.y, ub));
-}
-template <int B> __device__ __forceinline__ uint4 rows_word(uint4 a, u32 ua, uint4 b, u32 ub) {
-    return make_uint4(rows_word<B>(a.x, ua, b.x, ub), rows_word<B>(a.y, ua, b.y, ub), rows_word<B>(a.z, ua, b.z, ub),
-                      rows_word<B>(a.w, ua, b.w, ub));
-}
+    __device__ static __forceinline__ u32 of(u32 a, u32 ua, u32 b, u32 ub) {
+        constexpr u32 EVEN = B == 1 ? 0x55555555u : B == 2 ? 0x33333333u : B == 4 ? 0x0F0F0F0Fu : 0x00FF00FFu;
+        return ((ua != 0 ? a >> B : a) & EVEN) | ((ub != 0 ? b : b << B) & ~EVEN);
+    }
+    __device__ static __forceinline__ uint2 of(uint2 a, u32 ua, uint2 b, u32 ub) {
+        return make_uint2(of(a.x, ua, b.x, ub), of(a.y, ua, b.y, ub));
+    }
+    __device__ static __forceinline__ uint4 of(uint4 a, u32 ua, uint4 b, u32 ub) {
+        return make_uint4(of(a.x, ua, b.x, ub), of(a.y, ua, b.y, ub), of(a.z, ua, b.z, ub), of(a.w, ua, b.w, ub));
+    }
+};
 // The lane holding row `row` (lane 4 (row % 8) + t of its tile) and its half
 // of the lane's slots (0: the even ones, row g's; 1: the odd ones, g + 8's).
 __device__ __forceinline__ u32 row_lane(u64 row, u32 t) { return 4 * (u32)(row % 8) + t; }
@@ -315,9 +335,9 @@ template <> struct LowPlane<4> {
     typedef uint4 Words;
     __device__ static __forceinline__ Words load(const u8 *at) { return seismic_ld_nc_na_v4(at); }
     __device__ static __forceinline__ Words shared(const u8 *at) { return *reinterpret_cast<const uint4 *>(at); }
-    __device__ static __forceinline__ u32 nibbles(const Words &low, int step) { return word_of(low, step); }
+    __device__ static __forceinline__ u32 nibbles(const Words &low, int step) { return Vector::word(low, step); }
     __device__ static __forceinline__ u32 field(const Words &low, int step, u32 slot) {
-        return (word_of(low, step) >> (4 * slot)) & 15u;
+        return (Vector::word(low, step) >> (4 * slot)) & 15u;
     }
 };
 template <> struct LowPlane<2> {
@@ -382,8 +402,8 @@ template <int LOW, int HIGH, bool WHOLE> struct Planes {
     template <class W> __device__ static __forceinline__ Raw fetch_rows(const W &w, u64 a, u64 b, u64 kblock, u32 t) {
         const Raw x = fetch(w, a / 16, kblock, row_lane(a, t)), y = fetch(w, b / 16, kblock, row_lane(b, t));
         Raw raw;
-        raw.low = rows_word<LOW>(x.low, row_half(a), y.low, row_half(b));
-        raw.high = HIGH == 1 ? rows_word<1>(x.high, row_half(a), y.high, row_half(b)) : 0u;
+        raw.low = RowsWord<LOW>::of(x.low, row_half(a), y.low, row_half(b));
+        raw.high = HIGH == 1 ? RowsWord<1>::of(x.high, row_half(a), y.high, row_half(b)) : 0u;
         return raw;
     }
     // The lane chunks of one superblock (4 k-blocks). With WHOLE the warp's
@@ -475,6 +495,7 @@ template <int LOW, int HIGH, bool WHOLE> struct Planes {
     }
     // GEMM staging: the 16 B chunks of one tile's k-block, low plane first.
     static constexpr int CHUNKS = LOW_CHUNKS + (HIGH == 1 ? 8 : 0);
+    static constexpr int CHUNK_BYTES = 16;
     template <class W> __device__ static __forceinline__ const u8 *chunk_source(const W &w, u64 tile, u64 kblock, u32 chunk) {
         if constexpr (HIGH != 0)
             if (chunk >= LOW_CHUNKS)
@@ -510,8 +531,8 @@ template <> struct Planes<4, 2, true> {
     template <class W> __device__ static __forceinline__ Raw fetch_rows(const W &w, u64 a, u64 b, u64 kblock, u32 t) {
         const Raw x = fetch(w, a / 16, kblock, row_lane(a, t)), y = fetch(w, b / 16, kblock, row_lane(b, t));
         Raw raw;
-        raw.low = rows_word<4>(x.low, row_half(a), y.low, row_half(b));
-        raw.high = rows_word<2>(x.high, row_half(a), y.high, row_half(b));
+        raw.low = RowsWord<4>::of(x.low, row_half(a), y.low, row_half(b));
+        raw.high = RowsWord<2>::of(x.high, row_half(a), y.high, row_half(b));
         return raw;
     }
     struct Super {
@@ -555,12 +576,12 @@ template <> struct Planes<4, 2, true> {
     }
     __device__ static __forceinline__ u32 pair(const Raw &raw, int step, int i) {
         const u32 high = high_bits(raw, step);
-        u32 pair = (word_of(raw.low, step) >> (4 * i)) & 0x000F000Fu;
+        u32 pair = (Vector::word(raw.low, step) >> (4 * i)) & 0x000F000Fu;
         pair |= (((high >> (2 * i)) & 3u) << 4) | (((high >> (2 * i + 8)) & 3u) << 20);
         return pair;
     }
     __device__ static __forceinline__ S8Pair s8(const Raw &raw, int step) {
-        S8Pair pair = s8_nibbles(word_of(raw.low, step));
+        S8Pair pair = s8_nibbles(Vector::word(raw.low, step));
         const u32 high = high_bits(raw, step);
         pair.row_g |= ((high & 3u) << 4) | (((high >> 8) & 3u) << 12) | (((high >> 4) & 3u) << 20) |
                       (((high >> 12) & 3u) << 28);
@@ -569,9 +590,10 @@ template <> struct Planes<4, 2, true> {
         return pair;
     }
     __device__ static __forceinline__ u32 code(const Raw &raw, int step, u32 slot) {
-        return ((word_of(raw.low, step) >> (4 * slot)) & 15u) | (((high_bits(raw, step) >> (2 * slot)) & 3u) << 4);
+        return ((Vector::word(raw.low, step) >> (4 * slot)) & 15u) | (((high_bits(raw, step) >> (2 * slot)) & 3u) << 4);
     }
     static constexpr int CHUNKS = 32 + 16;
+    static constexpr int CHUNK_BYTES = 16;
     template <class W> __device__ static __forceinline__ const u8 *chunk_source(const W &w, u64 tile, u64 kblock, u32 chunk) {
         if (chunk < 32)
             return w.low.chunk(w.base, w.stride, tile, kblock * 512 + chunk * 16);
@@ -602,8 +624,8 @@ template <> struct Planes<8, 0, false> {
     template <class W> __device__ static __forceinline__ Raw fetch_rows(const W &w, u64 a, u64 b, u64 kblock, u32 t) {
         const Raw x = fetch(w, a / 16, kblock, row_lane(a, t)), y = fetch(w, b / 16, kblock, row_lane(b, t));
         Raw raw;
-        raw.first = rows_word<8>(x.first, row_half(a), y.first, row_half(b));
-        raw.second = rows_word<8>(x.second, row_half(a), y.second, row_half(b));
+        raw.first = RowsWord<8>::of(x.first, row_half(a), y.first, row_half(b));
+        raw.second = RowsWord<8>::of(x.second, row_half(a), y.second, row_half(b));
         return raw;
     }
     struct Super {
@@ -632,6 +654,7 @@ template <> struct Planes<8, 0, false> {
         return slot_code(low, high, slot);
     }
     static constexpr int CHUNKS = 64;
+    static constexpr int CHUNK_BYTES = 16;
     template <class W> __device__ static __forceinline__ const u8 *chunk_source(const W &w, u64 tile, u64 kblock, u32 chunk) {
         return w.low.chunk(w.base, w.stride, tile, kblock * 1024 + chunk * 16);
     }
@@ -950,13 +973,14 @@ template <class P, int GROUP> __host__ __device__ constexpr bool s8_gemm_entries
         return false;
 }
 
-template <class P, class Src, class Raw>
-__device__ __forceinline__ void slots_of(const Raw &raw, int step, u32 &low, u32 &high) {
-    if constexpr (IsGridPlanes<P>::value)
-        P::template slots<Src>(raw, step, low, high);
-    else
-        P::slots(raw, step, low, high);
-}
+template <class P, class Src> struct SlotsOf {
+    template <class Raw> __device__ static __forceinline__ void read(const Raw &raw, int step, u32 &low, u32 &high) {
+        if constexpr (IsGridPlanes<P>::value)
+            P::template slots<Src>(raw, step, low, high);
+        else
+            P::slots(raw, step, low, high);
+    }
+};
 
 // Linear codes (`OffsetCode`): the offset subtracted exactly in the
 // operand (`O::codes<OFFSET>`), in the s8 bytes (`s8_less`) and in the
@@ -1006,12 +1030,12 @@ struct Twos : TwosCode<8> {
     template <class O, class P, class Src = GlobalPoints>
     __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step, u32 (&a)[4]) {
         u32 low, high;
-        slots_of<P, Src>(raw, step, low, high);
+        SlotsOf<P, Src>::read(raw, step, low, high);
         slot_operands<O>(low, high, a);
     }
     template <class P> __device__ static __forceinline__ S8Pair s8(const typename P::Raw &raw, int step) {
         u32 low, high;
-        slots_of<P, GlobalPoints>(raw, step, low, high);
+        SlotsOf<P, GlobalPoints>::read(raw, step, low, high);
         return slot_s8(low, high);
     }
 };
@@ -1065,7 +1089,7 @@ struct E4M3 {
     template <class O, class P, class Src = GlobalPoints>
     __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step, u32 (&a)[4]) {
         u32 low, high;
-        slots_of<P, Src>(raw, step, low, high);
+        SlotsOf<P, Src>::read(raw, step, low, high);
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             a[i] = operands<O>(prmt(low, high, (u32)i | ((u32)(4 + i) << 8)));
@@ -1552,16 +1576,18 @@ template <class K, class P> struct CarriedPlanes;
 // The GEMM's staged coefficient of k-block `kblock`, group `group`: from
 // a record's words alone, or (`CarriedPlanes`) with row r's staged codes of
 // the k-block.
-template <class K>
-__device__ __forceinline__ void staged_coefficient_of(const K *, const u32 *words, const u8 *, u32, u64 kblock,
-                                                      int group, float &scale, float &bias) {
-    K::staged_coefficient(words, kblock, group, scale, bias);
-}
-template <class K, class P>
-__device__ __forceinline__ void staged_coefficient_of(const CarriedPlanes<K, P> *, const u32 *words, const u8 *codes,
-                                                      u32 r, u64 kblock, int group, float &scale, float &bias) {
-    CarriedPlanes<K, P>::staged_coefficient(words, codes, r, kblock, group, scale, bias);
-}
+template <class K> struct StagedCoefficient {
+    __device__ static __forceinline__ void of(const u32 *words, const u8 *, u32, u64 kblock, int group, float &scale,
+                                              float &bias) {
+        K::staged_coefficient(words, kblock, group, scale, bias);
+    }
+};
+template <class K, class P> struct StagedCoefficient<CarriedPlanes<K, P>> {
+    __device__ static __forceinline__ void of(const u32 *words, const u8 *codes, u32 r, u64 kblock, int group,
+                                              float &scale, float &bias) {
+        CarriedPlanes<K, P>::staged_coefficient(words, codes, r, kblock, group, scale, bias);
+    }
+};
 
 // A packed decoder of code planes P, interpretation C and coefficients K (see
 // the interface above); SCALED selects the scaled GEMM (projection.cuh
@@ -1660,7 +1686,7 @@ struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>
     __device__ static __forceinline__ int word_kblock(int word) { return K::word_kblock(word); }
     __device__ __forceinline__ void staged_coefficient(const u32 *words, const u8 *codes, u32 r, u64 kblock,
                                                        int group, float &scale, float &bias) const {
-        staged_coefficient_of(static_cast<const K *>(nullptr), words, codes, r, kblock, group, scale, bias);
+        StagedCoefficient<K>::of(words, codes, r, kblock, group, scale, bias);
     }
     __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<GROUPS> &c) const {
         K::coefficients(*this, block, q, c);
@@ -1683,10 +1709,53 @@ struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>
         return coded_value<C, BIAS>(code, scale, bias);
     }
     static constexpr int CHUNKS = P::CHUNKS;
+    static constexpr int CHUNK_BYTES = P::CHUNK_BYTES;
     __device__ __forceinline__ const u8 *chunk_source(u64 tile, u64 kblock, u32 chunk) const {
         return P::chunk_source(*this, tile, kblock, chunk);
     }
     __device__ __forceinline__ Raw from_shared(const u8 *staged, u32 lane) const { return P::from_shared(staged, lane); }
+    // The decoder with its tiles renumbered from `tile`: the start of tile
+    // `tile` becomes its start of tile 0, so a code chunk or coefficient word
+    // of tile 0 of the result, at any row within it, is that of tile `tile`.
+    __device__ __forceinline__ Packed at_tile(u64 tile) const {
+        Packed at = *this;
+        at.base = tile_base(tile);
+        return at;
+    }
+    // FP4 tensor operations over NVFP4 weights: the B fragments `b[h]` of a
+    // staged k-block's 8-row halves h of a tile (column g = lane / 4 of the
+    // half, register r values 8t .. 8t + 7 of 32r .. 32r + 31 for t = lane %
+    // 4: half t % 2 of k16 step s = 2r + t / 2, whose byte tt is lane (g, tt)'s
+    // step-s word's nibbles 2 (t % 2) + h and 2 (t % 2) + h + 4) and their
+    // UE4M3 scale words `sb[h]` (column g's four, the k-block's word of the
+    // row's staged record), from one load of each staged word the lane reads:
+    // `chunk` the tile's staged chunks (`from_shared`'s), `records` the staged
+    // records, RECORD bytes a row, of its rows from row0.
+    template <int RECORD>
+    __device__ static __forceinline__ void fp4_fragments(const u8 *chunk, const u8 *records, u32 row0, u64 kblock,
+                                                         u32 lane, u32 (&b)[2][2], u32 (&sb)[2]) {
+        static_assert(OPERANDS && P::BITS == 4 && P::CHUNK_BYTES == 16 && SUPER_WORDS == 4,
+                      "FP4 fragments are NVFP4 weights' 4-bit codes under a UE4M3 scale word a k-block");
+        const u32 g = lane / 4, t = lane % 4;
+        u32 words[2][4];
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int tt = 0; tt < 4; ++tt)
+                words[r][tt] = *reinterpret_cast<const u32 *>(chunk + (g * 4 + tt) * 16 + 4 * (2 * r + t / 2));
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const u32 p = 4 * (2 * (t % 2) + h);
+            b[h][0] = 0u;
+            b[h][1] = 0u;
+#pragma unroll
+            for (int r = 0; r < 2; ++r)
+#pragma unroll
+                for (int tt = 0; tt < 4; ++tt)
+                    b[h][r] |= (((words[r][tt] >> p) & 0xFu) | ((words[r][tt] >> (p + 12)) & 0xF0u)) << (8 * tt);
+            sb[h] = *reinterpret_cast<const u32 *>(records + (row0 + h * 8 + g) * RECORD + (kblock % 4) * 4);
+        }
+    }
 };
 
 // The sign with which the int8 GEMM multiplies weights W's local codes into
@@ -1695,7 +1764,10 @@ template <class W> __host__ __device__ constexpr auto int8_local_of(int) -> decl
     return W::int8_local();
 }
 template <class W> __host__ __device__ constexpr int int8_local_of(long) { return 0; }
-template <class W> __host__ __device__ constexpr int int8_local() { return int8_local_of<W>(0); }
+
+} // namespace detail
+
+template <class W> __host__ __device__ constexpr int int8_local() { return detail::int8_local_of<W>(0); }
 
 // Whether products over weights W take NVFP4 operand rows.
 template <class W, class = void> struct nvfp4_operands {
@@ -1704,6 +1776,8 @@ template <class W, class = void> struct nvfp4_operands {
 template <class W> struct nvfp4_operands<W, decltype(void(W::NVFP4_OPERANDS))> {
     static constexpr bool value = W::NVFP4_OPERANDS;
 };
+
+namespace detail {
 
 // ---------------------------------------------------------------------------
 // Vector-coded weights (the registry's grid codes: iq2xs, iq3xxs, iq2xxs). An
@@ -1971,7 +2045,7 @@ struct GridCodesOf {
 };
 
 // The staged chunk bytes of grid planes whose entries have `high` high
-// bits (`GridPlanes::chunk_bytes`; 0, 2 or 4, so a row's k-block holds 0, 8
+// bits (`GridPlanes::CHUNK_BYTES`; 0, 2 or 4, so a row's k-block holds 0, 8
 // or 16 high bytes): 16, or 8 where those are not whole 16 B.
 __host__ __device__ constexpr int grid_chunk_bytes(int high) {
     return 4 * high % 16 == 0 ? 16 : 8;
@@ -2153,18 +2227,18 @@ template <class G> struct GridPlanes {
         return slot_code(low, high, slot);
     }
     // A tile's k-block is its 16 rows' k-block bytes, row by row, then
-    // their high bits, row by row, in chunks of `chunk_bytes()`: 16, or
+    // their high bits, row by row, in chunks of `CHUNK_BYTES`: 16, or
     // fewer where a row's high bits of a 256-value group (4 HIGH bytes, a
     // multiple of which its high plane is) are not whole 16 B.
-    __host__ __device__ static constexpr int chunk_bytes() { return grid_chunk_bytes(G::high_bits()); }
-    static constexpr int CHUNKS = (16 * KBLOCK_BYTES + 16 * G::high_bits()) / grid_chunk_bytes(G::high_bits());
+    static constexpr int CHUNK_BYTES = grid_chunk_bytes(G::high_bits());
+    static constexpr int CHUNKS = (16 * KBLOCK_BYTES + 16 * G::high_bits()) / CHUNK_BYTES;
     template <class W> __device__ static __forceinline__ const u8 *chunk_source(const W &w, u64 tile, u64 kblock, u32 chunk) {
         if constexpr (G::high_bits() != 0) {
-            constexpr u32 LOW_CHUNKS = 16 * KBLOCK_BYTES / chunk_bytes();
+            constexpr u32 LOW_CHUNKS = 16 * KBLOCK_BYTES / CHUNK_BYTES;
             if (chunk >= LOW_CHUNKS)
                 return w.high.chunk(w.base, w.stride, tile,
-                                    kblock * 16 * high_bytes() + (chunk - LOW_CHUNKS) * chunk_bytes());
-            return w.low.chunk(w.base, w.stride, tile, kblock * 16 * KBLOCK_BYTES + chunk * chunk_bytes());
+                                    kblock * 16 * high_bytes() + (chunk - LOW_CHUNKS) * CHUNK_BYTES);
+            return w.low.chunk(w.base, w.stride, tile, kblock * 16 * KBLOCK_BYTES + chunk * CHUNK_BYTES);
         }
         return w.low.chunk(w.base, w.stride, tile, kblock * 16 * KBLOCK_BYTES + chunk * 16);
     }
@@ -2364,6 +2438,8 @@ template <class G, class K> struct Records {
     static constexpr bool BIAS = K::BIAS;
     static constexpr bool DENSE = false;
     static constexpr bool SCALED_GEMM = true;
+    // The GEMV reads the weight as records (`projection::gemv_records_group`).
+    static constexpr bool GEMV_RECORDS = true;
     // Bytes of one group's entries (16 rows of 64) and of its factors.
     static constexpr u64 ENTRIES = 1024;
     static constexpr u64 FACTORS = 32;
@@ -2371,6 +2447,14 @@ template <class G, class K> struct Records {
     // Where tile `tile`'s records begin: every group's entries, then its
     // factors (`factors`), each row's at its place within the tile.
     __device__ __forceinline__ const u8 *tile_base(u64 tile) const { return base + tile * 16 * stride; }
+    // The records with their tiles renumbered from `tile` (`Packed::at_tile`):
+    // a row within a tile stays the layout's to place (`chunk_source`,
+    // `super_word`), not at a multiple of the row stride.
+    __device__ __forceinline__ Records at_tile(u64 tile) const {
+        Records at = *this;
+        at.base = tile_base(tile);
+        return at;
+    }
     __device__ __forceinline__ const u8 *entries_at(u64 tile, u64 superblock) const {
         return tile_base(tile) + superblock * ENTRIES;
     }
@@ -2675,6 +2759,10 @@ template <class E> struct Dense {
     __device__ __forceinline__ float ordered_at(u64 row, u64 col, u64 cols) const {
         return (row < rows && col < cols) ? element::at<E>(base, row * stride + col * col_stride) : 0.0f;
     }
+    // Element `col` of row `row` (a gather's, <seismic/gather.cuh>).
+    __device__ __forceinline__ float value(u64 row, u64 col) const {
+        return element::at<E>(base, row * stride + col * col_stride);
+    }
 
     static constexpr int GROUP = 32;
     static constexpr int GROUPS = 2;
@@ -2801,6 +2889,7 @@ template <class E> struct Dense {
     }
     // GEMM: nothing is staged; fragments come from `fetch`.
     static constexpr int CHUNKS = 0;
+    static constexpr int CHUNK_BYTES = 16;
     static constexpr int SUPER_WORDS = 0;
     __device__ __forceinline__ const u8 *chunk_source(u64, u64, u32) const { return base; }
     __device__ __forceinline__ const u8 *super_word(u64, u64, int) const { return base; }
@@ -2943,6 +3032,54 @@ struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, L
     typedef typename Select<RECORDS, Records<Codes, K>, Packed<P, Twos, PK, FOLD, false, LOCAL>>::type type;
 };
 
+// The grid whose points weights W decode (`GridPlanes`, `Records`), 0 for
+// weights that read none.
+template <class W, class = void> struct GridOf {
+    static constexpr u32 value = 0;
+};
+template <class W> struct GridOf<W, decltype(void(W::planes::codes::points::GRID))> {
+    static constexpr u32 value = W::planes::codes::points::GRID;
+};
+template <class G, class K> struct GridOf<Records<G, K>> {
+    static constexpr u32 value = G::points::GRID;
+};
+// A list of weight types.
+template <class... Ws> struct List {};
+// Fills the block's copy of each distinct grid the listed weights read.
+template <u32... SEEN> struct PointsStager {
+    __device__ static __forceinline__ void run(List<>) {}
+    template <class W, class... Rest> __device__ static __forceinline__ void run(List<W, Rest...>) {
+        constexpr u32 GRID = GridOf<W>::value;
+        if constexpr (GRID != 0 && ((GRID != SEEN) && ...)) {
+            stage_block_points<GRID>();
+            PointsStager<SEEN..., GRID>::run(List<Rest...>{});
+        } else {
+            PointsStager<SEEN...>::run(List<Rest...>{});
+        }
+    }
+};
+
+} // namespace detail
+
+// The grid weights W decode (its `SEISMIC_GRID_*` id), 0 for weights that
+// read none.
+template <class W> constexpr u32 grid_of = detail::GridOf<W>::value;
+// Where the decoders of weights Ws read grid points when one block runs them
+// all (their `decode`'s and `s8_half`'s `Src`): the block's own copy where any
+// reads a grid (`stage_points` fills it), else global memory. `points_of<>`
+// is global memory.
+template <class... Ws>
+using points_of = typename Select<((grid_of<Ws> != 0) || ...), detail::BlockPoints, detail::GlobalPoints>::type;
+// Fill the block's copy of each distinct grid weights Ws read, then
+// synchronize the block, where any reads one (`points_of`); nothing
+// otherwise. Block-collective.
+template <class... Ws> __device__ __forceinline__ void stage_points() {
+    if constexpr (((grid_of<Ws> != 0) || ...)) {
+        detail::PointsStager<>::run(detail::List<Ws...>{});
+        __syncthreads();
+    }
+}
+
 // One row's values at k = 64*kb + 16*s + {2t, 2t+1, 2t+8, 2t+9} (s = 0..3)
 // into v[4*s + j]: the part of the row held by the lane chunk of lane
 // 4*(row % 8) + t, decoded with the row's coefficients.
@@ -2961,6 +3098,36 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
             w.coefficient(row, kb, (int)((16 * s + offsets[j]) / W::GROUP), scale, bias);
             v[4 * s + j] = W::apply(w.code(raw, s, slots[j]), scale, bias);
         }
+    }
+}
+
+namespace detail {
+// The column of value 4 s + j of work item (k-block `kb`, column pair `t`),
+// counted from the row's first: k-block column 16 s + {2t, 2t + 1, 2t + 8,
+// 2t + 9}[j] (`row_values16`'s). The one statement of a row's visit order.
+__device__ __forceinline__ u64 item16_column(u64 kb, u32 t, int s, int j) {
+    return kb * 64 + 16 * s + 2 * t + (j & 1) + 8 * (j >> 1);
+}
+} // namespace detail
+
+// `visit(column, value)` for every column of row `row` of `w` from column
+// `first` (a multiple of 64) for `width` columns (a multiple of 64), `column`
+// counted from `first`, by work items `start`, `start + step`, ...: item
+// (k-block, column pair t) holds 16 values (`row_values16`), visited in
+// `detail::item16_column` order.
+template <class W, class Visit>
+__device__ __forceinline__ void row_items16(const W &w, u64 row, u64 first, u64 width, u64 start, u64 step,
+                                            Visit visit) {
+    for (u64 item = start; item < width / 64 * 4; item += step) {
+        const u64 kb = item / 4;
+        const u32 t = (u32)(item % 4);
+        float values[16];
+        row_values16(w, row, first / 64 + kb, t, values);
+#pragma unroll
+        for (int s = 0; s < 4; ++s)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                visit(detail::item16_column(kb, t, s, j), values[4 * s + j]);
     }
 }
 
@@ -3007,7 +3174,7 @@ __device__ __forceinline__ void row_packet8(const W &w, u64 row, u64 rows, u64 p
 // A packed element's coefficients component (`packets::Direct`,
 // `packets::Hier`) for a tensor prefix `P`, in any row layout.
 #define PACKETS_COEFFICIENTS(P)                                                                          \
-    packets::CoefficientsOf<ELEMENT_CAT(P, _COEFF), ELEMENT_CAT(P, _COEFF_SCALE), ELEMENT_CAT(P, _COEFF_BIAS),  \
+    packets::detail::CoefficientsOf<ELEMENT_CAT(P, _COEFF), ELEMENT_CAT(P, _COEFF_SCALE), ELEMENT_CAT(P, _COEFF_BIAS),  \
                             ELEMENT_CAT(P, _COEFF_BIAS_SIGN), ELEMENT_CAT(P, _COEFF_GROUP),                    \
                             ELEMENT_CAT(P, _LOGICAL_GROUP), ELEMENT_CAT(P, _COEFF_FACTOR_GROUP),               \
                             ELEMENT_CAT(P, _COEFF_EXPONENT),                                                   \
@@ -3019,7 +3186,7 @@ __device__ __forceinline__ void row_packet8(const W &w, u64 row, u64 rows, u64 p
 
 // A packed element's decoder type, and its value at `pointer`.
 #define PACKETS_DECODER(P)                                                                               \
-    packets::Decoder<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS), \
+    packets::detail::Decoder<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS), \
                      ELEMENT_CAT(P, _CODES_OFFSET), ELEMENT_CAT(P, _CODES_TABLE), ELEMENT_CAT(P, _CODES_GRID),     \
                      ELEMENT_CAT(P, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(P, _CODES_GRID_LANES),                  \
                      ELEMENT_CAT(P, _CODES_GRID_SIGNS), ELEMENT_CAT(P, _CODES_GRID_DELTA),                       \
@@ -3031,10 +3198,10 @@ __device__ __forceinline__ void row_packet8(const W &w, u64 row, u64 rows, u64 p
                      ELEMENT_CAT(P, _FORM_S8_ENTRIES) != 0>::type
 #define PACKETS_MAKE(TYPE, P, pointer)                                                                   \
     TYPE {                                                                                               \
-        packets::Rows {                                                                                  \
+        packets::detail::Rows {                                                                          \
             (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES),                            \
-                packets::CodePlane{ELEMENT_CAT(P, _ROW_CODES), (packets::u32)ELEMENT_CAT(P, _ROW_CODES_BYTES)}, \
-                packets::CodePlane{ELEMENT_CAT(P, _ROW_HIGH), (packets::u32)ELEMENT_CAT(P, _ROW_HIGH_BYTES)},   \
+                packets::detail::CodePlane{ELEMENT_CAT(P, _ROW_CODES), (packets::u32)ELEMENT_CAT(P, _ROW_CODES_BYTES)}, \
+                packets::detail::CodePlane{ELEMENT_CAT(P, _ROW_HIGH), (packets::u32)ELEMENT_CAT(P, _ROW_HIGH_BYTES)},   \
                 ELEMENT_CAT(P, _ROW_SCALES), ELEMENT_CAT(P, _ROW_SUPERS), ELEMENT_CAT(P, _ROW_SUPERS_BYTES) \
         }                                                                                                \
     }
@@ -3047,13 +3214,13 @@ __device__ __forceinline__ void row_packet8(const W &w, u64 row, u64 rows, u64 p
 // Dense weights: the tensor's rows (extent 0) at its row stride (stride 0,
 // elements), or the single row of a rank-1 [K] vector.
 #define PACKETS_MAKE_DENSE_1(P, pointer)                                                                 \
-    packets::Dense<ELEMENT_OF(P)> {                                                                      \
+    packets::detail::Dense<ELEMENT_OF(P)> {                                                                      \
         (const packets::u8 *)(pointer),                                                                  \
             (packets::u64)ELEMENT_CAT(P, _EXTENT_0) * ELEMENT_CAT(P, _STRIDE_0), 1ull,                   \
             (packets::u64)ELEMENT_CAT(P, _STRIDE_0)                                                      \
     }
 #define PACKETS_MAKE_DENSE_2(P, pointer)                                                                 \
-    packets::Dense<ELEMENT_OF(P)> {                                                                      \
+    packets::detail::Dense<ELEMENT_OF(P)> {                                                                      \
         (const packets::u8 *)(pointer), (packets::u64)ELEMENT_CAT(P, _STRIDE_0),                         \
             (packets::u64)ELEMENT_CAT(P, _EXTENT_0), (packets::u64)ELEMENT_CAT(P, _STRIDE_1)             \
     }
@@ -3061,28 +3228,22 @@ __device__ __forceinline__ void row_packet8(const W &w, u64 row, u64 rows, u64 p
 #define PACKETS_MAKE_DENSE(P, pointer) PACKETS_MAKE_DENSE_RANK_(ELEMENT_CAT(P, _RANK), P, pointer)
 
 // Matrix `index` of a stacked rank-3 [B, N, K] tensor (such as expert
-// weights [E, N, K]), at `index` matrices' bytes from the tensor's base, the
-// one statement of a matrix's bytes (a stacked tensor's record): dense, its
-// matrix stride (stride 0, elements), N rows at row stride stride 1 within
-// it; packed, its N rows padded to whole row tiles at the layout's row
-// stride.
-#define PACKETS_DENSE_MATRIX_BYTES(P) ((packets::u64)ELEMENT_CAT(P, _STRIDE_0) * element::Of<ELEMENT_KIND(P)>::type::bytes)
-#define PACKETS_PACKED_MATRIX_BYTES(P)                                                                   \
-    (((packets::u64)ELEMENT_CAT(P, _EXTENT_1) + ELEMENT_CAT(P, _TILE_ROWS) - 1) /                        \
-     ELEMENT_CAT(P, _TILE_ROWS) * ELEMENT_CAT(P, _TILE_ROWS) * (packets::u64)ELEMENT_CAT(P, _ROW_STRIDE_BYTES))
+// weights [E, N, K]), at `index` matrices' bytes (`ELEMENT_MATRIX_BYTES`, a
+// stacked tensor's record) from the tensor's base: dense, N rows at row
+// stride stride 1 within it; packed, its rows at the layout's row stride.
 #define PACKETS_DENSE_MATRIX(P, pointer, index)                                                          \
-    packets::Dense<ELEMENT_OF(P)> {                                                                      \
-        (const packets::u8 *)(pointer) + (packets::u64)(index) * PACKETS_DENSE_MATRIX_BYTES(P),          \
+    packets::detail::Dense<ELEMENT_OF(P)> {                                                                      \
+        (const packets::u8 *)(pointer) + (packets::u64)(index) * ELEMENT_MATRIX_BYTES(P),                \
             (packets::u64)ELEMENT_CAT(P, _STRIDE_1), (packets::u64)ELEMENT_CAT(P, _EXTENT_1),            \
             (packets::u64)ELEMENT_CAT(P, _STRIDE_2)                                                      \
     }
 #define PACKETS_PACKED_MATRIX(P, pointer, index)                                                         \
-    ((const packets::u8 *)(pointer) + (packets::u64)(index) * PACKETS_PACKED_MATRIX_BYTES(P))
+    ((const packets::u8 *)(pointer) + (packets::u64)(index) * ELEMENT_MATRIX_BYTES(P))
 // The bytes of one row of a rank-2 [rows, K] tensor: dense, its row stride
-// (stride 0, elements); packed, the layout's row stride. Row r's decoder
-// value is `KERNEL_Wn_AT` at r rows' bytes from the base, for a packed r on a
-// whole row tile (`_TILE_ROWS`).
-#define PACKETS_DENSE_ROW_BYTES(P) PACKETS_DENSE_MATRIX_BYTES(P)
+// (stride 0, elements: `ELEMENT_MATRIX_BYTES`); packed, the layout's row
+// stride. Row r's decoder value is `KERNEL_Wn_AT` at r rows' bytes from the
+// base, for a packed r on a whole row tile (`_TILE_ROWS`).
+#define PACKETS_DENSE_ROW_BYTES(P) ELEMENT_MATRIX_BYTES(P)
 #define PACKETS_PACKED_ROW_BYTES(P) ((packets::u64)ELEMENT_CAT(P, _ROW_STRIDE_BYTES))
 
 // Slot bindings. Each bound slot must name a dense tensor or a tensor in the
@@ -3093,10 +3254,17 @@ __device__ __forceinline__ void row_packet8(const W &w, u64 row, u64 rows, u64 p
 // dense weights, which have no forms), as a constant expression of the slot
 // `KERNEL_Wn`.
 #define PACKETS_FORM_INT8(slot) ELEMENT_HAS(slot, _FORM_INT8)
+// The decoder value of slot `slot` (`KERNEL_Wn`, pasted unexpanded onto its
+// `_MATRIX`) over the record at `base`, a stacked tensor's matrix: its rows
+// 0.. from there.
+#define PACKETS_RECORD(slot, base) slot##_MATRIX(base, 0)
+// The decoder value of slot `slot` over matrix `matrix`, a `slab::Matrix`
+// naming a record in an address table: its record's region, then rows 0..
+#define PACKETS_MATRIX(slot, matrix) slot##_MATRIX(slab::region((matrix).stack, (matrix).record), 0)
 
 #if defined(KERNEL_W0)
 #if ELEMENT_HAS(KERNEL_W0, _KIND_DENSE)
-namespace packets { typedef Dense<ELEMENT_OF(KERNEL_W0)> W0; }
+namespace packets { typedef detail::Dense<ELEMENT_OF(KERNEL_W0)> W0; }
 #define KERNEL_W0_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W0, pointer)
 #elif !ELEMENT_HAS(KERNEL_W0, _LAYOUT_MMA16)
 #error "KERNEL_W0 must be dense or bound in the mma16 layout"
@@ -3110,11 +3278,11 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W0) W0; }
 #endif
 #if ELEMENT_HAS(KERNEL_W0, _KIND_DENSE)
 #define KERNEL_W0_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W0, pointer, index)
-#define KERNEL_W0_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W0)
+#define KERNEL_W0_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W0)
 #define KERNEL_W0_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W0)
 #else
 #define KERNEL_W0_MATRIX(pointer, index) KERNEL_W0_AT(PACKETS_PACKED_MATRIX(KERNEL_W0, pointer, index))
-#define KERNEL_W0_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W0)
+#define KERNEL_W0_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W0)
 #define KERNEL_W0_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W0)
 #endif
 // The slot's operand recipe (`operands(W)`): whether products over it take
@@ -3124,7 +3292,7 @@ namespace packets { constexpr bool W0_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W0, _O
 
 #if defined(KERNEL_W1)
 #if ELEMENT_HAS(KERNEL_W1, _KIND_DENSE)
-namespace packets { typedef Dense<ELEMENT_OF(KERNEL_W1)> W1; }
+namespace packets { typedef detail::Dense<ELEMENT_OF(KERNEL_W1)> W1; }
 #define KERNEL_W1_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W1, pointer)
 #elif !ELEMENT_HAS(KERNEL_W1, _LAYOUT_MMA16)
 #error "KERNEL_W1 must be dense or bound in the mma16 layout"
@@ -3138,11 +3306,11 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W1) W1; }
 #endif
 #if ELEMENT_HAS(KERNEL_W1, _KIND_DENSE)
 #define KERNEL_W1_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W1, pointer, index)
-#define KERNEL_W1_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W1)
+#define KERNEL_W1_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W1)
 #define KERNEL_W1_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W1)
 #else
 #define KERNEL_W1_MATRIX(pointer, index) KERNEL_W1_AT(PACKETS_PACKED_MATRIX(KERNEL_W1, pointer, index))
-#define KERNEL_W1_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W1)
+#define KERNEL_W1_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W1)
 #define KERNEL_W1_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W1)
 #endif
 namespace packets { constexpr bool W1_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W1, _OPERANDS_NVFP4); }
@@ -3150,7 +3318,7 @@ namespace packets { constexpr bool W1_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W1, _O
 
 #if defined(KERNEL_W2)
 #if ELEMENT_HAS(KERNEL_W2, _KIND_DENSE)
-namespace packets { typedef Dense<ELEMENT_OF(KERNEL_W2)> W2; }
+namespace packets { typedef detail::Dense<ELEMENT_OF(KERNEL_W2)> W2; }
 #define KERNEL_W2_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W2, pointer)
 #elif !ELEMENT_HAS(KERNEL_W2, _LAYOUT_MMA16)
 #error "KERNEL_W2 must be dense or bound in the mma16 layout"
@@ -3164,11 +3332,11 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W2) W2; }
 #endif
 #if ELEMENT_HAS(KERNEL_W2, _KIND_DENSE)
 #define KERNEL_W2_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W2, pointer, index)
-#define KERNEL_W2_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W2)
+#define KERNEL_W2_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W2)
 #define KERNEL_W2_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W2)
 #else
 #define KERNEL_W2_MATRIX(pointer, index) KERNEL_W2_AT(PACKETS_PACKED_MATRIX(KERNEL_W2, pointer, index))
-#define KERNEL_W2_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W2)
+#define KERNEL_W2_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W2)
 #define KERNEL_W2_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W2)
 #endif
 namespace packets { constexpr bool W2_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W2, _OPERANDS_NVFP4); }
@@ -3176,7 +3344,7 @@ namespace packets { constexpr bool W2_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W2, _O
 
 #if defined(KERNEL_W3)
 #if ELEMENT_HAS(KERNEL_W3, _KIND_DENSE)
-namespace packets { typedef Dense<ELEMENT_OF(KERNEL_W3)> W3; }
+namespace packets { typedef detail::Dense<ELEMENT_OF(KERNEL_W3)> W3; }
 #define KERNEL_W3_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W3, pointer)
 #elif !ELEMENT_HAS(KERNEL_W3, _LAYOUT_MMA16)
 #error "KERNEL_W3 must be dense or bound in the mma16 layout"
@@ -3190,11 +3358,11 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W3) W3; }
 #endif
 #if ELEMENT_HAS(KERNEL_W3, _KIND_DENSE)
 #define KERNEL_W3_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W3, pointer, index)
-#define KERNEL_W3_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W3)
+#define KERNEL_W3_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W3)
 #define KERNEL_W3_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W3)
 #else
 #define KERNEL_W3_MATRIX(pointer, index) KERNEL_W3_AT(PACKETS_PACKED_MATRIX(KERNEL_W3, pointer, index))
-#define KERNEL_W3_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W3)
+#define KERNEL_W3_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W3)
 #define KERNEL_W3_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W3)
 #endif
 namespace packets { constexpr bool W3_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W3, _OPERANDS_NVFP4); }

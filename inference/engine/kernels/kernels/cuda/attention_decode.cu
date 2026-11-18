@@ -1,5 +1,6 @@
 // Sink logits (SK): the merge adds each head's sink to its merged denominator
 // (`attention::normalizer`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ATTENTION_SINKS SEISMIC_DIM_SK
 #define ATTENTION_SINKS_BUFFER reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SINKS))
 #define ATTENTION_SINK_AT(query_head) (static_cast<attention::u64>(query_head) * SEISMIC_SINKS_STRIDE_1)

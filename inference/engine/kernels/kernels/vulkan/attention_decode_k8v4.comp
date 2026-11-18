@@ -53,6 +53,7 @@
 #define ATTENTION_SINK_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_SINKS)
 // Both forms' shared code (an entry's includes expand once, whatever the
 // branch).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/attention/history.glsl"
 
 #if SEISMIC_TUNE_MATRIX
@@ -79,7 +80,7 @@ void attention_decode_k8v4_merge() { prefill_decode_merge(); }
 #else
 
 // The prepared queries pack two activation elements per shared word.
-#if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "attention_decode_k8v4 requires a bf16 or f16 activation"
 #endif
 
@@ -251,7 +252,7 @@ void attention_decode_k8v4_partial() {
     // This subgroup's staging tile (a uvec4 index).
     const uint staging = (sums + G * HISTORY_PAIRS + 3u) / 4u + sg * ATTENTION_KEYS * HISTORY_STAGE_PITCH;
     const float query_scale = scale * ATTENTION_LOG2E;
-    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
+    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
     if (DECODE_KEYWISE) {
         // Each head's prepared queries as F32, and their group sums.
         for (uint head = sg; head < G; head += simds) {
@@ -261,7 +262,7 @@ void attention_decode_k8v4_partial() {
                 row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), x);
             float sum = 0.0;
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
-                const float q = element_round(ELEMENT_ACT, x[i]) * query_scale;
+                const float q = element_round(ACTIVATION_A, x[i]) * query_scale;
                 seismic_shared_f32[prepared + head * W + lane * E + i] = q;
                 sum += q;
             }
@@ -290,7 +291,7 @@ void attention_decode_k8v4_partial() {
                     high[i] = 0.0;
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                 seismic_shared_u32[prepared + pair * W + lane * E + i] =
-                    element_store(ELEMENT_ACT, low[i]) | (element_store(ELEMENT_ACT, high[i]) << 16u);
+                    element_store(ACTIVATION_A, low[i]) | (element_store(ACTIVATION_A, high[i]) << 16u);
         }
     }
     barrier();
@@ -308,7 +309,7 @@ void attention_decode_k8v4_partial() {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
             if (!DECODE_KEYWISE) {
                 const uint word = seismic_shared_u32[prepared + (head / 2u) * W + lane * E + i];
-                q[g][i] = element_load(ELEMENT_ACT, (word >> (16u * (head % 2u))) & 0xffffu) * query_scale;
+                q[g][i] = element_load(ACTIVATION_A, (word >> (16u * (head % 2u))) & 0xffffu) * query_scale;
                 sum += q[g][i];
             }
             result[g][i] = 0.0;

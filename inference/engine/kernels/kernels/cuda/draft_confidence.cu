@@ -1,6 +1,7 @@
 // draft_confidence: one block per row reduces weight · [features ; memory] +
 // bias and marks the row's selection declined (status 3) when its sigmoid is
 // below the threshold.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 #include "lib/core/reduce.cuh"
 
@@ -17,11 +18,11 @@ extern "C" __global__ void draft_confidence(SEISMIC_KERNEL_PARAMS) {
     float partial = 0.0f;
     for (u64 i = threadIdx.x; i < width; i += blockDim.x)
         partial = seismic_fma_rn(
-            element::at<element::Act>(features, row * SEISMIC_FEATURES_STRIDE_0 + i * SEISMIC_FEATURES_STRIDE_1),
+            element::at<activation::Act>(features, row * SEISMIC_FEATURES_STRIDE_0 + i * SEISMIC_FEATURES_STRIDE_1),
             weight[i * SEISMIC_WEIGHT_STRIDE_0], partial);
     for (u64 i = threadIdx.x; i < rank; i += blockDim.x)
         partial = seismic_fma_rn(
-            element::at<element::Act>(memory, row * SEISMIC_MEMORY_STRIDE_0 + i * SEISMIC_MEMORY_STRIDE_1),
+            element::at<activation::Act>(memory, row * SEISMIC_MEMORY_STRIDE_0 + i * SEISMIC_MEMORY_STRIDE_1),
             weight[(width + i) * SEISMIC_WEIGHT_STRIDE_0], partial);
     const float score = reduce::group_sum(partial, partials) + bias[0];
     if (threadIdx.x == 0 && 1.0f / (1.0f + expf(-score)) < __uint_as_float((unsigned)SEISMIC_PARAM_THRESHOLD))

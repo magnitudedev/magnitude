@@ -48,6 +48,7 @@
 // The index-list source (KS > 0): its state follows the attend grid's key
 // partitions (its z extent) in the partials and statistics scratch.
 #define PREFILL_PICKS (SEISMIC_DIM_KS != 0)
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/attention/prefill.glsl"
 // ceil(SPLIT_GROUPS / (tiles x KV)), at least 1: the numerator is a tuning
 // constant plus the divisor less one, so the quotient is below 2^32.

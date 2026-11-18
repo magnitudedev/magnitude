@@ -10,6 +10,7 @@
 //
 // Dynamic extents and parameters read `seismic_words`.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/head.h"
 #include "lib/core/rotary.h"
@@ -23,7 +24,7 @@ typedef rotary::layout<KEYS_W, SEISMIC_DIM_P, (SEISMIC_DIM_RT != 0 ? SEISMIC_DIM
     key_layout;
 
 kernel void indexer_keys(
-    device const element::Act::native *key [[buffer(SEISMIC_BUFFER_KEY)]],
+    device const activation::Act::native *key [[buffer(SEISMIC_BUFFER_KEY)]],
     device const float *key_norm [[buffer(SEISMIC_BUFFER_KEY_NORM)]],
     device const int *latent_rows [[buffer(SEISMIC_BUFFER_LATENT_ROWS)]],
     device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
@@ -48,11 +49,11 @@ kernel void indexer_keys(
     const rounding::Rounding trained = rounding::of(uint(SEISMIC_PARAM_BLOCK), uint(SEISMIC_PARAM_ELEMENT),
         uint(SEISMIC_PARAM_SCALE), uint(SEISMIC_PARAM_AMAX_FLOOR));
     head::rms_norm(x, key_norm, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
-    rounding::hold_lanes<element::Act>(x, trained);
+    rounding::hold_lanes<activation::Act>(x, trained);
     const key_layout::table table(coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes,
         lane);
     key_layout::rotate(table, lane, x);
-    rounding::hold_lanes<element::Act>(x, trained);
+    rounding::hold_lanes<activation::Act>(x, trained);
     rounding::round_lanes<KEYS_E>(x, trained);
     const element::Out<element::F32> target = slab::out_row(keys, ulong(destination), ulong(SEISMIC_PARAM_SLAB_ROWS),
         KEYS_W);

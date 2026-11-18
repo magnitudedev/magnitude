@@ -1,6 +1,7 @@
 // attention_output: the output projection of the gated attention rows plus
 // the residual join, the forms of the `dense` projection
 // (`lib/projection/operator.cuh`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
 #include "lib/projection/operator.cuh"
 

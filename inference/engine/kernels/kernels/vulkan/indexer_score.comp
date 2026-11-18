@@ -12,6 +12,7 @@
 // into one accumulator per head, so each head's dot is the ascending FMA
 // chain of the portable body; s = scale * sum_h relu(dot_h) * w_h, heads
 // ascending. Every score past the list is -inf.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include <seismic/element.glsl>
 #include <seismic/slab.glsl>
 #include "lib/core/activation.glsl"
@@ -60,7 +61,7 @@ void indexer_score() {
     for (uint head = simd; head < SCORE_H; head += SEISMIC_SUBGROUPS) {
         float x[LANE_E];
         [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-            x[i] = element_at(ELEMENT_ACT, query, row * SEISMIC_QUERY_STRIDE_0 + uint64_t(head) * SEISMIC_QUERY_STRIDE_1
+            x[i] = element_at(ACTIVATION_A, query, row * SEISMIC_QUERY_STRIDE_0 + uint64_t(head) * SEISMIC_QUERY_STRIDE_1
                 + uint64_t(lane * LANE_E + i) * SEISMIC_QUERY_STRIDE_2);
         // A rounded query is rounded from its norm and rotation held in A.
         if (SEISMIC_DIM_NQ != 0) {
@@ -103,7 +104,7 @@ void indexer_score() {
     float total = 0.0;
     [[unroll]] for (uint head = 0u; head < SCORE_H; ++head) {
         const float weight = SEISMIC_DIM_HW != 0
-            ? element_at(ELEMENT_ACT, head_weights, row * SEISMIC_HEAD_WEIGHTS_STRIDE_0 + uint64_t(head) * SEISMIC_HEAD_WEIGHTS_STRIDE_1)
+            ? element_at(ACTIVATION_A, head_weights, row * SEISMIC_HEAD_WEIGHTS_STRIDE_0 + uint64_t(head) * SEISMIC_HEAD_WEIGHTS_STRIDE_1)
             : 1.0;
         total = total + max(dot[head], 0.0) * weight;
     }

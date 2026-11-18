@@ -2,6 +2,7 @@
 // a sublayer's normed input rows within each draft block; one invocation per
 // output element over a grid-stride loop, summing its taps in offset order.
 // The Vulkan form of `metal/draft_convolve_input.metal`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 void draft_convolve_input() {
@@ -23,7 +24,7 @@ void draft_convolve_input() {
                 + element_f32_at(dynamic + (row * SEISMIC_DYNAMIC_STRIDE_0 + offset * SEISMIC_DYNAMIC_STRIDE_2
                     + group * SEISMIC_DYNAMIC_STRIDE_3) * 4ul);
             sum = seismic_fma_rn(coefficient,
-                element_at(ELEMENT_ACT, normed, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1),
+                element_at(ACTIVATION_A, normed, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1),
                 sum);
         }
         out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);

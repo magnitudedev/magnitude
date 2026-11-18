@@ -1,49 +1,34 @@
 // General expert selection (`routed_select`) on the `dense` projection
 // operator, single over `router` in the CPU 8-lane reference order; `norm` and
 // `router_norm` share the row's RMS inverse.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 // The projection's decoding launches stage their weights' tables (`packets.glsl`).
-#define PACKETS_STAGED_TABLES 1
+#define PACKETS_CONFIG_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #include "lib/projection/projection.glsl"
 #define SELECT_E uint(SEISMIC_DIM_E)
 #include "lib/routed/selection.glsl"
 
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define SELECT_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define SELECT_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define SELECT_NORM ELEMENT_BF16
-#else
-#error "routed norm must be dense"
-#endif
-#if defined(SEISMIC_ROUTER_NORM_REPRESENTATION_F32)
-#define SELECT_ROUTER_NORM ELEMENT_F32
-#elif defined(SEISMIC_ROUTER_NORM_REPRESENTATION_F16)
-#define SELECT_ROUTER_NORM ELEMENT_F16
-#elif defined(SEISMIC_ROUTER_NORM_REPRESENTATION_BF16)
-#define SELECT_ROUTER_NORM ELEMENT_BF16
-#else
-#error "routed router norm must be dense"
-#endif
+#define SELECT_NORM ELEMENT_OF(SEISMIC_NORM)
+#define SELECT_ROUTER_NORM ELEMENT_OF(SEISMIC_ROUTER_NORM)
 
 #define SELECT_H uint(SEISMIC_DIM_H)
 
 projection_prologue projected_input(uint g) {
-    return projection_ordered_rms(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+    return projection_ordered_rms(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_ROUTER_NORM),
         SEISMIC_ROUTER_NORM_STRIDE_0, SELECT_ROUTER_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), SELECT_H, 0ul);
 }
 
 projection_prologue select_norm_input() {
-    return projection_ordered_rms(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+    return projection_ordered_rms(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
         SEISMIC_NORM_STRIDE_0, SELECT_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), SELECT_H, 0ul);
 }
 
 projection_prologue projected_rows(uint g) {
-    return projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
+    return projection_plain(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
         SELECT_H, 1ul, SELECT_H, 0ul);
 }
 
@@ -78,7 +63,7 @@ void select_publish_decode_rows() {
 void routed_select_ordered_stage() {
     const uint row = gl_WorkGroupID.x;
     const float inv = projection_ordered_stage_row(projected_input(0u), row,
-        out_over_scratch(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)), SELECT_H, 1ul);
+        out_over_scratch(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)), SELECT_H, 1ul);
     const projection_prologue norm_in = select_norm_input();
     for (uint c = gl_LocalInvocationIndex; c < SELECT_H; c += gl_WorkGroupSize.x) {
         out_put(SEISMIC_RESULT_0_OUT,

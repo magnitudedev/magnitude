@@ -15,6 +15,7 @@
 //           in the block plane, publishing the latent, its block row and the
 //           origin coordinates. Other rows publish a zero latent, block row -1
 //           and zero coordinates.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include <seismic/element.glsl>
 #include <seismic/slab.glsl>
 #include "lib/core/activation.glsl"

@@ -2,6 +2,7 @@
 // through the `dense` projection (single). Group g of a grouped weight is the
 // projection of the source columns g * K .., through weight rows g * N ..,
 // into output columns g * N .. (`PROJECTION_OPERANDS(group)`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
@@ -11,7 +12,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) published;
 // The weight's operand rows (the source rows, or NVFP4 operands): the GEMV
 // row classes form them while staging, the stage launch into the scratch
@@ -48,17 +49,17 @@ typedef projection::operands<NVFP4> Operands;
 // output columns and `w` its weight rows.
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_N), k = uint(SEISMIC_DIM_K); \
-    const projection::Plain<activation, projection::AllRows> raw{source                 \
-        + ulong(group) * k * SEISMIC_SOURCE_STRIDE_1 * sizeof(typename activation::storage), \
+    const projection::Plain<activation_element, projection::AllRows> raw{source         \
+        + ulong(group) * k * SEISMIC_SOURCE_STRIDE_1 * sizeof(typename activation_element::storage), \
         SEISMIC_SOURCE_STRIDE_0, SEISMIC_SOURCE_STRIDE_1, k, {}};                       \
-    const projection::Plain<activation, projection::AllRows> in = NVFP4                 \
-        ? projection::Plain<activation, projection::AllRows>{staged, k, 1, k, {}}       \
+    const projection::Plain<activation_element, projection::AllRows> in = NVFP4         \
+        ? projection::Plain<activation_element, projection::AllRows>{staged, k, 1, k, {}}       \
         : raw;                                                                          \
     const auto out = projection::scaling<(SEISMIC_DIM_WS != 0)>::wrap(                  \
         projection::Store<published>{element::Out<published>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
             ulong(group) * n},                                                          \
         projection::scale_factor(weight_scale, SEISMIC_DIM_WS, 0, 0), 1.0f);            \
-    projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k, nullptr, ulong(group) * n}
+    projection::Weights<packets::W0> w{{weight, KERNEL_W0_LAYOUT(k), k}, nullptr, ulong(group) * n}
 
 #define PROJECTION_GEMV_INPUT(x) const auto x = raw
 #define PROJECTION_INT8_SCRATCH \

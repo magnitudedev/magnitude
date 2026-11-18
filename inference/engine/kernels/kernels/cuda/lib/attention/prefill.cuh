@@ -155,7 +155,7 @@ struct F16Operands {
 // their precision (a bf16 rounding costs up to a code step); activation
 // values enter exactly within the codec's range.
 template <class History> struct Operands;
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
+#if ELEMENT_KIND(KERNEL_A) == ELEMENT_BF16
 template <> struct Operands<DenseReads> : Bf16Operands {};
 template <> struct Operands<DenseHistory> : Bf16Operands {};
 #else

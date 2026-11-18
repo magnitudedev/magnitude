@@ -19,7 +19,7 @@ kernel void packing_bound(device const uchar *weight [[buffer(SEISMIC_BUFFER_WEI
     typedef projection::packing_codes<packets::W0> coded;
     static_assert(coded::folds == 1 || coded::folds == 2, "a packing bound is of a format's packed codes");
     const uint k = uint(SEISMIC_DIM_K), rows = uint(SEISMIC_DIM_N);
-    const projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k};
+    const projection::Weights<packets::W0> w{{weight, KERNEL_W0_LAYOUT(k), k}};
     // Each run's largest sum of squares over this thread's rows: a run's
     // sum is at most 32 x 128^2, so it is exact in 32 bits and in F32.
     uint2 largest = uint2(0u);

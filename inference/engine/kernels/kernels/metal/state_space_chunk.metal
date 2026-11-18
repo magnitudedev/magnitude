@@ -15,6 +15,7 @@
 // at most STATE_SPACE_SEQUENTIAL_ROWS rows are not chunked and the rows after
 // a stop row advance row-sequentially from the published state, both with
 // `state_space_step`'s bits. ROWS never changes result bits.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define SSC_LANE_ROWS (SEISMIC_TUNE_ROWS / 4)
 // The sequential advance's span (as the step's).
 #define SSC_SPAN (2048 / SEISMIC_DIM_N)
@@ -43,7 +44,7 @@
 
 #define STATE_SPACE_CHUNK_OPERANDS                                                           \
     const state_space::Operands in{projection, convolution, convolution_bias, rate, time_bias, skip, window, \
-        state, tape, element::Out<element::Act>(mixed), seismic_words};                      \
+        state, tape, element::Out<activation::Act>(mixed), seismic_words};                   \
     const versions::Slots slots{segments, stop, previous_bank, previous_tape, following_bank}
 
 using state_space::COLUMNS;

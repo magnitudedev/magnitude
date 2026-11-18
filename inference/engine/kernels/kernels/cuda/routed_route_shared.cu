@@ -1,6 +1,7 @@
 // Decode routing with the shared expert's gate/up expansion (`routed_route_shared`)
 // on the `dense` projection operator, segmented over
 // `(router, shared_router, (shared_gate, shared_up))`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #define KERNEL_W1 SEISMIC_SHARED_ROUTER
 #define KERNEL_W2 SEISMIC_SHARED_GATE
@@ -15,7 +16,7 @@ constexpr bool NVFP4_SHARED =
     projection::OperandRecipe<packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4>::NVFP4;
 using UnordPro = projection::Operands<NVFP4_SHARED, Raw>;
 using LogitStore = projection::Store<element::F32>;
-using SharedEpi = projection::SiluMul<element::Act>;
+using SharedEpi = projection::SiluMul<activation::Act>;
 using Segments = projection::op::SegmentSet<0, projection::op::Types<packets::W0, packets::W1, packets::W2, packets::W3>,
                                             projection::op::Types<LogitStore, LogitStore, SharedEpi>,
                                             projection::op::empty_mask(SEISMIC_DIM_E, 1, SEISMIC_DIM_S)>;

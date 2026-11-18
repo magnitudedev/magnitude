@@ -2,9 +2,10 @@
 // `metal/routed_scatter.metal`: block (x, m) owns columns of row m, each
 // thread one column. The grouped expert outputs of the row are unpermuted
 // and weighted in slot order, then added to `base` and published in R.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 
-using element::Act;
+using activation::Act;
 using element::u64;
 
 extern "C" __global__ void routed_scatter(SEISMIC_KERNEL_PARAMS) {

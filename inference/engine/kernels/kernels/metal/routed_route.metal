@@ -1,5 +1,6 @@
 // Routing (`routed_route`) on the `dense` projection operator, segmented over
 // `(router, shared_router)` in the CPU 8-lane reference order.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #define KERNEL_W1 SEISMIC_SHARED_ROUTER
 #define PROJECTION_N0 SEISMIC_DIM_E
@@ -7,7 +8,7 @@
 #include "lib/projection/projection.h"
 #include "lib/routed/route.h"
 
-typedef element::Act Act;
+typedef activation::Act Act;
 typedef ELEMENT_OF(SEISMIC_NORM) Norm;
 
 #define PROJECTION_ARGUMENTS                                                                \
@@ -39,8 +40,8 @@ typedef ELEMENT_OF(SEISMIC_NORM) Norm;
     const projection::Plain<Act, projection::AllRows> in{                                   \
         element::Out<Act>(normalized_cells).stored(), \
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, k, {}};                       \
-    const projection::Weights<packets::W0> w0{router, KERNEL_W0_LAYOUT(k), k};              \
-    const projection::Weights<packets::W1> w1{shared_router, KERNEL_W1_LAYOUT(k), k};       \
+    const projection::Weights<packets::W0> w0{{router, KERNEL_W0_LAYOUT(k), k}};            \
+    const projection::Weights<packets::W1> w1{{shared_router, KERNEL_W1_LAYOUT(k), k}};     \
     const projection::CoherentStore out0{logits, SEISMIC_DIM_E + 1ul, 1ul, 0ul}; \
     const projection::CoherentStore out1{logits, SEISMIC_DIM_E + 1ul, 1ul, SEISMIC_DIM_E}
 

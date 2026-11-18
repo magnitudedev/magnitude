@@ -5,10 +5,11 @@
 // each rounded to A; zero past W and past the last row); the attend launch
 // runs 64 query rows of one head per workgroup, 16 per subgroup, over the
 // keys of their spans in 32-key tiles. Bodies in lib/vision/vision.glsl.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 #include "lib/vision/vision.glsl"
 
-#if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "vision_attention requires a bf16 or f16 activation"
 #endif
 
@@ -41,7 +42,7 @@ void vision_attention_prepare() {
         : plane == 1u ? SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM) : 0ul;
     const uint heads = plane == 0u ? VISION_H : uint(SEISMIC_DIM_KV);
     const uint head = plane == 0u ? part : part - VISION_H - (plane - 1u) * uint(SEISMIC_DIM_KV);
-    vision_prepare_head(ELEMENT_ACT, source + (uint64_t(row) * heads + head) * VISION_W * 2ul, target, normed,
+    vision_prepare_head(ACTIVATION_A, source + (uint64_t(row) * heads + head) * VISION_W * 2ul, target, normed,
         norm, element_word_f32(SEISMIC_PARAM_EPSILON), plane < 2u && element_word_f32(SEISMIC_PARAM_LOG_BASE) != 0.0,
         SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + uint64_t(row) * 8ul, element_word_f32(SEISMIC_PARAM_LOG_BASE),
         VISION_W, VISION_WP);
@@ -50,7 +51,7 @@ void vision_attention_prepare() {
 // Workgroup (64-row query tile, head).
 void vision_attention_attend() {
     const float scale = int(SEISMIC_PARAM_UNIT_SCALE) != 0 ? 1.0 : inversesqrt(float(VISION_W));
-    vision_attend(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS), SEISMIC_RESULT_0_OUT,
+    vision_attend(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS), SEISMIC_RESULT_0_OUT,
         VISION_M, VISION_PADDED, VISION_H, uint(SEISMIC_DIM_G), VISION_W, VISION_WP, scale,
         SEISMIC_PTR(SEISMIC_BUFFER_SPANS), gl_WorkGroupID.x, gl_WorkGroupID.y);
 }

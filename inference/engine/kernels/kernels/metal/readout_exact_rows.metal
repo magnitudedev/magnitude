@@ -2,6 +2,7 @@
 // One simdgroup per 32 vocabulary rows keeps the rows level two leaves
 // (`fine`, `floor`) and projects them exactly over every plane, with the full
 // pass's own routine (`lib/readout/progressive.h`); −inf elsewhere.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/readout/progressive.h"
 
 #ifdef SEISMIC_FORMING_READOUT_EXACT_ROWS_GATHER

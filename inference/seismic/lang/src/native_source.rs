@@ -11,54 +11,160 @@ use crate::syntax::ast::RowsKind;
 
 /// Every identifier outside comments and literals, with its offset.
 pub fn identifiers(source: &str) -> Vec<(&str, usize)> {
-    let bytes = source.as_bytes();
-    let mut identifiers = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                index += 2;
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
+    tokens(source)
+        .filter(|token| token.kind == TokenKind::Identifier)
+        .map(|token| (token.text, token.offset))
+        .collect()
+}
+
+/// One preprocessing token of a native source: an identifier, a number or a
+/// punctuator, outside comments and string and character literals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Token<'s> {
+    pub kind: TokenKind,
+    pub text: &'s str,
+    pub offset: usize,
+    /// Whether it begins its logical line (lines joined by a trailing
+    /// backslash): a `#` that does is a directive's.
+    pub first: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenKind {
+    Identifier,
+    /// A preprocessing number (`1u`, `0x1Fu`, `1.5e-3f`), whose letters are
+    /// no identifier.
+    Number,
+    /// `##` and `::` are one punctuator each; any other is one character.
+    Punctuator,
+}
+
+/// The preprocessing tokens of `source`, in order.
+pub fn tokens(source: &str) -> Tokens<'_> {
+    Tokens {
+        source,
+        index: 0,
+        started: false,
+    }
+}
+
+/// The preprocessing tokens of a source ([`tokens`]).
+pub struct Tokens<'s> {
+    source: &'s str,
+    index: usize,
+    /// Whether the current logical line has had a token (or a literal).
+    started: bool,
+}
+
+impl<'s> Iterator for Tokens<'s> {
+    type Item = Token<'s>;
+
+    fn next(&mut self) -> Option<Token<'s>> {
+        let source = self.source;
+        let bytes = source.as_bytes();
+        let mut index = self.index;
+        while index < bytes.len() {
+            let start = index;
+            let kind = match bytes[index] {
+                b'\\' if bytes.get(index + 1) == Some(&b'\n') => {
+                    index += 2;
+                    continue;
                 }
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index += 2;
-                while index + 1 < bytes.len()
-                    && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-                {
-                    index += 1;
+                b'\\' if bytes.get(index + 1) == Some(&b'\r') && bytes.get(index + 2) == Some(&b'\n') => {
+                    index += 3;
+                    continue;
                 }
-                index = (index + 2).min(bytes.len());
-            }
-            b'"' | b'\'' => {
-                let quote = bytes[index];
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'\\' {
-                        index = (index + 2).min(bytes.len());
-                    } else if bytes[index] == quote {
-                        index += 1;
-                        break;
-                    } else {
+                b'\n' => {
+                    self.started = false;
+                    index += 1;
+                    continue;
+                }
+                byte if byte.is_ascii_whitespace() => {
+                    index += 1;
+                    continue;
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                    index += 2;
+                    while index < bytes.len() && bytes[index] != b'\n' {
                         index += 1;
                     }
+                    continue;
                 }
-            }
-            byte if byte == b'_' || byte.is_ascii_alphabetic() => {
-                let start = index;
-                index += 1;
-                while index < bytes.len()
-                    && (bytes[index] == b'_' || bytes[index].is_ascii_alphanumeric())
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    index += 2;
+                    while index + 1 < bytes.len()
+                        && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                    {
+                        index += 1;
+                    }
+                    index = (index + 2).min(bytes.len());
+                    continue;
+                }
+                b'"' | b'\'' => {
+                    let quote = bytes[index];
+                    index += 1;
+                    while index < bytes.len() {
+                        if bytes[index] == b'\\' {
+                            index = (index + 2).min(bytes.len());
+                        } else if bytes[index] == quote {
+                            index += 1;
+                            break;
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    self.started = true;
+                    continue;
+                }
+                byte if byte == b'_' || byte.is_ascii_alphabetic() => {
+                    index += 1;
+                    while index < bytes.len()
+                        && (bytes[index] == b'_' || bytes[index].is_ascii_alphanumeric())
+                    {
+                        index += 1;
+                    }
+                    TokenKind::Identifier
+                }
+                byte if byte.is_ascii_digit()
+                    || (byte == b'.' && bytes.get(index + 1).is_some_and(u8::is_ascii_digit)) =>
                 {
                     index += 1;
+                    while index < bytes.len() {
+                        match bytes[index] {
+                            b'+' | b'-' if matches!(bytes[index - 1], b'e' | b'E' | b'p' | b'P') => index += 1,
+                            byte if byte == b'_' || byte == b'.' || byte.is_ascii_alphanumeric() => index += 1,
+                            _ => break,
+                        }
+                    }
+                    TokenKind::Number
                 }
-                identifiers.push((&source[start..index], start));
-            }
-            _ => index += 1,
+                b'#' if bytes.get(index + 1) == Some(&b'#') => {
+                    index += 2;
+                    TokenKind::Punctuator
+                }
+                b':' if bytes.get(index + 1) == Some(&b':') => {
+                    index += 2;
+                    TokenKind::Punctuator
+                }
+                _ => {
+                    // One character, whole if it is not ASCII.
+                    index += source[index..].chars().next().map_or(1, char::len_utf8);
+                    TokenKind::Punctuator
+                }
+            };
+            self.index = index;
+            let first = !self.started;
+            self.started = true;
+            return Some(Token {
+                kind,
+                text: &source[start..index],
+                offset: start,
+                first,
+            });
         }
+        self.index = index;
+        None
     }
-    identifiers
 }
 
 /// The template parameters of launch `launch`'s kernel definition in a
@@ -578,6 +684,41 @@ pub fn check_fixture(
 mod tests {
     use super::*;
     use crate::checked::{check_source_with, CheckFailure, CheckedModule, SourceFile, SourceSet};
+
+    /// Numbers, `##` and `::` are one token each, and a backslash joins
+    /// lines: a directive's `#` is the first token of its logical line.
+    #[test]
+    fn tokens_are_preprocessing_tokens_of_logical_lines() {
+        let source = "#define CAT(a, b) a ## b /* x */ \\\n  ::q\n  # if 0x1Fu + 1.5e-3f // y\n'#' \"z\" #\n";
+        let tokens: Vec<(TokenKind, &str, bool)> =
+            tokens(source).map(|token| (token.kind, token.text, token.first)).collect();
+        use TokenKind::{Identifier as I, Number as N, Punctuator as P};
+        assert_eq!(
+            tokens,
+            [
+                (P, "#", true),
+                (I, "define", false),
+                (I, "CAT", false),
+                (P, "(", false),
+                (I, "a", false),
+                (P, ",", false),
+                (I, "b", false),
+                (P, ")", false),
+                (I, "a", false),
+                (P, "##", false),
+                (I, "b", false),
+                (P, "::", false),
+                (I, "q", false),
+                (P, "#", true),
+                (I, "if", false),
+                (N, "0x1Fu", false),
+                (P, "+", false),
+                (N, "1.5e-3f", false),
+                (P, "#", false),
+            ]
+        );
+        assert_eq!(identifiers("x = 0x1Fu;"), [("x", 0)]);
+    }
 
     /// A projecting CUDA kernel's prologue is exactly the kind its declaration names.
     #[test]

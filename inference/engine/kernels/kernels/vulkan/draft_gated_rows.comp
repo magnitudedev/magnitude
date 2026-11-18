@@ -1,5 +1,6 @@
 // draft_gated_rows: result = A(silu(gate) * up); one invocation per element
 // over a grid-stride loop. The Vulkan form of `metal/draft_gated_rows.metal`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 void draft_gated_rows() {
@@ -10,8 +11,8 @@ void draft_gated_rows() {
     const uint64_t count = SEISMIC_DIM_M * width;
     for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, width)); at.index < count; seismic_walk_next(at)) {
         const uint64_t row = at.axes.x, column = at.axes.w;
-        const float a = element_at(ELEMENT_ACT, gate, row * SEISMIC_GATE_STRIDE_0 + column * SEISMIC_GATE_STRIDE_1);
-        const float b = element_at(ELEMENT_ACT, up, row * SEISMIC_UP_STRIDE_0 + column * SEISMIC_UP_STRIDE_1);
+        const float a = element_at(ACTIVATION_A, gate, row * SEISMIC_GATE_STRIDE_0 + column * SEISMIC_GATE_STRIDE_1);
+        const float b = element_at(ACTIVATION_A, up, row * SEISMIC_UP_STRIDE_0 + column * SEISMIC_UP_STRIDE_1);
         out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
             a / (1.0 + exp(-a)) * b);
     }

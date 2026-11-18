@@ -1,3 +1,4 @@
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ATTENTION_AFFINE_HISTORY 1
 // Sink logits (SK): the merge adds each head's sink to its merged denominator
 // (`attention::normalizer`).

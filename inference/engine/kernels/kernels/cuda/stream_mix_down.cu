@@ -6,6 +6,7 @@
 // parts GEMV (a one-row block forms its stream's `shared_row`, and the
 // stream's first block publishes its inverse), the GEMMs its segmented tiles
 // (`lib/projection/operator.cuh`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #define KERNEL_W1 SEISMIC_INJECT_WEIGHT
 #define PROJECTION_PARTS SEISMIC_DIM_S
@@ -75,8 +76,8 @@ __device__ __forceinline__ void mix_gemv(const Stream streams, const projection:
     const auto rows = [=](unsigned part) {
         return [=] {
             seismic_dependency_start();
-            return projection::Plain<element::Act, projection::AllRows>{
-                staged + (unsigned long long)part * SEISMIC_DIM_H * element::Act::bytes, WIDTH, projection::AllRows{}};
+            return projection::Plain<activation::Act, projection::AllRows>{
+                staged + (unsigned long long)part * SEISMIC_DIM_H * activation::Act::bytes, WIDTH, projection::AllRows{}};
         };
     };
     projection::op::gemv_parts<NB, KSPLIT, SEISMIC_DIM_S, SEISMIC_DIM_H, Stream>(row, rows, partials, arrivals, M,

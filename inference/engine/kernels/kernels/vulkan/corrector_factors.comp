@@ -2,6 +2,7 @@
 // grid-stride loop, which publishes x, the block's anchor a and x · a (each
 // rounded once to A) into the node's three joined rows. Mirrors
 // `cpu/corrector_factors.rs`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 void corrector_factors() {
@@ -13,9 +14,9 @@ void corrector_factors() {
     for (seismic_walk walk = seismic_walk_grid(total, u64vec3(1ul, count, width)); walk.index < total;
             seismic_walk_next(walk)) {
         const uint64_t column = walk.axes.w, node = walk.axes.z, block = walk.axes.x;
-        const float x = element_at(ELEMENT_ACT, nodes,
+        const float x = element_at(ACTIVATION_A, nodes,
             block * SEISMIC_NODES_STRIDE_0 + node * SEISMIC_NODES_STRIDE_1 + column * SEISMIC_NODES_STRIDE_2);
-        const float a = element_at(ELEMENT_ACT, anchor, block * SEISMIC_ANCHOR_STRIDE_0 + column * SEISMIC_ANCHOR_STRIDE_1);
+        const float a = element_at(ACTIVATION_A, anchor, block * SEISMIC_ANCHOR_STRIDE_0 + column * SEISMIC_ANCHOR_STRIDE_1);
         const uint64_t at = block * SEISMIC_RESULT_0_STRIDE_0 + node * SEISMIC_RESULT_0_STRIDE_1
             + column * SEISMIC_RESULT_0_STRIDE_3;
         out_put(result, at, x);

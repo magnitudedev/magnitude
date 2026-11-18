@@ -2,6 +2,7 @@
 // column the gate of its stream's column, publishing the per-stream
 // partials (`Mix`): the forms of the `dense` projection
 // (`lib/projection/operator.cuh`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_UP_WEIGHT
 #include "lib/projection/operator.cuh"
 

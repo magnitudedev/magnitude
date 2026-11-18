@@ -4,6 +4,7 @@
 //   logits (Sv blocks): one block per selected vocabulary row decodes
 //     that weight row once per feature row (mma16 lane chunks) and sums the
 //     products in a fixed thread order, softcapped when `softcap` > 0.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.cuh"
 
@@ -26,24 +27,15 @@ extern "C" __global__ void readout_selected_rows_logits(SEISMIC_KERNEL_PARAMS) {
     const auto weight = KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT));
     const projection::u8 *features = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_FEATURES);
     const auto logits = SEISMIC_RESULT_0_OUT;
-    // Each work item (k-block, column pair t) owns 16 values of the row.
-    const projection::u64 items = SEISMIC_DIM_D / 64 * 4;
     for (projection::u64 o = 0; o < SEISMIC_DIM_O; ++o) {
+        // Each work item (k-block, column pair t) owns 16 values of the row,
+        // a lane chunk's whatever the weight's layout.
         float partial = 0.0f;
-        for (projection::u64 item = threadIdx.x; item < items; item += blockDim.x) {
-            const projection::u64 kb = item / 4;
-            const projection::u32 t = (projection::u32)(item % 4);
-            float values[16];
-            packets::row_values16(weight, vocabulary, kb, t, values);
-            const projection::u32 offsets[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
-#pragma unroll
-            for (int s = 0; s < 4; ++s)
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float x = element::at<element::Act>(features, o * SEISMIC_DIM_D + kb * 64 + 16 * s + offsets[j]);
-                    partial = seismic_fma_rn(x, values[4 * s + j], partial);
-                }
-        }
+        packets::row_items16(weight, vocabulary, 0, SEISMIC_DIM_D, threadIdx.x, blockDim.x,
+                             [&](projection::u64 column, float value) {
+                                 const float x = element::at<activation::Act>(features, o * SEISMIC_DIM_D + column);
+                                 partial = seismic_fma_rn(x, value, partial);
+                             });
         const float total = reduce::group_sum(partial, scratch);
         const float cap = __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP);
         if (threadIdx.x == 0)

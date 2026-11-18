@@ -3,20 +3,20 @@
 // projection launches project them through the gate rows with the
 // activated-product epilogue A(A(act(A(gate))) * inputs[m, layer, p]). The
 // Vulkan form of `metal/per_layer_gate.metal`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 // The projection's decoding launches stage their weights' tables (`packets.glsl`).
-#define PACKETS_STAGED_TABLES 1
+#define PACKETS_CONFIG_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_GS != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define GATE_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "per_layer_gate requires a bf16 or f16 activation"
 #endif
+#define GATE_ACT ACTIVATION_A
 
 
 #define GATE_D uint(SEISMIC_DIM_D)
@@ -54,7 +54,7 @@ projection_weights projected_weight(uint g) {
 // The `staged` rows: the F32 hidden rows rounded to A (as the gate weight's
 // NVFP4 operands over NVFP4 gate rows), one row a workgroup.
 void per_layer_gate_rows() {
-#if defined(SEISMIC_GATE_WEIGHT_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_GATE_WEIGHT)
     // The hidden rows rounded to A (one part, no norm) as the gate weight's
     // NVFP4 operands.
     projection_stage(projection_operands(projection_summed(GATE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),

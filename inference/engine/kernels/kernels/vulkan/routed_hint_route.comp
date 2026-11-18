@@ -1,6 +1,7 @@
 // Ahead-of-step expert hints (`routed_hint_route`) on the `dense` projection
 // operator, segmented over `(next_router, after_router)` in the CPU 8-lane
 // reference order; segment 1 is zeroed when `AHEAD < 2`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_NEXT_ROUTER
 #define KERNEL_W1 SEISMIC_AFTER_ROUTER
 #include "lib/core/activation.glsl"
@@ -14,22 +15,14 @@ ROUTE_DEFINE_RANK_AT
 #include "lib/streaming/control.glsl"
 #include "../streaming/hint.hpp"
 
-#if defined(SEISMIC_NEXT_NORM_REPRESENTATION_F32)
-#define HINT_NORM ELEMENT_F32
-#elif defined(SEISMIC_NEXT_NORM_REPRESENTATION_F16)
-#define HINT_NORM ELEMENT_F16
-#elif defined(SEISMIC_NEXT_NORM_REPRESENTATION_BF16)
-#define HINT_NORM ELEMENT_BF16
-#else
-#error "routed hint norm must be dense"
-#endif
+#define HINT_NORM ELEMENT_OF(SEISMIC_NEXT_NORM)
 
 #define HINT_H uint(SEISMIC_DIM_H)
 
 projection_prologue hint_segment_input(const uint s) {
     const uint64_t norm_ptr = s == 0u ? SEISMIC_PTR(SEISMIC_BUFFER_NEXT_NORM) : SEISMIC_PTR(SEISMIC_BUFFER_AFTER_NORM);
     const uint64_t norm_s0 = s == 0u ? SEISMIC_NEXT_NORM_STRIDE_0 : SEISMIC_AFTER_NORM_STRIDE_0;
-    return projection_ordered_input(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+    return projection_ordered_input(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm_ptr, norm_s0, HINT_NORM,
         element_word_f32(SEISMIC_PARAM_EPS), HINT_H, 0ul, uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT));
 }

@@ -22,9 +22,9 @@ extern "C" __global__ void ptx_mma_m16n8k16(SEISMIC_KERNEL_PARAMS) {
         const unsigned fa[4] = {a_pair(g, k0 + 2 * t), a_pair(g + 8, k0 + 2 * t),
                                 a_pair(g, k0 + 2 * t + 8), a_pair(g + 8, k0 + 2 * t + 8)};
         const unsigned fb[2] = {b_pair(g, k0 + 2 * t), b_pair(g, k0 + 2 * t + 8)};
-#if defined(SEISMIC_ELEMENT_E_REPRESENTATION_BF16)
+#if ELEMENT_KIND(SEISMIC_ELEMENT_E) == ELEMENT_BF16
         seismic_mma_m16n8k16_bf16(acc, fa, fb);
-#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_F16)
+#elif ELEMENT_KIND(SEISMIC_ELEMENT_E) == ELEMENT_F16
         seismic_mma_m16n8k16_f16(acc, fa, fb);
 #else
 #error "ptx_mma_m16n8k16 binds E to f16 or bf16"

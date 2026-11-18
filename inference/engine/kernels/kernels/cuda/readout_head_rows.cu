@@ -2,6 +2,7 @@
 // vocabulary projection into F32 logits, scaled by a present `weight_scale`
 // (static WS = 1) and softcapped from the accumulator when `softcap` > 0: the
 // forms of the `dense` projection (`lib/projection/operator.cuh`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/operator.cuh"
 

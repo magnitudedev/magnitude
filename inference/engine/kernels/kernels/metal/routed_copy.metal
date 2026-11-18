@@ -6,7 +6,7 @@
 
 #include <seismic/slab.h>
 #include "lib/streaming/control.h"
-#include "lib/repack/repack.h"
+#include <seismic/element.h>
 #include "../streaming/list.hpp"
 
 #define STREAMING_COPY_FROM(table, record) slab::region<const uchar, SLAB_SPACE(SEISMIC_SOURCE)>(table, ulong(record))
@@ -24,6 +24,6 @@ kernel void routed_copy(
     uint tid [[thread_index_in_threadgroup]],
     uint2 shape [[threads_per_threadgroup]]) {
     threadgroup int words[STREAMING_LIST_WORDS];
-    streaming_list_copy(source, list, step[0], destination, REPACK_MATRIX_BYTES(SEISMIC_SOURCE),
+    streaming_list_copy(source, list, step[0], destination, ELEMENT_MATRIX_BYTES(SEISMIC_SOURCE),
         group.x + groups.x * group.y, groups.x * groups.y, words, tid, shape.x, seismic_words);
 }

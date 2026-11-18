@@ -19,6 +19,18 @@
 // rounding: as product operands (`values`, where a zero is +0) or exactly
 // (`exact_values`, `pair_values`).
 //
+// The library's surface is this namespace's names outside `packets::detail`:
+// the packet interface (`Packet`, `Dense`, `Block`, `value_at`),
+// the matrix a kernel addresses a bound weight by (`Matrix`, its rows
+// `Located`), the bit primitives a kernel's own decoder is built on
+// (`split_nibbles`, `byte_floats`, `unsigned_bytes`, `code_pair`, `power2`),
+// the per-form readers (<seismic/forms.h>) and the slot bindings below.
+// How a format is laid out and decoded (its code planes, interpretations,
+// grids, codebooks and coefficients) is `packets::detail`, which no kernel
+// names: a reader of a code class is written once, here, against the one
+// description of where its bits are (`detail::Fields`, `detail::Entries`,
+// `detail::Grid`).
+//
 // Weight tensors are bound to slots before this file is included:
 //     #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 // which defines `packets::W0` (the decoder of the bound representation) and
@@ -39,8 +51,8 @@
 namespace packets {
 
 // A launch that runs only while nothing lands in its records defines
-// PACKETS_PLAIN_RECORDS before this file: plain loads read them.
-#ifdef PACKETS_PLAIN_RECORDS
+// PACKETS_CONFIG_PLAIN_RECORDS before this file: plain loads read them.
+#ifdef PACKETS_CONFIG_PLAIN_RECORDS
 typedef slab::space<false> space;
 #else
 typedef slab::space<ELEMENT_HAS(KERNEL_W0, _HOST_WRITTEN) || ELEMENT_HAS(KERNEL_W1, _HOST_WRITTEN)
@@ -100,23 +112,19 @@ struct Rows16 {
     }
 };
 
-// The eight WIDTH-bit codes (WIDTH 1 or 2) of an 8 WIDTH-bit field, codes
-// 0,2,4,6 in bytes 0..3 of `even` and 1,3,5,7 in those of `odd`, at bit AT
-// of each byte: the field's halves move to bits 0 and 16, each half's two
-// quarters to two bytes, and a byte's two codes apart.
-template <uint WIDTH, uint AT>
-inline void split_fields(uint field, thread uint &even, thread uint &odd) {
-    static_assert(WIDTH == 1u || WIDTH == 2u, "a byte holds two codes of a quarter field");
-    constexpr uint code = (1u << WIDTH) - 1u;
-    uint t = (field | (field << (16u - 4u * WIDTH))) & (((1u << (4u * WIDTH)) - 1u) * 0x00010001u);
-    t = (t | (t << (8u - 2u * WIDTH))) & (((1u << (2u * WIDTH)) - 1u) * 0x01010101u);
-    even = (t & (code * 0x01010101u)) << AT;
-    if constexpr (AT >= WIDTH)
-        odd = (t & ((code << WIDTH) * 0x01010101u)) << (AT - WIDTH);
-    else
-        odd = (t & ((code << WIDTH) * 0x01010101u)) >> (WIDTH - AT);
-}
+// A row as the packet decoders address it: its row tile's base (`Rows16::base_of`)
+// and its geometry (`Rows16::of`).
+struct Located {
+    weight_bytes row;
+    Rows16 geometry;
+};
 
+// ---------------------------------------------------------------------------
+// Bit primitives: the operations a decoder of codes held in registers is
+// built on, the library's own and a kernel's (an engine format's decoder).
+
+// A word's nibbles: those of its bytes' low halves (`even`) and high halves
+// (`odd`), each in its byte.
 inline void split_nibbles(uint word, thread uint &even, thread uint &odd) {
     even = word & 0x0f0f0f0fu;
     odd = (word >> 4) & 0x0f0f0f0fu;
@@ -144,54 +152,147 @@ constexpr float power2() {
     return N >= 0 ? float(1u << uint(N)) : 1.0f / float(1u << uint(-N));
 }
 
-// ---------------------------------------------------------------------------
-// Decoders are composed from the registry's decode axes (`registry::decode_axes`,
-// emitted as each bound element's `_CODE*` and `_COEFF*` macros): the code
-// planes a packet's codes are stored in (`P`), the codes' interpretation
-// (`C`), and the coefficients that scale them (`K`), with the consumer forms
-// it is admitted to (`F`, `_FORM_*`). `Packet<P, C, K, F>` is a
-// decoder of the uniform interface every reader takes: `load` a packet, and
-// its step's eight values (`values`, `even` lanes 0,2,4,6 and `odd` 1,3,5,7)
-// or two of them (`pair_values`), each with one F32 rounding.
+namespace detail {
 
-// A plane of WIDTH-bit codes (WIDTH 1 or 2): a packet's codes fill WIDTH words
-// (`words`, `load`ed from unit p of the code plane at row offset `plane`),
-// step s's eight are their bits [8 WIDTH s, 8 WIDTH (s + 1)) (`step`), and
-// its codes 2j and 2j + 1 the 2 WIDTH bits from bit 2 WIDTH j of those
-// (`pair`).
+// The eight WIDTH-bit codes (WIDTH 1 or 2) of an 8 WIDTH-bit field, codes
+// 0,2,4,6 in bytes 0..3 of `even` and 1,3,5,7 in those of `odd`, at bit AT
+// of each byte: the field's halves move to bits 0 and 16, each half's two
+// quarters to two bytes, and a byte's two codes apart.
+template <uint WIDTH, uint AT>
+inline void split_fields(uint field, thread uint &even, thread uint &odd) {
+    static_assert(WIDTH == 1u || WIDTH == 2u, "a byte holds two codes of a quarter field");
+    constexpr uint code = (1u << WIDTH) - 1u;
+    uint t = (field | (field << (16u - 4u * WIDTH))) & (((1u << (4u * WIDTH)) - 1u) * 0x00010001u);
+    t = (t | (t << (8u - 2u * WIDTH))) & (((1u << (2u * WIDTH)) - 1u) * 0x01010101u);
+    even = (t & (code * 0x01010101u)) << AT;
+    if constexpr (AT >= WIDTH)
+        odd = (t & ((code << WIDTH) * 0x01010101u)) << (AT - WIDTH);
+    else
+        odd = (t & ((code << WIDTH) * 0x01010101u)) >> (WIDTH - AT);
+}
+
+// A packet's 32 bytes of 8-bit codes, steps 0..1 and 2..3.
+struct Bytes32 {
+    uint4 first;
+    uint4 second;
+};
+
+// A plane of WIDTH-bit codes (WIDTH 1, 2, 4 or 8): the one description of
+// where a plane's bits are, which every reader of a code plane is written
+// against. A packet's 32 codes are its unit of `unit_bytes` (4 WIDTH) bytes
+// in the plane (unit p of the plane at row offset `plane`); step (chunk) s's
+// eight codes are the WIDTH bytes from byte WIDTH s of the unit (`chunk`),
+// and code i of a step is at bit WIDTH i of them. Its readers, one per
+// register shape:
+// - the step: a packet's words (`load`) and step s's field of them (`step`,
+//   below 8 bits a code);
+// - the pair: a step's codes 2j and 2j + 1, the 2 WIDTH bits from bit
+//   2 WIDTH j of its field (`pair`, below 8 bits a code);
+// - the lane: chunk k's place in a located row's plane (`at`, a 32-bit
+//   offset from the tensor), its bytes alone (`fetch`, of packet g, INDEXED
+//   from the place or from the place's and the packet's sum), and those
+//   spread so that codes p and p + 4 are the two halves of a word
+//   (`spread`, `lane_pair`; `lane_in_place` leaves them where they are).
 template <uint WIDTH>
 struct Fields {
-    static_assert(WIDTH == 1u || WIDTH == 2u, "a packet's codes fill one or two words");
-    typedef metal::conditional_t<WIDTH == 1u, uint, uint2> words;
+    static_assert(WIDTH == 1u || WIDTH == 2u || WIDTH == 4u || WIDTH == 8u, "a plane's codes are 1, 2, 4 or 8 bits");
+    static constant constexpr uint unit_bytes = 4u * WIDTH;
+    // A step's field: its bits, and the steps of one word of a packet's.
+    static constant constexpr uint step_bits = 8u * WIDTH;
+    static constant constexpr uint word_steps = WIDTH < 8u ? 32u / step_bits : 1u;
+    typedef metal::conditional_t<WIDTH == 1u, uchar,
+        metal::conditional_t<WIDTH == 2u, ushort, metal::conditional_t<WIDTH == 4u, uint, uint2>>> chunk;
+    typedef metal::conditional_t<WIDTH == 1u, uint,
+        metal::conditional_t<WIDTH == 2u, uint2, metal::conditional_t<WIDTH == 4u, uint4, Bytes32>>> words;
     static words load(weight_bytes row, Rows16 layout, ulong plane, uint p) {
-        return *slab::as<words>(layout.at(row, plane, 4ul * WIDTH, p));
+        if constexpr (WIDTH == 8u) {
+            const auto codes = slab::as<uint4>(layout.at(row, plane, ulong(unit_bytes), p));
+            words w;
+            w.first = codes[0];
+            w.second = codes[1];
+            return w;
+        } else {
+            return *slab::as<words>(layout.at(row, plane, ulong(unit_bytes), p));
+        }
     }
     static uint step(words w, uint s) {
-        if constexpr (WIDTH == 1u)
-            return (w >> (8u * s)) & 0xffu;
+        static_assert(WIDTH < 8u, "a step's field is a word's");
+        if constexpr (word_steps == 4u)
+            return (w >> (step_bits * s)) & ((1u << step_bits) - 1u);
+        else if constexpr (word_steps == 2u)
+            return (w[s / 2u] >> (step_bits * (s % 2u))) & ((1u << step_bits) - 1u);
         else
-            return (w[s >> 1] >> (16u * (s & 1u))) & 0xffffu;
+            return w[s];
     }
     // Always inlined: as a call, the batched GEMV of 4 + 1-bit codes
     // compiles to other code (M4 Pro, q5g32s `dense_output_batch`, +160 B).
     __attribute__((always_inline)) static uint pair(words w, uint s, uint j) {
-        if constexpr (WIDTH == 1u)
-            return (w >> (8u * s + 2u * j)) & 3u;
+        static_assert(WIDTH < 8u, "a pair is two codes of a step's field");
+        constexpr uint mask = (1u << (2u * WIDTH)) - 1u;
+        if constexpr (word_steps == 4u)
+            return (w >> (step_bits * s + 2u * WIDTH * j)) & mask;
+        else if constexpr (word_steps == 2u)
+            return (w[s / 2u] >> (step_bits * (s % 2u) + 2u * WIDTH * j)) & mask;
         else
-            return (w[s >> 1] >> (16u * (s & 1u) + 4u * j)) & 0xfu;
+            return (w[s] >> (2u * WIDTH * j)) & mask;
+    }
+    // A lane's place of chunk k in a row's plane whose first unit is at
+    // `unit0` (`Matrix::codes_at`, `high_at`, of `unit_bytes`).
+    static uint at(uint unit0, uint k) { return unit0 + k * WIDTH; }
+    // A load INDEXED from the lane's place (a base and a 32-bit index of its
+    // chunks), as the matrix GEMV's block loop takes it, or from the sum of
+    // the place and the packet's 32-bit offset, as PACK's does: indexed,
+    // PACK over q5g32s is 1.7% slower (M4 Pro, `dense_output` at M = 512,
+    // 5448 against 5353 µs) and over iq4xs 1%. A row tile's rows of one
+    // packet are adjacent, `tile` units apart.
+    template <bool INDEXED>
+    static metal::conditional_t<WIDTH == 8u, uint2, uint> fetch(weight_bytes base, uint tile, uint at, uint g) {
+        if constexpr (INDEXED)
+            return slab::as<chunk>(base + at)[g * 4u * tile];
+        else
+            return *slab::as<chunk>(base + at + g * unit_bytes * tile);
+    }
+    static uint spread(uint field) {
+        static_assert(WIDTH < 8u, "a chunk of bytes is its words");
+        if constexpr (WIDTH == 4u)
+            return field;
+        else
+            return (field | (field << (16u - 4u * WIDTH))) & (((1u << (4u * WIDTH)) - 1u) * 0x00010001u);
+    }
+    static uint lane_pair(uint spread, uint p) {
+        return (spread >> (WIDTH * p)) & (((1u << WIDTH) - 1u) * 0x00010001u);
+    }
+    // Codes p and p + 4 of a spread chunk where they are stored: code c is
+    // c 2^(WIDTH p) of its half.
+    static uint lane_in_place(uint spread, uint p) {
+        return spread & ((((1u << WIDTH) - 1u) << (WIDTH * p)) * 0x00010001u);
+    }
+    // Codes p and p + 4 of a spread chunk less `zero` as exact halves, read
+    // in place (`lane_in_place`, WIDTH 1 or 2): c 2^(WIDTH p) below bit 10 of
+    // a half is the mantissa of 1024 + c 2^(WIDTH p), which one FMA scales
+    // by 2^-(WIDTH p) and moves by 1024 + zero, exactly (both constants and
+    // the result are small integers or powers of two of a half). An and, an
+    // or and an FMA a pair, where a shifted pair (`lane_pair`) takes a shift
+    // more.
+    template <int ZERO>
+    static half2 lane_operand(uint spread, uint p) {
+        static_assert(WIDTH <= 2u && ZERO >= 0 && ZERO <= 1024, "a code in place and its zero fit a half's mantissa");
+        const half scale = as_type<half>(ushort((15u - WIDTH * p) << 10));
+        const half move = -half(float((1u << (10u - WIDTH * p)) + uint(ZERO)));
+        return metal::fma(as_type<half2>(lane_in_place(spread, p) | 0x64006400u), half2(scale), half2(move));
     }
 };
 
 // Code planes (`registry::code_planes`): a low plane of LOW bits a code and a
-// high plane of HIGH. `floats` yields a step's codes, their bytes with `mask`
-// flipped, each first shifted left by AT bits within its byte, as exact
-// floats less `offset - 1024`; `pair` the step's codes 2j and 2j + 1, the
-// second in bits 16.., with `mask` flipped alike; `nibbles` the step's eight
-// 4-bit codes as one word and `nibble_pair` its byte j (two codes), the
-// indices a codebook reads.
+// high plane of HIGH (`Fields`), the high bits at bit LOW of a code. `floats`
+// yields a step's codes, their bytes with `mask` flipped, each first shifted
+// left by AT bits within its byte, as exact floats less `offset - 1024`;
+// `pair` the step's codes 2j and 2j + 1, the second in bits 16.., with
+// `mask` flipped alike; `nibbles` the step's eight 4-bit codes as one word
+// and `nibble_pair` its byte j (two codes), the indices a codebook reads.
 
-// The words of a packet's codes below a nibble: its low plane's
-// (`Fields<LOW>`) and, HIGH, its high plane's (`Fields<HIGH>`).
+// The words of a packet's codes: its low plane's (`Fields<LOW>`) and, HIGH,
+// its high plane's (`Fields<HIGH>`).
 template <uint LOW, uint HIGH>
 struct FieldWords {
     typename Fields<LOW>::words low;
@@ -202,8 +303,7 @@ struct FieldWords<LOW, 0u> {
     typename Fields<LOW>::words low;
 };
 
-// Codes below a nibble: a plane of LOW-bit codes (`Fields<LOW>`) and, HIGH,
-// a plane of their HIGH high bits (`Fields<HIGH>`), at bit LOW of a code.
+// Codes below a nibble.
 template <uint LOW, uint HIGH>
 struct Planes {
     static_assert(LOW < 4u, "codes below a nibble");
@@ -241,23 +341,33 @@ struct Planes {
     // (M4 Pro). A 1-bit code selects its value; a 2-bit code masked in place
     // below bit 10 of its half is the mantissa of 1024 + c 2^b, which one FMA
     // scales and moves, exactly (`code_at`): the codes of bits 10.. of a half
-    // take one shift a word.
+    // take one shift a word (`code_in`).
     template <uint AT>
     static void in_place(typename low_plane::words w, uint step, float moved, thread float4 &even, thread float4 &odd) {
         if constexpr (LOW == 1u) {
             const float zero = -moved, one = float(1u << AT) - moved;
             for (uint j = 0; j < 4; ++j) {
-                even[j] = metal::select(zero, one, (w & (1u << (8u * step + 2u * j))) != 0u);
-                odd[j] = metal::select(zero, one, (w & (2u << (8u * step + 2u * j))) != 0u);
+                even[j] = metal::select(zero, one, (w & (1u << (low_plane::step_bits * step + LOW * (2u * j)))) != 0u);
+                odd[j] = metal::select(zero, one, (w & (2u << (low_plane::step_bits * step + LOW * (2u * j)))) != 0u);
             }
         } else {
-            const uint word = w[step >> 1], high = word >> 6;
-            const uint lane = step & 1u;
-            even = float4(code_at<AT, 0>(word, lane, moved), code_at<AT, 4>(word, lane, moved),
-                code_at<AT, 8>(word, lane, moved), code_at<AT, 6>(high, lane, moved));
-            odd = float4(code_at<AT, 2>(word, lane, moved), code_at<AT, 6>(word, lane, moved),
-                code_at<AT, 4>(high, lane, moved), code_at<AT, 8>(high, lane, moved));
+            const uint word = w[step / low_plane::word_steps], high = word >> 6;
+            const uint lane = step % low_plane::word_steps;
+            even = float4(code_in<AT, 0>(word, high, lane, moved), code_in<AT, 2>(word, high, lane, moved),
+                code_in<AT, 4>(word, high, lane, moved), code_in<AT, 6>(word, high, lane, moved));
+            odd = float4(code_in<AT, 1>(word, high, lane, moved), code_in<AT, 3>(word, high, lane, moved),
+                code_in<AT, 5>(word, high, lane, moved), code_in<AT, 7>(word, high, lane, moved));
         }
+    }
+    // Code I of a step's half `lane` (at bit LOW I, `Fields`): from `word`
+    // below bit 10 of its half, else from `high` (`word` >> 6).
+    template <uint AT, uint I>
+    static float code_in(uint word, uint high, uint lane, float moved) {
+        constexpr uint B = LOW * I;
+        if constexpr (B <= 8u)
+            return code_at<AT, B>(word, lane, moved);
+        else
+            return code_at<AT, B - 6u>(high, lane, moved);
     }
     // The 2-bit code at bit B of half `lane` of `word` as (c << AT) - moved:
     // 1024 + c 2^B is exact in a half (B <= 8), its conversion is an operand
@@ -284,80 +394,67 @@ struct Planes {
     }
 };
 
-template <>
-struct Planes<4, 0> {
-    struct words {
-        uint4 low;
-    };
+// Nibbles (`Fields<4>`) under a plane of their HIGH high bits (`Fields<HIGH>`,
+// none where HIGH is 0), at bit 4 of a code.
+template <uint HIGH>
+struct Planes<4, HIGH> {
+    typedef Fields<4> low_plane;
+    typedef Fields<HIGH> high_plane;
+    typedef FieldWords<4, HIGH> words;
     static words load(weight_bytes row, Rows16 layout, uint p) {
         words w;
-        w.low = *slab::as<uint4>(layout.at(row, layout.codes, 16ul, p));
+        w.low = low_plane::load(row, layout, layout.codes, p);
+        if constexpr (HIGH != 0u)
+            w.high = high_plane::load(row, layout, layout.high, p);
         return w;
     }
     template <uint MASK>
     static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
         uint e, o;
-        split_nibbles(w.low[step], e, o);
+        split_nibbles(low_plane::step(w.low, step), e, o);
+        if constexpr (HIGH != 0u) {
+            uint he, ho;
+            split_fields<HIGH, 4>(high_plane::step(w.high, step), he, ho);
+            e |= he;
+            o |= ho;
+        }
         even = byte_floats(e ^ MASK, offset);
         odd = byte_floats(o ^ MASK, offset);
     }
     template <uint MASK>
     static uint pair(thread const words &w, uint step, uint j) {
-        uint b = (w.low[step] >> (8u * j)) & 0xffu;
-        return ((b & 15u) | ((b >> 4) << 16)) ^ (MASK & 0x00ff00ffu);
+        uint b = low_plane::pair(w.low, step, j);
+        if constexpr (HIGH != 0u) {
+            uint h = high_plane::pair(w.high, step, j);
+            return ((b & 15u) | ((h & ((1u << HIGH) - 1u)) << 4) | (((b >> 4) | ((h >> HIGH) << 4)) << 16))
+                ^ (MASK & 0x00ff00ffu);
+        } else {
+            return ((b & 15u) | ((b >> 4) << 16)) ^ (MASK & 0x00ff00ffu);
+        }
     }
-    static uint nibbles(thread const words &w, uint step) { return w.low[step]; }
-    static uint nibble_pair(thread const words &w, uint step, uint j) { return (w.low[step] >> (8u * j)) & 0xffu; }
-};
-
-// Nibbles under a plane of their HIGH high bits (`Fields<HIGH>`), at bit 4
-// of a code.
-template <uint HIGH>
-struct Planes<4, HIGH> {
-    typedef Fields<HIGH> high_plane;
-    struct words {
-        uint4 low;
-        typename high_plane::words high;
-    };
-    static words load(weight_bytes row, Rows16 layout, uint p) {
-        words w;
-        w.low = *slab::as<uint4>(layout.at(row, layout.codes, 16ul, p));
-        w.high = high_plane::load(row, layout, layout.high, p);
-        return w;
+    static uint nibbles(thread const words &w, uint step) {
+        static_assert(HIGH == 0u, "a codebook's codes are nibbles");
+        return low_plane::step(w.low, step);
     }
-    template <uint MASK>
-    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
-        uint e, o, he, ho;
-        split_nibbles(w.low[step], e, o);
-        split_fields<HIGH, 4>(high_plane::step(w.high, step), he, ho);
-        even = byte_floats((e | he) ^ MASK, offset);
-        odd = byte_floats((o | ho) ^ MASK, offset);
-    }
-    template <uint MASK>
-    static uint pair(thread const words &w, uint step, uint j) {
-        uint b = (w.low[step] >> (8u * j)) & 0xffu;
-        uint h = high_plane::pair(w.high, step, j);
-        return ((b & 15u) | ((h & ((1u << HIGH) - 1u)) << 4) | (((b >> 4) | ((h >> HIGH) << 4)) << 16))
-            ^ (MASK & 0x00ff00ffu);
+    static uint nibble_pair(thread const words &w, uint step, uint j) {
+        static_assert(HIGH == 0u, "a codebook's codes are nibbles");
+        return low_plane::pair(w.low, step, j);
     }
 };
 
+// Bytes (`Fields<8>`).
 template <>
 struct Planes<8, 0> {
-    struct words {
-        uint4 first;
-        uint4 second;
-    };
+    typedef Fields<8> low_plane;
+    typedef FieldWords<8, 0> words;
     static words load(weight_bytes row, Rows16 layout, uint p) {
         words w;
-        const auto codes = slab::as<uint4>(layout.at(row, layout.codes, 32ul, p));
-        w.first = codes[0];
-        w.second = codes[1];
+        w.low = low_plane::load(row, layout, layout.codes, p);
         return w;
     }
     template <uint MASK>
     static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
-        uint4 half_words = step < 2 ? w.first : w.second;
+        uint4 half_words = step < 2 ? w.low.first : w.low.second;
         uint base = (step & 1u) * 2u;
         float4 a = byte_floats(half_words[base] ^ MASK, offset);
         float4 b = byte_floats(half_words[base + 1] ^ MASK, offset);
@@ -366,7 +463,7 @@ struct Planes<8, 0> {
     }
     template <uint MASK>
     static uint pair(thread const words &w, uint step, uint j) {
-        uint4 half_words = step < 2 ? w.first : w.second;
+        uint4 half_words = step < 2 ? w.low.first : w.low.second;
         uint word = half_words[(step & 1u) * 2u + (j >> 1)];
         uint flipped = (word ^ MASK) >> ((j & 1u) * 16u);
         return (flipped & 0xffu) | ((flipped & 0xff00u) << 8);
@@ -1261,15 +1358,19 @@ struct code_moves<C, metal::enable_if_t<C::moves()>> {
 // A step's codes less their zero code, exactly (`Linear::centered`; codes
 // of zero code 0 are their codes).
 template <typename C, typename P>
-inline void centered_codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
-    if constexpr (C::zero != 0)
-        C::template centered<P>(w, step, even, odd);
-    else
-        C::template codes<P>(w, step, even, odd);
-}
+struct centered_codes {
+    static void of(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
+        if constexpr (C::zero != 0)
+            C::template centered<P>(w, step, even, odd);
+        else
+            C::template codes<P>(w, step, even, odd);
+    }
+};
+
+} // namespace detail
 
 // A decoder of codes in planes `P` interpreted by `C` under coefficients `K`,
-// admitted to the consumer forms `F` (`Forms`).
+// admitted to the consumer forms `F` (`detail::Forms`).
 template <typename P, typename C, typename K, typename F>
 struct Packet {
     static constant constexpr uint groups = K::groups;
@@ -1300,7 +1401,7 @@ struct Packet {
     // unmoved one does.
     static constexpr bool moves_offsets() {
         if constexpr (K::offsets)
-            return code_moves<C>::value && K::offset_exponent() < 0 && K::offset_exponent() > -8;
+            return detail::code_moves<C>::value && K::offset_exponent() < 0 && K::offset_exponent() > -8;
         else
             return false;
     }
@@ -1315,7 +1416,7 @@ struct Packet {
             const half move = half(k.coefficients.offset(group(step)) * power2<int(S)>());
             C::template moved<S, P>(k.codes, step, move, even, odd);
         } else {
-            centered_codes<C, P>(k.codes, step, even, odd);
+            detail::centered_codes<C, P>::of(k.codes, step, even, odd);
             if constexpr (K::offsets) {
                 const float offset = k.coefficients.offset(group(step));
                 even += offset;
@@ -1348,7 +1449,7 @@ struct Packet {
     // them: scale * (code - zero code), the difference exact, plus a stored
     // bias by one fma, so a zero keeps the sign of scale * 0.
     static void exact_values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
-        centered_codes<C, P>(k.codes, step, even, odd);
+        detail::centered_codes<C, P>::of(k.codes, step, even, odd);
         const float s = scale(k, step);
         if (K::biased) {
             const float b = k.coefficients.bias(group(step));
@@ -1365,6 +1466,16 @@ struct Packet {
         const float2 codes = C::template pair<P>(k.codes, step, j);
         return K::biased ? metal::fma(float2(scale(k, step)), codes, float2(k.coefficients.bias(group(step))))
                          : scale(k, step) * codes;
+    }
+    // Step `step`'s eight codes less their zero code, plus SHIFT: exact
+    // small integers, the packed form's operand (SHIFT its codes' offset
+    // less their centre, `packets::pack`).
+    template <int SHIFT>
+    static void offset_codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+        C::template codes<P>(k.codes, step, even, odd);
+        constexpr float shift = float(SHIFT - int(C::zero));
+        even += shift;
+        odd += shift;
     }
 };
 
@@ -1408,8 +1519,13 @@ struct Dense {
     static void exact_values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         values(k, step, even, odd);
     }
+    // A located row's elements, for a kernel that reads dense rows as
+    // stored, and whether rows start 16-byte aligned.
+    static weight_bytes row_values(thread const Located &at) { return at.row + at.geometry.codes; }
+    static bool aligned16(thread const Located &at) { return (at.geometry.stride & 15ul) == 0ul; }
 };
 
+namespace detail {
 // Uniform packet loading: quantized packets ignore the row length.
 template <typename W>
 struct Loader {
@@ -1423,12 +1539,13 @@ struct Loader<Dense<E>> {
         return Dense<E>::load(row, layout, p, k);
     }
 };
+} // namespace detail
 
 // A row's coefficients over a run of `packets` consecutive packets, held in
 // registers by a kernel that walks one row along K. `load` reads the run's
 // coefficient storage once, positioned at packet p; `packet` then forms
-// packet p from its codes and that state, with the values `Loader<W>::load`
-// yields, and moves the state on to packet p + 1. Hierarchical coefficients
+// packet p from its codes and that state, with the values a plain load
+// (`detail::Loader<W>`) yields, and moves the state on to packet p + 1. Hierarchical coefficients
 // keep their local codes and factors per factor group in planes apart from
 // the codes, so a walk that loads them per packet touches two more places of
 // every row on every packet; with a run it touches them once per factor
@@ -1441,16 +1558,16 @@ struct Block {
     static state load(weight_bytes, Rows16, uint) { return state{}; }
     static typename W::packet packet(weight_bytes row, Rows16 layout, uint p, uint k,
         thread state &) {
-        return Loader<W>::load(row, layout, p, k);
+        return detail::Loader<W>::load(row, layout, p, k);
     }
 };
 
 template <typename P, typename C, typename FS, uint FACTOR_GROUP, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS,
     typename L, uint GROUP, bool MIN, int BIAS_SIGN, uint CARRIED_BIT, typename SB, typename F>
 struct Block<Packet<P, C,
-    Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB>,
+    detail::Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB>,
     F>> {
-    typedef Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB> K;
+    typedef detail::Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB> K;
     typedef Packet<P, C, K, F> W;
     static constant constexpr uint packets = K::packets;
     typedef typename K::run state;
@@ -1470,9 +1587,59 @@ inline float value_at(thread const typename W::packet &k, uint i) {
     return W::pair_values(k, i >> 3, (i & 7u) >> 1)[i & 1u];
 }
 
+// The rows of one weight tensor of decoder W (`k` logical values a row) in
+// the bound weights' space: its bytes (`base`) and geometry (`layout`, a
+// slot's `KERNEL_Wn_LAYOUT(k)`), addressed by stored row. A kernel maps its
+// rows to stored rows (a row table, a row range) and asks the matrix for the
+// rest: a row's place (`locate`), a row `r` rows after a located one of the
+// same row tile (`after`: the same base, so a lane that holds several rows of
+// a tile holds one address for them; on the M1 a launch of 512 threads
+// leaves a thread 104 registers, and each base a lane holds past that is
+// stack traffic at every packet), whether its row tiles are R-row groups
+// (`tiles`), a located row's packets (`packet`) and coefficient runs (`run`,
+// `Block`), and the 32-bit offset from `base` of a row's unit of `bytes`
+// bytes of the code plane (`codes_at`) or of the plane of high code bits
+// (`high_at`). Every per-form reader (<seismic/forms.h>) reads a weight
+// through it.
+template <typename W>
+struct Matrix {
+    weight_bytes base;
+    Rows16 layout;
+    uint k;
+    typedef Located located;
+    // Rows of one stored row tile (1: rows stored one after another).
+    uint tile() const { return layout.tile; }
+    located locate(ulong stored) const { return located{layout.base_of(base, stored), layout.of(stored)}; }
+    static located after(located at, uint r) {
+        at.geometry.r += r;
+        return at;
+    }
+    template <uint R>
+    bool tiles() const {
+        return layout.tile > 1u && layout.tile % R == 0u;
+    }
+    typename W::packet packet(thread const located &at, uint p) const {
+        return detail::Loader<W>::load(at.row, at.geometry, p, k);
+    }
+    typename Block<W>::state run(thread const located &at, uint p) const {
+        return Block<W>::load(at.row, at.geometry, p);
+    }
+    typename W::packet packet(thread const located &at, uint p, thread typename Block<W>::state &state) const {
+        return Block<W>::packet(at.row, at.geometry, p, k, state);
+    }
+    uint codes_at(thread const located &at, uint bytes, uint unit) const {
+        return uint(at.geometry.at(at.row, layout.codes, bytes, unit) - base);
+    }
+    uint high_at(thread const located &at, uint bytes, uint unit) const {
+        return uint(at.geometry.at(at.row, layout.high, bytes, unit) - base);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // The decoder of a packed element's emitted decode axes (`_CODE*`,
 // `_COEFF*`): each axis value's component, chosen in one place.
+
+namespace detail {
 
 // The producer of codes CODES in planes of LOW and HIGH bits.
 template <uint CODES, uint LOW, uint HIGH>
@@ -1579,6 +1746,8 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
             NoSignedBias>> type;
 };
 
+} // namespace detail
+
 } // namespace packets
 
 // ---------------------------------------------------------------------------
@@ -1587,20 +1756,20 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
 
 #define PACKETS_DECODER(P)                                                                                      \
     packets::Packet<                                                                                            \
-        packets::PlanesOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS)>::type, \
-        packets::InterpretationOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS) + ELEMENT_CAT(P, _CODE_HIGH_BITS), \
+        packets::detail::PlanesOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS)>::type, \
+        packets::detail::InterpretationOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS) + ELEMENT_CAT(P, _CODE_HIGH_BITS), \
             ELEMENT_CAT(P, _CODES_OFFSET), ELEMENT_CAT(P, _CODES_TABLE), ELEMENT_CAT(P, _CODES_GRID), ELEMENT_CAT(P, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(P, _CODES_GRID_LANES), \
             ELEMENT_CAT(P, _CODES_GRID_SIGNS), ELEMENT_CAT(P, _CODES_GRID_DELTA) != 0,                          \
             ELEMENT_CAT(P, _CODES_GRID_DELTA_EXPONENT), ELEMENT_CAT(P, _CODES_GRID_SIGN_BIT),                   \
             ELEMENT_CAT(P, _CODES_GRID_SIGN_BITS), ELEMENT_CAT(P, _CODES_GRID_DELTA_BIT)>::type,                                                       \
-        packets::CoefficientsOf<ELEMENT_CAT(P, _COEFF), ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _COEFF_SCALE),         \
+        packets::detail::CoefficientsOf<ELEMENT_CAT(P, _COEFF), ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _COEFF_SCALE),         \
             ELEMENT_CAT(P, _COEFF_BIAS), ELEMENT_CAT(P, _COEFF_BIAS_SIGN), ELEMENT_CAT(P, _COEFF_GROUP),            \
             ELEMENT_CAT(P, _LOGICAL_GROUP),                                                                     \
             ELEMENT_CAT(P, _COEFF_FACTOR_GROUP), ELEMENT_CAT(P, _COEFF_EXPONENT), ELEMENT_CAT(P, _CODES_EXPONENT),     \
             ELEMENT_CAT(P, _COEFF_LOCAL_BITS), ELEMENT_CAT(P, _COEFF_LOCAL_SCALE_BITS), ELEMENT_CAT(P, _COEFF_LOCAL), \
             ELEMENT_CAT(P, _COEFF_LOCAL_OFFSET),                                                                \
             ELEMENT_CAT(P, _COEFF_CARRIED), ELEMENT_CAT(P, _COEFF_SIGNED_BIAS_EXPONENT)>::type,                 \
-        packets::Forms<ELEMENT_CAT(P, _FORM_PACK) != 0, ELEMENT_CAT(P, _FORM_PACK_CENTRE),                       \
+        packets::detail::Forms<ELEMENT_CAT(P, _FORM_PACK) != 0, ELEMENT_CAT(P, _FORM_PACK_CENTRE),                       \
             ELEMENT_CAT(P, _FORM_PACK_OFFSET), ELEMENT_CAT(P, _FORM_PACK_RESIDUE),                              \
             ELEMENT_CAT(P, _FORM_PACK_SUMS) != 0, ELEMENT_CAT(P, _FORM_INT8) != 0,                              \
             ELEMENT_CAT(P, _FORM_MATRIX_CODES) != 0, ELEMENT_CAT(P, _FORM_MATRIX_RUNS),                          \

@@ -1,3 +1,4 @@
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ATTENTION_AFFINE_HISTORY 1
 #define ATTENTION_QUERY_GROUP 1
 // State-only geometry: common helpers have no query or gate rows.

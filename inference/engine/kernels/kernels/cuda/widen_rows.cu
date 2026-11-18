@@ -1,5 +1,6 @@
 // widen_rows: widened[row, column] = f32(rows[row, column]); one thread per
 // element.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 
 extern "C" __global__ void widen_rows(SEISMIC_KERNEL_PARAMS) {
@@ -12,5 +13,5 @@ extern "C" __global__ void widen_rows(SEISMIC_KERNEL_PARAMS) {
         return;
     const u64 row = index / width, column = index % width;
     widened.put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-                element::at<element::Act>(rows, row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1));
+                element::at<activation::Act>(rows, row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1));
 }

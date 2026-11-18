@@ -1,36 +1,29 @@
 // Routing (`routed_route`) on the `dense` projection operator, segmented over
 // `(router, shared_router)` in the CPU 8-lane reference order.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #define KERNEL_W1 SEISMIC_SHARED_ROUTER
 // The projection's decoding launches stage their weights' tables (`packets.glsl`).
-#define PACKETS_STAGED_TABLES 1
+#define PACKETS_CONFIG_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #include "lib/projection/projection.glsl"
 #define ROUTE_E uint(SEISMIC_DIM_E)
 #define ROUTE_STRIDE (uint(SEISMIC_DIM_E) + 1u)
 #include "lib/routed/route.glsl"
 
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define ROUTE_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define ROUTE_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define ROUTE_NORM ELEMENT_BF16
-#else
-#error "routed norm must be dense"
-#endif
+#define ROUTE_NORM ELEMENT_OF(SEISMIC_NORM)
 
 #define ROUTE_H uint(SEISMIC_DIM_H)
 
 projection_prologue projected_input(uint g) {
-    return projection_ordered_input(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+    return projection_ordered_input(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
         SEISMIC_NORM_STRIDE_0, ROUTE_NORM, element_word_f32(SEISMIC_PARAM_EPS), ROUTE_H, 0ul,
         uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT));
 }
 
 projection_prologue projected_rows(uint g) {
-    return projection_plain(ELEMENT_ACT, out_stored(SEISMIC_RESULT_0_OUT, 0ul),
+    return projection_plain(ACTIVATION_A, out_stored(SEISMIC_RESULT_0_OUT, 0ul),
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, ROUTE_H, 0ul);
 }
 

@@ -3,10 +3,11 @@
 // candidates' five features and their layer norm (every thread, redundantly)
 // and the H outputs silu(up · normed + up_bias), one column per thread,
 // rounded once to A.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/reduce.h"
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 
 #define FEATURES_THREADS 256u
 
@@ -24,7 +25,7 @@ kernel void corrector_features(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[FEATURES_THREADS / 32u];
-    const element::Out<activation> result(result_cells);
+    const element::Out<activation_element> result(result_cells);
     const ulong vocabulary = SEISMIC_DIM_V, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
     device const float *line = logits + ulong(row) * SEISMIC_LOGITS_STRIDE_0;
     float local = -INFINITY;

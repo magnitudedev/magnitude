@@ -20,7 +20,7 @@ using element::u8;
 using element::u16;
 using element::u32;
 using element::u64;
-typedef element::Act Act;
+typedef activation::Act Act;
 using Slot = versions::Slot;
 
 constexpr int NK = static_cast<int>(SEISMIC_DIM_NK);

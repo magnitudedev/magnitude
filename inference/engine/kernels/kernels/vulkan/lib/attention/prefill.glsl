@@ -48,7 +48,7 @@
 // ((row * KV * G + head) * PARTS + part) for the decode merge.
 #include "history.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) == ELEMENT_F32
 #error "prefill attention stages 2-byte activations"
 #endif
 
@@ -172,7 +172,7 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
                 x[i] = 0.0;
         }
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            x[i] = element_round(ELEMENT_ACT, x[i]);
+            x[i] = element_round(ACTIVATION_A, x[i]);
         const int exponent = prefill_query_exponent(x);
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
             element_put(ELEMENT_F16, queries, at + i, ldexp(x[i], -exponent));
@@ -262,7 +262,7 @@ int prefill_pick(uint64_t row, uint pick) {
 // gathered from the pick plane; a pick of -1 stages zeros.
 void prefill_stage_picks(uint64_t row, uint pick0, uint kv_head, uint column, const uint w) {
     const uint pieces = w / 8u;
-    const uint64_t head_bytes = uint64_t(ATTENTION_W) * ELEMENT_BYTES(ELEMENT_ACT);
+    const uint64_t head_bytes = uint64_t(ATTENTION_W) * ELEMENT_BYTES(ACTIVATION_A);
     for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
         const uint k = item / pieces;
         const uint c = (item % pieces) * 8u;
@@ -270,8 +270,8 @@ void prefill_stage_picks(uint64_t row, uint pick0, uint kv_head, uint column, co
         uvec4 bits = uvec4(0u);
         if (index >= 0) {
             bits = element_uvec4_at(history_address(PREFILL_PICK_PLANE, uint64_t(index), PREFILL_PICK_SLAB_ROWS,
-                uint64_t(ATTENTION_KV) * head_bytes, head_bytes, kv_head) + uint64_t(column + c) * ELEMENT_BYTES(ELEMENT_ACT));
-            if (ELEMENT_ACT == ELEMENT_BF16) {
+                uint64_t(ATTENTION_KV) * head_bytes, head_bytes, kv_head) + uint64_t(column + c) * ELEMENT_BYTES(ACTIVATION_A));
+            if (ACTIVATION_A == ELEMENT_BF16) {
                 vec4 even, odd;
                 element_split8(ELEMENT_BF16, bits, even, odd);
                 bits = element_pack8(ELEMENT_F16, even, odd);
@@ -691,12 +691,12 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
         float x[ATTENTION_E];
         if (i < PREFILL_QT * G && token < rows) {
             attention_prepare(ATTENTION_QUERY_BUFFER + ((token * KV * G + kv_head * G + i % G) * ATTENTION_QUERY_STRIDE)
-                    * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_QUERY_NORM,
+                    * uint64_t(ELEMENT_BYTES(ACTIVATION_A)), ATTENTION_QUERY_NORM,
                 SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + token * 16ul,
                 SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
                 ATTENTION_AMPLITUDE_BUFFER, element_word_f32(SEISMIC_PARAM_EPSILON), lane, rounding_none(), x);
             [[unroll]] for (uint j = 0u; j < ATTENTION_E; ++j)
-                x[j] = element_round(ELEMENT_ACT, x[j]);
+                x[j] = element_round(ACTIVATION_A, x[j]);
         } else {
             [[unroll]] for (uint j = 0u; j < ATTENTION_E; ++j)
                 x[j] = 0.0;
@@ -996,7 +996,7 @@ void prefill_picks(prefill_scratch scratch_planes, prefill_picked picked, uint64
             * element_f32_at(scratch_planes.query_factors + query_row * 4ul);
         accumulated[i] = 0.0;
     }
-    const uint64_t head_bytes = uint64_t(W) * ELEMENT_BYTES(ELEMENT_ACT);
+    const uint64_t head_bytes = uint64_t(W) * ELEMENT_BYTES(ACTIVATION_A);
     float maximum = -ATTENTION_INF;
     float denominator = 0.0;
     for (uint pick = 0u; pick < picks; ++pick) {

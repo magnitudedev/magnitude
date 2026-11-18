@@ -1,3 +1,5 @@
+#define KERNEL_A SEISMIC_ELEMENT_A
+#define KERNEL_SELECTED SEISMIC_SELECTED
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_I SEISMIC_DIM_I
 #define ATTENTION_U SEISMIC_DIM_U
@@ -32,7 +34,7 @@
         uint(SEISMIC_DIM_B), int(SEISMIC_DIM_BR), PREFILL_LIST_CAPACITY}
 
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
+#if ELEMENT_KIND(KERNEL_A) == ELEMENT_F32
 #error "prefill attention stages 2-byte activations in threadgroup memory"
 #endif
 
@@ -100,7 +102,7 @@ kernel void attention_prefill_attend(
     PREFILL_EXCHANGE(exchange, SEISMIC_TUNE_QT);
     attention::prefill_attend<SEISMIC_TUNE_QT>(attention::dense_planes{history_key,
         attention::values_plane(history_key, history_value), ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
-        query, gate, visible, fresh, element::Out<element::Act>(result_cells), queries, keys, values, partials,
+        query, gate, visible, fresh, element::Out<activation::Act>(result_cells), queries, keys, values, partials,
         statistics, counts, SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane,
         PREFILL_WORKLIST(selection, worklist), sinks);
@@ -119,7 +121,7 @@ kernel void attention_prefill_merge(
     uint column [[thread_index_in_threadgroup]]) {
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
-    attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, element::Out<element::Act>(result_cells), partials,
+    attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, element::Out<activation::Act>(result_cells), partials,
         statistics, counts, SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }
 
@@ -168,7 +170,7 @@ kernel void attention_prefill_shared(
         attention::decode_picks{selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS)},
         attention::key_rounding(SEISMIC_DIM_KR != 0, uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT),
             uint(SEISMIC_PARAM_KEY_SCALE), uint(SEISMIC_PARAM_KEY_AMAX_FLOOR)),
-        attention::shared_result{query, gate, sinks, element::Out<element::Act>(result_cells),
+        attention::shared_result{query, gate, sinks, element::Out<activation::Act>(result_cells),
             SEISMIC_PARAM_GATE_FUNCTION != 0});
 #endif
 }
@@ -208,6 +210,6 @@ kernel void attention_prefill_rotate(
     uint pair [[thread_index_in_threadgroup]]) {
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
-    attention::output_rotary(element::Out<element::Act>(result_cells), coordinates, rotary_components,
+    attention::output_rotary(element::Out<activation::Act>(result_cells), coordinates, rotary_components,
         rotary_frequencies, rotary_amplitudes, group.x, group.y, pair);
 }

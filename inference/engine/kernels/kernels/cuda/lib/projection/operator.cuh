@@ -106,10 +106,7 @@ __device__ __forceinline__ void gemv(const Pro &pro, const u8 *staged, const voi
     __shared__ GemvShared<Shape, typename GemvSource<Pro>::type, gemv_staged_bytes<STAGING, Shape, K, WA, WB>(),
                           Points>
         shared;
-    if constexpr (Same<Points, packets::BlockPoints>::value) {
-        stage_points(Readers{});
-        __syncthreads();
-    }
+    stage_points(Readers{});
     if constexpr (NB == 1)
         if (M == 1) {
             constexpr bool ENTRIES = s8_entries<S8, WA, WB>();
@@ -353,10 +350,7 @@ __device__ __forceinline__ void gemv_segmented(const Pro &pro, const u8 *staged,
     using Points = typename PointsOf<Weights>::type;
     __shared__ GemvShared<Shape, typename GemvSource<Pro>::type, StagingOf<STAGING, Shape, K, Weights>::bytes(), Points>
         shared;
-    if constexpr (Same<Points, packets::BlockPoints>::value) {
-        stage_points(Weights{});
-        __syncthreads();
-    }
+    stage_points(Weights{});
     const u64 kblocks = K / 64;
     u64 group = Shape::tile_group();
     u64 groups[Segments::COUNT];

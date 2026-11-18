@@ -16,11 +16,11 @@
     if (n >= SEISMIC_DIM_H)                                                                                \
         return;                                                                                            \
     const float *weights = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS));          \
-    const element::Act::storage *projected = ROUTED_PROJECTED + m * SEISMIC_DIM_K * SEISMIC_DIM_H; \
+    const activation::Act::storage *projected = ROUTED_PROJECTED + m * SEISMIC_DIM_K * SEISMIC_DIM_H; \
     float selected = 0.0f;                                                                                 \
     for (projection::u64 k = 0; k < SEISMIC_DIM_K; ++k)                                                    \
         selected = __fmaf_rn(weights[m * SEISMIC_WEIGHTS_STRIDE_0 + k * SEISMIC_WEIGHTS_STRIDE_1],          \
-                             element::Act::load(projected[k * SEISMIC_DIM_H + n]), selected);                   \
+                             activation::Act::load(projected[k * SEISMIC_DIM_H + n]), selected);                   \
     ROUTED_SITE_ADD(m, n, selected)                                                                        \
     const float *base =                                                                                    \
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BASE)) + m * SEISMIC_BASE_STRIDE_0;     \

@@ -2,6 +2,7 @@
 // the `dense` projection (`lib/projection/operator.cuh`) over two segments
 // along x: the u segment pairs the B and X streams into u = B * X (F32,
 // columns 0..CH), the C segment stores C (F32, columns CH..2CH).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_B_WEIGHT
 #define KERNEL_W1 SEISMIC_X_WEIGHT
 #define KERNEL_W2 SEISMIC_C_WEIGHT

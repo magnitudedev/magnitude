@@ -1,3 +1,4 @@
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ATTENTION_AFFINE_HISTORY 1
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_I SEISMIC_DIM_I
@@ -151,8 +152,8 @@ kernel void attention_decode_k8v4_partial(
             lane, x);
         ATTENTION_UNROLL
         for (uint i = 0; i < E; ++i)
-            reinterpret_cast<threadgroup element::Act::storage *>(prepared)[g * W + lane * E + i] =
-                element::Act::store(x[i]);
+            reinterpret_cast<threadgroup activation::Act::storage *>(prepared)[g * W + lane * E + i] =
+                activation::Act::store(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint head0 = (simd % SLICES) * H;
@@ -353,7 +354,7 @@ kernel void attention_decode_k8v4_merge(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     constexpr bool ROTATED = SEISMIC_DIM_RO != 0;
-    const element::Out<element::Act> result(result_cells);
+    const element::Out<activation::Act> result(result_cells);
     threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
     threadgroup float row_values[ROTATED ? ATTENTION_W : 1];
     attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_MATRIX ? SEISMIC_TUNE_KEYS : 0, 0,

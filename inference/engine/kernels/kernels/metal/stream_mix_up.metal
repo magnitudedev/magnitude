@@ -1,6 +1,7 @@
 // stream_mix_up: the low-rank rows through `up`, each output column the gate
 // of its stream's column, publishing the per-stream partials (`Mix`): the
 // `dense` projection (single) over the rows as given.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_UP_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
@@ -9,7 +10,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 // The up weight takes no NVFP4 operands (the entry's contract): every form
 // reads the rows as given.
@@ -41,14 +42,14 @@ typedef projection::operands<NVFP4> Operands;
 // `raw` and `in` are the low-rank rows, read in place by every form.
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_S * SEISMIC_DIM_H), k = uint(SEISMIC_DIM_LR); \
-    const projection::Plain<activation, projection::AllRows> raw{low, SEISMIC_LOW_STRIDE_0, \
+    const projection::Plain<activation_element, projection::AllRows> raw{low, SEISMIC_LOW_STRIDE_0, \
         SEISMIC_LOW_STRIDE_1, k, {}};                                                   \
     const auto in = raw;                                                                \
     const projection::Mix<norm_element> out{element::Out<element::F32>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, \
         inverse, SEISMIC_INVERSE_STRIDE_0, SEISMIC_INVERSE_STRIDE_1, norm,              \
         SEISMIC_NORM_STRIDE_1, uint(SEISMIC_DIM_H), float(SEISMIC_DIM_S)};              \
-    projection::Weights<packets::W0> w{up_weight, KERNEL_W0_LAYOUT(k), k}
+    projection::Weights<packets::W0> w{{up_weight, KERNEL_W0_LAYOUT(k), k}}
 
 #define PROJECTION_GROUPS 1
 #define PROJECTION_GEMV_INPUT(x) const auto x = raw

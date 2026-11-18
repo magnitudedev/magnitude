@@ -2,6 +2,7 @@
 // One simdgroup per 32 vocabulary rows keeps the rows level one leaves
 // (`coarse`, `floor`), adds bit 3 to their logits (the 5-bit view) and
 // publishes the raised threshold (`lib/readout/progressive.h`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/readout/progressive.h"
 
 #ifdef SEISMIC_FORMING_READOUT_REFINE_ROWS_GATHER

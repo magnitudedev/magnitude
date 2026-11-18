@@ -1177,6 +1177,7 @@ pub enum CodeValues {
 impl CodeValues {
     /// These values less `least`, as bytes: the x86 dots' shifted operands
     /// (unsigned bytes, `packed_x86::shift`).
+    #[cfg(target_arch = "x86_64")]
     pub const fn less(self, least: i32) -> Self {
         match self {
             Self::Table(mut table) => {
@@ -1314,8 +1315,11 @@ pub struct PanelCodes {
 /// A packet's 32 exact integer values: a code component.
 pub trait Codes: Copy + Send + Sync + 'static {
     /// The least and the greatest value: the registry's code domain
-    /// (`DecodeAxes::codes`), a component's const parameters.
+    /// (`DecodeAxes::codes`), a component's const parameters: the x86 dots'
+    /// shift.
+    #[cfg(target_arch = "x86_64")]
     const LEAST: i32;
+    #[cfg(target_arch = "x86_64")]
     const GREATEST: i32;
 
     /// How the codes lie in rows8 panels; None for grid codes, whose
@@ -1327,6 +1331,7 @@ pub trait Codes: Copy + Send + Sync + 'static {
     /// `r + offset`: `(HIGH, offset)`, which a 16-row tile's quantized dot
     /// reads with no unpermuting (`Hier::dot_tile16`). None for any other
     /// codes.
+    #[cfg(target_arch = "x86_64")]
     const NIBBLE_LANES: Option<(u32, i32)> = None;
 
     /// The values of packet `at`, in element order.
@@ -1434,6 +1439,7 @@ pub trait Codes: Copy + Send + Sync + 'static {
     /// [`Codes::x86_signed_pair`] gives apart at no cost: the x86 row dots
     /// then take the magnitudes as unsigned bytes against the activations
     /// signed by the codes, with no shift (`packed_x86::row_shift`).
+    #[cfg(target_arch = "x86_64")]
     const MAGNITUDES: bool = false;
 }
 
@@ -1498,6 +1504,7 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
     Planes<LOW, HIGH, I, LEAST, GREATEST>
 {
     /// The code domain, whose values fit a signed byte.
+    #[cfg(target_arch = "x86_64")]
     const DOMAIN: (i32, i32) = {
         assert!(
             i8::MIN as i32 <= LEAST && LEAST <= GREATEST && GREATEST <= i8::MAX as i32,
@@ -1765,9 +1772,12 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
 impl<const LOW: u32, const HIGH: u32, I: ByteValues<LOW, HIGH>, const LEAST: i32, const GREATEST: i32> Codes
     for Planes<LOW, HIGH, I, LEAST, GREATEST>
 {
+    #[cfg(target_arch = "x86_64")]
     const LEAST: i32 = Self::DOMAIN.0;
+    #[cfg(target_arch = "x86_64")]
     const GREATEST: i32 = Self::DOMAIN.1;
     const PANEL: Option<PanelCodes> = Some(PanelCodes { low: LOW, high: HIGH, values: I::VALUES });
+    #[cfg(target_arch = "x86_64")]
     const NIBBLE_LANES: Option<(u32, i32)> = match I::VALUES {
         CodeValues::Affine { double: false, offset } if LOW == 4 && HIGH <= 2 => Some((HIGH, offset as i32)),
         _ => None,
@@ -1984,6 +1994,7 @@ impl<
     const SIGN_MASK: u32 = (1 << Self::SIGN_BITS) - 1;
     /// The code domain: signed values below 128 in magnitude
     /// (`grid_values`).
+    #[cfg(target_arch = "x86_64")]
     const DOMAIN: (i32, i32) = {
         assert!(
             -LEAST <= i8::MAX as i32 && GREATEST <= i8::MAX as i32,
@@ -2083,7 +2094,9 @@ impl<
         const GREATEST: i32,
     > Codes for Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS, D, LEAST, GREATEST>
 {
+    #[cfg(target_arch = "x86_64")]
     const LEAST: i32 = Self::DOMAIN.0;
+    #[cfg(target_arch = "x86_64")]
     const GREATEST: i32 = Self::DOMAIN.1;
 
     #[inline(always)]
@@ -2135,6 +2148,7 @@ impl<
     }
 
     // A signed grid's points are its magnitudes, its lane signs their signs.
+    #[cfg(target_arch = "x86_64")]
     const MAGNITUDES: bool = Self::SIGN_BITS > 0 && D::BITS == 0;
 
     #[cfg(target_arch = "x86_64")]
@@ -2401,7 +2415,9 @@ pub trait Coefficients: Copy + Send + Sync + 'static {
     const UNIT: usize;
 
     /// Whether each unit's coefficient is an integer (a scale code), so the
-    /// units' widened sums add exactly into one per block (`tile::Scaled`).
+    /// units' widened sums add exactly into one per block (`tile::Scaled`),
+    /// on x86.
+    #[cfg(target_arch = "x86_64")]
     const INTEGER_UNITS: bool;
 
     /// The largest magnitude of a unit's integer and of a minimum code.
@@ -2940,6 +2956,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
 {
     const BIASED: bool = BIAS;
     const UNIT: usize = if GROUP < PACKET { GROUP } else { PACKET };
+    #[cfg(target_arch = "x86_64")]
     const INTEGER_UNITS: bool = false;
     const MAGNITUDE: i32 = 1;
     type Units<const W: usize> = tile::Sums<W>;
@@ -4104,6 +4121,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
 {
     const BIASED: bool = L::BIAS.is_some();
     const UNIT: usize = if GROUP < PACKET { GROUP } else { PACKET };
+    #[cfg(target_arch = "x86_64")]
     const INTEGER_UNITS: bool = true;
     const MAGNITUDE: i32 = L::MAGNITUDE;
     type Units<const W: usize> = tile::Scaled<W>;

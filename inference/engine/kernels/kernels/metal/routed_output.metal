@@ -4,10 +4,11 @@
 // last threadgroup of a channel tile to arrive (`arrivals`) joins the tile's
 // channels of every row.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #if defined(SEISMIC_FORMING_ROUTED_OUTPUT_RESIDENT) || defined(SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_RESIDENT)
 // A resident layer's: nothing lands in its records while it runs, so plain
 // loads read them.
-#define PACKETS_PLAIN_RECORDS
+#define PACKETS_CONFIG_PLAIN_RECORDS
 #endif
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
 #include "lib/routed/output.h"

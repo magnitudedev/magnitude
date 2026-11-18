@@ -36,7 +36,7 @@
 // A `segmented` projection defines instead the segments' macros (below).
 // Every body that decodes the weights first stages their tables
 // (`packets_stage_tables`), which an includer that defines
-// PACKETS_STAGED_TABLES before including `projection.glsl` reads from the
+// PACKETS_CONFIG_STAGED_TABLES before including `projection.glsl` reads from the
 // end of each such launch's shared region (`dense.seismic` holds them there).
 
 // The GEMM's shape: the declaration's tuned tile and sub-tile.

@@ -46,7 +46,7 @@ float reduce_group_max(float value, const uint partials) {
 }
 
 // Maximum of one unsigned value per invocation, as `reduce_group_max` (a
-// group's peak, `magnitude_peak`: its bits order NaN above +Inf, which no
+// group's peak, `nvfp4_peak`: its bits order NaN above +Inf, which no
 // float maximum here keeps).
 uint reduce_group_max_u32(uint value, const uint partials) {
     value = seismic_redux_max_u32(value);

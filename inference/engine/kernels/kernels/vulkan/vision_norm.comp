@@ -5,25 +5,9 @@
 #include "lib/vision/vision.glsl"
 
 
-#if defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
-#define WEIGHT_KIND ELEMENT_BF16
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
-#define WEIGHT_KIND ELEMENT_F16
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
-#define WEIGHT_KIND ELEMENT_F32
-#else
-#error "unsupported vision_norm weight representation"
-#endif
+#define WEIGHT_KIND ELEMENT_OF(SEISMIC_WEIGHT)
 
-#if defined(SEISMIC_BIAS_REPRESENTATION_BF16)
-#define BIAS_KIND ELEMENT_BF16
-#elif defined(SEISMIC_BIAS_REPRESENTATION_F16)
-#define BIAS_KIND ELEMENT_F16
-#elif defined(SEISMIC_BIAS_REPRESENTATION_F32)
-#define BIAS_KIND ELEMENT_F32
-#else
-#error "unsupported vision_norm bias representation"
-#endif
+#define BIAS_KIND ELEMENT_OF(SEISMIC_BIAS)
 
 void vision_norm() {
     const uint g = uint(SEISMIC_DIM_G), h = uint(SEISMIC_DIM_H);

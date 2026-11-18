@@ -7,7 +7,7 @@
 
 #include <seismic/slab.cuh>
 #include "lib/streaming/control.cuh"
-#include "lib/repack/repack.cuh"
+#include <seismic/element.cuh>
 #include "../streaming/list.hpp"
 
 #define STREAMING_COPY_FROM(table, record) slab::region(table, u64(record))
@@ -19,7 +19,7 @@ __device__ void routed_copy_block(SEISMIC_KERNEL_PARAMS) {
     __shared__ int words[STREAMING_LIST_WORDS];
     streaming_list_copy(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE), reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_LIST)),
                         reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP))[0],
-                        SEISMIC_PTR(SEISMIC_BUFFER_DESTINATION), REPACK_MATRIX_BYTES(SEISMIC_SOURCE),
+                        SEISMIC_PTR(SEISMIC_BUFFER_DESTINATION), ELEMENT_MATRIX_BYTES(SEISMIC_SOURCE),
                         blockIdx.x + gridDim.x * blockIdx.y, gridDim.x * gridDim.y, words, threadIdx.x, blockDim.x,
                         seismic_words_value);
 }

@@ -8,6 +8,7 @@
 // coordinates (the unit's first token's; `rotary_lane_rotate`), rounds it
 // with the indexer's trained rounding (`rounding_lanes`) and stores it in the
 // F32 key plane at latent_rows[row].
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include <seismic/element.glsl>
 #include <seismic/slab.glsl>
 #include "lib/core/activation.glsl"
@@ -36,7 +37,7 @@ void indexer_keys() {
     const uint64_t key = SEISMIC_PTR(SEISMIC_BUFFER_KEY);
     float x[LANE_E];
     [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-        x[i] = element_at(ELEMENT_ACT, key, row * SEISMIC_KEY_STRIDE_0 + uint64_t(lane * LANE_E + i) * SEISMIC_KEY_STRIDE_1);
+        x[i] = element_at(ACTIVATION_A, key, row * SEISMIC_KEY_STRIDE_0 + uint64_t(lane * LANE_E + i) * SEISMIC_KEY_STRIDE_1);
     // A rounded key is rounded from its norm and rotation held in A.
     const rounding_t trained =
         rounding_of(SEISMIC_PARAM_BLOCK, SEISMIC_PARAM_ELEMENT, SEISMIC_PARAM_SCALE, SEISMIC_PARAM_AMAX_FLOOR);

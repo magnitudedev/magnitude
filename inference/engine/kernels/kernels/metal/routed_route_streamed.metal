@@ -1,6 +1,7 @@
 // Expert streaming's decode routing (`routed_route_streamed`) on the `dense`
 // projection operator, segmented over `(router, shared_router, (shared_gate, shared_up))`,
 // followed by resolve and assignment in the selecting threadgroup.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #define KERNEL_W1 SEISMIC_SHARED_ROUTER
 #define KERNEL_W2 SEISMIC_SHARED_GATE
@@ -16,7 +17,7 @@
 #include "lib/streaming/control.h"
 #include "../streaming/resolve.hpp"
 
-typedef element::Act Act;
+typedef activation::Act Act;
 typedef ELEMENT_OF(SEISMIC_NORM) Norm;
 constant constexpr bool NVFP4_SHARED = projection::OperandRecipe<
     packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4>::NVFP4;
@@ -56,10 +57,10 @@ constant constexpr bool NVFP4_SHARED = projection::OperandRecipe<
         uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT)>::type raw{                              \
         residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm,               \
         SEISMIC_NORM_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_EPS)), k, {}};             \
-    const projection::Weights<packets::W0> w0{router, KERNEL_W0_LAYOUT(k), k};              \
-    const projection::Weights<packets::W1> w1{shared_router, KERNEL_W1_LAYOUT(k), k};       \
-    const projection::Weights<packets::W2> w2{shared_gate, KERNEL_W2_LAYOUT(k), k};         \
-    const projection::Weights<packets::W3> w_up{shared_up, KERNEL_W3_LAYOUT(k), k};         \
+    const projection::Weights<packets::W0> w0{{router, KERNEL_W0_LAYOUT(k), k}};            \
+    const projection::Weights<packets::W1> w1{{shared_router, KERNEL_W1_LAYOUT(k), k}};     \
+    const projection::Weights<packets::W2> w2{{shared_gate, KERNEL_W2_LAYOUT(k), k}};       \
+    const projection::Weights<packets::W3> w_up{{shared_up, KERNEL_W3_LAYOUT(k), k}};       \
     const projection::CoherentStore out0{logits, SEISMIC_DIM_E + 1ul, 1ul, 0ul}; \
     const projection::CoherentStore out1{logits, SEISMIC_DIM_E + 1ul, 1ul, SEISMIC_DIM_E}; \
     const projection::SiluMul<Act> out2{element::Out<Act>(shared_product_cells),            \

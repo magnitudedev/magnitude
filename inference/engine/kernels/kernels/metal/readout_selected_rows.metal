@@ -4,6 +4,7 @@
 // classes normalize while staging; from BATCH_FROM rows `stage` normalizes
 // once into `normalized`, which every other form reads. Logits are softcapped
 // from the accumulator when `softcap` > 0.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
@@ -12,7 +13,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 // The weight's operand rows (the normalized rows, or NVFP4 operands).
 constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
@@ -45,13 +46,13 @@ typedef projection::operands<NVFP4> Operands;
 // normalized rows every form past the GEMV reads.
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_SV), k = uint(SEISMIC_DIM_D); \
-    projection::InputOf<activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+    projection::InputOf<activation_element, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
         raw{hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0, \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
-    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    const projection::Plain<activation_element, projection::AllRows> in{normalized, k, 1, k, {}}; \
     const projection::Logits out{element::Out<element::F32>(logits), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
         as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))};                                   \
-    projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k, selected}
+    projection::Weights<packets::W0> w{{weight, KERNEL_W0_LAYOUT(k), k}, selected}
 
 // The GEMV's rows: the norm applied as they stage, from their sums of
 // squares over the threadgroup.

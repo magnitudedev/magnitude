@@ -3,6 +3,7 @@
 // form (`lib/projection/operator.cuh`) onto the exact codes, by the routine
 // the certified exact level shares (`lib/readout/progressive.cuh`), over the
 // rows' final norm, which `stage` forms.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/readout/progressive.cuh"
 #include "lib/projection/operator.cuh"
 

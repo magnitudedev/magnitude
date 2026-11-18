@@ -89,7 +89,7 @@ Out ss_window_row(int bank, int tap) {
 float ss_raw(versions_slot slot, int position, uint channel) {
     if (position < 0)
         return out_at(ss_window_row(slot.source, slot.taped + SS_TAPS - 1 + position), uint64_t(channel));
-    return element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
+    return element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
         uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + SS_X_COLUMN + channel);
 }
 
@@ -111,7 +111,7 @@ float ss_convolve(versions_slot slot, int local, uint channel) {
 // The step size delta = softplus(dt + time_bias) and the log decay
 // rate * delta of head `head` at `row`.
 void ss_step_of(int row, uint head, out float delta, out float log_decay) {
-    const float shifted = element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
+    const float shifted = element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
             uint64_t(row) * SEISMIC_PROJECTION_STRIDE_0 + SS_DT_COLUMN + head)
         + element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_TIME_BIAS) + uint64_t(head) * SEISMIC_TIME_BIAS_STRIDE_0 * 4ul);
     delta = max(shifted, 0.0) + log(1.0 + exp(-abs(shifted)));

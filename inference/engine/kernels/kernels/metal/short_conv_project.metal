@@ -5,6 +5,7 @@
 // while staging; `normalize` normalizes once into `normalized` for the matrix
 // GEMV and every form past 16 rows, and `normalize_tall` in the tall GEMM's
 // order.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_B_WEIGHT
 #define KERNEL_W1 SEISMIC_X_WEIGHT
 #define KERNEL_W2 SEISMIC_C_WEIGHT
@@ -22,7 +23,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 // The rows the three weights take (the normalized rows, or NVFP4 operands).
 constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
@@ -51,10 +52,10 @@ typedef projection::operands<NVFP4> Operands;
 // rows every form past the GEMV reads.
 #define PROJECTION_OPERANDS                                                             \
     const uint m = uint(SEISMIC_DIM_M), k = uint(SEISMIC_DIM_H), channels = uint(SEISMIC_DIM_CH); \
-    projection::Rms<activation, norm_element, projection::AllRows> raw{residual,        \
+    projection::Rms<activation_element, norm_element, projection::AllRows> raw{residual,        \
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0, \
         as_type<float>(uint(SEISMIC_PARAM_EPS)), k, {}};                                \
-    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    const projection::Plain<activation_element, projection::AllRows> in{normalized, k, 1, k, {}}; \
     const auto out0 = projection::scaling<(SEISMIC_DIM_BS != 0 || SEISMIC_DIM_XS != 0)>::wrap( \
         projection::Mul{element::Out<element::F32>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
             SEISMIC_RESULT_0_STRIDE_1},                                                 \
@@ -63,9 +64,9 @@ typedef projection::operands<NVFP4> Operands;
     const auto out1 = projection::scaling<(SEISMIC_DIM_CS != 0)>::wrap(                 \
         projection::Store<element::F32>{element::Out<element::F32>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, channels}, \
         projection::scale_factor(c_scale, SEISMIC_DIM_CS, 0, 0), 1.0f);                 \
-    projection::Weights<packets::W0> w0{b_weight, KERNEL_W0_LAYOUT(k), k};              \
-    projection::Weights<packets::W1> x_rows{x_weight, KERNEL_W1_LAYOUT(k), k};          \
-    projection::Weights<packets::W2> w1{c_weight, KERNEL_W2_LAYOUT(k), k}
+    projection::Weights<packets::W0> w0{{b_weight, KERNEL_W0_LAYOUT(k), k}};            \
+    projection::Weights<packets::W1> x_rows{{x_weight, KERNEL_W1_LAYOUT(k), k}};        \
+    projection::Weights<packets::W2> w1{{c_weight, KERNEL_W2_LAYOUT(k), k}}
 
 #define PROJECTION_GEMV_INPUT(x)                                                        \
     PROJECTION_SQUARES_SHARED(squares, decltype(raw)::parts);                           \
@@ -96,7 +97,7 @@ kernel void short_conv_project_normalize_tall(PROJECTION_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     PROJECTION_OPERANDS;
-    Operands::normalize<256, projection::TallOrder<activation>>(raw, item, normalized, k, norms, thread_index);
+    Operands::normalize<256, projection::TallOrder<activation_element>>(raw, item, normalized, k, norms, thread_index);
 }
 #endif
 

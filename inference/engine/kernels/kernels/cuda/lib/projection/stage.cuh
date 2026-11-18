@@ -161,95 +161,18 @@ template <class NORM, class Rows, u64 NORM_EXTENT, u64 PARTS>
 using Input = typename InputOf<NORM, Rows, NORM_EXTENT, PARTS>::type;
 
 // ---------------------------------------------------------------------------
-// Non-finite activations (`seismic-native-cpu` `quant.rs`): a NaN or ±Inf in
-// a group makes its scale NaN and its codes 0, so its products are NaN, as
-// the dense product's would be. A group's peak takes the NaN-propagating
-// maximum (`max.NaN`: one FMNMX, as `fmaxf`), and its scale maps a +Inf peak
-// to NaN once per group.
+// NVFP4 operand rows (<seismic/activation.cuh>, `packets::nvfp4`): the row's
+// global scale over its peak, and each 16-value block's scale and codes.
 
-// The larger of `peak` and |x|, NaN if either is.
-__device__ __forceinline__ float peak_with(float peak, float x) {
-    float result;
-    asm("max.NaN.f32 %0, %1, %2;" : "=f"(result) : "f"(peak), "f"(fabsf(x)));
-    return result;
-}
-
-// The smaller of a and b, NaN if either is.
-__device__ __forceinline__ float min_nan(float a, float b) {
-    float result;
-    asm("min.NaN.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// NVFP4 operands (docs/precision.md, "NVFP4 operands"; the portable
-// `nvfp4_row`): a product over NVFP4 weights takes each row x as
-// q * g * s, which A holds exactly. g, the row's global scale, is the least
-// power of two at or above amax(|x|) / (6 * 448); s, a 16-value block's
-// scale, is amax(|block|) / (6 * g) rounded to nearest even onto UE4M3; q
-// is x / (g * s) rounded to nearest even onto E2M1, saturating at 6 (zero
-// where s is). Every operation rounds once, to nearest even. The row is g's
-// group: a NaN or ±Inf in the row makes g NaN, so every block's s is NaN
-// (UE4M3's NaN, 0x7F) and every code 0.
-
-namespace nvfp4 {
-
-// NaN where amax is NaN or +Inf.
-__device__ __forceinline__ float global_scale(float amax) {
-    if (!(amax < __int_as_float(0x7f800000)))
-        return __int_as_float(0x7fffffff);
-    const u32 bits = __float_as_uint(__fdiv_rn(amax, 2688.0f));
-    const u32 exponent = (bits >> 23) + ((bits & 0x7fffffu) != 0u ? 1u : 0u);
-    return __uint_as_float(min(max(exponent, 1u), 254u) << 23);
-}
-
-// v >= 0 onto UE4M3 (exponent bias 7, three mantissa bits, subnormal
-// quantum 2^-9), saturating at 448; NaN stays NaN.
-__device__ __forceinline__ float ue4m3(float v) {
-    const u32 exponent = max((__float_as_uint(v) >> 23) & 255u, 121u);
-    const float quantum = __uint_as_float((exponent - 3u) << 23);
-    return min_nan(__fmul_rn(rintf(__fdiv_rn(v, quantum)), quantum), 448.0f);
-}
-
-// v onto E2M1's magnitudes 0, 0.5, 1, 1.5, 2, 3, 4 and 6 with v's sign,
-// saturating at 6; NaN stays NaN.
-__device__ __forceinline__ float e2m1(float v) {
-    const float a = fabsf(v);
-    const float m = a <= 0.25f   ? 0.0f
-                    : a < 0.75f  ? 0.5f
-                    : a <= 1.25f ? 1.0f
-                    : a < 1.75f  ? 1.5f
-                    : a <= 2.5f  ? 2.0f
-                    : a < 3.5f   ? 3.0f
-                    : a <= 5.0f  ? 4.0f
-                    : a > 5.0f   ? 6.0f
-                                 : a;
-    return v < 0.0f ? -m : m;
-}
-
-// The field of s, a UE4M3 value (`ue4m3`'s): exponent bias 7 above the
-// subnormal quantum 2^-9; a normal s's F32 exponent and three mantissa bits
-// rebiased, and NaN's 0x7F (whose F32 exponent field exceeds every finite
-// s's).
-__device__ __forceinline__ u32 ue4m3_field(float s) {
-    return s < 0.015625f ? (u32)__fmul_rn(s, 512.0f) : min((__float_as_uint(s) >> 20) - (120u << 3), 0x7fu);
-}
-
-// The code of q, an E2M1 value (`e2m1`'s): the magnitude's index among 0,
-// 0.5, 1, 1.5, 2, 3, 4, 6 with q's sign at bit 3 (zero positive).
-__device__ __forceinline__ u32 e2m1_code(float q) {
-    const float a = fabsf(q);
-    const u32 index = a < 2.0f ? (u32)__fmul_rn(a, 2.0f) : a < 4.0f ? 2u + (u32)a : a < 6.0f ? 6u : 7u;
-    return index | (q < 0.0f ? 8u : 0u);
-}
+namespace nvfp4_stage {
 
 // Row m's global scale g, by the whole block.
 template <class Pro>
 __device__ __forceinline__ float row_global(const Pro &pro, const float *factors, u32 m, u64 K, float *scratch) {
     float amax = 0.0f;
     for (u64 k = threadIdx.x; k < K; k += blockDim.x)
-        amax = peak_with(amax, pro.value(factors, m, k));
-    return global_scale(reduce::group_peak(amax, scratch));
+        amax = packets::peak_with(amax, pro.value(factors, m, k));
+    return packets::nvfp4::global_scale(reduce::group_peak(amax, scratch));
 }
 
 // The 16-value block `block` of row m under global scale g: its UE4M3
@@ -264,11 +187,11 @@ __device__ __forceinline__ void block_operands(const Pro &pro, const float *fact
         q[j] = pro.value(factors, m, block * 16 + j);
         maximum = fmaxf(maximum, fabsf(q[j]));
     }
-    s = ue4m3(__fdiv_rn(maximum, __fmul_rn(6.0f, g)));
+    s = packets::nvfp4::block_scale(maximum, g);
     const float d = __fmul_rn(g, s);
 #pragma unroll
     for (int j = 0; j < 16; ++j)
-        q[j] = d > 0.0f ? e2m1(__fdiv_rn(q[j], d)) : 0.0f;
+        q[j] = packets::nvfp4::code_value(q[j], d);
 }
 
 // The packed form of a block's codes (value j in nibble j % 8 of word
@@ -277,13 +200,13 @@ __device__ __forceinline__ uint2 packed_codes(const float (&q)[16]) {
     uint2 codes = make_uint2(0u, 0u);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-        codes.x |= e2m1_code(q[j]) << (4 * j);
-        codes.y |= e2m1_code(q[8 + j]) << (4 * j);
+        codes.x |= packets::nvfp4::e2m1_code(q[j]) << (4 * j);
+        codes.y |= packets::nvfp4::e2m1_code(q[8 + j]) << (4 * j);
     }
     return codes;
 }
 
-} // namespace nvfp4
+} // namespace nvfp4_stage
 
 // FP4 tensor operations: block-scaled `mma.sync` with E2M1 operands and
 // UE4M3 scales per 16 values, in the sm_12x family's architecture-specific
@@ -299,7 +222,7 @@ constexpr bool FP4_MMA = PROJECTION_FP4_MMA;
 
 // NVFP4 operand rows packed for FP4 tensor operations: a row of K values
 // holds K / 2 bytes of E2M1 codes (value k in nibble k % 2 of byte k / 2,
-// `nvfp4::e2m1_code`), then its K / 16 UE4M3 block scale fields, then its
+// `packets::nvfp4::e2m1_code`), then its K / 16 UE4M3 block scale fields, then its
 // global scale g (F32): value k is code * scale * g, `form_row`'s value.
 // K / 2 + K / 16 + 4 bytes fit the 2 K of a staged 16-bit row, at whose
 // pitch packed rows are staged.
@@ -358,10 +281,10 @@ __device__ __forceinline__ void form_row(const Pro &pro, u32 m, u64 K, u8 *out,
     if (published != nullptr && threadIdx.x < (unsigned)Pro::FACTORS)
         published->put(threadIdx.x * step, factors[threadIdx.x]);
     if constexpr (nvfp4_rows<Pro>::value) {
-        const float g = nvfp4::row_global(pro, factors, m, K, scratch);
+        const float g = nvfp4_stage::row_global(pro, factors, m, K, scratch);
         for (u64 block = threadIdx.x; block < K / 16; block += blockDim.x) {
             float s, q[16];
-            nvfp4::block_operands(pro, factors, m, block, g, s, q);
+            nvfp4_stage::block_operands(pro, factors, m, block, g, s, q);
             const float d = __fmul_rn(g, s);
 #pragma unroll
             for (int j = 0; j < 16; ++j)
@@ -385,16 +308,16 @@ __device__ __forceinline__ void form_packed_row(const Pro &pro, u32 m, u64 K, u8
     __shared__ float scratch[32];
     pro.prepare_row(factors, m, scratch);
     __syncthreads();
-    const float g = nvfp4::row_global(pro, factors, m, K, scratch);
+    const float g = nvfp4_stage::row_global(pro, factors, m, K, scratch);
     auto put = [&](u64 block, uint2 codes, float s) {
         *reinterpret_cast<uint2 *>(row + block * 8) = codes;
-        row[PackedRows::scales(K) + block] = (u8)nvfp4::ue4m3_field(s);
+        row[PackedRows::scales(K) + block] = (u8)packets::nvfp4::ue4m3_field(s);
     };
     if constexpr (BLOCKS == 0) {
         for (u64 block = threadIdx.x; block < K / 16; block += blockDim.x) {
             float s, q[16];
-            nvfp4::block_operands(pro, factors, m, block, g, s, q);
-            put(block, nvfp4::packed_codes(q), s);
+            nvfp4_stage::block_operands(pro, factors, m, block, g, s, q);
+            put(block, nvfp4_stage::packed_codes(q), s);
         }
     } else {
         uint2 codes[BLOCKS];
@@ -404,8 +327,8 @@ __device__ __forceinline__ void form_packed_row(const Pro &pro, u32 m, u64 K, u8
             const u64 block = threadIdx.x + (u64)i * blockDim.x;
             if (block < K / 16) {
                 float q[16];
-                nvfp4::block_operands(pro, factors, m, block, g, scales[i], q);
-                codes[i] = nvfp4::packed_codes(q);
+                nvfp4_stage::block_operands(pro, factors, m, block, g, scales[i], q);
+                codes[i] = nvfp4_stage::packed_codes(q);
             }
         }
         __syncthreads();
@@ -422,7 +345,7 @@ __device__ __forceinline__ void form_packed_row(const Pro &pro, u32 m, u64 K, u8
 
 // int8 activations (the GEMM's INT8 candidate): rows quantized per 32-code
 // group, x ~= d * q by the rule every backend's INT8 activations follow
-// (`s8_scale`, `s8_code`: the CPU's, `seismic-native-cpu` `quant.rs`), staged
+// (`packets::int8_scale_of`, `packets::int8_code_of`, <seismic/activation.cuh>), staged
 // by `stage_row_s8` as `q` ([M, width] bytes in the s8 fragments' virtual k
 // order, packets.cuh, in entry order where ENTRIES: `s8_real_offset`) and
 // `groups` (each group's (d, d * sum q)). Any s8 row source gives `row(m)`
@@ -439,7 +362,7 @@ template <bool ENTRIES> struct QuantizedRows {
 
 // Real offset within a 32-code group of virtual s8 position v (lane t of
 // the m16n8k32 fragment holds virtual 4t .. 4t + 3 and 16 + 4t ..), in the
-// weights' order (`packets::Packed::s8_half`). Slot order: the k16 steps'
+// weights' order (`W::s8_half`). Slot order: the k16 steps'
 // slots, real {2t, 2t + 1, 2t + 8, 2t + 9} of each step. Entry order
 // (ENTRIES, grid codes): lane t's eight are real 8t .. 8t + 7, one entry.
 template <bool ENTRIES> __device__ __forceinline__ u32 s8_real_offset(u32 v) {
@@ -448,49 +371,6 @@ template <bool ENTRIES> __device__ __forceinline__ u32 s8_real_offset(u32 v) {
         return 8 * t + 4 * half + j;
     else
         return half * 16 + 2 * t + (j % 2) + 8 * (j / 2);
-}
-
-// The scale of a group whose largest magnitude is `maximum` (`peak_with`'s):
-// `maximum / 127` rounded to nearest, or where that is subnormal, rounded up
-// onto the subnormal grid, so `maximum / d <= 127` and `d` is zero only for
-// an all-zero group; NaN where `maximum` is NaN or +Inf.
-__device__ __forceinline__ float s8_scale(float maximum) {
-    if (!(maximum < __int_as_float(0x7f800000)))
-        return __int_as_float(0x7fffffff);
-    const float least_normal = __uint_as_float(0x00800000u);
-    float d = __fdiv_rn(maximum, 127.0f);
-    // F64 holds `d * 127` exactly.
-    if (d < least_normal && (double)d * 127.0 < (double)maximum)
-        d = __uint_as_float(__float_as_uint(d) + 1u);
-    return d;
-}
-
-// The code of `x` under the scale `d` (`s8_scale`): the exact quotient
-// rounded once, half away from zero; a NaN scale, and a zero one, code 0. Where
-// `d` is normal the F32 quotient is within half an ulp of the exact one, so
-// only a quotient that lands on a half decides by the sign of its remainder;
-// where `d` is subnormal the F64 quotient of two F32 values rounds like the
-// exact one.
-__device__ __forceinline__ int s8_code(float x, float d) {
-    if (d == 0.0f)
-        return 0;
-    const float magnitude = fabsf(x);
-    float rounded;
-    if (d < __uint_as_float(0x00800000u)) {
-        const double quotient = (double)magnitude / (double)d;
-        if (!(quotient == quotient))
-            return 0;
-        rounded = (float)round(quotient);
-    } else {
-        const float quotient = __fdiv_rn(magnitude, d);
-        if (!(quotient == quotient))
-            return 0;
-        rounded = roundf(quotient);
-        // A tie in F32 is below the exact quotient where the remainder is negative.
-        if (quotient - truncf(quotient) == 0.5f && fmaf(-quotient, d, magnitude) < 0.0f)
-            rounded = truncf(quotient);
-    }
-    return x < 0.0f ? -(int)rounded : (int)rounded;
 }
 
 // Staging launch of the INT8 candidate, one block per row m: the prologue's
@@ -509,9 +389,9 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
             values[j] = pro.value(factors, m, group * 32 + j);
-            maximum = peak_with(maximum, values[j]);
+            maximum = packets::peak_with(maximum, values[j]);
         }
-        const float d = s8_scale(maximum);
+        const float d = packets::int8_scale_of(maximum);
         int total = 0;
         u32 words[8];
 #pragma unroll
@@ -519,7 +399,7 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
             u32 word = 0;
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
-                const int code = s8_code(values[s8_real_offset<ENTRIES>(4 * w + b)], d);
+                const int code = packets::int8_code_of(values[s8_real_offset<ENTRIES>(4 * w + b)], d);
                 total += code;
                 word |= ((u32)code & 0xFFu) << (8 * b);
             }

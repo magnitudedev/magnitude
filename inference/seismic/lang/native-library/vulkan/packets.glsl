@@ -24,15 +24,20 @@
 // `SEISMIC_AXIS_<AXIS>`. A slot's kind is its representation's identity (two
 // slots of one representation share a kind), passed as the first argument of
 // every operation; operations read the kind's axes as constants
-// (`PACKETS_AXIS`). Weight tensors are bound to slots before this file is
+// (`PACKETS_DETAIL_AXIS`). Weight tensors are bound to slots before this file is
 // included, as on Metal and CUDA:
 //     #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 // which defines `PACKETS_W0` (the slot's kind), `PACKETS_W0_ROWS` (its
 // `packets_rows16`, a dense tensor's rows its axis 0) and
 // `PACKETS_W0_STACKED_ROWS` (that of one matrix of a stacked [B, N, K]
-// tensor, such as one expert's). Slots W0..W3 exist. Code that loads or
+// tensor, such as one expert's). Slots W0..W3 exist. Whether products over
+// a weight `P` take NVFP4 operands is `PACKETS_OPERANDS_NVFP4(P)`
+// (<seismic/producers.glsl>), a preprocessor condition over its prefix.
+// Names with the prefix `packets_detail_`/`PACKETS_DETAIL_` are this file's
+// own, which no kernel names. Code that loads or
 // decodes an axis value, here and in the libraries over this file, is a
-// preprocessor group of the bound slots' values (`PACKETS_ANY`), so an
+// preprocessor group of the bound slots' values (`PACKETS_DETAIL_ANY`; the
+// kernels' `PACKETS_ANY_BIASED`), so an
 // entry's pipelines hold its own forms' paths alone: drivers compile code a
 // constant makes dead at full cost. RADV took 9.8 s and 1.96 GB to create a
 // projection GEMM pipeline staging every kind instead of 0.5 s and 213 MB
@@ -47,108 +52,108 @@
 #include <seismic/element.glsl>
 #include <seismic/producers.glsl>
 
-#define PACKETS_CAT_(a, b) a##b
-#define PACKETS_CAT(a, b) PACKETS_CAT_(a, b)
+#define PACKETS_DETAIL_CAT_(a, b) a##b
+#define PACKETS_DETAIL_CAT(a, b) PACKETS_DETAIL_CAT_(a, b)
 // The `packets_rows16` of a packed tensor (its row planes by role) and of a
 // dense one (its rows its axis AXIS, each of its elements' bytes).
-#define PACKETS_ROWS_PACKED(T) packets_rows16(PACKETS_CAT(T, _ROW_STRIDE_BYTES), PACKETS_CAT(T, _ROW_CODES), \
-    PACKETS_CAT(T, _ROW_HIGH), PACKETS_CAT(T, _ROW_SCALES), PACKETS_CAT(T, _ROW_SUPERS))
-#define PACKETS_ROWS_DENSE_UNSTACKED(T) \
-    packets_rows16(((PACKETS_CAT(T, _RANK) == 1) \
-        ? (PACKETS_CAT(T, _EXTENT_0) * PACKETS_CAT(T, _STRIDE_0)) \
-        : PACKETS_CAT(T, _STRIDE_0)) * uint64_t(PACKETS_CAT(T, _PACKET_SIZE)), 0ul, 0ul, 0ul, 0ul)
-#define PACKETS_ROWS_DENSE(T, AXIS) \
-    packets_rows16(PACKETS_CAT(T, _STRIDE_##AXIS) * uint64_t(PACKETS_CAT(T, _PACKET_SIZE)), 0ul, 0ul, 0ul, 0ul)
+#define PACKETS_DETAIL_ROWS_PACKED(T) packets_rows16(PACKETS_DETAIL_CAT(T, _ROW_STRIDE_BYTES), PACKETS_DETAIL_CAT(T, _ROW_CODES), \
+    PACKETS_DETAIL_CAT(T, _ROW_HIGH), PACKETS_DETAIL_CAT(T, _ROW_SCALES), PACKETS_DETAIL_CAT(T, _ROW_SUPERS))
+#define PACKETS_DETAIL_ROWS_DENSE_UNSTACKED(T) \
+    packets_rows16(((PACKETS_DETAIL_CAT(T, _RANK) == 1) \
+        ? (PACKETS_DETAIL_CAT(T, _EXTENT_0) * PACKETS_DETAIL_CAT(T, _STRIDE_0)) \
+        : PACKETS_DETAIL_CAT(T, _STRIDE_0)) * uint64_t(PACKETS_DETAIL_CAT(T, _PACKET_SIZE)), 0ul, 0ul, 0ul, 0ul)
+#define PACKETS_DETAIL_ROWS_DENSE(T, AXIS) \
+    packets_rows16(PACKETS_DETAIL_CAT(T, _STRIDE_##AXIS) * uint64_t(PACKETS_DETAIL_CAT(T, _PACKET_SIZE)), 0ul, 0ul, 0ul, 0ul)
 
 // Slot bindings: each slot's axes (`PACKETS_Wn_AXES`), kind and rows.
 #if defined(KERNEL_W0)
-#define PACKETS_W0_AXES KERNEL_W0
+#define PACKETS_DETAIL_W0_AXES KERNEL_W0
 #else
-#define PACKETS_W0_AXES SEISMIC_AXES_NONE
+#define PACKETS_DETAIL_W0_AXES SEISMIC_AXES_NONE
 #endif
-#define PACKETS_W0 PACKETS_W0_AXES(SEISMIC_AXIS_ID)
-#if defined(KERNEL_W0) && PACKETS_W0_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
-#define PACKETS_W0_ROWS PACKETS_ROWS_DENSE_UNSTACKED(KERNEL_W0)
-#define PACKETS_W0_STACKED_ROWS PACKETS_ROWS_DENSE(KERNEL_W0, 1)
-#elif defined(KERNEL_W0) && PACKETS_W0_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
-#define PACKETS_W0_ROWS PACKETS_ROWS_PACKED(KERNEL_W0)
-#define PACKETS_W0_STACKED_ROWS PACKETS_ROWS_PACKED(KERNEL_W0)
+#define PACKETS_W0 PACKETS_DETAIL_W0_AXES(SEISMIC_AXIS_ID)
+#if defined(KERNEL_W0) && PACKETS_DETAIL_W0_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
+#define PACKETS_W0_ROWS PACKETS_DETAIL_ROWS_DENSE_UNSTACKED(KERNEL_W0)
+#define PACKETS_W0_STACKED_ROWS PACKETS_DETAIL_ROWS_DENSE(KERNEL_W0, 1)
+#elif defined(KERNEL_W0) && PACKETS_DETAIL_W0_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
+#define PACKETS_W0_ROWS PACKETS_DETAIL_ROWS_PACKED(KERNEL_W0)
+#define PACKETS_W0_STACKED_ROWS PACKETS_DETAIL_ROWS_PACKED(KERNEL_W0)
 #elif defined(KERNEL_W0)
 #error "weight slot W0 binds a representation with neither dense nor packed rows"
 #endif
 #if defined(KERNEL_W1)
-#define PACKETS_W1_AXES KERNEL_W1
+#define PACKETS_DETAIL_W1_AXES KERNEL_W1
 #else
-#define PACKETS_W1_AXES SEISMIC_AXES_NONE
+#define PACKETS_DETAIL_W1_AXES SEISMIC_AXES_NONE
 #endif
-#define PACKETS_W1 PACKETS_W1_AXES(SEISMIC_AXIS_ID)
-#if defined(KERNEL_W1) && PACKETS_W1_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
-#define PACKETS_W1_ROWS PACKETS_ROWS_DENSE_UNSTACKED(KERNEL_W1)
-#define PACKETS_W1_STACKED_ROWS PACKETS_ROWS_DENSE(KERNEL_W1, 1)
-#elif defined(KERNEL_W1) && PACKETS_W1_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
-#define PACKETS_W1_ROWS PACKETS_ROWS_PACKED(KERNEL_W1)
-#define PACKETS_W1_STACKED_ROWS PACKETS_ROWS_PACKED(KERNEL_W1)
+#define PACKETS_W1 PACKETS_DETAIL_W1_AXES(SEISMIC_AXIS_ID)
+#if defined(KERNEL_W1) && PACKETS_DETAIL_W1_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
+#define PACKETS_W1_ROWS PACKETS_DETAIL_ROWS_DENSE_UNSTACKED(KERNEL_W1)
+#define PACKETS_W1_STACKED_ROWS PACKETS_DETAIL_ROWS_DENSE(KERNEL_W1, 1)
+#elif defined(KERNEL_W1) && PACKETS_DETAIL_W1_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
+#define PACKETS_W1_ROWS PACKETS_DETAIL_ROWS_PACKED(KERNEL_W1)
+#define PACKETS_W1_STACKED_ROWS PACKETS_DETAIL_ROWS_PACKED(KERNEL_W1)
 #elif defined(KERNEL_W1)
 #error "weight slot W1 binds a representation with neither dense nor packed rows"
 #endif
 #if defined(KERNEL_W2)
-#define PACKETS_W2_AXES KERNEL_W2
+#define PACKETS_DETAIL_W2_AXES KERNEL_W2
 #else
-#define PACKETS_W2_AXES SEISMIC_AXES_NONE
+#define PACKETS_DETAIL_W2_AXES SEISMIC_AXES_NONE
 #endif
-#define PACKETS_W2 PACKETS_W2_AXES(SEISMIC_AXIS_ID)
-#if defined(KERNEL_W2) && PACKETS_W2_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
-#define PACKETS_W2_ROWS PACKETS_ROWS_DENSE_UNSTACKED(KERNEL_W2)
-#define PACKETS_W2_STACKED_ROWS PACKETS_ROWS_DENSE(KERNEL_W2, 1)
-#elif defined(KERNEL_W2) && PACKETS_W2_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
-#define PACKETS_W2_ROWS PACKETS_ROWS_PACKED(KERNEL_W2)
-#define PACKETS_W2_STACKED_ROWS PACKETS_ROWS_PACKED(KERNEL_W2)
+#define PACKETS_W2 PACKETS_DETAIL_W2_AXES(SEISMIC_AXIS_ID)
+#if defined(KERNEL_W2) && PACKETS_DETAIL_W2_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
+#define PACKETS_W2_ROWS PACKETS_DETAIL_ROWS_DENSE_UNSTACKED(KERNEL_W2)
+#define PACKETS_W2_STACKED_ROWS PACKETS_DETAIL_ROWS_DENSE(KERNEL_W2, 1)
+#elif defined(KERNEL_W2) && PACKETS_DETAIL_W2_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
+#define PACKETS_W2_ROWS PACKETS_DETAIL_ROWS_PACKED(KERNEL_W2)
+#define PACKETS_W2_STACKED_ROWS PACKETS_DETAIL_ROWS_PACKED(KERNEL_W2)
 #elif defined(KERNEL_W2)
 #error "weight slot W2 binds a representation with neither dense nor packed rows"
 #endif
 #if defined(KERNEL_W3)
-#define PACKETS_W3_AXES KERNEL_W3
+#define PACKETS_DETAIL_W3_AXES KERNEL_W3
 #else
-#define PACKETS_W3_AXES SEISMIC_AXES_NONE
+#define PACKETS_DETAIL_W3_AXES SEISMIC_AXES_NONE
 #endif
-#define PACKETS_W3 PACKETS_W3_AXES(SEISMIC_AXIS_ID)
-#if defined(KERNEL_W3) && PACKETS_W3_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
-#define PACKETS_W3_ROWS PACKETS_ROWS_DENSE_UNSTACKED(KERNEL_W3)
-#define PACKETS_W3_STACKED_ROWS PACKETS_ROWS_DENSE(KERNEL_W3, 1)
-#elif defined(KERNEL_W3) && PACKETS_W3_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
-#define PACKETS_W3_ROWS PACKETS_ROWS_PACKED(KERNEL_W3)
-#define PACKETS_W3_STACKED_ROWS PACKETS_ROWS_PACKED(KERNEL_W3)
+#define PACKETS_W3 PACKETS_DETAIL_W3_AXES(SEISMIC_AXIS_ID)
+#if defined(KERNEL_W3) && PACKETS_DETAIL_W3_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
+#define PACKETS_W3_ROWS PACKETS_DETAIL_ROWS_DENSE_UNSTACKED(KERNEL_W3)
+#define PACKETS_W3_STACKED_ROWS PACKETS_DETAIL_ROWS_DENSE(KERNEL_W3, 1)
+#elif defined(KERNEL_W3) && PACKETS_DETAIL_W3_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
+#define PACKETS_W3_ROWS PACKETS_DETAIL_ROWS_PACKED(KERNEL_W3)
+#define PACKETS_W3_STACKED_ROWS PACKETS_DETAIL_ROWS_PACKED(KERNEL_W3)
 #elif defined(KERNEL_W3)
 #error "weight slot W3 binds a representation with neither dense nor packed rows"
 #endif
 
 // A kind's axis `SEL` (a selector `SEISMIC_AXIS_*`; a constant: `kind` is one
 // of the slots').
-#define PACKETS_AXIS(kind, SEL) ((kind) == PACKETS_W0 ? PACKETS_W0_AXES(SEL) : (kind) == PACKETS_W1 \
-    ? PACKETS_W1_AXES(SEL) : (kind) == PACKETS_W2 ? PACKETS_W2_AXES(SEL) : PACKETS_W3_AXES(SEL))
+#define PACKETS_DETAIL_AXIS(kind, SEL) ((kind) == PACKETS_W0 ? PACKETS_DETAIL_W0_AXES(SEL) : (kind) == PACKETS_W1 \
+    ? PACKETS_DETAIL_W1_AXES(SEL) : (kind) == PACKETS_W2 ? PACKETS_DETAIL_W2_AXES(SEL) : PACKETS_DETAIL_W3_AXES(SEL))
 // Whether slot axes `AXES` are packed rows with axis `SEL` equal to `V`, and
 // whether a bound slot is: preprocessor conditions.
-#define PACKETS_SLOT(AXES, SEL, V) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS && AXES(SEL) == (V))
-#define PACKETS_ANY(SEL, V) (PACKETS_SLOT(PACKETS_W0_AXES, SEL, V) || PACKETS_SLOT(PACKETS_W1_AXES, SEL, V) \
-    || PACKETS_SLOT(PACKETS_W2_AXES, SEL, V) || PACKETS_SLOT(PACKETS_W3_AXES, SEL, V))
-#define PACKETS_ANY_FORM(FORM) (PACKETS_W0_AXES(SEISMIC_AXIS_FORM) == (FORM) || PACKETS_W1_AXES(SEISMIC_AXIS_FORM) == (FORM) \
-    || PACKETS_W2_AXES(SEISMIC_AXIS_FORM) == (FORM) || PACKETS_W3_AXES(SEISMIC_AXIS_FORM) == (FORM))
-#define PACKETS_ANY_DENSE PACKETS_ANY_FORM(SEISMIC_FORM_DENSE)
-#define PACKETS_ANY_PACKED PACKETS_ANY_FORM(SEISMIC_FORM_ROWS)
+#define PACKETS_DETAIL_SLOT(AXES, SEL, V) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS && AXES(SEL) == (V))
+#define PACKETS_DETAIL_ANY(SEL, V) (PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W0_AXES, SEL, V) || PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W1_AXES, SEL, V) \
+    || PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W2_AXES, SEL, V) || PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W3_AXES, SEL, V))
+#define PACKETS_DETAIL_ANY_FORM(FORM) (PACKETS_DETAIL_W0_AXES(SEISMIC_AXIS_FORM) == (FORM) || PACKETS_DETAIL_W1_AXES(SEISMIC_AXIS_FORM) == (FORM) \
+    || PACKETS_DETAIL_W2_AXES(SEISMIC_AXIS_FORM) == (FORM) || PACKETS_DETAIL_W3_AXES(SEISMIC_AXIS_FORM) == (FORM))
+#define PACKETS_DETAIL_ANY_DENSE PACKETS_DETAIL_ANY_FORM(SEISMIC_FORM_DENSE)
+#define PACKETS_DETAIL_ANY_PACKED PACKETS_DETAIL_ANY_FORM(SEISMIC_FORM_ROWS)
 // Whether every bound slot's axes satisfy `PRED(AXES)`: a component's domain.
-#define PACKETS_ALL(PRED) (PRED(PACKETS_W0_AXES) && PRED(PACKETS_W1_AXES) && PRED(PACKETS_W2_AXES) \
-    && PRED(PACKETS_W3_AXES))
+#define PACKETS_DETAIL_ALL(PRED) (PRED(PACKETS_DETAIL_W0_AXES) && PRED(PACKETS_DETAIL_W1_AXES) && PRED(PACKETS_DETAIL_W2_AXES) \
+    && PRED(PACKETS_DETAIL_W3_AXES))
 // Whether some bound slot's axes satisfy `PRED(AXES)`, and whether a kind's
 // do (a constant: `kind` is one of the slots').
-#define PACKETS_SOME(PRED) (PRED(PACKETS_W0_AXES) || PRED(PACKETS_W1_AXES) || PRED(PACKETS_W2_AXES) \
-    || PRED(PACKETS_W3_AXES))
-#define PACKETS_OF(kind, PRED) ((kind) == PACKETS_W0 ? PRED(PACKETS_W0_AXES) : (kind) == PACKETS_W1 \
-    ? PRED(PACKETS_W1_AXES) : (kind) == PACKETS_W2 ? PRED(PACKETS_W2_AXES) : PRED(PACKETS_W3_AXES))
+#define PACKETS_DETAIL_SOME(PRED) (PRED(PACKETS_DETAIL_W0_AXES) || PRED(PACKETS_DETAIL_W1_AXES) || PRED(PACKETS_DETAIL_W2_AXES) \
+    || PRED(PACKETS_DETAIL_W3_AXES))
+#define PACKETS_DETAIL_OF(kind, PRED) ((kind) == PACKETS_W0 ? PRED(PACKETS_DETAIL_W0_AXES) : (kind) == PACKETS_W1 \
+    ? PRED(PACKETS_DETAIL_W1_AXES) : (kind) == PACKETS_W2 ? PRED(PACKETS_DETAIL_W2_AXES) : PRED(PACKETS_DETAIL_W3_AXES))
 // Whether slot axes `AXES` have coefficient groups that carry a bias term: a
 // minimum or stored bias (`COEFF_BIAS`) or the offset of offset codes
 // (`packets_bias`).
-#define PACKETS_BIASED(AXES) (AXES(SEISMIC_AXIS_COEFF_BIAS) != 0 || AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_OFFSET)
-#define PACKETS_ANY_BIASED PACKETS_SOME(PACKETS_BIASED)
+#define PACKETS_DETAIL_BIASED(AXES) (AXES(SEISMIC_AXIS_COEFF_BIAS) != 0 || AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_OFFSET)
+#define PACKETS_ANY_BIASED PACKETS_DETAIL_SOME(PACKETS_DETAIL_BIASED)
 
 // Staged tables. A grid code's points and a codebook code's values are read
 // at an index each lane forms from its own codes: from the device's tables
@@ -156,85 +161,85 @@
 // device memory, from shared memory in parallel, banks apart. An includer
 // whose decoding launches' shared regions may end with the bound slots'
 // tables (the declaration's `form(W, TABLE)` bytes, `dense.seismic`) defines
-// PACKETS_STAGED_TABLES 1
+// PACKETS_CONFIG_STAGED_TABLES 1
 // before including this file, and each such launch calls
 // `packets_stage_tables()` (workgroup-collective) before it decodes. The
 // declaration holds the tables where every device holds the region with them
 // (the backend's floor), and then pads it to an odd u32 length, which it
 // never has otherwise
-// (`packets_held`, a specialization constant). There the call copies every
+// (`packets_detail_held`, a specialization constant). There the call copies every
 // distinct table the slots read once to the region's end before the pad
 // word, in slot order, a grid's points as `u32` words (an eight-lane point's
 // low word first) and a codebook's values as `f32`s, and the readers of that
-// launch read it there (`packets_staged`). Every other read (a launch that
+// launch read it there (`packets_detail_staged`). Every other read (a launch that
 // stages nothing, a gathering kernel's few reads, a region the floor cannot
 // hold with the tables) reads the tables buffer, as staging does.
 
 // A slot's table, as a key equal for slots that read the same one (0: none),
 // and its words (`GRIDS_WORDS_<ID>`, `CODEBOOKS_WORDS_<ID>`; the id of the
 // table a slot does not read is 0, of no words).
-#define PACKETS_TABLE_KEY(AXES) ((AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
+#define PACKETS_DETAIL_TABLE_KEY(AXES) ((AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
     && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID) * AXES(SEISMIC_AXIS_CODES_GRID) \
     + (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE) \
     * (64 + AXES(SEISMIC_AXIS_CODES_TABLE)))
-#define PACKETS_TABLE_WORDS_OF(AXES) (PACKETS_CAT(GRIDS_WORDS_, AXES(SEISMIC_AXIS_CODES_GRID)) \
-    + PACKETS_CAT(CODEBOOKS_WORDS_, AXES(SEISMIC_AXIS_CODES_TABLE)))
-#define PACKETS_KEY_0 PACKETS_TABLE_KEY(PACKETS_W0_AXES)
-#define PACKETS_KEY_1 PACKETS_TABLE_KEY(PACKETS_W1_AXES)
-#define PACKETS_KEY_2 PACKETS_TABLE_KEY(PACKETS_W2_AXES)
-#define PACKETS_KEY_3 PACKETS_TABLE_KEY(PACKETS_W3_AXES)
+#define PACKETS_DETAIL_TABLE_WORDS_OF(AXES) (PACKETS_DETAIL_CAT(GRIDS_WORDS_, AXES(SEISMIC_AXIS_CODES_GRID)) \
+    + PACKETS_DETAIL_CAT(CODEBOOKS_WORDS_, AXES(SEISMIC_AXIS_CODES_TABLE)))
+#define PACKETS_DETAIL_KEY_0 PACKETS_DETAIL_TABLE_KEY(PACKETS_DETAIL_W0_AXES)
+#define PACKETS_DETAIL_KEY_1 PACKETS_DETAIL_TABLE_KEY(PACKETS_DETAIL_W1_AXES)
+#define PACKETS_DETAIL_KEY_2 PACKETS_DETAIL_TABLE_KEY(PACKETS_DETAIL_W2_AXES)
+#define PACKETS_DETAIL_KEY_3 PACKETS_DETAIL_TABLE_KEY(PACKETS_DETAIL_W3_AXES)
 // Whether slot n stages its table (the first slot that reads it), the words
 // it stages, and the place of its table among the staged ones.
-#define PACKETS_FIRST_0 (PACKETS_KEY_0 != 0)
-#define PACKETS_FIRST_1 (PACKETS_KEY_1 != 0 && PACKETS_KEY_1 != PACKETS_KEY_0)
-#define PACKETS_FIRST_2 (PACKETS_KEY_2 != 0 && PACKETS_KEY_2 != PACKETS_KEY_0 && PACKETS_KEY_2 != PACKETS_KEY_1)
-#define PACKETS_FIRST_3 (PACKETS_KEY_3 != 0 && PACKETS_KEY_3 != PACKETS_KEY_0 && PACKETS_KEY_3 != PACKETS_KEY_1 \
-    && PACKETS_KEY_3 != PACKETS_KEY_2)
-#if PACKETS_FIRST_0
-#define PACKETS_STAGED_0 PACKETS_TABLE_WORDS_OF(PACKETS_W0_AXES)
+#define PACKETS_DETAIL_FIRST_0 (PACKETS_DETAIL_KEY_0 != 0)
+#define PACKETS_DETAIL_FIRST_1 (PACKETS_DETAIL_KEY_1 != 0 && PACKETS_DETAIL_KEY_1 != PACKETS_DETAIL_KEY_0)
+#define PACKETS_DETAIL_FIRST_2 (PACKETS_DETAIL_KEY_2 != 0 && PACKETS_DETAIL_KEY_2 != PACKETS_DETAIL_KEY_0 && PACKETS_DETAIL_KEY_2 != PACKETS_DETAIL_KEY_1)
+#define PACKETS_DETAIL_FIRST_3 (PACKETS_DETAIL_KEY_3 != 0 && PACKETS_DETAIL_KEY_3 != PACKETS_DETAIL_KEY_0 && PACKETS_DETAIL_KEY_3 != PACKETS_DETAIL_KEY_1 \
+    && PACKETS_DETAIL_KEY_3 != PACKETS_DETAIL_KEY_2)
+#if PACKETS_DETAIL_FIRST_0
+#define PACKETS_DETAIL_STAGED_0 PACKETS_DETAIL_TABLE_WORDS_OF(PACKETS_DETAIL_W0_AXES)
 #else
-#define PACKETS_STAGED_0 0u
+#define PACKETS_DETAIL_STAGED_0 0u
 #endif
-#if PACKETS_FIRST_1
-#define PACKETS_STAGED_1 PACKETS_TABLE_WORDS_OF(PACKETS_W1_AXES)
+#if PACKETS_DETAIL_FIRST_1
+#define PACKETS_DETAIL_STAGED_1 PACKETS_DETAIL_TABLE_WORDS_OF(PACKETS_DETAIL_W1_AXES)
 #else
-#define PACKETS_STAGED_1 0u
+#define PACKETS_DETAIL_STAGED_1 0u
 #endif
-#if PACKETS_FIRST_2
-#define PACKETS_STAGED_2 PACKETS_TABLE_WORDS_OF(PACKETS_W2_AXES)
+#if PACKETS_DETAIL_FIRST_2
+#define PACKETS_DETAIL_STAGED_2 PACKETS_DETAIL_TABLE_WORDS_OF(PACKETS_DETAIL_W2_AXES)
 #else
-#define PACKETS_STAGED_2 0u
+#define PACKETS_DETAIL_STAGED_2 0u
 #endif
-#if PACKETS_FIRST_3
-#define PACKETS_STAGED_3 PACKETS_TABLE_WORDS_OF(PACKETS_W3_AXES)
+#if PACKETS_DETAIL_FIRST_3
+#define PACKETS_DETAIL_STAGED_3 PACKETS_DETAIL_TABLE_WORDS_OF(PACKETS_DETAIL_W3_AXES)
 #else
-#define PACKETS_STAGED_3 0u
+#define PACKETS_DETAIL_STAGED_3 0u
 #endif
-#define PACKETS_PLACE_0 0u
-#if PACKETS_KEY_1 == PACKETS_KEY_0
-#define PACKETS_PLACE_1 PACKETS_PLACE_0
+#define PACKETS_DETAIL_PLACE_0 0u
+#if PACKETS_DETAIL_KEY_1 == PACKETS_DETAIL_KEY_0
+#define PACKETS_DETAIL_PLACE_1 PACKETS_DETAIL_PLACE_0
 #else
-#define PACKETS_PLACE_1 (PACKETS_STAGED_0)
+#define PACKETS_DETAIL_PLACE_1 (PACKETS_DETAIL_STAGED_0)
 #endif
-#if PACKETS_KEY_2 == PACKETS_KEY_0
-#define PACKETS_PLACE_2 PACKETS_PLACE_0
-#elif PACKETS_KEY_2 == PACKETS_KEY_1
-#define PACKETS_PLACE_2 PACKETS_PLACE_1
+#if PACKETS_DETAIL_KEY_2 == PACKETS_DETAIL_KEY_0
+#define PACKETS_DETAIL_PLACE_2 PACKETS_DETAIL_PLACE_0
+#elif PACKETS_DETAIL_KEY_2 == PACKETS_DETAIL_KEY_1
+#define PACKETS_DETAIL_PLACE_2 PACKETS_DETAIL_PLACE_1
 #else
-#define PACKETS_PLACE_2 (PACKETS_STAGED_0 + PACKETS_STAGED_1)
+#define PACKETS_DETAIL_PLACE_2 (PACKETS_DETAIL_STAGED_0 + PACKETS_DETAIL_STAGED_1)
 #endif
-#if PACKETS_KEY_3 == PACKETS_KEY_0
-#define PACKETS_PLACE_3 PACKETS_PLACE_0
-#elif PACKETS_KEY_3 == PACKETS_KEY_1
-#define PACKETS_PLACE_3 PACKETS_PLACE_1
-#elif PACKETS_KEY_3 == PACKETS_KEY_2
-#define PACKETS_PLACE_3 PACKETS_PLACE_2
+#if PACKETS_DETAIL_KEY_3 == PACKETS_DETAIL_KEY_0
+#define PACKETS_DETAIL_PLACE_3 PACKETS_DETAIL_PLACE_0
+#elif PACKETS_DETAIL_KEY_3 == PACKETS_DETAIL_KEY_1
+#define PACKETS_DETAIL_PLACE_3 PACKETS_DETAIL_PLACE_1
+#elif PACKETS_DETAIL_KEY_3 == PACKETS_DETAIL_KEY_2
+#define PACKETS_DETAIL_PLACE_3 PACKETS_DETAIL_PLACE_2
 #else
-#define PACKETS_PLACE_3 (PACKETS_STAGED_0 + PACKETS_STAGED_1 + PACKETS_STAGED_2)
+#define PACKETS_DETAIL_PLACE_3 (PACKETS_DETAIL_STAGED_0 + PACKETS_DETAIL_STAGED_1 + PACKETS_DETAIL_STAGED_2)
 #endif
-#define PACKETS_TABLE_WORDS (PACKETS_STAGED_0 + PACKETS_STAGED_1 + PACKETS_STAGED_2 + PACKETS_STAGED_3)
-#if defined(PACKETS_STAGED_TABLES)
-#if PACKETS_STAGED_TABLES && (PACKETS_KEY_0 != 0 || PACKETS_KEY_1 != 0 || PACKETS_KEY_2 != 0 || PACKETS_KEY_3 != 0)
+#define PACKETS_DETAIL_TABLE_WORDS (PACKETS_DETAIL_STAGED_0 + PACKETS_DETAIL_STAGED_1 + PACKETS_DETAIL_STAGED_2 + PACKETS_DETAIL_STAGED_3)
+#if defined(PACKETS_CONFIG_STAGED_TABLES)
+#if PACKETS_CONFIG_STAGED_TABLES && (PACKETS_DETAIL_KEY_0 != 0 || PACKETS_DETAIL_KEY_1 != 0 || PACKETS_DETAIL_KEY_2 != 0 || PACKETS_DETAIL_KEY_3 != 0)
 #define PACKETS_STAGING
 #endif
 #endif
@@ -243,94 +248,93 @@
 // ones), an eight-lane grid's point `i` and a codebook's value `i`: staged
 // where the launch staged the tables, in place otherwise.
 #if defined(PACKETS_STAGING)
-const bool packets_held = (SEISMIC_SHARED_U32 & 1u) == 1u;
-bool packets_staged = false;
-#define PACKETS_TABLES_AT (SEISMIC_SHARED_U32 - 1u - PACKETS_TABLE_WORDS)
-#define PACKETS_TABLE_WORD(AXES, PLACE, i) (packets_staged ? seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + (i)] \
-    : PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i])
-#define PACKETS_TABLE_POINT8(AXES, PLACE, i) (packets_staged \
-    ? uvec2(seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + 2u * (i)], \
-        seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + 2u * (i) + 1u]) \
-    : PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i])
-#define PACKETS_TABLE_VALUE(AXES, PLACE, i) (packets_staged ? seismic_shared_f32[PACKETS_TABLES_AT + (PLACE) + (i)] \
-    : PACKETS_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i])
+const bool packets_detail_held = (SEISMIC_SHARED_U32 & 1u) == 1u;
+bool packets_detail_staged = false;
+#define PACKETS_DETAIL_TABLES_AT (SEISMIC_SHARED_U32 - 1u - PACKETS_DETAIL_TABLE_WORDS)
+#define PACKETS_DETAIL_TABLE_WORD(AXES, PLACE, i) (packets_detail_staged ? seismic_shared_u32[PACKETS_DETAIL_TABLES_AT + (PLACE) + (i)] \
+    : PACKETS_DETAIL_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i])
+#define PACKETS_DETAIL_TABLE_POINT8(AXES, PLACE, i) (packets_detail_staged \
+    ? uvec2(seismic_shared_u32[PACKETS_DETAIL_TABLES_AT + (PLACE) + 2u * (i)], \
+        seismic_shared_u32[PACKETS_DETAIL_TABLES_AT + (PLACE) + 2u * (i) + 1u]) \
+    : PACKETS_DETAIL_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i])
+#define PACKETS_DETAIL_TABLE_VALUE(AXES, PLACE, i) (packets_detail_staged ? seismic_shared_f32[PACKETS_DETAIL_TABLES_AT + (PLACE) + (i)] \
+    : PACKETS_DETAIL_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i])
+// The u32 words the staged tables reserve at the end of the launch's group
+// memory: its tables and the pad word where its region holds them (a
+// specialization constant), else none. A launch that sizes its own use of
+// the region reads it where `PACKETS_STAGING` is defined.
+#define packets_reserved_words() (packets_detail_held ? PACKETS_DETAIL_TABLE_WORDS + 1u : 0u)
 #else
-#define PACKETS_TABLE_WORD(AXES, PLACE, i) PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i]
-#define PACKETS_TABLE_POINT8(AXES, PLACE, i) PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i]
-#define PACKETS_TABLE_VALUE(AXES, PLACE, i) PACKETS_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i]
+#define PACKETS_DETAIL_TABLE_WORD(AXES, PLACE, i) PACKETS_DETAIL_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i]
+#define PACKETS_DETAIL_TABLE_POINT8(AXES, PLACE, i) PACKETS_DETAIL_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i]
+#define PACKETS_DETAIL_TABLE_VALUE(AXES, PLACE, i) PACKETS_DETAIL_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i]
 #endif
 
 // Copies slot axes `AXES`' table to its place PLACE among the staged ones,
 // the workgroup's invocations a word each in turn.
-#define PACKETS_STAGE_GRID8(AXES, PLACE) \
-    for (uint i = gl_LocalInvocationIndex; i < PACKETS_TABLE_WORDS_OF(AXES); i += threads) \
-        seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + i] = \
-            PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i >> 1u][i & 1u];
-#define PACKETS_STAGE_GRID4(AXES, PLACE) \
-    for (uint i = gl_LocalInvocationIndex; i < PACKETS_TABLE_WORDS_OF(AXES); i += threads) \
-        seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + i] = PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i];
-#define PACKETS_STAGE_CODEBOOK(AXES, PLACE) \
-    for (uint i = gl_LocalInvocationIndex; i < PACKETS_TABLE_WORDS_OF(AXES); i += threads) \
-        seismic_shared_f32[PACKETS_TABLES_AT + (PLACE) + i] = \
-            PACKETS_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i];
+#define PACKETS_DETAIL_STAGE_GRID8(AXES, PLACE) \
+    for (uint i = gl_LocalInvocationIndex; i < PACKETS_DETAIL_TABLE_WORDS_OF(AXES); i += threads) \
+        seismic_shared_u32[PACKETS_DETAIL_TABLES_AT + (PLACE) + i] = \
+            PACKETS_DETAIL_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i >> 1u][i & 1u];
+#define PACKETS_DETAIL_STAGE_GRID4(AXES, PLACE) \
+    for (uint i = gl_LocalInvocationIndex; i < PACKETS_DETAIL_TABLE_WORDS_OF(AXES); i += threads) \
+        seismic_shared_u32[PACKETS_DETAIL_TABLES_AT + (PLACE) + i] = PACKETS_DETAIL_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i];
+#define PACKETS_DETAIL_STAGE_CODEBOOK(AXES, PLACE) \
+    for (uint i = gl_LocalInvocationIndex; i < PACKETS_DETAIL_TABLE_WORDS_OF(AXES); i += threads) \
+        seismic_shared_f32[PACKETS_DETAIL_TABLES_AT + (PLACE) + i] = \
+            PACKETS_DETAIL_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i];
 
 // Stages the bound slots' tables (workgroup-collective: every invocation
 // calls it, in uniform control flow), where the includer stages them; a
 // launch calls it before it decodes.
 void packets_stage_tables() {
 #if defined(PACKETS_STAGING)
-    if (!packets_held)
+    if (!packets_detail_held)
         return;
     const uint threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
-#if PACKETS_FIRST_0 && PACKETS_W0_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
-    PACKETS_STAGE_CODEBOOK(PACKETS_W0_AXES, PACKETS_PLACE_0)
-#elif PACKETS_FIRST_0 && PACKETS_W0_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-    PACKETS_STAGE_GRID8(PACKETS_W0_AXES, PACKETS_PLACE_0)
-#elif PACKETS_FIRST_0
-    PACKETS_STAGE_GRID4(PACKETS_W0_AXES, PACKETS_PLACE_0)
+#if PACKETS_DETAIL_FIRST_0 && PACKETS_DETAIL_W0_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
+    PACKETS_DETAIL_STAGE_CODEBOOK(PACKETS_DETAIL_W0_AXES, PACKETS_DETAIL_PLACE_0)
+#elif PACKETS_DETAIL_FIRST_0 && PACKETS_DETAIL_W0_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+    PACKETS_DETAIL_STAGE_GRID8(PACKETS_DETAIL_W0_AXES, PACKETS_DETAIL_PLACE_0)
+#elif PACKETS_DETAIL_FIRST_0
+    PACKETS_DETAIL_STAGE_GRID4(PACKETS_DETAIL_W0_AXES, PACKETS_DETAIL_PLACE_0)
 #endif
-#if PACKETS_FIRST_1 && PACKETS_W1_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
-    PACKETS_STAGE_CODEBOOK(PACKETS_W1_AXES, PACKETS_PLACE_1)
-#elif PACKETS_FIRST_1 && PACKETS_W1_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-    PACKETS_STAGE_GRID8(PACKETS_W1_AXES, PACKETS_PLACE_1)
-#elif PACKETS_FIRST_1
-    PACKETS_STAGE_GRID4(PACKETS_W1_AXES, PACKETS_PLACE_1)
+#if PACKETS_DETAIL_FIRST_1 && PACKETS_DETAIL_W1_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
+    PACKETS_DETAIL_STAGE_CODEBOOK(PACKETS_DETAIL_W1_AXES, PACKETS_DETAIL_PLACE_1)
+#elif PACKETS_DETAIL_FIRST_1 && PACKETS_DETAIL_W1_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+    PACKETS_DETAIL_STAGE_GRID8(PACKETS_DETAIL_W1_AXES, PACKETS_DETAIL_PLACE_1)
+#elif PACKETS_DETAIL_FIRST_1
+    PACKETS_DETAIL_STAGE_GRID4(PACKETS_DETAIL_W1_AXES, PACKETS_DETAIL_PLACE_1)
 #endif
-#if PACKETS_FIRST_2 && PACKETS_W2_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
-    PACKETS_STAGE_CODEBOOK(PACKETS_W2_AXES, PACKETS_PLACE_2)
-#elif PACKETS_FIRST_2 && PACKETS_W2_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-    PACKETS_STAGE_GRID8(PACKETS_W2_AXES, PACKETS_PLACE_2)
-#elif PACKETS_FIRST_2
-    PACKETS_STAGE_GRID4(PACKETS_W2_AXES, PACKETS_PLACE_2)
+#if PACKETS_DETAIL_FIRST_2 && PACKETS_DETAIL_W2_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
+    PACKETS_DETAIL_STAGE_CODEBOOK(PACKETS_DETAIL_W2_AXES, PACKETS_DETAIL_PLACE_2)
+#elif PACKETS_DETAIL_FIRST_2 && PACKETS_DETAIL_W2_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+    PACKETS_DETAIL_STAGE_GRID8(PACKETS_DETAIL_W2_AXES, PACKETS_DETAIL_PLACE_2)
+#elif PACKETS_DETAIL_FIRST_2
+    PACKETS_DETAIL_STAGE_GRID4(PACKETS_DETAIL_W2_AXES, PACKETS_DETAIL_PLACE_2)
 #endif
-#if PACKETS_FIRST_3 && PACKETS_W3_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
-    PACKETS_STAGE_CODEBOOK(PACKETS_W3_AXES, PACKETS_PLACE_3)
-#elif PACKETS_FIRST_3 && PACKETS_W3_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-    PACKETS_STAGE_GRID8(PACKETS_W3_AXES, PACKETS_PLACE_3)
-#elif PACKETS_FIRST_3
-    PACKETS_STAGE_GRID4(PACKETS_W3_AXES, PACKETS_PLACE_3)
+#if PACKETS_DETAIL_FIRST_3 && PACKETS_DETAIL_W3_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
+    PACKETS_DETAIL_STAGE_CODEBOOK(PACKETS_DETAIL_W3_AXES, PACKETS_DETAIL_PLACE_3)
+#elif PACKETS_DETAIL_FIRST_3 && PACKETS_DETAIL_W3_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+    PACKETS_DETAIL_STAGE_GRID8(PACKETS_DETAIL_W3_AXES, PACKETS_DETAIL_PLACE_3)
+#elif PACKETS_DETAIL_FIRST_3
+    PACKETS_DETAIL_STAGE_GRID4(PACKETS_DETAIL_W3_AXES, PACKETS_DETAIL_PLACE_3)
 #endif
     barrier();
-    packets_staged = true;
+    packets_detail_staged = true;
 #endif
 }
 
 // A kind's form, and whether it is dense or has a bias term.
-bool packets_dense(const int kind) {
-    return PACKETS_AXIS(kind, SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE;
+bool packets_detail_dense(const int kind) {
+    return PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE;
 }
 
-bool packets_biased(const int kind) { return PACKETS_OF(kind, PACKETS_BIASED); }
+bool packets_biased(const int kind) { return PACKETS_DETAIL_OF(kind, PACKETS_DETAIL_BIASED); }
 
 // Coefficient groups per packet (one per 32 or more elements, two per 16).
 uint packets_groups(const int kind) {
-    return packets_dense(kind) ? 1u : 32u / min(32u, uint(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_GROUP)));
-}
-
-// A dense kind's element kind.
-int packets_element(const int kind) {
-    const int dtype = PACKETS_AXIS(kind, SEISMIC_AXIS_DTYPE);
-    return dtype == SEISMIC_DTYPE_BF16 ? ELEMENT_BF16 : dtype == SEISMIC_DTYPE_F16 ? ELEMENT_F16 : ELEMENT_F32;
+    return packets_detail_dense(kind) ? 1u : 32u / min(32u, uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_GROUP)));
 }
 
 // ---------------------------------------------------------------------------
@@ -345,16 +349,22 @@ struct packets_rows16 {
     uint64_t supers;  // the direct coefficients or the factors
 };
 
+// The first byte of row `r` (a uint64_t) of the weight rows at `base` of
+// geometry `geometry`: the matrix's addressing, which `packets_load` reads a
+// row's packets from. A macro, so a row's address is the multiply-add its
+// readers had.
+#define packets_row(base, geometry, r) ((base) + (r) * (geometry).stride)
+
 // Whether slot axes `AXES` have two biased coefficient groups a packet. A
 // packet holds a second bias only where a bound slot does: a launch whose
 // slots bind several kinds holds one packet for all of them (a staged GEMM
 // holds several), and a bias none of them has would be a register each.
-#define PACKETS_TWO_BIASES(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
+#define PACKETS_DETAIL_TWO_BIASES(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
     && AXES(SEISMIC_AXIS_COEFF_BIAS) != 0 && AXES(SEISMIC_AXIS_COEFF_GROUP) < 32)
 
 // One loaded packet. A group's coefficients are scalar fields, read and
-// written through `packets_group_scale`, `packets_group_bias` and
-// `packets_set_group`: held as one vec2, the scales spilled the q4k/q6k
+// written through `packets_detail_group_scale`, `packets_detail_group_bias` and
+// `packets_detail_set_group`: held as one vec2, the scales spilled the q4k/q6k
 // staged GEMM to 32 bytes of local memory instead of 16 and slowed it 3%
 // (NVIDIA GB10, driver 580.159.03).
 struct packets_packet {
@@ -365,7 +375,7 @@ struct packets_packet {
     float scale0;    // the scales of the packet's (one or two) coefficient groups
     float scale1;
     float bias0;     // their biases (a minimum or stored bias)
-#if PACKETS_SOME(PACKETS_TWO_BIASES)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_TWO_BIASES)
     float bias1;
 #endif
     uint64_t values; // dense: the packet's first element
@@ -376,10 +386,10 @@ struct packets_packet {
 
 // Coefficient group `g`'s scale and bias (a group's bias is the first's
 // where no bound slot has a second).
-float packets_group_scale(packets_packet packet, uint g) { return g == 0u ? packet.scale0 : packet.scale1; }
+float packets_detail_group_scale(packets_packet packet, uint g) { return g == 0u ? packet.scale0 : packet.scale1; }
 
-float packets_group_bias(packets_packet packet, uint g) {
-#if PACKETS_SOME(PACKETS_TWO_BIASES)
+float packets_detail_group_bias(packets_packet packet, uint g) {
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_TWO_BIASES)
     return g == 0u ? packet.bias0 : packet.bias1;
 #else
     return packet.bias0;
@@ -387,14 +397,14 @@ float packets_group_bias(packets_packet packet, uint g) {
 }
 
 // Set coefficient group `g`'s scale, and its bias where `biased`.
-void packets_set_group(inout packets_packet packet, uint g, float scale, const bool biased, float bias) {
+void packets_detail_set_group(inout packets_packet packet, uint g, float scale, const bool biased, float bias) {
     if (g == 0u) {
         packet.scale0 = scale;
         if (biased)
             packet.bias0 = bias;
     } else {
         packet.scale1 = scale;
-#if PACKETS_SOME(PACKETS_TWO_BIASES)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_TWO_BIASES)
         if (biased)
             packet.bias1 = bias;
 #endif
@@ -410,17 +420,17 @@ void packets_set_group(inout packets_packet packet, uint g, float scale, const b
 // The weights the decoder reads are its producer's (`producers.decl`,
 // `PRODUCERS_DECODE`): their code planes and interpretations, offset codes'
 // exact bias (`packets_values`) and the coefficient structures
-// `packets_coefficients` reads. Admission takes a native only weights its
+// `packets_detail_coefficients` reads. Admission takes a native only weights its
 // `DECODED` form admits, the same declaration, so a bound slot outside it is
 // an invariant violation.
-#define PACKETS_DECODED(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS || PRODUCERS_DECODE(AXES))
-#if !PACKETS_ALL(PACKETS_DECODED)
+#define PACKETS_DETAIL_DECODED(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS || PRODUCERS_DECODE(AXES))
+#if !PACKETS_DETAIL_ALL(PACKETS_DETAIL_DECODED)
 #error "packets: a bound weight slot is one DECODED does not admit (producers.decl)"
 #endif
 
 // Bytes 0,2,4,6 / 1,3,5,7 of a 16-bit field of 2-bit high codes, moved to
 // bits 4..5 of four bytes.
-void packets_split_high2(uint field, out uint even, out uint odd) {
+void packets_detail_split_high2(uint field, out uint even, out uint odd) {
     uint t = (field | (field << 8)) & 0x00ff00ffu;
     t = (t | (t << 4)) & 0x0f0f0f0fu;
     even = (t & 0x03030303u) << 4;
@@ -428,26 +438,26 @@ void packets_split_high2(uint field, out uint even, out uint odd) {
 }
 
 // The same for an 8-bit field of 1-bit high codes, moved to bit 4.
-void packets_split_high1(uint field, out uint even, out uint odd) {
+void packets_detail_split_high1(uint field, out uint even, out uint odd) {
     uint t = (field | (field << 12)) & 0x000f000fu;
     t = (t | (t << 6)) & 0x03030303u;
     even = (t & 0x01010101u) << 4;
     odd = (t & 0x02020202u) << 3;
 }
 
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
 // The same for a 16-bit field of 2-bit low codes, in bits 0..1.
-void packets_split_low2(uint field, out uint even, out uint odd) {
-    packets_split_high2(field, even, odd);
+void packets_detail_split_low2(uint field, out uint even, out uint odd) {
+    packets_detail_split_high2(field, even, odd);
     even >>= 4;
     odd >>= 4;
 }
 #endif
 
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1)
 // The same for an 8-bit field of 1-bit low codes, in bit 0.
-void packets_split_low1(uint field, out uint even, out uint odd) {
-    packets_split_high1(field, even, odd);
+void packets_detail_split_low1(uint field, out uint even, out uint odd) {
+    packets_detail_split_high1(field, even, odd);
     even >>= 4;
     odd >>= 4;
 }
@@ -459,13 +469,13 @@ void packets_split_low1(uint field, out uint even, out uint odd) {
 // with its top bit flipped is it plus 128, less 2^23 + 128): the same
 // values, the latter in logic and adds at their full rate where conversions
 // take a quarter (NVIDIA).
-vec4 packets_unsigned_bytes(uint word, const bool arithmetic) {
+vec4 packets_detail_unsigned_bytes(uint word, const bool arithmetic) {
     if (!arithmetic)
         return vec4(unpack8(word));
     return uintBitsToFloat(((uvec4(word) >> uvec4(0u, 8u, 16u, 24u)) & 0xffu) | 0x4b000000u) - 8388608.0;
 }
 
-vec4 packets_signed_bytes(uint word, const bool arithmetic) {
+vec4 packets_detail_signed_bytes(uint word, const bool arithmetic) {
     if (!arithmetic)
         return vec4(unpack8(int(word)));
     return uintBitsToFloat(((uvec4(word ^ 0x80808080u) >> uvec4(0u, 8u, 16u, 24u)) & 0xffu) | 0x4b000000u)
@@ -479,7 +489,7 @@ vec4 packets_signed_bytes(uint word, const bool arithmetic) {
 // offset of at most 128, so that the difference is a signed byte), two's
 // complement codes (bytes) the signed bytes, odd codes `2 (c - k) + 1`
 // (`CODES_OFFSET` k), and a codebook's codes (nibbles) the codebook's values
-// (`packets_codebook`), and E4M3 bytes
+// (`packets_detail_codebook`), and E4M3 bytes
 // (`registry::ValueCodes::E4m3`) their values. A product
 // operand takes an offset off as the exact bias -(offset scale)
 // (`packets_values`): the offset is a power of two, without a stored bias
@@ -487,34 +497,34 @@ vec4 packets_signed_bytes(uint word, const bool arithmetic) {
 
 // The codebook value of `code` of a kind (its slot's staged table, or
 // `CODEBOOKS_TABLE_<id>`).
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
-float packets_codebook(const int kind, uint code) {
-#if PACKETS_SLOT(PACKETS_W0_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
+float packets_detail_codebook(const int kind, uint code) {
+#if PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W0_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (kind == PACKETS_W0)
-        return PACKETS_TABLE_VALUE(PACKETS_W0_AXES, PACKETS_PLACE_0, code);
+        return PACKETS_DETAIL_TABLE_VALUE(PACKETS_DETAIL_W0_AXES, PACKETS_DETAIL_PLACE_0, code);
 #endif
-#if PACKETS_SLOT(PACKETS_W1_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
+#if PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W1_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (kind == PACKETS_W1)
-        return PACKETS_TABLE_VALUE(PACKETS_W1_AXES, PACKETS_PLACE_1, code);
+        return PACKETS_DETAIL_TABLE_VALUE(PACKETS_DETAIL_W1_AXES, PACKETS_DETAIL_PLACE_1, code);
 #endif
-#if PACKETS_SLOT(PACKETS_W2_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
+#if PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W2_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (kind == PACKETS_W2)
-        return PACKETS_TABLE_VALUE(PACKETS_W2_AXES, PACKETS_PLACE_2, code);
+        return PACKETS_DETAIL_TABLE_VALUE(PACKETS_DETAIL_W2_AXES, PACKETS_DETAIL_PLACE_2, code);
 #endif
-#if PACKETS_SLOT(PACKETS_W3_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
+#if PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W3_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (kind == PACKETS_W3)
-        return PACKETS_TABLE_VALUE(PACKETS_W3_AXES, PACKETS_PLACE_3, code);
+        return PACKETS_DETAIL_TABLE_VALUE(PACKETS_DETAIL_W3_AXES, PACKETS_DETAIL_PLACE_3, code);
 #endif
     return 0.0;
 }
 #endif
 
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_E4M3)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_E4M3)
 // Four E4M3 bytes as their exact values (`registry::ValueCodes::E4m3`): a
 // normal code's (1 + m/8) 2^(e - 7) built from its bits, a subnormal one's
 // m 2^-9 (an exact product, zero or normal), its sign kept on a zero, and
 // both NaN codes (S.1111.111) the registry's one NaN, 0x7fc00000.
-vec4 packets_e4m3(uint bytes) {
+vec4 packets_detail_e4m3(uint bytes) {
     const uvec4 raw = uvec4(bytes, bytes >> 8, bytes >> 16, bytes >> 24) & 0xffu;
     const uvec4 e = (raw >> 3) & 15u, m = raw & 7u;
     const uvec4 magnitude =
@@ -527,34 +537,34 @@ vec4 packets_e4m3(uint bytes) {
 // Four codes, a byte each, as exact values, offset codes less their offset
 // where `centred` (per byte: 128 + code - offset, without borrows, with its
 // top bit flipped: code - offset as a signed byte); `arithmetic` as
-// `packets_unsigned_bytes`.
-vec4 packets_interpret(const int kind, uint bytes, const bool centred, const bool arithmetic) {
-    const int interpretation = PACKETS_AXIS(kind, SEISMIC_AXIS_CODES);
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_OFFSET)
+// `packets_detail_unsigned_bytes`.
+vec4 packets_detail_interpret(const int kind, uint bytes, const bool centred, const bool arithmetic) {
+    const int interpretation = PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES);
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_OFFSET)
     if (centred && interpretation == SEISMIC_CODES_OFFSET)
-        return packets_signed_bytes(
-            ((bytes | 0x80808080u) - uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET)) * 0x01010101u) ^ 0x80808080u,
+        return packets_detail_signed_bytes(
+            ((bytes | 0x80808080u) - uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET)) * 0x01010101u) ^ 0x80808080u,
             arithmetic);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (interpretation == SEISMIC_CODES_TABLE)
-        return vec4(packets_codebook(kind, bytes & 0xffu), packets_codebook(kind, (bytes >> 8) & 0xffu),
-            packets_codebook(kind, (bytes >> 16) & 0xffu), packets_codebook(kind, bytes >> 24));
+        return vec4(packets_detail_codebook(kind, bytes & 0xffu), packets_detail_codebook(kind, (bytes >> 8) & 0xffu),
+            packets_detail_codebook(kind, (bytes >> 16) & 0xffu), packets_detail_codebook(kind, bytes >> 24));
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_TWOS)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_TWOS)
     if (interpretation == SEISMIC_CODES_TWOS)
-        return packets_signed_bytes(bytes, arithmetic);
+        return packets_detail_signed_bytes(bytes, arithmetic);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_ODD)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_ODD)
     if (interpretation == SEISMIC_CODES_ODD)
-        return 2.0 * packets_unsigned_bytes(bytes, arithmetic)
-            + float(1 - 2 * PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET));
+        return 2.0 * packets_detail_unsigned_bytes(bytes, arithmetic)
+            + float(1 - 2 * PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET));
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_E4M3)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_E4M3)
     if (interpretation == SEISMIC_CODES_E4M3)
-        return packets_e4m3(bytes);
+        return packets_detail_e4m3(bytes);
 #endif
-    return packets_unsigned_bytes(bytes, arithmetic);
+    return packets_detail_unsigned_bytes(bytes, arithmetic);
 }
 
 // ---------------------------------------------------------------------------
@@ -566,24 +576,24 @@ vec4 packets_interpret(const int kind, uint bytes, const bool centred, const boo
 // (past its signs) is set. One reader reads every grid code; its code for a
 // form (an entry's 8-bit whole bytes, its rest, explicit signs, signed
 // points, the delta) exists where a bound slot has that form.
-#define PACKETS_GRID_OF(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID)
-#define PACKETS_GRID_BYTE(AXES) (PACKETS_GRID_OF(AXES) && AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8)
-#define PACKETS_GRID_REST(AXES) (PACKETS_GRID_OF(AXES) && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) != 0)
-#define PACKETS_GRID_UNPARITIED(AXES) (PACKETS_GRID_OF(AXES) \
+#define PACKETS_DETAIL_GRID_OF(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID)
+#define PACKETS_DETAIL_GRID_BYTE(AXES) (PACKETS_DETAIL_GRID_OF(AXES) && AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8)
+#define PACKETS_DETAIL_GRID_REST(AXES) (PACKETS_DETAIL_GRID_OF(AXES) && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) != 0)
+#define PACKETS_DETAIL_GRID_UNPARITIED(AXES) (PACKETS_DETAIL_GRID_OF(AXES) \
     && AXES(SEISMIC_AXIS_CODES_GRID_SIGNS) != SEISMIC_GRID_SIGNS_PARITY_PLUS7)
-#define PACKETS_GRID_SIGNED_POINTS(AXES) (PACKETS_GRID_OF(AXES) \
+#define PACKETS_DETAIL_GRID_SIGNED_POINTS(AXES) (PACKETS_DETAIL_GRID_OF(AXES) \
     && AXES(SEISMIC_AXIS_CODES_GRID_SIGNS) == SEISMIC_GRID_SIGNS_NONE)
-#define PACKETS_GRID_DELTA(AXES) (PACKETS_GRID_OF(AXES) && AXES(SEISMIC_AXIS_CODES_GRID_DELTA) != 0)
+#define PACKETS_DETAIL_GRID_DELTA(AXES) (PACKETS_DETAIL_GRID_OF(AXES) && AXES(SEISMIC_AXIS_CODES_GRID_DELTA) != 0)
 
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
 // The whole bytes (`LOW` bits) of entry `step` of a packet's four.
-uint packets_grid_entry(const int kind, uvec4 entries, uint step) {
-#if PACKETS_SOME(PACKETS_GRID_BYTE)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 8)
+uint packets_detail_grid_entry(const int kind, uvec4 entries, uint step) {
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_BYTE)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 8)
         return (entries.x >> (8u * step)) & 0xffu;
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 24)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 24) {
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 24)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 24) {
         const uint word = (3u * step) >> 2, shift = (24u * step) & 31u;
         const uint spill = shift > 8u ? entries[word + 1u] << (32u - shift) : 0u;
         return ((entries[word] >> shift) | spill) & 0xffffffu;
@@ -597,46 +607,46 @@ uint packets_grid_entry(const int kind, uvec4 entries, uint step) {
 // the slot's table (PLACE among the staged ones). A grid's points are
 // `uvec2`s or `uint`s by its lanes, so a slot's lanes choose its code here,
 // in the preprocessor.
-#define PACKETS_GRID_MASK(AXES) ((1u << uint(AXES(SEISMIC_AXIS_CODES_GRID_INDEX_BITS))) - 1u)
-#define PACKETS_GRID_POINT8(AXES, PLACE, entry) \
-    return PACKETS_TABLE_POINT8(AXES, PLACE, (entry) & PACKETS_GRID_MASK(AXES));
-#define PACKETS_GRID_POINT4(AXES, PLACE, entry) \
-    return uvec2(PACKETS_TABLE_WORD(AXES, PLACE, (entry) & PACKETS_GRID_MASK(AXES)), \
-        PACKETS_TABLE_WORD(AXES, PLACE, ((entry) >> AXES(SEISMIC_AXIS_CODES_GRID_INDEX_BITS)) & PACKETS_GRID_MASK(AXES)));
-uvec2 packets_grid_point(const int kind, uint entry) {
-#if PACKETS_SLOT(PACKETS_W0_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
+#define PACKETS_DETAIL_GRID_MASK(AXES) ((1u << uint(AXES(SEISMIC_AXIS_CODES_GRID_INDEX_BITS))) - 1u)
+#define PACKETS_DETAIL_GRID_POINT8(AXES, PLACE, entry) \
+    return PACKETS_DETAIL_TABLE_POINT8(AXES, PLACE, (entry) & PACKETS_DETAIL_GRID_MASK(AXES));
+#define PACKETS_DETAIL_GRID_POINT4(AXES, PLACE, entry) \
+    return uvec2(PACKETS_DETAIL_TABLE_WORD(AXES, PLACE, (entry) & PACKETS_DETAIL_GRID_MASK(AXES)), \
+        PACKETS_DETAIL_TABLE_WORD(AXES, PLACE, ((entry) >> AXES(SEISMIC_AXIS_CODES_GRID_INDEX_BITS)) & PACKETS_DETAIL_GRID_MASK(AXES)));
+uvec2 packets_detail_grid_point(const int kind, uint entry) {
+#if PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W0_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
     if (kind == PACKETS_W0) {
-#if PACKETS_W0_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-        PACKETS_GRID_POINT8(PACKETS_W0_AXES, PACKETS_PLACE_0, entry)
+#if PACKETS_DETAIL_W0_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+        PACKETS_DETAIL_GRID_POINT8(PACKETS_DETAIL_W0_AXES, PACKETS_DETAIL_PLACE_0, entry)
 #else
-        PACKETS_GRID_POINT4(PACKETS_W0_AXES, PACKETS_PLACE_0, entry)
+        PACKETS_DETAIL_GRID_POINT4(PACKETS_DETAIL_W0_AXES, PACKETS_DETAIL_PLACE_0, entry)
 #endif
     }
 #endif
-#if PACKETS_SLOT(PACKETS_W1_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
+#if PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W1_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
     if (kind == PACKETS_W1) {
-#if PACKETS_W1_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-        PACKETS_GRID_POINT8(PACKETS_W1_AXES, PACKETS_PLACE_1, entry)
+#if PACKETS_DETAIL_W1_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+        PACKETS_DETAIL_GRID_POINT8(PACKETS_DETAIL_W1_AXES, PACKETS_DETAIL_PLACE_1, entry)
 #else
-        PACKETS_GRID_POINT4(PACKETS_W1_AXES, PACKETS_PLACE_1, entry)
+        PACKETS_DETAIL_GRID_POINT4(PACKETS_DETAIL_W1_AXES, PACKETS_DETAIL_PLACE_1, entry)
 #endif
     }
 #endif
-#if PACKETS_SLOT(PACKETS_W2_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
+#if PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W2_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
     if (kind == PACKETS_W2) {
-#if PACKETS_W2_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-        PACKETS_GRID_POINT8(PACKETS_W2_AXES, PACKETS_PLACE_2, entry)
+#if PACKETS_DETAIL_W2_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+        PACKETS_DETAIL_GRID_POINT8(PACKETS_DETAIL_W2_AXES, PACKETS_DETAIL_PLACE_2, entry)
 #else
-        PACKETS_GRID_POINT4(PACKETS_W2_AXES, PACKETS_PLACE_2, entry)
+        PACKETS_DETAIL_GRID_POINT4(PACKETS_DETAIL_W2_AXES, PACKETS_DETAIL_PLACE_2, entry)
 #endif
     }
 #endif
-#if PACKETS_SLOT(PACKETS_W3_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
+#if PACKETS_DETAIL_SLOT(PACKETS_DETAIL_W3_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
     if (kind == PACKETS_W3) {
-#if PACKETS_W3_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-        PACKETS_GRID_POINT8(PACKETS_W3_AXES, PACKETS_PLACE_3, entry)
+#if PACKETS_DETAIL_W3_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+        PACKETS_DETAIL_GRID_POINT8(PACKETS_DETAIL_W3_AXES, PACKETS_DETAIL_PLACE_3, entry)
 #else
-        PACKETS_GRID_POINT4(PACKETS_W3_AXES, PACKETS_PLACE_3, entry)
+        PACKETS_DETAIL_GRID_POINT4(PACKETS_DETAIL_W3_AXES, PACKETS_DETAIL_PLACE_3, entry)
 #endif
     }
 #endif
@@ -645,51 +655,51 @@ uvec2 packets_grid_point(const int kind, uint entry) {
 
 // An entry's first sign bit, its sign bits (seven, eight, or none) and its
 // delta bit (`registry::GridCodes`).
-#define PACKETS_GRID_SIGN_BIT(kind) uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_SIGN_BIT))
-#define PACKETS_GRID_SIGN_BITS(kind) uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_SIGN_BITS))
-#define PACKETS_GRID_DELTA_BIT(kind) uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_DELTA_BIT))
+#define PACKETS_DETAIL_GRID_SIGN_BIT(kind) uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_GRID_SIGN_BIT))
+#define PACKETS_DETAIL_GRID_SIGN_BITS(kind) uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_GRID_SIGN_BITS))
+#define PACKETS_DETAIL_GRID_DELTA_BIT(kind) uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_GRID_DELTA_BIT))
 
 // Entry `step` of a packet's four, whole: its whole bytes (LOW bits) and,
 // where a bound slot's entries have more, the rest of it (HIGH bits, a
 // packet's in `high.x`).
-#if PACKETS_SOME(PACKETS_GRID_REST)
-uint packets_grid_whole_entry(const int kind, packets_packet packet, uint step) {
-    const uint low = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS));
-    const uint high = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS));
-    uint entry = packets_grid_entry(kind, packet.low, step);
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_REST)
+uint packets_detail_grid_whole_entry(const int kind, packets_packet packet, uint step) {
+    const uint low = uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS));
+    const uint high = uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS));
+    uint entry = packets_detail_grid_entry(kind, packet.low, step);
     if (high != 0u)
         entry |= ((packet.high.x >> (high * step)) & ((1u << high) - 1u)) << low;
     return entry;
 }
-#define PACKETS_GRID_WHOLE_ENTRY(kind, packet, step) packets_grid_whole_entry(kind, packet, step)
+#define PACKETS_DETAIL_GRID_WHOLE_ENTRY(kind, packet, step) packets_detail_grid_whole_entry(kind, packet, step)
 #else
-#define PACKETS_GRID_WHOLE_ENTRY(kind, packet, step) packets_grid_entry(kind, packet.low, step)
+#define PACKETS_DETAIL_GRID_WHOLE_ENTRY(kind, packet, step) packets_detail_grid_entry(kind, packet.low, step)
 #endif
 
 // The mask of an entry's sign bits.
-#define PACKETS_GRID_SIGN_MASK(kind) ((1u << PACKETS_GRID_SIGN_BITS(kind)) - 1u)
+#define PACKETS_DETAIL_GRID_SIGN_MASK(kind) ((1u << PACKETS_DETAIL_GRID_SIGN_BITS(kind)) - 1u)
 
 // The eight codes of `point` under sign bits `signs` (seven completed by an
 // eighth of even parity unless the slot's `form` is another), as
 // (0,2,4,6), (1,3,5,7); a slot of signed points has no signs; `arithmetic`
-// as `packets_unsigned_bytes`.
-void packets_grid_codes(uvec2 point, uint signs,
-#if PACKETS_SOME(PACKETS_GRID_UNPARITIED)
+// as `packets_detail_unsigned_bytes`.
+void packets_detail_grid_codes(uvec2 point, uint signs,
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_UNPARITIED)
     const int form,
 #endif
     const bool arithmetic, out vec4 even, out vec4 odd) {
-#if PACKETS_SOME(PACKETS_GRID_UNPARITIED)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_UNPARITIED)
     if (form == SEISMIC_GRID_SIGNS_PARITY_PLUS7)
 #endif
     signs |= (uint(bitCount(signs)) & 1u) << 7;
-#if PACKETS_SOME(PACKETS_GRID_SIGNED_POINTS)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_SIGNED_POINTS)
     const bool magnitudes = form != SEISMIC_GRID_SIGNS_NONE;
     const vec4 low =
-        magnitudes ? packets_unsigned_bytes(point.x, arithmetic) : packets_signed_bytes(point.x, arithmetic);
+        magnitudes ? packets_detail_unsigned_bytes(point.x, arithmetic) : packets_detail_signed_bytes(point.x, arithmetic);
     const vec4 high =
-        magnitudes ? packets_unsigned_bytes(point.y, arithmetic) : packets_signed_bytes(point.y, arithmetic);
+        magnitudes ? packets_detail_unsigned_bytes(point.y, arithmetic) : packets_detail_signed_bytes(point.y, arithmetic);
 #else
-    const vec4 low = packets_unsigned_bytes(point.x, arithmetic), high = packets_unsigned_bytes(point.y, arithmetic);
+    const vec4 low = packets_detail_unsigned_bytes(point.x, arithmetic), high = packets_detail_unsigned_bytes(point.y, arithmetic);
 #endif
     even = uintBitsToFloat(floatBitsToUint(vec4(low.x, low.z, high.x, high.z)) ^
                            (((uvec4(signs) >> uvec4(0u, 2u, 4u, 6u)) & 1u) << 31));
@@ -709,18 +719,18 @@ void packets_grid_codes(uvec2 point, uint signs,
 // (`registry::ScaleEncoding::scales_exactly`).
 
 // Bytes of one scale of encoding `scale` (`SEISMIC_SCALE_*`).
-uint packets_scale_bytes(const int scale) {
+uint packets_detail_scale_bytes(const int scale) {
     return scale == SEISMIC_SCALE_F32 ? 4u : scale == SEISMIC_SCALE_F16 || scale == SEISMIC_SCALE_BF16 ? 2u : 1u;
 }
 
 // E8M0: 2^(e - 127) (e = 0 is the F32 subnormal 2^-127); 0xff is NaN.
-float packets_e8m0(uint e) {
+float packets_detail_e8m0(uint e) {
     return uintBitsToFloat(e == 0u ? 0x00400000u : e == 255u ? 0x7fc00000u : e << 23);
 }
 
 // UE4M3 (sign bit ignored; 0x7f is NaN): (1 + m/8) 2^(e - 7), or m 2^-9 when
 // e = 0.
-float packets_ue4m3(uint raw) {
+float packets_detail_ue4m3(uint raw) {
     raw &= 0x7fu;
     const uint e = raw >> 3, m = raw & 7u;
     const float normal = uintBitsToFloat(((e + 120u) << 23) | (m << 20));
@@ -728,65 +738,65 @@ float packets_ue4m3(uint raw) {
 }
 
 // The value of a scale of encoding `scale` stored as the low bytes of `raw`.
-float packets_scale_value(const int scale, uint raw) {
-#if PACKETS_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_F32)
+float packets_detail_scale_value(const int scale, uint raw) {
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_F32)
     if (scale == SEISMIC_SCALE_F32)
         return uintBitsToFloat(raw);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_F16)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_F16)
     if (scale == SEISMIC_SCALE_F16)
         return seismic_f16_to_f32(uint16_t(raw));
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_BF16)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_BF16)
     if (scale == SEISMIC_SCALE_BF16)
         return uintBitsToFloat(raw << 16);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_E8M0)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_E8M0)
     if (scale == SEISMIC_SCALE_E8M0)
-        return packets_e8m0(raw & 0xffu);
+        return packets_detail_e8m0(raw & 0xffu);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_UE4M3)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_COEFF_SCALE, SEISMIC_SCALE_UE4M3)
     if (scale == SEISMIC_SCALE_UE4M3)
-        return packets_ue4m3(raw & 0xffu);
+        return packets_detail_ue4m3(raw & 0xffu);
 #endif
     return 0.0;
 }
 
 // The scale of encoding `scale` at `at`, and the two adjacent ones there,
 // each read as one load.
-float packets_scale_at(const int scale, uint64_t at) {
-    const uint bytes = packets_scale_bytes(scale);
-    return packets_scale_value(scale,
+float packets_detail_scale_at(const int scale, uint64_t at) {
+    const uint bytes = packets_detail_scale_bytes(scale);
+    return packets_detail_scale_value(scale,
         bytes == 4u ? element_u32_at(at) : bytes == 2u ? element_u16_at(at) : element_u8_at(at));
 }
 
-vec2 packets_scale_pair_at(const int scale, uint64_t at) {
-    const uint bytes = packets_scale_bytes(scale);
+vec2 packets_detail_scale_pair_at(const int scale, uint64_t at) {
+    const uint bytes = packets_detail_scale_bytes(scale);
     if (bytes == 4u) {
         const uvec2 two = element_uvec2_at(at);
-        return vec2(packets_scale_value(scale, two.x), packets_scale_value(scale, two.y));
+        return vec2(packets_detail_scale_value(scale, two.x), packets_detail_scale_value(scale, two.y));
     }
     const uint two = bytes == 2u ? element_u32_at(at) : element_u16_at(at);
-    return vec2(packets_scale_value(scale, two), packets_scale_value(scale, two >> (8u * bytes)));
+    return vec2(packets_detail_scale_value(scale, two), packets_detail_scale_value(scale, two >> (8u * bytes)));
 }
 
 // Whether slot axes `AXES` have a signed bias (`SEISMIC_BIAS_KIND_SIGNED`),
 // ±2^(EXPONENT + SIGNED_BIAS_EXPONENT) times its group's factor and scale
 // code, signed by the local code's top bit.
-#define PACKETS_SIGNED_BIAS(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
+#define PACKETS_DETAIL_SIGNED_BIAS(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
     && AXES(SEISMIC_AXIS_COEFF_BIAS) == SEISMIC_BIAS_KIND_SIGNED)
 
 // A `bits`-bit local coefficient code's value: unsigned, two's complement,
 // offset, or odd (2 (c - K) + 1, K the offset). A scale code is
 // LOCAL_SCALE_BITS bits (under a signed bias, the local code's low bits).
-float packets_local_value(const int kind, uint code, uint bits) {
-    const int local = PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL);
+float packets_detail_local_value(const int kind, uint code, uint bits) {
+    const int local = PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL);
     if (local == SEISMIC_CODES_TWOS)
         return float(int(code << (32u - bits)) >> (32u - bits));
     if (local == SEISMIC_CODES_OFFSET)
-        return float(int(code) - PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL_OFFSET));
+        return float(int(code) - PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL_OFFSET));
     if (local == SEISMIC_CODES_ODD)
-        return float(2u * code + 1u) - float(2 * PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL_OFFSET));
+        return float(2u * code + 1u) - float(2 * PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL_OFFSET));
     return float(code);
 }
 
@@ -796,22 +806,22 @@ float packets_local_value(const int kind, uint code, uint bits) {
 // an add of a value's own split bit fields (`(p & ~7) + (p & 7)`, as an
 // address or a value) in the GEMV, while `p` itself, or the fields joined
 // with `|`, compile.
-void packets_coefficients(const int kind, uint64_t row, packets_rows16 geometry, uint p, inout packets_packet packet) {
-    const int coeff = PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF), scale = PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_SCALE);
+void packets_detail_coefficients(const int kind, uint64_t row, packets_rows16 geometry, uint p, inout packets_packet packet) {
+    const int coeff = PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF), scale = PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_SCALE);
     // A minimum: a direct group's stored bias, or a hierarchical group's
     // second local code under a minimum factor.
-    const bool minimum = PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS) == SEISMIC_BIAS_KIND_MINIMUM;
-    const uint bytes = packets_scale_bytes(scale), groups = packets_groups(kind);
-    const int code_exponent = PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_EXPONENT);
-#if PACKETS_ANY(SEISMIC_AXIS_COEFF, SEISMIC_COEFF_DIRECT)
+    const bool minimum = PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS) == SEISMIC_BIAS_KIND_MINIMUM;
+    const uint bytes = packets_detail_scale_bytes(scale), groups = packets_groups(kind);
+    const int code_exponent = PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_EXPONENT);
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_COEFF, SEISMIC_COEFF_DIRECT)
     if (coeff == SEISMIC_COEFF_DIRECT) {
         // Packet p's first group, without a product that could wrap (which
         // keeps a compiler from folding it).
-        const uint group = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_GROUP));
+        const uint group = uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_GROUP));
         const uint first = group < 32u ? p * (32u / group) : p / (group / 32u);
         if (groups == 2u && !minimum) {
             // The packet's two scales are adjacent: one load.
-            const vec2 stored = packets_scale_pair_at(scale, row + geometry.supers + uint64_t(first * bytes));
+            const vec2 stored = packets_detail_scale_pair_at(scale, row + geometry.supers + uint64_t(first * bytes));
             const vec2 scales = code_exponent != 0 ? ldexp(stored, ivec2(code_exponent)) : stored;
             packet.scale0 = scales.x;
             packet.scale1 = scales.y;
@@ -822,43 +832,43 @@ void packets_coefficients(const int kind, uint64_t row, packets_rows16 geometry,
                 // A group's scale, then its bias (a storage group is one
                 // coefficient group).
                 const uint64_t at = row + geometry.supers + uint64_t(first + g) * (minimum ? 2u * bytes : bytes);
-                const float stored = packets_scale_at(scale, at);
-                packets_set_group(packet, g, code_exponent != 0 ? ldexp(stored, code_exponent) : stored, minimum,
-                    minimum ? packets_scale_at(scale, at + uint64_t(bytes)) : 0.0);
+                const float stored = packets_detail_scale_at(scale, at);
+                packets_detail_set_group(packet, g, code_exponent != 0 ? ldexp(stored, code_exponent) : stored, minimum,
+                    minimum ? packets_detail_scale_at(scale, at + uint64_t(bytes)) : 0.0);
             }
         }
         return;
     }
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_COEFF, SEISMIC_COEFF_HIER)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_COEFF, SEISMIC_COEFF_HIER)
     if (coeff == SEISMIC_COEFF_HIER) {
-        const uint per = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_FACTOR_GROUP)) / 32u; // packets a factor
+        const uint per = uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_FACTOR_GROUP)) / 32u; // packets a factor
         const uint64_t factors = row + geometry.supers
             + uint64_t(minimum ? 2u * bytes : bytes) * uint64_t(p / per);
-        const int exponent = PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_EXPONENT);
+        const int exponent = PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_EXPONENT);
         // The scale factor and the minimum factor after it, one load.
-        const vec2 stored = minimum ? packets_scale_pair_at(scale, factors) : vec2(packets_scale_at(scale, factors), 0.0);
+        const vec2 stored = minimum ? packets_detail_scale_pair_at(scale, factors) : vec2(packets_detail_scale_at(scale, factors), 0.0);
         const float factor = exponent + code_exponent != 0 ? ldexp(stored.x, exponent + code_exponent) : stored.x;
-        const float minimum_factor = minimum ? float(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS_SIGN))
+        const float minimum_factor = minimum ? float(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS_SIGN))
             * (exponent != 0 ? ldexp(stored.y, exponent) : stored.y) : 0.0;
         // The packet's local field: per group a local code, then its minimum
         // code, LOCAL_BITS each; a local code's low LOCAL_SCALE_BITS bits are
         // its scale code.
-        const uint bits = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL_BITS));
+        const uint bits = uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL_BITS));
         const uint width = bits * (minimum ? 2u : 1u), mask = (1u << bits) - 1u;
-        const uint scale_bits = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL_SCALE_BITS));
+        const uint scale_bits = uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL_SCALE_BITS));
         const uint scale_mask = (1u << scale_bits) - 1u;
         uint field = 0u;
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
-        if (PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_CARRIED) != 0) {
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
+        if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_CARRIED) != 0) {
             // Carried in the entries: bit j of a group's code is its entry j's
             // carried bit (a packet's four entries, 4 / groups a group).
-            const uint carried = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_CARRIED));
+            const uint carried = uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_CARRIED));
             [[unroll]] for (uint g = 0u; g < 2u; ++g) {
                 if (g < groups) {
                     [[unroll]] for (uint j = 0u; j < 4u; ++j) {
                         if (j < bits)
-                            field |= ((PACKETS_GRID_WHOLE_ENTRY(kind, packet, g * (4u / groups) + j) >> carried) & 1u)
+                            field |= ((PACKETS_DETAIL_GRID_WHOLE_ENTRY(kind, packet, g * (4u / groups) + j) >> carried) & 1u)
                                 << (g * width + j);
                     }
                 }
@@ -889,19 +899,19 @@ void packets_coefficients(const int kind, uint64_t row, packets_rows16 geometry,
                 field >>= shift;
             }
         }
-#if PACKETS_SOME(PACKETS_SIGNED_BIAS)
-        if (PACKETS_OF(kind, PACKETS_SIGNED_BIAS)) {
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_SIGNED_BIAS)
+        if (PACKETS_DETAIL_OF(kind, PACKETS_DETAIL_SIGNED_BIAS)) {
             // A signed bias: the code's bit past its scale code the sign of
             // the bias, the stored factor times
             // 2^(EXPONENT + SIGNED_BIAS_EXPONENT) times the scale's code.
-            const int signed_exponent = exponent + PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_SIGNED_BIAS_EXPONENT);
+            const int signed_exponent = exponent + PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_SIGNED_BIAS_EXPONENT);
             [[unroll]] for (uint g = 0u; g < 2u; ++g) {
                 if (g < groups) {
                     const uint code = (field >> (g * width)) & mask;
-                    const float local = packets_local_value(kind, code & scale_mask, scale_bits);
+                    const float local = packets_detail_local_value(kind, code & scale_mask, scale_bits);
                     const float group_scale = factor * local;
                     const float term = ldexp(stored.x * local, signed_exponent);
-                    packets_set_group(packet, g, group_scale, true, (code >> scale_bits) != 0u ? -term : term);
+                    packets_detail_set_group(packet, g, group_scale, true, (code >> scale_bits) != 0u ? -term : term);
                 }
             }
             return;
@@ -909,8 +919,8 @@ void packets_coefficients(const int kind, uint64_t row, packets_rows16 geometry,
 #endif
         [[unroll]] for (uint g = 0u; g < 2u; ++g) {
             if (g < groups) {
-                packets_set_group(packet, g, factor * packets_local_value(kind, (field >> (g * width)) & scale_mask, scale_bits),
-                    minimum, minimum ? minimum_factor * packets_local_value(kind, (field >> (g * width + bits)) & mask, bits) : 0.0);
+                packets_detail_set_group(packet, g, factor * packets_detail_local_value(kind, (field >> (g * width)) & scale_mask, scale_bits),
+                    minimum, minimum ? minimum_factor * packets_detail_local_value(kind, (field >> (g * width + bits)) & mask, bits) : 0.0);
             }
         }
     }
@@ -927,15 +937,15 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
     packet.scale0 = 0.0;
     packet.scale1 = 0.0;
     packet.bias0 = 0.0;
-#if PACKETS_SOME(PACKETS_TWO_BIASES)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_TWO_BIASES)
     packet.bias1 = 0.0;
 #endif
     packet.values = 0ul;
     packet.valid = 0u;
     packet.aligned = false;
-#if PACKETS_ANY_DENSE
-    if (packets_dense(kind)) {
-        packet.values = row + geometry.codes + uint64_t(p) * 32ul * ELEMENT_BYTES(packets_element(kind));
+#if PACKETS_DETAIL_ANY_DENSE
+    if (packets_detail_dense(kind)) {
+        packet.values = row + geometry.codes + uint64_t(p) * 32ul * ELEMENT_BYTES(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_DTYPE));
         packet.valid = min(32u, k - 32u * p);
         // A row past the first lands off 16-byte alignment whenever its
         // byte stride isn't itself a multiple of 16 (a dense row's stride
@@ -947,139 +957,139 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
         return packet;
     }
 #endif
-#if PACKETS_ANY_PACKED
-    const uint low = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS));
-    const uint high = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS));
+#if PACKETS_DETAIL_ANY_PACKED
+    const uint low = uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS));
+    const uint high = uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS));
     // The packet's codes: 32 codes or 4 grid entries of `low` bits.
-    const bool grid = PACKETS_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID;
+    const bool grid = PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID;
     const uint64_t codes = row + geometry.codes + uint64_t((grid ? 4u : 32u) * low / 8u) * p;
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1)
     if (low == 1u)
         packet.low.x = element_u32_at(codes);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
     if (low == 2u)
         packet.low.xy = element_uvec2_at(codes);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 16)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 16)
     if (low == 16u)
         packet.low = uvec4(element_uvec2_at(codes), 0u, 0u);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 24)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 24)
     if (low == 24u)
         packet.low = uvec4(element_u32_at(codes), element_u32_at(codes + 4ul), element_u32_at(codes + 8ul), 0u);
 #endif
     // Grid entries of 8-bit whole bytes are one word a packet, never an
     // 8-bit plane's codes; the rest of grid entries is HIGH bits each, 4 HIGH
     // bits a packet, never a high plane's codes.
-#if PACKETS_SOME(PACKETS_GRID_BYTE)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_BYTE)
     if (grid && low == 8u)
         packet.low.x = element_u32_at(codes);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 4) || PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 8)
-#if PACKETS_SOME(PACKETS_GRID_BYTE)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 4) || PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 8)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_BYTE)
     if (low == 4u || (low == 8u && !grid))
 #else
     if (low == 4u || low == 8u)
 #endif
         packet.low = element_uvec4_at(codes);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 8)
-#if PACKETS_SOME(PACKETS_GRID_BYTE)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 8)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_BYTE)
     if (low == 8u && !grid)
 #else
     if (low == 8u)
 #endif
         packet.second = element_uvec4_at(codes + 16ul);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1)
     if (high == 1u)
         packet.high.x = element_u32_at(row + geometry.high + 4ul * p);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 2)
-#if PACKETS_SOME(PACKETS_GRID_REST)
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 2)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_REST)
     if (high == 2u && !grid)
 #else
     if (high == 2u)
 #endif
         packet.high = element_uvec2_at(row + geometry.high + 8ul * p);
 #endif
-#if PACKETS_SOME(PACKETS_GRID_REST)
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_REST)
     if (grid && high == 2u)
         packet.high.x = element_u8_at(row + geometry.high + uint64_t(p));
     if (grid && high == 4u)
         packet.high.x = element_u16_at(row + geometry.high + 2ul * p);
 #endif
-    packets_coefficients(kind, row, geometry, p, packet);
+    packets_detail_coefficients(kind, row, geometry, p, packet);
 #endif
     return packet;
 }
 
 // Element `i` of a dense packet (zero past the row).
-float packets_dense_element(const int kind, packets_packet packet, uint i) {
-    return i < packet.valid ? element_at(packets_element(kind), packet.values, i) : 0.0;
+float packets_detail_dense_element(const int kind, packets_packet packet, uint i) {
+    return i < packet.valid ? element_at(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_DTYPE), packet.values, i) : 0.0;
 }
 
-#if (PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1) || PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)) \
-    && (PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1) || PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 2))
+#if (PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1) || PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)) \
+    && (PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1) || PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 2))
 // Sub-step `step`'s high bits of codes below a nibble, of a `low`-bit low
 // plane, added at bit `low` of its low codes `even` and `odd`.
-void packets_high_codes(const int kind, packets_packet packet, uint step, uint low, inout uint even, inout uint odd) {
+void packets_detail_high_codes(const int kind, packets_packet packet, uint step, uint low, inout uint even, inout uint odd) {
     uint he = 0u, ho = 0u;
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 1)
-        packets_split_high1((packet.high.x >> (8u * step)) & 0xffu, he, ho);
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 1)
+        packets_detail_split_high1((packet.high.x >> (8u * step)) & 0xffu, he, ho);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 2)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 2)
-        packets_split_high2((packet.high[step >> 1] >> (16u * (step & 1u))) & 0xffffu, he, ho);
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 2)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 2)
+        packets_detail_split_high2((packet.high[step >> 1] >> (16u * (step & 1u))) & 0xffffu, he, ho);
 #endif
     even |= he >> (4u - low);
     odd |= ho >> (4u - low);
 }
 #else
-#define packets_high_codes(kind, packet, step, low, even, odd)
+#define packets_detail_high_codes(kind, packet, step, low, even, odd)
 #endif
 
 // The codes of sub-step `step` (elements 8 step ..) as (0,2,4,6), (1,3,5,7),
 // offset codes less their offset where `centred` (a dense packet's are its
-// values); `arithmetic` as `packets_unsigned_bytes`.
-void packets_decode(const int kind, packets_packet packet, uint step, const bool centred, const bool arithmetic,
+// values); `arithmetic` as `packets_detail_unsigned_bytes`.
+void packets_detail_decode(const int kind, packets_packet packet, uint step, const bool centred, const bool arithmetic,
     out vec4 even, out vec4 odd) {
-#if PACKETS_ANY_DENSE
-    if (packets_dense(kind)) {
+#if PACKETS_DETAIL_ANY_DENSE
+    if (packets_detail_dense(kind)) {
         const uint first = 8u * step;
         // `element_load8`'s vectorized path dereferences a 16-byte-aligned
         // buffer reference; `packet.aligned` (set once the packet forms,
         // `packets_load`) says whether this packet's address actually is
         // one. A step past the first stays 16-byte aligned too, since it
-        // moves by 8 elements of `packets_element(kind)` (2 or 4 bytes),
+        // moves by 8 elements of the slot's dtype (its element kind: 2 or 4 bytes),
         // i.e. a multiple of 16 bytes, from an aligned packet.
         if (first + 8u <= packet.valid && packet.aligned) {
-            element_load8(packets_element(kind), packet.values, first, even, odd);
+            element_load8(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_DTYPE), packet.values, first, even, odd);
         } else {
-            even = vec4(packets_dense_element(kind, packet, first), packets_dense_element(kind, packet, first + 2u),
-                packets_dense_element(kind, packet, first + 4u), packets_dense_element(kind, packet, first + 6u));
-            odd = vec4(packets_dense_element(kind, packet, first + 1u), packets_dense_element(kind, packet, first + 3u),
-                packets_dense_element(kind, packet, first + 5u), packets_dense_element(kind, packet, first + 7u));
+            even = vec4(packets_detail_dense_element(kind, packet, first), packets_detail_dense_element(kind, packet, first + 2u),
+                packets_detail_dense_element(kind, packet, first + 4u), packets_detail_dense_element(kind, packet, first + 6u));
+            odd = vec4(packets_detail_dense_element(kind, packet, first + 1u), packets_detail_dense_element(kind, packet, first + 3u),
+                packets_detail_dense_element(kind, packet, first + 5u), packets_detail_dense_element(kind, packet, first + 7u));
         }
         return;
     }
 #endif
-#if PACKETS_ANY_PACKED
-#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID) {
-        const uint entry = PACKETS_GRID_WHOLE_ENTRY(kind, packet, step);
-        packets_grid_codes(packets_grid_point(kind, entry), (entry >> PACKETS_GRID_SIGN_BIT(kind)) & PACKETS_GRID_SIGN_MASK(kind),
-#if PACKETS_SOME(PACKETS_GRID_UNPARITIED)
-            PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_SIGNS),
+#if PACKETS_DETAIL_ANY_PACKED
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID) {
+        const uint entry = PACKETS_DETAIL_GRID_WHOLE_ENTRY(kind, packet, step);
+        packets_detail_grid_codes(packets_detail_grid_point(kind, entry), (entry >> PACKETS_DETAIL_GRID_SIGN_BIT(kind)) & PACKETS_DETAIL_GRID_SIGN_MASK(kind),
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_UNPARITIED)
+            PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_GRID_SIGNS),
 #endif
             arithmetic, even, odd);
-#if PACKETS_SOME(PACKETS_GRID_DELTA)
-        if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_DELTA) != 0) {
+#if PACKETS_DETAIL_SOME(PACKETS_DETAIL_GRID_DELTA)
+        if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_GRID_DELTA) != 0) {
             // The delta bit, past the signs: 2^DELTA_EXPONENT v + 1, or - 1.
-            const float power = float(1u << uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_DELTA_EXPONENT)));
-            const float delta = ((entry >> PACKETS_GRID_DELTA_BIT(kind)) & 1u) != 0u ? -1.0 : 1.0;
+            const float power = float(1u << uint(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_GRID_DELTA_EXPONENT)));
+            const float delta = ((entry >> PACKETS_DETAIL_GRID_DELTA_BIT(kind)) & 1u) != 0u ? -1.0 : 1.0;
             even = even * power + delta;
             odd = odd * power + delta;
         }
@@ -1087,70 +1097,70 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
         return;
     }
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 8)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 8) {
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 8)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 8) {
         const uvec4 words = step < 2u ? packet.low : packet.second;
         const uint base = (step & 1u) * 2u;
-        const vec4 a = packets_interpret(kind, words[base], centred, arithmetic);
-        const vec4 b = packets_interpret(kind, words[base + 1u], centred, arithmetic);
+        const vec4 a = packets_detail_interpret(kind, words[base], centred, arithmetic);
+        const vec4 b = packets_detail_interpret(kind, words[base + 1u], centred, arithmetic);
         even = vec4(a.x, a.z, b.x, b.z);
         odd = vec4(a.y, a.w, b.y, b.w);
         return;
     }
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 2) {
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 2) {
         // A sub-step's codes are the 16 bits at bit 16 step of the packet's.
         uint e, o;
-        packets_split_low2((packet.low[step >> 1] >> (16u * (step & 1u))) & 0xffffu, e, o);
-        packets_high_codes(kind, packet, step, 2u, e, o);
-        even = packets_interpret(kind, e, centred, arithmetic);
-        odd = packets_interpret(kind, o, centred, arithmetic);
+        packets_detail_split_low2((packet.low[step >> 1] >> (16u * (step & 1u))) & 0xffffu, e, o);
+        packets_detail_high_codes(kind, packet, step, 2u, e, o);
+        even = packets_detail_interpret(kind, e, centred, arithmetic);
+        odd = packets_detail_interpret(kind, o, centred, arithmetic);
         return;
     }
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 1) {
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 1) {
         // A sub-step's codes are the 8 bits at bit 8 step of the packet's.
         uint e, o;
-        packets_split_low1((packet.low.x >> (8u * step)) & 0xffu, e, o);
-        packets_high_codes(kind, packet, step, 1u, e, o);
-        even = packets_interpret(kind, e, centred, arithmetic);
-        odd = packets_interpret(kind, o, centred, arithmetic);
+        packets_detail_split_low1((packet.low.x >> (8u * step)) & 0xffu, e, o);
+        packets_detail_high_codes(kind, packet, step, 1u, e, o);
+        even = packets_detail_interpret(kind, e, centred, arithmetic);
+        odd = packets_detail_interpret(kind, o, centred, arithmetic);
         return;
     }
 #endif
     // 4-bit codes and their high bits.
     const uint word = packet.low[step];
     uint he = 0u, ho = 0u;
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 1)
-        packets_split_high1((packet.high.x >> (8u * step)) & 0xffu, he, ho);
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 1)
+        packets_detail_split_high1((packet.high.x >> (8u * step)) & 0xffu, he, ho);
 #endif
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 2)
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 2)
-        packets_split_high2((packet.high[step >> 1] >> (16u * (step & 1u))) & 0xffffu, he, ho);
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 2)
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 2)
+        packets_detail_split_high2((packet.high[step >> 1] >> (16u * (step & 1u))) & 0xffffu, he, ho);
 #endif
-    even = packets_interpret(kind, (word & 0x0f0f0f0fu) | he, centred, arithmetic);
-    odd = packets_interpret(kind, ((word >> 4) & 0x0f0f0f0fu) | ho, centred, arithmetic);
+    even = packets_detail_interpret(kind, (word & 0x0f0f0f0fu) | he, centred, arithmetic);
+    odd = packets_detail_interpret(kind, ((word >> 4) & 0x0f0f0f0fu) | ho, centred, arithmetic);
 #endif
 }
 
 // The codes of sub-step `step`, for factored dot products (`packets_bias`);
-// `arithmetic` as `packets_unsigned_bytes`.
+// `arithmetic` as `packets_detail_unsigned_bytes`.
 void packets_codes(const int kind, packets_packet packet, uint step, const bool arithmetic, out vec4 even,
     out vec4 odd) {
-    packets_decode(kind, packet, step, false, arithmetic, even, odd);
+    packets_detail_decode(kind, packet, step, false, arithmetic, even, odd);
 }
 
 // Whether `kind`'s codes are signs: one bit each, odd codes 2 (c - 1) + 1,
 // -1 or +1.
 bool packets_signs(const int kind) {
-#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1) && PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_ODD)
-    return PACKETS_AXIS(kind, SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
-        && PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 1 && PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 0
-        && PACKETS_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_ODD
-        && PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET) == 1;
+#if PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1) && PACKETS_DETAIL_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_ODD)
+    return PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
+        && PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 1 && PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 0
+        && PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_ODD
+        && PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET) == 1;
 #else
     return false;
 #endif
@@ -1167,29 +1177,29 @@ void packets_sign_masks(packets_packet packet, uint step, out uvec4 even, out uv
 
 float packets_scale(const int kind, packets_packet packet, uint step) {
     if (packets_groups(kind) == 2u)
-        return packets_group_scale(packet, step >> 1);
-    return packets_dense(kind) ? 1.0 : packet.scale0;
+        return packets_detail_group_scale(packet, step >> 1);
+    return packets_detail_dense(kind) ? 1.0 : packet.scale0;
 }
 
 // The bias of coefficient group `group` in factored dot products,
 // scale * dot(code, x) + bias * sum(x): its minimum or stored bias, or an
 // offset code's exact bias -(offset * scale).
 float packets_bias(const int kind, packets_packet packet, uint group) {
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_OFFSET)
-        return -(float(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET)) * packets_group_scale(packet, group));
-    return PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS) != 0 ? packets_group_bias(packet, group) : 0.0;
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_OFFSET)
+        return -(float(PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET)) * packets_detail_group_scale(packet, group));
+    return PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS) != 0 ? packets_detail_group_bias(packet, group) : 0.0;
 }
 
 // The logical value of centred code `code` of sub-step `step`: scale *
 // (code - offset), the exact integer difference (decoded so) under one
 // multiply, with a stored bias by one fma (a dense packet's code is its
 // value).
-float packets_value(const int kind, packets_packet packet, uint step, float code) {
-    if (packets_dense(kind))
+float packets_detail_value(const int kind, packets_packet packet, uint step, float code) {
+    if (packets_detail_dense(kind))
         return code;
     const float scale = packets_scale(kind, packet, step);
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS) != 0)
-        return seismic_fma_rn(scale, code, packets_group_bias(packet, packets_groups(kind) == 2u ? step >> 1 : 0u));
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS) != 0)
+        return seismic_fma_rn(scale, code, packets_detail_group_bias(packet, packets_groups(kind) == 2u ? step >> 1 : 0u));
     return scale * code;
 }
 
@@ -1198,12 +1208,12 @@ float packets_value(const int kind, packets_packet packet, uint step, float code
 // bias or an offset code's exact bias (`packets_bias`), so a value of zero
 // is +0. Codes are not centred: the offset costs nothing past the fma.
 void packets_values(const int kind, packets_packet packet, uint step, out vec4 even, out vec4 odd) {
-    packets_decode(kind, packet, step, false, false, even, odd);
-    if (packets_dense(kind))
+    packets_detail_decode(kind, packet, step, false, false, even, odd);
+    if (packets_detail_dense(kind))
         return;
     const float scale = packets_scale(kind, packet, step);
-    if (PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS) != 0
-        || PACKETS_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_OFFSET) {
+    if (PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS) != 0
+        || PACKETS_DETAIL_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_OFFSET) {
         const float bias = packets_bias(kind, packet, packets_groups(kind) == 2u ? step >> 1 : 0u);
         [[unroll]] for (uint i = 0u; i < 4u; ++i) {
             even[i] = seismic_fma_rn(scale, even[i], bias);
@@ -1216,12 +1226,12 @@ void packets_values(const int kind, packets_packet packet, uint step, out vec4 e
 }
 
 // The logical values of sub-step `step` exactly, as a gather publishes
-// them (`packets_value`): a zero keeps the sign of scale * 0.
+// them (`packets_detail_value`): a zero keeps the sign of scale * 0.
 void packets_exact_values(const int kind, packets_packet packet, uint step, out vec4 even, out vec4 odd) {
-    packets_decode(kind, packet, step, true, false, even, odd);
+    packets_detail_decode(kind, packet, step, true, false, even, odd);
     [[unroll]] for (uint i = 0u; i < 4u; ++i) {
-        even[i] = packets_value(kind, packet, step, even[i]);
-        odd[i] = packets_value(kind, packet, step, odd[i]);
+        even[i] = packets_detail_value(kind, packet, step, even[i]);
+        odd[i] = packets_detail_value(kind, packet, step, odd[i]);
     }
 }
 
@@ -1229,7 +1239,7 @@ void packets_exact_values(const int kind, packets_packet packet, uint step, out 
 // its centred code, then its value.
 float packets_value_at(const int kind, packets_packet packet, uint i) {
     vec4 even, odd;
-    packets_decode(kind, packet, i >> 3, true, false, even, odd);
+    packets_detail_decode(kind, packet, i >> 3, true, false, even, odd);
     const uint lane = (i & 7u) >> 1;
-    return packets_value(kind, packet, i >> 3, (i & 1u) != 0u ? odd[lane] : even[lane]);
+    return packets_detail_value(kind, packet, i >> 3, (i & 1u) != 0u ? odd[lane] : even[lane]);
 }

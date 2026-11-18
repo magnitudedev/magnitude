@@ -10,7 +10,7 @@
 # other axes (`SEISMIC_AXIS_<NAME>`), which admission evaluates as the
 # library does.
 
-# The packet decoder (`packets_codes`, grid entries `packets_grid_codes`):
+# The packet decoder (`packets_codes`, grid entries `packets_detail_grid_codes`):
 # code planes of 1, 2 or 4 low bits with up to two high bits, or of 8 low
 # bits, split on nibble (or 2- or 1-bit) boundaries into exact small
 # integers; grid entries of 8, 16 or 24 whole bits with none, two or four
@@ -27,7 +27,7 @@ codes=grid planes=8.0|8.2|8.4|16.0|16.2|16.4|24.0|24.2|24.4
 # -(offset scale) (`packets_values`): the offset is a power of two of at
 # most 128 without a coefficient bias, and a code less it a signed byte.
 require CODES != CODES:OFFSET || (CODES_OFFSET <= 128 && (CODES_OFFSET & (CODES_OFFSET - 1)) == 0 && COEFF_BIAS == 0)
-# The coefficients `packets_coefficients` reads: direct ones per 16 values or
+# The coefficients `packets_detail_coefficients` reads: direct ones per 16 values or
 # a multiple of 32 (with a bias, each group's scale then its bias), and
 # hierarchical ones per 16 or 32 values whose local codes are unsigned, two's
 # complement, offset or odd, either carried by at most a group's grid

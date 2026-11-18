@@ -6,6 +6,7 @@
 // plane's as whole words of their size.
 #include <seismic/element.glsl>
 #include <seismic/slab.glsl>
+#include <seismic/repack.glsl>
 
 #if !defined(SEISMIC_ROWS_KIND_DENSE)
 #error "copy_rows supports dense state planes only"
@@ -34,23 +35,15 @@ void copy_rows() {
         const Out destination = slab_out_row(rows, uint(destination_row), slab_rows, SEISMIC_ROWS_STRIDE_0);
         out_move_stored(destination, at, source, at, 1ul);
 #else
-        // An integer plane.
+        // An integer plane, its elements moved as whole words of their size.
         const uint64_t rows = SEISMIC_PTR(SEISMIC_BUFFER_ROWS);
         const uint64_t source = slab_row(rows, uint(source_row), slab_rows,
-                SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE)
-            + at * SEISMIC_ROWS_PACKET_SIZE;
+                SEISMIC_ROWS_STRIDE_0 * REPACK_PACKET_BYTES(SEISMIC_ROWS))
+            + at * REPACK_PACKET_BYTES(SEISMIC_ROWS);
         const uint64_t destination = slab_row(rows, uint(destination_row), slab_rows,
-                SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE)
-            + at * SEISMIC_ROWS_PACKET_SIZE;
-#if SEISMIC_ROWS_PACKET_SIZE == 4
-        element_u32_put(destination, element_u32_at(source));
-#elif SEISMIC_ROWS_PACKET_SIZE == 2
-        element_u16_put(destination, element_u16_at(source));
-#elif SEISMIC_ROWS_PACKET_SIZE == 1
-        element_u8_put(destination, element_u8_at(source));
-#else
-#error "copy_rows moves 1-, 2- and 4-byte dense elements"
-#endif
+                SEISMIC_ROWS_STRIDE_0 * REPACK_PACKET_BYTES(SEISMIC_ROWS))
+            + at * REPACK_PACKET_BYTES(SEISMIC_ROWS);
+        ELEMENT_COPY(uint(REPACK_PACKET_BYTES(SEISMIC_ROWS)), destination, source);
 #endif
     }
 }

@@ -25,16 +25,16 @@
 #define STREAMING_LAND_PACKED(NAME, S, SRC, D, N, K) STREAMING_PACKED(NAME, S, SRC, D, N, K)
 #define STREAMING_LAND_DENSE(NAME, S, U, SRC, D, N, K) STREAMING_DENSE(NAME, S, U, SRC, D, N, K)
 
-// rows16 stores exactly the source's groups (every stored tile holds source
-// packets), and a window holds a packet of each row.
+// A packed routed tensor lands into rows16 (`REPACK_ROWS16`; any other
+// binding is declined), which stores exactly the source's groups (every
+// stored tile holds source packets: `REPACK_TILE`'s binding), and a window
+// holds a packet of each row (`STREAMING_PACKED`'s).
 #if defined(SEISMIC_ELEMENT_UG_KIND_DENSE)
 STREAMING_LAND_DENSE(land_gate, SEISMIC_ELEMENT_SG, SEISMIC_ELEMENT_UG, LAND_SOURCE_GATE, SEISMIC_GATE,
     SEISMIC_DIM_F, SEISMIC_DIM_H)
+#elif !REPACK_ROWS16(SEISMIC_ELEMENT_UG)
+#error "a routed tensor lands dense or into rows16 storage"
 #else
-#if SEISMIC_ELEMENT_UG_GROUP_MULTIPLE != 1 || \
-    !STREAMING_WINDOW_FITS(REPACK_TILE_ROWS_INT, SEISMIC_ELEMENT_SG_PACKET_SIZE, SEISMIC_CONST_WINDOW_BYTES)
-#error "rows16 stores no padding groups, and a window holds a source packet of each row"
-#endif
 REPACK_TILE(land_gate, SEISMIC_CONVERSION_SG_UG, SEISMIC_ELEMENT_SG, SEISMIC_GATE)
 STREAMING_LAND_PACKED(land_gate, SEISMIC_ELEMENT_SG, LAND_SOURCE_GATE, SEISMIC_GATE, SEISMIC_DIM_F, SEISMIC_DIM_H)
 #endif
@@ -42,11 +42,9 @@ STREAMING_LAND_PACKED(land_gate, SEISMIC_ELEMENT_SG, LAND_SOURCE_GATE, SEISMIC_G
 #if defined(SEISMIC_ELEMENT_UU_KIND_DENSE)
 STREAMING_LAND_DENSE(land_up, SEISMIC_ELEMENT_SU, SEISMIC_ELEMENT_UU, LAND_SOURCE_UP, SEISMIC_UP,
     SEISMIC_DIM_F, SEISMIC_DIM_H)
+#elif !REPACK_ROWS16(SEISMIC_ELEMENT_UU)
+#error "a routed tensor lands dense or into rows16 storage"
 #else
-#if SEISMIC_ELEMENT_UU_GROUP_MULTIPLE != 1 || \
-    !STREAMING_WINDOW_FITS(REPACK_TILE_ROWS_INT, SEISMIC_ELEMENT_SU_PACKET_SIZE, SEISMIC_CONST_WINDOW_BYTES)
-#error "rows16 stores no padding groups, and a window holds a source packet of each row"
-#endif
 REPACK_TILE(land_up, SEISMIC_CONVERSION_SU_UU, SEISMIC_ELEMENT_SU, SEISMIC_UP)
 STREAMING_LAND_PACKED(land_up, SEISMIC_ELEMENT_SU, LAND_SOURCE_UP, SEISMIC_UP, SEISMIC_DIM_F, SEISMIC_DIM_H)
 #endif
@@ -54,11 +52,9 @@ STREAMING_LAND_PACKED(land_up, SEISMIC_ELEMENT_SU, LAND_SOURCE_UP, SEISMIC_UP, S
 #if defined(SEISMIC_ELEMENT_UD_KIND_DENSE)
 STREAMING_LAND_DENSE(land_down, SEISMIC_ELEMENT_SD, SEISMIC_ELEMENT_UD, LAND_SOURCE_DOWN, SEISMIC_DOWN,
     SEISMIC_DIM_H, SEISMIC_DIM_F)
+#elif !REPACK_ROWS16(SEISMIC_ELEMENT_UD)
+#error "a routed tensor lands dense or into rows16 storage"
 #else
-#if SEISMIC_ELEMENT_UD_GROUP_MULTIPLE != 1 || \
-    !STREAMING_WINDOW_FITS(REPACK_TILE_ROWS_INT, SEISMIC_ELEMENT_SD_PACKET_SIZE, SEISMIC_CONST_WINDOW_BYTES)
-#error "rows16 stores no padding groups, and a window holds a source packet of each row"
-#endif
 REPACK_TILE(land_down, SEISMIC_CONVERSION_SD_UD, SEISMIC_ELEMENT_SD, SEISMIC_DOWN)
 STREAMING_LAND_PACKED(land_down, SEISMIC_ELEMENT_SD, LAND_SOURCE_DOWN, SEISMIC_DOWN, SEISMIC_DIM_H, SEISMIC_DIM_F)
 #endif

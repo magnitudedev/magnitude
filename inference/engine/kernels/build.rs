@@ -300,10 +300,6 @@ const STREAMING_LIBRARIES: &[(&str, &str)] = &[
         "decode router threadgroups of the `routed_route` contract, shared by `routed_route`, `routed_route_shared` and `routed_route_streamed`",
     ),
     (
-        "lib/repack/repack",
-        "the GGUF -> resident tile conversion over a binding (templates; on Vulkan, macros), so `repack_weight` and the streaming convert hold one conversion each per tensor pair; the CPU keeps it in `repack_weight`",
-    ),
-    (
         "lib/streaming/control",
         "expert streaming's backend shim (system-coherent accesses, system-scope fences, barriers, the spin wait, byte copies) under the protocol the GPU backends share in `kernels/streaming/`, for the streaming entries",
     ),
@@ -313,7 +309,7 @@ const STREAMING_LIBRARIES: &[(&str, &str)] = &[
     ),
     (
         "lib/streaming/window",
-        "expert streaming's windowed conversion of host-staged records over `lib/repack`, used by the landing launches",
+        "expert streaming's windowed conversion of host-staged records over the library's conversion (`<seismic/repack.*>`), used by the landing launches",
     ),
     (
         "lib/streaming/land",

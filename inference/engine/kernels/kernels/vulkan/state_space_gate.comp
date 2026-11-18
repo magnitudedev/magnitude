@@ -4,14 +4,15 @@
 // `cuda/state_space_gate.cu`: a workgroup of 256 invocations per (row,
 // group), strided lane chains, a logical-subgroup reduction, then the
 // subgroup sums in order.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 // The gated value of `channel` (in the row's flat head-major order).
 float ssg_gated_value(uint64_t row, uint64_t head, uint64_t within) {
     const uint64_t channel = head * SEISMIC_DIM_P + within;
-    const float gate = element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
+    const float gate = element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
         row * SEISMIC_PROJECTION_STRIDE_0 + channel * SEISMIC_PROJECTION_STRIDE_1);
-    const float value = element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_MIXED),
+    const float value = element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_MIXED),
         row * SEISMIC_MIXED_STRIDE_0 + head * SEISMIC_MIXED_STRIDE_1 + within * SEISMIC_MIXED_STRIDE_2);
     return seismic_mul_rn(value, seismic_div_rn(gate, 1.0 + exp(-gate)));
 }

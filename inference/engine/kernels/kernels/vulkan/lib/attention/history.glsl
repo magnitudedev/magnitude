@@ -221,7 +221,7 @@ void history_shared_store(const uint b, uint w[HISTORY_LANE_WORDS], vec2 sz, uin
 // read of it. A stored-key value is the prepared key. The whole subgroup
 // calls it.
 void history_fresh_row(const bool is_key, uint64_t row, uint kv_head, uint lane, out float x[ATTENTION_E]) {
-    const uint64_t source = (row * ATTENTION_KV + kv_head) * ATTENTION_W * uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
+    const uint64_t source = (row * ATTENTION_KV + kv_head) * ATTENTION_W * uint64_t(ELEMENT_BYTES(ACTIVATION_A));
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     if (is_key || ATTENTION_STORED_KEY) {
         attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_KEY) + source, ATTENTION_NORM,
@@ -229,7 +229,7 @@ void history_fresh_row(const bool is_key, uint64_t row, uint kv_head, uint lane,
             SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
             ATTENTION_AMPLITUDE_BUFFER, epsilon, lane, ATTENTION_KEY_ROUNDING, x);
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            x[i] = element_round(ELEMENT_ACT, x[i]);
+            x[i] = element_round(ACTIVATION_A, x[i]);
     } else {
         attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source, ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
     }
@@ -284,7 +284,7 @@ uvec4 history_piece(attention_history h, const bool is_key, int t, uint kv_head,
     const uint64_t head_elements = uint64_t(ATTENTION_W);
     uvec4 bits = stored_uvec4_at(out_stored(history_out(is_key ? h.key : h.value, uint64_t(t), h.slab_rows,
         uint64_t(ATTENTION_KV) * head_elements, head_elements, kv_head), uint64_t(c)), 0ul);
-    if (ELEMENT_ACT == ELEMENT_BF16) {
+    if (ACTIVATION_A == ELEMENT_BF16) {
         vec4 even, odd;
         element_split8(ELEMENT_BF16, bits, even, odd);
         bits = element_pack8(ELEMENT_F16, even, odd);

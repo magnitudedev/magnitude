@@ -6,6 +6,7 @@
 // adds the CPU's answer, read through system-coherent loads
 // (`lib/routed/sited.h`), after the slot-order sum.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/streaming/control.h"
 #include "../streaming/site.hpp"
 #include "lib/routed/routed.h"

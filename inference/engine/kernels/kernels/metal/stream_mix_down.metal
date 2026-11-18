@@ -7,6 +7,7 @@
 // normalize while staging (the first threadgroup publishing the inverses);
 // past 16 rows `stage` normalizes each row's streams into `normalized` with
 // their inverses, which the GEMM reads.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #define KERNEL_W1 SEISMIC_INJECT_WEIGHT
 #include "lib/core/arrive.h"
@@ -17,7 +18,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 // The rows every weight takes: the normalized streams (no NVFP4 operands,
 // `stream_mix_down`'s contract).
@@ -52,13 +53,13 @@ typedef projection::operands<NVFP4> Operands;
 // streams the GEMMs read.
 #define PROJECTION_OPERANDS                                                             \
     const uint m = uint(SEISMIC_DIM_M), k = uint(SEISMIC_DIM_S * SEISMIC_DIM_H);        \
-    projection::GroupRms<activation, norm_element, projection::AllRows> raw{hidden,     \
+    projection::GroupRms<activation_element, norm_element, projection::AllRows> raw{hidden,     \
         SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_1,  \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}, uint(SEISMIC_DIM_H)};       \
-    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
-    projection::Weights<packets::W0> w0{down_weight, KERNEL_W0_LAYOUT(k), k};           \
-    projection::Weights<packets::W1> w1{inject_weight, KERNEL_W1_LAYOUT(k), k};         \
-    projection::MixLow<activation> out0{element::Out<activation>(low_cells), SEISMIC_RESULT_0_STRIDE_0, \
+    const projection::Plain<activation_element, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    projection::Weights<packets::W0> w0{{down_weight, KERNEL_W0_LAYOUT(k), k}};         \
+    projection::Weights<packets::W1> w1{{inject_weight, KERNEL_W1_LAYOUT(k), k}};       \
+    projection::MixLow<activation_element> out0{element::Out<activation_element>(low_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, float(SEISMIC_DIM_S)};                               \
     projection::MixInject out1{element::Out<element::F32>(inject_cells), SEISMIC_RESULT_1_STRIDE_0, \
         SEISMIC_RESULT_1_STRIDE_1, float(SEISMIC_DIM_S)};                               \
@@ -68,7 +69,7 @@ typedef projection::operands<NVFP4> Operands;
 // threadgroup; its first row tile publishes its inverses.
 #define PROJECTION_PART_INPUT(rows_var, part, first)                                    \
     const ulong part_first = ulong(part) * uint(SEISMIC_DIM_H);                         \
-    const projection::GroupRms<activation, norm_element, projection::AllRows> stream{   \
+    const projection::GroupRms<activation_element, norm_element, projection::AllRows> stream{   \
         hidden + part_first * SEISMIC_HIDDEN_STRIDE_2, SEISMIC_HIDDEN_STRIDE_0,         \
         SEISMIC_HIDDEN_STRIDE_2, norm + part_first * SEISMIC_NORM_STRIDE_1 * norm_element::bytes, \
         SEISMIC_NORM_STRIDE_1, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), width, {}, width}; \

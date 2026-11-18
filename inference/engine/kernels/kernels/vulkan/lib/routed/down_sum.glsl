@@ -36,7 +36,7 @@ void routed_down_sum_channel(const bool answered, const uint64_t slot) {
         return;
     float selected = 0.0;
     for (uint64_t k = 0ul; k < SEISMIC_DIM_K; ++k) {
-        const float projected = element_at(ELEMENT_ACT, ROUTED_PROJECTED_BASE, ROUTED_PROJECTED_INDEX(m, k, n));
+        const float projected = element_at(ACTIVATION_A, ROUTED_PROJECTED_BASE, ROUTED_PROJECTED_INDEX(m, k, n));
         selected = routed_down_term(selected, m, k, projected);
     }
 #ifdef ROUTED_SITED

@@ -1,6 +1,7 @@
 // draft_path_step: one block of 256 threads per row reduces each candidate's
 // score unary + (predecessor * hidden) . successor, then selects the first
 // highest-scoring candidate.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 #include "lib/core/reduce.cuh"
 
@@ -21,10 +22,10 @@ extern "C" __global__ void draft_path_step(SEISMIC_KERNEL_PARAMS) {
         float partial = 0.0f;
         for (u64 r = threadIdx.x; r < SEISMIC_DIM_R; r += blockDim.x) {
             const float joint =
-                element::at<element::Act>(predecessor, row * SEISMIC_PREDECESSOR_STRIDE_0 + r * SEISMIC_PREDECESSOR_STRIDE_1) *
-                element::at<element::Act>(hidden, row * SEISMIC_HIDDEN_STRIDE_0 + r * SEISMIC_HIDDEN_STRIDE_1);
+                element::at<activation::Act>(predecessor, row * SEISMIC_PREDECESSOR_STRIDE_0 + r * SEISMIC_PREDECESSOR_STRIDE_1) *
+                element::at<activation::Act>(hidden, row * SEISMIC_HIDDEN_STRIDE_0 + r * SEISMIC_HIDDEN_STRIDE_1);
             partial = seismic_fma_rn(joint,
-                element::at<element::Act>(successor, at * SEISMIC_SUCCESSOR_STRIDE_0 + r * SEISMIC_SUCCESSOR_STRIDE_1), partial);
+                element::at<activation::Act>(successor, at * SEISMIC_SUCCESSOR_STRIDE_0 + r * SEISMIC_SUCCESSOR_STRIDE_1), partial);
         }
         const float score = reduce::group_sum(partial, partials) +
                             unary[row * SEISMIC_UNARY_STRIDE_0 + candidate * SEISMIC_UNARY_STRIDE_1];

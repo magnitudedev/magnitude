@@ -66,6 +66,7 @@
 //
 // This file is independent of any entry ABI.
 #include <seismic/packets.glsl>
+#include <seismic/activation.glsl>
 #include "../core/reduce.glsl"
 #include "../core/functions.glsl"
 #include "../core/matrix.glsl"
@@ -364,7 +365,7 @@ uint64_t projection_weights_row(projection_weights w, uint n) {
 #ifdef PROJECTION_TABLE_ROWS
     r = r < uint64_t(PROJECTION_TABLE_ROWS) ? r : 0ul;
 #endif
-    return w.base + r * w.geometry.stride;
+    return packets_row(w.base, w.geometry, r);
 }
 
 packets_packet projection_packet(const int kind, projection_weights w, uint n, uint p) {
@@ -375,7 +376,7 @@ packets_packet projection_packet(const int kind, projection_weights w, uint n, u
 // The stage pre-pass of the GEMM class.
 
 // The largest magnitude of row m's prologue output under its norm inverse
-// (NaN wins: `magnitude_peak`), reduced across the workgroup (shared: one
+// (NaN wins: `nvfp4_peak`), reduced across the workgroup (shared: one
 // float per subgroup at float 0, which every invocation may still be
 // reading: a normalization's squares).
 float projection_row_maximum(projection_prologue in_, uint m, float inverse) {
@@ -384,7 +385,7 @@ float projection_row_maximum(projection_prologue in_, uint m, float inverse) {
     for (uint i = 8u * thread; i < in_.columns; i += 8u * threads) {
         vec4 even, odd;
         projection_load8(in_, m, i, inverse, even, odd);
-        amax = magnitude_peak(amax, even, odd);
+        amax = nvfp4_peak(amax, even, odd);
     }
     return uintBitsToFloat(reduce_group_max_u32(amax, 0u));
 }
@@ -522,15 +523,15 @@ uint projection_gemv_packet_bytes(const bool f32) {
 
 // The packets of every activation row the GEMV stages at once:
 // PROJECTION_GEMV_STAGE_PACKETS (half of them where `f32`), or, where the
-// launch holds its weights' tables at its region's end (`packets_held`),
-// what the region holds before them, which its declaration sizes to at
-// least 8 * LANES (`dense.seismic`).
+// launch holds its weights' tables at its region's end
+// (`packets_reserved_words`), what the region holds before them, which its
+// declaration sizes to at least 8 * LANES (`dense.seismic`).
 uint projection_gemv_stage_packets(projection_prologue in_, const bool f32) {
     const uint most = f32 ? PROJECTION_GEMV_STAGE_PACKETS / 2u : PROJECTION_GEMV_STAGE_PACKETS;
 #if defined(PACKETS_STAGING)
-    if (packets_held)
-        return min(most,
-            (4u * PACKETS_TABLES_AT - 16u * projection_gemv_stage_word(in_)) / projection_gemv_packet_bytes(f32));
+    if (packets_reserved_words() != 0u)
+        return min(most, (4u * (SEISMIC_SHARED_U32 - packets_reserved_words()) - 16u * projection_gemv_stage_word(in_))
+            / projection_gemv_packet_bytes(f32));
 #endif
     return most;
 }
@@ -626,7 +627,7 @@ void projection_gemv_globals(projection_prologue in_, const int norm, uint m_row
         for (uint k = 8u * SEISMIC_LANE; k < in_.columns; k += 8u * SEISMIC_SUBGROUP_LANES) {
             vec4 even, odd;
             projection_load8(in_, m, k, inverse, even, odd);
-            amax = magnitude_peak(amax, even, odd);
+            amax = nvfp4_peak(amax, even, odd);
         }
         amax = seismic_redux_max_u32(amax);
         if (SEISMIC_LANE == 0u)
@@ -700,7 +701,7 @@ float projection_dot8(vec4 ce, vec4 co, vec4 xe, vec4 xo) {
 }
 
 // The dot product of sub-step `step` of `packet`'s codes with eight
-// activations: the codes decoded (`arithmetic` as `packets_unsigned_bytes`)
+// activations: the codes decoded (`packets_codes`, `arithmetic` where asked)
 // into projection_dot8, or, for codes that are signs decoded by
 // `arithmetic`, the activations with their signs flipped where a code is -1
 // and added in the same order: a sign's product is exact, so the roundings
@@ -719,7 +720,7 @@ float projection_code_dot8(const int kind, packets_packet packet, uint step, con
 
 // Accumulate one loaded packet (chunk-local `local`) for every activation row
 // of the staging from uvec4 `word` (as F32 where `f32`), its codes decoded by
-// `arithmetic` where asked (`packets_unsigned_bytes`).
+// `arithmetic` where asked (`packets_codes`).
 void projection_gemv_accumulate(const int wk, const int uk, const bool paired, const uint r_rows, const uint maxm,
     const bool f32, const bool arithmetic, const int act, inout float acc[PROJECTION_GEMV_SUMS],
     inout float acc2[PROJECTION_GEMV_SUMS], packets_packet a[PROJECTION_GEMV_MAX_R],
@@ -886,7 +887,7 @@ void projection_gemv_sums(const int wk, const int uk, const bool paired, const u
 // paired), R rows per lane group, LANES lanes per group, and the
 // activation-row bound `maxm` (1, 2, 4 or 8; m_rows <= maxm), activations
 // staged as F32 where `f32` (`projection_gemv_stage`) and codes decoded by
-// `arithmetic` where asked (`packets_unsigned_bytes`, and signs by the
+// `arithmetic` where asked (`packets_codes`, and signs by the
 // activations' sign bits, `projection_code_dot8`): the sums, then the
 // epilogue of each (weight row, activation row) from one lane of its group.
 // Rms prologues first reduce their rows' squares (norm SHARED). Every

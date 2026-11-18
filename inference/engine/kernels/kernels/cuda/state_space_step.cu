@@ -16,6 +16,7 @@
 // the dependency wait, so the state streams under the projection's tail; the
 // projection's rows and every write come after it.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/state_space.cuh"
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY

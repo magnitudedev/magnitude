@@ -87,7 +87,7 @@ inline bool rch_row_slot(device const int *segments, device const int *stop, dev
 // `inputs` scratch's q | k rows [NK, M, 2W] (`qk_rows`) or v rows [NV, M, W]
 // (`value_rows`) of `height` rows.
 inline void rch_prepare_row(device const recurrent::Storage *projection, device const float *convolution,
-    device const slab::Table<element::Act> *window, recurrent::Slot slot, ulong row, uint head,
+    device const slab::Table<activation::Act> *window, recurrent::Slot slot, ulong row, uint head,
     device float *qk_rows, device float *value_rows, ulong height, uint lane, constant ulong *seismic_words) {
     const uint width = RCH_WIDTH;
     const bool is_value = head >= 2 * RCH_KEY_HEADS;
@@ -153,7 +153,7 @@ template <typename Rule>
 inline void rch_inputs(Rule rule, device const recurrent::Storage *projection, device const float *convolution,
     device const int *segments, device const int *stop, device const int *previous_bank,
     device const int *previous_tape, device const int *following_bank,
-    device const slab::Table<element::Act> *window, device float *inputs, uint3 group, uint simdgroup, uint lane,
+    device const slab::Table<activation::Act> *window, device float *inputs, uint3 group, uint simdgroup, uint lane,
     constant ulong *seismic_words) {
     constexpr uint DECAYS = Rule::DECAYS;
     const uint head = group.y * 4 + simdgroup;
@@ -386,7 +386,7 @@ template <typename Rule>
 inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const recurrent::Storage *projection,
     device const float *convolution, device const int *segments, device const int *stop,
     device const int *previous_bank, device const int *previous_tape, device const int *following_bank,
-    device const slab::Table<element::Act> *window, device const slab::Table<element::F32> *delta,
+    device const slab::Table<activation::Act> *window, device const slab::Table<element::F32> *delta,
     device const slab::Table<element::F32> *tape, device float *inputs, device recurrent::Storage *mixed,
     threadgroup float *queries, threadgroup float *keys, threadgroup float *values, threadgroup float *gates,
     RchShares shares, uint3 group, uint thread_index, uint simdgroup, uint lane_index,
@@ -556,7 +556,7 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
                 device recurrent::Storage *destination = mixed
                     + recurrent::raw_index(ulong(first + long(row)), head, row0 + 8 * h + column, seismic_words);
                 RECURRENT_UNROLL for (ushort e = 0; e < 2; ++e) {
-                    destination[e] = element::Act::store(output[h].thread_elements()[e]);
+                    destination[e] = activation::Act::store(output[h].thread_elements()[e]);
                 }
             }
             update[h].thread_elements()[0] *= decays.tail();

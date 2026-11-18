@@ -7,7 +7,7 @@
 // while the block converts the window before it (staging is mapped host
 // memory, each load a PCIe round trip on a discrete device, so every row's
 // loads are in flight together), then stores them into shared memory, where its warps place the window's column tiles
-// by `repack::convert_tile` (lib/repack/repack.cuh), its source the copy,
+// by `repack::convert_tile` (<seismic/repack.cuh>), its source the copy,
 // two tiles at once a warp, a half warp each, wherever the layout lets half
 // a warp place a tile (`repack::Shape::WARP_TILES`). The tiles are placed in
 // the block's mirror of the row tile (`Mirror`, the launch's dynamic shared
@@ -32,7 +32,7 @@
 // includer includes lib/streaming/control.cuh first.
 
 #include <seismic/slab.cuh>
-#include "../repack/repack.cuh"
+#include <seismic/repack.cuh>
 #include "../../../streaming/window.hpp"
 
 namespace streaming {

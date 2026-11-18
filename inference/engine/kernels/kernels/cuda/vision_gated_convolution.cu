@@ -1,10 +1,11 @@
 // vision_gated_convolution: one thread per value, the taps summed in tap
 // order in F32 over the neighbours present, published to A, then times the
 // gate and published again.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 
 using element::u64;
-typedef element::Act A;
+typedef activation::Act A;
 typedef ELEMENT_OF(SEISMIC_WEIGHT) Weight;
 
 extern "C" __global__ void vision_gated_convolution(SEISMIC_KERNEL_PARAMS) {

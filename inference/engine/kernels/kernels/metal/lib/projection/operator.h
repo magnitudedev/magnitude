@@ -204,7 +204,7 @@
         return;                                                                                                 \
     PROJECTION_OPERANDS(0u);                                                                                    \
     PROJECTION_INT8_SCRATCH;                                                                                    \
-    projection::int8_quantize<projection::int8_codes<packets::W0>::interleaved>(in, scratch, m, k, index,       \
+    projection::int8_quantize<packets::int8<packets::W0>::interleaved>(in, scratch, m, k, index,                \
         thread_index, lane, 1.0f)
 
 #define PROJECTION_SINGLE_COEFFICIENTS                                                                          \
@@ -331,7 +331,7 @@
         return;                                                                                                 \
     PROJECTION_OPERANDS;                                                                                        \
     PROJECTION_INT8_SCRATCH;                                                                                    \
-    projection::int8_quantize<projection::int8_codes<packets::W0>::interleaved>(in, scratch0, m, k, index,      \
+    projection::int8_quantize<packets::int8<packets::W0>::interleaved>(in, scratch0, m, k, index,               \
         thread_index, lane, 1.0f)
 
 #define PROJECTION_PAIRED_COEFFICIENTS                                                                          \
@@ -777,7 +777,7 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
             PROJECTION_PACKING::sums>::value)
 #define PROJECTION_SERVED_BIT(s, ...) (PROJECTION_SERVED(s) ? 1u << s##u : 0u) |
 #define PROJECTION_ADMITTED(s, ...)                                                                             \
-    (projection::packing_admitted<PROJECTION_PACKET(s)>::value && PROJECTION_N##s != 0 && PROJECTION_N##s % 32 == 0) ||
+    (packets::admits<PROJECTION_PACKET(s)>::pack && PROJECTION_N##s != 0 && PROJECTION_N##s % 32 == 0) ||
 // PACK = 1 names the packed GEMM of a segment of weights admitted to it (the
 // projection's `where`).
 #define PROJECTION_PACKING_ADMITTED                                                                             \
@@ -999,9 +999,9 @@ struct OrderedWeight<packets::Dense<E>> {
     static fetched fetch_full(thread const Weights<packets::Dense<E>> &w, uint row, uint p, uint step) {
         fetched out;
         const uint base_col = 32u * p + 8u * step;
-        const auto geom = w.geometry(row);
-        const packets::weight_bytes ptr = w.row(row) + geom.codes + ulong(base_col) * E::bytes;
-        if ((geom.stride & 15ul) == 0ul) {
+        const auto at = w.locate(row);
+        const packets::weight_bytes ptr = packets::Dense<E>::row_values(at) + ulong(base_col) * E::bytes;
+        if (packets::Dense<E>::aligned16(at)) {
             const auto v = slab::as<uint4>(ptr);
             PROJECTION_UNROLL
             for (uint i = 0; i < words; ++i)
@@ -1027,8 +1027,8 @@ struct OrderedWeight<packets::Dense<E>> {
     // the eight lanes of a row read 16 consecutive bytes.
     static fetched fetch_strided(thread const Weights<packets::Dense<E>> &w, uint row, uint block, uint u) {
         fetched out;
-        const auto geom = w.geometry(row);
-        const auto s = slab::as<typename E::storage>(w.row(row) + geom.codes + ulong(64u * block + u) * E::bytes);
+        const auto s = slab::as<typename E::storage>(packets::Dense<E>::row_values(w.locate(row))
+            + ulong(64u * block + u) * E::bytes);
         if constexpr (E::bytes == 2u) {
             uint pair[4];
             PROJECTION_UNROLL
@@ -1043,15 +1043,14 @@ struct OrderedWeight<packets::Dense<E>> {
     }
     static fetched fetch(thread const Weights<packets::Dense<E>> &w, uint row, uint p, uint step) {
         const uint base_col = 32u * p + 8u * step;
-        if (base_col + 8u <= w.k)
+        if (base_col + 8u <= w.matrix.k)
             return fetch_full(w, row, p, step);
         fetched out = empty();
-        if (base_col >= w.k)
+        if (base_col >= w.matrix.k)
             return out;
-        const auto geom = w.geometry(row);
-        const packets::weight_bytes ptr = w.row(row) + geom.codes + ulong(base_col) * E::bytes;
+        const packets::weight_bytes ptr = packets::Dense<E>::row_values(w.locate(row)) + ulong(base_col) * E::bytes;
         const auto s = slab::as<typename E::storage>(ptr);
-        const uint rem = w.k - base_col;
+        const uint rem = w.matrix.k - base_col;
         if constexpr (E::bytes == 2u) {
             uint w0 = 0u, w1 = 0u, w2 = 0u, w3 = 0u;
             if (0u < rem) w0 |= uint(as_type<ushort>(s[0]));
@@ -1128,7 +1127,7 @@ inline float ordered_weight_at(thread const Weights<W> &w, uint row, uint col) {
 
 template <typename E>
 inline float ordered_weight_at(thread const Weights<packets::Dense<E>> &w, uint row, uint col) {
-    return E::load(slab::as<typename E::storage>(w.row(row) + w.geometry(row).codes)[col]);
+    return E::load(slab::as<typename E::storage>(packets::Dense<E>::row_values(w.locate(row)))[col]);
 }
 
 // Blocks a 1-row ordered walk fetches together (`ordered_gemv_maxm_run`):

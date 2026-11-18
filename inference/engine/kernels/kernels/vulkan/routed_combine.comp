@@ -10,18 +10,18 @@
 // choice's position and score once and the choice's 8 expert outputs as one
 // 16-byte load, so the gather moves whole rows of expert output.
 // The grouped projection's GEMMs stage their weights' tables (`packets.glsl`).
-#define PACKETS_STAGED_TABLES 1
+#define KERNEL_A SEISMIC_ELEMENT_A
+#define PACKETS_CONFIG_STAGED_TABLES 1
 #define KERNEL_W0 SEISMIC_SHARED_GATE
 #define KERNEL_W1 SEISMIC_SHARED_UP
 #define KERNEL_W2 SEISMIC_SHARED_DOWN
 #include "lib/core/activation.glsl"
 #include "lib/routed/routed.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define ROUTED_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "routed_combine requires a bf16 or f16 activation"
 #endif
+#define ROUTED_ACT ACTIVATION_A
 // The shared expert's GEMMs: the declaration's tuned tile and sub-tile.
 #define PROJECTION_GEMM_TM SEISMIC_TUNE_TILE_M
 #define PROJECTION_GEMM_TN SEISMIC_TUNE_TILE_N

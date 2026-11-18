@@ -14,7 +14,7 @@
 
 namespace state_space {
 
-typedef element::Act::storage Storage;
+typedef activation::Act::storage Storage;
 
 #define STATE_SPACE_UNROLL _Pragma("clang loop unroll(full)")
 
@@ -50,10 +50,10 @@ struct Operands {
     device const float *rate;
     device const float *time_bias;
     device const float *skip;
-    device const slab::Table<element::Act> *window;
+    device const slab::Table<activation::Act> *window;
     device const slab::Table<element::F32> *state;
     device const slab::Table<element::F32> *tape;
-    element::Out<element::Act> mixed;
+    element::Out<activation::Act> mixed;
     constant ulong *seismic_words;
 };
 
@@ -103,10 +103,10 @@ inline float raw(Operands in, versions::Slot slot, long position, ulong channel)
     if (position < 0) {
         device const Storage *window = versions::bank_view(in.window, slot.source, SEISMIC_WINDOW_STRIDE_0,
             seismic_words);
-        return element::Act::load(window[ulong(slot.taped + long(TAPS) - 1 + position) * SEISMIC_WINDOW_STRIDE_1
+        return activation::Act::load(window[ulong(slot.taped + long(TAPS) - 1 + position) * SEISMIC_WINDOW_STRIDE_1
             + channel]);
     }
-    return element::Act::load(in.projection[ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + X_COLUMN
+    return activation::Act::load(in.projection[ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + X_COLUMN
         + channel]);
 }
 
@@ -134,7 +134,7 @@ struct Step {
 
 inline Step step_of(Operands in, ulong row, uint head) {
     constant ulong *seismic_words = in.seismic_words;
-    const float shifted = element::Act::load(in.projection[row * SEISMIC_PROJECTION_STRIDE_0 + DT_COLUMN + head])
+    const float shifted = activation::Act::load(in.projection[row * SEISMIC_PROJECTION_STRIDE_0 + DT_COLUMN + head])
         + in.time_bias[head * SEISMIC_TIME_BIAS_STRIDE_0];
     Step result;
     result.delta = metal::max(shifted, 0.0f) + metal::log(1.0f + metal::exp(-metal::abs(shifted)));
@@ -150,9 +150,9 @@ inline void publish_window(Operands in, versions::Slot slot, uint head, uint thr
     constant ulong *seismic_words = in.seismic_words;
     const long taps = long(TAPS) - 1;
     const long rows = taps + versions::tape_rows(slot, long(SEISMIC_DIM_T));
-    const element::Out<element::Act> target = versions::bank(in.window, slot.target, SEISMIC_WINDOW_STRIDE_0,
+    const element::Out<activation::Act> target = versions::bank(in.window, slot.target, SEISMIC_WINDOW_STRIDE_0,
         seismic_words);
-    const element::Out<element::Act> source = versions::bank(in.window, slot.source, SEISMIC_WINDOW_STRIDE_0,
+    const element::Out<activation::Act> source = versions::bank(in.window, slot.source, SEISMIC_WINDOW_STRIDE_0,
         seismic_words);
     const uint group = group_of(head);
     const ulong per_tap = P + (leads_group(head) ? 2 * N : 0);

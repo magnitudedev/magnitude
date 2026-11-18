@@ -18,7 +18,7 @@ namespace state_space {
 using versions::u32;
 using versions::u64;
 using versions::u8;
-typedef element::Act Act;
+typedef activation::Act Act;
 
 constexpr int NH = static_cast<int>(SEISMIC_DIM_NH);
 constexpr int P = static_cast<int>(SEISMIC_DIM_P);

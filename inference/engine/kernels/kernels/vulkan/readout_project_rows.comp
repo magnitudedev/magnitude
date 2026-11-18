@@ -5,9 +5,10 @@
 // (`lib/projection/operator.glsl`) over the weight's first S rows; where I is
 // 1 the routed projection's `choice` over the S rows each feature row
 // selects (`gather_choice`), a selection past the vocabulary -inf.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 // The projection's decoding launches stage their weights' tables (`packets.glsl`).
-#define PACKETS_STAGED_TABLES 1
+#define PACKETS_CONFIG_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_WS != 0
 #define PROJECTION_SCALED
@@ -16,14 +17,13 @@
 #define PROJECTION_TABLE_ROWS SEISMIC_DIM_V
 #include "lib/projection/projection.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define HEAD_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "readout_project_rows requires a bf16 or f16 activation"
 #endif
+#define HEAD_ACT ACTIVATION_A
 // The weight's operand rows (the feature rows, or NVFP4 operands): the GEMV
 // forms them while staging, the stage launch into the scratch the GEMM reads.
-#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_WEIGHT)
 #define HEAD_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define HEAD_OPERANDS PROJECTION_OPERANDS_ROUNDED
@@ -60,7 +60,7 @@ projection_prologue projected_input(uint g) { return feature_rows(0ul); }
 // The rows the GEMM reads: the feature rows, or the operands the stage
 // launch formed.
 projection_prologue projected_rows(uint g) {
-#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_WEIGHT)
     return projection_plain(HEAD_ACT, PROJECTION_STAGED, uint64_t(HEAD_K), 1ul, HEAD_K, 0ul);
 #else
     return projection_plain(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0,

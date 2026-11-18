@@ -41,22 +41,19 @@ fn verify_polymorphic_native(device: &seismic::Device) -> Result<(), Box<dyn std
     })?;
     assert_eq!(read_f32(&f16_result)?, 3.0);
 
-    let q8g32 = seismic::Element::named("q8g32").expect("q8g32 representation");
-    let mut q8g32_bytes = vec![0u8; 36];
-    q8g32_bytes[0] = 3;
-    q8g32_bytes[32..36].copy_from_slice(&2.0f32.to_le_bytes());
-    let q8g32_input = seismic::Tensor::from_host(&charges, q8g32, &[32], &q8g32_bytes)?;
-    let mut q8g32_result = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[1])?;
+    let bf16 = seismic::Element::bf16();
+    let bf16_input = seismic::Tensor::from_host(&charges, bf16, &[1], &0x40c0u16.to_le_bytes())?;
+    let mut bf16_result = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[1])?;
     kernels::read_first::native_for_device_with(
         device,
-        kernels::read_first::Elements { E: q8g32 },
+        kernels::read_first::Elements { E: bf16 },
         &seismic::NativeSpecialization::new(),
     )?
     .call(&charges, kernels::read_first::Args {
-        x: &q8g32_input,
-        result: &mut q8g32_result,
+        x: &bf16_input,
+        result: &mut bf16_result,
     })?;
-    assert_eq!(read_f32(&q8g32_result)?, 6.0);
+    assert_eq!(read_f32(&bf16_result)?, 6.0);
     Ok(())
 }
 

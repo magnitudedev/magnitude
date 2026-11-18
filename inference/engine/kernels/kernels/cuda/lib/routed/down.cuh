@@ -22,7 +22,7 @@ using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_
                                        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, (m), (k), (expert))))
 
 struct ProjectedEpi {
-    element::Out<element::Act> projected;
+    element::Out<activation::Act> projected;
     projection::u64 s2;
     __device__ __forceinline__ void operator()(unsigned, projection::u64 n, float value, float) const {
         projected.put(n * s2, value);
@@ -32,7 +32,7 @@ struct ProjectedEpi {
 constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
 
 struct ChoiceProjectedEpi {
-    element::Out<element::Act> projected;
+    element::Out<activation::Act> projected;
     const projection::u64 *offsets;
     projection::u64 s2;
     __device__ __forceinline__ void operator()(unsigned r, projection::u64 n, float value, float) const {
@@ -52,7 +52,7 @@ struct ChoiceProjectedEpi {
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                         \
     const slab::Matrix down = DOWN_WEIGHTS(m, k, routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1]); \
     const projection::u64 s2 = ROUTED_PROJECTED_S2;                                                                \
-    const element::Out<element::Act> projected =                                                                   \
+    const element::Out<activation::Act> projected =                                                                   \
         ROUTED_PROJECTED_OUT.offset(m * (ROUTED_PROJECTED_S0) + k * (ROUTED_PROJECTED_S1));                        \
     if (down.stack == nullptr) {                                                                                   \
         routed::zero_block_rows<Shape>(SEISMIC_DIM_H, [&](projection::u64 n) { projected.put(n * s2, 0.0f); });    \
@@ -60,7 +60,7 @@ struct ChoiceProjectedEpi {
     }                                                                                                              \
     const projection::u64 group = Shape::tile_group();                                                             \
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_F / 64, group, SEISMIC_DIM_H,                     \
-                                    ROUTED_MATRIX(KERNEL_W0, down), projection::NoWeight{},             \
+                                    PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{},             \
                                     ProjectedEpi{projected, s2});
 
 #define ROUTED_DOWN_STAGE_BODY                                                                                     \
@@ -96,7 +96,7 @@ struct ChoiceProjectedEpi {
                                            routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, \
                                                          slots, choice));                                          \
     const projection::u64 s2 = ROUTED_PROJECTED_S2;                                                                \
-    const element::Out<element::Act> projected = ROUTED_PROJECTED_OUT;                                             \
+    const element::Out<activation::Act> projected = ROUTED_PROJECTED_OUT;                                             \
     if (down.stack == nullptr) {                                                                                   \
         for (unsigned r = 0; r < count; ++r)                                                                       \
             routed::zero_block_rows<Shape>(SEISMIC_DIM_H,                                                          \
@@ -107,5 +107,5 @@ struct ChoiceProjectedEpi {
     const projection::u8 *rows =                                                                                   \
         NVFP4 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPERT_DOWN_OPERANDS) : SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT);    \
     projection::gemv_segment<Shape>(shared, routed::GatheredRows{rows, rows_at}, count, SEISMIC_DIM_F / 64, group, \
-                                    SEISMIC_DIM_H, ROUTED_MATRIX(KERNEL_W0, down),                      \
+                                    SEISMIC_DIM_H, PACKETS_MATRIX(KERNEL_W0, down),                      \
                                     projection::NoWeight{}, ChoiceProjectedEpi{projected, offsets_at, s2});

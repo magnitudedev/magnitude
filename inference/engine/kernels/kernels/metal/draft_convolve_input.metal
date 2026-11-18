@@ -1,9 +1,10 @@
 // draft_convolve_input: DFlash2's half-0 grouped dynamic causal convolution of
 // a sublayer's normed input rows within each draft block; one thread per
 // output element, summing its taps in offset order.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 
 kernel void draft_convolve_input(
     device const uchar *input [[buffer(SEISMIC_BUFFER_INPUT)]],
@@ -22,8 +23,8 @@ kernel void draft_convolve_input(
         const float coefficient = base[offset * SEISMIC_BASE_STRIDE_1 + column * SEISMIC_BASE_STRIDE_2] +
             dynamic[row * SEISMIC_DYNAMIC_STRIDE_0 + offset * SEISMIC_DYNAMIC_STRIDE_2 + group * SEISMIC_DYNAMIC_STRIDE_3];
         sum = metal::fma(coefficient,
-            element::at<activation>(input, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1), sum);
+            element::at<activation_element>(input, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1), sum);
     }
-    element::Out<activation>(result_cells).put(
+    element::Out<activation_element>(result_cells).put(
         row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);
 }

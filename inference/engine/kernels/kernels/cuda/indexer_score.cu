@@ -16,6 +16,7 @@
 //
 // Dynamic extents, strides and parameters read `seismic_words`.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 #include "lib/core/head.cuh"
 #include "lib/core/rotary.cuh"
@@ -27,7 +28,7 @@ namespace score {
 
 typedef unsigned int u32;
 typedef unsigned long long u64;
-typedef element::Act Act;
+typedef activation::Act Act;
 
 constexpr int W = 2 * SEISMIC_DIM_P + SEISMIC_DIM_S;
 constexpr int E = W / 32;

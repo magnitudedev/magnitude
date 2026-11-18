@@ -2,6 +2,7 @@
 // normalized input rows, the forms of the `dense` projection
 // (`lib/projection/operator.cuh`), segmented. A call in mode 1 zeroes the
 // query and gate segments.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_QUERY_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT

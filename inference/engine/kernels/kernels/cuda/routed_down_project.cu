@@ -2,6 +2,7 @@
 // (`routed_down_project` in routed.seismic): `routed_down`'s projections
 // (`lib/routed/down.cuh`), published into the result for
 // `routed_down_sited`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ROUTED_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
 #define ROUTED_PROJECTED_OUT SEISMIC_RESULT_0_OUT
 #define ROUTED_PROJECTED_S0 SEISMIC_RESULT_0_STRIDE_0

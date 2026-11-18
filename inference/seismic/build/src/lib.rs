@@ -111,6 +111,15 @@ pub enum BuildError {
         column: usize,
         construct: String,
     },
+    /// An authored native file crosses the library boundary
+    /// (`boundary`): it names a library internal or a library-visibility
+    /// ABI symbol, opens or defines into the library, or pastes an ABI name.
+    LibraryBoundary {
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        rule: String,
+    },
     /// A launch names a kernel function the asset does not define.
     NativeKernelMissing {
         entry: String,
@@ -170,6 +179,12 @@ impl std::fmt::Display for BuildError {
                 "native implementation of `{entry}`: {}:{line}:{column}: {construct}",
                 path.display()
             ),
+            Self::LibraryBoundary {
+                path,
+                line,
+                column,
+                rule,
+            } => write!(f, "library boundary: {}:{line}:{column}: {rule}", path.display()),
             Self::NativeKernelMissing { entry, kernel } => write!(
                 f,
                 "native Vulkan implementation of `{entry}` launches `{kernel}`, but its source defines no `void {kernel}()`"
@@ -259,8 +274,14 @@ pub struct NativeCoverage {
     pub asset: PathBuf,
 }
 
+mod boundary;
+
 mod internals {
     use super::*;
+    use crate::boundary::{
+        violation as boundary_violation, visibility as boundary_visibility, Boundary, Rule, Visibility,
+        CONVERSION_FAMILIES, TENSOR_FAMILIES,
+    };
     use seismic_lang::checked::{CpuBinding, ElementSummary, NativeElementCoverage, RecordPort};
     use seismic_lang::entry::ResultClass;
     use seismic_lang::registry::{self, RepresentationInfo, SourceDialect};
@@ -268,7 +289,7 @@ mod internals {
         OwnerReach, element_reach, native_parameter_names, parameter_reach,
     };
     use std::collections::hash_map::Entry;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::fmt;
     use std::fs;
 
@@ -404,6 +425,7 @@ mod internals {
     ) -> Result<Vec<EntryNative<'a>>, BuildError> {
         use seismic_lang::registry::BackendName;
         let mut natives = Vec::new();
+        let mut boundary = Boundary::default();
         for entry in module.entries() {
             let mut any = false;
             let mut tuned = false;
@@ -450,6 +472,7 @@ mod internals {
                 let allowed = native_abi_symbols(entry, definition, dialect, module.constants())?;
                 for file in std::iter::once(&files.asset).chain(&files.includes) {
                     validate_native_abi(entry, &allowed, &file.path, &file.text)?;
+                    boundary.check(&file.path, &file.text)?;
                     validate_reserved(entry, dialect, &file.path, &file.text)?;
                 }
                 match dialect {
@@ -469,9 +492,11 @@ mod internals {
         Ok(natives)
     }
 
+    /// Every `SEISMIC_*` name `source` spells is generated for the entry, and
+    /// of surface visibility.
     fn validate_native_abi(
         entry: &EntryInfo,
-        allowed: &HashSet<String>,
+        allowed: &HashMap<String, Visibility>,
         path: &std::path::Path,
         source: &str,
     ) -> Result<(), BuildError> {
@@ -486,8 +511,12 @@ mod internals {
             }
         };
         for (symbol, offset) in seismic_identifiers(source) {
-            if !allowed.contains(symbol) {
-                return Err(failure(offset, symbol));
+            match allowed.get(symbol) {
+                None => return Err(failure(offset, symbol)),
+                Some(Visibility::Surface) => {}
+                Some(Visibility::Library) => {
+                    return Err(boundary_violation(path, source, offset, Rule::LibrarySymbol(symbol.to_owned())));
+                }
             }
         }
         Ok(())
@@ -565,7 +594,7 @@ mod internals {
     /// Directives the prefix owns.
     const VULKAN_RESERVED_DIRECTIVES: [&str; 2] = ["version", "extension"];
 
-    fn location(source: &str, offset: usize) -> (usize, usize) {
+    pub(crate) fn location(source: &str, offset: usize) -> (usize, usize) {
         let prefix = &source[..offset];
         let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
         let column = prefix
@@ -810,7 +839,7 @@ mod internals {
         definition: &NativeImplementation,
         dialect: SourceDialect,
         constants: &[(String, u64)],
-    ) -> Result<HashSet<String>, BuildError> {
+    ) -> Result<HashMap<String, Visibility>, BuildError> {
         let mut abi = AbiSymbols {
             entry: &entry.name,
             symbols: HashMap::new(),
@@ -819,14 +848,14 @@ mod internals {
         for (name, _) in constants {
             abi.define(
                 AbiMeaning::Constant(name.clone()),
-                [format!("SEISMIC_CONST_{}", native_macro(name))],
+                Symbols::surface([format!("SEISMIC_CONST_{}", native_macro(name))]),
             )?;
         }
         if !definition.launch_scoped() {
             for parameter in &definition.params {
                 abi.define(
                     AbiMeaning::Tune(parameter.name.clone()),
-                    [format!("SEISMIC_TUNE_{}", native_macro(&parameter.name))],
+                    Symbols::surface([format!("SEISMIC_TUNE_{}", native_macro(&parameter.name))]),
                 )?;
             }
         } else {
@@ -841,13 +870,13 @@ mod internals {
             for parameter in runtime {
                 abi.define(
                     AbiMeaning::Runtime(parameter.name.clone()),
-                    [format!("SEISMIC_RUNTIME_{}", native_macro(&parameter.name))],
+                    Symbols::surface([format!("SEISMIC_RUNTIME_{}", native_macro(&parameter.name))]),
                 )?;
             }
             for launch in &definition.launches {
                 abi.define(
                     AbiMeaning::Forming(launch.kernel.clone()),
-                    [format!("SEISMIC_FORMING_{}", native_macro(&launch.kernel))],
+                    Symbols::surface([format!("SEISMIC_FORMING_{}", native_macro(&launch.kernel))]),
                 )?;
             }
         }
@@ -859,24 +888,24 @@ mod internals {
             resident = true;
             abi.define(
                 AbiMeaning::Resident(launch.kernel.clone()),
-                [format!("SEISMIC_RESIDENT_{}", native_macro(&launch.kernel))],
+                Symbols::surface([format!("SEISMIC_RESIDENT_{}", native_macro(&launch.kernel))]),
             )?;
         }
         if resident {
             abi.define(
                 AbiMeaning::Abi,
-                ["SEISMIC_GRID_BARRIER".to_owned(), "SEISMIC_RESIDENT_GIVE_UP_WORD".to_owned()],
+                Symbols::surface(["SEISMIC_GRID_BARRIER".to_owned(), "SEISMIC_RESIDENT_GIVE_UP_WORD".to_owned()]),
             )?;
         }
         for scratch in &definition.scratch {
             abi.define(
                 AbiMeaning::Scratch(scratch.name.clone()),
-                [format!("SEISMIC_BUFFER_SCRATCH_{}", native_macro(&scratch.name))],
+                Symbols::surface([format!("SEISMIC_BUFFER_SCRATCH_{}", native_macro(&scratch.name))]),
             )?;
         }
         // The ABI's own names, fixed by the dialect; and the backend's
         // fact every dialect's prefix states.
-        let mut symbols = HashSet::new();
+        let mut symbols = Symbols::default();
         symbols.insert("SEISMIC_BUFFER_SCALAR_RESULTS".to_owned());
         symbols.insert("SEISMIC_PARKS_IN_KERNELS".to_owned());
         // A `segmented` projection's grouping, stated in every source (no
@@ -942,18 +971,18 @@ mod internals {
         for dimension in &entry.dimensions {
             abi.define(
                 AbiMeaning::Dimension(dimension.clone()),
-                [format!("SEISMIC_DIM_{}", native_macro(dimension))],
+                Symbols::surface([format!("SEISMIC_DIM_{}", native_macro(dimension))]),
             )?;
         }
         // A static extent as a plain integer, for `#if` guards.
         for dimension in &definition.statics {
             abi.define(
                 AbiMeaning::Dimension(dimension.clone()),
-                [format!("SEISMIC_STATIC_{}", native_macro(dimension))],
+                Symbols::surface([format!("SEISMIC_STATIC_{}", native_macro(dimension))]),
             )?;
         }
         for element in &entry.element_parameters {
-            let mut symbols = HashSet::new();
+            let mut symbols = Symbols::default();
             add_representation_symbols(
                 &mut symbols,
                 &format!("SEISMIC_ELEMENT_{}", native_macro(element)),
@@ -967,7 +996,7 @@ mod internals {
         // CUDA's stage (its row, tile and lanes) and fixed words' loads.
         for from in &entry.element_parameters {
             for to in &entry.element_parameters {
-                let mut symbols = HashSet::new();
+                let mut symbols = Symbols::default();
                 let prefix = format!(
                     "SEISMIC_CONVERSION_{}_{}",
                     native_macro(from),
@@ -984,30 +1013,35 @@ mod internals {
                     "KBLOCK_BYTES",
                     "KBLOCK_ALIGNMENT",
                 ] {
-                    symbols.insert(format!("{prefix}_{suffix}"));
+                    symbols.conversion(&prefix, &format!("_{suffix}"));
                 }
                 if dialect == SourceDialect::Cuda {
                     for suffix in ["STAGE_WORDS", "TILE_ROWS", "LANES", "FIXED_LOADS", "FIXED_LOAD"] {
-                        symbols.insert(format!("{prefix}_{suffix}"));
+                        symbols.conversion(&prefix, &format!("_{suffix}"));
                     }
                 }
                 for role in registry::RowPlaneRole::ALL {
                     let role = native_macro(role.name());
-                    symbols.insert(format!("{prefix}_{role}_WORD"));
-                    symbols.insert(format!("{prefix}_{role}_BYTES"));
-                    symbols.insert(format!("{prefix}_{role}_ALIGNMENT"));
+                    for suffix in ["WORD", "BYTES", "ALIGNMENT"] {
+                        symbols.conversion(&prefix, &format!("_{role}_{suffix}"));
+                    }
                 }
                 // The code planes' segments of their span.
                 for role in registry::RowPlaneRole::CODES {
                     let role = native_macro(role.name());
-                    symbols.insert(format!("{prefix}_{role}_FIRST"));
-                    symbols.insert(format!("{prefix}_{role}_UNIT_WORDS"));
-                    symbols.insert(format!("{prefix}_{role}_REST_ALIGNMENT"));
-                    symbols.insert(format!("{prefix}_{role}_CHUNK_BYTES"));
-                    symbols.insert(format!("{prefix}_{role}_CHUNK_ALIGNMENT"));
-                    symbols.insert(format!("{prefix}_{role}_FRAGMENT_ALIGNMENT"));
+                    for suffix in [
+                        "FIRST",
+                        "UNIT_WORDS",
+                        "REST_ALIGNMENT",
+                        "CHUNK_BYTES",
+                        "CHUNK_ALIGNMENT",
+                        "FRAGMENT_ALIGNMENT",
+                    ] {
+                        symbols.conversion(&prefix, &format!("_{role}_{suffix}"));
+                    }
                 }
-                symbols.insert(prefix);
+                // The bare prefix, a binding argument.
+                symbols.conversion(&prefix, "");
                 abi.define(AbiMeaning::Conversion(from.clone(), to.clone()), symbols)?;
             }
         }
@@ -1020,7 +1054,7 @@ mod internals {
                 .collect::<Vec<_>>(),
         );
         for ((ordinal, parameter), names) in entry.parameters.iter().enumerate().zip(&names) {
-            let mut symbols = HashSet::new();
+            let mut symbols = Symbols::default();
             match &parameter.kind {
                 // A host port defines nothing: the kernel never accesses it.
                 ParameterSummaryKind::Tensor {
@@ -1045,11 +1079,7 @@ mod internals {
                         }
                     }
                     for prefix in names.tensor_prefixes() {
-                        symbols.insert(format!("{prefix}_RANK"));
-                        for axis in 0..*rank {
-                            symbols.insert(format!("{prefix}_EXTENT_{axis}"));
-                            symbols.insert(format!("{prefix}_STRIDE_{axis}"));
-                        }
+                        add_shape_symbols(&mut symbols, &prefix, *rank);
                         add_element_representation_symbols(&mut symbols, &prefix, element);
                     }
                 }
@@ -1074,7 +1104,7 @@ mod internals {
         }
 
         for (ordinal, result) in entry.results.iter().enumerate() {
-            let mut symbols = HashSet::new();
+            let mut symbols = Symbols::default();
             match &result.kind {
                 ResultSummaryKind::Tensor { rank, element } => {
                     let prefix = format!("SEISMIC_RESULT_{ordinal}");
@@ -1091,11 +1121,7 @@ mod internals {
                             symbols.extend(owner_result_symbols(dialect, ordinal));
                         }
                     }
-                    symbols.insert(format!("{prefix}_RANK"));
-                    for axis in 0..*rank {
-                        symbols.insert(format!("{prefix}_EXTENT_{axis}"));
-                        symbols.insert(format!("{prefix}_STRIDE_{axis}"));
-                    }
+                    add_shape_symbols(&mut symbols, &prefix, *rank);
                     add_element_representation_symbols(&mut symbols, &prefix, element);
                 }
                 ResultSummaryKind::Scalar(_)
@@ -1106,7 +1132,11 @@ mod internals {
             }
             abi.define(AbiMeaning::Result(ordinal), symbols)?;
         }
-        Ok(abi.symbols.into_keys().collect())
+        Ok(abi
+            .symbols
+            .into_iter()
+            .map(|(symbol, (_, visibility))| (symbol, visibility))
+            .collect())
     }
 
     /// The declaration a generated ABI symbol stands for.
@@ -1147,33 +1177,37 @@ mod internals {
         }
     }
 
-    /// Every symbol an entry's native ABI defines, with its meaning. Every
-    /// generated symbol enters through [`AbiSymbols::define`].
+    /// Every symbol an entry's native ABI defines, with its meaning and
+    /// visibility. Every generated symbol enters through
+    /// [`AbiSymbols::define`].
     struct AbiSymbols<'a> {
         entry: &'a str,
-        symbols: HashMap<String, AbiMeaning>,
+        symbols: HashMap<String, (AbiMeaning, Visibility)>,
     }
 
     impl AbiSymbols<'_> {
         /// Defines `symbols` as `meaning`. A symbol already defined with
         /// another meaning is a collision: the rendered source's later
         /// definition replaces the earlier, so no asset could address both.
-        fn define(
-            &mut self,
-            meaning: AbiMeaning,
-            symbols: impl IntoIterator<Item = String>,
-        ) -> Result<(), BuildError> {
-            for symbol in symbols {
+        fn define(&mut self, meaning: AbiMeaning, symbols: Symbols) -> Result<(), BuildError> {
+            for (symbol, visibility) in symbols.0 {
                 match self.symbols.entry(symbol) {
                     Entry::Vacant(vacant) => {
-                        vacant.insert(meaning.clone());
+                        vacant.insert((meaning.clone(), visibility));
                     }
-                    Entry::Occupied(occupied) if *occupied.get() == meaning => {}
+                    Entry::Occupied(occupied) if occupied.get().0 == meaning => {
+                        assert_eq!(
+                            occupied.get().1,
+                            visibility,
+                            "`{}` has one visibility for one meaning",
+                            occupied.key()
+                        );
+                    }
                     Entry::Occupied(occupied) => {
                         return Err(BuildError::NativeAbiCollision {
                             entry: self.entry.to_owned(),
                             symbol: occupied.key().clone(),
-                            first: occupied.get().to_string(),
+                            first: occupied.get().0.to_string(),
                             second: meaning.to_string(),
                         });
                     }
@@ -1183,13 +1217,65 @@ mod internals {
         }
     }
 
+    /// Generated ABI symbols of one declaration, each with who may spell it.
+    #[derive(Default)]
+    struct Symbols(HashMap<String, Visibility>);
+
+    impl Symbols {
+        /// `symbols`, every one of surface visibility.
+        fn surface(symbols: impl IntoIterator<Item = String>) -> Self {
+            let mut out = Self::default();
+            out.extend(symbols);
+            out
+        }
+
+        /// A name the ABI fixes or an entry's own binding name: surface.
+        fn insert(&mut self, symbol: String) {
+            self.add(symbol, Visibility::Surface);
+        }
+
+        fn extend(&mut self, symbols: impl IntoIterator<Item = String>) {
+            for symbol in symbols {
+                self.insert(symbol);
+            }
+        }
+
+        /// `<prefix><suffix>` of a tensor's, element's or result's prefix,
+        /// visible as the visibility table's suffix family states.
+        fn tensor(&mut self, prefix: &str, suffix: &str) {
+            self.add(format!("{prefix}{suffix}"), boundary_visibility(suffix, TENSOR_FAMILIES));
+        }
+
+        /// `<prefix><suffix>` of a conversion's prefix.
+        fn conversion(&mut self, prefix: &str, suffix: &str) {
+            self.add(format!("{prefix}{suffix}"), boundary_visibility(suffix, CONVERSION_FAMILIES));
+        }
+
+        fn add(&mut self, symbol: String, visibility: Visibility) {
+            let previous = self.0.insert(symbol, visibility);
+            assert!(
+                previous.is_none_or(|previous| previous == visibility),
+                "a generated symbol has one visibility"
+            );
+        }
+    }
+
+    /// A tensor's or result's rank, extents and strides.
+    fn add_shape_symbols(symbols: &mut Symbols, prefix: &str, rank: u32) {
+        symbols.tensor(prefix, "_RANK");
+        for axis in 0..rank {
+            symbols.tensor(prefix, &format!("_EXTENT_{axis}"));
+            symbols.tensor(prefix, &format!("_STRIDE_{axis}"));
+        }
+    }
+
     /// The symbol of a result's owner handle, as the dialect names it.
     fn owner_result_symbols(dialect: SourceDialect, ordinal: usize) -> Vec<String> {
         vec![seismic_lang::native_parameter::result_handle(ordinal, dialect == SourceDialect::Metal)]
     }
 
     fn add_element_representation_symbols(
-        symbols: &mut HashSet<String>,
+        symbols: &mut Symbols,
         prefix: &str,
         element: &ElementSummary,
     ) {
@@ -1210,56 +1296,46 @@ mod internals {
     }
 
     fn add_representation_symbols<'a>(
-        symbols: &mut HashSet<String>,
+        symbols: &mut Symbols,
         prefix: &str,
         representations: impl Iterator<Item = &'a RepresentationInfo>,
     ) {
-        // Authored helper macros commonly receive the ABI family prefix and
-        // token-paste suffixes such as `_PACKET_SIZE` onto it.
-        symbols.insert(prefix.to_owned());
-        symbols.insert(format!("{prefix}_REPRESENTATION"));
+        // The bare prefix, which entries pass as a binding argument.
+        symbols.tensor(prefix, "");
+        symbols.tensor(prefix, "_REPRESENTATION");
         for representation in representations {
-            symbols.insert(format!(
-                "{prefix}_REPRESENTATION_{}",
-                native_macro(representation.representation)
-            ));
-            symbols.insert(format!(
-                "{prefix}_DECODED_{}",
-                native_macro(representation.decoded.name())
-            ));
+            symbols.tensor(prefix, &format!("_REPRESENTATION_{}", native_macro(representation.representation)));
+            symbols.tensor(prefix, &format!("_DECODED_{}", native_macro(representation.decoded.name())));
             if representation.operands == registry::OperandRecipe::Nvfp4Rows {
-                symbols.insert(format!("{prefix}_OPERANDS_NVFP4"));
+                symbols.tensor(prefix, &format!("_OPERANDS_NVFP4"));
             }
-            symbols.insert(format!("{prefix}_PACKET_SIZE"));
-            symbols.insert(format!("{prefix}_PACKET_ALIGNMENT"));
-            symbols.insert(format!("{prefix}_LOGICAL_GROUP"));
-            symbols.insert(format!("{prefix}_PLANE_COUNT"));
+            symbols.tensor(prefix, "_PACKET_SIZE");
+            symbols.tensor(prefix, "_PACKET_ALIGNMENT");
+            symbols.tensor(prefix, "_LOGICAL_GROUP");
+            symbols.tensor(prefix, "_PLANE_COUNT");
             match &representation.kind {
                 registry::RepresentationKind::Dense(_) => {
-                    symbols.insert(format!("{prefix}_KIND_DENSE"));
+                    symbols.tensor(prefix, "_KIND_DENSE");
                 }
                 registry::RepresentationKind::External(_) => {
-                    symbols.insert(format!("{prefix}_KIND_EXTERNAL"));
-                    symbols.insert(format!("{prefix}_GRID_PLANAR"));
-                    symbols.insert(format!("{prefix}_GRID_SCALE_BYTES"));
-                    symbols.insert(format!("{prefix}_GRID_TILE_ROWS"));
-                    symbols.insert(format!("{prefix}_GRID_TILE_COLUMNS"));
+                    symbols.tensor(prefix, "_KIND_EXTERNAL");
+                    symbols.tensor(prefix, "_GRID_PLANAR");
+                    symbols.tensor(prefix, "_GRID_SCALE_BYTES");
+                    symbols.tensor(prefix, "_GRID_TILE_ROWS");
+                    symbols.tensor(prefix, "_GRID_TILE_COLUMNS");
                 }
                 // The row-layout ABI of the frozen weight-storage interface
                 // (native-program-execution.md, "Weight storage").
                 registry::RepresentationKind::PackedRows(layout) => {
-                    symbols.insert(format!("{prefix}_KIND_PACKED"));
-                    symbols.insert(format!(
-                        "{prefix}_LAYOUT_{}",
-                        native_macro(layout.layout.as_str())
-                    ));
-                    symbols.insert(format!("{prefix}_ROW_STRIDE_BYTES"));
+                    symbols.tensor(prefix, "_KIND_PACKED");
+                    symbols.tensor(prefix, &format!("_LAYOUT_{}", native_macro(layout.layout.as_str())));
+                    symbols.tensor(prefix, "_ROW_STRIDE_BYTES");
                     // Row planes by role (`render_row_roles`).
                     for role in registry::RowPlaneRole::ALL {
                         let role = native_macro(role.name());
-                        symbols.insert(format!("{prefix}_ROW_{role}"));
-                        symbols.insert(format!("{prefix}_ROW_{role}_BYTES"));
-                        symbols.insert(format!("{prefix}_ROW_{role}_TAIL"));
+                        symbols.tensor(prefix, &format!("_ROW_{role}"));
+                        symbols.tensor(prefix, &format!("_ROW_{role}_BYTES"));
+                        symbols.tensor(prefix, &format!("_ROW_{role}_TAIL"));
                     }
                     for suffix in [
                         "ROW_GROUPS",
@@ -1276,11 +1352,11 @@ mod internals {
                         "RECORD_ENTRY",
                         "RECORD_FACTOR",
                     ] {
-                        symbols.insert(format!("{prefix}_{suffix}"));
+                        symbols.tensor(prefix, &format!("_{suffix}"));
                     }
                     for plane in &layout.planes {
-                        let plane_prefix = format!("{prefix}_PLANE_{}", native_macro(plane.name));
-                        symbols.insert(plane_prefix.clone());
+                        let plane_suffix = format!("_PLANE_{}", native_macro(plane.name));
+                        symbols.tensor(prefix, &plane_suffix);
                         for suffix in [
                             "ROW_OFFSET",
                             "BYTES_PER_ROW",
@@ -1292,16 +1368,16 @@ mod internals {
                             "ENTRY_BITS",
                             "KBLOCK_ENTRIES",
                         ] {
-                            symbols.insert(format!("{plane_prefix}_{suffix}"));
+                            symbols.tensor(prefix, &format!("{plane_suffix}_{suffix}"));
                         }
                     }
                 }
                 registry::RepresentationKind::Packed(layout) => {
-                    symbols.insert(format!("{prefix}_KIND_PACKED"));
-                    symbols.insert(format!("{prefix}_LAYOUT_PACKET"));
+                    symbols.tensor(prefix, "_KIND_PACKED");
+                    symbols.tensor(prefix, "_LAYOUT_PACKET");
                     for (ordinal, plane) in layout.planes.iter().enumerate() {
-                        let plane_prefix = format!("{prefix}_PLANE_{ordinal}");
-                        symbols.insert(format!("{plane_prefix}_NAME_{}", native_macro(plane.name)));
+                        let plane_suffix = format!("_PLANE_{ordinal}");
+                        symbols.tensor(prefix, &format!("{plane_suffix}_NAME_{}", native_macro(plane.name)));
                         for suffix in [
                             "OFFSET",
                             "BYTES_PER_GROUP",
@@ -1310,12 +1386,12 @@ mod internals {
                             "FIELDS",
                             "ENTRY_BITS",
                         ] {
-                            symbols.insert(format!("{plane_prefix}_{suffix}"));
+                            symbols.tensor(prefix, &format!("{plane_suffix}_{suffix}"));
                         }
-                        symbols.insert(format!(
-                            "{plane_prefix}_STORAGE_{}",
-                            native_macro(plane.storage_dtype.name())
-                        ));
+                        symbols.tensor(
+                            prefix,
+                            &format!("{plane_suffix}_STORAGE_{}", native_macro(plane.storage_dtype.name())),
+                        );
                     }
                 }
             }
@@ -2997,6 +3073,57 @@ mod internals {
         }
         output
     }
+
+    #[cfg(test)]
+    mod visibility_tests {
+        use super::*;
+
+        /// Every symbol of a representation prefix belongs to a family of the
+        /// visibility table, and only the bare prefix, the kinds, the decoded
+        /// types and the shape are surface.
+        #[test]
+        fn representation_symbols_take_their_family_visibility() {
+            let mut symbols = Symbols::default();
+            add_shape_symbols(&mut symbols, "SEISMIC_WEIGHT", 2);
+            add_representation_symbols(&mut symbols, "SEISMIC_WEIGHT", registry::representations().iter());
+            for (symbol, visibility) in &symbols.0 {
+                let suffix = &symbol["SEISMIC_WEIGHT".len()..];
+                let surface = suffix.is_empty()
+                    || ["_RANK", "_EXTENT_", "_STRIDE_", "_KIND_", "_DECODED_"]
+                        .iter()
+                        .any(|family| suffix.starts_with(family));
+                let expected = if surface { Visibility::Surface } else { Visibility::Library };
+                assert_eq!(*visibility, expected, "{symbol}");
+            }
+            for (symbol, visibility) in [
+                ("SEISMIC_WEIGHT", Visibility::Surface),
+                ("SEISMIC_WEIGHT_STRIDE_1", Visibility::Surface),
+                ("SEISMIC_WEIGHT_KIND_PACKED", Visibility::Surface),
+                ("SEISMIC_WEIGHT_DECODED_F32", Visibility::Surface),
+                ("SEISMIC_WEIGHT_REPRESENTATION", Visibility::Library),
+                ("SEISMIC_WEIGHT_OPERANDS_NVFP4", Visibility::Library),
+                ("SEISMIC_WEIGHT_LAYOUT_ROWS16", Visibility::Library),
+                ("SEISMIC_WEIGHT_PACKET_SIZE", Visibility::Library),
+                ("SEISMIC_WEIGHT_ROW_STRIDE_BYTES", Visibility::Library),
+                ("SEISMIC_WEIGHT_TILE_ROWS", Visibility::Library),
+            ] {
+                assert_eq!(symbols.0.get(symbol), Some(&visibility), "{symbol}");
+            }
+        }
+
+        /// A conversion's bare prefix is a binding argument; every suffix is
+        /// the library's.
+        #[test]
+        fn conversion_symbols_are_the_librarys_but_the_prefix() {
+            let mut symbols = Symbols::default();
+            symbols.conversion("SEISMIC_CONVERSION_S_D", "");
+            symbols.conversion("SEISMIC_CONVERSION_S_D", "_WORDS");
+            symbols.conversion("SEISMIC_CONVERSION_S_D", "_CODES_FIRST");
+            assert_eq!(symbols.0["SEISMIC_CONVERSION_S_D"], Visibility::Surface);
+            assert_eq!(symbols.0["SEISMIC_CONVERSION_S_D_WORDS"], Visibility::Library);
+            assert_eq!(symbols.0["SEISMIC_CONVERSION_S_D_CODES_FIRST"], Visibility::Library);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3307,7 +3434,7 @@ mod native_tests {
         .expect("Seismic fixture");
         fs::write(
             &metal,
-            "// SEISMIC_DIM_NOT_AN_ABI_SYMBOL inside a comment is inert.\n#define PACKET_SIZE(PREFIX) PREFIX##_PACKET_SIZE\nkernel void scale(device const float *x [[buffer(SEISMIC_BUFFER_X)]], SEISMIC_RESULT_0_PARAM(output), constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]], uint index [[thread_position_in_grid]]) {\n#if defined(SEISMIC_X_REPRESENTATION_F32) && defined(SEISMIC_RESULT_0_KIND_DENSE)\n    ulong packet_size = PACKET_SIZE(SEISMIC_X);\n    if (packet_size > 0 && index < SEISMIC_DIM_N) output[index * SEISMIC_RESULT_0_STRIDE_0] = x[index * SEISMIC_X_STRIDE_0];\n#endif\n}\n",
+            "// SEISMIC_DIM_NOT_AN_ABI_SYMBOL inside a comment is inert.\nkernel void scale(device const float *x [[buffer(SEISMIC_BUFFER_X)]], SEISMIC_RESULT_0_PARAM(output), constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]], uint index [[thread_position_in_grid]]) {\n#if defined(SEISMIC_X_KIND_DENSE) && defined(SEISMIC_RESULT_0_KIND_DENSE)\n    if (index < SEISMIC_DIM_N) output[index * SEISMIC_RESULT_0_STRIDE_0] = x[index * SEISMIC_X_STRIDE_0];\n#endif\n}\n",
         )
         .expect("Metal fixture");
 

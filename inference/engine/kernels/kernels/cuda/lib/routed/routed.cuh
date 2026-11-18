@@ -4,7 +4,7 @@
 // counterpart of `metal/lib/routed/routed.h`. An expert-stacked weight is a
 // record port, bound as its records' address table, and an expert's weights
 // are rows 0.. of its record's base (`slab::region(table, record)`,
-// `ROUTED_RECORD`), wherever that record lies.
+// `PACKETS_RECORD`), wherever that record lies.
 
 #include <seismic/slab.cuh>
 #include "decode.cuh"
@@ -219,13 +219,6 @@ template <class Shape, class Zero> __device__ __forceinline__ void zero_block_ro
     for (u64 n = first + threadIdx.x; n < first + BLOCK_ROWS && n < rows; n += blockDim.x)
         zero(n);
 }
-
-// The weights of slot W in the record at `base`: its rows 0.. from there.
-#define ROUTED_RECORD(W, base) W##_MATRIX(base, 0)
-
-// Weight slot W's matrix `matrix` (a `slab::Matrix` naming a record in an
-// address table): dereference its record's region, then read rows 0..
-#define ROUTED_MATRIX(W, matrix) W##_MATRIX(slab::region((matrix).stack, (matrix).record), 0)
 
 __device__ __forceinline__ void write_grid(u8 *grid, u64 x, u64 y, u64 z) {
     int *words = reinterpret_cast<int *>(grid);

@@ -2,14 +2,15 @@
 // project their joined [2D] row. Decode fuses these into one threadgroup per
 // (32 outputs, row). Prefill joins each row once to scratch, then projects
 // through the shared matrix library so a weight tile serves many rows.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_TABLE
 #define KERNEL_W1 SEISMIC_COMBINE
 #include "lib/projection/projection.h"
 #include "lib/core/gathered.h"
 #include "lib/core/reduce.h"
 
-typedef element::Act activation;
-static_assert(activation::bytes == 2, "draft_rows requires a bf16 or f16 activation");
+typedef activation::Act activation_element;
+static_assert(activation_element::bytes == 2, "draft_rows requires a bf16 or f16 activation");
 typedef ELEMENT_OF(SEISMIC_EMBEDDING_NORM) embedding_norm_element;
 typedef ELEMENT_OF(SEISMIC_HIDDEN_NORM) hidden_norm_element;
 
@@ -36,20 +37,20 @@ inline void draft_join(
     device const uchar *embedding_norm, device const uchar *hidden_norm,
     constant ulong *seismic_words, threadgroup uchar *shared, ulong row,
     uint thread_index, uint sg, uint lane) {
-    typedef typename activation::storage storage;
+    typedef typename activation_element::storage storage;
     const uint width = uint(SEISMIC_DIM_D);
     threadgroup storage *joined = reinterpret_cast<threadgroup storage *>(shared);
     threadgroup float *partials = reinterpret_cast<threadgroup float *>(shared + 4ul * width);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     // The embedding row in A, packet by packet, and its sum of squares.
-    projection::Weights<packets::W0> rows{table, KERNEL_W0_LAYOUT(width), width, nullptr};
+    projection::Weights<packets::W0> rows{{table, KERNEL_W0_LAYOUT(width), width}, nullptr};
     const long held = gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
         SEISMIC_DIM_F, tokens[(row / SEISMIC_DIM_S) * SEISMIC_TOKENS_STRIDE_0]);
     const uint token = uint(held);
     float embedding_squares = 0.0f;
     // A row that names no table row embeds zeros.
     for (uint column = thread_index; held < 0 && column < width; column += draft_threads)
-        joined[column] = activation::store(0.0f);
+        joined[column] = activation_element::store(0.0f);
     for (uint p = thread_index; held >= 0 && p * 32u < width; p += draft_threads) {
         typename packets::W0::packet packet = rows.packet(token, p);
         for (uint step = 0; step < 4; ++step) {
@@ -58,8 +59,8 @@ inline void draft_join(
             for (uint i = 0; i < 8; ++i) {
                 const uint column = 32u * p + 8u * step + i;
                 if (column < width) {
-                    const float value = activation::round((i & 1u) ? odd[i >> 1] : even[i >> 1]);
-                    joined[column] = activation::store(value);
+                    const float value = activation_element::round((i & 1u) ? odd[i >> 1] : even[i >> 1]);
+                    joined[column] = activation_element::store(value);
                     embedding_squares = metal::fma(value, value, embedding_squares);
                 }
             }
@@ -84,13 +85,13 @@ inline void draft_join(
         reduce::group_sum<draft_simdgroups>(hidden_squares, partials + draft_simdgroups, sg, lane) / float(width)
         + epsilon);
     for (uint column = thread_index; column < width; column += draft_threads) {
-        const float embedded = activation::load(joined[column]) * embedding_inverse
+        const float embedded = activation_element::load(joined[column]) * embedding_inverse
             * element::at<embedding_norm_element>(embedding_norm, ulong(column) * SEISMIC_EMBEDDING_NORM_STRIDE_0);
         const float hidden = element::at<conditioning_element>(conditioning, source_row * SEISMIC_CONDITIONING_STRIDE_0
             + (stream * width + column) * SEISMIC_CONDITIONING_STRIDE_1) * hidden_inverse
             * element::at<hidden_norm_element>(hidden_norm, (stream * width + column) * SEISMIC_HIDDEN_NORM_STRIDE_0);
-        joined[column] = activation::store(embedded);
-        joined[width + column] = activation::store(hidden);
+        joined[column] = activation_element::store(embedded);
+        joined[width + column] = activation_element::store(hidden);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -102,7 +103,7 @@ kernel void draft_rows(DRAFT_ROWS_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    typedef typename activation::storage storage;
+    typedef typename activation_element::storage storage;
     const uint width = uint(SEISMIC_DIM_D);
     const ulong row = ulong(group.y);
     const element::Out<element::F32> result(result_cells);
@@ -111,7 +112,7 @@ kernel void draft_rows(DRAFT_ROWS_ARGUMENTS,
     threadgroup storage *joined = reinterpret_cast<threadgroup storage *>(shared);
     // Four combine rows per simdgroup; lanes own packets of the 2D inputs.
     const uint inputs = 2u * width;
-    projection::Weights<packets::W1> weights{combine, KERNEL_W1_LAYOUT(inputs), inputs, nullptr};
+    projection::Weights<packets::W1> weights{{combine, KERNEL_W1_LAYOUT(inputs), inputs}, nullptr};
     for (uint r = 0; r < draft_rows_per_simdgroup; ++r) {
         const uint output = group.x * draft_outputs + sg * draft_rows_per_simdgroup + r;
         if (output >= width)
@@ -126,7 +127,7 @@ kernel void draft_rows(DRAFT_ROWS_ARGUMENTS,
                     const uint column = 32u * p + 8u * step + i;
                     if (column < inputs) {
                         sum = metal::fma((i & 1u) ? odd[i >> 1] : even[i >> 1],
-                            activation::load(joined[column]), sum);
+                            activation_element::load(joined[column]), sum);
                     }
                 }
             }
@@ -143,7 +144,7 @@ kernel void draft_rows_join(DRAFT_ROWS_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    typedef typename activation::storage storage;
+    typedef typename activation_element::storage storage;
     const uint width = uint(SEISMIC_DIM_D);
     const ulong row = ulong(group.y);
     draft_join(tokens, directory, table, conditioning, embedding_norm, hidden_norm, seismic_words,
@@ -161,10 +162,10 @@ kernel void draft_rows_gemm(DRAFT_ROWS_ARGUMENTS,
     PROJECTION_GEMM_SHARED(shared, 64, 64);
     const uint width = uint(SEISMIC_DIM_D);
     const uint inputs = 2u * width;
-    projection::Plain<activation, projection::AllRows> in{joined_rows, inputs, 1, inputs, {}};
+    projection::Plain<activation_element, projection::AllRows> in{joined_rows, inputs, 1, inputs, {}};
     projection::Store<element::F32> out{element::Out<element::F32>(result_cells),
         width, SEISMIC_RESULT_0_STRIDE_1, 0};
-    projection::Weights<packets::W1> weights{combine, KERNEL_W1_LAYOUT(inputs), inputs, nullptr};
+    projection::Weights<packets::W1> weights{{combine, KERNEL_W1_LAYOUT(inputs), inputs}, nullptr};
     projection::gemm<packets::W1, 64, 64>(in, out, weights, uint(SEISMIC_DIM_M * SEISMIC_DIM_S),
         width, inputs, tile.y, tile.x, shared, sg, lane);
 }

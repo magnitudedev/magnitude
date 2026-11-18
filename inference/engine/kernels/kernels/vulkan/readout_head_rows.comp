@@ -1,32 +1,24 @@
 // readout_head_rows: final RMS prologue over the `out_rows` rows, then the
 // vocabulary projection into F32 logits. The Vulkan form of
 // `metal/readout_head_rows.metal` on the `dense` projection (`lib/projection/operator.glsl`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 // The projection's decoding launches stage their weights' tables (`packets.glsl`).
-#define PACKETS_STAGED_TABLES 1
+#define PACKETS_CONFIG_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_WS != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define HEAD_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "readout_head_rows requires a bf16 or f16 activation"
 #endif
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define HEAD_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define HEAD_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define HEAD_NORM ELEMENT_BF16
-#else
-#error "readout_head_rows requires a dense norm"
-#endif
+#define HEAD_ACT ACTIVATION_A
+#define HEAD_NORM ELEMENT_OF(SEISMIC_NORM)
 // The weight's operand rows (the normalized rows, or NVFP4 operands): the
 // GEMV forms them while staging, the stage launch into the GEMM's scratch.
-#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_WEIGHT)
 #define HEAD_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define HEAD_OPERANDS PROJECTION_OPERANDS_ROUNDED

@@ -5,7 +5,7 @@
 // (group memory, SEISMIC_CONST_WINDOW_BYTES from the byte offset the
 // includer gives) in the widest loads their address admits, then places the
 // window's column tiles by `repack_weight`'s placement
-// (lib/repack/repack.glsl, its `_shared` form, reading the copy), so a slot
+// (<seismic/repack.glsl>, its `_shared` form, reading the copy), so a slot
 // holds exactly the bytes a resident import places. The call follows its
 // round's wait, which ended at a park the host opened after staging, so the
 // staged bytes are read as plain loads.
@@ -15,7 +15,7 @@
 // [N, K] packets), and the item count's one owner (`NAME_items`), which the
 // grid's workgroups stride over.
 //
-// A planar source (`S_GRID_PLANAR`: a record is each matrix's codes plane,
+// A planar source (`REPACK_PLANAR(S)`: a record is each matrix's codes plane,
 // then its grid of scales) is windowed over its packets' codes alone
 // (`NAME_packet_bytes`), and beside them, after them in the window, holds
 // the scales of the tiles its packets lie in (`NAME_scale_area`: a row's own
@@ -46,7 +46,7 @@
 //   `window` (a multiple of 16) of the group memory: every invocation calls
 //   it, and it begins and ends with a workgroup barrier.
 // The includer includes lib/streaming/control.glsl first.
-#include "../repack/repack.glsl"
+#include <seismic/repack.glsl>
 #include "../../../streaming/window.hpp"
 
 // `rows` spans of `span` bytes, from device address `from` (a row each
@@ -88,54 +88,54 @@ void streaming_window_copy(uint64_t from, uint64_t stride, uint to, uint pitch, 
     }
 }
 
-// A dense element `S`'s element kind (`element_at`, `element_put`).
-#define STREAMING_DENSE_KIND_(R) ELEMENT_##R
-#define STREAMING_DENSE_KIND_OF(R) STREAMING_DENSE_KIND_(R)
-#define STREAMING_DENSE_KIND(S) STREAMING_DENSE_KIND_OF(S##_REPRESENTATION)
-
 #define STREAMING_PACKED(NAME, S, SRC, D, N, K) \
-    /* The source's planar geometry (lib/repack/repack.glsl): its packets' */ \
+    /* A window holds a source packet of each row of a tile. */ \
+    struct NAME##_window { \
+        int fits[STREAMING_WINDOW_FITS(REPACK_TILE_ROWS_INT, REPACK_PACKET_BYTES(S), SEISMIC_CONST_WINDOW_BYTES) \
+            ? 1 : -1]; \
+    }; \
+    /* The source's planar geometry (<seismic/repack.glsl>): its packets' */ \
     /* codes and, under a grid, its scales; a plain source has no scale. */ \
     REPACK_PLANAR_SOURCE(NAME##_plane, S, N, K) \
     /* A source's stored row: its packets (the window rule's row length), */ \
     /* the source row's own, and its codes' bytes (a planar source's are */ \
     /* its codes plane's, the grid following the plane). */ \
     uint NAME##_row_packets() { \
-        return streaming_window_row_packets(uint64_t(D##_ROW_GROUPS) * uint64_t(S##_LOGICAL_GROUP), \
-            uint(S##_LOGICAL_GROUP)); \
+        return streaming_window_row_packets(uint64_t(REPACK_ROW_GROUPS(D)) * uint64_t(REPACK_GROUP(S)), \
+            uint(REPACK_GROUP(S))); \
     } \
     uint NAME##_source_packets() { \
-        return uint(seismic_quotient(uint64_t(K) + uint64_t(S##_LOGICAL_GROUP) - 1ul, uint(S##_LOGICAL_GROUP))); \
+        return uint(seismic_quotient(uint64_t(K) + uint64_t(REPACK_GROUP(S)) - 1ul, uint(REPACK_GROUP(S)))); \
     } \
     uint NAME##_packet_bytes() { \
         return uint(NAME##_plane_code_bytes()); \
     } \
-    /* Whether the source is planar (`S_GRID_PLANAR`). */ \
+    /* Whether the source is planar. */ \
     bool NAME##_planar() { \
-        return S##_GRID_PLANAR != 0; \
+        return REPACK_PLANAR(S); \
     } \
     /* The source's strides in packets: a planar source strides by */ \
     /* matrices (its tensor's last two axes are one unit), its rows and */ \
     /* packets those of its codes plane. */ \
     uint64_t NAME##_source_stride_1() { \
-        return NAME##_planar() ? NAME##_plane_row_packets() : uint64_t(SRC##_STRIDE_1); \
+        return NAME##_planar() ? NAME##_plane_row_packets() : uint64_t(REPACK_STRIDE_1(SRC)); \
     } \
     uint64_t NAME##_source_stride_2() { \
-        return NAME##_planar() ? 1ul : uint64_t(SRC##_STRIDE_2); \
+        return NAME##_planar() ? 1ul : uint64_t(REPACK_STRIDE_2(SRC)); \
     } \
     /* A planar source's scales area: `scale_rows` rows of a window's most */ \
     /* scales (a row of its packets lies in at most `scales_per_row` tiles */ \
     /* along it: the window's first packet need not be a tile's first). */ \
     uint NAME##_scale_rows() { \
-        return !NAME##_planar() ? 0u : uint(S##_GRID_TILE_ROWS) == 1u ? REPACK_TILE_ROWS : 1u; \
+        return !NAME##_planar() ? 0u : uint(REPACK_GRID_TILE_ROWS(S)) == 1u ? REPACK_TILE_ROWS : 1u; \
     } \
     uint NAME##_scales_per_row() { \
-        const uint columns = max(uint(S##_GRID_TILE_COLUMNS), 1u); \
+        const uint columns = max(uint(REPACK_GRID_TILE_COLUMNS(S)), 1u); \
         const uint most = uint(SEISMIC_CONST_WINDOW_BYTES) / (REPACK_TILE_ROWS * NAME##_packet_bytes()); \
-        return !NAME##_planar() ? 0u : (most * uint(S##_LOGICAL_GROUP) + columns - 1u) / columns + 1u; \
+        return !NAME##_planar() ? 0u : (most * uint(REPACK_GROUP(S)) + columns - 1u) / columns + 1u; \
     } \
     uint NAME##_scale_pitch() { \
-        return NAME##_scales_per_row() * uint(S##_GRID_SCALE_BYTES); \
+        return NAME##_scales_per_row() * uint(REPACK_GRID_SCALE_BYTES(S)); \
     } \
     uint NAME##_scale_area() { \
         return (NAME##_scale_rows() * NAME##_scale_pitch() + 15u) / 16u * 16u; \
@@ -185,11 +185,11 @@ void streaming_window_copy(uint64_t from, uint64_t stride, uint to, uint pitch, 
             streaming_window_copy(from, uint64_t(stride), window, pitch, stored * packet_bytes, rows); \
         /* A planar source's scales of the tiles the window's packets lie */ \
         /* in, after its codes: the record's grid follows its codes plane. */ \
-        const uint scale_bytes = uint(S##_GRID_SCALE_BYTES), tile_columns = max(uint(S##_GRID_TILE_COLUMNS), 1u), \
-            tile_rows = max(uint(S##_GRID_TILE_ROWS), 1u); \
-        const uint scale_at = window + NAME##_codes_bytes(), scale0 = first * uint(S##_LOGICAL_GROUP) / tile_columns; \
+        const uint scale_bytes = uint(REPACK_GRID_SCALE_BYTES(S)), tile_columns = max(uint(REPACK_GRID_TILE_COLUMNS(S)), 1u), \
+            tile_rows = max(uint(REPACK_GRID_TILE_ROWS(S)), 1u); \
+        const uint scale_at = window + NAME##_codes_bytes(), scale0 = first * uint(REPACK_GROUP(S)) / tile_columns; \
         if (NAME##_planar() && stored > 0u) { \
-            const uint count = (first + stored - 1u) * uint(S##_LOGICAL_GROUP) / tile_columns - scale0 + 1u; \
+            const uint count = (first + stored - 1u) * uint(REPACK_GROUP(S)) / tile_columns - scale0 + 1u; \
             const uint64_t grid = record + NAME##_plane_scale_at(n0, uint64_t(first)); \
             streaming_window_copy(grid, NAME##_plane_grid_columns() * uint64_t(scale_bytes), scale_at, NAME##_scale_pitch(), \
                 count * scale_bytes, tile_rows == 1u ? rows : 1u); \
@@ -197,18 +197,18 @@ void streaming_window_copy(uint64_t from, uint64_t stride, uint to, uint pitch, 
         memoryBarrierShared(); \
         barrier(); \
         const uint row = gl_LocalInvocationIndex % REPACK_TILE_ROWS; \
-        const uint tiles = stored * uint(S##_LOGICAL_GROUP) / NAME##_tile_columns(); \
+        const uint tiles = stored * uint(REPACK_GROUP(S)) / NAME##_tile_columns(); \
         if (row < rows) { \
-            const uint64_t placed = destination + (n0 + uint64_t(row)) * D##_STRIDE_1 * D##_ROW_STRIDE_BYTES; \
+            const uint64_t placed = destination + (n0 + uint64_t(row)) * REPACK_STRIDE_1(D) * REPACK_ROW_BYTES(D); \
             for (uint tile = gl_LocalInvocationIndex / REPACK_TILE_ROWS; tile < tiles; \
                  tile += gl_WorkGroupSize.x / REPACK_TILE_ROWS) { \
                 const uint column = tile * NAME##_tile_columns(); \
                 const uint scale = !NAME##_planar() ? 0u \
                     : scale_at + (tile_rows == 1u ? row * NAME##_scale_pitch() : 0u) \
-                        + ((first + column / uint(S##_LOGICAL_GROUP)) * uint(S##_LOGICAL_GROUP) / tile_columns \
+                        + ((first + column / uint(REPACK_GROUP(S))) * uint(REPACK_GROUP(S)) / tile_columns \
                             - scale0) * scale_bytes; \
-                NAME##_place_shared(window + row * pitch + column / uint(S##_LOGICAL_GROUP) * packet_bytes, scale, \
-                    placed, first * uint(S##_LOGICAL_GROUP) + column); \
+                NAME##_place_shared(window + row * pitch + column / uint(REPACK_GROUP(S)) * packet_bytes, scale, \
+                    placed, first * uint(REPACK_GROUP(S)) + column); \
             } \
         } \
         memoryBarrierBuffer(); \
@@ -220,7 +220,7 @@ void streaming_window_copy(uint64_t from, uint64_t stride, uint to, uint pitch, 
     /* an item holds (`streaming_dense_span`): each item is staged through the */ \
     /* window and converted from it. */ \
     uint NAME##_element() { \
-        return ELEMENT_BYTES(STREAMING_DENSE_KIND(S)); \
+        return ELEMENT_BYTES(ELEMENT_OF(S)); \
     } \
     uint NAME##_span() { \
         return streaming_dense_span(NAME##_element(), gl_WorkGroupSize.x, uint(SEISMIC_CONST_WINDOW_BYTES)); \
@@ -240,8 +240,8 @@ void streaming_window_copy(uint64_t from, uint64_t stride, uint to, uint pitch, 
         const uint row_step = gl_WorkGroupSize.x / uint(K), column_step = gl_WorkGroupSize.x % uint(K); \
         for (uint e = gl_LocalInvocationIndex; e < count; e += gl_WorkGroupSize.x) { \
             const uint64_t n = uint64_t(row), k = uint64_t(column); \
-            element_put(STREAMING_DENSE_KIND(U), destination, n * D##_STRIDE_1 + k * D##_STRIDE_2, \
-                element_at(STREAMING_DENSE_KIND(S), record, n * SRC##_STRIDE_1 + k * SRC##_STRIDE_2)); \
+            element_put(ELEMENT_OF(U), destination, n * REPACK_STRIDE_1(D) + k * REPACK_STRIDE_2(D), \
+                element_at(ELEMENT_OF(S), record, n * REPACK_STRIDE_1(SRC) + k * REPACK_STRIDE_2(SRC))); \
             row += row_step; \
             column += column_step; \
             if (column >= uint(K)) { \

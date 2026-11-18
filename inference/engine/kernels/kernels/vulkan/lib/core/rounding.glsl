@@ -7,7 +7,7 @@
 // This file is independent of any entry ABI. The lane forms take a row held
 // by a logical subgroup, lane l holding columns [l E, (l + 1) E),
 // E = `LANE_E`, which the including entry defines; `rounding_hold_lanes`
-// rounds to the entry's activation element (`ELEMENT_ACT`).
+// rounds to the entry's activation element (`ACTIVATION_A`).
 
 // A rounding as the entries take it (`rounding.seismic`'s codes): `block` 0
 // rounds nothing; `element` 0 E4M3, 1 E2M1; `scale` 0 UE8M0, 1 E4M3.
@@ -100,7 +100,7 @@ void rounding_hold_lanes(inout float x[LANE_E], rounding_t rounding) {
     if (rounding.block == 0)
         return;
     [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-        x[i] = element_round(ELEMENT_ACT, x[i]);
+        x[i] = element_round(ACTIVATION_A, x[i]);
 }
 
 #endif

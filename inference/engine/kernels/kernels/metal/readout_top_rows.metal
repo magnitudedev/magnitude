@@ -7,6 +7,7 @@
 // vocabulary row's lower-bound score raises its output row's threshold (a
 // threadgroup atomic maximum, then the sync-scratch keys); the last
 // threadgroup to arrive publishes the thresholds.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/readout/progressive.h"
 #include "lib/projection/operator.h"
 #if defined(SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV) || defined(SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV_ROWS) || defined(SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV_PAIR)
@@ -14,11 +15,9 @@
 #endif
 
 // The plane set's weight: its 4-bit view.
-namespace packets {
-typedef ProgressiveTop W0;
-}
+PACKETS_BIND(W0, readout::ProgressiveTop)
 
-typedef progressive::activation activation;
+typedef progressive::activation activation_element;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 constant constexpr bool NVFP4 = false;
 typedef projection::operands<NVFP4> Operands;
@@ -128,7 +127,7 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
 // the batched launch's rows form (`PROJECTION_GEMV_INPUT`).
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_V), k = uint(SEISMIC_DIM_D); \
-    projection::InputOf<activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+    projection::InputOf<activation_element, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
         raw{hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0, \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
     const projection::Weights<packets::W0> w{top, SEISMIC_TOP_STRIDE_0, scales, SEISMIC_SCALES_STRIDE_0}; \

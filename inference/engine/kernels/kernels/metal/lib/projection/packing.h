@@ -73,7 +73,7 @@
 // `packing_operand` the packed operand and the tokens' scales and code sums,
 // `packing_coefficients` the weights' block scales and biases. Weight codes
 // are read from the resident rows, a lane's chunk of eight codes per weight
-// row and block (`lane_codes`: its share of each code plane, its codebook
+// row and block (`packets::lane`: its share of each code plane, its codebook
 // codes or its grid entry), whose pairs the lanes sharing them exchange where
 // a block has two runs (`packing_layout`).
 //
@@ -106,7 +106,7 @@ namespace projection {
 //   token_scales   1 F32 per token: the power of two its block scales are
 //            held over
 //   weights  2 F16 per (32-row weight tile, block, row % 8, row / 8): the
-//            block's two factors (`packing_factors`), over the row's weight
+//            block's two factors (`packets::block_factors`), over the row's weight
 //            scale; with a min term a run (`sums`) 4, each run's two
 //            factors as one run's are
 //   weight_scales  1 F32 per weight row: the power of two its block factors
@@ -134,11 +134,11 @@ inline float packing_scale(float value) {
 
 // The packed codes of weights W (`packing_codes<W>`), the one place its
 // packed forms and its packing bound (`packing_bound`) read them from: a
-// layout of its lane codes (`lane_codes`, entering at the admitted `offset`;
-// `packing_layout`) and its
-// coefficients' factors (`packing_factors`), for weights the runtime admits
-// to the form (`packets::Forms::pack`, `_FORM_PACK`, which also gives their
-// codes' `centre`, `offset` and `residue`). Codes enter as F16 subnormals
+// layout of its lane codes (`packets::lane`, entering at the admitted
+// `offset`; `packing_layout`) and its coefficients' factors
+// (`packets::block_factors`), for weights the runtime admits to the form
+// (`packets::admits<W>::pack`, `_FORM_PACK`, with `packets::pack<W>` giving
+// their codes' `centre`, `offset` and `residue`). Codes enter as F16 subnormals
 // minus `centre`, half their range; a code's value is
 // scale (code - offset) + bias, so a block has the min term
 // (centre - offset) scale + bias where that is not zero (`biased`). A block
@@ -167,7 +167,7 @@ inline float packing_scale(float value) {
 // The packed product's forms, on a device without tensor operations.
 constant constexpr bool packing_forms = !SEISMIC_HAS_TENSOR_OPS;
 
-// How PACK carries a lane's codes L (`lane_codes`) ahead: a block's loads
+// How PACK carries a lane's codes L (`packets::lane`) ahead: a block's loads
 // alone (`fetch`, its `fields`: code planes' loads, or the words of a lane
 // without them) issue as it starts and become words as it ends (`spread`;
 // `gemm_packed_sums`).
@@ -176,7 +176,7 @@ struct packing_fetch {
     typedef typename L::words fields;
     template <typename W>
     static fields fetch(thread const Weights<W> &w, typename L::place at, uint g) {
-        return L::template load<false>(w, at, g);
+        return L::template load<false>(w.matrix, at, g);
     }
     static typename L::words spread(fields codes) { return codes; }
 };
@@ -185,12 +185,12 @@ struct packing_fetch<L, decltype((void)sizeof(typename L::fields))> {
     typedef typename L::fields fields;
     template <typename W>
     static fields fetch(thread const Weights<W> &w, typename L::place at, uint g) {
-        return L::template fetch<false>(w, at, g);
+        return L::template fetch<false>(w.matrix, at, g);
     }
     static typename L::words spread(fields codes) { return L::spread(codes); }
 };
 
-// The layout of a weight's lane codes L (`lane_codes`) for FOLDS runs a
+// The layout of a weight's lane codes L (`packets::lane`) for FOLDS runs a
 // block, in bytes of column order where BYTES (entries of 8 bits, the codes
 // with residue bits; `planes`): `at`, `fetch` (a block's loads, `fetched`),
 // `take` (their words, which the simdgroup forms together) and `step`. A lane
@@ -212,7 +212,7 @@ struct packing_layout<L, 1, false> {
     typedef typename L::words words;
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return L::at(w, w.locate(n), x >> 1);
+        return L::at(w.matrix, w.locate(n), x >> 1);
     }
     template <typename W>
     static fetched fetch(thread const Weights<W> &w, place at, uint g) { return packing_fetch<L>::fetch(w, at, g); }
@@ -244,7 +244,7 @@ struct packing_layout<L, 2, false> {
     typedef uint4 words;
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return place{L::at(w, w.locate(n), (x >> 2) + (x & 2u)), (x & 2u) != 0u};
+        return place{L::at(w.matrix, w.locate(n), (x >> 2) + (x & 2u)), (x & 2u) != 0u};
     }
     template <typename W>
     static fetched fetch(thread const Weights<W> &w, place at, uint g) {
@@ -296,7 +296,7 @@ inline uint2 packing_byte_planes(uint2 codes, uint x) {
 }
 
 // Values of 8 bits, one run a block: the lane's chunk x / 2 as bytes
-// (`lane_codes::bytes`).
+// (`packets::lane::bytes`).
 template <typename L>
 struct packing_layout<L, 1, true> {
     static constexpr bool implemented() { return L::implemented() && L::bytes(); }
@@ -305,7 +305,7 @@ struct packing_layout<L, 1, true> {
     typedef typename L::words words;
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return L::at(w, w.locate(n), x >> 1);
+        return L::at(w.matrix, w.locate(n), x >> 1);
     }
     template <typename W>
     static fetched fetch(thread const Weights<W> &w, place at, uint g) { return packing_fetch<L>::fetch(w, at, g); }
@@ -322,175 +322,31 @@ struct packing_layout<L, 1, true> {
     static uint2 planes(words codes, uint x) { return packing_byte_planes<RESIDUE>(codes, x); }
 };
 
-// The factors of coefficients K of codes (in planes P, whose entries may
-// carry K's local codes) centred at CENTRE whose value is zero at OFFSET, a
-// block's runs K's groups of a packet: a run's factors are its scale
-// 2^15 / 64 and, where the block has a min term (`biased`), its min term
-// (CENTRE - OFFSET) scale + bias. A block of one run has its two (or its
-// scale and 0); a block of two runs has its runs' scales, or with a min term
-// (`sums`) each run's two in turn (`width` 4). The fold takes a sum of at
-// most 1 of the first and a code sum / 64 below 128 of the second, so 512
-// |scale| + 128 |min term| of each run bounds what it multiplies (`reach`).
-// Implemented for the run of a 256-column block's factors one factor
-// group's or eight packets'; a power of two scaling the codes is in their
-// scales (`packets::Direct`, `packets::Hier`).
-template <typename K, uint CENTRE, uint OFFSET, typename P>
-struct packing_factors {
-    static constant constexpr bool implemented = false;
-};
-
-// The difference CENTRE - OFFSET.
-template <uint CENTRE, uint OFFSET>
-constexpr float packing_shift() {
-    return float(int(CENTRE) - int(OFFSET));
-}
-
-// Whether a block of coefficients K centred at CENTRE, zero at OFFSET, has a
-// min term, and whether its two runs each fold one (`sums`): their tokens'
-// entries then carry each run's code sums, and its factors each run's two.
-template <typename K, uint CENTRE, uint OFFSET>
-struct packing_terms {
-    static constant constexpr bool biased = K::biased || CENTRE != OFFSET;
-    static constant constexpr bool sums = K::groups == 2 && biased;
-    // A block's factors as the weights' table holds them: `width` of them.
-    static constant constexpr uint width = sums ? 4u : 2u;
-    typedef metal::vec<float, width> entry;
-};
-
-// The min term (CENTRE - OFFSET) scale + bias of group `g` from the
-// coefficients `k` (of K) of its packet; none where the block has none
-// (`packing_terms::biased`).
-template <typename K, uint CENTRE, uint OFFSET>
-inline float packing_min_term(thread const typename K::coefficients &k, uint g) {
-    if constexpr (packing_terms<K, CENTRE, OFFSET>::biased)
-        return packing_shift<CENTRE, OFFSET>() * k.scale(g) + k.bias(g);
-    else
-        return 0.0f;
-}
-
-// A block's factors from the coefficients `k` (of K) of its packet.
-template <typename K, uint CENTRE, uint OFFSET>
-inline typename packing_terms<K, CENTRE, OFFSET>::entry packing_block_factors(
-    thread const typename K::coefficients &k) {
-    constexpr float SCALE = 32768.0f / 64.0f;
-    if constexpr (packing_terms<K, CENTRE, OFFSET>::sums)
-        return float4(k.scale(0) * SCALE, packing_min_term<K, CENTRE, OFFSET>(k, 0),
-            k.scale(1) * SCALE, packing_min_term<K, CENTRE, OFFSET>(k, 1));
-    else if constexpr (K::groups == 2)
-        return float2(k.scale(0), k.scale(1)) * SCALE;
-    else
-        return float2(k.scale(0) * SCALE, packing_min_term<K, CENTRE, OFFSET>(k, 0));
-}
-
-// Hierarchical coefficients: a block's factors from the factor group's run
-// (`packets::Hier::run`), each packet's field from the scales plane or, where
-// its grid entries (in planes P) carry it, from its entries; bounded by the
-// local codes' largest magnitude under the group's factors, with a signed
-// bias's offset beside the min term's shift, alike for each run.
-template <typename FS, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, typename L, uint GROUP, bool MIN,
-    int BIAS_SIGN, uint CARRIED_BIT, typename SB, uint CENTRE, uint OFFSET, typename P>
-struct packing_factors<
-    packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB>, CENTRE,
-    OFFSET, P> : packing_terms<packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN,
-                     CARRIED_BIT, SB>, CENTRE, OFFSET> {
-    typedef packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB> K;
-    typedef packing_terms<K, CENTRE, OFFSET> terms;
-    static constant constexpr bool implemented = true;
-    struct run {
-        typename K::run fields;
-        packets::weight_bytes row;
-        Rows16 layout;
-        uint p;
-    };
-    static run start(packets::weight_bytes row, Rows16 layout, uint block) {
-        return run{K::start(row, layout, block * K::packets), row, layout, block * K::packets};
-    }
-    static typename terms::entry take(thread run &state) {
-        uint field;
-        if constexpr (K::carries)
-            field = K::template carried<P>(P::load(state.row, state.layout, state.p));
-        else
-            field = K::next(state.fields);
-        ++state.p;
-        return packing_block_factors<K, CENTRE, OFFSET>(K::form(field, state.fields.factor));
-    }
-    static float reach(packets::weight_bytes row, Rows16 layout, uint block) {
-        const typename K::group_factors factors = K::factors(row, layout, block);
-        const float offset = K::signed_bias() ? packets::power2<SB::exponent() - CODE_EXPONENT>() : 0.0f;
-        const float scale = (512.0f + 128.0f * (metal::abs(packing_shift<CENTRE, OFFSET>()) + offset))
-            * metal::abs(factors.scale(0));
-        return float(L::largest) * (MIN ? metal::fma(128.0f, metal::abs(factors.bias(0)), scale) : scale);
-    }
-};
-
-// Direct coefficients: a block's factors from its eight packets' own,
-// bounded by the largest of them.
-template <typename S, uint GROUP, bool BIAS, uint STORAGE, int EXPONENT, uint CENTRE, uint OFFSET, typename P>
-struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTRE, OFFSET, P>
-    : packing_terms<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTRE, OFFSET> {
-    typedef packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT> K;
-    typedef packing_terms<K, CENTRE, OFFSET> terms;
-    static_assert(256u % GROUP == 0u, "a 256-column block holds whole groups");
-    static constant constexpr bool implemented = true;
-    // A 256-column block's share of the supers plane, from its first
-    // group's scale: a packet's place in it is its index in the block.
-    static packets::weight_bytes block_supers(packets::weight_bytes row, Rows16 layout, uint block) {
-        return layout.super_at(row, 0ul) + ulong(K::scale_offset(block * (256u / GROUP)));
-    }
-    // The block's supers and the next packet taken.
-    struct run {
-        packets::weight_bytes supers;
-        uint p;
-    };
-    static run start(packets::weight_bytes row, Rows16 layout, uint block) {
-        return run{block_supers(row, layout, block), 0u};
-    }
-    static typename terms::entry take(thread run &state) {
-        return packing_block_factors<K, CENTRE, OFFSET>(K::at(state.supers, state.p++));
-    }
-    static float reach(packets::weight_bytes row, Rows16 layout, uint block) {
-        packets::weight_bytes supers = block_supers(row, layout, block);
-        // Without a min term the bound is 512 times the largest scale,
-        // exactly: a power of two scales every term alike.
-        float largest = 0.0f;
-        PROJECTION_UNROLL
-        for (uint i = 0; i < 8; ++i) {
-            const typename K::coefficients k = K::at(supers, i);
-            PROJECTION_UNROLL
-            for (uint g = 0; g < K::groups; ++g) {
-                const float scale = metal::abs(k.scale(g));
-                largest = metal::max(largest, terms::biased
-                    ? metal::fma(128.0f, metal::abs(packing_min_term<K, CENTRE, OFFSET>(k, g)), 512.0f * scale)
-                    : scale);
-            }
-        }
-        return terms::biased ? largest : 512.0f * largest;
-    }
-};
-
-// The packed codes of weights W the runtime admits to the form (`ADMITTED`),
-// its runs a block the coefficient groups of a packet, with the layout and
-// factors of an admitted weight's codes. None otherwise.
-template <typename W, bool ADMITTED>
+// The packed codes of weights W the runtime admits to the form (`ADMITTED`,
+// `packets::admits<W>::pack`), its runs a block the coefficient groups of a
+// packet (`packets::pack`), with the layout of its lane codes
+// (`packets::lane`, entering at the admitted offset) and its block factors
+// (`packets::block_factors`). None otherwise.
+template <typename W, bool ADMITTED = packets::admits<W>::pack>
 struct packing_codes_of {
     static constant constexpr bool available = false, biased = false, sums = false;
     static constant constexpr uint centre = 0, folds = 0, residue = 0;
 };
-template <typename P, typename C, typename K, typename F>
-struct packing_codes_of<packets::Packet<P, C, K, F>, true> {
-    typedef packets::Packet<P, C, K, F> W;
-    static constant constexpr uint centre = F::pack_centre, folds = K::groups, residue = F::pack_residue;
-    typedef lane_codes<P, C, int(F::pack_offset)> lanes;
-    static_assert(lanes::zero() == int(F::pack_offset), "an admitted weight's codes enter at their offset");
-    typedef packing_layout<lanes, K::groups, (F::pack_residue != 0)> layout;
+template <typename W>
+struct packing_codes_of<W, true> {
+    typedef packets::pack<W> admitted;
+    static constant constexpr uint centre = admitted::centre, folds = admitted::folds, residue = admitted::residue;
+    typedef packets::lane<W, int(admitted::offset)> lanes;
+    static_assert(lanes::zero() == int(admitted::offset), "an admitted weight's codes enter at their offset");
+    typedef packing_layout<lanes, folds, (residue != 0)> layout;
     static_assert(layout::implemented(), "an admitted weight's codes have a packing layout");
-    typedef packing_factors<K, centre, F::pack_offset, P> factors;
+    typedef packets::block_factors<W, centre, admitted::offset> factors;
     static_assert(factors::implemented, "an admitted weight's coefficients have packing factors");
     static constant constexpr bool available = packing_forms;
     static constant constexpr bool biased = factors::biased, sums = factors::sums;
     // The runtime sizes the operand's and the factors' scratch by its
     // admission's PACK_SUMS: it is this layout's.
-    static_assert(F::pack_sums == sums, "PACK_SUMS is the packed codes' layout");
+    static_assert(admitted::sums == sums, "PACK_SUMS is the packed codes' layout");
     typedef typename layout::place place;
     typedef typename layout::fetched fetched;
     typedef typename layout::words words;
@@ -505,18 +361,8 @@ struct packing_codes_of<packets::Packet<P, C, K, F>, true> {
     static uint2 planes(words codes, uint x) { return layout::template planes<RESIDUE>(codes, x); }
 };
 
-// Whether the runtime admits weights W to the form.
 template <typename W>
-struct packing_admitted {
-    static constant constexpr bool value = false;
-};
-template <typename P, typename C, typename K, typename F>
-struct packing_admitted<packets::Packet<P, C, K, F>> {
-    static constant constexpr bool value = F::pack;
-};
-
-template <typename W>
-using packing_codes = packing_codes_of<W, packing_admitted<W>::value>;
+using packing_codes = packing_codes_of<W>;
 
 // Whether a PACK launch over the weights W... runs the packed products: on a
 // device without tensor operations (`packing_forms`); elsewhere the form's
@@ -527,7 +373,7 @@ using packing_codes = packing_codes_of<W, packing_admitted<W>::value>;
 // A function, not a class's constant: a class's static data member is a
 // constant of the program, which moves what follows it.
 template <typename... W> constexpr bool packing_path() {
-    static_assert((packing_admitted<W>::value && ...), "PACK = 1 names the packed GEMM of weights admitted to it");
+    static_assert((packets::admits<W>::pack && ...), "PACK = 1 names the packed GEMM of weights admitted to it");
     return packing_forms;
 }
 
@@ -714,51 +560,6 @@ struct packing_shared {
     static constant constexpr uint centre = ab > cd ? ab : cd;
 };
 
-// The gain limits of a run of n = 32 / folds columns against codes minus
-// `centre` (each at most `centre` in magnitude): a run's sum is at most
-// centre |q|_1, and codes rounded to multiples of s have
-// |q|_1 <= g |x|_1 + n s / 2, so the largest gain under a sum limit is
-// (limit / centre - n s / 2) / |x|_1, with the limits of `packing_fields`
-// (32767 for the top token and 32767 - 64 n for the low one where the sums
-// fit 16 bits each). Returned as what a run's scale (64 / gain) is per unit
-// of |x|_1, of the top token, of the low token and of the low token with even
-// codes: 64 / limit over 1 - 2^-10, which covers the F32 rounding of the norm
-// (at most 2^-19 of a sum of 32 magnitudes, in any order) and of the
-// products with it. `packing_limit` is one lane's, for a sum limit and code
-// step s.
-inline float packing_limit(float limit, uint centre, uint folds, float step) {
-    const float n = 32.0f / float(folds);
-    return (64.0f / 0.9990234375f) / (limit / float(centre) - 0.5f * n * step);
-}
-
-// The certified scale of lane `l` of fields F (`packing_lanes`, or
-// `packing_fields` with residue bits) for a token of `packing_norms` `norms`
-// in a run of n = 32 / FOLDS columns, coded in multiples of `step`, against
-// codes minus `centre`. The format's bound certifies `packing_limit` per unit
-// of |x|_1; with the tensors' bound B^2 of the run (`squares`, BOUNDED),
-// Cauchy-Schwarz with the rounding of the codes inside,
-// (g |x|_2 + sqrt(n) s / 2) B <= limit, certifies its own (none in a run
-// whose codes are all the centre: the inverse is then infinite, and so is
-// the room), and the smaller of the two scales (the larger gain) holds. Not
-// yet held, nor capped by the lane's codes (`packing_lane_scales`).
-template <typename F, uint FOLDS, bool BOUNDED>
-inline float packing_lane_scale(uint l, float3 norms, float squares, uint centre, float step) {
-    const float n = 32.0f / float(FOLDS), limit = F::limit(l, n);
-    const float certified = norms.x * packing_limit(limit, centre, FOLDS, step);
-    if (!BOUNDED)
-        return certified;
-    const float root = FOLDS == 1 ? 5.65685424949238f : 4.0f;
-    const float room = limit * metal::rsqrt(squares) - 0.5f * root * step;
-    return metal::min(certified, (64.0f / 0.9990234375f) * metal::sqrt(norms.z) / room);
-}
-
-// A scale (64 / gain, what the fold multiplies) as the fold holds it, in 16
-// bits (`packing_scale_bits`): its fraction rounded up to 8 bits, so that
-// the gain, the reciprocal of what is held, is at most the one admitted.
-inline float packing_held(float scale) { return as_type<float>((as_type<uint>(scale) + 0x7fffu) & 0xffff8000u); }
-// The gain of a held scale: zero for a zero or NaN scale.
-inline float packing_gain(float scale) { return scale > 0.0f ? 64.0f / scale : 0.0f; }
-
 // A token's norms of a run from its eight columns of a chunk, joined over
 // the run's lanes (four neighbouring lanes hold a block, two a run of 16):
 // the sum of the magnitudes, the largest, and the sum of the squares.
@@ -806,41 +607,11 @@ struct packing_bounded {
     static constant constexpr uint value = (SERVED & ~BOUNDED) == 0 ? SERVED : 0;
 };
 
-// The held scales of an element's two tokens of one run (`scales`, by
-// lane), from their `packing_norms` (`norms`, by lane), of fields F against
-// codes minus `centre`; returned, the step of the bottom lane's codes. Each
-// lane's scale is certified (`packing_lane_scale`). A lane's codes stay within its
-// `codes`, and the top lane's within 2 codes + 1 beside even bottom codes
-// (the element is then even, so exact below 2^25); the element takes the
-// wider top where it lowers the sum of the top and bottom tokens' squared
-// relative steps (64 / gain over |x|_1, the bottom token's doubled by its
-// step), which only a top capped by its codes can.
-template <typename F, uint FOLDS, bool BOUNDED>
-inline float packing_lane_scales(thread const float3 (&norms)[packing_gemm_lanes], float squares, uint centre,
-    thread float (&scales)[packing_gemm_lanes]) {
-    // Each lane's certified scale, then the bottom lane's with even codes.
-    const float certified_top = packing_lane_scale<F, FOLDS, BOUNDED>(1, norms[1], squares, centre, 1.0f);
-    const float certified_low = packing_lane_scale<F, FOLDS, BOUNDED>(0, norms[0], squares, centre, 1.0f);
-    const float certified_even = packing_lane_scale<F, FOLDS, BOUNDED>(0, norms[0], squares, centre, 2.0f);
-    constexpr float NARROW = 64.0f / F::codes(1), WIDE = 64.0f / (2.0f * F::codes(1) + 1.0f);
-    constexpr float BOTTOM = 64.0f / F::codes(0);
-    const float3 top = norms[1], low = norms[0];
-    const float narrow = packing_held(metal::max(certified_top, top.y * NARROW));
-    const float wide = packing_held(metal::max(certified_top, top.y * WIDE));
-    const float fine = packing_held(metal::max(certified_low, low.y * BOTTOM));
-    const float even = packing_held(metal::max(certified_even, low.y * BOTTOM));
-    const bool widen = narrow * narrow * low.x * low.x + fine * fine * top.x * top.x
-        > wide * wide * low.x * low.x + 4.0f * even * even * top.x * top.x;
-    scales[1] = widen ? wide : narrow;
-    scales[0] = widen ? even : fine;
-    return widen ? 2.0f : 1.0f;
-}
-
 // One token's eight columns of a run as codes under a held `scale`, in
 // multiples of `step`, and the run's code sum (over its lanes).
 inline float packing_code(float4 even, float4 odd, float scale, float step, uint folds, thread float4 &even_codes,
     thread float4 &odd_codes) {
-    const float gain = packing_gain(scale) / step;
+    const float gain = packets::packing_gain(scale) / step;
     even_codes = metal::rint(even * gain) * step;
     odd_codes = metal::rint(odd * gain) * step;
     float sum = (even_codes.x + even_codes.y) + (even_codes.z + even_codes.w)
@@ -862,7 +633,7 @@ inline uint packing_plane(float4 even_codes, float4 odd_codes, uint bit, uint wo
     return plane;
 }
 
-// A held block scale (`packing_held`: non-negative, 8 fraction bits) as 16
+// A held block scale (`packets::packing_held`: non-negative, 8 fraction bits) as 16
 // bits, and back.
 inline ushort packing_scale_bits(float scale) { return ushort(as_type<uint>(scale) >> 15); }
 inline float packing_scale_of(ushort bits) { return as_type<float>(uint(bits) << 15); }
@@ -950,14 +721,14 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
             for (uint l = 0; l < packing_gemm_lanes; ++l)
                 lane_norms[l] = norms[packing_gemm_lanes * p + packing_role(l, phase)];
             float scales[packing_gemm_lanes];
-            const float step = packing_lane_scales<fields, FOLDS, (BOUNDS != 0)>(lane_norms, bound, CENTRE, scales);
+            const float step = packets::packing_lane_scales<fields, FOLDS, (BOUNDS != 0)>(lane_norms, bound, CENTRE, scales);
             float4 codes_even[packing_gemm_lanes], codes_odd[packing_gemm_lanes];
             float sums[packing_gemm_lanes];
             PROJECTION_UNROLL
             for (uint l = 0; l < packing_gemm_lanes; ++l) {
                 const uint t = packing_gemm_lanes * p + packing_role(l, phase);
                 // A non-finite run's scale: NaN, whose gain is 0
-                // (`packing_gain`), coding its zero run 0.
+                // (`packets::packing_gain`), coding its zero run 0.
                 scales[l] = finite[t] ? scales[l] : NAN;
                 sums[l] = packing_code(even[t], odd[t], scales[l], l == 0 ? step : 1.0f, FOLDS, codes_even[l],
                     codes_odd[l]);
@@ -1091,17 +862,16 @@ inline void packing_coefficients(thread const Weights<W> &w, thread const packin
         typedef typename packing_codes<W>::factors coded;
         const uint groups = columns / 32u, blocks = columns / 256u;
         const uint tile = n / 32u, within = n % 32u;
-        packets::weight_bytes row = w.row(n);
-        const Rows16 layout = w.geometry(n);
+        const typename Weights<W>::located row = w.locate(n);
         float largest = 0.0f;
         for (uint block = lane; block < blocks; block += 32u)
-            largest = metal::max(largest, coded::reach(row, layout, block));
+            largest = metal::max(largest, coded::reach(row, block));
         const float scale = packing_scale(simd_max(largest));
         if (lane == 0)
             s.weight_scales[n] = scale;
         const float inverse = 1.0f / scale;
         for (uint block = lane; block < blocks; block += 32u) {
-            typename coded::run run = coded::start(row, layout, block);
+            typename coded::run run = coded::start(row, block);
             PROJECTION_UNROLL
             for (uint i = 0; i < 8; ++i)
                 reinterpret_cast<device metal::vec<half, coded::width> *>(s.weights)[((ulong(tile) * groups
@@ -1126,7 +896,7 @@ inline void packing_tile_coefficients(thread const Weights<W> &w, thread const p
         float largest = 0.0f;
         for (uint item = thread_index; item < items; item += 256u) {
             const uint n = tile * 32u + (item & 31u);
-            largest = metal::max(largest, coded::reach(w.row(n), w.geometry(n), item >> 5));
+            largest = metal::max(largest, coded::reach(w.locate(n), item >> 5));
         }
         largest = simd_max(largest);
         if (lane == 0)
@@ -1141,7 +911,7 @@ inline void packing_tile_coefficients(thread const Weights<W> &w, thread const p
         const float inverse = 1.0f / scale;
         for (uint item = thread_index; item < items; item += 256u) {
             const uint within = item & 31u, block = item >> 5, n = tile * 32u + within;
-            typename coded::run run = coded::start(w.row(n), w.geometry(n), block);
+            typename coded::run run = coded::start(w.locate(n), block);
             PROJECTION_UNROLL
             for (uint i = 0; i < 8; ++i)
                 reinterpret_cast<device metal::vec<half, coded::width> *>(s.weights)[((ulong(tile) * groups
@@ -1217,7 +987,7 @@ inline void gemm_packed_sums(thread const Weights<W> &w, thread const packing_sc
     constexpr uint UNIT_WORDS = sizeof(unit) / 4u, UNITS = WORDS / UNIT_WORDS;
     device const float4 *operand = reinterpret_cast<device const float4 *>(s.operand);
     device const unit *tokens = reinterpret_cast<device const unit *>(s.tokens);
-    // Two weight rows' factors (`packing_factors::width` F16 each).
+    // Two weight rows' factors (`packets::block_factors::width` F16 each).
     typedef metal::conditional_t<coded::sums, uint4, uint2> factor_pair;
     device const factor_pair *weights = reinterpret_cast<device const factor_pair *>(s.weights);
     // The tile's first operand fragment of its operand tile (64

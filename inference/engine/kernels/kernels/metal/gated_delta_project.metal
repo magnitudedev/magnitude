@@ -4,6 +4,7 @@
 // classes, and the batched rows, normalize while staging; `stage` normalizes
 // once into `normalized` for the matrix GEMV and every form past 16 rows,
 // and `stage_tall` in the tall GEMM's order.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_QKV_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_ALPHA_WEIGHT
@@ -16,7 +17,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
 // The rows every weight takes (the normalized rows, or NVFP4 operands).
 constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
@@ -51,21 +52,21 @@ typedef projection::operands<NVFP4> Operands;
 // of the result row from the earlier segments' rows on.
 #define PROJECTION_OPERANDS                                                             \
     const uint m = uint(SEISMIC_DIM_M), k = uint(SEISMIC_DIM_H);                        \
-    projection::InputOf<activation, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+    projection::InputOf<activation_element, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
         raw{hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, input_norm,        \
         SEISMIC_INPUT_NORM_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}}; \
-    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
-    projection::Weights<packets::W0> w0{qkv_weight, KERNEL_W0_LAYOUT(k), k};            \
-    projection::Weights<packets::W1> w1{gate_weight, KERNEL_W1_LAYOUT(k), k};           \
-    projection::Weights<packets::W2> w2{alpha_weight, KERNEL_W2_LAYOUT(k), k};          \
-    projection::Weights<packets::W3> w3{beta_weight, KERNEL_W3_LAYOUT(k), k};           \
-    projection::Store<activation> out0{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+    const projection::Plain<activation_element, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    projection::Weights<packets::W0> w0{{qkv_weight, KERNEL_W0_LAYOUT(k), k}};          \
+    projection::Weights<packets::W1> w1{{gate_weight, KERNEL_W1_LAYOUT(k), k}};         \
+    projection::Weights<packets::W2> w2{{alpha_weight, KERNEL_W2_LAYOUT(k), k}};        \
+    projection::Weights<packets::W3> w3{{beta_weight, KERNEL_W3_LAYOUT(k), k}};         \
+    projection::Store<activation_element> out0{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
         PROJECTION_FIRST_0};                                                            \
-    projection::Store<activation> out1{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+    projection::Store<activation_element> out1{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
         PROJECTION_FIRST_1};                                                            \
-    projection::Store<activation> out2{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+    projection::Store<activation_element> out2{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
         PROJECTION_FIRST_2};                                                            \
-    projection::Store<activation> out3{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+    projection::Store<activation_element> out3{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
         PROJECTION_FIRST_3}
 
 // The GEMV's rows: the norm applied as they stage, from their sums of
@@ -101,7 +102,7 @@ kernel void gated_delta_project_stage_tall(PROJECTION_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     PROJECTION_OPERANDS;
-    Operands::normalize<256, projection::TallOrder<activation>>(raw, item, normalized, k, norms, thread_index);
+    Operands::normalize<256, projection::TallOrder<activation_element>>(raw, item, normalized, k, norms, thread_index);
 }
 #endif
 

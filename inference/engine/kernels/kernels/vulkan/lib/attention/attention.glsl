@@ -9,7 +9,7 @@
 //
 // Every dense operand is bound canonically (row-major, unit innermost
 // stride), so rows are addressed from their logical offsets. Activations are
-// the entry's element A (ELEMENT_ACT); the head width W = 2P + S is a
+// the entry's element A (ACTIVATION_A); the head width W = 2P + S is a
 // multiple of 32 and each of a subgroup's 32 lanes owns E = W / 32
 // contiguous columns.
 #define ATTENTION_W uint(2ul * SEISMIC_DIM_P + SEISMIC_DIM_S)
@@ -86,7 +86,7 @@ void attention_load_row(Stored source, uint64_t index, out float x[ATTENTION_E])
 }
 
 void attention_load_row(uint64_t base, uint64_t index, out float x[ATTENTION_E]) {
-    attention_load_row(stored_at_buffer(ELEMENT_ACT, base), index, x);
+    attention_load_row(stored_at_buffer(ACTIVATION_A, base), index, x);
 }
 
 // One value head row at `raw` (A elements) into lane `lane`'s E columns,
@@ -96,7 +96,7 @@ void attention_value(uint64_t raw, uint64_t norm, float epsilon, uint lane, out 
     if (ATTENTION_VALUE_NORM) {
         head_rms_norm(x, norm, 1ul, epsilon, lane);
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            x[i] = element_round(ELEMENT_ACT, x[i]);
+            x[i] = element_round(ACTIVATION_A, x[i]);
     }
 }
 
@@ -125,7 +125,7 @@ void attention_prepare(uint64_t raw, const bool normed, uint64_t norm, uint64_t 
 // without a destination), rounded to A.
 void attention_append(Out history, int destination, uint kv_head, uint lane, float x[ATTENTION_E]) {
     const uint64_t target = (uint64_t(destination) * ATTENTION_KV + kv_head) * ATTENTION_W + lane * ATTENTION_E;
-    if (ELEMENT_ACT != ELEMENT_F32 && ATTENTION_E % 8u == 0u) {
+    if (ACTIVATION_A != ELEMENT_F32 && ATTENTION_E % 8u == 0u) {
         [[unroll]] for (uint c = 0u; c < ATTENTION_E; c += 8u)
             out_put8(history, target + c, vec4(x[c], x[c + 2u], x[c + 4u], x[c + 6u]),
                 vec4(x[c + 1u], x[c + 3u], x[c + 5u], x[c + 7u]));
@@ -509,8 +509,8 @@ void attention_store_gated(uint64_t query, uint64_t gate, Out result, uint64_t r
     float value = attended;
     if (ATTENTION_I > 0u || ATTENTION_U > 0u) {
         const float g = ATTENTION_I > 0u
-            ? element_at(ELEMENT_ACT, query, (row * heads + head) * ATTENTION_QUERY_STRIDE + ATTENTION_W + column)
-            : element_at(ELEMENT_ACT, gate, (row * heads + head) * ATTENTION_U + column % max(ATTENTION_U, 1u));
+            ? element_at(ACTIVATION_A, query, (row * heads + head) * ATTENTION_QUERY_STRIDE + ATTENTION_W + column)
+            : element_at(ACTIVATION_A, gate, (row * heads + head) * ATTENTION_U + column % max(ATTENTION_U, 1u));
         value = ATTENTION_SOFTPLUS ? attended * (max(g, 0.0) + log(1.0 + exp(-abs(g))))
                                    : seismic_div_rn(attended, 1.0 + exp(-g));
     }

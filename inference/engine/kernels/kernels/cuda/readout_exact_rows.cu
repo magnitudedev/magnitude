@@ -2,6 +2,7 @@
 // One warp per 32 vocabulary rows keeps the rows level two leaves (`fine`,
 // `floor`) and projects them exactly over every plane, with the full pass's
 // own routine (`lib/readout/progressive.cuh`); −inf elsewhere.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/readout/progressive.cuh"
 
 #define F32_IN(buffer) reinterpret_cast<const float *>(SEISMIC_PTR(buffer))

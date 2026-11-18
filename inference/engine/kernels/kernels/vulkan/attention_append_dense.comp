@@ -19,6 +19,7 @@
 #define ATTENTION_VALUE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)
 // Both forms' shared code (an entry's includes expand once, whatever the
 // branch).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/attention/history.glsl"
 
 void attention_append_dense() {

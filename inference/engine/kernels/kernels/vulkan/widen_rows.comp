@@ -1,6 +1,7 @@
 // widen_rows: widened[row, column] = f32(rows[row, column]); one invocation
 // per element over a grid-stride loop (the grid is capped below the
 // 65535-group floor).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 void widen_rows() {
@@ -11,6 +12,6 @@ void widen_rows() {
     for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, width)); at.index < count; seismic_walk_next(at)) {
         const uint64_t row = at.axes.x, column = at.axes.w;
         out_put(widened, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-            element_at(ELEMENT_ACT, rows, row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1));
+            element_at(ACTIVATION_A, rows, row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1));
     }
 }

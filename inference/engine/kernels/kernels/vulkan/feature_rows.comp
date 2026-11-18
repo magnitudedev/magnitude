@@ -1,6 +1,7 @@
 // feature_rows: features[row, column] = A(fused[out_rows[row], column]); one
 // invocation per element over a grid-stride loop (the grid is capped below
 // the 65535-group floor).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 void feature_rows() {

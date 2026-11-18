@@ -2,9 +2,10 @@
 // (`lib/routed/output.cuh`) into scratch, the last arriving block of a
 // channel tile joining them (`lib/routed/output_sum.cuh`), without a CPU
 // site.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
-#define ROUTED_PUBLISHED_OUT element::out_over_scratch<element::Act>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PUBLISHED))
-#define ROUTED_PUBLISHED reinterpret_cast<const element::Act::storage *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PUBLISHED))
+#define ROUTED_PUBLISHED_OUT element::out_over_scratch<activation::Act>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PUBLISHED))
+#define ROUTED_PUBLISHED reinterpret_cast<const activation::Act::storage *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PUBLISHED))
 #define ROUTED_SITE_AWAIT(m)
 #define ROUTED_SITE_ADD(m, n, selected)
 #define ROUTED_ARRIVALS reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS))

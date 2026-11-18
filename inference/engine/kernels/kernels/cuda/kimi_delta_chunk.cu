@@ -3,6 +3,7 @@
 // `kimi::ChannelGates`: one log decay per key channel, inside the products),
 // then the gate launch.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/kimi.cuh"
 #include "lib/recurrent/chunk.cuh"
 

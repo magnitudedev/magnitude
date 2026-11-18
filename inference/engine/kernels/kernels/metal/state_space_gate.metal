@@ -6,22 +6,23 @@
 // give the group's sum, and the threads write their share of normalized
 // values (the gate recomputed with the same arithmetic).
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 
 // The gated value of `channel` (in the row's flat head-major order).
-inline float gated_value(device const element::Act::storage *mixed, device const element::Act::storage *projection,
+inline float gated_value(device const activation::Act::storage *mixed, device const activation::Act::storage *projection,
     ulong row, ulong channel, constant ulong *seismic_words) {
     const ulong head = channel / SEISMIC_DIM_P;
-    const float gate = element::Act::load(projection[row * SEISMIC_PROJECTION_STRIDE_0
+    const float gate = activation::Act::load(projection[row * SEISMIC_PROJECTION_STRIDE_0
         + channel * SEISMIC_PROJECTION_STRIDE_1]);
-    return element::Act::load(mixed[row * SEISMIC_MIXED_STRIDE_0 + head * SEISMIC_MIXED_STRIDE_1
+    return activation::Act::load(mixed[row * SEISMIC_MIXED_STRIDE_0 + head * SEISMIC_MIXED_STRIDE_1
                + (channel % SEISMIC_DIM_P) * SEISMIC_MIXED_STRIDE_2])
         * (gate / (1.0f + metal::exp(-gate)));
 }
 
 kernel void state_space_gate(
-    device const element::Act::storage *mixed [[buffer(SEISMIC_BUFFER_MIXED)]],
-    device const element::Act::storage *projection [[buffer(SEISMIC_BUFFER_PROJECTION)]],
+    device const activation::Act::storage *mixed [[buffer(SEISMIC_BUFFER_MIXED)]],
+    device const activation::Act::storage *projection [[buffer(SEISMIC_BUFFER_PROJECTION)]],
     device const float *state_norm [[buffer(SEISMIC_BUFFER_STATE_NORM)]],
     SEISMIC_RESULT_0_PARAM(normalized),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -55,7 +56,7 @@ kernel void state_space_gate(
         const float weight = state_norm[ulong(group.y) * SEISMIC_STATE_NORM_STRIDE_0 + local * SEISMIC_STATE_NORM_STRIDE_1
             + (column % SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_2];
         const float value = gated_value(mixed, projection, row, channel, seismic_words);
-        element::Out<element::Act>(normalized).put(row * SEISMIC_RESULT_0_STRIDE_0
+        element::Out<activation::Act>(normalized).put(row * SEISMIC_RESULT_0_STRIDE_0
             + (channel / SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_1 + (channel % SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_2,
             value * inverse * weight);
     }

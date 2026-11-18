@@ -3,13 +3,14 @@
 // inverse is reduced first (a pass over the decoded row), then the row is
 // decoded again and normalized. Published in the activation type and as F32
 // of that value.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_TABLE
 #include "lib/projection/projection.h"
 #include "lib/core/gathered.h"
 #include "lib/core/reduce.h"
 
-typedef element::Act activation;
-static_assert(activation::bytes == 2, "embedding_rows requires a bf16 or f16 activation");
+typedef activation::Act activation_element;
+static_assert(activation_element::bytes == 2, "embedding_rows requires a bf16 or f16 activation");
 
 constant constexpr uint embedding_threads = 256;
 
@@ -27,8 +28,8 @@ kernel void embedding_rows(
     threadgroup float partials[embedding_threads / 32];
     const uint width = uint(SEISMIC_DIM_D);
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
-    projection::Weights<packets::W0> rows{table, KERNEL_W0_LAYOUT(width), width, nullptr};
-    const element::Out<activation> out(embedded_cells);
+    projection::Weights<packets::W0> rows{{table, KERNEL_W0_LAYOUT(width), width}, nullptr};
+    const element::Out<activation_element> out(embedded_cells);
     const element::Out<element::F32> widened(widened_cells);
     const long held = gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
         SEISMIC_DIM_F, tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0]);
@@ -63,7 +64,7 @@ kernel void embedding_rows(
                 uint column = 32u * p + 8u * step + i;
                 if (column < width) {
                     float decoded = ((i & 1u) ? odd[i >> 1] : even[i >> 1]) * scale;
-                    float value = activation::round(SEISMIC_PARAM_NORMALIZE != 0 ? decoded * inverse : decoded);
+                    float value = activation_element::round(SEISMIC_PARAM_NORMALIZE != 0 ? decoded * inverse : decoded);
                     out.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1, value);
                     widened.put(ulong(row) * SEISMIC_RESULT_1_STRIDE_0 + ulong(column) * SEISMIC_RESULT_1_STRIDE_1, value);
                 }

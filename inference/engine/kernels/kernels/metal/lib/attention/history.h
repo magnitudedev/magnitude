@@ -168,7 +168,7 @@ inline lane_encoding<KEY ? ATTENTION_KEY_BITS : ATTENTION_VALUE_BITS> held_encod
     float rounded[ATTENTION_E];
     ATTENTION_UNROLL
     for (uint i = 0; i < ATTENTION_E; ++i)
-        rounded[i] = element::Act::round(x[i]);
+        rounded[i] = activation::Act::round(x[i]);
     return quantize<KEY ? ATTENTION_KEY_BITS : ATTENTION_VALUE_BITS>(rounded);
 }
 

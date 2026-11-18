@@ -4,7 +4,7 @@
 // memory with the widest aligned system-coherent loads (the host writes
 // staging within the step's command buffer; GGUF rows are contiguous), then
 // its simdgroups place the window's column tiles by `repack_tile`
-// (lib/repack/repack.h, the registered conversion), two tiles a simdgroup,
+// (<seismic/repack.h>, the registered conversion), two tiles a simdgroup,
 // reading the copy. The tile placement is `repack_weight`'s, so a slot holds
 // exactly the bytes a resident import places. A dense float record
 // (`B::dense()`: `repack` between dense representations) converts runs of
@@ -16,7 +16,7 @@
 // `control.h` first.
 
 #include <seismic/slab.h>
-#include "../repack/repack.h"
+#include <seismic/repack.h>
 #include "../../../streaming/window.hpp"
 
 #define STAGED volatile coherent(system) device const uchar

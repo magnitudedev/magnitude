@@ -21,7 +21,7 @@ struct Taps {
 // The convolution input rows of slot-local row `local` for taps 0..C: the
 // raw input row at slot-local `position` is the source version's window row
 // before the slot, read through its const view, and the projection's after.
-inline Taps taps(device const Storage *projection, device const slab::Table<element::Act> *window, Slot slot,
+inline Taps taps(device const Storage *projection, device const slab::Table<activation::Act> *window, Slot slot,
     long local, constant ulong *seismic_words) {
     device const Storage *source = versions::bank_view(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     Taps taps;
@@ -40,7 +40,7 @@ inline float convolve(device const float *convolution, thread const Taps &taps,
     float sum = 0.0f;
     RECURRENT_UNROLL for (uint tap = 0; tap < RECURRENT_TAPS; ++tap) {
         sum = metal::fma(convolution[channel * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1],
-            element::Act::load(taps.rows[tap][channel]), sum);
+            activation::Act::load(taps.rows[tap][channel]), sum);
     }
     return sum / (1.0f + metal::exp(-sum));
 }
@@ -54,7 +54,7 @@ inline float4 convolve4(device const float *convolution, thread const Taps &taps
         RECURRENT_UNROLL for (uint e = 0; e < 4; ++e) {
             weights[e] = convolution[(channel + e) * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1];
         }
-        sum = metal::fma(weights, element::Act::load4(taps.rows[tap] + channel), sum);
+        sum = metal::fma(weights, activation::Act::load4(taps.rows[tap] + channel), sum);
     }
     return sum / (1.0f + metal::exp(-sum));
 }
@@ -63,7 +63,7 @@ inline float4 convolve4(device const float *convolution, thread const Taps &taps
 // and the source window (`convolve`).
 struct Convolving {
     device const Storage *projection;
-    device const slab::Table<element::Act> *window;
+    device const slab::Table<activation::Act> *window;
     device const float *convolution;
     Slot slot;
     struct Row {
@@ -85,16 +85,16 @@ struct Convolving {
 // C - 1 raw rows before the publication row, then the raw rows of its tape):
 // its value channels and the q/k channels of the key heads congruent to it.
 // Thread `thread_index` of `threads` copies an even share.
-inline void publish_window(device const Storage *projection, device const slab::Table<element::Act> *window,
+inline void publish_window(device const Storage *projection, device const slab::Table<activation::Act> *window,
     Slot slot, ulong head, uint thread_index, uint threads, constant ulong *seismic_words) {
     const ulong width = SEISMIC_DIM_W;
     const ulong key_heads = SEISMIC_DIM_NK;
     const ulong value_heads = SEISMIC_DIM_NV;
     const long taps = long(RECURRENT_TAPS) - 1;
     const long rows = taps + versions::tape_rows(slot, long(SEISMIC_DIM_T));
-    const element::Out<element::Act> target_window =
+    const element::Out<activation::Act> target_window =
         versions::bank(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
-    const element::Out<element::Act> source_window =
+    const element::Out<activation::Act> source_window =
         versions::bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     const ulong owned = key_heads > head ? (key_heads - head - 1) / value_heads + 1 : 0;
     const ulong per_tap = width + 2 * width * owned;

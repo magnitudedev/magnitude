@@ -15,14 +15,13 @@
 // The includer defines ROUTED_SOURCE_ROWS, the sources' rows: the entry's
 // XS, or a streamed entry's fixed SOURCE_ROWS.
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define ROUTED_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "routed_down requires a bf16 or f16 activation"
 #endif
+#define ROUTED_ACT ACTIVATION_A
 // The down weight's operand row (the product row, or NVFP4 operands), which
 // each choice's GEMV forms while staging it.
-#if defined(SEISMIC_EXPERT_DOWN_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_EXPERT_DOWN)
 #define DOWN_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define DOWN_OPERANDS PROJECTION_OPERANDS_ROUNDED

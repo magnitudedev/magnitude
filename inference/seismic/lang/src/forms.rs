@@ -1579,7 +1579,7 @@ mod tests {
     }
 
     /// A native whose launches stage their weights' tables at the end of
-    /// their shared regions (its source defines `PACKETS_STAGED_TABLES` 1,
+    /// their shared regions (its source defines `PACKETS_CONFIG_STAGED_TABLES` 1,
     /// `vulkan/packets.glsl`) has every decoding launch of its projection
     /// (its GEMVs and GEMMs) read `form(W, TABLE)` of every element a slot
     /// of its binds in its `shared_bytes`: the library stages each distinct
@@ -1607,7 +1607,7 @@ mod tests {
         for entry in module.entries() {
             let Some(native) = module.native_implementation(entry.id, BackendName::Vulkan) else { continue };
             let asset = module.native_asset(entry.id, BackendName::Vulkan).expect("a Vulkan native has a source");
-            if !asset.text.lines().any(|line| line.trim() == "#define PACKETS_STAGED_TABLES 1") {
+            if !asset.text.lines().any(|line| line.trim() == "#define PACKETS_CONFIG_STAGED_TABLES 1") {
                 continue;
             }
             staging += 1;

@@ -5,6 +5,7 @@
 // exact level's own recipe. Each threadgroup normalizes its rows in place to
 // 16 rows; past them `stage` normalizes them once into `normalized`, which
 // the staged tiles read.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/readout/progressive.h"
 #include "lib/projection/operator.h"
 #if defined(SEISMIC_FORMING_READOUT_PLANES_ROWS_GEMV) || defined(SEISMIC_FORMING_READOUT_PLANES_ROWS_GEMV_ROWS) || defined(SEISMIC_FORMING_READOUT_PLANES_ROWS_GEMV_PAIR)
@@ -12,11 +13,9 @@
 #endif
 
 // The plane set's weight: its exact view.
-namespace packets {
-typedef ProgressiveExact W0;
-}
+PACKETS_BIND(W0, readout::ProgressiveExact)
 
-typedef progressive::activation activation;
+typedef progressive::activation activation_element;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 constant constexpr bool NVFP4 = false;
 typedef projection::operands<NVFP4> Operands;
@@ -37,10 +36,10 @@ typedef projection::operands<NVFP4> Operands;
 // `stage` normalizes, which the staged tiles read.
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_V), k = uint(SEISMIC_DIM_D); \
-    projection::InputOf<activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+    projection::InputOf<activation_element, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
         raw{hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0, \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
-    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    const projection::Plain<activation_element, projection::AllRows> in{normalized, k, 1, k, {}}; \
     const projection::Logits out{element::Out<element::F32>(logits), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
         as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))};                                   \
     const projection::Weights<packets::W0> w{top, SEISMIC_TOP_STRIDE_0, bit3, SEISMIC_BIT3_STRIDE_0, rest, \

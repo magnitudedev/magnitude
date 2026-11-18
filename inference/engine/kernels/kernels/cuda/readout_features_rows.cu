@@ -1,5 +1,6 @@
 // readout_features_rows: the final RMS prologue over the demanded rows
 // (`out_rows` gather), published as A. One block per output row.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/projection/projection.cuh"
 
 extern "C" __global__ void readout_features_rows(SEISMIC_KERNEL_PARAMS) {

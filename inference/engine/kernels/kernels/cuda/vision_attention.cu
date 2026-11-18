@@ -3,12 +3,13 @@
 // the [M, H + 2KV, WP] operand rows: H query heads, then KV key heads, then KV
 // value heads (W = 4P, WP = W rounded up to 16, the pad zero); the attend launch runs 64 query rows of one head per block over the
 // keys of their spans. Bodies in lib/vision/vision.cuh.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/vision/vision.cuh"
 
 using vision::u32;
 using vision::u64;
 using vision::u8;
-typedef element::Act A;
+typedef activation::Act A;
 
 constexpr u64 H = (u64)SEISMIC_DIM_KV * SEISMIC_DIM_G;
 constexpr u64 SLOTS = H + 2 * (u64)SEISMIC_DIM_KV;
