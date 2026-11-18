@@ -4,7 +4,7 @@ import { Option } from "effect"
 import { CatalogFormModelIdSchema, type LocalModel, type RecommendedModel } from "@magnitudedev/sdk"
 import { makeSetupModel } from "@magnitudedev/client-common/fixtures/model"
 import { offeredFromRecommendation } from "./data"
-import { RecommendedForYourMachine, useRecommendedSelection } from "./recommended-for-your-machine"
+import { RecommendedForYourMachine, selectedModel, useRecommendedSelection } from "./recommended-for-your-machine"
 import type { Recommendation, RecommendationsView } from "./recommendations"
 
 const GB = 1e9
@@ -26,16 +26,15 @@ function Shown({ measuring }: { measuring: RecommendationsView["measuring"] }) {
 /** Whether any button or link sits inside a button or an element acting as one. */
 const nestsControls = (html: string) => /role="button"/.test(html) || /<button\b(?:(?!<\/button>).)*<(?:button|a)\b/s.test(html)
 
-const STATUS = /<span role="status"[^>]*>.*?<\/span><\/span>/
+const STATUS = /<span role="status".*?<\/span><\/span><\/span>/
 
 describe("Recommended for your machine", () => {
-  it("says quants are still being measured in its title's row, leaving the cards exactly as they are without it", () => {
-    const measuring = renderToStaticMarkup(<Shown measuring={{ settled: 29, total: 36 }} />)
+  it("says how far measuring has come in its title's row, with the count and a bar, leaving everything else as it is", () => {
+    const measuring = renderToStaticMarkup(<Shown measuring={{ settled: 12, total: 36 }} />)
     const settled = renderToStaticMarkup(<Shown measuring={null} />)
-    expect(measuring).toContain("Measuring 7 more quants")
-    expect(measuring).toContain('title="Still measuring how 7 more quants run on this computer')
-    expect(measuring.indexOf("Measuring 7 more quants")).toBeLessThan(measuring.indexOf("Only models from US developers"))
-    expect(measuring.indexOf("Measuring 7 more quants")).toBeLessThan(measuring.indexOf("Qwen3.8 Flash Next"))
+    expect(measuring).toContain("Measuring speeds on this computer · 12 of 36")
+    expect(measuring).toContain("width:33.33")
+    expect(measuring.indexOf("Measuring speeds")).toBeLessThan(measuring.indexOf("Only models from US developers"))
     expect(measuring.replace(STATUS, "")).toBe(settled)
   })
 
@@ -43,5 +42,25 @@ describe("Recommended for your machine", () => {
     const html = renderToStaticMarkup(<Shown measuring={null} />)
     expect(html).toContain('aria-expanded="true"')
     expect(nestsControls(html)).toBe(false)
+  })
+})
+
+describe("the chosen recommendation", () => {
+  const listed = (...keys: string[]) => keys.map(key => ({ model: { key }, note: undefined }) as unknown as Recommendation)
+
+  it("stays chosen while it is offered, whatever is added above it or filtered out around it", () => {
+    expect(selectedModel("lfm3", listed("qwen27", "lfm25", "lfm3"))).toBe("lfm3")
+    expect(selectedModel("lfm3", listed("lfm25", "lfm3", "flash"))).toBe("lfm3")
+  })
+
+  it("opens the first until one is chosen, none once closed, and the first again once the chosen one isn't offered", () => {
+    expect(selectedModel(undefined, listed("a", "b"))).toBe("a")
+    expect(selectedModel(null, listed("a", "b"))).toBeNull()
+    expect(selectedModel("gone", listed("a", "b"))).toBe("a")
+  })
+
+  it("opens the first while a filter leaves the chosen model out, and the chosen one again once it is back", () => {
+    expect(selectedModel("qwen4", listed("lfm25", "lfm3"))).toBe("lfm25")
+    expect(selectedModel("qwen4", listed("qwen4", "lfm25", "lfm3"))).toBe("qwen4")
   })
 })

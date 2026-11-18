@@ -8,7 +8,7 @@ import { discoveredModel, onThisComputer, unrunnableFile } from "./data"
 import { machineView } from "./machine"
 import { Onboarding, preparationLabels, type PreparationStep } from "./onboarding"
 import { recordOnboardingCompleted } from "./onboarding-record"
-import { recommendedForYourMachine, useRecommendations } from "./recommendations"
+import { recommendationsSettled, recommendedForYourMachine, useRecommendations } from "./recommendations"
 
 /** First run on the service's data: the machine, models already found, and the top recommendations that run well here. */
 export function OnboardingScreen() {
@@ -34,8 +34,8 @@ export function OnboardingScreen() {
     { label: preparationLabels[1], done: Result.isSuccess(hardware), detail: null, fraction: null },
     { label: preparationLabels[2], done: preparation?.discovery.complete ?? false,
       detail: preparation && (preparation.discovery.complete || found.length > 0) ? `${plural(found.length, "model")} found` : null, fraction: null },
-    // Measuring never blocks onboarding once a model can be offered: a quant whose measurement doesn't finish is left out.
-    { label: preparationLabels[3], done: recommendations.ready && (recommendations.measuring === null || offered.length > 0),
+    // The models are offered once every quant has been measured, so the list never changes under the reader.
+    { label: preparationLabels[3], done: recommendationsSettled(recommendations),
       detail: recommendations.measuring && recommendations.measuring.total > 0 ? `${recommendations.measuring.settled} of ${plural(recommendations.measuring.total, "quant")}` : null,
       fraction: recommendations.measuring && recommendations.measuring.total > 0 ? recommendations.measuring.settled / recommendations.measuring.total : null },
   ]
@@ -49,7 +49,6 @@ export function OnboardingScreen() {
     discovered={found.flatMap(model => { const view = discoveredModel(model); return view ? [view] : [] })}
     unrunnable={(local?.unsupported ?? []).map(unrunnableFile)}
     recommendations={offered}
-    measuring={measuring ? null : recommendations.measuring}
     roomNote={recommendations.roomShortfall && !measuring
       ? `${recommendations.roomShortfall.name} would be the top pick here with ${formatStorageSize(recommendations.roomShortfall.missingBytes)} more free disk space.`
       : null}

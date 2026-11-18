@@ -9,7 +9,7 @@ import { cardClass, LabMark, MachineCard } from "./parts"
 import { MachineCardSkeleton, OfferedModelsSkeleton } from "./skeletons"
 import type { OfferedModel } from "./expanding-model"
 import { RecommendedForYourMachine, useRecommendedSelection } from "./recommended-for-your-machine"
-import type { Recommendation, RecommendationsView } from "./recommendations"
+import type { Recommendation } from "./recommendations"
 import { downloadContents } from "./data"
 import type { UnrunnableFile } from "./your-models"
 import type { MachineView, QuantView } from "./view"
@@ -64,15 +64,15 @@ function PreparationProgress({ steps }: { steps: readonly PreparationStep[] }) {
 
 /** Onboarding before the app has reached the service: the first step under way, the rest to come. */
 export function OnboardingStarting() {
-  return <Onboarding machine={null} discovered={[]} unrunnable={[]} recommendations={[]} roomNote={null} measuring={null} usOnly={false} setUsOnly={() => {}} owned={new Set()}
+  return <Onboarding machine={null} discovered={[]} unrunnable={[]} recommendations={[]} roomNote={null} usOnly={false} setUsOnly={() => {}} owned={new Set()}
     preparation={preparationLabels.map((label, index) => ({ label, detail: null, fraction: null, state: index === 0 ? "active" : "pending" }))}
     onDownload={() => {}} onFinish={() => {}} />
 }
 
 /** First run, in a modal over the app: what's already here, and one recommended model to download. */
-export function Onboarding({ machine, preparation, discovered, unrunnable, recommendations, roomNote, measuring: measuringQuants, usOnly, setUsOnly, owned, onDownload, onFinish }: {
+export function Onboarding({ machine, preparation, discovered, unrunnable, recommendations, roomNote, usOnly, setUsOnly, owned, onDownload, onFinish }: {
   machine: MachineView | null; preparation: readonly PreparationStep[] | null; discovered: readonly DiscoveredModel[]; unrunnable: readonly UnrunnableFile[]
-  recommendations: readonly Recommendation[]; roomNote: string | null; measuring: RecommendationsView["measuring"]; usOnly: boolean; setUsOnly: (value: boolean) => void; owned: ReadonlySet<string>
+  recommendations: readonly Recommendation[]; roomNote: string | null; usOnly: boolean; setUsOnly: (value: boolean) => void; owned: ReadonlySet<string>
   onDownload: (model: OfferedModel, quant: QuantView) => void; onFinish: () => void
 }) {
   const measuring = preparation !== null
@@ -113,7 +113,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
         </div>}
       </div>}
 
-      <RecommendedForYourMachine recommendations={recommendations} placeholder={measuring ? <OfferedModelsSkeleton firstOpened /> : null} measuring={measuringQuants}
+      <RecommendedForYourMachine recommendations={recommendations} placeholder={measuring ? <OfferedModelsSkeleton firstOpened /> : null} measuring={null}
         usOnly={usOnly} setUsOnly={setUsOnly} owned={owned} selection={selection} className={roomNote && !preparation && discovered.length === 0 ? "mt-5" : "mt-8"} />
 
     </div>

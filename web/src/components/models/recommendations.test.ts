@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import type { RecommendedModel } from "@magnitudedev/sdk"
-import { onboardingChoices, recommendedForYourMachine, stillMeasuring, type OfferedRecommendation } from "./recommendations"
+import { onboardingChoices, recommendationsSettled, recommendedForYourMachine, type OfferedRecommendation, type RecommendationsView } from "./recommendations"
 import type { OfferedModel } from "./expanding-model"
 
 const offer = (base: string, options: { chosen?: boolean; floor?: boolean; speed?: number | null; measuring?: boolean }): OfferedRecommendation => {
@@ -51,10 +51,25 @@ describe("Recommended for your machine", () => {
   })
 })
 
-describe("the line about quants still being measured", () => {
-  it("says how many are left, and nothing once all are settled", () => {
-    expect(stillMeasuring({ settled: 29, total: 36 })).toContain("7 more quants")
-    expect(stillMeasuring({ settled: 35, total: 36 })).toContain("1 more quant runs")
-    expect(stillMeasuring(null)).toBeNull()
+describe("when Recommended for your machine shows its list", () => {
+  const view = (measuring: RecommendationsView["measuring"], ready = true): RecommendationsView => ({ ready, measuring, offered: [], roomShortfall: null, families: [] })
+
+  it("shows no list while any quant is still being measured, nor before the recommendations are read", () => {
+    expect(recommendationsSettled(view({ settled: 12, total: 36 }))).toBe(false)
+    expect(recommendationsSettled(view(null, false))).toBe(false)
+    expect(recommendationsSettled(view(null))).toBe(true)
+  })
+
+  it("shows the three smartest that run well, smartest first, once measuring is done", () => {
+    const settled = [offer("flash", { floor: true, speed: 78 }), offer("qwen27", { floor: true, speed: 26 }), offer("lfm25", { floor: true, speed: 110 }), offer("lfm3", { floor: true, speed: 160 })]
+    expect(recommendedForYourMachine(settled, new Set()).map(entry => [entry.model.key, entry.note]))
+      .toEqual([["flash", "Smartest that runs well here"], ["qwen27", undefined], ["lfm25", "Fastest"]])
+  })
+
+  it("lists the same models again when the US filter is turned on and off", () => {
+    const all = [offer("qwen4", { floor: true, speed: 70 }), offer("lfm25", { floor: true, speed: 110 }), offer("lfm3", { floor: true, speed: 160 })]
+    const before = recommendedForYourMachine(all, new Set())
+    expect(recommendedForYourMachine(all.filter(entry => entry.model.key !== "qwen4"), new Set()).map(entry => entry.model.key)).toEqual(["lfm25", "lfm3"])
+    expect(recommendedForYourMachine(all, new Set())).toEqual(before)
   })
 })

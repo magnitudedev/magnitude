@@ -57,19 +57,8 @@ export const recommendedForYourMachine = (offered: readonly OfferedRecommendatio
   })
 }
 
-/** The quants still being measured, as a line beside offers already made from those that were. */
-export const stillMeasuring = (measuring: RecommendationsView["measuring"]): string | null => {
-  if (measuring === null || measuring.total <= measuring.settled) return null
-  const left = measuring.total - measuring.settled
-  return `Still measuring how ${left} more ${left === 1 ? "quant runs" : "quants run"} on this computer; more may be offered when that finishes.`
-}
-
-/** The quants still being measured, in the few words beside a section's title: "Measuring 7 more quants". */
-export const measuringBrief = (measuring: RecommendationsView["measuring"]): string | null => {
-  if (measuring === null || measuring.total <= measuring.settled) return null
-  const left = measuring.total - measuring.settled
-  return `Measuring ${left} more ${left === 1 ? "quant" : "quants"}`
-}
+/** Whether "Recommended for your machine" can show its list: once the recommendations are read and every quant measured. */
+export const recommendationsSettled = (view: RecommendationsView): boolean => view.ready && view.measuring === null
 
 export interface RecommendationsView {
   readonly ready: boolean
