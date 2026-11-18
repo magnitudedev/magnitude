@@ -35,11 +35,3 @@ pub use tokenizer::{
     AddedTokenEnd, BpeConfig, ByteBpeTokenizer, EncodedSequence, Normalization, PieceEncoding,
     PieceKind, SpecialTokens, Split, SplitBehavior, TokenDecoder, TokenizerError,
 };
-
-/// Measured physical execution time attributed to a request. Durations are
-/// accumulated at completed program boundaries, in nanoseconds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ExecutionTimings {
-    pub prompt_ns: u64,
-    pub predicted_ns: u64,
-}

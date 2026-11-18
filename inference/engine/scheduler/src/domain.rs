@@ -134,7 +134,7 @@ pub enum FlightOutcomes {
     Target(Vec<PendingOperationOutcome>),
     Head(Vec<PendingOperationOutcome>),
     Vision(PendingOperationOutcome),
-    Priming(magnitude_executor::RequestId, std::time::Duration),
+    Priming(magnitude_executor::RequestId),
 }
 
 /// Reserve and submit one group. Submission moves the bindings into the
@@ -223,7 +223,7 @@ pub fn finish<F: ProgramFamily>(
             .map(|(outcome, bindings)| (FlightOutcomes::Vision(outcome), TargetContinuation::Ready(bindings))),
         DomainFlight::Priming(flight) => domain
             .finish_priming(flight)
-            .map(|(request, duration, bindings)| (FlightOutcomes::Priming(request, duration), TargetContinuation::Ready(bindings))),
+            .map(|(request, bindings)| (FlightOutcomes::Priming(request), TargetContinuation::Ready(bindings))),
     }
 }
 

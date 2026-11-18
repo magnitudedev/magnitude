@@ -185,7 +185,6 @@ pub struct PrimingCompletionFlight<F: ProgramFamily> {
     pub(super) work: PrimingFlight<F::HeadSubmission>,
     pub(super) target_end: usize,
     pub(super) bindings: StateBindings,
-    pub(super) started: Instant,
 }
 
 impl<F: ProgramFamily> PrimingCompletionFlight<F> {

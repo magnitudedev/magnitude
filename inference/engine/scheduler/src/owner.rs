@@ -21,9 +21,9 @@ use super::{
     },
     protocol::{RequestSnapshot, RoomGrant, RoomRefusal, WorkerReply},
     publication::{
-        CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationQueue,
+        CapacityResource, ModelUnloadCause, PublicationPermit, PublicationQueue,
         PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
-        RequestError, ServiceCapacityError,
+        RequestError, RequestTimings, ServiceCapacityError,
     },
     round_driver::{RoundError, lower_round, reconcile_forward},
     serving::ServingCensus,
@@ -45,7 +45,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     num::NonZeroU64,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Where a newly admitted request stops its prefill to retain branch
@@ -277,9 +277,7 @@ fn ended(generation: &Generation) -> bool {
 struct Record {
     waiting_since: u64,
     service_ns: u64,
-    physical_timings: PhysicalTimings,
-    /// Purpose of the current operation chain, retained across pending/parked work.
-    timing_phase: TimingPhase,
+    clock: RequestClock,
     error: Option<RequestError>,
     preemption_debt: u32,
     /// Whether the request resumes from and contributes to the prefix cache.
@@ -301,47 +299,55 @@ struct Record {
     publication_permits: VecDeque<PublicationPermit>,
 }
 
-/// Request service purpose, independent of target/head lane and replay geometry.
+/// A request's wall-clock timing, kept as llama.cpp's server keeps a slot's:
+/// its prompt from the first service it receives to its first accepted output
+/// token, its generation from there to its latest accepted token. Everything in
+/// between counts, whatever the engine spent it on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TimingPhase {
-    Prompt,
-    Generation,
-    Retention,
+enum RequestClock {
+    /// Admitted, never served.
+    Waiting,
+    /// Served since `started`, no output accepted yet.
+    Prompt { started: Instant },
+    /// Output accepted: the first token at `first`, the latest at `latest`.
+    Generating { started: Instant, first: Instant, latest: Instant },
 }
 
-impl TimingPhase {
-    fn add(self, timings: &mut PhysicalTimings, duration: Duration) {
-        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-        let bucket = match self {
-            Self::Prompt => &mut timings.prompt_ns,
-            Self::Generation => &mut timings.predicted_ns,
-            Self::Retention => return,
+impl RequestClock {
+    /// The request receives service at `now`: its prompt starts at its first.
+    fn serve(&mut self, now: Instant) {
+        if let Self::Waiting = self {
+            *self = Self::Prompt { started: now };
+        }
+    }
+
+    /// The request's generation accepted output at `now`.
+    fn accepted(&mut self, now: Instant) {
+        *self = match *self {
+            Self::Waiting => panic!("output accepted for a request never served"),
+            Self::Prompt { started } => Self::Generating { started, first: now, latest: now },
+            Self::Generating { started, first, .. } => Self::Generating { started, first, latest: now },
         };
-        *bucket = bucket.saturating_add(nanos);
+    }
+
+    /// The timings of a request that completes at `now`.
+    fn timings(self, now: Instant) -> RequestTimings {
+        let nanos = |duration: Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        match self {
+            Self::Waiting => RequestTimings::default(),
+            Self::Prompt { started } => RequestTimings {
+                prompt_ns: nanos(now - started),
+                predicted_ns: 0,
+            },
+            Self::Generating { started, first, latest } => RequestTimings {
+                prompt_ns: nanos(first - started),
+                predicted_ns: nanos(latest - first),
+            },
+        }
     }
 }
 
 impl Record {
-    fn begin_service(&mut self, candidate: &Candidate) {
-        // A newly started chain owns its accounting purpose. Follow-up priming
-        // inherits it even after the target publishes its first token. Resuming
-        // pending/parked operations must not reclassify that existing chain.
-        if candidate.composed().is_none() {
-            let generation = candidate.generation();
-            self.timing_phase = if owes_reconciliation(self, generation) {
-                TimingPhase::Retention
-            } else if generation.generated().is_empty() {
-                TimingPhase::Prompt
-            } else {
-                TimingPhase::Generation
-            };
-        }
-    }
-
-    fn add_physical_duration(&mut self, duration: Duration) {
-        self.timing_phase.add(&mut self.physical_timings, duration);
-    }
-
     /// Drop everything the host would still receive.
     fn release_publication(&mut self) {
         self.pending_publication = None;
@@ -1205,8 +1211,7 @@ impl<F: ProgramFamily> Service<F> {
                 record: Record {
                     waiting_since: now,
                     service_ns: 0,
-                    physical_timings: PhysicalTimings::default(),
-                    timing_phase: TimingPhase::Prompt,
+                    clock: RequestClock::Waiting,
                     error: None,
                     preemption_debt: 0,
                     prefix_cache,
@@ -1450,7 +1455,7 @@ impl<F: ProgramFamily> Service<F> {
                         finish,
                         generation.detailed_usage(),
                         generation.method_identity().to_owned(),
-                        record.physical_timings,
+                        record.clock.timings(Instant::now()),
                     ),
                 }
             }
@@ -2315,7 +2320,7 @@ impl<F: ProgramFamily> Service<F> {
         selections: usize,
         bindings: &mut StateBindings,
     ) -> Result<Start, Fatal> {
-        record.begin_service(&candidate);
+        record.clock.serve(Instant::now());
         let generation = match candidate {
             Candidate::Parked(round, work) => {
                 return Ok(Start::Joined(
@@ -2913,12 +2918,7 @@ impl<F: ProgramFamily> Service<F> {
             FlightOutcomes::Target(pending) => self.reconcile_target(&mut round, pending, &operations),
             FlightOutcomes::Head(pending) => self.reconcile_method(&mut round, pending, &operations),
             FlightOutcomes::Vision(item) => self.reconcile_vision(&mut round, item, &operations),
-            FlightOutcomes::Priming(request, duration) => {
-                if let Some(member) = round.members.get_mut(&request) {
-                    member.record.add_physical_duration(duration);
-                }
-                Ok(())
-            }
+            FlightOutcomes::Priming(_) => Ok(()),
         };
         if let Err(error) = reconciled {
             return Err((Some(round.members), error));
@@ -2991,15 +2991,18 @@ impl<F: ProgramFamily> Service<F> {
                 self.domain.abort(item).map_err(classify_domain_error)?;
                 continue;
             };
-            record.add_physical_duration(item.physical_duration());
             // The member returns to the round before any fatal error is
             // returned: the owner terminates the round's members with it, and
             // a member held here would be dropped without its outcome.
             let (state, fatal) = match state {
                 Membership::Started(mut started) if !ended(started.generation()) => {
                     started.timed(TimedLaunch::Target, item.launch_duration(), sequences, rows);
+                    let output = started.generation().generated().len();
                     match reconcile_forward(started, &mut self.domain, request, item) {
                         Ok((generation, effects)) => {
+                            if generation.generated().len() > output {
+                                record.clock.accepted(Instant::now());
+                            }
                             followups.extend(effects.operations);
                             (Membership::Generation(generation), None)
                         }
@@ -3078,7 +3081,6 @@ impl<F: ProgramFamily> Service<F> {
                 self.domain.abort(item).map_err(classify_domain_error)?;
                 continue;
             };
-            member.record.add_physical_duration(item.physical_duration());
             let Membership::Generation(generation) = &mut member.state else {
                 return Err(invariant("service method flight")(
                     "drafter work reached a request with a started target round".into(),
@@ -3155,9 +3157,6 @@ impl<F: ProgramFamily> Service<F> {
         let Some(member) = round.members.get_mut(&request) else {
             return self.domain.abort(item).map_err(classify_domain_error);
         };
-        member
-            .record
-            .add_physical_duration(item.physical_duration());
         if ended(member.state.generation()) {
             return self.domain.abort(item).map_err(classify_domain_error);
         }
@@ -3536,7 +3535,7 @@ impl<F: ProgramFamily> Service<F> {
                         finish,
                         generation.detailed_usage(),
                         generation.method_identity().to_owned(),
-                        record.physical_timings,
+                        record.clock.timings(Instant::now()),
                     ),
                 }
             }
@@ -3897,16 +3896,6 @@ mod termination_tests {
 #[cfg(test)]
 mod timing_tests {
     use super::*;
-    use magnitude_executor::{FeatureReader, FeatureRows, FeatureSpan};
-    use magnitude_generation::{RoundStart, TokenId};
-    use std::time::Duration;
-
-    struct NoFeatures;
-    impl FeatureReader for NoFeatures {
-        fn read(&mut self, _: &FeatureSpan) -> Result<FeatureRows, String> {
-            panic!("plain prompt needs no features")
-        }
-    }
 
     /// A lone prefill group queues its next chunk only when nothing outside
     /// the round competes for the device: another live request's work would
@@ -3914,8 +3903,7 @@ mod timing_tests {
     #[test]
     fn only_live_work_outside_the_round_competes_with_a_queued_chunk() {
         let record = || Record {
-            waiting_since: 0, service_ns: 0, physical_timings: PhysicalTimings::default(),
-            timing_phase: TimingPhase::Prompt, error: None, preemption_debt: 0,
+            waiting_since: 0, service_ns: 0, clock: RequestClock::Waiting, error: None, preemption_debt: 0,
             prefix_cache: true, prefix_source: None,
             prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
             publication: None, publication_batch_limit: 4, pending_publication: None,
@@ -3960,89 +3948,44 @@ mod timing_tests {
         assert!(!computes_toward(&State::Between(cancelled, Stage::NonResident(None)), 1, |_| 0));
     }
 
+    /// The prompt runs from the request's first service to its first
+    /// accepted token, the generation from there to its latest: later
+    /// service (a round resumed, a recovery) restarts neither.
     #[test]
-    fn published_prompt_token_does_not_reclassify_parked_or_pending_work() {
-        let mut record = Record {
-            waiting_since: 0, service_ns: 0, physical_timings: PhysicalTimings::default(),
-            timing_phase: TimingPhase::Prompt, error: None, preemption_debt: 0,
-            prefix_cache: true, prefix_source: None,
-            prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
-            publication: None, publication_batch_limit: 4, pending_publication: None,
-            publication_permits: VecDeque::new(),
-        };
-        let candidate = Candidate::Ready(super::termination_tests::generation());
-        record.begin_service(&candidate);
-        let Candidate::Ready(generation) = candidate else { unreachable!() };
-        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4) else {
-            panic!("prompt round")
-        };
-        let work = lower_round(&round, RequestId(1), 0, None).unwrap();
-        let candidate = Candidate::Parked(round, Work(vec![work.clone()]));
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Prompt);
-        let Candidate::Parked(round, _) = candidate else { unreachable!() };
-        let transition = round.prepare_round_transition(
-            RequestId(1), &[TokenId(3)], None, &mut NoFeatures,
-        ).unwrap();
-        let (generation, _) = round.commit(transition);
-        assert_eq!(generation.generated(), &[TokenId(3)]);
-        // Pending operations retain the origin even though publication changed
-        // generation state. The operation's lane/kind is irrelevant here.
-        let candidate = Candidate::Pending(generation, Work(vec![work]));
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Prompt);
-        let Candidate::Pending(mut generation, _) = candidate else { unreachable!() };
-        generation.evicted().unwrap();
-        let candidate = Candidate::NonResident(generation);
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Generation);
+    fn the_clock_times_the_prompt_to_the_first_token_and_generation_to_the_latest() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut clock = RequestClock::Waiting;
+        clock.serve(at(0));
+        clock.serve(at(5));
+        clock.accepted(at(100));
+        clock.serve(at(150));
+        clock.accepted(at(160));
+        clock.accepted(at(400));
+        assert_eq!(
+            clock.timings(at(1000)),
+            RequestTimings { prompt_ns: 100_000_000, predicted_ns: 300_000_000 }
+        );
+    }
 
-        let generation = super::termination_tests::generation_with_limit(1);
-        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4) else {
-            panic!("terminal prompt round")
-        };
-        let transition = round.prepare_round_transition(
-            RequestId(1), &[TokenId(3)], None, &mut NoFeatures,
-        ).unwrap();
-        let (generation, _) = round.commit(transition);
-        assert!(owes_reconciliation(&record, &generation));
-        let candidate = Candidate::Ready(generation);
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Retention);
-        let Candidate::Ready(generation) = candidate else { unreachable!() };
-        let round = generation.start_reconciliation(4).unwrap_or_else(|(_, e)| panic!("{e}"));
-        let work = lower_round(&round, RequestId(1), round.generation().resident_position(), None).unwrap();
-        let candidate = Candidate::Parked(round, Work(vec![work]));
-        record.begin_service(&candidate);
-        assert_eq!(record.timing_phase, TimingPhase::Retention);
+    /// A request that ends before any output spent its whole service on
+    /// its prompt; one never served spent nothing.
+    #[test]
+    fn a_request_without_output_times_only_its_prompt() {
+        let start = Instant::now();
+        let mut clock = RequestClock::Waiting;
+        assert_eq!(clock.timings(start), RequestTimings::default());
+        clock.serve(start);
+        assert_eq!(
+            clock.timings(start + Duration::from_millis(7)),
+            RequestTimings { prompt_ns: 7_000_000, predicted_ns: 0 }
+        );
     }
 
     #[test]
-    fn history_work_follows_its_origin_and_retention_is_excluded() {
-        let mut timings = PhysicalTimings::default();
-        // The final target prompt publishes a token before its head priming
-        // completes. Both completions keep the prompt chain's phase.
-        let prompt_chain = TimingPhase::Prompt;
-        prompt_chain.add(&mut timings, Duration::from_millis(100));
-        prompt_chain.add(&mut timings, Duration::from_millis(3));
-        // Recovery can replay prompt rows after output has begun; it is still
-        // generation service, including its deferred head preparation.
-        let recovery_chain = TimingPhase::Generation;
-        recovery_chain.add(&mut timings, Duration::from_millis(7));
-        recovery_chain.add(&mut timings, Duration::from_millis(2));
-        // Retaining finished output does not change either throughput field.
-        TimingPhase::Retention.add(&mut timings, Duration::from_millis(20));
-        TimingPhase::Retention.add(&mut timings, Duration::from_millis(1));
-        assert_eq!(timings.prompt_ns, 103_000_000);
-        assert_eq!(timings.predicted_ns, 9_000_000);
-    }
-
-    #[test]
-    fn measured_duration_accumulation_saturates() {
-        let mut timings = PhysicalTimings { prompt_ns: u64::MAX - 1, predicted_ns: 0 };
-        TimingPhase::Prompt.add(&mut timings, Duration::from_nanos(2));
-        assert_eq!(timings.prompt_ns, u64::MAX);
-        assert_eq!(timings.predicted_ns, 0);
+    #[should_panic(expected = "never served")]
+    fn output_for_a_request_never_served_is_an_invariant_violation() {
+        RequestClock::Waiting.accepted(Instant::now());
     }
 }
 

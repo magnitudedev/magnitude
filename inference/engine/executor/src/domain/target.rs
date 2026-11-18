@@ -1038,7 +1038,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 work,
                 target_end,
                 bindings,
-                started: Instant::now(),
             }),
         };
         Ok((outcomes, continuation))
@@ -1047,7 +1046,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn finish_priming(
         &mut self,
         flight: PrimingCompletionFlight<F>,
-    ) -> Result<(RequestId, Duration, StateBindings), DomainError> {
+    ) -> Result<(RequestId, StateBindings), DomainError> {
         let request = flight.work.request;
         if let Some((_, advance)) = self.finish_priming_work(flight.work)? {
             if self.head.contains_key(&request) {
@@ -1072,7 +1071,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             };
             self.head.insert(request, state);
         }
-        Ok((request, flight.started.elapsed(), flight.bindings))
+        Ok((request, flight.bindings))
     }
 
     fn restore_advances(

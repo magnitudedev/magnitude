@@ -1791,7 +1791,6 @@ fn deferred_priming_keeps_pending_completion_and_reports_device_failure() {
         },
         target_end: 1,
         bindings,
-        started: Instant::now(),
     };
     assert!(!flight.completion().is_complete());
     let woke = Arc::new(AtomicBool::new(false));
@@ -1953,7 +1952,7 @@ fn deferred_priming_commits_after_target_publication_and_releases_leases() {
     }));
     control.resolve(Ok(()));
     assert!(woke.load(Ordering::SeqCst));
-    let (finished, _, mut bindings) = domain.finish_priming(priming).unwrap();
+    let (finished, mut bindings) = domain.finish_priming(priming).unwrap();
     assert_eq!(finished, request);
     let checkpoint = domain.resume_state(request).unwrap();
     assert_eq!(checkpoint.target.position(), 2);
@@ -1996,7 +1995,7 @@ fn a_deferred_entry_commits_with_the_chain_its_chunk_opens() {
         .unwrap();
     assert_eq!(domain.chain_holder(), Some(request));
     control.resolve(Ok(()));
-    let (_, _, mut bindings) = domain.finish_priming(priming).unwrap();
+    let (_, mut bindings) = domain.finish_priming(priming).unwrap();
     assert_eq!(domain.head[&request].position(), 1, "the entry committed with its chunk");
     for position in 1..3 {
         let flight = submit_claimed(&mut domain, bindings, vec![prefill(request, position)]);
@@ -2023,7 +2022,7 @@ fn deferred_priming_aborts_when_its_target_chunk_is_rejected() {
     assert_eq!(domain.target[&request].position(), 0);
     assert!(domain.resume_state(request).is_err());
     control.resolve(Ok(()));
-    let (_, _, bindings) = domain.finish_priming(priming).unwrap();
+    let (_, bindings) = domain.finish_priming(priming).unwrap();
     let checkpoint = domain.resume_state(request).unwrap();
     assert_eq!(checkpoint.target.position(), 0);
     assert_eq!(checkpoint.head.as_ref().unwrap().position(), 0);
@@ -2053,7 +2052,7 @@ fn deferred_priming_prevents_cancelled_request_retirement_until_completion() {
     assert!(domain.input.contains_key(&request));
     assert_eq!(domain.target[&request].position(), 2);
     control.resolve(Ok(()));
-    let (_, _, mut bindings) = domain.finish_priming(priming).unwrap();
+    let (_, mut bindings) = domain.finish_priming(priming).unwrap();
     domain.close(request).unwrap();
     assert!(!domain.input.contains_key(&request));
     assert!(!domain.target.contains_key(&request));

@@ -201,7 +201,8 @@ pub struct RequestProgress {
     pub output_tokens: usize,
 }
 
-/// Measured physical execution time of a completed request.
+/// A completed request's wall-clock timing: its prompt from first service to
+/// first output token, its generation from there to its last.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionTimings {
     pub prompt_ns: u64,
