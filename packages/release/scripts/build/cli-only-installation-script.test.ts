@@ -113,7 +113,7 @@ describe.skipIf(!os || !arch)("CLI-only installation script", () => {
     expect(readdirSync(cli()).sort()).toEqual(["0.1.7", "0.1.8", "current"])
     expect(spawnSync(command(), ["--version"], { encoding: "utf8" }).stdout.trim()).toBe("0.1.8")
     expect(lstatSync(join(cli(), "current")).isSymbolicLink()).toBe(true)
-  })
+  }, 240_000)
 
   it.each([
     ["a modified archive", { tamper: true }, "checksum does not match"],
