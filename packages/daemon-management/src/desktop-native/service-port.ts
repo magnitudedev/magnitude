@@ -1,4 +1,4 @@
-import { createServer } from "node:net"
+import { connect, createServer } from "node:net"
 import { FetchHttpClient } from "@effect/platform"
 import { Duration, Effect, Layer, Option } from "effect"
 import { MagnitudeClient } from "@magnitudedev/sdk"
@@ -43,6 +43,24 @@ export const portServedByOtherMagnitude = (port: number) => probePort(port).pipe
 
 /** Whether anything holds `port` on loopback, including a server that is still shutting down. */
 export const servicePortBound = (port: number) => probePort(port).pipe(Effect.map(failure => Option.exists(failure, occupied)))
+
+/** Whether something accepts connections on `port` on loopback. */
+const servicePortAccepts = (port: number) => Effect.async<boolean>(resume => {
+  const socket = connect({ host: "127.0.0.1", port })
+  const settle = (accepted: boolean) => { socket.destroy(); resume(Effect.succeed(accepted)) }
+  socket.setTimeout(1000, () => settle(false))
+  socket.once("connect", () => settle(true))
+  socket.once("error", () => settle(false))
+  return Effect.sync(() => socket.destroy())
+})
+
+/**
+ * Whether `port` is still being released: it cannot be bound, yet nothing accepts connections on it. Connections a
+ * stopped server closed linger (TCP TIME_WAIT: 30 s on macOS, read with `net.inet.tcp.msl` 15000), and until they
+ * expire another account cannot bind the port, even with SO_REUSEADDR.
+ */
+export const servicePortLingering = (port: number) => servicePortBound(port).pipe(
+  Effect.flatMap(bound => bound ? servicePortAccepts(port).pipe(Effect.map(accepts => !accepts)) : Effect.succeed(false)))
 
 /**
  * The desktop always serves. A Magnitude it cannot reach through its own lock (another account's, or a

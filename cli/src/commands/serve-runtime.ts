@@ -7,7 +7,7 @@ import { Deferred, Effect, Option, Ref, Runtime, Schema } from "effect"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, holdContainerData, makeUnixProcessContinuation, nativeHostLayer, resolveApplicationProfile,
-  isLegacyServerMarked, resolveInstalledApplicationRuntime, runHeadlessApplication, servicePortBound, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
+  isLegacyServerMarked, resolveInstalledApplicationRuntime, runHeadlessApplication, servicePortBound, servicePortLingering, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { containerImage } from "@magnitudedev/daemon-management/application-update"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { CLI_VERSION } from "../version"
@@ -80,6 +80,7 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const blocker = servingBlocker(stateDirectory, profile.port).pipe(Effect.provide(native))
   /** Waits while the desktop app or another Magnitude serves; resolves once this server may start. */
   const waited = yield* Ref.make(false)
+  const retried = yield* Ref.make(false)
   const awaitTurn = Effect.gen(function* () {
     let announced = false
     while (Option.isSome(yield* blocker)) {
@@ -133,15 +134,21 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     // Another Magnitude may have started between the wait and admission; wait for it rather than fail.
     if (attempt._tag === "Left") {
       if (Option.isSome(yield* blocker)) continue
-      // A Magnitude this server waited on stops answering before it releases the port; give it time to.
-      if ((yield* Ref.get(waited)) && (yield* servicePortBound(profile.port))) {
-        for (let second = 0; second < 30 && (yield* servicePortBound(profile.port)); second++) yield* Effect.sleep("1 second")
+      // A Magnitude that just stopped still holds the port for a while: it stops answering before it closes its
+      // listener, and its closed connections linger after (up to 30 s on macOS, where they keep another account
+      // from binding). Wait for the port while it is being released, then try again once.
+      const releasing = Effect.zipWith(Ref.get(waited), servicePortBound(profile.port), (waited, bound) => waited && bound).pipe(
+        Effect.flatMap(releasing => releasing ? Effect.succeed(true) : servicePortLingering(profile.port)))
+      if (!(yield* Ref.get(retried)) && (yield* releasing)) {
+        for (let second = 0; second < 90 && (yield* servicePortBound(profile.port)); second++) yield* Effect.sleep("1 second")
         yield* Ref.set(waited, false)
+        yield* Ref.set(retried, true)
         continue
       }
       return yield* Effect.fail(attempt.left)
     }
     const stop = attempt.right
+    yield* Ref.set(retried, false)
     // Installation replaces this process on success; otherwise the current version serves again.
     if (stop === "InstallUpdate" && Option.isSome(idle)) yield* idle.value.install
     else if (stop === "DesktopTakeover") yield* awaitDesktop

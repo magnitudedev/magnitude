@@ -23,7 +23,7 @@ export * from "./login-startup"
 export { LinuxTrayHost, linuxTrayHostLayer, type TrayHostState } from "./tray-host"
 
 export { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
-export { requireServicePort, takeOverServicePort, portServedByOtherMagnitude, servicePortBound } from "./service-port"
+export { requireServicePort, takeOverServicePort, portServedByOtherMagnitude, servicePortBound, servicePortLingering } from "./service-port"
 export * from "./serving-turn"
 export { installLinuxApplicationUpdate, guardLinuxInstallerParent, parseLinuxUpdateInstallation } from "./linux-update-maintenance"
 export { LinuxPackageUpdate, linuxPackageUpdateExitCode, linuxUpdateFailureReason } from "./linux-update-package"
