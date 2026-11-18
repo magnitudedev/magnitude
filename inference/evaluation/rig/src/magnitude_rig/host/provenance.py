@@ -243,12 +243,15 @@ def install(root: str) -> str:
     and schema."""
     path = os.path.join(root, *WRAPPER.split("/"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    script = os.path.abspath(__file__)
+    # This file as the rig deploys it, a module of its host package's zip, which runs it by name;
+    # or, run from a source tree, the file itself.
+    archive = getattr(globals().get("__loader__"), "archive", None)
+    command = [sys.executable, archive, __name__] if archive else [sys.executable, os.path.abspath(__file__)]
     if os.name == "nt":
         path += ".cmd"
-        text = '@"%s" "%s" rustc %%*\r\n' % (sys.executable, script)
+        text = "%s rustc %%*\r\n" % " ".join('"%s"' % part for part in command)
     else:
-        text = '#!/bin/sh\nexec %s %s rustc "$@"\n' % (shlex.quote(sys.executable), shlex.quote(script))
+        text = '#!/bin/sh\nexec %s rustc "$@"\n' % shlex.join(command)
     temporary = "%s.%d.tmp" % (path, os.getpid())
     with open(temporary, "w") as stream:
         stream.write(text)

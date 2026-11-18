@@ -13,13 +13,14 @@ from another source, rebuilding only what differs. The working tree's key names 
 directory and its path. A ref is materialized for the run in a temporary directory with
 `git archive` of its `inference/` tree, keeping file times (the commit time), and removed when
 the run ends.
-The working tree's `evaluation/` tools (this rig's host package, the references, the
-benchmark, the fixtures) replace the ref's, so two sources are always measured by the same
-tools, and a ref from before any of them still runs them. The harness is the exception: it is
+The working tree's `evaluation/` tools (the references, the benchmark, the fixtures) replace
+the ref's, so two sources are always measured by the same tools, and a ref from before any of
+them still runs them; the host steps of every source run the controller's own host package
+(`engine.host_module`), never the one in the tree it builds. The harness is the exception: it is
 versioned with the executor it drives, so a ref keeps its own (`evaluation/harness`, with the
 lock its workspace pins), and each instrument reads what either harness records. The ref's key
-is its commit and a digest of the tools overlaid on it (the host package and the venv synced
-from them are the checkout's), so runs of one ref with the same tools find the checkout they
+is its commit and a digest of the tools overlaid on it (the venv synced from them is the
+checkout's), so runs of one ref with the same tools find the checkout they
 last built.
 """
 

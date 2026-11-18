@@ -102,7 +102,6 @@ from .sources import Source
 # In each run's results (`store.results()`): what the run's process printed, its exit code once it has one, its
 # latest report, and every wait on it.
 TRANSCRIPT, CODE, REPORT, WAITS = "mrig.out", "mrig.code", "report.txt", "waits.jsonl"
-HOST_PACKAGE = "evaluation/rig/src"
 CATALOG_TOOL = "{target}/release/magnitude-service-catalog-tool"
 COMPILER = "RUSTC_WORKSPACE_WRAPPER"  # cargo runs rustc for workspace crates through it
 GATE = GateSettings()
@@ -647,8 +646,6 @@ class Plan:
             **{name: _fill(value, tokens) for name, value in step.env},
         }
 
-    def host_module(self, side: Side, *arguments: str) -> tuple[list[str], dict[str, str]]:
-        return host_module(self.remote, self.base(side), *arguments)
 
     def add(self, op: str, **fields) -> None:
         self.ops.append({"op": op, **fields})
@@ -672,9 +669,14 @@ class Plan:
         }
 
 
-def host_module(remote: Remote, checkout: str, *arguments: str) -> tuple[list[str], dict[str, str]]:
-    env = {"PYTHONPATH": f"{checkout}/src/{HOST_PACKAGE}", "PYTHONDONTWRITEBYTECODE": "1"}
-    return [remote.python, "-m", "magnitude_rig.host", *arguments], env
+def host_module(remote: Remote, *arguments: str) -> tuple[list[str], dict[str, str]]:
+    """A host command (`magnitude_rig.host`) and its environment: always from this controller's
+    own host package, deployed to the host when it connected (`connection.py`), never from the
+    tree a run measures, so the controller and every host step speak one protocol whatever
+    tree is built. The package is on PYTHONPATH for what the command starts (a job's host
+    modules)."""
+    return remote.host("magnitude_rig.host", *arguments), {"PYTHONPATH": remote.package,
+                                                          "PYTHONDONTWRITEBYTECODE": "1"}
 
 
 def _fill(text: str, tokens: dict[str, str]) -> str:
@@ -726,7 +728,7 @@ def _prepare(plan: Plan, side: Side) -> None:
 
 def _build(plan: Plan, side: Side) -> None:
     plan.phase(f"build-{side.label}")
-    argv, env = plan.host_module(side, "compiler", "--root", plan.checkout(side))
+    argv, env = host_module(plan.remote, "compiler", "--root", plan.checkout(side))
     plan.step(side, argv, env)
     for step in build_steps(plan.work, side):
         tokens = plan.tokens(side, None)
@@ -735,7 +737,7 @@ def _build(plan: Plan, side: Side) -> None:
     tokens = plan.tokens(side, None)
     output = plan.remote.path("runs", plan.run_id, PROVENANCE.format(side=side.label))
     tests = plan.remote.path("runs", plan.run_id, TESTS.format(side=side.label))  # the runner writes it
-    argv, env = plan.host_module(side, "provenance", "--output", output, "--source", tokens["src"],
+    argv, env = host_module(plan.remote, "provenance", "--output", output, "--source", tokens["src"],
                                  "--target", tokens["target"], "--tests", tests, "--", *_texts(plan, side))
     plan.step(side, argv, env, tests=tests)
     keeps = plan.keeps(side)
@@ -756,8 +758,8 @@ def _acquire(plan: Plan, side: Side) -> None:
         plan.step(side, [tool, "headers", "--output", tokens["catalog"], "--model-store", models], env,
                   unless=_fill(EXPORTED, tokens))
         if acquires.model is not None:
-            argv, module_env = plan.host_module(
-                side, "header-artifacts", "--export", f"{tokens['catalog']}/headers", "--model", acquires.model,
+            argv, module_env = host_module(
+                plan.remote, "header-artifacts", "--export", f"{tokens['catalog']}/headers", "--model", acquires.model,
                 "--output", tokens["artifacts"],
             )
             plan.step(side, argv, module_env)
@@ -787,7 +789,7 @@ def _jobs(plan: Plan) -> None:
             for name, value in vars(replace(GATE, temperatures=plan.remote.temperatures)).items()
             for argument in (f"--{name.replace('_', '-')}", str(value))
         ]
-        argv, env = plan.host_module(side, "gate", "--log", plan.remote.path("runs", plan.run_id, "thermal-gate.jsonl"), *settings)
+        argv, env = host_module(plan.remote, "gate", "--log", plan.remote.path("runs", plan.run_id, "thermal-gate.jsonl"), *settings)
         plan.step(side, argv, env)
     for job in work.jobs:
         side = sides[job.side]
@@ -799,8 +801,8 @@ def _jobs(plan: Plan) -> None:
                   input=json.dumps(side.source.identity.to_json(), indent=2))
         if job.step.fresh:
             fresh = f"{tokens['run_dir']}/artifacts.json"
-            argv, _ = plan.host_module(
-                side, "fresh", "--artifacts", tokens["artifacts"], "--output", fresh,
+            argv, _ = host_module(
+                plan.remote, "fresh", "--artifacts", tokens["artifacts"], "--output", fresh,
                 "--clones", f"{tokens['runs']}/{sync.RUN_CLONES}/{job.name}", "--",
                 *_substitute(job.step.argv, {**tokens, "artifacts": fresh}),
             )
@@ -808,8 +810,8 @@ def _jobs(plan: Plan) -> None:
             argv = _substitute(job.step.argv, tokens)
         # The job inherits `record`'s environment, the host package on PYTHONPATH among it, so a
         # job running a host module names none of its own.
-        record, record_env = plan.host_module(
-            side, "record", "--run-dir", tokens["run_dir"], "--alias", plan.remote.alias, "--", *argv,
+        record, record_env = host_module(
+            plan.remote, "record", "--run-dir", tokens["run_dir"], "--alias", plan.remote.alias, "--", *argv,
         )
         plan.step(side, record, {**plan.environment(job.step, tokens), **record_env}, job=job.name)
 
@@ -886,7 +888,6 @@ class Run:
             },
         )
         self.host: HostRun | None = None
-        self.package: str | None = None  # the first side's stage, with the host package, once staged
         self.plan_sent = False  # whether a start of the run may have reached the host with its plan
         self.sequence = 0  # the last event followed
         self.built = False  # whether it has entered its build, as its caller saw: from then on it is not placed again
@@ -918,7 +919,7 @@ class Run:
         (placed there): nothing of the host it left is kept, its queued time is."""
         self.carried = state.account(self.state.value, time.time())[0]
         self.remote, self.checkouts, self.request = candidate.remote, candidate.status["checkouts"], request
-        self.host, self.package, self.plan_sent, self.sequence, self.destination = None, None, False, 0, None
+        self.host, self.plan_sent, self.sequence, self.destination = None, False, 0, None
         self.state.update(host=self.remote.alias, estimate=request.estimate, waited=self.carried,
                           waiting_since=None)
 
@@ -981,7 +982,6 @@ class Run:
                 shutil.copyfile(path, local / path.name)
             _retrying(self, "stage", lambda: sync.push(self.remote, [path.name for path in work.files], local, inputs),
                       stop)
-        self.package = plan.stage(sides[0])
 
     # the report
 
@@ -1017,9 +1017,7 @@ class Run:
         return "\n".join(lines)
 
     def device_facts(self) -> str:
-        if self.package is None:
-            return "not read yet: the host's probe arrives with the run's source, still staging"
-        argv, env = host_module(self.remote, self.package, "probe")
+        argv, env = host_module(self.remote, "probe")
         line = shlex.join(["env", *(f"{k}={v}" for k, v in env.items()), *argv])
         try:
             reading = json.loads(_ssh(self.remote, line, timeout=30))

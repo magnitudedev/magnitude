@@ -1791,7 +1791,9 @@ class Runner:
         if "job" in op:
             self.codes[op["job"]] = code
         elif op.get("check", True) and code != 0:
-            raise Failed("`%s` exited %d" % (" ".join(argv)[:160], code))
+            # Each path by its name, so the command shows what it ran whatever root it lies in.
+            named = " ".join(os.path.basename(argument) if os.path.isabs(argument) else argument for argument in argv)
+            raise Failed("`%s` exited %d" % (named[:160], code))
         if "install" in op:  # its output has the tree before any run can share the checkout
             self.snapshot(op["install"])
             self.session.installed(self.checkouts[op["install"]])
