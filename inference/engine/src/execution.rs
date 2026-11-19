@@ -680,7 +680,7 @@ struct SealedLoad {
 /// The load's graphs prepared, planned and sealed, and its plan admitted
 /// at the resources they need: the load's preparation off the calling
 /// thread ends here.
-fn seal_graphs(prepared: Box<PreparedPrograms>, manifest: &ExecutionManifest) -> Result<SealedLoad, LoadError> {
+fn seal_graphs(prepared: Box<PreparedPrograms>, manifest: &ExecutionManifest) -> Result<Box<SealedLoad>, LoadError> {
     let PreparedPrograms {
         startup,
         draft,
@@ -778,7 +778,7 @@ fn seal_graphs(prepared: Box<PreparedPrograms>, manifest: &ExecutionManifest) ->
         opened.selector(),
     ))
     .map_err(internal)?;
-    Ok(SealedLoad {
+    Ok(Box::new(SealedLoad {
         startup,
         resident,
         planned,
@@ -790,7 +790,7 @@ fn seal_graphs(prepared: Box<PreparedPrograms>, manifest: &ExecutionManifest) ->
         site_requests,
         head_enabled,
         phase_started,
-    })
+    }))
 }
 
 /// What a load's target import made ([`import_target`]): the target
@@ -874,7 +874,7 @@ fn reserve_drafter(
 /// not hold is handed back where its experts can stream
 /// ([`streams_instead`]).
 fn import_target(
-    sealed: SealedLoad,
+    sealed: Box<SealedLoad>,
     manifest: &ExecutionManifest,
     package: &Arc<Package>,
     progress: &Rc<dyn Fn(LoadProgress)>,
@@ -891,7 +891,7 @@ fn import_target(
         site_requests,
         head_enabled,
         mut phase_started,
-    } = sealed;
+    } = *sealed;
     let plan = execution_plan.resources().clone();
     let target_graphs = programs
         .target_graphs()
@@ -1641,26 +1641,19 @@ fn expert_measures(
     costs_outstanding: Option<magnitude_executor::assessment::CostWalk>,
 ) -> magnitude_executor::ExpertMeasures {
     use magnitude_executor::assessment::{
-        expert_lines, expert_pass, host_lines, BankLines, CeilingError, ConvertCosts, MemoryCosts, MemoryError, Priced,
-        StorageCosts, StorageError, TierCopyCosts, TierCopyError,
+        expert_lines, expert_pass, host_lines, BankLines, ConvertCosts, MemoryCosts, Priced,
+        StorageCosts, TierCopyCosts,
     };
     let (topology, info) = (load.device.topology(), load.device.info());
     let records = KernelCache::measurement_records(root);
     // The model store's read line, a standing request of the job.
-    let read = match StorageCosts::stored(topology, info, &pricing.storage, &records) {
-        Ok(line) => Priced::Measured(line),
-        Err(error @ StorageError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
-        Err(error) => Priced::Unavailable(error.to_string()),
-    };
+    let read = StorageCosts::priced(topology, info, &pricing.storage, &records);
     let pass = costs.as_ref().derive(|costs| expert_pass(bank, costs));
     // A host tier's record read from host memory, at its memory line.
     let memory = match bank.tiered() {
         false => Priced::Measured(None),
-        true => match MemoryCosts::stored(topology, info, pricing.readers, &records) {
-            Ok(memory) => Priced::Measured(Some(memory.byte_seconds)),
-            Err(error @ MemoryError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
-            Err(error) => Priced::Unavailable(error.to_string()),
-        },
+        true => MemoryCosts::priced(topology, info, pricing.readers, &records)
+            .and_then(|memory| Priced::Measured(Some(memory.byte_seconds))),
     };
     // A CPU site's lines as the job stored them, and whose verdict admits it:
     // with either missing the site serves nothing, and a pricing reads them
@@ -1685,21 +1678,14 @@ fn expert_measures(
     // whole grid, as the bank opened.
     let tier_copy = match bank.tiered() {
         false => Priced::Measured(None),
-        true => match TierCopyCosts::stored(topology, info, &records) {
-            Ok(costs) => Priced::Measured(Some(costs)),
-            Err(error @ TierCopyError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
-            Err(error) => Priced::Unavailable(error.to_string()),
-        },
+        true => TierCopyCosts::priced(topology, info, &records).and_then(|costs| Priced::Measured(Some(costs))),
     };
     // The device's convert on unified memory on the line the job measured:
     // until then the host lands every miss.
     let convert = match bank.tiered() {
         true => Priced::Measured(None),
-        false => match ConvertCosts::lines(topology, info, bank, &records) {
-            Ok(lines) => Priced::Measured(Some(lines.into())),
-            Err(error @ CeilingError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
-            Err(error) => Priced::Unavailable(error.to_string()),
-        },
+        false => ConvertCosts::priced_lines(topology, info, bank, &records)
+            .and_then(|lines| Priced::Measured(Some(lines.into()))),
     };
     // The load waits now on its requests the job has points of left to
     // measure: the job measures them after assessment's standing requests.

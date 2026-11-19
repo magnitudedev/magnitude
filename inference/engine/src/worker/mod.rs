@@ -26,8 +26,9 @@ pub use client::{
     connect_worker, EngineClient, EngineRequest, RequestEvent, RequestOptions, WorkerConnection,
 };
 pub use preparation::{
-    load_prepared, observe_worker_process, prepare, start_worker_process, ChildTransport, Preparation, WorkerProcess,
-    WorkerEnd, WorkerReport,
+    load_prepared, observe_worker_process, prepare, run_priced, start_worker_process,
+    AcquiredDevice, ChildTransport, Preparation, PricedError, PricedFailure, WorkerEnd,
+    WorkerProcess, WorkerReport,
 };
 
 use crate::census::AllocationCensus;
@@ -59,7 +60,7 @@ const CONSTRAINT_CACHE: CacheLimits = CacheLimits {
 };
 
 /// How a worker ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WorkerExit {
     /// The host asked it to shut down.
     Shutdown,

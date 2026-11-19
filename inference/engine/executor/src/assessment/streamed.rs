@@ -7,7 +7,8 @@
 use super::cost::{host_lines, BankLines, HostLinesError};
 use super::executor_costs::ExecutorCosts;
 use super::priced::Priced;
-use super::streaming_costs::{CeilingError, ConvertCosts, ConvertForm, CpuCosts, CpuForm, MemoryCosts, MemoryError, StorageCosts, StorageError};
+use super::requests::{Outstanding, PendingPrices};
+use super::streaming_costs::{ConvertCosts, ConvertForm, CpuCosts, CpuForm, MemoryCosts, StorageCosts};
 use crate::planning::ExpertBankPlan;
 use magnitude_cost_model::{CpuLines, ExpertPass, HostLines, LandingLine, ReadLine, RecordLine, StreamedLayers};
 use seismic::measure::{InvalidLine, Record, RecordStore, StoreError};
@@ -42,43 +43,55 @@ impl StreamedFigures {
         store: &dyn RecordStore<PointKey>,
     ) -> (Priced<Self>, Vec<(PointKey, Record)>) {
         let reading = Reading { store, read: RefCell::default() };
-        let read = match StorageCosts::stored(topology, executor, storage, &reading) {
-            Ok(line) => Priced::Measured(line),
-            Err(error @ StorageError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
-            Err(error) => Priced::Unavailable(error.to_string()),
-        };
+        let read = StorageCosts::priced(topology, executor, storage, &reading);
+        let readers = seismic::threads::quota().get() as u64;
         let memory = match topology.shared_ranges_lie_in_device_memory(executor) {
             true => Priced::Measured(None),
-            false => match MemoryCosts::stored(topology, executor, seismic::threads::quota().get() as u64, &reading) {
-                Ok(costs) => Priced::Measured(Some(costs.byte_seconds)),
-                Err(error @ MemoryError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
-                Err(error) => Priced::Unavailable(error.to_string()),
-            },
+            false => MemoryCosts::priced(topology, executor, readers, &reading).and_then(|costs| Priced::Measured(Some(costs.byte_seconds))),
         };
         let site = match topology.shared_ranges_lie_in_device_memory(executor) {
             true => Priced::Measured(None),
             false => match CpuForm::reference(executor.backend()) {
                 Err(error) => Priced::Unavailable(error.to_string()),
                 Ok(None) => Priced::Unavailable(format!("{:?} streams nothing", executor.backend())),
-                Ok(Some(form)) => match CpuCosts::stored(topology, executor, &form, &reading) {
-                    Ok(Some(costs)) => Priced::Measured(Some((form, costs.lines))),
-                    Ok(None) => Priced::Pending("no record of the reference CPU site's lines".into()),
-                    Err(error) => Priced::Unavailable(error.to_string()),
-                },
+                Ok(Some(form)) => CpuCosts::priced(topology, executor, &form, &reading).and_then(|costs| Priced::Measured(Some((form, costs.lines)))),
             },
         };
         let convert = match ConvertForm::reference(executor.backend()) {
             Err(error) => Priced::Unavailable(error.to_string()),
             Ok(None) => Priced::Unavailable(format!("{:?} streams nothing", executor.backend())),
-            Ok(Some(form)) => match ConvertCosts::stored(topology, executor, form, &reading) {
-                Ok(costs) => form.stored_byte_seconds(costs.record_seconds).map_or_else(|error| Priced::Unavailable(error.to_string()), Priced::Measured),
-                Err(error @ CeilingError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
-                Err(error) => Priced::Unavailable(error.to_string()),
-            },
+            Ok(Some(form)) => ConvertCosts::priced(topology, executor, form, &reading).derive(|costs| form.stored_byte_seconds(costs.record_seconds)),
         };
-        let figures = read.and_then(|read| {
-            memory.and_then(|memory| site.and_then(|site| convert.and_then(|convert| Priced::Measured(Self { read, memory, site, convert }))))
-        });
+        let figures = match (read, memory, site, convert) {
+            (Priced::Measured(read), Priced::Measured(memory), Priced::Measured(site), Priced::Measured(convert)) => {
+                Priced::Measured(Self { read, memory, site, convert })
+            }
+            (read, memory, site, convert) => {
+                let mut standing = Vec::new();
+                let mut unavailable = None;
+                for state in [
+                    read.and_then(|_| Priced::Measured(())),
+                    memory.and_then(|_| Priced::Measured(())),
+                    site.and_then(|_| Priced::Measured(())),
+                    convert.and_then(|_| Priced::Measured(())),
+                ] {
+                    match state {
+                        Priced::Measured(()) => {}
+                        Priced::Pending(pending) => standing.extend(pending.outstanding().standing.iter().cloned()),
+                        Priced::Unavailable(reason) => {
+                            unavailable.get_or_insert(reason);
+                        }
+                    }
+                }
+                match unavailable {
+                    Some(reason) => Priced::Unavailable(reason),
+                    None => Priced::Pending(
+                        PendingPrices::new(Outstanding { standing, loads: Vec::new() })
+                            .expect("non-measured, non-unavailable streamed figures must have pending requests"),
+                    ),
+                }
+            }
+        };
         (figures, reading.read.into_inner())
     }
 }

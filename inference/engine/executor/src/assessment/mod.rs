@@ -67,7 +67,7 @@ pub use priced::Priced;
 pub(crate) use streaming_costs::CpuForm;
 #[cfg(feature = "machine-line")]
 pub use requests::line_outstanding;
-pub use requests::{Outstanding, PointRequest, PointRequests, SiteRequest, Waiter};
+pub use requests::{Outstanding, PendingPrices, PointRequest, PointRequests, SiteRequest, Waiter};
 pub use streamed::{streamed_layers, StreamedError, StreamedFigures};
 pub use misses::{Anticipated, HintCounts, LayerStep, TableCurve, TableRange};
 pub use streaming::{

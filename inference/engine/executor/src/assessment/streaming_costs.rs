@@ -376,6 +376,46 @@ impl ConvertCosts {
         Ok(Self { record_seconds: line.slope(), line: RecordLine::of(line) })
     }
 
+    /// [`Self::stored`] in its [`Priced`] state, owning the mapping from an
+    /// unrecorded point to [`PointRequest::Convert`].
+    pub fn priced(
+        topology: &DeviceTopology,
+        executor: &Executor,
+        form: ConvertForm,
+        store: &dyn RecordStore<PointKey>,
+    ) -> super::Priced<Self> {
+        match Self::stored(topology, executor, form, store) {
+            Ok(costs) => super::Priced::Measured(costs),
+            Err(CeilingError::Unrecorded { .. }) => {
+                super::Priced::Pending(super::PendingPrices::standing(super::PointRequest::Convert(form)))
+            }
+            Err(error) => super::Priced::Unavailable(error.to_string()),
+        }
+    }
+
+    /// Each bank group's convert line of `plan`'s bank in its [`Priced`] state,
+    /// derived from [`Self::priced`].
+    pub fn priced_lines(
+        topology: &DeviceTopology,
+        executor: &Executor,
+        plan: &ExpertBankPlan,
+        store: &dyn RecordStore<PointKey>,
+    ) -> super::Priced<Vec<RecordLine>> {
+        let mut lines = Vec::new();
+        let mut pending = Vec::new();
+        for form in Self::forms(plan) {
+            match Self::priced(topology, executor, form, store) {
+                super::Priced::Measured(costs) => lines.push(costs.line),
+                super::Priced::Pending(p) => pending.extend(p.outstanding().requests().cloned()),
+                super::Priced::Unavailable(reason) => return super::Priced::Unavailable(reason),
+            }
+        }
+        match super::PendingPrices::new(super::Outstanding { standing: Vec::new(), loads: pending }) {
+            Some(pending) => super::Priced::Pending(pending),
+            None => super::Priced::Measured(lines),
+        }
+    }
+
     /// Each bank group's convert line of `plan`'s bank ([`Self::stored`]).
     pub fn lines(
         topology: &DeviceTopology,
@@ -678,6 +718,22 @@ impl TierCopyCosts {
         };
         let (transfer, back) = (line(Direction::In)?, line(Direction::Out)?);
         Ok(Self { blocks, whole_seconds: whole, stall_share, transfer, back })
+    }
+
+    /// [`Self::stored`] in its [`Priced`] state, owning the mapping from an
+    /// unrecorded point to [`PointRequest::TierCopy`].
+    pub fn priced(
+        topology: &DeviceTopology,
+        executor: &Executor,
+        store: &dyn RecordStore<PointKey>,
+    ) -> super::Priced<Self> {
+        match Self::stored(topology, executor, store) {
+            Ok(costs) => super::Priced::Measured(costs),
+            Err(TierCopyError::Unrecorded { .. }) => {
+                super::Priced::Pending(super::PendingPrices::load(super::PointRequest::TierCopy))
+            }
+            Err(error) => super::Priced::Unavailable(error.to_string()),
+        }
     }
 
     /// The link's ceiling, a byte's seconds: the whole grid's copy from
@@ -1247,10 +1303,23 @@ impl StorageCosts {
         ReadLine::new(latency, byte_seconds).map_err(StorageError::Line)
     }
 
-    /// Whether the job has a point of the line left to measure: one no
-    /// record holds. A volume whose identity cannot be read has none.
-    pub(super) fn outstanding(topology: &DeviceTopology, executor: &Executor, directory: &Path, store: &dyn RecordStore<PointKey>) -> bool {
-        matches!(Self::stored(topology, executor, directory, store), Err(StorageError::Unrecorded { .. }))
+    /// [`Self::stored`] in its [`Priced`] state, owning the mapping from an
+    /// unrecorded point to [`PointRequest::Storage`].
+    pub fn priced(
+        topology: &DeviceTopology,
+        executor: &Executor,
+        directory: &Path,
+        store: &dyn RecordStore<PointKey>,
+    ) -> super::Priced<ReadLine> {
+        match Self::stored(topology, executor, directory, store) {
+            Ok(line) => super::Priced::Measured(line),
+            Err(StorageError::Unrecorded { .. }) => {
+                super::Priced::Pending(super::PendingPrices::standing(super::PointRequest::Storage {
+                    directory: directory.to_path_buf(),
+                }))
+            }
+            Err(error) => super::Priced::Unavailable(error.to_string()),
+        }
     }
 
     /// Measure the line's points in the job (`walks`), the probe file opened
@@ -1455,6 +1524,21 @@ impl CpuCosts {
         };
         let lines = CpuLines { expert: RowLine { one: ns(one)?, row }, handshake: ns(handshake)? };
         Ok(Some(Self { workers: workers as usize, lines }))
+    }
+
+    /// [`Self::stored`] in its [`Priced`] state, owning the mapping from an
+    /// unrecorded site to [`PointRequest::CpuSite`].
+    pub(super) fn priced(
+        topology: &DeviceTopology,
+        executor: &Executor,
+        form: &CpuForm,
+        store: &dyn RecordStore<PointKey>,
+    ) -> super::Priced<Self> {
+        match Self::stored(topology, executor, form, store) {
+            Ok(Some(costs)) => super::Priced::Measured(costs),
+            Ok(None) => super::Priced::Pending(super::PendingPrices::standing(super::PointRequest::CpuSite(form.clone()))),
+            Err(error) => super::Priced::Unavailable(error.to_string()),
+        }
     }
 
     /// Size `form`'s pool and measure its lines in the job, stored.
@@ -1662,6 +1746,23 @@ impl MemoryCosts {
         let medians = [none?, all?];
         let byte_seconds = rising(medians).ok_or(MemoryError::Flat { points: medians })?.slope();
         Ok(Self { byte_seconds })
+    }
+
+    /// [`Self::stored`] in its [`Priced`] state, owning the mapping from an
+    /// unrecorded point to [`PointRequest::HostMemory`].
+    pub fn priced(
+        topology: &DeviceTopology,
+        executor: &Executor,
+        readers: u64,
+        store: &dyn RecordStore<PointKey>,
+    ) -> super::Priced<Self> {
+        match Self::stored(topology, executor, readers, store) {
+            Ok(costs) => super::Priced::Measured(costs),
+            Err(MemoryError::Unrecorded { .. }) => {
+                super::Priced::Pending(super::PendingPrices::standing(super::PointRequest::HostMemory { readers }))
+            }
+            Err(error) => super::Priced::Unavailable(error.to_string()),
+        }
     }
 
     /// Measure the line's sweeps by `readers` threads in the measurement job

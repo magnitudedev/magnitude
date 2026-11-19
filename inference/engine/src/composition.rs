@@ -7,10 +7,13 @@ use crate::error::{ArtifactError, LoadError, ResolveError, UnsupportedModel};
 use crate::host::HostArtifacts;
 use crate::options::{ExecutionManifest, InputModalities, ModelPolicy, PackageOptions, ReadyInfo};
 use crate::execution::LoadAttempt;
-use crate::preview::{now, priced};
+use crate::preview::now;
 use crate::worker::{
-    connect_worker, load_prepared, measure::InProcessJobs, prepare, protocol::LoadProgress, run_worker,
-    start_worker_process, transport::channel_pair, EngineClient, Preparation, WorkerConnection,
+    connect_worker, load_prepared,
+    measure::{InProcessJobs, JobsStopped},
+    prepare, protocol::LoadProgress, run_priced, run_worker, start_worker_process,
+    transport::channel_pair, AcquiredDevice, EngineClient, Preparation, PricedError,
+    PricedFailure, WorkerConnection,
 };
 use magnitude_executor::UnpreparedUnits;
 use magnitude_artifacts::PackageIdentity;
@@ -207,61 +210,64 @@ impl ReadyEngine {
     }
 }
 
-/// Have the standing figures a load of `manifest` plans on measured in this
-/// process before it loads or prepares (`preview::priced`): no job runs
-/// beside a host that loads in its own process, so while they are pending
-/// its own jobs measure them ([`InProcessJobs`]), and the plan is taken
-/// again. A job that measures nothing of what is pending
-/// ([`crate::worker::measure::JobsStopped`]) fails the load with why. A preview that fails otherwise is the load's to report, as it
-/// plans the same. Returns how often its jobs measured; never without a
-/// kernel cache, which holds the figures. A load in its own process
-/// settles them once an attempt finds them pending ([`load_in_process`]),
-/// so a priced machine's load plans nothing more.
+/// Run an in-process operation (`load_prepared`, `prepare`, or a standalone
+/// price settlement) through [`run_priced`], measuring pending machine prices
+/// via [`InProcessJobs`].
 ///
-/// No device of this process is open as it runs, so each job opens its
-/// executor on tallies of its own and charges them
-/// (`worker::measure::measure_job`): every caller runs it before its load
-/// opens anything ([`prepare_in_process`], the harness), or after a load
-/// attempt whose prices were pending has ended and released what it opened
-/// ([`load_in_process`]: [`start_in_process`] joins the attempt's worker
-/// thread; an attempt on the caller's thread has returned). A job that
-/// found its executor open in an embedder's ledger would panic
-/// (`seismic::Charges::tally`): measuring beside a live load charges that
-/// load's measurement holding instead (`ExecutorDomain::measurement_charges`).
-pub fn settle_prices(manifest: &ExecutionManifest) -> Result<u64, LoadError> {
+/// No device of this process is open while settling, so each job opens its
+/// executor on tallies of its own and charges them (`worker::measure::measure_job`).
+pub fn in_process_priced<T>(
+    manifest: &ExecutionManifest,
+    mut run: impl FnMut() -> Result<T, LoadError>,
+) -> Result<T, LoadError> {
     let internal = |reason: String| LoadError::Internal { reason };
     let paths = vec![manifest.store().to_path_buf()];
     let catalog = seismic::Devices::discover(&paths).map_err(|error| internal(error.to_string()))?;
-    let Some(mut jobs) = InProcessJobs::of_load(&catalog, paths, manifest).map_err(internal)? else {
-        return Ok(0);
-    };
-    let mut ran = 0;
-    let mut measured = || {
-        ran += 1;
-        jobs.run()
-            .map(drop)
-            .map_err(|stopped| internal(format!("the plan's prices are pending, and {stopped}")))
-    };
-    // Settled once the preview is no longer pending: what it then previews
-    // is the load's to report, not this.
-    let _previewed = now(priced(
-        || std::future::ready(manifest.preview(&catalog)),
-        || std::future::ready(manifest.request_prices(&catalog).map_err(internal)),
-        || std::future::ready(measured()),
-    ))?;
-    Ok(ran)
+    let mut jobs = InProcessJobs::of_load(&catalog, paths, manifest).map_err(internal)?;
+    let has_jobs = jobs.is_some();
+    match now(run_priced(
+        || {
+            std::future::ready(if has_jobs {
+                manifest.preview(&catalog).map(|_| ())
+            } else {
+                Ok(())
+            })
+        },
+        || {
+            std::future::ready((|| {
+                let Some(jobs) = jobs.as_mut() else {
+                    return Ok(());
+                };
+                manifest.request_prices(&catalog).map_err(internal)?;
+                match jobs.run() {
+                    Ok(_) | Err(JobsStopped::Stalled { .. }) => Ok(()),
+                    Err(stopped) => {
+                        Err(internal(format!("the plan's prices are pending, and {stopped}")))
+                    }
+                }
+            })())
+        },
+        |&()| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+        |()| {},
+        (),
+        |&(), &(), ()| std::future::ready(run().map_err(|error| PricedFailure::Load(error, (), ()))),
+    )) {
+        Ok((value, (), ())) => Ok(value),
+        Err(PricedError::Preview(error)) => Err(error.into()),
+        Err(PricedError::Load(error, ()) | PricedError::Host(error)) => Err(error),
+    }
 }
 
 /// The model's Prepare, as a host that loads in its own process runs it
-/// for no load ([`prepare`]): its prices settled first ([`settle_prices`]),
-/// as its search plans the load.
+/// for no load ([`prepare`]), settling pending prices through [`run_priced`].
 pub fn prepare_in_process(
     manifest: &ExecutionManifest,
-    worker: std::process::Command,
-    progress: impl FnMut(LoadProgress),
+    mut worker: std::process::Command,
+    mut progress: impl FnMut(LoadProgress),
 ) -> Result<Preparation, LoadError> {
-    settle_prices(manifest)?;
-    prepare(manifest, || start_worker_process(worker), progress)
+    in_process_priced(manifest, || {
+        prepare(manifest, || start_worker_process(&mut worker), &mut progress)
+    })
 }
 
 /// [`load_prepared`] for a host that loads in its own process: `load` is its
@@ -274,44 +280,34 @@ pub fn prepare_in_process(
 /// is started and `kernel preparation ended in S s` once it is gone.
 pub fn load_in_process<L>(
     manifest: &ExecutionManifest,
-    load: impl FnMut(UnpreparedUnits) -> Result<LoadAttempt<L>, LoadError>,
-    worker: std::process::Command,
-    prepare_progress: impl FnMut(LoadProgress),
+    mut load: impl FnMut(UnpreparedUnits) -> Result<LoadAttempt<L>, LoadError>,
+    mut worker: std::process::Command,
+    mut prepare_progress: impl FnMut(LoadProgress),
 ) -> Result<L, LoadError> {
     // The diagnostic stream says when the Prepare's process began and that it
     // is gone, so a log's reader can tell preparation from the load itself.
     let preparing = std::cell::Cell::new(None);
-    let mut load = load;
-    let (loaded, preparation) = load_prepared(
-        manifest,
-        |unprepared| {
-            if let Some(began) = preparing.take() {
-                let began: std::time::Instant = began;
-                tracing::info!(
-                    "kernel preparation ended in {:.3} s",
-                    began.elapsed().as_secs_f64()
-                );
-            }
-            // An attempt whose prices are pending has them measured here and
-            // is made again; one still pending once nothing was left to
-            // measure plans otherwise than its preview, and fails as it is.
-            loop {
-                match load(unprepared) {
-                    Err(error @ LoadError::PricesPending { .. }) => match settle_prices(manifest)? {
-                        0 => return Err(error),
-                        _ => continue,
-                    },
-                    attempt => return attempt,
+    let (loaded, preparation) = in_process_priced(manifest, || {
+        load_prepared(
+            manifest,
+            |unprepared| {
+                if let Some(began) = preparing.take() {
+                    let began: std::time::Instant = began;
+                    tracing::info!(
+                        "kernel preparation ended in {:.3} s",
+                        began.elapsed().as_secs_f64()
+                    );
                 }
-            }
-        },
-        || {
-            tracing::info!("kernel preparation began");
-            preparing.set(Some(std::time::Instant::now()));
-            start_worker_process(worker)
-        },
-        prepare_progress,
-    )?;
+                load(unprepared)
+            },
+            || {
+                tracing::info!("kernel preparation began");
+                preparing.set(Some(std::time::Instant::now()));
+                start_worker_process(&mut worker)
+            },
+            &mut prepare_progress,
+        )
+    })?;
     if let Preparation::Incomplete(error) = preparation {
         tracing::warn!(
             "kernel preparation did not finish ({error}); the load serves \
@@ -347,7 +343,7 @@ pub fn start_in_process(
         // An attempt that did not load has released everything it opened
         // once its thread ends, which it does as its transport closes: its
         // device among them, so the jobs that settle its pending prices
-        // open the device anew ([`settle_prices`]).
+        // open the device anew ([`in_process_priced`]).
         let unloaded = |outcome: Result<LoadAttempt<ReadyEngine>, LoadError>| {
             worker.join().expect("the in-process worker's panic ends the process");
             outcome

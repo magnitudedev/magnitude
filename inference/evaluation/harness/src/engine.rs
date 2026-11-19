@@ -221,7 +221,7 @@ pub fn prepare(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> R
 /// recorded: no job runs beside the harness, and a cell times what a served
 /// load is once its job has run. The load's points come of its plan, which
 /// prices its holdings on the standing figures, so those settle first, as
-/// every load in its own process settles them (`composition::settle_prices`).
+/// every load in its own process settles them (`composition::in_process_priced`).
 /// The rest stops early only where a job measures nothing
 /// (`worker::measure::JobsStopped`), reporting why, and the load
 /// then serves what is pending as any load does. Nothing to do without a
@@ -232,7 +232,7 @@ fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::compo
     let Some(root) = &manifest.kernel_cache else {
         return Ok(());
     };
-    magnitude_engine::composition::settle_prices(manifest).map_err(|error| error.to_string())?;
+    magnitude_engine::composition::in_process_priced(manifest, || Ok(())).map_err(|error| error.to_string())?;
     let (paths, catalog, _) = selected_machine(artifacts, resolved, root)?;
     let catalog = std::rc::Rc::new(catalog);
     magnitude_engine::request_load_points(&catalog, manifest, resolved.host.package()).map_err(|error| error.to_string())?;

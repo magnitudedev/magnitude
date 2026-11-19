@@ -1028,11 +1028,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             (None, None) => {}
             (Some(experts), Some(bank)) => {
                 tracing::info!(
-                    read = experts.read.why().unwrap_or("measured"),
-                    lines = experts.lines.why().unwrap_or("measured"),
-                    pass = experts.pass.why().unwrap_or("measured"),
-                    tier_copy = experts.tier_copy.why().unwrap_or("measured"),
-                    convert = experts.convert.why().unwrap_or("measured"),
+                    read = experts.read.why().as_deref().unwrap_or("measured"),
+                    lines = experts.lines.why().as_deref().unwrap_or("measured"),
+                    pass = experts.pass.why().as_deref().unwrap_or("measured"),
+                    tier_copy = experts.tier_copy.why().as_deref().unwrap_or("measured"),
+                    convert = experts.convert.why().as_deref().unwrap_or("measured"),
                     "the experts are priced"
                 );
                 if let Some(Some(costs)) = experts.tier_copy.measured() {

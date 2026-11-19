@@ -40,7 +40,7 @@ impl fmt::Display for WeightReadError {
 
 impl error::Error for WeightReadError {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PlanError {
     InvalidDefinition(String),
     Unsupported(&'static str),
@@ -68,11 +68,11 @@ pub enum PlanError {
     WeightBound { bound: crate::WeightBound, needed: u64 },
     /// The load's routed experts cannot be streamed.
     Unstreamed(UnstreamedExperts),
-    /// The plan's settle has no prices for its holdings
-    /// (`planning::PlanPrices`): the machine's standing figures are not
-    /// measured yet (`pending`), or cannot be, with why. A load of it waits
-    /// for the measurement job, as its assessment does.
-    Unpriced { pending: bool, reason: String },
+    /// The plan's settle is waiting on unmeasured standing figures.
+    Pending(crate::assessment::PendingPrices),
+    /// The plan's settle has no prices for its holdings and they cannot be
+    /// measured, with why.
+    Unavailable(String),
 }
 
 /// Why a load's routed experts cannot be streamed through an expert bank.
@@ -173,8 +173,8 @@ impl fmt::Display for PlanError {
                  at its minimum, the records its steps need at once"
             ),
             Self::Unstreamed(reason) => write!(formatter, "experts cannot stream: {reason}"),
-            Self::Unpriced { pending: true, reason } => write!(formatter, "the plan's prices are pending: {reason}"),
-            Self::Unpriced { pending: false, reason } => write!(formatter, "the plan has no prices: {reason}"),
+            Self::Pending(pending) => write!(formatter, "the plan's prices are pending: {pending}"),
+            Self::Unavailable(reason) => write!(formatter, "the plan has no prices: {reason}"),
         }
     }
 }

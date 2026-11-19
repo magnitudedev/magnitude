@@ -1062,8 +1062,8 @@ fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
         costs: Ok(crate::LoadCosts { prices: prices.clone() }),
         experts: Some(crate::ExpertMeasures {
             lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
-            read: crate::assessment::Priced::Pending("unmeasured".into()),
-            pass: crate::assessment::Priced::Pending("unpriced".into()),
+            read: crate::assessment::Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required))),
+            pass: crate::assessment::Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required))),
             tier_copy: crate::assessment::Priced::Measured(Some(crate::assessment::TierCopyCosts {
                 blocks,
                 whole_seconds: 0.001,

@@ -3132,7 +3132,7 @@ mod tests {
 
     /// The plan's prices before the machine's costs are measured.
     fn pending() -> Priced<super::super::PlanPrices> {
-        Priced::Pending("the executor's costs are not measured yet".into())
+        Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required)))
     }
 
     /// A holding steps where its charge rises, each step holding the most
@@ -3918,7 +3918,7 @@ mod tests {
                 |_, _| Ok::<_, PlanError>(Ok(())),
             )
             .err();
-        assert!(matches!(waits, Some(PlanError::Unpriced { pending: true, .. })), "{waits:?}");
+        assert!(matches!(waits, Some(PlanError::Pending(_))), "{waits:?}");
     }
 
     /// Capped at 29 GB, below a tenth of its experts' weights beside the
@@ -4027,7 +4027,7 @@ mod tests {
             Priced::Measured(plan_prices_on(costs))
         };
         let unread = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, None, &along_host(None)).err();
-        assert!(matches!(unread, Some(PlanError::Unpriced { pending: true, .. })), "{unread:?}");
+        assert!(matches!(unread, Some(PlanError::Pending(_))), "{unread:?}");
         let read = draft.with_bank::<AssessmentMemoryCharge>(&definition, None, &along_host(Some(costs().first.activation)));
         let loaded = read.unwrap_or_else(|error| panic!("a bank prices once its costs read host storage: {error}")).into_draft();
         assert!(loaded.load().expert_bank().is_some());

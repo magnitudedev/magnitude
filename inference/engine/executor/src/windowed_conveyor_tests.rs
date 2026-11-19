@@ -300,7 +300,7 @@ fn open_domain(
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     let costs = crate::assessment::synthetic::costs();
     fn pending<T>() -> crate::assessment::Priced<T> {
-        crate::assessment::Priced::Pending("not measured by the test".to_owned())
+        crate::assessment::Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required)))
     }
     let experts = planned.load().expert_bank().map(|bank| crate::ExpertMeasures {
         lines: pending(),

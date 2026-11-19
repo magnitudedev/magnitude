@@ -694,7 +694,9 @@ fn cpu_structure() -> AssessmentStructure {
 fn cpu_setup() -> AssessmentSetup {
     AssessmentSetup {
         structure: Arc::new(cpu_structure()),
-        measurements: Measurements::Pending,
+        measurements: Measurements::Pending(magnitude_executor::assessment::PendingPrices::standing(
+            magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+        )),
     }
 }
 

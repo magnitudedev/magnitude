@@ -330,9 +330,9 @@ impl Pricing {
         lines: crate::assessment::Priced<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>,
         convert: crate::assessment::Priced<Option<std::sync::Arc<[magnitude_cost_model::RecordLine]>>>,
     ) -> crate::LoadMeasures {
-        use crate::assessment::Priced;
+        use crate::assessment::{CostWalk, PendingPrices, PointRequest, Priced};
         fn pending<T>() -> Priced<T> {
-            Priced::Pending("not measured by the test".to_owned())
+            Priced::Pending(PendingPrices::standing(PointRequest::Costs(CostWalk::Required)))
         }
         let experts = self.planned.load().expert_bank().map(|bank| crate::ExpertMeasures {
             lines,
@@ -870,9 +870,9 @@ fn price(
 ) -> Pricing {
     let backend = request.backend;
     let pricing = Pricing { definition: request.definition.clone(), resident, planned, costs: crate::assessment::synthetic::costs() };
-    let pending = "not measured by the test";
+    let pending = crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required));
     domain
-        .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.into()), crate::assessment::Priced::Pending(pending.into())), bindings)
+        .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.clone()), crate::assessment::Priced::Pending(pending)), bindings)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     pricing
 }

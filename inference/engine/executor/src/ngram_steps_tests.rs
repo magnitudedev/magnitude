@@ -1149,7 +1149,7 @@ fn test_measures(domain: &ExecutorDomain, pricing: &Pricing) -> crate::LoadMeasu
             .map(|bank| ExpertLines { host: HostLines { record_bytes: bank.record_bytes, ..reference.host }, ..reference })
             .collect(),
     );
-    pricing.measures(lines, Priced::Pending("not measured by the test".to_owned()))
+    pricing.measures(lines, Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required))))
 }
 
 /// The token a step's last row selected.

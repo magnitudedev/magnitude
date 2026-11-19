@@ -9,7 +9,7 @@
 
 use super::super::*;
 use crate::experts::{SiteLayer, SiteRecords, SiteScales, SiteShape, SiteTensors};
-use crate::assessment::{Priced, SiteRequest};
+use crate::assessment::{PendingPrices, PointRequest, Priced, SiteRequest};
 use crate::planning::{BankBinding, RecordTensor};
 use magnitude_kernels::cpu_library::cpu::lib::core::functions;
 
@@ -24,11 +24,12 @@ pub(super) fn site_verdict(
     requirement: &seismic::NumericalRequirement,
     cache: Option<&crate::kernel_cache::KernelCache>,
 ) -> Priced<()> {
+    let request = SiteRequest::of(binding, form, requirement.clone());
     let Some(cache) = cache else {
-        return Priced::Pending("no kernel cache keeps a CPU site's verdict".into());
+        return Priced::Pending(PendingPrices::load(PointRequest::Site(request)));
     };
     let records = crate::kernel_cache::KernelCache::measurement_records(cache.root());
-    SiteRequest::of(binding, form, requirement.clone()).verdict(charges.device().topology(), charges.device().info(), &records)
+    request.verdict(charges.device().topology(), charges.device().info(), &records)
 }
 
 /// Run `request`'s site in the measurement job, on its contained `device`:

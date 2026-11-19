@@ -101,7 +101,7 @@ pub trait StoredRecords: Clone + Send + Sync + 'static {
 impl StoredRecords for AssessmentSetup {
     fn stage(&self) -> Stage {
         match &self.measurements {
-            Measurements::Pending => Stage::Unmeasured,
+            Measurements::Pending(_) => Stage::Unmeasured,
             Measurements::Measured { pending: true, .. } => Stage::Refining,
             Measurements::Measured { pending: false, .. } | Measurements::Unavailable { .. } => Stage::Settled,
         }

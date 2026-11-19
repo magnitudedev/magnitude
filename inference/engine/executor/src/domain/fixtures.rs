@@ -781,7 +781,7 @@ pub fn measure_load(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut Stat
     let experts = domain.family.bank.is_some().then(|| crate::ExpertMeasures {
         lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
         read: crate::assessment::Priced::Measured(READ),
-        pass: crate::assessment::Priced::Pending("unpriced".into()),
+        pass: crate::assessment::Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required))),
         tier_copy: crate::assessment::Priced::Measured(None),
         convert: crate::assessment::Priced::Measured(None),
     });

@@ -1377,7 +1377,11 @@ mod tests {
         let environment = Arc::new(
             AssessmentEnvironment::new(
                 Arc::new(structure),
-                magnitude_engine::assessment::Measurements::Pending,
+                magnitude_engine::assessment::Measurements::Pending(
+                    magnitude_executor::assessment::PendingPrices::standing(
+                        magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+                    ),
+                ),
             )
             .expect("the CPU environment"),
         );

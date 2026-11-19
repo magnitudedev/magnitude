@@ -45,7 +45,7 @@ pub struct Invocation {
 }
 
 /// Why a model name did not produce an invocation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InvocationError {
     /// No served or catalog model has this name.
     UnknownModel { model: String },

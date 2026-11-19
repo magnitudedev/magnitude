@@ -874,6 +874,18 @@ impl StoredCosts {
             Self::Complete { pending: false, .. } => None,
         }
     }
+
+    /// The executor's costs in their [`Priced`] state, owning the mapping from
+    /// missing required costs to [`PointRequest::Costs`].
+    pub fn priced(stored: Result<Self, ExecutorCostsError>) -> super::Priced<ExecutorCosts> {
+        match stored {
+            Ok(Self::Complete { costs, .. }) => super::Priced::Measured(costs),
+            Ok(Self::Missing(_)) => {
+                super::Priced::Pending(super::PendingPrices::standing(super::PointRequest::Costs(CostWalk::Required)))
+            }
+            Err(error) => super::Priced::Unavailable(error.to_string()),
+        }
+    }
 }
 
 /// What a measurement job did ([`super::requests::measure`]).

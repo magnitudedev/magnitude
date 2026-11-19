@@ -111,6 +111,8 @@ fn recorded_setup(
             service,
             served_context: None,
         }),
-        measurements: Measurements::Pending,
+        measurements: Measurements::Pending(magnitude_executor::assessment::PendingPrices::standing(
+            magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+        )),
     }
 }

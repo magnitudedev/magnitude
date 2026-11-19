@@ -3,12 +3,15 @@
 //! policy that needs no cost until `Reprice` brings them), or unavailable,
 //! with why. Each decision takes the states of exactly its inputs.
 
+use super::requests::PendingPrices;
+use std::borrow::Cow;
+
 /// One input of a decision, in its state.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Priced<T> {
     Measured(T),
-    /// What is awaited.
-    Pending(String),
+    /// Non-empty set of outstanding measurement requests awaited.
+    Pending(PendingPrices),
     /// Why there is none.
     Unavailable(String),
 }
@@ -23,17 +26,18 @@ impl<T> Priced<T> {
     }
 
     /// What is awaited or why there is none; none where measured.
-    pub fn why(&self) -> Option<&str> {
+    pub fn why(&self) -> Option<Cow<'_, str>> {
         match self {
             Self::Measured(_) => None,
-            Self::Pending(why) | Self::Unavailable(why) => Some(why),
+            Self::Pending(pending) => Some(Cow::Owned(pending.to_string())),
+            Self::Unavailable(why) => Some(Cow::Borrowed(why)),
         }
     }
 
     pub fn as_ref(&self) -> Priced<&T> {
         match self {
             Self::Measured(value) => Priced::Measured(value),
-            Self::Pending(why) => Priced::Pending(why.clone()),
+            Self::Pending(pending) => Priced::Pending(pending.clone()),
             Self::Unavailable(why) => Priced::Unavailable(why.clone()),
         }
     }
@@ -43,7 +47,7 @@ impl<T> Priced<T> {
     pub fn and_then<U>(self, then: impl FnOnce(T) -> Priced<U>) -> Priced<U> {
         match self {
             Self::Measured(value) => then(value),
-            Self::Pending(why) => Priced::Pending(why),
+            Self::Pending(pending) => Priced::Pending(pending),
             Self::Unavailable(why) => Priced::Unavailable(why),
         }
     }

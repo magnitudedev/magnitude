@@ -44,7 +44,7 @@
 //!   on the job.
 
 use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, ProgramSet, Visit, Walks, Whose};
-use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, StorageCosts, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
+use super::streaming_costs::{CpuCosts, CpuForm, ConvertCosts, ConvertForm, MemoryCosts, StorageCosts, TierCopyCosts, GraphMemory, StoredVolume, VolumeCosts};
 use super::Priced;
 use crate::native::SiteForm;
 use crate::planning::BankBinding;
@@ -111,14 +111,10 @@ impl PointRequest {
     pub fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>, costs_outstanding: Option<CostWalk>) -> bool {
         match self {
             Self::Costs(part) => costs_outstanding.is_some_and(|first| first <= *part),
-            Self::Storage { directory } => StorageCosts::outstanding(topology, executor, directory, store),
-            Self::Convert(form) => {
-                matches!(ConvertCosts::stored(topology, executor, *form, store), Err(CeilingError::Unrecorded { .. }))
-            }
-            Self::HostMemory { readers } => {
-                matches!(MemoryCosts::stored(topology, executor, *readers, store), Err(MemoryError::Unrecorded { .. }))
-            }
-            Self::TierCopy => matches!(TierCopyCosts::stored(topology, executor, store), Err(TierCopyError::Unrecorded { .. })),
+            Self::Storage { directory } => matches!(StorageCosts::priced(topology, executor, directory, store), Priced::Pending(_)),
+            Self::Convert(form) => matches!(ConvertCosts::priced(topology, executor, *form, store), Priced::Pending(_)),
+            Self::HostMemory { readers } => matches!(MemoryCosts::priced(topology, executor, *readers, store), Priced::Pending(_)),
+            Self::TierCopy => matches!(TierCopyCosts::priced(topology, executor, store), Priced::Pending(_)),
             Self::GraphCost => matches!(GraphMemory::stored(topology, executor, store), Ok(None)),
             #[cfg(feature = "machine-line")]
             Self::Line => {
@@ -129,7 +125,7 @@ impl PointRequest {
                 )
             }
             Self::Site(site) => site.outstanding(topology, executor, store),
-            Self::CpuSite(form) => matches!(CpuCosts::stored(topology, executor, form, store), Ok(None)),
+            Self::CpuSite(form) => matches!(CpuCosts::priced(topology, executor, form, store), Priced::Pending(_)),
             Self::Volume { file, urgent } => {
                 let urgent = VolumeCosts::urgent(urgent);
                 matches!(VolumeCosts::stored(topology, executor, file, urgent.as_ref(), store), Ok(None | Some(StoredVolume::Earlier(_))))
@@ -225,7 +221,7 @@ impl SiteRequest {
         match store.load(&self.key(&identity)) {
             Ok(Some(Record::Measured(_))) => Priced::Measured(()),
             Ok(Some(Record::Unobtainable { reason })) => Priced::Unavailable(reason.to_string()),
-            Ok(None) => Priced::Pending("its CPU site's verdict".into()),
+            Ok(None) => Priced::Pending(PendingPrices::load(PointRequest::Site(self.clone()))),
             Err(error) => Priced::Unavailable(error.to_string()),
         }
     }
@@ -451,7 +447,7 @@ impl PointRequests {
 /// What a measurement job measures, in order ([`measure`]): assessment's
 /// standing requests ([`standing`]), then the loads', while its time lasts
 /// ([`JobDeadlines`]).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Outstanding {
     pub standing: Vec<PointRequest>,
     pub loads: Vec<PointRequest>,
@@ -466,6 +462,52 @@ impl Outstanding {
     /// Whether no request is outstanding.
     pub fn is_empty(&self) -> bool {
         self.standing.is_empty() && self.loads.is_empty()
+    }
+}
+
+/// Non-empty set of outstanding measurement requests blocking a price or plan.
+///
+/// Constructed only when at least one request is outstanding, so "pending on
+/// nothing" is unrepresentable by construction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingPrices(Outstanding);
+
+impl PendingPrices {
+    /// Wrap `outstanding` if at least one measurement request is outstanding.
+    pub fn new(outstanding: Outstanding) -> Option<Self> {
+        (!outstanding.is_empty()).then_some(Self(outstanding))
+    }
+
+    /// A pending set containing a single standing request.
+    pub fn standing(request: PointRequest) -> Self {
+        Self(Outstanding {
+            standing: vec![request],
+            loads: Vec::new(),
+        })
+    }
+
+    /// A pending set containing a single load request.
+    pub fn load(request: PointRequest) -> Self {
+        Self(Outstanding {
+            standing: Vec::new(),
+            loads: vec![request],
+        })
+    }
+
+    /// The underlying non-empty outstanding requests.
+    pub fn outstanding(&self) -> &Outstanding {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PendingPrices {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} standing and {} load measurement request(s) pending",
+            self.0.standing.len(),
+            self.0.loads.len()
+        )
     }
 }
 
@@ -601,6 +643,7 @@ pub fn measure(
 mod tests {
     use super::*;
     use super::super::executor_costs::MEASUREMENT_SECONDS;
+    use super::super::streaming_costs::MemoryError;
 
     /// The host's CPU executor, its topology and identity: one every host
     /// derives kernel identities of.
@@ -820,5 +863,113 @@ mod tests {
         let empty = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::ZERO);
         assert_eq!(empty.remaining(), std::time::Duration::ZERO);
         assert!(empty.ends() <= std::time::Instant::now());
+    }
+
+    /// Every leaf `Priced::Pending` request agrees with `PointRequest::outstanding`
+    /// and is satisfied when the measurement job runs that request.
+    #[test]
+    fn every_leaf_pending_request_is_satisfied_by_measuring_it() {
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+        let (topology, executor) = (device.topology(), device.info());
+        let root = std::env::temp_dir().join(format!("leaf-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let storage = root.join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let store = JsonFileStore::new(&root.join("records"));
+
+        let run_job = |requests: &Outstanding| {
+            let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
+            let deadlines = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::from_secs(600));
+            measure(
+                &mut measurer,
+                &seismic::Charges::tally(&device),
+                &store,
+                requests,
+                deadlines,
+                &mut |_| Attempt::Proceed,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        };
+
+        // 1. StorageCosts leaf
+        let Priced::Pending(pending) = StorageCosts::priced(topology, executor, &storage, &store) else {
+            panic!("empty store must leave StorageCosts pending");
+        };
+        assert!(pending.outstanding().requests().all(|r| r.outstanding(topology, executor, &store, None)));
+        run_job(pending.outstanding());
+        assert!(matches!(StorageCosts::priced(topology, executor, &storage, &store), Priced::Measured(_)));
+        assert!(pending.outstanding().requests().all(|r| !r.outstanding(topology, executor, &store, None)));
+
+        // 2. MemoryCosts leaf
+        let Priced::Pending(pending) = MemoryCosts::priced(topology, executor, 1, &store) else {
+            panic!("empty store must leave MemoryCosts pending");
+        };
+        assert!(pending.outstanding().requests().all(|r| r.outstanding(topology, executor, &store, None)));
+        run_job(pending.outstanding());
+        assert!(matches!(MemoryCosts::priced(topology, executor, 1, &store), Priced::Measured(_)));
+        assert!(pending.outstanding().requests().all(|r| !r.outstanding(topology, executor, &store, None)));
+
+        // 3. StoredCosts leaf (CostWalk::Required)
+        let walked = super::super::ExecutorCosts::stored(topology, executor, &store);
+        let costs_out = super::super::StoredCosts::outstanding_of(&walked);
+        let Priced::Pending(pending) = super::super::StoredCosts::priced(walked) else {
+            panic!("empty store must leave StoredCosts pending");
+        };
+        assert!(pending.outstanding().requests().all(|r| r.outstanding(topology, executor, &store, costs_out)));
+        run_job(pending.outstanding());
+        let walked_after = super::super::ExecutorCosts::stored(topology, executor, &store);
+        let costs_out_after = super::super::StoredCosts::outstanding_of(&walked_after);
+        let Priced::Measured(costs) = super::super::StoredCosts::priced(walked_after) else {
+            panic!("measuring CostWalk::Required must satisfy StoredCosts");
+        };
+        assert!(pending.outstanding().requests().all(|r| !r.outstanding(topology, executor, &store, costs_out_after)));
+
+        // 4. expert_lines host link line leaf (CostWalk::Whole)
+        let unread_pass = magnitude_cost_model::ExpertPass::new(
+            costs.rates(&[], &[]),
+            vec![(magnitude_cost_model::RoutedKind(0), Vec::new(), Vec::new())],
+            magnitude_cost_model::HostReads::Unread,
+        );
+        let dummy_host = magnitude_cost_model::HostLines {
+            cpu: None,
+            memory: Some(magnitude_cost_model::Nanoseconds::of(1.0).unwrap()),
+            landing: None,
+            record_bytes: 1,
+        };
+        let Priced::Pending(pending) = super::super::expert_lines(&[dummy_host], &unread_pass) else {
+            panic!("unread host route must leave expert_lines pending");
+        };
+        assert_eq!(pending.outstanding().standing, vec![PointRequest::Costs(CostWalk::Whole)]);
+        assert!(pending.outstanding().requests().all(|r| r.outstanding(topology, executor, &store, Some(CostWalk::Whole))));
+        run_job(pending.outstanding());
+        let walked_whole = super::super::ExecutorCosts::stored(topology, executor, &store);
+        let costs_out_whole = super::super::StoredCosts::outstanding_of(&walked_whole);
+        assert_eq!(costs_out_whole, None, "measuring CostWalk::Whole must satisfy every cost point");
+        assert!(pending.outstanding().requests().all(|r| !r.outstanding(topology, executor, &store, costs_out_whole)));
+
+        // 5. ConvertCosts (on every host executor whose backend streams) and CpuCosts
+        //    leaves agree with PointRequest::outstanding.
+        let empty_store = seismic::measure::HeldStore::default();
+        for exec in topology.executors() {
+            if let Some(convert_form) = ConvertForm::reference(exec.backend()).unwrap() {
+                let Priced::Pending(convert_pending) = ConvertCosts::priced(topology, exec, convert_form, &empty_store) else {
+                    panic!("empty store must leave ConvertCosts pending on {:?}", exec.backend());
+                };
+                assert_eq!(convert_pending.outstanding().standing, vec![PointRequest::Convert(convert_form)]);
+                assert!(convert_pending.outstanding().requests().all(|r| r.outstanding(topology, exec, &empty_store, None)));
+            }
+        }
+
+        let recorded = seismic::fixtures::recorded::rtx3090();
+        let cuda = recorded.executors().iter().find(|e| e.backend() == seismic::BackendName::Cuda).unwrap();
+        let cpu_form = CpuForm::reference(cuda.backend()).unwrap().unwrap();
+        let Priced::Pending(cpu_pending) = CpuCosts::priced(&recorded, cuda, &cpu_form, &empty_store) else {
+            panic!("empty store must leave CpuCosts pending");
+        };
+        assert_eq!(cpu_pending.outstanding().standing, vec![PointRequest::CpuSite(cpu_form.clone())]);
+        assert!(cpu_pending.outstanding().requests().all(|r| r.outstanding(&recorded, cuda, &empty_store, None)));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

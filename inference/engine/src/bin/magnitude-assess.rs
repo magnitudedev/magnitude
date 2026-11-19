@@ -270,7 +270,7 @@ fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result
         })
         .arg(executor.to_string());
     let WorkerProcess { transport, retire } =
-        start_worker_process(command).map_err(|error| format!("the measurement job: {error}"))?;
+        start_worker_process(&mut command).map_err(|error| format!("the measurement job: {error}"))?;
     let (events, heard) = std::sync::mpsc::channel();
     let reader = seismic::threads::spawn("measurement-job-reader", move || {
         observe_measurement(transport, |event| {
@@ -435,7 +435,7 @@ fn run() -> Result<bool, String> {
                 pending,
                 ..
             } => costs(measured, executor.backend(), *pending),
-            Measurements::Pending => json!("pending"),
+            Measurements::Pending(_) => json!("pending"),
             Measurements::Unavailable { reason } => json!({ "unavailable": reason }),
         };
         let topology = catalog.topology();
