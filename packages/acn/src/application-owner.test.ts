@@ -26,7 +26,7 @@ describe("owner requests", () => {
     expect(result._tag === "Left" && result.left._tag === "OwnerRequestFailed" && result.left.message).toBe("Stop the server first.")
   })
   it("reports an owner that is gone as unavailable", async () => {
-    const result = await attempt(Effect.fail(new JsonLineChannelFailed({ message: "Desktop control channel closed" })))
+    const result = await attempt(Effect.fail(new JsonLineChannelFailed({ message: "The connection to the process that owns the service closed" })))
     expect(result._tag === "Left" && result.left._tag).toBe("ApplicationOwnerUnavailable")
   })
   it("streams the owner's self-report", async () => {

@@ -91,10 +91,14 @@ export const readServerReach = (options: { readonly endpoint: string; readonly d
       endpoint: options.endpoint, network, configPath: join(options.dataDirectory, "config.json"), service: options.service, kubernetes: Option.isSome(kubernetes),
     })))
 
-/** A service manager restarts a stopped `serve`, so it is stopped through its service. */
+/**
+ * A service manager restarts a stopped `serve`, so it is stopped through its service. Windows tells a service only by
+ * its session, which a command run over SSH shares, so both are named.
+ */
 const stopService = (platform: NodeJS.Platform) => platform === "linux"
   ? "It runs as a systemd service; stop it with `systemctl stop` on its unit (for a user unit, `systemctl --user stop magnitude`)."
-  : platform === "darwin" ? "It runs as a launchd job; stop it with `launchctl bootout` on its job." : "It runs under a service manager; stop it there."
+  : platform === "darwin" ? "It runs as a launchd job; stop it with `launchctl bootout` on its job."
+  : "Started by its scheduled task, stop it with `Stop-ScheduledTask -TaskName \"Magnitude\"`; started over SSH, press Ctrl+C."
 
 /** Deleting a pod only makes its workload start another, so a pod is stopped by scaling the workload down. */
 const stopContainer = (reach: ServerReach) => reach.kubernetes
