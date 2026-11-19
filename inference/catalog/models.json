@@ -611,8 +611,14 @@
       "support": { "level": "supported" },
       "sources": [
         {
+          "repository": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+          "variants": [{"variantId": "gguf:iq1", "format": "IQ1_M", "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00006.gguf", "variantLabel": "IQ1", "quantizationAware": false}, {"variantId": "gguf:iq2-xxs", "format": "IQ2_XXS", "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf", "variantLabel": "IQ2 XXS", "quantizationAware": false}, {"variantId": "gguf:iq2", "format": "IQ2_XS", "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf", "variantLabel": "IQ2", "quantizationAware": false}],
+          "projector": { "path": "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf" },
+          "license": "mit"
+        },
+        {
           "repository": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
-          "variants": [{"variantId": "gguf:iq1", "format": "UD-IQ1_M", "variantLabel": "IQ1", "quantizationAware": false}, {"variantId": "gguf:iq2", "format": "UD-IQ2_XXS", "variantLabel": "IQ2", "quantizationAware": false}, {"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "mit"
         },
