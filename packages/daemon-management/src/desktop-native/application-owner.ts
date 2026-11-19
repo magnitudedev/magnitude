@@ -89,13 +89,37 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
   message: "The existing Magnitude owner has not finished stopping; it has not been replaced.",
 }) }))
 
+const refuseDuringUpdateInstallation = (directory: string) => Effect.gen(function* () {
+  if (yield* isUpdateInstallationActive(directory)) return yield* new ApplicationOwnershipFailed({
+    message: "A Magnitude update is being installed. Retry the command when it finishes.",
+  })
+})
+
 /** Finite mutations use the same kernel ownership, with no control listener, takeover or service. */
 export const acquireApplicationMaintenance = (directory: string) => Effect.gen(function* () {
   const native = yield* NativeHost
   yield* prepareOwnershipDirectory(directory)
   const lock = yield* ownershipLock(native, directory)
   if (Option.isNone(lock)) return yield* applicationAlreadyRunning(directory)
-  if (yield* isUpdateInstallationActive(directory)) return yield* new ApplicationOwnershipFailed({
-    message: "A Magnitude update is being installed. Retry the command when it finishes.",
-  })
+  yield* refuseDuringUpdateInstallation(directory)
 })
+
+/**
+ * The desktop installer's ownership. A running `magnitude serve` is asked to yield, as it does when the desktop
+ * opens, and serves again once the installed app has started and quit; a running desktop app is refused.
+ */
+export const acquireDesktopInstallation = (directory: string) => Effect.gen(function* () {
+  const native = yield* NativeHost
+  yield* prepareOwnershipDirectory(directory)
+  for (;;) {
+    const lock = yield* ownershipLock(native, directory)
+    if (Option.isSome(lock)) return yield* refuseDuringUpdateInstallation(directory)
+    const owner = yield* observeApplicationOwner(directory)
+    if (!Option.contains(owner, "Headless")) return yield* applicationAlreadyRunning(directory)
+    const endpoint = yield* native.inspectEndpoint(directory)
+    if (Option.isSome(endpoint)) yield* requestApplication(endpoint.value, "Yield").pipe(Effect.ignore)
+    yield* Effect.sleep("100 millis")
+  }
+}).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new ApplicationOwnershipFailed({
+  message: "The running `magnitude serve` has not stopped serving; the desktop app has not been installed.",
+}) }))

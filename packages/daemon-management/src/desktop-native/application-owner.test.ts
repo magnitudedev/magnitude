@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url"
 import { Deferred, Effect, Exit, Fiber, Option, Ref, Schema, Scope, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { ApplicationSnapshot, type ApplicationIntent } from "@magnitudedev/sdk/desktop-host"
-import { acquireApplicationMaintenance, acquireApplicationOwner } from "./application-owner"
+import { acquireApplicationMaintenance, acquireApplicationOwner, acquireDesktopInstallation } from "./application-owner"
 import { occupiedMessage } from "./service-port"
 import { requestApplication, serveApplicationControl } from "./application-control"
 import { acquireUpdateInstallationLease } from "./update-installation-lease"
@@ -150,6 +150,26 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
       const desktop = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" }).pipe(Effect.either, Effect.timeout("5 seconds"))
       expect(desktop._tag === "Right" && desktop.right._tag).toBe("Owner")
       expect(yield* Ref.get(intents)).toEqual(["Observe", "Yield"])
+    })).pipe(Effect.provide(nativeHostLayer(addon))))
+  })
+
+  it("installs the desktop over a running serve once it yields, and refuses a running desktop", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const root = yield* directory
+      const serveScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(serveScope, Exit.void))
+      const serve = yield* acquireApplicationOwner(root, { _tag: "Headless" }).pipe(Effect.provideService(Scope.Scope, serveScope))
+      if (serve._tag !== "Owner") return yield* Effect.die("Expected serve to own")
+      yield* serveApplicationControl(serve.socketPath, { snapshot: Effect.succeed(snapshot), login: noLogin, update: noUpdate,
+        dispatch: intent => intent === "Yield" ? Scope.close(serveScope, Exit.void).pipe(Effect.forkDaemon, Effect.asVoid) : Effect.void,
+      }).pipe(Effect.provideService(Scope.Scope, serveScope))
+      yield* Effect.scoped(acquireDesktopInstallation(root)).pipe(Effect.timeout("5 seconds"))
+      const desktop = yield* acquireApplicationOwner(root, { _tag: "Headless" })
+      if (desktop._tag !== "Owner") return yield* Effect.die("Expected a new owner")
+      yield* serveApplicationControl(desktop.socketPath, { snapshot: Effect.succeed({ ...snapshot, owner: { _tag: "Desktop", tray: { _tag: "Registered" } } }),
+        login: noLogin, update: noUpdate, dispatch: () => Effect.void })
+      const refused = yield* Effect.scoped(acquireDesktopInstallation(root)).pipe(Effect.flip)
+      expect(refused.message).toBe("Magnitude Desktop is still running. Fully quit the desktop app before retrying.")
     })).pipe(Effect.provide(nativeHostLayer(addon))))
   })
 
