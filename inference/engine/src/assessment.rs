@@ -32,22 +32,24 @@ use magnitude_artifacts::{
 };
 use magnitude_chat::{
     artifacts::{gguf_templates, gguf_tokenizer_vocabulary},
-    TemplateInspection, TokenizerError,
+    TemplateBundle, TemplateInspection, TokenizerError,
 };
 use magnitude_executor::{
     assessment::{
-        assess_execution_fit, estimate_execution, lookahead, performance_depths, streamed_layers,
-        prepare_execution_assessment, AssessmentError, StructuralCharge,
-        AssessmentRequest,
+        assess::assess_execution_fit_at_context, estimate_execution, lookahead, performance_depths,
+        pool, streamed_layers, stage_timer, AssessmentError, DecodeDemand, SizingScope,
+        StructuralCharge, AssessmentRequest,
         ExecutionAssessment, ExecutionFit, ExecutionShortfall,
         ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedExecutionAssessment,
-        PointRequests, Priced, Residency as FitResidency, StoredCosts, StreamedFigures,
+        PointRequests, Priced, StoredCosts, StreamedFigures,
     },
     platform::{self, DeviceRequest, GraphPricing, ReleaseRate, PlatformError, SelectedDevice},
     held_storage, resident_layout, scaled_source_element, stored_weights,
-    ExpertBankPlan, ExecutionPath, ExecutionPlanDraft, FloorForms, KernelCache, UndraftedBounds,
+    ExpertBankPlan, ExecutionPath, ExecutionPlanDraft, FloorForms, HeldForm, KernelCache, UndraftedBounds,
 };
-use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, ScaledActivations};
+use magnitude_family_contracts::{
+    DraftVariant, ModelDefinition, ModelFamily, Operator, ScaledActivations,
+};
 use magnitude_scheduler::ServiceLimits;
 use seismic::{DType, DeviceTopology, Devices, Layout, Status};
 use std::collections::BTreeMap;
@@ -392,7 +394,6 @@ pub enum PreparedDrafter {
 /// ([`target_alone`]): it carries a whole definition, plan draft and charge
 /// structure, and a preparation is moved by value through deep frames.
 pub struct TargetAlone {
-    definition: ModelDefinition,
     draft: ExecutionPlanDraft,
     structure: StructuralCharge,
 }
@@ -413,9 +414,10 @@ impl PreparedDrafter {
             Self::Rejected(unsupported) => return Ok(DrafterVerdict::Rejected(unsupported.clone())),
             Self::Bound { method, alone } => (*method, alone),
         };
-        let held = |definition: &ModelDefinition, draft: &ExecutionPlanDraft, structure: &StructuralCharge| {
+        let context = u64::from(context);
+        let held = |draft: &ExecutionPlanDraft, structure: &StructuralCharge| {
             let charge = structure
-                .charge(&at_context(definition, context), &draft.clone().with_graph_pricing(pricing))
+                .charge_at_context_with_pricing(context, draft, pricing)
                 .map_err(ModelAssessmentError::Assessment)?;
             charge
                 .host_bytes()
@@ -423,21 +425,14 @@ impl PreparedDrafter {
                 .map_err(ModelAssessmentError::Planning)
         };
         let primary = execution.primary();
-        let with = held(execution.definition(), &primary.draft, &primary.structure)?;
-        let without = held(&alone.definition, &alone.draft, &alone.structure)?;
+        let with = held(&primary.draft, &primary.structure)?;
+        let without = held(&alone.draft, &alone.structure)?;
         assert!(
             with >= without,
             "a drafted plan holds {with} bytes, less than its target's plan alone ({without}) at the same holding of experts"
         );
         Ok(DrafterVerdict::Bound { method, memory_bytes: with - without })
     }
-}
-
-/// `definition` served at `context` tokens.
-fn at_context(definition: &ModelDefinition, context: u32) -> ModelDefinition {
-    let mut definition = definition.clone();
-    definition.decoder.context_limit = u64::from(context);
-    definition
 }
 
 /// A complete assessment of one package on one execution environment.
@@ -612,12 +607,14 @@ pub fn finish_model_assessment(
         }
         PreparedModelAssessment::Planned { facts, execution, tiers } => (&**facts, &**execution, tiers),
     };
+    let _scope = SizingScope::enter();
     let definition = execution.definition();
     let structure = &setup.structure;
     let pricing = structure.selected.graph_cost;
     let served = served_tier(tiers.len(), |index| {
-        let fit = assess_execution_fit(
-            &at_context(definition, tiers[index]),
+        let tier = tiers[index];
+        let fit = assess_execution_fit_at_context(
+            u64::from(tier),
             execution,
             pricing,
             &structure.topology,
@@ -625,17 +622,14 @@ pub fn finish_model_assessment(
         )
         .map_err(ModelAssessmentError::Assessment)?;
         Ok::<_, ModelAssessmentError>(match fit {
-            ExecutionAssessment::Fits(fit) => Ok((tiers[index], fit)),
-            ExecutionAssessment::DoesNotFit(shortfall) => Err((tiers[index], shortfall)),
+            ExecutionAssessment::Fits(fit) => Ok((tier, fit)),
+            ExecutionAssessment::DoesNotFit(shortfall) => Err((tier, shortfall)),
         })
     })?;
-    let tier = match &served {
-        Ok((tier, _)) | Err((tier, _)) => *tier,
-    };
-    let facts = facts.with_drafter(facts.drafter.verdict(execution, tier, pricing)?);
-    let fit = match served {
-        Ok((_, fit)) => fit,
-        Err((_, shortfall)) => {
+    let (tier, fit) = match served {
+        Ok((tier, fit)) => (tier, fit),
+        Err((tier, shortfall)) => {
+            let facts = facts.with_drafter(facts.drafter.verdict(execution, tier, pricing)?);
             return Ok(ModelAssessment::Assessed {
                 facts,
                 execution: ModelExecution::DoesNotFit(shortfall),
@@ -648,20 +642,42 @@ pub fn finish_model_assessment(
         release: structure.release,
         sequences,
     };
-    let residency = match fit.residency() {
-        FitResidency::Streamed(bank) => {
-            let shares = ExpertShares::of(&bank);
-            let at = |held| streamed_performance(&setup.measurements, execution, &bank, &request, held);
-            ModelResidency::Streamed {
-                performance: at(shares.held(shares.slots()))?,
-                floor_performance: at(shares.held(shares.floor()))?,
-                shares,
+    let compute_residency = || -> Result<ModelResidency, AssessmentError> {
+        Ok(match fit.streamed_bank() {
+            Some(bank) => {
+                let shares = ExpertShares::of(bank);
+                let (performance, floor_performance) = streamed_performance_pair(
+                    &setup.measurements,
+                    execution,
+                    bank,
+                    &request,
+                    shares.held(shares.slots()),
+                    shares.held(shares.floor()),
+                )?;
+                ModelResidency::Streamed {
+                    performance,
+                    floor_performance,
+                    shares,
+                }
             }
-        }
-        FitResidency::Resident => ModelResidency::Resident {
-            performance: resident_performance(&setup.measurements, execution, &request)?,
-        },
+            None => ModelResidency::Resident {
+                performance: resident_performance(&setup.measurements, execution, &request)?,
+            },
+        })
     };
+    let (drafter, residency) = if matches!(facts.drafter, PreparedDrafter::Bound { .. })
+        && u64::from(tier) != definition.decoder.context_limit
+    {
+        let (residency, drafter) = pool::join(compute_residency, || {
+            facts.drafter.verdict(execution, tier, pricing)
+        });
+        (drafter?, residency.map_err(ModelAssessmentError::Assessment)?)
+    } else {
+        let drafter = facts.drafter.verdict(execution, tier, pricing)?;
+        let residency = compute_residency().map_err(ModelAssessmentError::Assessment)?;
+        (drafter, residency)
+    };
+    let facts = facts.with_drafter(drafter);
     Ok(ModelAssessment::Assessed {
         facts,
         execution: ModelExecution::Fits { fit, residency },
@@ -704,36 +720,105 @@ fn resident_performance(
     measurements: &Measurements,
     preparation: &PreparedExecutionAssessment,
     request: &AssessmentRequest,
-) -> Result<Performance, ModelAssessmentError> {
+) -> Result<Performance, AssessmentError> {
     Ok(match measurements {
         Measurements::Pending => Performance::Pending,
         Measurements::Unavailable { reason } => Performance::Unavailable {
             reason: reason.clone(),
         },
-        Measurements::Measured { costs, .. } => Performance::Estimated(
-            estimate_execution(preparation, costs, request)
-                .map_err(ModelAssessmentError::Assessment)?,
-        ),
+        Measurements::Measured { costs, .. } => {
+            Performance::Estimated(estimate_execution(preparation, costs, request)?)
+        }
     })
 }
 
-/// A streamed fit's decode speed holding `held` of each routed layer's
-/// experts: pending or unavailable as the setup's measurements or their
-/// streamed figures are, and once both are measured, [`streamed_estimate`].
-fn streamed_performance(
+/// A streamed fit's decode speeds at two slot holdings (`held_a`, `held_b`),
+/// sharing `streamed_layers`, `costs.figures`, and the `held`-independent
+/// compute step time across both evaluations, and evaluating independent
+/// depths and slot holdings concurrently on the assessment pool.
+fn streamed_performance_pair(
     measurements: &Measurements,
     preparation: &PreparedExecutionAssessment,
     bank: &ExpertBankPlan,
     request: &AssessmentRequest,
-    held: magnitude_cost_model::HeldSlots,
-) -> Result<Performance, ModelAssessmentError> {
+    held_a: magnitude_cost_model::HeldSlots,
+    held_b: magnitude_cost_model::HeldSlots,
+) -> Result<(Performance, Performance), AssessmentError> {
     match measurements {
-        Measurements::Pending => Ok(Performance::Pending),
-        Measurements::Unavailable { reason } => Ok(Performance::Unavailable { reason: reason.clone() }),
+        Measurements::Pending => Ok((Performance::Pending, Performance::Pending)),
+        Measurements::Unavailable { reason } => Ok((
+            Performance::Unavailable { reason: reason.clone() },
+            Performance::Unavailable { reason: reason.clone() },
+        )),
         Measurements::Measured { costs, streamed, .. } => match streamed {
-            Priced::Pending(_) => Ok(Performance::Pending),
-            Priced::Unavailable(reason) => Ok(Performance::Unavailable { reason: reason.clone() }),
-            Priced::Measured(figures) => streamed_estimate(costs, figures, preparation, bank, request, held),
+            Priced::Pending(_) => Ok((Performance::Pending, Performance::Pending)),
+            Priced::Unavailable(reason) => Ok((
+                Performance::Unavailable { reason: reason.clone() },
+                Performance::Unavailable { reason: reason.clone() },
+            )),
+            Priced::Measured(figures) => {
+                let (layers, (target, priced)) = pool::join(
+                    || streamed_layers(bank, costs, figures),
+                    || {
+                        let target = preparation.target_census();
+                        let priced = costs.figures(&target.censuses());
+                        (target, priced)
+                    },
+                );
+                let layers = match layers {
+                    Priced::Measured(layers) => layers,
+                    Priced::Pending(_) => return Ok((Performance::Pending, Performance::Pending)),
+                    Priced::Unavailable(reason) => {
+                        let msg = format!("the streamed layers: {reason}");
+                        return Ok((
+                            Performance::Unavailable { reason: msg.clone() },
+                            Performance::Unavailable { reason: msg },
+                        ));
+                    }
+                };
+                let pricing = seismic::measure::pricing::Pricing {
+                    figures: &priced,
+                    lookahead: lookahead(preparation.draft()),
+                };
+                let depths = performance_depths(request.context_limit, &request.performance_depths);
+                let seq_u64 = u64::from(request.sequences);
+                let seq_f64 = f64::from(request.sequences);
+                let read = figures.read;
+                let period_a = layers.prepare(None, held_a, seq_f64);
+                let period_b = (held_a != held_b).then(|| layers.prepare(None, held_b, seq_f64));
+                let pairs = pool::par_for_results(&depths, |&depth| {
+                    let compute = target.each(|census| {
+                        magnitude_cost_model::step_seconds(census, &pricing, seq_u64, depth)
+                    })?;
+                    let (step_a, step_b) = match &period_b {
+                        None => {
+                            let step = period_a.step_seconds(read, compute);
+                            (step, step)
+                        }
+                        Some(period_b) => (
+                            period_a.step_seconds(read, compute),
+                            period_b.step_seconds(read, compute),
+                        ),
+                    };
+                    Ok::<_, seismic::measure::pricing::PriceError>((
+                        PerformanceEstimate {
+                            context_tokens: depth,
+                            tokens_per_second: 1. / step_a.total_seconds,
+                        },
+                        PerformanceEstimate {
+                            context_tokens: depth,
+                            tokens_per_second: 1. / step_b.total_seconds,
+                        },
+                    ))
+                })?;
+                let mut est_a = Vec::with_capacity(pairs.len());
+                let mut est_b = Vec::with_capacity(pairs.len());
+                for (a, b) in pairs {
+                    est_a.push(a);
+                    est_b.push(b);
+                }
+                Ok((Performance::Estimated(est_a), Performance::Estimated(est_b)))
+            }
         },
     }
 }
@@ -755,22 +840,35 @@ pub fn streamed_estimate(
     request: &AssessmentRequest,
     held: magnitude_cost_model::HeldSlots,
 ) -> Result<Performance, ModelAssessmentError> {
-    let layers = match streamed_layers(bank, costs, figures) {
+    let (layers, (target, priced)) = pool::join(
+        || streamed_layers(bank, costs, figures),
+        || {
+            let target = preparation.target_census();
+            let priced = costs.figures(&target.censuses());
+            (target, priced)
+        },
+    );
+    let layers = match layers {
         Priced::Measured(layers) => layers,
         Priced::Pending(_) => return Ok(Performance::Pending),
         Priced::Unavailable(reason) => return Ok(Performance::Unavailable { reason: format!("the streamed layers: {reason}") }),
     };
-    let target = preparation.censuses();
-    let priced = costs.figures(&target.censuses());
     let pricing = seismic::measure::pricing::Pricing { figures: &priced, lookahead: lookahead(preparation.draft()) };
-    let mut estimates = Vec::new();
-    for depth in performance_depths(request.context_limit, &request.performance_depths) {
+    let depths = performance_depths(request.context_limit, &request.performance_depths);
+    let seq_u64 = u64::from(request.sequences);
+    let seq_f64 = f64::from(request.sequences);
+    let read = figures.read;
+    let period = layers.prepare(None, held, seq_f64);
+    let estimates = pool::par_for_results(&depths, |&depth| {
         let compute = target
-            .each(|census| magnitude_cost_model::step_seconds(census, &pricing, u64::from(request.sequences), depth))
-            .map_err(|error| ModelAssessmentError::Assessment(error.into()))?;
-        let step = layers.step_seconds(None, figures.read, held, f64::from(request.sequences), compute);
-        estimates.push(PerformanceEstimate { context_tokens: depth, tokens_per_second: 1. / step.total_seconds });
-    }
+            .each(|census| magnitude_cost_model::step_seconds(census, &pricing, seq_u64, depth))?;
+        let step = period.step_seconds(read, compute);
+        Ok::<_, seismic::measure::pricing::PriceError>(PerformanceEstimate {
+            context_tokens: depth,
+            tokens_per_second: 1. / step.total_seconds,
+        })
+    })
+    .map_err(|error| ModelAssessmentError::Assessment(error.into()))?;
     Ok(Performance::Estimated(estimates))
 }
 
@@ -796,6 +894,7 @@ pub fn assess_model(
     performance_depths: &[u32],
     sequences: u32,
 ) -> Result<ModelAssessment, ModelAssessmentError> {
+    let _scope = SizingScope::enter();
     let prepared = prepare_model_assessment(package, &setup.structure)?;
     finish_model_assessment(&prepared, setup, performance_depths, sequences)
 }
@@ -813,7 +912,7 @@ pub fn prepare_model_assessment(
     package: &ModelPackagePaths,
     structure: &AssessmentStructure,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
-    prepare_model_assessment_from(package, &FileHeaders, structure)
+    prepare_model_assessment_with(package, HeaderInput::Files, structure)
 }
 
 /// [`prepare_model_assessment`] with the package's headers from `headers`,
@@ -823,36 +922,409 @@ pub fn prepare_model_assessment_from(
     headers: &dyn HeaderSource,
     structure: &AssessmentStructure,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
+    prepare_model_assessment_with(package, HeaderInput::Source(headers), structure)
+}
+
+fn prepare_model_assessment_with(
+    package: &ModelPackagePaths,
+    headers: HeaderInput<'_>,
+    structure: &AssessmentStructure,
+) -> Result<PreparedModelAssessment, ModelAssessmentError> {
     let layout = resident_layout(ExecutionPath::Native, structure.selected.info.backend());
-    let admitted = match admit(package, headers, layout)? {
-        Admission::Unsupported {
-            unsupported,
-            fingerprint,
-        } => {
-            return Ok(PreparedModelAssessment::Unsupported {
-                unsupported,
-                fingerprint,
-            });
-        }
-        Admission::Admitted(admitted) => admitted.served_at(structure.served_context)?,
+    let source = headers.as_source();
+    let draft_prefetch_path = match headers {
+        HeaderInput::Files if package.method != ModelMethod::Plain => package.draft.as_deref(),
+        _ => None,
     };
-    let (drafter, execution) = match plan_package(&admitted, structure)? {
-        Ok(planned) => planned,
-        Err(unsupported) => {
-            return Ok(PreparedModelAssessment::Unsupported {
-                unsupported,
-                fingerprint: admitted.fingerprint.clone(),
-            });
-        }
-    };
+    let (vision, projector, context_limit, fingerprint, chat, drafter, execution) =
+        if let Some(draft_path) = draft_prefetch_path {
+            // Overlap draft header inspection (`PackageHeaders::inspect_component`)
+            // with target header admission, chat inspection, fingerprinting, and
+            // (for dense models) plain target planning so target work starts
+            // immediately instead of idling on draft I/O and populates the
+            // target-family layout cache reused by drafted certification (and
+            // `TargetAlone` / plain fallback). Routed MoE models skip plain
+            // pre-planning because `can_reuse_plain_as_target_alone` requires
+            // `expert_bank().is_none()`, so pre-planning would duplicate banked
+            // certification before `admit_drafter` can start.
+            let (prefetched, target_branch) = pool::join(
+                move || prefetch_draft(draft_path, layout),
+                || -> Result<PrefetchedTargetBranch, ModelAssessmentError> {
+                    let target = match admit_target_headers_timed(package, source, layout)? {
+                        TargetHeadersAdmission::Unsupported {
+                            unsupported,
+                            fingerprint,
+                        } => {
+                            return Ok(PrefetchedTargetBranch::Unsupported {
+                                unsupported,
+                                fingerprint,
+                            });
+                        }
+                        TargetHeadersAdmission::Admitted(target) => *target,
+                    };
+                    let AdmittedTarget {
+                        headers: pkg_headers,
+                        family,
+                        definition,
+                        bundle,
+                        projector,
+                    } = target;
+                    let recording = stage_timer::is_recording();
+                    if has_routed_experts(&definition) {
+                        // Defer chat inspection and fingerprinting until after
+                        // `admit_drafter` so they overlap with `plan_package`
+                        // instead of serializing cold template probing ahead of
+                        // banked MoE planning.
+                        return Ok(PrefetchedTargetBranch::Admitted(Box::new(PreplannedTarget {
+                            headers: pkg_headers,
+                            family,
+                            definition,
+                            projector,
+                            chat: DeferredChat::Pending(bundle),
+                            preplanned: None,
+                        })));
+                    }
+                    let target_dir = pkg_headers.target();
+                    let (((chat_res, chat_ns), (fingerprint, fp_ns)), (definition, preplanned)) =
+                        pool::join(
+                            move || inspect_chat_and_fingerprint(bundle, target_dir, recording),
+                            || preplan_plain(&pkg_headers, definition, structure),
+                        );
+                    if recording {
+                        stage_timer::record_stage(|t| {
+                            t.chat_inspect_ns += chat_ns;
+                            t.admit_fingerprint_ns += fp_ns;
+                        });
+                    }
+                    Ok(PrefetchedTargetBranch::Admitted(Box::new(PreplannedTarget {
+                        headers: pkg_headers,
+                        family,
+                        definition,
+                        projector,
+                        chat: DeferredChat::Done { chat_res, fingerprint },
+                        preplanned,
+                    })))
+                },
+            );
+            let PreplannedTarget {
+                headers: mut pkg_headers,
+                family,
+                mut definition,
+                projector,
+                chat,
+                preplanned,
+            } = match target_branch? {
+                PrefetchedTargetBranch::Unsupported {
+                    unsupported,
+                    fingerprint,
+                } => {
+                    return Ok(PreparedModelAssessment::Unsupported {
+                        unsupported,
+                        fingerprint,
+                    });
+                }
+                PrefetchedTargetBranch::Admitted(target) => *target,
+            };
+            let vision = definition.vision.is_some();
+            let _ = u32::try_from(definition.decoder.context_limit)
+                .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
+            let mut drafter = stage_timer::time_stage(
+                |t, ns| t.admit_drafter_ns += ns,
+                || {
+                    admit_drafter(
+                        package,
+                        source,
+                        &mut pkg_headers,
+                        Some(prefetched),
+                        family,
+                        &definition,
+                        layout,
+                    )
+                },
+            )?;
+            let context_limit =
+                apply_served_context(&mut definition, &mut drafter, structure.served_context)?;
+            let (chat_res, fingerprint, planned_res) = match chat {
+                DeferredChat::Done { chat_res, fingerprint } => {
+                    let chat = match chat_res {
+                        Ok(chat) => chat,
+                        Err(error) => {
+                            return Ok(PreparedModelAssessment::Unsupported {
+                                unsupported: UnsupportedModel::chat_template(error),
+                                fingerprint,
+                            });
+                        }
+                    };
+                    let planned_res =
+                        plan_package(&pkg_headers, definition, drafter, structure, preplanned);
+                    (Ok(chat), fingerprint, planned_res)
+                }
+                DeferredChat::Pending(bundle) => {
+                    let recording = stage_timer::is_recording();
+                    let target_dir = pkg_headers.target();
+                    let (((chat_res, chat_ns), (fingerprint, fp_ns)), planned_res) = pool::join(
+                        move || inspect_chat_and_fingerprint(bundle, target_dir, recording),
+                        || plan_package(&pkg_headers, definition, drafter, structure, preplanned),
+                    );
+                    if recording {
+                        stage_timer::record_stage(|t| {
+                            t.chat_inspect_ns += chat_ns;
+                            t.admit_fingerprint_ns += fp_ns;
+                        });
+                    }
+                    (chat_res, fingerprint, planned_res)
+                }
+            };
+            let chat = match chat_res {
+                Ok(chat) => chat,
+                Err(error) => {
+                    return Ok(PreparedModelAssessment::Unsupported {
+                        unsupported: UnsupportedModel::chat_template(error),
+                        fingerprint,
+                    });
+                }
+            };
+            let (drafter, execution) = match planned_res? {
+                Ok(planned) => planned,
+                Err(unsupported) => {
+                    return Ok(PreparedModelAssessment::Unsupported {
+                        unsupported,
+                        fingerprint,
+                    });
+                }
+            };
+            (vision, projector, context_limit, fingerprint, chat, drafter, execution)
+        } else {
+            let target = match admit_target_headers_timed(package, source, layout)? {
+                TargetHeadersAdmission::Unsupported {
+                    unsupported,
+                    fingerprint,
+                } => {
+                    return Ok(PreparedModelAssessment::Unsupported {
+                        unsupported,
+                        fingerprint,
+                    });
+                }
+                TargetHeadersAdmission::Admitted(target) => target,
+            };
+            let vision = target.definition.vision.is_some();
+            let projector = target.projector;
+            let bundle = target.bundle;
+            let mut pkg_headers = target.headers;
+            let family = target.family;
+            let mut definition = target.definition;
+            let _ = u32::try_from(definition.decoder.context_limit)
+                .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
+            let mut drafter = stage_timer::time_stage(
+                |t, ns| t.admit_drafter_ns += ns,
+                || {
+                    admit_drafter(
+                        package,
+                        source,
+                        &mut pkg_headers,
+                        None,
+                        family,
+                        &definition,
+                        layout,
+                    )
+                },
+            )?;
+            let context_limit =
+                apply_served_context(&mut definition, &mut drafter, structure.served_context)?;
+            let recording = stage_timer::is_recording();
+            let target_dir = pkg_headers.target();
+            // `bundle.inspect_cached()` and `ModelFingerprint::from_directory` are
+            // independent of each other and of execution planning; overlap both with
+            // each other and with `plan_package`.
+            let (((chat_res, chat_ns), (fingerprint, fp_ns)), planned_res) = pool::join(
+                move || inspect_chat_and_fingerprint(bundle, target_dir, recording),
+                || plan_package(&pkg_headers, definition, drafter, structure, None),
+            );
+            if recording {
+                stage_timer::record_stage(|t| {
+                    t.chat_inspect_ns += chat_ns;
+                    t.admit_fingerprint_ns += fp_ns;
+                });
+            }
+            let chat = match chat_res {
+                Ok(chat) => chat,
+                Err(error) => {
+                    return Ok(PreparedModelAssessment::Unsupported {
+                        unsupported: UnsupportedModel::chat_template(error),
+                        fingerprint,
+                    });
+                }
+            };
+            let (drafter, execution) = match planned_res? {
+                Ok(planned) => planned,
+                Err(unsupported) => {
+                    return Ok(PreparedModelAssessment::Unsupported {
+                        unsupported,
+                        fingerprint,
+                    });
+                }
+            };
+            (vision, projector, context_limit, fingerprint, chat, drafter, execution)
+        };
     Ok(PreparedModelAssessment::Planned {
-        facts: Box::new(admitted.facts(drafter)),
+        facts: Box::new(ModelFacts {
+            capabilities: ModelCapabilities {
+                vision,
+                tools: chat.tools,
+                structured_output: chat.structured_output,
+                reasoning: ReasoningCapabilities {
+                    efforts: chat
+                        .reasoning
+                        .mappings
+                        .into_iter()
+                        .map(|mapping| mapping.effort)
+                        .collect(),
+                    default_effort: chat.reasoning.default_effort,
+                },
+            },
+            template_fingerprint: chat.fingerprint,
+            context_limit,
+            fingerprint,
+            projector,
+            drafter,
+        }),
         execution,
         tiers: match structure.served_context {
-            Some(_) => vec![admitted.context_limit],
-            None => served_contexts(admitted.context_limit),
+            Some(_) => vec![context_limit],
+            None => served_contexts(context_limit),
         },
     })
+}
+
+enum PrefetchedTargetBranch {
+    Unsupported {
+        unsupported: UnsupportedModel,
+        fingerprint: Option<ModelFingerprint>,
+    },
+    Admitted(Box<PreplannedTarget>),
+}
+
+enum DeferredChat {
+    Pending(TemplateBundle),
+    Done {
+        chat_res: Result<TemplateInspection, String>,
+        fingerprint: Option<ModelFingerprint>,
+    },
+}
+
+struct PreplannedTarget {
+    headers: PackageHeaders,
+    family: &'static dyn ModelFamily,
+    definition: ModelDefinition,
+    projector: ProjectorVerdict,
+    chat: DeferredChat,
+    preplanned: Option<Result<FloorForms<()>, Refusal>>,
+}
+
+fn inspect_chat_and_fingerprint(
+    bundle: TemplateBundle,
+    target_dir: &Directory,
+    recording: bool,
+) -> (
+    (Result<TemplateInspection, String>, u64),
+    (Option<ModelFingerprint>, u64),
+) {
+    pool::join(
+        move || {
+            let chat_start = recording.then(std::time::Instant::now);
+            let chat_res = bundle.inspect_cached();
+            let chat_ns = chat_start.map_or(0, |s| {
+                u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+            });
+            (chat_res, chat_ns)
+        },
+        move || {
+            let fp_start = recording.then(std::time::Instant::now);
+            let fp = ModelFingerprint::from_directory(target_dir).ok();
+            let fp_ns = fp_start.map_or(0, |s| {
+                u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+            });
+            (fp, fp_ns)
+        },
+    )
+}
+
+/// Whether `definition`'s decoder contains any routed expert sublayer (directly
+/// or inside a parallel branch).
+fn has_routed_experts(definition: &ModelDefinition) -> bool {
+    fn op_is_routed(op: &Operator) -> bool {
+        match op {
+            Operator::RoutedFfn(_) => true,
+            Operator::Parallel(branches) => branches.iter().any(|branch| op_is_routed(&branch.op)),
+            _ => false,
+        }
+    }
+    definition
+        .decoder
+        .sublayers()
+        .any(|(_, layer)| op_is_routed(&layer.op))
+}
+
+/// Pre-plan the plain target while a separate draft component is being
+/// prefetched, returning `definition` with its declared `context_limit`
+/// restored alongside the plain target's [`FloorForms`].
+fn preplan_plain(
+    headers: &PackageHeaders,
+    mut definition: ModelDefinition,
+    structure: &AssessmentStructure,
+) -> (ModelDefinition, Option<Result<FloorForms<()>, Refusal>>) {
+    let declared_context_limit = definition.decoder.context_limit;
+    if u32::try_from(declared_context_limit).is_err() {
+        return (definition, None);
+    }
+    let served_limit = match crate::host::resolve_served_context(
+        structure.served_context,
+        declared_context_limit,
+    ) {
+        Ok(limit) if u32::try_from(limit).is_ok() => limit,
+        _ => return (definition, None),
+    };
+    let environment = Environment {
+        policy: &structure.policy,
+        service: &structure.service,
+        device: structure.device,
+        release: structure.release,
+    };
+    definition.decoder.context_limit = served_limit;
+    let mut package = headers.manifest();
+    package.draft = None;
+    let plain = match environment.plain_with_package_or_return(package, definition) {
+        Ok(plain) => plain,
+        Err((_error, mut definition)) => {
+            definition.decoder.context_limit = declared_context_limit;
+            return (definition, None);
+        }
+    };
+    let _scope = SizingScope::enter();
+    let outline = |definition: &ModelDefinition, draft: &ExecutionPlanDraft| {
+        StructuralCharge::of(definition, draft).map(|charge| (charge, ()))
+    };
+    let forms = prepare_forms(&plain, &structure.selected, outline, |_| ())
+        .map(|(forms, ())| forms);
+    let mut definition = plain.definition;
+    definition.decoder.context_limit = declared_context_limit;
+    (definition, Some(forms))
+}
+
+/// Apply `served` context to the target definition and any drafter candidate
+/// (which serves the same context as the target), returning the resolved limit.
+fn apply_served_context(
+    definition: &mut ModelDefinition,
+    drafter: &mut DrafterAdmission,
+    served: Option<usize>,
+) -> Result<u32, ModelAssessmentError> {
+    let limit = crate::host::resolve_served_context(served, definition.decoder.context_limit)
+        .map_err(|error| ModelAssessmentError::Configuration(error.to_string()))?;
+    definition.decoder.context_limit = limit;
+    if let DrafterAdmission::Candidate { definition, .. } = drafter {
+        definition.decoder.context_limit = limit;
+    }
+    u32::try_from(limit).map_err(|_| ModelAssessmentError::ContextLimit(limit))
 }
 
 /// `admitted` planned at its served context, as a load serving it there
@@ -860,99 +1332,282 @@ pub fn prepare_model_assessment_from(
 /// ([`prepare_forms`]): the drafted plan when its drafter plans, the
 /// target's alone otherwise; or the target's refusal.
 fn plan_package(
-    admitted: &AdmittedPackage,
+    headers: &PackageHeaders,
+    plain_definition: ModelDefinition,
+    drafter: DrafterAdmission,
     structure: &AssessmentStructure,
+    mut preplanned_plain: Option<Result<FloorForms<()>, Refusal>>,
 ) -> Result<Result<(PreparedDrafter, Box<PreparedExecutionAssessment>), UnsupportedModel>, ModelAssessmentError> {
+    let _scope = SizingScope::enter();
     let environment = Environment {
         policy: &structure.policy,
         service: &structure.service,
         device: structure.device,
         release: structure.release,
     };
-    let plain = environment
-        .plain(admitted, admitted.definition.clone())
-        .map_err(ModelAssessmentError::Configuration)?;
     // The target's plan alone is a package's refusal: a drafter's own is
     // the drafter's.
     let refused = |refusal| match refusal {
         Refusal::Unsupported(unsupported) => Ok(Err(unsupported)),
         Refusal::Failed(error) => Err(error),
     };
-    let (drafter, definition, forms) = match drafted_plan(&environment, admitted, &structure.selected) {
-        Ok((method, manifest, forms)) => match target_alone(plain, &structure.selected, &forms) {
-            Ok(alone) => (PreparedDrafter::Bound { method, alone }, manifest.definition, forms.structures()),
-            Err(refusal) => return refused(refusal),
-        },
-        Err(verdict) => {
-            let outline = |definition: &ModelDefinition, draft: &ExecutionPlanDraft| {
-                StructuralCharge::of(definition, draft).map(|charge| (charge, ()))
-            };
-            match prepare_forms(&plain, &structure.selected, outline) {
-                Ok(forms) => (verdict, plain.definition, forms),
-                Err(refusal) => return refused(refusal),
+    let manifest_package = headers.manifest();
+    let plain_forms_ref = preplanned_plain.as_ref().and_then(|res| res.as_ref().ok());
+    match drafted_plan(
+        &environment,
+        manifest_package,
+        drafter,
+        &plain_definition,
+        &structure.selected,
+        plain_forms_ref,
+    ) {
+        Ok(planned) => {
+            let DraftedPlan {
+                method,
+                manifest,
+                forms,
+                demands,
+                decode_demand_ns,
+                alone,
+            } = *planned;
+            if stage_timer::is_recording() {
+                stage_timer::record_stage(|t| t.decode_demand_ns += decode_demand_ns);
             }
+            let (draft, structure) = match alone {
+                Some(Ok(alone)) => alone,
+                Some(Err(refusal)) => return refused(refusal),
+                None => {
+                    let HeldForm { draft, structure, .. } = preplanned_plain
+                        .take()
+                        .expect("reused plain target_alone requires preplanned plain forms")
+                        .ok()
+                        .expect("reused plain target_alone came from Ok plain forms")
+                        .into_primary();
+                    (draft, structure)
+                }
+            };
+            let (demand, whole) = match demands {
+                Ok(demands) => demands,
+                Err(AssessmentError::Graph(error)) => return refused(Refusal::of(classify_graph(error))),
+                Err(error) => return Err(ModelAssessmentError::Assessment(error)),
+            };
+            let alone = Box::new(TargetAlone {
+                draft,
+                structure,
+            });
+            let execution = PreparedExecutionAssessment::from_demands(
+                manifest.definition,
+                forms.structures(),
+                demand,
+                whole,
+            );
+            Ok(Ok((PreparedDrafter::Bound { method, alone }, execution)))
         }
-    };
-    match prepare_execution_assessment(definition, forms) {
-        Ok(execution) => Ok(Ok((drafter, execution))),
-        Err(AssessmentError::Graph(error)) => refused(Refusal::of(classify_graph(error))),
-        Err(error) => Err(ModelAssessmentError::Assessment(error)),
+        Err((verdict, mut package)) => {
+            let recording = stage_timer::is_recording();
+            let (plain_definition, forms, demands_res, dd_ns) = match preplanned_plain {
+                Some(Ok(forms)) => {
+                    let start = recording.then(std::time::Instant::now);
+                    let demands_res = PreparedExecutionAssessment::compute_decode_demands(
+                        &plain_definition,
+                        forms.primary(),
+                    );
+                    let dd_ns = start.map_or(0, |s| {
+                        u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                    });
+                    (plain_definition, forms, demands_res, dd_ns)
+                }
+                Some(Err(refusal)) => return refused(refusal),
+                None => {
+                    package.draft = None;
+                    let plain = environment
+                        .plain_with_package(package, plain_definition)
+                        .map_err(ModelAssessmentError::Configuration)?;
+                    let outline = |definition: &ModelDefinition, draft: &ExecutionPlanDraft| {
+                        StructuralCharge::of(definition, draft).map(|charge| (charge, ()))
+                    };
+                    let def_ref = &plain.definition;
+                    let (forms, (demands_res, dd_ns)) = match prepare_forms(
+                        &plain,
+                        &structure.selected,
+                        outline,
+                        move |primary| {
+                            let start = recording.then(std::time::Instant::now);
+                            let res = PreparedExecutionAssessment::compute_decode_demands(def_ref, primary);
+                            let ns = start.map_or(0, |s| {
+                                u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            });
+                            (res, ns)
+                        },
+                    ) {
+                        Ok(planned) => planned,
+                        Err(refusal) => return refused(refusal),
+                    };
+                    (plain.definition, forms, demands_res, dd_ns)
+                }
+            };
+            if recording {
+                stage_timer::record_stage(|t| t.decode_demand_ns += dd_ns);
+            }
+            let (demand, whole) = match demands_res {
+                Ok(demands) => demands,
+                Err(AssessmentError::Graph(error)) => return refused(Refusal::of(classify_graph(error))),
+                Err(error) => return Err(ModelAssessmentError::Assessment(error)),
+            };
+            let execution = PreparedExecutionAssessment::from_demands(
+                plain_definition,
+                forms,
+                demand,
+                whole,
+            );
+            Ok(Ok((verdict, execution)))
+        }
     }
 }
 
+/// Output of [`drafted_plan`], boxed so its manifest and forms stay off
+/// [`plan_package`]'s stack frame.
+struct DraftedPlan {
+    method: SpeculativeMethod,
+    manifest: ExecutionManifest,
+    forms: FloorForms<Option<UndraftedBounds>>,
+    demands: Result<(DecodeDemand, Option<DecodeDemand>), AssessmentError>,
+    decode_demand_ns: u64,
+    /// `None` when the pre-planned plain primary form already equals
+    /// `target_alone` and is reused directly.
+    alone: Option<Result<(ExecutionPlanDraft, StructuralCharge), Refusal>>,
+}
+
+/// Whether `plain`'s primary form already has the exact same target holding,
+/// limits, codec, and pass as `drafted.without_drafter(plain_definition)`,
+/// so it can be reused directly as `TargetAlone` without certifying undrafted
+/// target/readout families.
+fn can_reuse_plain_as_target_alone(
+    drafted: &ExecutionPlanDraft,
+    plain: &ExecutionPlanDraft,
+) -> bool {
+    drafted.load().expert_bank().is_none()
+        && plain.load().expert_bank().is_none()
+        && drafted.policy().limits() == plain.policy().limits()
+        && drafted.policy().codec() == plain.policy().codec()
+        && drafted.load().pass(drafted.policy().limits())
+            == plain.load().pass(plain.policy().limits())
+}
+
 /// `admitted` drafting with its drafter, planned on `selected` with each
-/// way of holding its experts outlined once beside the target's writes
-/// alone (`StructuralCharge::with_undrafted`), and the method that drafts;
-/// or the drafter's verdict where there is no drafter, or it does not plan.
+/// way of holding its experts outlined once (reusing any pre-planned plain
+/// target-family layout cache, and reusing the pre-planned plain primary form
+/// directly as `TargetAlone` when its holding matches), overlapping decode
+/// demand and [`target_alone`] with any secondary resident form certification;
+/// or the drafter's verdict (returning `package` for the plain fallback)
+/// where there is no drafter, or it does not plan.
 /// A frame of its own: its manifests are each a whole definition, which
 /// [`plan_package`]'s frame would hold beside the target's.
 fn drafted_plan(
     environment: &Environment<'_>,
-    admitted: &AdmittedPackage,
+    package: PackageManifest,
+    drafter: DrafterAdmission,
+    plain_definition: &ModelDefinition,
     selected: &SelectedDevice,
-) -> Result<(SpeculativeMethod, ExecutionManifest, FloorForms<UndraftedBounds>), PreparedDrafter> {
-    match &admitted.drafter {
-        DrafterAdmission::None => Err(PreparedDrafter::None),
+    plain_forms: Option<&FloorForms<()>>,
+) -> Result<Box<DraftedPlan>, (PreparedDrafter, PackageManifest)> {
+    match drafter {
+        DrafterAdmission::None => Err((PreparedDrafter::None, package)),
         DrafterAdmission::Rejected(unsupported) => {
-            Err(PreparedDrafter::Rejected(unsupported.clone()))
+            Err((PreparedDrafter::Rejected(unsupported), package))
         }
-        DrafterAdmission::Candidate { definition, method } => environment
-            .drafted(admitted, definition, *method)
-            .and_then(|(manifest, method)| {
-                match prepare_forms(&manifest, selected, StructuralCharge::with_undrafted) {
-                    Ok(forms) => Ok((method, manifest, forms)),
-                    Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
-                    Err(Refusal::Failed(error)) => {
-                        Err(UnsupportedModel::mismatch(error.to_string()))
-                    }
+        DrafterAdmission::Candidate { definition, method } => {
+            let (manifest, method) = match environment.drafted_with_package(package, *definition, method) {
+                Ok(resolved) => resolved,
+                Err((unsupported, package)) => {
+                    return Err((PreparedDrafter::Rejected(unsupported), package));
                 }
-            })
-            .map_err(PreparedDrafter::Rejected),
+            };
+            let recording = stage_timer::is_recording();
+            let def_ref = &manifest.definition;
+            let plain_primary = plain_forms.map(FloorForms::primary);
+            let plain_cache = plain_primary.and_then(|form| form.structure.target_cache());
+            let outline = |definition: &ModelDefinition, draft: &ExecutionPlanDraft| {
+                if plain_primary.is_some_and(|plain| can_reuse_plain_as_target_alone(draft, &plain.draft)) {
+                    StructuralCharge::of_with_cache(definition, draft, plain_cache.as_ref())
+                        .map(|charge| (charge, None))
+                } else {
+                    StructuralCharge::with_undrafted_with_cache(definition, draft, plain_cache.as_ref())
+                        .map(|(charge, undrafted)| (charge, Some(undrafted)))
+                }
+            };
+            match prepare_forms(
+                &manifest,
+                selected,
+                outline,
+                move |primary: &HeldForm<Option<UndraftedBounds>>| {
+                    match primary.more.as_ref() {
+                        Some(undrafted) => {
+                            let (demands, alone) = pool::join(
+                                move || {
+                                    let start = recording.then(std::time::Instant::now);
+                                    let res = PreparedExecutionAssessment::compute_decode_demands(def_ref, primary);
+                                    let ns = start.map_or(0, |s| {
+                                        u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                                    });
+                                    (res, ns)
+                                },
+                                || target_alone(plain_definition, selected, &primary.draft, undrafted.clone()),
+                            );
+                            (demands, Some(alone))
+                        }
+                        None => {
+                            let start = recording.then(std::time::Instant::now);
+                            let res = PreparedExecutionAssessment::compute_decode_demands(def_ref, primary);
+                            let ns = start.map_or(0, |s| {
+                                u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            });
+                            ((res, ns), None)
+                        }
+                    }
+                },
+            ) {
+                Ok((forms, ((demands, decode_demand_ns), alone))) => Ok(Box::new(DraftedPlan {
+                    method,
+                    manifest,
+                    forms,
+                    demands,
+                    decode_demand_ns,
+                    alone,
+                })),
+                Err(Refusal::Unsupported(unsupported)) => {
+                    Err((PreparedDrafter::Rejected(unsupported), manifest.package))
+                }
+                Err(Refusal::Failed(error)) => Err((
+                    PreparedDrafter::Rejected(UnsupportedModel::mismatch(error.to_string())),
+                    manifest.package,
+                )),
+            }
+        }
     }
 }
 
-/// The target's plan alone (`plain`) at the drafted plan's holding of
-/// experts (`ExecutionPlanDraft::holding_as`), at the drafted plan's primary
-/// form (`FloorForms::primary`), and its charge's structure: its target and
-/// vision families are the drafted plan's without its drafter's writes,
-/// outlined with it (`StructuralCharge::with_undrafted`); every other term
-/// is the target's own, from its headers.
+/// The target's plan alone (`plain_definition`) at the drafted plan's holding
+/// of experts (`ExecutionPlanDraft::without_drafter`), at the drafted plan's
+/// primary form (`FloorForms::primary`), and its charge's structure: its
+/// target and vision families are the drafted plan's without its drafter's
+/// writes, outlined with it (`StructuralCharge::with_undrafted`); every other
+/// term is the target's own, from its headers.
 fn target_alone(
-    plain: ExecutionManifest,
+    plain_definition: &ModelDefinition,
     selected: &SelectedDevice,
-    drafted: &FloorForms<UndraftedBounds>,
-) -> Result<Box<TargetAlone>, Refusal> {
+    drafted_primary: &ExecutionPlanDraft,
+    undrafted: UndraftedBounds,
+) -> Result<(ExecutionPlanDraft, StructuralCharge), Refusal> {
     let backend = selected.info.backend();
-    let primary = drafted.primary();
-    let draft = plan_resident(&plain, selected)
-        .map_err(|error| planning_refusal(error, backend))?
-        .holding_as(&plain.definition, &primary.draft)
+    let draft = drafted_primary
+        .without_drafter(plain_definition)
         .map_err(|error| Refusal::of(classify_plan(error, backend)))?;
-    let structure = StructuralCharge::undrafted(&plain.definition, &draft, primary.more.clone()).map_err(|error| match error {
+    let structure = StructuralCharge::undrafted(plain_definition, &draft, undrafted).map_err(|error| match error {
         AssessmentError::Graph(error) => Refusal::of(classify_graph(error)),
         error => Refusal::Failed(ModelAssessmentError::Assessment(error)),
     })?;
-    Ok(Box::new(TargetAlone { definition: plain.definition, draft, structure }))
+    Ok((draft, structure))
 }
 
 /// The native kernels a load of one package prepares on a backend, or why
@@ -973,8 +1628,8 @@ pub fn kernel_inventory(
     backend: seismic::BackendName,
 ) -> Result<KernelInventory, ModelAssessmentError> {
     let layout = resident_layout(ExecutionPath::Native, backend);
-    let admitted = match admit(package, &FileHeaders, layout)? {
-        Admission::Unsupported { unsupported, .. } => {
+    let admitted = match admit(package, HeaderInput::Files, layout)? {
+        Admission::Unsupported(unsupported) => {
             return Ok(KernelInventory::Unsupported(unsupported));
         }
         Admission::Admitted(admitted) => admitted,
@@ -1065,19 +1720,26 @@ fn unpriced(reason: &str) -> ! {
 }
 
 /// `manifest` planned on the selected device, each way of holding its
-/// experts outlined once by `structure` (`ExecutionPlanDraft::floor_forms`).
+/// experts outlined once by `structure` (`ExecutionPlanDraft::floor_forms_with_primary`),
+/// running `after_primary` against the primary form as soon as it is ready
+/// (overlapping with any secondary resident form certification).
 /// Planner refusals and kernel domains classify exactly as a load's do.
-fn prepare_forms<T>(
+fn prepare_forms<T: Sync, U: Send>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
     structure: impl Fn(&ModelDefinition, &ExecutionPlanDraft) -> Result<(StructuralCharge, T), AssessmentError>,
-) -> Result<FloorForms<T>, Refusal> {
+    after_primary: impl FnOnce(&HeldForm<T>) -> U + Send,
+) -> Result<(FloorForms<T>, U), Refusal> {
     let backend = selected.info.backend();
-    let resident = plan_resident(manifest, selected).map_err(|error| planning_refusal(error, backend))?;
+    let resident = stage_timer::time_stage(|t, ns| t.plan_resident_ns += ns, || plan_resident(manifest, selected))
+        .map_err(|error| planning_refusal(error, backend))?;
     resident
-        .floor_forms(&manifest.definition, manifest.model.weight_bound, |draft| {
-            structure(&manifest.definition, draft).map_err(FormError::Assessment)
-        })
+        .floor_forms_with_primary(
+            &manifest.definition,
+            manifest.model.weight_bound,
+            |draft| structure(&manifest.definition, draft).map_err(FormError::Assessment),
+            after_primary,
+        )
         .map_err(|error| match error {
             FormError::Plan(error) => Refusal::of(classify_plan(error, backend)),
             FormError::Assessment(AssessmentError::Graph(error)) => Refusal::of(classify_graph(error)),
@@ -1119,18 +1781,50 @@ impl Environment<'_> {
     /// The target served alone: plain generation, without the drafter's
     /// component.
     fn plain(&self, admitted: &AdmittedPackage, definition: ModelDefinition) -> Result<ExecutionManifest, String> {
+        let package = PackageManifest {
+            draft: None,
+            ..admitted.headers.manifest()
+        };
+        self.plain_with_package(package, definition)
+    }
+
+    fn plain_with_package(
+        &self,
+        package: PackageManifest,
+        definition: ModelDefinition,
+    ) -> Result<ExecutionManifest, String> {
+        self.plain_with_package_or_return(package, definition)
+            .map_err(|(error, _)| error)
+    }
+
+    fn plain_with_package_or_return(
+        &self,
+        package: PackageManifest,
+        definition: ModelDefinition,
+    ) -> Result<ExecutionManifest, (String, ModelDefinition)> {
         let policy = ModelPolicy {
             method: ModelMethod::Plain,
             draft_policy: None,
             mtp_proposals: None,
             ..self.policy.clone()
         };
-        let model = policy.resolve(&definition)?;
-        let package = PackageManifest {
-            draft: None,
-            ..admitted.headers.manifest()
+        let model = match policy.resolve(&definition) {
+            Ok(model) => model,
+            Err(error) => return Err((error, definition)),
         };
-        self.manifest(package, definition, model)
+        if let Err(error) = self.service.validate() {
+            return Err((error, definition));
+        }
+        if package.identity != definition.artifact_identity {
+            return Err((
+                "package manifest and model definition identities differ".to_owned(),
+                definition,
+            ));
+        }
+        match self.manifest(package, definition, model) {
+            Ok(manifest) => Ok(manifest),
+            Err(_) => unreachable!("validated policy, service, and identity construct a manifest"),
+        }
     }
 
     /// The target with its admitted drafter, under the method that drafts
@@ -1141,13 +1835,24 @@ impl Environment<'_> {
         definition: &ModelDefinition,
         method: ModelMethod,
     ) -> Result<(ExecutionManifest, SpeculativeMethod), UnsupportedModel> {
+        self.drafted_with_package(admitted.headers.manifest(), definition.clone(), method)
+            .map_err(|(unsupported, _)| unsupported)
+    }
+
+    fn drafted_with_package(
+        &self,
+        package: PackageManifest,
+        definition: ModelDefinition,
+        method: ModelMethod,
+    ) -> Result<(ExecutionManifest, SpeculativeMethod), (UnsupportedModel, PackageManifest)> {
         let policy = ModelPolicy {
             method,
             ..self.policy.clone()
         };
-        let model = policy
-            .resolve(definition)
-            .map_err(UnsupportedModel::mismatch)?;
+        let model = match policy.resolve(&definition) {
+            Ok(model) => model,
+            Err(error) => return Err((UnsupportedModel::mismatch(error), package)),
+        };
         let method = match model.method {
             ResolvedMethod::Mtp { .. } => SpeculativeMethod::Mtp,
             ResolvedMethod::DFlash { .. } => {
@@ -1163,15 +1868,25 @@ impl Environment<'_> {
                 }
             }
             ResolvedMethod::Plain => {
-                return Err(UnsupportedModel::mismatch(
-                    "the drafter resolves to plain generation",
+                return Err((
+                    UnsupportedModel::mismatch("the drafter resolves to plain generation"),
+                    package,
                 ));
             }
         };
-        let manifest = self
-            .manifest(admitted.headers.manifest(), definition.clone(), model)
-            .map_err(UnsupportedModel::mismatch)?;
-        Ok((manifest, method))
+        if let Err(error) = self.service.validate() {
+            return Err((UnsupportedModel::mismatch(error), package));
+        }
+        if package.identity != definition.artifact_identity {
+            return Err((
+                UnsupportedModel::mismatch("package manifest and model definition identities differ"),
+                package,
+            ));
+        }
+        match self.manifest(package, definition, model) {
+            Ok(manifest) => Ok((manifest, method)),
+            Err(_) => unreachable!("validated policy, service, and identity construct a manifest"),
+        }
     }
 
     fn manifest(
@@ -1195,10 +1910,7 @@ impl Environment<'_> {
 }
 
 enum Admission {
-    Unsupported {
-        unsupported: UnsupportedModel,
-        fingerprint: Option<ModelFingerprint>,
-    },
+    Unsupported(UnsupportedModel),
     Admitted(Box<AdmittedPackage>),
 }
 
@@ -1207,53 +1919,38 @@ enum Admission {
 struct AdmittedPackage {
     headers: PackageHeaders,
     definition: ModelDefinition,
-    chat: TemplateInspection,
-    context_limit: u32,
-    fingerprint: Option<ModelFingerprint>,
-    projector: ProjectorVerdict,
     drafter: DrafterAdmission,
 }
 
-impl AdmittedPackage {
-    /// The package planned at `served` tokens of context, as a load serving
-    /// it at that context holds it; at its declared limit when none.
-    fn served_at(mut self: Box<Self>, served: Option<usize>) -> Result<Box<Self>, ModelAssessmentError> {
-        let limit = crate::host::resolve_served_context(served, self.definition.decoder.context_limit)
-            .map_err(|error| ModelAssessmentError::Configuration(error.to_string()))?;
-        self.definition.decoder.context_limit = limit;
-        // A drafter candidate drafts for the target's own definition, so it
-        // serves the same context.
-        if let DrafterAdmission::Candidate { definition, .. } = &mut self.drafter {
-            definition.decoder.context_limit = limit;
-        }
-        self.context_limit = u32::try_from(limit).map_err(|_| ModelAssessmentError::ContextLimit(limit))?;
-        Ok(self)
-    }
+enum TargetAdmission {
+    Unsupported {
+        unsupported: UnsupportedModel,
+        fingerprint: Option<ModelFingerprint>,
+    },
+    Admitted {
+        target: Box<AdmittedTarget>,
+        prefetched: Option<PrefetchedDraft>,
+    },
+}
 
-    fn facts<D>(&self, drafter: D) -> ModelFacts<D> {
-        ModelFacts {
-            capabilities: ModelCapabilities {
-                vision: self.definition.vision.is_some(),
-                tools: self.chat.tools,
-                structured_output: self.chat.structured_output,
-                reasoning: ReasoningCapabilities {
-                    efforts: self
-                        .chat
-                        .reasoning
-                        .mappings
-                        .iter()
-                        .map(|mapping| mapping.effort.clone())
-                        .collect(),
-                    default_effort: self.chat.reasoning.default_effort.clone(),
-                },
-            },
-            template_fingerprint: self.chat.fingerprint.clone(),
-            context_limit: self.context_limit,
-            fingerprint: self.fingerprint.clone(),
-            projector: self.projector.clone(),
-            drafter,
-        }
-    }
+enum TargetHeadersAdmission {
+    Unsupported {
+        unsupported: UnsupportedModel,
+        fingerprint: Option<ModelFingerprint>,
+    },
+    Admitted(Box<AdmittedTarget>),
+}
+
+/// A target header admitted before chat template inspection, target
+/// fingerprinting and drafter admission so callers can overlap
+/// `bundle.inspect_cached()` and `ModelFingerprint::from_directory` with
+/// execution planning.
+struct AdmittedTarget {
+    headers: PackageHeaders,
+    family: &'static dyn ModelFamily,
+    definition: ModelDefinition,
+    bundle: TemplateBundle,
+    projector: ProjectorVerdict,
 }
 
 /// What a drafter's headers decide: nothing to draft with, a definition
@@ -1283,24 +1980,156 @@ fn artifact_refusal(error: &magnitude_artifacts::Error) -> Option<UnsupportedMod
         .then(|| UnsupportedModel::unreadable(error.to_string()))
 }
 
+/// Where `admit` reads GGUF headers: directly from files (allowing draft
+/// header inspection to overlap with target header inspection on the
+/// assessment pool), or from a caller-provided [`HeaderSource`].
+#[derive(Clone, Copy)]
+enum HeaderInput<'a> {
+    Files,
+    Source(&'a dyn HeaderSource),
+}
+
+impl<'a> HeaderInput<'a> {
+    fn as_source(&self) -> &dyn HeaderSource {
+        match self {
+            Self::Files => &FileHeaders,
+            Self::Source(source) => *source,
+        }
+    }
+}
+
+type PrefetchedDraft = Result<
+    (Directory, Vec<magnitude_artifacts::ComponentFile>, Option<UnsupportedModel>),
+    magnitude_artifacts::Error,
+>;
+
 /// Admit `package` from its headers: the target's weight encodings, family
 /// interpretation, tokenizer and chat templates are independent checks,
 /// and every refusal among them is reported together. An admitted target's
 /// drafter is admitted the same way, against the target's definition.
 fn admit(
     package: &ModelPackagePaths,
-    source: &dyn HeaderSource,
+    input: HeaderInput<'_>,
     layout: Layout,
 ) -> Result<Admission, ModelAssessmentError> {
-    let mut headers = match PackageHeaders::open_shards_from(
-        &package.target_shards,
-        package.projector.as_deref(),
-        source,
+    let (mut target, prefetched) = match admit_target(package, input, layout)? {
+        TargetAdmission::Unsupported { unsupported, .. } => {
+            return Ok(Admission::Unsupported(unsupported));
+        }
+        TargetAdmission::Admitted { target, prefetched } => (target, prefetched),
+    };
+    if let Err(error) = stage_timer::time_stage(
+        |t, ns| t.chat_inspect_ns += ns,
+        || target.bundle.inspect_cached(),
     ) {
+        return Ok(Admission::Unsupported(UnsupportedModel::chat_template(
+            error,
+        )));
+    }
+    let _ = u32::try_from(target.definition.decoder.context_limit)
+        .map_err(|_| ModelAssessmentError::ContextLimit(target.definition.decoder.context_limit))?;
+    let drafter = stage_timer::time_stage(|t, ns| t.admit_drafter_ns += ns, || {
+        admit_drafter(
+            package,
+            input.as_source(),
+            &mut target.headers,
+            prefetched,
+            target.family,
+            &target.definition,
+            layout,
+        )
+    })?;
+    Ok(Admission::Admitted(Box::new(AdmittedPackage {
+        headers: target.headers,
+        definition: target.definition,
+        drafter,
+    })))
+}
+
+fn prefetch_draft(path: &Path, layout: Layout) -> PrefetchedDraft {
+    let (directory, files) = PackageHeaders::inspect_component(path)?;
+    let weight_refusal = unsupported_weights(&directory.tensors, Residency::Packed, layout);
+    Ok((directory, files, weight_refusal))
+}
+
+fn admit_target_headers_timed(
+    package: &ModelPackagePaths,
+    source: &dyn HeaderSource,
+    layout: Layout,
+) -> Result<TargetHeadersAdmission, ModelAssessmentError> {
+    let recording = stage_timer::is_recording();
+    let start = recording.then(std::time::Instant::now);
+    let before_sub = if recording {
+        let mut sub = 0u64;
+        stage_timer::record_stage(|t| sub = t.header_open_ns + t.chat_inspect_ns);
+        sub
+    } else {
+        0
+    };
+    let target_res = admit_target_headers(package, source, layout);
+    if let Some(start) = start {
+        let total = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        stage_timer::record_stage(|t| {
+            let sub = (t.header_open_ns + t.chat_inspect_ns).saturating_sub(before_sub);
+            t.admit_other_ns += total.saturating_sub(sub);
+        });
+    }
+    target_res
+}
+
+/// Admit `package`'s target headers while prefetching its separate draft
+/// component (if any) concurrently. When target headers have no refusals,
+/// returns the parsed [`TemplateBundle`] uninspected and defers target
+/// fingerprinting so callers can overlap `bundle.inspect_cached()` and
+/// `ModelFingerprint::from_directory` with execution planning; when target
+/// headers already have refusals, runs both immediately to preserve the
+/// exact refusal union and unsupported fingerprint.
+fn admit_target(
+    package: &ModelPackagePaths,
+    input: HeaderInput<'_>,
+    layout: Layout,
+) -> Result<TargetAdmission, ModelAssessmentError> {
+    let source = input.as_source();
+    let draft_prefetch_path = match input {
+        HeaderInput::Files if package.method != ModelMethod::Plain => package.draft.as_deref(),
+        _ => None,
+    };
+    let (prefetched, target_res) = if let Some(path) = draft_prefetch_path {
+        let (prefetched, target_res) = pool::join(
+            move || prefetch_draft(path, layout),
+            || admit_target_headers_timed(package, source, layout),
+        );
+        (Some(prefetched), target_res)
+    } else {
+        (None, admit_target_headers_timed(package, source, layout))
+    };
+    match target_res? {
+        TargetHeadersAdmission::Unsupported {
+            unsupported,
+            fingerprint,
+        } => Ok(TargetAdmission::Unsupported {
+            unsupported,
+            fingerprint,
+        }),
+        TargetHeadersAdmission::Admitted(target) => Ok(TargetAdmission::Admitted {
+            target,
+            prefetched,
+        }),
+    }
+}
+
+fn admit_target_headers(
+    package: &ModelPackagePaths,
+    source: &dyn HeaderSource,
+    layout: Layout,
+) -> Result<TargetHeadersAdmission, ModelAssessmentError> {
+    let headers = match stage_timer::time_stage(|t, ns| t.header_open_ns += ns, || {
+        PackageHeaders::open_shards_from(&package.target_shards, package.projector.as_deref(), source)
+    }) {
         Ok(headers) => headers,
         Err(error) => match artifact_refusal(&error) {
             Some(unsupported) => {
-                return Ok(Admission::Unsupported {
+                return Ok(TargetHeadersAdmission::Unsupported {
                     unsupported,
                     fingerprint: None,
                 });
@@ -1308,42 +2137,131 @@ fn admit(
             None => return Err(ModelAssessmentError::Artifact(error)),
         },
     };
-    let target = headers.target();
-    let fingerprint = ModelFingerprint::from_directory(target).ok();
-    let mut refusals = Vec::new();
-    refusals.extend(unsupported_weights(&target.tensors, Residency::Packed, layout));
-    let interpreted = interpret_header(
-        target,
-        headers.projector(),
-        headers.identity(),
-        &package.target().display().to_string(),
-    );
-    // A bound projector loads its weights; one that does not bind loads none.
-    if let (Ok((_, interpreted, _)), Some(projector)) = (&interpreted, headers.projector()) {
-        if interpreted.projector_unavailable.is_none() {
-            refusals.extend(unsupported_weights(
-                &projector.tensors,
-                Residency::Dequantized,
-                layout,
-            ));
+    let target_name = package.target().display().to_string();
+    let (mut refusals, header_bundle) = {
+        let target = headers.target();
+        let projector_dir = headers.projector();
+        let identity = headers.identity();
+        let recording = stage_timer::is_recording();
+        let (((weight_refusal, uw_ns), (tokenizer, vocabulary, bundle, tv_ns, gt_ns)), interpreted) =
+            pool::join(
+                || {
+                    pool::join(
+                        || {
+                            let start = recording.then(std::time::Instant::now);
+                            let res = unsupported_weights(&target.tensors, Residency::Packed, layout);
+                            let ns = start.map_or(0, |s| {
+                                u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            });
+                            (res, ns)
+                        },
+                        || parse_tokenizer_and_templates(target, &target_name, recording),
+                    )
+                },
+                || {
+                    stage_timer::time_stage(|t, ns| t.admit_interpret_target_ns += ns, || {
+                        crate::families::recognize(target).and_then(|family| {
+                            interpret_target(family, target, projector_dir, identity)
+                                .map(|interpreted| (family, interpreted))
+                        })
+                    })
+                },
+            );
+        if recording {
+            stage_timer::record_stage(|t| {
+                t.admit_unsupported_weights_ns += uw_ns;
+                t.admit_tokenizer_vocab_ns += tv_ns;
+                t.admit_gguf_templates_ns += gt_ns;
+            });
         }
-    }
+        let mut refusals = Vec::new();
+        refusals.extend(weight_refusal);
+        let header_bundle = assemble_header_bundle(interpreted, tokenizer, vocabulary, bundle);
+        // A bound projector loads its weights; one that does not bind loads none.
+        if let (HeaderBundle::Ready { interpreted, .. }, Some(projector)) =
+            (&header_bundle, projector_dir)
+        {
+            if interpreted.projector_unavailable.is_none() {
+                refusals.extend(stage_timer::time_stage(
+                    |t, ns| t.admit_unsupported_weights_ns += ns,
+                    || {
+                        unsupported_weights(
+                            &projector.tensors,
+                            Residency::Dequantized,
+                            layout,
+                        )
+                    },
+                ));
+            }
+        }
+        (refusals, header_bundle)
+    };
+    let finalize_refused = |mut refusals: Vec<UnsupportedModel>, bundle: Option<TemplateBundle>| {
+        let target_dir = headers.target();
+        let fingerprint = if let Some(bundle) = bundle {
+            let recording = stage_timer::is_recording();
+            let ((chat_res, chat_ns), (fp, fp_ns)) = pool::join(
+                move || {
+                    let chat_start = recording.then(std::time::Instant::now);
+                    let chat_res = bundle.inspect_cached();
+                    let chat_ns = chat_start.map_or(0, |s| {
+                        u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                    });
+                    (chat_res, chat_ns)
+                },
+                || {
+                    let fp_start = recording.then(std::time::Instant::now);
+                    let fp = ModelFingerprint::from_directory(target_dir).ok();
+                    let fp_ns = fp_start.map_or(0, |s| {
+                        u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                    });
+                    (fp, fp_ns)
+                },
+            );
+            if recording {
+                stage_timer::record_stage(|t| {
+                    t.chat_inspect_ns += chat_ns;
+                    t.admit_fingerprint_ns += fp_ns;
+                });
+            }
+            if let Err(error) = chat_res {
+                refusals.push(UnsupportedModel::chat_template(error));
+            }
+            fp
+        } else {
+            stage_timer::time_stage(
+                |t, ns| t.admit_fingerprint_ns += ns,
+                || ModelFingerprint::from_directory(target_dir).ok(),
+            )
+        };
+        TargetHeadersAdmission::Unsupported {
+            unsupported: UnsupportedModel::union(refusals)
+                .expect("a refused admission has a refusal"),
+            fingerprint,
+        }
+    };
     let (
         family,
         InterpretedTarget {
             definition,
             projector_unavailable,
         },
-        chat,
-    ) = match interpreted {
-        Ok(interpreted) if refusals.is_empty() => interpreted,
-        interpreted => {
-            refusals.extend(interpreted.err().into_iter().flatten());
-            return Ok(Admission::Unsupported {
-                unsupported: UnsupportedModel::union(refusals)
-                    .expect("a refused admission has a refusal"),
-                fingerprint,
-            });
+        bundle,
+    ) = match header_bundle {
+        HeaderBundle::Ready {
+            family,
+            interpreted,
+            bundle,
+        } if refusals.is_empty() => (family, interpreted, bundle),
+        HeaderBundle::Ready { bundle, .. } => {
+            return Ok(finalize_refused(refusals, Some(bundle)));
+        }
+        HeaderBundle::Refused {
+            refusals: header_refusals,
+            bundle,
+        } => {
+            refusals.extend(header_refusals);
+            return Ok(finalize_refused(refusals, bundle));
         }
     };
     let projector = match (headers.projector(), projector_unavailable) {
@@ -1351,18 +2269,122 @@ fn admit(
         (Some(_), None) => ProjectorVerdict::Bound,
         (None, None) => ProjectorVerdict::None,
     };
-    let context_limit = u32::try_from(definition.decoder.context_limit)
-        .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
-    let drafter = admit_drafter(package, source, &mut headers, family, &definition, layout)?;
-    Ok(Admission::Admitted(Box::new(AdmittedPackage {
+    Ok(TargetHeadersAdmission::Admitted(Box::new(AdmittedTarget {
         headers,
+        family,
         definition,
-        chat,
-        context_limit,
-        fingerprint,
+        bundle,
         projector,
-        drafter,
     })))
+}
+
+/// Result of interpreting a target header before [`TemplateBundle::inspect_cached`].
+enum HeaderBundle {
+    Ready {
+        family: &'static dyn ModelFamily,
+        interpreted: InterpretedTarget,
+        bundle: TemplateBundle,
+    },
+    Refused {
+        refusals: Vec<UnsupportedModel>,
+        bundle: Option<TemplateBundle>,
+    },
+}
+
+/// Parse a target header's tokenizer payload, vocabulary size, and chat template
+/// bundle, timing each step when `recording` is enabled.
+fn parse_tokenizer_and_templates(
+    target: &Directory,
+    name: &str,
+    recording: bool,
+) -> (
+    TokenizerPayload,
+    Result<usize, UnsupportedModel>,
+    Result<TemplateBundle, UnsupportedModel>,
+    u64,
+    u64,
+) {
+    let tv_start = recording.then(std::time::Instant::now);
+    let tokenizer = TokenizerPayload::from_directory(target);
+    // Support and vocabulary are header facts; a load builds the tokenizer.
+    let vocabulary = gguf_tokenizer_vocabulary(&tokenizer).map_err(UnsupportedModel::from);
+    let tv_ns = tv_start.map_or(0, |s| {
+        u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    });
+    let gt_start = recording.then(std::time::Instant::now);
+    let bundle = TemplatePayload::from_directory(target, name)
+        .map_err(|error| error.to_string())
+        .and_then(|templates| gguf_templates(&templates, &tokenizer))
+        .map_err(UnsupportedModel::chat_template);
+    let gt_ns = gt_start.map_or(0, |s| {
+        u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    });
+    (tokenizer, vocabulary, bundle, tv_ns, gt_ns)
+}
+
+/// Assemble a [`HeaderBundle`] from the independent family interpretation,
+/// tokenizer vocabulary check, and parsed template bundle.
+fn assemble_header_bundle(
+    interpreted: Result<(&'static dyn ModelFamily, InterpretedTarget), UnsupportedModel>,
+    tokenizer: TokenizerPayload,
+    vocabulary: Result<usize, UnsupportedModel>,
+    bundle: Result<TemplateBundle, UnsupportedModel>,
+) -> HeaderBundle {
+    let mut refusals = Vec::new();
+    if let (Ok((_, interpreted)), Ok(vocabulary)) = (&interpreted, &vocabulary) {
+        if u64::try_from(*vocabulary).ok() != Some(interpreted.definition.decoder.vocabulary) {
+            refusals.push(vocabulary_mismatch(&tokenizer));
+        }
+    }
+    match (interpreted, vocabulary, bundle) {
+        (Ok((family, interpreted)), Ok(_), Ok(bundle)) if refusals.is_empty() => {
+            HeaderBundle::Ready {
+                family,
+                interpreted,
+                bundle,
+            }
+        }
+        (interpreted, vocabulary, bundle) => {
+            refusals.extend(interpreted.err());
+            refusals.extend(vocabulary.err());
+            let bundle = match bundle {
+                Ok(bundle) => Some(bundle),
+                Err(error) => {
+                    refusals.push(error);
+                    None
+                }
+            };
+            HeaderBundle::Refused { refusals, bundle }
+        }
+    }
+}
+
+/// A target header's interpretation up to template bundle parsing: its family's
+/// definition with its projector bound when the family binds it
+/// ([`interpret_target`]), the tokenizer it declares (checked against the
+/// definition's vocabulary) and its parsed [`TemplateBundle`].
+fn interpret_header_bundle(
+    target: &Directory,
+    projector: Option<&Directory>,
+    identity: PackageIdentity,
+    name: &str,
+) -> HeaderBundle {
+    let interpreted = stage_timer::time_stage(|t, ns| t.admit_interpret_target_ns += ns, || {
+        crate::families::recognize(target).and_then(|family| {
+            interpret_target(family, target, projector, identity)
+                .map(|interpreted| (family, interpreted))
+        })
+    });
+    let recording = stage_timer::is_recording();
+    let (tokenizer, vocabulary, bundle, tv_ns, gt_ns) =
+        parse_tokenizer_and_templates(target, name, recording);
+    if recording {
+        stage_timer::record_stage(|t| {
+            t.admit_tokenizer_vocab_ns += tv_ns;
+            t.admit_gguf_templates_ns += gt_ns;
+        });
+    }
+    assemble_header_bundle(interpreted, tokenizer, vocabulary, bundle)
 }
 
 /// A target header's interpretation: its family's definition with its
@@ -1377,32 +2399,34 @@ fn interpret_header(
     name: &str,
 ) -> Result<(&'static dyn ModelFamily, InterpretedTarget, TemplateInspection), Vec<UnsupportedModel>>
 {
-    let interpreted = crate::families::recognize(target).and_then(|family| {
-        interpret_target(family, target, projector, identity)
-            .map(|interpreted| (family, interpreted))
-    });
-    let tokenizer = TokenizerPayload::from_directory(target);
-    // Support and vocabulary are header facts; a load builds the tokenizer.
-    let vocabulary = gguf_tokenizer_vocabulary(&tokenizer).map_err(UnsupportedModel::from);
-    let chat = TemplatePayload::from_directory(target, name)
-        .map_err(|error| error.to_string())
-        .and_then(|templates| gguf_templates(&templates, &tokenizer))
-        .and_then(|bundle| bundle.inspect_cached())
-        .map_err(UnsupportedModel::chat_template);
-    let mut refusals = Vec::new();
-    if let (Ok((_, interpreted)), Ok(vocabulary)) = (&interpreted, &vocabulary) {
-        if u64::try_from(*vocabulary).ok() != Some(interpreted.definition.decoder.vocabulary) {
-            refusals.push(vocabulary_mismatch(&tokenizer));
+    match interpret_header_bundle(target, projector, identity, name) {
+        HeaderBundle::Ready {
+            family,
+            interpreted,
+            bundle,
+        } => {
+            let chat = stage_timer::time_stage(
+                |t, ns| t.chat_inspect_ns += ns,
+                || bundle.inspect_cached(),
+            )
+            .map_err(UnsupportedModel::chat_template);
+            match chat {
+                Ok(chat) => Ok((family, interpreted, chat)),
+                Err(error) => Err(vec![error]),
+            }
         }
-    }
-    match (interpreted, vocabulary, chat) {
-        (Ok((family, interpreted)), Ok(_), Ok(chat)) if refusals.is_empty() => {
-            Ok((family, interpreted, chat))
-        }
-        (interpreted, vocabulary, chat) => {
-            refusals.extend(interpreted.err());
-            refusals.extend(vocabulary.err());
-            refusals.extend(chat.err());
+        HeaderBundle::Refused {
+            mut refusals,
+            bundle,
+        } => {
+            if let Some(bundle) = bundle {
+                if let Err(error) = stage_timer::time_stage(
+                    |t, ns| t.chat_inspect_ns += ns,
+                    || bundle.inspect_cached(),
+                ) {
+                    refusals.push(UnsupportedModel::chat_template(error));
+                }
+            }
             Err(refusals)
         }
     }
@@ -1458,6 +2482,7 @@ fn admit_drafter(
     package: &ModelPackagePaths,
     source: &dyn HeaderSource,
     headers: &mut PackageHeaders,
+    prefetched: Option<PrefetchedDraft>,
     family: &dyn ModelFamily,
     definition: &ModelDefinition,
     layout: Layout,
@@ -1486,16 +2511,35 @@ fn admit_drafter(
     if package.method == ModelMethod::Plain {
         return Ok(DrafterAdmission::None);
     }
-    match headers.add_draft_from(path, source) {
-        Ok(()) => {}
-        Err(error) => match artifact_refusal(&error) {
+    let weight_refusal = match prefetched {
+        Some(Ok((directory, files, weight_refusal))) => {
+            match headers.add_preopened_draft(path, directory, files) {
+                Ok(()) => weight_refusal,
+                Err(error) => match artifact_refusal(&error) {
+                    Some(unsupported) => return Ok(DrafterAdmission::Rejected(unsupported)),
+                    None => return Err(ModelAssessmentError::Artifact(error)),
+                },
+            }
+        }
+        Some(Err(error)) => match artifact_refusal(&error) {
             Some(unsupported) => return Ok(DrafterAdmission::Rejected(unsupported)),
             None => return Err(ModelAssessmentError::Artifact(error)),
         },
-    }
+        None => {
+            match headers.add_draft_from(path, source) {
+                Ok(()) => {}
+                Err(error) => match artifact_refusal(&error) {
+                    Some(unsupported) => return Ok(DrafterAdmission::Rejected(unsupported)),
+                    None => return Err(ModelAssessmentError::Artifact(error)),
+                },
+            }
+            let draft = headers.draft().expect("the draft component was just added");
+            unsupported_weights(&draft.tensors, Residency::Packed, layout)
+        }
+    };
     let draft = headers.draft().expect("the draft component was just added");
     let mut refusals = Vec::new();
-    refusals.extend(unsupported_weights(&draft.tensors, Residency::Packed, layout));
+    refusals.extend(weight_refusal);
     let bound = bind_draft(family, definition.clone(), Some(draft));
     refusals.extend(bound.draft_unavailable.map(|reason| reason.unsupported()));
     if let Some(unsupported) = UnsupportedModel::union(refusals) {

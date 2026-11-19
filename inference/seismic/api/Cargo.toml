@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 magnitude-ggml.workspace = true
 seismic-lang.workspace = true
+seismic-memory.workspace = true
 seismic-compiler.workspace = true
 seismic-runtime.workspace = true
 seismic-topology.workspace = true

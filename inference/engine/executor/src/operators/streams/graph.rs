@@ -16,7 +16,7 @@ use magnitude_family_contracts::{SinkhornInput, WeightKind, WeightScope};
 use magnitude_kernels::{
     repeat_rows, stream_collapse, stream_join, stream_mix_down, stream_mix_sinkhorn, stream_mix_up,
 };
-use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Argument, Dim, Element, NativeGraph, NativePort, WorkflowTensor};
 
 /// The kernel entries of one mix site: `stream_mix_down` (with inject
 /// values at a sublayer's site, without at the exit) and `stream_mix_up`,
@@ -178,20 +178,22 @@ impl CheckedStreamsEntries {
         }
     }
 
-    pub(crate) fn entries(&self) -> StreamsEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> StreamsEntries<'_, G> {
         StreamsEntries {
             mixing: match &self.mixing {
                 CheckedMixing::LowRank(sites) => MixingEntries::LowRank(sites.as_ref().map(|site| SiteEntries {
-                    down: &site.down[..],
-                    up: &site.up[..],
+                    down: G::bind_ranged(&site.down[..]),
+                    up: G::bind_ranged(&site.up[..]),
                 })),
                 CheckedMixing::Sinkhorn(none) => MixingEntries::Sinkhorn(SinkhornEntries {
-                    site: &none[..],
-                    collapse: &none[..],
-                    join: &none[..],
+                    site: G::bind(&none[..]),
+                    collapse: G::bind(&none[..]),
+                    join: G::bind(&none[..]),
                 }),
             },
-            repeat: &self.repeat,
+            repeat: G::bind(&self.repeat),
         }
     }
 }

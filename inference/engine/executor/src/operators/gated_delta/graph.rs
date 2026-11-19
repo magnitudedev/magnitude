@@ -36,7 +36,7 @@ use magnitude_kernels::{
     kimi_delta_step, project_rows,
 };
 use seismic::{
-    BackendName, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor,
+    BackendName, Dim, Element, NativeGraph, NativePort, WorkflowTensor,
 };
 
 /// How a backend advances the row-sequential (step) row classes.
@@ -54,17 +54,19 @@ impl StepForm {
     /// The convolved form wherever the checked bundle declares both of its
     /// entries for `backend`, else the step form.
     pub(crate) fn of(backend: BackendName) -> Result<Self, String> {
-        let project = seismic::generated::native_implementation_for_backend::<
-            gated_delta_project_convolved::Entry,
-        >(backend)
-        .map_err(|error| error.to_string())?;
-        let step = seismic::generated::native_implementation_for_backend::<
-            gated_delta_step_convolved::Entry,
-        >(backend)
-        .map_err(|error| error.to_string())?;
+        let project =
+            <gated_delta_project_convolved::Entry as seismic::EntryContract>::contract_node_shape(
+                backend,
+            )
+            .is_ok();
+        let step =
+            <gated_delta_step_convolved::Entry as seismic::EntryContract>::contract_node_shape(
+                backend,
+            )
+            .is_ok();
         match (project, step) {
-            (Some(_), Some(_)) => Ok(Self::Convolved),
-            (None, None) => Ok(Self::Step),
+            (true, true) => Ok(Self::Convolved),
+            (false, false) => Ok(Self::Step),
             _ => Err(format!(
                 "backend {backend:?} declares only one entry of the convolved recurrent step form"
             )),
@@ -205,32 +207,34 @@ impl CheckedRecurrentEntries {
         })
     }
 
-    pub(crate) fn entries(&self) -> RecurrentGraphEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> RecurrentGraphEntries<'_, G> {
         RecurrentGraphEntries {
             form: match &self.form {
                 CheckedForm::Gated { project, step } => RecurrentFormEntries::Gated {
-                    project,
+                    project: G::bind_ranged(project),
                     step: match step {
-                        StepForm::Step => RecurrentStepEntries::Step(&self.state[..]),
+                        StepForm::Step => RecurrentStepEntries::Step(G::bind(&self.state[..])),
                         StepForm::Convolved => RecurrentStepEntries::Convolved {
-                            project: &project[..],
-                            step: &self.state[..],
+                            project: G::bind_ranged(&project[..]),
+                            step: G::bind(&self.state[..]),
                         },
                     },
-                    chunk: &self.state,
+                    chunk: G::bind(&self.state),
                 },
                 CheckedForm::Kimi {
                     project,
                     up: [gate_up, alpha_up],
                 } => RecurrentFormEntries::Kimi {
-                    project,
-                    gate_up,
-                    alpha_up,
-                    step: &self.state,
-                    chunk: &self.state,
+                    project: G::bind_ranged(project),
+                    gate_up: G::bind_ranged(gate_up),
+                    alpha_up: G::bind_ranged(alpha_up),
+                    step: G::bind(&self.state),
+                    chunk: G::bind(&self.state),
                 },
             },
-            output: &self.output,
+            output: G::bind_ranged(&self.output),
         }
     }
 }

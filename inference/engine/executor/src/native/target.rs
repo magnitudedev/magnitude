@@ -152,22 +152,20 @@ impl BankSite {
         use magnitude_kernels::{
             routed_down_project, routed_down_sited, routed_output_project, routed_output_sited, routed_site_request,
         };
-        fn declares<E: seismic::Entry>(backend: seismic::BackendName) -> Result<bool, String> {
-            seismic::generated::native_implementation_for_backend::<E>(backend)
-                .map(|native| native.is_some())
-                .map_err(|error| error.to_string())
+        fn declares<E: seismic::EntryContract>(backend: seismic::BackendName) -> bool {
+            E::contract_node_shape(backend).is_ok()
         }
         let combine = match slot {
             BankedFeedForward::Routed(_) => {
-                declares::<routed_output_project::Entry>(backend)? && declares::<routed_output_sited::Entry>(backend)?
+                declares::<routed_output_project::Entry>(backend) && declares::<routed_output_sited::Entry>(backend)
             }
             BankedFeedForward::GeneralRouted(_) | BankedFeedForward::Parallel(_) => {
-                declares::<routed_down_project::Entry>(backend)? && declares::<routed_down_sited::Entry>(backend)?
+                declares::<routed_down_project::Entry>(backend) && declares::<routed_down_sited::Entry>(backend)
             }
         };
         // The CPU computes a miss from its host tier record; unified memory
         // has no tier and no CPU site.
-        Ok(bank.tier > 0 && combine && declares::<routed_site_request::Entry>(backend)?)
+        Ok(bank.tier > 0 && combine && declares::<routed_site_request::Entry>(backend))
     }
 }
 
@@ -245,9 +243,9 @@ impl ExpertBankKernels {
             routed_pass_map, routed_round, routed_route_streamed, routed_scratch_grids, routed_scratch_request,
             routed_seed_commit, routed_select_streamed, routed_step,
         };
-        type Declares = fn(seismic::BackendName) -> Result<bool, seismic::CheckedBundleError>;
-        fn declares<E: seismic::Entry>(backend: seismic::BackendName) -> Result<bool, seismic::CheckedBundleError> {
-            seismic::generated::native_implementation_for_backend::<E>(backend).map(|native| native.is_some())
+        type Declares = fn(seismic::BackendName) -> bool;
+        fn declares<E: seismic::EntryContract>(backend: seismic::BackendName) -> bool {
+            E::contract_node_shape(backend).is_ok()
         }
         let (route, hint): (Declares, Declares) = match form {
             BankRouteForm::Fused => (declares::<routed_route_streamed::Entry>, declares::<routed_hint_route::Entry>),
@@ -267,12 +265,7 @@ impl ExpertBankKernels {
             declares::<routed_list_grid::Entry>,
             declares::<routed_pass_map::Entry>,
         ];
-        for declares in bank.iter() {
-            if !declares(backend)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(bank.iter().all(|declares| declares(backend)))
     }
 }
 

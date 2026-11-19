@@ -199,7 +199,7 @@ impl TemplateBundle {
         request: &ChatRequest,
         selection: &TemplateSelection<'_>,
     ) -> Result<(PreparedRequest, ResolvedReasoning), ChatError> {
-        self.prepare_native(request, selection)
+        self.prepare_native(request, selection, None)
             .map_err(|error| match error {
                 Prepare::Invalid(message) => ChatError::InvalidRequest(message),
                 Prepare::Reasoning(error) => ChatError::Reasoning(error),
@@ -210,6 +210,7 @@ impl TemplateBundle {
         &self,
         request: &ChatRequest,
         selection: &TemplateSelection<'_>,
+        preparsed: Option<(&str, &Template)>,
     ) -> Result<(PreparedRequest, ResolvedReasoning), Prepare> {
         let choice = &request.tool_choice;
         let intent = &request.reasoning;
@@ -319,8 +320,19 @@ impl TemplateBundle {
             }
         }
         let variant = self.select(!request.tools.is_empty(), selection)?;
-        let template =
-            Template::new(&variant.source, &self.special_tokens).map_err(|e| e.to_string())?;
+        let owned_template;
+        let template = match preparsed {
+            Some((name, template))
+                if selection.source_override.is_none() && variant.name == name =>
+            {
+                template
+            }
+            _ => {
+                owned_template = Template::new(&variant.source, &self.special_tokens)
+                    .map_err(|e| e.to_string())?;
+                &owned_template
+            }
+        };
         // The default renders with no reasoning arguments, so it
         // needs no inspection; every other intent resolves against the profile.
         let reasoning = if *intent == ReasoningIntent::ModelDefault {
@@ -333,7 +345,7 @@ impl TemplateBundle {
                 .profiles
                 .lock()
                 .expect("template profile cache lock")
-                .inspect(&template, &request.template_arguments)?;
+                .inspect(template, &variant.source, &request.template_arguments)?;
             profile.resolve(intent).map_err(Prepare::Reasoning)?
         };
         for (key, value) in &reasoning.controls {
@@ -393,17 +405,27 @@ pub struct TemplateInspection {
     pub fingerprint: String,
 }
 
+type CachedInspection = std::sync::Arc<std::sync::OnceLock<Result<TemplateInspection, String>>>;
+static INSPECTIONS: std::sync::OnceLock<Mutex<std::collections::HashMap<Vec<u8>, CachedInspection>>> =
+    std::sync::OnceLock::new();
+
 impl TemplateBundle {
+    /// Clear the process-wide template inspection cache (for cold/held-out benchmarking).
+    #[doc(hidden)]
+    pub fn clear_inspection_cache() {
+        if let Some(map) = INSPECTIONS.get() {
+            map.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
     /// Reuse exact header inspection for bundles with identical literal
     /// variants and special tokens. Preparation still uses this bundle's own
     /// sources; the cache contains only the immutable inspection result.
     /// Each bundle has its own cell: the map is locked only to find it, so
     /// distinct bundles are inspected concurrently and equal ones once.
     pub fn inspect_cached(&self) -> Result<TemplateInspection, String> {
-        type Inspection = std::sync::Arc<std::sync::OnceLock<Result<TemplateInspection, String>>>;
-        static INSPECTIONS: std::sync::OnceLock<
-            Mutex<std::collections::HashMap<Vec<u8>, Inspection>>,
-        > = std::sync::OnceLock::new();
         let sources = self
             .variants
             .values()
@@ -435,18 +457,21 @@ impl TemplateBundle {
     }
 
     pub fn inspect(&self) -> Result<TemplateInspection, String> {
+        self.inspect_inner(true)
+    }
+
+    #[doc(hidden)]
+    pub fn inspect_unpruned(&self) -> Result<TemplateInspection, String> {
+        self.inspect_inner(false)
+    }
+
+    fn inspect_inner(&self, pruned: bool) -> Result<TemplateInspection, String> {
         let default = self
             .variants
             .get(&self.default)
             .ok_or("template bundle lost its default variant")?;
-        let template =
+        let default_template =
             Template::new(&default.source, &self.special_tokens).map_err(|e| e.to_string())?;
-        let reasoning = super::reasoning::inspect_reasoning(&template, &Default::default())?;
-        if reasoning.default_effort.is_none() {
-            return Err(
-                "the chat template's default reasoning is not exactly one of its efforts".into(),
-            );
-        }
         let question = serde_json::json!({"role":"user","content":"What is the weather in Paris?"});
         let mut tool_request = ChatRequest::new(vec![question.clone()], 946684800);
         tool_request.tools = vec![serde_json::json!({"type":"function","function":{
@@ -458,21 +483,116 @@ impl TemplateBundle {
         schema_request.json_schema = Some(serde_json::json!({
             "type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]
         }));
-        // A rejected probe is the capability's absence: the engine rejects
-        // every request of that kind for this bundle.
-        let accepted =
-            |request: &ChatRequest| self.prepare(request, &TemplateSelection::default()).is_ok();
-        let identities = self
-            .variants
-            .values()
-            .map(|variant| {
-                Template::new(&variant.source, &self.special_tokens)
-                    .map(|template| {
-                        serde_json::json!({"name": variant.name, "identity": template.identity()})
+        let (reasoning, identities, tools, structured_output) =
+            if pruned && self.variants.len() == 1 {
+                let preparsed = Some((default.name.as_str(), &default_template));
+                let (reasoning, (tools, structured_output)) = seismic_threads::pool::join(
+                    || {
+                        super::reasoning::inspect_reasoning(
+                            &default_template,
+                            &default.source,
+                            &Default::default(),
+                        )
+                    },
+                    || {
+                        seismic_threads::pool::join(
+                            || {
+                                self.prepare_native(
+                                    &tool_request,
+                                    &TemplateSelection::default(),
+                                    preparsed,
+                                )
+                                .is_ok()
+                            },
+                            || {
+                                self.prepare_native(
+                                    &schema_request,
+                                    &TemplateSelection::default(),
+                                    preparsed,
+                                )
+                                .is_ok()
+                            },
+                        )
+                    },
+                );
+                let reasoning = reasoning?;
+                if reasoning.default_effort.is_none() {
+                    return Err(
+                        "the chat template's default reasoning is not exactly one of its efforts"
+                            .into(),
+                    );
+                }
+                let identities = vec![serde_json::json!({
+                    "name": default.name,
+                    "identity": default_template.identity(),
+                })];
+                (reasoning, identities, tools, structured_output)
+            } else {
+                let reasoning = if pruned {
+                    super::reasoning::inspect_reasoning(
+                        &default_template,
+                        &default.source,
+                        &Default::default(),
+                    )?
+                } else {
+                    super::reasoning::inspect_reasoning_unpruned(
+                        &default_template,
+                        &Default::default(),
+                    )?
+                };
+                if reasoning.default_effort.is_none() {
+                    return Err(
+                        "the chat template's default reasoning is not exactly one of its efforts"
+                            .into(),
+                    );
+                }
+                let mut tool_use_template: Option<Template> = None;
+                let identities = self
+                    .variants
+                    .values()
+                    .map(|variant| {
+                        if pruned && variant.name == self.default {
+                            Ok(serde_json::json!({
+                                "name": variant.name,
+                                "identity": default_template.identity(),
+                            }))
+                        } else {
+                            let template = Template::new(&variant.source, &self.special_tokens)
+                                .map_err(|e| e.to_string())?;
+                            let identity = serde_json::json!({
+                                "name": variant.name,
+                                "identity": template.identity(),
+                            });
+                            if pruned && variant.name == "tool_use" {
+                                tool_use_template = Some(template);
+                            }
+                            Ok(identity)
+                        }
                     })
-                    .map_err(|e| e.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, String>>()?;
+                // A rejected probe is the capability's absence: the engine rejects
+                // every request of that kind for this bundle.
+                let accepted = |request: &ChatRequest| {
+                    let preparsed = if !pruned {
+                        None
+                    } else if !request.tools.is_empty() {
+                        tool_use_template
+                            .as_ref()
+                            .map(|template| ("tool_use", template))
+                            .or(Some((default.name.as_str(), &default_template)))
+                    } else {
+                        Some((default.name.as_str(), &default_template))
+                    };
+                    self.prepare_native(request, &TemplateSelection::default(), preparsed)
+                        .is_ok()
+                };
+                (
+                    reasoning,
+                    identities,
+                    accepted(&tool_request),
+                    accepted(&schema_request),
+                )
+            };
         let digest = sha2::Sha256::digest(
             serde_json::to_vec(&serde_json::json!({
                 "version": TEMPLATE_FINGERPRINT_VERSION,
@@ -483,8 +603,8 @@ impl TemplateBundle {
             .map_err(|e| e.to_string())?,
         );
         Ok(TemplateInspection {
-            tools: accepted(&tool_request),
-            structured_output: accepted(&schema_request),
+            tools,
+            structured_output,
             reasoning,
             fingerprint: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
         })

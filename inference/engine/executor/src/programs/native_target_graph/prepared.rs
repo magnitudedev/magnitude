@@ -18,12 +18,20 @@ use super::{
     heap::{GraphCounts, PlannedSealedGraphs, SealedGraphsHeap, SealedHeap, block_graph_storage},
 };
 use crate::{
-    MixerProgramSlot, ModelLoadPlan, ResidentTarget, ResourceLimits, StateResourcePlan, TargetProgramPlan,
+    AbsorbedQueryShape, AttentionShape, CandidatesBinding, GroupedOutputShape, MixerProgramSlot,
+    ModelLoadPlan, ResidentTarget, ResourceLimits, StateResourcePlan, TargetProgramPlan,
     native::AttestedTarget,
     operators,
     operators::{
-        BlockKeeps, attention::pooled::PooledSource, paired_block,
-        routed::split::{OnceStage, RunStage, Stage},
+        BlockKeeps, FeedForward, Mixer, PairedBlock,
+        attention::{PickedSource, pooled::PooledSource},
+        paired_block, post_norm_epsilon,
+        routed::{
+            GeneralRoutedShape,
+            split::{OnceStage, RunStage, Stage},
+        },
+        short_conv::ShortConvShape,
+        state_space::StateSpaceShape,
         streams::StreamsGeometry,
     },
     programs::{
@@ -33,10 +41,12 @@ use crate::{
     stored_table::SelectionNotice,
 };
 use magnitude_family_contracts::{
-    Decoder, ExitNorm, SublayerIndex, TapPoint, WeightKind, WeightScope,
+    ActivationFunction, Decoder, DenseFfn, ExitNorm, GateFunction, HeadNorm, HeadWeights, Indexer,
+    IndexerInput, IndexerKeys, NGramGate, NGramMedia, Pool, PoolNorm, RecurrentHeadMapping, Rotary,
+    RouteNormalization, RowRounding, SublayerIndex, TapPoint, WeightKind, WeightScope,
 };
 use magnitude_kernels::selection_notice;
-use magnitude_state::LayerRef;
+use magnitude_state::{ComponentSpec, LayerRef};
 use seismic::{Device, Element, HostHeap, NativeGraphFamily};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Instant};
 
@@ -128,17 +138,207 @@ impl SealReport {
     }
 }
 
+/// Typed equivalent of `format!("{:?}", (bank, history))` in
+/// `block_graph_shapes`: every field derives `PartialEq, Eq` and `Debug` with
+/// no floats or skipped fields, so structural equality is identical to the
+/// previous Debug-string key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockStateShape {
+    bank: Option<Option<Vec<ComponentSpec>>>,
+    history: Option<(usize, u32)>,
+}
+
+/// Typed equivalent of `PairedBlock::shape_key` (`block_graph_shapes`):
+/// captures the exact same numerical parameters per sublayer, comparing
+/// standalone floats by IEEE 754 bit pattern (`to_bits`, matching `Debug`
+/// formatting) and hashing vocabulary-long n-gram token maps to a raw 32-byte
+/// SHA-256 digest without hex formatting, so equality defines the exact same
+/// equivalence classes with zero `format!("{:?}")` allocations.
+#[derive(Clone, Debug, PartialEq)]
+struct BlockGeometryShape {
+    mixer: MixerShapeKey,
+    mixer_output_epsilon: Option<u64>,
+    feed_forward: Option<(FeedForwardShapeKey, Option<u64>)>,
+    per_layer: Option<PerLayerShapeKey>,
+    ngram: Option<NGramShapeKey>,
+    epsilon: u64,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+enum MixerShapeKey {
+    Attention {
+        shape: AttentionShape,
+        gate_function: i32,
+        head_norm_epsilon: u64,
+        rotary: Rotary,
+        scale: u64,
+        selection: Option<SelectionShapeKey>,
+        picked: Option<PickedShapeKey>,
+        low_rank_query: Option<(u64, u64)>,
+        grouped_output: Option<GroupedOutputShape>,
+        absorbed_query: Option<AbsorbedQueryShape>,
+    },
+    GatedDelta {
+        convolution_width: u64,
+        key_heads: u64,
+        value_heads: u64,
+        width: u64,
+        head_mapping: RecurrentHeadMapping,
+        output_gate_function: GateFunction,
+        key_norm_epsilon: u64,
+        decay_lower: Option<u32>,
+    },
+    StateSpace {
+        shape: StateSpaceShape,
+        norm_epsilon: u64,
+    },
+    ShortConv(ShortConvShape),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IndexerShapeKey {
+    heads: u64,
+    width: u64,
+    top: u64,
+    scale: u64,
+    query_rounding: RowRounding,
+    has_query_norm: bool,
+    has_projected_head_weights: bool,
+    candidates: CandidatesBinding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolShapeKey {
+    Mean,
+    Gated(bool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolNormShapeKey {
+    Pooled(u64),
+    Token(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SelectionShapeKey {
+    rate: u64,
+    pool: PoolShapeKey,
+    norm: PoolNormShapeKey,
+    query_input: IndexerInput,
+    query_norm_epsilon: Option<u64>,
+    indexer: IndexerShapeKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PickedShapeKey {
+    Own {
+        rate: u64,
+        gated: bool,
+        norm_epsilon: u64,
+        rounding: RowRounding,
+        latent_keys: (u64, RowRounding),
+        indexer: IndexerShapeKey,
+    },
+    Reindex {
+        source: SublayerIndex,
+        part: u32,
+        indexer: IndexerShapeKey,
+    },
+    Reused {
+        source: SublayerIndex,
+        part: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DenseShapeKey {
+    intermediate: u64,
+    activation: ActivationFunction,
+    limit: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FeedForwardShapeKey {
+    Dense(DenseShapeKey),
+    Routed {
+        experts: u64,
+        selected: u64,
+        intermediate: u64,
+        shared_intermediate: Option<u64>,
+        normalization: RouteNormalization,
+    },
+    GeneralRouted(GeneralRoutedShape),
+    Parallel {
+        dense: DenseShapeKey,
+        routed: GeneralRoutedShape,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PerLayerShapeKey {
+    layer: u64,
+    width: u64,
+    post_norm_epsilon: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NGramShapeKey {
+    context: u64,
+    heads_per_order: u64,
+    width: u64,
+    mixing: Option<(u64, u64)>,
+    gate_is_norms: bool,
+    epsilon: u64,
+    multipliers: Vec<u64>,
+    sizes: Vec<u64>,
+    offsets: Vec<u64>,
+    token_map_digest: Option<[u8; 32]>,
+    fill: u64,
+    boundary: Option<u64>,
+    media: NGramMedia,
+}
+
+/// Inline-small tensor shape dimensions avoiding a heap `Vec<u64>` allocation
+/// per weight in [`BlockGraphShape`] (all standard weight tensors have rank <= 4).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum WeightDims {
+    Inline { len: u8, dims: [u64; 4] },
+    Heap(Box<[u64]>),
+}
+
+impl WeightDims {
+    #[inline]
+    fn from_slice(slice: &[u64]) -> Self {
+        if slice.len() <= 4 {
+            let mut dims = [0u64; 4];
+            dims[..slice.len()].copy_from_slice(slice);
+            Self::Inline { len: slice.len() as u8, dims }
+        } else {
+            Self::Heap(slice.into())
+        }
+    }
+}
+
+/// The subset of [`BlockGraphShape`] that determines a block's
+/// `OnceStage::Pass` and `OnceStage::Fill` graphs: its feed-forward sublayer
+/// geometry, its sublayer-1 weights, and its expert-bank binding. Blocks that
+/// differ only in their mixer, taps, residual export, state, or carries share
+/// identical `OnceGraphShape`s.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct OnceGraphShape {
+    banked: Option<crate::BankBinding>,
+    epsilon: u64,
+    feed_forward: Option<(FeedForwardShapeKey, Option<u64>)>,
+    weights: Vec<((u32, Option<u32>), WeightKind, Element, WeightDims, u64)>,
+}
+
 /// The inputs that determine a block's sealed graph apart from its layer
 /// index: its geometry, the resident element and shape of each weight role
 /// within the block, and its recurrent state components. Blocks with equal
 /// shapes share plans.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct BlockGraphShape {
-    geometry: String,
-    /// (sublayer, branch) of each role, its resident element, shape and
-    /// accumulator-scale port extent.
-    weights: Vec<((u32, Option<u32>), WeightKind, Element, Vec<u64>, u64)>,
-    state: String,
     /// Decoder-boundary work belongs to the graph as well as its sublayers.
     /// Interior blocks cannot stand in for the stream widening or exit mix.
     widens_streams: bool,
@@ -151,13 +351,6 @@ pub(super) struct BlockGraphShape {
     /// Whether the block's routed layer is the load's first streamed one,
     /// which sets a bank-served launch's step.
     sets_step: bool,
-    /// The layers a streamed routed layer's route predicts (its lead): each
-    /// one's block offset from this block and the weights the route reads
-    /// of it (`BankLayer::hinted`). A graph shared by blocks binds each
-    /// one's layers at the same offsets (`block_scope`).
-    predicts: Vec<(u32, Vec<crate::planning::HintWeight>)>,
-    /// A streamed routed layer's bank binding.
-    banked: Option<crate::BankBinding>,
     /// The block offset back to the streamed layer whose route predicts
     /// this block's (whose hint ring its route reads, `StreamedLayer::hinted`);
     /// none for a block that streams none or the first streamed one. A
@@ -170,6 +363,18 @@ pub(super) struct BlockGraphShape {
     /// carries it in (`CarrySide`): blocks share plans only over equal
     /// readers, so over equal forms, whatever a load's tuning chose.
     carries: BlockCarries<MixerProgramSlot>,
+    /// A streamed routed layer's bank binding.
+    banked: Option<crate::BankBinding>,
+    /// (sublayer, branch) of each role, its resident element, shape and
+    /// accumulator-scale port extent.
+    weights: Vec<((u32, Option<u32>), WeightKind, Element, WeightDims, u64)>,
+    /// The layers a streamed routed layer's route predicts (its lead): each
+    /// one's block offset from this block and the weights the route reads
+    /// of it (`BankLayer::hinted`). A graph shared by blocks binds each
+    /// one's layers at the same offsets (`block_scope`).
+    predicts: Vec<(u32, Vec<crate::planning::HintWeight>)>,
+    state: BlockStateShape,
+    geometry: BlockGeometryShape,
 }
 
 impl BlockGraphShape {
@@ -183,6 +388,81 @@ impl BlockGraphShape {
     /// The shape with the operand carries `carries` (`block_carries`).
     pub(super) fn carrying(self, carries: BlockCarries<MixerProgramSlot>) -> Self {
         Self { carries, ..self }
+    }
+
+    /// The feed-forward-only key that governs `OnceStage::Pass` and
+    /// `OnceStage::Fill` graphs.
+    pub(super) fn once_shape(&self) -> OnceGraphShape {
+        OnceGraphShape {
+            banked: self.banked,
+            epsilon: self.geometry.epsilon,
+            feed_forward: self.geometry.feed_forward,
+            weights: self
+                .weights
+                .iter()
+                .filter(|((sublayer, _), ..)| *sublayer == 1)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Fast collision-safe fingerprint consistent with `PartialEq` (`a == b =>
+    /// a.fx_hash() == b.fx_hash()`), hashing only `Eq + Hash` fields for
+    /// `O(1)` bucketed lookups followed by exact `==` checks.
+    pub(super) fn fx_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = super::certify::FxHasher::default();
+        self.widens_streams.hash(&mut h);
+        self.mixes_exit.hash(&mut h);
+        (self.tapped.entry, self.tapped.middle, self.tapped.output).hash(&mut h);
+        self.residual.hash(&mut h);
+        self.sets_step.hash(&mut h);
+        self.hinted_by.hash(&mut h);
+        (self.carries.carry_in.is_some(), self.carries.carry_out.is_some()).hash(&mut h);
+        self.banked.is_some().hash(&mut h);
+        self.weights.hash(&mut h);
+        self.predicts.len().hash(&mut h);
+        for (offset, hints) in &self.predicts {
+            offset.hash(&mut h);
+            hints.len().hash(&mut h);
+        }
+        self.state.history.hash(&mut h);
+        self.state.bank.as_ref().map(|b| b.as_ref().map(Vec::len)).hash(&mut h);
+        std::mem::discriminant(&self.geometry.mixer).hash(&mut h);
+        self.geometry.mixer_output_epsilon.hash(&mut h);
+        self.geometry
+            .feed_forward
+            .as_ref()
+            .map(|(ff, eps)| (std::mem::discriminant(ff), *eps))
+            .hash(&mut h);
+        self.geometry
+            .per_layer
+            .as_ref()
+            .map(|p| (p.layer, p.width, p.post_norm_epsilon))
+            .hash(&mut h);
+        self.geometry
+            .ngram
+            .as_ref()
+            .map(|n| (n.context, n.width, n.token_map_digest))
+            .hash(&mut h);
+        self.geometry.epsilon.hash(&mut h);
+        h.finish()
+    }
+}
+
+impl OnceGraphShape {
+    /// Fast collision-safe fingerprint consistent with `PartialEq`.
+    pub(super) fn fx_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = super::certify::FxHasher::default();
+        self.banked.is_some().hash(&mut h);
+        self.epsilon.hash(&mut h);
+        self.feed_forward
+            .as_ref()
+            .map(|(ff, eps)| (std::mem::discriminant(ff), *eps))
+            .hash(&mut h);
+        self.weights.hash(&mut h);
+        h.finish()
     }
 }
 
@@ -339,14 +619,12 @@ pub(super) fn block_scope(scope: WeightScope, to: usize) -> Result<WeightScope, 
 
 /// The layers block `index`'s streamed routed layer predicts
 /// (`BlockGraphShape::predicts`); none for a block that streams none.
-fn predicted_layers(
-    load: &ModelLoadPlan,
+fn predicted_layers_for(
+    bank: Option<&crate::ExpertBankPlan>,
+    layer: Option<usize>,
     index: usize,
 ) -> Result<Vec<(u32, Vec<crate::planning::HintWeight>)>, String> {
-    let Some(bank) = load.expert_bank() else {
-        return Ok(Vec::new());
-    };
-    let Some((layer, _)) = bank.feed_forward(block_scopes(index)?[1]) else {
+    let (Some(bank), Some(layer)) = (bank, layer) else {
         return Ok(Vec::new());
     };
     bank.predicted(layer)
@@ -370,11 +648,12 @@ fn predicted_layers(
 }
 
 /// [`BlockGraphShape::hinted_by`] of block `index`.
-fn hinted_by(load: &ModelLoadPlan, index: usize) -> Result<Option<u32>, String> {
-    let Some(bank) = load.expert_bank() else {
-        return Ok(None);
-    };
-    let Some((layer, _)) = bank.feed_forward(block_scopes(index)?[1]) else {
+fn hinted_by_for(
+    bank: Option<&crate::ExpertBankPlan>,
+    layer: Option<usize>,
+    index: usize,
+) -> Result<Option<u32>, String> {
+    let (Some(bank), Some(layer)) = (bank, layer) else {
         return Ok(None);
     };
     if layer == 0 || bank.ahead(layer - 1) == 0 {
@@ -393,11 +672,298 @@ fn hinted_by(load: &ModelLoadPlan, index: usize) -> Result<Option<u32>, String> 
 }
 
 /// [`BlockGraphShape::banked`] of block `index`.
-fn banked_layer(load: &ModelLoadPlan, index: usize) -> Result<Option<crate::BankBinding>, String> {
-    let scope = block_scopes(index)?[1];
-    load.expert_bank()
-        .and_then(|bank| Some(bank.binding(bank.feed_forward(scope)?.0)))
+fn banked_layer_for(
+    bank: Option<&crate::ExpertBankPlan>,
+    layer: Option<usize>,
+) -> Result<Option<crate::BankBinding>, String> {
+    bank.zip(layer)
+        .map(|(bank, layer)| bank.binding(layer))
         .transpose()
+}
+
+#[inline]
+fn weight_kind_order_hash(kind: WeightKind) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = super::certify::FxHasher::default();
+    kind.hash(&mut h);
+    h.finish()
+}
+
+/// Stack-allocated `Debug` buffer used to sort `WeightKind` in the exact same
+/// lexicographical order as `format!("{kind:?}")` without heap allocations.
+#[derive(Eq, PartialEq)]
+struct StackDebug {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl StackDebug {
+    fn of(value: &impl std::fmt::Debug) -> Self {
+        use std::fmt::Write;
+        let mut out = Self { bytes: [0; 64], len: 0 };
+        let _ = write!(out, "{value:?}");
+        out
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl std::fmt::Write for StackDebug {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let take = s.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+impl Ord for StackDebug {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl PartialOrd for StackDebug {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn dense_shape_key(dense: &DenseFfn) -> DenseShapeKey {
+    DenseShapeKey {
+        intermediate: dense.intermediate,
+        activation: dense.up.activation(),
+        limit: dense.up.limit().map(|limit| f64::from(limit).to_bits()),
+    }
+}
+
+fn indexer_shape_key(
+    site: Option<operators::attention::DecoderSite<'_>>,
+    part: u64,
+    indexer: &Indexer,
+) -> Result<IndexerShapeKey, String> {
+    Ok(IndexerShapeKey {
+        heads: indexer.heads,
+        width: indexer.width,
+        top: indexer.top,
+        scale: indexer.scale.to_bits(),
+        query_rounding: indexer.query.rounding,
+        has_query_norm: matches!(indexer.query.norm, HeadNorm::Rms(_)),
+        has_projected_head_weights: matches!(indexer.head_weights, HeadWeights::Projected(_)),
+        candidates: operators::attention::candidates(site, part, indexer)
+            .map_err(|error| error.to_string())?,
+    })
+}
+
+fn token_map_digest<'a>(
+    map: &'a [u32],
+    cached: &mut Option<(&'a [u32], [u8; 32])>,
+) -> [u8; 32] {
+    if let Some((prev, digest)) = cached {
+        if *prev == map {
+            return *digest;
+        }
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64];
+    let mut chunks = map.chunks_exact(16);
+    for chunk in &mut chunks {
+        for (dst, &id) in buf.chunks_exact_mut(4).zip(chunk) {
+            dst.copy_from_slice(&id.to_le_bytes());
+        }
+        hasher.update(buf);
+    }
+    for &id in chunks.remainder() {
+        hasher.update(id.to_le_bytes());
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    *cached = Some((map, digest));
+    digest
+}
+
+fn block_geometry_shape<'a>(
+    paired: &PairedBlock<'a>,
+    site: Option<operators::attention::DecoderSite<'_>>,
+    token_map_cache: &mut Option<(&'a [u32], [u8; 32])>,
+) -> Result<BlockGeometryShape, String> {
+    let mixer = match paired.mixer {
+        Mixer::Attention(operator) => {
+            let mut shape = operators::attention::shape(0, operator, site)
+                .map_err(|error| error.to_string())?;
+            shape.widths.picks = 0;
+            let selection = operators::attention::selected_read(&operator.fresh().reads)
+                .map_err(|error| error.to_string())?
+                .map(|read| -> Result<SelectionShapeKey, String> {
+                    let norm = match &read.keys.norm {
+                        PoolNorm::Pooled(norm) => PoolNormShapeKey::Pooled(norm.epsilon.to_bits()),
+                        PoolNorm::Token { norm, .. } => {
+                            PoolNormShapeKey::Token(norm.epsilon.to_bits())
+                        }
+                    };
+                    let pool = match &read.keys.pool {
+                        Pool::Mean => PoolShapeKey::Mean,
+                        Pool::SoftmaxGated { position, .. } => {
+                            PoolShapeKey::Gated(position.is_some())
+                        }
+                        Pool::Identity => {
+                            unreachable!("selected_read admits pooling of two rows or more")
+                        }
+                    };
+                    let query_norm_epsilon = match &read.indexer.query.norm {
+                        HeadNorm::Rms(norm) => Some(norm.epsilon.to_bits()),
+                        HeadNorm::None => None,
+                    };
+                    Ok(SelectionShapeKey {
+                        rate: read.keys.rate,
+                        pool,
+                        norm,
+                        query_input: read.indexer.query.input,
+                        query_norm_epsilon,
+                        indexer: indexer_shape_key(None, 0, read.indexer)?,
+                    })
+                })
+                .transpose()?;
+            let picked = operators::attention::picked_source(operator)
+                .map_err(|error| error.to_string())?
+                .map(|source| -> Result<PickedShapeKey, String> {
+                    Ok(match source {
+                        PickedSource::Own { part, rows, indexer } => PickedShapeKey::Own {
+                            rate: rows.rate,
+                            gated: operators::attention::pooled::gated(rows),
+                            norm_epsilon: operators::attention::pooled_norm(rows)
+                                .map_err(|error| error.to_string())?
+                                .epsilon
+                                .to_bits(),
+                            rounding: rows.rounding,
+                            latent_keys: match &indexer.keys {
+                                IndexerKeys::Latent { norm, rounding, .. } => {
+                                    (norm.epsilon.to_bits(), *rounding)
+                                }
+                                IndexerKeys::Pooled(_) | IndexerKeys::Shared { .. } => {
+                                    unreachable!(
+                                        "picked_source admits an own source's latent keys alone"
+                                    )
+                                }
+                            },
+                            indexer: indexer_shape_key(site, u64::from(part), indexer)?,
+                        },
+                        PickedSource::Reindex { source, part, indexer } => {
+                            PickedShapeKey::Reindex {
+                                source,
+                                part,
+                                indexer: indexer_shape_key(site, u64::from(part), indexer)?,
+                            }
+                        }
+                        PickedSource::Reused { source, part, .. } => {
+                            PickedShapeKey::Reused { source, part }
+                        }
+                    })
+                })
+                .transpose()?;
+            MixerShapeKey::Attention {
+                shape,
+                gate_function: operators::attention::gate_function(operator),
+                head_norm_epsilon: operators::attention::head_norm_epsilon(
+                    operator,
+                    paired.epsilon(),
+                )
+                .map_err(|error| error.to_string())?
+                .to_bits(),
+                rotary: operator.rotary.clone(),
+                scale: operator.scale.to_bits(),
+                selection,
+                picked,
+                low_rank_query: operators::attention::low_rank_query(operator)
+                    .map(|(rank, epsilon)| (rank, epsilon.to_bits())),
+                grouped_output: operators::attention::grouped_output(operator),
+                absorbed_query: operators::attention::absorbed_query(operator),
+            }
+        }
+        Mixer::GatedDelta(operator) => MixerShapeKey::GatedDelta {
+            convolution_width: operator.convolution_width,
+            key_heads: operator.key_heads,
+            value_heads: operator.value_heads,
+            width: operator.width,
+            head_mapping: operator.head_mapping,
+            output_gate_function: operator.output_gate.function,
+            key_norm_epsilon: operator.key_norm_epsilon.to_bits(),
+            decay_lower: operators::gated_delta::decay_lower(operator).map(f32::to_bits),
+        },
+        Mixer::StateSpace(operator) => MixerShapeKey::StateSpace {
+            shape: StateSpaceShape::of(0, operator).map_err(|error| error.to_string())?,
+            norm_epsilon: operator.norm.epsilon.to_bits(),
+        },
+        Mixer::ShortConv(operator) => MixerShapeKey::ShortConv(
+            ShortConvShape::of(0, operator).map_err(|error| error.to_string())?,
+        ),
+    };
+    let feed_forward = paired
+        .feed_forward
+        .map(|feed_forward| -> Result<(FeedForwardShapeKey, Option<u64>), String> {
+            let op = match feed_forward.op {
+                FeedForward::Dense(operator) => {
+                    FeedForwardShapeKey::Dense(dense_shape_key(operator))
+                }
+                FeedForward::Routed(operator) => FeedForwardShapeKey::Routed {
+                    experts: operator.experts,
+                    selected: operator.selected,
+                    intermediate: operator.intermediate,
+                    shared_intermediate: operator.shared.as_ref().map(|shared| shared.intermediate),
+                    normalization: operator.router.normalization,
+                },
+                FeedForward::GeneralRouted(routed) => FeedForwardShapeKey::GeneralRouted(
+                    GeneralRoutedShape::of(0, routed).map_err(|error| error.to_string())?,
+                ),
+                FeedForward::Parallel(branches) => FeedForwardShapeKey::Parallel {
+                    dense: dense_shape_key(branches.dense),
+                    routed: GeneralRoutedShape::of(0, branches.routed)
+                        .map_err(|error| error.to_string())?,
+                },
+            };
+            Ok((op, post_norm_epsilon(feed_forward.output).map(f64::to_bits)))
+        })
+        .transpose()?;
+    let per_layer = paired.per_layer.map(|sublayer| PerLayerShapeKey {
+        layer: sublayer.op.layer,
+        width: sublayer.op.width,
+        post_norm_epsilon: post_norm_epsilon(sublayer.output).map(f64::to_bits),
+    });
+    let ngram = paired.ngram.map(|sublayer| {
+        let op = sublayer.op;
+        let hash = &op.hash;
+        NGramShapeKey {
+            context: hash.context,
+            heads_per_order: hash.heads_per_order,
+            width: op.width,
+            mixing: op
+                .mixing
+                .as_ref()
+                .map(|mixing| (mixing.kernel, mixing.dilation)),
+            gate_is_norms: matches!(op.gate, NGramGate::Norms { .. }),
+            epsilon: op.epsilon.to_bits(),
+            multipliers: hash.multipliers.clone(),
+            sizes: hash.sizes.clone(),
+            offsets: hash.offsets.clone(),
+            token_map_digest: hash
+                .token_map
+                .as_deref()
+                .map(|map| token_map_digest(map, token_map_cache)),
+            fill: hash.fill,
+            boundary: hash.boundary,
+            media: hash.media,
+        }
+    });
+    Ok(BlockGeometryShape {
+        mixer,
+        mixer_output_epsilon: post_norm_epsilon(paired.mixer_output).map(f64::to_bits),
+        feed_forward,
+        per_layer,
+        ngram,
+        epsilon: paired.epsilon().to_bits(),
+    })
 }
 
 pub(super) fn block_graph_shapes(
@@ -408,98 +974,106 @@ pub(super) fn block_graph_shapes(
     carries: &[BlockCarries<MixerProgramSlot>],
     residual: Option<usize>,
 ) -> Result<Vec<BlockGraphShape>, String> {
+    let block_count = geometry.blocks.len();
     let components = &state.target_state().recurrent_components;
-    geometry
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(index, block)| {
-            let paired = paired_block(block).map_err(|error| error.to_string())?;
-            let mut weights = load
-                .weights()
-                .filter_map(|weight| match weight.role.scope {
-                    WeightScope::TargetSublayer(sublayer) if sublayer.block as usize == index => {
-                        Some((
-                            (sublayer.sublayer, None),
-                            weight.role.kind,
-                            weight.resident,
-                            weight.shape.clone(),
-                            weight.scale_extent(),
-                        ))
+    let est_per_block = (load.weights().size_hint().0 / block_count.max(1)).max(8);
+    let mut block_weights: Vec<Vec<((u32, Option<u32>), WeightKind, Element, WeightDims, u64)>> =
+        (0..block_count).map(|_| Vec::with_capacity(est_per_block)).collect();
+    for weight in load.weights() {
+        let (block, sublayer) = match weight.role.scope {
+            WeightScope::TargetSublayer(sublayer) => {
+                (sublayer.block as usize, (sublayer.sublayer, None))
+            }
+            WeightScope::TargetBranch { sublayer, branch } => {
+                (sublayer.block as usize, (sublayer.sublayer, Some(branch)))
+            }
+            _ => continue,
+        };
+        if let Some(bucket) = block_weights.get_mut(block) {
+            bucket.push((
+                sublayer,
+                weight.role.kind,
+                weight.resident,
+                WeightDims::from_slice(&weight.shape),
+                weight.scale_extent(),
+            ));
+        }
+    }
+    let bank = load.expert_bank();
+    let bank_layers = super::classes::bank_layer_by_block(load, block_count);
+    let mut bank_cursor = 0usize;
+    let mut token_map_cache: Option<(&[u32], [u8; 32])> = None;
+    let mut shapes = Vec::with_capacity(block_count);
+    for (index, (block, mut weights)) in geometry.blocks.iter().zip(block_weights).enumerate() {
+        let paired = paired_block(block).map_err(|error| error.to_string())?;
+        weights.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| weight_kind_order_hash(a.1).cmp(&weight_kind_order_hash(b.1)))
+                .then_with(|| {
+                    if a.1 == b.1 {
+                        std::cmp::Ordering::Equal
+                    } else {
+                        StackDebug::of(&a.1).cmp(&StackDebug::of(&b.1))
                     }
-                    WeightScope::TargetBranch { sublayer, branch }
-                        if sublayer.block as usize == index =>
-                    {
-                        Some((
-                            (sublayer.sublayer, Some(branch)),
-                            weight.role.kind,
-                            weight.resident,
-                            weight.shape.clone(),
-                            weight.scale_extent(),
-                        ))
-                    }
-                    _ => None,
                 })
-                .collect::<Vec<_>>();
-            weights.sort_by_key(|(sublayer, kind, ..)| (*sublayer, format!("{kind:?}")));
-            // Blocks share a plan only over equal bank components, and
-            // within one history domain's rows and slabs.
-            let keeps = paired.keeps();
-            let bank = match keeps.bank() {
-                false => None,
-                true => {
-                    let first = operators::bank_component_index(&geometry.blocks, index)
-                        .map_err(|error| error.to_string())?;
-                    let count = paired.bank_components();
-                    Some(components.get(first..first + count))
-                }
-            };
-            let history = match keeps.history() {
-                false => None,
-                true => {
-                    let history = state
-                        .target_state()
-                        .layer_history(LayerRef::Target(
-                            u32::try_from(index).map_err(|_| "block index exceeds u32")?,
-                        ))
-                        .ok_or("attention block has no history domain")?;
-                    Some((history.store.rows, history.store.slab_rows))
-                }
-            };
-            let state = format!("{:?}", (bank, history));
-            Ok(BlockGraphShape {
-                geometry: paired
-                    .shape_key(Some(operators::attention::DecoderSite {
-                        decoder: geometry,
-                        index: SublayerIndex {
-                            block: u32::try_from(index).map_err(|_| "block index exceeds u32")?,
-                            sublayer: 0,
-                        },
-                    }))
-                    .map_err(|error| error.to_string())?,
-                weights,
-                state,
-                widens_streams: index == 0
-                    && StreamsGeometry::of(geometry)
-                        .map_err(|error| error.to_string())?
-                        .is_some(),
-                mixes_exit: index + 1 == geometry.blocks.len()
-                    && matches!(geometry.exit.norm, ExitNorm::HyperConnectionHead(_)),
-                tapped: tapped[index].positions(),
-                residual: residual == Some(index),
-                sets_step: {
-                    let scope = block_scopes(index)?[1];
-                    load.expert_bank().is_some_and(|bank| {
-                        bank.feed_forward(scope).is_some_and(|(layer, _)| bank.sets_step(layer))
-                    })
+        });
+        // Blocks share a plan only over equal bank components, and
+        // within one history domain's rows and slabs.
+        let keeps = paired.keeps();
+        let bank_count = paired.bank_components();
+        let bank_state = match keeps.bank() {
+            false => None,
+            true => Some(
+                components
+                    .get(bank_cursor..bank_cursor + bank_count)
+                    .map(<[ComponentSpec]>::to_vec),
+            ),
+        };
+        bank_cursor += bank_count;
+        let block_u32 = u32::try_from(index).map_err(|_| "block index exceeds u32")?;
+        let history = match keeps.history() {
+            false => None,
+            true => {
+                let history = state
+                    .target_state()
+                    .layer_history(LayerRef::Target(block_u32))
+                    .ok_or("attention block has no history domain")?;
+                Some((history.store.rows, history.store.slab_rows))
+            }
+        };
+        let state = BlockStateShape { bank: bank_state, history };
+        let geometry_shape = block_geometry_shape(
+            &paired,
+            Some(operators::attention::DecoderSite {
+                decoder: geometry,
+                index: SublayerIndex {
+                    block: block_u32,
+                    sublayer: 0,
                 },
-                predicts: predicted_layers(load, index)?,
-                banked: banked_layer(load, index)?,
-                hinted_by: hinted_by(load, index)?,
-                carries: carries[index],
-            })
-        })
-        .collect()
+            }),
+            &mut token_map_cache,
+        )?;
+        let bank_layer = bank_layers[index];
+        shapes.push(BlockGraphShape {
+            geometry: geometry_shape,
+            weights,
+            state,
+            widens_streams: index == 0
+                && StreamsGeometry::of(geometry)
+                    .map_err(|error| error.to_string())?
+                    .is_some(),
+            mixes_exit: index + 1 == block_count
+                && matches!(geometry.exit.norm, ExitNorm::HyperConnectionHead(_)),
+            tapped: tapped[index].positions(),
+            residual: residual == Some(index),
+            sets_step: bank.zip(bank_layer).is_some_and(|(bank, layer)| bank.sets_step(layer)),
+            predicts: predicted_layers_for(bank, bank_layer, index)?,
+            banked: banked_layer_for(bank, bank_layer)?,
+            hinted_by: hinted_by_for(bank, bank_layer, index)?,
+            carries: carries[index],
+        });
+    }
+    Ok(shapes)
 }
 
 impl PreparedTargetGraphs {
@@ -971,6 +1545,12 @@ impl PreparedTargetGraphs {
         assert!(
             sealed.within(&bound),
             "invariant violated: the target family's sealed graphs, {sealed:?}, exceed what the planner charged, {bound:?}"
+        );
+        crate::programs::graph::assert_storage_eq("target", &family, certificate.resources.storage);
+        assert_eq!(
+            max_output_bytes,
+            certificate.resources.storage.output,
+            "invariant violated: target family max_output_bytes differs from certified output bytes"
         );
         let seal = SealReport {
             classes: launch_classes.len(),

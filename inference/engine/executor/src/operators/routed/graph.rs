@@ -35,7 +35,7 @@ use magnitude_kernels::{
     routed_experts_up, routed_gate_up, routed_group, routed_hint_select, routed_scatter, routed_select,
     routed_select_streamed, routed_up,
 };
-use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Dim, Element, NativeGraph, NativePort, WorkflowTensor};
 
 /// What decides a general routed layer's graph beside its numbers: its
 /// operator's form and how it reads its experts.
@@ -250,37 +250,39 @@ impl CheckedGeneralRoutedEntries {
         }
     }
 
-    pub(crate) fn entries(&self) -> GeneralRoutedGraphEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> GeneralRoutedGraphEntries<'_, G> {
         let shape = self.binding.shape;
         GeneralRoutedGraphEntries {
-            select: &self.select,
+            select: G::bind(&self.select),
             experts: if shape.experts_expansion.gated {
                 ExpertEntries::Gated {
-                    decode: &self.gate_up,
-                    grouped: &self.experts,
+                    decode: G::bind_ranged(&self.gate_up),
+                    grouped: G::bind_ranged(&self.experts),
                 }
             } else {
                 ExpertEntries::Plain {
-                    decode: &self.up,
-                    grouped: &self.experts_up,
+                    decode: G::bind_ranged(&self.up),
+                    grouped: G::bind_ranged(&self.experts_up),
                 }
             },
-            down: &self.down,
-            group: &self.group,
-            scatter: &self.scatter,
+            down: G::bind_ranged(&self.down),
+            group: G::bind(&self.group),
+            scatter: G::bind(&self.scatter),
             shared: shape.shared.map(|(_, expansion)| {
                 (
                     if expansion.gated {
-                        ExpansionEntry::Gated(&self.shared_expand[..])
+                        ExpansionEntry::Gated(G::bind_ranged(&self.shared_expand[..]))
                     } else {
-                        ExpansionEntry::Plain(&self.shared_up[..])
+                        ExpansionEntry::Plain(G::bind_ranged(&self.shared_up[..]))
                     },
-                    &self.shared_output[..],
+                    G::bind_ranged(&self.shared_output[..]),
                 )
             }),
             latent: shape
                 .latent
-                .then_some((&self.latent_down[..], &self.latent_up[..])),
+                .then_some((G::bind_ranged(&self.latent_down[..]), G::bind_ranged(&self.latent_up[..]))),
         }
     }
 }

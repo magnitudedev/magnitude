@@ -33,17 +33,6 @@
 
 using json = common_json;
 
-static std::string format_time(const std::chrono::system_clock::time_point & now, const std::string & format) {
-    auto               time       = std::chrono::system_clock::to_time_t(now);
-    std::tm local_time{};
-    if (!templates_utc_calendar(time, local_time)) { throw std::invalid_argument("Timestamp outside UTC calendar range"); }
-    std::ostringstream ss;
-    ss.imbue(std::locale::classic());
-    ss << std::put_time(&local_time, format.c_str());
-    auto res = ss.str();
-    return res;
-}
-
 static json safe_args_parse(const std::string & to_parse) {
     std::string stripped = to_parse;
     if (to_parse.at(0) == '"' && to_parse.at(to_parse.length() - 1) == '"') {
@@ -295,6 +284,8 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
 }
 
 using chat_template_caps = jinja::caps;
+
+common_chat_template::~common_chat_template() = default;
 
 struct common_chat_templates {
     bool add_bos;
@@ -954,58 +945,79 @@ static void trim_all_content(std::vector<common_chat_msg> & messages) {
 }
 
 static json common_chat_extra_context(const std::chrono::system_clock::time_point & now) {
+    static constexpr const char * MONTHS[12] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+    auto time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+    if (!templates_utc_calendar(time, local_time)) { throw std::invalid_argument("Timestamp outside UTC calendar range"); }
+    const char * month = (local_time.tm_mon >= 0 && local_time.tm_mon < 12) ? MONTHS[local_time.tm_mon] : "Jan";
+    const int year = local_time.tm_year + 1900;
+    char datetime_buf[32];
+    char date_buf[32];
+    std::snprintf(datetime_buf, sizeof(datetime_buf), "%s %02d %04d", month, local_time.tm_mday, year);
+    std::snprintf(date_buf, sizeof(date_buf), "%02d %s %04d", local_time.tm_mday, month, year);
     json ctx = json::object();
-    std::string datetime_str = format_time(now, "%b %d %Y");
-    std::string date_str = format_time(now, "%d %b %Y");
-    ctx["datetime"] = datetime_str;
-    ctx["date_string"] = date_str;
+    ctx["datetime"] = std::string(datetime_buf);
+    ctx["date_string"] = std::string(date_buf);
     return ctx;
 }
 
-std::optional<common_chat_params> common_chat_try_specialized_template(
-        const common_chat_template &          tmpl,
-        const std::string &                   src,
-        autoparser::generation_params & params) {
+enum class specialized_handler {
+    none,
+    ministral_3,
+    gpt_oss,
+    muse_glimmer,
+    functionary_v3_2,
+    kimi_k2,
+    kimi_k3,
+    cohere2moe,
+    lfm2,
+    lfm2_5,
+    gigachat_v3,
+    minimax_m3,
+    deepseek_v3_2,
+    gemma4,
+    minicpm5,
+    qwen3_coder,
+};
+
+static specialized_handler match_specialized_handler(const std::string & src) {
     // Ministral/Mistral Large 3 - uses special reasoning structure fixes, can't use autoparser
     // Note: Mistral Small 3.2 uses [CALL_ID] which Ministral doesn't have, so we can distinguish them
     if (src.find("[SYSTEM_PROMPT]") != std::string::npos && src.find("[TOOL_CALLS]") != std::string::npos &&
         src.find("[ARGS]") != std::string::npos && src.find("[CALL_ID]") == std::string::npos) {
-        LOG_DBG("Using specialized template: Ministral/Magistral Large 3\n");
-        return common_chat_params_init_ministral_3(tmpl, params);
+        return specialized_handler::ministral_3;
     }
 
     // GPT-OSS - has unique channel-based structure that needs dedicated handler
     if (src.find("<|channel|>") != std::string::npos) {
-        LOG_DBG("Using specialized template: GPT-OSS\n");
-        return common_chat_params_init_gpt_oss(tmpl, params);
+        return specialized_handler::gpt_oss;
     }
 
     // Muse Glimmer format using " to=<recipient>" recipients and <|eom|>/<|eot|> message terminators.
     if (src.find("<atem:function_calls>") != std::string::npos && src.find("<|eom|>") != std::string::npos) {
-        LOG_DBG("Using specialized template: Muse Glimmer\n");
-        return common_chat_params_init_muse_glimmer(tmpl, params);
+        return specialized_handler::muse_glimmer;
     }
 
     // Functionary v3.2 - uses recipient-based format with >>>recipient\n{content}
     // Detection: template has ">>>all" for content and ">>>" prefix for tool calls
     if (src.find(">>>all") != std::string::npos && src.find(">>>${recipient}") != std::string::npos) {
-        LOG_DBG("Using specialized template: Functionary v3.2\n");
-        return common_chat_params_init_functionary_v3_2(tmpl, params);
+        return specialized_handler::functionary_v3_2;
     }
 
     // Kimi K2 Thinking - uses unique tool call ID format: functions.<name>:<index>
     // Detection: template has "<|tool_calls_section_begin|>" and "functions." prefix in tool call IDs
     if (src.find("<|tool_calls_section_begin|>") != std::string::npos &&
         src.find("<|tool_call_begin|>") != std::string::npos) {
-        LOG_DBG("Using specialized template: Kimi K2 Thinking\n");
-        return common_chat_params_init_kimi_k2(tmpl, params);
+        return specialized_handler::kimi_k2;
     }
 
     // Kimi K3 - the <|open|>/<|close|>/<|end_of_msg|> markers are unique to it
     if (src.find("<|open|>") != std::string::npos && src.find("<|close|>") != std::string::npos &&
         src.find("<|end_of_msg|>") != std::string::npos) {
-        LOG_DBG("Using specialized template: Kimi K3\n");
-        return common_chat_params_init_kimi_k3(tmpl, params);
+        return specialized_handler::kimi_k3;
     }
 
     // Cohere2 MoE / North Code - marker-wrapped format with <|START_TEXT|> content and
@@ -1013,13 +1025,11 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     // Command-R templates use <|START_RESPONSE|>).
     if (src.find("<|START_TEXT|>") != std::string::npos &&
         src.find("<|START_ACTION|>") != std::string::npos) {
-        LOG_DBG("Using specialized template: Cohere2 MoE\n");
-        return common_chat_params_init_cohere2moe(tmpl, params);
+        return specialized_handler::cohere2moe;
     }
 
     if (is_lfm2_template(src)) {
-        LOG_DBG("Using specialized template: LFM2\n");
-        return common_chat_params_init_lfm2(tmpl, params, /* tool_list_tokens = */ true);
+        return specialized_handler::lfm2;
     }
 
     // LFM2.5 format detection: the template lists tools without tool-list tokens and either writes calls as
@@ -1030,16 +1040,14 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         ((src.find("<|tool_call_start|>[") != std::string::npos &&
           src.find("]<|tool_call_end|>") != std::string::npos) ||
          src.find("List of tools: [") != std::string::npos)) {
-        LOG_DBG("Using specialized template: LFM2.5\n");
-        return common_chat_params_init_lfm2(tmpl, params, /* tool_list_tokens = */ false);
+        return specialized_handler::lfm2_5;
     }
 
     // GigaChatV3 format detection
     if (src.find("<|role_sep|>") != std::string::npos &&
         src.find("<|message_sep|>") != std::string::npos &&
         src.find("<|function_call|>") == std::string::npos) {
-        LOG_DBG("Using specialized template: GigaChatV3\n");
-        return common_chat_params_init_gigachat_v3(tmpl, params);
+        return specialized_handler::gigachat_v3;
     }
 
     // MiniMax-M3: the namespace token "]<]minimax[>[" collides with the autoparser's
@@ -1047,8 +1055,7 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     if (src.find("]<]minimax[>[") != std::string::npos &&
         src.find("<tool_call>") != std::string::npos &&
         src.find("<invoke name=") != std::string::npos) {
-        LOG_DBG("Using specialized template: MiniMax-M3\n");
-        return common_chat_params_init_minimax_m3(tmpl, params);
+        return specialized_handler::minimax_m3;
     }
 
     // DeepSeek V3.2/V4 format detection: template defines dsml_token and uses it for tool calls.
@@ -1060,37 +1067,114 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
          (src.find("function_calls") != std::string::npos ||
           src.find("tool_calls") != std::string::npos)) ||
         src.find("｜DSML｜ calls>") != std::string::npos) {
-        LOG_DBG("Using specialized template: DeepSeek V3.2/V4/V4.1\n");
-        return common_chat_params_init_deepseek_v3_2(tmpl, params);
+        return specialized_handler::deepseek_v3_2;
     }
 
     // Gemma4 format detection
     if (src.find("'<|tool_call>call:'") != std::string::npos) {
-        if (src.find("{#- OpenAI Chat Completions:") == std::string::npos) {
-            // apply workarounds if using the older gemma4 templates
-            LOG_WRN("%s: detected an outdated gemma4 chat template, applying compatibility workarounds. "
-                    "Consider updating to the official template.\n", __func__);
-            workaround::convert_tool_responses_gemma4(params.messages);
-        }
-        return common_chat_params_init_gemma4(tmpl, params);
+        return specialized_handler::gemma4;
     }
 
     // MiniCPM5 - XML tool calls with <function name="..."><param name="...">...</param></function>
     if (src.find("Tool usage guidelines:") != std::string::npos &&
         src.find("<function name=\"") != std::string::npos &&
         src.find("<param name=\"") != std::string::npos) {
-        LOG_DBG("Using specialized template: MiniCPM5\n");
-        return common_chat_params_init_minicpm5(tmpl, params);
+        return specialized_handler::minicpm5;
     }
 
     // Qwen3-Coder XML tool calls, also used by Nemotron Nano 3, Qwen3.5 and StepFun-3.5-Flash
     if (src.find("<tool_call>") != std::string::npos &&
         src.find("<function=") != std::string::npos &&
         src.find("<parameter=") != std::string::npos) {
-        LOG_DBG("Using specialized template: Qwen3-Coder\n");
-        return common_chat_params_init_qwen3_coder(tmpl, params);
+        return specialized_handler::qwen3_coder;
     }
 
+    return specialized_handler::none;
+}
+
+static std::vector<std::string> specialized_handler_context_variables(specialized_handler handler) {
+    switch (handler) {
+        case specialized_handler::muse_glimmer:
+            return { "enable_thinking", "reasoning_effort", "reasoning_strength" };
+        case specialized_handler::deepseek_v3_2:
+        case specialized_handler::minimax_m3:
+            return { "enable_thinking" };
+        case specialized_handler::none:
+        case specialized_handler::ministral_3:
+        case specialized_handler::gpt_oss:
+        case specialized_handler::functionary_v3_2:
+        case specialized_handler::kimi_k2:
+        case specialized_handler::kimi_k3:
+        case specialized_handler::cohere2moe:
+        case specialized_handler::lfm2:
+        case specialized_handler::lfm2_5:
+        case specialized_handler::gigachat_v3:
+        case specialized_handler::gemma4:
+        case specialized_handler::minicpm5:
+        case specialized_handler::qwen3_coder:
+            return {};
+    }
+    return {};
+}
+
+std::optional<common_chat_params> common_chat_try_specialized_template(
+        const common_chat_template &          tmpl,
+        const std::string &                   src,
+        autoparser::generation_params & params) {
+    switch (match_specialized_handler(src)) {
+        case specialized_handler::ministral_3:
+            LOG_DBG("Using specialized template: Ministral/Magistral Large 3\n");
+            return common_chat_params_init_ministral_3(tmpl, params);
+        case specialized_handler::gpt_oss:
+            LOG_DBG("Using specialized template: GPT-OSS\n");
+            return common_chat_params_init_gpt_oss(tmpl, params);
+        case specialized_handler::muse_glimmer:
+            LOG_DBG("Using specialized template: Muse Glimmer\n");
+            return common_chat_params_init_muse_glimmer(tmpl, params);
+        case specialized_handler::functionary_v3_2:
+            LOG_DBG("Using specialized template: Functionary v3.2\n");
+            return common_chat_params_init_functionary_v3_2(tmpl, params);
+        case specialized_handler::kimi_k2:
+            LOG_DBG("Using specialized template: Kimi K2 Thinking\n");
+            return common_chat_params_init_kimi_k2(tmpl, params);
+        case specialized_handler::kimi_k3:
+            LOG_DBG("Using specialized template: Kimi K3\n");
+            return common_chat_params_init_kimi_k3(tmpl, params);
+        case specialized_handler::cohere2moe:
+            LOG_DBG("Using specialized template: Cohere2 MoE\n");
+            return common_chat_params_init_cohere2moe(tmpl, params);
+        case specialized_handler::lfm2:
+            LOG_DBG("Using specialized template: LFM2\n");
+            return common_chat_params_init_lfm2(tmpl, params, /* tool_list_tokens = */ true);
+        case specialized_handler::lfm2_5:
+            LOG_DBG("Using specialized template: LFM2.5\n");
+            return common_chat_params_init_lfm2(tmpl, params, /* tool_list_tokens = */ false);
+        case specialized_handler::gigachat_v3:
+            LOG_DBG("Using specialized template: GigaChatV3\n");
+            return common_chat_params_init_gigachat_v3(tmpl, params);
+        case specialized_handler::minimax_m3:
+            LOG_DBG("Using specialized template: MiniMax-M3\n");
+            return common_chat_params_init_minimax_m3(tmpl, params);
+        case specialized_handler::deepseek_v3_2:
+            LOG_DBG("Using specialized template: DeepSeek V3.2/V4/V4.1\n");
+            return common_chat_params_init_deepseek_v3_2(tmpl, params);
+        case specialized_handler::gemma4:
+            if (src.find("{#- OpenAI Chat Completions:") == std::string::npos) {
+                // apply workarounds if using the older gemma4 templates
+                LOG_WRN("%s: detected an outdated gemma4 chat template, applying compatibility workarounds. "
+                        "Consider updating to the official template.\n", __func__);
+                workaround::convert_tool_responses_gemma4(params.messages);
+            }
+            return common_chat_params_init_gemma4(tmpl, params);
+        case specialized_handler::minicpm5:
+            LOG_DBG("Using specialized template: MiniCPM5\n");
+            return common_chat_params_init_minicpm5(tmpl, params);
+        case specialized_handler::qwen3_coder:
+            LOG_DBG("Using specialized template: Qwen3-Coder\n");
+            return common_chat_params_init_qwen3_coder(tmpl, params);
+        case specialized_handler::none:
+            return std::nullopt;
+    }
     return std::nullopt;
 }
 
@@ -1207,8 +1291,17 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
 
     try {
         LOG_DBG("%s: using differential autoparser\n", __func__);
-        struct autoparser::autoparser autoparser;
-        autoparser.analyze_template(tmpl);
+        std::shared_ptr<autoparser::autoparser> cached;
+        {
+            std::lock_guard<std::mutex> lock(*tmpl.cached_autoparser_mutex);
+            if (!tmpl.cached_autoparser) {
+                auto analyzed = std::make_shared<autoparser::autoparser>();
+                analyzed->analyze_template(tmpl);
+                tmpl.cached_autoparser = std::move(analyzed);
+            }
+            cached = tmpl.cached_autoparser;
+        }
+        const auto & autoparser = *cached;
         auto auto_params = autoparser::peg_generator::generate_parser(tmpl, params, autoparser);
 
         common_chat_msg_delimiters delimiters;
@@ -1229,9 +1322,6 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
                 auto_params.thinking_end_tags = {std::move(end_tag)};
             }
         }
-        common_peg_arena arena;
-        arena.load(auto_params.parser);
-        LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
         return auto_params;
     } catch (const std::exception & e) {
         throw std::invalid_argument(std::string("Unable to generate parser for this template. Automatic parser generation failed: ") + e.what());
@@ -1337,6 +1427,40 @@ std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_tem
         return chat_templates->template_tool_use->caps.to_map();
     }
     return chat_templates->template_default->caps.to_map();
+}
+
+std::vector<std::string> common_chat_templates_handler_context_variables(const common_chat_templates * chat_templates) {
+    TEMPLATES_ASSERT(chat_templates != nullptr);
+    TEMPLATES_ASSERT(chat_templates->template_default != nullptr);
+    auto vars = specialized_handler_context_variables(match_specialized_handler(chat_templates->template_default->source()));
+    if (chat_templates->template_tool_use != nullptr) {
+        for (auto & var : specialized_handler_context_variables(match_specialized_handler(chat_templates->template_tool_use->source()))) {
+            if (std::find(vars.begin(), vars.end(), var) == vars.end()) {
+                vars.push_back(std::move(var));
+            }
+        }
+    }
+    return vars;
+}
+
+bool common_chat_templates_reads_preserve_thinking(const common_chat_templates * chat_templates) {
+    TEMPLATES_ASSERT(chat_templates != nullptr);
+    TEMPLATES_ASSERT(chat_templates->template_default != nullptr);
+    return chat_templates->template_default->reads_preserve_thinking;
+}
+
+std::vector<std::string> common_chat_templates_reasoning_identifiers(const common_chat_templates * chat_templates) {
+    TEMPLATES_ASSERT(chat_templates != nullptr);
+    TEMPLATES_ASSERT(chat_templates->template_default != nullptr);
+    auto vars = chat_templates->template_default->reasoning_identifiers;
+    if (chat_templates->template_tool_use != nullptr) {
+        for (const auto & var : chat_templates->template_tool_use->reasoning_identifiers) {
+            if (std::find(vars.begin(), vars.end(), var) == vars.end()) {
+                vars.push_back(var);
+            }
+        }
+    }
+    return vars;
 }
 
 const common_chat_template & common_chat_templates_get_default(const common_chat_templates * templates) {

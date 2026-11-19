@@ -1300,3 +1300,302 @@ fn a_fits_placement_is_where_its_weights_are_held() {
     assert_eq!(fit.placement.disk_bytes, experts(&fit, &|experts, _| experts - bank.slots.max(bank.host_slots).min(experts)));
     assert_eq!(total(&fit), total(&resident));
 }
+
+#[test]
+fn assessment_timing_gate_m4_pro() {
+    let manifest = manifest();
+    assert!(!manifest.fixtures.is_empty());
+    let mut setup = m4_pro_setup(
+        ReleaseRate::of_machine(None),
+        ModelPolicy::default(),
+        standard_service_limits(),
+    );
+    setup.measurements = synthetic_measurements();
+
+    let mut timings_ms: Vec<(String, f64, f64, f64)> = Vec::new();
+    for fixture in &manifest.fixtures {
+        let scratch = Scratch::new(&format!("timing-{}", fixture.name));
+        let target_shards = fixture
+            .target
+            .iter()
+            .map(|component| scratch.materialize(component))
+            .collect::<Vec<_>>();
+        assert!(!target_shards.is_empty(), "a fixture has a target");
+        let package = ModelPackagePaths {
+            target_shards,
+            projector: None,
+            draft: fixture
+                .draft
+                .as_ref()
+                .map(|component| scratch.materialize(component)),
+            method: fixture.method.into(),
+        };
+
+        let t0 = std::time::Instant::now();
+        let prepared = prepare_model_assessment(&package, &setup.structure)
+            .unwrap_or_else(|error| panic!("{}: prepare failed: {error}", fixture.name));
+        let t1 = std::time::Instant::now();
+        let _assessment = finish_model_assessment(&prepared, &setup, &[], PROFILE_SEQUENCES)
+            .unwrap_or_else(|error| panic!("{}: finish failed: {error}", fixture.name));
+        let t2 = std::time::Instant::now();
+
+        let prepare_ms = t1.duration_since(t0).as_secs_f64() * 1_000.0;
+        let finish_ms = t2.duration_since(t1).as_secs_f64() * 1_000.0;
+        let total_ms = t2.duration_since(t0).as_secs_f64() * 1_000.0;
+        timings_ms.push((fixture.name.clone(), prepare_ms, finish_ms, total_ms));
+    }
+
+    timings_ms.sort_by(|a, b| a.3.total_cmp(&b.3));
+    let n = timings_ms.len();
+    let p50 = timings_ms[n / 2].3;
+    let p90 = timings_ms[(n * 9) / 10].3;
+    let max = timings_ms[n - 1].3;
+    eprintln!("=== assessment_timing_gate_m4_pro ({n} fixtures) ===");
+    for (name, prep, fin, tot) in &timings_ms {
+        eprintln!("  {name:<48} prepare={prep:6.2}ms  finish={fin:6.2}ms  total={tot:6.2}ms");
+    }
+    eprintln!("=== summary: p50={p50:.2}ms  p90={p90:.2}ms  max={max:.2}ms ===");
+
+    // Held-out (cold unseen template) protocol: clear the template inspection
+    // cache before every fixture so no fixture benefits from an earlier
+    // fixture's template inspection.
+    let mut cold_ms = Vec::with_capacity(manifest.fixtures.len());
+    for fixture in &manifest.fixtures {
+        let scratch = Scratch::new(&format!("timing-cold-{}", fixture.name));
+        let target_shards: Vec<PathBuf> = fixture
+            .target
+            .iter()
+            .map(|component| scratch.materialize(component))
+            .collect();
+        let package = ModelPackagePaths {
+            target_shards,
+            projector: None,
+            draft: fixture
+                .draft
+                .as_ref()
+                .map(|component| scratch.materialize(component)),
+            method: fixture.method.into(),
+        };
+        magnitude_chat::TemplateBundle::clear_inspection_cache();
+        let t0 = std::time::Instant::now();
+        let prepared = prepare_model_assessment(&package, &setup.structure)
+            .unwrap_or_else(|error| panic!("{}: cold prepare failed: {error}", fixture.name));
+        let t1 = std::time::Instant::now();
+        let _assessment = finish_model_assessment(&prepared, &setup, &[], PROFILE_SEQUENCES)
+            .unwrap_or_else(|error| panic!("{}: cold finish failed: {error}", fixture.name));
+        let t2 = std::time::Instant::now();
+        let prepare_ms = t1.duration_since(t0).as_secs_f64() * 1_000.0;
+        let finish_ms = t2.duration_since(t1).as_secs_f64() * 1_000.0;
+        let total_ms = t2.duration_since(t0).as_secs_f64() * 1_000.0;
+        cold_ms.push((fixture.name.clone(), prepare_ms, finish_ms, total_ms));
+    }
+    cold_ms.sort_by(|a, b| a.3.total_cmp(&b.3));
+    let cold_p50 = cold_ms[n / 2].3;
+    let cold_p90 = cold_ms[(n * 9) / 10].3;
+    let cold_max = cold_ms[n - 1].3;
+    eprintln!("=== assessment_timing_gate_m4_pro [held-out cold template] ({n} fixtures) ===");
+    for (name, prep, fin, tot) in &cold_ms {
+        eprintln!("  {name:<48} prepare={prep:6.2}ms  finish={fin:6.2}ms  total={tot:6.2}ms");
+    }
+    eprintln!("=== held-out summary: p50={cold_p50:.2}ms  p90={cold_p90:.2}ms  max={cold_max:.2}ms ===");
+
+    #[cfg(not(debug_assertions))]
+    {
+        assert!(p90 < 10.0, "p90 assessment latency {p90:.2}ms exceeds 10.0ms bar");
+        assert!(max < 50.0, "max assessment latency {max:.2}ms exceeds 50.0ms bar");
+    }
+}
+
+#[test]
+fn assessment_stage_breakdown_m4_pro() {
+    const TARGETS: [&str; 5] = [
+        "llama-supported",
+        "qwen35-supported",
+        "qwen35moe-supported",
+        "qwen4exp-mtp-head",
+        "qwen38-27b-dflash2",
+    ];
+    let manifest = manifest();
+    let mut setup = m4_pro_setup(
+        ReleaseRate::of_machine(None),
+        ModelPolicy::default(),
+        standard_service_limits(),
+    );
+    setup.measurements = synthetic_measurements();
+
+    let ms = |ns: u64| ns as f64 / 1_000_000.0;
+    eprintln!("=== assessment_stage_breakdown_m4_pro ===");
+    for name in TARGETS {
+        let fixture = manifest
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.name == name)
+            .unwrap_or_else(|| panic!("fixture `{name}` not found in manifest"));
+        let scratch = Scratch::new(&format!("breakdown-{name}"));
+        let target_shards = fixture
+            .target
+            .iter()
+            .map(|component| scratch.materialize(component))
+            .collect::<Vec<_>>();
+        assert!(!target_shards.is_empty(), "a fixture has a target");
+        let package = ModelPackagePaths {
+            target_shards,
+            projector: None,
+            draft: fixture
+                .draft
+                .as_ref()
+                .map(|component| scratch.materialize(component)),
+            method: fixture.method.into(),
+        };
+
+        let t0 = std::time::Instant::now();
+        let (prepared, stages) =
+            magnitude_executor::assessment::stage_timer::measure_stages(|| {
+                prepare_model_assessment(&package, &setup.structure)
+            });
+        let prepare_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let prepared =
+            prepared.unwrap_or_else(|error| panic!("{}: prepare failed: {error}", fixture.name));
+
+        let t1 = std::time::Instant::now();
+        let _assessment = finish_model_assessment(&prepared, &setup, &[], PROFILE_SEQUENCES)
+            .unwrap_or_else(|error| panic!("{}: finish failed: {error}", fixture.name));
+        let finish_ns = u64::try_from(t1.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        let accounted_ns = stages.header_open_ns
+            + stages.chat_inspect_ns
+            + stages.admit_other_ns
+            + stages.plan_resident_ns
+            + stages.target_ns
+            + stages.readout_ns
+            + stages.native_head_ns
+            + stages.other_drafter_ns
+            + stages.vision_state_ns
+            + stages.host_process_ns
+            + stages.decode_demand_ns;
+        let other_ms = (prepare_ns as f64 - accounted_ns as f64) / 1_000_000.0;
+
+        eprintln!("--- {name} ---");
+        eprintln!("  header_open:        {:8.3} ms", ms(stages.header_open_ns));
+        eprintln!("  chat_inspect:       {:8.3} ms", ms(stages.chat_inspect_ns));
+        eprintln!("  admit_other:        {:8.3} ms", ms(stages.admit_other_ns));
+        eprintln!("  plan_resident:      {:8.3} ms", ms(stages.plan_resident_ns));
+        eprintln!("  target:             {:8.3} ms", ms(stages.target_ns));
+        eprintln!("  readout:            {:8.3} ms", ms(stages.readout_ns));
+        eprintln!(
+            "  native_head:        {:8.3} ms  (groups={})",
+            ms(stages.native_head_ns),
+            stages.native_head_groups
+        );
+        eprintln!("  other_drafter:      {:8.3} ms", ms(stages.other_drafter_ns));
+        eprintln!("  vision_state:       {:8.3} ms", ms(stages.vision_state_ns));
+        eprintln!("  host_process:       {:8.3} ms", ms(stages.host_process_ns));
+        eprintln!("  decode_demand:      {:8.3} ms", ms(stages.decode_demand_ns));
+        eprintln!("  other:              {:8.3} ms", other_ms);
+        eprintln!("  prepare_total:      {:8.3} ms", ms(prepare_ns));
+        eprintln!("  finish_total:       {:8.3} ms", ms(finish_ns));
+        eprintln!("  [admit_inner deep]");
+        eprintln!("    fingerprint:        {:8.3} ms", ms(stages.admit_fingerprint_ns));
+        eprintln!("    unsupported_weights:{:8.3} ms", ms(stages.admit_unsupported_weights_ns));
+        eprintln!("    interpret_target:   {:8.3} ms", ms(stages.admit_interpret_target_ns));
+        eprintln!("    tokenizer_vocab:    {:8.3} ms", ms(stages.admit_tokenizer_vocab_ns));
+        eprintln!("    gguf_templates:     {:8.3} ms", ms(stages.admit_gguf_templates_ns));
+        eprintln!("    admit_drafter:      {:8.3} ms", ms(stages.admit_drafter_ns));
+        eprintln!("  [plan_resident deep]");
+        eprintln!("    load_derive:        {:8.3} ms", ms(stages.pr_load_derive_ns));
+        eprintln!("    record_ports:       {:8.3} ms", ms(stages.pr_record_ports_ns));
+        eprintln!("    readout_candidates: {:8.3} ms", ms(stages.pr_readout_candidates_ns));
+        eprintln!("    program_plan:       {:8.3} ms", ms(stages.pr_program_plan_ns));
+        eprintln!("  [floor_forms deep]");
+        eprintln!("    bank_ceiling:       {:8.3} ms", ms(stages.ff_bank_ceiling_ns));
+        eprintln!("    rising:             {:8.3} ms", ms(stages.ff_rising_ns));
+        eprintln!("    whole_chains:       {:8.3} ms", ms(stages.ff_whole_chains_ns));
+        eprintln!("  [SizingDraft deep]");
+        eprintln!(
+            "    counts:             drafts={}  nodes={}  slice_sets={}",
+            stages.sd_drafts_built, stages.sd_nodes_enqueued, stages.sd_slice_sets
+        );
+        eprintln!("    port_param_spec:    {:8.3} ms", ms(stages.sd_port_param_spec_ns));
+        eprintln!("    enqueue:            {:8.3} ms", ms(stages.sd_enqueue_ns));
+        eprintln!("    operand_links:      {:8.3} ms", ms(stages.sd_operand_links_ns));
+        eprintln!("    storage_compile:    {:8.3} ms", ms(stages.sd_storage_compile_ns));
+        eprintln!("    cover_ports:        {:8.3} ms", ms(stages.sd_cover_ports_ns));
+        eprintln!(
+            "    scratch_configs:    hit={:8.3} ms ({})  miss={:8.3} ms ({})",
+            ms(stages.sd_scratch_configs_hit_ns),
+            stages.sd_scratch_configs_hits,
+            ms(stages.sd_scratch_configs_miss_ns),
+            stages.sd_scratch_configs_misses
+        );
+        eprintln!(
+            "    sizing_point:       hit={:8.3} ms ({})  miss={:8.3} ms ({})",
+            ms(stages.sd_sizing_point_hit_ns),
+            stages.sd_sizing_point_hits,
+            ms(stages.sd_sizing_point_miss_ns),
+            stages.sd_sizing_point_misses
+        );
+        eprintln!("    storage_eval:       {:8.3} ms", ms(stages.sd_storage_eval_ns));
+
+        let mut top_configs: Vec<(&'static str, u64, u64)> = stages
+            .sd_configs_by_entry
+            .iter()
+            .map(|(&entry, &(ns, calls))| (entry, ns, calls))
+            .collect();
+        top_configs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        if !top_configs.is_empty() {
+            eprintln!("    top-10 sd_configs_by_entry (miss):");
+            for (entry, ns, calls) in top_configs.into_iter().take(10) {
+                eprintln!("      {:<40} {:8.3} ms ({} misses)", entry, ms(ns), calls);
+            }
+        }
+
+        let mut top_points: Vec<(&'static str, u64, u64)> = stages
+            .sd_point_by_entry
+            .iter()
+            .map(|(&entry, &(ns, calls))| (entry, ns, calls))
+            .collect();
+        top_points.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        if !top_points.is_empty() {
+            eprintln!("    top-10 sd_point_by_entry (miss):");
+            for (entry, ns, calls) in top_points.into_iter().take(10) {
+                eprintln!("      {:<40} {:8.3} ms ({} misses)", entry, ms(ns), calls);
+            }
+        }
+    }
+}
+
+#[test]
+fn chat_template_inspection_pruning_matches_unpruned_across_manifest() {
+    let manifest = manifest();
+    let mut checked = 0usize;
+    for fixture in &manifest.fixtures {
+        let scratch = Scratch::new(&format!("chat-parity-{}", fixture.name));
+        let target_path = scratch.materialize(
+            fixture
+                .target
+                .first()
+                .expect("a fixture has a target"),
+        );
+        let Ok(directory) = inspect_header(&target_path) else {
+            continue;
+        };
+        let tokenizer = magnitude_artifacts::TokenizerPayload::from_directory(&directory);
+        let Ok(templates) =
+            magnitude_artifacts::TemplatePayload::from_directory(&directory, &fixture.name)
+        else {
+            continue;
+        };
+        let Ok(bundle) = magnitude_chat::artifacts::gguf_templates(&templates, &tokenizer) else {
+            continue;
+        };
+        let pruned = bundle.inspect();
+        let unpruned = bundle.inspect_unpruned();
+        assert_eq!(
+            pruned, unpruned,
+            "pruned TemplateInspection diverged from unpruned on fixture `{}`",
+            fixture.name
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "expected at least one fixture with a chat template");
+}

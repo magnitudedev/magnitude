@@ -425,6 +425,7 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto callable            = !has_response_format && has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
+    common_chat_apply_cached_parser(tmpl, inputs, "", data, [&](common_chat_params & data) {
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto start = p.rule("start", p.optional(p.literal("<|turn>model\n")));
 
@@ -548,6 +549,7 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
             { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|tool_call>" },
         };
     }
+    });
 
     return data;
 }

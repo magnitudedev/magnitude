@@ -79,6 +79,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
         data.prompt += data.generation_prompt;
     }
 
+    common_chat_apply_cached_parser(tmpl, inputs, "", data, [&](common_chat_params & data) {
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal(GEN_PROMPT);
         auto end = p.end();
@@ -141,6 +142,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
             { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TOOL_CALL_START }
         };
     }
+    });
 
     return data;
 }

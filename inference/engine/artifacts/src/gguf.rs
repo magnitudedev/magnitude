@@ -88,7 +88,7 @@ struct Stored {
 enum Payload {
     /// A range of the header's bytes, shared with every other array read from them.
     Held {
-        bytes: Arc<Vec<u8>>,
+        bytes: Arc<walk::HeaderBacking>,
         range: Range<usize>,
     },
     /// Apart from the skeleton the array was read from ([`Absence`]), read when first needed
@@ -303,7 +303,7 @@ impl Array {
         stored: ValueType,
         order: ByteOrder,
         count: usize,
-        bytes: Arc<Vec<u8>>,
+        bytes: Arc<walk::HeaderBacking>,
         range: Range<usize>,
     ) -> Self {
         Self::stored(key, stored, order, count, Payload::Held { bytes, range })
@@ -390,6 +390,28 @@ impl Array {
                     walk::element(stored.stored, stored.order, stored.payload()?, index).map(Some)
                 }
                 None => Ok(None),
+            },
+        }
+    }
+
+    /// The elements at `indices`, in the same order (`None` past the end), checked as
+    /// [`Self::elements`] checks them. When stored and not yet decoded, a string array's payload
+    /// is walked once up to the largest in-bounds index rather than restarting for each lookup.
+    pub fn elements_at(&self, indices: &[usize]) -> Result<Vec<Option<Element<'_>>>, Error> {
+        match &self.0 {
+            Repr::Decoded(elements) => {
+                Ok(indices.iter().map(|&index| elements.get(index)).collect())
+            }
+            Repr::Stored(stored) => match stored.decoded.get() {
+                Some(elements) => Ok(indices.iter().map(|&index| elements.get(index)).collect()),
+                None if indices.iter().any(|&index| index < stored.count) => walk::elements_at(
+                    stored.stored,
+                    stored.order,
+                    stored.count,
+                    stored.payload()?,
+                    indices,
+                ),
+                None => Ok(vec![None; indices.len()]),
             },
         }
     }
@@ -1039,13 +1061,14 @@ pub fn read_prefix(
     let Some(last) = entries.last() else {
         return Ok(None);
     };
+    let backing = Arc::new(walk::HeaderBacking::Owned(Arc::clone(bytes)));
     Ok(Some((
         Directory {
             version: preamble.version,
             byte_order: preamble.byte_order,
             alignment,
             data_offset: (last.end as u64).next_multiple_of(alignment),
-            metadata: entries.iter().map(|entry| entry.metadata(bytes)).collect(),
+            metadata: entries.iter().map(|entry| entry.metadata(&backing)).collect(),
             tensors: Vec::new(),
         },
         open,
@@ -1066,12 +1089,26 @@ impl SharedHeader {
     }
 }
 
+fn open_header_file(path: &Path) -> Result<(std::fs::File, u64), Error> {
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::Invalid(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok((file, metadata.len()))
+}
+
 /// Inspect one downloaded GGUF file header before weight payloads exist.
 /// Header bounds, tensor geometry, offsets, and non-overlap are validated;
 /// only the physical presence of declared tensor bytes is deferred.
 pub fn inspect_header(path: impl AsRef<Path>) -> Result<Directory, Error> {
-    let source = FileSource::open(path)?;
-    read_file_directory(&source, false)
+    let (mut file, size) = open_header_file(path.as_ref())?;
+    let (directory, _) = read_stored_directory_from_file(&mut file, size, None)?;
+    directory.require_execution_byte_order()?;
+    Ok(directory)
 }
 
 /// One GGUF file's validated header directory and logical size.
@@ -1085,7 +1122,7 @@ pub struct FileHeader {
 /// ([`FileHeaders`]), or a host that already holds them, so assessing one
 /// file several ways never rereads it. A header is the file's bytes through
 /// its aligned tensor-data offset, parsed by [`read_header`].
-pub trait HeaderSource {
+pub trait HeaderSource: Sync {
     fn header(&self, path: &Path) -> Result<FileHeader, Error>;
 }
 
@@ -1094,11 +1131,10 @@ pub struct FileHeaders;
 
 impl HeaderSource for FileHeaders {
     fn header(&self, path: &Path) -> Result<FileHeader, Error> {
-        let source = FileSource::open(path)?;
-        Ok(FileHeader {
-            directory: read_file_directory(&source, false)?,
-            size: source.size(),
-        })
+        let (mut file, size) = open_header_file(path)?;
+        let (directory, _) = read_stored_directory_from_file(&mut file, size, None)?;
+        directory.require_execution_byte_order()?;
+        Ok(FileHeader { directory, size })
     }
 }
 
@@ -1125,10 +1161,13 @@ pub fn inspect_component_headers(
             match split_paths(path, &first.directory)? {
                 None => Ok((first.directory, vec![(first_path, first.size)])),
                 Some(split) => {
-                    let mut files = vec![(first_path, first.size)];
-                    let mut shards = vec![first.directory];
-                    for shard in &split[1..] {
-                        let (header, path) = read(shard)?;
+                    let rest =
+                        seismic_threads::pool::par_for_results(&split[1..], |shard| read(shard))?;
+                    let mut files = Vec::with_capacity(split.len());
+                    let mut shards = Vec::with_capacity(split.len());
+                    files.push((first_path, first.size));
+                    shards.push(first.directory);
+                    for (header, path) in rest {
                         files.push((path, header.size));
                         shards.push(header.directory);
                     }
@@ -1137,10 +1176,10 @@ pub fn inspect_component_headers(
             }
         }
         many => {
+            let loaded = seismic_threads::pool::par_for_results(many, |shard| read(shard))?;
             let mut files = Vec::with_capacity(many.len());
             let mut shards = Vec::with_capacity(many.len());
-            for shard in many {
-                let (header, path) = read(shard)?;
+            for (header, path) in loaded {
                 files.push((path, header.size));
                 shards.push(header.directory);
             }
@@ -1324,12 +1363,36 @@ fn read_stored_directory<R: Read + Seek>(
     source: &mut R,
     require_payload: bool,
 ) -> Result<(Directory, Vec<StoredType>), Error> {
-    let size = source.seek(SeekFrom::End(0))?;
-    source.seek(SeekFrom::Start(0))?;
+    let require_size = if require_payload {
+        let size = source.seek(SeekFrom::End(0))?;
+        source.seek(SeekFrom::Start(0))?;
+        Some(size)
+    } else {
+        None
+    };
+    read_stored_directory_from_reader(source, require_size)
+}
+
+fn read_stored_directory_from_file(
+    file: &mut std::fs::File,
+    #[cfg_attr(not(unix), allow(unused_variables))] file_size: u64,
+    require_size: Option<u64>,
+) -> Result<(Directory, Vec<StoredType>), Error> {
+    #[cfg(unix)]
+    if let Some(shared) = SharedHeader::read_mapped(file, file_size)? {
+        return stored_directory(&shared, require_size);
+    }
+    read_stored_directory_from_reader(file, require_size)
+}
+
+fn read_stored_directory_from_reader<R: Read>(
+    source: &mut R,
+    require_size: Option<u64>,
+) -> Result<(Directory, Vec<StoredType>), Error> {
     let mut bytes = HeaderBytes::new();
     bytes.read(source)?;
     let length = bytes.bytes().len();
-    stored_directory(&bytes.into_shared(length)?, require_payload.then_some(size))
+    stored_directory(&bytes.into_shared(length)?, require_size)
 }
 
 /// The directory of a walked GGUF header, with the stored type of each of its metadata values.
@@ -1342,12 +1405,14 @@ fn stored_directory(
     let (metadata, types) = header
         .entries
         .iter()
-        .map(|entry| (entry.metadata(shared.bytes()), entry.head().stored))
+        .map(|entry| (entry.metadata(shared.backing()), entry.head().stored))
         .unzip();
     let alignment = header.alignment;
-    let mut tensors = Vec::new();
+    let mut tensors = Vec::with_capacity(header.tensors.len());
     let mut unknown = std::collections::BTreeMap::<u32, u32>::new();
-    let mut names = HashSet::new();
+    let mut names = HashSet::with_capacity(header.tensors.len());
+    let mut offsets_sorted = true;
+    let mut prev_offset = 0u64;
     for tensor in &header.tensors {
         let name = tensor.name;
         if name.is_empty() || !names.insert(name) {
@@ -1372,6 +1437,10 @@ fn stored_directory(
         }
         let nbytes = stored_bytes(name, &shape, encoding)?;
         shape.reverse();
+        if tensor.offset < prev_offset {
+            offsets_sorted = false;
+        }
+        prev_offset = tensor.offset;
         tensors.push(TensorDescriptor {
             name: name.to_owned(),
             shape,
@@ -1382,23 +1451,33 @@ fn stored_directory(
     }
 
     let data_offset = header.data_offset as u64;
-    let mut stored = tensors.iter().collect::<Vec<_>>();
-    stored.sort_by_key(|tensor| tensor.offset);
-    let mut end = data_offset;
-    for tensor in stored {
+    let validate_span = |end: &mut u64, tensor: &TensorDescriptor| -> Result<(), Error> {
         let start = data_offset
             .checked_add(tensor.offset)
             .ok_or_else(|| invalid("GGUF tensor offset overflows"))?;
         let next = start
             .checked_add(tensor.nbytes)
             .ok_or_else(|| invalid("GGUF tensor end overflows"))?;
-        if start < end || size.is_some_and(|size| next > size) {
+        if start < *end || size.is_some_and(|size| next > size) {
             return Err(invalid(format!(
                 "overlapping or truncated tensor {:?}",
                 tensor.name
             )));
         }
-        end = next;
+        *end = next;
+        Ok(())
+    };
+    let mut end = data_offset;
+    if offsets_sorted {
+        for tensor in &tensors {
+            validate_span(&mut end, tensor)?;
+        }
+    } else {
+        let mut stored = tensors.iter().collect::<Vec<_>>();
+        stored.sort_by_key(|tensor| tensor.offset);
+        for tensor in stored {
+            validate_span(&mut end, tensor)?;
+        }
     }
 
     let directory = Directory {

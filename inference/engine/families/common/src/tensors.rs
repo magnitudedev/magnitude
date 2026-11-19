@@ -8,29 +8,38 @@ use magnitude_family_contracts::{
     checked_product, DefinitionError, ImportTransform, RowPart, ScaleCodes, ScaledActivations,
     WeightDescriptor,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct Tensors<'a> {
     directory: &'a Directory,
+    by_name: HashMap<&'a str, &'a TensorDescriptor>,
     bound: HashSet<&'a str>,
 }
 
 impl<'a> Tensors<'a> {
     pub fn new(directory: &'a Directory) -> Self {
+        let mut by_name = HashMap::with_capacity(directory.tensors.len());
+        for tensor in &directory.tensors {
+            by_name.entry(tensor.name.as_str()).or_insert(tensor);
+        }
         Self {
             directory,
-            bound: HashSet::new(),
+            by_name,
+            bound: HashSet::with_capacity(directory.tensors.len()),
         }
     }
 
+    fn lookup(&self, name: &str) -> Option<&'a TensorDescriptor> {
+        self.by_name.get(name).copied()
+    }
+
     fn stored(&self, name: &str) -> Result<&'a TensorDescriptor, HeaderError> {
-        self.directory
-            .tensor(name)
+        self.lookup(name)
             .ok_or_else(|| HeaderError::MissingWeight(name.to_owned()))
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.directory.tensor(name).is_some()
+        self.by_name.contains_key(name)
     }
 
     /// The stored shape of `name`, outermost first.
@@ -200,13 +209,13 @@ impl<'a> Tensors<'a> {
         };
         let stored = self.stored(weight)?;
         if let Some(grid) = ImportTransform::scale_grid(weight, stored.encoding) {
-            let scale = self.directory.tensor(&grid).ok_or(HeaderError::MissingWeight(grid))?;
+            let scale = self.lookup(&grid).ok_or(HeaderError::MissingWeight(grid))?;
             return self.scale_grid(stored, scale).map(Some);
         }
-        let Some(scale) = self.directory.tensor(&name) else {
+        let Some(scale) = self.lookup(&name) else {
             return Ok(None);
         };
-        let input = self.directory.tensor(&format!("{stem}.input_scale"));
+        let input = self.lookup(&format!("{stem}.input_scale"));
         for companion in std::iter::once(scale).chain(input) {
             if companion.encoding != Encoding::F32 || companion.shape != [matrices] {
                 return Err(HeaderError::CompanionScale {

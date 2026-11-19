@@ -75,6 +75,7 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
         data.prompt += data.generation_prompt;
     }
 
+    common_chat_apply_cached_parser(tmpl, inputs, parser_generation_prompt, data, [&](common_chat_params & data) {
     auto parser = autoparser.build_parser(inputs, parser_generation_prompt);
     data.parser = parser.save();
 
@@ -106,6 +107,7 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
             }
         }
     }
+    });
 
     return data;
 }

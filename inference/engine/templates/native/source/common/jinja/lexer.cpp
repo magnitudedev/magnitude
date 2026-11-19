@@ -31,6 +31,7 @@ static void string_rstrip(std::string & s, const char * chars) {
 
 lexer_result lexer::tokenize(const std::string & source) {
     std::vector<token> tokens;
+    tokens.reserve(source.size() / 6);
 
     // NOTE: do NOT transform the source string (i.e. preprocessing), as we need to keep
     //       the original character positions for error reporting etc.
@@ -286,7 +287,7 @@ lexer_result lexer::tokenize(const std::string & source) {
             if (seq == "}}" && curly_bracket_depth > 0) {
                 continue;
             }
-            if (pos + seq.size() <= src.size() && src.substr(pos, seq.size()) == seq) {
+            if (pos + seq.size() <= src.size() && src.compare(pos, seq.size(), seq) == 0) {
                 tokens.push_back({typ, seq, start_pos});
                 if (typ == token::open_expression) {
                     curly_bracket_depth = 0;

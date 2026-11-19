@@ -38,8 +38,10 @@ use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
     routed_route, routed_route_shared,
 };
+#[cfg(test)]
+use seismic::NativeGraphMetadata;
 use seismic::{
-    Argument, BackendName, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, OperandCarry, WorkflowTensor,
+    Argument, BackendName, Dim, Element, NativeGraph, NativePort, OperandCarry, WorkflowTensor,
 };
 
 /// The choices' gate/up arguments (`routed_gate_up`: SiLU and unclamped,
@@ -93,13 +95,12 @@ impl DecodeForm {
     /// `routed_route_shared` for `backend`, else the expand form.
     pub(crate) fn of(backend: BackendName) -> Result<Self, String> {
         Ok(
-            match seismic::generated::native_implementation_for_backend::<
-                routed_route_shared::Entry,
-            >(backend)
-            .map_err(|error| error.to_string())?
+            if <routed_route_shared::Entry as seismic::EntryContract>::contract_node_shape(backend)
+                .is_ok()
             {
-                Some(_) => Self::SharedRoute,
-                None => Self::Expand,
+                Self::SharedRoute
+            } else {
+                Self::Expand
             },
         )
     }
@@ -229,23 +230,25 @@ impl CheckedRoutedEntries {
         })
     }
 
-    pub(crate) fn entries(&self) -> RoutedGraphEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> RoutedGraphEntries<'_, G> {
         RoutedGraphEntries {
-            route: &self.route,
+            route: G::bind(&self.route),
             decode: match &self.decode {
-                CheckedDecodeEntries::Expand(expand) => RoutedDecodeEntries::Expand(&expand[..]),
+                CheckedDecodeEntries::Expand(expand) => RoutedDecodeEntries::Expand(G::bind_ranged(&expand[..])),
                 CheckedDecodeEntries::SharedRoute { route, choices } => {
                     RoutedDecodeEntries::SharedRoute {
-                        route: &route[..],
-                        choices: &choices[..],
+                        route: G::bind_ranged(&route[..]),
+                        choices: G::bind_ranged(&choices[..]),
                     }
                 }
             },
-            output: &self.output,
+            output: G::bind_ranged(&self.output),
             operand_norm: self.output[3].1,
-            group: &self.group,
-            experts: &self.experts,
-            combine: &self.combine,
+            group: G::bind(&self.group),
+            experts: G::bind_ranged(&self.experts),
+            combine: G::bind_ranged(&self.combine),
         }
     }
 }

@@ -1894,7 +1894,7 @@ impl Measured<'_, '_> {
         let left = self.left.max(1) as f64;
         let seconds = match self.whose {
             Whose::Standing => own + (MEASUREMENT_SECONDS - self.sampled - own - Self::least(self.ahead)).max(0.) / left,
-            Whose::Loads => self.ends().saturating_duration_since(std::time::Instant::now()).as_secs_f64() / left,
+            Whose::Loads => self.deadlines.remaining().as_secs_f64() / left,
         };
         let measure = Measure {
             stop: seismic::measure::Stop::Within {
@@ -1933,7 +1933,11 @@ impl Measured<'_, '_> {
         began: std::time::Instant,
         made: Option<std::time::Instant>,
     ) {
-        let sampled = made.map_or(0., |made| made.elapsed().as_secs_f64());
+        let sampled_duration = made.map_or(std::time::Duration::ZERO, |made| made.elapsed());
+        if !sampled_duration.is_zero() {
+            self.deadlines.charge(sampled_duration);
+        }
+        let sampled = sampled_duration.as_secs_f64();
         if self.whose == Whose::Standing {
             self.sampled += sampled;
         }
@@ -4727,10 +4731,10 @@ impl<'a, 'd> Walks<'a, 'd> {
     /// is told, nothing stored, and the next job attempts it again.
     pub(super) fn record(&mut self, key: PointKey, make: impl FnOnce(&seismic::Charges) -> Result<Record, String>) {
         let began = std::time::Instant::now();
-        let (_, ends) = self.measured.next(0.);
+        let _ = self.measured.next(0.);
         let measured = &mut self.measured;
         let store = measured.records.store;
-        if std::time::Instant::now() >= ends {
+        if measured.deadlines.remaining().is_zero() {
             return measured.tell(key, Outcome::<String, String>::Expired, began, None);
         }
         let (made, record) = match (measured.attempting)(&key) {

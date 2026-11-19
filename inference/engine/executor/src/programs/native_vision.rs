@@ -9,37 +9,46 @@
 //! (`seismic::trace`): assessment evaluates it at every later model of the
 //! same topology, and a load certifies the same recorder at its own numbers.
 
-use super::graph::facts::{FactIndex, FactSink, Facts, Numbers, RealIndex, constant, constant_reals};
-use super::graph::{GraphError, draft::{Certified, GraphDraft}};
+use super::graph::facts::{Numbers, constant, constant_reals};
+use super::graph::{
+    GraphError,
+    draft::{Certified, ElementBoundDraft, GraphDraft},
+    sizing::SizingOutline,
+};
 use super::native_target_graph::{GraphWeights, PlannedWeights};
 use super::native_constants::{
     CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
-    RecordedConstant, distinct_storage_bytes,
+    distinct_storage_bytes,
 };
 use super::{ReadySubmission, VisionProgram};
 use crate::error::PlanError;
 use crate::native::{AttestedVision, VisionKernels};
 use crate::operators::vision::{
-    LinearBounds, VisionEntry, VisionKernel, VisionOperands, VisionProgram as VisionOps, VisionRows,
-    VisionValue, vision_program,
+    LinearBounds, VisionEntry, VisionKernel, VisionOp, VisionOperands, VisionProgram as VisionOps,
+    VisionRows, VisionValue, vision_program,
 };
 use crate::{
     DeviceError, GraphOutputTensor, InvariantError, ModelLoadPlan, NativeGraphOutputLease,
     NativeGraphWorkspaceLease, ResidentVision, SubmitError, ValidatedVisionLaunch,
     VisionLaunchCore, VisionProgramPlan,
 };
-use magnitude_family_contracts::{VisionAttentionSpan, VisionDescription, WeightRole};
+use magnitude_family_contracts::{
+    VisionAttentionSpan, VisionDescription, WeightKind, WeightRole, WeightScope,
+};
 use magnitude_kernels::{
     post_norm_residual, vision_attention, vision_clamp, vision_gated_convolution, vision_linear,
     vision_norm, vision_patch_stem, vision_pool, vision_position,
 };
+#[cfg(test)]
+use seismic::NativeGraphMetadata;
 use seismic::{
-    Argument, BackendName, BoundNativeGraphPlan, ClassFact, Device, Dim, Element, NativeGraph, NativeGraphClassSlice,
-    NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata,
-    NativeGraphPlan, NativeGraphResourceTemplate, NativeGraphStorageBytes, NativeGraphTraces,
-    NativeKernel, NativePort, Reals, Tensor, WorkflowTensor, WorkflowTensorView,
+    Argument, BackendName, BoundNativeGraphPlan, ContractNodeShape, Device, Dim, Element,
+    EntryContract, GraphCensus, NativeGraph, NativeGraphClassSlice, NativeGraphFamily,
+    NativeGraphFamilySlot, NativeGraphLayout, NativeGraphPlan, NativeGraphStorageBytes,
+    NativeKernel, NativePort, Tensor, WorkflowTensor, WorkflowTensorView,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 
 fn invalid(detail: impl Into<String>) -> SubmitError {
@@ -62,10 +71,15 @@ fn planned_program(
     description: &VisionDescription,
     load: &ModelLoadPlan,
 ) -> Result<VisionOps, GraphError> {
+    let vision_weights: HashMap<WeightRole, Element> = load
+        .weights()
+        .filter(|plan| matches!(plan.role.kind, WeightKind::Vision(_)))
+        .map(|plan| (plan.role, plan.resident))
+        .collect();
     vision_program(description, &|role| {
-        load.weights()
-            .find(|plan| plan.role == role)
-            .map(|plan| plan.resident)
+        vision_weights
+            .get(&role)
+            .copied()
             .ok_or(PlanError::Topology("a vision weight is not planned"))
     })
     .map_err(|error| error.to_string().into())
@@ -161,15 +175,6 @@ impl<D> Numbers<D> for VisionNumbers<D> {
     }
 }
 
-/// A vision graph's trace key: its topology, and its numbers and weights
-/// with each number its fact's index.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct VisionKey {
-    topology: VisionTopology<RealIndex>,
-    numbers: VisionNumbers<FactIndex>,
-    weights: GraphWeights<FactIndex>,
-}
-
 /// The topology and numbers of `program`'s graph on `backend` at a class of
 /// `patches` patch rows, and the weights of `load` it reads.
 fn split(
@@ -219,33 +224,10 @@ fn split(
     Ok((topology, numbers, weights))
 }
 
-/// The vision graphs' traces, one per topology.
-static VISION_TRACES: NativeGraphTraces<VisionKey, Vec<RecordedConstant>> = NativeGraphTraces::new();
-
-/// How many vision traces this process recorded.
+/// Direct contract sizing records zero traces.
 #[cfg(test)]
 pub(crate) fn vision_traces_recorded() -> usize {
-    VISION_TRACES.recorded()
-}
-
-/// The template of a vision graph of `key` at `facts` and `reals`, and the
-/// constants its binding uploads.
-fn record_vision_graph(
-    key: &VisionKey,
-    facts: &[Dim],
-    reals: &Reals,
-) -> Result<(NativeGraphResourceTemplate, Vec<RecordedConstant>), GraphError> {
-    let facts = Facts::new(facts, reals);
-    let topology = facts.arguments(key.topology.clone());
-    let (graph, ports) = vision_graph_draft(
-        NativeGraphMetadata::new_template(key.topology.backend),
-        &topology,
-        &topology,
-        &facts.dims(key.numbers.clone()),
-        &facts.dims(key.weights.clone()),
-    )?;
-    let constants = ports.constants.iter().map(GraphConstant::recorded).collect();
-    Ok((graph.seal_template()?, constants))
+    0
 }
 
 /// The kernel a graph binds for invocation `index`: the prepared native
@@ -349,33 +331,33 @@ impl<R> VisionTopology<R> {
     }
 }
 
-impl<R> VisionBindings<NativeGraphMetadata> for VisionTopology<R> {
-    fn patch_stem(&self, index: usize, _rows: &Dim) -> Result<&[(&str, Element)], GraphError> {
-        self.elements(index)
+impl<G: ElementBoundDraft, R> VisionBindings<G> for VisionTopology<R> {
+    fn patch_stem(&self, index: usize, _rows: &Dim) -> Result<G::Binding<'_, vision_patch_stem::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
     }
-    fn norm(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
-        self.elements(index)
+    fn norm(&self, index: usize) -> Result<G::Binding<'_, vision_norm::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
     }
-    fn linear(&self, index: usize, _rows: &Dim) -> Result<&[(&str, Element)], GraphError> {
-        self.elements(index)
+    fn linear(&self, index: usize, _rows: &Dim) -> Result<G::Binding<'_, vision_linear::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
     }
-    fn clamp(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
-        self.elements(index)
+    fn clamp(&self, index: usize) -> Result<G::Binding<'_, vision_clamp::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
     }
-    fn attention(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
-        self.elements(index)
+    fn attention(&self, index: usize) -> Result<G::Binding<'_, vision_attention::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
     }
-    fn gated_convolution(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
-        self.elements(index)
+    fn gated_convolution(&self, index: usize) -> Result<G::Binding<'_, vision_gated_convolution::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
     }
-    fn pool(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
-        self.elements(index)
+    fn pool(&self, index: usize) -> Result<G::Binding<'_, vision_pool::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
     }
-    fn position(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
-        self.elements(index)
+    fn position(&self, index: usize) -> Result<G::Binding<'_, vision_position::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
     }
-    fn post_norm(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
-        self.elements(index)
+    fn post_norm(&self, index: usize) -> Result<G::Binding<'_, post_norm_residual::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
     }
 }
 
@@ -1155,6 +1137,810 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?
     ))
 }
 
+/// Single-owner per-kind composition for a vision encoder family.
+///
+/// A vision tower is a sequential pipeline `stem -> blocks[0..L] -> merger`.
+/// Identical consecutive blocks (and periodic block patterns) are collapsed so
+/// each distinct stage/block kind is drafted and sized once while preserving
+/// exact inter-layer carry lifetimes, R_b colouring parity, upload/output/sync
+/// storage, full-depth `GraphCensus`, binding constants, host heap, and kernel
+/// requests.
+pub(crate) struct VisionFamilyComposition {
+    pub(crate) resources: CheckedGraphResources,
+    pub(crate) kernels: HashSet<seismic::KernelRequest>,
+    /// Per-patch-class storage bytes, in `patch_rows` order.
+    pub(crate) class_storage: Vec<NativeGraphStorageBytes>,
+}
+
+struct VisionStages {
+    stem: Range<usize>,
+    blocks: Vec<Range<usize>>,
+    merger: Range<usize>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum RelativeValue {
+    Pixels,
+    Carry,
+    Local(usize),
+    PatchCarry,
+    PatchLocal(usize),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum RelativeBounds {
+    Stored,
+    Fixed { minimum: u32, maximum: u32 },
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum RelativeOperands {
+    PatchStem {
+        has_next_frame: bool,
+        has_bias: bool,
+        has_table: bool,
+    },
+    Norm {
+        source: RelativeValue,
+        rows: VisionRows,
+        has_weight: bool,
+        has_bias: bool,
+        gathered: bool,
+        epsilon_bits: u32,
+        centered: bool,
+        interleave: bool,
+        activation: i32,
+    },
+    Linear {
+        x: RelativeValue,
+        rows: VisionRows,
+        has_bias: bool,
+        residual: Option<RelativeValue>,
+        gate: Option<RelativeValue>,
+        bounds: Option<RelativeBounds>,
+        activation: i32,
+    },
+    Clamp {
+        x: RelativeValue,
+        rows: VisionRows,
+    },
+    Attention {
+        query: RelativeValue,
+        key: RelativeValue,
+        value: RelativeValue,
+        has_query_norm: bool,
+        has_key_norm: bool,
+        value_norm: bool,
+        span: VisionAttentionSpan,
+        log_base_bits: u32,
+        epsilon_bits: u32,
+        unit_scale: bool,
+    },
+    GatedConvolution {
+        value: RelativeValue,
+        gate: RelativeValue,
+    },
+    Pool {
+        source: RelativeValue,
+        has_standard: bool,
+        weight_bits: u32,
+        scale_bits: u32,
+    },
+    Position {
+        source: RelativeValue,
+    },
+    Registers {
+        source: RelativeValue,
+    },
+    PostNormResidual {
+        residual: RelativeValue,
+        projected: RelativeValue,
+        epsilon_bits: u32,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BlockOpSignature {
+    kernel: VisionKernel,
+    width: u64,
+    operands: RelativeOperands,
+    weight_specs: Vec<(Element, Vec<u64>)>,
+}
+
+fn for_each_operand_value(operands: &VisionOperands, mut f: impl FnMut(VisionValue)) {
+    match operands {
+        VisionOperands::PatchStem { .. } => {}
+        VisionOperands::Norm { source, .. }
+        | VisionOperands::Pool { source, .. }
+        | VisionOperands::Position { source, .. }
+        | VisionOperands::Registers { source, .. } => f(*source),
+        VisionOperands::Linear { x, residual, gate, .. } => {
+            f(*x);
+            if let Some(residual) = residual {
+                f(*residual);
+            }
+            if let Some(gate) = gate {
+                f(*gate);
+            }
+        }
+        VisionOperands::Clamp { x, .. } => f(*x),
+        VisionOperands::Attention { query, key, value, .. } => {
+            f(*query);
+            f(*key);
+            f(*value);
+        }
+        VisionOperands::GatedConvolution { value, gate, .. } => {
+            f(*value);
+            f(*gate);
+        }
+        VisionOperands::PostNormResidual { residual, projected, .. } => {
+            f(*residual);
+            f(*projected);
+        }
+    }
+}
+
+fn remap_operand_values(
+    operands: &VisionOperands,
+    mut remap: impl FnMut(VisionValue) -> VisionValue,
+) -> VisionOperands {
+    match operands.clone() {
+        VisionOperands::PatchStem { frame, next_frame, bias, table } => {
+            VisionOperands::PatchStem { frame, next_frame, bias, table }
+        }
+        VisionOperands::Norm {
+            source,
+            rows,
+            weight,
+            bias,
+            gathered,
+            epsilon,
+            centered,
+            interleave,
+            activation,
+        } => VisionOperands::Norm {
+            source: remap(source),
+            rows,
+            weight,
+            bias,
+            gathered,
+            epsilon,
+            centered,
+            interleave,
+            activation,
+        },
+        VisionOperands::Linear {
+            x,
+            rows,
+            weight,
+            bias,
+            residual,
+            gate,
+            bounds,
+            activation,
+        } => VisionOperands::Linear {
+            x: remap(x),
+            rows,
+            weight,
+            bias,
+            residual: residual.map(&mut remap),
+            gate: gate.map(&mut remap),
+            bounds,
+            activation,
+        },
+        VisionOperands::Clamp { x, rows, minimum, maximum } => {
+            VisionOperands::Clamp { x: remap(x), rows, minimum, maximum }
+        }
+        VisionOperands::Attention {
+            query,
+            key,
+            value,
+            query_norm,
+            key_norm,
+            value_norm,
+            span,
+            log_base,
+            epsilon,
+            unit_scale,
+        } => VisionOperands::Attention {
+            query: remap(query),
+            key: remap(key),
+            value: remap(value),
+            query_norm,
+            key_norm,
+            value_norm,
+            span,
+            log_base,
+            epsilon,
+            unit_scale,
+        },
+        VisionOperands::GatedConvolution { value, gate, kernel } => {
+            VisionOperands::GatedConvolution { value: remap(value), gate: remap(gate), kernel }
+        }
+        VisionOperands::Pool { source, standard, weight, scale } => {
+            VisionOperands::Pool { source: remap(source), standard, weight, scale }
+        }
+        VisionOperands::Position { source, table } => {
+            VisionOperands::Position { source: remap(source), table }
+        }
+        VisionOperands::Registers { source, table } => {
+            VisionOperands::Registers { source: remap(source), table }
+        }
+        VisionOperands::PostNormResidual { residual, projected, norm, epsilon } => {
+            VisionOperands::PostNormResidual {
+                residual: remap(residual),
+                projected: remap(projected),
+                norm,
+                epsilon,
+            }
+        }
+    }
+}
+
+fn op_output_element(op: &VisionOp) -> Element {
+    match op.kernel.entry {
+        VisionEntry::Norm | VisionEntry::Linear => op
+            .kernel
+            .elements
+            .iter()
+            .find(|(name, _)| *name == "Y")
+            .map(|(_, el)| *el)
+            .unwrap_or_else(Element::f32),
+        VisionEntry::Clamp | VisionEntry::Attention | VisionEntry::GatedConvolution => op
+            .kernel
+            .elements
+            .iter()
+            .find(|(name, _)| *name == "A")
+            .map(|(_, el)| *el)
+            .unwrap_or_else(Element::f32),
+        VisionEntry::PatchStem
+        | VisionEntry::Pool
+        | VisionEntry::Position
+        | VisionEntry::PostNormResidual => Element::f32(),
+    }
+}
+
+/// Partition `program.ops` into `stem`, `blocks[0..L]`, and `merger`, verifying
+/// that every stage boundary carries only the single hidden tensor `h`.
+fn partition_vision_stages(program: &VisionOps) -> Option<VisionStages> {
+    let mut last_op: Vec<Option<usize>> = Vec::new();
+    for (idx, op) in program.ops.iter().enumerate() {
+        for role in op.operands.weights() {
+            if let WeightScope::VisionBlock(block) = role.scope {
+                let block = block as usize;
+                if block >= last_op.len() {
+                    last_op.resize(block + 1, None);
+                }
+                last_op[block] = Some(idx);
+            }
+        }
+    }
+    if last_op.is_empty() {
+        return None;
+    }
+    let last_ops: Vec<usize> = last_op.into_iter().collect::<Option<Vec<_>>>()?;
+    if last_ops.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return None;
+    }
+    // Block 0's operator output reads the stem's output `h` as its residual.
+    let first_block0_residual = program
+        .ops
+        .iter()
+        .take(last_ops[0] + 1)
+        .enumerate()
+        .find_map(|(idx, op)| {
+            let is_block0 = op
+                .operands
+                .weights()
+                .into_iter()
+                .any(|role| role.scope == WeightScope::VisionBlock(0));
+            if !is_block0 {
+                return None;
+            }
+            match op.operands {
+                VisionOperands::Linear { residual: Some(VisionValue::Result(r)), .. }
+                | VisionOperands::PostNormResidual { residual: VisionValue::Result(r), .. }
+                    if r < idx =>
+                {
+                    Some(r)
+                }
+                _ => None,
+            }
+        })?;
+    let stem_end = first_block0_residual + 1;
+    if stem_end == 0 || stem_end > last_ops[0] {
+        return None;
+    }
+    let stem = 0..stem_end;
+    let mut blocks = Vec::with_capacity(last_ops.len());
+    let mut start = stem_end;
+    for &end_inclusive in &last_ops {
+        let end = end_inclusive + 1;
+        if start >= end {
+            return None;
+        }
+        blocks.push(start..end);
+        start = end;
+    }
+    let merger = start..program.ops.len();
+    if merger.is_empty() {
+        return None;
+    }
+    // Verify that every stage boundary carries only the single hidden tensor `h`
+    // of uniform width and element.
+    let carry_op = &program.ops[stem.end - 1];
+    let carry_width = carry_op.width;
+    let carry_element = op_output_element(carry_op);
+    for range in &blocks {
+        let out_op = &program.ops[range.end - 1];
+        if out_op.width != carry_width || op_output_element(out_op) != carry_element {
+            return None;
+        }
+        for idx in range.clone() {
+            let mut valid = true;
+            for_each_operand_value(&program.ops[idx].operands, |value| match value {
+                VisionValue::Result(src) | VisionValue::PatchRows(src) => {
+                    if src != range.start - 1 && !(range.start <= src && src < idx) {
+                        valid = false;
+                    }
+                }
+                VisionValue::Pixels => valid = false,
+            });
+            if !valid {
+                return None;
+            }
+        }
+    }
+    for idx in merger.clone() {
+        let mut valid = true;
+        for_each_operand_value(&program.ops[idx].operands, |value| match value {
+            VisionValue::Result(src) | VisionValue::PatchRows(src) => {
+                if src != merger.start - 1 && !(merger.start <= src && src < idx) {
+                    valid = false;
+                }
+            }
+            VisionValue::Pixels => valid = false,
+        });
+        if !valid {
+            return None;
+        }
+    }
+    Some(VisionStages { stem, blocks, merger })
+}
+
+fn relative_value(value: VisionValue, stage_start: usize) -> Option<RelativeValue> {
+    Some(match value {
+        VisionValue::Pixels => RelativeValue::Pixels,
+        VisionValue::Result(idx) if idx + 1 == stage_start => RelativeValue::Carry,
+        VisionValue::Result(idx) if idx >= stage_start => RelativeValue::Local(idx - stage_start),
+        VisionValue::PatchRows(idx) if idx + 1 == stage_start => RelativeValue::PatchCarry,
+        VisionValue::PatchRows(idx) if idx >= stage_start => {
+            RelativeValue::PatchLocal(idx - stage_start)
+        }
+        _ => return None,
+    })
+}
+
+fn block_signature(
+    ops: &[VisionOp],
+    stage_start: usize,
+    weights: &HashMap<WeightRole, (Element, &[u64])>,
+) -> Option<Vec<BlockOpSignature>> {
+    let mut sig = Vec::with_capacity(ops.len());
+    for op in ops {
+        let rel = |v| relative_value(v, stage_start);
+        let operands = match &op.operands {
+            VisionOperands::PatchStem { next_frame, bias, table, .. } => {
+                RelativeOperands::PatchStem {
+                    has_next_frame: next_frame.is_some(),
+                    has_bias: bias.is_some(),
+                    has_table: table.is_some(),
+                }
+            }
+            VisionOperands::Norm {
+                source,
+                rows,
+                weight,
+                bias,
+                gathered,
+                epsilon,
+                centered,
+                interleave,
+                activation,
+            } => RelativeOperands::Norm {
+                source: rel(*source)?,
+                rows: *rows,
+                has_weight: weight.is_some(),
+                has_bias: bias.is_some(),
+                gathered: *gathered,
+                epsilon_bits: epsilon.to_bits(),
+                centered: *centered,
+                interleave: *interleave,
+                activation: *activation,
+            },
+            VisionOperands::Linear {
+                x,
+                rows,
+                bias,
+                residual,
+                gate,
+                bounds,
+                activation,
+                ..
+            } => RelativeOperands::Linear {
+                x: rel(*x)?,
+                rows: *rows,
+                has_bias: bias.is_some(),
+                residual: match residual {
+                    Some(v) => Some(rel(*v)?),
+                    None => None,
+                },
+                gate: match gate {
+                    Some(v) => Some(rel(*v)?),
+                    None => None,
+                },
+                bounds: bounds.map(|b| match b {
+                    LinearBounds::Stored { .. } => RelativeBounds::Stored,
+                    LinearBounds::Fixed { minimum, maximum } => {
+                        RelativeBounds::Fixed { minimum, maximum }
+                    }
+                }),
+                activation: *activation,
+            },
+            VisionOperands::Clamp { x, rows, .. } => {
+                RelativeOperands::Clamp { x: rel(*x)?, rows: *rows }
+            }
+            VisionOperands::Attention {
+                query,
+                key,
+                value,
+                query_norm,
+                key_norm,
+                value_norm,
+                span,
+                log_base,
+                epsilon,
+                unit_scale,
+            } => RelativeOperands::Attention {
+                query: rel(*query)?,
+                key: rel(*key)?,
+                value: rel(*value)?,
+                has_query_norm: query_norm.is_some(),
+                has_key_norm: key_norm.is_some(),
+                value_norm: *value_norm,
+                span: *span,
+                log_base_bits: log_base.to_bits(),
+                epsilon_bits: epsilon.to_bits(),
+                unit_scale: *unit_scale,
+            },
+            VisionOperands::GatedConvolution { value, gate, .. } => {
+                RelativeOperands::GatedConvolution { value: rel(*value)?, gate: rel(*gate)? }
+            }
+            VisionOperands::Pool { source, standard, weight, scale } => RelativeOperands::Pool {
+                source: rel(*source)?,
+                has_standard: standard.is_some(),
+                weight_bits: weight.to_bits(),
+                scale_bits: scale.to_bits(),
+            },
+            VisionOperands::Position { source, .. } => {
+                RelativeOperands::Position { source: rel(*source)? }
+            }
+            VisionOperands::Registers { source, .. } => {
+                RelativeOperands::Registers { source: rel(*source)? }
+            }
+            VisionOperands::PostNormResidual { residual, projected, epsilon, .. } => {
+                RelativeOperands::PostNormResidual {
+                    residual: rel(*residual)?,
+                    projected: rel(*projected)?,
+                    epsilon_bits: epsilon.to_bits(),
+                }
+            }
+        };
+        let mut weight_specs = Vec::new();
+        for role in op.operands.weights() {
+            let &(element, shape) = weights.get(&role)?;
+            weight_specs.push((element, shape.to_vec()));
+        }
+        sig.push(BlockOpSignature {
+            kernel: op.kernel.clone(),
+            width: op.width,
+            operands,
+            weight_specs,
+        });
+    }
+    Some(sig)
+}
+
+/// Whether `block_ops` preserves R_b two-ended stack parity between its
+/// incoming carry `h_in` and its outgoing carry `h_out`.
+fn block_even_crossing_parity(block_ops: &[VisionOp], block_start: usize) -> bool {
+    let n = block_ops.len();
+    if n == 0 {
+        return true;
+    }
+    // Index 0 is `h_in`, indices 1..=n are `block_ops[0..n]`.
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(n + 1);
+    spans.push((1, 1));
+    for k in 0..n {
+        let start = (k + 1) * 2 + 1;
+        spans.push((start, start));
+    }
+    for (k, op) in block_ops.iter().enumerate() {
+        let consumer_end = (k + 1) * 2 + 1;
+        for_each_operand_value(&op.operands, |value| match value {
+            VisionValue::Result(src) | VisionValue::PatchRows(src) => {
+                if src + 1 == block_start {
+                    spans[0].1 = spans[0].1.max(consumer_end);
+                } else if src >= block_start && src - block_start < n {
+                    let slot = (src - block_start) + 1;
+                    spans[slot].1 = spans[slot].1.max(consumer_end);
+                }
+            }
+            VisionValue::Pixels => {}
+        });
+    }
+    // `h_out` (index `n`) lives into the following block or merger.
+    spans[n].1 = (n + 1) * 2 + 1;
+
+    let crosses = |a: (usize, usize), b: (usize, usize)| {
+        a.0 <= b.1
+            && b.0 <= a.1
+            && !(a.0 <= b.0 && b.1 <= a.1)
+            && !(b.0 <= a.0 && a.1 <= b.1)
+    };
+    let mut colour: Vec<Option<u8>> = vec![None; n + 1];
+    let mut queue = std::collections::VecDeque::new();
+    colour[0] = Some(0);
+    queue.push_back(0usize);
+    while let Some(u) = queue.pop_front() {
+        let cu = colour[u].unwrap();
+        for v in 0..=n {
+            if u != v && crosses(spans[u], spans[v]) {
+                match colour[v] {
+                    None => {
+                        colour[v] = Some(cu ^ 1);
+                        queue.push_back(v);
+                    }
+                    Some(cv) if cv == cu => return false,
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    !matches!(colour[n], Some(1))
+}
+
+/// Collapse runs of identical consecutive blocks (and periodic repetitions of
+/// even-parity block patterns) so each distinct stage/block kind is drafted
+/// and sized once. Returns `None` when no collapsing reduces the block count,
+/// or `Some((collapsed_program, kept_block_count))`.
+fn collapse_vision_program(
+    program: &VisionOps,
+    load: &ModelLoadPlan,
+) -> Option<(VisionOps, usize)> {
+    let stages = partition_vision_stages(program)?;
+    if stages.blocks.len() <= 1 {
+        return None;
+    }
+    let weights: HashMap<WeightRole, (Element, &[u64])> = load
+        .weights()
+        .filter(|plan| matches!(plan.role.kind, WeightKind::Vision(_)))
+        .map(|plan| (plan.role, (plan.resident, plan.shape.as_slice())))
+        .collect();
+
+    let mut kind_ids: HashMap<Vec<BlockOpSignature>, usize> = HashMap::new();
+    let mut kind_even_parity: Vec<bool> = Vec::new();
+    let mut block_kinds: Vec<usize> = Vec::with_capacity(stages.blocks.len());
+    for range in &stages.blocks {
+        let sig = block_signature(&program.ops[range.clone()], range.start, &weights)?;
+        let kind = match kind_ids.get(&sig) {
+            Some(&id) => id,
+            None => {
+                let id = kind_even_parity.len();
+                let even = block_even_crossing_parity(&program.ops[range.clone()], range.start);
+                kind_even_parity.push(even);
+                kind_ids.insert(sig, id);
+                id
+            }
+        };
+        block_kinds.push(kind);
+    }
+
+    // Group consecutive identical blocks into runs and collapse each run while
+    // preserving R_b crossing parity.
+    let mut collapsed: Vec<(usize, usize)> = Vec::new(); // (kind, representative_block_idx)
+    let mut i = 0;
+    while i < block_kinds.len() {
+        let kind = block_kinds[i];
+        let start = i;
+        while i < block_kinds.len() && block_kinds[i] == kind {
+            i += 1;
+        }
+        let count = i - start;
+        let kept = if count == 1 {
+            1
+        } else if kind_even_parity[kind] {
+            // Keep 2 blocks for any run of length >= 2 so `prev -> B`,
+            // `B -> B`, and `B -> next` transitions are all preserved (e.g. a
+            // sandwich post-norm block whose carry uses `"O"` rather than the
+            // stem's sliced `"M"`).
+            2
+        } else if count % 2 == 0 {
+            2
+        } else {
+            3.min(count)
+        };
+        for offset in 0..kept {
+            collapsed.push((kind, start + offset));
+        }
+    }
+
+    // Collapse periodic repetitions of an even-parity multi-block pattern,
+    // keeping 2 periods so the wrap-around transition `last -> first` is also
+    // preserved alongside `stem -> first` and `last -> merger`.
+    let m = collapsed.len();
+    for period in 2..=(m / 2) {
+        if m % period != 0 || m <= period * 2 {
+            continue;
+        }
+        let repeats = (0..m).all(|idx| collapsed[idx].0 == collapsed[idx % period].0);
+        if repeats && collapsed[..period].iter().all(|&(k, _)| kind_even_parity[k]) {
+            collapsed.truncate(period * 2);
+            break;
+        }
+    }
+
+    if collapsed.len() >= stages.blocks.len() {
+        return None;
+    }
+
+    let mut ops = Vec::with_capacity(
+        stages.stem.len()
+            + collapsed.iter().map(|&(_, b)| stages.blocks[b].len()).sum::<usize>()
+            + stages.merger.len(),
+    );
+    ops.extend(program.ops[stages.stem.clone()].iter().cloned());
+    let mut prev_out = ops.len() - 1;
+    let remap = |value: VisionValue, old_start: usize, new_start: usize, prev_out: usize| match value {
+        VisionValue::Pixels => VisionValue::Pixels,
+        VisionValue::Result(idx) if idx + 1 == old_start => VisionValue::Result(prev_out),
+        VisionValue::Result(idx) => VisionValue::Result(new_start + (idx - old_start)),
+        VisionValue::PatchRows(idx) if idx + 1 == old_start => VisionValue::PatchRows(prev_out),
+        VisionValue::PatchRows(idx) => VisionValue::PatchRows(new_start + (idx - old_start)),
+    };
+    for &(_, block_idx) in &collapsed {
+        let range = &stages.blocks[block_idx];
+        let new_start = ops.len();
+        for op in &program.ops[range.clone()] {
+            let mut cloned = op.clone();
+            cloned.operands = remap_operand_values(&op.operands, |v| {
+                remap(v, range.start, new_start, prev_out)
+            });
+            ops.push(cloned);
+        }
+        prev_out = ops.len() - 1;
+    }
+    let new_merger_start = ops.len();
+    for op in &program.ops[stages.merger.clone()] {
+        let mut cloned = op.clone();
+        cloned.operands = remap_operand_values(&op.operands, |v| {
+            remap(v, stages.merger.start, new_merger_start, prev_out)
+        });
+        ops.push(cloned);
+    }
+    Some((VisionOps { ops, ..*program }, collapsed.len()))
+}
+
+fn vision_entry_node_shape(
+    entry: VisionEntry,
+    backend: BackendName,
+) -> Result<ContractNodeShape, GraphError> {
+    let result = match entry {
+        VisionEntry::PatchStem => vision_patch_stem::Entry::contract_node_shape(backend),
+        VisionEntry::Norm => vision_norm::Entry::contract_node_shape(backend),
+        VisionEntry::Linear => vision_linear::Entry::contract_node_shape(backend),
+        VisionEntry::Clamp => vision_clamp::Entry::contract_node_shape(backend),
+        VisionEntry::Attention => vision_attention::Entry::contract_node_shape(backend),
+        VisionEntry::GatedConvolution => {
+            vision_gated_convolution::Entry::contract_node_shape(backend)
+        }
+        VisionEntry::Pool => vision_pool::Entry::contract_node_shape(backend),
+        VisionEntry::Position => vision_position::Entry::contract_node_shape(backend),
+        VisionEntry::PostNormResidual => post_norm_residual::Entry::contract_node_shape(backend),
+    };
+    result.map_err(|error| GraphError::Invalid(format!("vision entry {entry:?}: {error}")))
+}
+
+/// Exact `GraphCensus` over every op of the full unrolled vision program.
+fn full_recorded_census(
+    backend: BackendName,
+    program: &VisionOps,
+) -> Result<GraphCensus, GraphError> {
+    let mut shapes: HashMap<VisionEntry, (usize, usize, usize)> = HashMap::new();
+    let mut census_nodes = Vec::with_capacity(program.ops.len());
+    for op in &program.ops {
+        let entry = op.kernel.entry;
+        let triple = match shapes.get(&entry) {
+            Some(&triple) => triple,
+            None => {
+                let shape = vision_entry_node_shape(entry, backend)?;
+                let triple = (shape.arguments, shape.words, shape.launches);
+                shapes.insert(entry, triple);
+                triple
+            }
+        };
+        census_nodes.push(triple);
+    }
+    Ok(seismic::sizing::recorded_census_of(backend, &census_nodes, &[]))
+}
+
+impl VisionFamilyComposition {
+    pub(crate) fn certify(
+        backend: BackendName,
+        load: &ModelLoadPlan,
+        program: &VisionOps,
+        patch_rows: &[u64],
+    ) -> Result<Self, GraphError> {
+        let collapsed = collapse_vision_program(program, load).map(|(collapsed, _)| collapsed);
+        let sized_program = collapsed.as_ref().unwrap_or(program);
+        let family = VisionFamily::of(backend, load, sized_program, patch_rows)?;
+        let (collapsed_storage, classes) = family.certify::<SizingOutline>()?;
+        // Sync scratch is allocated disjointly per node across all layers; if
+        // any vision kernel ever requests sync scratch while collapsed, size
+        // the full unrolled program so `sync` remains exact.
+        let (classes, full_recorded) = if collapsed.is_some() && collapsed_storage.sync != 0 {
+            let full_family = VisionFamily::of(backend, load, program, patch_rows)?;
+            let (_, full_classes) = full_family.certify::<SizingOutline>()?;
+            (full_classes, None)
+        } else if collapsed.is_some() {
+            (classes, Some(full_recorded_census(backend, program)?))
+        } else {
+            (classes, None)
+        };
+
+        let class_storage: Vec<NativeGraphStorageBytes> = classes
+            .iter()
+            .map(|(outline, _)| {
+                let mut storage = outline.storage_bytes();
+                if let Some(recorded) = full_recorded {
+                    storage.recorded = recorded;
+                }
+                storage
+            })
+            .collect();
+        let storage = class_storage
+            .iter()
+            .copied()
+            .fold(NativeGraphStorageBytes::default(), NativeGraphStorageBytes::most);
+
+        let mut resources = CheckedGraphFamilyResources::new();
+        let mut kernels = HashSet::new();
+        // Each class's layout, a graph of its own; an encode runs on its own
+        // lane, never in a decode step's launch.
+        for &class_s in &class_storage {
+            resources.include_graph(class_s.recorded, false);
+        }
+        if let Some((first, _)) = classes.first() {
+            kernels.extend(first.kernels().iter().cloned());
+        }
+        for (&patches, (_, constants)) in patch_rows.iter().zip(&classes) {
+            let (rows, _) = class_rows(program.registers, program.cell_rows, patches)?;
+            resources.include(
+                storage,
+                constants
+                    .iter()
+                    .map(|constant| constant.at_rows(rows))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(Self {
+            resources: resources.finish()?,
+            kernels,
+            class_storage,
+        })
+    }
+}
+
 /// Whether every kernel of `program` is one `plan` planned.
 fn planned_by(program: &VisionOps, plan: &VisionProgramPlan) -> Result<(), GraphError> {
     match program.kernels().into_iter().find(|kernel| !plan.kernels().contains(kernel)) {
@@ -1165,6 +1951,7 @@ fn planned_by(program: &VisionOps, plan: &VisionProgramPlan) -> Result<(), Graph
 
 /// The graph family's storage and the distinct constants its binding
 /// uploads, for assessment.
+#[cfg(test)]
 pub(crate) fn checked_vision_family_resources(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -1172,28 +1959,22 @@ pub(crate) fn checked_vision_family_resources(
     plan: &VisionProgramPlan,
     patch_rows: impl IntoIterator<Item = u64>,
 ) -> Result<CheckedGraphResources, GraphError> {
+    checked_vision_family_with_kernels(backend, load, description, plan, patch_rows)
+        .map(|(resources, _)| resources)
+}
+
+pub(crate) fn checked_vision_family_with_kernels(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    description: &VisionDescription,
+    plan: &VisionProgramPlan,
+    patch_rows: impl IntoIterator<Item = u64>,
+) -> Result<(CheckedGraphResources, HashSet<seismic::KernelRequest>), GraphError> {
     let patch_rows = patch_rows.into_iter().collect::<Vec<_>>();
     let program = planned_program(description, load)?;
     planned_by(&program, plan)?;
-    let family = VisionFamily::of(backend, load, &program, &patch_rows)?;
-    let (storage, classes) = family.certify::<seismic::NativeGraphOutline>()?;
-    let mut resources = CheckedGraphFamilyResources::new();
-    // Each class's layout, a graph of its own; an encode runs on its own
-    // lane, never in a decode step's launch.
-    for (layout, _) in &classes {
-        resources.include_graph(layout.storage_bytes().recorded, false);
-    }
-    for (&patches, (_, constants)) in patch_rows.iter().zip(&classes) {
-        let (rows, _) = class_rows(program.registers, program.cell_rows, patches)?;
-        resources.include(
-            storage,
-            constants
-                .iter()
-                .map(|constant| constant.at_rows(rows))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-    }
-    Ok(resources.finish()?)
+    let composition = VisionFamilyComposition::certify(backend, load, &program, &patch_rows)?;
+    Ok((composition.resources, composition.kernels))
 }
 
 /// A vision graph family: its trace key and the split it indexes (its
@@ -1202,8 +1983,6 @@ pub(crate) fn checked_vision_family_resources(
 /// classes' patch rows: what its recordings and its load's graphs alike are
 /// built of.
 struct VisionFamily {
-    key: VisionKey,
-    facts: FactSink,
     topology: VisionTopology<f64>,
     numbers: VisionNumbers<u64>,
     weights: GraphWeights<u64>,
@@ -1232,23 +2011,9 @@ impl VisionFamily {
             return Err("the vision graph patch classes are invalid or duplicated".into());
         }
         let (topology, numbers, weights) = split(backend, program, load, largest)?;
-        let mut facts = FactSink::new();
-        let key = VisionKey {
-            topology: facts.index_reals(topology.clone()),
-            numbers: facts.index(numbers.clone()),
-            weights: facts.index(weights.clone()),
-        };
-        Ok(Self { key, facts, topology, numbers, weights, patch_rows: patch_rows.to_vec() })
+        Ok(Self { topology, numbers, weights, patch_rows: patch_rows.to_vec() })
     }
 
-    /// Each class's layout and the family's storage, the largest of each
-    /// part.
-    ///
-    /// Patch-row invocations read the class's tower rows (its register rows,
-    /// then its patch rows); cell-row ones its cells. The norm's rows are its
-    /// `C` (the stem's `C` is its channels). Each class has its own layout,
-    /// so its outputs hold its own image's features rather than the largest
-    /// class's.
     fn certify<L: Certified>(
         &self,
     ) -> Result<(NativeGraphStorageBytes, Vec<(L, Vec<GraphConstant>)>), GraphError> {
@@ -1260,18 +2025,19 @@ impl VisionFamily {
                 Ok(vec![NativeGraphClassSlice::new().dimension("M", [rows]).scoped(CELLS, "M", [cells])])
             })
             .collect::<Result<Vec<_>, GraphError>>()?;
-        let classes = [
-            ClassFact { fact: self.key.numbers.rows.position(), scope: None, dimension: "M" },
-            ClassFact { fact: self.key.numbers.cells.position(), scope: Some(CELLS), dimension: "M" },
-        ];
-        let layouts = L::traced_each(
-            &VISION_TRACES,
-            &self.key,
-            &self.facts,
-            &classes,
-            &slice_sets,
-            record_vision_graph,
+        let topology = constant_reals(self.topology.clone());
+        let (graph, ports) = vision_graph_draft(
+            L::new_draft(self.topology.backend),
+            &topology,
+            &topology,
+            &constant(self.numbers.clone()),
+            &constant(self.weights.clone()),
         )?;
+        let certified = L::certify_draft(graph, &slice_sets)?;
+        let layouts: Vec<(L, Vec<GraphConstant>)> = certified
+            .into_iter()
+            .map(|layout| (layout, ports.constants.clone()))
+            .collect();
         let storage = layouts
             .iter()
             .map(|(layout, _)| layout.storage_bytes())
@@ -1572,6 +2338,16 @@ impl PreparedVisionGraphs {
         let graph_error = |error: GraphError| invalid(error.to_string());
         let patch_rows = patch_rows.into_iter().collect::<Vec<_>>();
         let program = planned_program(description, load).map_err(graph_error)?;
+        // Single-owner reservation and census via per-kind composition; the
+        // sealed full-depth plans below are checked against it as an
+        // independent witness.
+        let composition = VisionFamilyComposition::certify(
+            target_device.backend(),
+            load,
+            &program,
+            &patch_rows,
+        )
+        .map_err(graph_error)?;
         let family = VisionFamily::of(target_device.backend(), load, &program, &patch_rows)
             .map_err(graph_error)?;
         let (_, layouts) = family.certify::<NativeGraphLayout>().map_err(graph_error)?;
@@ -1579,18 +2355,12 @@ impl PreparedVisionGraphs {
         let bindings = PreparedBindings { kernels: &handles.kernels, program: &program };
         let topology = constant_reals(family.topology.clone());
         let weights = constant(family.weights.clone());
-        // What the planner charged (`checked_vision_family_resources`), of
-        // `layouts`.
-        let planned = |layouts: &mut dyn Iterator<Item = &NativeGraphLayout>| {
-            seismic::LaunchGraphs::of(
-                layouts.map(|layout| seismic::LaunchedGraph { graph: layout.storage_bytes().recorded, pinned_runs: 0, runs: 1 }),
-                Vec::new(),
-            )
-            .ok_or_else(|| invalid("vision graph census overflows"))
-        };
-        let family_graphs = planned(&mut layouts.iter())?;
         let mut variants = Vec::new();
-        for (rows, layout) in patch_rows.into_iter().zip(&layouts) {
+        for ((rows, layout), &class_storage) in patch_rows
+            .into_iter()
+            .zip(&layouts)
+            .zip(&composition.class_storage)
+        {
             if variants
                 .iter()
                 .any(|variant: &PreparedVisionGraph| variant.patch_rows == rows)
@@ -1606,9 +2376,25 @@ impl PreparedVisionGraphs {
             )
             .map_err(graph_error)?;
             let plan = graph.seal().map_err(device)?;
+            let class_graphs = seismic::LaunchGraphs::of(
+                [seismic::LaunchedGraph {
+                    graph: class_storage.recorded,
+                    pinned_runs: 0,
+                    runs: 1,
+                }],
+                Vec::new(),
+            )
+            .ok_or_else(|| invalid("vision graph census overflows"))?;
+            let outputs = super::graph::serial_family(
+                "vision output",
+                [(false, plan.clone())],
+                &class_graphs,
+            )
+            .map_err(device)?;
+            super::graph::assert_storage_eq("vision output", &outputs, class_storage);
             variants.push(PreparedVisionGraph {
                 patch_rows: rows,
-                outputs: super::graph::serial_family("vision output", [(false, plan.clone())], &planned(&mut std::iter::once(layout))?).map_err(device)?,
+                outputs,
                 plan,
                 ports,
             });
@@ -1617,7 +2403,9 @@ impl PreparedVisionGraphs {
             return Err(invalid("vision graph family has no patch class"));
         }
         let plans = variants.iter().map(|variant| (false, variant.plan.clone()));
-        let family = super::graph::serial_family("vision", plans, &family_graphs).map_err(device)?;
+        let family = super::graph::serial_family("vision", plans, &composition.resources.graphs)
+            .map_err(device)?;
+        super::graph::assert_storage_eq("vision", &family, composition.resources.storage);
         Ok(Self {
             variants,
             family,
@@ -1808,5 +2596,288 @@ mod tests {
         assert_eq!(window(3), [0, 1, 4, 2, 3, 6, 8, 9, 12]);
         assert!(neighbors[16 * 9..].iter().all(|tap| *tap == -1));
         assert!(convolution_neighbors(&[[4, 0]], [4, 4], 3, 1).is_err());
+    }
+
+    #[test]
+    fn vision_family_composition_matches_unrolled_multi_layer_graphs() {
+        use super::{
+            VisionFamily, VisionFamilyComposition, class_rows, collapse_vision_program,
+            planned_program,
+        };
+        use crate::programs::graph::sizing::SizingOutline;
+        use crate::programs::native_constants::CheckedGraphFamilyResources;
+        use crate::{ArtifactComponent, ArtifactComponentKind, ModelLoadPlan, WeightPlan};
+        use magnitude_artifacts::ArtifactIdentity;
+        use magnitude_family_contracts::{
+            ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
+            VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
+            VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm,
+            VisionOperator, VisionPositions, VisionPreprocessing, VisionResampling, VisionResize,
+            VisionStem, VisionUp, WeightDescriptor,
+        };
+        use seismic::{BackendName, Element, NativeGraphLayout};
+        use std::collections::HashSet;
+
+        let f32 = Element::f32();
+        let stored = |name: &str, shape: &[u64]| WeightDescriptor::stored(name, shape);
+        let linear = |name: &str, outputs: u64, inputs: u64| VisionLinear {
+            weight: stored(&format!("{name}.weight"), &[outputs, inputs]),
+            bias: Some(stored(&format!("{name}.bias"), &[outputs])),
+            clamp: None,
+        };
+        let layer_norm = |name: &str, width: u64| VisionNorm::Layer {
+            weight: stored(&format!("{name}.weight"), &[width]),
+            bias: stored(&format!("{name}.bias"), &[width]),
+            epsilon: 1e-6,
+        };
+        let rms_norm = |name: &str, width: u64| VisionNorm::Rms {
+            weight: Some(stored(&format!("{name}.weight"), &[width])),
+            epsilon: 1e-6,
+        };
+        let make_block = |prefix: &str, span: VisionAttentionSpan, sandwich: bool, gated: bool| {
+            VisionBlock {
+                operator_norm: layer_norm(&format!("{prefix}.ln1"), 128),
+                operator: VisionOperator::Attention(VisionAttention {
+                    heads: 1,
+                    kv_heads: 1,
+                    width: 128,
+                    query: linear(&format!("{prefix}.q"), 128, 128),
+                    key: linear(&format!("{prefix}.k"), 128, 128),
+                    value: linear(&format!("{prefix}.v"), 128, 128),
+                    query_norm: None,
+                    key_norm: None,
+                    value_norm: None,
+                    rotary_base: Some(10000.0),
+                    scale: VisionAttentionScale::InverseSqrtWidth,
+                    span,
+                    output: linear(&format!("{prefix}.o"), 128, 128),
+                }),
+                operator_post_norm: sandwich
+                    .then(|| rms_norm(&format!("{prefix}.op_post"), 128)),
+                feedforward_norm: layer_norm(&format!("{prefix}.ln2"), 128),
+                feedforward: VisionFeedForward {
+                    up: if gated {
+                        VisionUp::Gated {
+                            gate: linear(&format!("{prefix}.gate"), 256, 128),
+                            up: linear(&format!("{prefix}.up"), 256, 128),
+                            limit: Some(7.0),
+                        }
+                    } else {
+                        VisionUp::Plain(linear(&format!("{prefix}.up"), 256, 128))
+                    },
+                    activation: VisionActivation::GeluTanh,
+                    down: linear(&format!("{prefix}.down"), 128, 256),
+                },
+                feedforward_post_norm: sandwich
+                    .then(|| rms_norm(&format!("{prefix}.ff_post"), 128)),
+            }
+        };
+
+        let base_preprocessing = VisionPreprocessing {
+            resize: VisionResize::PixelBounds { min_pixels: 16, max_pixels: 256 },
+            resampling: VisionResampling::Bicubic,
+            mean: [0.5; 3],
+            std: [0.5; 3],
+            channels: 3,
+            patch: 2,
+            merge: 2,
+        };
+        let base_stem = VisionStem::Patch {
+            frames: vec![
+                stored("patch.0", &[128, 3, 2, 2]),
+                stored("patch.1", &[128, 3, 2, 2]),
+            ],
+            bias: Some(stored("patch.bias", &[128])),
+            positions: Some(VisionPositions {
+                table: stored("position", &[16, 128]),
+                sampling: PositionSampling::AlignedCorners { side: 4 },
+            }),
+            norm: None,
+            registers: None,
+        };
+        let base_merger = VisionMerger {
+            norm: Some(layer_norm("post", 128)),
+            reduction: CellReduction::Concatenate,
+            standardize: None,
+            projection_norm: None,
+            stages: vec![
+                MergerStage {
+                    norm: None,
+                    linear: linear("mm.0", 512, 512),
+                    activation: Some(VisionActivation::GeluErf),
+                },
+                MergerStage {
+                    norm: None,
+                    linear: linear("mm.2", 128, 512),
+                    activation: None,
+                },
+            ],
+            feed_forward: None,
+            output_norm: None,
+        };
+
+        // 1. 27-layer uniform vision tower (Qwen3.5-shaped): collapses 27 -> 2 blocks.
+        let uniform_27 = VisionDescription {
+            activation_dtype: ActivationDType::BF16,
+            hidden: 128,
+            output_hidden: 128,
+            preprocessing: base_preprocessing.clone(),
+            stem: base_stem.clone(),
+            window: None,
+            blocks: (0..27)
+                .map(|i| make_block(&format!("b{i}"), VisionAttentionSpan::Full, false, false))
+                .collect(),
+            merger: base_merger.clone(),
+        };
+
+        // 2. 16-layer mixed Window + Full attention tower (Qwen2.5-VL-shaped):
+        //    collapses 16 -> 6 blocks (`[Window, Window, Full] * 2`).
+        let mixed_16 = VisionDescription {
+            activation_dtype: ActivationDType::BF16,
+            hidden: 128,
+            output_hidden: 128,
+            preprocessing: base_preprocessing.clone(),
+            stem: base_stem.clone(),
+            window: Some(4),
+            blocks: (0..16)
+                .map(|i| {
+                    let span = if (i + 1) % 4 == 0 {
+                        VisionAttentionSpan::Full
+                    } else {
+                        VisionAttentionSpan::Window
+                    };
+                    make_block(&format!("m{i}"), span, false, false)
+                })
+                .collect(),
+            merger: base_merger.clone(),
+        };
+
+        // 3. 12-layer sandwich post-norm + register rows + gated FFN with fixed bounds:
+        //    exercises row-dependent `Identity` constant, `Bound` constants, `register_blend`,
+        //    and `PostNormResidual`. Collapses 12 -> 2 blocks.
+        let sandwich_12 = VisionDescription {
+            activation_dtype: ActivationDType::BF16,
+            hidden: 128,
+            output_hidden: 128,
+            preprocessing: base_preprocessing,
+            stem: VisionStem::Patch {
+                frames: vec![stored("patch.0", &[128, 3, 2, 2])],
+                bias: None,
+                positions: Some(VisionPositions {
+                    table: stored("position", &[16, 128]),
+                    sampling: PositionSampling::CroppedSquare { side: 4 },
+                }),
+                norm: None,
+                registers: Some(stored("registers", &[3, 128])),
+            },
+            window: None,
+            blocks: (0..12)
+                .map(|i| make_block(&format!("s{i}"), VisionAttentionSpan::Full, true, true))
+                .collect(),
+            merger: base_merger,
+        };
+
+        let patch_rows = [4u64, 8, 16];
+        let cases = [
+            ("uniform_27", uniform_27, 2usize),
+            ("mixed_16", mixed_16, 6usize),
+            ("sandwich_12", sandwich_12, 2usize),
+        ];
+
+        for (label, description, expected_collapsed_blocks) in cases {
+            description.validate().unwrap_or_else(|e| panic!("{label}: invalid fixture: {e}"));
+            let component = ArtifactComponent {
+                kind: ArtifactComponentKind::Projector,
+                identity: ArtifactIdentity([9; 32]),
+            };
+            let weights = description
+                .weights()
+                .into_iter()
+                .map(|(role, descriptor)| {
+                    let bytes = descriptor.shape.iter().product::<u64>() * 4;
+                    WeightPlan {
+                        role,
+                        component,
+                        source: f32,
+                        upload: f32,
+                        resident: f32,
+                        shape: descriptor.shape.clone(),
+                        descriptor: descriptor.clone(),
+                        source_bytes: bytes,
+                        resident_bytes: bytes,
+                        scale: None,
+                        bound: 0,
+                        holding: crate::Holding::Whole,
+                    }
+                })
+                .collect();
+            let load = ModelLoadPlan::from_vision(weights);
+            let program = planned_program(&description, &load).unwrap();
+
+            // Verify collapsing actually reduced the block count as expected.
+            let (_, kept_blocks) = collapse_vision_program(&program, &load)
+                .unwrap_or_else(|| panic!("{label}: expected vision program to collapse"));
+            assert_eq!(
+                kept_blocks, expected_collapsed_blocks,
+                "{label}: collapsed block count"
+            );
+
+            let composed =
+                VisionFamilyComposition::certify(BackendName::Cpu, &load, &program, &patch_rows)
+                    .unwrap();
+
+            // Reference 1: full unrolled `SizingOutline`.
+            let full_family = VisionFamily::of(BackendName::Cpu, &load, &program, &patch_rows).unwrap();
+            let (ref_storage, ref_outlines) = full_family.certify::<SizingOutline>().unwrap();
+            let mut ref_resources = CheckedGraphFamilyResources::new();
+            let mut ref_kernels = HashSet::new();
+            for (outline, _) in &ref_outlines {
+                ref_resources.include_graph(outline.storage_bytes().recorded, false);
+                ref_kernels.extend(outline.kernels().iter().cloned());
+            }
+            for (&patches, (_, constants)) in patch_rows.iter().zip(&ref_outlines) {
+                let (rows, _) = class_rows(program.registers, program.cell_rows, patches).unwrap();
+                ref_resources.include(
+                    ref_storage,
+                    constants
+                        .iter()
+                        .map(|constant| constant.at_rows(rows))
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap(),
+                );
+            }
+            let ref_resources = ref_resources.finish().unwrap();
+
+            assert_eq!(
+                composed.resources, ref_resources,
+                "{label}: VisionFamilyComposition resources must match full unrolled SizingOutline"
+            );
+            assert_eq!(
+                composed.kernels, ref_kernels,
+                "{label}: VisionFamilyComposition kernels must match full unrolled SizingOutline"
+            );
+            for (idx, (outline, _)) in ref_outlines.iter().enumerate() {
+                assert_eq!(
+                    composed.class_storage[idx],
+                    outline.storage_bytes(),
+                    "{label}: class {idx} storage must match full unrolled SizingOutline"
+                );
+            }
+
+            // Reference 2: full unrolled `NativeGraphLayout`.
+            let (layout_storage, ref_layouts) =
+                full_family.certify::<NativeGraphLayout>().unwrap();
+            assert_eq!(
+                composed.resources.storage, layout_storage,
+                "{label}: VisionFamilyComposition storage must match full unrolled NativeGraphLayout"
+            );
+            for (idx, (layout, _)) in ref_layouts.iter().enumerate() {
+                assert_eq!(
+                    composed.class_storage[idx],
+                    layout.storage_bytes(),
+                    "{label}: class {idx} storage must match full unrolled NativeGraphLayout"
+                );
+            }
+        }
     }
 }

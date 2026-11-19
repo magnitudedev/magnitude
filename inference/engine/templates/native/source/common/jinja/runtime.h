@@ -62,68 +62,77 @@ struct context {
 
     // src is optional, used for error reporting
     context(std::string src = "") : src(std::make_shared<std::string>(std::move(src))) {
-        env = mk_val<value_object>();
-        env->has_builtins = false; // context object has no builtins
-        env->insert("true",  mk_val<value_bool>(true));
-        env->insert("True",  mk_val<value_bool>(true));
-        env->insert("false", mk_val<value_bool>(false));
-        env->insert("False", mk_val<value_bool>(false));
-        env->insert("none",  mk_val<value_none>());
-        env->insert("None",  mk_val<value_none>());
+        env.reserve(16);
+        auto v_true  = mk_val<value_bool>(true);
+        auto v_false = mk_val<value_bool>(false);
+        auto v_none  = mk_val<value_none>();
+        env.emplace("true",  v_true);
+        env.emplace("True",  std::move(v_true));
+        env.emplace("false", v_false);
+        env.emplace("False", std::move(v_false));
+        env.emplace("none",  v_none);
+        env.emplace("None",  std::move(v_none));
         current_time = std::time(nullptr);
     }
     ~context() = default;
 
-    context(const context & parent) : context() {
-        // inherit variables (for example, when entering a new scope)
-        auto & pvar = parent.env->as_ordered_object();
-        for (const auto & pair : pvar) {
-            set_val(pair.first, pair.second);
-        }
-        current_time = parent.current_time;
-        is_get_stats = parent.is_get_stats;
-        src = parent.src;
+    context(const context & parent)
+        : src(parent.src),
+          current_time(parent.current_time),
+          is_get_stats(parent.is_get_stats),
+          env(parent.env) {}
+
+    value * find_val(const std::string & name) {
+        auto it = env.find(name);
+        return it == env.end() ? nullptr : &it->second;
     }
 
     value get_val(const std::string & name) {
-        value default_val = mk_val<value_undefined>(name);
-        return env->at(name, default_val);
+        auto it = env.find(name);
+        return it == env.end() ? mk_val<value_undefined>(name) : it->second;
     }
 
     void set_val(const std::string & name, const value & val) {
-        set_val(mk_val<value_string>(name), val);
-    }
-
-    void set_val(const value & name, const value & val) {
         if (iteration_assignments) {
-            iteration_assignments->push_back({name, env->has_key(name) ? env->at(name) : nullptr});
+            auto it = env.find(name);
+            iteration_assignments->emplace_back(name, it != env.end() ? it->second : nullptr);
+            if (it != env.end()) {
+                it->second = val;
+            } else {
+                env.emplace(name, val);
+            }
+        } else {
+            env[name] = val;
         }
-        env->insert(name, val);
     }
 
     // Each assignment made while a loop iteration runs, with the value its name had (null when it
     // had none), so the iteration's scope ends with it: Jinja gives every iteration of a loop body
     // its own scope. Null outside a loop body; a copied context starts outside one.
-    std::vector<std::pair<value, value>> * iteration_assignments = nullptr;
+    std::vector<std::pair<std::string, value>> * iteration_assignments = nullptr;
 
     // Undo the iteration's assignments, latest first.
     void end_iteration() {
         for (auto it = iteration_assignments->rbegin(); it != iteration_assignments->rend(); ++it) {
             if (it->second) {
-                env->insert(it->first, it->second);
+                env[it->first] = std::move(it->second);
             } else {
-                env->erase(it->first);
+                env.erase(it->first);
             }
         }
         iteration_assignments->clear();
     }
 
     void print_vars() const {
-        printf("Context Variables:\n%s\n", value_to_json(env, 2).c_str());
+        auto obj = mk_val<value_object>();
+        for (const auto & pair : env) {
+            obj->insert(pair.first, pair.second);
+        }
+        printf("Context Variables:\n%s\n", value_to_json(obj, 2).c_str());
     }
 
 private:
-    value_object env;
+    std::unordered_map<std::string, value> env;
 };
 
 // utils for visiting AST nodes
@@ -750,7 +759,7 @@ static void gather_string_parts_recursive(const value & val, value_string & part
         std::string str_val = val->as_string().str();
         parts->val_str.append(str_val);
     } else if (is_val<value_array>(val)) {
-        auto items = cast_val<value_array>(val)->as_array();
+        const auto & items = cast_val<value_array>(val)->as_array();
         for (const auto & item : items) {
             gather_string_parts_recursive(item, parts);
         }

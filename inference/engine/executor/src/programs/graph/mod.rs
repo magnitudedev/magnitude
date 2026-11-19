@@ -6,6 +6,7 @@
 pub(crate) mod draft;
 pub(crate) mod facts;
 pub(crate) mod readout;
+pub(crate) mod sizing;
 pub(crate) mod tap;
 
 use crate::operators::{attention, gated_delta, routed};
@@ -83,6 +84,35 @@ pub(crate) fn serial_family(
         family.graphs()
     );
     Ok(family)
+}
+
+/// Assert exact equality of a sealed `NativeGraphFamily`'s storage bytes
+/// against the certified storage bytes (`NativeGraphStorageBytes`).
+pub(crate) fn assert_storage_eq(
+    name: &str,
+    family: &seismic::NativeGraphFamily,
+    charged: seismic::NativeGraphStorageBytes,
+) {
+    assert_eq!(
+        family.workspace_bytes(),
+        charged.workspace,
+        "invariant violated: {name} family workspace bytes differ from certified storage",
+    );
+    assert_eq!(
+        family.sync_bytes(),
+        charged.sync,
+        "invariant violated: {name} family sync bytes differ from certified storage",
+    );
+    assert_eq!(
+        family.output_bytes(),
+        charged.output,
+        "invariant violated: {name} family output bytes differ from certified storage",
+    );
+    assert_eq!(
+        family.upload_bytes(),
+        charged.upload,
+        "invariant violated: {name} family upload bytes differ from certified storage",
+    );
 }
 
 /// The structural form a row class selects in every row-dependent branch of

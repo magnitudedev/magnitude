@@ -14,7 +14,7 @@ use super::resources::{NativeGraphCharge, history_row_bytes, recurrent_bank_byte
 use super::{
     ComponentSelection, ModelLoadPlan, PlannedMethod, ResourceLimits,
 };
-use crate::assessment::{DomainFit, MemoryBreakdown};
+use crate::assessment::{DomainFit, MemoryBreakdown, stage_timer};
 use crate::memory::ClaimDemand;
 use crate::platform::{DomainRole, Fit, FitMode, StorageDemand};
 use crate::{AttestedPrograms, GraphError};
@@ -365,7 +365,6 @@ impl HostProcessBytes {
         limits: ResourceLimits,
         backend: BackendName,
     ) -> Result<Self, String> {
-        let costs = HostProcessCosts::of(backend);
         let kernels = crate::native::kernel_requests(
             backend,
             programs,
@@ -375,6 +374,139 @@ impl HostProcessBytes {
         )
         .map_err(|failure| crate::CatalogError::native(backend, failure).to_string())?
         .len() as u64;
+        Self::from_kernel_count(definition, programs, backend, kernels)
+    }
+
+    /// The worker's unplanned host bytes derived directly from the
+    /// deduplicated `SizingDraft` kernel set in `graph` plus non-graph
+    /// import/glue kernels from `programs`, without walking `CheckedModule`.
+    pub(crate) fn from_graph_bounds(
+        definition: &ModelDefinition,
+        programs: &super::ProgramPlan,
+        graph: &AssessmentGraphResourceBounds,
+        backend: BackendName,
+    ) -> Result<Self, String> {
+        stage_timer::time_stage(|t, ns| t.host_process_ns += ns, || {
+        use seismic::{EntryContract, KernelRequest};
+        use std::collections::{BTreeMap, HashSet};
+
+        let mut seen: HashSet<KernelRequest> = graph.target.census.kernels.clone();
+        seen.extend(graph.other_kernels.iter().cloned());
+        seen.extend(graph.state_kernels.iter().cloned());
+
+        fn insert_kernel(
+            seen: &mut HashSet<KernelRequest>,
+            backend: BackendName,
+            entry: &'static str,
+            elements: &[(&str, seismic::Element)],
+            statics: BTreeMap<String, u64>,
+        ) {
+            seen.insert(KernelRequest {
+                backend,
+                entry,
+                elements: elements
+                    .iter()
+                    .map(|&(name, el)| (name.to_owned(), el))
+                    .collect::<BTreeMap<_, _>>(),
+                statics,
+            });
+        }
+        let mut add = |entry: &'static str, elements: &[(&str, seismic::Element)]| {
+            insert_kernel(&mut seen, backend, entry, elements, BTreeMap::new());
+        };
+        let filter_statics = |names: &[&'static str], dims: &[(&str, u64)]| -> BTreeMap<String, u64> {
+            names
+                .iter()
+                .filter_map(|&name| {
+                    dims.iter()
+                        .find(|&&(dim, _)| dim == name)
+                        .map(|&(_, v)| (name.to_owned(), v))
+                })
+                .collect()
+        };
+
+        // Non-graph weight import kernels (`native::preparation::imports`).
+        for slot in programs.imports() {
+            match *slot {
+                super::ImportProgramSlot::Dense { source, resident } => {
+                    add(
+                        "import_dense",
+                        &[
+                            ("E", seismic::Element::dense(source)),
+                            ("U", seismic::Element::dense(resident)),
+                        ],
+                    );
+                }
+                super::ImportProgramSlot::Repack { source, resident } => {
+                    if super::packing_run(resident).is_some() {
+                        add("packing_bound", &[("W", resident)]);
+                    }
+                    add("repack_weight", &[("E", source), ("U", resident)]);
+                }
+            }
+        }
+
+        // Non-graph glue kernels (`native::preparation::Preparation::glue` & `target`).
+        if let Ok(shape) = <magnitude_kernels::shape_rows::Entry as EntryContract>::contract_node_shape(backend) {
+            insert_kernel(
+                &mut seen,
+                backend,
+                "shape_rows",
+                &[],
+                filter_statics(
+                    shape.statics,
+                    &[
+                        ("V", definition.decoder.vocabulary),
+                        ("Hn", magnitude_batching::HISTORY_WIDTH as u64),
+                    ],
+                ),
+            );
+        }
+        if let Ok(shape) = <magnitude_kernels::sample_rows::Entry as EntryContract>::contract_node_shape(backend) {
+            insert_kernel(
+                &mut seen,
+                backend,
+                "sample_rows",
+                &[],
+                filter_statics(shape.statics, &[("V", definition.decoder.vocabulary)]),
+            );
+        }
+        let mut add = |entry: &'static str, elements: &[(&str, seismic::Element)]| {
+            insert_kernel(&mut seen, backend, entry, elements, BTreeMap::new());
+        };
+        add("conditioning_overlay", &[]);
+        let feature_activation = programs
+            .head()
+            .and_then(|head| head.blocks().first())
+            .map_or(programs.target().embedding().activation, |head| head.conditioning);
+        add("feature_copy", &[("A", feature_activation)]);
+        if programs.drafts_with_head() || programs.draft().is_some() {
+            add("token_confidence", &[]);
+        }
+        if programs.copies_token_rows() {
+            add("selection_notice", &[]);
+        }
+        for &element in programs.state().copies() {
+            add("copy_rows", &[("A", element)]);
+        }
+        if let Some(head) = programs.head() {
+            for block in head.blocks() {
+                add("feature_copy", &[("A", block.conditioning)]);
+                add("feature_rows", &[("A", block.conditioning)]);
+            }
+        }
+
+        Self::from_kernel_count(definition, programs, backend, seen.len() as u64)
+        })
+    }
+
+    fn from_kernel_count(
+        definition: &ModelDefinition,
+        programs: &super::ProgramPlan,
+        backend: BackendName,
+        kernels: u64,
+    ) -> Result<Self, String> {
+        let costs = HostProcessCosts::of(backend);
         Ok(Self {
             runtime: costs.runtime,
             vocabulary: costs
@@ -506,6 +638,9 @@ pub struct TargetGraphBounds {
     /// The bytes its own buffers of a prompt group hold beyond the floor's,
     /// at the places each pass size merges (`CheckedTargetFamily::group_bytes`).
     pub group_bytes: super::ByPass<u64>,
+    /// Accumulated launch census and deduplicated kernel set recorded by
+    /// `SizingDraft` during assessment.
+    pub(crate) census: crate::programs::graph::sizing::TargetFamilySizingCensus,
 }
 
 impl TargetGraphBounds {
@@ -518,6 +653,7 @@ impl TargetGraphBounds {
             sealed: family.sealed,
             binding_constant_bytes: family.resources.binding_constant_bytes,
             group_bytes: family.group_bytes,
+            census: family.census,
         })
     }
 }
@@ -531,16 +667,20 @@ pub struct VisionGraphBounds {
     pub charge: NativeGraphCharge,
     /// The constants its binding allocates.
     pub binding_constant_bytes: u64,
+    /// Deduplicated kernels referenced by the vision family.
+    pub(crate) kernels: std::collections::HashSet<seismic::KernelRequest>,
 }
 
 /// What a drafted plan's certification gives of its target's plan alone at
 /// the same holding of experts: its target family without the drafter's
-/// writes, and the vision family both hold. Every other family of the target
-/// alone is its own ([`AssessmentGraphResourceBounds::of_target`]).
+/// writes, its readout family without the drafter's features, and the vision
+/// family both hold. Every other family of the target alone is its own
+/// ([`AssessmentGraphResourceBounds::of_target`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UndraftedBounds {
     pub target: TargetGraphBounds,
     pub vision: Option<VisionGraphBounds>,
+    pub(crate) readout: (NativeGraphCharge, crate::programs::graph::sizing::ReadoutSizingCensus),
 }
 
 /// Checked graph-pool demand and distinct bound constants from the same class
@@ -573,6 +713,16 @@ pub struct AssessmentGraphResourceBounds {
     /// copy of each constant value, exact from the classes the load
     /// prepares. Host memory, not part of `total_bytes`.
     pub drafter_graph_host_bytes: u64,
+    /// Decode readout calls recorded by `SizingDraft` for `DecodeDemand`.
+    pub(crate) readout_census: crate::programs::graph::sizing::ReadoutSizingCensus,
+    /// Deduplicated kernels referenced by non-target, non-state families
+    /// (readout, head/shared_head/draft, vision).
+    pub(crate) other_kernels: std::collections::HashSet<seismic::KernelRequest>,
+    /// Deduplicated kernels referenced by the state copy family.
+    pub(crate) state_kernels: std::collections::HashSet<seismic::KernelRequest>,
+    /// Target recurrent bank capacity for which `state` and `sealed_state_graphs`
+    /// were certified (`None` when the model has no recurrent state).
+    pub(crate) state_bank_capacity: Option<BankCapacity>,
 }
 
 impl AssessmentGraphResourceBounds {
@@ -586,65 +736,183 @@ impl AssessmentGraphResourceBounds {
         backend: BackendName,
     ) -> Result<Self, GraphError> {
         let plan = Self::program_plan(definition, load, method, codec)?;
-        let target = Self::target_at_pass(definition, load, &plan, state, limits, backend)?;
-        let vision = Self::vision(definition, load, &plan, limits, backend)?;
-        Self::of_target(definition, load, &plan, state, method, limits, backend, target, vision)
+        Self::derive_with_cache(definition, load, &plan, state, method, limits, backend, None)
+            .map(|(bounds, _)| bounds)
+    }
+
+    /// [`Self::derive`], also returning the target-family layout cache handle
+    /// so subsequent `reusing_non_target` / `at_pass` / drafted derivations
+    /// reuse invariant entry, per-layer, and block-shape layouts.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn derive_with_cache(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        plan: &super::ProgramPlan,
+        state: &super::StateResourcePlan,
+        method: PlannedMethod,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+        cache: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<(Self, std::sync::Arc<dyn std::any::Any + Send + Sync>), GraphError> {
+        Self::validate_program_plan(plan, method)?;
+        let (bounds, _vision, _undrafted_readout, cache) = Self::derive_parallel(
+            definition,
+            load,
+            plan,
+            state,
+            method,
+            limits,
+            backend,
+            false,
+            || Self::target_at_pass_with_cache(definition, load, plan, state, limits, backend, cache),
+        )?;
+        Ok((bounds, cache))
     }
 
     /// The bounds of `load`'s target family alone, certified at its pass
-    /// (`ModelLoadPlan::pass`): the one term of the bounds a load's pass
-    /// moves ([`Self::with_target`]).
-    fn target_at_pass(
+    /// (`ModelLoadPlan::pass`), optionally reusing a cached target-family
+    /// layout table from another holding/pass of the same target.
+    fn target_at_pass_with_cache(
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
         plan: &super::ProgramPlan,
         state: &super::StateResourcePlan,
         limits: super::ResourceLimits,
         backend: BackendName,
-    ) -> Result<TargetGraphBounds, GraphError> {
-        let target = crate::programs::native_target_graph::checked_target_family(
-            backend,
-            load,
-            &definition.decoder,
-            state,
-            plan.target(),
-            limits,
-            load.pass(limits),
-        )?;
-        Ok(TargetGraphBounds::of(target, limits.startup_slots(load.fronts()).target)?)
+        cache: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<(TargetGraphBounds, std::sync::Arc<dyn std::any::Any + Send + Sync>), GraphError> {
+        stage_timer::time_stage(|t, ns| t.target_ns += ns, || {
+            let target = match cache {
+                Some(cache) => crate::programs::native_target_graph::CheckedTargetFamily::certify_with_cache(
+                    cache,
+                    backend,
+                    load,
+                    &definition.decoder,
+                    state,
+                    plan.target(),
+                    limits,
+                    load.pass(limits),
+                )?,
+                None => crate::programs::native_target_graph::checked_target_family(
+                    backend,
+                    load,
+                    &definition.decoder,
+                    state,
+                    plan.target(),
+                    limits,
+                    load.pass(limits),
+                )?,
+            };
+            let handle = target.cache_handle();
+            Ok((TargetGraphBounds::of(target, limits.startup_slots(load.fronts()).target)?, handle))
+        })
     }
 
     /// These bounds of a load that differs from theirs only in its pass
-    /// (`ModelLoadPlan::pass`): its target family certified at that pass
-    /// ([`Self::target_at_pass`]) beside every other family's bounds as
-    /// they are, which no pass moves, composed as [`Self::of_target`]
-    /// composes them ([`Self::compose`]).
-    pub(crate) fn at_pass(
+    /// (`ModelLoadPlan::pass`), reusing `cache` when provided.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn at_pass_with_cache(
         &self,
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
+        plan: &super::ProgramPlan,
         state: &super::StateResourcePlan,
         method: PlannedMethod,
-        codec: KvCodec,
         limits: super::ResourceLimits,
         backend: BackendName,
-    ) -> Result<Self, GraphError> {
-        let plan = Self::program_plan(definition, load, method, codec)?;
-        let target = Self::target_at_pass(definition, load, &plan, state, limits, backend)?;
+        cache: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<(Self, std::sync::Arc<dyn std::any::Any + Send + Sync>), GraphError> {
+        self.derive_reusing_non_target_with_cache(definition, load, plan, state, method, limits, backend, cache)
+    }
+
+    /// These bounds of a load that differs from theirs only in how its target
+    /// routed experts are held (banked vs resident, window size, or pass):
+    /// certifies only the target family (reusing `cache` when provided, and
+    /// the state copy family only if the target's recurrent bank capacity
+    /// changed), reusing `readout`, `head`, `vision`, and their
+    /// kernels/constants from `self`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn derive_reusing_non_target_with_cache(
+        &self,
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        plan: &super::ProgramPlan,
+        state: &super::StateResourcePlan,
+        method: PlannedMethod,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+        cache: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<(Self, std::sync::Arc<dyn std::any::Any + Send + Sync>), GraphError> {
+        Self::validate_program_plan(plan, method)?;
+        let (target, handle) =
+            Self::target_at_pass_with_cache(definition, load, plan, state, limits, backend, cache)?;
         let others = self
             .binding_constant_bytes
             .checked_sub(self.target.binding_constant_bytes)
             .ok_or("checked graph constant charge underflow")?;
-        Self::compose(
+        let bank_capacity = state_bank_capacity(state);
+        let (state_charge, sealed_state_graphs, state_kernels) =
+            if self.state_bank_capacity == bank_capacity {
+                (
+                    self.state.clone(),
+                    self.sealed_state_graphs.clone(),
+                    self.state_kernels.clone(),
+                )
+            } else {
+                Self::state_bounds(load, state, limits, backend)?
+            };
+        let bounds = Self::compose(
             target,
             self.readout.clone(),
             self.head.clone(),
             self.vision.clone(),
-            self.state.clone(),
+            state_charge,
             others,
-            self.sealed_state_graphs.clone(),
+            sealed_state_graphs,
             self.drafter_graph_host_bytes,
-        )
+            self.readout_census.clone(),
+            self.other_kernels.clone(),
+            state_kernels,
+            bank_capacity,
+        )?;
+        Ok((bounds, handle))
+    }
+
+    /// Certify the state copy graph family for `state`.
+    fn state_bounds(
+        load: &ModelLoadPlan,
+        state: &super::StateResourcePlan,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+    ) -> Result<
+        (
+            NativeGraphCharge,
+            seismic::HostHeap,
+            std::collections::HashSet<seismic::KernelRequest>,
+        ),
+        GraphError,
+    > {
+        let (state_storage, state_graphs, sealed_state_graphs, state_kernels) =
+            stage_timer::time_stage(
+                |t, ns| t.vision_state_ns += ns,
+                || -> Result<_, GraphError> {
+                    let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
+                        .into_iter()
+                        .map(|rows| rows as u64)
+                        .collect::<Vec<_>>();
+                    crate::programs::native_state::checked_copy_family_with_kernels(
+                        backend,
+                        crate::programs::native_state::state_copy_classes(
+                            state.target_state(),
+                            state.head_state(),
+                            &row_classes,
+                        )?,
+                    )
+                },
+            )?;
+        let state_charge =
+            NativeGraphCharge::serial(state_storage, state_graphs, limits.startup_slots(load.fronts()).state)?;
+        Ok((state_charge, sealed_state_graphs, state_kernels))
     }
 
     /// [`Self::derive`], with the bounds of the same target's family
@@ -662,20 +930,151 @@ impl AssessmentGraphResourceBounds {
         backend: BackendName,
     ) -> Result<(Self, UndraftedBounds), GraphError> {
         let plan = Self::program_plan(definition, load, method, codec)?;
-        let [target, undrafted] = crate::programs::native_target_graph::checked_target_and_undrafted(
-            backend,
-            load,
-            &definition.decoder,
-            state,
-            plan.target(),
-            limits,
-            load.pass(limits),
-        )?;
+        Self::derive_with_undrafted_and_cache(definition, load, &plan, state, method, limits, backend, None)
+            .map(|(bounds, undrafted, _)| (bounds, undrafted))
+    }
+
+    /// [`Self::derive_with_undrafted`], optionally reusing an existing target-family
+    /// layout cache handle and returning the shared handle.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn derive_with_undrafted_and_cache(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        plan: &super::ProgramPlan,
+        state: &super::StateResourcePlan,
+        method: PlannedMethod,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+        cache: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<(Self, UndraftedBounds, std::sync::Arc<dyn std::any::Any + Send + Sync>), GraphError> {
+        Self::validate_program_plan(plan, method)?;
         let slots = limits.startup_slots(load.fronts()).target;
-        let target = TargetGraphBounds::of(target, slots)?;
-        let vision = Self::vision(definition, load, &plan, limits, backend)?;
-        let bounds = Self::of_target(definition, load, &plan, state, method, limits, backend, target, vision.clone())?;
-        Ok((bounds, UndraftedBounds { target: TargetGraphBounds::of(undrafted, slots)?, vision }))
+        let (bounds, vision, undrafted_readout, (undrafted, cache)) = Self::derive_parallel(
+            definition,
+            load,
+            plan,
+            state,
+            method,
+            limits,
+            backend,
+            true,
+            || {
+                let [target, undrafted] = stage_timer::time_stage(|t, ns| t.target_ns += ns, || {
+                    match cache {
+                        Some(cache) => crate::programs::native_target_graph::CheckedTargetFamily::certify_and_undrafted_with_cache(
+                            cache,
+                            backend,
+                            load,
+                            &definition.decoder,
+                            state,
+                            plan.target(),
+                            limits,
+                            load.pass(limits),
+                        ),
+                        None => crate::programs::native_target_graph::checked_target_and_undrafted(
+                            backend,
+                            load,
+                            &definition.decoder,
+                            state,
+                            plan.target(),
+                            limits,
+                            load.pass(limits),
+                        ),
+                    }
+                })?;
+                let cache = target.cache_handle();
+                Ok((
+                    TargetGraphBounds::of(target, slots)?,
+                    (TargetGraphBounds::of(undrafted, slots)?, cache),
+                ))
+            },
+        )?;
+        let undrafted_readout =
+            undrafted_readout.expect("derive_parallel with_undrafted_readout returns undrafted readout");
+        Ok((
+            bounds,
+            UndraftedBounds {
+                target: undrafted,
+                vision,
+                readout: undrafted_readout,
+            },
+            cache,
+        ))
+    }
+
+    /// Run `certify_target` on the calling thread concurrently with the
+    /// independent non-target families (`drafter` on one worker when present;
+    /// `vision`, `readout`, and `state` on another), merging results and errors
+    /// in deterministic serial order.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn derive_parallel<T>(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        plan: &super::ProgramPlan,
+        state: &super::StateResourcePlan,
+        method: PlannedMethod,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+        with_undrafted_readout: bool,
+        certify_target: impl FnOnce() -> Result<(TargetGraphBounds, T), GraphError>,
+    ) -> Result<
+        (
+            Self,
+            Option<VisionGraphBounds>,
+            Option<(NativeGraphCharge, crate::programs::graph::sizing::ReadoutSizingCensus)>,
+            T,
+        ),
+        GraphError,
+    > {
+        let has_drafter =
+            plan.head().is_some() || plan.draft().is_some() || plan.shared_head().is_some();
+        let ((vrs_result, drafter_result), target_result) = crate::assessment::pool::join(
+            || {
+                let _sizing = crate::programs::graph::sizing::SizingScope::enter();
+                let run_vrs = || {
+                    let _sizing = crate::programs::graph::sizing::SizingScope::enter();
+                    let vision = Self::vision(definition, load, plan, limits, backend);
+                    let readout = if with_undrafted_readout {
+                        Self::readout_bounds_with_undrafted(definition, load, limits, backend)
+                            .map(|(drafted, plain)| (drafted, Some(plain)))
+                    } else {
+                        Self::readout_bounds(definition, load, limits, backend)
+                            .map(|drafted| (drafted, None))
+                    };
+                    let state_bounds = Self::state_bounds(load, state, limits, backend);
+                    (vision, readout, state_bounds)
+                };
+                if has_drafter {
+                    crate::assessment::pool::join(run_vrs, || {
+                        Self::drafter_bounds(definition, load, plan, state, method, limits, backend)
+                    })
+                } else {
+                    (
+                        run_vrs(),
+                        Self::drafter_bounds(definition, load, plan, state, method, limits, backend),
+                    )
+                }
+            },
+            certify_target,
+        );
+        let (target, extra) = target_result?;
+        let (vision, readout, state_bounds) = vrs_result;
+        let vision = vision?;
+        let ((readout, readout_census), undrafted_readout) = readout?;
+        let drafter = drafter_result?;
+        let (state_charge, sealed_state_graphs, state_kernels) = state_bounds?;
+        let bounds = Self::compose_non_target(
+            target,
+            vision.clone(),
+            readout,
+            readout_census,
+            drafter,
+            state_charge,
+            sealed_state_graphs,
+            state_kernels,
+            state_bank_capacity(state),
+        )?;
+        Ok((bounds, vision, undrafted_readout, extra))
     }
 
     /// The bounds of `plan`'s vision family, of a projector's load.
@@ -688,25 +1087,39 @@ impl AssessmentGraphResourceBounds {
     ) -> Result<Option<VisionGraphBounds>, GraphError> {
         match (plan.vision(), definition.vision.as_deref()) {
             (Some(vision_plan), Some(vision_definition)) => {
-                let patch_rows = crate::programs::native_vision::image_patch_classes(
-                    limits.max_image_cells,
-                    vision_definition,
-                )?;
-                let vision_graph = crate::programs::native_vision::checked_vision_family_resources(
-                    backend,
-                    load,
-                    vision_definition,
-                    vision_plan,
-                    patch_rows,
-                )?;
-                Ok(Some(VisionGraphBounds {
-                    charge: NativeGraphCharge::serial(vision_graph.storage, vision_graph.graphs, limits.startup_slots(load.fronts()).vision)?,
-                    binding_constant_bytes: vision_graph.binding_constant_bytes,
-                }))
+                stage_timer::time_stage(|t, ns| t.vision_state_ns += ns, || {
+                    let patch_rows = crate::programs::native_vision::image_patch_classes(
+                        limits.max_image_cells,
+                        vision_definition,
+                    )?;
+                    let (vision_graph, kernels) =
+                        crate::programs::native_vision::checked_vision_family_with_kernels(
+                            backend,
+                            load,
+                            vision_definition,
+                            vision_plan,
+                            patch_rows,
+                        )?;
+                    Ok(Some(VisionGraphBounds {
+                        charge: NativeGraphCharge::serial(vision_graph.storage, vision_graph.graphs, limits.startup_slots(load.fronts()).vision)?,
+                        binding_constant_bytes: vision_graph.binding_constant_bytes,
+                        kernels,
+                    }))
+                })
             }
             (None, None) => Ok(None),
             _ => Err("vision program and definition disagree".into()),
         }
+    }
+
+    /// Validate that a prebuilt [`super::ProgramPlan`] agrees with `method`.
+    fn validate_program_plan(plan: &super::ProgramPlan, method: PlannedMethod) -> Result<(), GraphError> {
+        if plan.drafts_with_head() != matches!(method, PlannedMethod::Mtp { .. })
+            || plan.draft().is_some() != matches!(method, PlannedMethod::DFlash { .. })
+        {
+            return Err("assessment method and drafter program disagree".into());
+        }
+        Ok(())
     }
 
     /// The program plan the graphs are of, which must draft by `method`.
@@ -719,19 +1132,64 @@ impl AssessmentGraphResourceBounds {
         let plan = load
             .program_plan(definition, codec)
             .map_err(|error| error.to_string())?;
-        if plan.drafts_with_head() != matches!(method, PlannedMethod::Mtp { .. })
-            || plan.draft().is_some() != matches!(method, PlannedMethod::DFlash { .. })
-        {
-            return Err("assessment method and drafter program disagree".into());
-        }
+        Self::validate_program_plan(&plan, method)?;
         Ok(plan)
     }
 
-    /// The bounds of a load of `plan` (its [`Self::program_plan`]) whose
-    /// target and vision families' are `target` and `vision`: every other
-    /// family's certified here.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn of_target(
+    /// Certify the readout graph family for `load`.
+    fn readout_bounds(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+    ) -> Result<(NativeGraphCharge, crate::programs::graph::sizing::ReadoutSizingCensus), GraphError> {
+        let (readout_storage, readout_graphs, readout_census) = stage_timer::time_stage(
+            |t, ns| t.readout_ns += ns,
+            || crate::programs::graph::readout::checked_readout_storage_with_census(backend, load, &definition.decoder, limits),
+        )?;
+        let readout = NativeGraphCharge::serial(readout_storage, readout_graphs, limits.startup_slots(load.fronts()).readout)?;
+        Ok((readout, readout_census))
+    }
+
+    /// Certify `load`'s readout graph family alongside its drafter-free target
+    /// readout family in one pass, reusing un-fused regimes already certified
+    /// for `load`.
+    #[allow(clippy::type_complexity)]
+    fn readout_bounds_with_undrafted(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+    ) -> Result<
+        (
+            (NativeGraphCharge, crate::programs::graph::sizing::ReadoutSizingCensus),
+            (NativeGraphCharge, crate::programs::graph::sizing::ReadoutSizingCensus),
+        ),
+        GraphError,
+    > {
+        let (
+            (drafted_storage, drafted_graphs, drafted_census),
+            (plain_storage, plain_graphs, plain_census),
+        ) = stage_timer::time_stage(
+            |t, ns| t.readout_ns += ns,
+            || crate::programs::graph::readout::checked_readout_storage_with_undrafted(backend, load, &definition.decoder, limits),
+        )?;
+        let drafted = NativeGraphCharge::serial(
+            drafted_storage,
+            drafted_graphs,
+            limits.startup_slots(load.fronts()).readout,
+        )?;
+        let plain = NativeGraphCharge::serial(
+            plain_storage,
+            plain_graphs,
+            limits.startup_slots(false).readout,
+        )?;
+        Ok(((drafted, drafted_census), (plain, plain_census)))
+    }
+
+    /// Certify the drafter graph family (`shared_head`, `draft`, or `head`)
+    /// for `plan`, if any.
+    fn drafter_bounds(
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
         plan: &super::ProgramPlan,
@@ -739,26 +1197,20 @@ impl AssessmentGraphResourceBounds {
         method: PlannedMethod,
         limits: super::ResourceLimits,
         backend: BackendName,
-        target: TargetGraphBounds,
-        vision: Option<VisionGraphBounds>,
-    ) -> Result<Self, GraphError> {
-        // The same startup slots a load commits: one request's need.
+    ) -> Result<DrafterBounds, GraphError> {
         let slots = limits.startup_slots(load.fronts());
-        let (readout_storage, readout_graphs) =
-            crate::programs::graph::readout::checked_readout_storage(backend, load, &definition.decoder, limits)?;
-        let readout = NativeGraphCharge::serial(readout_storage, readout_graphs, slots.readout)?;
-        let (head, head_constant_bytes, drafter_graph_host_bytes) =
-            match (plan.head(), plan.draft(), state.head_state()) {
-                // A head reading target history keeps no state of its own.
-                (None, None, None) if plan.shared_head().is_some() => {
+        match (plan.head(), plan.draft(), state.head_state()) {
+            // A head reading target history keeps no state of its own.
+            (None, None, None) if plan.shared_head().is_some() => {
+                stage_timer::time_stage(|t, ns| t.other_drafter_ns += ns, || -> Result<_, GraphError> {
                     let shared = plan
                         .shared_head()
                         .ok_or("a shared head program is absent")?;
                     let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
                         definition, state, shared,
                     )?;
-                    let head_graph =
-                        crate::programs::native_shared_head::checked_shared_head_family_storage(
+                    let (head_graph, kernels) =
+                        crate::programs::native_shared_head::checked_shared_head_family_with_kernels(
                             backend,
                             load,
                             &geometry,
@@ -767,20 +1219,23 @@ impl AssessmentGraphResourceBounds {
                                 method.draft_rows(),
                             )?,
                         )?;
-                    (
-                        Some(NativeGraphCharge::serial(head_graph.storage, head_graph.graphs, slots.head)?),
-                        head_graph.binding_constant_bytes,
-                        head_graph.host_heap.bytes,
-                    )
-                }
-                (None, Some(draft_plan), Some(head_state)) => {
+                    Ok(DrafterBounds {
+                        head: Some(NativeGraphCharge::serial(head_graph.storage, head_graph.graphs, slots.head)?),
+                        constant_bytes: head_graph.binding_constant_bytes,
+                        host_bytes: head_graph.host_heap.bytes,
+                        kernels,
+                    })
+                })
+            }
+            (None, Some(draft_plan), Some(head_state)) => {
+                stage_timer::time_stage(|t, ns| t.other_drafter_ns += ns, || -> Result<_, GraphError> {
                     let draft = definition
                         .draft
                         .as_ref()
                         .ok_or("a draft program without a draft")?;
                     let geometry =
                         crate::programs::native_draft::DraftGeometry::new(definition, head_state)?;
-                    let draft_graph = crate::programs::native_draft::checked_draft_family_storage(
+                    let (draft_graph, kernels) = crate::programs::native_draft::checked_draft_family_with_kernels(
                         backend,
                         load,
                         draft_plan,
@@ -792,13 +1247,16 @@ impl AssessmentGraphResourceBounds {
                             draft,
                         )?,
                     )?;
-                    (
-                        Some(NativeGraphCharge::serial(draft_graph.storage, draft_graph.graphs, slots.head)?),
-                        draft_graph.binding_constant_bytes,
-                        draft_graph.host_heap.bytes,
-                    )
-                }
-                (Some(head), None, Some(head_state)) => {
+                    Ok(DrafterBounds {
+                        head: Some(NativeGraphCharge::serial(draft_graph.storage, draft_graph.graphs, slots.head)?),
+                        constant_bytes: draft_graph.binding_constant_bytes,
+                        host_bytes: draft_graph.host_heap.bytes,
+                        kernels,
+                    })
+                })
+            }
+            (Some(head), None, Some(head_state)) => {
+                stage_timer::time_stage(|t, ns| t.native_head_ns += ns, || -> Result<_, GraphError> {
                     let binding = *head.blocks().first().ok_or("head program has no block")?;
                     let head = definition
                         .head
@@ -811,7 +1269,7 @@ impl AssessmentGraphResourceBounds {
                             .ok_or("head graph requires a draft head block")?,
                     )
                     .map_err(|error| error.to_string())?;
-                    let head_graph = crate::programs::native_head::checked_head_family_storage(
+                    let (head_graph, kernels) = crate::programs::native_head::checked_head_family_with_kernels(
                         backend,
                         load,
                         &definition.decoder,
@@ -824,42 +1282,112 @@ impl AssessmentGraphResourceBounds {
                             load.fronts(),
                         )?,
                     )?;
-                    (
-                        Some(NativeGraphCharge::serial(head_graph.storage, head_graph.graphs, slots.head)?),
-                        head_graph.binding_constant_bytes,
-                        head_graph.host_heap.bytes,
-                    )
-                }
-                (None, None, None) => (None, 0, 0),
-                _ => return Err("drafter program and state disagree".into()),
-            };
+                    Ok(DrafterBounds {
+                        head: Some(NativeGraphCharge::serial(head_graph.storage, head_graph.graphs, slots.head)?),
+                        constant_bytes: head_graph.binding_constant_bytes,
+                        host_bytes: head_graph.host_heap.bytes,
+                        kernels,
+                    })
+                })
+            }
+            (None, None, None) => Ok(DrafterBounds::default()),
+            _ => Err("drafter program and state disagree".into()),
+        }
+    }
+
+    /// The bounds of a load of `plan` (its [`Self::program_plan`]) whose
+    /// target, vision, and readout families' are `target`, `vision`, and
+    /// `readout`: every other family's certified here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn of_target(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        plan: &super::ProgramPlan,
+        state: &super::StateResourcePlan,
+        method: PlannedMethod,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+        target: TargetGraphBounds,
+        vision: Option<VisionGraphBounds>,
+        readout: (NativeGraphCharge, crate::programs::graph::sizing::ReadoutSizingCensus),
+    ) -> Result<Self, GraphError> {
+        let (readout, readout_census) = readout;
+        let has_drafter =
+            plan.head().is_some() || plan.draft().is_some() || plan.shared_head().is_some();
+        let (drafter, state_bounds) = if has_drafter {
+            crate::assessment::pool::join(
+                || {
+                    let _sizing = crate::programs::graph::sizing::SizingScope::enter();
+                    Self::drafter_bounds(definition, load, plan, state, method, limits, backend)
+                },
+                || Self::state_bounds(load, state, limits, backend),
+            )
+        } else {
+            (
+                Self::drafter_bounds(definition, load, plan, state, method, limits, backend),
+                Self::state_bounds(load, state, limits, backend),
+            )
+        };
+        let drafter = drafter?;
+        let (state_charge, sealed_state_graphs, state_kernels) = state_bounds?;
+        Self::compose_non_target(
+            target,
+            vision,
+            readout,
+            readout_census,
+            drafter,
+            state_charge,
+            sealed_state_graphs,
+            state_kernels,
+            state_bank_capacity(state),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compose_non_target(
+        target: TargetGraphBounds,
+        vision: Option<VisionGraphBounds>,
+        readout: NativeGraphCharge,
+        readout_census: crate::programs::graph::sizing::ReadoutSizingCensus,
+        drafter: DrafterBounds,
+        state_charge: NativeGraphCharge,
+        sealed_state_graphs: seismic::HostHeap,
+        state_kernels: std::collections::HashSet<seismic::KernelRequest>,
+        bank_capacity: Option<BankCapacity>,
+    ) -> Result<Self, GraphError> {
+        let mut other_kernels = std::collections::HashSet::new();
+        other_kernels.extend(readout_census.kernels.iter().cloned());
+        other_kernels.extend(drafter.kernels);
         let (vision, vision_constant_bytes) = match vision {
-            Some(VisionGraphBounds { charge, binding_constant_bytes }) => (Some(charge), binding_constant_bytes),
+            Some(VisionGraphBounds { charge, binding_constant_bytes, kernels }) => {
+                other_kernels.extend(kernels);
+                (Some(charge), binding_constant_bytes)
+            }
             None => (None, 0),
         };
-        let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
-            .into_iter()
-            .map(|rows| rows as u64)
-            .collect::<Vec<_>>();
-        let (state_storage, state_graphs, sealed_state_graphs) =
-            crate::programs::native_state::checked_copy_family(
-                backend,
-                crate::programs::native_state::state_copy_classes(
-                    state.target_state(),
-                    state.head_state(),
-                    &row_classes,
-                )?,
-            )?;
-        let state = NativeGraphCharge::serial(state_storage, state_graphs, slots.state)?;
-        let others = head_constant_bytes
+        let others = drafter
+            .constant_bytes
             .checked_add(vision_constant_bytes)
             .ok_or("checked graph constant charge overflow")?;
-        Self::compose(target, readout, head, vision, state, others, sealed_state_graphs, drafter_graph_host_bytes)
+        Self::compose(
+            target,
+            readout,
+            drafter.head,
+            vision,
+            state_charge,
+            others,
+            sealed_state_graphs,
+            drafter.host_bytes,
+            readout_census,
+            other_kernels,
+            state_kernels,
+            bank_capacity,
+        )
     }
 
     /// The bounds of the target family `target` beside the other families'
     /// charges and `others`, their bound constants: the one composition
-    /// of the bounds ([`Self::of_target`], [`Self::at_pass`]).
+    /// of the bounds ([`Self::of_target`], [`Self::derive_reusing_non_target_with_cache`]).
     #[allow(clippy::too_many_arguments)]
     fn compose(
         target: TargetGraphBounds,
@@ -870,6 +1398,10 @@ impl AssessmentGraphResourceBounds {
         others: u64,
         sealed_state_graphs: seismic::HostHeap,
         drafter_graph_host_bytes: u64,
+        readout_census: crate::programs::graph::sizing::ReadoutSizingCensus,
+        other_kernels: std::collections::HashSet<seismic::KernelRequest>,
+        state_kernels: std::collections::HashSet<seismic::KernelRequest>,
+        state_bank_capacity: Option<BankCapacity>,
     ) -> Result<Self, GraphError> {
         let binding_constant_bytes = target
             .binding_constant_bytes
@@ -900,8 +1432,25 @@ impl AssessmentGraphResourceBounds {
             recorded_graphs,
             sealed_state_graphs,
             drafter_graph_host_bytes,
+            readout_census,
+            other_kernels,
+            state_kernels,
+            state_bank_capacity,
         })
     }
+}
+
+#[derive(Default)]
+struct DrafterBounds {
+    head: Option<NativeGraphCharge>,
+    constant_bytes: u64,
+    host_bytes: u64,
+    kernels: std::collections::HashSet<seismic::KernelRequest>,
+}
+
+fn state_bank_capacity(state: &super::StateResourcePlan) -> Option<BankCapacity> {
+    (!state.target_state().recurrent_components.is_empty())
+        .then_some(state.target_state().bank_capacity)
 }
 
 impl AssessmentHeaderBounds {
@@ -1120,7 +1669,7 @@ impl AssessmentMemoryCharge {
     /// from the weights' bytes (`weight_bytes`, which `weight_demand`
     /// places), the bounds and the state's phases: the one owner of how the
     /// roles compose.
-    fn compose(
+    pub(crate) fn compose(
         weight_bytes: u64,
         weight_demand: ClaimDemand,
         bounds: AssessmentMemoryBounds,
@@ -1171,16 +1720,12 @@ impl AssessmentMemoryCharge {
     /// windows are, which `load`'s must agree with.
     pub fn at_bank_slots(self, load: &ModelLoadPlan) -> Result<Self, String> {
         let weight_demand = ClaimDemand::checked_sum(load.weight_demands()?).ok_or("weight demand overflows")?;
-        let header = AssessmentHeaderBounds::derive(load)?;
-        assert_eq!(
-            (header.component_upload_bytes, header.staging_upload_bytes),
-            (self.bounds.component_upload_bytes, self.bounds.staging_upload_bytes),
-            "a bank's slots moved an upload window, which is of the bank's structure"
-        );
+        let startup_additional_bytes = AttestedPrograms::qualification_peak_bytes(load)?
+            .max(self.bounds.staging_upload_bytes);
         Self::compose(
             weight_demand.checked_bytes().ok_or("weight demand overflows")?,
             weight_demand,
-            AssessmentMemoryBounds { startup_additional_bytes: header.startup_additional_bytes, ..self.bounds },
+            AssessmentMemoryBounds { startup_additional_bytes, ..self.bounds },
             self.state_bytes,
             self.startup_state_bytes,
             self.host_table_bytes,

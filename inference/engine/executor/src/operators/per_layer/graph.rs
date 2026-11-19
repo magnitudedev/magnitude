@@ -20,7 +20,7 @@ use magnitude_kernels::{
     conditioning_overlay, import_dense, per_layer_gate, per_layer_inputs, project_rows,
     repack_weight,
 };
-use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Argument, Dim, Element, NativeGraph, NativePort, WorkflowTensor};
 
 /// The numbers of the per-layer rows: the residual's width, the layers and
 /// each layer's width.
@@ -149,17 +149,19 @@ impl CheckedPerLayerEntryEntries {
         }
     }
 
-    pub(crate) fn entries(&self) -> PerLayerEntryEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> PerLayerEntryEntries<'_, G> {
         PerLayerEntryEntries {
-            round: &self.round,
-            project: &self.project,
+            round: G::bind(&self.round),
+            project: G::bind_ranged(&self.project),
             table: if self.dense_table {
-                TableEntry::Dense(&self.table[..])
+                TableEntry::Dense(G::bind(&self.table[..]))
             } else {
-                TableEntry::Repack(&self.table[..])
+                TableEntry::Repack(G::bind(&self.table[..]))
             },
-            inputs: &self.inputs,
-            copy: &self.copy,
+            inputs: G::bind(&self.inputs),
+            copy: G::bind(&self.copy),
         }
     }
 }
@@ -221,8 +223,8 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
     let none = || Dim::from(0);
     let (scale_extent, bound_extent) =
         (projection.scale.clone().unwrap_or_else(none), projection.bound.clone().unwrap_or_else(none));
-    let projection = graph.port(projection.resident, &projection.shape)?;
-    let norm = graph.port(norm.resident, &norm.shape)?;
+    let projection = graph.weight_port(projection.resident, &projection.shape)?;
+    let norm = graph.weight_port(norm.resident, &norm.shape)?;
     let absent = graph.port(Element::f32(), &[0])?;
     let hidden = graph.port_with_class_extent(Element::f32(), &[rows.clone(), width.clone()], 0, "M")?;
     let table_dimensions = [("B", Dim::from(1)), ("N", rows.clone()), ("K", channels.clone())];
@@ -352,9 +354,11 @@ impl CheckedPerLayerEntries {
         })
     }
 
-    pub(crate) fn entries(&self) -> PerLayerEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> PerLayerEntries<'_, G> {
         PerLayerEntries {
-            gate: &self.gate,
+            gate: G::bind_ranged(&self.gate),
             output: self.output.entries(),
         }
     }

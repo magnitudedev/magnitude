@@ -33,8 +33,10 @@ pub mod misses;
 mod parity;
 #[cfg(test)]
 mod target_outlines;
+pub mod pool;
 pub mod priced;
 pub mod requests;
+pub mod stage_timer;
 pub mod streamed;
 pub mod streaming;
 pub mod streaming_costs;
@@ -44,10 +46,12 @@ mod vision_traces;
 pub mod synthetic;
 
 pub use assess::{
-    assess_execution_fit, decode_demand, estimate_execution, launch_prices, lookahead, execution_memory_charge, StructuralCharge,
+    assess_execution_fit, decode_demand, estimate_execution, launch_prices, lookahead, execution_memory_charge,
+    StructuralCharge, TargetLayoutCache,
     prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit, ExecutionAssessment,
     ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, MemoryBreakdown, ModelPlacement, PreparedExecutionAssessment, Residency,
 };
+pub use crate::programs::graph::sizing::SizingScope;
 pub use demand::{format_of, layout_of, Call, DecodeDemand};
 pub use estimate::{estimate_decode, expert_pass, performance_depths, PerformanceEstimate};
 pub use executor_costs::{

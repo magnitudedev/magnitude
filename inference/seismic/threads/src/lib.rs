@@ -29,6 +29,8 @@
     reason = "the one place the engine starts a thread or a runtime"
 )]
 
+pub mod pool;
+
 use std::any::Any;
 use std::cell::Cell;
 use std::future::Future;

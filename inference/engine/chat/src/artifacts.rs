@@ -51,14 +51,14 @@ pub fn gguf_templates(
             },
         );
     }
-    // Only the pieces the special-token IDs name are read, each alone.
+    // Only the pieces the special-token IDs name are read, in one pass.
     let key = "tokenizer.ggml.tokens";
     let pieces = match tokenizer.value(key) {
         Some(GgufValue::Array(pieces)) if pieces.kind() == Kind::String => pieces,
         Some(GgufValue::Array(_)) => return Err(format!("{key} requires strings")),
         _ => return Err(format!("missing string array {key}")),
     };
-    let mut tokens = BTreeMap::new();
+    let mut requested = Vec::new();
     for (native, name) in [
         ("bos", "bos_token"),
         ("eos", "eos_token"),
@@ -73,15 +73,19 @@ pub fn gguf_templates(
                 .unsigned()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or("invalid special-token ID")?;
-            let Element::String(piece) = pieces
-                .element(id)
-                .map_err(|error| error.to_string())?
-                .ok_or("special-token ID outside vocabulary")?
-            else {
-                unreachable!("a text array's elements are text")
-            };
-            tokens.insert(name.into(), piece.to_owned());
+            requested.push((name, id));
         }
+    }
+    let ids: Vec<usize> = requested.iter().map(|&(_, id)| id).collect();
+    let resolved = pieces
+        .elements_at(&ids)
+        .map_err(|error| error.to_string())?;
+    let mut tokens = BTreeMap::new();
+    for ((name, _), element) in requested.into_iter().zip(resolved) {
+        let Element::String(piece) = element.ok_or("special-token ID outside vocabulary")? else {
+            unreachable!("a text array's elements are text")
+        };
+        tokens.insert(name.into(), piece.to_owned());
     }
     TemplateBundle::new(variants.into_values().collect(), "default".into(), tokens)
 }

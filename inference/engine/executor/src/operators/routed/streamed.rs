@@ -77,7 +77,7 @@ use magnitude_kernels::{
     routed_scratch_request, routed_seed_commit, routed_select_streamed, routed_site_request, routed_step,
 };
 use seismic::{
-    Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
+    Dim, Element, NativeGraph, NativePort, NativeTimelinePort, WorkflowTensor,
     WorkflowTensorRef, WorkflowTensorView,
 };
 
@@ -356,43 +356,47 @@ impl CheckedBankEntries {
         })
     }
 
-    pub(crate) fn entries(&self) -> BankGraphEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> BankGraphEntries<'_, G> {
         BankGraphEntries {
             route: match &self.route {
                 CheckedRoute::Fused { route, hints } => BankRoute::Fused {
                     activation: hints[2].1,
-                    route: &route[..],
-                    hints: [Some(&hints[..]); HINT_LEADS as usize],
+                    route: G::bind_ranged(&route[..]),
+                    hints: [Some(G::bind(&hints[..])); HINT_LEADS as usize],
                 },
                 CheckedRoute::General { select, hints } => BankRoute::General {
                     activation: hints[2].1,
-                    select: &select[..],
-                    hints: [Some(&hints[..]); HINT_LEADS as usize],
+                    select: G::bind(&select[..]),
+                    hints: [Some(G::bind(&hints[..])); HINT_LEADS as usize],
                 },
             },
-            land: &self.landing,
-            step: &self.none,
-            scratch_request: &self.none,
-            round: &self.landing,
-            scratch_grids: &self.none,
-            pass_map: &self.none,
+            land: G::bind(&self.landing),
+            step: G::bind(&self.none),
+            scratch_request: G::bind(&self.none),
+            round: G::bind(&self.landing),
+            scratch_grids: G::bind(&self.none),
+            pass_map: G::bind(&self.none),
             seeding: BankSeedingEntries {
-                seed: self.seed.as_ref().map(|_, seed| &seed[..]),
-                seed_commit: &self.none[..],
-                list_grid: &self.none[..],
+                seed: self.seed.as_ref().map(|_, seed| G::bind(&seed[..])),
+                seed_commit: G::bind(&self.none[..]),
+                list_grid: G::bind(&self.none[..]),
             },
             site: self.site.as_ref().map(|site| BankSiteEntries {
-                request: &site.request[..],
+                request: G::bind(&site.request[..]),
                 combine: match &site.combine {
-                    CheckedCombine::Fused(project, sited) => {
-                        BankCombineEntry::Fused { project: &project[..], sited: &sited[..] }
-                    }
-                    CheckedCombine::General(project, sited) => {
-                        BankCombineEntry::General { project: &project[..], sited: &sited[..] }
-                    }
+                    CheckedCombine::Fused(project, sited) => BankCombineEntry::Fused {
+                        project: G::bind_ranged(&project[..]),
+                        sited: G::bind(&sited[..]),
+                    },
+                    CheckedCombine::General(project, sited) => BankCombineEntry::General {
+                        project: G::bind_ranged(&project[..]),
+                        sited: G::bind(&sited[..]),
+                    },
                 },
             }),
-            gate_up: self.gate_up.as_ref().map(|gate_up| &gate_up[..]),
+            gate_up: self.gate_up.as_ref().map(|gate_up| G::bind_ranged(&gate_up[..])),
         }
     }
 }

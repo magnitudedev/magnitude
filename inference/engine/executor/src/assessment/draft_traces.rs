@@ -17,8 +17,9 @@ use crate::{
     resident_layout, ComponentSelection, DraftWidths, ExecutionPath, ModelLoadPlan, PlannedMethod,
     ResourceCapacity, ResourcePlanner,
 };
+use crate::programs::graph::sizing::SizingOutline;
 use magnitude_state::{kv_codec_policy, KvCodec};
-use seismic::{BackendName, NativeGraphLayout, NativeGraphOutline};
+use seismic::{BackendName, NativeGraphLayout};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
@@ -99,7 +100,7 @@ fn every_served_draft_outlines_its_graphs_from_traces(backend: BackendName) {
                     let traces = draft_traces_recorded();
                     let began = Instant::now();
                     let outlined =
-                        certified_draft_family::<NativeGraphOutline>(backend, &load, plan, &geometry, &classes);
+                        certified_draft_family::<SizingOutline>(backend, &load, plan, &geometry, &classes);
                     let elapsed = began.elapsed();
                     let tally = match draft_traces_recorded() == traces {
                         true => &mut answered,

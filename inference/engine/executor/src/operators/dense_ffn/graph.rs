@@ -17,7 +17,7 @@ use crate::programs::native_target_graph::{PlannedWeights, WeightPort, packed_we
 use crate::{DenseBinding, ModelLoadPlan, SublayerTail, native::DenseKernels};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{dense_expand, dense_output};
-use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Argument, Dim, Element, NativeGraph, NativePort, WorkflowTensor};
 
 /// The same dense topology accepts prepared entries or checked metadata
 /// bindings. The latter carries only element assignments, never shapes.
@@ -64,11 +64,13 @@ impl CheckedDenseEntries {
         }
     }
 
-    pub(crate) fn entries(&self) -> DenseGraphEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> DenseGraphEntries<'_, G> {
         DenseGraphEntries {
-            expand: &self.expand,
+            expand: G::bind_ranged(&self.expand),
             output: match &self.post_norm {
-                None => TailEntries::Residual(&self.output[..]),
+                None => TailEntries::Residual(G::bind_ranged(&self.output[..])),
                 Some(post_norm) => TailEntries::PostNorm(post_norm.entries()),
             },
         }

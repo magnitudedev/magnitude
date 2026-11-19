@@ -3130,13 +3130,13 @@ pub mod kernel {
     /// prevents a result from being wired into another draft.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct WorkflowResultRef {
-        pub(crate) workflow: u64,
-        pub(crate) node: u32,
-        pub(crate) result: u32,
+        pub workflow: u64,
+        pub node: u32,
+        pub result: u32,
     }
 
     #[derive(Clone)]
-    pub(crate) enum EncodedWorkflowArgument {
+    pub enum EncodedWorkflowArgument {
         Tensor(WorkflowTensorArgument),
         Scalar(EncodedScalar),
         ScalarResult(WorkflowResultRef),
@@ -3149,7 +3149,7 @@ pub mod kernel {
     }
 
     #[derive(Clone)]
-    pub(crate) enum WorkflowTensorArgument {
+    pub enum WorkflowTensorArgument {
         External(Arc<TensorInner>),
         Result(WorkflowResultRef),
         ResultView {
@@ -3214,7 +3214,7 @@ pub mod kernel {
         pub(crate) fn into_arguments(self) -> Vec<EncodedWorkflowArgument> {
             self.arguments
         }
-        pub(crate) fn arguments(&self) -> &[EncodedWorkflowArgument] {
+        pub fn arguments(&self) -> &[EncodedWorkflowArgument] {
             &self.arguments
         }
     }
@@ -3227,7 +3227,8 @@ pub mod kernel {
     }
 
     impl PendingWorkflowResults {
-        pub(crate) fn new(workflow: u64, node: u32, count: u32) -> Self {
+        #[doc(hidden)]
+        pub fn new(workflow: u64, node: u32, count: u32) -> Self {
             Self {
                 workflow,
                 node,

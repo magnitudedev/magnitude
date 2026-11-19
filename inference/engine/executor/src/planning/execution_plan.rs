@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     ExecutionPath, UnstreamedExperts,
-    assessment::Priced,
+    assessment::{Priced, stage_timer},
     error::PlanError,
     platform::{FitReading, SelectedDevice},
 };
@@ -356,6 +356,53 @@ impl ExecutionPlanDraft {
         }
         self.bank_mut().host_slots = most;
         Ok(Ok(self))
+    }
+
+    /// Clone only the draft's `ExpertBankPlan` resized to `(slots, slots)` at
+    /// `PassLaunches::FLOOR` and size its linked host tier against `room`
+    /// beside `charge`, without cloning `ModelLoadPlan` or `ProgramPlan`.
+    pub(crate) fn bank_at_slots_with_host_tier(
+        &self,
+        slots: u64,
+        charge: &AssessmentMemoryCharge,
+        room: &impl SettleRoom,
+    ) -> Result<Result<super::ExpertBankPlan, UnstreamedExperts>, PlanError> {
+        let mut bank = self.bank().clone();
+        if slots < bank.floor() || slots > bank.widest().get() {
+            return Err(PlanError::Topology(
+                "an expert bank holds from its floor to its ceiling, at most every expert of each layer",
+            ));
+        }
+        bank.slots = slots;
+        bank.ceiling = slots;
+        bank.resident = slots == bank.widest().get();
+        bank.pass = PassLaunches::FLOOR;
+        if self.device.host != Some(HostTier::Linked) {
+            return Ok(Ok(bank));
+        }
+        let Some(ceiling) = bank.host_ceiling().filter(|&ceiling| ceiling > 0 && !bank.whole()) else {
+            return Ok(Ok(bank));
+        };
+        let host_charge = |host_slots: u64| bank.host_charge(host_slots).map_err(PlanError::ResourcePlanning);
+        let left = |host_slots: u64| -> Result<i64, PlanError> {
+            let growth = bank.host_cache(host_slots).map_err(PlanError::ResourcePlanning)?;
+            room.host_left(self, charge, growth)
+        };
+        if left(0)? < 0 {
+            let reserve = bank.landing_records();
+            let reason = format!("host memory admits not even the tier's landing reserve of {reserve} records a group");
+            return Ok(Err(UnstreamedExperts::Untiered { backend: self.device.backend, reason }));
+        }
+        let points = rising(0, ceiling, &host_charge)?;
+        let mut most = points[0];
+        for &host in &points {
+            if left(host)? < 0 {
+                break;
+            }
+            most = host;
+        }
+        bank.host_slots = most;
+        Ok(Ok(bank))
     }
 
     /// The host RAM `charge`, the draft's with its tier at its floor, leaves
@@ -743,12 +790,7 @@ impl ExecutionPlanDraft {
                 substrate,
             )?;
             let programs = load.program_plan(definition, self.policy.codec)?;
-            Self {
-                load: Box::new(load),
-                programs: Box::new(programs),
-                ..self.clone()
-            }
-            .with_chain(places)
+            self.with_load_and_programs(load, programs).with_chain(places)
         }) {
             Ok(whole) => whole,
             Err(error) => return unstreamed(error),
@@ -763,9 +805,15 @@ impl ExecutionPlanDraft {
         let mode = bank_prices.as_ref().map_or(CeilingPaths::Fixed, CeilingPaths::Priced);
         let w_hi = self.load.bank.as_ref().map_or(whole.bank().window_slots(), |bank| bank.window_slots());
         let w_lo = whole.bank().round_records();
-        let mut res = match w_hi == whole.bank().window_slots() {
-            true => self.ceiling_of(whole.clone(), definition, bound, places, mode)?,
-            false => self.with_window(&whole, definition, bound, w_hi, mode)?,
+        let (whole, mut res) = match w_hi == whole.bank().window_slots() {
+            true => match self.ceiling_of(whole, definition, bound, places, mode)? {
+                Ok(found) => return Ok(Ok(found)),
+                Err((whole, no)) => (whole, Err(no)),
+            },
+            false => {
+                let res = self.with_window(&whole, definition, bound, w_hi, mode)?;
+                (whole, res)
+            }
         };
         if matches!(res, Err(NoBank::Bound { .. } | NoBank::Unstreamed(UnstreamedExperts::Allocation { .. }))) {
             for &w in &window_ladder(w_hi, w_lo)[1..] {
@@ -779,6 +827,32 @@ impl ExecutionPlanDraft {
             }
         }
         Ok(res)
+    }
+
+    /// Clone this draft's metadata with a replacement `load` and `programs`,
+    /// avoiding cloning and immediately dropping `self.load` and `self.programs`.
+    fn with_load_and_programs(&self, load: ModelLoadPlan, programs: ProgramPlan) -> Self {
+        Self {
+            device: self.device.clone(),
+            components: self.components.clone(),
+            load: Box::new(load),
+            programs: Box::new(programs),
+            capabilities: self.capabilities,
+            policy: self.policy.clone(),
+        }
+    }
+
+    /// Clone this draft's metadata and programs with a replacement `load`,
+    /// avoiding cloning and immediately dropping `self.load`.
+    fn with_load(&self, load: ModelLoadPlan) -> Self {
+        Self {
+            device: self.device.clone(),
+            components: self.components.clone(),
+            load: Box::new(load),
+            programs: self.programs.clone(),
+            capabilities: self.capabilities,
+            policy: self.policy.clone(),
+        }
     }
 
     /// Rebuild `whole` with `window_slots` and compute its [`BankCeiling`]
@@ -798,96 +872,205 @@ impl ExecutionPlanDraft {
         mode: CeilingPaths<'_>,
         change: impl FnOnce(ModelLoadPlan) -> Result<ModelLoadPlan, PlanError>,
     ) -> Result<Result<BankCeiling, NoBank>, PlanError> {
-        let places = whole.bank().places;
-        let load = change((*whole.load).clone())?;
-        let programs = load.program_plan(definition, whole.policy.codec)?;
-        let rebuilt = Self {
-            load: Box::new(load),
-            programs: Box::new(programs),
-            ..whole.clone()
-        }
-        .with_chain(places)?;
-        self.ceiling_of(rebuilt, definition, bound, places, mode)
+        let prior_ceiling = self.load.bank.as_ref().map(|bank| bank.ceiling);
+        let prior_host_cap = self.load.bank.as_ref().and_then(|bank| bank.host_cap);
+        whole.rebuilt_under(definition, bound, mode, prior_ceiling, prior_host_cap, change)
+    }
+
+    /// Rebuild `self` (a banked draft) with `window_slots` at `experts` total
+    /// slots and compute its [`BankCeiling`] under `bound`, respecting any
+    /// prior ceiling/host_cap.
+    fn with_window_from_experts(
+        &self,
+        definition: &ModelDefinition,
+        experts: u64,
+        bound: HeldBound,
+        window_slots: u64,
+        prior_ceiling: Option<u64>,
+        prior_host_cap: Option<u64>,
+    ) -> Result<Result<BankCeiling, NoBank>, PlanError> {
+        let bank = self.bank();
+        let (places, flights, substrate, paths) =
+            (bank.places, bank.flights, bank.substrate(), bank.paths);
+        self.rebuilt_under(definition, bound, CeilingPaths::Fixed, prior_ceiling, prior_host_cap, |load| {
+            load.unbanked()
+                .with_expert_bank(definition, experts, Some(window_slots), places, flights, substrate)?
+                .with_bank_paths(paths)
+        })
+    }
+
+    /// Rebuild `self` (a whole-bank draft) with its load plan changed by
+    /// `change`, its target program plan and chain planned again, and its
+    /// [`BankCeiling`] under `bound`, respecting any prior ceiling/host_cap.
+    fn rebuilt_under(
+        &self,
+        definition: &ModelDefinition,
+        bound: HeldBound,
+        mode: CeilingPaths<'_>,
+        prior_ceiling: Option<u64>,
+        prior_host_cap: Option<u64>,
+        change: impl FnOnce(ModelLoadPlan) -> Result<ModelLoadPlan, PlanError>,
+    ) -> Result<Result<BankCeiling, NoBank>, PlanError> {
+        let places = self.bank().places;
+        let load = change((*self.load).clone())?;
+        let programs = load.program_plan(definition, self.policy.codec)?;
+        let rebuilt = self.with_load_and_programs(load, programs).with_chain(places)?;
+        Ok(rebuilt
+            .ceiling_of_under(definition, bound, places, mode, prior_ceiling, prior_host_cap)?
+            .map_err(|(_, no)| no))
     }
 
     /// Compute the [`BankCeiling`] of `whole` under `bound`, pricing each
     /// slot count's path records per `mode` so both refusal (`needed`) and
-    /// admission (`ceiling`) evaluate the same function.
+    /// admission (`ceiling`) evaluate the same function. Returns `whole` on
+    /// failure so callers can retry smaller scratch windows without cloning
+    /// on the happy path.
     fn ceiling_of(
         &self,
-        mut whole: Self,
+        whole: Self,
         definition: &ModelDefinition,
         bound: HeldBound,
         places: u64,
         mode: CeilingPaths<'_>,
-    ) -> Result<Result<BankCeiling, NoBank>, PlanError> {
-        let (experts, floor) = (whole.bank().slots, whole.bank().floor());
+    ) -> Result<Result<BankCeiling, (Self, NoBank)>, PlanError> {
+        let prior_ceiling = self.load.bank.as_ref().map(|bank| bank.ceiling);
+        let prior_host_cap = self.load.bank.as_ref().and_then(|bank| bank.host_cap);
+        whole.ceiling_of_under(definition, bound, places, mode, prior_ceiling, prior_host_cap)
+    }
+
+    /// Compute the [`BankCeiling`] of `self` (a whole-bank draft) under
+    /// `bound`, respecting any prior ceiling/host_cap.
+    fn ceiling_of_under(
+        mut self,
+        definition: &ModelDefinition,
+        bound: HeldBound,
+        places: u64,
+        mode: CeilingPaths<'_>,
+        prior_ceiling: Option<u64>,
+        prior_host_cap: Option<u64>,
+    ) -> Result<Result<BankCeiling, (Self, NoBank)>, PlanError> {
+        let (experts, floor) = (self.bank().slots, self.bank().floor());
         // A banked draft's re-planning never raises its ceiling.
-        let top = self.load.bank.as_ref().map_or(experts, |bank| bank.ceiling);
+        let top = prior_ceiling.unwrap_or(experts);
         // Its pooled records are granules of blocks the backend sizes within
         // its allocations; each lent allocation is one allocation.
-        let (lent, most) = (whole.bank().largest_lent().map_err(PlanError::ResourcePlanning)?, self.device.max_allocation_bytes);
+        let (lent, most) = (self.bank().largest_lent().map_err(PlanError::ResourcePlanning)?, self.device.max_allocation_bytes);
         if lent > most {
-            return Ok(Err(NoBank::Unstreamed(UnstreamedExperts::Allocation { lent, most })));
+            return Ok(Err((self, NoBank::Unstreamed(UnstreamedExperts::Allocation { lent, most }))));
         }
-        // The weights of the bank at `slots` with its path records at those
-        // slots, cached per distinct `BankPaths` (which varies monotonically
-        // across only a handful of levels).
-        let mut cached: Option<(super::BankPaths, super::ExpertBankPlan, u64)> = None;
-        let mut weights_at = |slots: u64| -> Result<(u64, super::BankPaths), PlanError> {
-            let paths = match mode {
-                CeilingPaths::Fixed => whole.bank().paths,
-                CeilingPaths::Priced(prices) => bank_paths(prices, whole.bank(), slots)?,
-            };
-            if cached.as_ref().is_none_or(|(of, _, _)| *of != paths) {
-                let load = match paths == whole.bank().paths {
-                    true => (*whole.load).clone(),
-                    false => (*whole.load).clone().with_bank_paths(paths)?,
-                };
-                let bank = load.bank.as_ref().expect("a streamed plan holds its bank").clone();
-                let base = weight_bytes(&load)?
-                    .checked_sub(bank.resident_charge(experts).map_err(PlanError::ResourcePlanning)?)
-                    .ok_or(PlanError::Arithmetic("a bank's weights hold less than its record reservations' charge"))?;
-                cached = Some((paths, bank, base));
-            }
-            let (_, bank, base) = cached.as_ref().expect("just populated");
-            let reserved = bank.resident_charge(slots).map_err(PlanError::ResourcePlanning)?;
-            let bytes = base
-                .checked_add(reserved)
-                .ok_or(PlanError::Arithmetic("a bank's weights overflow"))?;
-            Ok((bytes, paths))
-        };
         // The load's own bound (a cap or a device room) below the floor's
         // weights holds no bank. The machine's room below them refuses
         // nothing here: the plan's settle finds it short.
-        let (needed, floor_paths) = weights_at(floor)?;
-        if let Some(limit) = bound.limit.filter(|limit| needed > limit.bytes()) {
-            return Ok(Err(NoBank::Bound { bound: limit, needed }));
-        }
         // The ceiling: the most slots whose weights the device holds under
         // `bound`, where the bank's curve ends, the floor at least: the bank
         // grows to it as memory frees, whatever the room at the load
         // (`settle_bank`).
         let device = bound.device();
-        let mut ceiling = floor;
-        let mut ceiling_bytes = needed;
-        let mut ceiling_paths = floor_paths;
-        while ceiling < top.min(most) {
-            let (bytes, paths) = weights_at(ceiling + 1)?;
-            if bytes > device {
-                break;
+        let hi_bound = top.min(most);
+        let (ceiling, ceiling_bytes, ceiling_paths) = match mode {
+            CeilingPaths::Fixed => {
+                // Paths are fixed at `self.bank().paths`, so borrow `self.load`
+                // directly without cloning `ModelLoadPlan` or `ExpertBankPlan`,
+                // and binary-search the monotone `resident_charge` curve.
+                let bank = self.bank();
+                let base = weight_bytes(&self.load)?
+                    .checked_sub(bank.resident_charge(experts).map_err(PlanError::ResourcePlanning)?)
+                    .ok_or(PlanError::Arithmetic("a bank's weights hold less than its record reservations' charge"))?;
+                let bytes_at = |slots: u64| -> Result<u64, PlanError> {
+                    let reserved = bank.resident_charge(slots).map_err(PlanError::ResourcePlanning)?;
+                    base.checked_add(reserved)
+                        .ok_or(PlanError::Arithmetic("a bank's weights overflow"))
+                };
+                let needed = bytes_at(floor)?;
+                if let Some(limit) = bound.limit.filter(|limit| needed > limit.bytes()) {
+                    return Ok(Err((self, NoBank::Bound { bound: limit, needed })));
+                }
+                let (ceiling, ceiling_bytes) = if floor >= hi_bound || needed > device {
+                    (floor, needed)
+                } else {
+                    let hi_bytes = bytes_at(hi_bound)?;
+                    if hi_bytes <= device {
+                        (hi_bound, hi_bytes)
+                    } else {
+                        let (mut lo, mut lo_bytes, mut hi) = (floor, needed, hi_bound);
+                        while lo + 1 < hi {
+                            let mid = lo + (hi - lo) / 2;
+                            let mid_bytes = bytes_at(mid)?;
+                            if mid_bytes <= device {
+                                lo = mid;
+                                lo_bytes = mid_bytes;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        (lo, lo_bytes)
+                    }
+                };
+                (ceiling, ceiling_bytes, bank.paths)
             }
-            ceiling += 1;
-            ceiling_bytes = bytes;
-            ceiling_paths = paths;
+            CeilingPaths::Priced(prices) => {
+                // The weights of the bank at `slots` with its path records at those
+                // slots, cached per distinct `BankPaths` (which varies monotonically
+                // across only a handful of levels). Borrow `self.load` when `paths`
+                // matches `self.bank().paths` to avoid cloning `ModelLoadPlan`.
+                let mut cached: Option<(super::BankPaths, Option<super::ExpertBankPlan>, u64)> = None;
+                let mut weights_at = |slots: u64| -> Result<(u64, super::BankPaths), PlanError> {
+                    let paths = bank_paths(prices, self.bank(), slots)?;
+                    if cached.as_ref().is_none_or(|(of, _, _)| *of != paths) {
+                        if paths == self.bank().paths {
+                            let base = weight_bytes(&self.load)?
+                                .checked_sub(self.bank().resident_charge(experts).map_err(PlanError::ResourcePlanning)?)
+                                .ok_or(PlanError::Arithmetic("a bank's weights hold less than its record reservations' charge"))?;
+                            cached = Some((paths, None, base));
+                        } else {
+                            let load = (*self.load).clone().with_bank_paths(paths)?;
+                            let base = weight_bytes(&load)?
+                                .checked_sub(
+                                    load.bank
+                                        .as_ref()
+                                        .expect("a streamed plan holds its bank")
+                                        .resident_charge(experts)
+                                        .map_err(PlanError::ResourcePlanning)?,
+                                )
+                                .ok_or(PlanError::Arithmetic("a bank's weights hold less than its record reservations' charge"))?;
+                            let bank = load.bank.expect("a streamed plan holds its bank");
+                            cached = Some((paths, Some(bank), base));
+                        }
+                    }
+                    let (_, bank, base) = cached.as_ref().expect("just populated");
+                    let bank = bank.as_ref().unwrap_or_else(|| self.bank());
+                    let reserved = bank.resident_charge(slots).map_err(PlanError::ResourcePlanning)?;
+                    let bytes = base
+                        .checked_add(reserved)
+                        .ok_or(PlanError::Arithmetic("a bank's weights overflow"))?;
+                    Ok((bytes, paths))
+                };
+                let (needed, floor_paths) = weights_at(floor)?;
+                if let Some(limit) = bound.limit.filter(|limit| needed > limit.bytes()) {
+                    return Ok(Err((self, NoBank::Bound { bound: limit, needed })));
+                }
+                let mut ceiling = floor;
+                let mut ceiling_bytes = needed;
+                let mut ceiling_paths = floor_paths;
+                while ceiling < hi_bound {
+                    let (bytes, paths) = weights_at(ceiling + 1)?;
+                    if bytes > device {
+                        break;
+                    }
+                    ceiling += 1;
+                    ceiling_bytes = bytes;
+                    ceiling_paths = paths;
+                }
+                (ceiling, ceiling_bytes, ceiling_paths)
+            }
+        };
+        if self.bank().paths != ceiling_paths {
+            let load = (*self.load).clone().with_bank_paths(ceiling_paths)?;
+            let programs = load.program_plan(definition, self.policy.codec)?;
+            self.load = Box::new(load);
+            self.programs = Box::new(programs);
         }
-        if whole.bank().paths != ceiling_paths {
-            let load = (*whole.load).clone().with_bank_paths(ceiling_paths)?;
-            let programs = load.program_plan(definition, whole.policy.codec)?;
-            whole.load = Box::new(load);
-            whole.programs = Box::new(programs);
-        }
-        let bank = whole.bank();
+        let bank = self.bank();
         // A cap bounds every weight byte the load holds: a host tier holds
         // what it leaves beside the bank at its ceiling, its landing
         // reserve (the tier at no slots) aside, as staging is. A banked
@@ -897,37 +1080,51 @@ impl ExecutionPlanDraft {
                 let left = cap - ceiling_bytes;
                 let host = |slots: u64| bank.host_charge(slots).map_err(PlanError::ResourcePlanning);
                 let (empty, widest) = (host(0)?, bank.widest().get());
-                let mut cap = 0;
-                while cap < widest && host(cap + 1)? - empty <= left {
-                    cap += 1;
-                }
+                let cap = if host(widest)? - empty <= left {
+                    widest
+                } else {
+                    let (mut lo, mut hi) = (0, widest);
+                    while lo + 1 < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        if host(mid)? - empty <= left {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
+                };
                 Some(cap)
             }
             _ => None,
         };
-        let planned = self.load.bank.as_ref().and_then(|bank| bank.host_cap);
-        let host_cap = match (capped, planned) {
+        let host_cap = match (capped, prior_host_cap) {
             (Some(capped), Some(planned)) => Some(capped.min(planned)),
             (capped, planned) => capped.or(planned),
         };
-        whole.bank_mut().host_cap = host_cap;
+        self.bank_mut().host_cap = host_cap;
         let places = usize::try_from(places)
             .ok()
             .and_then(NonZeroUsize::new)
             .map(PassLaunches::new)
             .ok_or(PlanError::Arithmetic("a group's places exceed usize"))?;
-        Ok(Ok(BankCeiling { whole, ceiling, places }))
+        Ok(Ok(BankCeiling { whole: self, ceiling, places }))
     }
 
     /// The draft's bank (of every expert, [`Self::bank_ceiling`]) at
     /// `slots` under `ceiling`, its passes of `pass` launches.
     fn resized(&self, slots: u64, ceiling: u64, pass: PassLaunches) -> Result<Self, PlanError> {
-        let mut draft = Self {
-            load: Box::new(self.load.clone().with_bank_slots(slots, ceiling)?),
-            ..self.clone()
-        };
+        let mut draft = self.with_load(self.load.clone().with_bank_slots(slots, ceiling)?);
         draft.bank_mut().pass = pass;
         Ok(draft)
+    }
+
+    /// Consume this draft and resize its bank in place, avoiding a `ModelLoadPlan` clone.
+    fn into_resized(mut self, slots: u64, ceiling: u64, pass: PassLaunches) -> Result<Self, PlanError> {
+        let load = (*self.load).with_bank_slots(slots, ceiling)?;
+        self.load = Box::new(load);
+        self.bank_mut().pass = pass;
+        Ok(self)
     }
 
     /// The draft with its routed experts streamed through an expert bank
@@ -1128,9 +1325,15 @@ impl ExecutionPlanDraft {
     /// (`chain_rows`), and the graphs of the chains it seals. A placement
     /// holds the longest whose plan the room holds.
     fn whole_chains(&self, definition: &ModelDefinition, bound: HeldBound) -> Result<Option<Vec<u64>>, PlanError> {
-        let bytes = weight_bytes(&self.load.clone().unbanked())?;
-        if bound.limit.is_some_and(|limit| bytes > limit.bytes()) {
-            return Ok(None);
+        if let Some(limit) = bound.limit {
+            let bytes = if self.load.bank.is_some() {
+                weight_bytes(&self.load.clone().unbanked())?
+            } else {
+                weight_bytes(&self.load)?
+            };
+            if bytes > limit.bytes() {
+                return Ok(None);
+            }
         }
         let mut places = vec![self.whole_places(definition)?];
         while let Some(&last) = places.last().filter(|&&last| last > 1) {
@@ -1160,14 +1363,12 @@ impl ExecutionPlanDraft {
     /// The draft with its experts held whole, its prompt groups chaining up
     /// to `places` launches.
     fn held_whole_at(&self, definition: &ModelDefinition, places: u64) -> Result<Self, PlanError> {
+        if self.load.bank.is_none() {
+            return self.clone().with_chain(places);
+        }
         let load = self.load.clone().unbanked();
         let programs = load.program_plan(definition, self.policy.codec)?;
-        Self {
-            load: Box::new(load),
-            programs: Box::new(programs),
-            ..self.clone()
-        }
-        .with_chain(places)
+        self.with_load_and_programs(load, programs).with_chain(places)
     }
 
     /// The draft holding its experts as `held` does, a plan of the same
@@ -1183,12 +1384,7 @@ impl ExecutionPlanDraft {
             Some(bank) => {
                 let load = self.load.clone().banked_as(definition, bank, bank.window_slots())?;
                 let programs = load.program_plan(definition, self.policy.codec)?;
-                Self {
-                    load: Box::new(load),
-                    programs: Box::new(programs),
-                    ..self.clone()
-                }
-                .with_chain(bank.places)?
+                self.with_load_and_programs(load, programs).with_chain(bank.places)?
             }
         };
         assert_eq!(draft.load.bank, held.load.bank, "a plain plan's bank differs from its drafted plan's");
@@ -1197,6 +1393,99 @@ impl ExecutionPlanDraft {
             "a plain plan's limits differ from its drafted plan's"
         );
         Ok(draft)
+    }
+
+    /// This drafted plan stripped of its drafter component, policy, and
+    /// program slots, keeping its target weights, expert bank (if any), and
+    /// limits intact: identical to `ExecutionPlanner::prepare` on the plain
+    /// definition followed by [`Self::holding_as`], without re-planning every
+    /// target weight from scratch.
+    pub fn without_drafter(&self, plain_definition: &ModelDefinition) -> Result<Self, PlanError> {
+        if plain_definition.draft.is_some() {
+            return Err(PlanError::Topology(
+                "without_drafter requires a plain model definition without a drafter",
+            ));
+        }
+        let mut load = (*self.load).clone();
+        load.residual_conditioning = None;
+        load.head = None;
+        load.own_history_head = false;
+        load.target
+            .retain(|weight| weight.component.kind != ArtifactComponentKind::Draft);
+        load.unplaced_output.retain(|weight| {
+            weight.component.kind != ArtifactComponentKind::Draft
+                && !matches!(
+                    weight.role.scope,
+                    magnitude_family_contracts::WeightScope::HeadBlock(_)
+                )
+        });
+        for weight in &mut load.target {
+            if let super::Holding::Streamed(rows) = &mut weight.holding {
+                if matches!(rows.fill, super::TableFill::Imported(_)) {
+                    let slots = weight
+                        .shape
+                        .first()
+                        .copied()
+                        .and_then(|total| total.checked_sub(rows.landing_rows))
+                        .ok_or(PlanError::Arithmetic("streamed table slots underflow"))?;
+                    let plain_selected_rows =
+                        magnitude_batching::row_class(self.policy.limits.max_selected_rows)
+                            .ok_or_else(|| {
+                                PlanError::InvalidDefinition(format!(
+                                    "{} selected rows have no row class",
+                                    self.policy.limits.max_selected_rows
+                                ))
+                            })? as u64;
+                    let tile = weight.resident.tile_rows();
+                    let landing_rows = plain_selected_rows.div_ceil(tile) * tile;
+                    weight.shape[0] = slots + landing_rows;
+                    weight.resident_bytes =
+                        super::weights::representation_bytes(weight.resident, &weight.shape)
+                            .map_err(PlanError::InvalidDefinition)?;
+                    rows.landing_rows = landing_rows;
+                    rows.fill = super::TableFill::Imported(super::TableFlights {
+                        flights: self.policy.limits.flights(),
+                        lanes: 1,
+                        fronts: false,
+                    });
+                }
+            }
+        }
+        load.readout_candidates.clear();
+        load.rebuild_role_index();
+        if self.policy.path == ExecutionPath::Native
+            && crate::programs::graph::readout::reads_progressive_heads(self.device.backend)
+                .map_err(PlanError::ResourcePlanning)?
+        {
+            load = load
+                .with_readout_candidates(plain_definition)
+                .map_err(PlanError::InvalidDefinition)?;
+        }
+        let programs = load.program_plan(plain_definition, self.policy.codec)?;
+        Ok(Self {
+            device: self.device.clone(),
+            components: ComponentPlan {
+                target: self.components.target,
+                head: None,
+                vision: self.components.vision,
+            },
+            load: Box::new(load),
+            programs: Box::new(programs),
+            capabilities: CapabilityPlan {
+                max_draft_proposals: None,
+                vision: self.capabilities.vision,
+            },
+            policy: ResolvedPolicy {
+                path: self.policy.path,
+                method: PlannedMethod::Plain,
+                codec: self.policy.codec,
+                selection: ComponentSelection {
+                    head: false,
+                    vision: self.policy.selection.vision,
+                },
+                limits: self.policy.limits,
+            },
+        })
     }
 
     /// A test draft whose target weights load through `substrate`'s expert
@@ -2039,7 +2328,7 @@ pub enum FloorForms<T = ()> {
     /// pass, at the most slots the load's own bound holds, and held whole
     /// as their own allocations at groups of one launch where that bound
     /// holds them so.
-    Banked { bank: Box<BankForm<T>>, resident: Option<Box<HeldForm<T>>> },
+    Banked { bank: Box<BankForm<T>>, resident: Option<Box<HeldForm>> },
     /// Experts that cannot stream, held whole as their own allocations.
     Resident(Box<HeldForm<T>>),
 }
@@ -2053,8 +2342,9 @@ pub struct HeldForm<T = ()> {
 
 /// A bank form ([`FloorForms::Banked`]): its draft at its ceiling, whose
 /// charge at any slots is its structure's charge of [`Self::at_slots`],
-/// beside smaller scratch-window rungs (`window_ladder`) assessed lazily
-/// only when the full-layer scratch window's floor does not fit.
+/// beside smaller scratch-window rungs (`window_ladder`) materialized and
+/// assessed lazily only when the full-layer scratch window's floor does not
+/// fit.
 pub struct BankForm<T = ()> {
     pub form: HeldForm<T>,
     /// The bank's experts: a bank of all of them holds them whole.
@@ -2063,42 +2353,102 @@ pub struct BankForm<T = ()> {
     /// ceiling last.
     pub points: Vec<u64>,
     /// Smaller `window_slots` rungs (`window_ladder`), descending down to
-    /// `round_records`.
+    /// `round_records`, each materialized lazily on demand.
     pub(crate) windowed: Vec<WindowedBankForm>,
 }
 
-/// A smaller `window_slots` rung of [`BankForm`], its target-family structure
-/// certified lazily (`StructuralCharge::at_pass`) only when needed.
-pub(crate) struct WindowedBankForm {
+/// Shared inputs for lazily materializing smaller `window_slots` rungs of a
+/// [`BankForm`] only when the widest window's floor does not fit.
+struct WindowedBankContext {
+    bound: HeldBound,
+    prior_ceiling: Option<u64>,
+    prior_host_cap: Option<u64>,
+    #[cfg(test)]
+    whole: ExecutionPlanDraft,
+    #[cfg(test)]
+    definition: ModelDefinition,
+}
+
+/// Materialized rung of [`WindowedBankForm`].
+pub(crate) struct WindowedBankRung {
     pub(crate) draft: ExecutionPlanDraft,
     pub(crate) points: Vec<u64>,
+}
+
+/// A smaller `window_slots` rung of [`BankForm`], materialized (`with_window`
+/// + `rising`) and its target-family structure certified lazily
+/// (`StructuralCharge::reusing_non_target`) only when needed.
+pub(crate) struct WindowedBankForm {
+    context: std::sync::Arc<WindowedBankContext>,
+    window_slots: u64,
+    rung: std::sync::OnceLock<Option<WindowedBankRung>>,
     structure: std::sync::OnceLock<crate::assessment::StructuralCharge>,
 }
 
 impl WindowedBankForm {
-    pub(crate) fn at_slots(&self, slots: u64) -> Result<ExecutionPlanDraft, PlanError> {
-        self.draft.resized(slots, slots, PassLaunches::FLOOR)
-    }
-
-    pub(crate) fn with_host_tier(
+    pub(crate) fn materialize_from(
         &self,
-        slots: u64,
-        charge: &AssessmentMemoryCharge,
-        room: &impl SettleRoom,
-    ) -> Result<Result<ExecutionPlanDraft, UnstreamedExperts>, PlanError> {
-        self.at_slots(slots)?.with_host_tier(charge, room)
+        bank_draft: &ExecutionPlanDraft,
+        experts: u64,
+        definition: &ModelDefinition,
+    ) -> Result<Option<&WindowedBankRung>, PlanError> {
+        if let Some(rung) = self.rung.get() {
+            return Ok(rung.as_ref());
+        }
+        let ctx = &*self.context;
+        let materialized = match bank_draft.with_window_from_experts(
+            definition,
+            experts,
+            ctx.bound,
+            self.window_slots,
+            ctx.prior_ceiling,
+            ctx.prior_host_cap,
+        )? {
+            Ok(BankCeiling { whole: win_whole, ceiling: win_ceiling, .. }) => {
+                let win_bank = win_whole.bank();
+                let win_reserved = |slots| win_bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
+                let win_points = rising(win_bank.floor(), win_ceiling, &win_reserved)?;
+                let win_draft = win_whole.into_resized(win_ceiling, win_ceiling, PassLaunches::FLOOR)?;
+                Some(WindowedBankRung {
+                    draft: win_draft,
+                    points: win_points,
+                })
+            }
+            Err(_) => None,
+        };
+        let _ = self.rung.set(materialized);
+        Ok(self.rung.get().expect("just initialized").as_ref())
     }
 
     pub(crate) fn structure(
         &self,
+        bank_draft: &ExecutionPlanDraft,
+        experts: u64,
         prepared_definition: &ModelDefinition,
-    ) -> Result<&crate::assessment::StructuralCharge, crate::assessment::AssessmentError> {
+        base: &crate::assessment::StructuralCharge,
+    ) -> Result<Option<(&WindowedBankRung, &crate::assessment::StructuralCharge)>, crate::assessment::AssessmentError> {
+        let Some(rung) = self.materialize_from(bank_draft, experts, prepared_definition)? else {
+            return Ok(None);
+        };
         if let Some(structure) = self.structure.get() {
-            return Ok(structure);
+            return Ok(Some((rung, structure)));
         }
-        let certified = crate::assessment::StructuralCharge::of(prepared_definition, &self.draft)?;
+        let certified = base.reusing_non_target(prepared_definition, &rung.draft)?;
         let _ = self.structure.set(certified);
-        Ok(self.structure.get().expect("just initialized"))
+        Ok(Some((rung, self.structure.get().expect("just initialized"))))
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for WindowedBankForm {
+    type Target = WindowedBankRung;
+
+    fn deref(&self) -> &Self::Target {
+        let ctx = &*self.context;
+        let experts = ctx.whole.bank().slots;
+        self.materialize_from(&ctx.whole, experts, &ctx.definition)
+            .expect("lazy windowed bank rung materializes")
+            .expect("lazy windowed bank rung exists")
     }
 }
 
@@ -2130,7 +2480,7 @@ impl<T> FloorForms<T> {
                 let BankForm { form: held, experts, points, windowed } = *bank;
                 FloorForms::Banked {
                     bank: Box::new(BankForm { form: form(held), experts, points, windowed }),
-                    resident: resident.map(|resident| Box::new(form(*resident))),
+                    resident,
                 }
             }
             Self::Resident(resident) => FloorForms::Resident(Box::new(form(*resident))),
@@ -2146,6 +2496,14 @@ impl<T> FloorForms<T> {
         }
     }
 
+    /// Consume these forms, returning the primary form ([`Self::primary`]).
+    pub fn into_primary(self) -> HeldForm<T> {
+        match self {
+            Self::Banked { bank, .. } => bank.form,
+            Self::Resident(resident) => *resident,
+        }
+    }
+
     /// The bank form, where the experts stream.
     pub fn bank(&self) -> Option<&BankForm<T>> {
         match self {
@@ -2153,10 +2511,12 @@ impl<T> FloorForms<T> {
             Self::Resident(_) => None,
         }
     }
+}
 
+impl FloorForms {
     /// The experts held whole as their own allocations, where the load's
     /// own bound holds them so.
-    pub fn resident(&self) -> Option<&HeldForm<T>> {
+    pub fn resident(&self) -> Option<&HeldForm> {
         match self {
             Self::Banked { resident, .. } => resident.as_deref(),
             Self::Resident(resident) => Some(&**resident),
@@ -2173,55 +2533,160 @@ impl ExecutionPlanDraft {
         self
     }
 
-    /// The draft's [`FloorForms`] under the load's own `limit`, each form's
-    /// structure charged by `structure`; or why no form holds its experts,
-    /// as a load's placement refuses them.
-    pub fn floor_forms<T, E: From<PlanError>>(
+    /// The draft's [`FloorForms`] under the load's own `limit`, its primary
+    /// form's structure charged by `structure` (any secondary resident form
+    /// reuses non-target family bounds from the bank form); or why no form
+    /// holds its experts, as a load's placement refuses them.
+    pub fn floor_forms<T: Sync, E: From<PlanError>>(
         &self,
         definition: &ModelDefinition,
         limit: Option<WeightBound>,
         structure: impl Fn(&Self) -> Result<(crate::assessment::StructuralCharge, T), E>,
     ) -> Result<FloorForms<T>, E> {
+        let (forms, _) = self.floor_forms_inner(
+            definition,
+            limit,
+            structure,
+            None::<fn(&HeldForm<T>)>,
+        )?;
+        Ok(forms)
+    }
+
+    /// [`Self::floor_forms`], also running `after_primary` against the primary
+    /// form as soon as it is ready: for a banked model with a secondary
+    /// resident form, `after_primary` overlaps with certifying that resident
+    /// form (`reusing_non_target`) on the assessment pool.
+    pub fn floor_forms_with_primary<T: Sync, U: Send, E: From<PlanError>>(
+        &self,
+        definition: &ModelDefinition,
+        limit: Option<WeightBound>,
+        structure: impl Fn(&Self) -> Result<(crate::assessment::StructuralCharge, T), E>,
+        after_primary: impl FnOnce(&HeldForm<T>) -> U + Send,
+    ) -> Result<(FloorForms<T>, U), E> {
+        let (forms, out) = self.floor_forms_inner(definition, limit, structure, Some(after_primary))?;
+        Ok((forms, out.expect("Some(after_primary) always produces Some(U)")))
+    }
+
+    fn floor_forms_inner<T: Sync, U: Send, E: From<PlanError>>(
+        &self,
+        definition: &ModelDefinition,
+        limit: Option<WeightBound>,
+        structure: impl Fn(&Self) -> Result<(crate::assessment::StructuralCharge, T), E>,
+        after_primary: Option<impl FnOnce(&HeldForm<T>) -> U + Send>,
+    ) -> Result<(FloorForms<T>, Option<U>), E> {
         let bound = HeldBound::of(limit, StableRoom::of(&self.device).capacity()?);
         let form = |draft: Self| -> Result<HeldForm<T>, E> {
             let (structure, more) = structure(&draft)?;
             Ok(HeldForm { draft, structure, more })
         };
-        let bank = match self.bank_ceiling(definition, bound, None)? {
+        let bank = match stage_timer::time_stage(
+            |t, ns| t.ff_bank_ceiling_ns += ns,
+            || self.bank_ceiling(definition, bound, None),
+        )? {
             Ok(BankCeiling { whole, ceiling, .. }) => {
                 let bank = whole.bank();
                 let reserved = |slots| bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
-                let points = rising(bank.floor(), ceiling, &reserved)?;
+                let points = stage_timer::time_stage(
+                    |t, ns| t.ff_rising_ns += ns,
+                    || rising(bank.floor(), ceiling, &reserved),
+                )?;
                 let experts = bank.slots;
-                let draft = whole.resized(ceiling, ceiling, PassLaunches::FLOOR)?;
-                let mut windowed = Vec::new();
-                for &w in &bank.window_ladder()[1..] {
-                    if let Ok(BankCeiling { whole: win_whole, ceiling: win_ceiling, .. }) = self.with_window(&whole, definition, bound, w, CeilingPaths::Fixed)? {
-                        let win_bank = win_whole.bank();
-                        let win_reserved = |slots| win_bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
-                        let win_points = rising(win_bank.floor(), win_ceiling, &win_reserved)?;
-                        let win_draft = win_whole.resized(win_ceiling, win_ceiling, PassLaunches::FLOOR)?;
-                        windowed.push(WindowedBankForm {
-                            draft: win_draft,
-                            points: win_points,
-                            structure: std::sync::OnceLock::new(),
+                let ladder = bank.window_ladder();
+                let (draft, windowed) = if ladder.len() > 1 {
+                    #[cfg(test)]
+                    let (draft, context) = {
+                        let draft = whole.resized(ceiling, ceiling, PassLaunches::FLOOR)?;
+                        let context = std::sync::Arc::new(WindowedBankContext {
+                            bound,
+                            prior_ceiling: self.load.bank.as_ref().map(|bank| bank.ceiling),
+                            prior_host_cap: self.load.bank.as_ref().and_then(|bank| bank.host_cap),
+                            whole,
+                            definition: definition.clone(),
                         });
-                    }
-                }
+                        (draft, context)
+                    };
+                    #[cfg(not(test))]
+                    let (draft, context) = {
+                        let draft = whole.into_resized(ceiling, ceiling, PassLaunches::FLOOR)?;
+                        let context = std::sync::Arc::new(WindowedBankContext {
+                            bound,
+                            prior_ceiling: self.load.bank.as_ref().map(|bank| bank.ceiling),
+                            prior_host_cap: self.load.bank.as_ref().and_then(|bank| bank.host_cap),
+                        });
+                        (draft, context)
+                    };
+                    let windowed = ladder[1..]
+                        .iter()
+                        .map(|&window_slots| WindowedBankForm {
+                            context: std::sync::Arc::clone(&context),
+                            window_slots,
+                            rung: std::sync::OnceLock::new(),
+                            structure: std::sync::OnceLock::new(),
+                        })
+                        .collect();
+                    (draft, windowed)
+                } else {
+                    (whole.into_resized(ceiling, ceiling, PassLaunches::FLOOR)?, Vec::new())
+                };
                 Ok(BankForm { form: form(draft)?, experts, points, windowed })
             }
             Err(NoBank::Bound { bound, needed }) => return Err(PlanError::WeightBound { bound, needed }.into()),
             Err(NoBank::Unstreamed(reason)) => Err(reason),
             Err(no @ NoBank::Short { .. }) => unreachable!("a bank's ceiling asks no room, so it is never {no:?}"),
         };
-        let resident = match self.whole_chains(definition, bound)? {
-            Some(_) => Some(form(self.held_whole_at(definition, 1)?)?),
-            None => None,
-        };
-        match (bank, resident) {
-            (Ok(bank), resident) => Ok(FloorForms::Banked { bank: Box::new(bank), resident: resident.map(Box::new) }),
-            (Err(_), Some(resident)) => Ok(FloorForms::Resident(Box::new(resident))),
-            (Err(reason), None) => Err(PlanError::Unstreamed(reason).into()),
+        let has_resident = stage_timer::time_stage(
+            |t, ns| t.ff_whole_chains_ns += ns,
+            || self.whole_chains(definition, bound),
+        )?
+        .is_some();
+        match (bank, has_resident) {
+            (Ok(bank), true) => {
+                let certify_resident = || -> Result<(Self, crate::assessment::StructuralCharge), E> {
+                    let resident_draft = self.held_whole_at(definition, 1)?;
+                    let resident_structure = bank
+                        .form
+                        .structure
+                        .reusing_non_target(definition, &resident_draft)
+                        .map_err(|error| E::from(charge_error(error)))?;
+                    Ok((resident_draft, resident_structure))
+                };
+                let (primary_out, resident_res) = match after_primary {
+                    Some(after_primary) => {
+                        let bank_form = &bank.form;
+                        let (out, res) = crate::assessment::pool::join(
+                            move || {
+                                let _sizing = crate::programs::graph::sizing::SizingScope::enter();
+                                after_primary(bank_form)
+                            },
+                            certify_resident,
+                        );
+                        (Some(out), res)
+                    }
+                    None => (None, certify_resident()),
+                };
+                let (resident_draft, resident_structure) = resident_res?;
+                Ok((
+                    FloorForms::Banked {
+                        bank: Box::new(bank),
+                        resident: Some(Box::new(HeldForm {
+                            draft: resident_draft,
+                            structure: resident_structure,
+                            more: (),
+                        })),
+                    },
+                    primary_out,
+                ))
+            }
+            (Ok(bank), false) => {
+                let primary_out = after_primary.map(|f| f(&bank.form));
+                Ok((FloorForms::Banked { bank: Box::new(bank), resident: None }, primary_out))
+            }
+            (Err(_), true) => {
+                let resident = form(self.held_whole_at(definition, 1)?)?;
+                let primary_out = after_primary.map(|f| f(&resident));
+                Ok((FloorForms::Resident(Box::new(resident)), primary_out))
+            }
+            (Err(reason), false) => Err(PlanError::Unstreamed(reason).into()),
         }
     }
 }
@@ -2289,15 +2754,43 @@ impl super::ExpertBankPlan {
 /// The sizes of `from..=to` a holding steps through: the most of each
 /// `charge` level, `from`'s first and `to` last. A size whose charge is
 /// its predecessor's costs nothing more, so it is held with it.
+///
+/// `charge` is monotonically non-decreasing on `from..=to`; each distinct
+/// charge plateau is jumped in $O(\log(\text{to} - \text{cur}))$ queries.
 fn rising(from: u64, to: u64, charge: &impl Fn(u64) -> Result<u64, PlanError>) -> Result<Vec<u64>, PlanError> {
     let mut points = Vec::new();
-    let mut level = charge(from)?;
-    for size in from + 1..=to {
-        let next = charge(size)?;
-        if next > level {
-            points.push(size - 1);
-            level = next;
+    let mut cur = from;
+    let mut level = charge(cur)?;
+    if from >= to {
+        points.push(to);
+        return Ok(points);
+    }
+    let top = charge(to)?;
+    while level < top {
+        let next_charge = charge(cur + 1)?;
+        if next_charge > level {
+            points.push(cur);
+            cur += 1;
+            level = next_charge;
+            continue;
         }
+        // Invariant: `charge(lo) <= level` and `charge(hi) == hi_charge > level`.
+        let mut lo = cur + 1;
+        let mut hi = to;
+        let mut hi_charge = top;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            let mid_charge = charge(mid)?;
+            if mid_charge <= level {
+                lo = mid;
+            } else {
+                hi = mid;
+                hi_charge = mid_charge;
+            }
+        }
+        points.push(lo);
+        cur = hi;
+        level = hi_charge;
     }
     points.push(to);
     Ok(points)
@@ -2338,16 +2831,26 @@ fn streams_experts(
     use crate::native::{BankRouteForm, ExpertBankKernels};
     use crate::operators::routed::{fused_graph::DecodeForm, is_fused, routed_ffn};
     let refused = || PlanError::Unstreamed(crate::UnstreamedExperts::Backend(backend));
-    let forms = definition
-        .decoder
-        .sublayers()
-        .filter_map(|(_, sublayer)| routed_ffn(&sublayer.op))
-        .map(|routed| match is_fused(routed) {
-            true => BankRouteForm::Fused,
-            false => BankRouteForm::General,
-        })
-        .collect::<std::collections::HashSet<_>>();
-    for form in forms {
+    let (mut has_fused, mut has_general) = (false, false);
+    for (_, sublayer) in definition.decoder.sublayers() {
+        if let Some(routed) = routed_ffn(&sublayer.op) {
+            if is_fused(routed) {
+                has_fused = true;
+            } else {
+                has_general = true;
+            }
+            if has_fused && has_general {
+                break;
+            }
+        }
+    }
+    for (present, form) in [
+        (has_fused, BankRouteForm::Fused),
+        (has_general, BankRouteForm::General),
+    ] {
+        if !present {
+            continue;
+        }
         let declared = ExpertBankKernels::declared(backend, form)
             .map_err(|error| PlanError::ResourcePlanning(error.to_string()))?;
         let decodes = match form {
@@ -2452,11 +2955,17 @@ impl ExecutionPlanner {
             _ => {}
         }
         let layout = super::resident_layout(path, backend);
-        let load = ModelLoadPlan::derive(manifest, definition, selection, layout, method, limits)
-            .map_err(PlanError::InvalidDefinition)?;
+        let load = stage_timer::time_stage(
+            |t, ns| t.pr_load_derive_ns += ns,
+            || ModelLoadPlan::derive(manifest, definition, selection, layout, method, limits),
+        )
+        .map_err(PlanError::InvalidDefinition)?;
         // Native entries import the weights, through record ports.
         let load = match path {
-            ExecutionPath::Native => load.with_record_ports(backend),
+            ExecutionPath::Native => stage_timer::time_stage(
+                |t, ns| t.pr_record_ports_ns += ns,
+                || load.with_record_ports(backend),
+            ),
             ExecutionPath::Planned => load,
         };
         // The head in progressive planes, where the backend reads them.
@@ -2464,12 +2973,18 @@ impl ExecutionPlanner {
             && crate::programs::graph::readout::reads_progressive_heads(backend)
                 .map_err(PlanError::ResourcePlanning)?
         {
-            load.with_readout_candidates(definition)
-                .map_err(PlanError::InvalidDefinition)?
+            stage_timer::time_stage(
+                |t, ns| t.pr_readout_candidates_ns += ns,
+                || load.with_readout_candidates(definition),
+            )
+            .map_err(PlanError::InvalidDefinition)?
         } else {
             load
         };
-        let programs = load.program_plan(definition, codec)?;
+        let programs = stage_timer::time_stage(
+            |t, ns| t.pr_program_plan_ns += ns,
+            || load.program_plan(definition, codec),
+        )?;
         let target = ArtifactComponent {
             kind: ArtifactComponentKind::Target,
             identity: manifest.target.identity,
@@ -2588,9 +3103,40 @@ mod tests {
     /// sizes of its charge: a size that costs nothing more comes free.
     #[test]
     fn a_holding_steps_only_where_its_charge_rises() {
+        let linear = |from: u64, to: u64, charge: &dyn Fn(u64) -> u64| {
+            let mut points = Vec::new();
+            let mut level = charge(from);
+            for size in from + 1..=to {
+                let next = charge(size);
+                if next > level {
+                    points.push(size - 1);
+                    level = next;
+                }
+            }
+            points.push(to);
+            points
+        };
+        let check = |from: u64, to: u64, f: &dyn Fn(u64) -> u64| {
+            let got = rising(from, to, &|s| Ok::<_, PlanError>(f(s))).unwrap();
+            assert_eq!(got, linear(from, to, f), "mismatch for range {from}..={to}");
+        };
+
         let charge = |slots: u64| Ok::<_, PlanError>(slots.div_ceil(4) * 100);
         assert_eq!(rising(2, 13, &charge).unwrap(), vec![4, 8, 12, 13]);
         assert_eq!(rising(5, 5, &charge).unwrap(), vec![5]);
+
+        // Edge cases: from == to, constant, every-slot jump, plateau at start/end.
+        check(0, 0, &|s| s * 10);
+        check(7, 7, &|_| 42);
+        check(1, 200, &|_| 100);
+        check(1, 50, &|s| s * 10);
+        check(0, 100, &|s| if s == 0 { 10 } else { 20 });
+        check(0, 100, &|s| if s < 100 { 10 } else { 20 });
+        check(1, 100, &|s| if s < 30 { 10 } else if s < 70 { 20 } else { 30 });
+        for step in [1u64, 2, 3, 4, 7, 16, 64] {
+            check(0, 257, &|s| s.div_ceil(step) * 100);
+            check(3, 257, &|s| s.div_ceil(step) * 100);
+        }
     }
 
     /// The recorded RTX 3090 with `host` bytes of host RAM free, CUDA's

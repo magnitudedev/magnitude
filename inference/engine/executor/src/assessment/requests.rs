@@ -469,12 +469,14 @@ impl Outstanding {
     }
 }
 
-/// A measurement job's time: its host's slot for measuring, from when its
-/// device is open (`started`), so that discovering the machine, probing the
-/// device and opening it take none of it. It decides only whether a point
-/// begins ([`Self::ends`]): a point begun is formed (its kernels' compiles,
-/// however long, kept as they end) and timed to its end, and one not begun
-/// is left unrecorded for the next job. The standing points' samples share
+/// A measurement job's sampling budget: how much sampling time (`budget`)
+/// the job spends across its points before it stops beginning new ones.
+/// Discovering the machine, probing and opening the device, forming kernels
+/// (cold JIT), and constructing points take none of the budget — only the
+/// sampling window after a point is made (`Self::charge`) counts against it.
+/// A point begun while budget remains is formed and timed to its end, and
+/// one reached after the budget is exhausted is left unrecorded for the next
+/// job. The standing points' samples share
 /// [`MEASUREMENT_SECONDS`](super::executor_costs::MEASUREMENT_SECONDS) of sampling, which nothing but sampling takes.
 /// So a busy host stretches each sample, and fewer points begin in a job
 /// and fewer samples are read of each, but no point begun expires, none is
@@ -483,19 +485,36 @@ impl Outstanding {
 #[derive(Clone, Copy, Debug)]
 pub struct JobDeadlines {
     started: std::time::Instant,
-    ends: std::time::Instant,
+    budget: std::time::Duration,
+    spent: std::time::Duration,
 }
 
 impl JobDeadlines {
-    /// The time of a job whose device opened at `started`, given `time`.
+    /// A job opened at `started` with a sampling budget of `time`.
     pub fn new(started: std::time::Instant, time: std::time::Duration) -> Self {
-        Self { started, ends: started + time }
+        Self { started, budget: time, spent: std::time::Duration::ZERO }
     }
 
-    /// When the job begins no more points: a point begun by then is formed
-    /// and timed to its end.
+    /// The sampling budget remaining before the job stops beginning points.
+    pub fn remaining(&self) -> std::time::Duration {
+        self.budget.saturating_sub(self.spent)
+    }
+
+    /// When the job begins no more points: already passed once the sampling
+    /// budget is exhausted, else `remaining` from now.
     pub fn ends(&self) -> std::time::Instant {
-        self.ends
+        let remaining = self.remaining();
+        if remaining.is_zero() {
+            self.started
+        } else {
+            std::time::Instant::now() + remaining
+        }
+    }
+
+    /// Charge `sampled` (time spent actually sampling a made point) against
+    /// the job's budget.
+    pub(super) fn charge(&mut self, sampled: std::time::Duration) {
+        self.spent = self.spent.saturating_add(sampled);
     }
 }
 
@@ -755,5 +774,26 @@ mod tests {
                 assert!(convert.outstanding(&topology, executor, &records, walk_outstanding(&topology, executor, &records)), "{:?}", executor.backend());
             }
         }
+    }
+
+    #[test]
+    fn sampling_budget_ignores_elapsed_wall_time_until_charged() {
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        let budget = std::time::Duration::from_secs(10);
+        let mut deadlines = JobDeadlines::new(started, budget);
+        // 30 s of wall time (e.g. cold JIT) passed since `started`, yet none
+        // of the 10 s sampling budget has been spent.
+        assert_eq!(deadlines.remaining(), budget);
+        assert!(deadlines.ends() > std::time::Instant::now());
+        deadlines.charge(std::time::Duration::from_secs(4));
+        assert_eq!(deadlines.remaining(), std::time::Duration::from_secs(6));
+        assert!(deadlines.ends() > std::time::Instant::now());
+        deadlines.charge(std::time::Duration::from_secs(6));
+        assert_eq!(deadlines.remaining(), std::time::Duration::ZERO);
+        assert!(deadlines.ends() <= std::time::Instant::now());
+        // A zero-budget deadline is immediately exhausted.
+        let empty = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::ZERO);
+        assert_eq!(empty.remaining(), std::time::Duration::ZERO);
+        assert!(empty.ends() <= std::time::Instant::now());
     }
 }

@@ -32,7 +32,7 @@ struct caps {
     std::string to_string() const;
 };
 
-caps caps_get(jinja::program & prog);
+caps caps_get(jinja::program & prog, const std::string & src = "");
 
 void caps_apply_preserve_reasoning(jinja::context & ctx, bool enabled);
 void caps_apply_reasoning_effort(jinja::context & ctx, const std::string & effort);

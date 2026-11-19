@@ -44,6 +44,7 @@ use crate::expert_lines::ExpertLines;
 use crate::lines::ReadLine;
 use crate::miss_model::MissModel;
 use crate::step::{LayerLoad, LayerRun, ReadAhead, StepInputs};
+use std::collections::HashMap;
 
 
 /// What a bank of some size misses at a layer: the share of a step's routed
@@ -202,12 +203,15 @@ impl StreamedLayers {
         self.runs.iter().all(|run| held.slots as u64 >= run.experts)
     }
 
-    /// `C` of the form holding `held` decodes in ([`Self::whole`]).
-    fn compute(&self, held: HeldSlots, compute: FormSeconds) -> f64 {
-        match self.whole(held) {
-            true => compute.resident,
-            false => compute.streamed,
+    /// Prepare the deduplicated step patterns of a period of `rows` rows
+    /// holding `held` (and `live`'s reads where counted), reusable across
+    /// compute times (such as context depths) via
+    /// [`StreamedPeriod::step_seconds`].
+    pub fn prepare(&self, live: Option<&LiveDecode>, held: HeldSlots, rows: f64) -> StreamedPeriod<'_> {
+        if self.whole(held) {
+            return StreamedPeriod { layers: self, whole: true, patterns: Vec::new() };
         }
+        StreamedPeriod { layers: self, whole: false, patterns: self.period(live, held, rows) }
     }
 
     /// `T` of a decode step of `rows` rows holding `held` of each layer's
@@ -221,27 +225,21 @@ impl StreamedLayers {
     /// priced by the one step model over the period ([`Self::period`]), with
     /// no read ahead.
     pub fn step_seconds(&self, live: Option<&LiveDecode>, read: ReadLine, held: HeldSlots, rows: f64, compute: FormSeconds) -> StreamedStep {
-        let compute_seconds = self.compute(held, compute);
-        if self.whole(held) {
-            return StreamedStep { compute_seconds, exposed_seconds: 0., total_seconds: compute_seconds };
-        }
-        let period = self.period(live, held, rows);
-        let step = step_inputs(compute_seconds, read, ReadAhead::NONE, &self.lines).run(period.iter().map(|runs| (runs.as_slice(), 1)));
-        StreamedStep { compute_seconds, exposed_seconds: step.total - compute_seconds, total_seconds: step.total }
+        self.prepare(live, held, rows).step_seconds(read, compute)
     }
 
     /// The period of the widest layer's `E` steps of `rows` rows holding
-    /// `held`, in order, each once: its layers' loads ([`layer_period`]) as
-    /// runs of consecutive layers whose inputs are one by construction, their
-    /// misses and distinct experts `live`'s where it read and the generic
-    /// model's elsewhere ([`LiveDecode::shares`], [`LiveDecode::routed`]).
+    /// `held`, aggregated into distinct step patterns in order first seen with
+    /// their step counts: its layers' loads ([`layer_period`]) as runs of
+    /// consecutive layers whose inputs are one by construction, their misses
+    /// and distinct experts `live`'s where it read and the generic model's
+    /// elsewhere ([`LiveDecode::shares`], [`LiveDecode::routed`]).
     /// The generic model loads a kind's consecutive layers alike, so without
     /// `live` a run is its kind's; a load's own reads differ layer by layer,
-    /// so with it each layer is a run of its own. The step model prices each
-    /// distinct step once
-    /// ([`StepInputs::run`]), so a period costs at most its `E` steps'
-    /// evaluations, whatever the layers.
-    fn period(&self, live: Option<&LiveDecode>, held: HeldSlots, rows: f64) -> Vec<Vec<LayerRun>> {
+    /// so with it each layer is a run of its own. Within a period every group's
+    /// `routed`, `rows`, `recall` and `layers` are fixed, so `(tier, file)`
+    /// across groups identifies each distinct step exactly.
+    fn period(&self, live: Option<&LiveDecode>, held: HeldSlots, rows: f64) -> Vec<(Vec<LayerRun>, usize)> {
         let period = self.runs.iter().map(|run| run.experts).max().expect("a streamed plan streams a layer") as usize;
         // Each run of identical inputs: its loads over the period and its
         // layers.
@@ -261,7 +259,37 @@ impl StreamedLayers {
             }
             layer += run.layers;
         }
-        (0..period).map(|step| groups.iter().map(|(loads, layers)| LayerRun { load: loads[step], layers: *layers }).collect()).collect()
+        const LINEAR_LIMIT: usize = 8;
+        let mut patterns = Vec::<(Vec<LayerRun>, usize)>::new();
+        let mut seen = HashMap::<Vec<(u64, u64)>, usize>::new();
+        let mut key = Vec::<(u64, u64)>::with_capacity(groups.len());
+        for step in 0..period {
+            key.clear();
+            key.extend(groups.iter().map(|(loads, _)| (loads[step].tier, loads[step].file)));
+            if seen.is_empty() {
+                if let Some((_, count)) = patterns.iter_mut().find(|(runs, _)| {
+                    runs.iter().zip(&key).all(|(run, &(tier, file))| run.load.tier == tier && run.load.file == file)
+                }) {
+                    *count += 1;
+                    continue;
+                }
+                let runs = groups.iter().map(|(loads, layers)| LayerRun { load: loads[step], layers: *layers }).collect();
+                patterns.push((runs, 1));
+                if patterns.len() > LINEAR_LIMIT {
+                    seen.reserve(patterns.len());
+                    for (at, (runs, _)) in patterns.iter().enumerate() {
+                        seen.insert(runs.iter().map(|run| (run.load.tier, run.load.file)).collect(), at);
+                    }
+                }
+            } else if let Some(&at) = seen.get(key.as_slice()) {
+                patterns[at].1 += 1;
+            } else {
+                let runs = groups.iter().map(|(loads, layers)| LayerRun { load: loads[step], layers: *layers }).collect();
+                seen.insert(key.clone(), patterns.len());
+                patterns.push((runs, 1));
+            }
+        }
+        patterns
     }
 
     /// The seconds a prompt pass of `rows` rows waits on its misses' reads
@@ -270,6 +298,30 @@ impl StreamedLayers {
     /// cover them; none where `held` makes the bank whole.
     pub(crate) fn pass_reads(&self, read: ReadLine, held: HeldSlots, rows: f64) -> f64 {
         self.step_seconds(None, read, held, rows, FormSeconds { resident: 0., streamed: 0. }).total_seconds
+    }
+}
+
+/// The deduplicated step patterns of a [`StreamedLayers`] over one period at a
+/// fixed holding and row count ([`StreamedLayers::prepare`]), reusable across
+/// compute times (such as context depths).
+pub struct StreamedPeriod<'a> {
+    layers: &'a StreamedLayers,
+    whole: bool,
+    patterns: Vec<(Vec<LayerRun>, usize)>,
+}
+
+impl StreamedPeriod<'_> {
+    /// `T` of a decode step on `compute` (`C` of each form), its file reads
+    /// along `read`: identical to [`StreamedLayers::step_seconds`] at the
+    /// holding and row count this period was prepared for.
+    pub fn step_seconds(&self, read: ReadLine, compute: FormSeconds) -> StreamedStep {
+        if self.whole {
+            return StreamedStep { compute_seconds: compute.resident, exposed_seconds: 0., total_seconds: compute.resident };
+        }
+        let compute_seconds = compute.streamed;
+        let step = step_inputs(compute_seconds, read, ReadAhead::NONE, &self.layers.lines)
+            .run(self.patterns.iter().map(|(runs, count)| (runs.as_slice(), *count)));
+        StreamedStep { compute_seconds, exposed_seconds: step.total - compute_seconds, total_seconds: step.total }
     }
 }
 
@@ -461,5 +513,43 @@ mod tests {
         let none = LiveDecode { layers: vec![LayerReads::of_depths(&[0; 5], &[0; 5])], steps: 1, rows: 1., depth: 100 };
         assert_eq!(none.shares(0, 2, model), model, "a layer that read nothing is the model's");
         assert_eq!((live.routed(0), none.routed(0)), (Some(4.), None), "its 4 reads in its one step");
+    }
+
+    /// Deduplicating a period into weighted distinct patterns preserves the
+    /// exact step time (both in the small linear path and the hash-map path)
+    /// and a prepared period can be reused across compute times.
+    #[test]
+    fn prepared_period_deduplicates_steps_and_matches_expanded_run() {
+        let lines = ExpertLines::reference(1_000_000);
+        let layers = StreamedLayers::new(vec![512; 4], 8, std::sync::Arc::from([lines; 4]));
+        let held = HeldSlots { slots: 120, host: 300 };
+        let prepared = layers.prepare(None, held, 1.);
+        assert!(!prepared.whole);
+        assert!(prepared.patterns.len() <= 8, "expected few distinct patterns, got {}", prepared.patterns.len());
+        assert_eq!(prepared.patterns.iter().map(|(_, count)| *count).sum::<usize>(), 512);
+
+        // Compare against un-deduplicated 512 weight-1 steps.
+        let expanded = prepared
+            .patterns
+            .iter()
+            .flat_map(|(runs, count)| std::iter::repeat_n((runs.as_slice(), 1usize), *count))
+            .collect::<Vec<_>>();
+        for compute in [
+            FormSeconds { resident: 0.010, streamed: 0.012 },
+            FormSeconds { resident: 0.020, streamed: 0.025 },
+        ] {
+            let direct = layers.step_seconds(None, READ, held, 1., compute);
+            let reused = prepared.step_seconds(READ, compute);
+            assert_eq!(reused, direct);
+            let reference = step_inputs(compute.streamed, READ, ReadAhead::NONE, &layers.lines).run(expanded.iter().copied());
+            assert_eq!(reused.total_seconds, reference.total);
+        }
+
+        // Whole bank skips period construction and returns resident compute.
+        let whole = layers.prepare(None, HeldSlots::bank(512), 1.);
+        assert!(whole.whole);
+        assert!(whole.patterns.is_empty());
+        let compute = FormSeconds { resident: 0.010, streamed: 0.012 };
+        assert_eq!(whole.step_seconds(READ, compute), StreamedStep { compute_seconds: 0.010, exposed_seconds: 0., total_seconds: 0.010 });
     }
 }

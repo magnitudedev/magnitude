@@ -7,7 +7,11 @@
 //! written once, then executable.
 
 pub mod entry;
+pub mod placement;
 pub mod pool;
+
+/// Alignment of the base of every workspace buffer placed in a graph arena.
+pub const BUFFER_ALIGNMENT: u64 = 256;
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -19,14 +19,11 @@ void enable_debug(bool enable) {
 }
 
 static value_string exec_statements(const statements & stmts, context & ctx) {
-    auto result = mk_val<value_array>();
+    value_string str = mk_val<value_string>();
     for (const auto & stmt : stmts) {
         JJ_DEBUG("Executing statement of type %s", stmt->type().c_str());
-        result->push_back(stmt->execute(ctx));
+        gather_string_parts_recursive(stmt->execute(ctx), str);
     }
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
     return str;
 }
 
@@ -81,17 +78,18 @@ value statement::execute(context & ctx) {
 }
 
 value identifier::execute_impl(context & ctx) {
-    auto it = ctx.get_val(val);
-    const auto & builtins = global_builtins();
-    if (!it->is_undefined()) {
+    if (value * found = ctx.find_val(val)) {
         if (ctx.is_get_stats) {
-            value_t::stats_t::mark_used(it);
+            value_t::stats_t::mark_used(*found);
         }
-        JJ_DEBUG("Identifier '%s' found, type = %s", val.c_str(), it->type().c_str());
-        return it;
-    } else if (builtins.find(val) != builtins.end()) {
+        JJ_DEBUG("Identifier '%s' found, type = %s", val.c_str(), (*found)->type().c_str());
+        return *found;
+    }
+    const auto & builtins = global_builtins();
+    auto bit = builtins.find(val);
+    if (bit != builtins.end()) {
         JJ_DEBUG("Identifier '%s' found in builtins", val.c_str());
-        return mk_val<value_func>(val, builtins.at(val));
+        return mk_val<value_func>(val, bit->second);
     } else {
         JJ_DEBUG("Identifier '%s' not found, returning undefined", val.c_str());
         return mk_val<value_undefined>(val);
@@ -299,17 +297,27 @@ value binary_expression::execute_impl(context & ctx) {
     throw std::runtime_error("Unknown operator \"" + op.value + "\" between " + left_val->type() + " and " + right_val->type());
 }
 
-static value try_builtin_func(context & ctx, const std::string & name, value & input, bool undef_on_missing = false) {
+static value try_builtin_func_opt(context & ctx, const std::string & name, value & input) {
     JJ_DEBUG("Trying built-in function '%s' for type %s", name.c_str(), input->type().c_str());
     if (ctx.is_get_stats) {
         value_t::stats_t::mark_used(input);
-        input->stats.ops.insert(name);
+        input->stats.record_op(name);
+    }
+    if (auto * obj = cast_val<value_object>(input); obj && !obj->has_builtins) {
+        return nullptr;
     }
     const auto & builtins = input->get_builtins();
     auto it = builtins.find(name);
     if (it != builtins.end()) {
         JJ_DEBUG("Binding built-in '%s'", name.c_str());
         return mk_val<value_func>(name, it->second, input);
+    }
+    return nullptr;
+}
+
+static value try_builtin_func(context & ctx, const std::string & name, value & input, bool undef_on_missing = false) {
+    if (value found = try_builtin_func_opt(ctx, name, input)) {
+        return found;
     }
     if (undef_on_missing) {
         return mk_val<value_undefined>(name);
@@ -427,7 +435,7 @@ value test_expression::execute_impl(context & ctx) {
 
     if (ctx.is_get_stats) {
         value_t::stats_t::mark_used(input);
-        input->stats.ops.insert(test_name);
+        input->stats.record_op(test_name);
     }
 
     auto res = it->second(args);
@@ -461,21 +469,18 @@ value unary_expression::execute_impl(context & ctx) {
 value if_statement::execute_impl(context & ctx) {
     value test_val = test->execute(ctx);
 
-    auto out = mk_val<value_array>();
+    value_string str = mk_val<value_string>();
     if (test_val->as_bool()) {
         for (auto & stmt : body) {
             JJ_DEBUG("IF --> Executing THEN body, current block: %s", stmt->type().c_str());
-            out->push_back(stmt->execute(ctx));
+            gather_string_parts_recursive(stmt->execute(ctx), str);
         }
     } else {
         for (auto & stmt : alternate) {
             JJ_DEBUG("IF --> Executing ELSE body, current block: %s", stmt->type().c_str());
-            out->push_back(stmt->execute(ctx));
+            gather_string_parts_recursive(stmt->execute(ctx), str);
         }
     }
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(out, str);
     return str;
 }
 
@@ -501,7 +506,7 @@ value for_statement::execute_impl(context & ctx) {
     // mark the variable being iterated as used for stats
     if (ctx.is_get_stats) {
         value_t::stats_t::mark_used(iterable_val);
-        iterable_val->stats.ops.insert("array_access");
+        iterable_val->stats.op_flags |= value_t::stats_t::OP_ARRAY_ACCESS;
     }
 
     if (iterable_val->is_undefined()) {
@@ -517,23 +522,24 @@ value for_statement::execute_impl(context & ctx) {
     if (is_val<value_object>(iterable_val)) {
         JJ_DEBUG("%s", "For loop over object keys");
         auto & obj = iterable_val->as_ordered_object();
+        items.reserve(obj.size());
         for (auto & p : obj) {
             auto tuple = mk_val<value_tuple>(p);
             items.push_back(std::move(tuple));
         }
         if (ctx.is_get_stats) {
             value_t::stats_t::mark_used(iterable_val);
-            iterable_val->stats.ops.insert("object_access");
         }
     } else {
         JJ_DEBUG("%s", "For loop over array items");
         auto & arr = iterable_val->as_array();
+        items.reserve(arr.size());
         for (const auto & item : arr) {
             items.push_back(item);
         }
         if (ctx.is_get_stats) {
             value_t::stats_t::mark_used(iterable_val);
-            iterable_val->stats.ops.insert("array_access");
+            iterable_val->stats.op_flags |= value_t::stats_t::OP_ARRAY_ACCESS;
         }
     }
 
@@ -599,9 +605,9 @@ value for_statement::execute_impl(context & ctx) {
     }
     JJ_DEBUG("For loop: %zu items after filtering", filtered_items.size());
 
-    auto result = mk_val<value_array>();
+    value_string str = mk_val<value_string>();
 
-    std::vector<std::pair<value, value>> iteration_assignments;
+    std::vector<std::pair<std::string, value>> iteration_assignments;
     bool noIteration = true;
     for (size_t i = 0; i < filtered_items.size(); i++) {
         JJ_DEBUG("For loop iteration %zu/%zu", i + 1, filtered_items.size());
@@ -623,8 +629,7 @@ value for_statement::execute_impl(context & ctx) {
         bool broken = false;
         try {
             for (auto & stmt : body) {
-                value val = stmt->execute(scope);
-                result->push_back(val);
+                gather_string_parts_recursive(stmt->execute(scope), str);
             }
         } catch (const continue_statement::signal &) {
         } catch (const break_statement::signal &) {
@@ -640,14 +645,10 @@ value for_statement::execute_impl(context & ctx) {
     JJ_DEBUG("For loop complete, total iterations: %zu", filtered_items.size());
     if (noIteration) {
         for (auto & stmt : default_block) {
-            value val = stmt->execute(ctx);
-            result->push_back(val);
+            gather_string_parts_recursive(stmt->execute(ctx), str);
         }
     }
 
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
     return str;
 }
 
@@ -859,8 +860,7 @@ value member_expression::execute_impl(context & ctx) {
         if (!is_stmt<identifier>(this->property)) {
             throw std::runtime_error("Static member property must be an identifier");
         }
-        property = mk_val<value_string>(cast_stmt<identifier>(this->property)->val);
-        std::string prop = property->as_string().str();
+        const std::string & prop = cast_stmt<identifier>(this->property)->val;
         JJ_DEBUG("Member expression, object type %s, static property '%s'", object->type().c_str(), prop.c_str());
 
         // behavior of jinja2: obj having prop as a built-in function AND 'prop', as an object key,
@@ -868,34 +868,55 @@ value member_expression::execute_impl(context & ctx) {
         // while obj['prop'] returns the property value.
         // example: {"obj": {"items": 123}} -> obj.items is the built-in function, obj['items'] is 123
 
-        value val = try_builtin_func(ctx, prop, object, true);
-        if (!is_val<value_undefined>(val)) {
-            return val;
+        if (value builtin = try_builtin_func_opt(ctx, prop, object)) {
+            return builtin;
         }
-        // else, fallthrough to normal property access below
+        if (auto * obj = cast_val<value_object>(object)) {
+            if (value * found = obj->find_key(prop)) {
+                if (ctx.is_get_stats) {
+                    value_t::stats_t::mark_used(*found);
+                    value_t::stats_t::mark_used(object);
+                }
+                return *found;
+            }
+            if (ctx.is_get_stats) {
+                value_t::stats_t::mark_used(object);
+            }
+            return mk_val<value_undefined>("object_property");
+        }
+        if (is_val<value_undefined>(object)) {
+            return mk_val<value_undefined>("object_property");
+        }
+        // Other types only have builtins (already checked above).
+        if (ctx.is_get_stats) {
+            value_t::stats_t::mark_used(object);
+        }
+        return mk_val<value_undefined>("object_property");
     }
 
     JJ_DEBUG("Member expression on object type %s, property type %s", object->type().c_str(), property->type().c_str());
-    value val = mk_val<value_undefined>("object_property");
 
     if (property->is_undefined()) {
         JJ_DEBUG("%s", "Member expression property is undefined, returning undefined");
-        return val;
+        return mk_val<value_undefined>("object_property");
     }
 
     ensure_key_type_allowed(property);
 
+    value val;
     if (is_val<value_undefined>(object)) {
         JJ_DEBUG("%s", "Accessing property on undefined object, returning undefined");
-        return val;
+        return mk_val<value_undefined>("object_property");
 
-    } else if (is_val<value_object>(object)) {
-        auto key = property->as_string().str();
-        val = object->at(property, val);
-        if (is_val<value_undefined>(val)) {
-            val = try_builtin_func(ctx, key, object, true);
+    } else if (auto * obj = cast_val<value_object>(object)) {
+        if (value * found = obj->find_key(property)) {
+            val = *found;
+        } else if (value builtin = try_builtin_func_opt(ctx, property->as_string().str(), object)) {
+            val = std::move(builtin);
+        } else {
+            val = mk_val<value_undefined>("object_property");
         }
-        JJ_DEBUG("Accessed property '%s' value, got type: %s", key.c_str(), val->type().c_str());
+        JJ_DEBUG("Accessed property value, got type: %s", val->type().c_str());
 
     } else if (is_val<value_array>(object) || is_val<value_string>(object)) {
         if (is_val<value_int>(property)) {
@@ -914,6 +935,9 @@ value member_expression::execute_impl(context & ctx) {
                 if (index >= 0 && index < static_cast<int64_t>(str.size())) {
                     val = mk_val<value_string>(std::string(1, str[index]));
                 }
+            }
+            if (!val) {
+                val = mk_val<value_undefined>("object_property");
             }
 
         } else if (is_val<value_string>(property)) {
@@ -937,9 +961,7 @@ value member_expression::execute_impl(context & ctx) {
         value_t::stats_t::mark_used(object);
         value_t::stats_t::mark_used(property);
         if (is_val<value_int>(property)) {
-            object->stats.ops.insert("array_access");
-        } else if (is_val<value_string>(property)) {
-            object->stats.ops.insert("object_access");
+            object->stats.op_flags |= value_t::stats_t::OP_ARRAY_ACCESS;
         }
     }
 

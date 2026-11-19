@@ -44,6 +44,15 @@ common_chat_rendered_prompt common_chat_template_render_prompt(
     const std::optional<json> & tools_override = std::nullopt,
     const std::optional<json> & additional_context = std::nullopt);
 
+// Build or reuse the cached PEG parser, GBNF grammar, and recorded relaxations/diagnostics
+// for `tmpl` when all parser- and grammar-affecting inputs match.
+void common_chat_apply_cached_parser(
+    const common_chat_template &                       tmpl,
+    const autoparser::generation_params &              inputs,
+    const std::string &                                parser_generation_prompt,
+    common_chat_params &                               data,
+    const std::function<void(common_chat_params &)> &  build);
+
 // Adds rule `name`: text that does not begin with `open` and either contains
 // no `close` (`including` false) or ends at its first `close`, inclusive. A
 // parser reads text beginning with `open` another way (an opened value, or

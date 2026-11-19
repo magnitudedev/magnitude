@@ -13,14 +13,18 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
 using chat_template_caps = jinja::caps;
 
 struct common_chat_templates;
+struct common_chat_parser_cache;
+std::shared_ptr<common_chat_parser_cache> common_chat_parser_cache_create();
 
 namespace autoparser {
+struct autoparser;
 struct generation_params;
 }  // namespace autoparser
 
@@ -55,19 +59,57 @@ struct common_chat_template {
     std::string eos_tok;
     std::string src;
     chat_template_caps caps;
+    bool reads_preserve_thinking = false;
+    std::vector<std::string> reasoning_identifiers;
+    mutable std::shared_ptr<std::mutex> cached_autoparser_mutex;
+    mutable std::shared_ptr<autoparser::autoparser> cached_autoparser;
+    mutable std::shared_ptr<common_chat_parser_cache> cached_parsers;
 
     common_chat_template(const std::string & src, const std::string & bos_token, const std::string & eos_token) {
         jinja::lexer lexer;
         auto lexer_res = lexer.tokenize(src);
+        bool has_enable_thinking    = false;
+        bool has_thinking           = false;
+        bool has_thinking_mode      = false;
+        bool has_reasoning_effort   = false;
+        bool has_reasoning_strength = false;
+        for (const auto & token : lexer_res.tokens) {
+            if (token.t != jinja::token::identifier) {
+                continue;
+            }
+            if (token.value == "preserve_thinking") {
+                this->reads_preserve_thinking = true;
+            } else if (token.value == "enable_thinking") {
+                has_enable_thinking = true;
+            } else if (token.value == "thinking") {
+                has_thinking = true;
+            } else if (token.value == "thinking_mode") {
+                has_thinking_mode = true;
+            } else if (token.value == "reasoning_effort") {
+                has_reasoning_effort = true;
+            } else if (token.value == "reasoning_strength") {
+                has_reasoning_strength = true;
+            }
+        }
+        if (has_enable_thinking)    { this->reasoning_identifiers.emplace_back("enable_thinking"); }
+        if (has_thinking)           { this->reasoning_identifiers.emplace_back("thinking"); }
+        if (has_thinking_mode)      { this->reasoning_identifiers.emplace_back("thinking_mode"); }
+        if (has_reasoning_effort)   { this->reasoning_identifiers.emplace_back("reasoning_effort"); }
+        if (has_reasoning_strength) { this->reasoning_identifiers.emplace_back("reasoning_strength"); }
+
         this->prog = jinja::parse_from_tokens(lexer_res);
 
         this->src = lexer_res.source;
         this->bos_tok = bos_token;
         this->eos_tok = eos_token;
 
-        this->caps = jinja::caps_get(prog);
+        this->caps = jinja::caps_get(prog, this->src);
+        this->cached_autoparser_mutex = std::make_shared<std::mutex>();
+        this->cached_parsers = common_chat_parser_cache_create();
         // LOG_INF("%s: caps:\n%s\n", __func__, this->caps.to_string().c_str());
     }
+
+    ~common_chat_template();
 
     const std::string & source() const { return src; }
     const std::string & bos_token() const { return bos_tok; }
@@ -361,6 +403,15 @@ common_json common_chat_tool_parameters(const common_json & function);
 
 // get template caps, useful for reporting to server /props endpoint
 std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_templates * chat_templates);
+
+// Context variables read outside Jinja by the specialized handler matching this template.
+std::vector<std::string> common_chat_templates_handler_context_variables(const common_chat_templates * chat_templates);
+
+// Whether the template source names `preserve_thinking` as a Jinja identifier.
+bool common_chat_templates_reads_preserve_thinking(const common_chat_templates * chat_templates);
+
+// Reasoning-control identifiers appearing as Jinja identifier tokens in the template source.
+std::vector<std::string> common_chat_templates_reasoning_identifiers(const common_chat_templates * chat_templates);
 
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,

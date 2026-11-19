@@ -24,7 +24,7 @@ use magnitude_family_contracts::{StateSpace, WeightKind, WeightRole, WeightScope
 use magnitude_kernels::{
     attention_output, attention_project, state_space_chunk, state_space_gate, state_space_step,
 };
-use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Dim, Element, NativeGraph, NativePort, WorkflowTensor};
 
 /// A state-space block's entries; each projection's by row range.
 pub(crate) struct StateSpaceGraphEntries<'a, G: GraphDraft + 'a> {
@@ -73,13 +73,15 @@ impl CheckedStateSpaceEntries {
         }
     }
 
-    pub(crate) fn entries(&self) -> StateSpaceGraphEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> StateSpaceGraphEntries<'_, G> {
         StateSpaceGraphEntries {
-            project: &self.project,
-            step: &self.activation,
-            chunk: &self.activation,
-            gate: &self.activation,
-            output: &self.output,
+            project: G::bind_ranged(&self.project),
+            step: G::bind(&self.activation),
+            chunk: G::bind(&self.activation),
+            gate: G::bind(&self.activation),
+            output: G::bind_ranged(&self.output),
         }
     }
 }

@@ -59,6 +59,9 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
         data.prompt += data.generation_prompt;
     }
 
+    const bool thinking_opened = data.generation_prompt.find("<think>") != std::string::npos;
+
+    common_chat_apply_cached_parser(tmpl, inputs, thinking_opened ? "<think>" : "", data, [&](common_chat_params & data) {
     std::vector<std::string> tool_call_starts = { "<tool_call>" };
 
     if (is_qwen3_coder) {
@@ -211,7 +214,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                 std::string without_calls = closed + text;
                 // Reasoning the generation prompt opens is only reasoning:
                 // content follows only its close. Otherwise it may be skipped.
-                if (data.generation_prompt.find("<think>") == std::string::npos) {
+                if (!thinking_opened) {
                     before_calls += " |" + text;
                     without_calls = "(" + closed + ")?" + text;
                 }
@@ -245,6 +248,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
             }
         }
     }
+    });
 
     return data;
 }

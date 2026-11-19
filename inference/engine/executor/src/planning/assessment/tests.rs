@@ -1524,20 +1524,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
                 }
             })
             .collect();
-        let load = ModelLoadPlan {
-            residual_conditioning: None,
-            target: Vec::new(),
-            head: None,
-            own_history_head: false,
-            vision: Some(weights),
-            host_tables: Vec::new(),
-            readout_candidates: Vec::new(),
-            readout_choices: Vec::new(),
-            unplaced_output: Vec::new(),
-            bank: None,
-            record_ports: None,
-            recorded_routes: false,
-        };
+        let load = ModelLoadPlan::from_vision(weights);
         let program =
             crate::operators::vision::vision_program(&description, &|_| Ok(f32)).unwrap();
         assert_eq!(program.registers, description.stem.registers());

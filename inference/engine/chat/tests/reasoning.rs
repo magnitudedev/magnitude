@@ -1,6 +1,6 @@
 use magnitude_chat::reasoning::{
-    inspect_reasoning, normalize_effort, EffortDomain, EffortMapping, ReasoningError,
-    ReasoningIntent, ReasoningProfile, DETECTOR,
+    inspect_reasoning, inspect_reasoning_unpruned, normalize_effort, EffortDomain, EffortMapping,
+    ReasoningError, ReasoningIntent, ReasoningProfile, DETECTOR,
 };
 use magnitude_chat::{TemplateBundle, TemplateVariant};
 use magnitude_templates::Template;
@@ -12,8 +12,9 @@ fn fixtures() -> BTreeMap<String, String> {
 }
 
 fn profile_of(name: &str) -> ReasoningProfile {
-    let template = Template::new(&fixtures()[name], &Default::default()).unwrap();
-    inspect_reasoning(&template, &Default::default()).unwrap()
+    let source = &fixtures()[name];
+    let template = Template::new(source, &Default::default()).unwrap();
+    inspect_reasoning(&template, source, &Default::default()).unwrap()
 }
 
 #[test]
@@ -243,7 +244,7 @@ fn disabled_and_extra_high_spellings_normalize() {
 
 fn asset_profile(source: &str) -> ReasoningProfile {
     let template = Template::new(source, &Default::default()).unwrap();
-    inspect_reasoning(&template, &Default::default()).unwrap()
+    inspect_reasoning(&template, source, &Default::default()).unwrap()
 }
 
 /// Turning reasoning off counts only when the generation prompt no longer
@@ -284,12 +285,9 @@ fn an_off_setting_that_still_opens_reasoning_does_not_disable_it() {
 
 #[test]
 fn muse_glimmer_reasoning_can_be_disabled() {
-    let template = Template::new(
-        include_str!("../../templates/tests/assets/Muse-Glimmer-30B.jinja"),
-        &Default::default(),
-    )
-    .unwrap();
-    let profile = inspect_reasoning(&template, &Default::default()).unwrap();
+    let source = include_str!("../../templates/tests/assets/Muse-Glimmer-30B.jinja");
+    let template = Template::new(source, &Default::default()).unwrap();
+    let profile = inspect_reasoning(&template, source, &Default::default()).unwrap();
     assert_eq!(
         profile
             .mappings
@@ -371,4 +369,126 @@ fn a_template_without_a_unique_default_effort_fails_inspection() {
         inspect("TOGGLE").unwrap().reasoning.default_effort.as_deref(),
         Some("high")
     );
+}
+
+#[test]
+fn pruned_and_unpruned_reasoning_inspection_are_identical() {
+    let assert_parity = |label: &str, source: &str| {
+        let template = Template::new(source, &Default::default())
+            .unwrap_or_else(|e| panic!("failed to parse template {label}: {e}"));
+        let pruned = inspect_reasoning(&template, source, &Default::default());
+        let unpruned = inspect_reasoning_unpruned(&template, &Default::default());
+        assert_eq!(
+            pruned, unpruned,
+            "pruned and unpruned reasoning inspection diverged for {label}"
+        );
+    };
+
+    for (name, source) in fixtures() {
+        assert_parity(&format!("fixture:{name}"), &source);
+    }
+
+    const ASSETS: &[(&str, &str)] = &[
+        (
+            "DeepSeek-V3.2.jinja",
+            include_str!("../../templates/tests/assets/DeepSeek-V3.2.jinja"),
+        ),
+        (
+            "Kimi-K2-Thinking.jinja",
+            include_str!("../../templates/tests/assets/Kimi-K2-Thinking.jinja"),
+        ),
+        (
+            "LFM2.5-1.2B-Instruct.jinja",
+            include_str!("../../templates/tests/assets/LFM2.5-1.2B-Instruct.jinja"),
+        ),
+        (
+            "LFM2.5-1.2B-Thinking.jinja",
+            include_str!("../../templates/tests/assets/LFM2.5-1.2B-Thinking.jinja"),
+        ),
+        (
+            "LFM2.5-2.6B.jinja",
+            include_str!("../../templates/tests/assets/LFM2.5-2.6B.jinja"),
+        ),
+        (
+            "LFM2.5-8B-A1B-Q3.8-TBrilliance.jinja",
+            include_str!("../../templates/tests/assets/LFM2.5-8B-A1B-Q3.8-TBrilliance.jinja"),
+        ),
+        (
+            "LFM2.5-8B-A1B.jinja",
+            include_str!("../../templates/tests/assets/LFM2.5-8B-A1B.jinja"),
+        ),
+        (
+            "Laguna-S-2.1.jinja",
+            include_str!("../../templates/tests/assets/Laguna-S-2.1.jinja"),
+        ),
+        (
+            "Llama-3.2-3B-Instruct.jinja",
+            include_str!("../../templates/tests/assets/Llama-3.2-3B-Instruct.jinja"),
+        ),
+        (
+            "MiniCPM5-2B.jinja",
+            include_str!("../../templates/tests/assets/MiniCPM5-2B.jinja"),
+        ),
+        (
+            "Muse-Glimmer-30B.jinja",
+            include_str!("../../templates/tests/assets/Muse-Glimmer-30B.jinja"),
+        ),
+        (
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B.jinja",
+            include_str!("../../templates/tests/assets/NVIDIA-Nemotron-3.5-Lightning-30B-A3B.jinja"),
+        ),
+        (
+            "Qwen-Qwen3-0.6B.jinja",
+            include_str!("../../templates/tests/assets/Qwen-Qwen3-0.6B.jinja"),
+        ),
+        (
+            "Qwen3.5-4B.jinja",
+            include_str!("../../templates/tests/assets/Qwen3.5-4B.jinja"),
+        ),
+        (
+            "Qwen3.6-35B-A3B.jinja",
+            include_str!("../../templates/tests/assets/Qwen3.6-35B-A3B.jinja"),
+        ),
+        (
+            "gemma-4-12B-it.jinja",
+            include_str!("../../templates/tests/assets/gemma-4-12B-it.jinja"),
+        ),
+        (
+            "synthetic-cohere2moe.jinja",
+            include_str!("../../templates/tests/assets/synthetic-cohere2moe.jinja"),
+        ),
+        (
+            "synthetic-gpt-oss.jinja",
+            include_str!("../../templates/tests/assets/synthetic-gpt-oss.jinja"),
+        ),
+        (
+            "synthetic-kimi-k3.jinja",
+            include_str!("../../templates/tests/assets/synthetic-kimi-k3.jinja"),
+        ),
+        (
+            "synthetic-minimax-m3.jinja",
+            include_str!("../../templates/tests/assets/synthetic-minimax-m3.jinja"),
+        ),
+        (
+            "synthetic-ministral3.jinja",
+            include_str!("../../templates/tests/assets/synthetic-ministral3.jinja"),
+        ),
+    ];
+    for &(label, source) in ASSETS {
+        assert_parity(&format!("asset:{label}"), source);
+    }
+
+    let mut header = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(&include_bytes!("assets/glm53.gguf.gz")[..]),
+        &mut header,
+    )
+    .unwrap();
+    let directory = magnitude_artifacts::gguf::read_header(header).unwrap();
+    let payload =
+        magnitude_artifacts::TemplatePayload::from_directory(&directory, "glm53.gguf.gz").unwrap();
+    assert!(!payload.sources.is_empty());
+    for item in &payload.sources {
+        assert_parity(&format!("gguf:glm53:{}", item.name), &item.source);
+    }
 }

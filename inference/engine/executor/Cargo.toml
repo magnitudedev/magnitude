@@ -14,6 +14,7 @@ magnitude-kernels = { path = "../kernels" }
 magnitude-state = { path = "../state" }
 seismic.workspace = true
 seismic-io.workspace = true
+seismic-threads.workspace = true
 serde.workspace = true
 # Persisted precision policies and objective weights retain their exact f64 identity.
 serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }

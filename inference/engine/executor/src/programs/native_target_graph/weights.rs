@@ -13,7 +13,7 @@ use crate::{
 use magnitude_family_contracts::{SublayerIndex, Decoder, ProgressiveCodeDepth, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{import_dense, repack_weight, selection_notice, stored_rows};
 use seismic::{
-    Dim, Element, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
+    Dim, Element, NativePort, NativeTimelinePort, WorkflowTensor,
 };
 
 /// How a load holds a planned weight's values, as its graphs read them
@@ -68,8 +68,7 @@ impl WeightView<u64> {
     /// The view of `load`'s planned weight of `role`.
     pub(crate) fn planned(load: &ModelLoadPlan, role: WeightRole) -> Result<Self, GraphError> {
         let plan = load
-            .weights()
-            .find(|plan| plan.role == role)
+            .weight_by_role(role)
             .ok_or_else(|| format!("missing planned weight {role:?}"))?;
         Ok(Self::of(load, plan))
     }
@@ -501,7 +500,7 @@ pub(crate) fn weight_port<G: GraphDraft>(
 ) -> Result<NativePort, GraphError> {
     let view = weights.weight(role)?;
     let port = match part {
-        WeightPart::Values => graph.port(view.resident, &view.shape),
+        WeightPart::Values => graph.weight_port(view.resident, &view.shape),
         WeightPart::Scale => match view.scale {
             Some(extent) => graph.port(Element::f32(), &[extent]),
             None => return Err(format!("planned weight {role:?} has no second-level scale").into()),
@@ -518,7 +517,7 @@ pub(crate) fn weight_port<G: GraphDraft>(
         },
         // The group's records' shape at its layer's experts.
         WeightPart::Home => match view.home {
-            Some(experts) => graph.port(view.resident, &[&[experts][..], &view.shape[1..]].concat()),
+            Some(experts) => graph.weight_port(view.resident, &[&[experts][..], &view.shape[1..]].concat()),
             None => {
                 return Err(format!("planned weight {role:?} is no banked stack and has no home records").into());
             }
@@ -818,13 +817,15 @@ impl CheckedLandingEntries {
         }))
     }
 
-    pub(crate) fn entries(&self) -> LandingEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> LandingEntries<'_, G> {
         LandingEntries {
-            notice: &[],
+            notice: G::bind(&[]),
             import: match self.import {
-                crate::ImportProgramSlot::Dense { .. } => LandingImport::Dense(&self.elements[..]),
+                crate::ImportProgramSlot::Dense { .. } => LandingImport::Dense(G::bind(&self.elements[..])),
                 crate::ImportProgramSlot::Repack { .. } => {
-                    LandingImport::Repack(&self.elements[..])
+                    LandingImport::Repack(G::bind(&self.elements[..]))
                 }
             },
         }

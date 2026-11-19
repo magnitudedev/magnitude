@@ -289,6 +289,7 @@ pub struct NativeCoverage {
 }
 
 mod boundary;
+mod render_contract;
 
 mod internals {
     use super::*;
@@ -1601,13 +1602,14 @@ mod internals {
         }
         for entry in module.entries() {
             let native = native_assets.iter().find(|native| native.entry == entry.id);
-            render_entry(&mut out, entry, native, cpu_library)?;
+            render_entry(&mut out, module, entry, native, cpu_library)?;
         }
         Ok(out)
     }
 
     fn render_entry(
         out: &mut String,
+        module: &seismic_lang::checked::CheckedModule,
         entry: &EntryInfo,
         native: Option<&EntryNative<'_>>,
         cpu_library: Option<&CpuLibrary>,
@@ -1918,6 +1920,7 @@ mod internals {
             }
             out.push_str("    ])\n  }\n");
         }
+        crate::render_contract::render_contract(out, module, entry)?;
         if let Some(native) = native {
             render_native(out, entry, native, cpu_library)?;
         }

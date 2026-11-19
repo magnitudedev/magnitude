@@ -515,7 +515,7 @@ impl Drop for GraphHold {
 
 /// Bytes charged to a scratch buffer that is empty or inactive: it keeps
 /// its ABI slot.
-pub(crate) const MINIMUM_SCRATCH_BYTES: u64 = 1;
+pub const MINIMUM_SCRATCH_BYTES: u64 = 1;
 
 /// One call-private scratch buffer: its bytes, whether it holds arrival
 /// counters (`sync`), which live in their execution's sync region

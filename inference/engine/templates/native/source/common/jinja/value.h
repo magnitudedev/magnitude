@@ -12,6 +12,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 
@@ -115,9 +116,25 @@ struct value_t {
 
     // only used if ctx.is_get_stats = true
     struct stats_t {
+        static constexpr uint8_t OP_TEST_IS_STRING = 1u << 0;
+        static constexpr uint8_t OP_SELECTATTR     = 1u << 1;
+        static constexpr uint8_t OP_ARRAY_ACCESS   = 1u << 2;
+
         bool used = false;
-        // ops can be builtin calls or operators: "array_access", "object_access"
-        std::set<std::string> ops;
+        uint8_t op_flags = 0;
+
+        void record_op(std::string_view op_name) noexcept {
+            if (op_name == "test_is_string") {
+                op_flags |= OP_TEST_IS_STRING;
+            } else if (op_name == "selectattr") {
+                op_flags |= OP_SELECTATTR;
+            } else if (op_name == "array_access") {
+                op_flags |= OP_ARRAY_ACCESS;
+            }
+        }
+        bool has_op(uint8_t flag) const noexcept {
+            return (op_flags & flag) != 0;
+        }
         // utility to recursively mark value and its children as used
         static void mark_used(value & val, bool deep = false);
     } stats;
@@ -246,11 +263,9 @@ using value_int = std::shared_ptr<value_int_t>;
 
 
 struct value_float_t : public value_t {
-    value val;
     value_float_t(double v) {
         val_flt = v;
         val_int = std::isfinite(v) ? static_cast<int64_t>(v) : 0;
-        val = mk_val<value_int>(val_int);
     }
     virtual std::string type() const override { return "Float"; }
     virtual double as_float() const override { return val_flt; }
@@ -269,7 +284,9 @@ struct value_float_t : public value_t {
     virtual bool is_hashable() const override { return true; }
     virtual hasher unique_hash() const noexcept override {
         if (static_cast<double>(val_int) == val_flt) {
-            return val->unique_hash();
+            return hasher(typeid(value_int_t))
+                .update(&val_int, sizeof(val_int))
+                .update(&val_flt, sizeof(val_flt));
         } else {
             return hasher(typeid(*this))
                 .update(&val_int, sizeof(val_int))
@@ -324,11 +341,9 @@ using value_string = std::shared_ptr<value_string_t>;
 
 
 struct value_bool_t : public value_t {
-    value val;
     value_bool_t(bool v) {
         val_int = static_cast<int64_t>(v);
         val_flt = static_cast<double>(v);
-        val = mk_val<value_int>(val_int);
     }
     virtual std::string type() const override { return "Boolean"; }
     virtual int64_t as_int() const override { return val_int; }
@@ -338,7 +353,9 @@ struct value_bool_t : public value_t {
     virtual bool is_numeric() const override { return true; }
     virtual bool is_hashable() const override { return true; }
     virtual hasher unique_hash() const noexcept override {
-        return val->unique_hash();
+        return hasher(typeid(value_int_t))
+            .update(&val_int, sizeof(val_int))
+            .update(&val_flt, sizeof(val_flt));
     }
 protected:
     virtual bool equivalent(const value_t & other) const override {
@@ -527,23 +544,23 @@ struct value_object_t : public value_t {
         return unordered.find(key) != unordered.end();
     }
     virtual void insert(const value & key, const value & val) override {
-        bool replaced = false;
         if (is_immutable()) {
             throw std::runtime_error("Attempting to modify immutable type");
         }
-        if (has_key(key)) {
-            // if key exists, replace value in ordered list instead of appending
+        if (!key->is_immutable() || !key->is_hashable()) {
+            throw std::runtime_error("Object key of unhashable type: " + key->type());
+        }
+        auto [it, inserted] = unordered.emplace(key, val);
+        if (inserted) {
+            val_obj.push_back({key, val});
+        } else {
+            it->second = val;
             for (auto & pair : val_obj) {
                 if (*(pair.first) == *key) {
                     pair.second = val;
-                    replaced = true;
                     break;
                 }
             }
-        }
-        unordered[key] = val;
-        if (!replaced) {
-            val_obj.push_back({key, val});
         }
     }
     void erase(const value & key) {
@@ -558,25 +575,50 @@ struct value_object_t : public value_t {
             }
         }
     }
-    virtual value & at(const value & key, value & default_val) override {
-        if (!has_key(key)) {
-            return default_val;
+    static value & scratch_string_key(const std::string & key) {
+        thread_local value_string scratch = mk_val<value_string>("");
+        thread_local value scratch_val = scratch;
+        scratch->val_str.parts[0].val = key;
+        return scratch_val;
+    }
+    value * find_key(const std::string & key) {
+        auto it = unordered.find(scratch_string_key(key));
+        return it == unordered.end() ? nullptr : &it->second;
+    }
+    value * find_key(const value & key) {
+        if (!key->is_immutable() || !key->is_hashable()) {
+            throw std::runtime_error("Object key of unhashable type: " + key->type());
         }
-        return unordered.at(key);
+        auto it = unordered.find(key);
+        return it == unordered.end() ? nullptr : &it->second;
+    }
+    virtual value & at(const value & key, value & default_val) override {
+        if (!key->is_immutable() || !key->is_hashable()) {
+            throw std::runtime_error("Object key of unhashable type: " + key->type());
+        }
+        auto it = unordered.find(key);
+        return it == unordered.end() ? default_val : it->second;
     }
     virtual value & at(const value & key) override {
-        if (!has_key(key)) {
+        if (!key->is_immutable() || !key->is_hashable()) {
+            throw std::runtime_error("Object key of unhashable type: " + key->type());
+        }
+        auto it = unordered.find(key);
+        if (it == unordered.end()) {
             throw std::runtime_error("Key '" + key->as_string().str() + "' not found in value of type " + type());
         }
-        return unordered.at(key);
+        return it->second;
     }
     virtual value & at(const std::string & key, value & default_val) override {
-        value key_val = mk_val<value_string>(key);
-        return at(key_val, default_val);
+        auto it = unordered.find(scratch_string_key(key));
+        return it == unordered.end() ? default_val : it->second;
     }
     virtual value & at(const std::string & key) override {
-        value key_val = mk_val<value_string>(key);
-        return at(key_val);
+        auto it = unordered.find(scratch_string_key(key));
+        if (it == unordered.end()) {
+            throw std::runtime_error("Key '" + key + "' not found in value of type " + type());
+        }
+        return it->second;
     }
     virtual const func_builtins & get_builtins() const override;
     virtual bool is_hashable() const override {

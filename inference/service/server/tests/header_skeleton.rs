@@ -3,8 +3,8 @@
 //! it stores any other, and the skeleton it gives back is fingerprinted,
 //! admitted and inspected exactly as the whole header.
 
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use magnitude_artifacts::catalog_headers::ComponentRole;
@@ -33,7 +33,8 @@ const PHASES: [&str; 6] = [
 struct Skeletons {
     cache: ModelCache,
     /// The time spent reading skeletons from the cache, and parsing them.
-    timing: Cell<[Duration; 2]>,
+    /// Also serializes temporary `.moved` renames across concurrent shard reads.
+    timing: Mutex<[Duration; 2]>,
 }
 
 impl HeaderSource for Skeletons {
@@ -70,17 +71,21 @@ impl HeaderSource for Skeletons {
             .map(|absence| absence.file.clone())
             .collect::<Vec<_>>();
         let moved = |file: &PathBuf| file.with_extension("moved");
-        for file in &others {
-            std::fs::rename(file, moved(file))?;
-        }
-        let started = Instant::now();
-        let directory = read_skeleton(skeleton);
-        let parse_time = started.elapsed();
-        for file in &others {
-            std::fs::rename(moved(file), file)?;
-        }
-        let [read, parse] = self.timing.get();
-        self.timing.set([read + read_time, parse + parse_time]);
+        let directory = {
+            let mut timing = self.timing.lock().unwrap();
+            for file in &others {
+                std::fs::rename(file, moved(file))?;
+            }
+            let started = Instant::now();
+            let directory = read_skeleton(skeleton);
+            let parse_time = started.elapsed();
+            for file in &others {
+                std::fs::rename(moved(file), file)?;
+            }
+            timing[0] += read_time;
+            timing[1] += parse_time;
+            directory
+        };
         Ok(FileHeader {
             directory: directory?,
             size: std::fs::metadata(path)?.len(),
@@ -121,13 +126,13 @@ fn every_catalog_targets_skeleton_assesses_as_its_whole_header() {
         let root = tempfile::tempdir().unwrap();
         let source = Skeletons {
             cache: ModelCache::new(root.path()),
-            timing: Cell::new([Duration::ZERO; 2]),
+            timing: Mutex::new([Duration::ZERO; 2]),
         };
         let skeletal = PackageHeaders::open_from(&file, None, &source)
             .unwrap_or_else(|error| panic!("{name}: {error}"))
             .target()
             .clone();
-        let [skeleton_read, skeleton_parse] = source.timing.get();
+        let [skeleton_read, skeleton_parse] = *source.timing.lock().unwrap();
 
         let started = Instant::now();
         let fingerprint = ModelFingerprint::from_directory(&skeletal);

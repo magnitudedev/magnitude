@@ -1,4 +1,4 @@
-use super::{BankGroup, BankLayer, BankLayers, BankPaths, BankSites, BankSubstrate, BankTable, ExpertBankPlan, HintWeight, NonEmpty, RecordForm, RoutedTensor, routed_experts};
+use super::{BankGroup, BankLayer, BankLayers, BankPaths, BankSites, BankSubstrate, BankTable, ExpertBankPlan, HintWeight, NonEmpty, RecordForm, routed_experts};
 use super::conveyor;
 use super::records::{record_tensor, routed_layers};
 use super::table::stored_table_heads;
@@ -69,11 +69,7 @@ impl ModelLoadPlan {
             if *shape.get_or_insert((form, routed.selected)) != (form, routed.selected) {
                 return Err(PlanError::Unstreamed(UnstreamedExperts::Shape(index)));
             }
-            let planned = |kind| {
-                self.target
-                    .iter()
-                    .find(|plan| plan.role == WeightRole { scope, kind })
-            };
+            let planned = |kind| self.target_weight(WeightRole { scope, kind });
             let hinted = hint_kinds(routed)
                 .into_iter()
                 .map(|kind| HintWeight {
@@ -174,20 +170,20 @@ impl ModelLoadPlan {
             paths: BankPaths::Unpriced,
             recording: self.recorded_routes,
         };
-        for weight in &mut self.target {
-            let Some((_, layer)) = bank.layer(weight.role.scope) else {
-                continue;
-            };
-            if RoutedTensor::of(weight.role.kind).is_none() {
-                continue;
+        for layer in bank.layers() {
+            let records = bank.records(layer.group);
+            for (kind, _) in layer.resident.iter() {
+                if let Some(weight) = self.target_weight_mut(WeightRole { scope: layer.scope, kind: kind.kind() }) {
+                    weight.shape[0] = records;
+                    // The bank holds the values: empty, or every expert imported
+                    // into its records (`ExpertBankPlan::whole`).
+                    weight.source_bytes = 0;
+                    weight.holding = Holding::Banked { group: layer.group };
+                }
             }
-            weight.shape[0] = bank.records(layer.group);
-            // The bank holds the values: empty, or every expert imported
-            // into its records (`ExpertBankPlan::whole`).
-            weight.source_bytes = 0;
-            weight.holding = Holding::Banked { group: layer.group };
         }
         self.bank = Some(bank);
+        self.rebuild_bank_table_index();
         self.with_front_stagings().with_bank_slots(slots, slots)
     }
 
@@ -198,7 +194,7 @@ impl ModelLoadPlan {
     /// (`ExpertBankPlan::banked_bytes`). Everything else of the plan, its
     /// program plan included, is of the bank's structure alone.
     pub fn with_bank_slots(mut self, slots: u64, ceiling: u64) -> Result<Self, PlanError> {
-        let bank = self.bank.as_mut().ok_or(PlanError::Topology("a plan without a bank has no slots"))?;
+        let mut bank = self.bank.take().ok_or(PlanError::Topology("a plan without a bank has no slots"))?;
         if slots < bank.floor() || slots > ceiling || ceiling > bank.widest().get() {
             return Err(PlanError::Topology(
                 "an expert bank holds from its floor to its ceiling, at most every expert of each layer",
@@ -207,20 +203,19 @@ impl ModelLoadPlan {
         bank.slots = slots;
         bank.ceiling = ceiling;
         bank.resident = slots == bank.widest().get();
-        let bank = self.bank.as_ref().expect("the bank was just resized");
-        for weight in &mut self.target {
-            let Some((index, _)) = bank.layer(weight.role.scope) else {
-                continue;
-            };
-            let Some(kind) = RoutedTensor::of(weight.role.kind) else {
-                continue;
-            };
-            weight.resident_bytes = *bank
+        for (index, layer) in bank.layers().iter().enumerate() {
+            let bytes = bank
                 .banked_bytes(index)
-                .map_err(PlanError::InvalidDefinition)?
-                .get(kind)
-                .ok_or(PlanError::Topology("a banked layer's stack outside its record"))?;
+                .map_err(PlanError::InvalidDefinition)?;
+            for (kind, _) in layer.resident.iter() {
+                if let Some(weight) = self.target_weight_mut(WeightRole { scope: layer.scope, kind: kind.kind() }) {
+                    weight.resident_bytes = *bytes
+                        .get(kind)
+                        .ok_or(PlanError::Topology("a banked layer's stack outside its record"))?;
+                }
+            }
         }
+        self.bank = Some(bank);
         Ok(self)
     }
 
@@ -241,14 +236,13 @@ impl ModelLoadPlan {
     pub(crate) fn with_bank_paths(mut self, paths: BankPaths) -> Result<Self, PlanError> {
         let mut bank = self.bank.take().ok_or(PlanError::Topology("a plan without a bank has no path"))?;
         bank.paths = paths;
-        for weight in &mut self.target {
-            let Some((_, layer)) = bank.layer(weight.role.scope) else {
-                continue;
-            };
-            if RoutedTensor::of(weight.role.kind).is_none() {
-                continue;
+        for layer in bank.layers() {
+            let records = bank.records(layer.group);
+            for (kind, _) in layer.resident.iter() {
+                if let Some(weight) = self.target_weight_mut(WeightRole { scope: layer.scope, kind: kind.kind() }) {
+                    weight.shape[0] = records;
+                }
             }
-            weight.shape[0] = bank.records(layer.group);
         }
         let slots = bank.slots.max(bank.floor()).min(bank.ceiling);
         let ceiling = bank.ceiling;
@@ -278,11 +272,16 @@ impl ModelLoadPlan {
         let Some(bank) = self.bank.take() else {
             return self;
         };
-        for weight in &mut self.target {
-            if let Some(resident) = bank.resident_plan(weight.role) {
-                *weight = resident.clone();
+        self.rebuild_bank_table_index();
+        for layer in bank.layers() {
+            for (_, resident) in layer.resident.iter() {
+                if let Some(weight) = self.target_weight_mut(resident.role) {
+                    *weight = resident.clone();
+                }
             }
-            if let Some(table) = bank.tables.iter().find(|table| table.role == weight.role) {
+        }
+        for table in &bank.tables {
+            if let Some(weight) = self.target_weight_mut(table.role) {
                 *weight = table.fixed.clone();
             }
         }

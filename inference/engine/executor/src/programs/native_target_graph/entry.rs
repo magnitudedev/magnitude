@@ -1,28 +1,21 @@
 use super::weights::{
     CheckedLandingEntries, LandedReadPorts, LandingEntries, PlannedWeights, WeightView, activation, landed_read,
 };
-use crate::programs::graph::{
-    draft::Certified,
-    facts::{FactIndex, FactSink, Facts, RealIndex},
-};
+use crate::programs::graph::draft::{Certified, ElementBoundDraft, GraphDraft};
 use crate::{
     ModelLoadPlan, TargetProgramPlan,
     native::AttestedTarget,
     operators::per_layer::graph::{PerLayerEntryEntries, PerLayerEntryPorts, per_layer_entry, split_entry},
-    programs::graph::{GraphError, draft::GraphDraft},
+    programs::graph::GraphError,
     stored_table::SelectionNotice,
 };
 use magnitude_family_contracts::{Decoder, EmbeddingScale, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{embedding_rows, selection_notice};
 #[cfg(test)]
-use seismic::NativeGraphStorageBytes;
+use seismic::{NativeGraphMetadata, NativeGraphStorageBytes};
 use seismic::{
-    Argument, BackendName, ClassFact, NativeGraphClassSlice, NativeGraphMetadata, NativeGraphResourceTemplate,
-    NativeGraphTraces,
-};
-use seismic::{
-    Device, Dim, Element, NativeGraphLayout, NativeGraphPlan, NativePort, NativeTimelinePort,
-    WorkflowTensor,
+    Argument, BackendName, Device, Dim, Element, NativeGraphClassSlice, NativeGraphLayout,
+    NativeGraphPlan, NativePort, NativeTimelinePort, WorkflowTensor,
 };
 
 /// The per-layer entry graph of one row class.
@@ -266,7 +259,7 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     if keeps_guesses && !keeps_tokens {
         return Err("a load that fronts keeps its token rows".into());
     }
-    let table = graph.port(weight.resident, &weight.shape)?;
+    let table = graph.weight_port(weight.resident, &weight.shape)?;
     let two = Dim::from(2);
     // Uploaded tokens are the host's: of a streamed table it writes their
     // slots. Selected tokens are the device's, which finds their slots in
@@ -382,56 +375,8 @@ pub(super) fn keep_tokens<'a, G: GraphDraft + 'a>(
     Ok(KeptTokens { uploaded, rows: copied })
 }
 
-/// What decides a target entry graph's topology: everything it is built
-/// from but its numbers (its token table's extents, its rows and width),
-/// which are facts of its trace (`certify_entry`).
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) struct EntryTopology {
-    backend: BackendName,
-    source: EntryTokens,
-    activation: Element,
-    notifies: bool,
-    landing: Option<CheckedLandingEntries>,
-    keeps_tokens: bool,
-    fronts: bool,
-    transform: (RealIndex, i32, RealIndex),
-    table: WeightView<FactIndex>,
-    rows: FactIndex,
-    hidden: FactIndex,
-}
-
-/// The target entry graphs' traces, one per topology.
-pub(super) static ENTRY_TRACES: NativeGraphTraces<EntryTopology, ()> = NativeGraphTraces::new();
-
-/// The template of a target entry graph of `topology` at `facts`.
-fn record_entry(
-    topology: &EntryTopology,
-    facts: &[Dim],
-    reals: &seismic::Reals,
-) -> Result<(NativeGraphResourceTemplate, ()), GraphError> {
-    let facts = Facts::new(facts, reals);
-    let weight = facts.dims(topology.table.clone());
-    let elements = [("EW", weight.resident), ("A", topology.activation)];
-    let (scale, normalize, epsilon) = topology.transform;
-    let draft = entry_graph_topology(
-        NativeGraphMetadata::new_template(topology.backend),
-        &elements,
-        (topology.notifies || topology.keeps_tokens).then_some(&[][..]),
-        topology.notifies,
-        topology.landing.as_ref().map(CheckedLandingEntries::entries),
-        topology.keeps_tokens,
-        topology.fronts,
-        &weight,
-        EntryWidth { hidden: &facts.dim(topology.hidden), transform: (facts.real(scale).f32(), normalize, facts.real(epsilon).f32()) },
-        &facts.dim(topology.rows),
-        topology.source,
-    )?;
-    Ok((draft.graph.seal_template()?, ()))
-}
-
 /// The target entry graph of `source`, certified over the row classes
-/// `row_classes`, the largest `largest_rows`: from the entry graphs' traces
-/// (`Certified::traced_each`).
+/// `row_classes`, the largest `largest_rows`.
 pub(super) fn certify_entry<L: Certified>(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -440,29 +385,31 @@ pub(super) fn certify_entry<L: Certified>(
     row_classes: &[u64],
     largest_rows: u64,
 ) -> Result<L, GraphError> {
-    let (scale, normalize, epsilon) = embedding_transform(geometry);
-    let mut facts = FactSink::new();
-    let topology = EntryTopology {
-        backend,
+    let weight = load.weight(TARGET_TABLE)?;
+    let elements = [("EW", weight.resident), ("A", activation(geometry))];
+    let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
+    let draft = entry_graph_topology(
+        L::new_draft(backend),
+        L::Draft::bind(&elements),
+        load.copies_token_rows().then(|| L::Draft::bind(&[][..])),
+        load.notifies_selection(),
+        landing.as_ref().map(CheckedLandingEntries::entries),
+        load.keeps_token_rows(),
+        load.fronts(),
+        &weight,
+        EntryWidth {
+            hidden: &Dim::from(geometry.hidden),
+            transform: transform_arguments(embedding_transform(geometry)),
+        },
+        &Dim::from(largest_rows),
         source,
-        activation: activation(geometry),
-        notifies: load.notifies_selection(),
-        landing: CheckedLandingEntries::of(load, TARGET_TABLE)?,
-        keeps_tokens: load.keeps_token_rows(),
-        fronts: load.fronts(),
-        transform: (facts.real(f64::from(scale)), normalize, facts.real(f64::from(epsilon))),
-        table: facts.index(WeightView::planned(load, TARGET_TABLE)?),
-        rows: facts.fact(largest_rows),
-        hidden: facts.fact(geometry.hidden),
-    };
-    let rows = ClassFact { fact: topology.rows.position(), scope: None, dimension: "M" };
-    let slices = [vec![NativeGraphClassSlice::new().dimension("M", row_classes.iter().copied())]];
-    let [(layout, ())] = <[_; 1]>::try_from(
-        L::traced_each(&ENTRY_TRACES, &topology, &facts, &[rows], &slices, record_entry)
-            .map_err(|error| error.context("target entry graph"))?,
     )
-    .unwrap_or_else(|_| unreachable!("one slice set certifies to one layout"));
-    Ok(layout)
+    .map_err(|error| error.context("target entry graph"))?;
+    L::certify_one(
+        draft.graph,
+        vec![NativeGraphClassSlice::new().dimension("M", row_classes.iter().copied())],
+    )
+    .map_err(|error| error.context("target entry graph"))
 }
 
 /// What an entry graph embeds into: the rows' width and `embedding_rows`'

@@ -7,10 +7,10 @@ use super::classes::Topology;
 use super::entry::EntryTokens;
 use crate::{
     ModelLoadPlan, PassLaunches, ResourceLimits, StateResourcePlan, TargetProgramPlan,
-    programs::graph::draft::Certified,
+    programs::graph::{draft::Certified, sizing::SizingOutline},
 };
 use magnitude_family_contracts::Decoder;
-use seismic::{BackendName, HostHeap, NativeGraphLayout, NativeGraphOutline, NativeGraphStorageBytes};
+use seismic::{BackendName, HostHeap, NativeGraphLayout, NativeGraphStorageBytes};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ pub(crate) fn target_outline_differences(
     pass: PassLaunches,
 ) -> (Vec<String>, [Duration; 2], usize) {
     let began = Instant::now();
-    let outlined = certify_target_and_undrafted::<NativeGraphOutline>(backend, load, geometry, state, plan, limits, pass);
+    let outlined = certify_target_and_undrafted::<SizingOutline>(backend, load, geometry, state, plan, limits, pass);
     let outlining = began.elapsed();
     let began = Instant::now();
     let laid = certify_target_and_undrafted::<NativeGraphLayout>(backend, load, geometry, state, plan, limits, pass);
@@ -84,7 +84,7 @@ fn blocks<L: Certified>(
 
 fn compare(
     differences: &mut Vec<String>,
-    outlined: &TargetFamilyCertificate<NativeGraphOutline>,
+    outlined: &TargetFamilyCertificate<SizingOutline>,
     laid: &TargetFamilyCertificate<NativeGraphLayout>,
     limits: ResourceLimits,
 ) {
@@ -128,15 +128,14 @@ fn entries<L: Certified>(
     entries.iter().map(|(&source, layout)| (source, charge(layout))).collect()
 }
 
-/// The traces the target family's graphs recorded so far, entries' and
-/// blocks' (`NativeGraphTraces::recorded`).
+/// Direct contract sizing records zero traces.
 pub(crate) fn recorded_traces() -> usize {
-    super::entry::ENTRY_TRACES.recorded() + super::block::BLOCK_TRACES.recorded()
+    0
 }
 
 /// How many graphs the outlined drafted and undrafted families of `plan`
-/// hold: each an answer of the traces, or a recording.
-pub(crate) fn outlined_graphs(certificates: &[TargetFamilyCertificate<NativeGraphOutline>]) -> usize {
+/// hold.
+pub(crate) fn outlined_graphs(certificates: &[TargetFamilyCertificate<SizingOutline>]) -> usize {
     certificates
         .iter()
         .map(|family| {

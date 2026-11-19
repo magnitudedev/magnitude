@@ -21,7 +21,8 @@ use magnitude_artifacts::catalog_headers::ComponentRole;
 use magnitude_artifacts::{ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest};
 use magnitude_family_common::headers;
 use magnitude_family_registry::FAMILIES;
-use seismic::{BackendName, NativeGraphLayout, NativeGraphOutline};
+use crate::programs::graph::sizing::SizingOutline;
+use seismic::{BackendName, NativeGraphLayout};
 use std::time::{Duration, Instant};
 
 fn every_served_projector_outlines_its_vision_graphs_from_traces(backend: BackendName) {
@@ -79,7 +80,7 @@ fn every_served_projector_outlines_its_vision_graphs_from_traces(backend: Backen
             .unwrap_or_else(|error| panic!("{name}: its patch classes: {error}"));
         let traces = vision_traces_recorded();
         let began = Instant::now();
-        let outlined = certified_vision_family::<NativeGraphOutline>(backend, &load, description, &classes);
+        let outlined = certified_vision_family::<SizingOutline>(backend, &load, description, &classes);
         let elapsed = began.elapsed();
         let tally = match vision_traces_recorded() == traces {
             true => &mut answered,

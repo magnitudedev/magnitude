@@ -69,6 +69,7 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & 
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
+    common_chat_apply_cached_parser(tmpl, inputs, "", data, [&](common_chat_params & data) {
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto start           = p.rule("start", p.literal("<|start|>assistant"));
         auto end             = p.rule("end", p.literal("<|end|>"));
@@ -162,6 +163,7 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & 
             { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "<\\|start\\|>assistant(<\\|channel\\|>(?:commentary|analysis)\\s+to)" }
         };
     }
+    });
 
     return data;
 }

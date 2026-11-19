@@ -10,6 +10,7 @@
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 
@@ -24,14 +25,6 @@ struct template_state {
     json special_tokens;
     bool reads_preserve_thinking;
 };
-// Whether the template source names `preserve_thinking` as a Jinja identifier,
-// decided from its tokens so text and string literals do not count.
-bool reads_preserve_thinking(const std::string & source) {
-    for (const auto & token : jinja::lexer().tokenize(source).tokens) {
-        if (token.t == jinja::token::identifier && token.value == "preserve_thinking") { return true; }
-    }
-    return false;
-}
 // A schema keyword the prepared constraint does not enforce, for a tool's
 // arguments (named) or for the JSON output (unnamed).
 struct subject_relaxation {
@@ -44,14 +37,13 @@ struct subject_relaxation {
 };
 struct prepared_state {
     common_chat_params parameters;
-    common_chat_parser_params parser;
     std::vector<std::string> diagnostics;
     std::set<subject_relaxation> relaxations;
     uint64_t renders;
 };
 std::mutex mutex;
 uint64_t next_handle = 1;
-std::unordered_map<uint64_t, std::unique_ptr<template_state>> templates;
+std::unordered_map<uint64_t, std::shared_ptr<const template_state>> templates;
 std::unordered_map<uint64_t, std::shared_ptr<const prepared_state>> requests;
 std::unordered_map<uint64_t, std::unique_ptr<templates_native::output_stream>> streams;
 std::unordered_map<uint64_t, std::unique_ptr<std::string>> buffers;
@@ -119,10 +111,14 @@ json payload(const uint8_t * input, uint64_t size) {
     return data;
 }
 
-template_state & get_template(uint64_t handle) {
+std::shared_ptr<const template_state> get_template_shared(uint64_t handle) {
     auto it = templates.find(handle);
     if (it == templates.end()) { throw abi_error(TEMPLATES_INVALID_HANDLE, "Unknown or released template handle"); }
-    return *it->second;
+    return it->second;
+}
+
+const template_state & get_template(uint64_t handle) {
+    return *get_template_shared(handle);
 }
 
 void require_output(const void * output) {
@@ -138,6 +134,161 @@ templates_native::output_stream & get_stream(uint64_t handle) {
     auto it = streams.find(handle);
     if (it == streams.end()) { throw abi_error(TEMPLATES_INVALID_HANDLE, "Unknown or released stream"); }
     return *it->second;
+}
+
+void append_json_string(std::string & out, std::string_view s) {
+    static constexpr char hex[] = "0123456789abcdef";
+    out.push_back('"');
+    const char * data = s.data();
+    const size_t len = s.size();
+    size_t start = 0;
+    for (size_t i = 0; i < len; ++i) {
+        const auto c = static_cast<unsigned char>(data[i]);
+        if (c >= 0x20 && c != '"' && c != '\\') {
+            continue;
+        }
+        if (i > start) {
+            out.append(data + start, i - start);
+        }
+        switch (c) {
+            case '"':  out.append("\\\"", 2); break;
+            case '\\': out.append("\\\\", 2); break;
+            case '\b': out.append("\\b", 2);  break;
+            case '\f': out.append("\\f", 2);  break;
+            case '\n': out.append("\\n", 2);  break;
+            case '\r': out.append("\\r", 2);  break;
+            case '\t': out.append("\\t", 2);  break;
+            default: {
+                const char escaped[6] = {'\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f]};
+                out.append(escaped, 6);
+                break;
+            }
+        }
+        start = i + 1;
+    }
+    if (len > start) {
+        out.append(data + start, len - start);
+    }
+    out.push_back('"');
+}
+
+void append_json_string_array(std::string & out, const std::vector<std::string> & values) {
+    out.push_back('[');
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            out.push_back(',');
+        }
+        append_json_string(out, values[i]);
+    }
+    out.push_back(']');
+}
+
+void append_json_hash128(std::string & out, std::string_view s) {
+    // Two independent 64-bit FNV-1a/SplitMix64 streams over bytes + length,
+    // finalized with SplitMix64 avalanche (128 bits = 32 hex chars).
+    uint64_t h1 = 0xcbf29ce484222325ULL;
+    uint64_t h2 = 0x84222325cbf29ce4ULL;
+    const auto * data = reinterpret_cast<const unsigned char *>(s.data());
+    const size_t len = s.size();
+    for (size_t i = 0; i < len; ++i) {
+        const uint64_t b = data[i];
+        h1 = (h1 ^ b) * 0x100000001b3ULL;
+        h2 = (h2 ^ (b + 0x9e3779b97f4a7c15ULL)) * 0x9e3779b185ebca87ULL;
+    }
+    h1 ^= static_cast<uint64_t>(len);
+    h2 ^= static_cast<uint64_t>(len) * 0xbf58476d1ce4e5b9ULL;
+    auto finalize = [](uint64_t x) -> uint64_t {
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    };
+    h1 = finalize(h1);
+    h2 = finalize(h2);
+
+    static constexpr char hex[] = "0123456789abcdef";
+    char buf[34];
+    buf[0] = '"';
+    for (int i = 0; i < 16; ++i) {
+        buf[1 + i] = hex[(h1 >> (60 - i * 4)) & 0x0f];
+        buf[17 + i] = hex[(h2 >> (60 - i * 4)) & 0x0f];
+    }
+    buf[33] = '"';
+    out.append(buf, sizeof(buf));
+}
+
+prepared_state apply_request_payload(const template_state & state, const uint8_t * input, uint64_t size) {
+    auto data = payload(input, size);
+    common_chat_templates_inputs request;
+    request.messages = common_chat_msgs_parse_oaicompat(data.at("messages"));
+    if (request.messages.empty()) { throw std::invalid_argument("Request requires messages"); }
+    request.tool_choice = common_chat_tool_choice_parse_oaicompat(data.value("tool_choice", std::string("auto")));
+    // Thinking is enabled unless the caller turns it off, as in upstream
+    // common chat, so a template's own `enable_thinking` fallback never
+    // decides the default.
+    request.enable_thinking = true;
+    // Schemas are valid JSON Schemas (the host admits only those) and
+    // always lower; lowering records what the constraint does not enforce.
+    std::set<subject_relaxation> relaxations;
+    auto lower = [&](const std::optional<std::string> & tool, const json & schema) {
+        for (auto & relaxation : common_chat_schema_from_json(schema).relaxations) {
+            relaxations.insert({ tool, std::move(relaxation) });
+        }
+    };
+    if (request.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && data.contains("tools")) {
+        for (const auto & tool : data.at("tools")) {
+            const auto & function = tool.at("function");
+            lower(function.at("name").get<std::string>(), common_chat_tool_parameters(function));
+        }
+        request.tools = common_chat_tools_parse_oaicompat(data.at("tools"));
+    }
+    request.parallel_tool_calls = data.value("parallel_tool_calls", true);
+    request.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    auto now = data.at("now").get<int64_t>();
+    const auto max_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::duration::max()).count();
+    const auto min_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::duration::min()).count();
+    if (now < min_seconds || now > max_seconds) { throw std::invalid_argument("Timestamp outside native clock range"); }
+    request.now = std::chrono::system_clock::from_time_t(static_cast<time_t>(now));
+    if (data.contains("template_arguments")) {
+        const auto & arguments = data.at("template_arguments");
+        if (!arguments.is_object()) { throw std::invalid_argument("template_arguments must be an object"); }
+        const std::vector<std::string> reserved = {"messages", "tools", "bos_token", "eos_token",
+            "add_generation_prompt", "tokenize", "chat_template", "now", "date_string", "datetime"};
+        for (const auto & [key, value] : arguments.items()) {
+            if (std::find(reserved.begin(), reserved.end(), key) != reserved.end() || state.special_tokens.contains(key)) {
+                throw std::invalid_argument("Reserved template argument: " + key);
+            }
+            request.chat_template_kwargs[key] = value.dump();
+            if (key == "enable_thinking") { request.enable_thinking = value.get<bool>(); }
+        }
+    }
+    // Reasoning stays on every assistant message unless the caller turns it
+    // off, so a new user message appends to the previous prompt instead of
+    // rewriting earlier replies, and the prefix cache reuses earlier tasks.
+    if (state.reads_preserve_thinking && !request.chat_template_kwargs.count("preserve_thinking")) {
+        request.chat_template_kwargs["preserve_thinking"] = "true";
+    }
+    if (data.contains("json_schema")) {
+        if (!request.tools.empty()) { throw std::invalid_argument("Combining tools with JSON output is unsupported"); }
+        lower(std::nullopt, data.at("json_schema"));
+        request.json_schema = data.at("json_schema").dump();
+    }
+    prepared_state prepared;
+    prepared.parameters = common_chat_templates_apply(state.compiled.get(), request);
+    // Extracted generators enforce the whole completion. Specialized handlers
+    // may still provide activation metadata, which has no meaning in this mode.
+    if (prepared.parameters.grammar_lazy) {
+        throw std::logic_error("Unexpected lazy grammar from extracted generator");
+    }
+    prepared.parameters.grammar_triggers.clear();
+    prepared.diagnostics = templates_native::diagnostics;
+    prepared.renders = templates_native::renders;
+    for (auto & recorded : templates_native::relaxations) {
+        relaxations.insert({ recorded.tool, std::move(recorded.relaxation) });
+    }
+    prepared.relaxations = std::move(relaxations);
+    return prepared;
 }
 }
 
@@ -174,11 +325,11 @@ int32_t templates_template_create(const uint8_t * input, uint64_t size,
         for (const auto & [key, value] : tokens.items()) {
             if (!value.is_string()) { throw std::invalid_argument("Special token values must be strings"); }
         }
-        auto state = std::make_unique<template_state>();
+        auto state = std::make_shared<template_state>();
         state->compiled = common_chat_templates_init(source,
             tokens.value("bos_token", std::string()), tokens.value("eos_token", std::string()));
         state->special_tokens = std::move(tokens);
-        state->reads_preserve_thinking = reads_preserve_thinking(source);
+        state->reads_preserve_thinking = common_chat_templates_reads_preserve_thinking(state->compiled.get());
         auto id = allocate_handle();
         templates.emplace(id, std::move(state));
         *output = id;
@@ -196,7 +347,12 @@ int32_t templates_template_inspect(uint64_t handle, templates_buffer * output, t
     return guarded(error, [&] {
         require_output(output);
         auto & state = get_template(handle);
-        *output = owned(json({{"version", 1}, {"capabilities", common_chat_templates_get_caps(state.compiled.get())}}).dump());
+        *output = owned(json({
+            {"version", 1},
+            {"capabilities", common_chat_templates_get_caps(state.compiled.get())},
+            {"handler_context_variables", common_chat_templates_handler_context_variables(state.compiled.get())},
+            {"template_reasoning_identifiers", common_chat_templates_reasoning_identifiers(state.compiled.get())}
+        }).dump());
     });
 }
 
@@ -224,86 +380,80 @@ int32_t templates_template_render(uint64_t handle, const uint8_t * input, uint64
     });
 }
 
+int32_t templates_template_probe(uint64_t handle, const uint8_t * input, uint64_t size,
+    templates_buffer * output, templates_buffer * error) {
+    if (output) { *output = {}; }
+    if (!error) { return TEMPLATES_INVALID_ARGUMENT; }
+    *error = {};
+    auto record_error = [&](const char * message) {
+        std::lock_guard<std::mutex> lock(mutex);
+        *error = owned(message);
+    };
+    try {
+        try {
+            require_output(output);
+            std::shared_ptr<const template_state> state_ptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                state_ptr = get_template_shared(handle);
+            }
+            templates_native::diagnostics.clear();
+            templates_native::relaxations.clear();
+            templates_native::renders = 0;
+            auto prepared = apply_request_payload(*state_ptr, input, size);
+            const auto & params = prepared.parameters;
+            std::string out;
+            out.reserve(params.prompt.size() + params.generation_prompt.size() + params.thinking_start_tag.size() + 256);
+            out.append("{\"prompt\":");
+            append_json_string(out, params.prompt);
+            out.append(",\"generation_prefix\":");
+            append_json_string(out, params.generation_prompt);
+            out.append(",\"parser_hash\":");
+            append_json_hash128(out, params.parser);
+            out.append(",\"grammar_hash\":");
+            append_json_hash128(out, params.grammar);
+            out.append(",\"supports_thinking\":");
+            out.append(params.supports_thinking ? "true" : "false");
+            out.append(",\"thinking_start\":");
+            append_json_string(out, params.thinking_start_tag);
+            out.append(",\"thinking_ends\":");
+            append_json_string_array(out, params.thinking_end_tags);
+            out.push_back('}');
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                *output = owned(std::move(out));
+            }
+            return TEMPLATES_OK;
+        } catch (const abi_error & e) {
+            record_error(e.what());
+            return e.status;
+        } catch (const std::invalid_argument & e) {
+            record_error(e.what());
+            return TEMPLATES_INVALID_ARGUMENT;
+        } catch (const std::bad_alloc &) {
+            throw;
+        } catch (const std::exception & e) {
+            record_error(e.what());
+            return TEMPLATES_NATIVE_ERROR;
+        }
+    } catch (const std::bad_alloc &) {
+        static const std::string_view message = "Native templates allocation failed";
+        *error = {reinterpret_cast<const uint8_t *>(message.data()), message.size(), 0};
+        return TEMPLATES_OUT_OF_MEMORY;
+    } catch (...) {
+        static const std::string_view message = "Unknown native templates failure";
+        *error = {reinterpret_cast<const uint8_t *>(message.data()), message.size(), 0};
+        return TEMPLATES_NATIVE_ERROR;
+    }
+}
+
 int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_t size,
     uint64_t * output, templates_buffer * error) {
     if (output) { *output = 0; }
     return guarded(error, [&] {
         require_output(output);
         auto & state = get_template(handle);
-        auto data = payload(input, size);
-        common_chat_templates_inputs request;
-        request.messages = common_chat_msgs_parse_oaicompat(data.at("messages"));
-        if (request.messages.empty()) { throw std::invalid_argument("Request requires messages"); }
-        request.tool_choice = common_chat_tool_choice_parse_oaicompat(data.value("tool_choice", std::string("auto")));
-        // Thinking is enabled unless the caller turns it off, as in upstream
-        // common chat, so a template's own `enable_thinking` fallback never
-        // decides the default.
-        request.enable_thinking = true;
-        // Schemas are valid JSON Schemas (the host admits only those) and
-        // always lower; lowering records what the constraint does not enforce.
-        std::set<subject_relaxation> relaxations;
-        auto lower = [&](const std::optional<std::string> & tool, const json & schema) {
-            for (auto & relaxation : common_chat_schema_from_json(schema).relaxations) {
-                relaxations.insert({ tool, std::move(relaxation) });
-            }
-        };
-        if (request.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && data.contains("tools")) {
-            for (const auto & tool : data.at("tools")) {
-                const auto & function = tool.at("function");
-                lower(function.at("name").get<std::string>(), common_chat_tool_parameters(function));
-            }
-            request.tools = common_chat_tools_parse_oaicompat(data.at("tools"));
-        }
-        request.parallel_tool_calls = data.value("parallel_tool_calls", true);
-        request.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-        auto now = data.at("now").get<int64_t>();
-        const auto max_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::duration::max()).count();
-        const auto min_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::duration::min()).count();
-        if (now < min_seconds || now > max_seconds) { throw std::invalid_argument("Timestamp outside native clock range"); }
-        request.now = std::chrono::system_clock::from_time_t(static_cast<time_t>(now));
-        if (data.contains("template_arguments")) {
-            const auto & arguments = data.at("template_arguments");
-            if (!arguments.is_object()) { throw std::invalid_argument("template_arguments must be an object"); }
-            const std::vector<std::string> reserved = {"messages", "tools", "bos_token", "eos_token",
-                "add_generation_prompt", "tokenize", "chat_template", "now", "date_string", "datetime"};
-            for (const auto & [key, value] : arguments.items()) {
-                if (std::find(reserved.begin(), reserved.end(), key) != reserved.end() || state.special_tokens.contains(key)) {
-                    throw std::invalid_argument("Reserved template argument: " + key);
-                }
-                request.chat_template_kwargs[key] = value.dump();
-                if (key == "enable_thinking") { request.enable_thinking = value.get<bool>(); }
-            }
-        }
-        // Reasoning stays on every assistant message unless the caller turns it
-        // off, so a new user message appends to the previous prompt instead of
-        // rewriting earlier replies, and the prefix cache reuses earlier tasks.
-        if (state.reads_preserve_thinking && !request.chat_template_kwargs.count("preserve_thinking")) {
-            request.chat_template_kwargs["preserve_thinking"] = "true";
-        }
-        if (data.contains("json_schema")) {
-            if (!request.tools.empty()) { throw std::invalid_argument("Combining tools with JSON output is unsupported"); }
-            lower(std::nullopt, data.at("json_schema"));
-            request.json_schema = data.at("json_schema").dump();
-        }
-        auto prepared = std::make_shared<prepared_state>();
-        prepared->parameters = common_chat_templates_apply(state.compiled.get(), request);
-        // Extracted generators enforce the whole completion. Specialized handlers
-        // may still provide activation metadata, which has no meaning in this mode.
-        if (prepared->parameters.grammar_lazy) {
-            throw std::logic_error("Unexpected lazy grammar from extracted generator");
-        }
-        prepared->parameters.grammar_triggers.clear();
-        prepared->parser = common_chat_parser_params(prepared->parameters);
-        prepared->parser.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-        if (!prepared->parameters.parser.empty()) { prepared->parser.parser.load(prepared->parameters.parser); }
-        prepared->diagnostics = templates_native::diagnostics;
-        prepared->renders = templates_native::renders;
-        for (auto & recorded : templates_native::relaxations) {
-            relaxations.insert({ recorded.tool, std::move(recorded.relaxation) });
-        }
-        prepared->relaxations = std::move(relaxations);
+        auto prepared = std::make_shared<prepared_state>(apply_request_payload(state, input, size));
         auto id = allocate_handle();
         requests.emplace(id, std::move(prepared));
         *output = id;
@@ -316,26 +466,75 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
         require_output(output);
         const auto & state = get_request(handle);
         const auto & params = state.parameters;
-        json triggers = json::array();
-        for (const auto & trigger : params.grammar_triggers) {
-            triggers.push_back(json({{"type", static_cast<int>(trigger.type)}, {"value", trigger.value}, {"token", trigger.token}}));
+        std::string out;
+        out.reserve(params.prompt.size() + params.generation_prompt.size() + params.parser.size() + params.grammar.size() + 1024);
+        out.append("{\"version\":1,\"prompt\":");
+        append_json_string(out, params.prompt);
+        out.append(",\"generation_prefix\":");
+        append_json_string(out, params.generation_prompt);
+        out.append(",\"parser\":");
+        append_json_string(out, params.parser);
+        out.append(",\"format\":");
+        append_json_string(out, common_chat_format_name(params.format));
+        out.append(",\"grammar\":");
+        append_json_string(out, params.grammar);
+        out.append(",\"grammar_dialect\":\"gbnf\",\"grammar_initial_prefix\":");
+        append_json_string(out, params.grammar.empty() ? std::string_view() : std::string_view(params.generation_prompt));
+        out.append(",\"grammar_lazy\":");
+        out.append(params.grammar_lazy ? "true" : "false");
+        out.append(",\"grammar_triggers\":[");
+        for (size_t i = 0; i < params.grammar_triggers.size(); ++i) {
+            if (i > 0) {
+                out.push_back(',');
+            }
+            const auto & trigger = params.grammar_triggers[i];
+            out.append("{\"type\":");
+            out.append(std::to_string(static_cast<int>(trigger.type)));
+            out.append(",\"value\":");
+            append_json_string(out, trigger.value);
+            out.append(",\"token\":");
+            out.append(std::to_string(trigger.token));
+            out.push_back('}');
         }
-        json relaxations = json::array();
+        out.append("],\"preserved_tokens\":");
+        append_json_string_array(out, params.preserved_tokens);
+        out.append(",\"additional_stops\":");
+        append_json_string_array(out, params.additional_stops);
+        out.append(",\"supports_thinking\":");
+        out.append(params.supports_thinking ? "true" : "false");
+        out.append(",\"thinking_start\":");
+        append_json_string(out, params.thinking_start_tag);
+        out.append(",\"thinking_ends\":");
+        append_json_string_array(out, params.thinking_end_tags);
+        out.append(",\"diagnostics\":");
+        append_json_string_array(out, state.diagnostics);
+        out.append(",\"relaxations\":[");
+        bool first_relaxation = true;
         for (const auto & [tool, relaxation] : state.relaxations) {
-            json subject = tool ? json({{"kind", "tool"}, {"name", *tool}}) : json({{"kind", "output"}});
-            relaxations.push_back(json({{"subject", subject}, {"path", relaxation.path}, {"keyword", relaxation.keyword},
-                {"reason", common_chat_schema_relaxation::reason_name(relaxation.reason)}}));
+            if (!first_relaxation) {
+                out.push_back(',');
+            }
+            first_relaxation = false;
+            out.append("{\"subject\":");
+            if (tool) {
+                out.append("{\"kind\":\"tool\",\"name\":");
+                append_json_string(out, *tool);
+                out.push_back('}');
+            } else {
+                out.append("{\"kind\":\"output\"}");
+            }
+            out.append(",\"path\":");
+            append_json_string(out, relaxation.path);
+            out.append(",\"keyword\":");
+            append_json_string(out, relaxation.keyword);
+            out.append(",\"reason\":");
+            append_json_string(out, common_chat_schema_relaxation::reason_name(relaxation.reason));
+            out.push_back('}');
         }
-        *output = owned(json({{"version", 1}, {"prompt", params.prompt},
-            {"generation_prefix", params.generation_prompt}, {"parser", params.parser},
-            {"format", common_chat_format_name(params.format)},
-            {"grammar", params.grammar}, {"grammar_dialect", "gbnf"},
-            {"grammar_initial_prefix", params.grammar.empty() ? std::string() : params.generation_prompt},
-            {"grammar_lazy", params.grammar_lazy}, {"grammar_triggers", triggers},
-            {"preserved_tokens", params.preserved_tokens}, {"additional_stops", params.additional_stops},
-            {"supports_thinking", params.supports_thinking}, {"thinking_start", params.thinking_start_tag},
-            {"thinking_ends", params.thinking_end_tags}, {"diagnostics", state.diagnostics},
-            {"relaxations", relaxations}, {"renders", state.renders}}).dump());
+        out.append("],\"renders\":");
+        out.append(std::to_string(state.renders));
+        out.push_back('}');
+        *output = owned(std::move(out));
     });
 }
 

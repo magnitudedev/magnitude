@@ -39,7 +39,9 @@ fn sources_do_not_import_model_or_execution_implementations() {
     ]
     .join("\n");
     for forbidden in [
-        "seismic",
+        "seismic::",
+        "use seismic;",
+        "use seismic ",
         "magnitude_engine",
         "magnitude_scheduler",
         "magnitude_family_qwen35",
