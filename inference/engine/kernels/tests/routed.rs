@@ -6964,9 +6964,10 @@ fn streaming_copy_walks_a_list_past_its_first_chunk() {
 /// run of its own: `records` records of `per` bytes in a host tier (every
 /// byte `record % 251`), `copied` of them listed (record r into slot r) for
 /// the step, into device slots, the copy reading the tier in place over the
-/// link as a bank's fill does.
+/// link as a bank's fill does. The copy waits at a host gate each run binds.
 struct TierFill {
     plan: seismic::NativeGraphPlan,
+    gate: seismic::NativeTimelinePort<seismic::timeline::Gate>,
     ports: [seismic::NativePort; 5],
     tensors: [seismic::Tensor; 5],
     _tier: seismic::SlabTensor,
@@ -6996,6 +6997,7 @@ impl TierFill {
         let mut port = |tensor: &seismic::Tensor| graph.port(tensor.element(), &tensor.extents()).unwrap();
         let ports = [&tier, &staged, &step, &destination, &grid].map(&mut port);
         let [source, list_port, step_port, mut destination_port, grid_port] = ports.clone();
+        let gate = graph.timeline(seismic::timeline::Wait);
         graph
             .enqueue(
                 &copy,
@@ -7008,7 +7010,7 @@ impl TierFill {
                 },
             )
             .unwrap();
-        Self { plan: graph.seal().unwrap(), ports, tensors: [tier, staged, step, destination, grid], _tier: store }
+        Self { plan: graph.seal().unwrap(), gate, ports, tensors: [tier, staged, step, destination, grid], _tier: store }
     }
 
     /// The slots it copies into.
@@ -7016,13 +7018,22 @@ impl TierFill {
         &self.tensors[3]
     }
 
-    /// Submit one copy on `queue` from `slot`, without waiting.
-    fn submit(&self, device: &seismic::Device, slot: &mut seismic::NativeGraphSlot, queue: seismic::NativeQueue) -> seismic::NativeGraphCompletion {
+    /// Submit one copy on `queue` from `slot`, held until the host raises
+    /// `gate` to `value`, without waiting.
+    fn submit(
+        &self,
+        device: &seismic::Device,
+        slot: &mut seismic::NativeGraphSlot,
+        queue: seismic::NativeQueue,
+        gate: &seismic::Timeline<seismic::timeline::Gate>,
+        value: u64,
+    ) -> seismic::NativeGraphCompletion {
         let charges = seismic::Charges::tally(device);
         let mut bindings = self.plan.bindings();
         for (port, tensor) in self.ports.iter().zip(&self.tensors) {
             bindings.set(&charges, port, tensor).unwrap();
         }
+        bindings.set_timeline(self.gate, gate, value).unwrap();
         let mut sequence = device.native_sequence(queue);
         slot.attach(bindings, self.plan.new_outputs(&charges).unwrap()).unwrap().queue(&mut sequence).unwrap();
         sequence.submit().unwrap()
@@ -7050,7 +7061,9 @@ fn compute_reading_a_fills_slots_follows_the_fill() {
     let (grid, staged) = list_grid(&device, &list, step);
     let copy = declared::prepared(&device, &routed_copy::native_entry_with(routed_copy::Elements { U: byte }), &seismic::NativeSpecialization::new()).unwrap();
     let mut slot = fill.plan.new_slot(&charges).unwrap();
-    let filled = fill.submit(&device, &mut slot, seismic::NativeQueue::Fill);
+    let open = seismic::Timeline::new(&device).unwrap();
+    open.signal(1).unwrap();
+    let filled = fill.submit(&device, &mut slot, seismic::NativeQueue::Fill, &open, 1);
     copy.call(&charges, routed_copy::Args { source: fill.destination(), list: &staged, step, destination: &mut read, grid: &grid })
         .unwrap();
     filled.wait().unwrap();
@@ -7065,9 +7078,11 @@ fn compute_reading_a_fills_slots_follows_the_fill() {
 /// (`routed_step`), an allocation of its own (the bank's
 /// `PlacedAllocations::step`), and so waits for no fill of another place
 /// reading its own: where fills run beside compute, the write returns while
-/// a 256 MiB fill on one block (about 40 ms) still runs. Writing the fill's
-/// own step words instead waits for the fill, as a read must be followed:
-/// the device orders queues by what each submission touches.
+/// a fill on the fill queue is held at its gate, so has provably not run.
+/// Writing the fill's own step words instead waits for the fill, as a read
+/// must be followed: it has not returned while the gate holds the fill, and
+/// returns with the fill complete once it opens. The device orders queues by
+/// what each submission touches.
 #[test]
 fn a_fronts_step_words_wait_for_no_other_places_fill() {
     let Some(device) = streaming_device() else {
@@ -7077,20 +7092,51 @@ fn a_fronts_step_words_wait_for_no_other_places_fill() {
     if !device.backend().fills_beside_compute() {
         return;
     }
-    let fill = TierFill::new(&device, 64, 4 << 20, 64, Some(1));
+    let fill = TierFill::new(&device, 4, 1024, 4, None);
     let mut slot = fill.plan.new_slot(&charges).unwrap();
     let step = declared::prepared(&device, &routed_step::native_entry(), &seismic::NativeSpecialization::new()).unwrap();
-    let sequence = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(STREAMING_SEQUENCE as u64));
+    let words = step_words(STREAMING_SEQUENCE as u64);
+    let sequence = i32_tensor(&device, &[constants::STEP_WORDS], &words);
     let mut other = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
-    let filled = fill.submit(&device, &mut slot, seismic::NativeQueue::Fill);
-    step.call(&charges, routed_step::Args { step: &mut other, sequence: &sequence }).unwrap();
-    assert!(!filled.is_complete(), "another place's step words waited for the fill");
+    let gate = seismic::Timeline::new(&device).unwrap();
+    let filled = fill.submit(&device, &mut slot, seismic::NativeQueue::Fill, &gate, 1);
+    // A call that waited for the fill would return only once the window
+    // passed and the gate opened: the window bounds the failure, not the pass.
+    let returned = returned_while_held(&gate, 1, std::time::Duration::from_secs(10), || {
+        step.call(&charges, routed_step::Args { step: &mut other, sequence: &sequence }).unwrap();
+        assert!(!filled.is_complete(), "the fill ran before its gate opened");
+    });
+    assert!(returned, "another place's step words waited for the fill");
+    assert_eq!(read_i32(&other), words, "another place's step words");
     filled.wait().unwrap();
-    let filled = fill.submit(&device, &mut slot, seismic::NativeQueue::Fill);
+    let filled = fill.submit(&device, &mut slot, seismic::NativeQueue::Fill, &gate, 2);
     let mut own = fill.tensors[2].clone();
-    step.call(&charges, routed_step::Args { step: &mut own, sequence: &sequence }).unwrap();
+    // An ordered call cannot return while the gate is held, whatever the
+    // window; one that did not wait returns within it.
+    let returned = returned_while_held(&gate, 2, std::time::Duration::from_millis(200), || {
+        step.call(&charges, routed_step::Args { step: &mut own, sequence: &sequence }).unwrap();
+    });
+    assert!(!returned, "the fill's own step words were written while its gate held it");
     assert!(filled.is_complete(), "the fill's own step words were written while it read them");
     filled.wait().unwrap();
+}
+
+/// Run `call` on this thread while another holds `gate` below `value` until
+/// `call` returns or `within` passes, whichever is first, then raises it:
+/// whether `call` returned while the gate was held.
+fn returned_while_held(gate: &seismic::Timeline<seismic::timeline::Gate>, value: u64, within: std::time::Duration, call: impl FnOnce()) -> bool {
+    let (tell, heard) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let opener = scope.spawn(move || {
+            let returned = heard.recv_timeout(within).is_ok();
+            gate.signal(value).unwrap();
+            returned
+        });
+        call();
+        // The opener stops listening once the window passes.
+        let _ = tell.send(());
+        opener.join().unwrap()
+    })
 }
 
 /// The step word `routed_step` sets from `STREAMING_SEQUENCE`, which it
