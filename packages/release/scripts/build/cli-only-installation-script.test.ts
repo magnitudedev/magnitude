@@ -75,7 +75,7 @@ describe.skipIf(!os || !arch)("CLI-only installation script", () => {
   it("installs into the account's own folders, links the command through current, and registers PATH", async () => {
     const result = run(await release("0.1.6"))
     expect(result.status, result.stderr).toBe(0)
-    expect(result.stderr).toContain("Installing the Magnitude CLI only (for servers and headless use). For the desktop app, press Ctrl-C and run: curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop")
+    expect(result.stderr).toContain("Installing the Magnitude CLI only (for servers and headless use). For the desktop app, press Ctrl-C and run: `curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop`")
     expect(result.stdout).toBe(`${finished("0.1.6")}Open a new terminal to use the magnitude command.\n`)
     expect(readlinkSync(join(cli(), "current"))).toBe("0.1.6")
     expect(readdirSync(join(cli(), "0.1.6")).sort()).toEqual([...payloadFiles].sort())
@@ -148,6 +148,7 @@ describe.skipIf(!os || !arch)("CLI-only installation script", () => {
     const result = run(await release("0.1.6"))
     expect(result.status, result.stderr).toBe(0)
     expect(result.stdout).toContain("The Magnitude desktop app is installed and already includes the magnitude command. Nothing was changed.")
+    expect(result.stderr).not.toContain("Installing the Magnitude CLI")
     expect(result.events).toEqual([])
     expect(existsSync(join(home, ".magnitude"))).toBe(false)
   })

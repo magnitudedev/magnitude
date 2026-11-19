@@ -283,13 +283,13 @@ function Assert-CliFiles([string]$Directory) {
   }
 }
 function Install-MagnitudeCli {
-  [Console]::Error.WriteLine('Installing the Magnitude CLI only (for servers and headless use). For the desktop app, press Ctrl-C and rerun with -Desktop:')
-  [Console]::Error.WriteLine('  & ([scriptblock]::Create((irm https://magnitude.dev/install.ps1))) -Desktop')
-  [Console]::Error.WriteLine("`nInstalling the Magnitude CLI`nWindows $([char]0xb7) x64`n")
   if (Test-Path -LiteralPath $desktopExecutable -PathType Leaf) {
     Write-Output 'The Magnitude desktop app is installed and already includes the magnitude command. Nothing was changed.'
     return
   }
+  [Console]::Error.WriteLine('Installing the Magnitude CLI only (for servers and headless use). For the desktop app, press Ctrl-C and rerun with -Desktop:')
+  [Console]::Error.WriteLine('  & ([scriptblock]::Create((irm https://magnitude.dev/install.ps1))) -Desktop')
+  [Console]::Error.WriteLine("`nInstalling the Magnitude CLI`nWindows $([char]0xb7) x64`n")
   $offerPath = Join-Path $scratch 'offer.json'
   # The landing server counts each request and answers with the publisher-signed offer.
   Get-InstallerFile "$origin/api/installer?os=windows&arch=x64&package=cli-only&offer=1" $offerPath 16384 'Checking latest release' 'Checked latest release'

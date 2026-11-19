@@ -339,8 +339,6 @@ check_cli_signatures() {
 # Installs into ~/.magnitude/cli/<version>, with `current` naming the version and ~/.magnitude/bin/magnitude
 # linking through it. Everything is in the account's own folders: no sudo and no package manager.
 install_cli() {
-  printf 'Installing the Magnitude CLI only (for servers and headless use). For the desktop app, press Ctrl-C and run: curl -fsSL %s/install.sh | sh -s -- --desktop\n' "$origin" >&2
-  printf '\nInstalling the Magnitude CLI\n%s · %s\n\n' "$2" "$arch" >&2
   [ -n "${HOME:-}" ] && [ -d "$HOME" ] || fail 'HOME is not set to an existing directory.'
   if desktop_installed "$1"; then
     printf '%s\n' 'The Magnitude desktop app is installed and already includes the magnitude command. Nothing was changed.'
@@ -348,14 +346,15 @@ install_cli() {
   fi
   if [ "$1" = darwin ]; then
     require_macos
-    read_mac_offer cli-only
   else
     require_glibc
     for tool in curl tar gzip openssl; do
       command -v "$tool" >/dev/null 2>&1 || fail "Install $tool before running this installer."
     done
-    read_linux_offer cli-only
   fi
+  printf 'Installing the Magnitude CLI only (for servers and headless use). For the desktop app, press Ctrl-C and run: `curl -fsSL %s/install.sh | sh -s -- --desktop`\n' "$origin" >&2
+  printf '\nInstalling the Magnitude CLI\n%s · %s\n\n' "$2" "$arch" >&2
+  if [ "$1" = darwin ]; then read_mac_offer cli-only; else read_linux_offer cli-only; fi
   cli_root="$HOME/.magnitude/cli"
   command_directory="$HOME/.magnitude/bin"
   previous=$(readlink "$cli_root/current" 2>/dev/null) || previous=''
