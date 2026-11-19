@@ -55,9 +55,13 @@ libc = "0.2"
 seismic-vulkan.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# `Win32_UI_Shell` and `Win32_System_Com`: the user's program store's
+# directory (`SHGetKnownFolderPath`, `CoTaskMemFree`).
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_System_Com",
   "Win32_System_Memory",
+  "Win32_UI_Shell",
 ] }
 
 # Serves the probe processes it starts, as every executable that runs the

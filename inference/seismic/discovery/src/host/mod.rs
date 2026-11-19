@@ -18,21 +18,48 @@ use windows as platform;
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::pressure_files;
+pub(crate) use platform::{Facts, Os};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::Tree;
 
 use seismic_topology::Reported;
 use std::fmt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// One OS read inside a reader: the value, or none where the source is
+/// missing or refused ([`seismic_memory::unanswered`]): either way the
+/// reader goes to the fact's next source, and past its last to the fact's
+/// one documented value. No read's failure crosses the discovery boundary:
+/// every fact there is a plain value.
+///
+/// # Panics
+/// Where the read failed in any other way (`EIO`, text that is not UTF-8):
+/// an invariant violation.
+pub(crate) fn read<T>(what: impl fmt::Display, result: std::io::Result<T>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) if seismic_memory::unanswered(&error) => None,
+        Err(error) => panic!("invariant violated: {what}: {error}"),
+    }
+}
+
+/// The host's diagnostics for the hardware report: on Linux, a container
+/// whose own cgroup sets no memory limit, so limits above it are not
+/// visible (the one line of its kind).
+pub(crate) fn diagnostics(facts: &impl Facts) -> Vec<seismic_topology::Diagnostic> {
+    platform::diagnostics(facts)
+}
+
 /// Host RAM capacity: RAM the OS can use.
-pub(crate) fn capacity() -> Result<Reported<u64>, String> {
-    platform::capacity()
+pub(crate) fn capacity(facts: &impl Facts) -> Reported<u64> {
+    platform::capacity(facts)
 }
 
 /// The OS version and build, as the OS reports it: the driver of the CPU
 /// executor and of Metal.
-pub(crate) fn os_build() -> Result<String, String> {
-    platform::os_build()
+pub(crate) fn os_build(facts: &impl Facts) -> String {
+    platform::os_build(facts)
 }
 
 /// The CPU as the OS reports it: the platform's identifying CPU fields
@@ -43,26 +70,24 @@ pub(crate) fn os_build() -> Result<String, String> {
 /// `;isa=<tier>` for the highest native tier it supports, where it supports
 /// one, and `;cache=<bytes>` for its last-level `cache`
 /// ([`last_level_cache`]), where the OS reports one.
-pub(crate) fn cpu_identity(cache: Option<u64>) -> Result<String, String> {
-    let mut identity = platform::cpu_identity()?;
+pub(crate) fn cpu_identity(facts: &impl Facts, cache: Option<u64>) -> String {
+    let mut identity = platform::cpu_identity(facts);
     if let Some(tier) = seismic_native_cpu::Tier::detected() {
         identity.push_str(&format!(";isa={}", tier.name()));
     }
     if let Some(cache) = cache {
         identity.push_str(&format!(";cache={cache}"));
     }
-    Ok(identity)
+    identity
 }
 
 /// The CPU's last-level caches: the highest-level data or unified caches the
 /// OS reports, each instance's size as the OS reports it summed over the
 /// instances (no memory-side cache, which no OS reports): part of the CPU's
-/// identity, and the host's reported cache. `None` only where the OS
-/// reports no such cache, or no size or sharing for one; a cache the OS
-/// reports but that cannot be read is an error, never a lower level
-/// standing in for it.
-pub(crate) fn last_level_cache() -> Result<Option<Reported<u64>>, String> {
-    platform::last_level_cache()
+/// identity, and the host's reported cache. `None` where the OS reports no
+/// such cache, or no size or sharing for one: then the largest L2, or none.
+pub(crate) fn last_level_cache(facts: &impl Facts) -> Option<Reported<u64>> {
+    platform::last_level_cache(facts)
 }
 
 /// The machine's names as its firmware writes them (`crate::machine`).
@@ -71,14 +96,14 @@ pub(crate) fn machine() -> crate::machine::Firmware {
 }
 
 /// The host's processors (`crate::processors`).
-pub(crate) fn processors() -> Result<crate::Processors, String> {
-    platform::processors()
+pub(crate) fn processors(facts: &impl Facts) -> crate::Processors {
+    platform::processors(facts)
 }
 
 /// The memory node of the PCI device at `location`
 /// (`crate::processors::device_node`).
-pub(crate) fn device_node(location: crate::PciLocation) -> Result<crate::DeviceNode, String> {
-    platform::device_node(location)
+pub(crate) fn device_node(facts: &impl Facts, location: crate::PciLocation) -> crate::DeviceNode {
+    platform::device_node(facts, location)
 }
 
 /// Place every thread of the process on `cpus`
@@ -92,15 +117,15 @@ pub(crate) fn pin(cpus: &[usize]) -> Result<(), String> {
     platform::pin(cpus)
 }
 
-/// Host RAM at one instant ([`HostSample`]), read now.
-///
-/// # Panics
-/// Where a figure the sample needs cannot be read: each OS's reader names
-/// it. The figures are the OS's own counts of its memory, present on every
-/// release the engine runs on, so a missing one is the invariant's
-/// violation, never a reading to work around.
+/// Host RAM at one instant ([`HostSample`]), read now: every figure from
+/// its sources in order, or its documented value where none answers.
 pub fn host_sample() -> HostSample {
-    platform::sample()
+    sample(&Os)
+}
+
+/// Host RAM at one instant from `facts` ([`host_sample`]).
+pub(crate) fn sample(facts: &impl Facts) -> HostSample {
+    platform::sample(facts)
 }
 
 /// Host RAM at one instant: what the OS can give a taker without writing
@@ -112,11 +137,10 @@ pub fn host_sample() -> HostSample {
 /// ledger attributes its own changes ([`Lag`] says how late each shows in
 /// the supply, [`Counted`] what the counters show).
 ///
-/// The scope is bound once per process: its total is the least of the
-/// host's RAM and each physical-memory limit on this process (a Linux
-/// cgroup's, a Windows job's), and its supply the least any of them leaves,
-/// so neither jumps between scopes from one sample to the
-/// next.
+/// Its total is the least of the host's RAM and each limit on this
+/// process ([`Limit`]: a Linux cgroup's, `RLIMIT_AS`, its memory nodes', a
+/// Windows job's), read again at every sample, and its supply the least
+/// any of them leaves ([`binding`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostSample {
     /// When the reading of the live figures (`total`, `supply`,
@@ -314,11 +338,14 @@ pub struct WiredFigures {
     pub wire_count: u64,
 }
 
-/// `iogpu.wired_limit_mb`: the ceiling on host RAM the GPU may wire.
+/// The ceiling on host RAM Apple silicon's GPU may wire, as the IOGPU
+/// stack's sysctls state it: `iogpu.wired_limit_mb` (macOS 14+, in MiB),
+/// then `debug.iogpu.wired_limit` (macOS 13, in bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WiredLimit {
-    /// Zero: the OS's default, which Metal's `recommendedMaxWorkingSetSize`
-    /// reports.
+    /// Neither set (zero): the OS's default, which is no number the host
+    /// reads; the device's `recommendedMaxWorkingSetSize` reports it, and
+    /// the memory ledger reads it there.
     OsDefault,
     /// Set, in bytes.
     Set(u64),
@@ -429,13 +456,13 @@ pub(crate) struct Binding {
     pub(crate) supplier: Option<usize>,
 }
 
-/// The binding scope of `host` and each physical-memory limit of `limits`:
+/// The binding scope of `host` and each limit of `limits`:
 /// the least total of them all and the least supply any of them leaves.
 /// Each bounds what this process may take, so both are bound by every one
 /// at once: whichever leaves the least supply, the total never moves with
 /// it, and the supply moves only as the scopes' own figures move.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-pub(crate) fn binding(host: Scope, limits: &[ProcessMemoryLimit]) -> Binding {
+pub(crate) fn binding(host: Scope, limits: &[Limit]) -> Binding {
     limits.iter().map(|limit| limit.scope(host.total)).enumerate().fold(
         Binding { scope: host, supplier: None },
         |least, (index, bound)| {
@@ -469,10 +496,12 @@ impl fmt::Display for ObservationError {
 
 impl std::error::Error for ObservationError {}
 
-/// One applicable limit with the usage it is enforced against.
+/// A limit on this process's memory, read, with the usage it is enforced
+/// against. A limit no source shows is no limit: the host's figures and the
+/// process's rlimits bound it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-pub(crate) struct ProcessMemoryLimit {
+pub(crate) struct Limit {
     /// Which limit it is.
     pub(crate) kind: ProcessLimitKind,
     /// The limit.
@@ -480,13 +509,13 @@ pub(crate) struct ProcessMemoryLimit {
     /// The usage the limit is enforced against.
     pub(crate) used_bytes: u64,
     /// Clean file cache the OS can reclaim within this limit. Zero for a
-    /// committed-memory limit, where reclaiming physical pages does not
-    /// release the accounted resource.
+    /// limit of address space or commit, where reclaiming physical pages
+    /// does not release the accounted resource.
     pub(crate) reclaimable_bytes: u64,
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-impl ProcessMemoryLimit {
+impl Limit {
     /// The limit as a scope of host RAM of `capacity` bytes: its room
     /// beyond its usage, negative where the usage overran it (cgroup v2's
     /// `memory.high` lets it, reclaiming and throttling past it), and the
@@ -508,17 +537,26 @@ impl ProcessMemoryLimit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // each OS builds only its own kinds; a cgroup is named for Debug
 pub(crate) enum ProcessLimitKind {
-    /// cgroup v1 `memory.limit_in_bytes` of this process's cgroup or a
-    /// visible ancestor in the v1 memory hierarchy, enforced against that
-    /// cgroup's `memory.usage_in_bytes`.
+    /// cgroup v1: `memory.stat`'s `hierarchical_memory_limit` of this
+    /// process's cgroup, the least limit of it and every ancestor (past any
+    /// namespace), enforced against its `memory.usage_in_bytes`.
     CgroupV1 { cgroup: String },
     /// cgroup v2 `memory.max` (or the lower `memory.high`, past which the
     /// kernel reclaims and throttles) of this process's cgroup or a visible
     /// ancestor, enforced against that cgroup's `memory.current`.
     CgroupV2 { cgroup: String },
-    /// A Windows job's per-process committed-memory limit, enforced against
-    /// this process's private commit.
-    WindowsJobProcess,
+    /// `RLIMIT_AS`, enforced against the process's `VmSize`.
+    AddressSpace,
+    /// The memory nodes `Mems_allowed` confines the process to, a strict
+    /// subset of those with memory: their total, enforced against their
+    /// used memory.
+    AllowedNodes { nodes: Vec<usize> },
+    /// The commit limit of the Windows job this process runs in (its job's
+    /// or its process limit), enforced against the commit it counts.
+    WindowsJobCommit,
+    /// A Windows job's working-set limit (`MaximumWorkingSetSize`): a
+    /// physical-memory scope, past which pages are trimmed.
+    WindowsJobWorkingSet,
 }
 
 #[cfg(test)]
@@ -527,8 +565,8 @@ mod tests {
 
     const GB: u64 = 1 << 30;
 
-    fn cgroup(limit: u64, used: u64, reclaimable: u64) -> ProcessMemoryLimit {
-        ProcessMemoryLimit {
+    fn cgroup(limit: u64, used: u64, reclaimable: u64) -> Limit {
+        Limit {
             kind: ProcessLimitKind::CgroupV2 { cgroup: "/load".into() },
             limit_bytes: limit,
             used_bytes: used,

@@ -611,6 +611,8 @@ pub enum DiagnosticSource {
     Backend(BackendName),
     /// The OS's adapter interface (DXGI).
     Adapters,
+    /// The host's memory limits: a container whose own cgroup sets none.
+    Host,
 }
 
 /// An enumeration problem retained from discovery: an absent driver, a

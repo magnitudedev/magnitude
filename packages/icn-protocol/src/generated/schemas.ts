@@ -1588,6 +1588,12 @@ export const HardwareDiagnosticSource = S.Union(
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
+  S.extend(
+    S.Struct({
+      type: S.Literal("host"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
 )
 export type HardwareDiagnosticSource = S.Schema.Type<typeof HardwareDiagnosticSource>
 export type HardwareDiagnosticSourceEncoded = S.Schema.Encoded<typeof HardwareDiagnosticSource>

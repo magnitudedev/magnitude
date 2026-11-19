@@ -14,7 +14,8 @@ const READS: f64 = 2.;
 
 /// The machine of `nodes`, the process allowed on `allowed`.
 fn processors(nodes: Vec<seismic::MemoryNode>, allowed: std::ops::Range<usize>) -> seismic::Processors {
-    seismic::Processors::new(nodes, allowed.collect(), seismic::ProcessorsReportedBy::LinuxSysfs).unwrap()
+    let quota = std::num::NonZeroUsize::new(allowed.len()).unwrap();
+    seismic::Processors::new(nodes, allowed.collect(), quota, seismic::ProcessorsReportedBy::LinuxSysfs).unwrap()
 }
 
 /// An EPYC 7313, 4 nodes of 4 cores (`0-3,16-19`, …), every CPU
@@ -134,8 +135,8 @@ fn this_machine_sizes_beside_its_device() {
     assert_eq!(busy_threads(cpu.host_threads(), 0.77), others + 1);
     assert_eq!(busy_threads(cpu.host_threads(), 1.6), others + 2);
     let _placement = crate::test_support::process_placement();
-    let processors = seismic::Processors::discover().unwrap();
-    let quota = std::thread::available_parallelism().unwrap().get();
+    let processors = seismic::Processors::discover();
+    let quota = processors.quota().get();
     let machine = Machine::discover(&cpu, reads).unwrap();
     assert_eq!(cpu.host_node(), Ok(seismic::DeviceNode::Unknown), "a CPU device sits on no bus");
     assert_eq!(machine, Machine::of(&processors, quota, busy_threads(cpu.host_threads(), reads), seismic::DeviceNode::Unknown));

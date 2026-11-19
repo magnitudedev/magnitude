@@ -607,7 +607,8 @@ properties! {
     queries {
         max_threadgroup_memory_length: Count,
         // The GPU's cores, as the device's IORegistry entry states them
-        // (`gpu-core-count`).
+        // (`gpu-core-count`), or one where it states none (an Intel, AMD or
+        // paravirtualized GPU, which has no AGX entry).
         gpu_cores: Count,
         apple10_family: Support,
         // The compiler forms a `matmul2d` pipeline: asked of the API at

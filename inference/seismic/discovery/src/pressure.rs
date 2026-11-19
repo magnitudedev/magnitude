@@ -1,7 +1,7 @@
 //! The OS's memory pressure events, which wake a reading of host RAM: no
-//! timer. macOS's memory pressure dispatch source, a Linux PSI trigger
-//! (`poll()` on the machine's and the limiting cgroup's PSI files), and
-//! Windows' memory resource notifications.
+//! timer. macOS's memory pressure dispatch source, Linux PSI triggers
+//! (`poll()` on the machine's and this process's cgroup v2's PSI files),
+//! and Windows' memory resource notifications.
 
 /// The OS's memory pressure events, waited on by one thread and woken by any
 /// ([`PressureWaker`]), so the thread that reads host RAM waits for the OS
@@ -27,7 +27,7 @@ pub enum Wake {
     /// A [`PressureWaker`] asked.
     Asked,
     /// The OS's events ended and could not be set again (Linux: a watched
-    /// cgroup was removed and the kernel refuses a trigger on the files a
+    /// cgroup was removed and the kernel refuses a trigger on every file a
     /// sample reads now): no pressure wake will come from the OS, only
     /// asked ones. Returned once, as soon as the wait that found it ends.
     Lost,
@@ -35,12 +35,13 @@ pub enum Wake {
 
 impl PressureEvents {
     /// The OS's pressure events, from now on; none where the OS gives this
-    /// process none: Linux without a PSI trigger it may set on every PSI
-    /// file a sample reads (a kernel built without PSI or booted `psi=0`, a
-    /// trigger refused to a process without `CAP_SYS_RESOURCE` before Linux
-    /// 6.4, a `/proc/pressure` or cgroup mounted read-only, a cgroup with
-    /// its PSI off). Events from only some of those files would leave
-    /// pressure in the others unwatched, so there are all or none.
+    /// process none. Linux sets a PSI trigger on each PSI file a sample
+    /// reads on its own, and watches those the kernel accepts: one it
+    /// refuses (a kernel built without PSI or booted `psi=0`, a trigger
+    /// refused to a process without `CAP_SYS_RESOURCE` before Linux 6.4, a
+    /// cgroup file refused under `nsdelegate` or mounted read-only as Docker
+    /// mounts it, a cgroup with its PSI off) leaves that file unwatched
+    /// alone, never the others; where it refuses every one there are none.
     ///
     /// # Panics
     /// Where the OS facility fails otherwise, naming it.
@@ -288,10 +289,10 @@ mod platform {
     }
 }
 
-/// Linux: a PSI trigger on the machine's PSI file and on the limiting
-/// cgroup's, each firing once some task has stalled on memory within PSI's
-/// own two-second sampling period, and again each window the stall
-/// persists, and an eventfd for wakes, all polled together. Only a trigger's
+/// Linux: a PSI trigger on the machine's PSI file and on this process's
+/// cgroup v2's, each set on its own, each firing once some task has stalled on
+/// memory within PSI's own two-second sampling period, and again each
+/// window the stall persists, and an eventfd for wakes, all polled together. Only a trigger's
 /// edge is an event ([`super::StallEdges`]): a standing stall is one. A
 /// trigger whose file is gone (its cgroup removed once this process moved
 /// out of it, where `poll` reports it in error at once and for good) ends
@@ -300,6 +301,7 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{stall_total, StallEdges, Wake, PSI_WINDOW};
+    use std::fs::File;
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::{Path, PathBuf};
@@ -316,31 +318,38 @@ mod platform {
     /// A PSI trigger set on one PSI file, and its edges.
     struct Trigger {
         path: PathBuf,
-        file: std::fs::File,
+        file: File,
         edges: StallEdges,
     }
 
     /// A trigger on each PSI file a sample reads now
-    /// ([`crate::host::pressure_files`]), or none where the kernel refuses
-    /// any of them ([`refused`]): events from only some would leave pressure
-    /// in the others unwatched.
+    /// ([`crate::host::pressure_files`]) whose trigger the kernel accepts
+    /// ([`set_each`]).
+    fn triggers() -> Vec<Trigger> {
+        set_each(crate::host::pressure_files(), |path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(trigger().as_bytes()).map(|()| file))
+        })
+    }
+
+    /// A trigger set by `set` on each of `files` on its own: a file whose
+    /// trigger the kernel refuses ([`crate::host::read`]: no PSI file
+    /// `ENOENT`, PSI off `EOPNOTSUPP`, a trigger refused without
+    /// `CAP_SYS_RESOURCE` before Linux 6.4 or a cgroup's under `nsdelegate`
+    /// `EACCES`/`EPERM`, a read-only mount `EROFS`) is left out alone, and
+    /// the others are watched all the same.
     ///
     /// # Panics
     /// Where a trigger cannot be set otherwise.
-    fn triggers() -> Option<Vec<Trigger>> {
-        crate::host::pressure_files()
+    fn set_each(files: Vec<PathBuf>, set: impl Fn(&Path) -> std::io::Result<File>) -> Vec<Trigger> {
+        files
             .into_iter()
-            .map(|path| {
-                let set = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)
-                    .and_then(|mut file| file.write_all(trigger().as_bytes()).map(|()| file));
-                match set {
-                    Ok(file) => Some(Trigger { path, file, edges: StallEdges::default() }),
-                    Err(error) if refused(&error) => None,
-                    Err(error) => panic!("invariant violated: a PSI trigger on {} cannot be set: {error}", path.display()),
-                }
+            .filter_map(|path| {
+                let file = crate::host::read(format!("a PSI trigger on {}", path.display()), set(&path))?;
+                Some(Trigger { path, file, edges: StallEdges::default() })
             })
             .collect()
     }
@@ -361,7 +370,7 @@ mod platform {
 
     pub(super) struct Source {
         /// The triggers: the one waiting thread's alone. Empty where the
-        /// kernel refused a trigger when the watch was set again.
+        /// kernel refused every trigger when the watch was set again.
         triggers: Mutex<Vec<Trigger>>,
         wakes: Arc<OwnedFd>,
         /// The triggers could not be set again since the last wait
@@ -371,7 +380,15 @@ mod platform {
 
     impl Source {
         pub(super) fn open() -> Option<Self> {
-            let triggers = triggers()?;
+            Self::watching(triggers())
+        }
+
+        /// The source of `triggers`; none where there are none: no event
+        /// comes from the OS.
+        fn watching(triggers: Vec<Trigger>) -> Option<Self> {
+            if triggers.is_empty() {
+                return None;
+            }
             let wakes = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             assert!(wakes >= 0, "invariant violated: eventfd failed: {}", std::io::Error::last_os_error());
             // SAFETY: a descriptor just opened, owned here alone.
@@ -438,24 +455,20 @@ mod platform {
                     // with its stall's edges (its cumulative stall time
                     // continues across the new trigger), so a stall that
                     // stands is not taken for a new one. Where the kernel
-                    // refuses a trigger no event comes from the OS again.
-                    match self::triggers() {
-                        Some(mut fresh) => {
-                            for trigger in &mut fresh {
-                                if gone.contains(&trigger.path) {
-                                    continue;
-                                }
-                                if let Some(old) = triggers.iter_mut().find(|old| old.path == trigger.path) {
-                                    trigger.edges = std::mem::take(&mut old.edges);
-                                }
-                            }
-                            *triggers = fresh;
+                    // refuses every trigger no event comes from the OS again.
+                    let mut fresh = self::triggers();
+                    for trigger in &mut fresh {
+                        if gone.contains(&trigger.path) {
+                            continue;
                         }
-                        None => {
-                            triggers.clear();
-                            self.lost.store(true, Ordering::Release);
+                        if let Some(old) = triggers.iter_mut().find(|old| old.path == trigger.path) {
+                            trigger.edges = std::mem::take(&mut old.edges);
                         }
                     }
+                    if fresh.is_empty() {
+                        self.lost.store(true, Ordering::Release);
+                    }
+                    *triggers = fresh;
                 }
                 match (edge, asked) {
                     (true, _) => return Wake::Pressure,
@@ -468,14 +481,6 @@ mod platform {
         pub(super) fn waker(&self) -> Waker {
             Waker(self.wakes.clone())
         }
-    }
-
-    /// Whether `error`, opening or writing a PSI trigger, is the kernel
-    /// giving this process no trigger: no PSI file (`ENOENT`), PSI off
-    /// (`EOPNOTSUPP`), a trigger refused without `CAP_SYS_RESOURCE` before
-    /// Linux 6.4 (`EACCES`, `EPERM`), a read-only mount (`EROFS`).
-    fn refused(error: &std::io::Error) -> bool {
-        matches!(error.raw_os_error(), Some(libc::ENOENT | libc::EOPNOTSUPP | libc::EACCES | libc::EPERM | libc::EROFS))
     }
 
     #[cfg(test)]
@@ -508,16 +513,51 @@ mod platform {
             assert!(triggers.iter().all(|trigger| trigger.path != gone), "the ended trigger is no longer watched");
         }
 
-        /// Only the kernel's refusals of a trigger leave the process
-        /// without events; any other failure is no state of the OS.
+        const MACHINE: &str = "/proc/pressure/memory";
+        const CGROUP: &str = "/sys/fs/cgroup/load/memory.pressure";
+
+        /// The triggers `set_each` sets on the machine's and a cgroup's PSI
+        /// files where the kernel fails the files of `failed` with their
+        /// codes and accepts the others' triggers (a file standing for each).
+        fn set(failed: &[(&str, i32)]) -> Vec<Trigger> {
+            set_each(vec![PathBuf::from(MACHINE), PathBuf::from(CGROUP)], |path| {
+                match failed.iter().find(|(file, _)| Path::new(file) == path) {
+                    Some(&(_, code)) => Err(std::io::Error::from_raw_os_error(code)),
+                    None => File::open("/dev/null"),
+                }
+            })
+        }
+
+        fn paths(triggers: &[Trigger]) -> Vec<&Path> {
+            triggers.iter().map(|trigger| trigger.path.as_path()).collect()
+        }
+
+        /// A cgroup trigger the kernel refuses (`EPERM` under `nsdelegate`,
+        /// `EROFS` on Docker's read-only cgroup mount) leaves the machine's
+        /// trigger set.
         #[test]
-        fn only_a_refused_trigger_gives_no_events() {
-            for code in [libc::ENOENT, libc::EOPNOTSUPP, libc::EACCES, libc::EPERM, libc::EROFS] {
-                assert!(super::refused(&std::io::Error::from_raw_os_error(code)));
+        fn a_refused_cgroup_trigger_leaves_the_machines_set() {
+            for code in [libc::EPERM, libc::EROFS] {
+                assert_eq!(paths(&set(&[(CGROUP, code)])), [Path::new(MACHINE)], "the cgroup's trigger refused with {code}");
             }
-            for code in [libc::EINVAL, libc::EBADF, libc::ENOMEM] {
-                assert!(!super::refused(&std::io::Error::from_raw_os_error(code)));
-            }
+            assert_eq!(paths(&set(&[])), [Path::new(MACHINE), Path::new(CGROUP)]);
+        }
+
+        /// Where the kernel refuses every trigger (no PSI: `/proc/pressure`
+        /// absent, a cgroup's PSI off) there is none, and no source of
+        /// events.
+        #[test]
+        fn every_trigger_refused_is_no_trigger() {
+            let triggers = set(&[(MACHINE, libc::ENOENT), (CGROUP, libc::EOPNOTSUPP)]);
+            assert!(triggers.is_empty());
+            assert!(Source::watching(triggers).is_none());
+        }
+
+        /// A failure that is no refusal is no state of the OS.
+        #[test]
+        #[should_panic(expected = "invariant violated: a PSI trigger on /sys/fs/cgroup/load/memory.pressure")]
+        fn a_trigger_failing_otherwise_panics() {
+            set(&[(CGROUP, libc::EINVAL)]);
         }
     }
 

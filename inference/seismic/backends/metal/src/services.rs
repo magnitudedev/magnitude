@@ -773,7 +773,7 @@ fn gpu_elapsed_pipeline_batch(
                 "Metal could not create a service-probe command buffer".into(),
             )
         })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
+        let encoder = device.compute_encoder(&command, crate::device::EncoderKind::Serial).ok_or_else(|| {
             seismic_compiler::errors::TargetError::DeviceUnavailable(
                 "Metal could not create a service-probe encoder".into(),
             )

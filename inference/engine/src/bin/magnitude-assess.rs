@@ -447,6 +447,7 @@ fn run() -> Result<bool, String> {
                 let source = match diagnostic.source {
                     DiagnosticSource::Backend(backend) => json!({ "backend": backend.as_str() }),
                     DiagnosticSource::Adapters => json!("adapters"),
+                    DiagnosticSource::Host => json!("host"),
                 };
                 json!({ "source": source, "message": diagnostic.message })
             })

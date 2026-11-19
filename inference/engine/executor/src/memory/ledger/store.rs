@@ -648,8 +648,9 @@ impl PoolEntries {
 pub enum DeviceGrant {
     /// Host RAM with no separate device ceiling (CPU).
     Host,
-    /// macOS unified Metal: host RAM bounded by the kernel wired ceiling and
-    /// `recommendedMaxWorkingSetSize`.
+    /// macOS unified Metal: host RAM bounded by the kernel wired ceiling,
+    /// where the host has one, and `recommendedMaxWorkingSetSize`
+    /// ([`Reading::unified`]).
     Wired { working_set: u64 },
     /// Unified host RAM bounded by a static device ceiling (unified CUDA's
     /// total or usable memory on Linux or Windows).

@@ -6,10 +6,12 @@
 
 use crate::Metal;
 use objc2::rc::Retained;
+use objc2::Message;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions,
+    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePassDescriptor,
+    MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLResidencySet, MTLResidencySetDescriptor,
+    MTLResource, MTLResourceOptions, MTLResourceUsage,
 };
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::DeviceService;
@@ -119,42 +121,59 @@ impl fmt::Debug for DeviceHandle {
     }
 }
 
-/// The device's residency set: every buffer the device allocates, made
-/// resident as it joins, and so wired while the process holds it (its
-/// charge is [`Wiring::Wired`]). macOS may let the set's residency lapse and
-/// un-wire its allocations until the next request or GPU work wires them
-/// again; the GPU work wires the set itself (the queue has it attached), so
-/// the set's residency is requested only where a host reading needs it
-/// wired, and never on a timer:
+/// What keeps every buffer the device allocates resident while the
+/// process holds it: a residency set, which wires it, or, on a GPU that
+/// cannot create one, the buffers themselves, declared to every compute
+/// encoder ([`Keeping`]), which wires nothing ([`Residency::wiring`]).
+///
+/// A set's residency may lapse, macOS un-wiring its allocations until the
+/// next request or GPU work wires them again; the GPU work wires the set
+/// itself (the queue has it attached), so the set's residency is requested
+/// only where a host reading needs it wired, and never on a timer:
 /// - each change of the set (a buffer added or freed);
 /// - a reading of the host's wired count
 ///   ([`MetalDevice::request_residency`], which the embedder's reading runs
 ///   before it reads the count).
 ///
-/// A change holds the set's lock across its commit; a reading never waits
-/// on it: where a change holds it, that change's own request, made after its
+/// A change holds the lock across its commit; a reading never waits on it:
+/// where a change holds it, that change's own request, made after its
 /// commit, wires the set again.
 struct Residency {
     wired: Mutex<Wired>,
 }
 
 struct Wired {
-    set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    keeping: Keeping,
     /// The residency requests made: one per event that asks for one while
     /// the set holds anything.
     #[cfg(test)]
     requests: u64,
 }
 
-// The set is used only under the residency mutex, on whichever thread holds
-// it.
+/// How the device's buffers are kept resident.
+enum Keeping {
+    /// A residency set the queue carries, so command buffers inherit it
+    /// without per-encoder declarations.
+    Set(Retained<ProtocolObject<dyn MTLResidencySet>>),
+    /// A GPU that cannot create a residency set (an Intel Mac's
+    /// `MTLIGAccelDevice`, Intel UHD Graphics 630 on macOS 15.8.2: "The
+    /// operation couldn't be completed"): the buffers held, each declared
+    /// to every compute encoder (`useResource:usage:`), as Metal kept
+    /// resident what slab and record tables address before residency sets.
+    /// A buffer is then backed by the first GPU work that declares it,
+    /// not as it is allocated.
+    Declared(Vec<Retained<ProtocolObject<dyn MTLBuffer>>>),
+}
+
+// The set and the buffers are used only under the residency mutex, on
+// whichever thread holds it.
 unsafe impl Send for Wired {}
 
 impl Residency {
-    fn new(set: Retained<ProtocolObject<dyn MTLResidencySet>>) -> Arc<Self> {
+    fn new(keeping: Keeping) -> Arc<Self> {
         Arc::new(Self {
             wired: Mutex::new(Wired {
-                set,
+                keeping,
                 #[cfg(test)]
                 requests: 0,
             }),
@@ -165,29 +184,47 @@ impl Residency {
         self.wired.lock().expect("Metal residency lock poisoned")
     }
 
-    /// Add `buffer` to the set and wire it now, on the calling thread: every
-    /// page of it backed and resident before this returns. A buffer the set
-    /// only holds is wired by the first GPU work that binds it, on the
-    /// thread submitting that work (a 20 GiB buffer: +142 ms before its
-    /// first read, M4 Pro, 2026-10-25), which an allocation is made away
-    /// from.
+    /// How the OS holds a buffer kept resident here, which its charge
+    /// states: wired by a set, pageable where declared, as the wire count
+    /// of a GPU without a set (an Intel Mac's, which defines no wired
+    /// limit) shows.
+    fn wiring(&self) -> Wiring {
+        match self.lock().keeping {
+            Keeping::Set(_) => Wiring::Wired,
+            Keeping::Declared(_) => Wiring::Pageable,
+        }
+    }
+
+    /// Keep `buffer` resident from now. A set wires it now, on the calling
+    /// thread: every page of it backed and resident before this returns. A
+    /// buffer the set only holds is wired by the first GPU work that binds
+    /// it, on the thread submitting that work (a 20 GiB buffer: +142 ms
+    /// before its first read, M4 Pro, 2026-10-25), which an allocation is
+    /// made away from.
     fn add(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
         let mut wired = self.lock();
-        crate::pooled(|| wired.set.addAllocation(ProtocolObject::from_ref(buffer)));
+        match &mut wired.keeping {
+            Keeping::Set(set) => crate::pooled(|| set.addAllocation(ProtocolObject::from_ref(buffer))),
+            Keeping::Declared(buffers) => return buffers.push(buffer.retain()),
+        }
         wired.changed();
     }
 
-    /// Remove `buffer` from the set.
+    /// Keep `buffer` resident no longer.
     fn remove(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
         let mut wired = self.lock();
-        crate::pooled(|| wired.set.removeAllocation(ProtocolObject::from_ref(buffer)));
+        match &mut wired.keeping {
+            Keeping::Set(set) => crate::pooled(|| set.removeAllocation(ProtocolObject::from_ref(buffer))),
+            Keeping::Declared(buffers) => return buffers.retain(|held| !std::ptr::eq(&**held, buffer)),
+        }
         wired.changed();
     }
 
     /// A reading of the wired count: request the set's residency, without
-    /// waiting. A change holding the set's lock requests it itself once its
+    /// waiting. A change holding the lock requests it itself once its
     /// commit is made ([`Wired::changed`]), so that request stands for this
-    /// one.
+    /// one. Declared buffers have no residency to request between
+    /// encoders.
     fn before_reading(&self) {
         match self.wired.try_lock() {
             Ok(mut wired) => wired.request(),
@@ -195,20 +232,35 @@ impl Residency {
             Err(std::sync::TryLockError::Poisoned(_)) => panic!("Metal residency lock poisoned"),
         }
     }
+
+    /// Make every buffer resident for `encoder`'s work: nothing for a set,
+    /// which the queue carries; each declared buffer, read and written,
+    /// otherwise.
+    fn declare(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+        let wired = self.lock();
+        if let Keeping::Declared(buffers) = &wired.keeping {
+            for buffer in buffers {
+                encoder.useResource_usage(ProtocolObject::from_ref(&**buffer), MTLResourceUsage::Read | MTLResourceUsage::Write);
+            }
+        }
+    }
 }
 
 impl Wired {
     /// The set changed: commit it, and request its residency again.
     fn changed(&mut self) {
-        crate::pooled(|| self.set.commit());
+        if let Keeping::Set(set) = &self.keeping {
+            crate::pooled(|| set.commit());
+        }
         self.request();
     }
 
     /// Request the set's residency where it holds anything.
     fn request(&mut self) {
+        let Keeping::Set(set) = &self.keeping else { return };
         crate::pooled(|| {
-            if self.set.allocationCount() > 0 {
-                self.set.requestResidency();
+            if set.allocationCount() > 0 {
+                set.requestResidency();
                 #[cfg(test)]
                 {
                     self.requests += 1;
@@ -216,6 +268,26 @@ impl Wired {
             }
         });
     }
+
+    /// How many buffers are kept resident.
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        match &self.keeping {
+            Keeping::Set(set) => set.allocationCount() as usize,
+            Keeping::Declared(buffers) => buffers.len(),
+        }
+    }
+}
+
+/// How a compute encoder is made ([`MetalDevice::compute_encoder`]).
+pub(crate) enum EncoderKind<'a> {
+    /// `computeCommandEncoder`: serial dispatch.
+    Serial,
+    /// `computeCommandEncoderWithDispatchType`.
+    Dispatch(MTLDispatchType),
+    /// `computeCommandEncoderWithDescriptor`: a pass, with its sample
+    /// buffers.
+    Pass(&'a MTLComputePassDescriptor),
 }
 
 /// One Metal buffer with the bytes Metal took for it, charged exactly to an
@@ -480,8 +552,8 @@ unsafe fn host_read(base: *mut u8, length: u64, offset: u64, into: &mut [u8]) {
 pub struct MetalDevice {
     handle: DeviceHandle,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// Every buffer this device allocates. The queue carries the set, so
-    /// command buffers inherit it without per-buffer encodings.
+    /// What keeps every buffer this device allocates resident
+    /// ([`Residency`]).
     residency: Arc<Residency>,
     /// A buffer every direct encoder declares it writes and no launch binds
     /// (`direct::DirectBatch`): hazard tracking then orders each encoder on
@@ -514,13 +586,15 @@ impl MetalDevice {
         let queue = handle.raw().newCommandQueue().ok_or_else(|| {
             TargetError::DeviceUnavailable("could not create a Metal command queue".into())
         })?;
-        let residency = handle
-            .raw()
-            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
-            .map_err(|error| TargetError::DeviceUnavailable(format!(
-                "could not create a Metal residency set: {error}"
-            )))?;
-        queue.addResidencySet(&residency);
+        // A GPU that cannot create a residency set runs all the same, its
+        // buffers declared to each encoder instead ([`Keeping::Declared`]).
+        let keeping = match handle.raw().newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()) {
+            Ok(set) => {
+                queue.addResidencySet(&set);
+                Keeping::Set(set)
+            }
+            Err(_) => Keeping::Declared(Vec::new()),
+        };
         // Metal rejects a zero-length buffer; nothing reads or writes it. It
         // stays outside the residency set: pageable.
         let order =
@@ -530,7 +604,7 @@ impl MetalDevice {
         Ok(Self {
             handle,
             queue,
-            residency: Residency::new(residency),
+            residency: Residency::new(keeping),
             order: Arc::new(order),
             store,
         })
@@ -553,6 +627,24 @@ impl MetalDevice {
     /// begins on the device. None where Metal creates none.
     pub(crate) fn command_buffer(&self) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         crate::pooled(|| self.queue.commandBuffer())
+    }
+
+    /// A new compute encoder of `command`, of `kind`, with every buffer the
+    /// device keeps resident made resident for its work ([`Residency`]):
+    /// the one way compute work is encoded on the device. None where Metal
+    /// creates none.
+    pub(crate) fn compute_encoder(
+        &self,
+        command: &ProtocolObject<dyn MTLCommandBuffer>,
+        kind: EncoderKind<'_>,
+    ) -> Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>> {
+        let encoder = match kind {
+            EncoderKind::Serial => command.computeCommandEncoder(),
+            EncoderKind::Dispatch(dispatch) => command.computeCommandEncoderWithDispatchType(dispatch),
+            EncoderKind::Pass(pass) => command.computeCommandEncoderWithDescriptor(pass),
+        }?;
+        self.residency.declare(&encoder);
+        Some(encoder)
     }
 
     /// Request the residency set resident: run before each reading of the
@@ -590,13 +682,14 @@ impl MetalDevice {
         let length = usize::try_from(bytes.max(1)).map_err(|_| {
             ExecutionError::AllocationFailed(format!("{bytes} bytes exceed the host address space"))
         })?;
-        // Wired: it joins the residency set before it is handed out.
+        // Kept resident before it is handed out, wired where a set keeps it.
+        let wiring = self.residency.wiring();
         let (charged, mapping) = match block {
             true => {
-                let (charged, mapping) = mapped_buffer(&self.handle, length, entry, Wiring::Wired)?;
+                let (charged, mapping) = mapped_buffer(&self.handle, length, entry, wiring)?;
                 (charged, Some(mapping))
             }
-            false => (charged_buffer(&self.handle, length, MTLResourceOptions::StorageModeShared, entry, Wiring::Wired)?, None),
+            false => (charged_buffer(&self.handle, length, MTLResourceOptions::StorageModeShared, entry, wiring)?, None),
         };
         let buffer = Retained::clone(&charged);
         let wired = WiredAllocation::wire(&self.residency, charged, mapping);
@@ -790,7 +883,7 @@ mod mapped_tests {
         buffer.read_bytes(0, &mut byte);
         assert_eq!(byte, [73]);
         // A host mapping stays file-backed: it never joins the residency set.
-        assert_eq!(device.residency.lock().set.allocationCount(), 0);
+        assert_eq!(device.residency.lock().count(), 0);
         drop(buffer);
         assert!(weak.upgrade().is_none());
     }
@@ -802,7 +895,8 @@ mod mapped_tests {
         };
         let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
         let wired = |buffer: &MetalBuffer| {
-            let set = &device.residency.lock().set;
+            let wired = device.residency.lock();
+            let Keeping::Set(set) = &wired.keeping else { panic!("this GPU keeps a residency set") };
             (
                 set.containsAllocation(ProtocolObject::from_ref(&*buffer.raw())),
                 set.allocationCount(),
@@ -820,7 +914,7 @@ mod mapped_tests {
         drop(handle);
         assert_eq!(wired(&second), (true, 1, 1 << 16));
         drop(second);
-        assert_eq!(device.residency.lock().set.allocationCount(), 0);
+        assert_eq!(device.residency.lock().count(), 0);
     }
 
     /// A buffer's bytes are charged exactly as Metal counts them (its size
@@ -883,7 +977,7 @@ mod mapped_tests {
         assert_eq!(requests(), 4, "a free leaving the set holding a buffer requests it again");
         drop(second);
         assert_eq!(requests(), 4, "an empty set requests nothing");
-        assert_eq!(device.residency.lock().set.allocationCount(), 0);
+        assert_eq!(device.residency.lock().count(), 0);
     }
 
     /// A reading of the wired count while a change of the set holds its lock
@@ -1061,7 +1155,7 @@ mod mapped_tests {
         };
         let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
         let block = 1u64 << 21;
-        let count = || device.residency.lock().set.allocationCount() as u64;
+        let count = || device.residency.lock().count() as u64;
         let before = count();
         let started = std::time::Instant::now();
         let blocks = (0..512)

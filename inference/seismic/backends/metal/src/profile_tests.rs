@@ -709,3 +709,16 @@ fn integer_subgroup_folds_are_exact() {
         }
     }
 }
+
+/// The GPU architecture's name is Metal's where it states one and the
+/// device's name where it states none (an Intel Mac's GPU): on either, a
+/// name the probe answers' key reads, never a panic on nil.
+#[test]
+fn the_architecture_is_its_stated_name_or_the_devices() {
+    let device = metal_device();
+    let raw = device.handle().raw();
+    // SAFETY: `architecture` is a property getter taking no arguments that returns an `MTLArchitecture` or nil.
+    let stated: Option<Retained<objc2_metal::MTLArchitecture>> = unsafe { objc2::msg_send![raw, architecture] };
+    let expected = stated.map_or_else(|| device.handle().name(), |architecture| architecture.name().to_string());
+    assert_eq!(crate::profile::architecture_name(raw), expected);
+}

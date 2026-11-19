@@ -337,14 +337,15 @@ mod schema {
         pub message: String,
     }
 
-    /// What a discovery diagnostic is about: one backend's enumeration, or the
-    /// OS's adapter interface (DXGI).
+    /// What a discovery diagnostic is about: one backend's enumeration, the OS's
+    /// adapter interface (DXGI), or the host's memory limits.
     #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
     pub enum HardwareDiagnosticSource {
         Backend { backend: ExecutionBackend },
         Adapters,
+        Host,
     }
 
     #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

@@ -1079,6 +1079,25 @@ fn a_devices_own_memory_is_charged_as_it_opens_before_its_store_is_read() {
     assert_eq!(opening.allocated(), 0, "freed with the device's objects");
 }
 
+/// Unified Metal on a host that reads no wired figures (an Intel Mac's
+/// integrated GPU, whose macOS defines no wired limit) is bounded by the
+/// device's working set alone, a static ceiling, where the reading needed
+/// a wired ceiling before.
+#[test]
+fn unified_metal_without_wired_figures_is_bounded_by_its_working_set() {
+    let sample = seismic::HostSample { wired: None, ..seismic::host_samples::m4_pro() };
+    let read = |grant| {
+        let scope = Ledgers::new();
+        let (_ledgers, reading) = DeviceLedgers::unified_in(&scope, shape()).read_granted(&Sample::scripted(scope.changes(), sample), grant);
+        reading.device
+    };
+    let room = read(DeviceGrant::Host).budget();
+    let working_set = room / 2;
+    let unified = read(DeviceGrant::Wired { working_set });
+    assert_eq!(unified.wired_limit(), None, "no wired ceiling is read");
+    assert_eq!(unified.budget(), working_set, "the working set bounds the room");
+}
+
 /// What opening charges is the device's own entries': any other entry
 /// allocating in a store never read is an invariant violation.
 #[test]

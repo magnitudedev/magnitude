@@ -665,9 +665,7 @@ impl DeviceInner {
 }
 
 pub(crate) fn host_cores() -> Result<std::num::NonZeroUsize, String> {
-    seismic_discovery::Processors::discover()
-        .map_err(|error| format!("the host's processors: {error}"))?
-        .cores()
+    seismic_discovery::Processors::discover().cores()
 }
 
 fn open_error(error: ExecutionError) -> OpenError {

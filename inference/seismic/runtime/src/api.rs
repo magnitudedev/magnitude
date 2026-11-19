@@ -843,7 +843,7 @@ pub mod device {
             match &self.kind {
                 OpenedKind::Cuda(opened) => {
                     let [domain, bus, device] = seismic_cuda::describe(opened.executor().device().ordinal()).map_err(|error| error.to_string())?.pci;
-                    seismic_discovery::device_node(seismic_discovery::PciLocation { domain, bus, device })
+                    Ok(seismic_discovery::device_node(seismic_discovery::PciLocation { domain, bus, device }))
                 }
                 #[allow(unreachable_patterns)]
                 _ => Ok(seismic_discovery::DeviceNode::Unknown),

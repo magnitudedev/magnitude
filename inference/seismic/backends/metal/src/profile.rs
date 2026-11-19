@@ -110,7 +110,7 @@ fn discover_device(
     let size = raw.maxThreadsPerThreadgroup();
     let facts = MetalFacts {
         device_name: handle.name(),
-        architecture: raw.architecture().name().to_string(),
+        architecture: architecture_name(raw),
         operating_system: operating_system(),
         registry_id: handle.registry_id(),
         unified_memory: handle.has_unified_memory(),
@@ -648,6 +648,17 @@ impl MetalProbeAnswers {
     }
 }
 
+/// The name of `device`'s GPU architecture (`MTLDevice.architecture.name`);
+/// where Metal states none, the device's name (`MTLDevice.name`). An Intel
+/// Mac's GPU (`MTLIGAccelDevice`, read on a Mac mini 2018 with UHD Graphics
+/// 630 on macOS 15.8.2) answers nil, which objc2-metal's `architecture`
+/// binding takes as never null and panics on.
+pub(crate) fn architecture_name(device: &ProtocolObject<dyn MTLDevice>) -> String {
+    // SAFETY: `architecture` is a property getter taking no arguments that returns an `MTLArchitecture` or nil.
+    let architecture: Option<objc2::rc::Retained<objc2_metal::MTLArchitecture>> = unsafe { objc2::msg_send![device, architecture] };
+    crate::pooled(|| architecture.map_or_else(|| device.name(), |architecture| architecture.name()).to_string())
+}
+
 /// The answers of `device`'s capability probes, under the key of everything
 /// that determines them (this build's formation code, the device's name and
 /// GPU architecture, and the OS build, which ships the Metal compiler): this
@@ -661,7 +672,7 @@ impl MetalProbeAnswers {
 /// key covers what determines them, not where they are kept.
 pub fn probe_answers(device: &crate::DeviceHandle, store: &dyn ArtifactStore) -> MetalProbeAnswers {
     static HELD: Mutex<BTreeMap<String, Arc<OnceLock<MetalProbeAnswers>>>> = Mutex::new(BTreeMap::new());
-    let architecture = device.raw().architecture().name().to_string();
+    let architecture = architecture_name(device.raw());
     let key = ArtifactKey::of(&[
         crate::toolchain::FORMATION_BUILD.as_bytes(),
         device.name().as_bytes(),
@@ -888,8 +899,10 @@ impl seismic_lang::device::metal::Queries for Queries<'_> {
     fn max_threadgroup_memory_length(&self) -> Option<u64> {
         Some(self.device.maxThreadgroupMemoryLength() as u64)
     }
+    /// The cores resident launches are bound by
+    /// ([`crate::registry_entry::gpu_cores`]).
     fn gpu_cores(&self) -> Option<u64> {
-        crate::registry_entry::gpu_cores(self.device.registryID())
+        Some(crate::registry_entry::gpu_cores(self.device.registryID()))
     }
     fn apple10_family(&self) -> Option<bool> {
         Some(crate::pooled(|| self.device.supportsFamily(MTLGPUFamily::Apple10)))
