@@ -7,8 +7,9 @@ memory, has room on disk and is estimated to decode at 20 tokens per second or m
 conversation; else the largest within 90% of the fastest that fits; and where no speed can be
 measured, the smallest that fits.
 
-Models whose chosen quant reaches 20 tokens per second come first, by intelligence; the rest follow,
-also by intelligence, marked "below 20 tok/s on this computer". `--country US` recommends only
+Models whose chosen quant reaches 20 tokens per second come first, by intelligence; then those that
+reach 10 tokens per second; then slower ones. Each group is ordered by intelligence, and models below
+20 tok/s are marked "below 20 tok/s on this computer". `--country US` recommends only
 models whose developer is from that country, choosing among them the same way. A recommendation is
 a starting point for choosing with the user, not a claim that one model is best for every workload.
 

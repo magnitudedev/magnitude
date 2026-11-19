@@ -263,24 +263,29 @@ describe("inference command surface", () => {
 
 describe("recommendations, families, and assessment progress", () => {
   it("renders assessment progress", () => {
-    expect(renderPreparation(makePreparation(3, 4))).toBe("Assessment: In progress - 3 of 4 models assessed")
-    expect(renderPreparation(makePreparation(4, 4))).toBe("Assessment: Complete - 4 of 4 models assessed")
+    const measured = makeCatalogModel()
+    expect(renderPreparation(makePreparation(3, 4), [measured])).toBe("Assessment: In progress - 3 of 4 models assessed")
+    expect(renderPreparation(makePreparation(4, 4), [measured])).toBe("Assessment: Complete - 4 of 4 models assessed")
+    const measuring = makeCatalogModel({ servingState: { ...measured.servingState, assessment: {
+      ...fitsAssessment(), residency: { _tag: "Resident", performance: { _tag: "Pending", measurement: { _tag: "Measuring" } } } } } as typeof measured.servingState })
+    expect(renderPreparation(makePreparation(4, 4), [measured, measuring]))
+      .toBe("Assessment: In progress - 4 of 4 models assessed, measuring the speed of 1 quant")
   })
 
-  it("says recommendations may change while catalog models are still assessed", () => {
+  it("says recommendations may change while quants are still measured, even once every model is assessed", () => {
     const model = makeCatalogModel()
-    const assessing = makeCatalogModel({
-      modelId: CatalogFormModelIdSchema.make("assessing:gguf:q4"),
-      servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } },
-    })
-    const models = [model, assessing]
-    expect(renderRecommendations({ catalog: catalogState(models), models, hardware: makeHardware(), developerCountry: Option.none(), recommended: [model].map(recommendedModel) }))
-      .toContain("Assessing 1 more model; recommendations may change.")
+    const view = { catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none() }
+    expect(renderRecommendations({ ...view, recommended: [model].map(recommendedModel), unmeasured: 3 }))
+      .toContain("Measuring 3 more quants; recommendations may change.")
+    const empty = renderRecommendations({ ...view, recommended: [], unmeasured: 1 }).split("\n")
+    expect(empty[0]).toBe("Magnitude is still measuring how models run on this computer.")
+    expect(empty[1]).toBe("Measuring 1 more quant; recommendations may change.")
+    expect(renderRecommendations({ ...view, recommended: [], unmeasured: 0 }).split("\n")[0]).toBe("No models run on this computer.")
   })
 
   it("shows each recommendation's chosen quant with its speed, context and placement, and its ladder", () => {
     const model = makeCatalogModel()
-    const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none(), recommended: [model].map(recommendedModel) }).split("\n")
+    const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none(), recommended: [model].map(recommendedModel), unmeasured: 0 }).split("\n")
     expect(lines.slice(3, 9)).toEqual([
       "1. Qwen Test (UD-Q4_K_XL) - Alibaba (CN) - Intelligence 75%",
       "   4-bit unsloth UD-Q4_K_XL - 17.2 GB - ~24 tok/s - 32K context - Fits in GPU",
@@ -310,10 +315,10 @@ describe("recommendations, families, and assessment progress", () => {
   it("ends recommendations with the methodology and Hugging Face hints", () => {
     const model = makeCatalogModel()
     const view = { catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none() }
-    const lines = renderRecommendations({ ...view, recommended: [model].map(recommendedModel) }).trimEnd().split("\n")
+    const lines = renderRecommendations({ ...view, recommended: [model].map(recommendedModel), unmeasured: 0 }).trimEnd().split("\n")
     expect(lines.at(-2)).toBe("Learn more: magnitude docs recommendations")
     expect(lines.at(-1)).toBe("Looking for a specific version, finetune, or uncensored model? magnitude models search \"<model name>\"")
-    expect(renderRecommendations({ ...view, recommended: [] }).trimEnd().split("\n").at(-1)).toContain("magnitude models search")
+    expect(renderRecommendations({ ...view, recommended: [], unmeasured: 0 }).trimEnd().split("\n").at(-1)).toContain("magnitude models search")
   })
 
   it("heads recommendations with the machine, and lists the device in use before available ones", () => {
@@ -324,7 +329,7 @@ describe("recommendations, families, and assessment progress", () => {
     const hardware = { ...base, accelerators: [igpu, ...base.accelerators],
       memoryDomains: [{ memoryDomainId: system, kind: "System" as const, totalBytes: base.totalSystemMemoryBytes, availableBytes: Option.none() }, ...base.memoryDomains] }
     const model = makeCatalogModel()
-    const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware, developerCountry: Option.none(), recommended: [model].map(recommendedModel) }).split("\n")
+    const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware, developerCountry: Option.none(), recommended: [model].map(recommendedModel), unmeasured: 0 }).split("\n")
     expect(lines[1]).toBe("Workstation · Test CPU - 64 GB")
     expect(describeLocalHardware(hardware).accelerators).toEqual([
       { name: "Test GPU", details: "24 GB VRAM · CUDA acceleration · in use" },
@@ -1218,7 +1223,7 @@ describe("--json internal identities", () => {
     const unrunnable = makeFolderModel({ servingState: { ...assessed, assessment: unsupportedAssessment("IQ1_M") } })
     const catalog = catalogState([makeCatalogModel(), makeFoundModel(), makeAddedModel()], [makeUnsupportedLocalModel()], [unrunnable])
     const documents = [
-      encode(recommendationsJson, { catalog, models: [makeCatalogModel()], hardware: makeHardware(), developerCountry: Option.none(), recommended: [makeCatalogModel()].map(recommendedModel) }),
+      encode(recommendationsJson, { catalog, models: [makeCatalogModel()], hardware: makeHardware(), developerCountry: Option.none(), recommended: [makeCatalogModel()].map(recommendedModel), unmeasured: 0 }),
       encode(modelsListJson, statusView({ models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), unrunnable], hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })] })),
       encode(modelDetailJson, { model: makeAddedModel(), models: [], hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false }),
       encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false }),

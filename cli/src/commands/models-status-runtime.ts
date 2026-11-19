@@ -275,11 +275,18 @@ export interface ModelsListView {
 const unsupportedReasonLine = (model: UnsupportedLocalModel): string =>
   unsupportedReasonMessages(model.reasons).join(". ")
 
-/** How far the service is in assessing the models it offers on this computer. */
-export const renderPreparation = ({ assessment }: LocalModelPreparation): string => {
+/** The quants that fit here whose speed is still being measured; recommendations wait for them. */
+const measuringQuants = (models: readonly LocalModel[]): number => models.filter((model) =>
+  model.servingState._tag === "Assessed"
+  && model.servingState.assessment._tag === "Fits"
+  && model.servingState.assessment.residency.performance._tag === "Pending").length
+
+/** How far the service is in assessing the models it offers on this computer, and in measuring their speed. */
+export const renderPreparation = ({ assessment }: LocalModelPreparation, models: readonly LocalModel[]): string => {
   const progress = `${assessment.settledModels} of ${plural(assessment.totalModels, "model")} assessed`
+  const measuring = measuringQuants(models)
   const status = assessment.complete
-    ? `Complete - ${progress}`
+    ? measuring > 0 ? `In progress - ${progress}, measuring the speed of ${plural(measuring, "quant")}` : `Complete - ${progress}`
     : assessment.totalModels === 0
       ? "Not complete - no assessment targets reported"
       : `In progress - ${progress}`
@@ -300,7 +307,7 @@ export const renderModelsList = ({ models, unsupported, hidden, all, preparation
       ...(unsupported.length > 0 || hidden.length > 0 ? ["List them: magnitude models list --all"] : []),
     ]),
     ...warnings.map((message) => `Model warning: ${message}`),
-    renderPreparation(preparation),
+    renderPreparation(preparation, [...models, ...hidden]),
   ]
   const unsupportedSection = all && unsupported.length > 0 ? [
     "",

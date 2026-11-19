@@ -187,15 +187,16 @@ describe("recommendations", () => {
     expect(alike?.chosen).toEqual(Option.some("alike:gguf:q4"))
   })
 
-  it("orders fast models by intelligence, then slow ones, then those that do not fit", () => {
+  it("orders fast models by intelligence, then usable ones, then slow ones, then those that do not fit", () => {
     const { models } = project([
       rung({ id: "fast-dim:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 50, intelligence: 20 }),
-      rung({ id: "slow-smart:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 5, intelligence: 90 }),
+      rung({ id: "slow-smart:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 1, intelligence: 90 }),
+      rung({ id: "usable:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 14, intelligence: 40 }),
       rung({ id: "fast-smart:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 30, intelligence: 60 }),
       rung({ id: "huge:gguf:q4", storageBytes: 1 * GB, fits: false, intelligence: 95 }),
     ])
-    expect(models.map(({ base }) => base)).toEqual(["fast-smart", "fast-dim", "slow-smart", "huge"])
-    expect(models.map(({ chosen }) => Option.isSome(chosen))).toEqual([true, true, true, false])
+    expect(models.map(({ base }) => base)).toEqual(["fast-smart", "fast-dim", "usable", "slow-smart", "huge"])
+    expect(models.map(({ chosen }) => Option.isSome(chosen))).toEqual([true, true, true, true, false])
   })
 
   it("leaves out disabled models except those of a family that is coming soon, which have no chosen rung", () => {

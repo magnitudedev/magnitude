@@ -105,9 +105,12 @@ const byIntelligence = Order.mapInput(
   (model: RecommendedModel) => model.intelligence,
 )
 
-/** Models whose chosen rung reaches the target first, then the rest with a fitting rung, then those with none. */
+/**
+ * Models whose chosen rung reaches the target first, then those reaching the onboarding floor, then the rest with a
+ * fitting rung, then those with none: a smarter model too slow to use never leads one that is usable.
+ */
 const standing = (model: RecommendedModel): number =>
-  model.meetsTarget ? 0 : Option.isSome(model.chosen) ? 1 : 2
+  model.meetsTarget ? 0 : model.meetsOnboardingFloor ? 1 : Option.isSome(model.chosen) ? 2 : 3
 
 const recommendationOrder = Order.combine(
   Order.mapInput(Order.number, standing),
