@@ -26,7 +26,7 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
       if (Option.isSome(outcome)) yield* store.markOutcomeReported.pipe(Effect.ignore)
       return candidate
     }).pipe(
-      Effect.mapError(() => new ApplicationUpdateFailed({ message: "Could not check for application updates." })), Effect.provide(FetchHttpClient.layer),
+      Effect.mapError(() => new ApplicationUpdateFailed({ message: "Could not check for updates." })), Effect.provide(FetchHttpClient.layer),
     ),
     download: (candidate, progress) => Effect.gen(function* () {
       const url = yield* resolveHostedDownload({ ...options, release: candidate })
@@ -39,7 +39,9 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
         onProgress: Option.some(value => progress(value.acceptedBytes)),
       })
       return downloaded.destination
-  }).pipe(Effect.mapError(() => new ApplicationUpdateFailed({ message: "Could not download and verify the application update." })), Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Path.Path, path), Effect.provide(FetchHttpClient.layer)),
+  }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error._tag === "ArtifactDownloadError" && error.phase === "integrity"
+    ? `The download of Magnitude ${candidate.version} did not match its signed size and checksum, so it was not installed.`
+    : `Could not download Magnitude ${candidate.version}.` })), Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Path.Path, path), Effect.provide(FetchHttpClient.layer)),
   stage,
   })
 })

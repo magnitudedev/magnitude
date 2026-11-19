@@ -11,7 +11,7 @@ import { applicationNativeHostPath, applicationStateDirectory, holdContainerData
 import { containerImage } from "@magnitudedev/daemon-management/application-update"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { CLI_VERSION } from "../version"
-import { announceAvailableUpdates, idleInstallationSystem, initializeContainerUpdates, initializeServeUpdates, makeAvailableNotice, makeDownloadedNotice, makeIdleInstallation, makeImageNotice, prepareServeStartup } from "../server/serve-updates"
+import { announceAvailableUpdates, announceFailedUpdates, idleInstallationSystem, initializeContainerUpdates, initializeServeUpdates, makeAvailableNotice, makeDownloadedNotice, makeIdleInstallation, makeImageNotice, prepareServeStartup } from "../server/serve-updates"
 import { recordResidentModels, resumeResidentModels } from "../server/model-resumption"
 import { isContainer, renderNodeHint, requireWritableDataDirectory, unopenableRenderNodes } from "../server/container"
 import { resolveServeOwner } from "../server/serve-owner"
@@ -54,7 +54,10 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const availableNotice = yield* makeAvailableNotice(notify, runtime._tag === "Installed" && runtime.layout === "Standalone")
   const initializeUpdates = runtime._tag === "Installed" && container
     ? initializeContainerUpdates(runtime, profile, addon, owner, yield* makeImageNotice(notify))
-    : initializeServeUpdates(runtime, profile, addon, owner).pipe(Effect.tap(updates => announceAvailableUpdates(updates, availableNotice).pipe(Effect.forkScoped)))
+    : initializeServeUpdates(runtime, profile, addon, owner).pipe(Effect.tap(updates => Effect.all([
+        announceAvailableUpdates(updates, availableNotice),
+        announceFailedUpdates(updates, notify),
+      ], { concurrency: "unbounded", discard: true }).pipe(Effect.forkScoped)))
   const fs = yield* FileSystem.FileSystem
   const scope = yield* Effect.scope
   const native = process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon)

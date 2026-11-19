@@ -42,7 +42,7 @@ describe("container updates", () => {
   it("keeps an announced image when a later check fails", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     let calls = 0
     const updates = yield* makeContainerApplicationUpdate("magnitudedev/magnitude").pipe(Effect.provideService(ApplicationUpdateSource,
-      source(() => calls++ === 0 ? Effect.succeed(Option.some(candidate)) : new ApplicationUpdateFailed({ message: "Could not check for application updates." }))))
+      source(() => calls++ === 0 ? Effect.succeed(Option.some(candidate)) : new ApplicationUpdateFailed({ message: "Could not check for updates." }))))
     yield* updates.check("launch")
     yield* settled(updates.changes)
     yield* updates.check("manual")

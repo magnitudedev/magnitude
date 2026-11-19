@@ -10,7 +10,7 @@ const failedPhrase = { verify: "could not be verified", install: "failed to inst
 export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "Desktop" | "Headless" | "None" = "Desktop"): string => {
   // A running check supersedes the previous check's offer or failure; only transfers in progress stay visible.
   if (state.check._tag === "Checking" && (state.transfer._tag === "Idle" || state.transfer._tag === "Failed" || state.transfer._tag === "Available" || state.transfer._tag === "ImageAvailable")) {
-    return "Checking for application updates.\n"
+    return "Checking for updates.\n"
   }
   switch (state.transfer._tag) {
     case "Unavailable": case "Failed": return `${state.transfer.message}\n`
@@ -32,14 +32,16 @@ export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "D
     case "Cancelling": return "Cancelling the automatic update download.\nCheck progress: magnitude update status\n"
     case "Closed": return "Magnitude is quitting.\n"
     case "Idle": return state.check._tag === "Succeeded" ? "Magnitude is up to date.\n"
-      : state.check._tag === "Checking" ? "Checking for application updates.\n"
+      : state.check._tag === "Checking" ? "Checking for updates.\n"
       : state.check._tag === "Failed" ? `${state.check.message}\n` : "No update check has completed.\nCheck now: magnitude update\n"
   }
 }
 
-/** The reply to an install request a running `magnitude serve` accepts: it installs the update at its next idle point. */
-export const renderIdleInstallation = (state: ApplicationUpdateState): string => state.transfer._tag === "Downloading" || state.transfer._tag === "Staging" || state.transfer._tag === "Ready"
+/** The reply to an install request a running `magnitude serve` accepts: it installs the update at its next idle point, once the download is verified. */
+export const renderIdleInstallation = (state: ApplicationUpdateState): string => state.transfer._tag === "Ready"
   ? `Magnitude ${state.transfer.version} will be installed once \`magnitude serve\` is idle; it restarts into the new version.\nCheck progress: magnitude update status\n`
+  : state.transfer._tag === "Downloading" || state.transfer._tag === "Staging"
+  ? `Magnitude ${state.transfer.version} is downloading. Once it is verified, \`magnitude serve\` installs it when idle and restarts into the new version.\nCheck progress: magnitude update status\n`
   : renderApplicationUpdate(state, "Headless")
 
 /** Polls the update status until a check started by `update check` finishes, so its result is what is printed. */

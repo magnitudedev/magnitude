@@ -12,6 +12,7 @@ import { UpdateHardwareSource } from "./update-hardware"
 
 const checks: UpdateCheck[] = []
 let serverAvailable = true
+let downloadFailure: "integrity" | "stream" | undefined
 vi.mock("@magnitudedev/release/hosted-update", async importOriginal => {
   const actual = await importOriginal<typeof import("@magnitudedev/release/hosted-update")>()
   return {
@@ -22,6 +23,7 @@ vi.mock("@magnitudedev/release/hosted-update", async importOriginal => {
     }),
     resolveHostedDownload: () => Effect.succeed(new URL("https://example.com/installer")),
     downloadUpdateArtifact: (options: Parameters<typeof actual.downloadUpdateArtifact>[0]) => Effect.gen(function* () {
+      if (downloadFailure !== undefined) return yield* Effect.fail({ _tag: "ArtifactDownloadError", phase: downloadFailure, message: "fixture" })
       const fs = yield* FileSystem.FileSystem
       yield* fs.writeFileString(options.destination, "verified transfer fixture")
       return { destination: options.destination }
@@ -80,6 +82,27 @@ describe("hosted update transfer storage", () => {
       })).pipe(Effect.provide(BunContext.layer)))
       expect(await readdir(join(root, "update-downloads"))).toEqual([])
       expect(await readdir(root)).toEqual(["update-downloads"])
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+})
+
+describe("hosted update transfer failures", () => {
+  it("says a download that fails verification was refused, and any other failure that the download failed", async () => {
+    const release = Schema.decodeUnknownSync(UpdateRelease)({ version: "2.0.0", bytes: 25, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" })
+    const root = await mkdtemp(join(tmpdir(), "hosted-update-failure-"))
+    const messages = async (phase: "integrity" | "stream") => {
+      downloadFailure = phase
+      try {
+        return await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+          const source = yield* hostedUpdateSource({ ...options, dataDirectory: root }, () => Effect.void).pipe(
+            Effect.provideService(PreparedUpdateStore, store(Option.none(), yield* Ref.make(0))), Effect.provideService(UpdateHardwareSource, hardwareSource(Option.none())))
+          return yield* source.download(release, () => Effect.void).pipe(Effect.flip, Effect.map(error => error.message))
+        })).pipe(Effect.provide(BunContext.layer)))
+      } finally { downloadFailure = undefined }
+    }
+    try {
+      expect(await messages("integrity")).toBe("The download of Magnitude 2.0.0 did not match its signed size and checksum, so it was not installed.")
+      expect(await messages("stream")).toBe("Could not download Magnitude 2.0.0.")
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 })

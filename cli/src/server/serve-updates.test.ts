@@ -5,7 +5,7 @@ import type { UpdateOutcome } from "@magnitudedev/release/hosted-update"
 import type { ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
 import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { CLI_VERSION } from "../version"
-import { announceAvailableUpdates, IdleInstallationSystem, makeAvailableNotice, makeDownloadedNotice, makeIdleInstallation } from "./serve-updates"
+import { announceAvailableUpdates, announceFailedUpdates, IdleInstallationSystem, makeAvailableNotice, makeDownloadedNotice, makeIdleInstallation } from "./serve-updates"
 
 const release = { version: "99.0.0", bytes: 1, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" }
 const updatesIn = (...transfers: ApplicationUpdateState["transfer"][]) => ({
@@ -225,5 +225,23 @@ describe("available notice", () => {
       "Magnitude 2.0.0 is available. Download it with `magnitude update download`.",
       "Magnitude 2.2.0 is available. Download it with `magnitude update download`.",
     ])
+  })
+})
+
+describe("failed update notice", () => {
+  it("prints each failure's reason once", async () => {
+    const lines: string[] = []
+    const with_ = (transfer: ApplicationUpdateState["transfer"]): ApplicationUpdateState => ({ transfer, check: { _tag: "Succeeded", at: 0 }, preference: { _tag: "Known", autoDownload: true } })
+    const refused = "The download of Magnitude 2.0.0 did not match its signed size and checksum, so it was not installed."
+    const states = [
+      with_({ _tag: "Downloading", version: "2.0.0", completed: 0, total: 1 }),
+      with_({ _tag: "Failed", message: refused }),
+      with_({ _tag: "Failed", message: refused }),
+      with_({ _tag: "Idle" }),
+      with_({ _tag: "Failed", message: "Could not download Magnitude 2.1.0." }),
+    ]
+    const updates = { changes: Stream.fromIterable(states) } as unknown as ApplicationUpdate
+    await Effect.runPromise(announceFailedUpdates(updates, line => Effect.sync(() => { lines.push(line) })))
+    expect(lines).toEqual([refused, "Could not download Magnitude 2.1.0."])
   })
 })

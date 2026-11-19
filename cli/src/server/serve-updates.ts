@@ -107,6 +107,13 @@ export const announceAvailableUpdates = (updates: ApplicationUpdate, notice: (ve
     ? Option.some(state.transfer.version) : Option.none()),
   Stream.runForEach(notice))
 
+/** Prints why each download or preparation failed, as serve's output is where an unattended failure is looked for. */
+export const announceFailedUpdates = (updates: ApplicationUpdate, notify: (line: string) => Effect.Effect<void>) => updates.changes.pipe(
+  Stream.map(state => state.transfer._tag === "Failed" ? Option.some(state.transfer.message) : Option.none()),
+  Stream.changes,
+  Stream.filterMap(message => message),
+  Stream.runForEach(notify))
+
 /** The one line a container prints for each newer release, which a newer image provides. */
 export const makeImageNotice = (notify: (line: string) => Effect.Effect<void>) =>
   makeVersionNotice(notify, version => containerUpdateNotice(version, containerImage(CLI_VERSION)))
