@@ -14,7 +14,7 @@
 // Shared: one partial per subgroup (reduce_group_sum at float 0).
 void readout_features_rows() {
     const uint width = uint(SEISMIC_DIM_D);
-    const uint row = gl_WorkGroupID.x, thread = gl_LocalInvocationIndex;
+    const uint row = gl_WorkGroupID.x;
     const projection_prologue in_ = projection_input(FEATURES_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
         SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
         FEATURES_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), width, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS),
@@ -22,15 +22,21 @@ void readout_features_rows() {
     const Out features = SEISMIC_RESULT_0_OUT;
 #if SEISMIC_STATIC_NM == 0
     // No norm: the sum in part order of the mix site's partials.
-    for (uint i = thread; i < width; i += gl_WorkGroupSize.x)
+    for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x)
         out_put(features,
             uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1,
             element_round(FEATURES_ACT, projection_summed_at(in_, row, i)));
 #else
+    // Every invocation's rounds, spread by `SEISMIC_THREAD`; one past the row
+    // adds nothing.
+    const uint thread = SEISMIC_THREAD;
     float squares = 0.0;
-    for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
-        const float v = projection_norm_input(in_, row, i);
-        squares = seismic_fma_rn(v, v, squares);
+    for (uint base = 0u; base < width; base += gl_WorkGroupSize.x) {
+        const uint i = base + thread;
+        if (i < width) {
+            const float v = projection_norm_input(in_, row, i);
+            squares = seismic_fma_rn(v, v, squares);
+        }
     }
     squares = reduce_group_sum(squares, 0u);
     const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + in_.eps);

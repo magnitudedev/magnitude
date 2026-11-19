@@ -188,15 +188,11 @@ pub(crate) struct Boundary {
 }
 
 impl Boundary {
-    /// Rules 1-4 over the authored file `path`, once per build: the first
-    /// violation fails the build.
-    pub(crate) fn check(&mut self, path: &Path, source: &str) -> Result<(), BuildError> {
-        if !self.checked.insert(path.to_path_buf()) {
-            return Ok(());
-        }
-        match violations(source).into_iter().next() {
-            Some((offset, rule)) => Err(violation(path, source, offset, rule)),
-            None => Ok(()),
+    /// Rules 1-4 over the authored file `path`, once per build: every
+    /// violation joins the build's `found`.
+    pub(crate) fn check(&mut self, path: &Path, source: &str, found: &mut Vec<BuildError>) {
+        if self.checked.insert(path.to_path_buf()) {
+            found.extend(violations(source).into_iter().map(|(offset, rule)| violation(path, source, offset, rule)));
         }
     }
 }

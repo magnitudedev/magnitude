@@ -56,8 +56,7 @@ impl MachineDescription {
         let system = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_cpu(sysinfo::CpuRefreshKind::nothing()),
         );
-        let processors = seismic::Processors::discover()
-            .map_err(|error| format!("the host's processors: {error}"))?;
+        let processors = seismic::Processors::discover();
         let cores = || processors.nodes().iter().flat_map(|node| &node.cores);
         Ok(Self {
             machine: seismic::Machine::discover(),
@@ -380,6 +379,7 @@ fn snapshot(
                     backend: execution_backend(backend),
                 },
                 DiagnosticSource::Adapters => HardwareDiagnosticSource::Adapters,
+                DiagnosticSource::Host => HardwareDiagnosticSource::Host,
             },
             message: diagnostic.message.clone(),
         })

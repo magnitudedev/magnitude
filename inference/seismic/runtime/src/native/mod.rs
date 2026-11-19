@@ -67,7 +67,7 @@ use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, PrepareError};
 #[cfg(any(test, target_os = "macos"))]
 use crate::api::tensor::Records;
-use crate::api::tensor::TensorInner;
+use crate::api::tensor::{exclusive_pairs, Reaching, TensorInner};
 use crate::api::{CallError, OutputError};
 use crate::artifacts::ArtifactKey;
 use crate::backends::{CpuOpened, CudaOpened, OpenedKind};
@@ -93,7 +93,7 @@ use seismic_lang::checked::{
 };
 use seismic_lang::entry::{
     CallSchema, CheckedProgramSubject, ElementBindings, LogicalEntry, ParameterKind, ResultClass,
-    ResultKind, TensorAccess,
+    ResultKind,
 };
 use seismic_lang::expr::compiled::{CompiledNat, InvocationValues};
 use seismic_lang::expr::{SymbolId, SymbolValue};
@@ -932,7 +932,7 @@ fn formed_launches(
 
 /// The geometry a pipeline fixes for one launch (Vulkan's specialization
 /// constants): its threads per group and group-shared bytes.
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(any(test, feature = "coverage", not(target_os = "macos")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PipelineGeometry {
     threads: [u64; 3],
@@ -945,13 +945,13 @@ struct PipelineGeometry {
 /// checker's Vulkan rule), so they are known at preparation. A formed launch
 /// with no thread on an axis is a declaration that cannot run the work it
 /// is formed for: refused.
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(any(test, feature = "coverage", not(target_os = "macos")))]
 fn pipeline_geometry(
     name: &str,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
     formed: &[bool],
-) -> Result<Vec<Option<PipelineGeometry>>, PrepareError> {
+) -> Result<Vec<Option<PipelineGeometry>>, String> {
     implementation
         .launches
         .iter()
@@ -967,7 +967,7 @@ fn pipeline_geometry(
                     .evaluate(&|dimension| specialization.static_value(dimension), &|parameter| {
                         specialization.launch_param(ordinal, parameter).or_else(|| specialization.param(parameter))
                     })
-                    .map_err(|error| preparation(format!("`{name}` launch `{kernel}`: {error}")))
+                    .map_err(|error| format!("`{name}` launch `{kernel}`: {error}"))
             };
             let threads = [
                 evaluate(&launch.group_extent[0])?,
@@ -975,41 +975,76 @@ fn pipeline_geometry(
                 evaluate(&launch.group_extent[2])?,
             ];
             if threads.contains(&0) {
-                return Err(preparation(format!(
-                    "`{name}` launch `{kernel}` is formed with {threads:?} threads per group"
-                )));
+                return Err(format!("`{name}` launch `{kernel}` is formed with {threads:?} threads per group"));
             }
             Ok(Some(PipelineGeometry { threads, shared_bytes: evaluate(&launch.shared_bytes)? }))
         })
         .collect()
 }
 
-/// The pipeline geometry of every formed launch of a Vulkan implementation
-/// ([`pipeline_geometry`]), checked against the device: its workgroup size
-/// and group-memory view lengths. Every pipeline is formed, and checked, at
-/// preparation.
-#[cfg(not(target_os = "macos"))]
-fn vulkan_geometry(
-    opened: &crate::backends::VulkanOpened,
+/// The entry of every launch of a Vulkan implementation that `formed`
+/// names, by declaration ordinal, as preparation forms it on any device,
+/// with the geometry it is of ([`pipeline_geometry`]): its workgroup size,
+/// and as its constants its group-memory view lengths, which follow the
+/// workgroup size in the pipeline's specialization. A launch not formed has
+/// none. Preparation checks these against its device
+/// ([`vulkan_device_entries`]); coverage forms them as they are.
+#[cfg(any(test, feature = "coverage", not(target_os = "macos")))]
+fn vulkan_entries(
     name: &str,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
     formed: &[bool],
-) -> Result<Vec<Option<([u32; 3], Vec<u32>)>>, PrepareError> {
-    let limits = opened.service().facts().limits;
-    let properties = *opened.service().properties();
+) -> Result<Vec<Option<(ProgramEntry, PipelineGeometry)>>, String> {
     let narrow = |value: u64, what: &str| {
-        u32::try_from(value)
-            .map_err(|_| preparation(format!("`{name}`: {what} {value} exceeds the Vulkan ABI")))
+        u32::try_from(value).map_err(|_| format!("`{name}`: {what} {value} exceeds the Vulkan ABI"))
     };
     pipeline_geometry(name, implementation, specialization, formed)?
         .into_iter()
         .zip(&implementation.launches)
         .map(|(geometry, launch)| {
-            let Some(PipelineGeometry { threads, shared_bytes }) = geometry else {
+            let Some(geometry) = geometry else {
                 return Ok(None);
             };
-            let kernel = &launch.kernel;
+            let [x, y, z] = geometry.threads;
+            let entry = ProgramEntry {
+                symbol: launch.kernel.clone(),
+                group_size: Some([
+                    narrow(x, "a workgroup extent")?,
+                    narrow(y, "a workgroup extent")?,
+                    narrow(z, "a workgroup extent")?,
+                ]),
+                constants: abi::vulkan::shared_view_lengths(geometry.shared_bytes)
+                    .into_iter()
+                    .map(|length| narrow(length, "a shared view length"))
+                    .collect::<Result<_, _>>()?,
+            };
+            Ok(Some((entry, geometry)))
+        })
+        .collect()
+}
+
+/// The entry of every formed launch of a Vulkan implementation
+/// ([`vulkan_entries`]), its geometry checked against the device. Every
+/// pipeline is formed, and checked, at preparation.
+#[cfg(not(target_os = "macos"))]
+fn vulkan_device_entries(
+    opened: &crate::backends::VulkanOpened,
+    name: &str,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    formed: &[bool],
+) -> Result<Vec<Option<ProgramEntry>>, PrepareError> {
+    let limits = opened.service().facts().limits;
+    let properties = *opened.service().properties();
+    vulkan_entries(name, implementation, specialization, formed)
+        .map_err(preparation)?
+        .into_iter()
+        .map(|launch| {
+            let Some((entry, PipelineGeometry { threads, shared_bytes })) = launch else {
+                return Ok(None);
+            };
+            let kernel = &entry.symbol;
             let invocations = threads.iter().try_fold(1u64, |product, value| product.checked_mul(*value));
             if invocations.is_none_or(|invocations| invocations > properties.max_group_threads.get())
                 || threads.iter().zip(limits.max_group_size).any(|(threads, limit)| *threads > limit)
@@ -1026,17 +1061,7 @@ fn vulkan_geometry(
                     properties.shared_bytes_per_group.get()
                 )));
             }
-            Ok(Some((
-                [
-                    narrow(threads[0], "a workgroup extent")?,
-                    narrow(threads[1], "a workgroup extent")?,
-                    narrow(threads[2], "a workgroup extent")?,
-                ],
-                abi::vulkan::shared_view_lengths(shared_bytes)
-                    .into_iter()
-                    .map(|length| narrow(length, "a shared view length"))
-                    .collect::<Result<_, _>>()?,
-            )))
+            Ok(Some(entry))
         })
         .collect()
 }
@@ -1632,16 +1657,15 @@ fn rendered_programs(
         OpenedKind::Cuda(opened) => Ok(programs(cuda_dialect(opened), asset(BackendName::Cuda)?)),
         #[cfg(not(target_os = "macos"))]
         OpenedKind::Vulkan(opened) => {
-            let geometry = vulkan_geometry(
+            let entries = vulkan_device_entries(
                 opened,
                 &entry_name(module, entry),
                 implementation,
                 specialization,
                 &reachable,
             )?;
-            // Each formed entry's constants are its workgroup size, then its
-            // group-memory views: the pipeline's specialization. A launch
-            // not formed keeps its place by name only, and `whole` drops it.
+            // A launch not formed keeps its place by name only, and `whole`
+            // drops it.
             let source = ProgramSource {
                 text: abi::render_source(
                     abi::Dialect::Vulkan(opened.features()),
@@ -1654,15 +1678,8 @@ fn rendered_programs(
                 entries: implementation
                     .launches
                     .iter()
-                    .zip(&geometry)
-                    .map(|(launch, geometry)| match geometry {
-                        Some((threads, views)) => ProgramEntry {
-                            symbol: launch.kernel.clone(),
-                            group_size: Some(*threads),
-                            constants: views.clone(),
-                        },
-                        None => ProgramEntry::named(launch.kernel.as_str()),
-                    })
+                    .zip(entries)
+                    .map(|(launch, entry)| entry.unwrap_or_else(|| ProgramEntry::named(launch.kernel.as_str())))
                     .collect(),
             };
             Ok(whole(source))
@@ -2257,6 +2274,14 @@ impl NativePrepared {
         self.schema().parameters()[ordinal].binding == seismic_lang::entry::PortBinding::Slab
     }
 
+    /// Whether a launch writes buffer `buffer` (ABI order), or its host
+    /// rewrites it once it sees the launch: what its hazards order it as
+    /// and what binding keeps apart from its other buffers
+    /// ([`crate::api::tensor::exclusive_pairs`]).
+    pub(crate) fn writes(&self, buffer: usize) -> bool {
+        self.buffer_writes[buffer] || self.host_writes[buffer]
+    }
+
     /// The buffers the kernel's argument table binds: every one but its
     /// host ports.
     pub(crate) fn bound_buffers(&self) -> usize {
@@ -2831,7 +2856,7 @@ impl NativePrepared {
         for (parameter, tensor) in self.schema().parameters().iter().zip(args.tensors()) {
             if let (ParameterKind::Tensor { access, .. }, Some(tensor)) = (&parameter.kind, tensor)
             {
-                if matches!(access, TensorAccess::Owned | TensorAccess::Mutable)
+                if access.writer().is_some()
                     && tensor.allocation().storage().read_only()
                 {
                     return Err(CallError::Execution(ExecutionError::SubmissionFailed(
@@ -2867,8 +2892,6 @@ impl NativePrepared {
                         self.device,
                         spec.representation,
                         &spec.extents,
-                        &args,
-                        &results,
                     )?;
                     tensor
                 }
@@ -2879,18 +2902,9 @@ impl NativePrepared {
             };
             results.push(tensor);
         }
-        let (scratch, regions) = place_scratch(&shape.scratch);
-        let (sync, body) = arena.holding(regions)?;
-
         let schema = self.schema();
-        let mut buffers = Vec::new();
-        #[cfg(any(test, target_os = "macos"))]
-        let mut slabs = Vec::new();
-        #[cfg(any(test, target_os = "macos"))]
-        let mut records = Vec::new();
-        let mut representations = Vec::new();
-        let mut access = collect_native_access(schema, &args);
-        // Tensor parameters by schema ordinal, then results by ordinal.
+        // Tensor parameters by schema ordinal, then results by ordinal: the
+        // tensor buffers in ABI order.
         let parameters = schema
             .parameters()
             .iter()
@@ -2903,8 +2917,34 @@ impl NativePrepared {
                 (Ok(ordinal), tensor)
             });
         let produced = results.iter().enumerate().map(|(ordinal, tensor)| (Err(ordinal), tensor));
+        let tensors: Vec<(Result<usize, usize>, &Arc<TensorInner>)> = parameters.chain(produced).collect();
+        // No two of them it writes either of share a bound byte; scratch,
+        // placed apart in the call's arena, never meets them.
+        let reaching: Vec<Reaching<'_>> = tensors.iter().map(|&(_, tensor)| Reaching::new(tensor)).collect();
+        if let Some((first, second)) = exclusive_pairs(tensors.len(), |buffer| self.writes(buffer)).find(|&(first, second)| {
+            let ((_, first_tensor), (_, second_tensor)) = (tensors[first], tensors[second]);
+            reaching[first].meets(0..first_tensor.byte_len(), &reaching[second], 0..second_tensor.byte_len())
+        }) {
+            return Err(match tensors[second].0 {
+                Ok(_) => CallError::Invocation(InvocationError::IllegalAliasing {
+                    first: abi::tensor_buffer_name(schema, first).to_owned(),
+                    second: abi::tensor_buffer_name(schema, second).to_owned(),
+                }),
+                Err(result) => CallError::Output(OutputError::IllegalAliasing { result }),
+            });
+        }
+        let (scratch, regions) = place_scratch(&shape.scratch);
+        let (sync, body) = arena.holding(regions)?;
+
+        let mut buffers = Vec::new();
+        #[cfg(any(test, target_os = "macos"))]
+        let mut slabs = Vec::new();
+        #[cfg(any(test, target_os = "macos"))]
+        let mut records = Vec::new();
+        let mut representations = Vec::new();
+        let mut access = collect_native_access(schema, &args);
         let record_ports = self.records(&shape.launches);
-        for (port, tensor) in parameters.chain(produced) {
+        for &(port, tensor) in &tensors {
             let name = || match port {
                 Ok(ordinal) => schema.parameters()[ordinal].name.clone(),
                 Err(ordinal) => format!("result {ordinal}"),
@@ -3243,7 +3283,7 @@ impl NativeBoundCall {
                 continue;
             }
             match self.slabs.iter().find(|(slabbed, _)| *slabbed == buffer) {
-                Some((_, slab)) => slab.extend(buffer, allocation, *offset, reaches),
+                Some((_, slab)) => slab.extend_whole(buffer, allocation, *offset, reaches),
                 None => reaches.push(hazard::Reach {
                     buffer,
                     allocation: allocation.identity(),
@@ -3936,8 +3976,6 @@ fn validate_output(
     device: DeviceIdentity,
     representation: RepresentationId,
     extents: &[u64],
-    args: &EncodedArgs,
-    prior_outputs: &[Arc<TensorInner>],
 ) -> Result<(), CallError> {
     if tensor.allocation().storage().read_only() {
         return Err(CallError::Execution(ExecutionError::SubmissionFailed(
@@ -3972,17 +4010,6 @@ fn validate_output(
         return Err(CallError::Output(OutputError::NoncanonicalLayout {
             result,
         }));
-    }
-    let overlaps = |other: &Arc<TensorInner>| {
-        let other = other.descriptor();
-        descriptor.allocation == other.allocation
-            && descriptor.byte_offset < other.byte_offset.saturating_add(other.byte_len)
-            && other.byte_offset < descriptor.byte_offset.saturating_add(descriptor.byte_len)
-    };
-    if args.tensors().flatten().any(|other| overlaps(other))
-        || prior_outputs.iter().any(|other| overlaps(other))
-    {
-        return Err(CallError::Output(OutputError::IllegalAliasing { result }));
     }
     Ok(())
 }

@@ -19,7 +19,7 @@ const SUPPORTED_VERSIONS: std::ops::RangeInclusive<u32> = 2..=3;
 /// The version of the rules that derive an inspection's facts and labels from a header. Every
 /// cache of something they derive carries it in its key, so changing it re-derives all of them;
 /// bump it with any change to what an inspection reports.
-pub const RULES: &str = "gguf-rules-v1";
+pub const RULES: &str = "gguf-rules-v2";
 
 /// Header facts of one GGUF file. `header_digest` is the lowercase hex SHA-256 of the first
 /// `header_bytes` bytes, which identifies the file's content without reading tensor data.
@@ -99,6 +99,15 @@ impl GgufTensors {
                 .and_then(|architecture| directory.value(&format!("{architecture}.{key}")))
                 .and_then(Value::unsigned)
         };
+        let split = directory
+            .value("split.count")
+            .and_then(Value::unsigned)
+            .is_some_and(|count| count > 1);
+        if split && directory.tensors.is_empty() {
+            return Self::Model {
+                embedded_mtp: unsigned("nextn_predict_layers").is_some_and(|layers| layers > 0),
+            };
+        }
         if let (Some(blocks), Some(layers @ 1..)) =
             (unsigned("block_count"), unsigned("nextn_predict_layers"))
         {
@@ -1631,6 +1640,39 @@ mod tests {
                 ],
             ),
             (Some("MXFP4".to_owned()), Some("4-bit".to_owned()))
+        );
+    }
+
+    #[test]
+    fn metadata_only_split_first_shard_with_nextn_predict_layers_is_model_not_drafter() {
+        let mut split_shard_1 = Vec::new();
+        split_shard_1.extend_from_slice(b"GGUF");
+        split_shard_1.extend_from_slice(&3_u32.to_le_bytes());
+        split_shard_1.extend_from_slice(&0_u64.to_le_bytes()); // 0 tensors
+        split_shard_1.extend_from_slice(&5_u64.to_le_bytes()); // 5 kv
+        let write_str = |buf: &mut Vec<u8>, s: &str| {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        };
+        let write_kv_str = |buf: &mut Vec<u8>, k: &str, v: &str| {
+            write_str(buf, k);
+            buf.extend_from_slice(&8_u32.to_le_bytes());
+            write_str(buf, v);
+        };
+        let write_kv_u32 = |buf: &mut Vec<u8>, k: &str, v: u32| {
+            write_str(buf, k);
+            buf.extend_from_slice(&4_u32.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        };
+        write_kv_str(&mut split_shard_1, "general.architecture", "glm5-next");
+        write_kv_u32(&mut split_shard_1, "glm5-next.block_count", 46);
+        write_kv_u32(&mut split_shard_1, "glm5-next.nextn_predict_layers", 1);
+        write_kv_u32(&mut split_shard_1, "split.no", 0);
+        write_kv_u32(&mut split_shard_1, "split.count", 4);
+        let directory = magnitude_artifacts::gguf::read_header(split_shard_1).unwrap();
+        assert_eq!(
+            GgufTensors::of(&directory, Some("glm5-next")),
+            GgufTensors::Model { embedded_mtp: true }
         );
     }
 }

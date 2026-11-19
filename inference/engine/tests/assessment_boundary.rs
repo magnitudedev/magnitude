@@ -298,12 +298,7 @@ impl Drop for Scratch {
 }
 
 fn package(target: PathBuf) -> ModelPackagePaths {
-    ModelPackagePaths {
-        target,
-        projector: None,
-        draft: None,
-        method: ModelMethod::Auto,
-    }
+    ModelPackagePaths::single(target, None, None, ModelMethod::Auto)
 }
 
 /// The header-only inventory a CPU load of `package` would prepare, or why

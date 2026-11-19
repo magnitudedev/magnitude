@@ -104,7 +104,8 @@ pub struct ProcessMemory {
     /// The physical footprint: what memory pressure and the peak-footprint
     /// accounting count. On Linux, the resident anonymous and shared memory
     /// and what a driver holds for the process in host RAM
-    /// ([`DriverMemory`]).
+    /// ([`DriverMemory`]); on Windows, the private commit (`PrivateUsage`),
+    /// what the commit limits of the system and of a job count.
     pub footprint_bytes: Option<u64>,
     /// Heap blocks in use: what the process's own code and the frameworks
     /// it calls have allocated and not freed, by the sizes allocated. Pages
@@ -152,7 +153,11 @@ impl ProcessMemory {
             SAMPLED_PEAK.fetch_max(footprint, std::sync::atomic::Ordering::Relaxed);
             Some(footprint)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            Some(windows::own()?.PrivateUsage as u64)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         None
     }
 
@@ -161,11 +166,13 @@ impl ProcessMemory {
     /// keeps: what the footprint was between two readings is then in no
     /// peak. True on Linux, whose one high-water mark (`VmHWM`) is of the
     /// whole resident set, resident pages of mapped files included, which
-    /// the footprint is not.
-    pub const PEAK_IS_SAMPLED: bool = cfg!(not(target_os = "macos"));
+    /// the footprint is not. Windows keeps the private commit's own mark
+    /// (`PeakPagefileUsage`).
+    pub const PEAK_IS_SAMPLED: bool = cfg!(target_os = "linux");
 
     /// The most the footprint has been in the life of the process, in the
-    /// footprint's own quantity: on macOS the system's mark; on Linux the
+    /// footprint's own quantity: on macOS and Windows the system's mark
+    /// (Windows' `PeakPagefileUsage`, the private commit's); on Linux the
     /// most of every reading taken ([`ProcessMemory::footprint_now`]:
     /// around each piece of a search, when a worker thread ends a job and
     /// when a compile holds its program and what it formed), because the
@@ -181,7 +188,11 @@ impl ProcessMemory {
             let now = Self::footprint_now()?;
             Some(now.max(SAMPLED_PEAK.load(std::sync::atomic::Ordering::Relaxed)))
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            Some(windows::own()?.PeakPagefileUsage as u64)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         None
     }
 
@@ -189,7 +200,9 @@ impl ProcessMemory {
     /// where the system keeps it: what a process's peak accounting reports
     /// when it exits. On Linux that is the whole resident set (`VmHWM`),
     /// resident pages of mapped files included, so it is not the
-    /// footprint's peak ([`ProcessMemory::footprint_peak`]). It cannot be
+    /// footprint's peak ([`ProcessMemory::footprint_peak`]); on Windows the
+    /// private commit's mark (`PeakPagefileUsage`), which a job's
+    /// accounting reports, and which is the footprint's peak. It cannot be
     /// started again, so it bounds a span of the process only from the
     /// span's end on.
     pub fn peak_footprint() -> Option<u64> {
@@ -201,7 +214,11 @@ impl ProcessMemory {
         {
             linux::peak_resident_bytes()
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            Self::footprint_peak()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         None
     }
 
@@ -233,7 +250,11 @@ impl ProcessMemory {
                 mapped_bytes: linux::field_bytes(&status, "RssFile:"),
             }
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            Self { footprint_bytes: Self::footprint_now(), ..Self::default() }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         Self::default()
     }
 }
@@ -312,6 +333,40 @@ mod linux {
         }
         #[cfg(not(target_env = "gnu"))]
         None
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    /// `K32GetProcessMemoryInfo` of this process.
+    pub(super) fn own() -> Option<PROCESS_MEMORY_COUNTERS_EX> {
+        counters(unsafe { GetCurrentProcess() })
+    }
+
+    /// `K32GetProcessMemoryInfo` of the process `pid`; none where it is
+    /// gone or this process may not query it.
+    pub(super) fn of(pid: u32) -> Option<PROCESS_MEMORY_COUNTERS_EX> {
+        // SAFETY: a handle opened here, closed below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return None;
+        }
+        let read = counters(process);
+        unsafe { CloseHandle(process) };
+        read
+    }
+
+    /// The process's private commit (`PrivateUsage`) and its mark
+    /// (`PeakPagefileUsage`), among its other counters.
+    fn counters(process: HANDLE) -> Option<PROCESS_MEMORY_COUNTERS_EX> {
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX { cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
+        // SAFETY: writes at most `cb` bytes of the structure it is given.
+        let read = unsafe { K32GetProcessMemoryInfo(process, (&raw mut counters).cast(), counters.cb) };
+        (read != 0).then_some(counters)
     }
 }
 
@@ -488,9 +543,10 @@ pub enum ProcessFootprint {
 /// The host RAM footprint of `process` now: macOS's physical footprint
 /// (`proc_pid_rusage`, `ri_phys_footprint`), Linux's resident anonymous
 /// and shared memory (`/proc/<pid>/status` `RssAnon` and `RssShmem`, the
-/// footprint's own terms, file-backed pages left out); unobserved
+/// footprint's own terms, file-backed pages left out), Windows' private
+/// commit (`K32GetProcessMemoryInfo`'s `PrivateUsage`); unobserved
 /// elsewhere, or where the process is gone. A device's own memory is in
-/// neither.
+/// none of them.
 pub fn host_footprint(process: ProcessId) -> ProcessFootprint {
     #[cfg(target_os = "macos")]
     let bytes = macos::phys_footprint(process.0);
@@ -498,7 +554,9 @@ pub fn host_footprint(process: ProcessId) -> ProcessFootprint {
     let bytes = std::fs::read_to_string(format!("/proc/{}/status", process.0))
         .ok()
         .and_then(|status| linux::footprint_of(&status, 0));
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    let bytes = windows::of(process.0).map(|counters| counters.PrivateUsage as u64);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let bytes: Option<u64> = {
         let _ = process;
         None

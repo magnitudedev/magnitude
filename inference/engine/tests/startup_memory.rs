@@ -18,13 +18,13 @@ use std::path::PathBuf;
 
 fn model() -> ResolvedEngineConfiguration {
     EngineConfiguration {
-        package: PackageOptions {
-            target: std::env::var_os("MAGNITUDE_TEST_GGUF")
+        package: PackageOptions::single(
+            std::env::var_os("MAGNITUDE_TEST_GGUF")
                 .expect("set MAGNITUDE_TEST_GGUF")
                 .into(),
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+            ProjectorSelection::Disabled,
+            None,
+        ),
         model: ModelPolicy::default(),
         context_tokens: Some(1024),
         service: standard_service_limits(),

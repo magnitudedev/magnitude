@@ -70,10 +70,13 @@ pub struct MetalReport {
     /// `seismic_metal::profile::MetalProbeAnswers::forms_tensor_operations`, for a device the
     /// backend admits.
     pub tensor_operations: bool,
+    /// `recommendedMaxWorkingSetSize`: on a unified device the share of
+    /// host RAM it may take, on one whose memory is its own that memory.
     pub working_set: u64,
     pub max_allocation: u64,
-    /// Its one kind, which every contract is allocated in.
-    pub kind: KindReport,
+    /// Its kinds: shared storage, and on a device whose memory is its own
+    /// private storage too (`seismic_metal::topology::kinds`).
+    pub kinds: Vec<KindReport>,
 }
 
 #[derive(Debug)]
@@ -297,6 +300,12 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
     // report is the store's capacity; a device whose memory is the host's
     // has the dedicated memory the OS reports for its adapter.
     let mut own: Vec<(PhysicalIdentity, Reported<u64>)> = Vec::new();
+    for metal in reports.metal.iter().filter(|metal| !metal.unified) {
+        own.push((
+            PhysicalIdentity::Registry(metal.registry_id),
+            Reported::new(metal.working_set, ReportedBy::MetalRecommendedWorkingSet),
+        ));
+    }
     for cuda in &reports.cuda {
         if device_memory(reports, cuda.uuid) == DeviceMemory::Own {
             own.push((
@@ -381,18 +390,13 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
     };
 
     // Metal: a device whose memory is the host's places as every such
-    // device does, under its recommended working set.
+    // device does, under its recommended working set; one whose memory is
+    // its own (an Intel Mac's discrete AMD GPU) places as every such device
+    // does, its own kinds in that memory under the working set, which Metal
+    // reports as its size, and its shared kind in host RAM.
     for metal in &reports.metal {
         let physical = builder.device(&PhysicalIdentity::Registry(metal.registry_id));
         let own = own_memory(&builder, physical);
-        let admission = metal.admission.clone().and_then(|()| {
-            if metal.unified {
-                Ok(())
-            } else {
-                Err("its memory is not the host's, and Metal reports no size for it".into())
-            }
-        });
-        let available = admission.is_ok();
         let mut executor = builder.executor(ExecutorReport {
             physical,
             selector: ExecutorSelector::Metal {
@@ -404,7 +408,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 ExecutorKind::DiscreteGpu
             },
             name: metal.name.clone(),
-            availability: availability(admission),
+            availability: availability(metal.admission.clone()),
             driver: reports.os_build.clone(),
             limits: Limits {
                 max_allocation: AllocationLimit::Device {
@@ -416,27 +420,19 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             },
             tensor_operations: metal.tensor_operations,
         });
-        if available {
-            let paths = host_class_paths(
-                &mut executor,
-                own,
-                host_ram,
-                Reported::new(metal.working_set, ReportedBy::MetalRecommendedWorkingSet),
-                ReportedBy::MetalWorkingSetBeyondDedicated,
-                |before| {
-                    Some(GrantSource::MetalWorkingSet {
-                        registry_id: metal.registry_id,
-                        before,
-                    })
-                },
-            );
-            place_kinds(
-                &mut executor,
-                std::slice::from_ref(&metal.kind),
-                true,
-                |executor, kind| executor.kind(kind, &paths),
-            );
+        if metal.admission.is_err() {
+            continue;
         }
+        let working_set = Reported::new(metal.working_set, ReportedBy::MetalRecommendedWorkingSet);
+        let status = |before| Some(GrantSource::MetalWorkingSet { registry_id: metal.registry_id, before });
+        let paths = match metal.unified {
+            true => KindPaths::Alike(host_class_paths(&mut executor, own, host_ram, working_set, ReportedBy::MetalWorkingSetBeyondDedicated, status)),
+            false => KindPaths::Own {
+                device: executor.granted(own.expect("a Metal device whose memory is its own has a store").0, working_set, status(0)),
+                host: executor.ungranted(host_ram),
+            },
+        };
+        place_kinds(&mut executor, &metal.kinds, metal.unified, |executor, kind| executor.kind(kind, &paths.along(kind)));
     }
 
     // CUDA: a device whose memory is its own places device storage on it
@@ -481,50 +477,34 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             },
             tensor_operations: false,
         });
-        // Each kind's paths: on a device whose memory is the host's every
-        // kind is charged alike, along the host-class paths; on one whose
-        // memory is its own, along the path of the memory it lies in.
-        let (alike, own_paths) = match placement {
-            Ok(None) => {
-                let paths = host_class_paths(
-                    &mut executor,
-                    own,
-                    host_ram,
-                    Reported::new(cuda.total, ReportedBy::CudaTotalMemory),
-                    ReportedBy::CudaTotalBeyondDedicated,
-                    // What is left of these grants only the opened executor
-                    // knows (`RuntimeStatus`).
-                    |_| None,
-                );
-                (Some(paths), None)
-            }
-            Ok(Some(usable)) => {
-                let device = executor.granted(
+        let paths = match placement {
+            Ok(None) => KindPaths::Alike(host_class_paths(
+                &mut executor,
+                own,
+                host_ram,
+                Reported::new(cuda.total, ReportedBy::CudaTotalMemory),
+                ReportedBy::CudaTotalBeyondDedicated,
+                // What is left of these grants only the opened executor
+                // knows (`RuntimeStatus`).
+                |_| None,
+            )),
+            Ok(Some(usable)) => KindPaths::Own {
+                device: executor.granted(
                     own.expect("a CUDA device whose memory is its own has a store")
                         .0,
                     Reported::new(usable, ReportedBy::CudaUsableMemory),
                     // What is left of it only the opened executor knows.
                     None,
-                );
-                (None, Some((device, executor.ungranted(host_ram))))
-            }
+                ),
+                host: executor.ungranted(host_ram),
+            },
             Err(_) => continue,
         };
         place_kinds(
             &mut executor,
             &cuda.kinds,
             memory == DeviceMemory::Host,
-            |executor, kind| {
-                let along = match (&alike, own_paths, kind.memory) {
-                    (Some(paths), _, _) => paths.clone(),
-                    (None, Some((device, _)), KindMemory::DeviceMemory) => vec![device],
-                    (None, Some((_, host)), KindMemory::HostRam) => vec![host],
-                    (None, _, memory) => unreachable!(
-                        "a CUDA kind lies in its device's memory or host RAM, not {memory:?}"
-                    ),
-                };
-                executor.kind(kind, &along)
-            },
+            |executor, kind| executor.kind(kind, &paths.along(kind)),
         );
     }
 
@@ -708,6 +688,28 @@ fn reported_kind(kinds: &[KindReport], id: u32) -> &KindReport {
         .iter()
         .find(|kind| kind.id == id)
         .expect("the rule places only kinds a backend reports")
+}
+
+/// The paths a device's kinds are charged along: on a device whose memory
+/// is the host's, alike, along the host-class paths ([`host_class_paths`]);
+/// on one whose memory is its own, along the path of the memory a kind lies
+/// in, its own (granted) or host RAM (ungranted).
+enum KindPaths {
+    Alike(Vec<OwnPath>),
+    Own { device: OwnPath, host: OwnPath },
+}
+
+impl KindPaths {
+    fn along(&self, kind: &KindReport) -> Vec<OwnPath> {
+        match (self, kind.memory) {
+            (Self::Alike(paths), _) => paths.clone(),
+            (Self::Own { device, .. }, KindMemory::DeviceMemory) => vec![*device],
+            (Self::Own { host, .. }, KindMemory::HostRam) => vec![*host],
+            (Self::Own { .. }, memory) => panic!(
+                "invariant violated: a kind of a device whose memory is its own lies in that memory or host RAM, not {memory:?}"
+            ),
+        }
+    }
 }
 
 /// Apply the placement rule to a backend's `kinds`: every contract

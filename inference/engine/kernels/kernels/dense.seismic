@@ -663,6 +663,9 @@ projection dense for vulkan:
     where (ORDERED_ANY == 0 or SPLIT == 1) for single
     where (ORDERED_ALL == 0 or (ROWS == 1 and LANES == 16))
     where SUB_M <= TILE_M and SUB_N <= TILE_N
+    # Every workgroup holds whole 64-lane hardware subgroups: a GEMM tile of
+    # one sub-tile (32 x 64 of 32 x 64) would launch 32 invocations.
+    where TILE_M * TILE_N >= 2 * SUB_M * SUB_N
     where (G == 1 or OPERANDS == 0)
     where each(W, form(W, DECODED) == 1)
     scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > VERIFY_ROWS and SPLIT > 1 for single

@@ -4,6 +4,7 @@ use crate::driver::workflow::{
     ByteRange, OutputDescription, OutputRef, PlanError, PreparedPolicy, ResourceId,
     ScalarDescriptor, TensorDescriptor, WorkflowId, WorkflowPlanDraft,
 };
+use crate::api::tensor::{exclusive_pairs, meet};
 use crate::driver::AdmittedCommand;
 use crate::memory::Charges;
 use crate::driver::*;
@@ -147,18 +148,34 @@ impl<T: TargetFamily, E: NativeExecutor<T>> PreparedPolicy for InvocationTarget<
             .parameters()
             .iter()
             .map(|parameter| match &parameter.kind {
-                ParameterKind::Tensor { access, .. } => Some(match access {
-                    TensorAccess::Shared | TensorAccess::Host { write: false } => AccessMode::Read,
-                    // Ordered as the host's rewrite once it sees the launch.
-                    TensorAccess::Owned | TensorAccess::Mutable | TensorAccess::Host { write: true } => {
-                        AccessMode::ReadWrite
-                    }
+                // A host rewrite is ordered as the launch's own write.
+                ParameterKind::Tensor { access, .. } => Some(match access.writer() {
+                    Some(_) => AccessMode::ReadWrite,
+                    None => AccessMode::Read,
                 }),
                 ParameterKind::Scalar { .. }
                 | ParameterKind::Index { .. }
                 | ParameterKind::Range { .. } => None,
             })
             .collect::<Vec<_>>();
+        // No two tensors it writes either of share a byte of one resource.
+        let bytes = |range: ByteRange| range.offset..range.offset + range.len;
+        let aliased = exclusive_pairs(arguments.len(), |argument| {
+            argument_access[argument].is_some_and(AccessMode::writes)
+        })
+        .find(|&(first, second)| match (&arguments[first], &arguments[second]) {
+            (
+                crate::driver::workflow::ValueDescriptor::Tensor(first),
+                crate::driver::workflow::ValueDescriptor::Tensor(second),
+            ) => first.resource == second.resource && meet(&bytes(first.range), &bytes(second.range)),
+            _ => false,
+        });
+        if let Some((first, second)) = aliased {
+            return Err(CallError::Invocation(InvocationError::IllegalAliasing {
+                first: schema.parameters()[first].name.clone(),
+                second: schema.parameters()[second].name.clone(),
+            }));
+        }
 
         let mut allocations = Vec::with_capacity(executable.allocations().len());
         let mut private_allocations = Vec::new();
@@ -684,14 +701,11 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
             .zip(args.arguments())
         {
             if let (
-                ParameterKind::Tensor {
-                    access: TensorAccess::Owned | TensorAccess::Mutable,
-                    ..
-                },
+                ParameterKind::Tensor { access, .. },
                 EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::External(tensor)),
             ) = (&parameter.kind, argument)
             {
-                if tensor.allocation().storage().read_only() {
+                if access.writer().is_some() && tensor.allocation().storage().read_only() {
                     return Err(crate::api::WorkflowError::ReadOnlyTensor {
                         parameter: parameter.name.clone(),
                     });

@@ -24,6 +24,11 @@ pub(crate) struct VulkanFeatures {
     pub(crate) mixed_dot: bool,
     pub(crate) f32_atomic_add: bool,
     pub(crate) shared_int64_atomics: bool,
+    /// The module may rely on invocations rejoining after a lane-varying
+    /// loop (`SEISMIC_HAS_MAXIMAL_RECONVERGENCE`): the seal pass declares
+    /// `MaximallyReconvergesKHR` where it does, and the uniformity check
+    /// accepts a subgroup operation after such a loop only then.
+    pub(crate) maximal_reconvergence: bool,
 }
 
 impl VulkanFeatures {
@@ -38,6 +43,7 @@ impl VulkanFeatures {
             mixed_dot: facts.mixed_dot,
             f32_atomic_add: facts.f32_atomic_add,
             shared_int64_atomics: facts.shared_int64_atomics,
+            maximal_reconvergence: facts.maximal_reconvergence,
         }
     }
 }
@@ -142,6 +148,7 @@ pub(super) fn header(features: VulkanFeatures) -> String {
         ("MIXED_DOT", features.mixed_dot),
         ("F32_ATOMIC_ADD", features.f32_atomic_add),
         ("SHARED_INT64_ATOMICS", features.shared_int64_atomics),
+        ("MAXIMAL_RECONVERGENCE", features.maximal_reconvergence),
     ] {
         header.push_str(&format!("#define SEISMIC_HAS_{name} {}\n", u8::from(on)));
     }
@@ -157,26 +164,44 @@ pub(super) fn header(features: VulkanFeatures) -> String {
 
 /// The argument block (buffer addresses, the scalar-result address, then
 /// the words: there is no words buffer), read-only flags and workgroup size
-/// of a source with one buffer per `absent` flag, each absent one's address
-/// 0 (`super::addresses`).
-pub(super) fn tail(read_only: impl Iterator<Item = bool>, absent: &[bool]) -> String {
-    let buffers = absent.len();
+/// of a source binding `bound`, each absent one's address 0
+/// (`super::addresses`). The addresses of the buffers the launch only
+/// reads, and the words, are read through the input block; those of the
+/// address tables of ports it may write through, which it only reads,
+/// through the address-table block; the rest through the argument block. So
+/// formation knows which memory nothing in the launch writes, and that what
+/// an address table holds points into its port's own bytes
+/// (`seismic_vulkan::formation::INPUT_BLOCK`, `ADDRESS_TABLE_BLOCK`).
+pub(super) fn tail(bound: &[super::BoundBuffer]) -> String {
+    use super::BufferAccess;
+    use seismic_vulkan::formation::{ADDRESS_TABLE_BLOCK, ARGUMENT_BLOCK, INPUT_BLOCK};
+    let buffers = bound.len();
     let mut tail = format!("#define SEISMIC_BUFFER_SCALAR_RESULTS {buffers}\n");
-    tail.push_str(
-        "layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer seismic_argument_block_t { uint64_t w[]; };\n",
-    );
+    for block in [ARGUMENT_BLOCK, INPUT_BLOCK, ADDRESS_TABLE_BLOCK] {
+        tail.push_str(&format!(
+            "layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer {block} {{ uint64_t w[]; }};\n"
+        ));
+    }
     tail.push_str(&super::addresses(
-        absent,
-        |index| format!("(seismic_argument_block_t(seismic_arguments).w[{index}])"),
+        bound,
+        |index| {
+            let block = match bound[index].access {
+                BufferAccess::ReadOnly => INPUT_BLOCK,
+                BufferAccess::AddressTable => ADDRESS_TABLE_BLOCK,
+                BufferAccess::Written => ARGUMENT_BLOCK,
+            };
+            format!("({block}(seismic_arguments).w[{index}])")
+        },
         |_| "0ul".to_owned(),
     ));
     tail.push_str(&format!(
-        "#define SEISMIC_SCALAR_RESULTS (seismic_argument_block_t(seismic_arguments).w[{buffers}])\n\
-         #define seismic_words (seismic_argument_block_t(seismic_arguments + {}ul).w)\n",
+        "#define SEISMIC_SCALAR_RESULTS ({ARGUMENT_BLOCK}(seismic_arguments).w[{buffers}])\n\
+         #define seismic_words ({INPUT_BLOCK}(seismic_arguments + {}ul).w)\n",
         (buffers + 1) * 8
     ));
     tail.push_str("#define SEISMIC_READONLY_(index) SEISMIC_READONLY_##index\n#define SEISMIC_READONLY(index) SEISMIC_READONLY_(index)\n");
-    for (index, read_only) in read_only.enumerate() {
+    for (index, buffer) in bound.iter().enumerate() {
+        let read_only = buffer.access == BufferAccess::ReadOnly;
         tail.push_str(&format!("#define SEISMIC_READONLY_{index} {read_only}\n"));
     }
     tail.push_str("layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
@@ -282,6 +307,7 @@ void main() {
             mixed_dot: false,
             f32_atomic_add: false,
             shared_int64_atomics: false,
+            maximal_reconvergence: false,
         };
         let source = format!("{}{KERNEL}", header(features));
         let former = ProgramFormer::new(VulkanToolchain::new(device.clone()), ProgramStore::user());
@@ -483,6 +509,7 @@ void main() {
             mixed_dot: false,
             f32_atomic_add: false,
             shared_int64_atomics: false,
+            maximal_reconvergence: false,
         };
         let source = format!("{}{HALVES}", header(features));
         let former = ProgramFormer::new(VulkanToolchain::new(device.clone()), ProgramStore::user());

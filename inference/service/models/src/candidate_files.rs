@@ -132,6 +132,42 @@ pub enum CandidateFileRole {
     Auxiliary,
 }
 
+/// The GGUF split header fields that identify a file's slot in a multi-part split GGUF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitMetadata {
+    /// Zero-based shard index (`split.no`).
+    pub index: u32,
+    /// Total shard count (`split.count`).
+    pub count: u32,
+    /// Optional total tensor count across all shards (`split.tensors.count`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensors_count: Option<u64>,
+}
+
+impl SplitMetadata {
+    /// Extract `(split.no, split.count, split.tensors.count)` from a GGUF header when the file
+    /// belongs to a multi-part split (`split.count > 1` and `split.no < split.count`).
+    #[must_use]
+    pub fn of(directory: &Directory) -> Option<Self> {
+        let index = directory
+            .value("split.no")
+            .and_then(Value::unsigned)
+            .and_then(|value| u32::try_from(value).ok())?;
+        let count = directory
+            .value("split.count")
+            .and_then(Value::unsigned)
+            .and_then(|value| u32::try_from(value).ok())?;
+        (count > 1 && index < count).then(|| Self {
+            index,
+            count,
+            tensors_count: directory
+                .value("split.tensors.count")
+                .and_then(Value::unsigned),
+        })
+    }
+}
+
 impl CandidateFileRole {
     /// The role of the file with this header directory and its `general.tags`
     /// ([`crate::gguf::header_tags`]).
@@ -142,6 +178,10 @@ impl CandidateFileRole {
         architectures: &RecognizedArchitectures,
     ) -> Self {
         if directory.value("general.type").and_then(Value::string) == Some("imatrix") {
+            return Self::Auxiliary;
+        }
+        // A later shard (`split.no > 0`) is never a standalone model, drafter, or projector.
+        if SplitMetadata::of(directory).is_some_and(|split| split.index > 0) {
             return Self::Auxiliary;
         }
         // A split's first shard may hold only metadata; any other file without tensors holds no
@@ -201,6 +241,8 @@ pub struct HeaderClassification {
     pub quantization: Option<String>,
     pub declared_bytes: u64,
     pub embedded_mtp: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitMetadata>,
 }
 
 impl HeaderClassification {
@@ -244,6 +286,7 @@ pub(crate) fn classify(
         base_repositories: header_base_repositories(directory),
         quantization: inspection.quantization.clone(),
         declared_bytes: crate::gguf::declared_length(directory),
+        split: SplitMetadata::of(directory),
     }
 }
 
@@ -365,11 +408,44 @@ impl GgufGroup {
     }
 }
 
-/// Group GGUFs into complete files: split shards (`name-00001-of-00003.gguf`) together in shard
-/// order, every other file on its own. Incomplete shard sets are dropped.
+/// A stem-matched split set (`<prefix>-NNNNN-of-MMMMM.gguf`) that is missing at least one shard
+/// under that naming pattern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncompleteShardSet {
+    pub parent: PathBuf,
+    pub prefix: String,
+    pub total: u32,
+    pub present: BTreeMap<u32, CandidateGguf>,
+}
+
+impl IncompleteShardSet {
+    /// A present shard whose header is cheap to inspect for `split.tensors.count` (prefers a later
+    /// shard since shard 1 carries the tokenizer before `split.*`, falling back to the first
+    /// present shard).
+    #[must_use]
+    pub fn probe_shard(&self) -> Option<&CandidateGguf> {
+        self.present
+            .iter()
+            .find(|(index, _)| **index > 1)
+            .or_else(|| self.present.iter().next())
+            .map(|(_, file)| file)
+    }
+}
+
+/// The stem-based partition of a repository or directory's `.gguf` files before header-based
+/// completion of any incomplete split sets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartitionedGgufs {
+    pub complete_splits: Vec<GgufGroup>,
+    pub incomplete_splits: Vec<IncompleteShardSet>,
+    pub unstemmed: Vec<CandidateGguf>,
+}
+
+/// Partition GGUFs by `<prefix>-NNNNN-of-MMMMM.gguf` stem: complete sets (`1..=total`), incomplete
+/// sets missing one or more slots, and unstemmed files.
 #[must_use]
-pub fn group_ggufs(files: &[CandidateGguf]) -> Vec<GgufGroup> {
-    let mut groups = Vec::new();
+pub fn partition_ggufs(files: &[CandidateGguf]) -> PartitionedGgufs {
+    let mut unstemmed = Vec::new();
     let mut shard_sets = BTreeMap::<(PathBuf, String, u32), BTreeMap<u32, CandidateGguf>>::new();
     for file in files {
         match split_shard(&file.path) {
@@ -384,20 +460,134 @@ pub fn group_ggufs(files: &[CandidateGguf]) -> Vec<GgufGroup> {
                     .or_default()
                     .insert(index, file.clone());
             }
-            None => groups.push(GgufGroup {
-                files: vec![file.clone()],
-            }),
+            None => unstemmed.push(file.clone()),
         }
     }
-    for ((_, _, total), shards) in shard_sets {
-        if (1..=total).all(|index| shards.contains_key(&index)) {
-            groups.push(GgufGroup {
-                files: shards.into_values().collect(),
+    let mut complete_splits = Vec::new();
+    let mut incomplete_splits = Vec::new();
+    for ((parent, prefix, total), present) in shard_sets {
+        if (1..=total).all(|index| present.contains_key(&index)) {
+            complete_splits.push(GgufGroup {
+                files: present.into_values().collect(),
             });
+        } else {
+            incomplete_splits.push(IncompleteShardSet {
+                parent,
+                prefix,
+                total,
+                present,
+            });
+        }
+    }
+    PartitionedGgufs {
+        complete_splits,
+        incomplete_splits,
+        unstemmed,
+    }
+}
+
+/// Resolve complete GGUF groups using GGUF split header metadata (`split.no`, `split.count`,
+/// `split.tensors.count`) as the single authority for missing/shared shards:
+/// - Unstemmed files whose header declares `split.no > 0` are later shards, never standalone
+///   models.
+/// - For each incomplete stem-matched set, every missing slot `k` (`1..=total`) is matched against
+///   the unique unstemmed later shard in the set's directory (or nearest ancestor directory) whose
+///   header declares `split.no == k - 1`, `split.count == total`, and matching
+///   `split.tensors.count` when both declare it.
+/// - Incomplete or ambiguous sets are dropped rather than guessed.
+#[must_use]
+pub fn resolve_split_groups(
+    partitioned: PartitionedGgufs,
+    headers: &BTreeMap<PathBuf, Option<SplitMetadata>>,
+) -> Vec<GgufGroup> {
+    let mut groups = partitioned.complete_splits;
+    let mut stray_later_shards = Vec::<(CandidateGguf, SplitMetadata)>::new();
+    for file in partitioned.unstemmed {
+        match headers.get(&file.path).copied().flatten() {
+            Some(meta) if meta.index > 0 => stray_later_shards.push((file, meta)),
+            _ => groups.push(GgufGroup { files: vec![file] }),
+        }
+    }
+    for incomplete in partitioned.incomplete_splits {
+        let expected_tensors = incomplete
+            .present
+            .values()
+            .find_map(|file| headers.get(&file.path).copied().flatten()?.tensors_count);
+        let mut resolved = Vec::with_capacity(incomplete.total as usize);
+        let mut complete = true;
+        for slot in 1..=incomplete.total {
+            if let Some(file) = incomplete.present.get(&slot) {
+                resolved.push(file.clone());
+                continue;
+            }
+            let matched = match_stray_shard(
+                &incomplete.parent,
+                slot,
+                incomplete.total,
+                expected_tensors,
+                &stray_later_shards,
+            );
+            match matched {
+                Some(file) => resolved.push(file.clone()),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            groups.push(GgufGroup { files: resolved });
         }
     }
     groups.sort_by(|left, right| left.primary().path.cmp(&right.primary().path));
     groups
+}
+
+fn match_stray_shard<'a>(
+    parent: &Path,
+    slot: u32,
+    total: u32,
+    expected_tensors: Option<u64>,
+    stray: &'a [(CandidateGguf, SplitMetadata)],
+) -> Option<&'a CandidateGguf> {
+    let matches_meta = |meta: &SplitMetadata| {
+        meta.index + 1 == slot
+            && meta.count == total
+            && match (expected_tensors, meta.tensors_count) {
+                (Some(expected), Some(actual)) => expected == actual,
+                _ => true,
+            }
+    };
+    let mut scope: Option<&Path> = Some(parent);
+    while let Some(dir) = scope {
+        let candidates = stray
+            .iter()
+            .filter(|(file, meta)| {
+                file.path.parent().unwrap_or_else(|| Path::new("")) == dir && matches_meta(meta)
+            })
+            .map(|(file, _)| file)
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            return (candidates.len() == 1).then(|| candidates[0]);
+        }
+        scope = dir.parent();
+    }
+    None
+}
+
+/// Group GGUFs into complete files by filename stem alone (used only where headers have not been
+/// read, such as approximate search counts). Incomplete shard sets are dropped.
+#[must_use]
+pub fn group_ggufs(files: &[CandidateGguf]) -> Vec<GgufGroup> {
+    let partitioned = partition_ggufs(files);
+    resolve_split_groups(
+        PartitionedGgufs {
+            complete_splits: partitioned.complete_splits,
+            incomplete_splits: Vec::new(),
+            unstemmed: partitioned.unstemmed,
+        },
+        &BTreeMap::new(),
+    )
 }
 
 /// `(prefix, index, total)` of a split shard name.
@@ -1355,5 +1545,84 @@ mod tests {
         ] {
             assert!(!identifies(name), "{name}");
         }
+    }
+
+    #[test]
+    fn header_resolver_completes_shared_and_cross_directory_shards_and_rejects_ambiguity() {
+        let mut files = Vec::new();
+        for quant in ["IQ1_M", "IQ2_XXS"] {
+            for idx in 1..=5 {
+                files.push(gguf(
+                    &format!("DeepSeek-V4.1-Flash-{quant}-{idx:05}-of-00006.gguf"),
+                    10,
+                ));
+            }
+        }
+        // Cross-directory quant (Coder layout: shards 1..5 in subdir, shared shard 6 at root).
+        for idx in 1..=5 {
+            files.push(gguf(
+                &format!("IQ2_XXS/DeepSeek-V4.1-Flash-Coder-{idx:05}-of-00006.gguf"),
+                10,
+            ));
+        }
+        files.push(gguf("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf", 110));
+        files.push(gguf("mmproj-BF16.gguf", 1));
+
+        let shared = SplitMetadata {
+            index: 5,
+            count: 6,
+            tensors_count: Some(1043),
+        };
+        let probe = SplitMetadata {
+            index: 1,
+            count: 6,
+            tensors_count: Some(1043),
+        };
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            PathBuf::from("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"),
+            Some(shared),
+        );
+        headers.insert(PathBuf::from("mmproj-BF16.gguf"), None);
+        headers.insert(
+            PathBuf::from("DeepSeek-V4.1-Flash-IQ1_M-00002-of-00006.gguf"),
+            Some(probe),
+        );
+        headers.insert(
+            PathBuf::from("DeepSeek-V4.1-Flash-IQ2_XXS-00002-of-00006.gguf"),
+            Some(probe),
+        );
+        headers.insert(
+            PathBuf::from("IQ2_XXS/DeepSeek-V4.1-Flash-Coder-00002-of-00006.gguf"),
+            Some(probe),
+        );
+
+        let resolved = resolve_split_groups(partition_ggufs(&files), &headers);
+        assert_eq!(resolved.len(), 4); // 3 completed 6-shard models + 1 mmproj (Engram NOT standalone)
+        assert!(
+            resolved
+                .iter()
+                .all(|group| group.primary().path != Path::new("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"))
+        );
+        for group in resolved.iter().filter(|group| group.files.len() > 1) {
+            assert_eq!(group.files.len(), 6);
+            assert_eq!(
+                group.files[5].path,
+                PathBuf::from("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf")
+            );
+        }
+
+        // Ambiguous second stray file claiming the same slot drops incomplete sets rather than guessing.
+        let mut ambiguous_files = files.clone();
+        ambiguous_files.push(gguf("DeepSeek-V4.1-Flash-Engram-Q6_K.gguf", 160));
+        let mut ambiguous_headers = headers.clone();
+        ambiguous_headers.insert(
+            PathBuf::from("DeepSeek-V4.1-Flash-Engram-Q6_K.gguf"),
+            Some(shared),
+        );
+        let ambiguous =
+            resolve_split_groups(partition_ggufs(&ambiguous_files), &ambiguous_headers);
+        assert_eq!(ambiguous.len(), 1); // only mmproj survives
+        assert_eq!(ambiguous[0].primary().path, PathBuf::from("mmproj-BF16.gguf"));
     }
 }

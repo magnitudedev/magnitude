@@ -242,11 +242,11 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
         options::{PackageOptions, ProjectorSelection},
     };
     let open = |target: &std::path::Path| {
-        HostArtifacts::open(&PackageOptions {
-            target: target.to_path_buf(),
-            projector: ProjectorSelection::Discover,
-            draft: None,
-        })
+        HostArtifacts::open(&PackageOptions::single(
+            target.to_path_buf(),
+            ProjectorSelection::Discover,
+            None,
+        ))
     };
     fn string(out: &mut Vec<u8>, value: &str) {
         out.extend_from_slice(&(value.len() as u64).to_le_bytes());

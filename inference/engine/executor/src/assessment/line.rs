@@ -861,15 +861,10 @@ impl MachineLine {
 /// The readers the CPU's stream is read by: the pool the CPU peaks run on
 /// (the performance cores the process may run on, within its quota), and one
 /// step more: every hardware thread where the pool has fewer, else twice the
-/// pool. Why there are none where the host's processors cannot be read or
-/// the process may run on no performance core.
+/// pool. None where the process may run on no performance core.
 pub(super) fn host_readers() -> Result<[u64; 2], ExecutorCostsError> {
-    let threads = std::thread::available_parallelism()
-        .map_err(|error| ExecutorCostsError(format!("the host's processors: {error}")))?
-        .get();
-    let processors = seismic::Processors::discover()
-        .map_err(|error| ExecutorCostsError(format!("the host's processors: {error}")))?;
-    readers_among(threads, processors.performance_cores())
+    let processors = seismic::Processors::discover();
+    readers_among(processors.quota().get(), processors.performance_cores())
 }
 
 /// [`host_readers`] on a host of `threads` hardware threads, `performance`

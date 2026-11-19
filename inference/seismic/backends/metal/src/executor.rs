@@ -212,7 +212,7 @@ impl MetalSubmission {
             .retain(|pending| !pending.words.overlaps(&words));
         completed?;
         // The schedule plans the word table as this submission's own input.
-        unsafe { words.buffer.write_device_bytes(words.bytes.start, &bytes) };
+        unsafe { words.buffer.write_device_bytes(words.bytes.start, &bytes) }?;
         Ok(words)
     }
 
@@ -309,7 +309,7 @@ impl MetalSubmission {
             let command = self.device.command_buffer().ok_or_else(|| {
                 ExecutionError::SubmissionFailed("Metal could not create a command buffer".into())
             })?;
-            let encoder = command.computeCommandEncoder().ok_or_else(|| {
+            let encoder = self.device.compute_encoder(&command, crate::device::EncoderKind::Serial).ok_or_else(|| {
                 ExecutionError::SubmissionFailed("Metal could not create a compute encoder".into())
             })?;
             encoder.setComputePipelineState(&kernel.pipeline().state);
@@ -378,8 +378,7 @@ impl MetalSubmission {
         self.device
             .read(source.buffer, source.byte_offset, &mut data)?;
         // The schedule plans the destination as written by this command.
-        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) };
-        Ok(())
+        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) }
     }
     fn fill(
         &self,
@@ -395,8 +394,7 @@ impl MetalSubmission {
             *byte = pattern[index % pattern.len()];
         }
         // The schedule plans the destination as written by this command.
-        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) };
-        Ok(())
+        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) }
     }
     fn scalar_read(
         &self,
@@ -500,7 +498,7 @@ mod completion_tests {
     ) {
         let words = submission.write_words(table, &words).unwrap();
         let command = submission.device.command_buffer().unwrap();
-        let encoder = command.computeCommandEncoder().unwrap();
+        let encoder = submission.device.compute_encoder(&command, crate::device::EncoderKind::Serial).unwrap();
         encoder.setComputePipelineState(pipeline);
         unsafe {
             encoder.setBuffer_offset_atIndex(

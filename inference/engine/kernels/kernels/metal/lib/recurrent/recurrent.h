@@ -419,32 +419,39 @@ inline void store_gated8(thread const Gated8 &v, float inverse, element::Out<act
 
 // Gates every row of value head `head` (the step): W / 8 adjacent lanes per
 // row, lane j owning columns 8j..8j+7, each sum the squares of their eight
-// raw values in column order, and a butterfly over the lanes gives each the
-// head's square sum. This is the lane grouping of the projection GEMV
+// raw values in column order, and a butterfly over the lanes (zeros past the
+// W / 8 owners up to the next power of two) gives each the head's square
+// sum. This is the lane grouping of the projection GEMV
 // staging. All threads of the threadgroup (whole simdgroups) call it.
 inline void gate_head(arrive::coherent_device<const Storage> mixed, long covered, GateInput input,
     device const uchar *norm, element::Out<activation::Act> gated, ulong head, uint thread_index, uint threads,
     constant ulong *seismic_words) {
     constexpr uint LANES = SEISMIC_DIM_W / 8;
-    static_assert(SEISMIC_DIM_W % 8 == 0 && LANES <= 32 && (LANES & (LANES - 1)) == 0,
-        "a head is gated over W / 8 lanes, a power of two up to 32");
+    static_assert(SEISMIC_DIM_W % 8 == 0 && LANES <= 32, "a head is gated over W / 8 lanes, up to 32");
+    // A row's butterfly group: the power of two at or above LANES (LANES
+    // itself when it is one). Lanes of the group past LANES read an owner's
+    // columns, so every address lies in the row, but add zero and store
+    // nothing.
+    constexpr uint GROUP = LANES <= 1 ? 1 : LANES <= 2 ? 2 : LANES <= 4 ? 4 : LANES <= 8 ? 8 : LANES <= 16 ? 16 : 32;
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
-    const uint items = uint(SEISMIC_DIM_M) * LANES;
+    const uint items = uint(SEISMIC_DIM_M) * GROUP;
     for (uint first = 0; first < items; first += threads) {
         const uint item = first + thread_index;
+        const uint owner = item % GROUP;
         // Lanes past the rows repeat the last row, so every lane of a
         // butterfly group takes part; they store nothing.
-        const ulong row = metal::min(ulong(item / LANES), ulong(SEISMIC_DIM_M) - 1);
-        const uint i = 8 * (item % LANES);
+        const ulong row = metal::min(ulong(item / GROUP), ulong(SEISMIC_DIM_M) - 1);
+        const uint i = 8 * (owner % LANES);
         const Gated8 v = gated_inputs8(mixed, covered, input, norm, row, head, i, seismic_words);
         float squares = 0.0f;
         RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
             squares = metal::fma(v.raw_even[j], v.raw_even[j], squares);
             squares = metal::fma(v.raw_odd[j], v.raw_odd[j], squares);
         }
-        for (ushort offset = 1; offset < LANES; offset <<= 1)
+        squares = owner < LANES ? squares : 0.0f;
+        for (ushort offset = 1; offset < GROUP; offset <<= 1)
             squares += simd_shuffle_xor(squares, offset);
-        if (item < items)
+        if (item < items && owner < LANES)
             store_gated8(v, metal::rsqrt(squares / float(SEISMIC_DIM_W) + epsilon), gated, row, head, i,
                 seismic_words);
     }

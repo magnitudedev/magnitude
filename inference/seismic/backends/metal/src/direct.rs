@@ -559,7 +559,7 @@ fn grouped_encoder(
     dispatch: MTLDispatchType,
 ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, ExecutionError> {
     crate::pooled(|| {
-        let encoder = command.computeCommandEncoderWithDispatchType(dispatch)?;
+        let encoder = device.compute_encoder(command, crate::device::EncoderKind::Dispatch(dispatch))?;
         ordered(device, &encoder);
         Some(encoder)
     })
@@ -850,8 +850,8 @@ impl DirectBatch {
                         attachment.setStartOfEncoderSampleIndex(offset);
                         attachment.setEndOfEncoderSampleIndex(offset + 1);
                     }
-                    let encoder = command
-                        .computeCommandEncoderWithDescriptor(&pass)
+                    let encoder = device
+                        .compute_encoder(&command, crate::device::EncoderKind::Pass(&pass))
                         .ok_or_else(|| {
                             ExecutionError::SubmissionFailed(
                                 "Metal could not create a timed compute encoder".into(),

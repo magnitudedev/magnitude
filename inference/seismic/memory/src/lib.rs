@@ -105,15 +105,22 @@ fn large_page() -> Result<Option<usize>, AllocationFailure> {
     Ok(*LARGE.get_or_init(|| large))
 }
 
+/// The span of one last-level page table: the host page squared over a
+/// page-table entry (2 MiB on 4 KiB pages, 32 MiB on 16 KiB, 512 MiB on
+/// 64 KiB), which is the kernel's PMD size, its transparent huge page.
+fn table_span(page: usize) -> usize {
+    page * (page / std::mem::size_of::<u64>())
+}
+
 /// The unit a device registers host memory in (CUDA's registered host
 /// blocks over a link): the large page, which a block of them is then
 /// backed in. Where the host has none it is a size choice only, not a
-/// measured one: the span of one last-level page table (host page squared
-/// over a page-table entry, 2 MiB on 4 KiB pages), as many registrations
-/// as large pages would take; no host without large pages was measured.
+/// measured one: the span of one last-level page table ([`table_span`]),
+/// as many registrations as large pages would take; no host without large
+/// pages was measured.
 pub fn registration_granule() -> Result<u64, AllocationFailure> {
     let page = host::page()?;
-    Ok(large_page()?.unwrap_or(page * (page / std::mem::size_of::<u64>())) as u64)
+    Ok(large_page()?.unwrap_or(table_span(page)) as u64)
 }
 
 /// Bytes of every live block that asks for large pages
@@ -135,6 +142,28 @@ pub fn large_page_backing() -> LargePageBacking {
         large_bytes: LARGE_BYTES.load(Ordering::Relaxed),
         small_bytes: SMALL_BYTES.load(Ordering::Relaxed),
     }
+}
+
+/// Whether a host read's `error` is its source missing (`ENOENT`,
+/// `ENOTDIR`, `ENOSYS`, `EOPNOTSUPP`; Windows' file, path or function not
+/// found or not supported) or refused (`EACCES`, `EPERM`, `EROFS`; Windows'
+/// access denied, a privilege not held): either way the reader goes to the
+/// fact's next source. The one rule every host reader shares; any other
+/// error is no answer of the source's but an invariant violation.
+pub fn unanswered(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{NotADirectory, NotFound, PermissionDenied, ReadOnlyFilesystem, Unsupported};
+    if matches!(error.kind(), NotFound | PermissionDenied | ReadOnlyFilesystem | Unsupported | NotADirectory) {
+        return true;
+    }
+    #[cfg(unix)]
+    let codes = [libc::ENOSYS, libc::EOPNOTSUPP];
+    #[cfg(windows)]
+    let codes = [
+        windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION as i32,
+        windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED as i32,
+        windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32,
+    ];
+    error.raw_os_error().is_some_and(|code| codes.contains(&code))
 }
 
 /// The host page, which every block is a whole number of.
@@ -317,29 +346,45 @@ mod host {
             .map_err(|_| AllocationFailure::PageUnknown)
     }
 
-    /// The large page transparent huge pages back memory in, where the
-    /// kernel has them and collapses a range into them on demand: probed
-    /// on a block of its own. None where the kernel has no transparent
-    /// huge pages (no `hpage_pmd_size`) or no `MADV_COLLAPSE` (refused as
-    /// invalid, whatever the range); a refusal for want of memory now is
-    /// still a kernel that collapses.
+    /// The kernel's transparent huge page size.
+    #[cfg(target_os = "linux")]
+    const THP_SIZE: &str = "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size";
+
+    /// The transparent huge page size `read` of [`THP_SIZE`] gives on a
+    /// host of `page`: the size it reads; where it is missing (a kernel
+    /// without transparent huge pages, a sandbox's `/sys`) or refused, the
+    /// PMD size the kernel's page tables fix ([`super::table_span`]).
+    ///
+    /// # Panics
+    /// Where the size present does not parse, or the read fails otherwise.
+    #[cfg(target_os = "linux")]
+    pub(super) fn thp_size(read: std::io::Result<String>, page: usize) -> usize {
+        match read {
+            Ok(size) => size.trim().parse().unwrap_or_else(|error| panic!("invariant violated: {THP_SIZE} reads {size:?}: {error}")),
+            Err(error) if super::unanswered(&error) => super::table_span(page),
+            Err(error) => panic!("invariant violated: {THP_SIZE}: {error}"),
+        }
+    }
+
+    /// The large page transparent huge pages back memory in ([`thp_size`]),
+    /// where the kernel collapses a range into them on demand: probed on a
+    /// block of its own. None where the kernel refuses the range large
+    /// pages (`MADV_HUGEPAGE`: `EINVAL` from a kernel without transparent
+    /// huge pages, or a filter refusing the call) or has no `MADV_COLLAPSE`
+    /// (`EINVAL`, whatever the range); any other refusal of the collapse
+    /// (want of memory now) is still a kernel that collapses.
     #[cfg(target_os = "linux")]
     pub(super) fn large_page() -> Result<Option<usize>, AllocationFailure> {
-        const SIZE: &str = "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size";
-        let large: usize = match std::fs::read_to_string(SIZE) {
-            Ok(size) => size.trim().parse().unwrap_or_else(|error| panic!("{SIZE} reads {size:?}: {error}")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => panic!("reading {SIZE}: {error}"),
-        };
+        let large = thp_size(std::fs::read_to_string(THP_SIZE), page()?);
         let base = map(large, large)?;
         let collapses = unsafe {
-            let probed = prefer_large(base.as_ptr(), large).map(|()| {
+            let collapses = prefer_large(base.as_ptr(), large).is_ok() && {
                 std::ptr::write_volatile(base.as_ptr(), 0);
                 libc::madvise(base.as_ptr().cast(), large, libc::MADV_COLLAPSE) == 0
                     || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
-            });
+            };
             unmap(base, large);
-            probed?
+            collapses
         };
         Ok(collapses.then_some(large))
     }
@@ -550,6 +595,18 @@ mod tests {
         }
         drop(block);
         assert_eq!(large_page_backing(), before, "a dropped block is uncounted");
+    }
+
+    /// The transparent huge page size is `hpage_pmd_size`'s; where it is
+    /// missing or refused, the PMD size: the page squared over an 8-byte
+    /// page-table entry.
+    #[test]
+    fn a_missing_thp_size_is_the_pmd_size() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(host::thp_size(Ok("2097152\n".into()), 4096), 2 << 20);
+        assert_eq!(host::thp_size(Err(Error::from(ErrorKind::NotFound)), 4096), 2 << 20);
+        assert_eq!(host::thp_size(Err(Error::from(ErrorKind::PermissionDenied)), 16384), 32 << 20);
+        assert_eq!(host::thp_size(Err(Error::from(ErrorKind::NotFound)), 65536), 512 << 20);
     }
 
     /// A block that is not whole large pages, or that asks for host pages,

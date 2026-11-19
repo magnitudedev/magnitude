@@ -20,7 +20,7 @@ use seismic_native_target::{ProgramEntry, StatisticValue};
 
 /// The revision of these probes: their kernels and expected results. It
 /// keys their stored results, so a change runs them again.
-pub const REVISION: u32 = 1;
+pub const REVISION: u32 = 3;
 
 /// What every probe kernel declares: the floor's extensions it uses and the
 /// argument block.
@@ -52,10 +52,11 @@ pub fn run(device: &Device, name: &str) -> Result<ProbeResult<u64>, String> {
 }
 
 /// The pipeline of `body` (after the head and `extensions`, with `defines`)
-/// sealed for `environment`, one workgroup of `threads`. The driver's
-/// compiler rejecting it is the probe's finding, not an error: it rejected
-/// what it reports supporting. The host's compilation failing is the
-/// probe's own bug, which says nothing of the device: it panics.
+/// formed for `environment` as every launch is ([`formation::form`]), one
+/// workgroup of `threads`. The driver's compiler rejecting it is the
+/// probe's finding, not an error: it rejected what it reports supporting.
+/// The host's formation failing is the probe's own bug, which says nothing
+/// of the device: it panics.
 fn form(
     device: &Device,
     defines: &str,
@@ -65,9 +66,9 @@ fn form(
     threads: u32,
 ) -> Result<DirectModule, String> {
     let source = format!("#version 460\n{defines}{extensions}{HEAD}{body}");
-    let words = formation::compile(&source, "main", environment)
-        .unwrap_or_else(|error| panic!("a probe kernel does not compile on the host: {error}\n{source}"));
     let entry = ProgramEntry { symbol: "main".into(), group_size: Some([threads, 1, 1]), constants: Vec::new() };
+    let words = formation::form(&source, &entry, environment)
+        .unwrap_or_else(|error| panic!("a probe kernel does not form on the host: {error}\n{source}"));
     DirectModule::compile(device, &[(&words[..], &entry)]).map(|(module, _)| module).map_err(|error| error.to_string())
 }
 
@@ -191,7 +192,7 @@ fn f16_bits(value: f32) -> u16 {
 /// `wide_accumulators`: the flash-attention body's cooperative-matrix path
 /// with 8 and 16 output fragments computes attention correctly.
 ///
-/// Expected: for 16 query rows and 80 keys (two whole tiles and a partial
+/// Expected: for 16 query rows per subgroup and 80 keys (two whole tiles and a partial
 /// one) of operands k / 512 (|k| <= 256, exact in f16), at head widths 128
 /// (8 fragments) and 256 (16 fragments), every output is within 4e-3 of the
 /// host's attention over the same operands in f64; the kernel rounds only
@@ -202,8 +203,14 @@ fn f16_bits(value: f32) -> u16 {
 /// 580.159.03 computes this one within 2e-5 at 4, 8 and 16 fragments). The same
 /// kernel at width 64 (4 fragments) is the control: where it fails, the probe, not the accumulators, is
 /// wrong, and nothing is answered.
+///
+/// The workgroup is two 32-lane subgroups, 64 invocations, a whole number of
+/// the widest hardware subgroup, as formation requires of a launch that
+/// reads its subgroups; each subgroup attends its own 16 query rows into its
+/// own 16 output rows, over the keys and values they stage together.
 fn wide_accumulators(device: &Device) -> Result<ProbeResult<u64>, String> {
-    const ROWS: usize = 16;
+    const SUBGROUPS: usize = 2;
+    const ROWS: usize = 16 * SUBGROUPS;
     const KEYS: usize = 80;
     let target = device.formation();
     if !(device.properties().matrix.holds() && target.float16 && target.subgroup_lanes == crate::SUBGROUP_WIDTH) {
@@ -219,11 +226,11 @@ fn wide_accumulators(device: &Device) -> Result<ProbeResult<u64>, String> {
         let v = (0..KEYS * width).map(|_| operand()).collect::<Vec<_>>();
         let module = match form(
             device,
-            &format!("#define W {width}u\n"),
+            &format!("#define W {width}u\n#define SUBGROUPS {SUBGROUPS}u\n"),
             WIDE_EXTENSIONS,
             include_str!("probe/wide_accumulators.glsl"),
             target.environment(),
-            32,
+            SUBGROUPS as u32 * crate::SUBGROUP_WIDTH,
         ) {
             Ok(module) => module,
             Err(reason) => return Ok(Err(format!("width {width} does not form: {reason}"))),

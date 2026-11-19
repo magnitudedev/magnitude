@@ -5,11 +5,12 @@
 //   shape_rows_prepare (PARTS x Sx): penalized/tempered values in place over
 //     `logits` (-inf where a constrained row's mask rejects a finite value;
 //     each invocation reads and rewrites its own tokens) and the partition
-//     maxima.
-//   shape_rows_select (Sx): the cutoffs. Top-k is a count-weighted radix
-//     select of the k-th largest key; top-p a mass-weighted radix select of the
-//     first token whose inclusive mass reaches ceil(top_p * total), then its
-//     rank among equal keys by token index. Masses are exp(v - max) in 2^-32
+//     maxima (scratch `maxima`).
+//   shape_rows_select (Sx): the cutoffs (scratch `state`). Top-k is a
+//     count-weighted radix select of the k-th largest key; top-p a
+//     mass-weighted radix select of the first token whose inclusive mass
+//     reaches ceil(top_p * total), then its rank among equal keys by token
+//     index. Masses are exp(v - max) in 2^-32
 //     fixed point, so every sum is order-independent and exact.
 //   shape_rows_apply (PARTS x Sx): writes -inf over every removed token.
 // A zero temperature leaves the penalized values unshaped, as does a tempered
@@ -20,8 +21,8 @@
 // the sums stay exact without 64-bit shared atomics (a gated device feature).
 #include <seismic/element.glsl>
 
-// Scratch per row (u32 words): PARTS partition-maximum keys, then the
-// selection state.
+// Scratch per row (u32 words): PARTS partition-maximum keys in `maxima`, the
+// selection state in `state`, apart so that select only reads the maxima.
 #define SELECTION_MAXIMUM 0u     // ordered key of the row maximum
 #define SELECTION_TOP_K_KEY 1u   // keys below are removed (0: none)
 #define SELECTION_TOP_P_KEY 2u   // removed: key below, or equal with token above top_p_token
@@ -59,8 +60,12 @@ uint shape_slice_end(uint part) {
     return min(shape_slice_begin(part) + span, uint(SEISMIC_DIM_V));
 }
 
-uint64_t shape_row_scratch(uint64_t row) {
-    return SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATE) + row * uint64_t(SEISMIC_TUNE_PARTS + 8u) * 4ul;
+uint64_t shape_row_maxima(uint64_t row) {
+    return SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MAXIMA) + row * uint64_t(SEISMIC_TUNE_PARTS) * 4ul;
+}
+
+uint64_t shape_row_selection(uint64_t row) {
+    return SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATE) + row * 8ul * 4ul;
 }
 
 // The element index of row `row`'s logit of `token` in the logits' owner handle.
@@ -119,11 +124,13 @@ void shape_rows_prepare() {
     atomicMax(seismic_shared_u32[recent_count], maximum);
     barrier();
     if (thread == 0u)
-        element_u32_put(shape_row_scratch(row) + uint64_t(part) * 4ul, seismic_shared_u32[recent_count]);
+        element_u32_put(shape_row_maxima(row) + uint64_t(part) * 4ul, seismic_shared_u32[recent_count]);
 }
 
 // ---------------------------------------------------------------------------
-// Selection: one workgroup of 1024 invocations per row. Shared (u32 words):
+// Selection: one workgroup of 1024 invocations per row. What steers a barrier
+// (the top-p total, each level's digit) is read in a phase that stores no
+// shared memory, between barriers. Shared (u32 words):
 
 #define SHAPE_BINS 2048u
 #define SHAPE_HIST_LO 0u
@@ -131,9 +138,7 @@ void shape_rows_prepare() {
 #define SHAPE_LANE_TOTALS 4096u   // 32 u64 as (low, high) pairs
 #define SHAPE_TOTAL 4160u         // one u64 as (low, high)
 #define SHAPE_CHUNK_COUNTS 4162u  // one u32 per invocation (1024)
-#define SHAPE_DIGIT 5186u
-#define SHAPE_BASE 5188u          // one u64
-// shared_bytes = 5190 * 4 = 20760
+// shared_bytes = 5186 * 4 = 20744
 
 uint64_t shape_shared_u64(uint at) { return packUint2x32(uvec2(seismic_shared_u32[at], seismic_shared_u32[at + 1u])); }
 
@@ -197,58 +202,59 @@ uint64_t shape_mass(shape_survivor survivor, float value) {
     return (uint64_t(significand) << 9) >> min(127u - max(biased, 1u), 63u);
 }
 
+// Zero histogram planes for the next level's counts (ordered by the
+// barrier opening it).
+void shape_histogram_clear() {
+    for (uint bin = gl_LocalInvocationIndex; bin < SHAPE_BINS; bin += gl_WorkGroupSize.x) {
+        seismic_shared_u32[SHAPE_HIST_LO + bin] = 0u;
+        seismic_shared_u32[SHAPE_HIST_HI + bin] = 0u;
+    }
+}
+
 // Descending digit of a weighted histogram at which the running weight
 // `above` + bins reaches `target`; adds the weight of higher bins to `above`.
-// Returns SHAPE_BINS when the whole histogram stays below the target.
+// Returns SHAPE_BINS when the whole histogram stays below the target. Every
+// invocation scans alike (shared loads only), between the barrier after the
+// lane totals and the one after the scan.
 uint shape_descend(uint bins, uint64_t target, inout uint64_t above) {
-    // Subgroup 0: lane l owns bins [bins - (l + 1) * per, bins - l * per), highest first.
-    if (SEISMIC_SUBGROUP == 0u) {
-        const uint lane = SEISMIC_LANE;
-        const uint per = bins / 32u;
+    // Invocation l < 32 owns bins [bins - (l + 1) * per, bins - l * per), highest first.
+    const uint thread = gl_LocalInvocationIndex;
+    const uint per = bins / 32u;
+    if (thread < 32u) {
         uint64_t total = 0ul;
         for (uint i = 0u; i < per; ++i)
-            total += shape_histogram(bins - 1u - (lane * per + i));
-        shape_shared_u64_put(SHAPE_LANE_TOTALS + 2u * lane, total);
+            total += shape_histogram(bins - 1u - (thread * per + i));
+        shape_shared_u64_put(SHAPE_LANE_TOTALS + 2u * thread, total);
     }
-    // Publish lane totals in a workgroup phase before the leader consumes
-    // them. Subgroup-only synchronization here produced inconsistent
-    // radix cutoffs on the tested NVIDIA Vulkan path.
     barrier();
-    if (SEISMIC_SUBGROUP == 0u) {
-        const uint lane = SEISMIC_LANE;
-        const uint per = bins / 32u;
-        if (lane == 0u) {
-            uint64_t running = above;
-            uint digit = SHAPE_BINS;
-            for (uint l = 0u; l < 32u; ++l) {
-                const uint64_t lane_total = shape_shared_u64(SHAPE_LANE_TOTALS + 2u * l);
-                if (running + lane_total >= target) {
-                    for (uint i = 0u; i < per; ++i) {
-                        const uint bin = bins - 1u - (l * per + i);
-                        const uint64_t weight = shape_histogram(bin);
-                        if (running + weight >= target) {
-                            digit = bin;
-                            break;
-                        }
-                        running += weight;
-                    }
+    uint64_t running = above;
+    uint digit = SHAPE_BINS;
+    for (uint l = 0u; l < 32u; ++l) {
+        const uint64_t lane_total = shape_shared_u64(SHAPE_LANE_TOTALS + 2u * l);
+        if (running + lane_total >= target) {
+            for (uint i = 0u; i < per; ++i) {
+                const uint bin = bins - 1u - (l * per + i);
+                const uint64_t weight = shape_histogram(bin);
+                if (running + weight >= target) {
+                    digit = bin;
                     break;
                 }
-                running += lane_total;
+                running += weight;
             }
-            seismic_shared_u32[SHAPE_DIGIT] = digit;
-            shape_shared_u64_put(SHAPE_BASE, running);
+            break;
         }
+        running += lane_total;
     }
     barrier();
-    above = shape_shared_u64(SHAPE_BASE);
-    return seismic_shared_u32[SHAPE_DIGIT];
+    above = running;
+    return digit;
 }
 
 // Radix select over the keys of survivors (weight 1, or the mass when
 // `by_mass`): the key K with weight(key > K) < target <= weight(key >= K).
 // Returns false when the total weight is below the target; `above` receives
-// weight(key > K).
+// weight(key > K). The histogram is zero on entry (`shape_histogram_clear`
+// before a barrier) and on return.
 bool shape_select_key(shape_survivor survivor, const bool by_mass, uint64_t target, out uint key_out, out uint64_t above) {
     const uint thread = gl_LocalInvocationIndex;
     uint prefix = 0u;
@@ -258,10 +264,6 @@ bool shape_select_key(shape_survivor survivor, const bool by_mass, uint64_t targ
     for (uint level = 0u; level < 3u; ++level) {
         const uint shift = level == 0u ? 21u : level == 1u ? 10u : 0u;
         const uint bins = level == 2u ? 1024u : 2048u;
-        for (uint bin = thread; bin < bins; bin += gl_WorkGroupSize.x) {
-            seismic_shared_u32[SHAPE_HIST_LO + bin] = 0u;
-            seismic_shared_u32[SHAPE_HIST_HI + bin] = 0u;
-        }
         barrier();
         for (uint token = thread; token < uint(SEISMIC_DIM_V); token += gl_WorkGroupSize.x) {
             float value;
@@ -271,11 +273,11 @@ bool shape_select_key(shape_survivor survivor, const bool by_mass, uint64_t targ
         }
         barrier();
         const uint digit = shape_descend(bins, target, above);
+        shape_histogram_clear();
         if (digit == SHAPE_BINS)
             return false;
         prefix |= digit << shift;
         mask |= (bins - 1u) << shift;
-        barrier();
     }
     key_out = prefix;
     return true;
@@ -316,24 +318,31 @@ void shape_rows_select() {
     const uint64_t params = SEISMIC_PTR(SEISMIC_BUFFER_PARAMS);
     const uint64_t row = gl_WorkGroupID.x;
     const uint thread = gl_LocalInvocationIndex;
-    const uint64_t scratch = shape_row_scratch(row);
-    const uint64_t selection = scratch + uint64_t(SEISMIC_TUNE_PARTS) * 4ul;
+    const uint64_t maxima = shape_row_maxima(row);
+    const uint64_t selection = shape_row_selection(row);
     if (shape_parameter(params, row, 0u) == 0.0)
         return;
     const int top_k = int(shape_parameter(params, row, 1u));
     const float top_p = shape_parameter(params, row, 2u);
     uint maximum = 0u;
     for (uint part = 0u; part < SEISMIC_TUNE_PARTS; ++part)
-        maximum = max(maximum, element_u32_at(scratch + uint64_t(part) * 4ul));
+        maximum = max(maximum, element_u32_at(maxima + uint64_t(part) * 4ul));
     if (maximum == SHAPE_UNSHAPED) {
         if (thread == 0u)
             element_u32_put(selection + SELECTION_MAXIMUM * 4ul, SHAPE_UNSHAPED);
         return;
     }
     shape_survivor survivor = shape_survivor(row, shape_key_value(maximum), 0u, 0.0);
+    const bool by_top_k = top_k > 0 && uint64_t(top_k) < SEISMIC_DIM_V && maximum != 0u;
+    const bool by_top_p = top_p < 1.0 && maximum != 0u;
+    // Ordered by the first barrier of top-k or top-p.
+    if (by_top_k || by_top_p)
+        shape_histogram_clear();
+    if (by_top_p && thread == 0u)
+        shape_shared_u64_put(SHAPE_TOTAL, 0ul);
     uint top_k_key = 0u;
     uint64_t above;
-    if (top_k > 0 && uint64_t(top_k) < SEISMIC_DIM_V && maximum != 0u) {
+    if (by_top_k) {
         uint key;
         if (shape_select_key(survivor, false, uint64_t(top_k), key, above))
             top_k_key = key;
@@ -341,9 +350,7 @@ void shape_rows_select() {
     survivor.top_k_key = top_k_key;
     survivor.min_p = shape_parameter(params, row, 3u);
     uint mode = 0u, top_p_key = 0u;
-    if (top_p < 1.0 && maximum != 0u) {
-        if (thread == 0u)
-            shape_shared_u64_put(SHAPE_TOTAL, 0ul);
+    if (by_top_p) {
         barrier();
         uint64_t total = 0ul;
         for (uint token = thread; token < uint(SEISMIC_DIM_V); token += gl_WorkGroupSize.x) {
@@ -417,7 +424,7 @@ void shape_rows_apply() {
     const uint part = gl_WorkGroupID.x;
     if (shape_parameter(params, row, 0u) == 0.0)
         return;
-    const uint64_t selection = shape_row_scratch(row) + uint64_t(SEISMIC_TUNE_PARTS) * 4ul;
+    const uint64_t selection = shape_row_selection(row);
     const uint maximum_key = element_u32_at(selection + SELECTION_MAXIMUM * 4ul);
     if (maximum_key == SHAPE_UNSHAPED)
         return;

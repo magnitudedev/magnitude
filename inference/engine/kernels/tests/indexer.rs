@@ -22,6 +22,7 @@
 // shapes (H 32, W 128, rate 4, top 512) past 2048 keys.
 
 mod common;
+mod decision;
 mod indexer_common;
 mod rounding_model;
 mod versions_common;
@@ -882,16 +883,18 @@ fn compare(case: &Case, expected: &Model, outcome: &Outcome, who: &str, backend:
     }
 }
 
-/// Whether every selecting row's K-th and (K + 1)-th scores lie farther
-/// apart than the backends' F32 summation orders move them: more than the
-/// two scores' order spreads together.
+/// Whether every selecting row's top K is settled (`decision::settled`):
+/// its K-th and (K + 1)-th scores lie farther apart than the backends' F32
+/// summation orders move them, each score's order spread its scale.
 fn robust(case: &Case) -> bool {
     let model = model(case);
     model.scores.iter().zip(&model.spreads).all(|(scores, spreads)| {
-        let mut order = (0..scores.len()).collect::<Vec<_>>();
-        order.sort_by(|a, b| scores[*b].partial_cmp(&scores[*a]).unwrap());
-        order.len() <= case.k
-            || f64::from(scores[order[case.k - 1]] - scores[order[case.k]]) > spreads[order[case.k - 1]] + spreads[order[case.k]]
+        let quantities = scores
+            .iter()
+            .zip(spreads)
+            .map(|(score, spread)| decision::Quantity { value: f64::from(*score), scale: *spread })
+            .collect::<Vec<_>>();
+        decision::settled(&quantities, case.k)
     })
 }
 

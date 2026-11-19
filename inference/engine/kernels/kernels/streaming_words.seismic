@@ -374,12 +374,12 @@ const LIST_ENTRY_WORDS = 2
 const LIST_FROM = 0
 const LIST_TO = 1
 
-# A group's words of a list it reads (streaming/list.hpp): the pair of the
-# entry it visits (LIST_GROUP_PAIR, its from and to words), the first entry
-# of the chunk it staged (LIST_GROUP_FIRST) and the chunk's count
-# (LIST_GROUP_STAGED), then from LIST_GROUP_CHUNK the chunk's entries, at
-# most LIST_CHUNK.
-const LIST_GROUP_PAIR = 0
+# A group's words of a list it reads (streaming/list.hpp): the list's
+# sequence and count (LIST_GROUP_HEADER, at LIST_SEQUENCE and LIST_COUNT),
+# the first entry of the chunk it staged (LIST_GROUP_FIRST) and the chunk's
+# count (LIST_GROUP_STAGED), then from LIST_GROUP_CHUNK the chunk's entries,
+# at most LIST_CHUNK.
+const LIST_GROUP_HEADER = 0
 const LIST_GROUP_FIRST = 2
 const LIST_GROUP_STAGED = 3
 const LIST_GROUP_CHUNK = 4

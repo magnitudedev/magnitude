@@ -337,14 +337,15 @@ mod schema {
         pub message: String,
     }
 
-    /// What a discovery diagnostic is about: one backend's enumeration, or the
-    /// OS's adapter interface (DXGI).
+    /// What a discovery diagnostic is about: one backend's enumeration, the OS's
+    /// adapter interface (DXGI), or the host's memory limits.
     #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
     pub enum HardwareDiagnosticSource {
         Backend { backend: ExecutionBackend },
         Adapters,
+        Host,
     }
 
     #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1041,8 +1042,16 @@ pub enum InventoryProperties {
 pub struct ModelPreviewSource {
     pub repository: String,
     pub revision: String,
-    pub primary_gguf: PathBuf,
+    /// Ordered shard paths for the primary GGUF component (1 element for an unsplit GGUF).
+    pub shards: Vec<PathBuf>,
     pub additional_components: Vec<ModelPreviewComponentSource>,
+}
+
+impl ModelPreviewSource {
+    #[must_use]
+    pub fn primary_gguf(&self) -> Option<&std::path::Path> {
+        self.shards.first().map(PathBuf::as_path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

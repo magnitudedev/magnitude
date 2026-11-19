@@ -16,7 +16,8 @@
 //!
 //! Every process has one store, the user's ([`ProgramStore::user`]): a
 //! [`DirectoryStore`] in the user's cache directory, which every process of
-//! the user shares, so no process forms a program another formed. It holds
+//! the user shares, so no process forms a program another formed (in memory
+//! where the user has no cache directory). It holds
 //! the programs, and the probe answers devices are opened with, which
 //! eviction keeps. A device opened without naming a store forms through it;
 //! a test that observes its own compiles names one of its own
@@ -32,6 +33,8 @@ pub use directory::{DirectoryStore, Writing, DEFAULT_CAPACITY};
 pub use seismic_io::{Eviction, Examining, Layout};
 
 pub use seismic_native_target::{ArtifactKey, ArtifactStore, HeldFile, MemoryStore};
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The store every device forms its programs through: `bytes`, where
@@ -136,15 +139,12 @@ impl ProgramStore {
     }
 
     /// The user's store, the one store of the process, opened once: a
-    /// directory store of [`DEFAULT_CAPACITY`] in the user's cache
-    /// directory (`$XDG_CACHE_HOME`, else `~/Library/Caches` on macOS and
-    /// `~/.cache` elsewhere, under `seismic/programs`), which every process
-    /// of the user shares. A device opened without naming a store forms
-    /// through it. Where the directory cannot open, it is the same one
-    /// store with persistence unavailable: its bytes are held in memory, so
-    /// every claim, wait and count works as on disk and each program forms
-    /// once in the process, and every process compiles again until the
-    /// directory opens. That is reported once a process, at error level.
+    /// directory store of [`DEFAULT_CAPACITY`] under `seismic/programs` in
+    /// the user's cache directory ([`cache_directory`]), which every
+    /// process of the user shares. A device opened without naming a store
+    /// forms through it. Where the user has no cache directory, or it
+    /// refuses the store, the same one store keeps its bytes in memory
+    /// ([`user_store`]).
     pub fn user() -> Arc<Self> {
         USER.0.clone()
     }
@@ -214,46 +214,138 @@ impl ProgramStore {
 }
 
 /// The user's store ([`ProgramStore::user`]), and the directory store in
-/// the user's cache directory that keeps its bytes, none where it did not
-/// open and they are held in memory.
-static USER: std::sync::LazyLock<(Arc<ProgramStore>, Option<Arc<DirectoryStore>>)> = std::sync::LazyLock::new(|| {
-    match user_directory() {
-        Ok(directory) => {
-            let directory = Arc::new(directory);
-            (Arc::new(ProgramStore::new(directory.clone())), Some(directory))
-        }
-        Err(reason) => {
-            tracing::error!(
-                "{reason}: the programs this process forms are kept in its memory alone, so every process compiles them again until the store opens"
-            );
-            (Arc::new(ProgramStore::new(Arc::new(MemoryStore::default()))), None)
-        }
-    }
-});
+/// the user's cache directory that keeps its bytes, none where they are
+/// held in memory.
+static USER: std::sync::LazyLock<(Arc<ProgramStore>, Option<Arc<DirectoryStore>>)> =
+    std::sync::LazyLock::new(|| user_store(cache_directory(&Process)));
 
 /// The directory store that keeps the user's store on disk, none where it
-/// did not open.
+/// is kept in memory.
 pub(crate) fn user_on_disk() -> Option<&'static DirectoryStore> {
     USER.1.as_deref()
 }
 
-/// The directory store in the user's cache directory ([`ProgramStore::user`]):
-/// `%LOCALAPPDATA%` on Windows, which sets no `HOME`.
-fn user_directory() -> Result<DirectoryStore, String> {
-    let cache = match std::env::var_os("XDG_CACHE_HOME") {
-        Some(cache) => std::path::PathBuf::from(cache),
-        None if cfg!(windows) => std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
-            .ok_or("the user's program store has no directory to open: neither XDG_CACHE_HOME nor LOCALAPPDATA is set")?,
-        None => {
-            let home = std::env::var_os("HOME")
-                .ok_or("the user's program store has no directory to open: neither XDG_CACHE_HOME nor HOME is set")?;
-            let home = std::path::PathBuf::from(home);
-            if cfg!(target_os = "macos") { home.join("Library/Caches") } else { home.join(".cache") }
+/// The user's store kept under `seismic/programs` in `cache`, with that
+/// directory store; where there is no `cache`, or the directory does not
+/// open (refused, read-only, a full disk), kept in memory, with none. In
+/// memory, every claim, wait and count works as on disk and each program
+/// forms once in the process, and every process forms its programs again.
+fn user_store(cache: Option<PathBuf>) -> (Arc<ProgramStore>, Option<Arc<DirectoryStore>>) {
+    let directory = cache.and_then(|cache| {
+        let root = cache.join("seismic").join("programs");
+        DirectoryStore::open(root.clone(), DEFAULT_CAPACITY, directory::programs)
+            .inspect_err(|error| {
+                tracing::error!(
+                    "the user's program store {} does not open: {error}: the programs this process forms are kept in its memory alone, so every process compiles them again until the store opens",
+                    root.display()
+                )
+            })
+            .ok()
+            .map(Arc::new)
+    });
+    match directory {
+        Some(directory) => (Arc::new(ProgramStore::new(directory.clone())), Some(directory)),
+        None => (Arc::new(ProgramStore::new(Arc::new(MemoryStore::default()))), None),
+    }
+}
+
+/// The user's cache directory, from its sources in order, each answering
+/// with an absolute path or not at all (an unset, empty or relative
+/// variable is no answer, as the XDG base directory specification has it):
+/// - macOS: `XDG_CACHE_HOME`, `$HOME/Library/Caches`, then the account's
+///   home's `Library/Caches` ([`Environment::account_home`]).
+/// - Linux and every other Unix: `XDG_CACHE_HOME`, `$HOME/.cache`, then
+///   the account's home's `.cache`.
+/// - Windows, which sets no `HOME`: the profile's local application data
+///   ([`Environment::local_app_data`]), then `LOCALAPPDATA`.
+///
+/// None where no source answers: the store is then kept in memory
+/// ([`user_store`]).
+fn cache_directory(environment: &impl Environment) -> Option<PathBuf> {
+    let var = |name: &str| environment.var(name).map(PathBuf::from).filter(|path| path.is_absolute());
+    #[cfg(unix)]
+    {
+        let caches = if cfg!(target_os = "macos") { "Library/Caches" } else { ".cache" };
+        var("XDG_CACHE_HOME")
+            .or_else(|| var("HOME").map(|home| home.join(caches)))
+            .or_else(|| environment.account_home().filter(|home| home.is_absolute()).map(|home| home.join(caches)))
+    }
+    #[cfg(windows)]
+    {
+        environment.local_app_data().filter(|path| path.is_absolute()).or_else(|| var("LOCALAPPDATA"))
+    }
+}
+
+/// What the user's cache directory is read from ([`cache_directory`]).
+trait Environment {
+    /// The environment variable `name`.
+    fn var(&self, name: &str) -> Option<OsString>;
+    /// The home directory of the account this process runs as:
+    /// `getpwuid_r(getuid())`'s `pw_dir`, read apart from the environment.
+    #[cfg(unix)]
+    fn account_home(&self) -> Option<PathBuf>;
+    /// `SHGetKnownFolderPath(FOLDERID_LocalAppData)`: the local application
+    /// data of the profile of this process's token, read apart from the
+    /// environment.
+    #[cfg(windows)]
+    fn local_app_data(&self) -> Option<PathBuf>;
+}
+
+/// This process's environment and account.
+struct Process;
+
+impl Environment for Process {
+    fn var(&self, name: &str) -> Option<OsString> {
+        std::env::var_os(name)
+    }
+
+    /// None where the account has no entry (`ENOENT`, `ESRCH`, `EBADF`,
+    /// `EPERM`, POSIX's "not found").
+    ///
+    /// # Panics
+    /// Where the account database fails in any other way.
+    #[cfg(unix)]
+    fn account_home(&self) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buffer = vec![0 as libc::c_char; 1024];
+        loop {
+            // SAFETY: `getpwuid_r` fills `entry`, whose strings point into
+            // `buffer`, read before either is dropped.
+            let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut found: *mut libc::passwd = std::ptr::null_mut();
+            let status = unsafe { libc::getpwuid_r(libc::getuid(), &mut entry, buffer.as_mut_ptr(), buffer.len(), &mut found) };
+            match status {
+                0 if found.is_null() || entry.pw_dir.is_null() => return None,
+                0 => {
+                    let home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+                    return Some(PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())));
+                }
+                libc::ERANGE => buffer.resize(buffer.len() * 2, 0),
+                libc::EINTR => {}
+                libc::ENOENT | libc::ESRCH | libc::EBADF | libc::EPERM => return None,
+                code => panic!("invariant violated: getpwuid_r: {}", std::io::Error::from_raw_os_error(code)),
+            }
         }
-    };
-    let root = cache.join("seismic").join("programs");
-    DirectoryStore::open(root.clone(), DEFAULT_CAPACITY, directory::programs)
-        .map_err(|error| format!("the user's program store {} does not open: {error}", root.display()))
+    }
+
+    /// None where the call fails: its failures are the folder having no
+    /// path for this token (one whose profile is not loaded).
+    #[cfg(windows)]
+    fn local_app_data(&self) -> Option<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+        let mut path: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: the path the call allocates, NUL-terminated where it
+        // succeeds, is read and then freed whatever it returned.
+        let result = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut path) };
+        let found = (result >= 0).then(|| {
+            let length = (0usize..).take_while(|&at| unsafe { *path.add(at) } != 0).count();
+            PathBuf::from(OsString::from_wide(unsafe { std::slice::from_raw_parts(path, length) }))
+        });
+        unsafe { CoTaskMemFree(path.cast_const().cast()) };
+        found
+    }
 }
 
 /// A former's claim on the formations it forms ([`ProgramStore::claim`]).
@@ -370,4 +462,71 @@ pub struct DeviceOptions {
     /// What its recorded graphs hold, as records hold it. Without one its
     /// backend measures it on opening, once a process.
     pub graph_cost: Option<seismic_compiler::graph_cost::GraphCost>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An environment of the variables `vars` and the account's own
+    /// directory `account` (its home on Unix, its local application data
+    /// on Windows).
+    struct Given {
+        vars: Vec<(&'static str, &'static str)>,
+        account: Option<&'static str>,
+    }
+
+    impl Environment for Given {
+        fn var(&self, name: &str) -> Option<OsString> {
+            self.vars.iter().find(|(var, _)| *var == name).map(|(_, value)| OsString::from(value))
+        }
+
+        #[cfg(unix)]
+        fn account_home(&self) -> Option<PathBuf> {
+            self.account.map(PathBuf::from)
+        }
+
+        #[cfg(windows)]
+        fn local_app_data(&self) -> Option<PathBuf> {
+            self.account.map(PathBuf::from)
+        }
+    }
+
+    fn cache(vars: &[(&'static str, &'static str)], account: Option<&'static str>) -> Option<PathBuf> {
+        cache_directory(&Given { vars: vars.to_vec(), account })
+    }
+
+    /// Unix: `XDG_CACHE_HOME`, then `$HOME`'s caches, then the account's
+    /// home's; an empty or relative variable is no answer.
+    #[test]
+    #[cfg(unix)]
+    fn the_unix_cache_is_xdg_then_home_then_the_account() {
+        let caches = if cfg!(target_os = "macos") { "Library/Caches" } else { ".cache" };
+        let home = [("HOME", "/home/a")];
+        assert_eq!(cache(&[("XDG_CACHE_HOME", "/xdg"), home[0]], Some("/account")), Some(PathBuf::from("/xdg")));
+        assert_eq!(cache(&[("XDG_CACHE_HOME", "relative"), home[0]], None), Some(PathBuf::from("/home/a").join(caches)));
+        assert_eq!(cache(&[("XDG_CACHE_HOME", ""), ("HOME", "")], Some("/account")), Some(PathBuf::from("/account").join(caches)));
+        assert_eq!(cache(&[], None), None);
+    }
+
+    /// Windows: the profile's local application data, then `LOCALAPPDATA`.
+    #[test]
+    #[cfg(windows)]
+    fn the_windows_cache_is_the_profile_then_localappdata() {
+        let local = [("LOCALAPPDATA", r"D:\env\Local")];
+        assert_eq!(cache(&local, Some(r"C:\Users\a\AppData\Local")), Some(PathBuf::from(r"C:\Users\a\AppData\Local")));
+        assert_eq!(cache(&local, None), Some(PathBuf::from(r"D:\env\Local")));
+        assert_eq!(cache(&[("XDG_CACHE_HOME", r"C:\xdg"), ("HOME", r"C:\home")], None), None);
+    }
+
+    /// With no cache directory anywhere, the user's store is kept in
+    /// memory.
+    #[test]
+    fn without_a_cache_directory_the_store_is_in_memory() {
+        let (store, on_disk) = user_store(None);
+        assert!(on_disk.is_none());
+        let key = ArtifactKey::of(&[b"programs".as_slice()]);
+        store.put("ns", &key, b"bytes");
+        assert_eq!(store.get("ns", &key).as_deref(), Some(&b"bytes"[..]));
+    }
 }

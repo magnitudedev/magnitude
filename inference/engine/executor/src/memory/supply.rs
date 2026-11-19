@@ -146,22 +146,28 @@ impl Reading {
     }
 
     /// Unified Metal's reading from `sample`: host RAM's, its grant bounded
-    /// by the wired ceiling, `min(iogpu.wired_limit_mb or its default,
-    /// working_set)` with `working_set` the device's
-    /// `recommendedMaxWorkingSetSize`. Its release lag is the host's, none:
-    /// a pool block's buffer is made purgeable-Empty before it is released,
-    /// which discards its pages in that call, so the free shows at once.
-    ///
-    /// # Panics
-    /// Where the sample reads no wired figures: every macOS sample reads
-    /// them, and unified Metal is macOS's.
+    /// by `working_set`, the device's `recommendedMaxWorkingSetSize`. On
+    /// Apple silicon the bound is the wired ceiling: the wired limit set
+    /// ([`seismic::WiredLimit::Set`]) within `working_set`, or the OS's
+    /// default, which `working_set` reports
+    /// ([`seismic::WiredLimit::OsDefault`]). Where the GPU wires no host RAM
+    /// (the sample has no wired figures: an Intel Mac's integrated GPU, no
+    /// IOGPU stack), `working_set` alone bounds it, a static ceiling within
+    /// host RAM's supply. Its release lag is the host's, none: a pool
+    /// block's buffer is made purgeable-Empty before it is released, which
+    /// discards its pages in that call, so the free shows at once.
     pub fn unified(sample: &seismic::HostSample, working_set: u64) -> Self {
-        let wired = sample.wired.unwrap_or_else(|| panic!("invariant violated: a unified Metal host reads no wired limit or wire count"));
-        let limit = match wired.limit {
-            seismic::WiredLimit::OsDefault => working_set,
-            seismic::WiredLimit::Set(bytes) => bytes.min(working_set),
+        let grant = match sample.wired {
+            Some(wired) => {
+                let limit = match wired.limit {
+                    seismic::WiredLimit::OsDefault => working_set,
+                    seismic::WiredLimit::Set(bytes) => bytes.min(working_set),
+                };
+                HostGrant::Wired(Ceiling { limit, wired: wired.wire_count })
+            }
+            None => HostGrant::Limit(working_set),
         };
-        Self { grant: Some(HostGrant::Wired(Ceiling { limit, wired: wired.wire_count })), ..Self::host(sample) }
+        Self { grant: Some(grant), ..Self::host(sample) }
     }
 
     /// Unified host RAM bounded by a static device ceiling `limit` (unified
@@ -530,6 +536,25 @@ impl Boundary {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Unified Metal's wired ceiling: the OS's default is the device's
+    /// working set, a limit set is bounded by it, and a host whose GPU
+    /// wires nothing (an Intel Mac's integrated GPU) is bounded by the
+    /// working set alone, never a panic.
+    #[test]
+    fn unified_metals_grant_is_its_working_set_under_any_wired_limit() {
+        let working_set = 48 * GB;
+        let wired = |limit| seismic::HostSample {
+            wired: Some(seismic::WiredFigures { limit, wire_count: 4 * GB }),
+            ..seismic::host_samples::m4_pro()
+        };
+        let limit = |sample: seismic::HostSample| Reading::unified(&sample, working_set).ceiling().map(|ceiling| ceiling.limit);
+        assert_eq!(limit(wired(seismic::WiredLimit::OsDefault)), Some(working_set));
+        assert_eq!(limit(wired(seismic::WiredLimit::Set(36 * GB))), Some(36 * GB));
+        assert_eq!(limit(wired(seismic::WiredLimit::Set(60 * GB))), Some(working_set));
+        let unwired = Reading::unified(&seismic::HostSample { wired: None, ..seismic::host_samples::m4_pro() }, working_set);
+        assert!(matches!(unwired.grant(), Some(HostGrant::Limit(bytes)) if bytes == working_set));
+    }
 
     const GB: u64 = 1 << 30;
 

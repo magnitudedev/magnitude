@@ -105,8 +105,8 @@ pub struct Gguf {
 
 impl Gguf {
     pub async fn open(source: &GgufSource) -> anyhow::Result<Self> {
-        let (location, first) = match source {
-            GgufSource::Local { path } => (Location::Local, path.clone()),
+        let (location, first, resolved_hub_shards) = match source {
+            GgufSource::Local { path } => (Location::Local, path.clone(), None),
             GgufSource::Hub {
                 repository,
                 revision,
@@ -115,7 +115,11 @@ impl Gguf {
             } => {
                 let store = store.open().await?;
                 let snapshot = pinned_snapshot(&store, repository, revision).await?;
-                (Location::Hub { store, snapshot }, path.clone())
+                let shards = store
+                    .resolve_snapshot_shards(&snapshot, path)
+                    .await
+                    .ok();
+                (Location::Hub { store, snapshot }, path.clone(), shards)
             }
         };
         let mut gguf = Self {
@@ -124,10 +128,41 @@ impl Gguf {
             tensors: HashMap::new(),
         };
         let shard = gguf.read_shard(first.clone()).await?;
-        let paths = split_paths(&first, &shard.directory)?;
+        let paths = match resolved_hub_shards {
+            Some(shards) if shards.len() > 1 => Some(shards),
+            _ => split_paths(&first, &shard.directory)?,
+        };
         gguf.add(shard)?;
         for path in paths.into_iter().flatten().skip(1) {
             let shard = gguf.read_shard(path).await?;
+            gguf.add(shard)?;
+        }
+        Ok(gguf)
+    }
+
+    /// Open a GGUF from an explicit ordered list of shard paths.
+    pub async fn open_shards(source: &GgufSource, shard_paths: &[PathBuf]) -> anyhow::Result<Self> {
+        anyhow::ensure!(!shard_paths.is_empty(), "a GGUF has at least one shard");
+        let location = match source {
+            GgufSource::Local { .. } => Location::Local,
+            GgufSource::Hub {
+                repository,
+                revision,
+                store,
+                ..
+            } => {
+                let store = store.open().await?;
+                let snapshot = pinned_snapshot(&store, repository, revision).await?;
+                Location::Hub { store, snapshot }
+            }
+        };
+        let mut gguf = Self {
+            location,
+            shards: Vec::new(),
+            tensors: HashMap::new(),
+        };
+        for path in shard_paths {
+            let shard = gguf.read_shard(path.clone()).await?;
             gguf.add(shard)?;
         }
         Ok(gguf)

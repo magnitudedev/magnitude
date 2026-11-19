@@ -515,6 +515,9 @@ projection routed for vulkan:
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
         SUB_M in [32, 64] default 32 for grouped, SUB_N in [32, 64] default 32 for grouped)
     where SUB_M <= TILE_M and SUB_N <= TILE_N for grouped
+    # Every workgroup holds whole 64-lane hardware subgroups: a GEMM tile of
+    # one sub-tile (32 x 64 of 32 x 64) would launch 32 invocations.
+    where TILE_M * TILE_N >= 2 * SUB_M * SUB_N for grouped
     where each(W, form(W, DECODED) == 1)
     scratch gathered bytes (M * K * (1 + 2 * VERIFY_ROWS) * 4) when GATHERED == 1 and PER_ROW == 0 for choice
     scratch staged bytes (M * WIDTH * 2) when STACKED == 1 and any(W, FIRST == 1 and operands(W) == 1) for grouped

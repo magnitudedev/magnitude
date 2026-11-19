@@ -24,7 +24,7 @@
 //!   hazard domain: device work bound to a store is a use of its pool, host
 //!   access to a slab orders after it, and a granule a slab released is
 //!   claimable once the pool's work submitted by then completes. A released
-//!   granule leaves its slab once no view of it remains ([`GranuleHold`]).
+//!   granule leaves its slab once no view of it remains ([`SlabHold`]).
 //! - A block is returned to the OS once every granule of it is free: no
 //!   work in flight then reaches it, but its storage's release waits for
 //!   every use of the domain, so a block leaves the pool at once and is
@@ -546,12 +546,36 @@ impl Pool {
 }
 
 /// A granule claimed for a slab, held while its slab or any view of it
-/// lives: as the last drops it leaves the slab, free to claim once the
-/// pool's work submitted by then completes. So a freed slab's bytes outlive
-/// every view that could still reach them.
-pub(crate) struct GranuleHold {
+/// lives ([`SlabHold`]): as the last drops it leaves the slab, free to claim
+/// once the pool's work submitted by then completes. So a freed slab's bytes
+/// outlive every view that could still reach them.
+struct GranuleHold {
     pool: Arc<PoolShared>,
     granule: GranuleId,
+}
+
+/// A slab's place, held by the slab and by every view of its regions
+/// (`TensorInner::in_slab`): its store's slot, and its granule where it is
+/// a pool's. A view's bytes are that slot's slab's, which no other store
+/// holds, so binding's no-alias check finds the slot a view lies in without
+/// a search (`api::tensor::Reaching`).
+pub(crate) struct SlabHold {
+    /// The store's identity ([`Slots::id`]).
+    store: u64,
+    slot: usize,
+    granule: Option<GranuleHold>,
+}
+
+impl SlabHold {
+    /// The identity of the store whose slot holds the slab.
+    pub(crate) fn store(&self) -> u64 {
+        self.store
+    }
+
+    /// The slot that holds the slab, as long as it is not freed.
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
 }
 
 impl Drop for GranuleHold {
@@ -593,14 +617,14 @@ pub struct SlabGeometry {
 struct Slab {
     /// Each region's allocation and byte offset in it.
     regions: Vec<(Arc<Allocation>, u64)>,
-    /// Its granule; none for a lent slab, and for a copy's slab
-    /// ([`Slots::copy`]).
-    hold: Option<Arc<GranuleHold>>,
+    /// Its place in the store, and its granule where it is a pool's: not
+    /// for a lent slab, nor a copy's ([`Slots::copy`]).
+    hold: Arc<SlabHold>,
 }
 
 impl Slab {
     fn granule(&self) -> Option<GranuleId> {
-        self.hold.as_ref().map(|hold| hold.granule)
+        self.hold.granule.as_ref().map(|hold| hold.granule)
     }
 }
 
@@ -637,8 +661,11 @@ pub(crate) struct Slots {
     absent: u64,
     /// The leading slots whose slabs are lent, never freed.
     lent: usize,
-    /// The allocations the lent slabs lie in, each in its own hazard domain.
-    lenders: Vec<Arc<Allocation>>,
+    /// Per region, where its lent slabs lie: the allocation they are lent
+    /// from, each in its own hazard domain, and the byte offset of slot 0's
+    /// region in it, slot `s`'s `s` of the region's slab bytes after; empty
+    /// for a store that lends none.
+    lent_regions: Vec<(Arc<Allocation>, u64)>,
     /// The table's generation: moves each time a slot is repointed
     /// ([`Self::point`]), under the slab lock, with the slab it names.
     generation: AtomicU64,
@@ -656,6 +683,24 @@ impl Slots {
 
     pub(crate) fn device(&self) -> &Arc<DeviceInner> {
         &self.device
+    }
+
+    /// The store's identity, which its slabs' holds name
+    /// ([`SlabHold::store`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The leading slots whose slabs are lent: `0..lent`.
+    pub(crate) fn lent(&self) -> usize {
+        self.lent
+    }
+
+    /// Where region `region`'s lent slabs lie: the allocation they are lent
+    /// from and slot 0's byte offset in it, each next slot's a slab of the
+    /// region after; none where the store lends none.
+    pub(crate) fn lent_region(&self, region: usize) -> Option<(&Arc<Allocation>, u64)> {
+        self.lent_regions.get(region).map(|(lender, offset)| (lender, *offset))
     }
 
     pub(crate) fn table(&self) -> &Arc<Allocation> {
@@ -700,9 +745,13 @@ impl Slots {
 
     /// The allocations device work bound to a view of the store reaches
     /// besides the table's hazard domain, which every pooled slab shares:
-    /// the lenders'.
-    pub(crate) fn lenders(&self) -> &[Arc<Allocation>] {
-        &self.lenders
+    /// the lenders', each once.
+    pub(crate) fn lenders(&self) -> impl Iterator<Item = &Arc<Allocation>> {
+        let lent = &self.lent_regions;
+        lent.iter()
+            .enumerate()
+            .filter(move |(region, (lender, _))| !lent[..*region].iter().any(|(earlier, _)| Arc::ptr_eq(earlier, lender)))
+            .map(|(_, (lender, _))| lender)
     }
 
     /// The table's generation now: a view's reach read after it shows
@@ -768,7 +817,7 @@ impl Slots {
             return Ok(None);
         };
         let (allocation, offset) = slab.regions[region].clone();
-        TensorInner::in_slab(&self.device, allocation, offset, representation, extents, slab.hold.clone()).map(Some)
+        TensorInner::in_slab(&self.device, allocation, offset, representation, extents, Some(slab.hold.clone())).map(Some)
     }
 
     /// The views of region `region` of `count` slots from `first`, as
@@ -786,23 +835,24 @@ impl Slots {
             .collect()
     }
 
-    /// Where region `region` of each backed slot in `first..first + count`
-    /// lies now (`Allocation::identity`, byte offset, `bytes`): what device
-    /// work bound to a view of those slots reaches, without keeping a removed
-    /// slab's pool block alive inside a cached reach.
+    /// Where region `region` of each slot in `first..first + count` lies now
+    /// (`Allocation::identity`, byte offset, `bytes`), `None` a free slot's:
+    /// what device work bound to a view of those slots reaches, without
+    /// keeping a removed slab's pool block alive inside a cached reach.
     pub(crate) fn reach(
         &self,
         region: usize,
         first: usize,
         count: usize,
         bytes: u64,
-    ) -> Vec<(u64, u64, u64)> {
+    ) -> Vec<Option<(u64, u64, u64)>> {
         self.slabs()[first..first + count]
             .iter()
-            .flatten()
             .map(|slab| {
-                let (allocation, offset) = &slab.regions[region];
-                (allocation.identity(), *offset, bytes)
+                slab.as_ref().map(|slab| {
+                    let (allocation, offset) = &slab.regions[region];
+                    (allocation.identity(), *offset, bytes)
+                })
             })
             .collect()
     }
@@ -826,7 +876,7 @@ impl Slots {
             .iter()
             .map(|moved| match slabs.get(moved.holder.slot) {
                 Some(Some(slab)) if slab.granule() == Some(moved.from) => {
-                    match slab.hold.as_ref().is_some_and(|hold| Arc::strong_count(hold) > 1) {
+                    match Arc::strong_count(&slab.hold) > 1 {
                         true => Adopted::Viewed,
                         false => Adopted::Moved,
                     }
@@ -874,7 +924,11 @@ impl Slots {
             .map(|(moved, (_, to))| {
                 let adopted = Slab {
                     regions: self.offsets.iter().map(|offset| (to.clone(), at(moved.to) + offset)).collect(),
-                    hold: Some(Arc::new(GranuleHold { pool: pool.clone(), granule: moved.to })),
+                    hold: Arc::new(SlabHold {
+                        store: self.id,
+                        slot: moved.holder.slot,
+                        granule: Some(GranuleHold { pool: pool.clone(), granule: moved.to }),
+                    }),
                 };
                 std::mem::replace(slabs[moved.holder.slot].as_mut().expect("a moving slot is backed"), adopted)
             })
@@ -897,16 +951,21 @@ impl Slots {
         images: &[Option<Vec<u8>>],
     ) -> Result<Arc<Self>, TensorError> {
         let device = charges.device();
+        let id = crate::driver::fresh_allocation_identity();
         let capacity = images.len();
         let table = Self::allocate_table(charges, 1, capacity, None)?;
         let slabs = images
             .iter()
-            .map(|image| {
+            .enumerate()
+            .map(|(slot, image)| {
                 image
                     .as_ref()
                     .map(|bytes| {
                         let slab = TensorInner::from_host_in(charges, representation, extents, bytes, Some(table.access_group().clone()))?;
-                        Ok::<_, TensorError>(Slab { regions: vec![(slab.allocation().clone(), 0)], hold: None })
+                        Ok::<_, TensorError>(Slab {
+                            regions: vec![(slab.allocation().clone(), 0)],
+                            hold: Arc::new(SlabHold { store: id, slot, granule: None }),
+                        })
                     })
                     .transpose()
             })
@@ -917,7 +976,7 @@ impl Slots {
         // Fresh: nothing uses it yet.
         table.storage().write(0, &words)?;
         Ok(Arc::new(Self {
-            id: crate::driver::fresh_allocation_identity(),
+            id,
             device: device.clone(),
             pool: None,
             table,
@@ -926,7 +985,7 @@ impl Slots {
             offsets: vec![0],
             absent,
             lent: 0,
-            lenders: Vec::new(),
+            lent_regions: Vec::new(),
             generation: AtomicU64::new(0),
             slabs: Mutex::new(slabs),
             repointed: Mutex::new(None),
@@ -959,8 +1018,10 @@ impl SlabStore {
     /// number of the region's slab rows, all as many slabs, which the store
     /// views for its life and never frees. Every other slot is free. Refused
     /// where a slab is larger than a granule and some slot is not lent, its
-    /// alignment is not one every granule has, or the lent tensors do not
-    /// match the regions. Its address table is allocated through `charges`.
+    /// alignment is not one every granule has, a region does not lie in the
+    /// slab apart from every other, or the lent tensors do not match the
+    /// regions or lie in a slab's bytes. Its address table is allocated
+    /// through `charges`.
     ///
     /// # Panics
     /// Where `charges` are of another device than the pool's.
@@ -973,11 +1034,30 @@ impl SlabStore {
                 geometry.slab_alignment
             )));
         }
+        // Each region's bytes of a slab, which lie in it apart from every
+        // other's: binding's no-alias check takes two regions of one slab
+        // as sharing none (`api::tensor::Reaching`).
+        let spans = geometry
+            .regions
+            .iter()
+            .map(|(representation, row_shape, offset)| -> Result<std::ops::Range<u64>, TensorError> {
+                let slab_extents = std::iter::once(geometry.rows_per_slab).chain(row_shape.iter().copied()).collect::<Vec<_>>();
+                let bytes = crate::layout::canonical(*representation, &slab_extents)?.byte_len;
+                offset
+                    .checked_add(bytes)
+                    .filter(|&end| end <= geometry.slab_bytes)
+                    .map(|end| *offset..end)
+                    .ok_or_else(|| refused(format!("a slab region of {bytes} bytes at {offset} exceeds its {}-byte slab", geometry.slab_bytes)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if spans.iter().enumerate().any(|(index, span)| spans[..index].iter().any(|earlier| crate::api::tensor::meet(earlier, span))) {
+            return Err(refused("two regions of a slab share bytes".into()));
+        }
         let device = &shared.device;
         charges.of_device(device);
+        let id = crate::driver::fresh_allocation_identity();
         let capacity = geometry.capacity;
         let mut slabs = (0..capacity).map(|_| None).collect::<Vec<Option<Slab>>>();
-        let mut lenders = Vec::<Arc<Allocation>>::new();
         let lent_slabs = match lent {
             [] => 0,
             lent if lent.len() != geometry.regions.len() => {
@@ -995,19 +1075,24 @@ impl SlabStore {
                         && Arc::ptr_eq(tensor.device(), device)
                         && !tensor.is_slab_view()
                         && crate::layout::canonical(*representation, tensor.extents())?.strides == tensor.strides()
-                        && tensor.byte_len() == rows / geometry.rows_per_slab * slab.byte_len;
+                        && tensor.byte_len() == rows / geometry.rows_per_slab * slab.byte_len
+                        // A slab's bytes are its store's alone: a view of
+                        // one is never lent to another.
+                        && tensor.slab_hold().is_none();
                     let slabs_of = rows / geometry.rows_per_slab;
                     if !whole || count.is_some_and(|count| count != slabs_of) {
                         return Err(refused(
                             "a lent tensor is a contiguous canonical view of whole slab rows of its region, \
-                             as many slabs as every other's, on the pool's device"
+                             as many slabs as every other's, on the pool's device, of no slab's bytes"
                                 .into(),
                         ));
                     }
                     count = Some(slabs_of);
                 }
-                let count = usize::try_from(count.unwrap_or(0)).ok().filter(|&count| count <= capacity).ok_or_else(|| {
-                    refused(format!("more lent slabs than the store's {capacity} slots"))
+                // A store that lends lends at least one slab, so its lent
+                // regions are exactly the bytes it reaches through them.
+                let count = usize::try_from(count.unwrap_or(0)).ok().filter(|&count| (1..=capacity).contains(&count)).ok_or_else(|| {
+                    refused(format!("a store lends from one slab up to its {capacity} slots"))
                 })?;
                 for (slot, slab) in slabs.iter_mut().enumerate().take(count) {
                     let regions = lent
@@ -1019,12 +1104,7 @@ impl SlabStore {
                             Ok::<_, TensorError>((tensor.allocation().clone(), tensor.byte_offset() + slot as u64 * bytes))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    *slab = Some(Slab { regions, hold: None });
-                }
-                for tensor in lent {
-                    if !lenders.iter().any(|held| Arc::ptr_eq(held, tensor.allocation())) {
-                        lenders.push(tensor.allocation().clone());
-                    }
+                    *slab = Some(Slab { regions, hold: Arc::new(SlabHold { store: id, slot, granule: None }) });
                 }
                 count
             }
@@ -1041,7 +1121,7 @@ impl SlabStore {
         let offsets = geometry.regions.iter().map(|(_, _, offset)| *offset).collect::<Vec<_>>();
         let absent = device.allocation_address(&shared.absent.allocation, 0);
         let slots = Arc::new(Slots {
-            id: crate::driver::fresh_allocation_identity(),
+            id,
             device: device.clone(),
             pool: Some(shared.clone()),
             table,
@@ -1050,7 +1130,7 @@ impl SlabStore {
             offsets,
             absent,
             lent: lent_slabs,
-            lenders,
+            lent_regions: lent.iter().map(|tensor| (tensor.allocation().clone(), tensor.byte_offset())).collect(),
             generation: AtomicU64::new(0),
             slabs: Mutex::new(Vec::new()),
             repointed: Mutex::new(None),
@@ -1167,7 +1247,7 @@ impl SlabStore {
             (claimed, block)
         };
         // Its granule goes back free should the slab not form.
-        let hold = Arc::new(GranuleHold { pool: pool.clone(), granule });
+        let hold = Arc::new(SlabHold { store: slots.id, slot, granule: Some(GranuleHold { pool: pool.clone(), granule }) });
         let base = u64::from(granule.index) * pool.granule;
         if fill == SlabFill::Zeroed && !fresh {
             // No work in flight reads the granule: its last reader ended. The
@@ -1192,7 +1272,7 @@ impl SlabStore {
         slots.point(slot, slots.offsets.iter().map(|offset| address + offset))?;
         slabs[slot] = Some(Slab {
             regions: slots.offsets.iter().map(|offset| (block.clone(), base + offset)).collect(),
-            hold: Some(hold),
+            hold,
         });
         Ok(slot)
     }

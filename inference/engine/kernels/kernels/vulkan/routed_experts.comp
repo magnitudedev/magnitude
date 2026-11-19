@@ -62,12 +62,12 @@ void routed_experts_grids() {
 }
 
 // The source the layer's map holds expert `expert` in for the step
-// (`held`, `streaming_held`: >= 0 a bank record, -2 - s scratch slot s, -1
-// skipped), or -2 - `expert` without a map (X = 0).
+// (`held`, `streaming_held_input`: >= 0 a bank record, -2 - s scratch slot
+// s, -1 skipped), or -2 - `expert` without a map (X = 0).
 int routed_expert_slot(const int expert) {
     if (SEISMIC_DIM_X == 0ul)
         return -2 - expert;
-    return streaming_held(SEISMIC_PTR(SEISMIC_BUFFER_MAP) + uint64_t(expert) * SEISMIC_MAP_STRIDE_0 * 4ul,
+    return streaming_held_input(SEISMIC_PTR(SEISMIC_BUFFER_MAP) + uint64_t(expert) * SEISMIC_MAP_STRIDE_0 * 4ul,
         SEISMIC_MAP_STRIDE_1, streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0));
 }
 #define EXPERTS_SLOT(expert) routed_expert_slot(expert)

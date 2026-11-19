@@ -19,10 +19,23 @@
 // hardware subgroup; on 64-lane hardware (`SEISMIC_SUBGROUP_LANES` 64, AMD
 // GCN) each hardware subgroup holds two, lanes 0-31 and 32-63. Kernels name
 // lanes and subgroups only through `SEISMIC_LANE`, `SEISMIC_SUBGROUP` and
-// `SEISMIC_SUBGROUPS`, and reduce, vote or shuffle by absolute lane only
-// through the `seismic_subgroup_*` and `seismic_shuffle` helpers. Shuffles by
-// an xor mask or an up/down delta below 32 stay within a logical subgroup,
-// and subgroup barriers cover it, on both; kernels use those directly.
+// `SEISMIC_SUBGROUPS`, and reduce, vote, ballot or shuffle by absolute lane
+// only through the `seismic_subgroup_*`, `seismic_ballot` and
+// `seismic_shuffle` helpers (seismic-build refuses the subgroup built-ins
+// otherwise). Shuffles by an xor mask below 32 stay within a logical
+// subgroup, and subgroup barriers cover it, on both; kernels use those
+// directly. An up or down delta stays within it only where the source lane
+// does (lane - delta >= 0, lane + delta < 32): past the edge it reads the
+// other logical subgroup on 64-lane hardware and an undefined value on
+// 32-lane hardware, so a caller discards what an edge lane receives.
+//
+// A kernel that reads its subgroups declares its workgroup X extent a
+// multiple of 64, and formation requires its subgroups full, so every hardware
+// subgroup is full on both widths, and `SEISMIC_THREAD` (logical subgroup, then lane)
+// numbers the workgroup's invocations 0 .. size - 1. A kernel that spreads
+// work over the invocations and then reduces, votes or shuffles indexes by
+// `SEISMIC_THREAD`, never by the local invocation index: Vulkan does not say
+// which local indices share a subgroup, nor in which lane order.
 // ---------------------------------------------------------------------------
 
 #if SEISMIC_SUBGROUP_LANES == 32
@@ -34,6 +47,18 @@
 #define seismic_subgroup_min(value) subgroupMin(value)
 #define seismic_subgroup_max(value) subgroupMax(value)
 #define seismic_subgroup_all(value) subgroupAll(value)
+// One logical subgroup is the hardware subgroup: a value it holds alike is
+// already the hardware subgroup's, and its join is the value itself.
+// Formation requires each argument uniform, then removes the calls before the
+// module ships, so the joins cost nothing (`uniformity.rs`, `formation.rs`).
+// The parameters are `const` so that glslang passes them by value, which
+// formation's removal requires. `seismic_hardware_any` is `seismic_steer`'s
+// own, never a kernel's (seismic-build refuses it in kernels).
+bool seismic_hardware_any(const bool value) { return value; }
+uint seismic_hardware_first(const uint value) { return value; }
+uvec2 seismic_hardware_first(const uvec2 value) { return value; }
+// The region it steers runs only where `predicate` holds: `live` is true.
+#define seismic_steer(live, predicate) (live = true, seismic_hardware_any(predicate))
 #elif SEISMIC_SUBGROUP_LANES == 64
 #define SEISMIC_LANE (gl_SubgroupInvocationID & 31u)
 #define SEISMIC_SUBGROUP (2u * gl_SubgroupID + (gl_SubgroupInvocationID >> 5))
@@ -43,12 +68,93 @@
 #define seismic_subgroup_min(value) subgroupClusteredMin(value, 32u)
 #define seismic_subgroup_max(value) subgroupClusteredMax(value, 32u)
 #define seismic_subgroup_all(value) (subgroupClusteredAnd(uint(value), 32u) != 0u)
+#define seismic_hardware_first(value) subgroupBroadcastFirst(value)
+// The region it steers runs where `predicate` holds in either logical
+// subgroup: `live` is the caller's own.
+#define seismic_steer(live, predicate) (live = (predicate), subgroupAny(live))
 #else
 #error "SEISMIC_SUBGROUP_LANES must be 32 or 64"
 #endif
 // The value of `value` on logical lane `lane` of the caller's logical
 // subgroup.
 #define seismic_shuffle(value, lane) subgroupShuffle(value, SEISMIC_LANE_BASE + (lane))
+// The lanes of the caller's logical subgroup for which `predicate` holds: bit
+// l for logical lane l.
+uint seismic_ballot(bool predicate) {
+    const uvec4 lanes = subgroupBallot(predicate);
+#if SEISMIC_SUBGROUP_LANES == 32
+    return lanes.x;
+#else
+    return SEISMIC_LANE_BASE == 0u ? lanes.x : lanes.y;
+#endif
+}
+// The invocation's place in the workgroup: logical subgroup, then lane.
+#define SEISMIC_THREAD (SEISMIC_SUBGROUP * 32u + SEISMIC_LANE)
+// The first logical subgroup of the caller's hardware subgroup, uniform across
+// it: for hardware-uniform rounds and trip counts.
+#define SEISMIC_HARDWARE_SUBGROUP (gl_SubgroupID * (SEISMIC_SUBGROUP_LANES / 32u))
+// Votes over the whole hardware subgroup of a value each invocation holds
+// its own, uniform across it on both widths (unlike the logical
+// `seismic_subgroup_all`): for steering control flow.
+#define seismic_uniform_all(value) subgroupAll(value)
+#define seismic_uniform_any(value) subgroupAny(value)
+// `seismic_steer(live, predicate)` steers the hardware subgroup by a
+// predicate each logical subgroup holds alike, and binds `live`, a `bool` the
+// caller declares, to whether the caller's logical subgroup takes part. It is
+// the whole condition of an `if`, `while` or `for` (seismic-build refuses it
+// elsewhere, and as the condition of a `break` or `continue`, so a loop it
+// steers exits at its header), and `live` means it only inside the region
+// the condition guards: the body, or the rest of the function after
+// `if (!seismic_steer(...)) return`. The region runs where the predicate
+// holds in either logical subgroup of the hardware subgroup; `live` is the
+// caller's own predicate on 64-lane hardware and the literal `true` on
+// 32-lane hardware, where the region runs only where it holds, so a 32-lane
+// module keeps nothing of either the vote or `live`.
+// `seismic_hardware_first` broadcasts a value each logical subgroup holds
+// alike from the first: the value itself on 32-lane hardware.
+//
+// `seismic_strided_from(T, i, origin, offset, end, step)` heads a loop over
+// `i` = `origin` + `offset`, then up by `step`, below `end`: `origin`, `end`
+// and `step` uniform, each invocation its own `offset` below `step` (a lane,
+// or `SEISMIC_THREAD`); `seismic_strided(T, i, offset, end, step)` is the
+// loop from `origin` 0. Where the device has maximal reconvergence
+// (`SEISMIC_HAS_MAXIMAL_RECONVERGENCE` 1: the seal pass declares
+// `MaximallyReconvergesKHR` on a module that relies on it) it is the plain
+// loop, each invocation leaving at its own bound and every
+// invocation rejoined after it, so a subgroup operation after the loop sees
+// them all. Elsewhere every invocation runs the rounds of the first, `i`
+// held by the guard `i < end` alone, so the trip count is uniform and a
+// subgroup operation after the loop runs where Vulkan's core model has the
+// invocations together. Its body is one statement or block, as a `for`'s; it
+// holds no subgroup operation either way (the uniformity check refuses one in
+// the plain loop, whose invocations leave apart), and no `continue` or
+// `break` (in the rounds each is taken under the guard, which makes the loop
+// lane-varying).
+//
+// `seismic_strided_bounded(T, i, origin, offset, end, bound, step)` is the
+// loop whose `end` is each invocation's own, below a uniform `bound`: the
+// plain loop where the device has maximal reconvergence, and elsewhere the
+// rounds up to `bound`, guarded by `end`. `seismic_strided_from` is the loop
+// whose `end` is its `bound`.
+//
+// `seismic_rejoin()` rejoins the invocations ahead of a subgroup operation
+// that follows loops they left apart, at a point where a workgroup barrier
+// is legal: nothing where the device has maximal reconvergence, elsewhere
+// that barrier. Sources leave the mode to these: they do not read
+// `SEISMIC_HAS_MAXIMAL_RECONVERGENCE` (`seismic-build` refuses it).
+#if SEISMIC_HAS_MAXIMAL_RECONVERGENCE
+#define seismic_strided_bounded(T, i, origin, offset, end, bound, step) \
+    for (T i = (origin) + (offset); i < (end); i += (step))
+#define seismic_rejoin()
+#else
+#define seismic_strided_bounded(T, i, origin, offset, end, bound, step) \
+    for (T i##_round = (origin), i = (origin) + (offset); i##_round < (bound); i##_round += (step), i += (step)) \
+        if (i < (end))
+#define seismic_rejoin() barrier()
+#endif
+#define seismic_strided_from(T, i, origin, offset, end, step) \
+    seismic_strided_bounded(T, i, origin, offset, end, end, step)
+#define seismic_strided(T, i, offset, end, step) seismic_strided_from(T, i, T(0), offset, end, step)
 
 // Element references: one element per block, so a reference indexes like a
 // pointer (`seismic_f32(address)[i].v`) and advances by the element size.
@@ -418,6 +524,16 @@ float seismic_div_rn(float a, float b) {
     return seismic_div_core(a, b, q0);
 }
 
+// One digit step of `seismic_sqrt_rn`'s restoring square root, and four.
+#define SEISMIC_SQRT_STEP \
+    { \
+        const uint64_t trial = root + one; \
+        const bool take = rest >= trial; \
+        rest -= take ? trial : 0ul; \
+        root = (root >> 1) + (take ? one : 0ul); \
+        one >>= 2; \
+    }
+#define SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEP SEISMIC_SQRT_STEP SEISMIC_SQRT_STEP SEISMIC_SQRT_STEP
 float seismic_sqrt_rn(float x) {
     const uint bits = floatBitsToUint(x);
     if (isnan(x) || (x < 0.0))
@@ -428,23 +544,20 @@ float seismic_sqrt_rn(float x) {
     const uint significand = seismic_normalize(bits, exponent);
     // x = significand * 2^(exponent - 23) = M * 2^t with t even.
     int t = exponent - 23 - 30;
-    uint64_t m = uint64_t(significand) << 30;
-    if ((t & 1) != 0) {
-        m <<= 1;
-        t -= 1;
-    }
-    uint64_t rest = m, root = 0ul, one = 1ul << 62;
-    while (one > rest)
-        one >>= 2;
-    while (one != 0ul) {
-        if (rest >= root + one) {
-            rest -= root + one;
-            root = (root >> 1) + one;
-        } else {
-            root >>= 1;
-        }
-        one >>= 2;
-    }
+    // An odd t moves one factor of two into m.
+    const int odd = t & 1;
+    uint64_t m = uint64_t(significand) << (30 + odd);
+    t -= odd;
+    // m lies in [2^53, 2^55), so its leading power of four is at most 2^54:
+    // 28 digit steps from there (a leading step above the operand leaves the
+    // root 0). Each step's conditional subtraction is selects, not a branch
+    // (NVIDIA's 580 compiler crashes on a 64-bit subtraction under a 64-bit
+    // compare). The steps are straight-line, not a loop: on the loop form
+    // NVIDIA's 580 drivers computed odd exponents wrongly (GB10) or hung
+    // (Ada) (docs/compatibility.md, "Driver defects").
+    uint64_t rest = m, root = 0ul, one = 1ul << 54;
+    SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4
+    SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4
     bool sticky = rest != 0ul;
     int biased = 26 + t / 2 + 127;
     if (root >= (1ul << 27)) {
@@ -454,6 +567,8 @@ float seismic_sqrt_rn(float x) {
     }
     return seismic_round_pack(0u, biased, uint(root), sticky);
 }
+#undef SEISMIC_SQRT_STEPS4
+#undef SEISMIC_SQRT_STEP
 
 // Hardware approximations. Not correctly rounded: admitted only where an
 // entry's precision gate allows them. Their divisions are `seismic_div_rn`,
@@ -478,8 +593,8 @@ float seismic_tanh_approx(float x) {
     return 1.0 - seismic_div_rn(2.0, exp2(2.8853900817779268 * clamped) + 1.0);
 }
 
-// Subgroup shuffles within the logical subgroup (lane masks and deltas
-// below 32).
+// Subgroup shuffles within the logical subgroup (lane masks below 32; an
+// up or down delta only where the source lane is within it, as above).
 uint seismic_shfl_xor_u32(uint value, uint lane_mask) {
     return subgroupShuffleXor(value, lane_mask);
 }
@@ -505,9 +620,9 @@ float seismic_shfl_up_f32(float value, uint delta) {
     return subgroupShuffleUp(value, delta);
 }
 
-// Butterfly reductions: every lane receives the result, combined in the fixed
-// order xor 16, 8, 4, 2, 1 (bitwise identical on every lane and every run).
-// `subgroupAdd` on floats is not used: its order is implementation-defined.
+// Butterfly reductions over the logical subgroup: masks below 32 keep them
+// inside it at either width, and every lane receives the same value, combined
+// in the order xor 16, 8, 4, 2, 1.
 float seismic_subgroup_sum_f32(float value) {
     [[unroll]] for (uint mask = 16u; mask > 0u; mask >>= 1)
         value = value + subgroupShuffleXor(value, mask);

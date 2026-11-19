@@ -198,6 +198,14 @@ pub(crate) enum AccessMode {
 }
 
 impl AccessMode {
+    /// Whether the access writes: every mode but `Read`.
+    pub(crate) fn writes(self) -> bool {
+        match self {
+            Self::Read => false,
+            Self::Write | Self::ReadWrite => true,
+        }
+    }
+
     fn merge(self, other: Self) -> Self {
         match (self, other) {
             (Self::Read, Self::Read) => Self::Read,

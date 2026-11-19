@@ -74,11 +74,11 @@ fn test_width() -> Option<usize> {
 
 fn resolved() -> ResolvedEngineConfiguration {
     EngineConfiguration {
-        package: PackageOptions {
-            target: path("MAGNITUDE_TEST_TARGET_GGUF"),
-            projector: ProjectorSelection::Disabled,
-            draft: Some(path("MAGNITUDE_TEST_DRAFT_GGUF")),
-        },
+        package: PackageOptions::single(
+            path("MAGNITUDE_TEST_TARGET_GGUF"),
+            ProjectorSelection::Disabled,
+            Some(path("MAGNITUDE_TEST_DRAFT_GGUF")),
+        ),
         model: policy(),
         context_tokens: None,
         service: standard_service_limits(),
@@ -374,12 +374,12 @@ fn header_only_assessment_charges_what_a_load_commits() {
     )
     .unwrap();
     let prepared = prepare_model_assessment(
-        &ModelPackagePaths {
-            target: path("MAGNITUDE_TEST_TARGET_GGUF"),
-            projector: None,
-            draft: Some(path("MAGNITUDE_TEST_DRAFT_GGUF")),
-            method: method(),
-        },
+        &ModelPackagePaths::single(
+            path("MAGNITUDE_TEST_TARGET_GGUF"),
+            None,
+            Some(path("MAGNITUDE_TEST_DRAFT_GGUF")),
+            method(),
+        ),
         &structure,
     )
     .unwrap();

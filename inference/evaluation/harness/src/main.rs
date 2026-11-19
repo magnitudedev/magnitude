@@ -309,11 +309,11 @@ struct RunArgs {
 
 /// The model's host artifacts, opened for rendering as the target serves.
 fn host(artifacts: &ArtifactsFile) -> Result<HostArtifacts, String> {
-    HostArtifacts::open(&PackageOptions {
-        target: artifacts.artifacts.target.clone(),
-        projector: ProjectorSelection::Disabled,
-        draft: None,
-    })
+    HostArtifacts::open(&PackageOptions::single(
+        artifacts.artifacts.target.clone(),
+        ProjectorSelection::Disabled,
+        None,
+    ))
     .map_err(|error| error.to_string())
 }
 

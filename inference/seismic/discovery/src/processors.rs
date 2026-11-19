@@ -3,11 +3,14 @@
 //! process may run on; and the placement of a thread on one CPU.
 //!
 //! Every fact is the OS's, read when [`Processors::discover`] runs (the
-//! process's affinity is its own and can change, so it is no part of a
-//! topology revision); nothing is presumed where the OS reports nothing,
-//! and a report that cannot be read or parsed is an error.
+//! process's affinity and quota are its own and can change, so they are no
+//! part of a topology revision). Where the OS's report is absent the
+//! processors are the flat topology of the CPUs the process may run on
+//! ([`ProcessorsReportedBy::Flat`]), never one presumed; a report present
+//! that does not parse, or contradicts itself, panics.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
 /// The host's processors (module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,6 +18,8 @@ pub struct Processors {
     nodes: Vec<MemoryNode>,
     /// The CPUs this process may run on.
     allowed: BTreeSet<usize>,
+    /// The CPUs this process may keep busy at once ([`Self::quota`]).
+    quota: NonZeroUsize,
     by: ProcessorsReportedBy,
 }
 
@@ -42,7 +47,7 @@ pub enum ProcessorsReportedBy {
     /// each node's `cpulist`), `/sys/devices/system/cpu` (`online`, each
     /// CPU's `topology/thread_siblings_list`) and a hybrid part's
     /// performance CPUs (`/sys/devices/cpu_core/cpus`); the affinity is
-    /// `sched_getaffinity`.
+    /// `sched_getaffinity`, the quota `available_parallelism`.
     LinuxSysfs,
     /// macOS `sysctl`: one memory node; each performance level's
     /// (`hw.nperflevels`, `hw.perflevel<n>.{physicalcpu,logicalcpu}`, level
@@ -55,20 +60,30 @@ pub enum ProcessorsReportedBy {
     /// performance cores), `GetNumaAvailableMemoryNodeEx` and the process's
     /// group affinity; a CPU is its group's 64 times its group plus its bit.
     WindowsProcessorInformation,
+    /// None of the above could be read (a sandbox's `/sys`, an OS refusing
+    /// the calls): one memory node of every CPU the process may run on
+    /// (where the OS states none, `available_parallelism`'s count of them,
+    /// numbered from 0; where neither answers, CPU 0), each its own core and
+    /// every one serving ([`flat`]). Nothing here is the OS's topology; nodes, siblings and
+    /// core kinds are unknown.
+    Flat,
 }
 
 impl Processors {
-    /// The processors as the OS reports them now.
-    pub fn discover() -> Result<Self, String> {
-        crate::host::processors()
+    /// The processors as the OS reports them now: each fact from its
+    /// sources in order, or its documented value where none answers.
+    pub fn discover() -> Self {
+        crate::host::processors(&crate::host::Os)
     }
 
-    /// `nodes`, of which the process may run on `allowed`, as `by` reported
-    /// them: every core's threads ascending and non-empty, no CPU twice.
-    /// Public so a consumer's host tests state a recorded machine.
+    /// `nodes`, of which the process may run on `allowed` and keep `quota`
+    /// busy at once, as `by` reported them: every core's threads ascending
+    /// and non-empty, no CPU twice. Public so a consumer's host tests state
+    /// a recorded machine.
     pub fn new(
         nodes: Vec<MemoryNode>,
         allowed: BTreeSet<usize>,
+        quota: NonZeroUsize,
         by: ProcessorsReportedBy,
     ) -> Result<Self, String> {
         let mut seen = BTreeSet::new();
@@ -80,7 +95,7 @@ impl Processors {
                 return Err(format!("CPU {cpu} reported in two cores"));
             }
         }
-        Ok(Self { nodes, allowed, by })
+        Ok(Self { nodes, allowed, quota, by })
     }
 
     pub fn nodes(&self) -> &[MemoryNode] {
@@ -112,13 +127,22 @@ impl Processors {
             .count()
     }
 
+    /// The CPUs this process may keep busy at once, however many it may
+    /// run on: `available_parallelism`, which on Linux is its affinity under
+    /// its cgroup's CPU quota (`cpu.max`: a container's `--cpus` caps it
+    /// without narrowing the affinity); where that is unanswered, the CPUs
+    /// it may run on. The one cap every pool of the process's CPUs is sized
+    /// under.
+    pub fn quota(&self) -> NonZeroUsize {
+        self.quota
+    }
+
     /// The performance cores the process may keep busy at once: those it
-    /// may run on ([`Self::performance_cores`]) under its quota of CPUs
-    /// (`seismic_threads::quota`, which follows a cgroup's `cpu.max`). The
-    /// machine's cores as one process sees them: the CPU device's pool.
-    pub fn cores(&self) -> Result<std::num::NonZeroUsize, String> {
-        std::num::NonZeroUsize::new(self.performance_cores())
-            .map(|cores| cores.min(seismic_threads::quota()))
+    /// may run on ([`Self::performance_cores`]) under its [`Self::quota`].
+    /// The machine's cores as one process sees them: the CPU device's pool.
+    pub fn cores(&self) -> Result<NonZeroUsize, String> {
+        NonZeroUsize::new(self.performance_cores())
+            .map(|cores| cores.min(self.quota))
             .ok_or_else(|| "the process may run on no performance core".to_owned())
     }
 
@@ -210,9 +234,8 @@ pub fn place_process(cpus: &[usize]) -> Result<ProcessPlacement, String> {
         !PLACED.swap(true, std::sync::atomic::Ordering::AcqRel),
         "the process is placed already: one placement owns every thread's CPUs at a time (a second serving executor in one process)"
     );
-    let placed = Processors::discover()
-        .map(|processors| processors.allowed().iter().copied().collect::<Vec<_>>())
-        .and_then(|every| crate::host::place_process(cpus).map(|()| ProcessPlacement { every }));
+    let every = Processors::discover().allowed().iter().copied().collect::<Vec<_>>();
+    let placed = crate::host::place_process(cpus).map(|()| ProcessPlacement { every });
     if placed.is_err() {
         PLACED.store(false, std::sync::atomic::Ordering::Release);
     }
@@ -220,10 +243,11 @@ pub fn place_process(cpus: &[usize]) -> Result<ProcessPlacement, String> {
 }
 
 /// The memory node a device is attached to, as the OS reports its bus
-/// location's: `Node(n)` names [`MemoryNode::id`]; `Unknown` where the OS
-/// reports none (Linux's `-1`, a host without NUMA), where the OS here reads
-/// no device's node (macOS, Windows), or where the device reports no bus
-/// location (a CPU device, Metal, Vulkan).
+/// location's: `Node(n)` names [`MemoryNode::id`]; `Unknown`, no
+/// preference, where the OS reports none (Linux's `-1`, a host without
+/// NUMA, or no `numa_node` at all or one refused, as WSL2 gives its GPU),
+/// where the OS here reads no device's node (macOS, Windows), or where the
+/// device reports no bus location (a CPU device, Metal, Vulkan).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceNode {
     Node(usize),
@@ -239,9 +263,16 @@ pub struct PciLocation {
 }
 
 /// The memory node of the device at `location` ([`DeviceNode`]): Linux's
-/// `/sys/bus/pci/devices/<location>.0/numa_node`.
-pub fn device_node(location: PciLocation) -> Result<DeviceNode, String> {
-    crate::host::device_node(location)
+/// `/sys/bus/pci/devices/<location>.0/numa_node`, or no preference.
+pub fn device_node(location: PciLocation) -> DeviceNode {
+    crate::host::device_node(&crate::host::Os, location)
+}
+
+/// The topology of `cpus` where the OS reports none
+/// ([`ProcessorsReportedBy::Flat`]): one node with memory, each CPU its own
+/// core, every one serving.
+pub(crate) fn flat(cpus: &BTreeSet<usize>) -> Vec<MemoryNode> {
+    vec![MemoryNode { id: 0, memory: true, cores: cpus.iter().map(|&cpu| Core { threads: vec![cpu], performance: true }).collect() }]
 }
 
 /// A Linux PCI `numa_node` file's contents: `-1` is no node.
@@ -280,67 +311,51 @@ pub(crate) fn parse_list(list: &str) -> Result<Vec<usize>, String> {
     Ok(values)
 }
 
-/// The nodes sysfs under `devices` (`/sys/devices`) reports: each online
-/// node (one node of every online CPU where the kernel has no nodes: no
-/// `system/node`), whether it has memory, and its online CPUs grouped into
-/// cores by their thread siblings, each a performance core unless the part
-/// lists its performance CPUs (`cpu_core/cpus`) without it.
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn sysfs_nodes(devices: &std::path::Path) -> Result<Vec<MemoryNode>, String> {
-    let read = |path: std::path::PathBuf| {
-        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
+/// The nodes sysfs reports (`/sys/devices`): each online node (one node
+/// of every online CPU where the kernel has no nodes: no `system/node`),
+/// whether it has memory, and its online CPUs grouped into cores by their
+/// thread siblings. A hybrid part lists its performance CPUs
+/// (`cpu_core/cpus`); where it lists none, the kernel states no core kinds
+/// and every core serves. None where any of it is absent (a sandbox's
+/// `/sys`, a kernel without CPU topology): a part of the topology is no
+/// topology.
+///
+/// # Panics
+/// Where a list present does not parse.
+#[cfg(target_os = "linux")]
+pub(crate) fn sysfs_nodes(facts: &impl crate::host::Facts) -> Option<Vec<MemoryNode>> {
+    use std::path::Path;
+    let list = |path: &str| -> Option<Vec<usize>> {
+        let path = Path::new("/sys/devices").join(path);
+        let text = facts.text(&path)?;
+        Some(parse_list(&text).unwrap_or_else(|error| panic!("invariant violated: {}: {error}", path.display())))
     };
-    let list = |path: std::path::PathBuf| {
-        parse_list(&read(path.clone())?).map_err(|error| format!("{}: {error}", path.display()))
-    };
-    let online = list(devices.join("system/cpu/online"))?;
-    let performance = match std::fs::read_to_string(devices.join("cpu_core/cpus")) {
-        Ok(cpus) => Some(parse_list(&cpus)?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(format!(
-                "{}: {error}",
-                devices.join("cpu_core/cpus").display()
-            ))
+    let online = list("system/cpu/online")?;
+    let performance = list("cpu_core/cpus");
+    let nodes: Vec<(usize, bool, Vec<usize>)> = match list("system/node/online") {
+        Some(indices) => {
+            let memory = list("system/node/has_memory")?;
+            indices
+                .into_iter()
+                .map(|index| Some((index, memory.contains(&index), list(&format!("system/node/node{index}/cpulist"))?)))
+                .collect::<Option<_>>()?
         }
-    };
-    let node = devices.join("system/node");
-    let nodes: Vec<(usize, bool, Vec<usize>)> = if node.exists() {
-        let memory = list(node.join("has_memory"))?;
-        list(node.join("online"))?
-            .into_iter()
-            .map(|index| {
-                Ok((
-                    index,
-                    memory.contains(&index),
-                    list(node.join(format!("node{index}/cpulist")))?,
-                ))
-            })
-            .collect::<Result<_, String>>()?
-    } else {
-        vec![(0, true, online.clone())]
+        None => vec![(0, true, online.clone())],
     };
     nodes
         .into_iter()
         .map(|(id, memory, cpus)| {
             let mut cores: Vec<Core> = Vec::new();
             for cpu in cpus.into_iter().filter(|cpu| online.contains(cpu)) {
-                let mut threads = list(
-                    devices.join(format!("system/cpu/cpu{cpu}/topology/thread_siblings_list")),
-                )?;
+                let mut threads = list(&format!("system/cpu/cpu{cpu}/topology/thread_siblings_list"))?;
                 threads.retain(|thread| online.contains(thread));
                 threads.sort_unstable();
                 if !cores.iter().any(|core| core.threads == threads) {
-                    let performance = performance
-                        .as_ref()
-                        .is_none_or(|performance| performance.contains(&cpu));
-                    cores.push(Core {
-                        threads,
-                        performance,
-                    });
+                    let performance = performance.as_ref().is_none_or(|performance| performance.contains(&cpu));
+                    cores.push(Core { threads, performance });
                 }
             }
-            Ok(MemoryNode { id, memory, cores })
+            Some(MemoryNode { id, memory, cores })
         })
         .collect()
 }
@@ -349,16 +364,35 @@ pub(crate) fn sysfs_nodes(devices: &std::path::Path) -> Result<Vec<MemoryNode>, 
 mod tests {
     use super::*;
 
-    /// A sysfs tree under a fresh directory of `files` (path, contents).
-    fn sysfs(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    /// A sysfs tree of `files` (path under `/sys/devices`, contents) under a
+    /// fresh directory, of a machine of four CPUs ([`crate::host::Tree::new`]).
+    #[cfg(target_os = "linux")]
+    fn sysfs(name: &str, files: &[(&str, &str)]) -> crate::host::Tree {
         let root =
             std::env::temp_dir().join(format!("seismic-processors-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tree = crate::host::Tree::new(root);
         for (path, contents) in files {
-            let path = root.join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, contents).unwrap();
+            tree.file(&format!("/sys/devices/{path}"), contents);
         }
-        root
+        tree
+    }
+
+    /// A quota of `cpus`.
+    fn quota(cpus: usize) -> NonZeroUsize {
+        NonZeroUsize::new(cpus).unwrap()
+    }
+
+    /// The pool is the performance cores the process may run on, capped by
+    /// its quota where that is fewer, never raised by it.
+    #[test]
+    fn the_pool_is_the_performance_cores_under_the_quota() {
+        let nodes = flat(&(0..128).collect());
+        let pool = |cap| Processors::new(nodes.clone(), (0..128).collect(), quota(cap), ProcessorsReportedBy::Flat).unwrap().cores().unwrap().get();
+        assert_eq!(pool(20), 20);
+        assert_eq!(pool(128), 128);
+        let few = Processors::new(nodes, (0..8).collect(), quota(128), ProcessorsReportedBy::Flat).unwrap();
+        assert_eq!(few.cores().unwrap().get(), 8);
     }
 
     #[test]
@@ -379,6 +413,7 @@ mod tests {
         assert!(parse_list("3-1").is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn nodes_without_memory_and_second_threads_serve_no_core() {
         // Two nodes, the second without memory; two cores a node, each of
@@ -418,15 +453,16 @@ mod tests {
         );
         // The process may run on CPUs 1 to 7: core [0, 4] serves on 4.
         let processors =
-            Processors::new(nodes, (1..8).collect(), ProcessorsReportedBy::LinuxSysfs).unwrap();
+            Processors::new(nodes, (1..8).collect(), quota(7), ProcessorsReportedBy::LinuxSysfs).unwrap();
         assert_eq!(
             processors.memory_cores(),
             vec![(0, vec![vec![4], vec![1, 5]])]
         );
         assert_eq!(processors.performance_cores(), 4);
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(&root.root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_hybrid_part_counts_its_performance_cores_and_a_kernel_without_nodes_has_one() {
         let mut files = vec![("system/cpu/online", "0-3"), ("cpu_core/cpus", "0-1")];
@@ -463,36 +499,39 @@ mod tests {
             }]
         );
         let processors =
-            Processors::new(nodes, (0..4).collect(), ProcessorsReportedBy::LinuxSysfs).unwrap();
+            Processors::new(nodes, (0..4).collect(), quota(4), ProcessorsReportedBy::LinuxSysfs).unwrap();
         assert_eq!(
             (processors.performance_cores(), processors.memory_cores()),
             (1, vec![(0, vec![vec![0, 1]])])
         );
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(&root.root).unwrap();
     }
 
+    /// A topology sysfs reports in part is none: the process's CPUs are
+    /// then flat, each its own core.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn an_unreadable_report_is_an_error() {
+    fn a_partial_report_is_a_flat_topology() {
         let root = sysfs(
-            "unreadable",
+            "partial",
             &[
                 ("system/cpu/online", "0-1"),
                 ("system/cpu/cpu0/topology/thread_siblings_list", "0"),
             ],
         );
-        assert!(
-            sysfs_nodes(&root).is_err(),
-            "CPU 1's siblings are unreported"
-        );
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(sysfs_nodes(&root), None, "CPU 1's siblings are unreported");
+        let processors = crate::host::processors(&root);
+        assert_eq!(processors.by(), ProcessorsReportedBy::Flat);
+        assert_eq!(processors.performance_cores(), processors.allowed().len());
+        std::fs::remove_dir_all(&root.root).unwrap();
     }
 
     #[test]
     fn this_host_reports_its_processors() {
-        let processors = Processors::discover().unwrap();
+        let processors = Processors::discover();
         assert!(processors.performance_cores() >= 1);
         let cores = processors.cores().unwrap().get();
-        assert_eq!(cores, processors.performance_cores().min(seismic_threads::quota().get()));
+        assert_eq!(cores, processors.performance_cores().min(processors.quota().get()));
         assert!(!processors.memory_cores().is_empty());
         let cpus = processors
             .memory_cores()

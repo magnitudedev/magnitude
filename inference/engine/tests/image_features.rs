@@ -30,11 +30,11 @@ fn variable(name: &str) -> PathBuf {
 
 fn resolved() -> ResolvedEngineConfiguration {
     EngineConfiguration {
-        package: PackageOptions {
-            target: variable("MAGNITUDE_TEST_GGUF"),
-            projector: ProjectorSelection::Explicit(variable("MAGNITUDE_TEST_MMPROJ")),
-            draft: None,
-        },
+        package: PackageOptions::single(
+            variable("MAGNITUDE_TEST_GGUF"),
+            ProjectorSelection::Explicit(variable("MAGNITUDE_TEST_MMPROJ")),
+            None,
+        ),
         model: ModelPolicy {
             draft_policy: None,
             method: ModelMethod::Plain,

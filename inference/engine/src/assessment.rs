@@ -57,17 +57,41 @@ use std::sync::Arc;
 
 /// The package components to assess and the generation method the bundle
 /// declares (`Auto` for a standalone package). Only their headers are read.
-/// `target` is the target GGUF or the first shard of a split GGUF (the other
-/// shards are found beside it by the split naming convention); `draft` is a
-/// separate drafter (DFlash, DSpark, DFlash2, LiLiCorr, a Gemma assistant or a
-/// prediction head). A drafter the method cannot draft with is `Rejected`
-/// and the target is assessed without it.
+/// `target_shards` holds the target GGUF file(s) in shard order: one file for
+/// an unsplit GGUF or the first shard of a standard-named split GGUF, or every
+/// shard explicitly when shards have non-standard names or live across
+/// directories; `draft` is a separate drafter (DFlash, DSpark, DFlash2,
+/// LiLiCorr, a Gemma assistant or a prediction head). A drafter the method
+/// cannot draft with is `Rejected` and the target is assessed without it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPackagePaths {
-    pub target: PathBuf,
+    pub target_shards: Vec<PathBuf>,
     pub projector: Option<PathBuf>,
     pub draft: Option<PathBuf>,
     pub method: ModelMethod,
+}
+
+impl ModelPackagePaths {
+    pub fn single(
+        target: PathBuf,
+        projector: Option<PathBuf>,
+        draft: Option<PathBuf>,
+        method: ModelMethod,
+    ) -> Self {
+        Self {
+            target_shards: vec![target],
+            projector,
+            draft,
+            method,
+        }
+    }
+
+    pub fn target(&self) -> &Path {
+        self.target_shards
+            .first()
+            .map(PathBuf::as_path)
+            .unwrap_or_else(|| Path::new(""))
+    }
 }
 
 /// The structural part of the configuration every model is assessed on:
@@ -1265,8 +1289,8 @@ fn admit(
     source: &dyn HeaderSource,
     layout: Layout,
 ) -> Result<Admission, ModelAssessmentError> {
-    let mut headers = match PackageHeaders::open_from(
-        &package.target,
+    let mut headers = match PackageHeaders::open_shards_from(
+        &package.target_shards,
         package.projector.as_deref(),
         source,
     ) {
@@ -1289,7 +1313,7 @@ fn admit(
         target,
         headers.projector(),
         headers.identity(),
-        &package.target.display().to_string(),
+        &package.target().display().to_string(),
     );
     // A bound projector loads its weights; one that does not bind loads none.
     if let (Ok((_, interpreted, _)), Some(projector)) = (&interpreted, headers.projector()) {

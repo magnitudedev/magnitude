@@ -174,11 +174,12 @@ def record(results_dir: Path, found: list[dict]) -> None:
 
 
 def read() -> list[dict]:
-    """Every row, oldest first."""
+    """Every row that records what its executable was built in, oldest first. Rows written before
+    rows carried a `configuration` can't vouch for any configured build, so they are not read."""
     if not path().exists():
         return []
     with open(path()) as stream:
-        return [json.loads(line) for line in stream if line.strip()]
+        return [row for line in stream if line.strip() and "configuration" in (row := json.loads(line))]
 
 
 @dataclass(frozen=True)

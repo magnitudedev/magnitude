@@ -72,6 +72,11 @@
 #include "../core/matrix.glsl"
 #include "../core/staging.glsl"
 
+// The workgroup's invocations, which `SEISMIC_THREAD` (the prelude's) numbers
+// 0 .. PROJECTION_THREADS - 1 for work that reaches a subgroup operation or
+// memory read in lane order.
+#define PROJECTION_THREADS (gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z)
+
 #include "stage.glsl"
 #include "join.glsl"
 
@@ -375,14 +380,27 @@ packets_packet projection_packet(const int kind, projection_weights w, uint n, u
 // ---------------------------------------------------------------------------
 // The stage pre-pass of the GEMM class.
 
+// The Rms norm inverse of columns first .. first + width of row m, reduced
+// across the workgroup (shared: one float per subgroup at float 0).
+float projection_stage_inverse(projection_prologue in_, uint m, uint first, uint width) {
+    const uint thread = SEISMIC_THREAD, threads = PROJECTION_THREADS;
+    float squares = 0.0;
+    seismic_strided(uint, i, thread, width, threads) {
+        const float v = projection_norm_input(in_, m, first + i);
+        squares = seismic_fma_rn(v, v, squares);
+    }
+    squares = reduce_group_sum(squares, 0u);
+    return inversesqrt(seismic_div_rn(squares, float(width)) + in_.eps);
+}
+
 // The largest magnitude of row m's prologue output under its norm inverse
 // (NaN wins: `nvfp4_peak`), reduced across the workgroup (shared: one
 // float per subgroup at float 0, which every invocation may still be
 // reading: a normalization's squares).
 float projection_row_maximum(projection_prologue in_, uint m, float inverse) {
-    const uint thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    const uint thread = SEISMIC_THREAD, threads = PROJECTION_THREADS;
     uint amax = 0u;
-    for (uint i = 8u * thread; i < in_.columns; i += 8u * threads) {
+    seismic_strided(uint, i, 8u * thread, in_.columns, 8u * threads) {
         vec4 even, odd;
         projection_load8(in_, m, i, inverse, even, odd);
         amax = nvfp4_peak(amax, even, odd);
@@ -398,15 +416,8 @@ void projection_stage(projection_prologue in_, uint m, uint64_t x, uint columns)
     const uint thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
     const uint width = in_.columns;
     float inverse = 0.0;
-    if (in_.kind == PROJECTION_RMS) {
-        float squares = 0.0;
-        for (uint i = thread; i < width; i += threads) {
-            const float v = projection_norm_input(in_, m, i);
-            squares = seismic_fma_rn(v, v, squares);
-        }
-        squares = reduce_group_sum(squares, 0u);
-        inverse = inversesqrt(seismic_div_rn(squares, float(width)) + in_.eps);
-    }
+    if (in_.kind == PROJECTION_RMS)
+        inverse = projection_stage_inverse(in_, m, 0u, width);
     const float g = in_.operands == PROJECTION_OPERANDS_NVFP4
         ? nvfp4_global_scale(projection_row_maximum(in_, m, inverse))
         : 0.0;
@@ -431,13 +442,7 @@ void projection_stage(projection_prologue in_, uint m, uint64_t x, uint columns)
 float projection_stage_stream(projection_prologue in_, uint m, uint stream, uint width, uint64_t x, uint columns) {
     const uint thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
     const uint first = stream * width;
-    float squares = 0.0;
-    for (uint i = thread; i < width; i += threads) {
-        const float v = projection_norm_input(in_, m, first + i);
-        squares = seismic_fma_rn(v, v, squares);
-    }
-    squares = reduce_group_sum(squares, 0u);
-    const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + in_.eps);
+    const float inverse = projection_stage_inverse(in_, m, first, width);
     const uint64_t row = uint64_t(m) * columns + first;
     const bool vector = (columns & 7u) == 0u && (first & 7u) == 0u;
     for (uint i = 8u * thread; i < width; i += 8u * threads) {
@@ -457,9 +462,10 @@ float projection_stage_stream(projection_prologue in_, uint m, uint stream, uint
 // place as NVFP4 operands by the workgroup: each invocation reads and
 // rewrites whole 16-value blocks, so none reads a value another has
 // rewritten (the grouped expert products a down projection takes). Shared:
-// one float per subgroup at float 0.
+// one float per subgroup at float 0. The blocks are numbered by
+// `SEISMIC_THREAD`: `projection_row_maximum` reads the row in lane order.
 void projection_form_in_place(const int act, uint64_t row, uint columns) {
-    const uint thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    const uint thread = SEISMIC_THREAD, threads = PROJECTION_THREADS;
     const projection_prologue in_ = projection_operands(projection_plain(act, row, 0ul, 1ul, columns, 0ul),
         PROJECTION_OPERANDS_NVFP4);
     const float g = nvfp4_global_scale(projection_row_maximum(in_, 0u, 0.0));
@@ -591,10 +597,13 @@ void projection_gemv_squares(projection_prologue in_, uint m_rows) {
         projection_ordered_inverses(in_, m_rows, 0u, slots, 0u, m_rows * slots <= 64u, 64u);
         return;
     }
-    for (uint item = SEISMIC_SUBGROUP; item < m_rows * slots; item += SEISMIC_SUBGROUPS) {
-        const float sum = seismic_subgroup_sum_f32(
-            projection_rms_squares(in_, item / slots, item % slots, SEISMIC_LANE));
-        if (SEISMIC_LANE == 0u)
+    // A logical subgroup past the items (on 64 lanes, beside one with an
+    // item) reduces the last item again and stores nothing.
+    bool held;
+    for (uint item = SEISMIC_SUBGROUP; seismic_steer(held, item < m_rows * slots); item += SEISMIC_SUBGROUPS) {
+        const uint at = held ? item : m_rows * slots - 1u;
+        const float sum = seismic_subgroup_sum_f32(projection_rms_squares(in_, at / slots, at % slots, SEISMIC_LANE));
+        if (held && SEISMIC_LANE == 0u)
             seismic_shared_f32[item] = sum;
     }
 }
@@ -621,16 +630,19 @@ float projection_gemv_norm_inverse(projection_prologue in_, const int norm, uint
 // ... The staging's opening barrier publishes them.
 void projection_gemv_globals(projection_prologue in_, const int norm, uint m_rows) {
     barrier();
-    for (uint m = SEISMIC_SUBGROUP; m < m_rows; m += SEISMIC_SUBGROUPS) {
-        const float inverse = projection_gemv_norm_inverse(in_, norm, m);
+    // As `projection_gemv_squares` takes its items.
+    bool held;
+    for (uint m = SEISMIC_SUBGROUP; seismic_steer(held, m < m_rows); m += SEISMIC_SUBGROUPS) {
+        const uint row = held ? m : m_rows - 1u;
+        const float inverse = projection_gemv_norm_inverse(in_, norm, row);
         uint amax = 0u;
-        for (uint k = 8u * SEISMIC_LANE; k < in_.columns; k += 8u * SEISMIC_SUBGROUP_LANES) {
+        seismic_strided(uint, k, 8u * SEISMIC_LANE, in_.columns, 8u * 32u) {
             vec4 even, odd;
-            projection_load8(in_, m, k, inverse, even, odd);
+            projection_load8(in_, row, k, inverse, even, odd);
             amax = nvfp4_peak(amax, even, odd);
         }
         amax = seismic_redux_max_u32(amax);
-        if (SEISMIC_LANE == 0u)
+        if (held && SEISMIC_LANE == 0u)
             seismic_shared_f32[PROJECTION_GEMV_GLOBALS + m] = nvfp4_global_scale(uintBitsToFloat(amax));
     }
 }
@@ -650,26 +662,36 @@ void projection_gemv_stage(projection_prologue in_, const int norm, const uint m
     uint first, uint count, uint chunk) {
     const uint word = projection_gemv_stage_word(in_);
     const uint sums = projection_gemv_sums_float(f32, word, maxm, chunk);
-    for (uint item = gl_LocalInvocationIndex; item < 4u * m_rows * count; item += gl_WorkGroupSize.x) {
+    // Each logical subgroup takes 32 items a round, and all its lanes take
+    // part in the pairing shuffle: it runs inside the loop, so the loop
+    // steers whole subgroups and a lane past the items stages nothing (items
+    // come in whole packets, so a pair is staged or not together).
+    const uint items = 4u * m_rows * count;
+    bool held;
+    for (uint base = 32u * SEISMIC_SUBGROUP; seismic_steer(held, base < items); base += 32u * SEISMIC_SUBGROUPS) {
+        const uint item = base + SEISMIC_LANE;
         const uint step = item & 3u, packet = item >> 2;
         // Under the bound 1 every packet is of row 0, without a division.
         const uint m = maxm == 1u ? 0u : packet / count;
         const uint local = maxm == 1u ? packet : packet - m * count;
-        vec4 even, odd;
-        projection_gemv_prologue8(in_, norm, m, 32u * (first + local) + 8u * step, even, odd);
-        const uint at = projection_gemv_x_word(f32, word, m, step, chunk, local);
-        if (f32) {
-            vec4 e, o;
-            element_split8(in_.act, element_pack8(in_.act, even, odd), e, o);
-            seismic_shared_uvec4[at] = floatBitsToUint(e);
-            seismic_shared_uvec4[at + chunk] = floatBitsToUint(o);
-        } else {
-            seismic_shared_uvec4[at] = element_pack8(in_.act, even, odd);
+        float sum = 0.0;
+        if (item < items) {
+            vec4 even, odd;
+            projection_gemv_prologue8(in_, norm, m, 32u * (first + local) + 8u * step, even, odd);
+            const uint at = projection_gemv_x_word(f32, word, m, step, chunk, local);
+            if (f32) {
+                vec4 e, o;
+                element_split8(in_.act, element_pack8(in_.act, even, odd), e, o);
+                seismic_shared_uvec4[at] = floatBitsToUint(e);
+                seismic_shared_uvec4[at + chunk] = floatBitsToUint(o);
+            } else {
+                seismic_shared_uvec4[at] = element_pack8(in_.act, even, odd);
+            }
+            const vec4 pair = even + odd;
+            sum = (pair.x + pair.y) + (pair.z + pair.w);
         }
-        const vec4 pair = even + odd;
-        float sum = (pair.x + pair.y) + (pair.z + pair.w);
         sum += subgroupShuffleXor(sum, 1u);
-        if ((step & 1u) == 0u)
+        if (item < items && (step & 1u) == 0u)
             seismic_shared_f32[sums + 2u * (m * chunk + local) + (step >> 1)] = sum;
     }
 }
@@ -927,7 +949,7 @@ void projection_gemv(const int wk, const int uk, const bool paired, const uint r
 // matching the CPU reference order bit for bit.
 
 float projection_ordered_stage_row(projection_prologue in_, uint m, Out out_, uint64_t stride0, uint64_t stride1) {
-    const uint tid = SEISMIC_SUBGROUP * 32u + SEISMIC_LANE, threads = SEISMIC_SUBGROUPS * 32u;
+    const uint tid = SEISMIC_THREAD, threads = SEISMIC_SUBGROUPS * 32u;
     projection_ordered_inverses(in_, 1u, 0u, 1u, m, true, 4u);
     const float inv = seismic_shared_f32[0];
     for (uint c = tid; c < in_.columns; c += threads)
@@ -974,7 +996,7 @@ void projection_ordered_gemv(const int kind, const bool publish, const uint maxm
     const uint groups = SEISMIC_SUBGROUPS * 4u;
     projection_ordered_inverses(in_, m, 0u, 1u, 0u, true, 64u);
     const uint w_row = local_tile * groups + sg * 4u + q;
-    const uint hw_first_row = local_tile * groups + 4u * (sg & ~(SEISMIC_SUBGROUP_LANES / 32u - 1u));
+    const uint hw_first_row = local_tile * groups + 4u * SEISMIC_HARDWARE_SUBGROUP;
     float acc[8];
     [[unroll]] for (uint r = 0u; r < 8u; ++r)
         acc[r] = 0.0;
@@ -1122,20 +1144,24 @@ void projection_ordered_gemm(const int kind, projection_prologue in_, projection
                 }
             }
         }
-        if (has_lo) {
+        // A logical subgroup without rows (on 64 lanes, beside one with
+        // them) shuffles its zeros and accumulates nothing.
+        bool lo;
+        if (seismic_steer(lo, has_lo)) {
             [[unroll]] for (uint s = 0u; s < 4u; ++s) {
                 const float x0 = seismic_shuffle(cur_x0[s], u);
                 const float x1 = seismic_shuffle(cur_x0[s], 8u + u);
                 const float x2 = seismic_shuffle(cur_x0[s], 16u + u);
                 const float x3 = seismic_shuffle(cur_x0[s], 24u + u);
                 float y0 = 0.0, y1 = 0.0, y2 = 0.0, y3 = 0.0;
-                if (has_hi) {
+                bool hi;
+                if (seismic_steer(hi, has_hi)) {
                     y0 = seismic_shuffle(cur_x1[s], u);
                     y1 = seismic_shuffle(cur_x1[s], 8u + u);
                     y2 = seismic_shuffle(cur_x1[s], 16u + u);
                     y3 = seismic_shuffle(cur_x1[s], 24u + u);
                 }
-                if (has_cols && (k0 + 32u <= k || k0 + 8u * s + u < k)) {
+                if (lo && has_cols && (k0 + 32u <= k || k0 + 8u * s + u < k)) {
                     const uint row_off = cur_buf + (8u * s + u) * 36u + 8u * gn;
                     float wc[8];
                     [[unroll]] for (uint j = 0u; j < 8u; ++j)
@@ -1163,7 +1189,11 @@ void projection_ordered_gemm(const int kind, projection_prologue in_, projection
                 seismic_shared_f32[dst_buf + (8u * s_dec + j) * 36u + c_dec] = next_w[j];
         }
     }
-    if (has_lo && has_cols) {
+    // Every lane of a subgroup with rows takes part in the combine; a lane
+    // without columns, or (on 64 lanes) a logical subgroup without rows,
+    // combines zeros and publishes nothing.
+    bool lo;
+    if (seismic_steer(lo, has_lo)) {
         [[unroll]] for (uint i = 0u; i < 4u; ++i) {
             const uint out_r = act_lo + i;
             [[unroll]] for (uint j = 0u; j < 8u; ++j) {
@@ -1174,7 +1204,8 @@ void projection_ordered_gemm(const int kind, projection_prologue in_, projection
             }
         }
     }
-    if (has_hi && has_cols) {
+    bool hi;
+    if (seismic_steer(hi, has_hi)) {
         [[unroll]] for (uint i = 0u; i < 4u; ++i) {
             const uint out_r = act_hi + i;
             [[unroll]] for (uint j = 0u; j < 8u; ++j) {

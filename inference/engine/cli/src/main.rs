@@ -356,11 +356,7 @@ fn run() -> Result<(), String> {
     };
     let release = ReleaseRate::of_machine(options.kernel_cache.as_deref().zip(topology.as_deref()));
     let mut resolved = EngineConfiguration {
-        package: PackageOptions {
-            target: options.target,
-            projector: options.projector,
-            draft: options.draft,
-        },
+        package: PackageOptions::single(options.target, options.projector, options.draft),
         model: ModelPolicy {
             draft_policy: options.draft_policy,
             method: options.method,

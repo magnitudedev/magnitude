@@ -65,7 +65,9 @@
 #define PROJECTION_TN uint(PROJECTION_GEMM_TN)
 #define PROJECTION_WM uint(PROJECTION_GEMM_WM)
 #define PROJECTION_WN uint(PROJECTION_GEMM_WN)
-// Invocations of a GEMM workgroup.
+// Invocations of a GEMM workgroup. The staging spreads its items over them by
+// `SEISMIC_THREAD`, never by the local invocation index: the matrix path's
+// cooperative-matrix operations take what it stages (the prelude's rule).
 #define PROJECTION_GEMM_THREADS (PROJECTION_TM * PROJECTION_TN * 32u / (PROJECTION_WM * PROJECTION_WN))
 // Staged items per invocation and step: activation items (8 columns of one
 // tile row) and weight items (half-packets of one tensor's tile rows, TN of
@@ -112,11 +114,11 @@ uint projection_gemm_row_word(uint row, uint word) { return row * (PROJECTION_GE
 // exponent(max |x|) - 14), stored in its A slot. Every invocation takes part;
 // the caller has freed the region.
 void projection_gemm_scan_rows(projection_prologue in_, uint m0, uint m_rows) {
-    for (uint row = gl_LocalInvocationIndex; row < PROJECTION_TM; row += gl_WorkGroupSize.x)
+    for (uint row = SEISMIC_THREAD; row < PROJECTION_TM; row += PROJECTION_GEMM_THREADS)
         seismic_shared_u32[projection_gemm_row_word(row, PROJECTION_GEMM_ROW_MAXIMUM)] = 0u;
     barrier();
     const uint pieces = (in_.columns + 7u) / 8u;
-    for (uint item = gl_LocalInvocationIndex; item < PROJECTION_TM * pieces; item += gl_WorkGroupSize.x) {
+    for (uint item = SEISMIC_THREAD; item < PROJECTION_TM * pieces; item += PROJECTION_GEMM_THREADS) {
         const uint row = item / pieces;
         if (m0 + row >= m_rows)
             continue;
@@ -127,7 +129,7 @@ void projection_gemm_scan_rows(projection_prologue in_, uint m0, uint m_rows) {
         atomicMax(seismic_shared_u32[projection_gemm_row_word(row, PROJECTION_GEMM_ROW_MAXIMUM)], floatBitsToUint(value));
     }
     barrier();
-    for (uint row = gl_LocalInvocationIndex; row < PROJECTION_TM; row += gl_WorkGroupSize.x) {
+    for (uint row = SEISMIC_THREAD; row < PROJECTION_TM; row += PROJECTION_GEMM_THREADS) {
         const float largest = uintBitsToFloat(seismic_shared_u32[projection_gemm_row_word(row, PROJECTION_GEMM_ROW_MAXIMUM)]);
         seismic_shared_u32[projection_gemm_row_word(row, PROJECTION_GEMM_ROW_EXPONENT)] = uint(staging_f16_exponent(largest));
     }
@@ -148,7 +150,7 @@ uint projection_gemm_b_items(const uint count) {
 // tile row item / 4, as f16 words (scaled by the row's 2^-e).
 void projection_gemm_load_a(projection_prologue in_, uint m0, uint m_rows, uint k0) {
     [[unroll]] for (uint j = 0u; j < PROJECTION_GEMM_A_ITEMS; ++j) {
-        const uint item = gl_LocalInvocationIndex + j * PROJECTION_GEMM_THREADS;
+        const uint item = SEISMIC_THREAD + j * PROJECTION_GEMM_THREADS;
         const uint row = item / 4u, column = k0 + 8u * (item % 4u);
         projection_gemm_a[j] = uvec4(0u);
         if (row < PROJECTION_TM && m0 + row < m_rows && column < in_.columns) {
@@ -166,7 +168,7 @@ void projection_gemm_load_a(projection_prologue in_, uint m0, uint m_rows, uint 
 
 void projection_gemm_store_a() {
     [[unroll]] for (uint j = 0u; j < PROJECTION_GEMM_A_ITEMS; ++j) {
-        const uint item = gl_LocalInvocationIndex + j * PROJECTION_GEMM_THREADS;
+        const uint item = SEISMIC_THREAD + j * PROJECTION_GEMM_THREADS;
         const uint row = item / 4u;
         if (row < PROJECTION_TM)
             seismic_shared_uvec4[row * (PROJECTION_GEMM_LDA / 8u) + item % 4u] = projection_gemm_a[j];
@@ -178,7 +180,7 @@ void projection_gemm_store_a() {
 void projection_gemm_load_b_of(const int kind, const bool partner, projection_weights w, uint first,
     const uint count, uint rows, uint k0, uint k) {
     [[unroll]] for (uint j = 0u; j < projection_gemm_b_items(count); ++j) {
-        const uint item = gl_LocalInvocationIndex + j * PROJECTION_GEMM_THREADS;
+        const uint item = SEISMIC_THREAD + j * PROJECTION_GEMM_THREADS;
         const uint local = item / 2u;
         const uint p = k0 / 32u;
         const bool valid = local < count && 32u * p < k;
@@ -202,7 +204,7 @@ void projection_gemm_load_b_of(const int kind, const bool partner, projection_we
 void projection_gemm_store_b_of(const int kind, const bool partner, const uint count, uint tile_row0,
     uint spacing, uint b_word) {
     [[unroll]] for (uint j = 0u; j < projection_gemm_b_items(count); ++j) {
-        const uint item = gl_LocalInvocationIndex + j * PROJECTION_GEMM_THREADS;
+        const uint item = SEISMIC_THREAD + j * PROJECTION_GEMM_THREADS;
         const uint local = item / 2u, within = item % 2u;
         if (local >= count)
             continue;

@@ -30,8 +30,9 @@ void corrector_path() {
         for (uint candidate = 0u; candidate < uint(SEISMIC_DIM_K); ++candidate) {
             const uint64_t row = incoming + (slot * SEISMIC_INCOMING_STRIDE_0 + step * SEISMIC_INCOMING_STRIDE_1
                 + candidate * SEISMIC_INCOMING_STRIDE_2) * 4ul;
+            // Numbered by `SEISMIC_THREAD`: the partials reach the reduction.
             float partial = 0.0;
-            for (uint64_t f = lane; f < SEISMIC_DIM_F; f += threads)
+            seismic_strided(uint64_t, f, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_F, threads)
                 partial = seismic_fma_rn(element_f32_at(row + f * SEISMIC_INCOMING_STRIDE_3 * 4ul),
                     element_f32_at(other + f * other_stride * 4ul), partial);
             const float score = reduce_group_sum(partial, 0u);

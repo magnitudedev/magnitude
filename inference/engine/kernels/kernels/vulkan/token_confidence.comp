@@ -22,12 +22,13 @@ void token_confidence_partition() {
     const uint64_t line = logits
         + uint64_t(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_ROWS), row * SEISMIC_ROWS_STRIDE_0))
             * SEISMIC_LOGITS_STRIDE_0 * 4ul;
+    // Numbered by `SEISMIC_THREAD`: the partials reach the reductions.
     float local = -uintBitsToFloat(0x7f800000u);
-    for (uint64_t v = begin + lane; v < end; v += threads)
+    seismic_strided_from(uint64_t, v, begin, uint64_t(SEISMIC_THREAD), end, threads)
         local = max(local, element_f32_at(line + v * SEISMIC_LOGITS_STRIDE_1 * 4ul));
     const float maximum = reduce_group_max(local, 0u);
     float partial = 0.0;
-    for (uint64_t v = begin + lane; v < end; v += threads)
+    seismic_strided_from(uint64_t, v, begin, uint64_t(SEISMIC_THREAD), end, threads)
         partial += exp(element_f32_at(line + v * SEISMIC_LOGITS_STRIDE_1 * 4ul) - maximum);
     const float total = reduce_group_sum(partial, 0u);
     if (lane != 0ul) return;

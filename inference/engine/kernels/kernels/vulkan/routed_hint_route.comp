@@ -49,16 +49,21 @@ void routed_hint_route_publish() {
     const uint lead = gl_WorkGroupID.y;
     const uint64_t plane = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)
         + uint64_t(lead) * SEISMIC_DIM_M * SEISMIC_DIM_EN * 4ul;
-    for (uint64_t row = SEISMIC_SUBGROUP; row < SEISMIC_DIM_M; row += SEISMIC_SUBGROUPS) {
+    // Steered while a logical subgroup holds a row: one past the rows on a
+    // 64-lane hardware subgroup ranks the last row again and stores nothing.
+    bool live;
+    for (uint64_t placed = SEISMIC_SUBGROUP; seismic_steer(live, placed < SEISMIC_DIM_M);
+         placed += SEISMIC_SUBGROUPS) {
+        const uint64_t row = live ? placed : SEISMIC_DIM_M - 1ul;
         float chosen[ROUTE_K];
         int winners[ROUTE_K];
         route_rank_at(plane, row, chosen, winners);
-        if (SEISMIC_LANE == 0u)
+        if (live && SEISMIC_LANE == 0u)
             for (uint r = 0u; r < ROUTE_K; ++r)
                 seismic_shared_i32[uint(STREAMING_HINT_CHOSEN(uint(row))) + r] = winners[r];
     }
     streaming_hint(uint(SEISMIC_DIM_M), SEISMIC_PTR(SEISMIC_BUFFER_RINGS) + uint64_t(lead) * SEISMIC_RINGS_STRIDE_0 * 4ul,
         SEISMIC_RINGS_STRIDE_1,
         streaming_device_load(SEISMIC_PTR(SEISMIC_BUFFER_STEP) + SEISMIC_CONST_STEP_LOW * SEISMIC_STEP_STRIDE_0 * 4ul),
-        0u, gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+        0u, SEISMIC_THREAD, gl_WorkGroupSize.x);
 }

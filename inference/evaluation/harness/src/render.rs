@@ -655,11 +655,11 @@ mod tests {
         let variable = |name: &str| {
             std::path::PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("set {name}")))
         };
-        let host = HostArtifacts::open(&PackageOptions {
-            target: variable("MAGNITUDE_TEST_GGUF"),
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        })
+        let host = HostArtifacts::open(&PackageOptions::single(
+            variable("MAGNITUDE_TEST_GGUF"),
+            ProjectorSelection::Disabled,
+            None,
+        ))
         .unwrap();
         (
             host,

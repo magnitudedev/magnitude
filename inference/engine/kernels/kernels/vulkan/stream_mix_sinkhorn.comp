@@ -59,7 +59,9 @@ void sinkhorn_slice(const bool tiled) {
     const uint tile_rows = tiled ? uint(SEISMIC_CONST_SINKHORN_TILE) : 1u;
     const uint per = tiled ? SINKHORN_PER : 1u;
     const uint pass = tiled ? 32u : SINKHORN_THREADS;
-    const uint thread = gl_LocalInvocationIndex;
+    // Staging is indexed by `SEISMIC_THREAD`: what it stores reaches the
+    // subgroup sums.
+    const uint thread = SEISMIC_THREAD;
     const uint subgroup = SEISMIC_SUBGROUP, lane = SEISMIC_LANE;
     const uint h = uint(SEISMIC_DIM_H), width = SINKHORN_STREAMS * h, split = uint(SEISMIC_CONST_SINKHORN_SPLIT);
     const uint rows = uint(SEISMIC_DIM_M), row0 = gl_WorkGroupID.y * tile_rows;
@@ -78,7 +80,7 @@ void sinkhorn_slice(const bool tiled) {
             sums[r][j] = 0.0;
     }
     if (!tiled) {
-        for (uint at = first + subgroup * 32u + lane; at < last; at += pass) {
+        seismic_strided_from(uint, at, first, thread, last, pass) {
             const uint stream = at / h, column = at % h;
             const float v = element_f32_at(x[0] + (uint64_t(stream) * SEISMIC_HIDDEN_STRIDE_1
                 + uint64_t(column) * SEISMIC_HIDDEN_STRIDE_2) * 4ul);
@@ -95,7 +97,7 @@ void sinkhorn_slice(const bool tiled) {
                 seismic_shared_f32[SINKHORN_STAGED + j * SINKHORN_CHUNK + c] = sinkhorn_function(j, chunk + c);
             }
             barrier();
-            for (uint c = lane; c < count; c += pass) {
+            seismic_strided(uint, c, lane, count, pass) {
                 const uint at = chunk + c, stream = at / h, column = at % h;
                 [[unroll]] for (uint r = 0u; r < SINKHORN_PER; ++r) {
                     const float v = element_f32_at(x[r] + (uint64_t(stream) * SEISMIC_HIDDEN_STRIDE_1
@@ -113,16 +115,16 @@ void sinkhorn_slice(const bool tiled) {
     [[unroll]] for (uint r = 0u; r < SINKHORN_PER; ++r) {
         [[unroll]] for (uint j = 0u; j < SINKHORN_SUMS; ++j) {
             const float total = seismic_subgroup_sum_f32(sums[r][j]);
-            if (lane != 0u)
-                continue;
-            if (tiled) {
-                const uint row = row0 + subgroup + r * SINKHORN_SUBGROUPS;
-                if (live[r])
-                    element_f32_put(partials
-                        + ((uint64_t(row) * uint64_t(split) + uint64_t(gl_WorkGroupID.x)) * uint64_t(SINKHORN_SUMS) + uint64_t(j)) * 4ul,
-                        total);
-            } else if (r == 0u) {
-                seismic_shared_f32[j * SINKHORN_SUBGROUPS + subgroup] = total;
+            if (lane == 0u) {
+                if (tiled) {
+                    const uint row = row0 + subgroup + r * SINKHORN_SUBGROUPS;
+                    if (live[r])
+                        element_f32_put(partials
+                            + ((uint64_t(row) * uint64_t(split) + uint64_t(gl_WorkGroupID.x)) * uint64_t(SINKHORN_SUMS) + uint64_t(j)) * 4ul,
+                            total);
+                } else if (r == 0u) {
+                    seismic_shared_f32[j * SINKHORN_SUBGROUPS + subgroup] = total;
+                }
             }
         }
     }

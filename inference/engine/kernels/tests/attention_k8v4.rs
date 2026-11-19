@@ -495,8 +495,9 @@ fn metal_device() -> Option<Device> {
 }
 
 /// Whether Vulkan's vector decode form (SIMDS, SLICES, KEYWISE) is within the
-/// declaration's `where`: the per-key walk needs four subgroups, and the
-/// walk's shared bytes (the keywise walk's staging tiles among them) fit.
+/// declaration's `where`: the per-key walk needs four subgroups and the
+/// keywise walk two, and the walk's shared bytes (the keywise walk's staging
+/// tiles among them) fit.
 fn vulkan_vector_fits(geometry: Geometry, simds: u64, slices: u64, keywise: u64) -> bool {
     let (g, w) = (geometry.g as u64, geometry.w() as u64);
     let heads = g / slices;
@@ -508,13 +509,13 @@ fn vulkan_vector_fits(geometry: Geometry, simds: u64, slices: u64, keywise: u64)
             + (simds * w * 4)
                 .max(32 + g * w * 4 + simds * heads * 128 + g * w / 8 + simds * 512 * pitch)
     };
-    (keywise == 1 || simds >= 4) && bytes <= 32768
+    (simds >= 4 || (keywise == 1 && simds >= 2)) && bytes <= 32768
 }
 
-/// Vulkan's grouped-query matrix decode configurations (PARTS, SIMDS) whose
-/// SIMDS * 16 matrix rows hold the query group, within the declaration's
-/// shared bytes (the K/V tile, the subgroup scratch, the query tile and its
-/// rows' factors).
+/// Vulkan's grouped-query matrix decode configurations (PARTS, SIMDS) of two
+/// subgroups at least whose SIMDS * 16 matrix rows hold the query group,
+/// within the declaration's shared bytes (the K/V tile, the subgroup
+/// scratch, the query tile and its rows' factors).
 fn vulkan_matrix_configs(
     geometry: Geometry,
     configs: &[(u64, u64)],
@@ -523,7 +524,8 @@ fn vulkan_matrix_configs(
     configs
         .iter()
         .filter(|(_, simds)| {
-            geometry.g as u64 <= simds * 16
+            *simds >= 2
+                && geometry.g as u64 <= simds * 16
                 && 64 * (w.min(256) + 8) + simds * 2048 + simds * 16 * ((w + 8) * 2 + 4) <= 32768
         })
         .map(|&(parts, simds)| {
@@ -762,7 +764,6 @@ fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static
             (32, 16, 8, 8),
             (32, 16, 2, 1),
             (64, 32, 2, 2),
-            (64, 16, 1, 1),
         ]
         .into_iter()
         .filter(|(_, _, _, slices)| group.is_multiple_of(*slices as usize))
@@ -783,7 +784,7 @@ fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static
         })
         .chain(vulkan_matrix_configs(
             geometry,
-            &[(16, 1), (64, 2), (32, 4)],
+            &[(16, 2), (64, 2), (32, 4)],
         ))
         .collect(),
     }

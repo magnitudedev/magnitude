@@ -62,7 +62,7 @@ pub struct ResolvedEngineConfiguration {
 impl EngineConfiguration {
     pub fn resolve(self) -> Result<ResolvedEngineConfiguration, ResolveError> {
         let package = self.package.open().map_err(|error| {
-            ResolveError::Artifact(ArtifactError::from_artifacts(error, &self.package.target))
+            ResolveError::Artifact(ArtifactError::from_artifacts(error, self.package.target()))
         })?;
         let host = HostArtifacts::interpret(
             package,

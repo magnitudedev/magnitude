@@ -120,7 +120,7 @@ impl ComputeThreads {
     pub(crate) fn placeable(workers: usize) -> Self {
         let nodes = {
             let _placement = crate::test_support::process_placement();
-            seismic::Processors::discover().expect("the host's processors").memory_cores()
+            seismic::Processors::discover().memory_cores()
         };
         let cpus = nodes.iter().flat_map(|(_, cores)| cores).map(|threads| threads[0]).collect::<Vec<_>>();
         Self::unplaced(vec![(0..workers).map(|worker| cpus[worker % cpus.len()]).collect()])
@@ -137,7 +137,7 @@ impl ComputeThreads {
 /// each memory node with memory, its performance cores the process may run
 /// on (a core's second thread shares its first's units, so a worker on it
 /// would halve both; a node of CPUs alone reads every byte across the
-/// fabric), as many cores as the quota (`seismic::threads::quota`, which
+/// fabric), as many cores as the quota (`seismic::Processors::quota`, which
 /// follows a cgroup's CPU quota and the process's affinity) leaves beside
 /// the runtime's busy threads ([`busy_threads`]). Never the process's thread
 /// share: the pool's size is part of the device's identity, which the
@@ -169,9 +169,8 @@ impl Machine {
     /// This machine's beside a device of `device_threads` threads on the
     /// host, attached to node `device_node`, and reads of `read_cores`.
     fn beside(device_threads: usize, read_cores: f64, device_node: seismic::DeviceNode) -> Result<Self, String> {
-        let quota = seismic::threads::quota();
-        let processors = seismic::Processors::discover().map_err(|error| format!("the host's processors: {error}"))?;
-        Ok(Self::of(&processors, quota.get(), busy_threads(device_threads, read_cores), device_node))
+        let processors = seismic::Processors::discover();
+        Ok(Self::of(&processors, processors.quota().get(), busy_threads(device_threads, read_cores), device_node))
     }
 
     /// The machine of `processors` under `quota` threads, of which `busy`

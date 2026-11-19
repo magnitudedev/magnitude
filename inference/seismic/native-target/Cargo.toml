@@ -11,6 +11,13 @@ seismic-threads.workspace = true
 serde.workspace = true
 sha2.workspace = true
 
+# The process's private commit, its footprint on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
 
 [lints]
 workspace = true

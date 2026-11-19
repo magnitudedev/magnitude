@@ -183,7 +183,11 @@ void recurrent_publish_window(recurrent_inputs in_, recurrent_slot slot, uint pa
     const uint per = (total + parts - 1u) / parts;
     const uint first = part * per;
     const uint last = min(total, first + per);
-    for (uint index = first + gl_LocalInvocationIndex; index < last; index += gl_WorkGroupSize.x) {
+    // Strided: `chunk_scan` reaches `chunk_sequential_rows`' shuffle through
+    // `chunk_scan_rows`, whose piece loop may (as formation sees it) take no
+    // trip and so cross no barrier. Spread by `SEISMIC_THREAD`: the state the
+    // caller's subgroups reduce is read from the arenas these stores write.
+    seismic_strided_from(uint, index, first, SEISMIC_THREAD, last, gl_WorkGroupSize.x) {
         const int row = int(index / RECURRENT_CH);
         const uint channel = index % RECURRENT_CH;
         const int position = slot.stop + row - (int(RECURRENT_C) - 1);
@@ -269,7 +273,9 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
     const uint prepared_width = 2u * W + block_rows;
     const uint beta_at = RECURRENT_SPAN * prepared_width;
     const uint decay_at = beta_at + RECURRENT_SPAN;
-    const uint lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex;
+    // The staging is spread by `SEISMIC_THREAD`, as the subgroup sums that
+    // read it need.
+    const uint lane = SEISMIC_LANE, thread = SEISMIC_THREAD;
     const uint key_row = recurrent_key_head(in_, head);
     const int publish = slot.lo + slot.stop;
     const int taped = recurrent_tape_rows(slot);
@@ -465,43 +471,58 @@ void recurrent_store_gated8(recurrent_gated8 v, float inverse, uint64_t row, uin
     }
 }
 
-// The `gate` launch of every entry: workgroup (head, row), one subgroup,
-// gates the row's head from the raw outputs (`recurrent_raw`: a row no slot
-// covers from zeros, which the advance never stores). With `lanes` (the step
-// to 8 rows), W / 8 lanes each own eight columns, sum their squares in
-// column order, and a butterfly over the lanes gives the head's sum: the
-// order of the projection GEMV's staging. Otherwise lanes stride the columns and the
-// workgroup sums them: the order of its staging launch.
+// The `gate` launch of every entry: workgroup (head, pair of rows), each
+// logical subgroup gating one row's head from the raw outputs
+// (`recurrent_raw`: a row no slot covers from zeros, which the advance never
+// stores). A hardware subgroup whose rows are all past M leaves; a logical
+// subgroup past M on a 64-lane one gates row M - 1 again and stores nothing.
+// With `lanes` (the step to 8 rows), W / 8 lanes each own eight columns, sum
+// their squares in column order, and a butterfly over the lanes (zeros past
+// the W / 8 owners up to the next power of two) gives the head's sum: the
+// order of the projection GEMV's staging. Otherwise lanes stride the columns
+// and the subgroup sums them: the order of its staging launch.
 void recurrent_gate(const bool lanes) {
     const recurrent_inputs in_ = recurrent_inputs_of();
     const uint64_t mixed = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIXED);
     const uint head = gl_WorkGroupID.x, W = RECURRENT_W, lane = SEISMIC_LANE;
-    const uint64_t row = gl_WorkGroupID.y;
+    const uint64_t paired = uint64_t(gl_WorkGroupID.y) * 2ul + uint64_t(SEISMIC_SUBGROUP);
+    bool live;
+    if (!seismic_steer(live, paired < SEISMIC_DIM_M))
+        return;
+    const uint64_t row = live ? paired : SEISMIC_DIM_M - 1ul;
     const int covered = versions_covered_end();
     const float eps = element_word_f32(SEISMIC_PARAM_EPSILON);
     if (lanes) {
-        // Lanes past W / 8 repeat the first W / 8, so every lane of a
-        // butterfly group takes part; they store nothing.
-        const uint i = 8u * (lane % (W / 8u));
+        // The butterfly runs over the power-of-two group of lanes holding
+        // the W / 8 owners (W / 8 itself when it is a power of two). Lanes
+        // past the owners read an owner's columns, so every address lies in
+        // the row, but add zero and store nothing: W / 8 = 12 (W = 96) would
+        // otherwise count columns 0..31 twice through lanes 12..15.
+        const uint owners = W / 8u;
+        const uint group = 1u << uint(findMSB(owners - 1u) + 1);
+        const uint i = 8u * (lane % owners);
         const recurrent_gated8 v = recurrent_gated_inputs8(in_, mixed, covered, row, head, i);
         float squares = 0.0;
         [[unroll]] for (uint j = 0u; j < 4u; ++j) {
             squares = seismic_fma_rn(v.me[j], v.me[j], squares);
             squares = seismic_fma_rn(v.mo[j], v.mo[j], squares);
         }
-        for (uint offset = 1u; offset < W / 8u; offset <<= 1)
+        squares = lane < owners ? squares : 0.0;
+        for (uint offset = 1u; offset < group; offset <<= 1)
             squares += subgroupShuffleXor(squares, offset);
-        if (lane < W / 8u)
+        if (live && lane < owners)
             recurrent_store_gated8(v, inversesqrt(seismic_div_rn(squares, float(W)) + eps), row, head, i);
         return;
     }
+    // W is a multiple of 32: every lane takes W / 32 columns.
     float squares = 0.0;
-    for (uint i = lane; i < W; i += 32u) {
-        const float v = recurrent_raw(mixed, covered, row, head, i);
+    for (uint c = 0u; c < W / 32u; ++c) {
+        const float v = recurrent_raw(mixed, covered, row, head, lane + 32u * c);
         squares = seismic_fma_rn(v, v, squares);
     }
-    squares = reduce_group_sum(squares, 0u);
+    squares = seismic_subgroup_sum_f32(squares);
     const float inverse = inversesqrt(seismic_div_rn(squares, float(W)) + eps);
-    for (uint i = 8u * lane; i < W; i += 8u * 32u)
-        recurrent_store_gated8(recurrent_gated_inputs8(in_, mixed, covered, row, head, i), inverse, row, head, i);
+    if (live)
+        for (uint i = 8u * lane; i < W; i += 8u * 32u)
+            recurrent_store_gated8(recurrent_gated_inputs8(in_, mixed, covered, row, head, i), inverse, row, head, i);
 }

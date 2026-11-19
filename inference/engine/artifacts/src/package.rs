@@ -85,7 +85,11 @@ struct HeaderComponent {
 
 impl HeaderComponent {
     fn inspect(path: &Path, headers: &dyn HeaderSource) -> Result<Self, Error> {
-        let (directory, files) = gguf::inspect_component_header(path, headers)?;
+        Self::inspect_shards(&[path.to_path_buf()], headers)
+    }
+
+    fn inspect_shards(paths: &[PathBuf], headers: &dyn HeaderSource) -> Result<Self, Error> {
+        let (directory, files) = gguf::inspect_component_headers(paths, headers)?;
         Ok(Self {
             directory,
             files: files
@@ -118,15 +122,48 @@ impl PackageHeaders {
         projector: Option<&Path>,
         headers: &dyn HeaderSource,
     ) -> Result<Self, Error> {
-        let target_path = target.as_ref();
-        if let Some(projector_path) = projector {
-            if target_path.canonicalize()? == projector_path.canonicalize()? {
-                return Err(Error::Invalid(
-                    "target and projector must be distinct package components".into(),
-                ));
+        Self::open_shards_from(&[target.as_ref().to_path_buf()], projector, headers)
+    }
+
+    /// Inspect a target's headers from its explicit shard paths (in shard
+    /// order) and an optional explicit projector header. No tensor payload is
+    /// read or required to exist.
+    pub fn open_shards(
+        target_shards: &[PathBuf],
+        projector: Option<&Path>,
+    ) -> Result<Self, Error> {
+        Self::open_shards_from(target_shards, projector, &FileHeaders)
+    }
+
+    /// [`Self::open_shards`] with headers from `headers`.
+    pub fn open_shards_from(
+        target_shards: &[PathBuf],
+        projector: Option<&Path>,
+        headers: &dyn HeaderSource,
+    ) -> Result<Self, Error> {
+        if target_shards.is_empty() {
+            return Err(Error::Invalid("split GGUF has no shards".into()));
+        }
+        let canonical_projector = projector.map(Path::canonicalize).transpose()?;
+        if let Some(canonical_projector) = &canonical_projector {
+            for shard in target_shards {
+                if shard.canonicalize()? == *canonical_projector {
+                    return Err(Error::Invalid(
+                        "target and projector must be distinct package components".into(),
+                    ));
+                }
             }
         }
-        let target = HeaderComponent::inspect(target_path, headers)?;
+        let target = HeaderComponent::inspect_shards(target_shards, headers)?;
+        if let Some(canonical_projector) = &canonical_projector {
+            for file in &target.files {
+                if file.path.canonicalize()? == *canonical_projector {
+                    return Err(Error::Invalid(
+                        "target and projector must be distinct package components".into(),
+                    ));
+                }
+            }
+        }
         let projector = projector
             .map(|projector| HeaderComponent::inspect(projector, headers))
             .transpose()?;
@@ -243,13 +280,84 @@ impl Package {
         Self::open_paths(target.as_ref(), Some(projector.as_ref()))
     }
 
+    /// Opens a target from its explicit shard paths (in shard order) with an
+    /// optional explicit projector component.
+    pub fn open_target_shards(
+        target_shards: &[PathBuf],
+        projector: Option<&Path>,
+    ) -> Result<Self, Error> {
+        let first = target_shards
+            .first()
+            .ok_or_else(|| Error::Invalid("split GGUF has no shards".into()))?;
+        if let Some(projector_path) = projector {
+            let canonical_projector = projector_path.canonicalize()?;
+            for shard in target_shards {
+                if shard.canonicalize()? == canonical_projector {
+                    return Err(Error::Invalid(
+                        "target and projector must be distinct package components".into(),
+                    ));
+                }
+            }
+        }
+        let target = GgufArtifact::open_shards(target_shards)?;
+        let projector = projector.map(GgufArtifact::open).transpose()?;
+        if let Some(projector) = &projector {
+            for target in target.sources() {
+                for projector in projector.sources() {
+                    if same_file(target, projector)? {
+                        return Err(Error::Invalid(
+                            "target and projector must be distinct package components".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        let identity = PackageIdentity {
+            target: target.identity(),
+            projector: projector.as_ref().map(GgufArtifact::identity),
+        };
+        let store = model_store(first)?;
+        let tokenizer = TokenizerPayload::from_directory(target.directory());
+        let templates = TemplatePayload::from_directory(
+            target.directory(),
+            &component_files(&target)[0].path.display().to_string(),
+        )?;
+        Ok(Self {
+            target,
+            store,
+            projector,
+            draft: None,
+            identity,
+            tokenizer,
+            templates,
+        })
+    }
+
+    /// Opens a target from its explicit shard paths (in shard order) and
+    /// discovers an unambiguous `mmproj-*.gguf` sibling beside the first shard.
+    pub fn open_target_shards_discovering_projector(
+        target_shards: &[PathBuf],
+    ) -> Result<Self, Error> {
+        let first = target_shards
+            .first()
+            .ok_or_else(|| Error::Invalid("split GGUF has no shards".into()))?;
+        let projector = discover_projector(first)?;
+        Self::open_target_shards(target_shards, projector.as_deref())
+    }
+
     /// Opens exactly the package a host admitted, in another process: each
     /// component must still have the admitted size and tensor directory, and
     /// the opened package carries the host's identities so both sides name
     /// the same package.
     pub fn open_manifest(manifest: &PackageManifest) -> Result<Self, Error> {
-        let mut package = Self::open_paths(
-            manifest.target.path(),
+        let target_shards: Vec<PathBuf> = manifest
+            .target
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        let mut package = Self::open_target_shards(
+            &target_shards,
             manifest.projector.as_ref().map(ComponentManifest::path),
         )?;
         let admitted = |artifact: &mut GgufArtifact, component: &ComponentManifest| {
@@ -304,45 +412,7 @@ impl Package {
     }
 
     fn open_paths(target_path: &Path, projector_path: Option<&Path>) -> Result<Self, Error> {
-        if let Some(projector_path) = projector_path {
-            if target_path.canonicalize()? == projector_path.canonicalize()? {
-                return Err(Error::Invalid(
-                    "target and projector must be distinct package components".into(),
-                ));
-            }
-        }
-        let target = GgufArtifact::open(target_path)?;
-        let projector = projector_path.map(GgufArtifact::open).transpose()?;
-        if let Some(projector) = &projector {
-            for target in target.sources() {
-                for projector in projector.sources() {
-                    if same_file(target, projector)? {
-                        return Err(Error::Invalid(
-                            "target and projector must be distinct package components".into(),
-                        ));
-                    }
-                }
-            }
-        }
-        let identity = PackageIdentity {
-            target: target.identity(),
-            projector: projector.as_ref().map(GgufArtifact::identity),
-        };
-        let store = model_store(target_path)?;
-        let tokenizer = TokenizerPayload::from_directory(target.directory());
-        let templates = TemplatePayload::from_directory(
-            target.directory(),
-            &component_files(&target)[0].path.display().to_string(),
-        )?;
-        Ok(Self {
-            target,
-            store,
-            projector,
-            draft: None,
-            identity,
-            tokenizer,
-            templates,
-        })
+        Self::open_target_shards(&[target_path.to_path_buf()], projector_path)
     }
 
     pub fn target(&self) -> &GgufArtifact {
@@ -459,12 +529,155 @@ fn discover_projector(target: &Path) -> Result<Option<PathBuf>, Error> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::model_store;
+    use super::{Package, PackageHeaders};
+    use crate::gguf::{Encoding, Metadata, Scalar, StoredHeader, StoredMetadata, StoredType, Value, ValueType};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temporary_directory(tag: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "magnitude-package-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_shard(
+        path: &Path,
+        split_no: u64,
+        split_count: u64,
+        split_tensors: Option<u64>,
+        name: Option<&str>,
+        tensors: &[(&str, Vec<u64>, Encoding)],
+        fill: u8,
+    ) -> PathBuf {
+        let mut metadata = vec![
+            StoredMetadata {
+                metadata: Metadata {
+                    name: "split.no".into(),
+                    value: Value::Scalar(Scalar::Unsigned(split_no)),
+                },
+                stored: StoredType::Scalar(ValueType::U16),
+            },
+            StoredMetadata {
+                metadata: Metadata {
+                    name: "split.count".into(),
+                    value: Value::Scalar(Scalar::Unsigned(split_count)),
+                },
+                stored: StoredType::Scalar(ValueType::U16),
+            },
+        ];
+        if let Some(count) = split_tensors {
+            metadata.push(StoredMetadata {
+                metadata: Metadata {
+                    name: "split.tensors.count".into(),
+                    value: Value::Scalar(Scalar::Unsigned(count)),
+                },
+                stored: StoredType::Scalar(ValueType::U32),
+            });
+        }
+        if let Some(name) = name {
+            metadata.push(StoredMetadata {
+                metadata: Metadata {
+                    name: "general.name".into(),
+                    value: Value::Scalar(Scalar::String(name.into())),
+                },
+                stored: StoredType::Scalar(ValueType::String),
+            });
+        }
+        let header = StoredHeader::new(
+            3,
+            metadata,
+            tensors
+                .iter()
+                .map(|(name, shape, encoding)| ((*name).to_owned(), shape.clone(), *encoding)),
+        )
+        .unwrap();
+        let mut bytes = header.encode().unwrap();
+        let alignment = header.alignment().unwrap();
+        let data_offset = bytes.len() as u64;
+        for tensor in &header.tensors {
+            let start = (data_offset + tensor.offset) as usize;
+            if bytes.len() < start {
+                bytes.resize(start, 0);
+            }
+            bytes.resize(start + tensor.nbytes as usize, fill);
+        }
+        let end = (bytes.len() as u64).next_multiple_of(alignment) as usize;
+        bytes.resize(end, 0);
+        std::fs::write(path, bytes).unwrap();
+        path.to_path_buf()
+    }
+
+    #[test]
+    fn open_shards_and_open_manifest_support_cross_directory_non_standard_splits() {
+        let root = temporary_directory("cross-dir-split");
+        let sub = root.join("Q4_K_M");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let shard0 = write_shard(
+            &sub.join("model-00001-of-00003.gguf"),
+            0,
+            3,
+            Some(2),
+            Some("cross-dir-split"),
+            &[],
+            0,
+        );
+        let shard1 = write_shard(
+            &sub.join("model-00002-of-00003.gguf"),
+            1,
+            3,
+            None,
+            None,
+            &[("first", vec![2, 256], Encoding::Q4K)],
+            0x33,
+        );
+        let shard2 = write_shard(
+            &root.join("shared-non-standard-shard.gguf"),
+            2,
+            3,
+            None,
+            None,
+            &[("second", vec![3, 32], Encoding::Q8_0)],
+            0x44,
+        );
+        let shards = vec![shard0, shard1, shard2];
+
+        let headers = PackageHeaders::open_shards(&shards, None).unwrap();
+        let header_manifest = headers.manifest();
+        assert_eq!(header_manifest.target.files.len(), 3);
+        assert_eq!(header_manifest.target.tensors.len(), 2);
+
+        let package = Package::open_target_shards(&shards, None).unwrap();
+        let manifest = package.manifest();
+        assert_eq!(manifest.target.files.len(), 3);
+        assert_eq!(manifest.target.files, header_manifest.target.files);
+        assert_eq!(manifest.target.tensors, header_manifest.target.tensors);
+
+        let reopened = Package::open_manifest(&manifest).unwrap();
+        assert_eq!(reopened.identity(), package.identity());
+        assert_eq!(reopened.manifest(), manifest);
+        assert_eq!(
+            reopened.target().tensor("first").unwrap().read().unwrap(),
+            vec![0x33; 288]
+        );
+        assert_eq!(
+            reopened.target().tensor("second").unwrap().read().unwrap(),
+            vec![0x44; 102]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// A snapshot's link into a blob store in another directory is stored
     /// where the blob lies, not where the link does.
+    #[cfg(unix)]
     #[test]
     fn a_linked_target_is_stored_where_its_file_lies() {
         let root = std::env::temp_dir().join(format!("model-store-{}", std::process::id()));
@@ -474,7 +687,7 @@ mod tests {
         std::fs::write(blobs.join("sha256-model"), b"GGUF").unwrap();
         let link = snapshot.join("model.gguf");
         std::os::unix::fs::symlink(blobs.join("sha256-model"), &link).unwrap();
-        let stored = model_store(&link);
+        let stored = super::model_store(&link);
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(stored.unwrap(), blobs.canonicalize().unwrap_or(blobs));
     }

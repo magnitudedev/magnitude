@@ -22,15 +22,17 @@ void corrector_features() {
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t row = gl_WorkGroupID.x;
     const uint64_t count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
-    const uint64_t lane = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    // Numbered by `SEISMIC_THREAD`: the partials reach the reductions, and
+    // the candidates' group memory is read beside theirs.
+    const uint64_t lane = SEISMIC_THREAD, threads = gl_WorkGroupSize.x;
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
 
     float local = -uintBitsToFloat(0x7f800000u);
-    for (uint64_t v = lane; v < SEISMIC_DIM_V; v += threads)
+    seismic_strided(uint64_t, v, lane, SEISMIC_DIM_V, threads)
         local = max(local, element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + v * SEISMIC_LOGITS_STRIDE_1) * 4ul));
     const float maximum = reduce_group_max(local, 0u);
     float partial = 0.0;
-    for (uint64_t v = lane; v < SEISMIC_DIM_V; v += threads)
+    seismic_strided(uint64_t, v, lane, SEISMIC_DIM_V, threads)
         partial += exp(element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + v * SEISMIC_LOGITS_STRIDE_1) * 4ul)
             - maximum);
     const float normalizer = maximum + log(reduce_group_sum(partial, 0u));
@@ -61,7 +63,7 @@ void corrector_features() {
     }
     barrier();
 
-    for (seismic_walk at = seismic_walk_begin(gl_LocalInvocationIndex, gl_WorkGroupSize.x, count * width,
+    for (seismic_walk at = seismic_walk_begin(uint(lane), gl_WorkGroupSize.x, count * width,
                 u64vec3(1ul, 1ul, width));
             at.index < count * width; seismic_walk_next(at)) {
         const uint64_t rank = at.axes.x, column = at.axes.w;

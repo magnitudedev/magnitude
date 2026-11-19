@@ -201,19 +201,20 @@ projection_weights vision_weights(uint64_t base, packets_rows16 rows, uint k) {
 // Norm of one F32 row of `width` values by the whole workgroup: `norm_*`'s
 // two-pass statistics, centered (a layer norm) or not (the mean taken as 0, a
 // root-mean-square norm), out[i * stride] = Y(centered * inverse [* weight]
-// [+ bias]). Shared: one float per subgroup at float 0.
+// [+ bias]), the statistics spread by `SEISMIC_THREAD`, as their group sums
+// need. Shared: one float per subgroup at float 0.
 void vision_row_norm(uint64_t x, Out out_, uint64_t stride, const bool weighted, uint64_t weight,
     const int weight_kind, const bool biased, uint64_t bias, const int bias_kind, uint width, bool centered,
     float epsilon, int activation) {
     float mean = 0.0;
     if (centered) {
         float sum = 0.0;
-        for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x)
+        seismic_strided(uint, i, SEISMIC_THREAD, width, gl_WorkGroupSize.x)
             sum += element_f32_at(x + uint64_t(i) * 4ul);
         mean = norm_mean(reduce_group_sum(sum, 0u), width);
     }
     float squares = 0.0;
-    for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x)
+    seismic_strided(uint, i, SEISMIC_THREAD, width, gl_WorkGroupSize.x)
         squares = norm_square(element_f32_at(x + uint64_t(i) * 4ul) - mean, squares);
     const float inverse = norm_inverse(reduce_group_sum(squares, 0u), width, epsilon);
     for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x) {
@@ -238,19 +239,27 @@ float vision_head_value(const int act, uint64_t source, bool normed, uint64_t no
     return normed ? (norm != 0ul ? x * inverse * element_f32_at(norm + uint64_t(i) * 4ul) : x * inverse) : x;
 }
 
-void vision_prepare_head(const int act, uint64_t source, uint64_t target, bool normed, uint64_t norm, float epsilon,
-    bool rotated, uint64_t coordinates, float log_base, const uint w, const uint wp) {
+void vision_prepare_head(const int act, uint64_t source, uint64_t target, bool live, bool normed, uint64_t norm,
+    float epsilon, bool rotated, uint64_t coordinates, float log_base, const uint w, const uint wp) {
     const uint lane = SEISMIC_LANE;
     const uint p = w / 4u;
     float inverse = 1.0;
-    if (normed) {
+    // The norm's sum is taken wherever a hardware subgroup holds a normed
+    // row (its two logical subgroups on 64 lanes may hold rows of different
+    // planes); a row without one keeps 1.
+    bool summing;
+    if (seismic_steer(summing, normed)) {
         float squares = 0.0;
-        for (uint i = lane; i < w; i += 32u) {
+        seismic_strided(uint, i, lane, w, 32u) {
             const float x = element_at(act, source, i);
             squares += x * x;
         }
-        inverse = inversesqrt(seismic_div_rn(seismic_subgroup_sum_f32(squares), float(w)) + epsilon);
+        const float total = seismic_subgroup_sum_f32(squares);
+        if (summing)
+            inverse = inversesqrt(seismic_div_rn(total, float(w)) + epsilon);
     }
+    if (!live)
+        return;
     for (uint i = lane; i < w; i += 32u) {
         float x = vision_head_value(act, source, normed, norm, inverse, i);
         if (rotated) {

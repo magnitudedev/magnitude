@@ -53,7 +53,7 @@ bool topk_picked(bool prefix, uint limit, uint threshold, uint take, uint ordina
 
 void rows_topk() {
     const uint64_t row = gl_WorkGroupID.x;
-    const uint thread = SEISMIC_SUBGROUP * 32u + SEISMIC_LANE;
+    const uint thread = SEISMIC_THREAD;
     const uint n = uint(SEISMIC_DIM_N);
     const uint k = uint(SEISMIC_DIM_K);
     const uint r = uint(SEISMIC_DIM_R);
@@ -66,6 +66,15 @@ void rows_topk() {
     const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
     const uint64_t result_stride = SEISMIC_RESULT_0_STRIDE_1 * 4ul;
     uint total = 0u;
+
+    // The select's first bins and state, here so that no group-memory store
+    // follows a scan's reads before a barrier: every invocation reads the
+    // listed rows alike.
+    seismic_shared_u32[TOPK_BINS + thread] = 0u;
+    if (thread == 0u) {
+        seismic_shared_u32[TOPK_STATE] = 0u;
+        seismic_shared_u32[TOPK_STATE + 1u] = k;
+    }
 
     // The row's listed rows: its spans' lengths, summed over chunks of 256.
     uint listed = 0u;
@@ -86,13 +95,8 @@ void rows_topk() {
     uint threshold = 0u;
     uint take = 0u;
     if (!prefix) {
-        if (thread == 0u) {
-            seismic_shared_u32[TOPK_STATE] = 0u;
-            seismic_shared_u32[TOPK_STATE + 1u] = k;
-        }
         uint mask = 0u;
         for (int digit = 3; digit >= 0; --digit) {
-            seismic_shared_u32[TOPK_BINS + thread] = 0u;
             barrier();
             const uint prefix_bits = seismic_shared_u32[TOPK_STATE];
             const uint remaining = seismic_shared_u32[TOPK_STATE + 1u];
@@ -104,11 +108,17 @@ void rows_topk() {
                 const uint value = (u >> shift) & 255u;
                 // One atomic per distinct digit of the subgroup: the first
                 // pending lane's digit, counted over the lanes holding it.
-                for (uint lanes = reduce_lanes_ballot(pending); lanes != 0u; lanes = reduce_lanes_ballot(pending)) {
-                    const uint leader = uint(findLSB(lanes));
+                // The rounds are steered while any lane of the hardware
+                // subgroup is pending, so its logical subgroups (two on
+                // 64-lane hardware) leave together; one with none pending
+                // adds nothing.
+                bool counting;
+                for (uint lanes = seismic_ballot(pending); seismic_steer(counting, lanes != 0u);
+                        lanes = seismic_ballot(pending)) {
+                    const uint leader = counting ? uint(findLSB(lanes)) : 0u;
                     const uint chosen = seismic_shuffle(value, leader);
-                    const uint holding = reduce_lanes_ballot(pending && value == chosen);
-                    if (SEISMIC_LANE == leader)
+                    const uint holding = seismic_ballot(pending && value == chosen);
+                    if (counting && SEISMIC_LANE == leader)
                         atomicAdd(seismic_shared_u32[TOPK_BINS + chosen], uint(bitCount(holding)));
                     pending = pending && value != chosen;
                 }
@@ -126,9 +136,11 @@ void rows_topk() {
                 seismic_shared_u32[TOPK_STATE] = prefix_bits | (bin << shift);
                 seismic_shared_u32[TOPK_STATE + 1u] = remaining - above;
             }
+            // The next pass's bins, read past this one's.
+            seismic_shared_u32[TOPK_BINS + thread] = 0u;
             mask |= 255u << shift;
-            barrier();
         }
+        barrier();
         threshold = seismic_shared_u32[TOPK_STATE];
         take = seismic_shared_u32[TOPK_STATE + 1u];
     }
@@ -137,16 +149,20 @@ void rows_topk() {
     const uint share = (scored + TOPK_THREADS - 1u) / TOPK_THREADS;
     const uint lo = min(thread * share, scored);
     const uint hi = min(lo + share, scored);
-    // The rank among the ordinals equal to T of the share's first.
+    // The rank among the ordinals equal to T of the share's first. Every
+    // invocation runs `share` rounds, one past its share's end counting
+    // nothing.
     uint equal = 0u;
     if (!prefix)
-        for (uint ordinal = lo; ordinal < hi; ++ordinal)
-            equal += topk_key(ordinal) == threshold ? 1u : 0u;
+        for (uint i = 0u; i < share; ++i)
+            if (lo + i < hi)
+                equal += topk_key(lo + i) == threshold ? 1u : 0u;
     const uint first_rank = reduce_group_exclusive_add(equal, TOPK_SCAN, total);
     uint picks = 0u;
     uint rank = first_rank;
-    for (uint ordinal = lo; ordinal < hi; ++ordinal)
-        picks += topk_picked(prefix, limit, threshold, take, ordinal, rank) ? 1u : 0u;
+    for (uint i = 0u; i < share; ++i)
+        if (lo + i < hi)
+            picks += topk_picked(prefix, limit, threshold, take, lo + i, rank) ? 1u : 0u;
     uint placed;
     uint position = reduce_group_exclusive_add(picks, TOPK_SCAN, placed);
     // The span holding `lo` and the listed rows before it: the last whose

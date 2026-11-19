@@ -23,8 +23,9 @@ void state_space_gate() {
     const uint64_t row = gl_WorkGroupID.x;
     const uint64_t width = SEISMIC_DIM_U * SEISMIC_DIM_P;
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    // Spread by `SEISMIC_THREAD`, as the subgroup sums need.
     float squares = 0.0;
-    for (uint64_t column = gl_LocalInvocationIndex; column < width; column += gl_WorkGroupSize.x) {
+    seismic_strided(uint64_t, column, SEISMIC_THREAD, width, gl_WorkGroupSize.x) {
         uint64_t head, within;
         seismic_split(uint(column), SEISMIC_DIM_P, head, within);
         const float value = ssg_gated_value(row, uint64_t(gl_WorkGroupID.y) * SEISMIC_DIM_U + head, within);

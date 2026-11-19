@@ -513,6 +513,23 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it_on_vulkan(
     every_target_is_placed_whole_wherever_the_resident_planner_fits_it(BackendName::Vulkan);
 }
 
+/// LFM2.5 8B-A1B q4 on the discrete Metal fixture (an Intel Mac's AMD GPU: its own memory under the
+/// recommended working set, host-mapped storage in host RAM), at the service's limits: planned and placed
+/// without breaking an invariant, whole and fitting wherever the resident-only planner's charge fits,
+/// and assessed as the load planner places it. One row of the Metal sweep, for the one fixture whose
+/// placement is split between two memories.
+#[test]
+fn lfm2_5_8b_on_a_discrete_metal_gpu_is_placed_as_the_resident_planner_fits_it() {
+    let target = super::catalog::artifact_target("lfm2.5-8b-a1b-q4");
+    let topology = recorded::m4_pro_without_unified_memory();
+    let status = unopened(&topology);
+    let executor = topology.executors().iter().find(|executor| executor.backend() == BackendName::Metal).unwrap();
+    let workload = Workload { label: "service", context: SERVED_FLOOR, limits: service(BackendName::Metal, &target.1) };
+    let row = row(&target.0, &target.1, &target.2, "m4_pro_without_unified_memory", &topology, &status, executor, workload);
+    println!("{}", row.line);
+    assert!(!row.regression && !row.panicked && !row.diverged, "{}", row.line);
+}
+
 /// Qwen3.6 35B-A3B q4 with its catalog draft at 4,096 tokens, on the
 /// recorded M4 Pro's Metal and RTX 3090's CUDA at the service's limits, is
 /// placed as its assessment places it: its drafted plan's charge certifies

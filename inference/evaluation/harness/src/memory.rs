@@ -387,11 +387,7 @@ fn configured(
     release: ReleaseRate,
 ) -> Result<ResolvedEngineConfiguration, String> {
     EngineConfiguration {
-        package: PackageOptions {
-            target: target.to_path_buf(),
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+        package: PackageOptions::single(target.to_path_buf(), ProjectorSelection::Disabled, None),
         model: policy,
         context_tokens,
         service: standard_service_limits(),

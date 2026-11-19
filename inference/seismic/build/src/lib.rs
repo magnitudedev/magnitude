@@ -131,6 +131,10 @@ pub enum BuildError {
         path: PathBuf,
         reason: String,
     },
+    /// Every native source violation of the build, each one of the native
+    /// variants above, in the order the sources are checked: one build
+    /// names them all.
+    Natives(Vec<BuildError>),
 }
 
 impl std::fmt::Display for BuildError {
@@ -191,6 +195,13 @@ impl std::fmt::Display for BuildError {
             ),
             Self::CpuNative { path, reason } => {
                 write!(f, "CPU native source {}: {reason}", path.display())
+            }
+            Self::Natives(violations) => {
+                write!(f, "{} native source violations:", violations.len())?;
+                for violation in violations {
+                    write!(f, "\n  {violation}")?;
+                }
+                Ok(())
             }
         }
     }
@@ -289,7 +300,7 @@ mod internals {
         OwnerReach, element_reach, native_parameter_names, parameter_reach,
     };
     use std::collections::hash_map::Entry;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fmt;
     use std::fs;
 
@@ -426,6 +437,7 @@ mod internals {
         use seismic_lang::registry::BackendName;
         let mut natives = Vec::new();
         let mut boundary = Boundary::default();
+        let mut violations = Vec::new();
         for entry in module.entries() {
             let mut any = false;
             let mut tuned = false;
@@ -469,15 +481,21 @@ mod internals {
                 // Included files are validated against the including entry's
                 // ABI, exactly like the asset itself. The ABI is independent
                 // of the file, so build its symbol set once for this entry.
-                let allowed = native_abi_symbols(entry, definition, dialect, module.constants())?;
+                let allowed = match native_abi_symbols(entry, definition, dialect, module.constants()) {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        violations.push(error);
+                        continue;
+                    }
+                };
                 for file in std::iter::once(&files.asset).chain(&files.includes) {
-                    validate_native_abi(entry, &allowed, &file.path, &file.text)?;
-                    boundary.check(&file.path, &file.text)?;
-                    validate_reserved(entry, dialect, &file.path, &file.text)?;
+                    validate_native_abi(entry, &allowed, &file.path, &file.text, &mut violations);
+                    boundary.check(&file.path, &file.text, &mut violations);
+                    validate_reserved(entry, dialect, &file.path, &file.text, &mut violations);
                 }
                 match dialect {
-                    SourceDialect::Metal => validate_metal_buffer_slots(entry, definition)?,
-                    SourceDialect::Vulkan => validate_vulkan_kernels(entry, definition, source)?,
+                    SourceDialect::Metal => validate_metal_buffer_slots(entry, definition, &mut violations),
+                    SourceDialect::Vulkan => validate_vulkan_kernels(entry, definition, source, &mut violations),
                     SourceDialect::Cuda => {}
                 }
             }
@@ -489,6 +507,21 @@ mod internals {
                 });
             }
         }
+        // A library file every including entry checks breaks a reserved or
+        // boundary rule once, wherever it is included.
+        let mut reported = HashSet::new();
+        violations.retain(|violation| match violation {
+            BuildError::NativeReserved { path, line, column, construct, .. } => {
+                reported.insert((path.clone(), *line, *column, construct.clone()))
+            }
+            BuildError::LibraryBoundary { path, line, column, rule } => {
+                reported.insert((path.clone(), *line, *column, rule.clone()))
+            }
+            _ => true,
+        });
+        if !violations.is_empty() {
+            return Err(BuildError::Natives(violations));
+        }
         Ok(natives)
     }
 
@@ -499,7 +532,8 @@ mod internals {
         allowed: &HashMap<String, Visibility>,
         path: &std::path::Path,
         source: &str,
-    ) -> Result<(), BuildError> {
+        violations: &mut Vec<BuildError>,
+    ) {
         let failure = |offset: usize, symbol: &str| {
             let (line, column) = location(source, offset);
             BuildError::NativeAbi {
@@ -512,14 +546,13 @@ mod internals {
         };
         for (symbol, offset) in seismic_identifiers(source) {
             match allowed.get(symbol) {
-                None => return Err(failure(offset, symbol)),
+                None => violations.push(failure(offset, symbol)),
                 Some(Visibility::Surface) => {}
                 Some(Visibility::Library) => {
-                    return Err(boundary_violation(path, source, offset, Rule::LibrarySymbol(symbol.to_owned())));
+                    violations.push(boundary_violation(path, source, offset, Rule::LibrarySymbol(symbol.to_owned())));
                 }
             }
         }
-        Ok(())
     }
 
     /// Metal's argument table holds 31 buffers. The native ABI binds every
@@ -530,7 +563,8 @@ mod internals {
     fn validate_metal_buffer_slots(
         entry: &EntryInfo,
         definition: &NativeImplementation,
-    ) -> Result<(), BuildError> {
+        violations: &mut Vec<BuildError>,
+    ) {
         let tensors = entry
             .parameters
             .iter()
@@ -546,13 +580,12 @@ mod internals {
                 .count();
         let slots = tensors + definition.scratch.len() + 2;
         if slots > METAL_BUFFER_SLOTS {
-            return Err(BuildError::MetalBufferSlots {
+            violations.push(BuildError::MetalBufferSlots {
                 entry: entry.name.clone(),
                 slots,
                 limit: METAL_BUFFER_SLOTS,
             });
         }
-        Ok(())
     }
 
     /// Metal's per-stage buffer argument table size.
@@ -565,8 +598,12 @@ mod internals {
 
     /// Identifiers a Vulkan asset may not use, with why: the prefix and
     /// suffix own the workgroup size, push constants, group memory and
-    /// `main`; float subgroup sums have an implementation-defined order.
-    const VULKAN_RESERVED_IDENTIFIERS: [(&str, &str); 13] = [
+    /// `main`, and the device library owns the reconvergence mode.
+    const VULKAN_RESERVED_IDENTIFIERS: [(&str, &str); 10] = [
+        (
+            "SEISMIC_HAS_MAXIMAL_RECONVERGENCE",
+            "the device library's `seismic_strided*` loops and `seismic_rejoin` own the reconvergence mode",
+        ),
         ("local_size_x", "the workgroup size is generated"),
         ("local_size_y", "the workgroup size is generated"),
         ("local_size_z", "the workgroup size is generated"),
@@ -582,14 +619,124 @@ mod internals {
             "group memory is the generated `seismic_shared_*` views of `shared_bytes`",
         ),
         ("main", "`main` is generated and calls the launch's kernel"),
-        (
-            "subgroupAdd",
-            "float subgroup sums have no fixed order; use `seismic_subgroup_sum_f32` or `seismic_redux_add_*`",
-        ),
-        ("subgroupInclusiveAdd", "subgroup scans have no fixed order"),
-        ("subgroupExclusiveAdd", "subgroup scans have no fixed order"),
-        ("subgroupClusteredAdd", "clustered sums have no fixed order"),
     ];
+
+    /// Why a Vulkan asset may not use the subgroup built-in `identifier`, if
+    /// it may not. Kernels are written for the 32-lane logical subgroup,
+    /// which on 64-lane hardware is half the hardware subgroup; the device
+    /// library maps it to the hardware (`vulkan_prelude.glsl`). A built-in
+    /// that names hardware lanes or subgroups, or spans the hardware
+    /// subgroup, breaks that mapping on 64-lane hardware. Xor shuffles by a
+    /// mask below 32, up and down shuffles whose edge lanes are discarded,
+    /// and subgroup barriers stay within a logical subgroup on both widths.
+    fn vulkan_subgroup_rule(identifier: &str) -> Option<&'static str> {
+        if identifier.starts_with("gl_Subgroup") || identifier == "gl_NumSubgroups" {
+            return Some(
+                "it names hardware lanes or subgroups; use `SEISMIC_LANE`, `SEISMIC_SUBGROUP`, \
+                 `SEISMIC_SUBGROUPS`, `SEISMIC_THREAD` or `SEISMIC_HARDWARE_SUBGROUP`",
+            );
+        }
+        // GLSL's subgroup built-in functions, `subgroup` then a capital;
+        // kernels' own names are snake case.
+        let operation = identifier.strip_prefix("subgroup")?;
+        if !operation.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return None;
+        }
+        match operation {
+            "ShuffleXor" | "ShuffleUp" | "ShuffleDown" | "Barrier" | "MemoryBarrier"
+            | "MemoryBarrierBuffer" | "MemoryBarrierShared" | "MemoryBarrierImage" => None,
+            "Shuffle" => Some("its lane is a hardware lane; use `seismic_shuffle`"),
+            _ if operation.starts_with("Quad") => {
+                Some("quad operations are xor shuffles by a mask below 4 or `seismic_shuffle`")
+            }
+            _ => Some(
+                "it spans the hardware subgroup, both logical subgroups on 64-lane hardware; \
+                 use `seismic_subgroup_*`, `seismic_ballot`, `seismic_uniform_*`, `seismic_steer` or `seismic_hardware_first`",
+            ),
+        }
+    }
+
+    /// Why `identifier` at `offset` in a Vulkan asset breaks the steering form,
+    /// if it does. The hardware subgroup is steered only by `seismic_steer`
+    /// (`vulkan_prelude.glsl`), as the whole condition of an `if`, `while` or
+    /// `for`, so the logical subgroup's predicate it binds is the literal true
+    /// in a 32-lane module and a loop it steers exits at its header: steering
+    /// written otherwise (the 32-lane join called directly, an exit in a
+    /// loop's body) keeps the predicate and the exit in the module the 32-lane
+    /// driver compiles, which it does not fold away.
+    fn vulkan_steering_rule(source: &str, identifier: &str, offset: usize) -> Option<String> {
+        if identifier == "seismic_hardware_any" {
+            return Some("`seismic_hardware_any` is `seismic_steer`'s; steer by `seismic_steer`".to_owned());
+        }
+        if identifier != "seismic_steer" {
+            return None;
+        }
+        let whole = "`seismic_steer` is the whole condition of an `if`, `while` or `for`";
+        // The condition's opening parenthesis: the innermost one open at `offset`.
+        let before = &source[..offset];
+        let mut depth = 0usize;
+        let open = before.char_indices().rev().find_map(|(at, c)| match c {
+            ')' => {
+                depth += 1;
+                None
+            }
+            '(' if depth == 0 => Some(at),
+            '(' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        });
+        let Some(open) = open else {
+            return Some(whole.to_owned());
+        };
+        let keyword = source[..open].trim_end();
+        let keyword = &keyword[keyword
+            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .map_or(0, |at| at + 1)..];
+        let inside = source[open + 1..offset].trim();
+        let leading = match keyword {
+            "if" | "while" => inside.is_empty() || inside == "!",
+            // The condition: after the header's one `;` at its own depth.
+            "for" => {
+                inside.ends_with(';') && source[open + 1..offset].matches(';').count() == 1
+            }
+            _ => false,
+        };
+        // The call's closing parenthesis, and what follows it.
+        let mut depth = 0usize;
+        let close = source[offset..].char_indices().find_map(|(at, c)| match c {
+            '(' => {
+                depth += 1;
+                None
+            }
+            ')' if depth == 1 => Some(offset + at),
+            ')' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        })?;
+        let after = source[close + 1..].trim_start();
+        let trailing = match keyword {
+            "for" => after.starts_with(';'),
+            _ => after.starts_with(')'),
+        };
+        if !leading || !trailing {
+            return Some(whole.to_owned());
+        }
+        if keyword == "if" {
+            let body = after[1..].trim_start().trim_start_matches('{').trim_start();
+            if body.starts_with("break") || body.starts_with("continue") {
+                return Some(
+                    "a loop steered by `seismic_steer` exits at its header, `for (...; seismic_steer(live, p); ...)` \
+                     or `while (seismic_steer(live, p))`, not by a `break` or `continue` in its body"
+                        .to_owned(),
+                );
+            }
+        }
+        None
+    }
 
     /// Directives the prefix owns.
     const VULKAN_RESERVED_DIRECTIVES: [&str; 2] = ["version", "extension"];
@@ -605,13 +752,15 @@ mod internals {
 
     /// Refuses, in every dialect's authored sources, the constructs that would reach a floating
     /// result or mutated tensor other than through its owner handle, and in Vulkan the constructs
-    /// the generated prefix and suffix own. Each refusal names its rule.
+    /// the generated prefix and suffix own and the subgroup built-ins that break the logical
+    /// subgroup ([`vulkan_subgroup_rule`]). Each refusal names its rule.
     fn validate_reserved(
         entry: &EntryInfo,
         dialect: SourceDialect,
         path: &std::path::Path,
         source: &str,
-    ) -> Result<(), BuildError> {
+        violations: &mut Vec<BuildError>,
+    ) {
         let reserved = |offset: usize, construct: String| {
             let (line, column) = location(source, offset);
             BuildError::NativeReserved {
@@ -633,7 +782,7 @@ mod internals {
                         .next()
                         .unwrap_or("");
                     if VULKAN_RESERVED_DIRECTIVES.contains(&name) {
-                        return Err(reserved(
+                        violations.push(reserved(
                             offset + (line.len() - trimmed.len()),
                             format!("prefix-owned directive: `#{name}` is generated by the Vulkan prefix"),
                         ));
@@ -644,7 +793,7 @@ mod internals {
         }
         for (identifier, offset) in identifiers(source) {
             if let Some(rule) = owner_rule(dialect, source, identifier, offset) {
-                return Err(reserved(offset, rule));
+                violations.push(reserved(offset, rule));
             }
             if dialect != SourceDialect::Vulkan {
                 continue;
@@ -653,19 +802,27 @@ mod internals {
                 .iter()
                 .find(|(name, _)| *name == identifier)
             {
-                return Err(reserved(
+                violations.push(reserved(
                     offset,
                     format!("reserved identifier: `{identifier}` is reserved: {why}"),
                 ));
             }
+            if let Some(why) = vulkan_subgroup_rule(identifier) {
+                violations.push(reserved(
+                    offset,
+                    format!("logical subgroup: `{identifier}` is refused: {why}"),
+                ));
+            }
+            if let Some(why) = vulkan_steering_rule(source, identifier, offset) {
+                violations.push(reserved(offset, format!("hardware steering: {why}")));
+            }
             if matches!(identifier, "seismic_base" | "seismic_kind" | "seismic_table") {
-                return Err(reserved(
+                violations.push(reserved(
                     offset,
                     format!("handle field: `{identifier}` is a field of the element owner's handle"),
                 ));
             }
         }
-        Ok(())
     }
 
     /// The owner rule `identifier` at `offset` breaks, if any:
@@ -810,7 +967,8 @@ mod internals {
         entry: &EntryInfo,
         definition: &NativeImplementation,
         source: &str,
-    ) -> Result<(), BuildError> {
+        violations: &mut Vec<BuildError>,
+    ) {
         let tokens = identifiers(source);
         for launch in &definition.launches {
             let defined = tokens.windows(2).any(|pair| {
@@ -825,13 +983,12 @@ mod internals {
                         .is_some_and(|rest| rest.trim_start().starts_with(')'))
             });
             if !defined {
-                return Err(BuildError::NativeKernelMissing {
+                violations.push(BuildError::NativeKernelMissing {
                     entry: entry.name.clone(),
                     kernel: launch.kernel.clone(),
                 });
             }
         }
-        Ok(())
     }
 
     fn native_abi_symbols(
@@ -918,6 +1075,9 @@ mod internals {
             symbols.insert(format!("SEISMIC_SEGMENT_WEIGHTS_{segment}"));
             symbols.insert(format!("SEISMIC_SEGMENT_ORDERED_{segment}"));
         }
+        // The device library's names, surface like the names the ABI fixes:
+        // kernels spell them.
+        symbols.extend(library_symbols(dialect));
         match dialect {
             SourceDialect::Cuda => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
@@ -926,8 +1086,6 @@ mod internals {
                     "SEISMIC_PTR",
                     "SEISMIC_PTR_",
                     "SEISMIC_SCALAR_RESULTS",
-                    // Device library (`cuda_prelude.cuh`).
-                    "SEISMIC_PROGRAMMATIC_DEPENDENCY",
                     // Device facts.
                     "SEISMIC_MULTIPROCESSORS",
                 ] {
@@ -944,10 +1102,6 @@ mod internals {
                     "SEISMIC_SCALAR_RESULTS",
                     "SEISMIC_KERNEL",
                     "SEISMIC_SUBGROUP_LANES",
-                    "SEISMIC_LANE",
-                    "SEISMIC_LANE_BASE",
-                    "SEISMIC_SUBGROUP",
-                    "SEISMIC_SUBGROUPS",
                     "SEISMIC_HAS_FLOAT16",
                     "SEISMIC_HAS_MATRIX",
                     "SEISMIC_HAS_MATRIX_HARDWARE",
@@ -955,6 +1109,7 @@ mod internals {
                     "SEISMIC_HAS_MIXED_DOT",
                     "SEISMIC_HAS_F32_ATOMIC_ADD",
                     "SEISMIC_HAS_SHARED_INT64_ATOMICS",
+                    "SEISMIC_HAS_MAXIMAL_RECONVERGENCE",
                 ] {
                     symbols.insert(symbol.to_owned());
                 }
@@ -3074,6 +3229,28 @@ mod internals {
         output
     }
 
+    /// The device library every source of `dialect` is formed with, as the
+    /// runtime pastes it into the source's prefix. Metal has none: its one
+    /// library, the resident grid barrier, is pasted only beside a resident
+    /// launch, whose names are defined with it.
+    fn device_library(dialect: SourceDialect) -> &'static str {
+        match dialect {
+            SourceDialect::Cuda => include_str!("../../runtime/src/native/cuda_prelude.cuh"),
+            SourceDialect::Vulkan => include_str!("../../runtime/src/native/vulkan_prelude.glsl"),
+            SourceDialect::Metal => "",
+        }
+    }
+
+    /// The ABI names `dialect`'s device library defines (each `#define
+    /// SEISMIC_*` in it): read from the library, its one source.
+    fn library_symbols(dialect: SourceDialect) -> impl Iterator<Item = String> {
+        device_library(dialect).lines().filter_map(|line| {
+            let name = line.trim_start().strip_prefix("#define")?.trim_start();
+            let name = &name[..name.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(name.len())];
+            name.starts_with("SEISMIC_").then(|| name.to_owned())
+        })
+    }
+
     #[cfg(test)]
     mod visibility_tests {
         use super::*;
@@ -3157,7 +3334,7 @@ mod native_tests {
             .source(&source)
             .std(false)
             .out_dir(&output)
-            .run()
+            .run().map_err(first_violation)
             .expect("first build");
         let generated = fs::read_to_string(&first.bindings).expect("generated bindings");
         assert!(generated.contains("pub fn native_for_device"));
@@ -3170,10 +3347,19 @@ mod native_tests {
             .source(&source)
             .std(false)
             .out_dir(&output)
-            .run()
+            .run().map_err(first_violation)
             .expect("second build");
         assert_ne!(first.identity, second.identity);
         fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    /// The first violation a failed build names: the one each test below is
+    /// about, which the checks reach in the order they once stopped at.
+    fn first_violation(error: BuildError) -> BuildError {
+        match error {
+            BuildError::Natives(mut violations) => violations.remove(0),
+            other => other,
+        }
     }
 
     /// Build a one-entry module whose Vulkan asset is `asset`.
@@ -3198,7 +3384,7 @@ mod native_tests {
             .source(&source)
             .std(false)
             .out_dir(root.join("out"))
-            .run();
+            .run().map_err(first_violation);
         fs::remove_dir_all(&root).expect("remove fixture directory");
         result
     }
@@ -3242,11 +3428,6 @@ mod native_tests {
                 1,
             ),
             ("void scale() { Out o = Out(0ul, 0); }\n", "handle construction", 1),
-            (
-                "void scale() { float x = subgroupAdd(1.0); }\n",
-                "`subgroupAdd`",
-                1,
-            ),
         ] {
             match build_vulkan(asset) {
                 Err(BuildError::NativeReserved {
@@ -3272,6 +3453,84 @@ mod native_tests {
         ));
     }
 
+    /// A Vulkan asset names lanes and subgroups, and reduces, votes, ballots
+    /// and shuffles by absolute lane, only through the device library's
+    /// logical-subgroup helpers.
+    #[test]
+    fn vulkan_assets_keep_to_the_logical_subgroup() {
+        for identifier in [
+            "gl_SubgroupInvocationID",
+            "gl_SubgroupID",
+            "gl_SubgroupSize",
+            "gl_NumSubgroups",
+            "gl_SubgroupEqMask",
+            "subgroupElect",
+            "subgroupAll",
+            "subgroupAny",
+            "subgroupAllEqual",
+            "subgroupBroadcast",
+            "subgroupBroadcastFirst",
+            "subgroupBallot",
+            "subgroupBallotBitCount",
+            "subgroupAdd",
+            "subgroupMax",
+            "subgroupXor",
+            "subgroupInclusiveAdd",
+            "subgroupExclusiveMin",
+            "subgroupClusteredAdd",
+            "subgroupShuffle",
+            "subgroupQuadSwapHorizontal",
+        ] {
+            let asset = format!("void scale() {{\n    uint x = 0u;\n    x += uint({identifier});\n}}\n");
+            match build_vulkan(&asset) {
+                Err(BuildError::NativeReserved { construct, line, .. }) => {
+                    assert!(construct.contains(&format!("`{identifier}`")), "{construct}");
+                    assert_eq!(line, 3, "{identifier}");
+                }
+                other => panic!("{identifier}: expected a refusal, got {other:?}"),
+            }
+        }
+        build_vulkan(
+            "// gl_SubgroupID subgroupBallot\nvoid scale() {\n    const uint subgroup = SEISMIC_SUBGROUP;\n    \
+             uint x = subgroupShuffleXor(subgroup, 16u);\n    x += subgroupShuffleUp(x, 1u) + subgroupShuffleDown(x, 1u);\n    \
+             subgroupBarrier();\n    subgroupMemoryBarrierShared();\n    x += seismic_ballot(x != 0u);\n}\n",
+        )
+        .expect("xor, up and down shuffles, subgroup barriers, the library's helpers and comments are admitted");
+    }
+
+    /// A Vulkan asset steers the hardware subgroup only by `seismic_steer`, as
+    /// the whole condition of an `if`, `while` or `for`, with a steered loop
+    /// exiting at its header.
+    #[test]
+    fn vulkan_assets_steer_at_conditions() {
+        for (body, refused) in [
+            ("if (seismic_hardware_any(n > 0u)) x = 1u;", "`seismic_hardware_any` is `seismic_steer`'s"),
+            ("const bool any = seismic_steer(live, n > 0u);", "whole condition"),
+            ("if (seismic_steer(live, n > 0u) && x > 0u) x = 1u;", "whole condition"),
+            ("for (uint i = 0u; i < 4u && seismic_steer(live, i < n); ++i) x += i;", "whole condition"),
+            (
+                "for (uint i = 0u;; ++i) { if (!seismic_steer(live, i < n)) break; x += i; }",
+                "exits at its header",
+            ),
+            ("while (true) { if (!seismic_steer(live, x < n)) { continue; } x += 1u; }", "exits at its header"),
+        ] {
+            let asset = format!("void scale() {{\n    uint x = 0u;\n    bool live;\n    {body}\n}}\n");
+            match build_vulkan(&asset) {
+                Err(BuildError::NativeReserved { construct, line, .. }) => {
+                    assert!(construct.contains(refused), "{body}: {construct}");
+                    assert_eq!(line, 4, "{body}");
+                }
+                other => panic!("{body}: expected a refusal, got {other:?}"),
+            }
+        }
+        build_vulkan(
+            "void scale() {\n    uint x = 0u;\n    bool live;\n    if (!seismic_steer(live, n > 0u))\n        return;\n    \
+             if (seismic_steer(live, x < n)) x = 1u;\n    while (seismic_steer(live, x < n)) x += 1u;\n    \
+             for (uint i = min(x, 2u); seismic_steer(live, i < n); ++i) x += live ? i : 0u;\n}\n",
+        )
+        .expect("`seismic_steer` as an `if`, `while` or `for` condition is admitted");
+    }
+
     #[test]
     fn vulkan_launches_name_defined_kernels() {
         match build_vulkan("void scaled() {}\nvoid other(uint x) {}\n") {
@@ -3282,6 +3541,33 @@ mod native_tests {
         }
         build_vulkan("void helper() {}\n\nvoid scale ( ) {\n    helper();\n}\n")
             .expect("the kernel is defined");
+    }
+
+    #[test]
+    fn one_build_names_every_native_violation() {
+        let asset = "void scaled() { uint64_t w = SEISMIC_BUFFER_WORDS; }\nshared float staging[64];\n";
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let root = std::env::temp_dir().join(format!("seismic-native-violations-{}-{unique}", std::process::id()));
+        fs::create_dir_all(root.join("vulkan")).expect("fixture directories");
+        let source = root.join("ops.seismic");
+        fs::write(&source, "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for vulkan from \"vulkan/scale.comp\":\n    launch scale:\n        threadgroups (ceil_div(N, 64), 1, 1)\n        threads_per_threadgroup (64, 1, 1)\n").expect("Seismic fixture");
+        fs::write(root.join("vulkan/scale.comp"), asset).expect("Vulkan fixture");
+        let result = Build::new("fixture").source(&source).std(false).out_dir(root.join("out")).run();
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+        match result {
+            Err(BuildError::Natives(violations)) => assert!(
+                matches!(
+                    violations.as_slice(),
+                    [
+                        BuildError::NativeAbi { symbol, .. },
+                        BuildError::NativeReserved { line: 2, .. },
+                        BuildError::NativeKernelMissing { kernel, .. },
+                    ] if symbol == "SEISMIC_BUFFER_WORDS" && kernel == "scale"
+                ),
+                "{violations:?}"
+            ),
+            other => panic!("expected every violation, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3313,7 +3599,7 @@ mod native_tests {
             .source(&source)
             .std(false)
             .out_dir(&output)
-            .run()
+            .run().map_err(first_violation)
             .expect_err("unknown entry ABI symbol must fail the consumer build");
         match error {
             BuildError::NativeAbi {
@@ -3346,7 +3632,7 @@ mod native_tests {
             .source(&source)
             .std(false)
             .out_dir(root.join("out"))
-            .run();
+            .run().map_err(first_violation);
         fs::remove_dir_all(&root).expect("remove fixture directory");
         result
     }
@@ -3442,7 +3728,7 @@ mod native_tests {
             .source(&source)
             .std(false)
             .out_dir(&output)
-            .run()
+            .run().map_err(first_violation)
             .expect("exact entry ABI symbols must pass the consumer build");
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }
@@ -3459,7 +3745,7 @@ mod native_tests {
                 .source(&source)
                 .std(false)
                 .out_dir(root.join(name))
-                .run()
+                .run().map_err(first_violation)
         };
         let built = build(
             "kernel void scale(uint index [[thread_position_in_grid]]) { if (index < SEISMIC_CONST_WIDTH) {} }\n",
@@ -3507,7 +3793,7 @@ mod native_tests {
                 .source(&source)
                 .std(false)
                 .out_dir(root.join(name))
-                .run()
+                .run().map_err(first_violation)
         };
         build("valid").expect("forming guards are part of the scoped native ABI");
         fs::write(&asset, "#ifdef SEISMIC_FORMING_SCALE_A\ntemplate <unsigned TILE>\n__global__ void scale_a() { (void)SEISMIC_TUNE_TILE; }\n#endif\n#ifdef SEISMIC_FORMING_SCALE_B\ntemplate <unsigned TILE>\n__global__ void scale_b() {}\n#endif\n").unwrap();
@@ -3531,7 +3817,7 @@ mod native_tests {
                 .source(&source)
                 .std(false)
                 .out_dir(root.join(name))
-                .run()
+                .run().map_err(first_violation)
         };
         fs::write(&asset, format!("{small}{large}")).unwrap();
         build("valid").unwrap();
@@ -3596,7 +3882,7 @@ mod native_tests {
                 .source(&source)
                 .std(false)
                 .out_dir(root.join(name))
-                .run()
+                .run().map_err(first_violation)
         };
         fs::write(&asset, format!("{small}{large}")).unwrap();
         build("valid").unwrap();
@@ -3626,7 +3912,7 @@ mod native_tests {
         fs::write(&source, "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for cpu from \"native/scale.rs\":\n    launch scale:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n").expect("Seismic fixture");
         fs::create_dir_all(root.join("native")).expect("native directory");
         fs::write(root.join("native/scale.rs"), "fn scale<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {\n    let i = group[0] as usize;\n    unsafe { cx.result_0().set([i], cx.arg_x().get([i])) };\n}\n").expect("CPU fixture");
-        let error = Build::new("fixture").source(&source).std(false).out_dir(root.join("out")).run().expect_err("an out-of-line function is refused");
+        let error = Build::new("fixture").source(&source).std(false).out_dir(root.join("out")).run().map_err(first_violation).expect_err("an out-of-line function is refused");
         assert!(error.to_string().contains("`scale` is not declared `#[inline(always)]`"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
@@ -3648,7 +3934,7 @@ mod native_tests {
                 .source(&source)
                 .std(false)
                 .out_dir(root.join(name))
-                .run()
+                .run().map_err(first_violation)
         };
         let artifacts = build("out").expect("tuning and scratch symbols are generated ABI");
         let generated = fs::read_to_string(&artifacts.bindings).expect("generated bindings");
@@ -3698,7 +3984,7 @@ mod native_tests {
             .source(&source)
             .std(false)
             .out_dir(root.join("out"))
-            .run()
+            .run().map_err(first_violation)
             .expect("a CPU entry with a host port builds");
         let generated = fs::read_to_string(&artifacts.bindings).expect("generated bindings");
         let accessor = |name: &str| {
@@ -3751,7 +4037,7 @@ mod native_tests {
             )
             .expect("Seismic fixture");
             fs::write(root.join("native/fill.metal"), asset).expect("Metal fixture");
-            let result = Build::new("fixture").source(&source).std(false).out_dir(root.join("out")).run();
+            let result = Build::new("fixture").source(&source).std(false).out_dir(root.join("out")).run().map_err(first_violation);
             fs::remove_dir_all(&root).expect("remove fixture directory");
             result
         };
@@ -3782,7 +4068,7 @@ mod native_tests {
         );
         fs::write(&source, text).expect("Seismic fixture");
         fs::write(root.join(format!("native/scale.{extension}")), asset).expect("native fixture");
-        let result = Build::new("fixture").source(&source).std(false).out_dir(root.join("out")).run();
+        let result = Build::new("fixture").source(&source).std(false).out_dir(root.join("out")).run().map_err(first_violation);
         fs::remove_dir_all(&root).expect("remove fixture directory");
         result
     }
@@ -3869,7 +4155,7 @@ mod native_tests {
                 .source(&source)
                 .std(false)
                 .out_dir(root.join(name))
-                .run()
+                .run().map_err(first_violation)
         };
         let first = build("first").expect("an include builds");
         let rendered = fs::read_to_string(root.join("first/scale.metal")).expect("rendered asset");
@@ -3943,7 +4229,7 @@ mod native_tests {
             .source(&source)
             .std(false)
             .out_dir(root.join("out"))
-            .run()
+            .run().map_err(first_violation)
         {
             Err(BuildError::MetalBufferSlots {
                 entry,

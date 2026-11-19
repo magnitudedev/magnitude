@@ -574,6 +574,32 @@ pub enum TensorAccess {
     Host { write: bool },
 }
 
+/// What writes a tensor buffer a call declares its access to
+/// ([`TensorAccess::writer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writer {
+    /// Its launches (`Owned`, `Mutable`).
+    Device,
+    /// Its host, once it sees the launch (`&host mut`): the device never
+    /// writes it, and a launch is ordered as though it did.
+    Host,
+}
+
+impl TensorAccess {
+    /// What writes a buffer of this access, if anything does: the one
+    /// reading of a declaration's writes. A buffer is written where this is
+    /// some, and no two tensors a call binds, either of them written, may
+    /// share a byte: the entry's alias rules ([`AliasRule`]) and every
+    /// binder's no-alias check take it.
+    pub fn writer(&self) -> Option<Writer> {
+        match self {
+            Self::Owned | Self::Mutable => Some(Writer::Device),
+            Self::Host { write: true } => Some(Writer::Host),
+            Self::Shared | Self::Host { write: false } => None,
+        }
+    }
+}
+
 /// One result leaf, by ordinal tuple path (§3.1: names never define
 /// identity).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -640,7 +666,7 @@ impl ResultKind {
 pub enum AliasRule {
     /// The two parameters must not share any byte.
     Disjoint(ParameterId, ParameterId),
-    /// The two parameters may overlap (both shared reads).
+    /// The two parameters may overlap (neither written).
     MayOverlap(ParameterId, ParameterId),
 }
 

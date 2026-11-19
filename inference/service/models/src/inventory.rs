@@ -2571,18 +2571,39 @@ pub(crate) fn discover_groups(
         &mut files,
         unreadable,
     );
-    let mut groups: BTreeMap<PathBuf, Vec<(u32, u32, PathBuf)>> = BTreeMap::new();
-    let mut standalone = Vec::new();
-    let mut projectors = Vec::new();
-    for path in files {
-        if let Some((prefix, index, total)) = split_shard_name(&path) {
-            groups.entry(prefix).or_default().push((index, total, path));
-            continue;
+    let candidate_files = files
+        .into_iter()
+        .map(|path| crate::candidate_files::CandidateGguf {
+            path,
+            size_bytes: 0,
+        })
+        .collect::<Vec<_>>();
+    let partitioned = crate::candidate_files::partition_ggufs(&candidate_files);
+    let mut split_headers = BTreeMap::new();
+    for file in &partitioned.unstemmed {
+        let split = crate::candidate_files::local_directory(&file.path)
+            .ok()
+            .and_then(|directory| crate::candidate_files::SplitMetadata::of(&directory));
+        split_headers.insert(file.path.clone(), split);
+    }
+    for incomplete in &partitioned.incomplete_splits {
+        if let Some(probe) = incomplete.probe_shard() {
+            let split = crate::candidate_files::local_directory(&probe.path)
+                .ok()
+                .and_then(|directory| crate::candidate_files::SplitMetadata::of(&directory));
+            split_headers.insert(probe.path.clone(), split);
         }
-        let role = inspect_cached(cache, &path).map(|inspection| inspection.role(architectures));
-        match role {
-            Some(gguf::GgufRole::Projector) => projectors.push(path),
-            role => standalone.push((path, role)),
+    }
+    let resolved_groups = crate::candidate_files::resolve_split_groups(partitioned, &split_headers);
+    let mut projectors = Vec::new();
+    let mut candidates = Vec::new();
+    for group in resolved_groups {
+        let primary = &group.primary().path;
+        let role = inspect_cached(cache, primary).map(|inspection| inspection.role(architectures));
+        if group.files.len() == 1 && role == Some(gguf::GgufRole::Projector) {
+            projectors.push(primary.clone());
+        } else if role != Some(gguf::GgufRole::Projector) {
+            candidates.push((group, role));
         }
     }
     let pairing = |path: &Path, role: Option<&gguf::GgufRole>| match role {
@@ -2593,37 +2614,16 @@ pub(crate) fn discover_groups(
             .or_else(|| unique_projector_for(path, &projectors)),
         _ => None,
     };
-    let mut output = standalone
-        .iter()
-        .map(|(path, role)| ModelGroup {
-            projector: pairing(path, role.as_ref()),
-            paths: vec![path.clone()],
+    let output = candidates
+        .into_iter()
+        .map(|(group, role)| {
+            let first = group.primary().path.clone();
+            ModelGroup {
+                projector: pairing(&first, role.as_ref()),
+                paths: group.files.into_iter().map(|file| file.path).collect(),
+            }
         })
         .collect::<Vec<_>>();
-    for (_prefix, mut shards) in groups {
-        shards.sort_by_key(|(index, _, _)| *index);
-        let total = shards.first().map(|(_, total, _)| *total).unwrap_or(0);
-        if total == 0
-            || shards.len() != total as usize
-            || shards
-                .iter()
-                .enumerate()
-                .any(|(offset, (index, candidate_total, _))| {
-                    *index != offset as u32 + 1 || *candidate_total != total
-                })
-        {
-            continue;
-        }
-        let first = shards[0].2.clone();
-        let role = inspect_cached(cache, &first).map(|inspection| inspection.role(architectures));
-        if role == Some(gguf::GgufRole::Projector) {
-            continue;
-        }
-        output.push(ModelGroup {
-            projector: pairing(&first, role.as_ref()),
-            paths: shards.into_iter().map(|(_, _, path)| path).collect(),
-        });
-    }
     Ok(output)
 }
 
@@ -2733,21 +2733,6 @@ fn collect_gguf(
             break;
         }
     }
-}
-
-pub(crate) fn split_shard_name(path: &Path) -> Option<(PathBuf, u32, u32)> {
-    if !path.extension()?.to_str()?.eq_ignore_ascii_case("gguf") {
-        return None;
-    }
-    let stem = path.file_stem()?.to_str()?;
-    let (left, total) = stem.rsplit_once("-of-")?;
-    let (prefix, index) = left.rsplit_once('-')?;
-    if index.len() != 5 || total.len() != 5 {
-        return None;
-    }
-    let index = index.parse().ok()?;
-    let total = total.parse().ok()?;
-    Some((path.parent()?.join(prefix), index, total))
 }
 
 fn unique_projector_for(model: &Path, projectors: &[PathBuf]) -> Option<PathBuf> {
@@ -4125,21 +4110,6 @@ mod tests {
             published.properties,
             InventoryProperties::Inspected { .. }
         ));
-    }
-
-    #[test]
-    fn recognizes_only_complete_split_names() {
-        let first = Path::new("model-00001-of-00002.gguf");
-        assert_eq!(
-            split_shard_name(first).map(|(_, index, total)| (index, total)),
-            Some((1, 2))
-        );
-        assert_eq!(
-            split_shard_name(Path::new("model-00002-of-00002.GGUF"))
-                .map(|(_, index, total)| (index, total)),
-            Some((2, 2))
-        );
-        assert!(split_shard_name(Path::new("model-1-of-2.gguf")).is_none());
     }
 
     #[cfg(unix)]

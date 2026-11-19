@@ -18,6 +18,23 @@ target architecture the engine's family registry admits belongs to exactly one f
 architectures belong to none. Clients show the table as what runs in Magnitude, and a model of a
 family that is coming soon is recommended with no chosen quant.
 
+`intelligenceFrontier` names the frontier model on [Epoch AI's Capabilities
+Index](https://epoch.ai/benchmarks/eci) (ECI), its ECI, and `benchmarksSince`: catalog intelligence
+is measured on the benchmarks Epoch rates that were released on or after that date (two years
+before `asOfDate`). A model's `intelligence` is its ECI and `percent`, its expected score on those
+benchmarks as a whole percentage of the frontier model's, from Epoch's fitted benchmark difficulty
+and slope. Every supported model has one; a disabled or deprecated model, never ranked, may have
+none. Its `provenance` says where the ECI comes from: `epochPublished` (Epoch rates the model),
+`epochData` (fitted with Epoch's difficulties to Epoch's own results for the model, naming the
+benchmarks) or `bridged` (predicted from other published evaluations, calibrated on models Epoch
+rates, with the method and evidence). After changing an ECI, the frontier or the window, check every
+`percent` against Epoch's current difficulties:
+
+```sh
+curl -sLo edi_scores.csv https://epoch.ai/data/edi_scores.csv
+cargo run --release -p magnitude-service-catalog-tool -- intelligence --benchmark-difficulties edi_scores.csv
+```
+
 A variant's `format` is its quant name in its repository (for example `UD-Q4_K_XL`), which clients
 show with the repository as the quant's identity and read its bit width from. A model's variants
 are its tested ladder, which recommendations choose a rung from.

@@ -30,11 +30,11 @@ fn artifacts() -> HostArtifacts {
         .map(|relative| home(relative))
         .find(|path| path.exists())
         .expect("the pinned 4B GGUF");
-    HostArtifacts::open(&PackageOptions {
+    HostArtifacts::open(&PackageOptions::single(
         target,
-        projector: ProjectorSelection::Explicit(home(PROJECTOR)),
-        draft: None,
-    })
+        ProjectorSelection::Explicit(home(PROJECTOR)),
+        None,
+    ))
     .unwrap()
 }
 

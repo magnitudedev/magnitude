@@ -22,10 +22,10 @@
 #include "lib/projection/operator.h"
 #include "lib/streaming/control.h"
 
-inline int routed_expert_slot(SYSTEM const int *map, device const int *step, int expert,
+inline int routed_expert_slot(device const int *map, device const int *step, int expert,
     constant ulong *seismic_words) {
     return SEISMIC_DIM_X == 0 ? -2 - expert
-        : streaming_held(map + ulong(expert) * SEISMIC_MAP_STRIDE_0, SEISMIC_MAP_STRIDE_1,
+        : streaming_held_input(map + ulong(expert) * SEISMIC_MAP_STRIDE_0, SEISMIC_MAP_STRIDE_1,
               streaming_step(step, SEISMIC_STEP_STRIDE_0));
 }
 
@@ -49,7 +49,7 @@ constant constexpr uint TALL_TILES = (uint(SEISMIC_DIM_T) + 63u) / 64u;
     device const int *used [[buffer(SEISMIC_BUFFER_USED)]],                                                     \
     device const ulong *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],                                         \
     device const ulong *expert_down [[buffer(SEISMIC_BUFFER_EXPERT_DOWN)]],                                     \
-    SYSTEM const int *map [[buffer(SEISMIC_BUFFER_MAP)]],                                                       \
+    device const int *map [[buffer(SEISMIC_BUFFER_MAP)]],                                                       \
     device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],                                                     \
     device const ulong *records_up [[buffer(SEISMIC_BUFFER_RECORDS_UP)]],                                       \
     device const ulong *records_down [[buffer(SEISMIC_BUFFER_RECORDS_DOWN)]],                                   \
@@ -68,7 +68,7 @@ constant constexpr uint TALL_TILES = (uint(SEISMIC_DIM_T) + 63u) / 64u;
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 // Block `block`'s expert and the source of its weights: the record the
-// layer's map holds for it at the step (`streaming_held`), or its place by
+// layer's map holds for it at the step (`streaming_held_input`), or its place by
 // index without a map (X 0).
 #define EXPERTS_UP_BLOCK(block)                                                                                 \
     const int expert = blocks[ulong(block) * SEISMIC_BLOCKS_STRIDE_0];                                          \

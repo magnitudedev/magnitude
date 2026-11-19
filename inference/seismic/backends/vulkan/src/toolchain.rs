@@ -130,7 +130,7 @@ impl Toolchain for VulkanToolchain {
         let modules = source
             .entries
             .iter()
-            .map(|entry| formation::compile(&source.text, &entry.symbol, environment))
+            .map(|entry| formation::form(&source.text, entry, environment))
             .collect::<Result<Vec<_>, _>>()?;
         let entries = modules
             .iter()

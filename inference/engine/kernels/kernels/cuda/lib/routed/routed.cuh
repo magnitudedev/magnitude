@@ -246,9 +246,9 @@ __device__ __forceinline__ void expert_grids(const u8 *rows, const u8 *used, u64
 
 // The source holding expert `expert`'s weights for step `q`: the entry the
 // layer's map (`map`, `mapped` rows of MAP_WORDS at strides `map0`, `map1`)
-// holds for the step (`streaming_held`: >= 0 a bank record, -2 - s scratch
-// slot s, -1 skipped), or -2 - `expert` without a map (`mapped` == 0). A
-// macro, expanded where it is used, by the entries that include
+// holds for the step (`streaming_held_input`: >= 0 a bank record, -2 - s
+// scratch slot s, -1 skipped), or -2 - `expert` without a map (`mapped` ==
+// 0). A macro, expanded where it is used, by the entries that include
 // `lib/streaming/control.cuh` (`routed_experts`, `routed_experts_up`).
 #define ROUTED_EXPERT_SLOT(map, mapped, map0, map1, q, expert)                                             \
-    ((mapped) == 0 ? -2 - (int)(expert) : streaming_held((map) + (u64)(expert) * (map0), (map1), (q)))
+    ((mapped) == 0 ? -2 - (int)(expert) : streaming_held_input((map) + (u64)(expert) * (map0), (map1), (q)))

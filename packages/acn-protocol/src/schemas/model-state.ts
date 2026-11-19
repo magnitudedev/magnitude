@@ -507,7 +507,7 @@ export const HttpsUrlSchema = Schema.String.pipe(
   Schema.brand("HttpsUrl"),
 )
 
-/** A model's intelligence as a whole percentage of the top Artificial Analysis Intelligence Index score. */
+/** A model's expected score on current benchmarks as a whole percentage of the frontier model's, from Epoch AI's Capabilities Index. */
 export const IntelligenceScoreSchema = Schema.Int.pipe(Schema.between(0, 100))
 
 export const MemoryAssessmentSchema = Schema.Struct({
@@ -888,13 +888,13 @@ const DisabledCatalogDataSchema = Schema.Struct({
 const DeprecatedCatalogDataSchema = Schema.Struct({
   ...LocalModelCatalogDataFields,
   support: DeprecatedCatalogSupportSchema,
-  intelligence: IntelligenceScoreSchema,
+  intelligence: Schema.optionalWith(IntelligenceScoreSchema, { as: "Option", exact: true }),
 })
 const UnavailableCatalogDataSchema = Schema.Union(DisabledCatalogDataSchema, DeprecatedCatalogDataSchema)
 /**
  * A catalog model's catalog facts. `aliases` are the IDs its files would have as found models (the
  * catalog's exact target found in another app's location); a request naming one means this model. A
- * hidden external copy keeps its own ID and is not an alias here. Only a disabled model may be unrated.
+ * hidden external copy keeps its own ID and is not an alias here. Only a supported model must be rated.
  */
 export const LocalModelCatalogDataSchema = Schema.Union(
   AvailableCatalogDataSchema,

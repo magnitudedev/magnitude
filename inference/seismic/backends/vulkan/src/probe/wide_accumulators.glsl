@@ -3,11 +3,13 @@
 // cooperative-matrix path with the whole head as one output window: W / 16
 // output fragments of a 16-fragment accumulator array, 8 at W = 128 and 16 at
 // W = 256.
-// One subgroup scores its 16 query rows against N keys streamed through
-// shared memory in tiles of 32, runs the online softmax, and accumulates
-// P V. Buffers: q (16 x W f16), k and v (N x W f16), out (16 x W f32); the
-// word: N. Its extensions are `WIDE_EXTENSIONS` (`probe.rs`), declared
-// before the head.
+// The workgroup's SUBGROUPS subgroups stage N keys (then their values)
+// through shared memory together in tiles of 32; each subgroup
+// (`gl_SubgroupID`) scores its own 16 query rows against them, runs the
+// online softmax in a scratch region of its own, and accumulates P V into
+// its own 16 output rows. Buffers: q (SUBGROUPS x 16 x W f16), k and v
+// (N x W f16), out (SUBGROUPS x 16 x W f32); the word: N. Its extensions
+// are `WIDE_EXTENSIONS` (`probe.rs`), declared before the head.
 
 #define FLASH_KEYS 32u
 #define FLASH_MAX_W 256u
@@ -19,7 +21,7 @@
 #define FRAGMENT_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 #define FRAGMENT_C coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define PITCH (W + 8u)
-#define SHARED_BYTES (FLASH_KEYS * PITCH * 2u + FLASH_SCRATCH_FLOATS * 4u)
+#define SHARED_BYTES (FLASH_KEYS * PITCH * 2u + SUBGROUPS * FLASH_SCRATCH_FLOATS * 4u)
 
 shared probe_shared_f32_t { float shared_f32[SHARED_BYTES / 4u]; };
 shared probe_shared_f16_t { float16_t shared_f16[SHARED_BYTES / 2u]; };
@@ -31,16 +33,22 @@ layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer fl
 
 FRAGMENT_C matrix_zero() { return FRAGMENT_C(0.0); }
 
+// A uniform trip count: every invocation runs every iteration, so the
+// subgroup operations after it have every lane (the execution model).
 void flash_stage(uint64_t plane, int first, int end) {
     const uint pieces = W / 8u;
-    for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
-        const uint k = item / pieces;
-        const uint c = (item % pieces) * 8u;
-        const int t = first + int(k);
-        uvec4 bits = uvec4(0u);
-        if (t < end)
-            bits = flash_uvec4_rows(plane + (uint64_t(t) * W + c) * 2ul).v[0];
-        shared_uvec4[(k * PITCH + c) / 8u] = bits;
+    for (uint base = 0u; base < FLASH_KEYS * pieces; base += gl_WorkGroupSize.x) {
+        // Numbered in lane order, as the lanes later read this memory.
+        const uint item = base + gl_SubgroupID * gl_SubgroupSize + LANE;
+        if (item < FLASH_KEYS * pieces) {
+            const uint k = item / pieces;
+            const uint c = (item % pieces) * 8u;
+            const int t = first + int(k);
+            uvec4 bits = uvec4(0u);
+            if (t < end)
+                bits = flash_uvec4_rows(plane + (uint64_t(t) * W + c) * 2ul).v[0];
+            shared_uvec4[(k * PITCH + c) / 8u] = bits;
+        }
     }
 }
 
@@ -148,12 +156,13 @@ float flash_output_value(inout flash_output o, uint scratch, uint q) {
 }
 
 void main() {
-    const uint64_t q = PROBE_ARGUMENT(0);
+    // This subgroup's 16 query rows, output rows and scratch.
+    const uint64_t q = PROBE_ARGUMENT(0) + uint64_t(gl_SubgroupID) * (16ul * W * 2ul);
     const uint64_t k = PROBE_ARGUMENT(1);
     const uint64_t v = PROBE_ARGUMENT(2);
-    probe_f32 out_rows = probe_f32(PROBE_ARGUMENT(3));
-    const int n = int(PROBE_ARGUMENT(5));
-    const uint scratch = (FLASH_KEYS * PITCH) / 2u;
+    probe_f32 out_rows = probe_f32(PROBE_ARGUMENT(3) + uint64_t(gl_SubgroupID) * (16ul * W * 4ul));
+    const int n = int(PROBE_WORD(4ul, 0));
+    const uint scratch = (FLASH_KEYS * PITCH) / 2u + gl_SubgroupID * FLASH_SCRATCH_FLOATS;
     // log2(e) / sqrt(W): the scores' scale in the base-2 softmax.
     const float scale = 1.4426950408889634 * inversesqrt(float(W));
     flash_output o;

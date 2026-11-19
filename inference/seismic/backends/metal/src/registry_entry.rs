@@ -31,9 +31,27 @@ const UTF8: u32 = 0x0800_0100;
 /// `kCFNumberSInt64Type`.
 const SINT64: isize = 4;
 
+/// The GPU cores resident launches are bound by where the device's
+/// registry entry states none ([`gpu_cores`]): one. The count is used only
+/// to size a resident launch's grid (`RESIDENT`: half of the threadgroups
+/// the cores hold at once), whose threadgroups wait for one another at grid
+/// barriers. Counting more cores than run at once dispatches threadgroups
+/// that are not co-resident, so a barrier waits on groups that cannot run
+/// until its bounded wait gives up and fails the submission; counting fewer
+/// only runs fewer groups, each covering more of the work. Every GPU has a
+/// core, so one is the one count that is never more than the GPU's.
+pub(crate) const UNSTATED_GPU_CORES: u64 = 1;
+
 /// The GPU cores of the device whose registry entry is `registry_id`
-/// (`MTLDevice.registryID`); `None` when the entry states none.
-pub(crate) fn gpu_cores(registry_id: u64) -> Option<u64> {
+/// (`MTLDevice.registryID`): its AGX accelerator's `gpu-core-count`; where
+/// no entry states one (an Intel or AMD GPU, which is no AGX accelerator,
+/// or a macOS VM's paravirtual GPU), [`UNSTATED_GPU_CORES`].
+pub(crate) fn gpu_cores(registry_id: u64) -> u64 {
+    stated_gpu_cores(registry_id).unwrap_or(UNSTATED_GPU_CORES)
+}
+
+/// The positive `gpu-core-count` the registry entry `registry_id` states.
+fn stated_gpu_cores(registry_id: u64) -> Option<u64> {
     // SAFETY: each IOKit and CoreFoundation call gets the arguments its
     // documentation requires; the matching dictionary is consumed by
     // `IOServiceGetMatchingService`, and every object created here is
@@ -59,5 +77,18 @@ pub(crate) fn gpu_cores(registry_id: u64) -> Option<u64> {
             && CFNumberGetValue(value, SINT64, (&raw mut cores).cast()) != 0;
         CFRelease(value);
         (read && cores > 0).then_some(cores as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device no registry entry states cores of (here, an id no entry
+    /// has) bounds its resident launches by the documented count, one.
+    #[test]
+    fn a_device_without_a_stated_core_count_is_bound_to_one_core() {
+        assert_eq!(gpu_cores(u64::MAX), UNSTATED_GPU_CORES);
+        assert_eq!(UNSTATED_GPU_CORES, 1);
     }
 }

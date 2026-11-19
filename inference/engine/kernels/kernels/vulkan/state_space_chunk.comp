@@ -137,7 +137,9 @@ float ssc_reduce_scatter(inout float values[32], uint lane) {
 // in the state-space dual form and writes the piece's mixed outputs.
 void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, int piece, int local, uint head,
     uint block_row0, uint row0, inout float rows[SS_LANE_ROWS][SS_COLUMNS]) {
-    const uint lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    // The staging is spread by `SEISMIC_THREAD`, as the reduce-scatter that
+    // reads what it feeds needs.
+    const uint lane = SEISMIC_LANE, thread = SEISMIC_THREAD, threads = gl_WorkGroupSize.x;
     const uint g = ss_group_of(head);
     const int first = slot.lo + local * STATE_SPACE_PIECE;
     const uint count = uint(min(STATE_SPACE_PIECE, slot.stop - local * STATE_SPACE_PIECE));
@@ -196,7 +198,9 @@ void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, i
         const uint i = i0 + lane / SS_LANE_ROWS;
         if (i < count) {
             float sum = 0.0;
-            for (uint j = 0u; j <= i; ++j)
+            // Each lane's rows j <= i, below the group's: the next group's
+            // reduce-scatter follows.
+            seismic_strided_bounded(uint, j, 0u, 0u, i + 1u, min(i0 + SSC_GROUP, count), 1u)
                 sum = seismic_fma_rn(seismic_shared_f32[SSC_WEIGHTS + i * SSC_WEIGHT_STRIDE + j],
                     seismic_mul_rn(seismic_shared_f32[SSC_DELTA + j],
                         seismic_shared_f32[SSC_X + j * SS_BLOCK_ROWS + local_row + r]),

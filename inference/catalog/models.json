@@ -1,10 +1,10 @@
 {
-  "artificialAnalysisFrontier": {
-    "model": "Claude Opus 5.5 (Adaptive Reasoning, Max Effort)",
-    "score": 57.6,
-    "methodologyVersion": "4.3.2",
-    "asOfDate": "2026-09-29",
-    "url": "https://artificialanalysis.ai/models/claude-opus-5-5"
+  "intelligenceFrontier": {
+    "model": "GPT-6.2 Astra",
+    "eci": 174.17,
+    "asOfDate": "2026-11-18",
+    "benchmarksSince": "2024-11-18",
+    "url": "https://epoch.ai/benchmarks/eci"
   },
   "labs": [
     { "id": "alibaba", "name": "Alibaba", "country": "CN", "huggingFaceOrganizations": ["Qwen"] },
@@ -44,16 +44,15 @@
         }
       ],
       "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.5-4B-DFlash-GGUF", "path": "Qwen3.5-4B-DFlash-Q8_0.gguf" } },
-      "artificialAnalysis": {
-        "score": 13.1,
+      "intelligence": {
+        "eci": 137.9,
+        "percent": 21,
         "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "kind": "bridged",
+          "method": "Predicted from Artificial Analysis's GPQA Diamond and Terminal-Bench Hard results by a least-squares fit of ECI across the 15 models both Artificial Analysis and Epoch rate; held-out error ±1.4 ECI.",
           "evidenceUrls": [
-            "https://artificialanalysis.ai/models/qwen3-5-4b"
+            "https://artificialanalysis.ai/models/qwen3-5-4b",
+            "https://epoch.ai/benchmarks/eci"
           ]
         }
       }
@@ -65,7 +64,12 @@
       "description": "Small dense model with a substantial capability gain over the 4B tier.",
       "releaseDate": "2026-03-02",
       "parameterization": { "architecture": "dense", "totalParameters": 9000000000 },
-      "support": { "level": "supported" },
+      "support": {
+        "level": "deprecated",
+        "since": "2026-11-18",
+        "replacement": "qwen3.8-27b:gguf:iq2",
+        "reason": "Superseded by Qwen3.8 27B at 2-bit, which is far smarter at a similar size."
+      },
       "sources": [
         {
           "repository": "unsloth/Qwen3.5-9B-MTP-GGUF",
@@ -74,16 +78,7 @@
           "license": "apache-2.0"
         }
       ],
-      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.5-9B-DFlash-GGUF", "path": "Qwen3.5-9B-DFlash-Q8_0.gguf" } },
-      "artificialAnalysis": {
-        "score": 11.2,
-        "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/qwen3-5-9b"
-        }
-      }
+      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.5-9B-DFlash-GGUF", "path": "Qwen3.5-9B-DFlash-Q8_0.gguf" } }
     },
     {
       "id": "qwen3.8-27b",
@@ -95,20 +90,35 @@
       "support": { "level": "supported" },
       "sources": [
         {
+          "repository": "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF",
+          "variants": [{"variantId": "gguf:iq2", "format": "IQ2_S", "path": "Qwen3.8-27B-GSQ-RCO-IQ2_S.gguf", "variantLabel": "IQ2", "quantizationAware": false}, {"variantId": "gguf:iq3-xxs", "format": "IQ3_XXS", "path": "Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf", "variantLabel": "IQ3 XXS", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "IQ3_S", "path": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf", "variantLabel": "IQ3", "quantizationAware": false}],
+          "projector": { "path": "mmproj-Qwen3.8-27B-BF16.gguf" },
+          "license": "apache-2.0"
+        },
+        {
           "repository": "unsloth/Qwen3.8-27B-GGUF",
-          "variants": [{"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
       ],
       "speculativeDecoding": { "method": "dflash2", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.8-27B-DFlash2-GGUF", "path": "Qwen3.8-27B-DFlash2-Q8_0.gguf" } },
-      "artificialAnalysis": {
-        "score": 33.7,
+      "intelligence": {
+        "eci": 152.4,
+        "percent": 48,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/qwen3-8-27b"
+          "kind": "epochData",
+          "benchmarks": [
+            "APEX-Agents",
+            "ARC-AGI",
+            "ARC-AGI-2",
+            "DTBench",
+            "LMCA",
+            "ProofBench",
+            "SimpleBench",
+            "Surface Evolver Bench"
+          ],
+          "url": "https://epoch.ai/benchmarks"
         }
       }
     },
@@ -123,7 +133,7 @@
       "sources": [
         {
           "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
-          "variants": [{"variantId": "gguf:q2", "format": "Q2_0", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "IQ3_S", "variantLabel": "IQ3", "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q2", "format": "Q2_0", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3-xxs", "format": "IQ3_XXS", "variantLabel": "IQ3 XXS", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "IQ3_S", "variantLabel": "IQ3", "quantizationAware": false}],
           "license": "apache-2.0"
         },
         {
@@ -131,19 +141,28 @@
           "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "qwen-community-1.0"
+        },
+        {
+          "repository": "magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF",
+          "variants": [{"variantId": "gguf:nvfp4", "format": "NVFP4", "path": "Qwen3.8-Flash-Next-NVFP4-00001-of-00003.gguf", "variantLabel": "NVFP4", "quantizationAware": false}],
+          "projector": { "path": "mmproj-Qwen3.8-Flash-Next-NVFP4-BF16.gguf" },
+          "license": "nvidia-open-model-license"
         }
       ],
       "speculativeDecoding": {
         "method": "mtp",
         "draft": { "type": "file", "repository": "unsloth/Qwen3.8-Flash-Next-GGUF", "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" }
       },
-      "artificialAnalysis": {
-        "score": 39.8,
+      "intelligence": {
+        "eci": 154.1,
+        "percent": 53,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/qwen3-8-flash-next"
+          "kind": "bridged",
+          "method": "Predicted from Artificial Analysis's GPQA Diamond, SciCode, long-context reasoning, GDPval and CritPt results by a least-squares fit of ECI across the 20 models both Artificial Analysis and Epoch rate; held-out error ±1.2 ECI.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/qwen3-8-flash-next",
+            "https://epoch.ai/benchmarks/eci"
+          ]
         }
       }
     },
@@ -171,13 +190,23 @@
           "path": "Qwen3.6-35B-A3B-DFlash-Q8_0.gguf"
         }
       },
-      "artificialAnalysis": {
-        "score": 18.2,
+      "intelligence": {
+        "eci": 145.0,
+        "percent": 32,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/qwen3-6-35b-a3b"
+          "kind": "epochData",
+          "benchmarks": [
+            "GPQA diamond",
+            "OTIS Mock AIME 2024-2025",
+            "DTBench",
+            "LMCA",
+            "WeirdML",
+            "Surface Evolver Bench",
+            "Terminal Bench",
+            "FrontierMath-Tiers-1-3-v2-Private",
+            "Mystery Game Puzzles"
+          ],
+          "url": "https://epoch.ai/benchmarks"
         }
       }
     },
@@ -198,13 +227,16 @@
         }
       ],
       "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Muse-Glimmer-30B-DFlash-GGUF", "path": "dflash-kquant.gguf" } },
-      "artificialAnalysis": {
-        "score": 17.5,
+      "intelligence": {
+        "eci": 146.4,
+        "percent": 35,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/muse-glimmer"
+          "kind": "bridged",
+          "method": "Predicted from Artificial Analysis's GPQA Diamond, SciCode, long-context reasoning, GDPval and CritPt results by a least-squares fit of ECI across the 20 models both Artificial Analysis and Epoch rate; held-out error ±1.2 ECI.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/muse-glimmer",
+            "https://epoch.ai/benchmarks/eci"
+          ]
         }
       }
     },
@@ -215,7 +247,12 @@
       "description": "Small dense model with per-layer embeddings that materially improves capability over the E2B tier while remaining practical on memory-constrained machines.",
       "releaseDate": "2026-04-02",
       "parameterization": { "architecture": "dense", "totalParameters": 8000000000 },
-      "support": { "level": "supported" },
+      "support": {
+        "level": "deprecated",
+        "since": "2026-11-18",
+        "replacement": "nemotron-3.5-bolt-e4b:gguf:q4",
+        "reason": "Superseded by Nemotron 3.5 Bolt E4B, NVIDIA’s tuned Gemma 4 E4B at a similar size."
+      },
       "sources": [
         {
           "repository": "unsloth/gemma-4-E4B-it-qat-GGUF",
@@ -231,19 +268,6 @@
           "repository": "magnitudedev/gemma-4-E4B-it-qat-MTP-GGUF",
           "path": "gemma-4-E4B-it-qat-MTP-Q4_0.gguf"
         }
-      },
-      "artificialAnalysis": {
-        "score": 8.9,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/gemma-4-e4b"
-          ]
-        }
       }
     },
     {
@@ -258,7 +282,10 @@
         "activeParameters": 2450000000
       },
       "support": {
-        "level": "supported"
+        "level": "deprecated",
+        "since": "2026-11-18",
+        "replacement": "qwen3.6-35b-a3b:gguf:q4",
+        "reason": "Superseded by Qwen3.6 35B-A3B, which is smarter at a similar size."
       },
       "sources": [
         {
@@ -266,22 +293,7 @@
           "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "lfm1.0"
         }
-      ],
-      "artificialAnalysis": {
-        "score": 15.6,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-10-13",
-          "methodology": "Scaled two measured anchors, Qwen3.6 35B-A3B (18.2) and Nemotron 3.5 Lightning (12.9), by the geometric mean of LFM2.5 24B-A2B benchmark ratios against each on GPQA Diamond, HLE, IFBench, SciCode, tau3-Bench Banking and SWE-Bench Verified (OpenCode), from Liquid AI's release comparison. The scaled estimates are approximately 17.2 and 14.2; their geometric mean rounds to 15.6. This is an estimated Intelligence Index, not a measured score.",
-          "evidenceUrls": [
-            "https://www.liquid.ai/blog/lfm2-5-24b-a2b",
-            "https://artificialanalysis.ai/models/qwen3-6-35b-a3b",
-            "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
-          ]
-        }
-      }
+      ]
     },
     {
       "id": "lfm3-1.7b",
@@ -298,18 +310,15 @@
           "license": "lfm1.0"
         }
       ],
-      "artificialAnalysis": {
-        "score": 14.0,
+      "intelligence": {
+        "eci": 137.0,
+        "percent": 20,
         "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-10-27",
-          "methodology": "Scaled two measured anchors, MiniCPM5 2B (12.5) and Qwen3.5 9B (11.2), by the geometric mean of LFM3 1.7B benchmark ratios against each on the Intelligence Index components in Liquid AI's release comparison: AutomationBench, Terminal-Bench 2.1, SciCode, Humanity's Last Exam (no tools), AA-Omniscience accuracy and non-hallucination, and AA-LCR. The scaled estimates are approximately 18.7 and 10.5; their geometric mean rounds to 14.0. The anchors disagree widely, mostly on AutomationBench and Terminal-Bench, so this is a loose estimate. This is an estimated Intelligence Index, not a measured score.",
+          "kind": "bridged",
+          "method": "Interpolated from Liquid AI's same-setup results (SWE-bench Verified, Terminal-Bench 2.1, LiveCodeBench v6 and GPQA Diamond) for this model, Gemma 4 E4B, Qwen3.5 4B and Qwen3.5 9B, whose ECI is known.",
           "evidenceUrls": [
             "https://huggingface.co/LiquidAI/LFM3-1.7B",
-            "https://artificialanalysis.ai/models/minicpm5-2b",
-            "https://artificialanalysis.ai/models/qwen3-5-9b"
+            "https://epoch.ai/benchmarks/eci"
           ]
         }
       }
@@ -333,21 +342,7 @@
           "variants": [{"variantId": "gguf:q1-qat", "format": "Q1_0", "variantLabel": "Q1 QAT", "quantizationAware": true}],
           "license": "apache-2.0"
         }
-      ],
-      "artificialAnalysis": {
-        "score": 6.4,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Scaled the direct Qwen3 8B reasoning score by the geometric mean of Bonsai's published per-benchmark retention ratios against that exact parent.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/qwen3-8b-instruct-reasoning",
-            "https://huggingface.co/prism-ml/Bonsai-8B-gguf"
-          ]
-        }
-      }
+      ]
     },
     {
       "id": "gemma-4-12b-it-qat",
@@ -373,16 +368,15 @@
           "path": "gemma-4-12B-it-qat-MTP-Q4_0.gguf"
         }
       },
-      "artificialAnalysis": {
-        "score": 14.2,
+      "intelligence": {
+        "eci": 139.1,
+        "percent": 23,
         "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "kind": "bridged",
+          "method": "Predicted from Artificial Analysis's GPQA Diamond, long-context reasoning, GDPval and CritPt results by a least-squares fit of ECI across the 20 models both Artificial Analysis and Epoch rate; held-out error ±1.4 ECI.",
           "evidenceUrls": [
-            "https://artificialanalysis.ai/models/gemma-4-12b"
+            "https://artificialanalysis.ai/models/gemma-4-12b",
+            "https://epoch.ai/benchmarks/eci"
           ]
         }
       }
@@ -394,7 +388,12 @@
       "description": "Mid-size MoE model balancing a substantial weight footprint with low active compute.",
       "releaseDate": "2026-04-02",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 25200000000, "activeParameters": 3800000000 },
-      "support": { "level": "supported" },
+      "support": {
+        "level": "deprecated",
+        "since": "2026-11-18",
+        "replacement": "qwen3.6-35b-a3b:gguf:q3",
+        "reason": "Superseded by Qwen3.6 35B-A3B, which is smarter at a similar size."
+      },
       "sources": [
         {
           "repository": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
@@ -410,19 +409,6 @@
           "repository": "magnitudedev/gemma-4-26B-A4B-it-qat-MTP-GGUF",
           "path": "gemma-4-26B-A4B-it-qat-MTP-Q4_0.gguf"
         }
-      },
-      "artificialAnalysis": {
-        "score": 16.7,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/gemma-4-26b-a4b"
-          ]
-        }
       }
     },
     {
@@ -432,7 +418,12 @@
       "description": "Large dense Gemma model with the strongest measured coding score in its family.",
       "releaseDate": "2026-04-02",
       "parameterization": { "architecture": "dense", "totalParameters": 30700000000 },
-      "support": { "level": "supported" },
+      "support": {
+        "level": "deprecated",
+        "since": "2026-11-18",
+        "replacement": "qwen3.8-27b:gguf:q4",
+        "reason": "Superseded by Qwen3.8 27B, which is smarter at a similar size."
+      },
       "sources": [
         {
           "repository": "unsloth/gemma-4-31B-it-qat-GGUF",
@@ -447,19 +438,6 @@
           "type": "file",
           "repository": "magnitudedev/gemma-4-31B-it-qat-MTP-GGUF",
           "path": "gemma-4-31B-it-qat-MTP-Q4_0.gguf"
-        }
-      },
-      "artificialAnalysis": {
-        "score": 19.0,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/gemma-4-31b"
-          ]
         }
       }
     },
@@ -494,16 +472,7 @@
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
-      ],
-      "artificialAnalysis": {
-        "score": 15.6,
-        "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/qwen3-5-122b-a10b"
-        }
-      }
+      ]
     },
     {
       "id": "nemotron-3-super-120b-a12b",
@@ -519,14 +488,42 @@
           "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}, {"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "quantizationAware": true}],
           "license": "nvidia-nemotron-open-model-license"
         }
+      ]
+    },
+    {
+      "id": "nemotron-3.5-bolt-e4b",
+      "displayName": "Nemotron 3.5 Bolt E4B",
+      "lab": "nvidia",
+      "description": "Compact dense model built on Gemma 4 E4B and tuned by NVIDIA, sized for 8GB machines.",
+      "releaseDate": "2026-10-23",
+      "parameterization": { "architecture": "dense", "totalParameters": 7520000000 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB",
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}],
+          "license": "openmdw-1.1"
+        }
       ],
-      "artificialAnalysis": {
-        "score": 12.8,
+      "speculativeDecoding": {
+        "method": "dflash",
+        "draft": {
+          "type": "file",
+          "repository": "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-DFlash",
+          "path": "Nemotron-3.5-Bolt-E4B-DFlash-BF16.gguf"
+        }
+      },
+      "intelligence": {
+        "eci": 133.4,
+        "percent": 16,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/nvidia-nemotron-3-super-120b-a12b"
+          "kind": "bridged",
+          "method": "NVIDIA has published only instruction-following results for this model (IFBench and InverseIFEval), where it matches or beats Qwen3.5 4B and its base model, Gemma 4 E4B. Placed midway between those two models' ECI (129.0 and 137.9) until reasoning results are published.",
+          "evidenceUrls": [
+            "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB",
+            "https://artificialanalysis.ai/models/nemotron-3-5-bolt-e4b-4gb",
+            "https://epoch.ai/benchmarks/eci"
+          ]
         }
       }
     },
@@ -554,18 +551,15 @@
           "path": "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr.gguf"
         }
       },
-      "artificialAnalysis": {
-        "score": 19.0,
+      "intelligence": {
+        "eci": 144.7,
+        "percent": 32,
         "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-10-15",
-          "methodology": "Scaled two measured anchors, Qwen3.6 35B-A3B (18.2) and Nemotron 3.5 Lightning (12.9), by the geometric mean of Nemotron 3.5 Bolt 74B-A9B 24GB benchmark ratios against each on the Intelligence Index components in NVIDIA's release comparison: GDPval-AA, Terminal-Bench, Humanity's Last Exam, AA-Omniscience accuracy and non-hallucination, SciCode and AA-LCR. The scaled estimates are approximately 19.5 and 18.5; their geometric mean rounds to 19.0. This is an estimated Intelligence Index, not a measured score.",
+          "kind": "bridged",
+          "method": "Predicted from Artificial Analysis's Humanity's Last Exam, SciCode, long-context reasoning and CritPt results by a least-squares fit of ECI across the 32 models both Artificial Analysis and Epoch rate; held-out error ±2.1 ECI.",
           "evidenceUrls": [
-            "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
-            "https://artificialanalysis.ai/models/qwen3-6-35b-a3b",
-            "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
+            "https://artificialanalysis.ai/models/nemotron-3-5-bolt-74b-a9b",
+            "https://epoch.ai/benchmarks/eci"
           ]
         }
       }
@@ -594,49 +588,86 @@
           "path": "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr.gguf"
         }
       },
-      "artificialAnalysis": {
-        "score": 26.5,
+      "intelligence": {
+        "eci": 149.0,
+        "percent": 40,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-10-15",
-          "url": "https://artificialanalysis.ai/models/nemotron-3-5-super-vl"
+          "kind": "bridged",
+          "method": "Predicted from Artificial Analysis's Humanity's Last Exam, SciCode, long-context reasoning and CritPt results by a least-squares fit of ECI across the 32 models both Artificial Analysis and Epoch rate; held-out error ±2.1 ECI.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/nemotron-3-5-super-vl",
+            "https://epoch.ai/benchmarks/eci"
+          ]
         }
       }
     },
     {
       "id": "deepseek-v4.1-flash",
-      "displayName": "DeepSeek V4.1 Flash 552B-A16B",
+      "displayName": "DeepSeek V4.1 Flash",
       "lab": "deepseek",
       "description": "Multimodal MoE model with a causal encoder-decoder, Engram memory and low active compute.",
       "releaseDate": "2026-10-17",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 552000000000, "activeParameters": 16000000000 },
-      "support": { "level": "disabled", "reason": "DeepSeek V4.1 Flash is withheld: its output diverges from the reference on long non-repeating text (an unresolved precision defect)" },
+      "support": { "level": "supported" },
       "sources": [
+        {
+          "repository": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+          "variants": [{"variantId": "gguf:iq1", "format": "IQ1_M", "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00006.gguf", "variantLabel": "IQ1", "quantizationAware": false}, {"variantId": "gguf:iq2-xxs", "format": "IQ2_XXS", "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf", "variantLabel": "IQ2 XXS", "quantizationAware": false}, {"variantId": "gguf:iq2", "format": "IQ2_XS", "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf", "variantLabel": "IQ2", "quantizationAware": false}],
+          "projector": { "path": "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf" },
+          "license": "mit"
+        },
+        {
+          "repository": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+          "variants": [{"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "mit"
+        },
         {
           "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF",
           "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "quantizationAware": true}],
           "license": "mit"
         }
       ],
-      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF", "path": "DeepSeek-V4.1-Flash-1017-DSpark.gguf" } }
+      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF", "path": "DeepSeek-V4.1-Flash-1017-DSpark.gguf" } },
+      "intelligence": {
+        "eci": 159.4,
+        "percent": 67,
+        "provenance": {
+          "kind": "epochPublished",
+          "url": "https://epoch.ai/benchmarks/eci"
+        }
+      }
     },
     {
       "id": "glm-5.3-flash",
-      "displayName": "GLM-5.3 Flash 321B-A18B",
+      "displayName": "GLM-5.3 Flash",
       "lab": "zai",
       "description": "Multimodal MoE model with hybrid linear and latent attention, hyper-connections and low active compute.",
       "releaseDate": "2026-08-25",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 321300000000, "activeParameters": 18000000000 },
-      "support": { "level": "disabled", "reason": "GLM-5.3 Flash is withheld until the whole model meets its bar: D11 on the full checkpoint, measured MTP acceptance and served throughput. It has no Artificial Analysis score yet." },
+      "support": { "level": "supported" },
       "sources": [
         {
+          "repository": "unsloth/GLM-5.3-Flash-GGUF",
+          "variants": [{"variantId": "gguf:iq2", "format": "UD-IQ2_XXS", "variantLabel": "IQ2", "quantizationAware": false}, {"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "mit"
+        },
+        {
           "repository": "magnitudedev/GLM-5.3-Flash-GGUF",
-          "variants": [{"variantId": "gguf:fp8", "format": "FP8", "variantLabel": "FP8", "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:nvfp4", "format": "NVFP4", "path": "NVFP4/GLM-5.3-Flash-NVFP4-00001-of-00004.gguf", "variantLabel": "NVFP4", "quantizationAware": false}, {"variantId": "gguf:fp8", "format": "FP8", "variantLabel": "FP8", "quantizationAware": true}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "mit"
         }
-      ]
+      ],
+      "intelligence": {
+        "eci": 153.78,
+        "percent": 52,
+        "provenance": {
+          "kind": "epochPublished",
+          "url": "https://epoch.ai/benchmarks/eci"
+        }
+      }
     },
     {
       "id": "nemotron-3-ultra-550b-a55b",
@@ -653,13 +684,12 @@
           "license": "openmdw-1.1"
         }
       ],
-      "artificialAnalysis": {
-        "score": 22.9,
+      "intelligence": {
+        "eci": 147.0,
+        "percent": 36,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/nvidia-nemotron-3-ultra-550b-a55b"
+          "kind": "epochPublished",
+          "url": "https://epoch.ai/benchmarks/eci"
         }
       }
     },
@@ -678,16 +708,7 @@
           "license": "mit"
         }
       ],
-      "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } },
-      "artificialAnalysis": {
-        "score": 33.7,
-        "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/glm-5-2"
-        }
-      }
+      "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } }
     }
   ]
 }

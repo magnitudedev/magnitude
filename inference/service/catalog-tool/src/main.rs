@@ -47,6 +47,13 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
+    /// Recompute every scored model's intelligence from its ECI and Epoch AI's benchmark
+    /// difficulties (`https://epoch.ai/data/edi_scores.csv`), print it beside the catalog's, and fail
+    /// when any differs.
+    Intelligence {
+        #[arg(long)]
+        benchmark_difficulties: PathBuf,
+    },
     /// Build the assessment header bundle from the pinned catalog revisions.
     BuildBundle {
         #[arg(long)]
@@ -560,6 +567,25 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
+fn intelligence(benchmark_difficulties: &Path) -> anyhow::Result<()> {
+    let csv = std::fs::read_to_string(benchmark_difficulties)
+        .with_context(|| format!("failed to read {}", benchmark_difficulties.display()))?;
+    let checks = magnitude_service_models::catalog_intelligence_check(&csv)?;
+    let mut differing = 0;
+    for check in &checks {
+        let mark = if check.declared == check.computed { "" } else { "  differs" };
+        if !mark.is_empty() {
+            differing += 1;
+        }
+        println!(
+            "{:34} ECI {:7.2}  declared {:3}%  computed {:3}%{mark}",
+            check.model, check.eci, check.declared, check.computed
+        );
+    }
+    anyhow::ensure!(differing == 0, "{differing} declared intelligence values differ from their ECI");
+    Ok(())
+}
+
 /// The command's work, boxed: the futures of every command together would
 /// otherwise fill the one frame that polls them.
 async fn run(command: Command) -> anyhow::Result<()> {
@@ -576,6 +602,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
             };
             update_lock(output, advance, &store).await
         }),
+        Command::Intelligence {
+            benchmark_difficulties,
+        } => Box::pin(async move { intelligence(&benchmark_difficulties) }),
         Command::BuildBundle { output, store } => {
             Box::pin(async move { build_bundle(output, &store).await })
         }

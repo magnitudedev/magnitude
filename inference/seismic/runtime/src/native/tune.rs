@@ -46,7 +46,7 @@ use seismic_compiler::prepared::{validate_invocation, InvocationContract};
 use seismic_lang::checked::{
     CheckedModule, NativeDefault, NativeImplementation, NativeNatExpr, NativeParameter, NativeSpecialization,
 };
-use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
+use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, Writer};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
 use seismic_lang::registry::BackendName;
@@ -7334,6 +7334,7 @@ pub fn kernel_digest(
                     mixed_dot: false,
                     f32_atomic_add: false,
                     shared_int64_atomics: false,
+                    maximal_reconvergence: false,
                 },
             ))
         }
@@ -8083,10 +8084,7 @@ fn mutable_parameters(logical: &LogicalEntry) -> Vec<(usize, String)> {
         .filter(|(_, parameter)| {
             matches!(
                 parameter.kind,
-                ParameterKind::Tensor {
-                    access: TensorAccess::Mutable | TensorAccess::Owned,
-                    ..
-                }
+                ParameterKind::Tensor { access, .. } if access.writer() == Some(Writer::Device)
             )
         })
         .map(|(ordinal, parameter)| (ordinal, parameter.name.clone()))

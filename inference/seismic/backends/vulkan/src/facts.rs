@@ -47,9 +47,40 @@ pub struct FormationTarget {
     pub shared_int64_atomics: bool,
     pub rounding_rte_32: bool,
     pub denorm_preserve_32: bool,
+    /// `VK_KHR_shader_subgroup_uniform_control_flow`: the seal pass declares
+    /// `SubgroupUniformControlFlowKHR` on every module that relies on a
+    /// selection rejoining at its merge, which it then guarantees
+    /// (`crate::uniformity`).
+    pub subgroup_uniform_control_flow: bool,
+    /// `VK_KHR_shader_maximal_reconvergence`: sources see it as
+    /// `SEISMIC_HAS_MAXIMAL_RECONVERGENCE`, the uniformity check accepts a
+    /// subgroup operation after a lane-varying loop, and the seal pass
+    /// declares `MaximallyReconvergesKHR` on every module that relies on it.
+    pub maximal_reconvergence: bool,
 }
 
 impl FormationTarget {
+    /// The floor's baseline: a 32-lane fp16 device without cooperative
+    /// matrix, whose fp32 rounds and flushes by its defaults (no
+    /// `RoundingModeRTE 32` or `DenormPreserve 32`, which a device meeting
+    /// the floor may lack) and whose invocations need not rejoin after a
+    /// lane-varying loop. Every check that forms for the floor rather than
+    /// for a device forms in this target or a variation of it.
+    pub const FLOOR: Self = Self {
+        subgroup_lanes: SUBGROUP_WIDTH,
+        float16: true,
+        matrix: false,
+        matrix_hardware: false,
+        wide_accumulators: true,
+        mixed_dot: true,
+        f32_atomic_add: false,
+        shared_int64_atomics: false,
+        rounding_rte_32: false,
+        denorm_preserve_32: false,
+        subgroup_uniform_control_flow: true,
+        maximal_reconvergence: false,
+    };
+
     /// The target a device with `properties` forms in. The cooperative-
     /// matrix path needs fp16 arithmetic and 32-lane hardware subgroups, and
     /// is formed only where `matrix_path` ([`Facts::matrix_path`]).
@@ -68,6 +99,8 @@ impl FormationTarget {
             shared_int64_atomics: properties.shared_int64_atomics.holds(),
             rounding_rte_32: properties.rounding_rte_32.holds(),
             denorm_preserve_32: properties.denorm_preserve_32.holds(),
+            subgroup_uniform_control_flow: properties.subgroup_uniform_control_flow.holds(),
+            maximal_reconvergence: properties.maximal_reconvergence.holds(),
         }
     }
 
@@ -95,11 +128,14 @@ impl FormationTarget {
             shared_int64_atomics,
             rounding_rte_32,
             denorm_preserve_32,
+            subgroup_uniform_control_flow,
+            maximal_reconvergence,
         } = *self;
         format!(
             "subgroup_lanes={subgroup_lanes};float16={float16};matrix={matrix};matrix_hardware={matrix_hardware};wide_accumulators={wide_accumulators};\
              mixed_dot={mixed_dot};f32_atomic_add={f32_atomic_add};shared_int64_atomics={shared_int64_atomics};\
-             rounding_rte_32={rounding_rte_32};denorm_preserve_32={denorm_preserve_32}"
+             rounding_rte_32={rounding_rte_32};denorm_preserve_32={denorm_preserve_32};\
+             subgroup_uniform_control_flow={subgroup_uniform_control_flow};maximal_reconvergence={maximal_reconvergence}"
         )
     }
 
@@ -109,6 +145,8 @@ impl FormationTarget {
             float16: self.float16,
             rounding_rte_32: self.rounding_rte_32,
             denorm_preserve_32: self.denorm_preserve_32,
+            subgroup_uniform_control_flow: self.subgroup_uniform_control_flow,
+            maximal_reconvergence: self.maximal_reconvergence,
         }
     }
 
@@ -126,6 +164,8 @@ impl FormationTarget {
             shared_int64_atomics,
             rounding_rte_32,
             denorm_preserve_32,
+            subgroup_uniform_control_flow,
+            maximal_reconvergence,
         } = *self;
         let other_lanes = if subgroup_lanes == SUBGROUP_WIDTH {
             2 * SUBGROUP_WIDTH
@@ -171,6 +211,14 @@ impl FormationTarget {
             },
             Self {
                 denorm_preserve_32: !denorm_preserve_32,
+                ..*self
+            },
+            Self {
+                subgroup_uniform_control_flow: !subgroup_uniform_control_flow,
+                ..*self
+            },
+            Self {
+                maximal_reconvergence: !maximal_reconvergence,
                 ..*self
             },
         ]
@@ -553,6 +601,8 @@ struct Queried {
     shader_shared_int64_atomics: bool,
     shader_denorm_preserve_float32: bool,
     shader_fma: ShaderFma,
+    shader_subgroup_uniform_control_flow: bool,
+    shader_maximal_reconvergence: bool,
 }
 
 impl seismic_lang::device::vulkan::Queries for Queried {
@@ -604,6 +654,12 @@ impl seismic_lang::device::vulkan::Queries for Queried {
     fn shader_rounding_mode_rte_float32(&self) -> Option<bool> {
         Some(self.shader_rounding_mode_rte_float32)
     }
+    fn shader_subgroup_uniform_control_flow(&self) -> Option<bool> {
+        Some(self.shader_subgroup_uniform_control_flow)
+    }
+    fn shader_maximal_reconvergence(&self) -> Option<bool> {
+        Some(self.shader_maximal_reconvergence)
+    }
 }
 
 /// Device extensions of the floor.
@@ -647,6 +703,8 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
     let mut atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
     let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
     let mut shader_fma = ShaderFmaFeatures::default();
+    let mut uniform_control_flow = vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR::default();
+    let mut maximal_reconvergence = vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR::default();
     let mut executables = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
     let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
     let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
@@ -666,6 +724,12 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
     }
     if has(SHADER_FMA_EXTENSION) {
         features = features.push_next(&mut shader_fma);
+    }
+    if has(ash::khr::shader_subgroup_uniform_control_flow::NAME) {
+        features = features.push_next(&mut uniform_control_flow);
+    }
+    if has(ash::khr::shader_maximal_reconvergence::NAME) {
+        features = features.push_next(&mut maximal_reconvergence);
     }
     if has(ash::khr::pipeline_executable_properties::NAME) {
         features = features.push_next(&mut executables);
@@ -724,6 +788,8 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
             float32: on(shader_fma.float32),
             float64: on(shader_fma.float64),
         },
+        shader_subgroup_uniform_control_flow: on(uniform_control_flow.shader_subgroup_uniform_control_flow),
+        shader_maximal_reconvergence: on(maximal_reconvergence.shader_maximal_reconvergence),
     };
     // The floor reads properties only queries establish, so no probe
     // decides whether a device meets it.

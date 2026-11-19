@@ -6678,7 +6678,7 @@ mod tests {
                 &magnitude_service_contracts::ModelPreviewSource {
                     repository: repository.to_owned(),
                     revision: commit.clone(),
-                    primary_gguf: PathBuf::from("Added-Q4_K_M.gguf"),
+                    shards: vec![PathBuf::from("Added-Q4_K_M.gguf")],
                     additional_components: Vec::new(),
                 },
                 &snapshot,

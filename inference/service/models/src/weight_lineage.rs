@@ -227,11 +227,46 @@ impl ManagedModelStore {
     /// The weight sample of the GGUF at `path`, from its header and a few hundred bytes of its
     /// tensor data.
     pub fn local_weight_sample(&self, path: &Path) -> Result<Option<WeightSample>, InventoryError> {
-        let (_, header) = self.local_gguf_header(path)?;
-        let directory = read_header(header)
-            .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?;
-        WeightSample::read_file(&directory, path)
-            .map_err(|error| InventoryError::Io(format!("{}: {error}", path.display())))
+        self.local_weight_sample_shards(&[path.to_path_buf()])
+    }
+
+    /// The weight sample of a single or multi-shard GGUF on disk, scanning shards in order until
+    /// enough early normalization weights are sampled (for a metadata-only first shard, sampling
+    /// continues into shard 2+).
+    pub fn local_weight_sample_shards(
+        &self,
+        shards: &[std::path::PathBuf],
+    ) -> Result<Option<WeightSample>, InventoryError> {
+        let mut parts = Vec::new();
+        for path in shards {
+            let (_, header) = self.local_gguf_header(path)?;
+            let directory = read_header(header).map_err(|error| {
+                InventoryError::Integrity(format!("{}: {error}", path.display()))
+            })?;
+            let reads = WeightSample::reads(&directory);
+            if reads.is_empty() {
+                continue;
+            }
+            let mut source = std::fs::File::open(path)
+                .map_err(|error| InventoryError::Io(format!("{}: {error}", path.display())))?;
+            for read in reads {
+                let mut bytes = vec![0; usize::try_from(read.end - read.start).unwrap_or(0)];
+                source
+                    .seek(SeekFrom::Start(read.start))
+                    .map_err(|error| InventoryError::Io(format!("{}: {error}", path.display())))?;
+                match source.read_exact(&mut bytes) {
+                    Ok(()) => parts.push((read, bytes)),
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                    Err(error) => {
+                        return Err(InventoryError::Io(format!("{}: {error}", path.display())));
+                    }
+                }
+            }
+            if WeightSample::from_reads(parts.clone()).is_some() {
+                break;
+            }
+        }
+        Ok(WeightSample::from_reads(parts))
     }
 
     /// The weight sample of the Hub file at `path` in `snapshot`: its header (cached with the
@@ -242,11 +277,27 @@ impl ManagedModelStore {
         snapshot: &HuggingFaceRepositorySnapshot,
         path: &Path,
     ) -> Result<Option<WeightSample>, InventoryError> {
+        self.hub_weight_sample_shards(snapshot, &[path.to_path_buf()])
+            .await
+    }
+
+    /// The weight sample of a single or multi-shard Hub GGUF in `snapshot`, scanning shards in
+    /// order so a metadata-only first shard samples from the shard holding `blk.0`/`blk.1` norms.
+    pub async fn hub_weight_sample_shards(
+        &self,
+        snapshot: &HuggingFaceRepositorySnapshot,
+        shards: &[std::path::PathBuf],
+    ) -> Result<Option<WeightSample>, InventoryError> {
+        let key = shards
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("|");
         let evidence = format!(
             "{}@{}:{}{}",
             snapshot.repository,
             snapshot.commit,
-            path.display(),
+            key,
             self.restricted_access_scope(snapshot.gated || snapshot.private)
         );
         if let Some(cached) = self
@@ -255,33 +306,55 @@ impl ManagedModelStore {
         {
             return Ok(cached.sample);
         }
-        let file = snapshot
-            .gguf_files
-            .iter()
-            .find(|file| file.path == path)
-            .ok_or_else(|| {
-                InventoryError::NotFound(format!(
-                    "{} has no {}",
-                    snapshot.repository,
-                    path.display()
-                ))
+        let mut parts = Vec::new();
+        for path in shards {
+            let file = snapshot
+                .gguf_files
+                .iter()
+                .find(|file| file.path == *path)
+                .ok_or_else(|| {
+                    InventoryError::NotFound(format!(
+                        "{} has no {}",
+                        snapshot.repository,
+                        path.display()
+                    ))
+                })?;
+            let header = self
+                .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, file, &[])
+                .await?;
+            let directory = read_header(header.bytes).map_err(|error| {
+                InventoryError::Integrity(format!("{}: {error}", path.display()))
             })?;
-        let header = self
-            .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, file, &[])
-            .await?;
-        let directory = read_header(header.bytes)
-            .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?;
-        let token = self.hub_token();
-        let mut remote = RemoteRanges::new(
-            &self.http,
-            token.as_deref(),
-            self.client.endpoint(),
-            &snapshot.repository,
-            &snapshot.commit,
-            path,
-            file.size_bytes,
-        )?;
-        let sample = remote_weight_sample(&mut remote, &directory).await?;
+            let reads = WeightSample::reads(&directory);
+            if reads.is_empty() {
+                continue;
+            }
+            let token = self.hub_token();
+            let mut remote = RemoteRanges::new(
+                &self.http,
+                token.as_deref(),
+                self.client.endpoint(),
+                &snapshot.repository,
+                &snapshot.commit,
+                path,
+                file.size_bytes,
+            )?;
+            for read in reads {
+                let (Ok(start), Ok(end)) = (usize::try_from(read.start), usize::try_from(read.end))
+                else {
+                    continue;
+                };
+                if end > remote.logical_length() {
+                    continue;
+                }
+                let bytes = remote.read(start, end).await?;
+                parts.push((read, bytes));
+            }
+            if WeightSample::from_reads(parts.clone()).is_some() {
+                break;
+            }
+        }
+        let sample = WeightSample::from_reads(parts);
         self.cache.write_index(
             ModelIndexKind::HuggingFaceWeightSample,
             &evidence,

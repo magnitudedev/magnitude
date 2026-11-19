@@ -132,7 +132,11 @@ STREAMING_FN void streaming_assign(u32 choices, u32 most, STREAMING_GROUP_PARAM)
 // Choice c of `choices` is the route of `routes` at row c / K, slot c % K
 // (`routes0`, `routes1` its strides); `step` the step pair (stride
 // `step0`). Every thread of the group calls it, after the routes are the
-// group's own stores.
+// group's own stores. Where the backend's group barrier does not make one
+// thread's device stores visible to another (Vulkan's plain references),
+// the includer defines STREAMING_ROUTES_GROUPED and its selection also
+// stores each choice's expert at the group word STREAMING_RESOLVE_EXPERT(c),
+// which the resolve then reads in place of `routes`.
 STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u64 routes1, u32 choices,
     STREAMING_DEVICE_READ step, u64 step0, bool whole, STREAMING_SYSTEM_READ map, u64 map0, u64 map1,
     STREAMING_SYSTEM_READ tier, u64 tier0, u32 tiered, u32 sited,
@@ -142,10 +146,18 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
     STREAMING_SYSTEM_READ policy, STREAMING_GROUP_PARAM, u32 tid, u32 threads) {
     const u32 K = u32(SEISMIC_DIM_K);
     if (whole) {
+#ifdef STREAMING_ROUTES_GROUPED
+        streaming_barrier();
+#else
         streaming_device_barrier();
+#endif
         for (u32 c = tid; c < choices; c += threads) {
+#ifdef STREAMING_ROUTES_GROUPED
+            const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
+#else
             const int expert =
                 streaming_device_load(STREAMING_AT(routes, u64(c / K) * routes0 + u64(c % K) * routes1));
+#endif
             const int home = streaming_load(STREAMING_AT(policy, SEISMIC_CONST_POLICY_HOME * SEISMIC_POLICY_STRIDE_0));
             const u64 at = u64(c / K) * sources1 + u64(c % K) * sources2;
             streaming_device_store(STREAMING_AT(sources, SEISMIC_CONST_SOURCE_RECORD * sources0 + at), home + expert);
@@ -159,11 +171,15 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
     STREAMING_SYSTEM_WORDS record = STREAMING_AT(routing, streaming_modulo(q, u64(flight)) * routing0);
     if (tid == 0)
         STREAMING_GROUP(0) = 0;
+#ifdef STREAMING_ROUTES_GROUPED
+    streaming_barrier();
+#else
     streaming_device_barrier();
     for (u32 c = tid; c < choices; c += threads)
         STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c)) =
             streaming_device_load(STREAMING_AT(routes, u64(c / K) * routes0 + u64(c % K) * routes1));
     streaming_barrier();
+#endif
     // Each expert's source, read once, on its first choice: the host maps
     // and unmaps while a step runs, so two reads of an expert's words may
     // differ, and every choice of an expert takes its expert's one source.

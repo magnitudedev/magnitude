@@ -8,10 +8,10 @@
 #define KERNEL_W3 SEISMIC_SHARED_UP
 #include "lib/core/activation.glsl"
 #include "lib/projection/projection.glsl"
+#include "lib/routed/streamed.glsl"
 #define ROUTE_E uint(SEISMIC_DIM_E)
 #define ROUTE_STRIDE (uint(SEISMIC_DIM_E) + 1u)
 #include "lib/routed/route.glsl"
-#include "lib/routed/streamed.glsl"
 
 #define ROUTE_NORM ELEMENT_OF(SEISMIC_NORM)
 
@@ -67,8 +67,15 @@ void routed_route_streamed_ordered_gemv4() { projection_segmented_ordered_gemv_m
 void routed_route_streamed_ordered_gemv8() { projection_segmented_ordered_gemv_mixed(8u, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES); }
 
 void routed_route_finish(const bool whole) {
-    for (uint64_t row = SEISMIC_SUBGROUP; row < SEISMIC_DIM_M; row += SEISMIC_SUBGROUPS)
-        route_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), row);
+    // Rounds of SEISMIC_SUBGROUPS rows, steered while a logical subgroup holds
+    // a row: a logical subgroup past the rows on a 64-lane hardware subgroup
+    // ranks the last row again and stores nothing.
+    bool live;
+    for (uint64_t base = 0ul; seismic_steer(live, base + uint64_t(SEISMIC_SUBGROUP) < SEISMIC_DIM_M);
+         base += SEISMIC_SUBGROUPS) {
+        const uint64_t placed = base + uint64_t(SEISMIC_SUBGROUP);
+        route_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), live ? placed : SEISMIC_DIM_M - 1ul, live);
+    }
     routed_resolve(whole);
 }
 

@@ -45,15 +45,15 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
         PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("set {name}")))
     };
     EngineConfiguration {
-        package: PackageOptions {
-            target: variable("MAGNITUDE_TEST_GGUF"),
-            projector: if projector {
+        package: PackageOptions::single(
+            variable("MAGNITUDE_TEST_GGUF"),
+            if projector {
                 ProjectorSelection::Explicit(variable("MAGNITUDE_TEST_MMPROJ"))
             } else {
                 ProjectorSelection::Disabled
             },
-            draft: None,
-        },
+            None,
+        ),
         model: ModelPolicy {
             draft_policy: None,
             method: ModelMethod::Plain,

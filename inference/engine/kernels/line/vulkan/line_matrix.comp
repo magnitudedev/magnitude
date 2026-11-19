@@ -12,8 +12,9 @@ void line_matrix() {
 #if SEISMIC_HAS_MATRIX_HARDWARE
     const uint UNROLL = SEISMIC_TUNE_UNROLL;
     const uint PRODUCTS = SEISMIC_STATIC_S / (4096u / SEISMIC_SUBGROUP_LANES);
-    const uint64_t lane = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
-    const uint64_t first = lane - gl_SubgroupInvocationID;
+    // The global index of the hardware subgroup's first invocation, and of this one.
+    const uint64_t first = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + SEISMIC_HARDWARE_SUBGROUP * 32u;
+    const uint64_t lane = first + (SEISMIC_LANE_BASE + SEISMIC_LANE);
     if (first >= SEISMIC_DIM_N)
         return;
     seismic_f32 xs = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));

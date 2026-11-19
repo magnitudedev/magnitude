@@ -2378,6 +2378,79 @@ fn external_bindings_are_checked_at_attach() {
     }
 }
 
+/// A standalone call refuses two tensors it writes either of whose bytes
+/// meet, by the bytes it binds: `accumulate`'s `state` over half of `x`
+/// is refused, and over the storage's other half it runs.
+#[test]
+fn a_call_refuses_written_tensors_whose_bytes_meet() {
+    for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
+        let n = 64u64;
+        let accumulate = accumulate::native_for_device(
+            &device,
+            &NativeSpecialization::new()
+                .with_param("BIAS", 0)
+                .with_param("WIDTH", 32),
+        )
+        .unwrap();
+        let storage = f32_tensor(&charges, &[2 * n], &vec![1.0; 2 * n as usize]);
+        let mut state = storage.slice_leading(0, n).unwrap();
+        let overlapping = storage.slice_leading(n / 2, n / 2 + n).unwrap();
+        match accumulate.call(&charges, accumulate::Args { state: &mut state, x: &overlapping }) {
+            Err(CallError::Invocation(InvocationError::IllegalAliasing { first, second })) => {
+                assert_eq!([first.as_str(), second.as_str()], ["state", "x"]);
+            }
+            other => panic!(
+                "{:?}: expected illegal aliasing, got {:?}",
+                device.backend(),
+                other.err()
+            ),
+        }
+        let adjacent = storage.slice_leading(n, 2 * n).unwrap();
+        accumulate
+            .call(&charges, accumulate::Args { state: &mut state, x: &adjacent })
+            .unwrap();
+        assert_eq!(read_f32(&state), vec![2.0; n as usize], "{:?}", device.backend());
+    }
+}
+
+/// A graph's own storage is placed at seal, so seal refuses a node that
+/// binds one value of it as two tensors it writes either of: `accumulate`
+/// over one local port as both `state` and `x`.
+#[test]
+fn seal_refuses_a_node_binding_one_internal_value_twice() {
+    for device in seismic_native_tests::every_device() {
+        let accumulate = accumulate::native_for_device(
+            &device,
+            &NativeSpecialization::new()
+                .with_param("BIAS", 0)
+                .with_param("WIDTH", 32),
+        )
+        .unwrap();
+        let mut graph = device.native_graph();
+        let mut state = graph.local_for(&accumulate, "state", &[("N", 64)]).unwrap();
+        let alias = state.tensor().clone();
+        graph
+            .enqueue(
+                &accumulate,
+                accumulate::WorkflowArgs {
+                    state: state.tensor_mut().into(),
+                    x: (&alias).into(),
+                },
+            )
+            .unwrap();
+        match graph.seal().err() {
+            Some(CallError::Invocation(InvocationError::IllegalAliasing { first, second })) => {
+                assert_eq!([first.as_str(), second.as_str()], ["state", "x"]);
+            }
+            other => panic!(
+                "{:?}: expected illegal aliasing at seal, got {other:?}",
+                device.backend()
+            ),
+        }
+    }
+}
+
 /// `gated_sum` by the portable body (the reference interpreter).
 fn portable_gated_sum(values: &[f32]) -> f32 {
     use seismic_lang::{

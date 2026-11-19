@@ -78,13 +78,18 @@ uint vector_next(uint64_t row, uint position, uint visible) { return position; }
 // (`history_fresh_row`), or one of the row's `picks` from the selected plane
 // read as key and value. A stored-key value is the key. Returns whether the
 // key is attended: a pick of -1 is not, nor a visible key a WorkList prefill
-// does not select (their columns are zero).
+// does not select, nor any key where the read is not `live` (their columns
+// are zero; a cursor not live stays where it is). The whole hardware
+// subgroup calls it. On 32 lanes the subgroup leaves at the key's kind; on
+// 64 lanes its logical subgroups may read keys of different kinds, so it
+// takes every path, and a fresh row is prepared where either reads one.
 bool vector_read(attention_history h, inout attention_cursor c, inout Stored keys, inout Stored values,
-    uint64_t row, uint kv_head, uint picks, uint position, out float k[ATTENTION_E], out float v[ATTENTION_E]) {
+    uint64_t row, uint kv_head, uint picks, uint position, const bool live, out float k[ATTENTION_E],
+    out float v[ATTENTION_E]) {
     bool moved;
     const uint64_t index = attention_cursor_seek(c, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
         SEISMIC_PTR(SEISMIC_BUFFER_FRESH), row, SEISMIC_DIM_R, picks, uint64_t(SEISMIC_PARAM_SLAB_ROWS), position,
-        moved);
+        live, moved);
     const uint lane = SEISMIC_LANE;
     const uint64_t row_elements = uint64_t(ATTENTION_KV) * ATTENTION_W;
     // The slab's rows follow the cursor whether or not this key is read.
@@ -92,6 +97,7 @@ bool vector_read(attention_history h, inout attention_cursor c, inout Stored key
         keys = out_stored(slab_out_region(h.key, c.slab), uint64_t(kv_head) * ATTENTION_W);
         values = out_stored(slab_out_region(h.value, c.slab), uint64_t(kv_head) * ATTENTION_W);
     }
+#if SEISMIC_SUBGROUP_LANES == 32
     if (VECTOR_SELECTED && c.span <= SEISMIC_DIM_R && !vector_reads(row, position)) {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
             k[i] = 0.0;
@@ -116,7 +122,12 @@ bool vector_read(attention_history h, inout attention_cursor c, inout Stored key
             history_fresh_row(false, index, kv_head, lane, v);
         return true;
     }
-    const int pick = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED_ROWS) + (row * picks + index) * 4ul);
+    // The picks path exists only where there are picks: without them the
+    // selected plane is absent (address 0), and its read must not be one the
+    // module can reach.
+    int pick = -1;
+    if (picks != 0u)
+        pick = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED_ROWS) + (row * picks + index) * 4ul);
     if (pick < 0) {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
             k[i] = 0.0;
@@ -130,6 +141,64 @@ bool vector_read(attention_history h, inout attention_cursor c, inout Stored key
         uint64_t(lane) * ATTENTION_E, k);
     v = k;
     return true;
+#else
+    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
+        k[i] = 0.0;
+        v[i] = 0.0;
+    }
+    bool read = live;
+    if (VECTOR_SELECTED && read && c.span <= SEISMIC_DIM_R && !vector_reads(row, position))
+        read = false;
+    // The fresh row first: a logical subgroup reading no fresh key prepares
+    // its own batch row (which exists) and zeroes it again.
+    bool fresh_key;
+    if (seismic_steer(fresh_key, read && c.span == SEISMIC_DIM_R)) {
+        const uint64_t token = fresh_key ? index : row;
+        history_fresh_row(true, token, kv_head, lane, k);
+        if (ATTENTION_STORED_KEY)
+            v = k;
+        else
+            history_fresh_row(false, token, kv_head, lane, v);
+        if (!fresh_key)
+            [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
+                k[i] = 0.0;
+                v[i] = 0.0;
+            }
+    }
+    if (read && c.span < SEISMIC_DIM_R) {
+        const uint64_t at = (index - c.slab_lo) * row_elements + uint64_t(lane) * ATTENTION_E;
+        attention_load_row(keys, at, k);
+        if (ATTENTION_STORED_KEY)
+            v = k;
+        else
+            attention_load_row(values, at, v);
+    }
+    // The picks path exists only where there are picks (above).
+    if (picks != 0u && read && c.span > SEISMIC_DIM_R) {
+        const int pick = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED_ROWS) + (row * picks + index) * 4ul);
+        if (pick < 0) {
+            read = false;
+        } else {
+            const uint64_t head_bytes = uint64_t(ATTENTION_W) * uint64_t(ELEMENT_BYTES(ACTIVATION_A));
+            attention_load_row(history_address(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), uint64_t(pick),
+                uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS), uint64_t(ATTENTION_KV) * head_bytes, head_bytes, kv_head),
+                uint64_t(lane) * ATTENTION_E, k);
+            v = k;
+        }
+    }
+    return read;
+#endif
+}
+
+// Where a key group's walk still takes batches (`batches`), moves `position`
+// to the batch holding its next read, at a fixed position first + i *
+// VECTOR_BATCH, and returns whether that batch ends by `last`; elsewhere
+// `position` stays and it returns false. The whole hardware subgroup calls
+// it (`vector_next`).
+bool vector_batch(uint64_t row, uint first, uint last, uint visible, const bool batches, inout uint position) {
+    const uint next = vector_next(row, position, batches ? visible : 0u);
+    position = batches ? first + (next - first) / VECTOR_BATCH * VECTOR_BATCH : position;
+    return batches && position + VECTOR_BATCH <= last;
 }
 
 // The partial of workgroup (`kv_head`, head group `group`, partition `part`,
@@ -154,13 +223,17 @@ void vector_partial(attention_history h, uint kv_head, uint group, uint part, ui
     const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
 
     // Subgroup 0 appends the key, subgroup 1 the value (none for a
-    // stored-key history).
-    if (ATTENTION_FRESH && part == 0u && group == 0u && sg < (ATTENTION_STORED_KEY ? 1u : 2u)) {
+    // stored-key history); a hardware subgroup holding either runs the
+    // preparation in both its logical subgroups, the other storing nothing.
+    bool appending;
+    if (seismic_steer(appending,
+            ATTENTION_FRESH && part == 0u && group == 0u && sg < (ATTENTION_STORED_KEY ? 1u : 2u))) {
         const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul);
-        if (destination >= 0) {
+        bool appends;
+        if (seismic_steer(appends, appending && destination >= 0)) {
             float x[ATTENTION_E];
             history_fresh_row(sg == 0u, row, kv_head, lane, x);
-            history_hold(h, sg == 0u, destination, kv_head, lane, false, x);
+            history_hold(h, sg == 0u, appends ? destination : -1, kv_head, lane, false, x);
         }
     }
 
@@ -177,22 +250,31 @@ void vector_partial(attention_history h, uint kv_head, uint group, uint part, ui
     const float query_scale = scale * ATTENTION_LOG2E;
     // Head pair p's prepared queries share words: head 2p in the low half,
     // head 2p + 1 in the high half.
-    for (uint pair = sg; pair < (GROUP + 1u) / 2u; pair += simds) {
-        const uint64_t head = row * KV * G + kv_head * G + head_base + 2u * pair;
+    // The hardware subgroup runs while either of its logical subgroups holds
+    // a pair; one past the pairs prepares pair 0 and stores nothing.
+    bool held;
+    for (uint pair = sg; seismic_steer(held, pair < (GROUP + 1u) / 2u); pair += simds) {
+        const uint64_t head = row * KV * G + kv_head * G + head_base + 2u * (held ? pair : 0u);
         float low[ATTENTION_E];
         float high[ATTENTION_E];
         attention_prepare(ATTENTION_QUERY_BUFFER + head * ATTENTION_QUERY_STRIDE * act_bytes, ATTENTION_QUERY_NORM,
             query_norm, row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), low);
-        if (2u * pair + 1u < GROUP)
-            attention_prepare(ATTENTION_QUERY_BUFFER + (head + 1ul) * ATTENTION_QUERY_STRIDE * act_bytes,
+        bool paired;
+        if (seismic_steer(paired, held && 2u * pair + 1u < GROUP)) {
+            attention_prepare(ATTENTION_QUERY_BUFFER + (paired ? head + 1ul : head) * ATTENTION_QUERY_STRIDE * act_bytes,
                 ATTENTION_QUERY_NORM, query_norm, row_coordinates, components, frequencies, amplitudes, epsilon,
                 lane, rounding_none(), high);
-        else
+            if (!paired)
+                [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+                    high[i] = 0.0;
+        } else {
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                 high[i] = 0.0;
-        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            seismic_shared_u32[prepared + pair * W + lane * E + i] =
-                element_store(ACTIVATION_A, low[i]) | (element_store(ACTIVATION_A, high[i]) << 16u);
+        }
+        if (held)
+            [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+                seismic_shared_u32[prepared + pair * W + lane * E + i] =
+                    element_store(ACTIVATION_A, low[i]) | (element_store(ACTIVATION_A, high[i]) << 16u);
     }
     barrier();
     const uint head0 = attention_slice(sg) * ATTENTION_HEADS;
@@ -219,26 +301,28 @@ void vector_partial(attention_history h, uint kv_head, uint group, uint part, ui
     // The row's visible keys, which the bitmap selects among; its picks follow.
     const uint visible_keys = total - picks;
     // The batches at fixed positions first + i * VECTOR_BATCH, from the one
-    // holding the next read; then the keys that fill no batch, one at a time.
+    // holding the next read; then the keys that fill no batch, one at a
+    // time. The hardware subgroup walks while any of its logical subgroups
+    // has a key left; one that has none reads nothing and absorbs nothing.
     uint position = first;
-    for (;;) {
-        const uint next = vector_next(row, position, visible_keys);
-        position = first + (next - first) / VECTOR_BATCH * VECTOR_BATCH;
-        if (position + VECTOR_BATCH > last)
-            break;
+    // `batching` is also the last round's: a key group out of batches stays.
+    bool batching = true;
+    while (seismic_steer(batching, vector_batch(row, first, last, visible_keys, batching, position))) {
         float k[4][ATTENTION_E];
         float v[4][ATTENTION_E];
         uint live = 0u;
         [[unroll]] for (uint j = 0u; j < VECTOR_BATCH; ++j)
-            live |= uint(vector_read(h, c, keys, values, row, kv_head, picks, position + j, k[j], v[j])) << j;
+            live |= uint(vector_read(h, c, keys, values, row, kv_head, picks, position + j, batching, k[j], v[j])) << j;
         attention_absorb(VECTOR_BATCH, live, q, k, v, maximum, denominator, result);
-        position += VECTOR_BATCH;
+        position += batching ? VECTOR_BATCH : 0u;
     }
-    for (position = vector_next(row, position, visible_keys); position < last;
-         position = vector_next(row, position + 1u, visible_keys)) {
+    // A key group past its keys stays (`vector_next` of no visible keys).
+    bool single;
+    for (position = vector_next(row, position, visible_keys); seismic_steer(single, position < last);
+         position = vector_next(row, single ? position + 1u : position, single ? visible_keys : 0u)) {
         float k[4][ATTENTION_E];
         float v[4][ATTENTION_E];
-        const uint live = uint(vector_read(h, c, keys, values, row, kv_head, picks, position, k[0], v[0]));
+        const uint live = uint(vector_read(h, c, keys, values, row, kv_head, picks, position, single, k[0], v[0]));
         attention_absorb(1u, live, q, k, v, maximum, denominator, result);
     }
 

@@ -153,20 +153,33 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
     uint64_t row, head_at;
     seismic_split_group(gl_WorkGroupID.x, SEISMIC_SUBGROUPS, SEISMIC_SUBGROUP, KV * (G + 1u), row, head_at);
     const uint head = uint(head_at);
-    if (row >= padded)
+    // A hardware subgroup's logical subgroups may hold items of either kind
+    // (or none, past the padded rows): each kind's preparation runs where any
+    // of them holds one, the others preparing a row that exists (row 0, head
+    // 0) and storing nothing. So a query item does not return after its
+    // preparation: the fresh one's test below turns it away.
+    bool tiled;
+    if (!seismic_steer(tiled, row < padded))
         return;
     const uint64_t queries = scratch_planes.queries;
-    if (head < KV * G) {
-        const uint kv_head = head / G, g = head % G;
+    bool is_query;
+    if (seismic_steer(is_query, tiled && head < KV * G)) {
+        const uint query_head = is_query ? head : 0u;
+        const uint kv_head = query_head / G, g = query_head % G;
         const uint64_t query_row = (uint64_t(kv_head) * padded + row) * G + g;
         const uint64_t at = query_row * W + lane * E;
         float x[ATTENTION_E];
-        if (row < rows) {
-            attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + head) * ATTENTION_QUERY_STRIDE) * 2ul,
+        bool real;
+        if (seismic_steer(real, is_query && row < rows)) {
+            const uint64_t source = real ? row : 0ul;
+            attention_prepare(ATTENTION_QUERY_BUFFER + ((source * KV * G + query_head) * ATTENTION_QUERY_STRIDE) * 2ul,
                 ATTENTION_QUERY_NORM, SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM),
-                SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul,
+                SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + source * 16ul,
                 SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
                 ATTENTION_AMPLITUDE_BUFFER, element_word_f32(SEISMIC_PARAM_EPSILON), lane, rounding_none(), x);
+            if (!real)
+                [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+                    x[i] = 0.0;
         } else {
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                 x[i] = 0.0;
@@ -174,28 +187,34 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
             x[i] = element_round(ACTIVATION_A, x[i]);
         const int exponent = prefill_query_exponent(x);
-        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            element_put(ELEMENT_F16, queries, at + i, ldexp(x[i], -exponent));
-        if (lane == 0u)
-            element_f32_put(scratch_planes.query_factors + query_row * 4ul, ldexp(1.0, exponent));
-        return;
+        if (is_query) {
+            [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+                element_put(ELEMENT_F16, queries, at + i, ldexp(x[i], -exponent));
+            if (lane == 0u)
+                element_f32_put(scratch_planes.query_factors + query_row * 4ul, ldexp(1.0, exponent));
+        }
     }
-    if (row >= rows || !ATTENTION_FRESH)
+    bool is_fresh;
+    if (!seismic_steer(is_fresh, ATTENTION_FRESH && tiled && head >= KV * G && row < rows))
         return;
-    const uint kv_head = head - KV * G;
-    const uint64_t source = (row * KV + kv_head) * W;
-    const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul);
+    const uint kv_head = is_fresh ? head - KV * G : 0u;
+    const uint64_t token = is_fresh ? row : 0ul;
+    const uint64_t source = (token * KV + kv_head) * W;
+    const int destination =
+        is_fresh ? element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + token * 4ul) : -1;
     float k[ATTENTION_E], v[ATTENTION_E];
-    history_fresh_row(true, row, kv_head, lane, k);
+    history_fresh_row(true, token, kv_head, lane, k);
     history_hold(h, true, destination, kv_head, lane, true, k);
     // A stored-key value is the key.
     if (ATTENTION_STORED_KEY) {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
             v[i] = k[i];
     } else {
-        history_fresh_row(false, row, kv_head, lane, v);
+        history_fresh_row(false, token, kv_head, lane, v);
         history_hold(h, false, destination, kv_head, lane, true, v);
     }
+    if (!is_fresh)
+        return;
     const uint64_t keys = scratch_planes.keys;
     const uint64_t values = scratch_planes.values;
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
@@ -227,17 +246,26 @@ void prefill_stage(attention_history h, prefill_scratch scratch_planes, const bo
         history_stage(h, is_key, first, end, kv_head, column, w, 0u);
     } else {
 #if !PREFILL_PREPARED
-        for (uint r = SEISMIC_SUBGROUP; r < FLASH_KEYS; r += SEISMIC_SUBGROUPS) {
+        // A row a logical subgroup; a row past `end` stages zeros, its
+        // logical subgroup preparing row first (which exists) where another
+        // of its hardware subgroup prepares.
+        bool held;
+        for (uint r = SEISMIC_SUBGROUP; seismic_steer(held, r < FLASH_KEYS); r += SEISMIC_SUBGROUPS) {
             const int t = first + int(r);
             float x[ATTENTION_E];
-            if (t < end) {
-                history_fresh_row(is_key, uint64_t(t), kv_head, SEISMIC_LANE, x);
+            bool staged;
+            if (seismic_steer(staged, held && t < end)) {
+                history_fresh_row(is_key, uint64_t(staged ? t : first), kv_head, SEISMIC_LANE, x);
                 history_hold(h, is_key, -1, kv_head, SEISMIC_LANE, true, x);
+                if (!staged)
+                    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+                        x[i] = 0.0;
             } else {
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                     x[i] = 0.0;
             }
-            prefill_put_row(0u, flash_pitch(w), r, column, w, SEISMIC_LANE, x);
+            if (held)
+                prefill_put_row(0u, flash_pitch(w), r, column, w, SEISMIC_LANE, x);
         }
 #else
         const uint64_t plane =
@@ -263,7 +291,7 @@ int prefill_pick(uint64_t row, uint pick) {
 void prefill_stage_picks(uint64_t row, uint pick0, uint kv_head, uint column, const uint w) {
     const uint pieces = w / 8u;
     const uint64_t head_bytes = uint64_t(ATTENTION_W) * ELEMENT_BYTES(ACTIVATION_A);
-    for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
+    for (uint item = SEISMIC_THREAD; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
         const uint k = item / pieces;
         const uint c = (item % pieces) * 8u;
         const int index = prefill_pick(row, pick0 + k);
@@ -337,7 +365,9 @@ void prefill_stage_positions(attention_history h, prefill_scratch scratch_planes
     const int historical = end - max(fresh_hi - fresh_lo, 0);
     const uvec2 start = attention_locate(visible, fresh, row, spans, uint(first));
     const uint pieces = w / 8u;
-    for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
+    // The fresh keys' preparation below reduces over each subgroup: the walk
+    // rejoins first (`seismic_strided`).
+    seismic_strided(uint, item, SEISMIC_THREAD, FLASH_KEYS * pieces, gl_WorkGroupSize.x) {
         const uint k = item / pieces;
         const uint c = (item % pieces) * 8u;
         const int key = first + int(k);
@@ -364,14 +394,21 @@ void prefill_stage_positions(attention_history h, prefill_scratch scratch_planes
         seismic_shared_uvec4[(k * flash_pitch(w) + c) / 8u] = bits;
     }
 #if !PREFILL_PREPARED
-    for (uint r = SEISMIC_SUBGROUP; r < FLASH_KEYS; r += SEISMIC_SUBGROUPS) {
+    // A row a logical subgroup; a row that is not fresh prepares the tile's
+    // first fresh key where another of its hardware subgroup prepares, and
+    // stores nothing.
+    bool held;
+    for (uint r = SEISMIC_SUBGROUP; seismic_steer(held, r < FLASH_KEYS); r += SEISMIC_SUBGROUPS) {
         const int key = first + int(r);
-        if (key < historical || key >= end)
-            continue;
-        float x[ATTENTION_E];
-        history_fresh_row(is_key, uint64_t(fresh_lo + key - historical), kv_head, SEISMIC_LANE, x);
-        history_hold(h, is_key, -1, kv_head, SEISMIC_LANE, true, x);
-        prefill_put_row(0u, flash_pitch(w), r, column, w, SEISMIC_LANE, x);
+        bool is_fresh;
+        if (seismic_steer(is_fresh, held && key >= historical && key < end)) {
+            float x[ATTENTION_E];
+            history_fresh_row(is_key, uint64_t(fresh_lo + (is_fresh ? key : max(first, historical)) - historical),
+                kv_head, SEISMIC_LANE, x);
+            history_hold(h, is_key, -1, kv_head, SEISMIC_LANE, true, x);
+            if (is_fresh)
+                prefill_put_row(0u, flash_pitch(w), r, column, w, SEISMIC_LANE, x);
+        }
     }
 #endif
 }
@@ -410,28 +447,33 @@ uint prefill_index_tiles(uint64_t visible, uint64_t fresh, uint64_t tile_first, 
 }
 
 // The query tile's key tiles over all its spans. Lane l counts spans l, l +
-// 32, ...; the whole subgroup calls it.
+// 32, ... (`seismic_strided`). The whole hardware subgroup calls it for one
+// tile, so every logical subgroup forms the same count and the result is
+// uniform across the hardware subgroup.
 uint prefill_total_tiles(uint64_t visible, uint64_t fresh, uint64_t tile_first, uint64_t rows, uint64_t spans) {
     uint total = 0u;
-    for (uint64_t index = SEISMIC_LANE; index <= spans; index += 32ul)
+    seismic_strided(uint64_t, index, uint64_t(SEISMIC_LANE), spans + 1ul, 32ul)
         total += prefill_index_tiles(visible, fresh, tile_first, rows, spans, index);
-    return seismic_subgroup_add(total);
+    return seismic_hardware_first(seismic_subgroup_add(total));
 }
 
 // The span holding the query tile's key tile `tile` (in span order) and the
 // tiles before it: the first span in 0..=spans whose tiles end past `tile`,
-// or (spans + 1, total) when there is none. The whole subgroup calls it, 32
-// spans at a time.
+// or (spans + 1, total) when there is none. The whole hardware subgroup
+// calls it for one tile, 32 spans at a time, so every logical subgroup finds
+// the same span: the walk leaves, and its result is, uniform across the
+// hardware subgroup.
 uvec2 prefill_locate_tile(uint64_t visible, uint64_t fresh, uint64_t tile_first, uint64_t rows, uint64_t spans,
     uint tile) {
     uint carried = 0u;
     for (uint64_t base = 0ul; base <= spans; base += 32ul) {
         uint found;
-        if (reduce_lanes_locate(prefill_index_tiles(visible, fresh, tile_first, rows, spans, base + SEISMIC_LANE),
-                tile, carried, found))
-            return uvec2(uint(base) + found, carried);
+        if (seismic_hardware_first(uint(reduce_lanes_locate(
+                prefill_index_tiles(visible, fresh, tile_first, rows, spans, base + SEISMIC_LANE), tile, carried,
+                found))) != 0u)
+            return seismic_hardware_first(uvec2(uint(base) + found, carried));
     }
-    return uvec2(uint(spans) + 1u, carried);
+    return seismic_hardware_first(uvec2(uint(spans) + 1u, carried));
 }
 
 // The lane's 16 scaled, masked scores of the tile starting at key `first`;
@@ -470,7 +512,13 @@ bool prefill_reads(uint64_t row, int base, int key, int lo) {
 // the bitmap unread), or `end` when it reads none there. It reads the
 // bitmap's words, not its keys, so a walk of the selected keys costs its
 // selection and the bitmap's words, not the context.
+//
+// The whole hardware subgroup calls it with `ordinal` and `end` held alike by
+// each logical subgroup. On 64 lanes they may differ between its logical
+// subgroups, so the scan cannot leave at the first one's read: it runs until
+// every one has its own.
 uint prefill_next_read(uint64_t row, uint ordinal, uint end) {
+#if SEISMIC_SUBGROUP_LANES == 32
     if (!PREFILL_SELECTED || ordinal >= end)
         return ordinal;
     const uint block = ordinal / uint(PREFILL_BLOCK_ROWS);
@@ -482,6 +530,27 @@ uint prefill_next_read(uint64_t row, uint ordinal, uint end) {
             return min(max((w * 32u + uint(findLSB(word))) * uint(PREFILL_BLOCK_ROWS), ordinal), end);
     }
     return end;
+#else
+    if (!PREFILL_SELECTED)
+        return ordinal;
+    bool found = ordinal >= end;
+    uint next = found ? ordinal : end;
+    const uint block = ordinal / uint(PREFILL_BLOCK_ROWS);
+    bool scans;
+    for (uint w = block / 32u; seismic_steer(scans, !found && w < uint(PREFILL_SELECTION_WORDS)); ++w) {
+        if (scans) {
+            uint word = element_u32_at(
+                PREFILL_SELECTION_BUFFER + (row * uint64_t(PREFILL_SELECTION_WORDS) + uint64_t(w)) * 4ul);
+            if (w == block / 32u)
+                word &= ~0u << (block % 32u);
+            if (word != 0u) {
+                next = min(max((w * 32u + uint(findLSB(word))) * uint(PREFILL_BLOCK_ROWS), ordinal), end);
+                found = true;
+            }
+        }
+    }
+    return next;
+#endif
 }
 
 // The list launch (PREFILL_SELECTED): workgroup per QT-row query tile, 256
@@ -686,17 +755,27 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     // its rows' factors [ROWS] (F32).
     const uint queries = FLASH_KEYS * flash_pitch(chunk) + 2u * SEISMIC_SUBGROUPS * FLASH_SCRATCH_FLOATS;
     const uint query_factors = (queries + PREFILL_ROWS * (W + 8u)) / 2u;
-    for (uint i = SEISMIC_SUBGROUP; i < PREFILL_ROWS; i += SEISMIC_SUBGROUPS) {
+    // A row a logical subgroup: a padding row stages zeros, its logical
+    // subgroup preparing the tile's first row (which exists) where another
+    // of its hardware subgroup prepares.
+    bool held;
+    for (uint i = SEISMIC_SUBGROUP; seismic_steer(held, i < PREFILL_ROWS); i += SEISMIC_SUBGROUPS) {
         const uint64_t token = tile_first + i / G;
         float x[ATTENTION_E];
-        if (i < PREFILL_QT * G && token < rows) {
-            attention_prepare(ATTENTION_QUERY_BUFFER + ((token * KV * G + kv_head * G + i % G) * ATTENTION_QUERY_STRIDE)
+        bool real;
+        if (seismic_steer(real, held && i < PREFILL_QT * G && token < rows)) {
+            const uint64_t source = real ? token : tile_first;
+            attention_prepare(ATTENTION_QUERY_BUFFER
+                    + ((source * KV * G + kv_head * G + (real ? i % G : 0u)) * ATTENTION_QUERY_STRIDE)
                     * uint64_t(ELEMENT_BYTES(ACTIVATION_A)), ATTENTION_QUERY_NORM,
-                SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + token * 16ul,
+                SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + source * 16ul,
                 SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
                 ATTENTION_AMPLITUDE_BUFFER, element_word_f32(SEISMIC_PARAM_EPSILON), lane, rounding_none(), x);
             [[unroll]] for (uint j = 0u; j < ATTENTION_E; ++j)
                 x[j] = element_round(ACTIVATION_A, x[j]);
+            if (!real)
+                [[unroll]] for (uint j = 0u; j < ATTENTION_E; ++j)
+                    x[j] = 0.0;
         } else {
             [[unroll]] for (uint j = 0u; j < ATTENTION_E; ++j)
                 x[j] = 0.0;
@@ -704,21 +783,22 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
         const int exponent = prefill_query_exponent(x);
         [[unroll]] for (uint j = 0u; j < ATTENTION_E; ++j)
             x[j] = ldexp(x[j], -exponent);
-        prefill_put_row(queries, W + 8u, i, 0u, W, lane, x);
-        if (lane == 0u)
-            seismic_shared_f32[query_factors + i] = ldexp(1.0, exponent);
+        if (held) {
+            prefill_put_row(queries, W + 8u, i, 0u, W, lane, x);
+            if (lane == 0u)
+                seismic_shared_f32[query_factors + i] = ldexp(1.0, exponent);
+        }
     }
     if (ATTENTION_FRESH && part == 0u) {
-        for (uint64_t token = tile_first + SEISMIC_SUBGROUP; token < min(tile_first + PREFILL_QT, rows);
-             token += SEISMIC_SUBGROUPS) {
-            const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + token * 4ul);
-            if (destination < 0)
-                continue;
-            float x[ATTENTION_E];
-            history_fresh_row(true, token, kv_head, lane, x);
-            history_hold(h, true, destination, kv_head, lane, false, x);
-            history_fresh_row(false, token, kv_head, lane, x);
-            history_hold(h, false, destination, kv_head, lane, false, x);
+        // A tile row a logical subgroup; one past the tile's rows has no
+        // destination (`history_append_fresh`, the tile's first row
+        // existing).
+        bool appending;
+        for (uint64_t token = tile_first + SEISMIC_SUBGROUP;
+             seismic_steer(appending, token < min(tile_first + PREFILL_QT, rows)); token += SEISMIC_SUBGROUPS) {
+            const int destination =
+                appending ? element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + token * 4ul) : -1;
+            history_append_fresh(h, token, tile_first, kv_head, destination);
         }
     }
     barrier();
@@ -782,7 +862,10 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint used = max(1u, (total_tiles + per - 1u) / per);
     if (part >= used)
         return;
-    if (part == 0u && kv_head == 0u && gl_LocalInvocationIndex == 0u)
+    // By `SEISMIC_THREAD`: a store under the local index's control would mix
+    // it into every later read of memory the launch writes, which the
+    // subgroups combine by lane order.
+    if (part == 0u && kv_head == 0u && SEISMIC_THREAD == 0u)
         element_u32_put(scratch_planes.counts + uint64_t(tile) * 4ul, used);
     const uint tiles_lo = part * per;
     const uint tiles_hi = min(tiles_lo + per, total_tiles);
@@ -974,8 +1057,10 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
 #ifndef PREFILL_DECODE
 // ---------------------------------------------------------------------------
 // The index-list source (PREFILL_PICKS), after L1 put the queries:
-// workgroup (row, query head), one subgroup. Its softmax state over the row's
-// `picks` picks (`selected_rows`, [M][picks] i32, -1 for none; each the kv
+// workgroup (row, query head pair), a 32-lane subgroup per query head (the
+// pair's second past the last returns, or where it shares a hardware subgroup
+// with the first, runs the first's and stores nothing). Its
+// softmax state over the row's `picks` picks (`selected_rows`, [M][picks] i32, -1 for none; each the kv
 // head's vector of the `selected` plane, [rows][KV][W] A in slabs of
 // `selected_slab_rows` rows, read as key and value) is `picked`'s.
 void prefill_picks(prefill_scratch scratch_planes, prefill_picked picked, uint64_t selected_rows, uint picks,
@@ -984,7 +1069,11 @@ void prefill_picks(prefill_scratch scratch_planes, prefill_picked picked, uint64
     const uint64_t rows = SEISMIC_DIM_M;
     const uint64_t padded = prefill_padded(rows);
     const uint64_t row = gl_WorkGroupID.x;
-    const uint head = gl_WorkGroupID.y;
+    const uint paired = gl_WorkGroupID.y * 2u + SEISMIC_SUBGROUP;
+    bool live;
+    if (!seismic_steer(live, paired < KV * G))
+        return;
+    const uint head = live ? paired : paired - 1u;
     const uint kv_head = head / G;
     const uint lane = SEISMIC_LANE;
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE) * ATTENTION_LOG2E;
@@ -1019,6 +1108,8 @@ void prefill_picks(prefill_scratch scratch_planes, prefill_picked picked, uint64
             accumulated[i] = seismic_fma_rn(accumulated[i], carry, weight * x[i]);
         maximum = next;
     }
+    if (!live)
+        return;
     const uint64_t state = row * KV * G + head;
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
         element_f32_put(picked.partials + (state * W + lane * E + i) * 4ul, accumulated[i]);
@@ -1066,13 +1157,16 @@ void prefill_merge(prefill_scratch scratch_planes, prefill_picked picked) {
 #endif
 
 #ifdef PREFILL_DECODE
-// The decode merge of the matrix form: workgroup (query head, row), one
-// invocation per column; every one of the row's PREFILL_PARTS partitions
-// stored a partial (an empty one with denominator 0), merged in partition
-// order, then the output gate.
+// The decode merge of the matrix form: workgroup (query heads, row), one
+// invocation per column (`attention_merge_place`); every one of the row's
+// PREFILL_PARTS partitions stored a partial (an empty one with denominator
+// 0), merged in partition order, then the output gate.
 void prefill_decode_merge() {
-    const uint64_t head = gl_WorkGroupID.x, row = gl_WorkGroupID.y;
-    const uint column = gl_LocalInvocationIndex;
+    const uvec2 place = attention_merge_place();
+    const uint64_t head = place.x, row = gl_WorkGroupID.y;
+    const uint column = place.y;
+    if (column >= ATTENTION_W)
+        return;
     const float attended = attention_merge(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS),
         (row * ATTENTION_KV * ATTENTION_G + head) * PREFILL_PARTS, 1ul, PREFILL_PARTS, column, head);

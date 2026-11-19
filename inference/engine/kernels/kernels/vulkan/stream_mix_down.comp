@@ -78,12 +78,13 @@ projection_prologue projected_part(uint part) {
         SEISMIC_NORM_STRIDE_1, MIX_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), uint(SEISMIC_DIM_H), 0ul);
 }
 
-// The stream's first workgroup publishes its rows' inverses.
+// The stream's first workgroup publishes its rows' inverses, row m by
+// invocation `SEISMIC_THREAD`: its subgroups stored the rows' squares.
 void projected_part_first(uint part, projection_prologue x) {
-    if (gl_LocalInvocationIndex < PROJECTION_M)
-        out_put(SEISMIC_RESULT_2_OUT, uint64_t(gl_LocalInvocationIndex)
-            * SEISMIC_RESULT_2_STRIDE_0 + uint64_t(part) * SEISMIC_RESULT_2_STRIDE_1,
-            projection_gemv_inverse(x, gl_LocalInvocationIndex));
+    const uint m = SEISMIC_THREAD;
+    if (m < PROJECTION_M)
+        out_put(SEISMIC_RESULT_2_OUT, uint64_t(m) * SEISMIC_RESULT_2_STRIDE_0
+            + uint64_t(part) * SEISMIC_RESULT_2_STRIDE_1, projection_gemv_inverse(x, m));
 }
 
 #include "lib/projection/operator.glsl"

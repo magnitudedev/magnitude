@@ -41,11 +41,7 @@ fn each_run_reconciles_at_most_one_cpu_flight() {
         conversations: std::num::NonZeroUsize::MIN,
     };
     let resolved = EngineConfiguration {
-        package: PackageOptions {
-            target: model,
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+        package: PackageOptions::single(model, ProjectorSelection::Disabled, None),
         model: ModelPolicy {
             draft_policy: None,
             method: ModelMethod::Plain,

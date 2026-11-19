@@ -9,22 +9,28 @@
 #define ROUTE_PER_LANE ((ROUTE_E + 31u) / 32u)
 ROUTE_DEFINE_RANK_AT
 
-void route_select_row(uint64_t logits_base, uint64_t row) {
+// Row `row`'s selection; a subgroup not `live` ranks it without storing
+// (its 64-lane partner's row is live).
+void route_select_row(uint64_t logits_base, uint64_t row, bool live) {
     const uint lane = SEISMIC_LANE;
     const uint64_t routes = SEISMIC_PTR(SEISMIC_BUFFER_ROUTES);
     const Out scores = SEISMIC_OUT_SCORES;
     float chosen[ROUTE_K];
     int winners[ROUTE_K];
     route_rank_at(logits_base, row, chosen, winners);
-    if (lane == 0u)
-        for (uint slot = 0u; slot < ROUTE_K; ++slot)
+    if (live && lane == 0u)
+        for (uint slot = 0u; slot < ROUTE_K; ++slot) {
             element_i32_put(routes + (row * SEISMIC_ROUTES_STRIDE_0 + uint64_t(slot) * SEISMIC_ROUTES_STRIDE_1) * 4ul,
                 winners[ROUTE_K - 1u - slot]);
+#ifdef STREAMING_ROUTES_GROUPED
+            routed_group_route(row, slot, winners[ROUTE_K - 1u - slot]);
+#endif
+        }
     float denominator = 0.0;
     if (SEISMIC_PARAM_NORMALIZE != 0ul)
         for (uint slot = 0u; slot < ROUTE_K; ++slot)
             denominator += chosen[ROUTE_K - 1u - slot];
-    if (lane == 0u) {
+    if (live && lane == 0u) {
         for (uint slot = 0u; slot < ROUTE_K; ++slot) {
             const uint rank = ROUTE_K - 1u - slot;
             float score = SEISMIC_PARAM_NORMALIZE != 0ul ? seismic_div_rn(chosen[rank], denominator) : chosen[rank];

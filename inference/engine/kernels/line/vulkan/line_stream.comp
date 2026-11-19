@@ -5,19 +5,22 @@
 
 void line_stream() {
     const uint UNROLL = SEISMIC_TUNE_UNROLL;
-    const uint64_t row = uint64_t(gl_WorkGroupID.x) * (gl_WorkGroupSize.x / 32u) + gl_LocalInvocationID.x / 32u;
-    if (row >= SEISMIC_DIM_R)
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * (gl_WorkGroupSize.x / 32u) + SEISMIC_SUBGROUP;
+    // A hardware subgroup without a row leaves; a logical subgroup past R on a
+    // 64-lane one sums row R - 1 and stores nothing.
+    bool live;
+    if (!seismic_steer(live, row < SEISMIC_DIM_R))
         return;
     const uint lane = SEISMIC_LANE;
-    seismic_uvec4 line = seismic_uvec4(SEISMIC_PTR(SEISMIC_BUFFER_INPUT) + row * SEISMIC_INPUT_STRIDE_0 * 4ul);
+    seismic_uvec4 line = seismic_uvec4(SEISMIC_PTR(SEISMIC_BUFFER_INPUT) + (live ? row : SEISMIC_DIM_R - 1ul) * SEISMIC_INPUT_STRIDE_0 * 4ul);
     const uint vectors = uint(SEISMIC_DIM_C / 4ul);
     float partial[UNROLL];
     [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
         partial[k] = 0.0;
-    for (uint at = lane; at < vectors; at += 32u * UNROLL) {
+    for (uint base = 0u; base < vectors; base += 32u * UNROLL) {
         vec4 loaded[UNROLL];
         [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
-            loaded[k] = uintBitsToFloat(line[at + 32u * k].v);
+            loaded[k] = uintBitsToFloat(line[base + lane + 32u * k].v);
         [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
             partial[k] += (loaded[k].x + loaded[k].y) + (loaded[k].z + loaded[k].w);
     }
@@ -25,6 +28,6 @@ void line_stream() {
     [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
         total += partial[k];
     total = seismic_subgroup_sum_f32(total);
-    if (lane == 0u)
+    if (live && lane == 0u)
         out_put(SEISMIC_OUT_OUT, row * SEISMIC_OUT_STRIDE_0, total);
 }

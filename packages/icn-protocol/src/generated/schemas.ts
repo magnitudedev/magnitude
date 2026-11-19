@@ -603,7 +603,7 @@ export const CatalogSupport = S.Union(
   ),
   S.extend(
     S.Struct({
-      intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      intelligence: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
       level: S.Literal("deprecated"),
       reason: S.String,
       replacement: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
@@ -1585,6 +1585,12 @@ export const HardwareDiagnosticSource = S.Union(
   S.extend(
     S.Struct({
       type: S.Literal("adapters"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      type: S.Literal("host"),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
