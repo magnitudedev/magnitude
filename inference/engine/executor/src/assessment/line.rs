@@ -863,7 +863,7 @@ impl MachineLine {
 /// step more: every hardware thread where the pool has fewer, else twice the
 /// pool. None where the process may run on no performance core.
 pub(super) fn host_readers() -> Result<[u64; 2], ExecutorCostsError> {
-    let processors = seismic::Processors::discover();
+    let processors = seismic::discover_processors();
     readers_among(processors.quota().get(), processors.performance_cores())
 }
 

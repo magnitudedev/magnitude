@@ -14,11 +14,14 @@ use crate::fixtures::{
     STRIX_HALO_WINDOWS_HEAPS, STRIX_HALO_WINDOWS_LUID, STRIX_HALO_WINDOWS_UUID,
 };
 use crate::model::{
-    Availability, DeviceMemory, DeviceTopology, PhysicalIdentity, Reported, ReportedBy, StoreId, StoreKind,
+    Availability, CacheSize, DeviceMemory, DeviceTopology, Grant, GrantKind, PhysicalIdentity,
+    Reported, ReportedBy, StoreId, StoreKind,
 };
 use crate::placement::Contract;
+use crate::processors::HostNode;
 use crate::reports::Reports;
 use crate::selector::ExecutorSelector;
+use crate::system::{FormFactor, HardwareIdentity, SystemIdentity};
 use seismic_lang::registry::BackendName;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,8 +43,11 @@ fn store_of(topology: &DeviceTopology, kind: &StoreKind) -> StoreId {
         .id()
 }
 
-fn reported(value: u64, by: ReportedBy) -> Option<Reported<u64>> {
-    Some(Reported::new(value, by))
+fn grant(value: u64, by: ReportedBy, kind: GrantKind) -> Option<Grant> {
+    Some(Grant {
+        bytes: Reported::new(value, by),
+        kind,
+    })
 }
 
 #[test]
@@ -53,7 +59,11 @@ fn m4_pro_places_metal_on_host_ram_under_its_working_set() {
     let registry = PhysicalIdentity::Registry(M4_PRO_REGISTRY);
     let metal = executor(&topology, BackendName::Metal, &registry);
     let cpu = topology.resolve(ExecutorSelector::HostCpu).unwrap();
-    let working_set = reported(M4_PRO_WORKING_SET, ReportedBy::MetalRecommendedWorkingSet);
+    let working_set = grant(
+        M4_PRO_WORKING_SET,
+        ReportedBy::MetalRecommendedWorkingSet,
+        GrantKind::Wired,
+    );
     for kind in Contract::ALL {
         assert_eq!(
             placement(&topology, metal, kind),
@@ -77,7 +87,7 @@ fn rtx3090_granting_grants_the_backends_device_path_alone() {
     let grant_of = |topology: &DeviceTopology, backend| {
         placement(topology, executor(topology, backend, &gpu), Contract::DeviceOnly)
             .into_iter()
-            .map(|(_, grant)| grant.map(|grant| grant.value))
+            .map(|(_, grant)| grant.map(|grant| grant.bytes.value))
             .collect::<Vec<_>>()
     };
     for (backend, other, recorded) in [
@@ -113,7 +123,11 @@ fn rtx3090_cuda_and_vulkan_share_its_memory_under_their_own_grants() {
         placement(&topology, cuda, Contract::DeviceOnly),
         [(
             own.clone(),
-            reported(RTX3090_CUDA_USABLE, ReportedBy::CudaUsableMemory)
+            grant(
+                RTX3090_CUDA_USABLE,
+                ReportedBy::CudaUsableMemory,
+                GrantKind::DeviceOpened,
+            )
         )]
     );
     for kind in [Contract::Upload, Contract::Shared] {
@@ -134,7 +148,11 @@ fn rtx3090_cuda_and_vulkan_share_its_memory_under_their_own_grants() {
             placement(&topology, vulkan, kind),
             [(
                 own.clone(),
-                reported(RTX3090_VULKAN_HEAP, ReportedBy::VulkanHeap)
+                grant(
+                    RTX3090_VULKAN_HEAP,
+                    ReportedBy::VulkanHeap,
+                    GrantKind::DeviceUnopened,
+                )
             )]
         );
     }
@@ -164,14 +182,22 @@ fn gb10_places_every_executor_on_host_ram() {
             placement(&topology, cuda, kind),
             [(
                 StoreKind::HostRam,
-                reported(GB10_CUDA_TOTAL, ReportedBy::CudaTotalMemory)
+                grant(
+                    GB10_CUDA_TOTAL,
+                    ReportedBy::CudaTotalMemory,
+                    GrantKind::HostLimit,
+                )
             )]
         );
         assert_eq!(
             placement(&topology, vulkan, kind),
             [(
                 StoreKind::HostRam,
-                reported(GB10_VULKAN_HEAP, ReportedBy::VulkanHeaps)
+                grant(
+                    GB10_VULKAN_HEAP,
+                    ReportedBy::VulkanHeaps,
+                    GrantKind::HostBudget,
+                )
             )]
         );
     }
@@ -191,7 +217,11 @@ fn strix_halo_on_linux_is_granted_its_heaps_together() {
             placement(&topology, vulkan, kind),
             [(
                 StoreKind::HostRam,
-                reported(STRIX_HALO_LINUX_HEAPS.iter().sum(), ReportedBy::VulkanHeaps)
+                grant(
+                    STRIX_HALO_LINUX_HEAPS.iter().sum(),
+                    ReportedBy::VulkanHeaps,
+                    GrantKind::HostBudget,
+                )
             )]
         );
     }
@@ -234,16 +264,18 @@ fn strix_halo_on_windows_places_its_dedicated_memory_first() {
             [
                 (
                     radeon.clone(),
-                    reported(
+                    grant(
                         STRIX_HALO_WINDOWS_DEDICATED,
-                        ReportedBy::DxgiDedicatedMemory
+                        ReportedBy::DxgiDedicatedMemory,
+                        GrantKind::HostBudget,
                     )
                 ),
                 (
                     StoreKind::HostRam,
-                    reported(
+                    grant(
                         total - STRIX_HALO_WINDOWS_DEDICATED,
-                        ReportedBy::VulkanHeapsBeyondDedicated
+                        ReportedBy::VulkanHeapsBeyondDedicated,
+                        GrantKind::HostBudget,
                     )
                 ),
             ]
@@ -264,7 +296,11 @@ fn lunar_lake_is_granted_its_one_heap() {
         placement(&topology, vulkan, Contract::DeviceOnly),
         [(
             StoreKind::HostRam,
-            reported(LUNAR_LAKE_HEAP, ReportedBy::VulkanHeaps)
+            grant(
+                LUNAR_LAKE_HEAP,
+                ReportedBy::VulkanHeaps,
+                GrantKind::HostBudget,
+            )
         )]
     );
 }
@@ -286,7 +322,11 @@ fn an_igpu_and_a_discrete_gpu_are_both_physical_devices() {
         placement(&topology, on_igpu, Contract::DeviceOnly),
         [(
             StoreKind::HostRam,
-            reported(RYZEN_IGPU_HEAPS.iter().sum(), ReportedBy::VulkanHeaps)
+            grant(
+                RYZEN_IGPU_HEAPS.iter().sum(),
+                ReportedBy::VulkanHeaps,
+                GrantKind::HostBudget,
+            )
         )]
     );
     let on_gpu = executor(&topology, BackendName::Vulkan, &PhysicalIdentity::Uuid(gpu));
@@ -294,47 +334,38 @@ fn an_igpu_and_a_discrete_gpu_are_both_physical_devices() {
         placement(&topology, on_gpu, Contract::DeviceOnly),
         [(
             device_memory(&topology, gpu),
-            reported(RTX4070_HEAP, ReportedBy::VulkanHeap)
+            grant(
+                RTX4070_HEAP,
+                ReportedBy::VulkanHeap,
+                GrantKind::DeviceUnopened,
+            )
         )]
     );
 }
 
-/// Two RTX 3090s, each the RTX 3090 machine's, with and without the peer
-/// access CUDA reports: the host has one GPU, so the peer report is the
-/// rule's input here, not a recording.
+/// Two RTX 3090s, each the RTX 3090 machine's: each gets its own device
+/// memory store, and CUDA and Vulkan place device storage on it.
 #[test]
-fn gpus_copy_to_each_other_where_cuda_reports_peer_access() {
+fn two_discrete_gpus_have_separate_device_memory_stores() {
     let (first, second) = (rtx3090_uuid(), uuid("D37CB696763FCACE0D8DCBA6B3D100D1"));
-    for peered in [false, true] {
-        let mut reports = linux_host(RTX3090_HOST);
-        let peers = |other| if peered { vec![other] } else { Vec::new() };
-        reports.cuda.push(rtx3090_cuda(first, peers(second)));
-        reports.cuda.push(rtx3090_cuda(second, peers(first)));
-        reports.vulkan.push(rtx3090_vulkan(first));
-        reports.vulkan.push(rtx3090_vulkan(second));
-        let topology = topology(&reports);
-        show(&format!("2 x RTX 3090, peer access {peered}"), &topology);
-        assert_consistent(&topology);
-        assert_eq!(topology.stores().len(), 3);
-        for each in [first, second] {
-            let own = device_memory(&topology, each);
-            for backend in [BackendName::Cuda, BackendName::Vulkan] {
-                let executor = executor(&topology, backend, &PhysicalIdentity::Uuid(each));
-                assert_eq!(
-                    placement(&topology, executor, Contract::DeviceOnly)[0].0,
-                    own
-                );
-            }
+    let mut reports = linux_host(RTX3090_HOST);
+    reports.cuda.push(rtx3090_cuda(first));
+    reports.cuda.push(rtx3090_cuda(second));
+    reports.vulkan.push(rtx3090_vulkan(first));
+    reports.vulkan.push(rtx3090_vulkan(second));
+    let topology = topology(&reports);
+    show("2 x RTX 3090", &topology);
+    assert_consistent(&topology);
+    assert_eq!(topology.stores().len(), 3);
+    for each in [first, second] {
+        let own = device_memory(&topology, each);
+        for backend in [BackendName::Cuda, BackendName::Vulkan] {
+            let executor = executor(&topology, backend, &PhysicalIdentity::Uuid(each));
+            assert_eq!(
+                placement(&topology, executor, Contract::DeviceOnly)[0].0,
+                own
+            );
         }
-        let host = topology.host_ram().id();
-        let peer_paths = topology
-            .transfer_paths()
-            .iter()
-            .filter(|path| path.from() != host && path.to() != host)
-            .count();
-        // Each CUDA executor copies both ways between its memory and its
-        // peer's.
-        assert_eq!(peer_paths, if peered { 4 } else { 0 });
     }
 }
 
@@ -431,7 +462,7 @@ fn a_small_bar_counts_as_host_ram() {
 fn a_discrete_gpu_has_an_access_path_to_host_ram() {
     let gpu = rtx3090_uuid();
     let mut reports = rtx3090_host();
-    reports.cuda.push(rtx3090_cuda(gpu, Vec::new()));
+    reports.cuda.push(rtx3090_cuda(gpu));
     let topology = topology(&reports);
     let cuda = executor(&topology, BackendName::Cuda, &PhysicalIdentity::Uuid(gpu));
     assert!(topology
@@ -504,12 +535,23 @@ fn a_vgpu_slice_is_the_device_its_apis_expose() {
         placement(&topology, cuda, Contract::DeviceOnly),
         [(
             own.clone(),
-            reported(A10_8Q_CUDA_USABLE, ReportedBy::CudaUsableMemory)
+            grant(
+                A10_8Q_CUDA_USABLE,
+                ReportedBy::CudaUsableMemory,
+                GrantKind::DeviceOpened,
+            )
         )]
     );
     assert_eq!(
         placement(&topology, vulkan, Contract::DeviceOnly),
-        [(own, reported(A10_8Q_VULKAN_HEAP, ReportedBy::VulkanHeap))]
+        [(
+            own,
+            grant(
+                A10_8Q_VULKAN_HEAP,
+                ReportedBy::VulkanHeap,
+                GrantKind::DeviceUnopened,
+            )
+        )]
     );
 }
 
@@ -527,7 +569,14 @@ fn a_metal_device_without_unified_memory_places_in_its_own_memory() {
     let own = StoreKind::DeviceMemory(metal.physical());
     assert_eq!(
         placement(&topology, metal, Contract::DeviceOnly),
-        [(own, Some(Reported::new(M4_PRO_WORKING_SET, ReportedBy::MetalRecommendedWorkingSet)))]
+        [(
+            own,
+            grant(
+                M4_PRO_WORKING_SET,
+                ReportedBy::MetalRecommendedWorkingSet,
+                GrantKind::DeviceUnopened,
+            )
+        )]
     );
     for contract in [Contract::Upload, Contract::Shared, Contract::Words] {
         assert_eq!(placement(&topology, metal, contract), [(StoreKind::HostRam, None)], "{contract:?}");
@@ -744,13 +793,18 @@ fn every_view_of_a_device_whose_memory_is_the_hosts_places_its_dedicated_memory_
         [
             (
                 own.clone(),
-                reported(dedicated, ReportedBy::DxgiDedicatedMemory)
+                grant(
+                    dedicated,
+                    ReportedBy::DxgiDedicatedMemory,
+                    GrantKind::HostLimit,
+                )
             ),
             (
                 StoreKind::HostRam,
-                reported(
+                grant(
                     GB10_CUDA_TOTAL - dedicated,
-                    ReportedBy::CudaTotalBeyondDedicated
+                    ReportedBy::CudaTotalBeyondDedicated,
+                    GrantKind::HostLimit,
                 )
             ),
         ]
@@ -758,12 +812,20 @@ fn every_view_of_a_device_whose_memory_is_the_hosts_places_its_dedicated_memory_
     assert_eq!(
         placement(&topology, vulkan, Contract::DeviceOnly),
         [
-            (own, reported(dedicated, ReportedBy::DxgiDedicatedMemory)),
+            (
+                own,
+                grant(
+                    dedicated,
+                    ReportedBy::DxgiDedicatedMemory,
+                    GrantKind::HostBudget,
+                )
+            ),
             (
                 StoreKind::HostRam,
-                reported(
+                grant(
                     GB10_VULKAN_HEAP - dedicated,
-                    ReportedBy::VulkanHeapsBeyondDedicated
+                    ReportedBy::VulkanHeapsBeyondDedicated,
+                    GrantKind::HostBudget,
                 )
             ),
         ]
@@ -818,7 +880,7 @@ fn cpu_hardware_changes_change_the_cpu_executor_identity() {
 
 /// A device's cache is what an API reports for it: the host's is its CPU's
 /// last-level total, a GPU's is its CUDA L2 for its CUDA and Vulkan views
-/// alike, and a device no API reports one for has none.
+/// alike, and a device no API reports one for gets [`CacheSize::UNREPORTED`].
 #[test]
 fn a_device_carries_the_cache_its_apis_report() {
     let topology = topology(&gb10());
@@ -830,15 +892,29 @@ fn a_device_carries_the_cache_its_apis_report() {
             .unwrap()
             .cache()
     };
-    let host = topology.physical_devices()[0].identity().clone();
+    let host = topology.host_device().identity().clone();
     assert!(matches!(host, PhysicalIdentity::Host { .. }));
     assert_eq!(
         cache(&host),
-        reported(crate::fixtures::GB10_CPU_CACHE, ReportedBy::LinuxSysfsCache)
+        CacheSize {
+            bytes: crate::fixtures::GB10_CPU_CACHE,
+            is_last_level: true,
+        }
     );
     assert_eq!(
         cache(&PhysicalIdentity::Uuid(GB10_UUID)),
-        reported(crate::fixtures::GB10_CUDA_L2, ReportedBy::CudaL2Cache)
+        CacheSize {
+            bytes: crate::fixtures::GB10_CUDA_L2,
+            is_last_level: false,
+        }
+    );
+    let mac = crate::fixtures::topology(&m4_pro());
+    assert_eq!(
+        mac.host_device().cache(),
+        CacheSize {
+            bytes: crate::fixtures::M4_PRO_CPU_CACHE,
+            is_last_level: false,
+        }
     );
     let mut vulkan_only = gb10();
     vulkan_only.cuda.clear();
@@ -848,7 +924,122 @@ fn a_device_carries_the_cache_its_apis_report() {
         .iter()
         .find(|device| *device.identity() == PhysicalIdentity::Uuid(GB10_UUID))
         .unwrap();
-    assert_eq!(gpu.cache(), None);
+    assert_eq!(gpu.cache(), CacheSize::UNREPORTED);
+}
+
+/// Static host metadata is carried on `topology.host()`, and `topology.host_device()`
+/// returns the host physical device.
+#[test]
+fn host_metadata_and_host_device_are_exposed_on_topology() {
+    let mut reports = m4_pro();
+    reports.system = SystemIdentity {
+        identity: Some(HardwareIdentity {
+            manufacturer: "Apple".into(),
+            model: "Mac16,7".into(),
+            family: Some("MacBook Pro".into()),
+            version: None,
+        }),
+        form_factor: FormFactor::Portable,
+        name: Some("MacBook Pro".into()),
+    };
+    let topology = topology(&reports);
+    let host = topology.host();
+    assert_eq!(
+        host.identity,
+        format!("{};ram={}", reports.cpu.identity, reports.host.value)
+    );
+    assert_eq!(host.cpu_model, "Apple M4 Pro");
+    assert_eq!(host.os_build, crate::fixtures::M4_PRO_OS);
+    assert_eq!(host.page_bytes, 16384);
+    assert_eq!(host.processors, reports.processors);
+    assert_eq!(host.system, reports.system);
+
+    let device = topology.host_device();
+    assert_eq!(device, &topology.physical_devices()[0]);
+    assert_eq!(
+        device.identity(),
+        &PhysicalIdentity::Host {
+            machine: host.identity.clone(),
+        }
+    );
+    assert_eq!(device.memory(), DeviceMemory::Host);
+    assert_eq!(device.host_node(), HostNode::Any);
+}
+
+/// Every backend and memory-ownership combination receives its semantic `GrantKind`.
+#[test]
+fn grant_kind_matches_each_backend_and_memory_ownership() {
+    let grant_kind = |topology: &DeviceTopology, backend: BackendName, identity: &PhysicalIdentity| {
+        let exec = executor(topology, backend, identity);
+        placement(topology, exec, Contract::DeviceOnly)
+            .into_iter()
+            .map(|(_, grant)| grant.unwrap().kind)
+            .collect::<Vec<_>>()
+    };
+
+    let metal_id = PhysicalIdentity::Registry(M4_PRO_REGISTRY);
+    assert_eq!(
+        grant_kind(&topology(&m4_pro()), BackendName::Metal, &metal_id),
+        [GrantKind::Wired]
+    );
+    assert_eq!(
+        grant_kind(
+            &topology(&m4_pro_without_unified_memory()),
+            BackendName::Metal,
+            &metal_id,
+        ),
+        [GrantKind::DeviceUnopened]
+    );
+
+    let gb10_id = PhysicalIdentity::Uuid(GB10_UUID);
+    let gb10_topology = topology(&gb10());
+    assert_eq!(
+        grant_kind(&gb10_topology, BackendName::Cuda, &gb10_id),
+        [GrantKind::HostLimit]
+    );
+    assert_eq!(
+        grant_kind(&gb10_topology, BackendName::Vulkan, &gb10_id),
+        [GrantKind::HostBudget]
+    );
+
+    let rtx_id = PhysicalIdentity::Uuid(rtx3090_uuid());
+    let rtx_topology = topology(&rtx3090());
+    assert_eq!(
+        grant_kind(&rtx_topology, BackendName::Cuda, &rtx_id),
+        [GrantKind::DeviceOpened]
+    );
+    assert_eq!(
+        grant_kind(&rtx_topology, BackendName::Vulkan, &rtx_id),
+        [GrantKind::DeviceUnopened]
+    );
+}
+
+/// Host NUMA affinity reported on CUDA or Vulkan views propagates onto the physical device.
+#[test]
+fn host_node_propagates_from_cuda_and_vulkan_reports() {
+    let gpu = PhysicalIdentity::Uuid(rtx3090_uuid());
+    let node_of = |reports: &Reports| {
+        let topology = topology(reports);
+        topology
+            .physical_devices()
+            .iter()
+            .find(|device| device.identity() == &gpu)
+            .unwrap()
+            .host_node()
+    };
+
+    let mut reports = rtx3090();
+    assert_eq!(node_of(&reports), HostNode::Any);
+
+    reports.cuda[0].host_node = HostNode::Node(1);
+    assert_eq!(node_of(&reports), HostNode::Node(1));
+
+    reports.cuda[0].host_node = HostNode::Any;
+    reports.vulkan[0].host_node = HostNode::Node(2);
+    assert_eq!(node_of(&reports), HostNode::Node(2));
+
+    reports.cuda.clear();
+    assert_eq!(node_of(&reports), HostNode::Node(2));
 }
 
 /// A driver update changes the identity of that driver's executor only.

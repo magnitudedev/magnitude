@@ -124,7 +124,7 @@ pub struct Vacating<H> {
 
 pub use seismic_topology::NativeAllocations;
 
-/// The facts a pool's block size follows from ([`block_bytes`]).
+/// The parameters a pool's block size follows from ([`block_bytes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockSizing {
     /// Bytes of one granule.

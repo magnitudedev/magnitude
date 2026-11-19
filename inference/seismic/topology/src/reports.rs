@@ -13,13 +13,15 @@
 
 use crate::kind::{KindMemory, KindReport};
 use crate::model::{
-    AllocationLimit, Availability, Builder, DeviceAllocationBound, DeviceMemory, DeviceTopology, Diagnostic,
-    ExecutorBuilder, ExecutorKind, ExecutorReport, GrantSource, Limits, NativeAllocations, OwnKind, OwnPath,
-    PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy, Revision, StoreId, StoreKind,
-    VolumeId,
+    AllocationLimit, Availability, Builder, CacheSize, DeviceMemory, DeviceTopology, Diagnostic,
+    ExecutorBuilder, ExecutorKind, ExecutorReport, Grant, GrantKind, GrantSource, Host, Limits,
+    NativeAllocations, OwnKind, OwnPath, PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy,
+    Revision, StoreId, StoreKind, VolumeId,
 };
 use crate::placement::{place, Contract};
+use crate::processors::{HostNode, Processors};
 use crate::selector::ExecutorSelector;
+use crate::system::SystemIdentity;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -28,11 +30,17 @@ use std::path::PathBuf;
 pub struct Reports {
     /// Host RAM capacity.
     pub host: Reported<u64>,
+    /// Human-readable CPU brand string.
+    pub cpu_model: String,
     /// The OS build: the CPU's and Metal's driver.
     pub os_build: String,
     /// The host's page: what the host's allocations, the CPU's and Metal's,
     /// round each one's bytes up to.
     pub page: u64,
+    /// Host CPU topology, memory nodes, and process thread quota.
+    pub processors: Processors,
+    /// Firmware / enclosure identity.
+    pub system: SystemIdentity,
     pub cpu: CpuReport,
     pub metal: Vec<MetalReport>,
     pub cuda: Vec<CudaReport>,
@@ -49,9 +57,8 @@ pub struct CpuReport {
     pub name: String,
     /// The CPU as the OS reports it: model, instruction set and caches.
     pub identity: String,
-    /// Its last-level caches, summed over their instances
-    /// (`seismic-discovery` reads them from the OS).
-    pub cache: Option<Reported<u64>>,
+    /// Its last-level cache size and whether it is the full LLC before RAM.
+    pub cache: CacheSize,
     pub availability: Availability,
     pub max_allocation: u64,
     /// Its one kind, which every contract is allocated in.
@@ -101,10 +108,9 @@ pub struct CudaReport {
     pub integrated: bool,
     /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`; none where it reads zero.
     pub l2: Option<u64>,
+    /// The host NUMA memory node this device is attached to.
+    pub host_node: HostNode,
     pub memory: CudaMemory,
-    /// The CUDA devices whose memory it reads and writes directly
-    /// (`cuDeviceCanAccessPeer`).
-    pub peers: Vec<[u8; 16]>,
     /// The kinds it allocates.
     pub kinds: Vec<KindReport>,
 }
@@ -139,6 +145,8 @@ pub struct VulkanReport {
     /// `maxMemoryAllocationCount`; why it has none (it allows no memory
     /// object), which leaves the device unavailable.
     pub least_object: Result<u64, String>,
+    /// The host NUMA memory node this device is attached to.
+    pub host_node: HostNode,
     pub memory: VulkanMemory,
     /// The kinds it allocates: its memory types, each on its heap, and
     /// imported host pages where it imports them.
@@ -220,15 +228,37 @@ fn device_memory(reports: &Reports, uuid: [u8; 16]) -> DeviceMemory {
     }
 }
 
-/// The last-level cache of the GPU of `uuid`, as its CUDA view reports it:
-/// Vulkan reports no cache size, so a device without a CUDA view has none.
-fn device_cache(reports: &Reports, uuid: [u8; 16]) -> Option<Reported<u64>> {
+/// The cache of the GPU of `uuid`, as its CUDA view reports it:
+/// Vulkan reports no cache size, so a device without a CUDA view gets
+/// [`CacheSize::UNREPORTED`].
+fn device_cache(reports: &Reports, uuid: [u8; 16]) -> CacheSize {
     reports
         .cuda
         .iter()
         .filter(|cuda| cuda.uuid == uuid)
         .find_map(|cuda| cuda.l2)
-        .map(|bytes| Reported::new(bytes, ReportedBy::CudaL2Cache))
+        .map_or(CacheSize::UNREPORTED, |bytes| CacheSize {
+            bytes,
+            is_last_level: false,
+        })
+}
+
+/// The host NUMA memory node of the GPU of `uuid`, as any of its views reports it.
+fn device_host_node(reports: &Reports, uuid: [u8; 16]) -> HostNode {
+    reports
+        .cuda
+        .iter()
+        .filter(|cuda| cuda.uuid == uuid)
+        .map(|cuda| cuda.host_node)
+        .chain(
+            reports
+                .vulkan
+                .iter()
+                .filter(|vulkan| vulkan.uuid == uuid)
+                .map(|vulkan| vulkan.host_node),
+        )
+        .find(|node| !matches!(node, HostNode::Any))
+        .unwrap_or(HostNode::Any)
 }
 
 /// The OS adapter LUID of the GPU of `uuid`, as any of its views reports it.
@@ -259,13 +289,15 @@ fn undecided(reports: &Reports, uuid: [u8; 16]) -> String {
 
 /// The revision `revision` of the machine `reports` describe.
 pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
-    let machine = format!("{};ram={}", reports.cpu.identity, reports.host.value);
-    let mut builder = Builder::new(
-        revision,
-        PhysicalIdentity::Host { machine },
-        reports.cpu.cache,
-        reports.host,
-    );
+    let host_info = Host {
+        identity: format!("{};ram={}", reports.cpu.identity, reports.host.value),
+        cpu_model: reports.cpu_model.clone(),
+        os_build: reports.os_build.clone(),
+        page_bytes: reports.page,
+        processors: reports.processors.clone(),
+        system: reports.system.clone(),
+    };
+    let mut builder = Builder::new(revision, host_info, reports.cpu.cache, reports.host);
     let host = builder.host();
     let host_ram = builder.host_ram();
 
@@ -279,7 +311,12 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         } else {
             DeviceMemory::Own
         };
-        builder.physical(PhysicalIdentity::Registry(metal.registry_id), memory, None);
+        builder.physical(
+            PhysicalIdentity::Registry(metal.registry_id),
+            memory,
+            CacheSize::UNREPORTED,
+            HostNode::Any,
+        );
     }
     for uuid in reports.cuda.iter().map(|cuda| cuda.uuid).chain(
         reports
@@ -292,6 +329,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             PhysicalIdentity::Uuid(uuid),
             device_memory(reports, uuid),
             device_cache(reports, uuid),
+            device_host_node(reports, uuid),
         );
     }
 
@@ -413,7 +451,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             limits: Limits {
                 max_allocation: AllocationLimit::Device {
                     bytes: metal.max_allocation,
-                    by: DeviceAllocationBound::MetalMaxBufferLength,
+                    by: ReportedBy::MetalMaxBufferLength,
                 },
                 // Its buffers are mappings of whole host pages.
                 allocations: Ok(NativeAllocations { least: 0, granularity: reports.page }),
@@ -424,11 +462,19 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             continue;
         }
         let working_set = Reported::new(metal.working_set, ReportedBy::MetalRecommendedWorkingSet);
-        let status = |before| Some(GrantSource::MetalWorkingSet { registry_id: metal.registry_id, before });
+        let status = Some(GrantSource::MetalWorkingSet { registry_id: metal.registry_id, before: 0 });
         let paths = match metal.unified {
-            true => KindPaths::Alike(host_class_paths(&mut executor, own, host_ram, working_set, ReportedBy::MetalWorkingSetBeyondDedicated, status)),
+            true => KindPaths::Alike(vec![executor.granted(
+                host_ram,
+                Grant { bytes: working_set, kind: GrantKind::Wired },
+                status,
+            )]),
             false => KindPaths::Own {
-                device: executor.granted(own.expect("a Metal device whose memory is its own has a store").0, working_set, status(0)),
+                device: executor.granted(
+                    own.expect("a Metal device whose memory is its own has a store").0,
+                    Grant { bytes: working_set, kind: GrantKind::DeviceUnopened },
+                    status,
+                ),
                 host: executor.ungranted(host_ram),
             },
         };
@@ -471,7 +517,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             limits: Limits {
                 max_allocation: AllocationLimit::Device {
                     bytes: cuda.max_allocation,
-                    by: DeviceAllocationBound::CudaTotalMemory,
+                    by: ReportedBy::CudaTotalMemory,
                 },
                 allocations: Ok(NativeAllocations { least: 0, granularity: cuda.allocation_granularity }),
             },
@@ -484,6 +530,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 host_ram,
                 Reported::new(cuda.total, ReportedBy::CudaTotalMemory),
                 ReportedBy::CudaTotalBeyondDedicated,
+                GrantKind::HostLimit,
                 // What is left of these grants only the opened executor
                 // knows (`RuntimeStatus`).
                 |_| None,
@@ -492,7 +539,10 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 device: executor.granted(
                     own.expect("a CUDA device whose memory is its own has a store")
                         .0,
-                    Reported::new(usable, ReportedBy::CudaUsableMemory),
+                    Grant {
+                        bytes: Reported::new(usable, ReportedBy::CudaUsableMemory),
+                        kind: GrantKind::DeviceOpened,
+                    },
                     // What is left of it only the opened executor knows.
                     None,
                 ),
@@ -533,7 +583,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             limits: Limits {
                 max_allocation: AllocationLimit::Device {
                     bytes: vulkan.max_allocation,
-                    by: DeviceAllocationBound::VulkanMaxAllocation,
+                    by: ReportedBy::VulkanMaxAllocation,
                 },
                 allocations: vulkan.least_object.clone().map(|least| NativeAllocations { least, granularity: 1 }),
             },
@@ -556,6 +606,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                     host_ram,
                     Reported::new(total, ReportedBy::VulkanHeaps),
                     ReportedBy::VulkanHeapsBeyondDedicated,
+                    GrantKind::HostBudget,
                     |before| {
                         Some(GrantSource::VulkanHeaps {
                             uuid: vulkan.uuid,
@@ -580,7 +631,10 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                         vec![*local.entry(index).or_insert_with(|| {
                             executor.granted(
                                 own.expect("a device-local heap is its own memory").0,
-                                Reported::new(bytes, ReportedBy::VulkanHeap),
+                                Grant {
+                                    bytes: Reported::new(bytes, ReportedBy::VulkanHeap),
+                                    kind: GrantKind::DeviceUnopened,
+                                },
                                 Some(GrantSource::VulkanHeaps {
                                     uuid: vulkan.uuid,
                                     heaps: vec![index],
@@ -602,8 +656,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
     }
 
     // Transfer paths: each executor's copies between host RAM and the other
-    // stores it reaches, the CPU's file reads from each volume, and a GPU's
-    // copies to another whose memory it reports peer access to.
+    // stores it reaches, and the CPU's file reads from each volume.
     let mut transfers = Vec::new();
     let topology = builder.topology();
     for executor in topology.executors() {
@@ -625,32 +678,6 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         for store in topology.stores() {
             if let StoreKind::Volume(_) = store.kind() {
                 transfers.push((store.id(), host_ram, cpu));
-            }
-        }
-    }
-    let own_store = |uuid: [u8; 16]| {
-        let device = topology
-            .physical_devices()
-            .iter()
-            .find(|device| *device.identity() == PhysicalIdentity::Uuid(uuid))?;
-        topology
-            .stores()
-            .iter()
-            .find(|store| *store.kind() == StoreKind::DeviceMemory(device.id()))
-            .map(|store| store.id())
-    };
-    for cuda in &reports.cuda {
-        let executor = topology.executors().iter().find(|executor| {
-            executor.selector() == ExecutorSelector::Cuda { uuid: cuda.uuid }
-                && *executor.availability() == Availability::Available
-        });
-        let (Some(executor), Some(from)) = (executor, own_store(cuda.uuid)) else {
-            continue;
-        };
-        for &peer in &cuda.peers {
-            if let Some(to) = own_store(peer) {
-                transfers.push((from, to, executor.id()));
-                transfers.push((to, from, executor.id()));
             }
         }
     }
@@ -753,13 +780,14 @@ fn host_class_paths(
     host_ram: StoreId,
     total: Reported<u64>,
     beyond: ReportedBy,
+    kind: GrantKind,
     status: impl Fn(u64) -> Option<GrantSource>,
 ) -> Vec<OwnPath> {
     let mut paths = Vec::new();
     let mut before = 0;
     let mut grant =
         |executor: &mut ExecutorBuilder<'_>, store: StoreId, reported: Reported<u64>| {
-            let path = executor.granted(store, reported, status(before));
+            let path = executor.granted(store, Grant { bytes: reported, kind }, status(before));
             before += reported.value;
             paths.push(path);
         };

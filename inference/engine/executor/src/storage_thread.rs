@@ -39,7 +39,7 @@ impl StorageThread {
     /// (one alternated pair); spread, 7.6%; on the workers' own nodes, 21.9
     /// ms against 11.9.
     pub(crate) fn start(name: &str) -> Result<Self, String> {
-        let every = seismic::Processors::discover().allowed().iter().copied().collect::<Vec<_>>();
+        let every = seismic::discover_processors().allowed().iter().copied().collect::<Vec<_>>();
         let (work, received) = std::sync::mpsc::channel::<Work>();
         let (placed, placement) = std::sync::mpsc::sync_channel(1);
         let thread = seismic::threads::spawn(name, move || {

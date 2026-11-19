@@ -7,7 +7,7 @@
 //! core-owned executable schedule drives.
 //!
 //! There is no schedule mirror, fallback, retry, or source accommodation.
-//! Device-wide legality lives in `MetalFacts`/`TargetLimits`; concrete
+//! Device-wide legality lives in `MetalDeviceInfo`/`TargetLimits`; concrete
 //! pipeline width, launch domain, and static threadgroup storage enter
 //! planning only through authoritative native reflection. Every command the
 //! executor runs is derived once from the frozen plan's `ExecutableStep`
@@ -28,9 +28,9 @@ pub mod model;
 pub mod device;
 pub mod direct;
 pub mod executor;
-pub mod facts;
 pub mod intrinsic;
 pub mod profile;
+pub mod device_info;
 pub mod toolchain;
 pub mod topology;
 
@@ -68,7 +68,7 @@ pub use executor::MetalExecutor;
 /// a program ([`seismic_native_target::Programs`]).
 pub type MetalPrograms =
     std::sync::Arc<dyn seismic_native_target::Programs<toolchain::MetalToolchain>>;
-pub use facts::MetalFacts;
+pub use device_info::MetalDeviceInfo;
 use seismic_ir::metal::MetalIntrinsic;
 
 /// Revision of this backend's implementation: every change to a lowering,
@@ -114,7 +114,7 @@ impl seismic_ir::physical_target::PhysicalDialect for Metal {
     const NAME: BackendName = BackendName::Metal;
 
     type Intrinsic = MetalIntrinsic;
-    type Facts = MetalFacts;
+    type DeviceInfo = MetalDeviceInfo;
 
     fn write_intrinsic_identity(
         intrinsic: &MetalIntrinsic,
@@ -130,7 +130,7 @@ impl seismic_ir::physical_target::PhysicalDialect for Metal {
     }
 
     fn intrinsic_numerics(
-        _facts: &Self::Facts,
+        _specs: &Self::DeviceInfo,
         signature: &seismic_lang::registry::IntrinsicSignature,
         intrinsic: &Self::Intrinsic,
     ) -> seismic_ir::physical_target::IntrinsicNumericalSemantics {

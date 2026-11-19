@@ -45,7 +45,7 @@ pub use compile::NativeCandidate;
 pub use executor::{Device, Executor};
 pub use open::{open_host, OpenedCpu};
 pub use profile::{
-    HostFacts, HostKernelAbi, ScratchPolicy, SimdTier, BACKEND_REVISION, MAX_ALLOCATION_BYTES,
+    CpuDeviceInfo, HostKernelAbi, ScratchPolicy, SimdTier, BACKEND_REVISION, MAX_ALLOCATION_BYTES,
 };
 pub use registry::registry;
 pub use workers::{NativeStep, NativeSteps, Workers};
@@ -85,7 +85,7 @@ impl seismic_ir::physical_target::PhysicalDialect for Cpu {
 
     const NAME: BackendName = BackendName::Cpu;
     type Intrinsic = CpuIntrinsic;
-    type Facts = HostFacts;
+    type DeviceInfo = CpuDeviceInfo;
 
     fn write_intrinsic_identity(
         intrinsic: &Self::Intrinsic,
@@ -95,7 +95,7 @@ impl seismic_ir::physical_target::PhysicalDialect for Cpu {
     }
 
     fn intrinsic_numerics(
-        _facts: &Self::Facts,
+        _specs: &Self::DeviceInfo,
         _signature: &seismic_lang::registry::IntrinsicSignature,
         intrinsic: &Self::Intrinsic,
     ) -> seismic_ir::physical_target::IntrinsicNumericalSemantics {

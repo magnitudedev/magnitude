@@ -227,10 +227,12 @@ impl Os {
                 cold_reclaimable: self.cold / 2,
             },
             counted: seismic::Counted { at: snapshot.at, lag: Duration::ZERO },
-            cold: snapshot.cold,
-            own_cold: match self.wired {
-                Some(_) => seismic::OwnCold::Unobserved,
-                None => seismic::OwnCold::Bytes(0),
+            cold: seismic::ColdPages {
+                machine: snapshot.cold,
+                own: match self.wired {
+                    Some(_) => None,
+                    None => Some(0),
+                },
             },
             own_reclaimed: self.reports_reclaimed.then_some(seismic::OwnReclaimed {
                 bytes: self.swapped - self.unreported,

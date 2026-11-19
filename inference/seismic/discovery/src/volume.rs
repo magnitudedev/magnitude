@@ -1,7 +1,7 @@
 //! Volumes: the filesystem a served path is on, its size and the space left
 //! on it (spec §2.1).
 
-use crate::host::ObservationError;
+use crate::status::ObservationError;
 use seismic_topology::{Reported, ReportedBy, VolumeId};
 use std::path::Path;
 

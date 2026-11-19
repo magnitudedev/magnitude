@@ -200,7 +200,7 @@ mod tests {
         type LaunchDescriptor = ();
         fn ordinary_launch() {}
         const NAME: registry::BackendName = registry::BackendName::Cpu;
-        type Facts = ();
+        type DeviceInfo = ();
         type Intrinsic = NoIntrinsic;
         fn write_intrinsic_identity(op: &NoIntrinsic, _: &mut IntrinsicIdentityBuilder) {
             match *op {}

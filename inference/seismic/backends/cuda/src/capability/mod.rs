@@ -108,7 +108,7 @@ pub fn signature_id(capability: &str, name: &str, arguments: &[OperandCategory])
 /// device's subgroup is the 32-lane warp the butterfly and shuffle masks
 /// assume; none otherwise.
 fn subgroup_supported(
-    _facts: &crate::profile::CudaFacts,
+    _specs: &crate::profile::CudaDeviceInfo,
     limits: &TargetLimits,
     dtypes: &DataTypeSupport,
 ) -> BTreeSet<IntrinsicId> {
@@ -125,7 +125,7 @@ fn subgroup_supported(
 /// `cuda.matrix` on this profile: every implemented signature (the `sm_80`
 /// floor guarantees `mma.sync.m16n8k16`).
 fn matrix_supported(
-    facts: &crate::profile::CudaFacts,
+    specs: &crate::profile::CudaDeviceInfo,
     _limits: &TargetLimits,
     dtypes: &DataTypeSupport,
 ) -> BTreeSet<IntrinsicId> {
@@ -135,7 +135,7 @@ fn matrix_supported(
             let signature = registry::intrinsic_signature(*id);
             if matches!(signature.name, "nvfp4_matmul" | "nvfp4_matmul_add")
                 && !matches!(
-                    facts.tensor_memory,
+                    specs.tensor_memory,
                     crate::profile::TensorMemory::Tcgen05 { .. }
                 )
             {

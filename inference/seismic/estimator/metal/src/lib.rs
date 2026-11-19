@@ -486,7 +486,7 @@ mod tests {
         const NAME: seismic_lang::registry::BackendName =
             seismic_lang::registry::BackendName::Metal;
         type Intrinsic = MetalIntrinsic;
-        type Facts = ();
+        type DeviceInfo = ();
         fn write_intrinsic_identity(_: &MetalIntrinsic, _: &mut IntrinsicIdentityBuilder) {
             panic!("fixture has no intrinsics")
         }

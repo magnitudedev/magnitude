@@ -33,6 +33,7 @@ impl DeviceTopology {
                     "identity": device.identity(),
                     "memory": device.memory(),
                     "cache": device.cache(),
+                    "host_node": device.host_node(),
                 })
             })
             .collect::<Vec<_>>();

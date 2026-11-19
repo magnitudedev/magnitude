@@ -2701,7 +2701,7 @@ mod tests {
     enum NoIntrinsic {}
     impl PhysicalDialect for Dialect {
         const NAME: seismic_lang::registry::BackendName = seismic_lang::registry::BackendName::Cpu;
-        type Facts = ();
+        type DeviceInfo = ();
         type Intrinsic = NoIntrinsic;
         type LaunchDescriptor = ();
         fn ordinary_launch() {}

@@ -1,4 +1,4 @@
-//! `MetalFacts`: every Metal-specific target fact planning and native
+//! `MetalDeviceInfo`: every Metal-specific target capability and limit planning and native
 //! compilation consume, gathered once at device open (spec §4.1).
 //!
 //! These are immutable observations, not a live device or native artifact.
@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 pub use seismic_lang::device::metal::Properties;
 
-/// Vendor GPU families are observations used to derive facts; they never
+/// Vendor GPU families are observations used to derive device capabilities; they never
 /// appear in kernel source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MetalFamily {
@@ -68,9 +68,9 @@ pub struct MatrixCombination {
     pub right: DType,
 }
 
-/// Complete Metal facts of one device.
+/// Complete Metal capabilities and limits of one device.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MetalFacts {
+pub struct MetalDeviceInfo {
     pub(crate) device_name: String,
     pub(crate) architecture: String,
     /// Exact operating-system build string returned by `NSProcessInfo`; the
@@ -121,8 +121,8 @@ pub const RESERVED_ARGUMENT_ENTRIES: u32 = 4;
 /// limit.
 pub const MSL_GRID_INDEX_MAX: u64 = u32::MAX as u64;
 
-impl MetalFacts {
-    /// The facts that distinguish GPU performance behavior, for keying
+impl MetalDeviceInfo {
+    /// The device identity fields that distinguish GPU performance behavior, for keying
     /// per-device native tuning: device, architecture and families.
     pub fn tuning_material(&self) -> String {
         let families = self
@@ -147,7 +147,7 @@ impl MetalFacts {
         &self.properties
     }
 
-    /// Every fact, serialized deterministically for the profile fingerprint.
+    /// Every device capability and limit, serialized deterministically for the profile fingerprint.
     pub fn fingerprint_material(&self) -> String {
         let families = self
             .families

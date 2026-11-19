@@ -17,12 +17,12 @@ impl AnalyticalModelDefinition<Metal> for MetalAnalyticalModel {
 
     fn service_state(
         &self,
-        facts: &<Metal as seismic_ir::physical_target::PhysicalDialect>::Facts,
+        specs: &<Metal as seismic_ir::physical_target::PhysicalDialect>::DeviceInfo,
         supported_intrinsics: &BTreeSet<seismic_lang::ids::IntrinsicId>,
         service: Self::Service,
     ) -> seismic_estimator::AnalyticalServiceState {
         if seismic_estimator_metal::service_available(
-            facts.bfloat_arithmetic,
+            specs.bfloat_arithmetic,
             supported_intrinsics,
             service,
         ) {
@@ -36,7 +36,7 @@ impl AnalyticalModelDefinition<Metal> for MetalAnalyticalModel {
 
     fn operation_cost(
         &self,
-        _facts: &<Metal as seismic_ir::physical_target::PhysicalDialect>::Facts,
+        _specs: &<Metal as seismic_ir::physical_target::PhysicalDialect>::DeviceInfo,
         _supported_intrinsics: &BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut seismic_lang::expr::ExprArena,
         kernel: &Kernel<Metal>,

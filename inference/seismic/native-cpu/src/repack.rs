@@ -1276,7 +1276,7 @@ mod tests {
     #[test]
     #[ignore = "measurement; run with --release --ignored --nocapture"]
     fn repack_throughput() {
-        let threads = std::thread::available_parallelism().unwrap().get();
+        let threads = seismic_threads::quota().get();
         let (rows, k) = (4096usize, 4096usize);
         for conversion in conversions() {
             let source = admitted_source(conversion, &[rows, k], 0);
@@ -1387,7 +1387,7 @@ mod tests {
     #[test]
     #[ignore = "measurement; run with --release --ignored --nocapture"]
     fn mma16_record_rate() {
-        let threads = std::thread::available_parallelism().unwrap().get();
+        let threads = seismic_threads::quota().get();
         const PASSES: usize = 64;
         /// The pieces of a `[rows, k]` tensor of `conversion`: source and
         /// destination ranges.

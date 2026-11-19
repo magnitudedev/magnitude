@@ -539,9 +539,9 @@ impl State {
             return 0;
         }
         match paging.own_cold {
-            seismic::OwnCold::Bytes(_) => figures.cold_reclaimable.min(paging.cold),
-            seismic::OwnCold::Unobserved if self.allocated > self.wired => 0,
-            seismic::OwnCold::Unobserved => figures.cold_reclaimable,
+            Some(_) => figures.cold_reclaimable.min(paging.cold),
+            None if self.allocated > self.wired => 0,
+            None => figures.cold_reclaimable,
         }
     }
 }

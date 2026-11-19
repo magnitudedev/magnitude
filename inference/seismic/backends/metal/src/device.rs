@@ -75,6 +75,17 @@ impl DeviceHandle {
         self.device.hasUnifiedMemory()
     }
 
+    /// Whether this device supports Metal residency sets (`MTLResidencySet`).
+    /// Devices without them (e.g. Intel Mac GPUs) run with per-encoder
+    /// resource declarations (`Keeping::Declared`).
+    pub(crate) fn supports_residency_sets(&self) -> bool {
+        crate::pooled(|| {
+            self.device
+                .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+                .is_ok()
+        })
+    }
+
     /// `MTLDevice.recommendedMaxWorkingSetSize`: Metal's advisory ceiling for
     /// this device's working set. Advice, not physical capacity.
     pub fn recommended_working_set_bytes(&self) -> u64 {
@@ -386,7 +397,11 @@ impl Drop for Mapping {
 /// `wiring`: no-copy, so Metal takes exactly the mapping's bytes. A refusal allocates and
 /// charges nothing.
 fn mapped_buffer(handle: &DeviceHandle, length: usize, entry: &Arc<dyn Entry>, wiring: Wiring) -> Result<(ChargedBuffer, Mapping), ExecutionError> {
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("a host page size is positive");
+    let page = seismic_memory::host_page()
+        .map_err(|error| ExecutionError::AllocationFailed(error.to_string()))?;
+    let page = usize::try_from(page).map_err(|_| {
+        ExecutionError::AllocationFailed("host page size exceeds the host address space".into())
+    })?;
     let length = length.checked_next_multiple_of(page).ok_or_else(|| ExecutionError::AllocationFailed(format!("{length} bytes exceed the host address space")))?;
     let mut mapping = None;
     let buffer = Backed::take(entry, length as u64, wiring, |_| {
@@ -928,9 +943,10 @@ impl MetalDevice {
         length: usize,
         owner: Arc<dyn Any + Send + Sync>,
     ) -> Result<MetalBuffer, ExecutionError> {
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = seismic_memory::host_page()
+            .map_err(|error| ExecutionError::AllocationFailed(error.to_string()))?;
         let page = usize::try_from(page).map_err(|_| {
-            ExecutionError::AllocationFailed("host page size is unavailable".into())
+            ExecutionError::AllocationFailed("host page size exceeds the host address space".into())
         })?;
         if length == 0 || pointer.as_ptr() as usize % page != 0 || length % page != 0 {
             return Err(ExecutionError::AllocationFailed(

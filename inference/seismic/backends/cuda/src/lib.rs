@@ -113,7 +113,7 @@ pub(crate) fn test_ptx_programs(opened: &OpenedCuda) -> CudaPtxPrograms {
                 .collect()
         }
     }
-    let capability = opened.device.facts().compute_capability;
+    let capability = opened.device.device_info().compute_capability;
     let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
     std::sync::Arc::new(Compiling(toolchain::CudaPtxToolchain::new(opened.service.clone(), architecture)))
 }
@@ -126,9 +126,8 @@ pub use executor::{CudaStores, Device, Executor, MemoryInfo, NativeStream};
 pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
 pub use open::{open, open_analytical, usable_memory_bytes, OpenedCuda};
 pub use profile::{
-    can_access_peer, describe, device_count, max_allocation_bytes, ComputeCapability, CudaFacts,
-    CudaKernelAbi, DeviceDescriptor, DriverApiVersion, PtxFeatureSet, PtxTarget, TensorMemory,
-    BACKEND_REVISION,
+    describe, device_count, max_allocation_bytes, ComputeCapability, CudaKernelAbi, CudaDeviceInfo,
+    DeviceDescriptor, DriverApiVersion, PtxFeatureSet, PtxTarget, TensorMemory, BACKEND_REVISION,
 };
 pub use registry::registry;
 
@@ -244,14 +243,14 @@ fn active_blocks_expression(
 impl seismic_ir::physical_target::PhysicalDialect for Cuda {
     type LaunchDescriptor = CudaLaunchMode;
     fn launch_for_participation(
-        facts: &CudaFacts,
+        specs: &CudaDeviceInfo,
         requirement: seismic_ir::schedule::LaunchParticipation,
     ) -> Option<CudaLaunchMode> {
         match requirement {
             seismic_ir::schedule::LaunchParticipation::Independent => {
                 Some(CudaLaunchMode::Independent)
             }
-            seismic_ir::schedule::LaunchParticipation::CooperativeGrid => facts
+            seismic_ir::schedule::LaunchParticipation::CooperativeGrid => specs
                 .properties
                 .cooperative_launch
                 .holds()
@@ -265,7 +264,7 @@ impl seismic_ir::physical_target::PhysicalDialect for Cuda {
 
     const NAME: BackendName = BackendName::Cuda;
     type Intrinsic = CudaIntrinsic;
-    type Facts = CudaFacts;
+    type DeviceInfo = CudaDeviceInfo;
 
     fn write_intrinsic_identity(
         intrinsic: &CudaIntrinsic,
@@ -343,7 +342,7 @@ impl seismic_ir::physical_target::PhysicalDialect for Cuda {
     }
 
     fn intrinsic_numerics(
-        _facts: &Self::Facts,
+        _specs: &Self::DeviceInfo,
         signature: &seismic_lang::registry::IntrinsicSignature,
         _intrinsic: &Self::Intrinsic,
     ) -> seismic_ir::physical_target::IntrinsicNumericalSemantics {
@@ -392,13 +391,13 @@ pub(crate) fn native_launch_constraints(
     _kernel: &seismic_ir::kernel::Kernel<Cuda>,
     native: &seismic_native_target::NativeKernelDescription<Cuda>,
 ) -> Vec<seismic_lang::expr::BoolExpr> {
-    let facts = target.facts();
+    let specs = target.device_info();
     let threads = arena.nat_product(&launch.workgroup);
     let blocks = arena.nat_product(&launch.grid);
     let one = arena.nat(1);
     let resident =
         active_blocks_expression(arena, &native.properties, threads, locals.workgroup_bytes);
-    let multiprocessors = arena.nat(facts.properties.units.get());
+    let multiprocessors = arena.nat(specs.properties.units.get());
     let capacity = arena.nat_mul(multiprocessors, resident);
     let mut constraints = vec![arena.nat_cmp(seismic_lang::expr::CmpOp::Ge, resident, one)];
     if launch.descriptor == CudaLaunchMode::CooperativeGrid {
@@ -407,8 +406,8 @@ pub(crate) fn native_launch_constraints(
     constraints
 }
 
-pub(crate) fn addressable_resources(facts: &CudaFacts) -> Vec<AddressableResourceClass> {
-    match facts.tensor_memory {
+pub(crate) fn addressable_resources(specs: &CudaDeviceInfo) -> Vec<AddressableResourceClass> {
+    match specs.tensor_memory {
         profile::TensorMemory::Unavailable => Vec::new(),
         profile::TensorMemory::Tcgen05 {
             columns,
@@ -622,7 +621,7 @@ impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
         let max_dynamic_shared = nonnegative("maximum dynamic shared bytes", attribute(8)?)?;
         if max_threads == 0 || registers == 0 {
             return Err(NativeCompilationError::MalformedToolchainOutput(
-                "CUDA function reflection omitted a required resource fact".into(),
+                "CUDA function reflection omitted a required resource property".into(),
             ));
         }
         let max_threads_u32 = u32::try_from(max_threads).map_err(|_| {
@@ -661,7 +660,7 @@ impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
                     )
                 })?;
         }
-        let cluster = if target.facts().compute_capability.major >= 9 {
+        let cluster = if target.device_info().compute_capability.major >= 9 {
             let required = attribute(10)?;
             let width = attribute(11)?;
             let height = attribute(12)?;
@@ -694,7 +693,7 @@ impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
             NativeClusterDomain::NotApplicable
         };
         let mut modes = vec![CudaLaunchMode::Independent];
-        if target.facts().properties.cooperative_launch.holds() {
+        if target.device_info().properties.cooperative_launch.holds() {
             modes.push(CudaLaunchMode::CooperativeGrid);
         }
         let handle = CompiledKernel {

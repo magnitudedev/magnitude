@@ -183,7 +183,7 @@ pub fn host(gpus: Option<Vec<String>>) -> Value {
         "cpu_cores": if macos {
             run("sysctl", &["-n", "hw.physicalcpu"]).and_then(|cores| cores.parse::<u64>().ok())
         } else {
-            std::thread::available_parallelism().ok().map(|cores| cores.get() as u64)
+            Some(seismic::threads::quota().get() as u64)
         },
         "memory_bytes": if macos {
             run("sysctl", &["-n", "hw.memsize"]).and_then(|bytes| bytes.parse::<u64>().ok())

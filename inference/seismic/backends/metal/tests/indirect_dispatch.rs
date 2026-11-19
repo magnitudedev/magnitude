@@ -34,7 +34,7 @@ fn indirect_launches_after_encoders_of_the_other_type_run_their_written_grids() 
     )
     .unwrap();
     let description = seismic_metal::profile::open_device(&device, &seismic_native_target::MemoryStore::default()).unwrap();
-    let toolchain = MetalToolchain::new(device.clone(), description.facts());
+    let toolchain = MetalToolchain::new(device.clone(), description.device_info());
     let source = ProgramSource {
         text: SOURCE.into(),
         entries: vec![ProgramEntry::named("grid"), ProgramEntry::named("count")],

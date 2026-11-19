@@ -15,20 +15,20 @@ const READS: f64 = 2.;
 /// The machine of `nodes`, the process allowed on `allowed`.
 fn processors(nodes: Vec<seismic::MemoryNode>, allowed: std::ops::Range<usize>) -> seismic::Processors {
     let quota = std::num::NonZeroUsize::new(allowed.len()).unwrap();
-    seismic::Processors::new(nodes, allowed.collect(), quota, seismic::ProcessorsReportedBy::LinuxSysfs).unwrap()
+    seismic::Processors::new(nodes, allowed.collect(), quota).unwrap()
 }
 
 /// An EPYC 7313, 4 nodes of 4 cores (`0-3,16-19`, …), every CPU
 /// allowed, a cgroup quota of 15.36 CPUs (`available_parallelism` 15).
 fn epyc_7313() -> Machine {
     let nodes = (0..4).map(|index| node(index, true, index * 4..index * 4 + 4, 16)).collect::<Vec<_>>();
-    Machine::of(&processors(nodes, 0..32), 15, busy_threads(1, READS), seismic::DeviceNode::Unknown)
+    Machine::of(&processors(nodes, 0..32), 15, busy_threads(1, READS), seismic::HostNode::Any)
 }
 
 /// A Xeon E5-2696 v3, one node of 18 cores (`0-35`), a quota of
 /// 34.56 CPUs.
 fn xeon_e5_2696() -> Machine {
-    Machine::of(&processors(vec![node(0, true, 0..18, 18)], 0..36), 34, busy_threads(1, READS), seismic::DeviceNode::Node(0))
+    Machine::of(&processors(vec![node(0, true, 0..18, 18)], 0..36), 34, busy_threads(1, READS), seismic::HostNode::Node(0))
 }
 
 fn counts(candidates: &[ComputeThreads]) -> Vec<usize> {
@@ -62,7 +62,7 @@ fn an_epyc_takes_two_whole_nodes_and_leaves_the_others_to_the_runtime() {
 #[test]
 fn an_epyc_keeps_the_gpus_node_for_the_runtime() {
     let nodes = (0..4).map(|index| node(index, true, index * 4..index * 4 + 4, 16)).collect::<Vec<_>>();
-    let machine = Machine::of(&processors(nodes, 0..32), 15, busy_threads(1, READS), seismic::DeviceNode::Node(1));
+    let machine = Machine::of(&processors(nodes, 0..32), 15, busy_threads(1, READS), seismic::HostNode::Node(1));
     let threads = machine.candidates().pop().unwrap();
     assert_eq!(threads.nodes, vec![vec![0, 1, 2, 3], vec![8, 9, 10, 11]]);
     assert_eq!(threads.runtime.to_vec(), (4..8).chain(12..16).chain(20..24).chain(28..32).collect::<Vec<_>>());
@@ -92,18 +92,18 @@ fn a_xeon_takes_the_fewest_workers_on_its_flat_curve() {
 #[test]
 fn a_machine_without_a_quota_and_nodes_without_memory() {
     let quota = 8;
-    let small = Machine::of(&processors(vec![node(0, true, 0..4, 4)], 0..8), quota, busy_threads(1, READS), seismic::DeviceNode::Unknown);
+    let small = Machine::of(&processors(vec![node(0, true, 0..4, 4)], 0..8), quota, busy_threads(1, READS), seismic::HostNode::Any);
     assert_eq!(counts(&small.candidates()), vec![1, 2], "8 CPUs less 6 busy");
     let b = vec![node(0, true, 0..8, 32), node(1, false, 16..24, 32), node(2, true, 8..16, 32), node(3, false, 24..32, 32)];
-    let machine = Machine::of(&processors(b.clone(), 1..64), 30, busy_threads(1, READS), seismic::DeviceNode::Unknown);
+    let machine = Machine::of(&processors(b.clone(), 1..64), 30, busy_threads(1, READS), seismic::HostNode::Any);
     assert_eq!(counts(&machine.candidates()), vec![1, 2, 4, 8, 16]);
     let widest = machine.widest().unwrap();
     assert_eq!(widest.nodes, vec![vec![32, 1, 2, 3, 4, 5, 6, 7], (8..16).collect::<Vec<_>>()]);
     assert!(widest.runtime.iter().all(|cpu| (16..32).contains(cpu) || (48..64).contains(cpu)), "{:?}", widest.runtime);
     // Past the quota, one worker for the landings, whatever the runtime.
-    assert_eq!(counts(&Machine::of(&processors(b.clone(), 0..64), 3, busy_threads(1, READS), seismic::DeviceNode::Unknown).candidates()), vec![1]);
+    assert_eq!(counts(&Machine::of(&processors(b.clone(), 0..64), 3, busy_threads(1, READS), seismic::HostNode::Any).candidates()), vec![1]);
     // No memory-attached core the process may run on: no pool.
-    assert!(Machine::of(&processors(b.to_vec(), 16..32), 30, 1, seismic::DeviceNode::Unknown).widest().is_err());
+    assert!(Machine::of(&processors(b.to_vec(), 16..32), 30, 1, seismic::HostNode::Any).widest().is_err());
 }
 
 /// The job sizes a pool with no reads beside it: a load whose reads leave
@@ -111,9 +111,9 @@ fn a_machine_without_a_quota_and_nodes_without_memory() {
 #[test]
 fn a_stored_pool_stays_within_what_a_loads_reads_leave() {
     let nodes = (0..2).map(|index| node(index, true, index * 8..index * 8 + 8, 16)).collect::<Vec<_>>();
-    let unread = Machine::of(&processors(nodes.clone(), 0..32), 24, busy_threads(1, 0.), seismic::DeviceNode::Unknown);
+    let unread = Machine::of(&processors(nodes.clone(), 0..32), 24, busy_threads(1, 0.), seismic::HostNode::Any);
     assert_eq!(unread.at_most(16).unwrap().count(), 16, "the stored pool itself, whole");
-    let read = Machine::of(&processors(nodes, 0..32), 24, busy_threads(1, 6.), seismic::DeviceNode::Unknown);
+    let read = Machine::of(&processors(nodes, 0..32), 24, busy_threads(1, 6.), seismic::HostNode::Any);
     assert_eq!(counts(&read.candidates()), vec![1, 2, 4, 8]);
     assert_eq!(read.at_most(16).unwrap().count(), 8, "16 is past 24 less 10");
     assert_eq!(read.at_most(2).unwrap().count(), 2);
@@ -135,11 +135,11 @@ fn this_machine_sizes_beside_its_device() {
     assert_eq!(busy_threads(cpu.host_threads(), 0.77), others + 1);
     assert_eq!(busy_threads(cpu.host_threads(), 1.6), others + 2);
     let _placement = crate::test_support::process_placement();
-    let processors = seismic::Processors::discover();
+    let processors = &cpu.topology().host().processors;
     let quota = processors.quota().get();
     let machine = Machine::discover(&cpu, reads).unwrap();
-    assert_eq!(cpu.host_node(), Ok(seismic::DeviceNode::Unknown), "a CPU device sits on no bus");
-    assert_eq!(machine, Machine::of(&processors, quota, busy_threads(cpu.host_threads(), reads), seismic::DeviceNode::Unknown));
+    assert_eq!(cpu.host_node(), seismic::HostNode::Any, "a CPU device sits on no bus");
+    assert_eq!(machine, Machine::of(processors, quota, busy_threads(cpu.host_threads(), reads), seismic::HostNode::Any));
     assert!(machine.widest().unwrap().count() >= 1);
 }
 

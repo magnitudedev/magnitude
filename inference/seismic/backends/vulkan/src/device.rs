@@ -5,7 +5,7 @@
 //! numbers every submission, the block allocator, and host access to
 //! storage.
 
-use crate::facts::{self, Description, Facts, FormationTarget, Probed, Properties};
+use crate::device_info::{self, Description, DeviceInfo, FormationTarget, Probed, Properties};
 use crate::instance::{Instance, LoaderError};
 use crate::memory::{Buffer, DevicePools, Memory, MemoryStores, Pool, Range};
 use ash::vk;
@@ -391,7 +391,7 @@ struct Side {
 
 pub(crate) struct Inner {
     pub(crate) device: ash::Device,
-    pub(crate) facts: Facts,
+    pub(crate) info: DeviceInfo,
     pub(crate) properties: Properties,
     pub(crate) memory: Memory,
     pub(crate) layout: vk::PipelineLayout,
@@ -405,7 +405,7 @@ pub(crate) struct Inner {
     /// on it (`Inner::zero`) beside work the first runs.
     side: Option<Mutex<Side>>,
     /// `VK_KHR_pipeline_executable_properties`' functions, where formed
-    /// pipelines report their statistics (`Facts::pipeline_statistics`).
+    /// pipelines report their statistics (`DeviceInfo::pipeline_statistics`).
     pub(crate) executables: Option<ash::khr::pipeline_executable_properties::Device>,
     recording: Mutex<Recording>,
     /// Device memory recorded graphs took (their command memory), measured
@@ -625,12 +625,15 @@ impl Device {
             .physical_devices()
             .map_err(OpenError::Loader)?
             .into_iter()
-            .map(|physical| facts::describe(&instance, physical))
-            .find(|description| description.facts.uuid == uuid)
+            .map(|physical| device_info::describe(&instance, physical))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(OpenError::Loader)?
+            .into_iter()
+            .find(|description| description.info.uuid == uuid)
             .ok_or(OpenError::Missing)?;
         let properties = description.properties(probed).map_err(OpenError::Floor)?;
-        let Description { handle, facts, .. } = description;
-        let inner = Arc::new(Inner::create(instance, handle.physical, facts, properties)?);
+        let Description { handle, info, .. } = description;
+        let inner = Arc::new(Inner::create(instance, handle.physical, info, properties)?);
         // The logical device's tables are written once, before it is
         // registered: no other open finds it until they are.
         let device = Self::opening(inner, stores)?;
@@ -708,8 +711,8 @@ impl Device {
         self.wait(command.value)
     }
 
-    pub fn facts(&self) -> &Facts {
-        &self.inner.facts
+    pub fn info(&self) -> &DeviceInfo {
+        &self.inner.info
     }
 
     /// The device's properties (`seismic_lang::device::vulkan`).
@@ -719,7 +722,7 @@ impl Device {
 
     /// The target this device forms sources in.
     pub fn formation(&self) -> FormationTarget {
-        self.inner.facts.formation(&self.inner.properties)
+        self.inner.info.formation(&self.inner.properties)
     }
 
     /// Storage in the backend's own device placement, for what it allocates
@@ -1201,7 +1204,7 @@ impl Device {
     }
 }
 
-/// `VK_EXT_memory_budget` of the heaps `facts`' device storage is allocated
+/// `VK_EXT_memory_budget` of the heaps the device's storage is allocated
 /// from, together. The budget is what the driver grants this process of the
 /// heaps, its own usage included.
 pub(crate) fn memory_budget(instance: &Instance, physical: vk::PhysicalDevice, heaps: &[u32]) -> MemoryBudget {
@@ -1310,18 +1313,18 @@ impl Inner {
     fn create(
         instance: Arc<Instance>,
         physical: vk::PhysicalDevice,
-        facts: Facts,
+        info: DeviceInfo,
         properties: Properties,
     ) -> Result<Self, OpenError> {
-        let target = facts.formation(&properties);
+        let target = info.formation(&properties);
         let usage_before = memory_budget(
             &instance,
             physical,
-            &facts.allocation.device_heaps,
+            &info.allocation.device_heaps,
         )
         .heap_usage_bytes;
         let raw = instance.raw();
-        let mut extensions: Vec<&CStr> = facts::FLOOR_EXTENSIONS.to_vec();
+        let mut extensions: Vec<&CStr> = device_info::FLOOR_EXTENSIONS.to_vec();
         // Enabled wherever the device supports it, whether or not formation
         // takes the path, so the measurement job's probes reach it.
         let matrix = properties.matrix.holds();
@@ -1332,7 +1335,7 @@ impl Inner {
             extensions.push(ash::ext::shader_atomic_float::NAME);
         }
         if properties.fma_32.holds() {
-            extensions.push(facts::SHADER_FMA_EXTENSION);
+            extensions.push(device_info::SHADER_FMA_EXTENSION);
         }
         if target.subgroup_uniform_control_flow {
             extensions.push(ash::khr::shader_subgroup_uniform_control_flow::NAME);
@@ -1340,17 +1343,17 @@ impl Inner {
         if target.maximal_reconvergence {
             extensions.push(ash::khr::shader_maximal_reconvergence::NAME);
         }
-        if facts.pipeline_statistics {
+        if info.pipeline_statistics {
             extensions.push(ash::khr::pipeline_executable_properties::NAME);
         }
         let extension_names = extensions
             .iter()
             .map(|name| name.as_ptr())
             .collect::<Vec<_>>();
-        let mut shader_fma = facts::ShaderFmaFeatures::default();
-        shader_fma.float16 = facts.shader_fma().float16.into();
+        let mut shader_fma = device_info::ShaderFmaFeatures::default();
+        shader_fma.float16 = info.shader_fma().float16.into();
         shader_fma.float32 = properties.fma_32.holds().into();
-        shader_fma.float64 = facts.shader_fma().float64.into();
+        shader_fma.float64 = info.shader_fma().float64.into();
 
         let mut explicit = vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default()
             .workgroup_memory_explicit_layout(true)
@@ -1413,30 +1416,30 @@ impl Inner {
         }
         let mut executables =
             vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
-        if facts.pipeline_statistics {
+        if info.pipeline_statistics {
             features = features.push_next(&mut executables);
         }
         let priorities = [1.0f32; 2];
         // The second queue, of the first's family or of a family of its own.
-        let side_family = facts.side_family;
-        let shares_family = side_family == Some(facts.queue_family);
+        let side_family = info.side_family;
+        let shares_family = side_family == Some(info.queue_family);
         let mut queues = vec![vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(facts.queue_family)
+            .queue_family_index(info.queue_family)
             .queue_priorities(&priorities[..if shares_family { 2 } else { 1 }])];
         if let Some(family) = side_family.filter(|_| !shares_family) {
             queues.push(vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities[..1]));
         }
-        let info = vk::DeviceCreateInfo::default()
+        let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&extension_names)
             .push_next(&mut features);
         let device = creation(
-            unsafe { raw.create_device(physical, &info, None) },
+            unsafe { raw.create_device(physical, &create_info, None) },
             "vkCreateDevice",
         )?;
         // From here every created object is destroyed by `Drop` (null
         // handles are ignored), so partial construction cleans up.
-        let queue = unsafe { device.get_device_queue(facts.queue_family, 0) };
+        let queue = unsafe { device.get_device_queue(info.queue_family, 0) };
         let side = side_family.map(|family| {
             Mutex::new(Side {
                 raw: unsafe { device.get_device_queue(family, u32::from(shares_family)) },
@@ -1445,12 +1448,12 @@ impl Inner {
                 fence: vk::Fence::null(),
             })
         });
-        let executables = facts
+        let executables = info
             .pipeline_statistics
             .then(|| ash::khr::pipeline_executable_properties::Device::new(raw, &device));
         // The tables: the device's own block on the device placement's
         // first kind, held as the driver's memory (`Inner::tables`).
-        let formed = Memory::new(&facts, instance.clone(), physical, usage_before)
+        let formed = Memory::new(&info, instance.clone(), physical, usage_before)
             .map_err(|reason| OpenError::Creation(reason.into()))
             .and_then(|memory| {
                 let tables = memory
@@ -1468,7 +1471,7 @@ impl Inner {
         };
         let mut inner = Self {
             device,
-            facts,
+            info,
             properties,
             memory,
             layout: vk::PipelineLayout::null(),
@@ -1522,7 +1525,7 @@ impl Inner {
         )?;
         let pool = creation(
             unsafe {
-                device.create_command_pool(&command_pool_info(inner.facts.queue_family), None)
+                device.create_command_pool(&command_pool_info(inner.info.queue_family), None)
             },
             "vkCreateCommandPool",
         )?;
@@ -1580,7 +1583,7 @@ impl Inner {
         let device = &self.device;
         let pool = call(
             unsafe {
-                device.create_command_pool(&command_pool_info(self.facts.queue_family), None)
+                device.create_command_pool(&command_pool_info(self.info.queue_family), None)
             },
             "vkCreateCommandPool",
         )?;
@@ -1617,7 +1620,7 @@ impl Inner {
 }
 
 impl Device {
-    /// Whether the second queue is open (`Facts::side_family`): what zeroes
+    /// Whether the second queue is open (`DeviceInfo::side_family`): what zeroes
     /// pool blocks and runs transfers beside the first's work.
     pub(crate) fn has_side_queue(&self) -> bool {
         self.inner.side.is_some()
@@ -1661,7 +1664,7 @@ impl Inner {
         // formed pool and fence).
         if side.fence == vk::Fence::null() {
             let pool = call(
-                unsafe { device.create_command_pool(&command_pool_info(self.facts.side_family.expect("a second queue has a family")), None) },
+                unsafe { device.create_command_pool(&command_pool_info(self.info.side_family.expect("a second queue has a family")), None) },
                 "vkCreateCommandPool",
             )?;
             let info = vk::CommandBufferAllocateInfo::default()
@@ -1770,7 +1773,7 @@ mod reconcile_tests {
         devices
             .into_iter()
             .filter(|description| description.floor.is_ok())
-            .map(|description| Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens"))
+            .map(|description| Device::open(description.info.uuid, crate::unbounded_stores(&description.info), &Default::default()).expect("a device meeting the floor opens"))
             .collect()
     }
 

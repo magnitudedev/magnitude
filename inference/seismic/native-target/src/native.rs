@@ -399,7 +399,7 @@ mod tests {
     struct FakeTarget;
 
     #[derive(Clone, Debug, PartialEq)]
-    struct FakeFacts;
+    struct FakeDeviceInfo;
 
     impl seismic_ir::physical_target::PhysicalDialect for FakeTarget {
         type LaunchDescriptor = ();
@@ -409,12 +409,12 @@ mod tests {
 
         const NAME: BackendName = BackendName::Cpu;
         type Intrinsic = ();
-        type Facts = FakeFacts;
+        type DeviceInfo = FakeDeviceInfo;
 
         fn write_intrinsic_identity(_: &(), _: &mut IntrinsicIdentityBuilder) {}
 
         fn intrinsic_numerics(
-            _: &Self::Facts,
+            _: &Self::DeviceInfo,
             signature: &IntrinsicSignature,
             _: &(),
         ) -> IntrinsicNumericalSemantics {
@@ -524,7 +524,7 @@ mod tests {
             },
             capabilities: BTreeSet::new(),
             intrinsics: BTreeSet::new(),
-            facts: FakeFacts,
+            device_info: FakeDeviceInfo,
             kernel_abi: FakeAbi,
             local_realization: LocalRealizationPolicy {
                 workgroup: LocalRealization::NativeDynamic,

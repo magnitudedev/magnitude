@@ -1639,7 +1639,7 @@ fn expert_requests(
     sites: &[Option<magnitude_executor::assessment::SiteRequest>],
 ) -> Result<(Vec<magnitude_executor::assessment::PointRequest>, u64), LoadError> {
     use magnitude_executor::assessment::{ConvertCosts, PointRequest};
-    let readers = std::thread::available_parallelism().map_err(|error| internal(error.to_string()))?.get() as u64;
+    let readers = seismic::threads::quota().get() as u64;
     let tier = bank.tiered().then_some(PointRequest::TierCopy).into_iter();
     let sites = sites.iter().flatten().cloned().map(PointRequest::Site);
     let converts = (!bank.tiered()).then(|| ConvertCosts::forms(bank).map(PointRequest::Convert)).into_iter().flatten();

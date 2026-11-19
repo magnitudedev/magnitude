@@ -107,7 +107,7 @@ impl<B: PhysicalDialect> Construction<B> {
     pub fn portable_kernel<'a>(
         &'a mut self,
         arena: &'a mut ExprArena,
-        facts: &'a B::Facts,
+        device_info: &'a B::DeviceInfo,
         resources: &'a [AddressableResourceClass],
         vectors: &'a VectorSupport,
     ) -> internals::PortableBuilder<'a, B> {
@@ -118,7 +118,7 @@ impl<B: PhysicalDialect> Construction<B> {
             &self.schedule,
             &mut self.kernels,
             &mut self.kernel_state,
-            facts,
+            device_info,
             resources,
             vectors,
         )
@@ -127,7 +127,7 @@ impl<B: PhysicalDialect> Construction<B> {
     pub fn resume_portable_kernel<'a>(
         &'a mut self,
         arena: &'a mut ExprArena,
-        facts: &'a B::Facts,
+        device_info: &'a B::DeviceInfo,
         resources: &'a [AddressableResourceClass],
         vectors: &'a VectorSupport,
         cursor: internals::PortableCursor,
@@ -139,7 +139,7 @@ impl<B: PhysicalDialect> Construction<B> {
             &self.schedule,
             &mut self.kernels,
             &mut self.kernel_state,
-            facts,
+            device_info,
             resources,
             vectors,
             cursor,
@@ -1200,7 +1200,7 @@ mod tests {
         }
 
         const NAME: seismic_lang::registry::BackendName = seismic_lang::registry::BackendName::Cpu;
-        type Facts = ();
+        type DeviceInfo = ();
         type Intrinsic = NoIntrinsic;
         fn write_intrinsic_identity(op: &NoIntrinsic, _: &mut IntrinsicIdentityBuilder) {
             match *op {}

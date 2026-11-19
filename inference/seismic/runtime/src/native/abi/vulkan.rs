@@ -290,14 +290,14 @@ void main() {
         let Some(description) = seismic_vulkan::discover().ok().and_then(|devices| {
             devices
                 .into_iter()
-                .find(|device| device.floor.is_ok() && device.facts.is_gpu())
+                .find(|device| device.floor.is_ok() && device.info.is_gpu())
         }) else {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let stores = crate::backends::vulkan::test_stores(&description.facts);
+        let stores = crate::backends::vulkan::test_stores(&description.info);
         let own = stores.host.own();
-        let device = seismic_vulkan::Device::open(description.facts.uuid, stores, &Default::default()).expect("device opens");
+        let device = seismic_vulkan::Device::open(description.info.uuid, stores, &Default::default()).expect("device opens");
         let features = VulkanFeatures {
             subgroup_lanes: device.formation().subgroup_lanes,
             float16: device.formation().float16,
@@ -453,7 +453,7 @@ void main() {
             "{} of {} cases differ on {}:\n{}",
             failures.len(),
             cases.len(),
-            device.facts().name,
+            device.info().name,
             failures
                 .iter()
                 .take(20)
@@ -492,14 +492,14 @@ void main() {
         let Some(description) = seismic_vulkan::discover().ok().and_then(|devices| {
             devices
                 .into_iter()
-                .find(|device| device.floor.is_ok() && device.facts.is_gpu())
+                .find(|device| device.floor.is_ok() && device.info.is_gpu())
         }) else {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let stores = crate::backends::vulkan::test_stores(&description.facts);
+        let stores = crate::backends::vulkan::test_stores(&description.info);
         let own = stores.host.own();
-        let device = seismic_vulkan::Device::open(description.facts.uuid, stores, &Default::default()).expect("device opens");
+        let device = seismic_vulkan::Device::open(description.info.uuid, stores, &Default::default()).expect("device opens");
         let features = VulkanFeatures {
             subgroup_lanes: device.formation().subgroup_lanes,
             float16: false,
@@ -604,7 +604,7 @@ void main() {
             "{} of {} conversions differ on {}:\n{}",
             failures.len(),
             2 * inputs.len(),
-            device.facts().name,
+            device.info().name,
             failures
                 .iter()
                 .take(20)

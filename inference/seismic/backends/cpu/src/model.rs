@@ -16,7 +16,7 @@ impl AnalyticalModelDefinition<Cpu> for CpuAnalyticalModel {
 
     fn operation_cost(
         &self,
-        _facts: &<Cpu as seismic_ir::physical_target::PhysicalDialect>::Facts,
+        _specs: &<Cpu as seismic_ir::physical_target::PhysicalDialect>::DeviceInfo,
         _supported_intrinsics: &std::collections::BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut seismic_lang::expr::ExprArena,
         kernel: &Kernel<Cpu>,

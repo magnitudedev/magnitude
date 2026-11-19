@@ -58,7 +58,7 @@ pub struct CpuToolchain {
 
 impl CpuToolchain {
     pub fn new(device: &DeviceDescription<Cpu>) -> Self {
-        let policy = &device.facts().codegen;
+        let policy = &device.device_info().codegen;
         let flags = |flags: &std::collections::BTreeMap<String, String>| {
             flags
                 .iter()

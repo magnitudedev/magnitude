@@ -281,7 +281,7 @@ pub(crate) fn open(
                 executor,
                 device,
             } = seismic_cpu::open_host(
-                host_cores().map_err(|reason| OpenError::Unavailable { selector, reason })?,
+                topology.host().processors.cores().map_err(|reason| OpenError::Unavailable { selector, reason })?,
                 memory.store(Contract::DeviceOnly),
             )
             .map_err(OpenError::Backend)?;
@@ -309,7 +309,7 @@ pub(crate) fn open(
                 seismic_metal::profile::open_device(&service, &*probes).map_err(OpenError::Backend)?;
             let executor = seismic_metal::MetalExecutor::new(service.clone());
             let metal = DeviceFormer::new(
-                seismic_metal::toolchain::MetalToolchain::new(service.clone(), device.facts()),
+                seismic_metal::toolchain::MetalToolchain::new(service.clone(), device.device_info()),
                 &store,
             );
             let analytical = metal.programs().clone();
@@ -339,7 +339,7 @@ pub(crate) fn open(
             };
             let seismic_cuda::OpenedCuda { service, device } =
                 seismic_cuda::open(ordinal, stores).map_err(OpenError::Backend)?;
-            let capability = device.facts().compute_capability;
+            let capability = device.device_info().compute_capability;
             let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
             let cuda = DeviceFormer::new(seismic_cuda::toolchain::CudaToolchain::new(service.clone(), architecture), &store);
             let cuda_ptx =
@@ -384,10 +384,10 @@ pub(crate) fn open(
         OpenedKind::Cpu(opened) => seismic_lang::device::DeviceProperties::Cpu(*opened.executor().properties()),
         #[cfg(target_os = "macos")]
         OpenedKind::Metal(opened) => {
-            seismic_lang::device::DeviceProperties::Metal(*opened.device_description().facts().properties())
+            seismic_lang::device::DeviceProperties::Metal(*opened.device_description().device_info().properties())
         }
         OpenedKind::Cuda(opened) => {
-            seismic_lang::device::DeviceProperties::Cuda(opened.device_description().facts().properties)
+            seismic_lang::device::DeviceProperties::Cuda(opened.device_description().device_info().properties)
         }
         #[cfg(not(target_os = "macos"))]
         OpenedKind::Vulkan(opened) => seismic_lang::device::DeviceProperties::Vulkan(*opened.service().properties()),
@@ -665,7 +665,7 @@ impl DeviceInner {
 }
 
 pub(crate) fn host_cores() -> Result<std::num::NonZeroUsize, String> {
-    seismic_discovery::Processors::discover().cores()
+    seismic_discovery::discover_processors().cores()
 }
 
 fn open_error(error: ExecutionError) -> OpenError {
@@ -735,7 +735,7 @@ impl OpenedKind {
     /// one: CUDA's L2. Metal, Vulkan and the CPU route report none.
     pub(crate) fn last_level_cache_bytes(&self) -> Option<u64> {
         match self {
-            Self::Cuda(device) => Some(device.device_description().facts().properties.l2_bytes.get()),
+            Self::Cuda(device) => Some(device.device_description().device_info().properties.l2_bytes.get()),
             _ => None,
         }
     }
@@ -750,30 +750,30 @@ impl OpenedKind {
             // The detected tier fixes which native forms exist, and the CPU
             // library version their machine code.
             Self::Cpu(device) => {
-                let facts = device.device_description().facts();
+                let info = device.device_description().device_info();
                 format!(
                     "cpu;{};workers {};simd {:?};tier {};library {}",
                     std::env::consts::ARCH,
-                    facts.workers,
-                    facts.simd,
+                    info.workers,
+                    info.simd,
                     seismic_native_cpu::Tier::detected().map_or("none", |tier| tier.name()),
                     seismic_native_cpu::VERSION
                 )
             }
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.device_description().facts().tuning_material(),
+            Self::Metal(device) => device.device_description().device_info().tuning_material(),
             // The driver runs CUDA code: an update can change which
             // configuration wins.
             Self::Cuda(device) => {
-                let facts = device.device_description().facts();
+                let info = device.device_description().device_info();
                 format!(
                     "cuda;sm {};multiprocessors {};driver {}",
-                    facts.compute_capability, facts.properties.units.get(), facts.driver_api
+                    info.compute_capability, info.properties.units.get(), info.driver_api
                 )
             }
             // A driver update changes the key (§7.5).
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.service().facts().tuning_identity(),
+            Self::Vulkan(device) => device.service().info().tuning_identity(),
         }
     }
 
@@ -1114,7 +1114,7 @@ mod tests {
             };
             #[cfg(target_os = "macos")]
             if let super::OpenedKind::Metal(metal) = &device.kind {
-                let os = metal.device_description().facts().operating_system().to_owned();
+                let os = metal.device_description().device_info().operating_system().to_owned();
                 let toolchain = device.programs.toolchain().expect("Metal forms programs");
                 assert!(toolchain.material.starts_with(&format!("metal;{os};msl-")));
             }

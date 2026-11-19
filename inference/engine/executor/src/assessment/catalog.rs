@@ -144,7 +144,7 @@ fn every_admitted_catalog_target_derives_complete_terms_on(backend: BackendName)
         .filter(|component| component.role == ComponentRole::Target)
         .collect::<Vec<_>>();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let threads = seismic::threads::quota().get();
     let derived = std::thread::scope(|scope| {
         let workers = (0..threads.min(targets.len()))
             .map(|_| {

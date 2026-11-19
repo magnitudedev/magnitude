@@ -1,9 +1,9 @@
-//! CUDA opened-device acquisition. Device-wide legality and numerical facts
+//! CUDA opened-device acquisition. Device-wide legality and numerical specs
 //! form `DeviceDescription<Cuda>`; fixed service probes on the production
 //! context/stream form its separately identity-bound `ExecutionProfile`.
 //! Concrete function resources are reflected only during native reconciliation.
 //!
-//! Facts are exact device/driver reports except where a field's
+//! Specs are exact device/driver reports except where a field's
 //! documentation names it a backend rule.
 
 use crate::capability;
@@ -275,7 +275,7 @@ impl PtxTarget {
 }
 
 /// Native tensor-memory availability of the exact opened target. The
-/// dimensions and allocation unit are architectural facts of the
+/// dimensions and allocation unit are architectural properties of the
 /// `sm_100f` family, not byte-storage estimates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TensorMemory {
@@ -290,7 +290,7 @@ pub enum TensorMemory {
 
 /// Everything CUDA knows about one opened device before planning.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CudaFacts {
+pub struct CudaDeviceInfo {
     /// Driver device ordinal; the primary context of this ordinal is what
     /// native compilation and execution retain.
     pub device_ordinal: u32,
@@ -301,7 +301,7 @@ pub struct CudaFacts {
     /// The device's properties (`seismic_lang::device::cuda`): its
     /// multiprocessors, warp, block, register and shared-memory limits, L2
     /// and cooperative launch. No reliable pre-JIT register pressure model
-    /// exists for PTX, so its register limits are facts, not constraints.
+    /// exists for PTX, so its register limits are reported specs, not constraints.
     pub properties: Properties,
     /// Fixed physical-register ceiling emitted on every entry.
     pub codegen_registers_per_thread: u32,
@@ -448,27 +448,6 @@ impl DeviceDescriptor {
     }
 }
 
-/// Whether device `ordinal` can read and write device `peer`'s memory
-/// directly (`cuDeviceCanAccessPeer`), without a context.
-pub fn can_access_peer(ordinal: u32, peer: u32) -> Result<bool, TargetError> {
-    let driver = Driver::load().map_err(TargetError::DeviceUnavailable)?;
-    let device = |ordinal: u32| {
-        c_int::try_from(ordinal).map_err(|_| {
-            TargetError::DeviceUnavailable(format!("ordinal {ordinal} exceeds the driver ABI"))
-        })
-    };
-    let mut access = 0;
-    unsafe {
-        driver
-            .check(
-                (driver.device_can_access_peer)(&mut access, device(ordinal)?, device(peer)?),
-                "peer access",
-            )
-            .map_err(unavailable)?;
-    }
-    Ok(access != 0)
-}
-
 fn read_compute_capability(
     driver: &Driver,
     device: c_int,
@@ -583,11 +562,17 @@ const NOT_SUPPORTED: i32 = 801;
 fn numa_node(driver: &Driver, device: c_int) -> Result<bool, TargetError> {
     /// `CU_DEVICE_NUMA_CONFIG_NUMA_NODE`.
     const NUMA_NODE: i32 = 1;
-    match driver.attribute(attr::NUMA_CONFIG, device) {
-        Ok(config) => Ok(config == NUMA_NODE),
-        Err(error) if error.code == INVALID_VALUE => Ok(false),
-        Err(error) => Err(unavailable(error)),
-    }
+    let config = match driver.attribute(attr::NUMA_CONFIG, device) {
+        Ok(config) => Some(config == NUMA_NODE),
+        Err(error) if error.code == INVALID_VALUE => None,
+        Err(error) => return Err(unavailable(error)),
+    };
+    Ok(seismic_topology::resolve(
+        &[("CU_DEVICE_ATTRIBUTE_NUMA_CONFIG", &|| config)],
+        "default",
+        || false,
+    )
+    .0)
 }
 
 /// `cuDeviceGetLuid`, which only a driver under WDDM supports: elsewhere the
@@ -691,7 +676,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         KERNEL_PARAMETER_BYTES_CLASSIC
     };
     let global_memory_bytes = memory as u64;
-    let facts = CudaFacts {
+    let specs = CudaDeviceInfo {
         device_ordinal: ordinal,
         compute_capability,
         driver_api,
@@ -775,15 +760,15 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         driver: driver_api.to_string(),
         toolchain: format!(
             "driver-jit ptx{}.{} sm_{}{}",
-            facts.ptx.isa_major,
-            facts.ptx.isa_minor,
-            facts.ptx.architecture,
-            match facts.ptx.feature_set {
+            specs.ptx.isa_major,
+            specs.ptx.isa_minor,
+            specs.ptx.architecture,
+            match specs.ptx.feature_set {
                 PtxFeatureSet::Baseline => "",
                 PtxFeatureSet::Family => "f",
             }
         ),
-        fingerprint: fingerprint(&facts, &limits, &dtypes, &numerics),
+        fingerprint: fingerprint(&specs, &limits, &dtypes, &numerics),
     };
     Ok(DiscoveredTarget {
         identity,
@@ -791,7 +776,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         dtypes,
         vectors: VectorSupport::default(),
         numerics,
-        facts,
+        device_info: specs,
         kernel_abi: CudaKernelAbi,
         local_realization: LocalRealizationPolicy {
             workgroup: LocalRealization::NativeDynamic,
@@ -820,7 +805,7 @@ pub(crate) fn profile_for_opened(
         panic!("CUDA profile acquisition received a context/stream for another opened device")
     }
     let (services, composition_qualification, probe_build_ns, probe_execution_ns) =
-        acquire_services(service, device.facts(), programs)?;
+        acquire_services(service, device.device_info(), programs)?;
     let execution_parts = ExecutionProfileParts::new(
         device,
         "seismic-cuda-probes-v5-classified-host-confidence95",
@@ -865,7 +850,7 @@ const MAX_HOST_ACQUISITION_ROUNDS: usize = 8;
 
 fn acquire_services(
     service: &crate::Device,
-    facts: &CudaFacts,
+    specs: &CudaDeviceInfo,
     programs: &CudaPtxPrograms,
 ) -> Result<
     (
@@ -879,7 +864,7 @@ fn acquire_services(
     let (context, stream) = (service.context(), service.stream());
     let build_started = Instant::now();
     let source = seismic_native_target::ProgramSource {
-        text: probe_source(facts.ptx),
+        text: probe_source(specs.ptx),
         entries: PROBE_ENTRIES.into_iter().map(seismic_native_target::ProgramEntry::named).collect(),
     };
     let formed = programs.form(std::slice::from_ref(&source)).map_err(|error| {
@@ -920,7 +905,7 @@ fn acquire_services(
             * u64::from(latency_block[2])
             * operations_per_thread
             / participants_per_unit;
-        let capacity_grid = [u32::try_from(facts.properties.units.get()).expect("a device's multiprocessors fit u32").max(1), 1, 1];
+        let capacity_grid = [u32::try_from(specs.properties.units.get()).expect("a device's multiprocessors fit u32").max(1), 1, 1];
         let capacity_units = u64::from(capacity_grid[0])
             * u64::from(capacity_block[0])
             * u64::from(capacity_block[1])
@@ -994,8 +979,8 @@ fn acquire_services(
         ));
         Ok(())
     };
-    let sms = u32::try_from(facts.properties.units.get()).expect("a device's multiprocessors fit u32").max(1);
-    let lanes = u32::try_from(facts.properties.threads_per_unit.get()).expect("a multiprocessor's threads fit u32").max(1);
+    let sms = u32::try_from(specs.properties.units.get()).expect("a device's multiprocessors fit u32").max(1);
+    let lanes = u32::try_from(specs.properties.threads_per_unit.get()).expect("a multiprocessor's threads fit u32").max(1);
     let compute_topology = ResourceTopology {
         resources: sms,
         max_concurrency: lanes,
@@ -2169,7 +2154,7 @@ fn host_timer_resolution() -> Result<DurationInterval, TargetError> {
 }
 
 fn fingerprint(
-    facts: &CudaFacts,
+    specs: &CudaDeviceInfo,
     limits: &TargetLimits,
     dtypes: &DataTypeSupport,
     numerics: &NumericalEnvironment,
@@ -2177,18 +2162,18 @@ fn fingerprint(
     let mut digest = Sha256::new();
     put_str(&mut digest, registry::REGISTRY_REVISION);
     put_str(&mut digest, BACKEND_REVISION);
-    digest.update(facts.device_ordinal.to_le_bytes());
-    digest.update(facts.compute_capability.major.to_le_bytes());
-    digest.update(facts.compute_capability.minor.to_le_bytes());
-    digest.update(facts.driver_api.0.to_le_bytes());
-    digest.update(facts.ptx.isa_major.to_le_bytes());
-    digest.update(facts.ptx.isa_minor.to_le_bytes());
-    digest.update(facts.ptx.architecture.to_le_bytes());
-    digest.update([match facts.ptx.feature_set {
+    digest.update(specs.device_ordinal.to_le_bytes());
+    digest.update(specs.compute_capability.major.to_le_bytes());
+    digest.update(specs.compute_capability.minor.to_le_bytes());
+    digest.update(specs.driver_api.0.to_le_bytes());
+    digest.update(specs.ptx.isa_major.to_le_bytes());
+    digest.update(specs.ptx.isa_minor.to_le_bytes());
+    digest.update(specs.ptx.architecture.to_le_bytes());
+    digest.update([match specs.ptx.feature_set {
         PtxFeatureSet::Baseline => 0,
         PtxFeatureSet::Family => 1,
     }]);
-    match facts.tensor_memory {
+    match specs.tensor_memory {
         TensorMemory::Unavailable => digest.update([0]),
         TensorMemory::Tcgen05 {
             columns,
@@ -2203,9 +2188,9 @@ fn fingerprint(
             digest.update(allocation_granularity_columns.to_le_bytes());
         }
     }
-    digest.update(facts.properties.identity().as_bytes());
-    digest.update(facts.codegen_registers_per_thread.to_le_bytes());
-    for value in [facts.global_memory_bytes, facts.kernel_parameter_bytes] {
+    digest.update(specs.properties.identity().as_bytes());
+    digest.update(specs.codegen_registers_per_thread.to_le_bytes());
+    for value in [specs.global_memory_bytes, specs.kernel_parameter_bytes] {
         digest.update(value.to_le_bytes());
     }
     for value in limits.max_workgroup_size {
@@ -2266,9 +2251,9 @@ fn put_option_u32(digest: &mut Sha256, value: Option<u32>) {
 }
 
 #[allow(dead_code)]
-fn _facts_are_send_sync() {
+fn _specs_are_send_sync() {
     fn assert<T: Send + Sync>() {}
-    assert::<CudaFacts>();
+    assert::<CudaDeviceInfo>();
     let _: BTreeSet<DType> = BTreeSet::new();
 }
 

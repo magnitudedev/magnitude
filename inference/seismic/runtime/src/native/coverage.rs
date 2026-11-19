@@ -275,7 +275,7 @@ enum Former {
     },
     #[cfg(target_os = "macos")]
     Metal {
-        language: seismic_metal::facts::LanguageVersion,
+        language: seismic_metal::device_info::LanguageVersion,
         tensor_ops: bool,
         operating_system: String,
         preprocessor: String,
@@ -2444,9 +2444,7 @@ fn subjects(
 fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(Vec::with_capacity(items.len()));
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(items.len());
+    let workers = seismic_threads::quota().get().min(items.len());
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
@@ -2482,7 +2480,7 @@ fn gated<R>(work: impl FnOnce() -> R) -> R {
         std::sync::OnceLock::new();
     let (free, released) = PERMITS.get_or_init(|| {
         (
-            std::sync::Mutex::new(std::thread::available_parallelism().map_or(1, usize::from)),
+            std::sync::Mutex::new(seismic_threads::quota().get()),
             std::sync::Condvar::new(),
         )
     });

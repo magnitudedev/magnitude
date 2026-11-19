@@ -28,7 +28,7 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
 
     fn operation_cost(
         &self,
-        _facts: &<Cuda as seismic_ir::physical_target::PhysicalDialect>::Facts,
+        _specs: &<Cuda as seismic_ir::physical_target::PhysicalDialect>::DeviceInfo,
         _supported_intrinsics: &BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut seismic_lang::expr::ExprArena,
         kernel: &seismic_ir::kernel::Kernel<Cuda>,

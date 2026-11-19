@@ -83,7 +83,7 @@ fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
             let output_view = construction.view(output_view, registry::dense(DType::U32));
             let mut builder = construction.portable_kernel(
                 &mut arena,
-                target.facts(),
+                target.device_info(),
                 target.addressable_resources(),
                 target.vectors(),
             );
@@ -225,7 +225,7 @@ fn native_subgroup_ordinal_uses_the_actual_two_dimensional_cohort() {
     let output = construction.view(output, registry::dense(DType::U32));
     let mut builder = construction.portable_kernel(
         &mut arena,
-        target.facts(),
+        target.device_info(),
         target.addressable_resources(),
         target.vectors(),
     );

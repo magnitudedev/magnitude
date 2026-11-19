@@ -1698,7 +1698,7 @@ mod internals {
         ) -> seismic_ir::kernel::dynamic::PortableBuilder<'_, B> {
             self.state.construction.portable_kernel(
                 self.arena,
-                self.target.facts(),
+                self.target.device_info(),
                 self.target.addressable_resources(),
                 self.target.vectors(),
             )
@@ -1709,7 +1709,7 @@ mod internals {
         ) -> seismic_ir::kernel::dynamic::PortableBuilder<'_, B> {
             self.state.construction.resume_portable_kernel(
                 self.arena,
-                self.target.facts(),
+                self.target.device_info(),
                 self.target.addressable_resources(),
                 self.target.vectors(),
                 cursor,
@@ -1723,7 +1723,7 @@ mod internals {
         ) {
             let kernel = self.state.construction.portable_kernel(
                 self.arena,
-                self.target.facts(),
+                self.target.device_info(),
                 self.target.addressable_resources(),
                 self.target.vectors(),
             );

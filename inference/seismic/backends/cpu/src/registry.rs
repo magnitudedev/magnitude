@@ -16,7 +16,7 @@ fn native_launch_constraints(
 }
 
 fn addressable_resources(
-    _: &<Cpu as seismic_ir::physical_target::PhysicalDialect>::Facts,
+    _: &<Cpu as seismic_ir::physical_target::PhysicalDialect>::DeviceInfo,
 ) -> Vec<seismic_ir::physical_target::AddressableResourceClass> {
     Vec::new()
 }

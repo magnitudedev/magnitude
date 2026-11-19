@@ -105,7 +105,7 @@ impl VulkanOpened {
 
     fn allocation_limits(&self) -> AllocationLimits {
         AllocationLimits {
-            max_allocation_bytes: self.service.facts().limits.max_allocation_bytes,
+            max_allocation_bytes: self.service.info().limits.max_allocation_bytes,
             max_allocation_alignment: MAX_ALLOCATION_ALIGNMENT,
         }
     }
@@ -153,12 +153,12 @@ pub(crate) fn vulkan_buffer(allocation: &Allocation) -> &seismic_vulkan::Buffer 
         .buffer
 }
 
-/// The stores a test opens a device of `facts` with: one unbounded store
+/// The stores a test opens a device of `info` with: one unbounded store
 /// for every kind and the host.
 #[cfg(test)]
-pub(crate) fn test_stores(facts: &seismic_vulkan::Facts) -> seismic_vulkan::MemoryStores {
+pub(crate) fn test_stores(info: &seismic_vulkan::DeviceInfo) -> seismic_vulkan::MemoryStores {
     let store: Arc<dyn crate::memory::Store> =
         Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam));
-    let kinds = (0..facts.memory.types.len() as u32).map(|kind| (kind, store.clone())).collect();
+    let kinds = (0..info.memory.types.len() as u32).map(|kind| (kind, store.clone())).collect();
     seismic_vulkan::MemoryStores { kinds, host: store }
 }

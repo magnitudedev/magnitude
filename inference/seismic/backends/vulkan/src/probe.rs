@@ -294,7 +294,7 @@ fn wide_accumulators(device: &Device) -> Result<ProbeResult<u64>, String> {
 /// driver names the statistic "Register Count"; a driver reporting no such
 /// statistic cannot answer.
 fn registers(device: &Device, threads: u32) -> ProbeResult<u64> {
-    if !device.facts().pipeline_statistics {
+    if !device.info().pipeline_statistics {
         return ProbeResult::Unanswerable("the device reports no pipeline executable statistics".into());
     }
     // A kernel that does not form answers no count.
@@ -340,7 +340,7 @@ fn registers(device: &Device, threads: u32) -> ProbeResult<u64> {
 /// The device argument of a probe process for the device of `uuid`, which
 /// [`open`] reads: its 32 hex digits.
 pub fn argument(uuid: &[u8; 16]) -> String {
-    crate::facts::hex(uuid)
+    crate::device_info::hex(uuid)
 }
 
 /// The device a probe process runs its probe on: the one of UUID `device`
@@ -356,7 +356,7 @@ pub fn open(device: &str) -> Result<Device, String> {
     let description = crate::discover()
         .map_err(|error| error.to_string())?
         .into_iter()
-        .find(|description| description.facts.uuid == uuid)
+        .find(|description| description.info.uuid == uuid)
         .ok_or_else(|| format!("no Vulkan device has UUID {device}"))?;
-    Device::open(uuid, crate::unbounded_stores(&description.facts), &Default::default()).map_err(|error| error.to_string())
+    Device::open(uuid, crate::unbounded_stores(&description.info), &Default::default()).map_err(|error| error.to_string())
 }

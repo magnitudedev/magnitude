@@ -326,7 +326,7 @@ where
     ) -> Result<seismic_estimator::OperationCost, seismic_estimator::ModelLimitation> {
         self.definition
             .operation_cost(
-                self.device.facts(),
+                self.device.device_info(),
                 self.device.intrinsics(),
                 arena,
                 kernel,
@@ -393,7 +393,7 @@ impl<T: seismic_native_target::TargetFamily> AnalyticalEvaluationContext<T> {
             .iter()
             .copied()
             .map(|service| {
-                let state = definition.service_state(device.facts(), device.intrinsics(), service);
+                let state = definition.service_state(device.device_info(), device.intrinsics(), service);
                 (service, state)
             })
             .collect();

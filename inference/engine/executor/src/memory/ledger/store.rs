@@ -173,14 +173,25 @@ impl DeviceLedgers {
     ///
     /// # Panics
     /// Where `device`'s own memory is a store apart from host RAM and its
-    /// backend reads that store's grant by no mechanism that shows the
-    /// process's changes in step with what the ledger counts
-    /// ([`GrantSource`]).
+    /// access path carries no device grant ([`seismic::GrantKind`]).
     pub fn open_in(scope: &Ledgers, device: &seismic::Device, shape: Arc<LoadShape>) -> UnreadLedgers {
         let view = |contract, shape| scope.view(placed_store(device.topology(), device.info(), contract), shape);
         let ledgers = Self { device: view(seismic::Contract::DeviceOnly, shape.clone()), host: view(seismic::Contract::Shared, shape) };
         if !Arc::ptr_eq(&ledgers.device.store, &ledgers.host.store) {
-            GrantSource::of(device.backend());
+            let path = device
+                .info()
+                .paths(seismic::Contract::DeviceOnly)
+                .first()
+                .and_then(|path| device.topology().access_path(*path))
+                .expect("an opened device places device storage");
+            assert!(
+                matches!(
+                    path.grant().map(|grant| grant.kind),
+                    Some(seismic::GrantKind::DeviceUnopened | seismic::GrantKind::DeviceOpened)
+                ),
+                "invariant violated: {} has memory of its own without a device grant",
+                device.info().selector()
+            );
         }
         UnreadLedgers(ledgers)
     }
@@ -392,8 +403,7 @@ impl DeviceLedgers {
     /// set under the wired ceiling (Metal's
     /// `recommendedMaxWorkingSetSize`, its grant); the device's own memory,
     /// where it is a store of its own, by what its grant leaves of the
-    /// store's capacity, read in step with what the ledger counts
-    /// ([`GrantSource`]).
+    /// store's capacity, read in step with what the ledger counts.
     ///
     /// # Panics
     /// Where a device whose memory is its own reads no grant, or one it
@@ -415,48 +425,35 @@ impl DeviceLedgers {
             .first()
             .and_then(|path| topology.access_path(*path))
             .expect("an opened device places device storage");
-        let grant = match Arc::ptr_eq(&self.device.store, &self.host.store) {
-            true => match path.grant() {
-                None => DeviceGrant::Host,
-                Some(grant) => match grant.by {
-                    seismic::ReportedBy::MetalRecommendedWorkingSet
-                    | seismic::ReportedBy::MetalWorkingSetBeyondDedicated => {
-                        DeviceGrant::Wired { working_set: grant.value }
-                    }
-                    seismic::ReportedBy::CudaTotalMemory
-                    | seismic::ReportedBy::CudaUsableMemory
-                    | seismic::ReportedBy::CudaTotalBeyondDedicated => {
-                        DeviceGrant::HostLimit { limit: grant.value }
-                    }
-                    seismic::ReportedBy::VulkanHeap
-                    | seismic::ReportedBy::VulkanHeaps
-                    | seismic::ReportedBy::VulkanHeapsBeyondDedicated => {
-                        let left = sample
-                            .grant
-                            .unwrap_or_else(|| panic!("invariant violated: {} read no grant with its usage", device.info().selector()))
-                            .left
-                            .min(grant.value);
-                        DeviceGrant::HostBudget { capacity: grant.value, left }
-                    }
-                    other => panic!(
-                        "invariant violated: {} reports an unexpected host-memory grant {other:?}",
-                        device.info().selector()
-                    ),
-                },
+        let grant_from_status = || match sample.status().grant_left(path) {
+            Some(Ok(left)) => left.value,
+            Some(Err(error)) => panic!("invariant violated: {} read no grant of its own memory: {error}", device.info().selector()),
+            None => panic!("invariant violated: an opened device whose memory is its own reports no grant"),
+        };
+        let grant = match path.grant() {
+            None => DeviceGrant::Host,
+            Some(grant) => match grant.kind {
+                seismic::GrantKind::Wired => DeviceGrant::Wired { working_set: grant.bytes.value },
+                seismic::GrantKind::HostLimit => DeviceGrant::HostLimit { limit: grant.bytes.value },
+                seismic::GrantKind::HostBudget => {
+                    let left = sample
+                        .grant
+                        .unwrap_or_else(|| panic!("invariant violated: {} read no grant with its usage", device.info().selector()))
+                        .left
+                        .min(grant.bytes.value);
+                    DeviceGrant::HostBudget { capacity: grant.bytes.value, left }
+                }
+                seismic::GrantKind::DeviceUnopened => {
+                    let capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
+                    let free = sample.grant.map_or_else(grant_from_status, |grant| grant.left);
+                    DeviceGrant::Own { capacity, free }
+                }
+                seismic::GrantKind::DeviceOpened => {
+                    let capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
+                    let free = grant_from_status();
+                    DeviceGrant::Own { capacity, free }
+                }
             },
-            false => {
-                let capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
-                let free = match (GrantSource::of(device.backend()), sample.grant) {
-                    (GrantSource::SameQuery, Some(grant)) => grant.left,
-                    (GrantSource::SameQuery, None) => panic!("invariant violated: {} read no grant with its usage", device.info().selector()),
-                    (GrantSource::Synchronous, _) => match sample.status().grant_left(path) {
-                        Some(Ok(left)) => left.value,
-                        Some(Err(error)) => panic!("invariant violated: {} read no grant of its own memory: {error}", device.info().selector()),
-                        None => panic!("invariant violated: an opened device whose memory is its own reports no grant"),
-                    },
-                };
-                DeviceGrant::Own { capacity, free }
-            }
         };
         self.read_granted_after(sample, grant, after_idle)
     }
@@ -660,7 +657,7 @@ pub enum DeviceGrant {
     /// `capacity` beyond current heap usage).
     HostBudget { capacity: u64, left: u64 },
     /// A store of the device's own: `free` of its `capacity` that its grant
-    /// leaves, read in step with what the ledger counts (`GrantSource`).
+    /// leaves, read in step with what the ledger counts.
     Own { capacity: u64, free: u64 },
 }
 
@@ -968,45 +965,7 @@ fn placed_store(topology: &seismic::DeviceTopology, executor: &seismic::Executor
         .expect("an opened device places device, upload and shared storage")
 }
 
-/// How a device store whose memory is its own shows the process's changes
-/// in the grant a reading takes, in step with what the ledger counts of it:
-/// so no change the ledger counts is read again as others' (`IN_STEP`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GrantSource {
-    /// Vulkan: the grant (budget less usage) comes from the one
-    /// `VK_EXT_memory_budget` query the driver's own memory is settled from
-    /// ([`seismic::Device::reconcile_driver_memory`]). A driver that shows a
-    /// free late shows it late in both, so the freed bytes stay counted as
-    /// the driver's own until it shows them free: the visibility is
-    /// observed, never assumed.
-    SameQuery,
-    /// CUDA: `cuMemGetInfo`'s free figure and `cuMemAlloc`/`cuMemFree` are
-    /// one synchronous driver count, so every change shows in the next
-    /// reading. Metal (a discrete GPU): its recommended working set less
-    /// `currentAllocatedSize`, the device's count of the process's
-    /// resources, which counts a buffer as Metal makes it and drops it as
-    /// its last reference does: a buffer work still holds stays counted,
-    /// so a free shows late, never early.
-    Synchronous,
-}
-
-impl GrantSource {
-    /// The source of `backend`'s devices.
-    ///
-    /// # Panics
-    /// For a backend with memory of its own and neither mechanism: the
-    /// CPU's memory is the host's.
-    fn of(backend: seismic::BackendName) -> Self {
-        match backend {
-            seismic::BackendName::Vulkan => Self::SameQuery,
-            seismic::BackendName::Cuda | seismic::BackendName::Metal => Self::Synchronous,
-            seismic::BackendName::Cpu => panic!("invariant violated: the CPU has memory of its own"),
-        }
-    }
-}
-
-/// The lag of a device store's grant behind what the ledger counts of it,
-/// by either [`GrantSource`]: none.
+/// The lag of a device store's grant behind what the ledger counts of it: none.
 const IN_STEP: seismic::Lag = seismic::Lag {
     release: std::time::Duration::ZERO,
     growth: std::time::Duration::ZERO,
@@ -1032,17 +991,17 @@ pub fn own_lag(store: &seismic::StoreIdentity, host: &seismic::HostSample) -> se
 
 #[cfg(test)]
 mod tests {
-    use super::{executor_shares_host, GrantSource};
+    use super::executor_shares_host;
     use seismic::fixtures::recorded;
-    use seismic::{Availability, Contract};
+    use seismic::{Availability, Contract, GrantKind};
 
     /// Every available executor of every recorded machine whose ledgers
     /// open (it places device and shared storage: the A10-8Q's Vulkan
     /// places no shared storage), with its device storage in a store apart
     /// from its shared storage (memory of its own: discrete CUDA and
-    /// Vulkan, and a discrete Metal GPU, whose ledgers panicked as they
-    /// opened), has a grant source its ledgers open and read by; a discrete
-    /// Metal GPU's device path names the working set it reads.
+    /// Vulkan, and a discrete Metal GPU), has a device grant kind its
+    /// ledgers open and read by; a discrete Metal GPU's device path names
+    /// the working set it reads.
     #[test]
     fn every_device_with_memory_of_its_own_reads_its_grant() {
         let machines = [
@@ -1067,9 +1026,15 @@ mod tests {
                 if executor_shares_host(topology, executor) {
                     continue;
                 }
-                own.push((executor.backend(), GrantSource::of(executor.backend())));
+                let device = executor.paths(Contract::DeviceOnly)[0];
+                let kind = topology.access_path(device).unwrap().grant().expect("own memory has a grant").kind;
+                assert!(
+                    matches!(kind, GrantKind::DeviceUnopened | GrantKind::DeviceOpened),
+                    "{:?} has own memory with grant kind {kind:?}",
+                    executor.selector()
+                );
+                own.push((executor.backend(), kind));
                 if executor.backend() == seismic::BackendName::Metal {
-                    let device = executor.paths(Contract::DeviceOnly)[0];
                     assert!(
                         topology.grant_sources().any(|(path, _, _)| path.id() == device),
                         "a discrete Metal GPU's device path reads its working set"
@@ -1077,6 +1042,6 @@ mod tests {
                 }
             }
         }
-        assert!(own.contains(&(seismic::BackendName::Metal, GrantSource::Synchronous)), "{own:?}");
+        assert!(own.contains(&(seismic::BackendName::Metal, GrantKind::DeviceUnopened)), "{own:?}");
     }
 }

@@ -115,7 +115,7 @@ pub(crate) struct Paging {
     pub(crate) cold: u64,
     /// The process's own cold bytes, where the OS counts them: what the
     /// ledger leaves out of cold supply (`memory::ledger`).
-    pub(crate) own_cold: seismic::OwnCold,
+    pub(crate) own_cold: Option<u64>,
     pub(crate) pressure: Option<seismic::PressureLevel>,
     pub(crate) counted: seismic::Counted,
 }
@@ -136,7 +136,7 @@ impl Reading {
                 harm: sample.harm,
                 page_bytes: sample.page_bytes,
                 cold: others_cold(sample),
-                own_cold: sample.own_cold,
+                own_cold: sample.cold.own,
                 pressure: sample.pressure,
                 counted: sample.counted,
             }),
@@ -266,9 +266,9 @@ impl Reading {
 /// admits at most one step, whose harm sets B again, one step's faults,
 /// the bound the rule already pays for wrong evidence.
 fn others_cold(sample: &seismic::HostSample) -> u64 {
-    match sample.own_cold {
-        seismic::OwnCold::Bytes(own) => sample.cold.saturating_sub(own),
-        seismic::OwnCold::Unobserved => sample.cold,
+    match sample.cold.own {
+        Some(own) => sample.cold.machine.saturating_sub(own),
+        None => sample.cold.machine,
     }
 }
 
@@ -568,7 +568,7 @@ mod tests {
             harm: Some(seismic::Harm { machine, own: 0 }),
             page_bytes: 4096,
             cold: 0,
-            own_cold: seismic::OwnCold::Bytes(0),
+            own_cold: Some(0),
             pressure: Some(seismic::PressureLevel::Normal),
             counted: seismic::Counted { at, lag: LAG },
         };

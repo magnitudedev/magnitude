@@ -453,17 +453,17 @@ fn heap_bytes(layout: &crate::MemoryLayout) -> Result<u64, String> {
     layout.heaps.iter().try_fold(0u64, |sum, heap| sum.checked_add(heap.bytes)).ok_or_else(|| "the device's heaps' bytes overflow".to_owned())
 }
 
-/// The least bytes of each memory object of the device `facts` describes:
+/// The least bytes of each memory object of the device `info` describes:
 /// its heaps over `maxMemoryAllocationCount`, so its memory objects stay
 /// within the count by construction. What discovery reports
 /// (`seismic_topology::VulkanReport::least_object`) and the device's blocks
 /// are at least.
-pub(crate) fn least_object(facts: &crate::Facts) -> Result<u64, String> {
-    let object_limit = facts.limits.max_memory_allocations;
+pub(crate) fn least_object(info: &crate::DeviceInfo) -> Result<u64, String> {
+    let object_limit = info.limits.max_memory_allocations;
     if object_limit == 0 {
         return Err("the device allows no memory object".to_owned());
     }
-    Ok(heap_bytes(&facts.memory)?.div_ceil(object_limit))
+    Ok(heap_bytes(&info.memory)?.div_ceil(object_limit))
 }
 
 impl Memory {
@@ -474,21 +474,21 @@ impl Memory {
     }
 
     /// The backend's own device and upload storage, on the kinds the
-    /// placement rule gives them, and staging on `facts.allocation`'s type.
+    /// placement rule gives them, and staging on `info.allocation`'s type.
     pub(crate) fn new(
-        facts: &crate::Facts,
+        info: &crate::DeviceInfo,
         instance: Arc<Instance>,
         physical: vk::PhysicalDevice,
         baseline: u64,
     ) -> Result<Self, String> {
-        let layout = &facts.memory;
-        let staging_kind = facts
+        let layout = &info.memory;
+        let staging_kind = info
             .allocation
             .staging
             .ok_or("no host staging memory type")?;
-        let kinds = crate::topology::kinds(facts);
+        let kinds = crate::topology::kinds(info);
         let placed = |contract| {
-            let kinds = seismic_topology::place(&kinds, facts.device_type.memory_is_host(), contract);
+            let kinds = seismic_topology::place(&kinds, info.device_type.memory_is_host(), contract);
             let _ = new_pool(layout, &kinds, Charged::Kind)?;
             Ok::<Vec<u32>, String>(kinds)
         };
@@ -497,9 +497,9 @@ impl Memory {
             placed(seismic_topology::Contract::Upload)?,
         );
         let _ = new_pool(layout, &[staging_kind], Charged::Staging)?;
-        let (heaps, object_limit) = (heap_bytes(layout)?, facts.limits.max_memory_allocations);
-        let least_object = least_object(facts)?;
-        let block_cap = facts.limits.max_allocation_bytes.min(BLOCK_CAP_BYTES);
+        let (heaps, object_limit) = (heap_bytes(layout)?, info.limits.max_memory_allocations);
+        let least_object = least_object(info)?;
+        let block_cap = info.limits.max_allocation_bytes.min(BLOCK_CAP_BYTES);
         if least_object > block_cap {
             return Err(format!(
                 "the device's {heaps} heap bytes over its {object_limit} memory objects need objects of {least_object} bytes, beyond its {block_cap}-byte blocks"
@@ -510,10 +510,10 @@ impl Memory {
             upload_kinds,
             staging_kind,
             layout: layout.clone(),
-            families: std::iter::once(facts.queue_family).chain(facts.side_family.filter(|&family| family != facts.queue_family)).collect(),
-            device_heaps: facts.allocation.device_heaps.clone(),
+            families: std::iter::once(info.queue_family).chain(info.side_family.filter(|&family| family != info.queue_family)).collect(),
+            device_heaps: info.allocation.device_heaps.clone(),
             block_cap,
-            max_allocation: facts.limits.max_allocation_bytes,
+            max_allocation: info.limits.max_allocation_bytes,
             instance,
             physical,
             device_blocks: AtomicU64::new(0),

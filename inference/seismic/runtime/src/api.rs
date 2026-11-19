@@ -836,18 +836,12 @@ pub mod device {
             }
         }
         /// The host memory node the device is attached to
-        /// (`seismic_discovery::DeviceNode`): a CUDA device's, from its PCI
-        /// location; none a device without a bus location reports (a CPU
-        /// device, Metal, Vulkan).
-        pub fn host_node(&self) -> Result<seismic_discovery::DeviceNode, String> {
-            match &self.kind {
-                OpenedKind::Cuda(opened) => {
-                    let [domain, bus, device] = seismic_cuda::describe(opened.executor().device().ordinal()).map_err(|error| error.to_string())?.pci;
-                    Ok(seismic_discovery::device_node(seismic_discovery::PciLocation { domain, bus, device }))
-                }
-                #[allow(unreachable_patterns)]
-                _ => Ok(seismic_discovery::DeviceNode::Unknown),
-            }
+        /// ([`seismic_topology::HostNode`]).
+        pub fn host_node(&self) -> seismic_topology::HostNode {
+            self.topology
+                .physical_device(self.info.physical())
+                .expect("an executor's device is of its revision")
+                .host_node()
         }
         /// The native programs this device has formed, and the time it took.
         pub fn programs_formed(&self) -> crate::formation::FormedPrograms {

@@ -1035,7 +1035,7 @@ fn vulkan_device_entries(
     specialization: &NativeSpecialization,
     formed: &[bool],
 ) -> Result<Vec<Option<ProgramEntry>>, PrepareError> {
-    let limits = opened.service().facts().limits;
+    let limits = opened.service().info().limits;
     let properties = *opened.service().properties();
     vulkan_entries(name, implementation, specialization, formed)
         .map_err(preparation)?
@@ -1461,7 +1461,7 @@ fn template_instance(kernel: &str, values: &[u64]) -> ProgramEntry {
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Dialect {
     abi::Dialect::Metal(abi::MetalFeatures {
-        tensor_ops: opened.device_description().facts().properties().tensor_ops.holds(),
+        tensor_ops: opened.device_description().device_info().properties().tensor_ops.holds(),
     })
 }
 
@@ -1469,7 +1469,7 @@ pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Diale
 /// fact macros.
 pub(crate) fn cuda_dialect(opened: &crate::backends::CudaOpened) -> abi::Dialect {
     abi::Dialect::Cuda(abi::CudaFeatures {
-        multiprocessors: opened.device_description().facts().properties.units.get(),
+        multiprocessors: opened.device_description().device_info().properties.units.get(),
     })
 }
 
@@ -2139,7 +2139,7 @@ impl NativePrepared {
                     let toolchain = format!(
                         "{};driver {}",
                         former.toolchain().identity().material,
-                        opened.device_description().facts().driver_api.0
+                        opened.device_description().device_info().driver_api.0
                     );
                     (
                         NativeRoute::Cuda {
@@ -2590,7 +2590,7 @@ impl NativePrepared {
                     if launch.resident.is_some() {
                         let per_core = (pipeline.max_threads_per_threadgroup() / participants.max(1))
                             .min(available / group_bytes.max(1));
-                        let cores = opened.device_description().facts().properties().units.get();
+                        let cores = opened.device_description().device_info().properties().units.get();
                         groups = [groups[0].min((cores * per_core / 2).max(1)), 1, 1];
                     }
                 }
@@ -2618,7 +2618,7 @@ impl NativePrepared {
                         let resident = module
                             .active_blocks(opened.service(), function, participants, shared_bytes)
                             .map_err(CallError::Execution)?
-                            * opened.device_description().facts().properties.units.get();
+                            * opened.device_description().device_info().properties.units.get();
                         if resident == 0 {
                             return Err(limit(format!(
                                 "launch `{}`: no multiprocessor holds one of its blocks",
@@ -2633,7 +2633,7 @@ impl NativePrepared {
                 // checked at preparation; only the grid varies per call.
                 #[cfg(not(target_os = "macos"))]
                 NativeRoute::Vulkan { opened, .. } => {
-                    let available = opened.service().facts().limits.max_group_count;
+                    let available = opened.service().info().limits.max_group_count;
                     if let Some(axis) = (0..3).find(|axis| groups[*axis] > available[*axis]) {
                         return Err(limit(format!(
                             "launch `{}` requests {} workgroups on axis {axis}; the device allows {}",
@@ -4200,7 +4200,7 @@ mod tests {
         let NativeRoute::Metal { opened, launches } = &prepared.route else {
             unreachable!("a Metal device's route");
         };
-        let cores = opened.device_description().facts().properties().units.get();
+        let cores = opened.device_description().device_info().properties().units.get();
         let per_core = launches.pipeline(0).max_threads_per_threadgroup() / 256;
         let resident = (cores * per_core / 2).max(1);
         for (work, expected) in [(1, 1), (resident, resident), (resident + 1, resident), (1 << 20, resident)] {

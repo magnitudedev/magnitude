@@ -6,12 +6,12 @@
 //! or write placeholders a vendor never filled in; neither is a name, so
 //! either reads as absent rather than as an error.
 
-/// The machine (module docs).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Machine {
+/// The system identity as firmware reports it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SystemIdentity {
     /// The maker and model, where the firmware names both.
-    pub identity: Option<MachineIdentity>,
-    pub form_factor: MachineFormFactor,
+    pub identity: Option<HardwareIdentity>,
+    pub form_factor: FormFactor,
     /// What people call the machine: macOS's marketing name ("MacBook
     /// Pro"), and elsewhere its model ("XPS 15 9530"), or a board's own
     /// name from its device tree where it has no firmware tables.
@@ -21,7 +21,7 @@ pub struct Machine {
 /// The firmware's names for the machine: SMBIOS's system information
 /// (type 1), or on macOS Apple and `hw.model`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MachineIdentity {
+pub struct HardwareIdentity {
     pub manufacturer: String,
     pub model: String,
     pub family: Option<String>,
@@ -29,20 +29,20 @@ pub struct MachineIdentity {
 }
 
 /// The enclosure, from SMBIOS's chassis type (type 3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MachineFormFactor {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FormFactor {
     Portable,
     Desktop,
     AllInOne,
     MiniPc,
     Server,
+    #[default]
     Unknown,
 }
 
-/// What a host's reader found, each field as the firmware wrote it (empty
-/// where it wrote nothing).
-#[derive(Default)]
-pub(crate) struct Firmware {
+/// Raw firmware strings before placeholder filtering.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Firmware {
     pub manufacturer: Vec<u8>,
     pub model: Vec<u8>,
     pub family: Vec<u8>,
@@ -52,25 +52,27 @@ pub(crate) struct Firmware {
     pub name: Vec<u8>,
 }
 
-impl Machine {
-    /// The machine as its firmware names it now.
-    pub fn discover() -> Self {
-        Self::from_firmware(crate::host::machine())
-    }
-
-    fn from_firmware(firmware: Firmware) -> Self {
+impl SystemIdentity {
+    /// Normalize raw firmware fields into a [`SystemIdentity`].
+    pub fn from_firmware(firmware: Firmware) -> Self {
         let model = label(&firmware.model);
-        let identity = label(&firmware.manufacturer).zip(model.clone()).map(|(manufacturer, model)| MachineIdentity {
-            manufacturer,
-            model,
-            family: label(&firmware.family),
-            version: label(&firmware.version),
-        });
+        let identity = label(&firmware.manufacturer)
+            .zip(model.clone())
+            .map(|(manufacturer, model)| HardwareIdentity {
+                manufacturer,
+                model,
+                family: label(&firmware.family),
+                version: label(&firmware.version),
+            });
         Self {
             identity,
-            form_factor: firmware.chassis_type.map_or(MachineFormFactor::Unknown, form_factor),
+            form_factor: firmware
+                .chassis_type
+                .map_or(FormFactor::Unknown, form_factor),
             // A model's underscores ("NVIDIA_DGX_Spark") are its firmware's spelling, not its name's.
-            name: label(&firmware.name).or(model).map(|name| name.replace('_', " ")),
+            name: label(&firmware.name)
+                .or(model)
+                .map(|name| name.replace('_', " ")),
         }
     }
 }
@@ -78,7 +80,7 @@ impl Machine {
 /// `raw` as a name: control characters and runs of space as one space,
 /// trimmed; none where nothing is left, where it runs past 255 bytes, or
 /// where it is a placeholder.
-pub(crate) fn label(raw: &[u8]) -> Option<String> {
+pub fn label(raw: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(raw);
     let name = text
         .split(|character: char| character.is_control() || character.is_whitespace())
@@ -104,14 +106,14 @@ pub(crate) fn label(raw: &[u8]) -> Option<String> {
 }
 
 /// SMBIOS's chassis type, its lock bit masked.
-fn form_factor(chassis_type: u8) -> MachineFormFactor {
+fn form_factor(chassis_type: u8) -> FormFactor {
     match chassis_type & 0x7f {
-        8 | 9 | 10 | 11 | 14 | 30 | 31 | 32 => MachineFormFactor::Portable,
-        3 | 4 | 5 | 6 | 7 | 15 | 16 => MachineFormFactor::Desktop,
-        13 => MachineFormFactor::AllInOne,
-        35 | 36 => MachineFormFactor::MiniPc,
-        17 | 23 | 28 | 29 => MachineFormFactor::Server,
-        _ => MachineFormFactor::Unknown,
+        8 | 9 | 10 | 11 | 14 | 30 | 31 | 32 => FormFactor::Portable,
+        3 | 4 | 5 | 6 | 7 | 15 | 16 => FormFactor::Desktop,
+        13 => FormFactor::AllInOne,
+        35 | 36 => FormFactor::MiniPc,
+        17 | 23 | 28 | 29 => FormFactor::Server,
+        _ => FormFactor::Unknown,
     }
 }
 
@@ -120,8 +122,7 @@ fn form_factor(chassis_type: u8) -> MachineFormFactor {
 /// structure's type, in either order. A structure that runs past the table
 /// ends the walk; a string index past a structure's strings, or a string
 /// past 255 bytes, names nothing.
-#[cfg(any(target_os = "windows", test))]
-pub(crate) fn parse_smbios(table: &[u8]) -> Firmware {
+pub fn parse_smbios(table: &[u8]) -> Firmware {
     let mut firmware = Firmware::default();
     let (mut system, mut chassis) = (false, false);
     let mut rest = table;
@@ -131,7 +132,11 @@ pub(crate) fn parse_smbios(table: &[u8]) -> Firmware {
             break;
         }
         // The strings end at the first double NUL after the formatted area.
-        let Some(end) = rest[formatted..].windows(2).position(|pair| pair == [0, 0]).map(|at| formatted + at) else {
+        let Some(end) = rest[formatted..]
+            .windows(2)
+            .position(|pair| pair == [0, 0])
+            .map(|at| formatted + at)
+        else {
             break;
         };
         let (fields, strings) = (&rest[..formatted], &rest[formatted..end + 1]);
@@ -166,8 +171,6 @@ pub(crate) fn parse_smbios(table: &[u8]) -> Firmware {
 mod tests {
     use super::*;
 
-    /// Type 1 (Lenovo, 21HD, version T14, family ThinkPad; its serial
-    /// string is never read), then type 3 with its lock bit set.
     fn records() -> (Vec<u8>, Vec<u8>) {
         let mut system = vec![1, 27, 0, 0, 1, 2, 3, 5];
         system.resize(26, 0);
@@ -180,17 +183,17 @@ mod tests {
     fn smbios_names_the_system_and_its_enclosure_in_either_order() {
         let (system, chassis) = records();
         for table in [[system.clone(), chassis.clone()].concat(), [chassis, system].concat()] {
-            let machine = Machine::from_firmware(parse_smbios(&table));
+            let machine = SystemIdentity::from_firmware(parse_smbios(&table));
             assert_eq!(
                 machine.identity,
-                Some(MachineIdentity {
+                Some(HardwareIdentity {
                     manufacturer: "Lenovo".into(),
                     model: "21HD".into(),
                     family: Some("ThinkPad".into()),
                     version: Some("T14".into()),
                 })
             );
-            assert_eq!(machine.form_factor, MachineFormFactor::Portable);
+            assert_eq!(machine.form_factor, FormFactor::Portable);
             assert_eq!(machine.name.as_deref(), Some("21HD"));
         }
     }
@@ -225,16 +228,23 @@ mod tests {
 
     #[test]
     fn placeholders_and_unusable_labels_are_no_name() {
-        for model in [&b""[..], b"System Product Name", b"Default string", b"To Be Filled By O.E.M.", b"Not Applicable", &[b'x'; 256]] {
-            let machine = Machine::from_firmware(Firmware {
+        for model in [
+            &b""[..],
+            b"System Product Name",
+            b"Default string",
+            b"To Be Filled By O.E.M.",
+            b"Not Applicable",
+            &[b'x'; 256],
+        ] {
+            let machine = SystemIdentity::from_firmware(Firmware {
                 manufacturer: b"Vendor".to_vec(),
                 model: model.to_vec(),
                 chassis_type: Some(10),
                 ..Firmware::default()
             });
-            assert_eq!((machine.identity, machine.name, machine.form_factor), (None, None, MachineFormFactor::Portable));
+            assert_eq!((machine.identity, machine.name, machine.form_factor), (None, None, FormFactor::Portable));
         }
-        let machine = Machine::from_firmware(Firmware {
+        let machine = SystemIdentity::from_firmware(Firmware {
             manufacturer: b" Lenovo\n".to_vec(),
             model: b"21HD\0".to_vec(),
             family: b"System Family".to_vec(),
@@ -248,9 +258,16 @@ mod tests {
 
     #[test]
     fn a_name_is_the_hosts_own_or_the_models_spelled_as_a_name() {
-        let board = Machine::from_firmware(Firmware { name: b"Raspberry Pi 5 Model B Rev 1.0\0".to_vec(), ..Firmware::default() });
+        let board = SystemIdentity::from_firmware(Firmware {
+            name: b"Raspberry Pi 5 Model B Rev 1.0\0".to_vec(),
+            ..Firmware::default()
+        });
         assert_eq!((board.identity, board.name.as_deref()), (None, Some("Raspberry Pi 5 Model B Rev 1.0")));
-        let spark = Machine::from_firmware(Firmware { manufacturer: b"NVIDIA".to_vec(), model: b"NVIDIA_DGX_Spark".to_vec(), ..Firmware::default() });
+        let spark = SystemIdentity::from_firmware(Firmware {
+            manufacturer: b"NVIDIA".to_vec(),
+            model: b"NVIDIA_DGX_Spark".to_vec(),
+            ..Firmware::default()
+        });
         assert_eq!(spark.identity.unwrap().model, "NVIDIA_DGX_Spark");
         assert_eq!(spark.name.as_deref(), Some("NVIDIA DGX Spark"));
     }
@@ -258,16 +275,16 @@ mod tests {
     #[test]
     fn chassis_types_classify_their_enclosure() {
         for (kind, expected) in [
-            (8, MachineFormFactor::Portable),
-            (10, MachineFormFactor::Portable),
-            (32, MachineFormFactor::Portable),
-            (3, MachineFormFactor::Desktop),
-            (13, MachineFormFactor::AllInOne),
-            (35, MachineFormFactor::MiniPc),
-            (23, MachineFormFactor::Server),
-            (0x8a, MachineFormFactor::Portable),
-            (0, MachineFormFactor::Unknown),
-            (255, MachineFormFactor::Unknown),
+            (8, FormFactor::Portable),
+            (10, FormFactor::Portable),
+            (32, FormFactor::Portable),
+            (3, FormFactor::Desktop),
+            (13, FormFactor::AllInOne),
+            (35, FormFactor::MiniPc),
+            (23, FormFactor::Server),
+            (0x8a, FormFactor::Portable),
+            (0, FormFactor::Unknown),
+            (255, FormFactor::Unknown),
         ] {
             assert_eq!(form_factor(kind), expected, "{kind}");
         }

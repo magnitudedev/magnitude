@@ -4,7 +4,7 @@
 
 use crate::Cuda;
 use crate::capability::CudaIntrinsic;
-use crate::profile::CudaFacts;
+use crate::profile::CudaDeviceInfo;
 use seismic_ir::kernel::ops::*;
 use seismic_ir::kernel::{BlockId, Kernel};
 use seismic_ir::physical_target::{
@@ -103,19 +103,19 @@ pub(crate) fn emit(
     layout: &KernelEmissionLayout,
 ) -> Result<EmittedPtx, NativeCompilationError> {
     let entry = "seismic_cuda_kernel".to_string();
-    let mut emitter = Emitter::new(target.facts(), kernel, layout);
+    let mut emitter = Emitter::new(target.device_info(), kernel, layout);
     emitter.collect(kernel.root());
     emitter.header(&entry);
     emitter.emit_block(kernel.root());
     emitter.nvfp4_epilogue();
     emitter.line("ret;");
     emitter.line("}");
-    let source = format!("{}\n", target.facts().ptx.header()) + &emitter.text;
+    let source = format!("{}\n", target.device_info().ptx.header()) + &emitter.text;
     Ok(EmittedPtx { source, entry })
 }
 
 struct Emitter<'a> {
-    facts: &'a CudaFacts,
+    specs: &'a CudaDeviceInfo,
     kernel: &'a Kernel<Cuda>,
     layout: &'a KernelEmissionLayout,
     values: HashMap<ErasedValue, u32>,
@@ -132,12 +132,12 @@ struct Emitter<'a> {
 
 impl<'a> Emitter<'a> {
     fn new(
-        facts: &'a CudaFacts,
+        specs: &'a CudaDeviceInfo,
         kernel: &'a Kernel<Cuda>,
         layout: &'a KernelEmissionLayout,
     ) -> Self {
         Self {
-            facts,
+            specs,
             kernel,
             layout,
             values: HashMap::new(),
@@ -285,7 +285,7 @@ impl<'a> Emitter<'a> {
         }
         self.raw(format!(
             ".visible .entry {entry}(.param .u64 launch_frame) .maxnreg {} {{",
-            self.facts.codegen_registers_per_thread
+            self.specs.codegen_registers_per_thread
         ));
         let temporaries = self.temp_bound;
         self.line(format!(".reg .b16 %h<{temporaries}>;"));
@@ -3896,11 +3896,11 @@ mod tests {
     fn vector_reinterpretation_is_not_a_scalar_bitcast() {
         use seismic_ir::{construction::Construction, physical_target::VectorSupport};
 
-        let facts = facts();
+        let specs = specs();
         let mut arena = seismic_lang::expr::ExprArena::new();
         let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
         let vectors = VectorSupport::default();
-        let mut builder = construction.portable_kernel(&mut arena, &facts, &[], &vectors);
+        let mut builder = construction.portable_kernel(&mut arena, &specs, &[], &vectors);
         let word = builder.constant(
             ConstantValue::U32(0x7c01_8000),
             ValueType::Scalar(DType::U32),
@@ -3929,11 +3929,11 @@ mod tests {
                 (ConstantValue::F16(0x7c01), ValueType::Scalar(DType::F16)),
                 (ConstantValue::Index(1), ValueType::Index),
             ] {
-                let facts = facts();
+                let specs = specs();
                 let mut arena = seismic_lang::expr::ExprArena::new();
                 let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
                 let vectors = VectorSupport::default();
-                let mut builder = construction.portable_kernel(&mut arena, &facts, &[], &vectors);
+                let mut builder = construction.portable_kernel(&mut arena, &specs, &[], &vectors);
                 let start = builder.index_constant(0);
                 let end = builder.index_constant(1);
                 let initial = (0..count).map(|_| builder.constant(constant, ty)).collect();
@@ -3957,7 +3957,7 @@ mod tests {
                     scalar_args: vec![],
                     result_types: vec![],
                 };
-                let mut emitter = Emitter::new(&facts, kernel, &layout);
+                let mut emitter = Emitter::new(&specs, kernel, &layout);
                 emitter.collect(kernel.root());
                 emitter.header("carry_probe");
                 emitter.emit_block(kernel.root());
@@ -4050,9 +4050,9 @@ mod tests {
         seismic_lang::device::cuda::describe(&Attributes { cooperative_launch }, &Default::default()).unwrap()
     }
 
-    fn facts() -> CudaFacts {
+    fn specs() -> CudaDeviceInfo {
         use crate::profile::{ComputeCapability, DriverApiVersion, PtxTarget, TensorMemory};
-        CudaFacts {
+        CudaDeviceInfo {
             device_ordinal: 0,
             compute_capability: ComputeCapability::SM80,
             driver_api: DriverApiVersion::MINIMUM,
@@ -4104,11 +4104,11 @@ mod tests {
             construction::Construction,
             physical_target::{KernelWordLayout, VectorSupport},
         };
-        let facts = facts();
+        let specs = specs();
         let mut arena = seismic_lang::expr::ExprArena::new();
         let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
         let vectors = VectorSupport::default();
-        let mut builder = construction.portable_kernel(&mut arena, &facts, &[], &vectors);
+        let mut builder = construction.portable_kernel(&mut arena, &specs, &[], &vectors);
         let half = builder.constant(ConstantValue::F16(0xfc01), ValueType::Scalar(DType::F16));
         let bf = builder.constant(ConstantValue::BF16(0xff81), ValueType::Scalar(DType::BF16));
         builder.constant(
@@ -4131,7 +4131,7 @@ mod tests {
             scalar_args: vec![],
             result_types: vec![],
         };
-        let mut emitter = Emitter::new(&facts, kernel, &layout);
+        let mut emitter = Emitter::new(&specs, kernel, &layout);
         emitter.collect(kernel.root());
         emitter.header("payload_probe");
         emitter.emit_block(kernel.root());
@@ -4153,7 +4153,7 @@ mod tests {
             construction::Construction,
             physical_target::{KernelWordLayout, VectorSupport},
         };
-        let facts = facts();
+        let specs = specs();
         for (from, to) in [
             (DType::F16, DType::F32),
             (DType::BF16, DType::F32),
@@ -4163,7 +4163,7 @@ mod tests {
             let mut arena = seismic_lang::expr::ExprArena::new();
             let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
             let vectors = VectorSupport::default();
-            let mut builder = construction.portable_kernel(&mut arena, &facts, &[], &vectors);
+            let mut builder = construction.portable_kernel(&mut arena, &specs, &[], &vectors);
             let constant = match from {
                 DType::F16 => ConstantValue::F16(0xfc01),
                 DType::BF16 => ConstantValue::BF16(0xff81),
@@ -4190,7 +4190,7 @@ mod tests {
                     .all(|op| !matches!(kernel.closed_op(op, &layout), ClosedOpView::Cast { .. })),
                 "source scalar conversion must expand its recipe"
             );
-            let mut emitter = Emitter::new(&facts, kernel, &layout);
+            let mut emitter = Emitter::new(&specs, kernel, &layout);
             emitter.collect(kernel.root());
             emitter.header("source_cast");
             emitter.emit_block(kernel.root());
@@ -4218,21 +4218,21 @@ mod tests {
             },
             schedule::{Launch, LaunchParticipation},
         };
-        let mut facts = facts();
-        facts.properties = properties(false);
+        let mut specs = specs();
+        specs.properties = properties(false);
         assert_eq!(
-            Cuda::launch_for_participation(&facts, LaunchParticipation::CooperativeGrid),
+            Cuda::launch_for_participation(&specs, LaunchParticipation::CooperativeGrid),
             None
         );
         assert_eq!(Cuda::ordinary_launch(), crate::CudaLaunchMode::Independent);
-        facts.properties = properties(true);
+        specs.properties = properties(true);
         let cooperative =
-            Cuda::launch_for_participation(&facts, LaunchParticipation::CooperativeGrid).unwrap();
+            Cuda::launch_for_participation(&specs, LaunchParticipation::CooperativeGrid).unwrap();
         let mut arena = seismic_lang::expr::ExprArena::new();
         let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
         let vectors = VectorSupport::default();
         let kernel = construction
-            .portable_kernel(&mut arena, &facts, &[], &vectors)
+            .portable_kernel(&mut arena, &specs, &[], &vectors)
             .close();
         let one = arena.nat(1);
         let empty = arena.bool(false);

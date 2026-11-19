@@ -16,7 +16,7 @@ fn a_timed_batch_behind_its_own_shut_gate_fails_when_the_pool_is_exhausted() {
         std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam)),
     ).unwrap();
     let description = seismic_metal::profile::open_device(&device, &seismic_native_target::MemoryStore::default()).unwrap();
-    let toolchain = MetalToolchain::new(device.clone(), description.facts());
+    let toolchain = MetalToolchain::new(device.clone(), description.device_info());
     let source = ProgramSource {
         text: "#include <metal_stdlib>\nusing namespace metal;\n\
                kernel void bump(device float* x [[buffer(0)]], \

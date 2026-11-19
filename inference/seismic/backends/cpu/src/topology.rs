@@ -1,4 +1,4 @@
-//! The CPU backend's facts in the topology's terms.
+//! The CPU backend's memory kinds in the topology's terms.
 
 use seismic_topology::{HostReads, KindMemory, KindReport, Reach};
 

@@ -764,7 +764,7 @@ pub(crate) fn check_program(
         }
         levels[depth[def]].push(def);
     }
-    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let workers = seismic_threads::quota().get();
     for level in levels {
         let env = Env {
             resolved: &resolved,

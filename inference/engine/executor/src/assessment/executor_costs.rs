@@ -105,7 +105,7 @@ use seismic::measure::{Attempt, Measure, Outcome, Reason, Record, RecordStore, T
 use seismic::{
     AccessPathId, BoundEntry, CallError, DType, Device, DeviceTopology, Element,
     Entry, Executor, GraphTiming, Identity, KernelIdentity, Measurer, NativeKernel,
-    NativeKind, NativeSpecialization, Point, PointKey, Reported, ReportedBy, SlabLayout, SlabRegion,
+    NativeKind, NativeSpecialization, Point, PointKey, SlabLayout, SlabRegion,
     SlabTensor, Tensor,
 };
 use std::collections::BTreeMap;
@@ -2048,24 +2048,26 @@ impl Times for Measured<'_, '_> {
 /// a gigabyte in up to 1.5 s, is most of its job. macOS reports an Apple
 /// CPU's L2, behind which its system-level cache sits.
 pub(super) fn largest_cache(topology: &DeviceTopology, executor: &Executor) -> u64 {
-    cache_bound(topology.physical_device(executor.physical()))
+    cache_bound(
+        topology
+            .physical_device(executor.physical())
+            .expect("an executor's device is of its revision"),
+    )
 }
 
 /// The largest cache that can serve host memory ([`largest_cache`]'s, of the
 /// host's own physical device): what a sweep of host memory is sized beyond
 /// ([`super::streaming_costs::MemoryCosts`]).
 pub(super) fn host_cache(topology: &DeviceTopology) -> u64 {
-    cache_bound(topology.physical_devices().first())
+    cache_bound(topology.host_device())
 }
 
-fn cache_bound(physical: Option<&seismic::PhysicalDevice>) -> u64 {
-    match physical.and_then(|physical| physical.cache()) {
-        Some(Reported {
-            value,
-            by: ReportedBy::LinuxSysfsCache | ReportedBy::WindowsProcessorCache,
-        }) => value,
-        Some(cache) => cache.value.max(UNREPORTED_CACHE),
-        None => UNREPORTED_CACHE,
+fn cache_bound(physical: &seismic::PhysicalDevice) -> u64 {
+    let cache = physical.cache();
+    if cache.is_last_level {
+        cache.bytes
+    } else {
+        cache.bytes.max(UNREPORTED_CACHE)
     }
 }
 
@@ -3823,7 +3825,7 @@ fn rotation_room(topology: &DeviceTopology, route: &Route) -> u64 {
                 .expect("a path's store belongs to its topology")
                 .capacity()
                 .value;
-            path.grant().map_or(store, |grant| grant.value.min(store))
+            path.grant().map_or(store, |grant| grant.bytes.value.min(store))
         })
         .min()
         .expect("a route has a path")

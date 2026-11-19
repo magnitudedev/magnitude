@@ -2694,7 +2694,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sysinfo",
  "tempfile",
  "tokio",
  "tower",
@@ -4255,6 +4254,7 @@ dependencies = [
  "seismic-native-target",
  "seismic-topology",
  "sha2 0.11.0",
+ "tracing",
 ]
 
 [[package]]
@@ -4272,7 +4272,6 @@ dependencies = [
  "seismic-threads",
  "seismic-topology",
  "seismic-vulkan",
- "serde",
  "serde_json",
  "windows",
  "windows-sys 0.61.2",
@@ -4482,6 +4481,7 @@ dependencies = [
  "seismic-native-target",
  "seismic-topology",
  "spirv-tools",
+ "tracing",
 ]
 
 [[package]]

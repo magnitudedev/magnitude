@@ -351,7 +351,7 @@ extern "C" __global__ void spin(unsigned int* out, Words words, unsigned int* sc
         eprintln!("transfer rate: {rate:.2} GB/s over {} MiB", BYTES >> 20);
 
         // A kernel spinning about 0.5 s, then a transfer queued behind it.
-        let capability = description.facts().compute_capability;
+        let capability = description.device_info().compute_capability;
         let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
         let cubin = crate::nvrtc::compile_cubin_named(SPIN, "spin.cu", architecture, &["spin"]).unwrap();
         let module = DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();
@@ -413,7 +413,7 @@ extern "C" __global__ void sum(const unsigned long long* data, unsigned long lon
             return;
         }
         let device = opened.service;
-        let capability = opened.device.facts().compute_capability;
+        let capability = opened.device.device_info().compute_capability;
         let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
         let cubin = crate::nvrtc::compile_cubin_named(SUM, "sum.cu", architecture, &["sum"]).unwrap();
         let module = DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();

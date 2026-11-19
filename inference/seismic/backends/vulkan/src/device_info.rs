@@ -1,13 +1,14 @@
-//! Physical-device facts and the device floor.
+//! Physical-device info and the device floor.
 //!
-//! Discovery and opening read the same facts through [`describe`]: the floor
+//! Discovery and opening read the same info through [`describe`]: the floor
 //! decides availability (the first missing item is the reason), and the gated
-//! facts select prefix macros, the numerical environment and the formation and
+//! info selects prefix macros, the numerical environment and the formation and
 //! tuning identities.
 
 use crate::device::DeviceHandle;
-use crate::instance::Instance;
+use crate::instance::{Instance, LoaderError};
 use ash::vk;
+use seismic_topology::PciLocation;
 use std::ffi::CStr;
 use std::sync::Arc;
 
@@ -83,7 +84,7 @@ impl FormationTarget {
 
     /// The target a device with `properties` forms in. The cooperative-
     /// matrix path needs fp16 arithmetic and 32-lane hardware subgroups, and
-    /// is formed only where `matrix_path` ([`Facts::matrix_path`]).
+    /// is formed only where `matrix_path` ([`DeviceInfo::matrix_path`]).
     pub fn of(properties: &Properties, matrix_path: bool) -> Self {
         let subgroup_lanes = u32::try_from(properties.subgroup_width.get()).expect("a subgroup's lanes fit u32");
         let float16 = properties.float16.holds();
@@ -230,7 +231,7 @@ impl FormationTarget {
 
 /// How a device runs the 32-lane logical subgroup: the query layer's
 /// answer, of which the `subgroup_width` property holds the lanes and
-/// [`Facts::requires_subgroup_size`] whether pipelines require them.
+/// [`DeviceInfo::requires_subgroup_size`] whether pipelines require them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SubgroupWidth {
     /// Pipelines require a subgroup size of 32.
@@ -340,25 +341,18 @@ pub(crate) struct ShaderFma {
 }
 
 /// TEMPORARY: whether the cooperative-matrix path is formed. It is a
-/// performance choice, not a fact (`matrix` reports the device's support),
-/// and moves to a `form MATRIX` default the kernels declare, when this
-/// function is deleted. Not formed on RDNA2 (no WMMA units whatever its
+/// performance choice, not a hardware property (`matrix` reports the device's
+/// support), and moves to a `form MATRIX` default the kernels declare, when
+/// this function is deleted. Not formed on RDNA2 (no WMMA units whatever its
 /// driver reports; accelerated mixed-signedness packed dot identifies
 /// RDNA3+).
 fn matrix_path(vendor_id: u32, mixed_dot: bool) -> bool {
     vendor_id != AMD_VENDOR || mixed_dot
 }
 
-/// How a device pairs its timestamps with the host clock.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Calibration {
-    Khr,
-    Ext,
-}
-
 /// Everything Seismic uses about one physical device.
 #[derive(Clone, Debug)]
-pub struct Facts {
+pub struct DeviceInfo {
     pub name: String,
     /// `VkPhysicalDeviceIDProperties::deviceUUID`.
     pub uuid: [u8; 16],
@@ -390,10 +384,12 @@ pub struct Facts {
     /// Whether the cooperative-matrix path is formed ([`matrix_path`], the
     /// temporary performance rule).
     pub matrix_path: bool,
-    pub calibration: Option<Calibration>,
     /// `VkPhysicalDeviceIDProperties::deviceLUID`, when `deviceLUIDValid`:
     /// the OS adapter's identity, in `LUID` memory layout.
     pub luid: Option<[u8; 8]>,
+    /// `VkPhysicalDevicePCIBusInfoPropertiesEXT`, when `VK_EXT_pci_bus_info` is
+    /// reported by the physical device.
+    pub pci: Option<PciLocation>,
     /// The device's memory heaps and types.
     pub memory: MemoryLayout,
     /// The memory types the backend allocates each storage kind from.
@@ -487,7 +483,7 @@ impl Allocation {
     }
 }
 
-impl Facts {
+impl DeviceInfo {
     pub fn is_gpu(&self) -> bool {
         matches!(
             self.device_type,
@@ -557,15 +553,15 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// One enumerated physical device: its handle, its facts and whether it
-/// meets the floor (`Err` names the first missing item). Its facts hold
+/// One enumerated physical device: its handle, its device info and whether it
+/// meets the floor (`Err` names the first missing item). Its info holds
 /// its API's answers to the property queries, which establish its
 /// properties with what the measurement job stored of its probes
 /// ([`Description::properties`]).
 #[derive(Clone, Debug)]
 pub struct Description {
     pub handle: DeviceHandle,
-    pub facts: Facts,
+    pub info: DeviceInfo,
     pub floor: Result<(), String>,
 }
 
@@ -575,7 +571,7 @@ impl Description {
     /// floor.
     pub fn properties(&self, probed: &Probed) -> Result<Properties, String> {
         self.floor.clone()?;
-        Ok(seismic_lang::device::vulkan::describe(&self.facts.queried, probed)
+        Ok(seismic_lang::device::vulkan::describe(&self.info.queried, probed)
             .expect("a device meeting the floor answers every property query"))
     }
 }
@@ -676,10 +672,16 @@ fn text(raw: &[std::ffi::c_char]) -> String {
 }
 
 /// Describe one physical device.
-pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -> Description {
+pub(crate) fn describe(
+    instance: &Arc<Instance>,
+    physical: vk::PhysicalDevice,
+) -> Result<Description, LoaderError> {
     let raw = instance.raw();
     let extensions = unsafe { raw.enumerate_device_extension_properties(physical) }
-        .unwrap_or_default()
+        .map_err(|result| LoaderError::Call {
+            call: "vkEnumerateDeviceExtensionProperties",
+            result,
+        })?
         .iter()
         .map(|extension| text(&extension.extension_name))
         .collect::<Vec<_>>();
@@ -692,10 +694,15 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
     let mut v11 = vk::PhysicalDeviceVulkan11Properties::default();
     let mut v12 = vk::PhysicalDeviceVulkan12Properties::default();
     let mut v13 = vk::PhysicalDeviceVulkan13Properties::default();
+    let mut pci_bus_info = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+    let has_pci_bus_info = has(ash::ext::pci_bus_info::NAME);
     let mut properties = vk::PhysicalDeviceProperties2::default()
         .push_next(&mut v11)
         .push_next(&mut v12)
         .push_next(&mut v13);
+    if has_pci_bus_info {
+        properties = properties.push_next(&mut pci_bus_info);
+    }
     unsafe { raw.get_physical_device_properties2(physical, &mut properties) };
     let base = properties.properties;
 
@@ -794,15 +801,8 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
     // The floor reads properties only queries establish, so no probe
     // decides whether a device meets it.
     let queries_answer = seismic_lang::device::vulkan::describe(&queried, &Probed::default());
-    let calibration = if has(ash::khr::calibrated_timestamps::NAME) {
-        Some(Calibration::Khr)
-    } else if has(ash::ext::calibrated_timestamps::NAME) {
-        Some(Calibration::Ext)
-    } else {
-        None
-    };
     let limits = base.limits;
-    let facts = Facts {
+    let info = DeviceInfo {
         name: text(&base.device_name),
         uuid: v11.device_uuid,
         vendor_id: base.vendor_id,
@@ -829,8 +829,12 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
         side_family,
         pipeline_statistics: executables.pipeline_executable_info == vk::TRUE,
         matrix_path: matrix_path(base.vendor_id, mixed_dot),
-        calibration,
         luid: (v11.device_luid_valid == vk::TRUE).then_some(v11.device_luid),
+        pci: has_pci_bus_info.then_some(PciLocation {
+            domain: pci_bus_info.pci_domain,
+            bus: pci_bus_info.pci_bus,
+            device: pci_bus_info.pci_device,
+        }),
         memory,
         allocation,
         queried,
@@ -878,25 +882,25 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
         ("65535 workgroups on every axis", limits.max_compute_work_group_count.iter().all(|count| *count >= FLOOR_GROUP_COUNT)),
         ("workgroup size (1024, 1024, 64)", limits.max_compute_work_group_size.iter().zip(FLOOR_GROUP_SIZE).all(|(size, floor)| *size >= floor)),
         ("128 bytes of push constants", limits.max_push_constants_size >= FLOOR_PUSH_CONSTANT_BYTES),
-        ("a GPU or CPU device type", !matches!(facts.device_type, DeviceType::Other)),
+        ("a GPU or CPU device type", !matches!(info.device_type, DeviceType::Other)),
         (
             "a device-local heap",
-            facts.memory.heaps.iter().any(|heap| heap.device_local && heap.bytes > 0),
+            info.memory.heaps.iter().any(|heap| heap.device_local && heap.bytes > 0),
         ),
-        ("host-visible coherent memory", facts.memory.types.iter().any(MemoryType::mappable)),
-        ("device memory", !facts.allocation.device_heaps.is_empty()),
-        ("host staging memory", facts.allocation.staging.is_some()),
-        ("a nonzero allocation limit", facts.limits.max_allocation_bytes > 0),
+        ("host-visible coherent memory", info.memory.types.iter().any(MemoryType::mappable)),
+        ("device memory", !info.allocation.device_heaps.is_empty()),
+        ("host staging memory", info.allocation.staging.is_some()),
+        ("a nonzero allocation limit", info.limits.max_allocation_bytes > 0),
     ];
     let floor = match requirements.iter().find(|(_, met)| !met) {
         Some((missing, _)) => Err(format!("missing {missing}")),
         None => queries_answer.map(|_| ()).map_err(|unanswered| unanswered.to_string()),
     };
-    Description {
+    Ok(Description {
         handle: DeviceHandle { instance: instance.clone(), physical },
-        facts,
+        info,
         floor,
-    }
+    })
 }
 
 /// The heaps and types of `properties`, in the driver's order.
@@ -933,19 +937,24 @@ pub(crate) fn memory_layout(properties: &vk::PhysicalDeviceMemoryProperties) -> 
 /// as 16x16x32.)
 fn matrix_shapes(instance: &Instance, physical: vk::PhysicalDevice) -> bool {
     let loader = ash::khr::cooperative_matrix::Instance::new(instance.entry(), instance.raw());
-    let Ok(shapes) =
-        (unsafe { loader.get_physical_device_cooperative_matrix_properties(physical) })
-    else {
-        return false;
+    let supported = match unsafe { loader.get_physical_device_cooperative_matrix_properties(physical) } {
+        Ok(shapes) => Some(shapes.iter().any(|shape| {
+            shape.scope == vk::ScopeKHR::SUBGROUP
+                && (shape.m_size, shape.n_size, shape.k_size) == (16, 16, 16)
+                && shape.a_type == vk::ComponentTypeKHR::FLOAT16
+                && shape.b_type == vk::ComponentTypeKHR::FLOAT16
+                && shape.c_type == vk::ComponentTypeKHR::FLOAT32
+                && shape.result_type == vk::ComponentTypeKHR::FLOAT32
+        })),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR failed; treating cooperative matrix as unavailable"
+            );
+            None
+        }
     };
-    shapes.iter().any(|shape| {
-        shape.scope == vk::ScopeKHR::SUBGROUP
-            && (shape.m_size, shape.n_size, shape.k_size) == (16, 16, 16)
-            && shape.a_type == vk::ComponentTypeKHR::FLOAT16
-            && shape.b_type == vk::ComponentTypeKHR::FLOAT16
-            && shape.c_type == vk::ComponentTypeKHR::FLOAT32
-            && shape.result_type == vk::ComponentTypeKHR::FLOAT32
-    })
+    seismic_topology::resolve(&[("VK_KHR_cooperative_matrix", &|| supported)], "default", || false).0
 }
 
 #[cfg(test)]

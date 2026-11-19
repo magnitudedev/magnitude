@@ -10,7 +10,9 @@
 
 use crate::kind::{Kind, KindReport, NativeKind};
 use crate::placement::Contract;
+use crate::processors::{HostNode, Processors};
 use crate::selector::ExecutorSelector;
+use crate::system::SystemIdentity;
 use seismic_lang::registry::BackendName;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -77,6 +79,21 @@ fn index(position: usize) -> u32 {
     u32::try_from(position).expect("a topology holds fewer than 2^32 nodes of a kind")
 }
 
+/// Evaluate ordered sources in priority order, returning the first `Some`
+/// paired with its source tag, or `default()` tagged with `fallback`.
+pub fn resolve<S: Copy, T>(
+    sources: &[(S, &dyn Fn() -> Option<T>)],
+    fallback: S,
+    default: impl FnOnce() -> T,
+) -> (T, S) {
+    for &(source, reader) in sources {
+        if let Some(value) = reader() {
+            return (value, source);
+        }
+    }
+    (default(), fallback)
+}
+
 /// A value an API reports, with the API that reported it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Reported<T> {
@@ -98,24 +115,12 @@ impl<T> Reported<T> {
 pub enum ReportedBy {
     /// Linux `/proc/meminfo` `MemTotal`: RAM the OS can use.
     LinuxMemTotal,
+    /// Linux `sysinfo(2)` `totalram`: fallback when `/proc/meminfo` is unanswered.
+    LinuxSysinfo,
     /// macOS `sysctl hw.memsize`: installed RAM.
     MacOsMemsize,
     /// Windows `GlobalMemoryStatusEx` `ullTotalPhys`: RAM the OS can use.
     WindowsTotalPhys,
-    /// Linux `/proc/meminfo` `MemAvailable`.
-    LinuxMemAvailable,
-    /// macOS Mach `HOST_VM_INFO64`: free, active and inactive pages, every
-    /// page neither wired nor held by the compressor: what the OS can make
-    /// available, compressing other programs' data if it must.
-    MachMovablePages,
-    /// macOS `vm.page_free_count` (read-ahead apart) and
-    /// `vm.page_purgeable_count` pages above `vm.vm_page_free_target`: what
-    /// can be taken without the OS reclaiming anything, so without
-    /// compressing or swapping a program's data.
-    MacOsFreePages,
-    /// Windows `GlobalMemoryStatusEx`: the lesser of available physical
-    /// memory and available commit.
-    WindowsPhysicalAndCommit,
     /// The CPU backend's largest allocation, the host's address-size limit.
     CpuAddressSpace,
     /// `MTLDevice.maxBufferLength`.
@@ -146,25 +151,10 @@ pub enum ReportedBy {
     /// CUDA's device total less the dedicated memory the OS reports for
     /// its adapter.
     CudaTotalBeyondDedicated,
-    /// Metal's recommended working set less the dedicated memory the OS
-    /// reports for its adapter.
-    MetalWorkingSetBeyondDedicated,
     /// DXGI `DXGI_ADAPTER_DESC1::DedicatedVideoMemory` and
     /// `DedicatedSystemMemory` together: the memory the OS does not manage
     /// that it reports as the adapter's.
     DxgiDedicatedMemory,
-    /// Linux cacheinfo (`/sys/devices/system/cpu/cpu*/cache/index*`): the
-    /// highest-level data or unified caches, summed over their instances.
-    LinuxSysfsCache,
-    /// macOS `sysctl hw.perflevel*.l{2,3}cachesize` over
-    /// `hw.perflevel*.cpusperl{2,3}`: each core type's last-level caches,
-    /// summed over their instances.
-    MacOsSysctlCache,
-    /// Windows `GetLogicalProcessorInformationEx(RelationCache)`: the
-    /// highest-level data or unified caches, summed over their records.
-    WindowsProcessorCache,
-    /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`.
-    CudaL2Cache,
     /// The filesystem's size (`statvfs` blocks, `GetDiskFreeSpaceExW`
     /// total).
     FilesystemSize,
@@ -173,13 +163,51 @@ pub enum ReportedBy {
     FilesystemAvailable,
 }
 
+/// A device's reported cache size and whether it is the full last-level cache
+/// before main memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct CacheSize {
+    pub bytes: u64,
+    /// True when `bytes` is the full last-level cache before main memory
+    /// (Linux sysfs, Windows `RelationCache`). False when a larger
+    /// system-level cache may sit behind it (macOS L2, CUDA L2) or when no
+    /// API reported one.
+    pub is_last_level: bool,
+}
+
+impl CacheSize {
+    /// Documented value when no API reports a cache size for the device.
+    pub const UNREPORTED: Self = Self {
+        bytes: 0,
+        is_last_level: false,
+    };
+}
+
+/// Static properties of the host machine, discovered once per topology revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Host {
+    /// Persistent host identity for measurement keying (`<cpu_identity>;ram=<bytes>`).
+    pub identity: String,
+    /// Human-readable CPU brand string (e.g. `"Apple M4 Pro"`).
+    pub cpu_model: String,
+    /// OS version and build string.
+    pub os_build: String,
+    /// Host memory page size in bytes.
+    pub page_bytes: u64,
+    /// Host CPU topology, memory nodes, and process thread quota.
+    pub processors: Processors,
+    /// Firmware / enclosure identity.
+    pub system: SystemIdentity,
+}
+
 /// One piece of hardware, by the identity its drivers share.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalDevice {
     id: PhysicalDeviceId,
     identity: PhysicalIdentity,
     memory: DeviceMemory,
-    cache: Option<Reported<u64>>,
+    cache: CacheSize,
+    host_node: HostNode,
 }
 
 impl PhysicalDevice {
@@ -196,11 +224,14 @@ impl PhysicalDevice {
     pub fn memory(&self) -> DeviceMemory {
         self.memory
     }
-    /// The device's last-level cache as an API reports it: the host CPU's
-    /// summed over its instances, a CUDA device's L2. None where no API
-    /// reports one (Metal, Vulkan, and every memory-side cache).
-    pub fn cache(&self) -> Option<Reported<u64>> {
+    /// The device's cache size and whether it is the full last-level cache
+    /// before main memory.
+    pub fn cache(&self) -> CacheSize {
         self.cache
+    }
+    /// The host NUMA memory node this device is attached to.
+    pub fn host_node(&self) -> HostNode {
+        self.host_node
     }
 }
 
@@ -347,21 +378,10 @@ impl NativeAllocations {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllocationLimit {
     /// The device's own bound, `bytes`, as its API reports it `by`.
-    Device { bytes: u64, by: DeviceAllocationBound },
+    Device { bytes: u64, by: ReportedBy },
     /// No device bound: the host's address-size limit, `bytes` of it (the
     /// CPU backend's).
     AddressSpace(u64),
-}
-
-/// The API figure that reports a device's single-allocation bound.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeviceAllocationBound {
-    /// `MTLDevice.maxBufferLength`.
-    MetalMaxBufferLength,
-    /// `cuDeviceTotalMem`: memory of the exposed device or partition.
-    CudaTotalMemory,
-    /// `min(maxMemoryAllocationSize, maxBufferSize)`.
-    VulkanMaxAllocation,
 }
 
 impl AllocationLimit {
@@ -375,14 +395,7 @@ impl AllocationLimit {
     /// The limit as reported, with the figure that reported it.
     pub fn reported(&self) -> Reported<u64> {
         match *self {
-            Self::Device { bytes, by } => Reported::new(
-                bytes,
-                match by {
-                    DeviceAllocationBound::MetalMaxBufferLength => ReportedBy::MetalMaxBufferLength,
-                    DeviceAllocationBound::CudaTotalMemory => ReportedBy::CudaTotalMemory,
-                    DeviceAllocationBound::VulkanMaxAllocation => ReportedBy::VulkanMaxAllocation,
-                },
-            ),
+            Self::Device { bytes, by } => Reported::new(bytes, by),
             Self::AddressSpace(bytes) => Reported::new(bytes, ReportedBy::CpuAddressSpace),
         }
     }
@@ -452,7 +465,7 @@ impl Executor {
     }
     /// Whether the executor forms Metal tensor operations: Apple GPU family
     /// 10 or later with a compiler that forms the tensor probe
-    /// (`seismic_metal::profile::MetalProbeAnswers::forms_tensor_operations`), the fact the
+    /// (`seismic_metal::profile::MetalProbeAnswers::forms_tensor_operations`), the condition the
     /// opened device's native sources are formed under. Always false on the
     /// other backends, whose kernels have no such form.
     pub fn forms_tensor_operations(&self) -> bool {
@@ -540,14 +553,36 @@ pub struct AccessPath {
     id: AccessPathId,
     executor: ExecutorId,
     store: StoreId,
-    grant: Option<Grant>,
+    grant: Option<AccessGrant>,
+}
+
+/// What a driver grants along an access path, with its semantic kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Grant {
+    pub bytes: Reported<u64>,
+    pub kind: GrantKind,
+}
+
+/// How an access path's grant behaves at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum GrantKind {
+    /// Unified GPU wired ceiling within host RAM (Metal unified).
+    Wired,
+    /// Static device ceiling within host RAM (CUDA unified).
+    HostLimit,
+    /// Dynamic driver heap budget within host RAM (Vulkan unified, `VK_EXT_memory_budget`).
+    HostBudget,
+    /// Device's own dedicated memory, queried without opening an executor (Metal discrete, Vulkan discrete).
+    DeviceUnopened,
+    /// Device's own dedicated memory, queried only through an opened executor (CUDA discrete).
+    DeviceOpened,
 }
 
 /// A path's grant, and where its live status is read without an opened
 /// executor, where it can be.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Grant {
-    reported: Reported<u64>,
+struct AccessGrant {
+    grant: Grant,
     source: Option<GrantSource>,
 }
 
@@ -564,15 +599,16 @@ impl AccessPath {
     pub fn store(&self) -> StoreId {
         self.store
     }
-    /// What the driver lets this process charge along the path; none for a
-    /// path no driver grants, which only the store's own headroom bounds.
-    pub fn grant(&self) -> Option<Reported<u64>> {
-        self.grant.as_ref().map(|grant| grant.reported)
+    /// What the driver lets this process charge along the path, with its
+    /// semantic kind; none for a path no driver grants, which only the store's
+    /// own headroom bounds.
+    pub fn grant(&self) -> Option<Grant> {
+        self.grant.as_ref().map(|grant| grant.grant)
     }
     /// Where the grant's live status is read without an opened executor.
     pub(crate) fn grant_source(&self) -> Option<(u64, &GrantSource)> {
         let grant = self.grant.as_ref()?;
-        Some((grant.reported.value, grant.source.as_ref()?))
+        Some((grant.grant.bytes.value, grant.source.as_ref()?))
     }
 }
 
@@ -640,6 +676,7 @@ impl Diagnostic {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceTopology {
     revision: Revision,
+    host: Host,
     physical: Vec<PhysicalDevice>,
     executors: Vec<Executor>,
     stores: Vec<Store>,
@@ -672,6 +709,14 @@ impl DeviceTopology {
     /// The revision this topology is.
     pub fn revision(&self) -> Revision {
         self.revision
+    }
+    /// Static properties of the host machine.
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+    /// The host physical device; every topology has exactly one.
+    pub fn host_device(&self) -> &PhysicalDevice {
+        &self.physical[HOST]
     }
     /// The persistent identity of an executor of this revision; none for an
     /// executor of another.
@@ -812,17 +857,21 @@ pub(crate) struct Builder {
 }
 
 impl Builder {
-    /// A revision holding the host of identity `host`, whose CPU's
-    /// last-level cache is `cache`, and host RAM of `capacity`.
+    /// A revision holding `host`, whose CPU's cache is `cache`, and host RAM
+    /// of `capacity`.
     pub(crate) fn new(
         revision: Revision,
-        host: PhysicalIdentity,
-        cache: Option<Reported<u64>>,
+        host: Host,
+        cache: CacheSize,
         capacity: Reported<u64>,
     ) -> Self {
+        let identity = PhysicalIdentity::Host {
+            machine: host.identity.clone(),
+        };
         let mut builder = Self {
             topology: DeviceTopology {
                 revision,
+                host,
                 physical: Vec::new(),
                 executors: Vec::new(),
                 stores: Vec::new(),
@@ -833,7 +882,7 @@ impl Builder {
                 diagnostics: Vec::new(),
             },
         };
-        builder.physical(host, DeviceMemory::Host, cache);
+        builder.physical(identity, DeviceMemory::Host, cache, HostNode::Any);
         builder.store(StoreKind::HostRam, capacity);
         builder
     }
@@ -856,14 +905,14 @@ impl Builder {
             .id
     }
 
-    /// The physical device of `identity`, whose memory is `memory` and whose
-    /// reported cache is `cache`, added when it is new. Both are decided
-    /// once for the device.
+    /// The physical device of `identity`, whose memory is `memory`, cache is
+    /// `cache`, and host NUMA node is `host_node`, added when it is new.
     pub(crate) fn physical(
         &mut self,
         identity: PhysicalIdentity,
         memory: DeviceMemory,
-        cache: Option<Reported<u64>>,
+        cache: CacheSize,
+        host_node: HostNode,
     ) -> PhysicalDeviceId {
         if let Some(device) = self
             .topology
@@ -873,6 +922,7 @@ impl Builder {
         {
             assert_eq!(device.memory, memory, "a device's memory is decided once");
             assert_eq!(device.cache, cache, "a device's cache is decided once");
+            assert_eq!(device.host_node, host_node, "a device's host NUMA node is decided once");
             return device.id;
         }
         let id = PhysicalDeviceId {
@@ -884,6 +934,7 @@ impl Builder {
             identity,
             memory,
             cache,
+            host_node,
         });
         id
     }
@@ -1009,17 +1060,13 @@ impl ExecutorBuilder<'_> {
     pub(crate) fn granted(
         &mut self,
         store: StoreId,
-        grant: Reported<u64>,
+        grant: Grant,
         source: Option<GrantSource>,
     ) -> OwnPath {
-        let grant = Grant {
-            reported: grant,
-            source,
-        };
-        self.access(store, Some(grant))
+        self.access(store, Some(AccessGrant { grant, source }))
     }
 
-    fn access(&mut self, store: StoreId, grant: Option<Grant>) -> OwnPath {
+    fn access(&mut self, store: StoreId, grant: Option<AccessGrant>) -> OwnPath {
         let topology = &mut self.builder.topology;
         let id = AccessPathId {
             revision: topology.revision,

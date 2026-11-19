@@ -205,7 +205,7 @@ fn groups(device: &Device, launch: &DirectLaunch<'_>) -> Result<Option<[u32; 3]>
     if launch.groups.contains(&0) {
         return Ok(None);
     }
-    let limit = device.facts().limits.max_group_count;
+    let limit = device.info().limits.max_group_count;
     let mut groups = [0u32; 3];
     for axis in 0..3 {
         if launch.groups[axis] > limit[axis] {
@@ -562,7 +562,7 @@ impl Stamps {
             },
             "vkGetQueryPoolResults",
         )?;
-        let limits = self.device.facts().limits;
+        let limits = self.device.info().limits;
         let ticks = values[to].wrapping_sub(values[from]) & mask(limits.timestamp_valid_bits);
         Ok(ticks as f64 * limits.timestamp_period / 1e9)
     }
@@ -1228,7 +1228,7 @@ pub struct TimelineAnchor {
 
 impl TimelineAnchor {
     pub fn record(device: &Device, host_clock: impl Fn() -> f64) -> Result<Self, ExecutionError> {
-        let limits = device.facts().limits;
+        let limits = device.info().limits;
         let (period, mask) = (limits.timestamp_period, mask(limits.timestamp_valid_bits));
         let mut anchor: Option<Self> = None;
         for _ in 0..ANCHOR_SAMPLES {
@@ -1338,7 +1338,7 @@ impl DirectSubmission<Measured> {
     pub fn device_seconds(&self) -> Result<f64, ExecutionError> {
         let end = self.stamps.end;
         let values = self.timestamps(end + 1)?;
-        let limits = self.device.facts().limits;
+        let limits = self.device.info().limits;
         let ticks =
             values[end as usize].wrapping_sub(values[0]) & mask(limits.timestamp_valid_bits);
         Ok(ticks as f64 * limits.timestamp_period / 1e9)
@@ -1526,7 +1526,7 @@ mod park_tests {
             text.split_whitespace().next().unwrap().parse::<f64>().unwrap() / 1e9
         };
         for description in devices.into_iter().filter(|description| description.floor.is_ok()) {
-            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens");
+            let device = Device::open(description.info.uuid, crate::unbounded_stores(&description.info), &Default::default()).expect("a device meeting the floor opens");
             for work in [Duration::from_micros(50), Duration::from_micros(300), Duration::from_millis(2)] {
                 let gate = Arc::new(HostTimeline::new(&device).unwrap());
                 let reached = Arc::new(HostTimeline::new(&device).unwrap());
@@ -1564,7 +1564,7 @@ mod park_tests {
                 }
                 eprintln!(
                     "{}: device reaching the value {work:?} after the wait began: the wait ran {:.0}% of it and returned {:.1} µs after a polling thread saw it",
-                    description.facts.name,
+                    description.info.name,
                     100.0 * ran_share / WAITS as f64,
                     late / WAITS as f64 * 1e6
                 );
@@ -1587,7 +1587,7 @@ mod park_tests {
             return;
         };
         for description in devices.into_iter().filter(|description| description.floor.is_ok()) {
-            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens");
+            let device = Device::open(description.info.uuid, crate::unbounded_stores(&description.info), &Default::default()).expect("a device meeting the floor opens");
             let run = |parked: bool| {
                 let (reached, gate) = (Arc::new(HostTimeline::new(&device).unwrap()), Arc::new(HostTimeline::new(&device).unwrap()));
                 let answerer = parked.then(|| {
@@ -1630,7 +1630,7 @@ mod park_tests {
             let (plain, parked) = (median(false), median(true));
             eprintln!(
                 "{}: {PARKS} submissions {:.1} µs each ungated, {:.1} µs each after a park: a park costs {:.1} µs",
-                description.facts.name,
+                description.info.name,
                 plain / PARKS as f64 * 1e6,
                 parked / PARKS as f64 * 1e6,
                 (parked - plain) / PARKS as f64 * 1e6
@@ -1641,8 +1641,8 @@ mod park_tests {
     #[test]
     fn a_park_holds_what_follows_it_on_the_host() {
         for description in crate::test_devices() {
-            eprintln!("{}:", description.facts.name);
-            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens");
+            eprintln!("{}:", description.info.name);
+            let device = Device::open(description.info.uuid, crate::unbounded_stores(&description.info), &Default::default()).expect("a device meeting the floor opens");
             case(&device, false);
             case(&device, true);
         }

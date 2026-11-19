@@ -429,7 +429,7 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it(backend: B
         .flat_map(|target| machines.iter().map(move |machine| (target, machine)))
         .collect::<Vec<_>>();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
+    let threads = seismic::threads::quota().get();
     let mut rows: Vec<Row> = std::thread::scope(|scope| {
         let workers = (0..threads)
             .map(|_| {

@@ -1,8 +1,8 @@
 //! Complete host discovery and the CPU target profile.
 //!
-//! Discovery fixes every fact used by planning or emission before a plan is
-//! constructed. Native compilation only reconstructs the Cranelift ISA from
-//! `HostFacts::codegen`; it never probes or narrows the target.
+//! Discovery fixes every target capability and limit used by planning or emission
+//! before a plan is constructed. Native compilation only reconstructs the Cranelift
+//! ISA from `CpuDeviceInfo::codegen`; it never probes or narrows the target.
 
 use crate::codegen::CodegenPolicy;
 use crate::numeric::{MATH_IDENTITY, MATH_VERSION};
@@ -43,7 +43,7 @@ pub struct ScratchPolicy {
 }
 
 /// Fixed-width SIMD register classes the profiled Cranelift ISA may emit.
-/// Width is a target fact; factories select only from this closed set.
+/// Width is a target capability; factories select only from this closed set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SimdTier {
     Bits128,
@@ -89,7 +89,7 @@ impl KernelAbiModel<Cpu> for HostKernelAbi {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct HostFacts {
+pub struct CpuDeviceInfo {
     pub workers: u32,
     pub codegen: CodegenPolicy,
     pub scratch: ScratchPolicy,
@@ -162,7 +162,7 @@ pub(crate) fn device_for_workers(
     } else {
         Vec::new()
     };
-    let facts = HostFacts {
+    let specs = CpuDeviceInfo {
         workers,
         codegen,
         scratch,
@@ -210,15 +210,15 @@ pub(crate) fn device_for_workers(
         approximate_transcendentals: BTreeSet::new(),
         denormals_preserved: true,
     };
-    let vectors = vector_support(&facts);
-    let identity = identity(&facts, &limits, &dtypes, &vectors, &numerics);
+    let vectors = vector_support(&specs);
+    let identity = identity(&specs, &limits, &dtypes, &vectors, &numerics);
     let parts = DiscoveredTarget {
         identity,
         limits,
         dtypes,
         vectors,
         numerics,
-        facts,
+        device_info: specs,
         kernel_abi: HostKernelAbi,
         local_realization: LocalRealizationPolicy {
             workgroup: LocalRealization::NativeDynamic,
@@ -233,7 +233,7 @@ pub(crate) fn device_for_workers(
 }
 
 fn identity(
-    facts: &HostFacts,
+    specs: &CpuDeviceInfo,
     limits: &TargetLimits,
     dtypes: &DataTypeSupport,
     vectors: &VectorSupport,
@@ -242,32 +242,32 @@ fn identity(
     let mut digest = Sha256::new();
     put_str(&mut digest, REGISTRY_REVISION);
     put_str(&mut digest, BACKEND_REVISION);
-    put_str(&mut digest, &facts.codegen.compiler);
-    put_str(&mut digest, &facts.codegen.triple);
-    digest.update([call_conv_tag(facts.codegen.call_conv)]);
-    for (name, value) in &facts.codegen.shared_flags {
+    put_str(&mut digest, &specs.codegen.compiler);
+    put_str(&mut digest, &specs.codegen.triple);
+    digest.update([call_conv_tag(specs.codegen.call_conv)]);
+    for (name, value) in &specs.codegen.shared_flags {
         put_str(&mut digest, name);
         put_str(&mut digest, value);
     }
     digest.update([0xff]);
-    for (name, value) in &facts.codegen.isa_flags {
+    for (name, value) in &specs.codegen.isa_flags {
         put_str(&mut digest, name);
         put_str(&mut digest, value);
     }
     digest.update([0xfe]);
-    digest.update(facts.workers.to_le_bytes());
-    digest.update(facts.scratch.workgroup_bytes.to_le_bytes());
-    digest.update(facts.scratch.participant_bytes.to_le_bytes());
-    digest.update(facts.scratch.alignment.to_le_bytes());
-    for tier in &facts.simd {
+    digest.update(specs.workers.to_le_bytes());
+    digest.update(specs.scratch.workgroup_bytes.to_le_bytes());
+    digest.update(specs.scratch.participant_bytes.to_le_bytes());
+    digest.update(specs.scratch.alignment.to_le_bytes());
+    for tier in &specs.simd {
         digest.update(tier.bits().to_le_bytes());
     }
     digest.update([0xfb]);
-    for tier in &facts.simd_fma {
+    for tier in &specs.simd_fma {
         digest.update(tier.bits().to_le_bytes());
     }
-    put_str(&mut digest, facts.math_identity);
-    digest.update(facts.math_version.to_le_bytes());
+    put_str(&mut digest, specs.math_identity);
+    digest.update(specs.math_version.to_le_bytes());
     for value in limits.max_workgroup_size {
         digest.update(value.to_le_bytes());
     }
@@ -313,18 +313,18 @@ fn identity(
     CompatibilityIdentity {
         backend: BackendName::Cpu,
         backend_revision: BACKEND_REVISION,
-        hardware: facts.codegen.triple.clone(),
+        hardware: specs.codegen.triple.clone(),
         driver: "host".into(),
-        toolchain: facts.codegen.compiler.clone(),
+        toolchain: specs.codegen.compiler.clone(),
         fingerprint: digest.finalize().into(),
     }
 }
 
-fn vector_support(facts: &HostFacts) -> VectorSupport {
+fn vector_support(specs: &CpuDeviceInfo) -> VectorSupport {
     use seismic_ir::kernel::ops::{BinaryOp, BitOp, UnaryOp};
 
     let mut entries = Vec::new();
-    for tier in &facts.simd {
+    for tier in &specs.simd {
         let lanes = tier.f32_lanes();
         for dtype in DType::ALL {
             let mut operations = vec![
@@ -379,7 +379,7 @@ fn vector_support(facts: &HostFacts) -> VectorSupport {
                         VectorOperationClass::Bit(BitOp::Shr),
                     ]);
                 }
-                if facts.simd_fma.contains(tier) && dtype.is_float() {
+                if specs.simd_fma.contains(tier) && dtype.is_float() {
                     operations.push(VectorOperationClass::Fma);
                 }
             }

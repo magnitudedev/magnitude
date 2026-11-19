@@ -19,7 +19,6 @@ seismic-native-target.workspace = true
 seismic-memory.workspace = true
 # The process's quota of CPUs, which bounds its cores.
 seismic-threads.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]

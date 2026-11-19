@@ -544,7 +544,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         domain: SegmentLaunchDomain,
         logical: Option<seismic_ir::kernel::dynamic::LogicalIndexBinding>,
     ) {
-        let descriptor = B::launch_for_participation(self.builder.target().facts(), domain.mode)
+        let descriptor = B::launch_for_participation(self.builder.target().device_info(), domain.mode)
             .expect("semantic participation was admitted on an unsupported target");
         self.builder
             .schedule()

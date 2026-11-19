@@ -279,14 +279,14 @@ mod tests {
         }
 
         const NAME: seismic_lang::registry::BackendName = seismic_lang::registry::BackendName::Cpu;
-        type Facts = ();
+        type DeviceInfo = ();
         type Intrinsic = NoIntrinsic;
 
         fn write_intrinsic_identity(op: &Self::Intrinsic, _: &mut IntrinsicIdentityBuilder) {
             match *op {}
         }
         fn intrinsic_numerics(
-            _: &Self::Facts,
+            _: &Self::DeviceInfo,
             _: &seismic_lang::registry::IntrinsicSignature,
             op: &Self::Intrinsic,
         ) -> IntrinsicNumericalSemantics {

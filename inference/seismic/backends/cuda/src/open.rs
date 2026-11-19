@@ -34,11 +34,21 @@ pub fn open(ordinal: u32, stores: CudaStores) -> Result<OpenedCuda, TargetError>
 /// never a fall in the device's free memory, which other programs move
 /// while the context opens.
 pub fn usable_memory_bytes(ordinal: u32, uuid: [u8; 16]) -> Result<u64, ExecutionError> {
+    usable_memory_report(ordinal, uuid).map(|(bytes, _)| bytes)
+}
+
+/// [`usable_memory_bytes`], together with a diagnostic message when NVML could
+/// not be used on a non-Windows host and the figure fell back to
+/// `cuMemGetInfo` free bytes.
+pub(crate) fn usable_memory_report(
+    ordinal: u32,
+    uuid: [u8; 16],
+) -> Result<(u64, Option<String>), ExecutionError> {
     #[cfg(target_os = "windows")]
     {
         let _ = uuid;
         let context = context(ordinal)?;
-        Ok(crate::executor::memory_info(&context)?.free_bytes)
+        Ok((crate::executor::memory_info(&context)?.free_bytes, None))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -49,16 +59,50 @@ pub fn usable_memory_bytes(ordinal: u32, uuid: [u8; 16]) -> Result<u64, Executio
         let fresh = !driver
             .primary_context_active(ordinal as std::ffi::c_int)
             .map_err(|error| ExecutionError::SubmissionFailed(error.to_string()))?;
-        let nvml = fresh.then(|| crate::nvml::NvmlDevice::open(uuid)).flatten();
+        let nvml = fresh.then(|| crate::nvml::NvmlDevice::open(uuid));
         let context = context(ordinal)?;
         let free = crate::executor::memory_info(&context)?.free_bytes;
-        let accounting = nvml.as_ref().and_then(|nvml| {
-            let sample = nvml.sample()?;
-            let context = nvml.process_bytes(std::process::id()).ok()?;
-            Some(DeviceAccounting { total: sample.total, reserved: sample.reserved, context })
-        });
+        let mut fallback = None;
+        let accounting = match nvml {
+            None => None,
+            Some(None) => {
+                fallback = Some(
+                    "NVML is unavailable for the device; falling back to cuMemGetInfo free bytes"
+                        .to_owned(),
+                );
+                None
+            }
+            Some(Some(nvml)) => match nvml.sample() {
+                None => {
+                    fallback = Some(
+                        "NVML memory query failed; falling back to cuMemGetInfo free bytes"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Some(sample) => match nvml.process_bytes(std::process::id()) {
+                    Ok(context_bytes) => Some(DeviceAccounting {
+                        total: sample.total,
+                        reserved: sample.reserved,
+                        context: context_bytes,
+                    }),
+                    Err(error) => {
+                        fallback = Some(format!(
+                            "{error}; falling back to cuMemGetInfo free bytes"
+                        ));
+                        None
+                    }
+                },
+            },
+        };
         drop(context);
-        Ok(usable_capacity(free, accounting))
+        if let Some(reason) = &fallback {
+            tracing::warn!(ordinal, reason = %reason, "CUDA usable memory query fell back to cuMemGetInfo");
+        }
+        let nvml_usable = accounting.map(|accounting| usable_capacity(free, Some(accounting)));
+        let usable =
+            seismic_topology::resolve(&[("NVML", &|| nvml_usable)], "cuMemGetInfo", || free).0;
+        Ok((usable, fallback))
     }
 }
 

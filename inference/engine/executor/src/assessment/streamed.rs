@@ -85,13 +85,10 @@ impl StreamedFigures {
         };
         let memory = match topology.shared_ranges_lie_in_device_memory(executor) {
             true => Priced::Measured(None),
-            false => match std::thread::available_parallelism() {
-                Err(error) => Priced::Unavailable(format!("the host's processors: {error}")),
-                Ok(readers) => match MemoryCosts::stored(topology, executor, readers.get() as u64, &reading) {
-                    Ok(costs) => Priced::Measured(Some(costs.byte_seconds)),
-                    Err(error @ MemoryError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
-                    Err(error) => Priced::Unavailable(error.to_string()),
-                },
+            false => match MemoryCosts::stored(topology, executor, seismic::threads::quota().get() as u64, &reading) {
+                Ok(costs) => Priced::Measured(Some(costs.byte_seconds)),
+                Err(error @ MemoryError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
+                Err(error) => Priced::Unavailable(error.to_string()),
             },
         };
         let site = match topology.shared_ranges_lie_in_device_memory(executor) {

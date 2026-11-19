@@ -6,7 +6,7 @@
 //! compile options against the language recipe. The executions are
 //! regression guards over a hard corpus and random operands; they are never a
 //! row's basis (sampling is not a basis, A5 §2.5).
-use crate::facts::MatrixCombination;
+use crate::device_info::MatrixCombination;
 use crate::profile::{compile_options, open_device};
 use crate::test_support::metal_device;
 use crate::MetalDevice;
@@ -170,7 +170,7 @@ fn subgroup_width_is_the_pipeline_execution_width() {
 #[test]
 fn fragment_formats_are_the_matrix_combinations() {
     let description = open_device(&metal_device(), crate::test_support::probes()).expect("Metal device description");
-    let combinations = &description.facts().matrix_combinations;
+    let combinations = &description.device_info().matrix_combinations;
     for (left, accumulator) in [(DType::F16, DType::F32), (DType::F32, DType::F32)] {
         assert!(
             combinations.contains(&MatrixCombination { accumulator, left, right: left }),
@@ -297,7 +297,7 @@ impl NativeProbe {
 
     fn pipeline(&self, source: &str) -> Retained<ProtocolObject<dyn MTLComputePipelineState>> {
         let raw = self.device.handle().raw();
-        let options = compile_options(self.description.facts().language);
+        let options = compile_options(self.description.device_info().language);
         let library = raw
             .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
             .unwrap_or_else(|e| panic!("probe does not compile: {e}\n{source}"));
@@ -607,7 +607,7 @@ fn deviating_rows_compile_and_run() {
 #[test]
 fn float_subgroup_folds_compile_and_run() {
     let probe = NativeProbe::open();
-    let collectives = &probe.description.facts().scalar_collective_dtypes;
+    let collectives = &probe.description.device_info().scalar_collective_dtypes;
     assert!(collectives.contains(&DType::F32) && collectives.contains(&DType::F16));
     for dtype in FLOATS.into_iter().filter(|dtype| collectives.contains(dtype)) {
         let bits_of = |value: u32| float_literal(dtype, f64::from(value)).bits();

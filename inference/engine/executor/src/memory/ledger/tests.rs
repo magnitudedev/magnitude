@@ -99,8 +99,7 @@ pub(crate) fn host_sample(total: u64, available: u64) -> seismic::HostSample {
         total,
         supply: seismic::Supply { free_beyond_target: i64::try_from(available).expect("bytes fit i64"), clean_cache: 0, cold_reclaimable: 0 },
         counted: seismic::Counted { at, lag: Duration::ZERO },
-        cold: 0,
-        own_cold: seismic::OwnCold::Unobserved,
+        cold: seismic::ColdPages::default(),
         own_reclaimed: Some(seismic::OwnReclaimed::NONE),
         wired: None,
         harm: Some(seismic::Harm { machine: 0, own: 0 }),
@@ -728,7 +727,7 @@ fn every_claim_counts_the_supply() {
     let sample = host_sample(64 * GB, 4 * GB);
     let sample = seismic::HostSample {
         supply: seismic::Supply { clean_cache: 6 * GB, cold_reclaimable: 3 * GB, ..sample.supply },
-        cold: 6 * GB,
+        cold: seismic::ColdPages { machine: 6 * GB, own: None },
         ..sample
     };
     ledger.read(ledger.sampled(clock.next()), Reading::host(&sample));
@@ -1725,8 +1724,7 @@ fn linux_unified_host_prices_cuda_and_vulkan_grants_without_wired_figures() {
             cold_reclaimable: 0,
         },
         counted: seismic::Counted { at, lag: Duration::ZERO },
-        cold: 0,
-        own_cold: seismic::OwnCold::Unobserved,
+        cold: seismic::ColdPages::default(),
         own_reclaimed: None,
         wired: None,
         harm: None,

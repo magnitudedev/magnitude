@@ -1220,7 +1220,7 @@ extern "C" __global__ void mark(unsigned int* out, Words words, unsigned int* sc
         else {
             return;
         };
-        let capability = description.facts().compute_capability;
+        let capability = description.device_info().compute_capability;
         let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
         let cubin =
             crate::nvrtc::compile_cubin_named(SOURCE, "abandon.cu", architecture, &["mark"])

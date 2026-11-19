@@ -384,10 +384,12 @@ pub fn device_block_packing(backend: BackendName) -> Option<DeviceBlockPacking> 
 }
 mod slab;
 pub use seismic_discovery::{
-    device_node, host_sample, pin, place_process, volume_available, volume_identity, Core, DeviceNode, DiscoveryError,
-    Counted, Harm, HostSample, Inventory, Lag, Machine, MachineFormFactor, MachineIdentity, MemoryNode, ObservationError, OwnCold, OwnReclaimed, PciLocation,
-    PressureEvents, PressureLevel, PressureWaker, ProcessPlacement, Processors, ProcessorsReportedBy, RuntimeStatus,
-    Sample, Status, Supply, Wake, WiredFigures, WiredLimit,
+    device_node, discover_processors, host_sample, pin, place_process,
+    volume_available, volume_identity, ColdPages, Core, Counted, DiscoveryError, FormFactor,
+    HardwareIdentity, Harm, HostNode, HostSample, Inventory, Lag, MemoryNode, ObservationError,
+    OwnReclaimed, PciLocation, PressureEvents, PressureLevel, PressureWaker, ProcessPlacement,
+    Processors, RuntimeStatus, Sample, Status, Supply, SystemIdentity, Wake,
+    WiredFigures, WiredLimit,
 };
 pub use seismic_lang::forms::MetalPacking;
 /// The threads this process may run at once (`seismic-threads`): its share
@@ -403,12 +405,12 @@ pub use seismic_runtime::native::{
     GraphPending, GraphPoint, GraphTiming, KernelPoint, NativeSpans, Point, PointPending,
 };
 pub use seismic_topology::{
-    AccessPath, AccessPathId, AllocationLimit, Availability, DeviceAllocationBound, Contract, DeviceMemory, DeviceTopology,
-    Diagnostic, DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, HostReads, Identity,
-    Kind, KindId, KindMemory, Limits, NativeKind, PhysicalDevice,
-    PhysicalDeviceId, PhysicalIdentity, Reach, Reported, ReportedBy,
-    Revision, Store, StoreId,
-    StoreIdentity, StoreKind, TransferPath, TransferPathId, VolumeId,
+    AccessPath, AccessPathId, AllocationLimit, Availability, CacheSize, Contract, DeviceMemory,
+    DeviceTopology, Diagnostic, DiagnosticSource, Executor, ExecutorId, ExecutorKind,
+    ExecutorSelector, Grant, GrantKind, Host, HostReads, Identity, Kind, KindId, KindMemory,
+    Limits, NativeKind, PhysicalDevice, PhysicalDeviceId, PhysicalIdentity, Reach, Reported,
+    ReportedBy, Revision, Store, StoreId, StoreIdentity, StoreKind, TransferPath, TransferPathId,
+    VolumeId,
 };
 mod measurer;
 pub use measurer::{KernelIdentity, Measurer, PointKey};
@@ -733,7 +735,7 @@ impl Device {
         self.inner.host_threads()
     }
     /// The host memory node the device is attached to.
-    pub fn host_node(&self) -> Result<DeviceNode, String> {
+    pub fn host_node(&self) -> HostNode {
         self.inner.host_node()
     }
     /// Stable key of this device's model and configuration for native
