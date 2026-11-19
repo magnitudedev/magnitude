@@ -123,7 +123,10 @@ impl ResolvedConfigurations {
             let key = ResolutionKey {
                 bundle: servable_model_bundle_key_for_bundle(&configuration.bundle),
                 context_tokens,
-                files: std::iter::once(paths.target.clone())
+                files: paths
+                    .target_shards
+                    .iter()
+                    .cloned()
                     .chain(paths.projector.clone())
                     .chain(paths.draft.clone())
                     .collect(),
@@ -175,7 +178,7 @@ fn engine_configuration(
 ) -> EngineConfiguration {
     EngineConfiguration {
         package: PackageOptions {
-            target: package.target,
+            target_shards: package.target_shards,
             projector: match package.projector {
                 Some(projector) => ProjectorSelection::Explicit(projector),
                 None => ProjectorSelection::Disabled,
@@ -346,7 +349,7 @@ mod tests {
             PathBuf::from(std::env::var_os(variable).unwrap_or_else(|| panic!("set {variable}")))
         };
         ModelPackagePaths {
-            target: path("MAGNITUDE_TEST_TARGET_GGUF"),
+            target_shards: vec![path("MAGNITUDE_TEST_TARGET_GGUF")],
             projector: None,
             draft: Some(path("MAGNITUDE_TEST_DRAFT_GGUF")),
             method,
@@ -410,7 +413,7 @@ mod tests {
         let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
         let configuration = engine_configuration(
             ModelPackagePaths {
-                target: PathBuf::from("target.gguf"),
+                target_shards: vec![PathBuf::from("target.gguf")],
                 projector: None,
                 draft: None,
                 method: ModelMethod::Plain,

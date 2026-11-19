@@ -1041,8 +1041,16 @@ pub enum InventoryProperties {
 pub struct ModelPreviewSource {
     pub repository: String,
     pub revision: String,
-    pub primary_gguf: PathBuf,
+    /// Ordered shard paths for the primary GGUF component (1 element for an unsplit GGUF).
+    pub shards: Vec<PathBuf>,
     pub additional_components: Vec<ModelPreviewComponentSource>,
+}
+
+impl ModelPreviewSource {
+    #[must_use]
+    pub fn primary_gguf(&self) -> Option<&std::path::Path> {
+        self.shards.first().map(PathBuf::as_path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

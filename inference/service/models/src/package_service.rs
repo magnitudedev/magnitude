@@ -1368,17 +1368,40 @@ impl ManagedModelStore {
                     else {
                         return Err(InventoryError::NotReady(package.id.0));
                     };
-                    let primary = package
+                    let shard_index_of = |file_id: &magnitude_service_contracts::models::ModelFileId| {
+                        package.relationships.iter().find_map(|relationship| {
+                            if let ModelFileRelationship::Shard {
+                                file_id: id, index, ..
+                            } = relationship
+                                && id == file_id
+                            {
+                                Some(*index)
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                    let mut weight_files = package
                         .files
                         .iter()
                         .filter(|file| file.role == ModelFileRole::Weights)
-                        .min_by(|left, right| left.path.cmp(&right.path))
-                        .ok_or_else(|| {
-                            InventoryError::InvalidRequest(format!(
-                                "package {} has no weights",
-                                package.id.0
-                            ))
-                        })?;
+                        .collect::<Vec<_>>();
+                    weight_files.sort_by(|left, right| {
+                        shard_index_of(&left.id)
+                            .unwrap_or(0)
+                            .cmp(&shard_index_of(&right.id).unwrap_or(0))
+                            .then_with(|| left.path.cmp(&right.path))
+                    });
+                    let primary = *weight_files.first().ok_or_else(|| {
+                        InventoryError::InvalidRequest(format!(
+                            "package {} has no weights",
+                            package.id.0
+                        ))
+                    })?;
+                    let shards = weight_files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect::<Vec<_>>();
                     let additional_components = package
                         .files
                         .iter()
@@ -1431,7 +1454,7 @@ impl ManagedModelStore {
                         .prepare_preview(&ModelPreviewSource {
                             repository: repository.clone(),
                             revision: revision.clone(),
-                            primary_gguf: primary.path.clone(),
+                            shards,
                             additional_components,
                         })
                         .await?;

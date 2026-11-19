@@ -22,7 +22,7 @@ use crate::inventory::{
     ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, LinkedFiles, LocationScan,
     ModelGroup, UnreadableDirectories, components_for_group, discover_groups,
     inspect_cached, io_error, modified_seconds, now, primary_path, read_dir_sorted,
-    readable_entries, scan_hf_cache, split_shard_name,
+    readable_entries, scan_hf_cache,
 };
 
 const OLLAMA_MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
@@ -737,18 +737,71 @@ fn scan_folder_file(
     let Some(folder) = file.parent() else {
         return Ok(());
     };
-    let paths = match split_shard_name(file) {
+    let paths = match crate::candidate_files::split_shard(file) {
         None => vec![file.to_path_buf()],
-        Some(_) => match file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(crate::candidate_files::split_set)
-        {
-            Some(shards) if shards.len() > 1 => {
-                shards.into_iter().map(|name| folder.join(name)).collect()
+        Some((_, 1, _)) => {
+            let named = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(crate::candidate_files::split_set)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|name| folder.join(name))
+                .collect::<Vec<_>>();
+            if named.len() > 1
+                && named
+                    .iter()
+                    .all(|path| path.is_file() && !is_partial_download(path))
+            {
+                named
+            } else {
+                let mut folder_files = Vec::new();
+                if let Ok(entries) = read_dir_sorted(folder) {
+                    for entry in entries {
+                        let path = entry.path();
+                        if !entry.file_name().to_string_lossy().starts_with('.')
+                            && path.is_file()
+                            && !is_partial_download(&path)
+                            && path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+                        {
+                            folder_files.push(crate::candidate_files::CandidateGguf {
+                                path,
+                                size_bytes: 0,
+                            });
+                        }
+                    }
+                }
+                let partitioned = crate::candidate_files::partition_ggufs(&folder_files);
+                let mut split_headers = std::collections::BTreeMap::new();
+                for candidate in &partitioned.unstemmed {
+                    let split = crate::candidate_files::local_directory(&candidate.path)
+                        .ok()
+                        .and_then(|directory| crate::candidate_files::SplitMetadata::of(&directory));
+                    split_headers.insert(candidate.path.clone(), split);
+                }
+                for incomplete in &partitioned.incomplete_splits {
+                    if let Some(probe) = incomplete.probe_shard() {
+                        let split = crate::candidate_files::local_directory(&probe.path)
+                            .ok()
+                            .and_then(|directory| {
+                                crate::candidate_files::SplitMetadata::of(&directory)
+                            });
+                        split_headers.insert(probe.path.clone(), split);
+                    }
+                }
+                match crate::candidate_files::resolve_split_groups(partitioned, &split_headers)
+                    .into_iter()
+                    .find(|group| group.primary().path == file)
+                {
+                    Some(group) => group.files.into_iter().map(|candidate| candidate.path).collect(),
+                    None => return Ok(()),
+                }
             }
-            _ => return Ok(()),
-        },
+        }
+        Some(_) => return Ok(()),
     };
     if paths
         .iter()
@@ -825,7 +878,7 @@ fn folder_drafters(
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
                 && !is_partial_download(path)
-                && split_shard_name(path).is_none()
+                && crate::candidate_files::split_shard(path).is_none()
                 && path.is_file()
         })
         .filter(|path| {

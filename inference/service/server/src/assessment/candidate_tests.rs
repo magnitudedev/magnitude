@@ -1054,7 +1054,7 @@ fn hugging_face_package<'a>(
                 &ModelPreviewSource {
                     repository: repository.to_owned(),
                     revision: snapshot.commit.clone(),
-                    primary_gguf: PathBuf::from(path),
+                    shards: vec![PathBuf::from(path)],
                     additional_components: Vec::new(),
                 },
                 &snapshot,
@@ -3028,7 +3028,7 @@ async fn a_flat_llama_cpp_root_offers_only_the_models_own_repository_drafters() 
     let target = super::DrafterTarget {
         material: fixture
             .candidates
-            .local_target(model.clone(), None)
+            .local_target(vec![model.clone()], None)
             .expect("target material"),
         repository: Some(("owner/Llama-GGUF".to_owned(), String::new())),
         primary: None,

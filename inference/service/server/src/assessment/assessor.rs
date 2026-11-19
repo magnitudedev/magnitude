@@ -362,7 +362,7 @@ pub(crate) fn engine_material(
         },
     };
     let components = &resolved.target_model.components;
-    let target = components
+    let mut target_components = components
         .iter()
         .filter(|component| {
             matches!(
@@ -370,9 +370,17 @@ pub(crate) fn engine_material(
                 ComponentRole::Weights | ComponentRole::Shard
             )
         })
-        .min_by_key(|component| component.shard_index.unwrap_or(0))
+        .collect::<Vec<_>>();
+    target_components.sort_by_key(|component| (component.shard_index.unwrap_or(0), &component.path));
+    let target_shards = target_components
+        .into_iter()
         .map(|component| component.path.clone())
-        .ok_or_else(|| InventoryError::NotReady("model has no runnable weights".to_owned()))?;
+        .collect::<Vec<_>>();
+    if target_shards.is_empty() {
+        return Err(InventoryError::NotReady(
+            "model has no runnable weights".to_owned(),
+        ));
+    }
     let projectors = components
         .iter()
         .filter(|component| component.role == ComponentRole::Projector)
@@ -388,7 +396,7 @@ pub(crate) fn engine_material(
         }
     };
     Ok(ModelPackagePaths {
-        target,
+        target_shards,
         projector,
         draft,
         method,
@@ -1124,7 +1132,7 @@ mod tests {
             (SpeculativeMethod::Mtp, ModelMethod::Mtp),
         ] {
             let material = engine_material(&speculative(true, method)).unwrap();
-            assert_eq!(material.target, PathBuf::from("/models/target.gguf"));
+            assert_eq!(material.target(), std::path::Path::new("/models/target.gguf"));
             assert_eq!(material.draft, Some(PathBuf::from("/models/draft.gguf")));
             assert_eq!(material.method, expected);
         }

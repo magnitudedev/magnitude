@@ -196,41 +196,28 @@ pub(crate) fn resolve_components(
 }
 
 fn validate_shard_layout(components: &[ResolvedComponent]) -> Result<(), InventoryError> {
-    let mut groups = Vec::<(magnitude_service_contracts::ComponentRole, PathBuf)>::new();
+    let mut roles = Vec::<magnitude_service_contracts::ComponentRole>::new();
     for component in components
         .iter()
         .filter(|component| component.shard_index.is_some())
     {
-        let directory = component.path.parent().unwrap_or_else(|| Path::new(""));
-        if !groups
-            .iter()
-            .any(|(role, parent)| role == &component.role && parent == directory)
-        {
-            groups.push((component.role.clone(), directory.to_path_buf()));
+        if !roles.contains(&component.role) {
+            roles.push(component.role.clone());
         }
     }
-    for (role, directory) in groups {
+    for role in roles {
         let shards = components
             .iter()
-            .filter(|component| {
-                component.role == role
-                    && component.shard_index.is_some()
-                    && component.path.parent() == Some(directory.as_path())
-            })
+            .filter(|component| component.role == role && component.shard_index.is_some())
             .collect::<Vec<_>>();
         let count = u32::try_from(shards.len()).map_err(|_| invalid_split_layout(&role))?;
         let mut indices = BTreeSet::new();
+        let mut paths = BTreeSet::new();
         for component in shards {
             let index = component
                 .shard_index
                 .expect("sharded components were filtered");
-            let name = component
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            let suffix = format!("-{index:05}-of-{count:05}.gguf");
-            if !indices.insert(index) || !name.ends_with(&suffix) {
+            if !indices.insert(index) || !paths.insert(&component.path) {
                 return Err(invalid_split_layout(&role));
             }
         }
@@ -731,23 +718,41 @@ mod tests {
     }
 
     #[test]
-    fn invalid_split_filename_is_rejected_before_native_planning() {
+    fn non_contiguous_or_duplicate_shard_layout_is_rejected_while_arbitrary_names_pass() {
         let directory = tempfile::tempdir().expect("shards");
-        let components = (1..=2)
-            .map(|index| {
-                let path = directory.path().join(format!("blob-{index}"));
-                fs::write(&path, b"fixture").expect("fixture");
-                ResolvedComponent {
-                    path,
-                    role: ComponentRole::Shard,
-                    shard_index: Some(index),
-                    relationship: None,
-                }
-            })
-            .collect::<Vec<_>>();
+        let sub = directory.path().join("quant");
+        fs::create_dir_all(&sub).expect("subdir");
+        let valid = vec![
+            ResolvedComponent {
+                path: sub.join("model-00001-of-00002.gguf"),
+                role: ComponentRole::Shard,
+                shard_index: Some(1),
+                relationship: None,
+            },
+            ResolvedComponent {
+                path: directory.path().join("shared-engram.gguf"),
+                role: ComponentRole::Shard,
+                shard_index: Some(2),
+                relationship: None,
+            },
+        ];
+        validate_shard_layout(&valid).expect("arbitrary cross-directory shard layout is valid");
 
-        let error = validate_shard_layout(&components).expect_err("invalid split layout");
-
+        let gap = vec![
+            ResolvedComponent {
+                path: sub.join("model-00001-of-00003.gguf"),
+                role: ComponentRole::Shard,
+                shard_index: Some(1),
+                relationship: None,
+            },
+            ResolvedComponent {
+                path: directory.path().join("shared-engram.gguf"),
+                role: ComponentRole::Shard,
+                shard_index: Some(3),
+                relationship: None,
+            },
+        ];
+        let error = validate_shard_layout(&gap).expect_err("non-contiguous split layout");
         assert!(matches!(
             error,
             InventoryError::ModelOperation { code, retryable: false, .. }

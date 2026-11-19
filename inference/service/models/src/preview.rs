@@ -956,6 +956,95 @@ impl ManagedModelStore {
         self.materialize_preview(artifact)
     }
 
+    /// Resolve the explicit ordered shard paths for `primary` inside `snapshot` using GGUF split
+    /// header metadata (`split.no`, `split.count`, `split.tensors.count`) as the single authority.
+    pub async fn resolve_snapshot_shards(
+        &self,
+        snapshot: &HuggingFaceRepositorySnapshot,
+        primary: &Path,
+    ) -> Result<Vec<PathBuf>, InventoryError> {
+        let files = snapshot
+            .gguf_files
+            .iter()
+            .map(|file| crate::candidate_files::CandidateGguf {
+                path: file.path.clone(),
+                size_bytes: file.size_bytes,
+            })
+            .collect::<Vec<_>>();
+        let partitioned = crate::candidate_files::partition_ggufs(&files);
+        if let Some(group) = partitioned
+            .complete_splits
+            .iter()
+            .find(|group| group.primary().path == primary)
+        {
+            return Ok(group.files.iter().map(|file| file.path.clone()).collect());
+        }
+        if partitioned.unstemmed.iter().any(|file| file.path == primary) {
+            return Ok(vec![primary.to_path_buf()]);
+        }
+        Box::pin(self.complete_snapshot_shards(snapshot, primary, partitioned)).await
+    }
+
+    async fn complete_snapshot_shards(
+        &self,
+        snapshot: &HuggingFaceRepositorySnapshot,
+        primary: &Path,
+        partitioned: crate::candidate_files::PartitionedGgufs,
+    ) -> Result<Vec<PathBuf>, InventoryError> {
+        let Some(incomplete) = partitioned
+            .incomplete_splits
+            .iter()
+            .find(|set| set.present.get(&1).is_some_and(|file| file.path == primary))
+        else {
+            return Err(InventoryError::Integrity(format!(
+                "preview GGUF {} does not exist in the repository snapshot",
+                primary.display()
+            )));
+        };
+        let mut to_inspect = Vec::new();
+        if let Some(probe) = incomplete.probe_shard() {
+            to_inspect.push(probe.path.clone());
+        }
+        for file in &partitioned.unstemmed {
+            to_inspect.push(file.path.clone());
+        }
+        let fetched = futures_util::stream::iter(to_inspect)
+            .map(|path| async move {
+                let Some(file) = snapshot.gguf_files.iter().find(|file| file.path == path) else {
+                    return Ok::<_, InventoryError>((path, None));
+                };
+                let header = self
+                    .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, file, &[])
+                    .await?;
+                let split = crate::gguf::known_tensors(magnitude_artifacts::gguf::read_header(
+                    header.bytes,
+                ))
+                .ok()
+                .and_then(|directory| crate::candidate_files::SplitMetadata::of(&directory));
+                Ok((path, split))
+            })
+            .buffer_unordered(6)
+            .collect::<Vec<_>>()
+            .await;
+        let mut headers = std::collections::BTreeMap::new();
+        for item in fetched {
+            let (path, split) = item?;
+            headers.insert(path, split);
+        }
+        let resolved = crate::candidate_files::resolve_split_groups(partitioned, &headers);
+        resolved
+            .into_iter()
+            .find(|group| group.primary().path == primary)
+            .map(|group| group.files.into_iter().map(|file| file.path).collect())
+            .ok_or_else(|| {
+                InventoryError::Integrity(format!(
+                    "preview GGUF {} has missing or ambiguous split shards in {}",
+                    primary.display(),
+                    snapshot.repository
+                ))
+            })
+    }
+
     /// Write `artifact`'s exact header, every shard's of a split GGUF, each extended sparsely
     /// to its file's size, under `root` at `<repository>/<revision>/<path>`, read as a preview
     /// of its pinned source reads it (from the derived cache when it holds it).
@@ -964,10 +1053,14 @@ impl ManagedModelStore {
         artifact: &ArtifactHeader,
         root: &Path,
     ) -> Result<(), InventoryError> {
+        let shards = crate::candidate_files::split_set(&artifact.path.to_string_lossy())
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         let source = ModelPreviewSource {
             repository: artifact.repository.clone(),
             revision: artifact.revision.clone(),
-            primary_gguf: artifact.path.clone(),
+            shards,
             additional_components: Vec::new(),
         };
         let cached = self.preview_artifact(&source).await?;
@@ -1121,7 +1214,7 @@ impl ManagedModelStore {
         Ok(CachedArtifact {
             repository: source.repository.clone(),
             commit,
-            primary_gguf: source.primary_gguf.clone(),
+            primary_gguf: source.shards[0].clone(),
             components,
         })
     }
@@ -1165,7 +1258,7 @@ impl ManagedModelStore {
         Ok(CachedArtifact {
             repository: source.repository.clone(),
             commit: snapshot.commit.clone(),
-            primary_gguf: source.primary_gguf.clone(),
+            primary_gguf: source.shards[0].clone(),
             components: components
                 .into_iter()
                 .map(|(_, component)| component)
@@ -1274,15 +1367,21 @@ fn validate_source(source: &ModelPreviewSource) -> Result<(), InventoryError> {
             .revision
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    let valid_path = valid_gguf_path(&source.primary_gguf);
-    let mut selected_paths = std::collections::BTreeSet::from([&source.primary_gguf]);
-    let valid_additional = source.additional_components.len() < MAX_MODEL_COMPONENTS as usize
+    let mut selected_paths = std::collections::BTreeSet::new();
+    let valid_shards = !source.shards.is_empty()
+        && source.shards.len() <= MAX_MODEL_COMPONENTS as usize
+        && source
+            .shards
+            .iter()
+            .all(|path| valid_gguf_path(path) && selected_paths.insert(path));
+    let valid_additional = source.shards.len() + source.additional_components.len()
+        <= MAX_MODEL_COMPONENTS as usize
         && source.additional_components.iter().all(|component| {
             valid_gguf_path(&component.path)
-                && !is_split_path(&component.path)
+                && crate::candidate_files::split_shard(&component.path).is_none()
                 && selected_paths.insert(&component.path)
         });
-    if valid_repository && valid_revision && valid_path && valid_additional {
+    if valid_repository && valid_revision && valid_shards && valid_additional {
         Ok(())
     } else {
         Err(InventoryError::InvalidRequest(
@@ -1334,23 +1433,16 @@ fn valid_gguf_path(path: &Path) -> bool {
 }
 
 fn artifact_matches_source(artifact: &CachedArtifact, source: &ModelPreviewSource) -> bool {
+    let Some(primary_gguf) = source.primary_gguf() else {
+        return false;
+    };
     if artifact.repository != source.repository
         || artifact.commit != source.revision
-        || artifact.primary_gguf != source.primary_gguf
+        || artifact.primary_gguf != primary_gguf
     {
         return false;
     }
-    let primary_paths = if let Some((prefix, total)) = split_parts(&source.primary_gguf) {
-        let parent = source
-            .primary_gguf
-            .parent()
-            .unwrap_or_else(|| Path::new(""));
-        (1..=total)
-            .map(|index| parent.join(format!("{prefix}-{index:05}-of-{total:05}.gguf")))
-            .collect::<Vec<_>>()
-    } else {
-        vec![source.primary_gguf.clone()]
-    };
+    let primary_paths = &source.shards;
     if artifact.components.len() != primary_paths.len() + source.additional_components.len() {
         return false;
     }
@@ -1379,77 +1471,43 @@ fn artifact_matches_source(artifact: &CachedArtifact, source: &ModelPreviewSourc
                 && cached.component.role == expected.role.component_role()
                 && cached.component.shard_index.is_none()
                 && cached.component.relationship
-                    == Some(component_relationship(expected, &source.primary_gguf))
+                    == Some(component_relationship(expected, primary_gguf))
         })
     });
     structurally_valid && primary_valid && additional_valid
-}
-
-fn is_split_path(path: &Path) -> bool {
-    split_parts(path).is_some()
-}
-
-fn split_parts(path: &Path) -> Option<(String, u32)> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".gguf")?;
-    let (left, total) = stem.rsplit_once("-of-")?;
-    let (prefix, index) = left.rsplit_once('-')?;
-    if index != "00001" || total.len() != 5 {
-        return None;
-    }
-    let total = total.parse().ok()?;
-    (1..=MAX_MODEL_COMPONENTS)
-        .contains(&total)
-        .then(|| (prefix.to_owned(), total))
-}
-
-fn select_components<'a>(
-    siblings: &'a [HubSibling],
-    primary: &Path,
-) -> Result<Vec<&'a HubSibling>, InventoryError> {
-    if let Some((prefix, total)) = split_parts(primary) {
-        let parent = primary.parent().unwrap_or_else(|| Path::new(""));
-        return (1..=total)
-            .map(|index| {
-                let path = parent.join(format!("{prefix}-{index:05}-of-{total:05}.gguf"));
-                siblings
-                    .iter()
-                    .find(|sibling| Path::new(&sibling.rfilename) == path)
-                    .ok_or_else(|| {
-                        InventoryError::Integrity(format!(
-                            "missing preview shard {}",
-                            path.display()
-                        ))
-                    })
-            })
-            .collect();
-    }
-    siblings
-        .iter()
-        .find(|sibling| Path::new(&sibling.rfilename) == primary)
-        .map(|sibling| vec![sibling])
-        .ok_or_else(|| InventoryError::Integrity("preview GGUF does not exist".to_owned()))
 }
 
 fn select_artifact_components<'a>(
     siblings: &'a [HubSibling],
     source: &ModelPreviewSource,
 ) -> Result<Vec<SelectedComponent<'a>>, InventoryError> {
-    let split = is_split_path(&source.primary_gguf);
-    let mut selected = select_components(siblings, &source.primary_gguf)?
-        .into_iter()
+    let primary_gguf = source
+        .primary_gguf()
+        .ok_or_else(|| InventoryError::InvalidRequest("preview has no shards".to_owned()))?;
+    let split = source.shards.len() > 1;
+    let mut selected = source
+        .shards
+        .iter()
         .enumerate()
-        .map(|(index, sibling)| SelectedComponent {
-            sibling,
-            role: if split {
-                ComponentRole::Shard
-            } else {
-                ComponentRole::Weights
-            },
-            shard_index: split.then_some(index as u32 + 1),
-            relationship: None,
+        .map(|(index, path)| {
+            let sibling = siblings
+                .iter()
+                .find(|sibling| Path::new(&sibling.rfilename) == path)
+                .ok_or_else(|| {
+                    InventoryError::Integrity(format!("missing preview shard {}", path.display()))
+                })?;
+            Ok(SelectedComponent {
+                sibling,
+                role: if split {
+                    ComponentRole::Shard
+                } else {
+                    ComponentRole::Weights
+                },
+                shard_index: split.then_some(index as u32 + 1),
+                relationship: None,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, InventoryError>>()?;
     for additional in &source.additional_components {
         let sibling = siblings
             .iter()
@@ -1464,7 +1522,7 @@ fn select_artifact_components<'a>(
             sibling,
             role: additional.role.component_role(),
             shard_index: None,
-            relationship: Some(component_relationship(additional, &source.primary_gguf)),
+            relationship: Some(component_relationship(additional, primary_gguf)),
         });
     }
     if selected.len() > MAX_MODEL_COMPONENTS as usize {
@@ -1479,17 +1537,10 @@ fn select_repository_snapshot_components(
     files: &[HuggingFaceRepositoryFile],
     source: &ModelPreviewSource,
 ) -> Result<Vec<ModelComponent>, InventoryError> {
-    let primary_paths = if let Some((prefix, total)) = split_parts(&source.primary_gguf) {
-        let parent = source
-            .primary_gguf
-            .parent()
-            .unwrap_or_else(|| Path::new(""));
-        (1..=total)
-            .map(|index| parent.join(format!("{prefix}-{index:05}-of-{total:05}.gguf")))
-            .collect::<Vec<_>>()
-    } else {
-        vec![source.primary_gguf.clone()]
-    };
+    let primary_gguf = source
+        .primary_gguf()
+        .ok_or_else(|| InventoryError::InvalidRequest("preview has no shards".to_owned()))?;
+    let primary_paths = &source.shards;
     let mut selected = primary_paths
         .iter()
         .enumerate()
@@ -1533,7 +1584,7 @@ fn select_repository_snapshot_components(
             size_bytes: file.size_bytes,
             content: file.content.clone(),
             shard_index: None,
-            relationship: Some(component_relationship(additional, &source.primary_gguf)),
+            relationship: Some(component_relationship(additional, primary_gguf)),
         });
     }
     if selected.len() > MAX_MODEL_COMPONENTS as usize {
@@ -2747,7 +2798,10 @@ mod tests {
         let source = ModelPreviewSource {
             repository: "owner/model-gguf".to_owned(),
             revision: "a".repeat(40),
-            primary_gguf: PathBuf::from("model-00001-of-00002.gguf"),
+            shards: vec![
+                PathBuf::from("model-00001-of-00002.gguf"),
+                PathBuf::from("model-00002-of-00002.gguf"),
+            ],
             additional_components: Vec::new(),
         };
         let files = vec![
@@ -2789,7 +2843,7 @@ mod tests {
         let valid = ModelPreviewSource {
             repository: "owner/repository".to_owned(),
             revision: "a".repeat(40),
-            primary_gguf: PathBuf::from("models/model.gguf"),
+            shards: vec![PathBuf::from("models/model.gguf")],
             additional_components: Vec::new(),
         };
         assert!(validate_source(&valid).is_ok());
@@ -2802,7 +2856,14 @@ mod tests {
         );
         assert!(
             validate_source(&ModelPreviewSource {
-                primary_gguf: PathBuf::from("../model.gguf"),
+                shards: vec![PathBuf::from("../model.gguf")],
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_source(&ModelPreviewSource {
+                shards: Vec::new(),
                 ..valid
             })
             .is_err()
@@ -2861,20 +2922,29 @@ mod tests {
         let siblings = vec![
             sibling("weights/model-00002-of-00003.gguf", 2),
             sibling("weights/model-00001-of-00003.gguf", 1),
-            sibling("weights/model-00003-of-00003.gguf", 3),
+            sibling("shared-engram.gguf", 3),
             sibling("weights/unrelated.gguf", 4),
         ];
-        let selected =
-            select_components(&siblings, Path::new("weights/model-00001-of-00003.gguf")).unwrap();
+        let source = ModelPreviewSource {
+            repository: "owner/repository".to_owned(),
+            revision: "a".repeat(40),
+            shards: vec![
+                PathBuf::from("weights/model-00001-of-00003.gguf"),
+                PathBuf::from("weights/model-00002-of-00003.gguf"),
+                PathBuf::from("shared-engram.gguf"),
+            ],
+            additional_components: Vec::new(),
+        };
+        let selected = select_artifact_components(&siblings, &source).unwrap();
         assert_eq!(
             selected
                 .iter()
-                .map(|item| item.rfilename.as_str())
+                .map(|item| (item.sibling.rfilename.as_str(), item.shard_index))
                 .collect::<Vec<_>>(),
             vec![
-                "weights/model-00001-of-00003.gguf",
-                "weights/model-00002-of-00003.gguf",
-                "weights/model-00003-of-00003.gguf",
+                ("weights/model-00001-of-00003.gguf", Some(1)),
+                ("weights/model-00002-of-00003.gguf", Some(2)),
+                ("shared-engram.gguf", Some(3)),
             ]
         );
 
@@ -2882,7 +2952,16 @@ mod tests {
             sibling("model-00001-of-00002.gguf", 1),
             sibling("other.gguf", 2),
         ];
-        assert!(select_components(&incomplete, Path::new("model-00001-of-00002.gguf")).is_err());
+        let missing_source = ModelPreviewSource {
+            repository: "owner/repository".to_owned(),
+            revision: "a".repeat(40),
+            shards: vec![
+                PathBuf::from("model-00001-of-00002.gguf"),
+                PathBuf::from("model-00002-of-00002.gguf"),
+            ],
+            additional_components: Vec::new(),
+        };
+        assert!(select_artifact_components(&incomplete, &missing_source).is_err());
     }
 
     #[test]
@@ -2895,7 +2974,7 @@ mod tests {
         let source = ModelPreviewSource {
             repository: "owner/repository".to_owned(),
             revision: "a".repeat(40),
-            primary_gguf: PathBuf::from("model.gguf"),
+            shards: vec![PathBuf::from("model.gguf")],
             additional_components: vec![
                 magnitude_service_contracts::ModelPreviewComponentSource {
                     path: PathBuf::from("projector.gguf"),

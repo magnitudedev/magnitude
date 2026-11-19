@@ -75,15 +75,21 @@ const ENRICHMENT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_se
 
 type Guard = Arc<dyn Send + Sync>;
 
-/// A target's header material: its first GGUF (shards beside it), its projector, the identity
+/// A target's header material: its ordered target shard paths, its projector, the identity
 /// of exactly those bytes, and the header digest of each file whose digest is known, so the engine
 /// reads that header from the header cache rather than the file.
 struct TargetMaterial {
-    target: PathBuf,
+    target_shards: Vec<PathBuf>,
     projector: Option<PathBuf>,
     identity: String,
     headers: BTreeMap<PathBuf, String>,
     _guards: Vec<Guard>,
+}
+
+impl TargetMaterial {
+    fn primary(&self) -> &Path {
+        &self.target_shards[0]
+    }
 }
 
 /// A separate drafter's header material.
@@ -229,10 +235,10 @@ struct RepositoryReach {
 /// Where a target's own weights are read for its weight sample: a file holding its bytes, or its
 /// file in a Hub repository at a commit.
 enum WeightSource {
-    File(PathBuf),
+    Files(Vec<PathBuf>),
     Hub {
         snapshot: HuggingFaceRepositorySnapshot,
-        path: PathBuf,
+        shards: Vec<PathBuf>,
     },
 }
 
@@ -936,7 +942,7 @@ impl ManagedModelCandidates {
         }
         let _share = self.host.share().await;
         let paths = ModelPackagePaths {
-            target: target.target.clone(),
+            target_shards: target.target_shards.clone(),
             projector: target.projector.clone(),
             draft: drafter.map(|drafter| drafter.path.clone()),
             method,
@@ -960,7 +966,7 @@ impl ManagedModelCandidates {
                 // one; without one it has no profile.
                 let fallback_context = match &prepared {
                     Ok(PreparedModelAssessment::Unsupported { .. }) => headers
-                        .header(&paths.target)
+                        .header(paths.target())
                         .ok()
                         .and_then(|header| {
                             magnitude_service_models::gguf::training_context_length(
@@ -1071,13 +1077,13 @@ impl ManagedModelCandidates {
     async fn hugging_face_target(
         &self,
         snapshot: &HuggingFaceRepositorySnapshot,
-        primary: &Path,
+        shards: Vec<PathBuf>,
         projector: Option<&Path>,
     ) -> Result<TargetMaterial, InventoryError> {
         let source = ModelPreviewSource {
             repository: snapshot.repository.clone(),
             revision: snapshot.commit.clone(),
-            primary_gguf: primary.to_path_buf(),
+            shards,
             additional_components: projector
                 .map(|projector| ModelPreviewComponentSource {
                     path: projector.to_path_buf(),
@@ -1090,7 +1096,7 @@ impl ManagedModelCandidates {
             .models()
             .prepare_preview_from_repository_snapshot(&source, snapshot)
             .await?;
-        let (target, projector) = resolved_paths(&prepared.model)?;
+        let (target_shards, projector) = resolved_paths(&prepared.model)?;
         let identity = header_identity(
             prepared
                 .headers
@@ -1098,7 +1104,7 @@ impl ManagedModelCandidates {
                 .map(|header| (path_string(&header.path), header.digest.clone())),
         );
         Ok(TargetMaterial {
-            target,
+            target_shards,
             projector,
             identity,
             headers: preview_headers(&prepared),
@@ -1114,14 +1120,18 @@ impl ManagedModelCandidates {
         let source = ModelPreviewSource {
             repository: snapshot.repository.clone(),
             revision: snapshot.commit.clone(),
-            primary_gguf: path.to_path_buf(),
+            shards: vec![path.to_path_buf()],
             additional_components: Vec::new(),
         };
         let prepared = self
             .models()
             .prepare_preview_from_repository_snapshot(&source, snapshot)
             .await?;
-        let (path, _) = resolved_paths(&prepared.model)?;
+        let (target_shards, _) = resolved_paths(&prepared.model)?;
+        let path = target_shards
+            .into_iter()
+            .next()
+            .ok_or_else(|| InventoryError::NotReady("drafter has no runnable weights".to_owned()))?;
         let identity = prepared
             .headers
             .iter()
@@ -1140,18 +1150,18 @@ impl ManagedModelCandidates {
     /// never read again, and the engine reads its header from the header cache.
     fn local_target(
         &self,
-        target: PathBuf,
+        target_shards: Vec<PathBuf>,
         projector: Option<PathBuf>,
     ) -> Result<TargetMaterial, InventoryError> {
         let mut identity = Vec::new();
         let mut headers = BTreeMap::new();
-        for path in std::iter::once(&target).chain(projector.iter()) {
+        for path in target_shards.iter().chain(projector.iter()) {
             let digest = self.models().local_gguf(path)?.inspection.header_digest;
             identity.push(digest.clone());
             headers.insert(path.clone(), digest);
         }
         Ok(TargetMaterial {
-            target,
+            target_shards,
             projector,
             identity: identity.join(","),
             headers,
@@ -1207,10 +1217,10 @@ impl ManagedModelCandidates {
     ) -> BoxFuture<'_, Result<TargetMaterial, InventoryError>> {
         Box::pin(async move {
             let resolved = self.assessor.resolve_material(bundle).await?;
-            let (target, projector) = resolved_paths(&resolved.target_model)?;
+            let (target_shards, projector) = resolved_paths(&resolved.target_model)?;
             let identity = format!("package:{}", bundle_target(&resolved.bundle).id.0);
             Ok(TargetMaterial {
-                target,
+                target_shards,
                 projector,
                 identity,
                 headers: BTreeMap::new(),
@@ -1269,11 +1279,12 @@ impl ManagedModelCandidates {
     /// by header, so only files never seen before are read: one whole header first, whose large
     /// metadata entries (the tokenizer) the others then share (see the store's
     /// `hugging_face_gguf_header`), read concurrently.
-    async fn classify_hugging_face(
+    /// Resolve a repository snapshot's GGUF files into complete groups using GGUF split header
+    /// metadata when any stem-matched split set is incomplete (e.g. a shared Engram shard).
+    async fn resolve_hugging_face_groups(
         &self,
         snapshot: &HuggingFaceRepositorySnapshot,
-        progress: &InspectionProgress,
-    ) -> Result<Vec<ClassifiedGroup>, InventoryError> {
+    ) -> Result<Vec<GgufGroup>, InventoryError> {
         let files = snapshot
             .gguf_files
             .iter()
@@ -1282,7 +1293,68 @@ impl ManagedModelCandidates {
                 size_bytes: file.size_bytes,
             })
             .collect::<Vec<_>>();
-        let groups = group_ggufs(&files);
+        let partitioned = magnitude_service_models::candidate_files::partition_ggufs(&files);
+        if partitioned.incomplete_splits.is_empty() {
+            return Ok(magnitude_service_models::candidate_files::resolve_split_groups(
+                partitioned,
+                &BTreeMap::new(),
+            ));
+        }
+        Box::pin(self.complete_hugging_face_groups(snapshot, partitioned)).await
+    }
+
+    async fn complete_hugging_face_groups(
+        &self,
+        snapshot: &HuggingFaceRepositorySnapshot,
+        partitioned: magnitude_service_models::candidate_files::PartitionedGgufs,
+    ) -> Result<Vec<GgufGroup>, InventoryError> {
+        let mut to_inspect = Vec::new();
+        for incomplete in &partitioned.incomplete_splits {
+            if let Some(probe) = incomplete.probe_shard() {
+                to_inspect.push(probe.path.clone());
+            }
+        }
+        for file in &partitioned.unstemmed {
+            to_inspect.push(file.path.clone());
+        }
+        let fetched = futures_util::stream::iter(to_inspect)
+            .map(|path| async move {
+                let Ok(file) = snapshot_file(snapshot, &path) else {
+                    return Ok::<_, InventoryError>((path, None));
+                };
+                let header = self
+                    .models()
+                    .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, file, &[])
+                    .await?;
+                let split = magnitude_service_models::gguf::known_tensors(
+                    magnitude_artifacts::gguf::read_header(header.bytes),
+                )
+                .ok()
+                .and_then(|directory| {
+                    magnitude_service_models::candidate_files::SplitMetadata::of(&directory)
+                });
+                Ok((path, split))
+            })
+            .buffer_unordered(6)
+            .collect::<Vec<_>>()
+            .await;
+        let mut headers = BTreeMap::new();
+        for item in fetched {
+            let (path, split) = item?;
+            headers.insert(path, split);
+        }
+        Ok(magnitude_service_models::candidate_files::resolve_split_groups(
+            partitioned,
+            &headers,
+        ))
+    }
+
+    async fn classify_hugging_face(
+        &self,
+        snapshot: &HuggingFaceRepositorySnapshot,
+        progress: &InspectionProgress,
+    ) -> Result<Vec<ClassifiedGroup>, InventoryError> {
+        let groups = Box::pin(self.resolve_hugging_face_groups(snapshot)).await?;
         // Until their headers are read, the rows are the files that may be versions, named by
         // their files; a name only orders and labels them here, and headers decide every role.
         progress.reading_headers(
@@ -1369,7 +1441,8 @@ impl ManagedModelCandidates {
         for group in rest {
             classified.push(group?);
         }
-        let order = files
+        let order = snapshot
+            .gguf_files
             .iter()
             .enumerate()
             .map(|(index, file)| (file.path.clone(), index))
@@ -1572,15 +1645,7 @@ impl ManagedModelCandidates {
         let started = std::time::Instant::now();
         let snapshot = self.snapshot(repository.as_str(), commit).await?;
         let snapshot_ms = started.elapsed().as_millis();
-        let files = snapshot
-            .gguf_files
-            .iter()
-            .map(|file| CandidateGguf {
-                path: file.path.clone(),
-                size_bytes: file.size_bytes,
-            })
-            .collect::<Vec<_>>();
-        let groups = group_ggufs(&files);
+        let groups = self.resolve_hugging_face_groups(&snapshot).await?;
         // The projector a download brings along, by name: the smallest, as inspection's choice is.
         let projector_bytes = groups
             .iter()
@@ -1606,11 +1671,17 @@ impl ManagedModelCandidates {
                     return None;
                 }
                 let assess = std::time::Instant::now();
+                let shard_paths = classified
+                    .group
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>();
                 let assessment = self
                     .version_assessment(
                         &classified,
                         self.cached_hugging_face_identity(&snapshot, &classified.group, None),
-                        self.hugging_face_target(&snapshot, &classified.group.primary().path, None),
+                        self.hugging_face_target(&snapshot, shard_paths, None),
                     )
                     .await;
                 tracing::debug!(
@@ -1724,6 +1795,12 @@ impl ManagedModelCandidates {
             progress.checking_versions(version_rows(&targets));
             let mut pending = Vec::new();
             for group in &targets {
+                let shard_paths = group
+                    .group
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>();
                 pending.push(self.version_assessment(
                     group,
                     self.cached_hugging_face_identity(
@@ -1731,11 +1808,7 @@ impl ManagedModelCandidates {
                         &group.group,
                         projector_path.as_deref(),
                     ),
-                    self.hugging_face_target(
-                        &snapshot,
-                        &group.group.primary().path,
-                        projector_path.as_deref(),
-                    ),
+                    self.hugging_face_target(&snapshot, shard_paths, projector_path.as_deref()),
                 ));
             }
             let assessments = checked_versions(pending, progress).await;
@@ -1888,10 +1961,13 @@ impl ManagedModelCandidates {
         progress.checking_versions(version_rows(&targets));
         let mut pending = Vec::new();
         for group in &targets {
-            let material = self.local_target(
-                root.join(&group.group.primary().path),
-                projector_path.clone(),
-            );
+            let shard_paths = group
+                .group
+                .files
+                .iter()
+                .map(|file| root.join(&file.path))
+                .collect::<Vec<_>>();
+            let material = self.local_target(shard_paths, projector_path.clone());
             let unreadable = unreadable_local_group(self.models(), &root, &group.group);
             pending.push(async move {
                 match unreadable {
@@ -2045,8 +2121,9 @@ impl ManagedModelCandidates {
                         .ok()?;
                     let model_id = candidate.model_id;
                     magnitude_service_utils::blocking::run(move || {
-                        let target = resolved_paths(&resolved.target_model).ok()?.0;
-                        let fingerprint = EngineModelFingerprint::from_path(&target)
+                        let target_shards = resolved_paths(&resolved.target_model).ok()?.0;
+                        let target = target_shards.first()?;
+                        let fingerprint = EngineModelFingerprint::from_path(target)
                             .ok()
                             .as_ref()
                             .map(super::assessor::model_fingerprint);
@@ -2211,10 +2288,11 @@ impl ManagedModelCandidates {
     /// the content sample), or from its Hub file by range requests, cached with the commit.
     async fn target_weight_sample(&self, target: &DrafterTarget) -> Option<WeightSample> {
         match target.weights.as_ref()? {
-            WeightSource::File(path) => {
+            WeightSource::Files(shards) => {
+                let primary = shards.first()?;
                 let content = self
                     .models()
-                    .local_gguf(path)
+                    .local_gguf(primary)
                     .ok()?
                     .inspection
                     .content_sample?;
@@ -2227,22 +2305,24 @@ impl ManagedModelCandidates {
                     return known;
                 }
                 let models = Arc::clone(self.models());
-                let path = path.clone();
-                let sample = magnitude_service_utils::blocking::run(move || models.local_weight_sample(&path))
-                    .await
-                    .map_err(|error| tracing::warn!(%error, "weight sample unavailable"))
-                    .ok()?;
+                let shards = shards.clone();
+                let sample = magnitude_service_utils::blocking::run(move || {
+                    models.local_weight_sample_shards(&shards)
+                })
+                .await
+                .map_err(|error| tracing::warn!(%error, "weight sample unavailable"))
+                .ok()?;
                 if let Ok(mut samples) = self.weight_samples.write() {
                     samples.insert(content, sample.clone());
                 }
                 sample
             }
-            WeightSource::Hub { snapshot, path } => self
-                .models()
-                .hub_weight_sample(snapshot, path)
-                .await
-                .map_err(|error| tracing::warn!(%error, "Hub weight sample unavailable"))
-                .ok()?,
+            WeightSource::Hub { snapshot, shards } => {
+                Box::pin(self.models().hub_weight_sample_shards(snapshot, shards))
+                    .await
+                    .map_err(|error| tracing::warn!(%error, "Hub weight sample unavailable"))
+                    .ok()?
+            }
         }
     }
 
@@ -2252,7 +2332,12 @@ impl ManagedModelCandidates {
         &self,
         candidate: &ModelCandidate,
     ) -> Result<DrafterTarget, InventoryError> {
-        let primary = candidate.target.first().map(PathBuf::from).ok_or_else(|| {
+        let shards = candidate
+            .target
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let primary = shards.first().cloned().ok_or_else(|| {
             InventoryError::InvalidRequest("a candidate names its target".to_owned())
         })?;
         match &candidate.source {
@@ -2263,20 +2348,20 @@ impl ManagedModelCandidates {
                     .as_ref()
                     .map(|file| PathBuf::from(&file.path));
                 let material = self
-                    .hugging_face_target(&snapshot, &primary, projector.as_deref())
+                    .hugging_face_target(&snapshot, shards.clone(), projector.as_deref())
                     .await?;
                 let mut lineage = self
                     .lineage
                     .hub()
                     .lineage(&snapshot.repository, Some(snapshot.base_models.clone()))
                     .await;
-                lineage.extend(self.header_lineage(&material.target, &material.headers));
+                lineage.extend(self.header_lineage(material.primary(), &material.headers));
                 Ok(DrafterTarget {
                     material,
                     repository: Some((snapshot.repository.clone(), snapshot.commit.clone())),
                     weights: Some(WeightSource::Hub {
                         snapshot: snapshot.clone(),
-                        path: primary.clone(),
+                        shards,
                     }),
                     primary: Some(primary),
                     folders: Vec::new(),
@@ -2288,21 +2373,21 @@ impl ManagedModelCandidates {
                 })
             }
             CandidateSource::Local { path } => {
-                let target = path.join(&primary);
+                let target_shards = shards.iter().map(|shard| path.join(shard)).collect();
                 let projector = candidate
                     .projector
                     .as_ref()
                     .map(|file| path.join(&file.path));
-                let material = self.local_target(target, projector)?;
-                let lineage = self.header_lineage(&material.target, &material.headers);
+                let material = self.local_target(target_shards, projector)?;
+                let lineage = self.header_lineage(material.primary(), &material.headers);
                 let folders = material
-                    .target
+                    .primary()
                     .parent()
                     .map(|parent| DrafterFolder::whole(parent.to_path_buf()))
                     .into_iter()
                     .collect();
                 Ok(DrafterTarget {
-                    weights: Some(WeightSource::File(material.target.clone())),
+                    weights: Some(WeightSource::Files(material.target_shards.clone())),
                     material,
                     repository: None,
                     primary: None,
@@ -2410,13 +2495,14 @@ impl ManagedModelCandidates {
                         .map(|repository| (repository, String::new())),
                 },
             };
-            let primary = target
+            let hub_shards = target
                 .files
                 .iter()
                 .filter(|file| file.role == ModelFileRole::Weights)
                 .map(|file| file.path.clone())
-                .min();
-            let mut lineage = self.header_lineage(&material.target, &material.headers);
+                .collect::<Vec<_>>();
+            let primary = hub_shards.first().cloned();
+            let mut lineage = self.header_lineage(material.primary(), &material.headers);
             let (snapshot, downloaded_from) = match &repository {
                 Some(repository) => {
                     let added = matches!(model.origin, CustomModelOrigin::Added { .. });
@@ -2433,7 +2519,8 @@ impl ManagedModelCandidates {
                     .as_ref()
                     .map(|(repository, _)| repository.as_str()),
                 snapshot.as_ref(),
-                primary.as_deref(),
+                &material.target_shards,
+                &hub_shards,
             );
             Ok(DrafterTarget {
                 material,
@@ -2514,7 +2601,8 @@ impl ManagedModelCandidates {
         model: &CustomModel,
         repository: Option<&str>,
         snapshot: Option<&HuggingFaceRepositorySnapshot>,
-        primary: Option<&Path>,
+        target_shards: &[PathBuf],
+        hub_shards: &[PathBuf],
     ) -> (Vec<DrafterFolder>, Option<WeightSource>) {
         let locations = self
             .resolver
@@ -2544,12 +2632,12 @@ impl ManagedModelCandidates {
         let weights = match (
             locations.iter().find(|location| location.is_file()),
             snapshot,
-            primary,
+            !hub_shards.is_empty(),
         ) {
-            (Some(location), _, _) => Some(WeightSource::File(location.clone())),
-            (None, Some(snapshot), Some(primary)) => Some(WeightSource::Hub {
+            (Some(_), _, _) => Some(WeightSource::Files(target_shards.to_vec())),
+            (None, Some(snapshot), true) => Some(WeightSource::Hub {
                 snapshot: snapshot.clone(),
-                path: primary.to_path_buf(),
+                shards: hub_shards.to_vec(),
             }),
             _ => None,
         };
@@ -3137,13 +3225,13 @@ impl ManagedModelCandidates {
     async fn hugging_face_package(
         &self,
         snapshot: &HuggingFaceRepositorySnapshot,
-        primary: &Path,
+        shards: &[PathBuf],
         projector: Option<&Path>,
     ) -> Result<ModelPackage, InventoryError> {
         let source = ModelPreviewSource {
             repository: snapshot.repository.clone(),
             revision: snapshot.commit.clone(),
-            primary_gguf: primary.to_path_buf(),
+            shards: shards.to_vec(),
             additional_components: projector
                 .map(|projector| ModelPreviewComponentSource {
                     path: projector.to_path_buf(),
@@ -3226,7 +3314,7 @@ impl ManagedModelCandidates {
             } => {
                 let snapshot = self.snapshot(repository.as_str(), commit).await?;
                 Ok(Some(
-                    self.hugging_face_package(&snapshot, Path::new(path), None)
+                    self.hugging_face_package(&snapshot, &[PathBuf::from(path)], None)
                         .await?,
                 ))
             }
@@ -3297,12 +3385,18 @@ impl ManagedModelCandidates {
         commit: String,
         choice: &DrafterChoice,
     ) -> Result<ServableModelBundle, InventoryError> {
+        let snapshot = self.snapshot(added.repository.as_str(), &commit).await?;
+        let primary = PathBuf::from(added.path.as_str());
+        let shards = Box::pin(self.models().resolve_snapshot_shards(&snapshot, &primary)).await?;
         let candidate = ModelCandidate {
             source: CandidateSource::HuggingFace {
                 repository: added.repository.clone(),
                 commit: commit.clone(),
             },
-            target: magnitude_service_models::candidate_files::split_set(added.path.as_str()),
+            target: shards
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
             projector: added.projector.clone().map(|path| CandidateFile {
                 path,
                 size_bytes: 0,
@@ -3314,13 +3408,11 @@ impl ManagedModelCandidates {
             Some(drafter) => self.drafter_package(drafter).await?,
             None => None,
         };
-        let snapshot = self.snapshot(added.repository.as_str(), &commit).await?;
-        let primary = PathBuf::from(added.path.as_str());
         let projector = added.projector.as_deref().map(Path::new);
         let target = self
-            .hugging_face_package(&snapshot, &primary, projector)
+            .hugging_face_package(&snapshot, &shards, projector)
             .await?;
-        let expected = candidate.target.iter().map(PathBuf::from).collect::<BTreeSet<_>>();
+        let expected = shards.iter().cloned().collect::<BTreeSet<_>>();
         let resolved = target
             .files
             .iter()
@@ -3893,9 +3985,9 @@ fn bundle_target(bundle: &ServableModelBundle) -> &ModelPackage {
     }
 }
 
-/// The resolved first GGUF (a split file's first shard) and projector.
-fn resolved_paths(model: &ResolvedModel) -> Result<(PathBuf, Option<PathBuf>), InventoryError> {
-    let target = model
+/// The resolved ordered target shard paths and optional projector.
+fn resolved_paths(model: &ResolvedModel) -> Result<(Vec<PathBuf>, Option<PathBuf>), InventoryError> {
+    let mut weight_components = model
         .components
         .iter()
         .filter(|component| {
@@ -3904,15 +3996,23 @@ fn resolved_paths(model: &ResolvedModel) -> Result<(PathBuf, Option<PathBuf>), I
                 ComponentRole::Weights | ComponentRole::Shard | ComponentRole::Draft
             )
         })
-        .min_by_key(|component| (component.shard_index.unwrap_or(0), component.path.clone()))
+        .collect::<Vec<_>>();
+    weight_components.sort_by_key(|component| (component.shard_index.unwrap_or(0), &component.path));
+    let target_shards = weight_components
+        .into_iter()
         .map(|component| component.path.clone())
-        .ok_or_else(|| InventoryError::NotReady("model has no runnable weights".to_owned()))?;
+        .collect::<Vec<_>>();
+    if target_shards.is_empty() {
+        return Err(InventoryError::NotReady(
+            "model has no runnable weights".to_owned(),
+        ));
+    }
     let projector = model
         .components
         .iter()
         .find(|component| component.role == ComponentRole::Projector)
         .map(|component| component.path.clone());
-    Ok((target, projector))
+    Ok((target_shards, projector))
 }
 
 fn snapshot_file<'a>(

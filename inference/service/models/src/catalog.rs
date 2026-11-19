@@ -1983,13 +1983,17 @@ impl ResolvingRecommendableCatalog {
             })
             .into_iter()
             .collect();
+        let target_shards = self
+            .models
+            .resolve_snapshot_shards(snapshot, &primary.path)
+            .await?;
         let target_prepared = self
             .models
             .prepare_preview_from_repository_snapshot(
                 &ModelPreviewSource {
                     repository: snapshot.repository.clone(),
                     revision: snapshot.commit.clone(),
-                    primary_gguf: primary.path.clone(),
+                    shards: target_shards.clone(),
                     additional_components,
                 },
                 snapshot,
@@ -1999,7 +2003,7 @@ impl ResolvingRecommendableCatalog {
             self.release_planner_package(target_prepared, &primary.path)?;
         if let Some(sample) = self
             .models
-            .hub_weight_sample(snapshot, &primary.path)
+            .hub_weight_sample_shards(snapshot, &target_shards)
             .await?
         {
             let bytes = sample.encode();
@@ -2035,13 +2039,17 @@ impl ResolvingRecommendableCatalog {
                         draft_path.display()
                     )));
                 }
+                let draft_shards = self
+                    .models
+                    .resolve_snapshot_shards(snapshot, draft_path)
+                    .await?;
                 let prepared = self
                     .models
                     .prepare_preview_from_repository_snapshot(
                         &ModelPreviewSource {
                             repository: snapshot.repository.clone(),
                             revision: snapshot.commit.clone(),
-                            primary_gguf: draft_path.to_path_buf(),
+                            shards: draft_shards,
                             additional_components: Vec::new(),
                         },
                         snapshot,
@@ -3077,5 +3085,115 @@ mod tests {
         );
         assert!(declared_primary_gguf(&snapshot, Path::new("mmproj-BF16.gguf")).is_err());
         assert!(declared_primary_gguf(&snapshot, Path::new("Q8_0/Missing.gguf")).is_err());
+    }
+
+    #[test]
+    fn deepseek_shared_engram_and_glm_metadata_only_shard_1_resolve_and_classify() {
+        // 1. ISTA DeepSeek-V4.1-Flash: 3 builds sharing shard 6 as DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf.
+        let mut ista_paths = vec![
+            "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf".to_owned(),
+            "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf".to_owned(),
+        ];
+        for format in ["IQ1_M", "IQ2_XXS", "IQ2_XS"] {
+            for idx in 1..=5 {
+                ista_paths.push(format!(
+                    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-{format}-{idx:05}-of-00006.gguf"
+                ));
+            }
+        }
+        let ista_refs = ista_paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let ista_snapshot = repository_snapshot(&ista_refs);
+        let candidate_files = ista_snapshot
+            .gguf_files
+            .iter()
+            .map(|file| crate::candidate_files::CandidateGguf {
+                path: file.path.clone(),
+                size_bytes: file.size_bytes,
+            })
+            .collect::<Vec<_>>();
+        let mut split_headers = BTreeMap::new();
+        split_headers.insert(
+            PathBuf::from("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"),
+            Some(crate::candidate_files::SplitMetadata {
+                index: 5,
+                count: 6,
+                tensors_count: Some(1043),
+            }),
+        );
+        for format in ["IQ1_M", "IQ2_XXS", "IQ2_XS"] {
+            split_headers.insert(
+                PathBuf::from(format!(
+                    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-{format}-00002-of-00006.gguf"
+                )),
+                Some(crate::candidate_files::SplitMetadata {
+                    index: 1,
+                    count: 6,
+                    tensors_count: Some(1043),
+                }),
+            );
+        }
+        let resolved = crate::candidate_files::resolve_split_groups(
+            crate::candidate_files::partition_ggufs(&candidate_files),
+            &split_headers,
+        );
+        for format in ["IQ1_M", "IQ2_XXS", "IQ2_XS"] {
+            let primary = select_primary_gguf(&ista_snapshot, format).unwrap();
+            let group = resolved
+                .iter()
+                .find(|group| group.primary().path == primary.path)
+                .expect("shared Engram shard completes variant");
+            assert_eq!(group.files.len(), 6);
+            assert_eq!(
+                group.files[5].path,
+                PathBuf::from("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf")
+            );
+        }
+
+        // 2. Unsloth GLM-5.3-Flash: metadata-only 0-tensor shard 1 with nextn_predict_layers = 1.
+        let glm_snapshot = repository_snapshot(&[
+            "UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf",
+            "UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00002-of-00004.gguf",
+            "UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00003-of-00004.gguf",
+            "UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00004-of-00004.gguf",
+            "mmproj-BF16.gguf",
+        ]);
+        assert_eq!(
+            select_primary_gguf(&glm_snapshot, "UD-IQ2_XXS").unwrap().path,
+            Path::new("UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf")
+        );
+        let mut glm_header = Vec::new();
+        glm_header.extend_from_slice(b"GGUF");
+        glm_header.extend_from_slice(&3_u32.to_le_bytes());
+        glm_header.extend_from_slice(&0_u64.to_le_bytes());
+        glm_header.extend_from_slice(&5_u64.to_le_bytes());
+        let write_str = |buf: &mut Vec<u8>, s: &str| {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        };
+        let write_kv_str = |buf: &mut Vec<u8>, k: &str, v: &str| {
+            write_str(buf, k);
+            buf.extend_from_slice(&8_u32.to_le_bytes());
+            write_str(buf, v);
+        };
+        let write_kv_u32 = |buf: &mut Vec<u8>, k: &str, v: u32| {
+            write_str(buf, k);
+            buf.extend_from_slice(&4_u32.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        };
+        write_kv_str(&mut glm_header, "general.architecture", "glm5-next");
+        write_kv_u32(&mut glm_header, "glm5-next.block_count", 46);
+        write_kv_u32(&mut glm_header, "glm5-next.nextn_predict_layers", 1);
+        write_kv_u32(&mut glm_header, "split.no", 0);
+        write_kv_u32(&mut glm_header, "split.count", 4);
+        let architectures = crate::candidate_files::RecognizedArchitectures::new(["glm5-next"], []);
+        let classified =
+            crate::candidate_files::classify_header(glm_header, &architectures).unwrap();
+        assert_eq!(
+            classified.role,
+            crate::candidate_files::CandidateFileRole::Target {
+                architecture: Some("glm5-next".to_owned()),
+            }
+        );
+        assert!(classified.embedded_mtp);
     }
 }
