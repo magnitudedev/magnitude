@@ -603,7 +603,7 @@ export const CatalogSupport = S.Union(
   ),
   S.extend(
     S.Struct({
-      intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      intelligence: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
       level: S.Literal("deprecated"),
       reason: S.String,
       replacement: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),

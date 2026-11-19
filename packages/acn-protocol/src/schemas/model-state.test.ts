@@ -89,7 +89,7 @@ describe("CatalogSupportSchema", () => {
     })).not.toThrow()
   })
 
-  it("rates every supported and deprecated model, and lets a disabled one go unrated", () => {
+  it("rates every supported model, and lets a disabled or deprecated one go unrated", () => {
     const { intelligence: _intelligence, ...unrated } = catalogModel.catalogData
     const decode = Schema.decodeUnknownSync(LocalModelSchema)
     expect(() => decode({ ...catalogModel, catalogData: unrated })).toThrow()
@@ -99,7 +99,7 @@ describe("CatalogSupportSchema", () => {
         ...unrated,
         support: { _tag: "Deprecated", since: "2026-09-27", reason: "superseded", replacement: "other:gguf:q4" },
       },
-    })).toThrow()
+    })).not.toThrow()
     expect(() => decode({
       ...catalogModel,
       catalogData: { ...unrated, support: { _tag: "Disabled", reason: "not implemented yet" } },

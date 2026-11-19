@@ -3940,7 +3940,6 @@
               "since",
               "replacement",
               "reason",
-              "intelligence",
               "level"
             ],
             "properties": {
@@ -3967,7 +3966,7 @@
             }
           }
         ],
-        "description": "What the release promises for a catalog model, with its `intelligence`: its Artificial\nAnalysis score as a percentage of the frontier's, which only a disabled model may lack. It is\nindependent of assessment, which says what one device can do with it."
+        "description": "What the release promises for a catalog model, with its `intelligence`: its expected score on\ncurrent benchmarks as a whole percentage of the frontier model's, from Epoch AI's Capabilities\nIndex. Only a supported model is ranked, so only a supported model must have one. It is\nindependent of assessment, which says what one device can do with it."
       },
       "CatalogUpdatePart": {
         "type": "string",

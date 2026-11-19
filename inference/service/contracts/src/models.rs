@@ -729,8 +729,9 @@ mod schema {
         },
     }
 
-    /// What the release promises for a catalog model, with its `intelligence`: its Artificial
-    /// Analysis score as a percentage of the frontier's, which only a disabled model may lack. It is
+    /// What the release promises for a catalog model, with its `intelligence`: its expected score on
+    /// current benchmarks as a whole percentage of the frontier model's, from Epoch AI's Capabilities
+    /// Index. Only a supported model is ranked, so only a supported model must have one. It is
     /// independent of assessment, which says what one device can do with it.
     #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,7 +753,9 @@ mod schema {
             since: String,
             replacement: ModelId,
             reason: String,
-            intelligence: u32,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            intelligence: Option<u32>,
         },
     }
 

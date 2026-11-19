@@ -49,7 +49,7 @@ const MAX_PLANNER_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CatalogSource {
-    artificial_analysis_frontier: ArtificialAnalysisFrontier,
+    intelligence_frontier: IntelligenceFrontier,
     labs: Vec<CatalogLab>,
     families: Vec<CatalogFamily>,
     models: Vec<CatalogModel>,
@@ -158,59 +158,124 @@ pub fn model_families() -> &'static [ModelFamily] {
     &FAMILIES
 }
 
-/// The top Artificial Analysis Intelligence Index result. Catalog intelligence is each model's
-/// Artificial Analysis score as a percentage of it, so updating it rescales every model.
+/// The frontier model on Epoch AI's Capabilities Index (ECI) and the benchmarks catalog intelligence
+/// is measured on: those Epoch rates that were released on or after `benchmarks_since`. A model's
+/// intelligence is its expected score on them as a whole percentage of the frontier model's
+/// (`expected_benchmark_score`), so the frontier is 100.
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ArtificialAnalysisFrontier {
+struct IntelligenceFrontier {
     model: String,
-    score: f64,
-    methodology_version: String,
+    eci: f64,
     as_of_date: String,
+    benchmarks_since: String,
     url: String,
 }
 
-impl ArtificialAnalysisFrontier {
-    /// Rounded half-up to a whole percentage.
-    fn intelligence(&self, artificial_analysis: &ArtificialAnalysisScore) -> u32 {
-        (artificial_analysis.score * 100.0 / self.score).round() as u32
-    }
-}
-
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ArtificialAnalysisScore {
-    score: f64,
-    provenance: ArtificialAnalysisProvenance,
+struct IntelligenceScore {
+    eci: f64,
+    percent: u32,
+    provenance: IntelligenceProvenance,
 }
 
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum ArtificialAnalysisTarget {
-    ArtificialAnalysisIntelligenceIndex,
-}
-
+/// Where a model's ECI comes from.
 #[derive(Clone, Deserialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
-enum ArtificialAnalysisProvenance {
-    #[serde(
-        rename = "artificialAnalysisIntelligenceIndex",
-        rename_all = "camelCase"
-    )]
-    ArtificialAnalysisIntelligenceIndex {
-        methodology_version: String,
-        as_of_date: String,
-        url: String,
-    },
-    #[serde(rename = "estimate", rename_all = "camelCase")]
-    Estimate {
-        #[allow(dead_code)]
-        target: ArtificialAnalysisTarget,
-        methodology_version: String,
-        as_of_date: String,
-        methodology: String,
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum IntelligenceProvenance {
+    /// Epoch's published ECI for the model.
+    EpochPublished { url: String },
+    /// Fitted with Epoch's benchmark difficulties to Epoch's own benchmark results for the model.
+    EpochData { benchmarks: Vec<String>, url: String },
+    /// Predicted from other evaluations of the model, calibrated on models Epoch also rates.
+    #[serde(rename_all = "camelCase")]
+    Bridged {
+        method: String,
         evidence_urls: Vec<String>,
     },
+}
+
+/// One benchmark's fitted difficulty and slope on the ECI scale, from Epoch's `edi_scores.csv`.
+struct BenchmarkDifficulty {
+    difficulty: f64,
+    slope: f64,
+}
+
+/// The mean expected score, from 0 to 1, of a model at `eci` on `benchmarks`: Epoch's model
+/// predicts `1 / (1 + e^(-slope * (eci - difficulty)))` on each.
+fn expected_benchmark_score(eci: f64, benchmarks: &[BenchmarkDifficulty]) -> f64 {
+    benchmarks
+        .iter()
+        .map(|benchmark| 1.0 / (1.0 + (-benchmark.slope * (eci - benchmark.difficulty)).exp()))
+        .sum::<f64>()
+        / benchmarks.len() as f64
+}
+
+/// A catalog model's declared intelligence beside the one its ECI gives on the frontier's benchmarks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntelligenceCheck {
+    pub model: String,
+    pub eci: f64,
+    pub declared: u32,
+    pub computed: u32,
+}
+
+/// Recomputes every scored catalog model's intelligence from its ECI and Epoch's benchmark
+/// difficulties (`edi_scores.csv`: `benchmark_name,is_anchor,benchmark_release_date,edi,
+/// estimated_slope_scaled`), keeping the benchmarks released on or after the frontier's
+/// `benchmarks_since`.
+pub fn catalog_intelligence_check(
+    benchmark_difficulties: &str,
+) -> Result<Vec<IntelligenceCheck>, InventoryError> {
+    let source = catalog_source()?;
+    let frontier = &source.intelligence_frontier;
+    let invalid = |message: String| InventoryError::Integrity(message);
+    let mut lines = benchmark_difficulties.lines();
+    let header = lines.next().unwrap_or_default();
+    if header.trim() != "benchmark_name,is_anchor,benchmark_release_date,edi,estimated_slope_scaled" {
+        return Err(invalid(format!("unexpected benchmark difficulty header: {header}")));
+    }
+    let mut benchmarks = Vec::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split(',').collect();
+        let [_, _, released, difficulty, slope] = fields.as_slice() else {
+            return Err(invalid(format!("malformed benchmark difficulty row: {line}")));
+        };
+        let parse = |value: &str| {
+            value
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| invalid(format!("malformed benchmark difficulty row: {line}")))
+        };
+        if released.trim() >= frontier.benchmarks_since.as_str() {
+            benchmarks.push(BenchmarkDifficulty {
+                difficulty: parse(difficulty)?,
+                slope: parse(slope)?,
+            });
+        }
+    }
+    if benchmarks.is_empty() {
+        return Err(invalid(format!(
+            "no rated benchmark was released on or after {}",
+            frontier.benchmarks_since
+        )));
+    }
+    let frontier_score = expected_benchmark_score(frontier.eci, &benchmarks);
+    Ok(source
+        .models
+        .iter()
+        .filter_map(|model| {
+            model.intelligence.as_ref().map(|intelligence| IntelligenceCheck {
+                model: model.id.clone(),
+                eci: intelligence.eci,
+                declared: intelligence.percent,
+                computed: (100.0 * expected_benchmark_score(intelligence.eci, &benchmarks)
+                    / frontier_score)
+                    .round() as u32,
+            })
+        })
+        .collect())
 }
 
 #[derive(Clone, Deserialize)]
@@ -225,9 +290,9 @@ struct CatalogModel {
     sources: Vec<CatalogModelSource>,
     #[serde(default)]
     speculative_decoding: Option<CatalogSpeculativeDecoding>,
-    /// Required of every model that is not disabled (`valid_model_score`).
+    /// Required of every supported model (`valid_model_score`).
     #[serde(default)]
-    artificial_analysis: Option<ArtificialAnalysisScore>,
+    intelligence: Option<IntelligenceScore>,
     support: DeclaredSupport,
 }
 
@@ -259,18 +324,13 @@ impl DeclaredSupport {
 }
 
 impl CatalogModel {
-    /// The model's support with its intelligence score, which `catalog_source` requires of every
-    /// model that is not disabled (`valid_model_score`).
-    fn rated_support(&self, frontier: &ArtificialAnalysisFrontier) -> CatalogSupport {
-        let intelligence = self
-            .artificial_analysis
-            .as_ref()
-            .map(|artificial_analysis| frontier.intelligence(artificial_analysis));
-        let rated =
-            || intelligence.expect("catalog_source scores every model that is not disabled");
+    /// The model's support with its intelligence, which `catalog_source` requires of every supported
+    /// model (`valid_model_score`).
+    fn rated_support(&self) -> CatalogSupport {
+        let intelligence = self.intelligence.as_ref().map(|intelligence| intelligence.percent);
         match &self.support {
             DeclaredSupport::Supported => CatalogSupport::Supported {
-                intelligence: rated(),
+                intelligence: intelligence.expect("catalog_source scores every supported model"),
             },
             DeclaredSupport::Disabled { reason } => CatalogSupport::Disabled {
                 reason: reason.clone(),
@@ -284,7 +344,7 @@ impl CatalogModel {
                 since: since.clone(),
                 replacement: replacement.clone(),
                 reason: reason.clone(),
-                intelligence: rated(),
+                intelligence,
             },
         }
     }
@@ -484,9 +544,9 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             "catalog source must contain at least one model".to_owned(),
         ));
     }
-    if !valid_artificial_analysis_frontier(&source.artificial_analysis_frontier) {
+    if !valid_intelligence_frontier(&source.intelligence_frontier) {
         return Err(InventoryError::Integrity(
-            "invalid Artificial Analysis frontier declaration".to_owned(),
+            "invalid intelligence frontier declaration".to_owned(),
         ));
     }
     if !valid_labs(&source.labs) {
@@ -573,7 +633,7 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                         }
                     }
                 })
-            || !valid_model_score(model, &source.artificial_analysis_frontier)
+            || !valid_model_score(model, &source.intelligence_frontier)
             || !source.labs.iter().any(|lab| lab.id == model.lab)
             || !ids.insert(model.id.as_str())
             || model.variants().any(|(_, variant)| {
@@ -671,56 +731,47 @@ fn valid_catalog_support(model: &CatalogModel, source: &CatalogSource) -> bool {
     }
 }
 
-/// Every model that is not disabled has a score; a disabled one may have none, and a score it has is
-/// valid.
-fn valid_model_score(model: &CatalogModel, frontier: &ArtificialAnalysisFrontier) -> bool {
-    match &model.artificial_analysis {
-        Some(artificial_analysis) => valid_artificial_analysis(artificial_analysis, frontier),
-        None => matches!(model.support, DeclaredSupport::Disabled { .. }),
+/// Every supported model has a score; a disabled or deprecated one, never ranked, may have none, and
+/// a score it has is valid.
+fn valid_model_score(model: &CatalogModel, frontier: &IntelligenceFrontier) -> bool {
+    match &model.intelligence {
+        Some(intelligence) => valid_intelligence(intelligence, frontier),
+        None => !model.support.is_available(),
     }
 }
 
-fn valid_artificial_analysis_frontier(frontier: &ArtificialAnalysisFrontier) -> bool {
-    frontier.score.is_finite()
-        && frontier.score > 0.0
+fn valid_intelligence_frontier(frontier: &IntelligenceFrontier) -> bool {
+    frontier.eci.is_finite()
+        && frontier.eci > 0.0
         && valid_non_empty(&frontier.model)
-        && valid_non_empty(&frontier.methodology_version)
         && ModelReleaseDate::new(frontier.as_of_date.clone()).is_ok()
+        && ModelReleaseDate::new(frontier.benchmarks_since.clone()).is_ok()
+        && frontier.benchmarks_since < frontier.as_of_date
         && valid_https_url(&frontier.url)
 }
 
-/// A model's score shares the frontier's Intelligence Index version, because scores from different
-/// versions are not on one scale, and never exceeds the frontier.
-fn valid_artificial_analysis(
-    artificial_analysis: &ArtificialAnalysisScore,
-    frontier: &ArtificialAnalysisFrontier,
-) -> bool {
-    if !artificial_analysis.score.is_finite()
-        || artificial_analysis.score < 0.0
-        || artificial_analysis.score > frontier.score
+/// A model's ECI never exceeds the frontier's, its percentage never exceeds 100, and its provenance
+/// names its evidence.
+fn valid_intelligence(intelligence: &IntelligenceScore, frontier: &IntelligenceFrontier) -> bool {
+    if !intelligence.eci.is_finite()
+        || intelligence.eci <= 0.0
+        || intelligence.eci > frontier.eci
+        || intelligence.percent > 100
     {
         return false;
     }
-    match &artificial_analysis.provenance {
-        ArtificialAnalysisProvenance::ArtificialAnalysisIntelligenceIndex {
-            methodology_version,
-            as_of_date,
-            url,
-        } => {
-            *methodology_version == frontier.methodology_version
-                && ModelReleaseDate::new(as_of_date.clone()).is_ok()
+    match &intelligence.provenance {
+        IntelligenceProvenance::EpochPublished { url } => valid_https_url(url),
+        IntelligenceProvenance::EpochData { benchmarks, url } => {
+            !benchmarks.is_empty()
+                && benchmarks.iter().all(|benchmark| valid_non_empty(benchmark))
                 && valid_https_url(url)
         }
-        ArtificialAnalysisProvenance::Estimate {
-            methodology_version,
-            as_of_date,
-            methodology,
+        IntelligenceProvenance::Bridged {
+            method,
             evidence_urls,
-            ..
         } => {
-            *methodology_version == frontier.methodology_version
-                && ModelReleaseDate::new(as_of_date.clone()).is_ok()
-                && valid_non_empty(methodology)
+            valid_non_empty(method)
                 && !evidence_urls.is_empty()
                 && evidence_urls.iter().all(|url| valid_https_url(url))
         }
@@ -1823,7 +1874,7 @@ fn recommendable_model(
         license: source.license.clone(),
         parameterization: declaration.parameterization.clone(),
         developer: catalog.developer(declaration),
-        support: declaration.rated_support(&catalog.artificial_analysis_frontier),
+        support: declaration.rated_support(),
         quant: CatalogQuant {
             repository: source.repository.clone(),
             name: variant.format.clone(),
@@ -2699,62 +2750,121 @@ mod tests {
     }
 
     #[test]
-    fn intelligence_is_a_rounded_percentage_of_the_frontier() {
-        let source = catalog_source().expect("catalog source should be valid");
-        let frontier = source.artificial_analysis_frontier;
-        let scored = |score: f64| ArtificialAnalysisScore {
-            score,
-            provenance: ArtificialAnalysisProvenance::ArtificialAnalysisIntelligenceIndex {
-                methodology_version: frontier.methodology_version.clone(),
-                as_of_date: "2026-09-29".to_owned(),
-                url: "https://artificialanalysis.ai/models/example".to_owned(),
+    fn expected_benchmark_score_follows_each_benchmarks_difficulty_and_slope() {
+        let even = [BenchmarkDifficulty {
+            difficulty: 150.0,
+            slope: 0.1,
+        }];
+        assert!((expected_benchmark_score(150.0, &even) - 0.5).abs() < 1e-12);
+        let one_logit_up = expected_benchmark_score(160.0, &even);
+        assert!((one_logit_up - 1.0 / (1.0 + (-1.0f64).exp())).abs() < 1e-12);
+        let mixed = [
+            BenchmarkDifficulty {
+                difficulty: 140.0,
+                slope: 0.2,
             },
-        };
-        assert_eq!(frontier.intelligence(&scored(frontier.score)), 100);
-        assert_eq!(frontier.intelligence(&scored(0.0)), 0);
-        let rescaled = ArtificialAnalysisFrontier {
-            score: 50.0,
-            ..frontier.clone()
-        };
-        assert_eq!(rescaled.intelligence(&scored(33.7)), 67);
-        assert_eq!(rescaled.intelligence(&scored(12.25)), 25);
-        assert_eq!(rescaled.intelligence(&scored(12.2)), 24);
+            BenchmarkDifficulty {
+                difficulty: 170.0,
+                slope: 0.2,
+            },
+        ];
+        let low = expected_benchmark_score(140.0, &mixed);
+        let high = expected_benchmark_score(170.0, &mixed);
+        assert!(low < high);
+        assert!((low - (0.5 + 1.0 / (1.0 + 6.0f64.exp())) / 2.0).abs() < 1e-12);
     }
 
     #[test]
-    fn artificial_analysis_scores_share_the_frontier_version_and_never_exceed_it() {
+    fn intelligence_is_checked_against_the_frontiers_benchmarks() {
         let source = catalog_source().expect("catalog source should be valid");
-        let frontier = &source.artificial_analysis_frontier;
-        assert!(valid_artificial_analysis_frontier(frontier));
+        let since = &source.intelligence_frontier.benchmarks_since;
+        let csv = format!(
+            "benchmark_name,is_anchor,benchmark_release_date,edi,estimated_slope_scaled\n\
+             Old,False,2016-06-20,40.0,0.02\n\
+             Current,False,{since},150.0,0.1\n"
+        );
+        let checks = catalog_intelligence_check(&csv).expect("the difficulties parse");
+        assert_eq!(
+            checks.len(),
+            source.models.iter().filter(|model| model.intelligence.is_some()).count()
+        );
+        let frontier = source.intelligence_frontier.eci;
+        let current = [BenchmarkDifficulty {
+            difficulty: 150.0,
+            slope: 0.1,
+        }];
+        for check in &checks {
+            let expected = (100.0 * expected_benchmark_score(check.eci, &current)
+                / expected_benchmark_score(frontier, &current))
+            .round() as u32;
+            assert_eq!(check.computed, expected, "{}", check.model);
+        }
+        assert!(catalog_intelligence_check("name,edi\n").is_err());
+        assert!(catalog_intelligence_check(
+            "benchmark_name,is_anchor,benchmark_release_date,edi,estimated_slope_scaled\n\
+             Old,False,2016-06-20,40.0,0.02\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn intelligence_never_exceeds_the_frontier_and_names_its_evidence() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let frontier = &source.intelligence_frontier;
+        assert!(valid_intelligence_frontier(frontier));
         for model in &source.models {
             assert!(valid_model_score(model, frontier));
         }
-        let model = source.models[0]
-            .artificial_analysis
-            .clone()
-            .expect("the first catalog model is scored");
-        let above = ArtificialAnalysisScore {
-            score: frontier.score + 0.1,
-            ..model.clone()
+        let scored = |eci: f64, percent: u32, provenance: IntelligenceProvenance| IntelligenceScore {
+            eci,
+            percent,
+            provenance,
         };
-        assert!(!valid_artificial_analysis(&above, frontier));
-        let other_version = ArtificialAnalysisFrontier {
-            methodology_version: "4.1.1".to_owned(),
-            ..frontier.clone()
+        let published = || IntelligenceProvenance::EpochPublished {
+            url: "https://epoch.ai/benchmarks/eci".to_owned(),
         };
-        assert!(!valid_artificial_analysis(&model, &other_version));
+        assert!(valid_intelligence(&scored(150.0, 48, published()), frontier));
+        assert!(!valid_intelligence(&scored(frontier.eci + 0.1, 48, published()), frontier));
+        assert!(!valid_intelligence(&scored(150.0, 101, published()), frontier));
+        assert!(!valid_intelligence(&scored(f64::NAN, 48, published()), frontier));
+        assert!(!valid_intelligence(
+            &scored(
+                150.0,
+                48,
+                IntelligenceProvenance::EpochData {
+                    benchmarks: Vec::new(),
+                    url: "https://epoch.ai/benchmarks/eci".to_owned(),
+                }
+            ),
+            frontier
+        ));
+        assert!(!valid_intelligence(
+            &scored(
+                150.0,
+                48,
+                IntelligenceProvenance::Bridged {
+                    method: "fitted".to_owned(),
+                    evidence_urls: vec!["http://example.com".to_owned()],
+                }
+            ),
+            frontier
+        ));
         for invalid in [0.0, -1.0, f64::NAN] {
-            assert!(!valid_artificial_analysis_frontier(&ArtificialAnalysisFrontier {
-                score: invalid,
+            assert!(!valid_intelligence_frontier(&IntelligenceFrontier {
+                eci: invalid,
                 ..frontier.clone()
             }));
         }
+        assert!(!valid_intelligence_frontier(&IntelligenceFrontier {
+            benchmarks_since: frontier.as_of_date.clone(),
+            ..frontier.clone()
+        }));
     }
 
     #[test]
-    fn only_a_disabled_model_may_have_no_score() {
+    fn only_a_supported_model_needs_a_score() {
         let source = catalog_source().expect("catalog source should be valid");
-        let frontier = &source.artificial_analysis_frontier;
+        let frontier = &source.intelligence_frontier;
         let mut model = source
             .models
             .iter()
@@ -2762,14 +2872,14 @@ mod tests {
             .expect("the catalog has a supported model")
             .clone();
         assert!(valid_model_score(&model, frontier));
-        model.artificial_analysis = None;
+        model.intelligence = None;
         assert!(!valid_model_score(&model, frontier));
         model.support = DeclaredSupport::Deprecated {
             since: "2026-01-01".to_owned(),
             replacement: "qwen3.5-4b:gguf:q4".parse().expect("model ID"),
             reason: "superseded".to_owned(),
         };
-        assert!(!valid_model_score(&model, frontier));
+        assert!(valid_model_score(&model, frontier));
         model.support = DeclaredSupport::Disabled {
             reason: "not implemented yet".to_owned(),
         };

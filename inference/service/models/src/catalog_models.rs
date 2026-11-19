@@ -1605,7 +1605,7 @@ mod tests {
             since: "2026-09-27".to_owned(),
             replacement: "replacement:gguf:q4".parse().expect("model ID"),
             reason: "unsupported architecture".to_owned(),
-            intelligence: 1,
+            intelligence: None,
         };
         let Err(InventoryError::ModelOperation {
             code,
