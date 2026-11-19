@@ -6267,9 +6267,23 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "host"
+                ]
+              }
+            }
           }
         ],
-        "description": "What a discovery diagnostic is about: one backend's enumeration, or the\nOS's adapter interface (DXGI)."
+        "description": "What a discovery diagnostic is about: one backend's enumeration, the OS's\nadapter interface (DXGI), or the host's memory limits."
       },
       "HardwareExecutor": {
         "type": "object",
