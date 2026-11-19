@@ -688,7 +688,8 @@ mod tests {
         let link = snapshot.join("model.gguf");
         std::os::unix::fs::symlink(blobs.join("sha256-model"), &link).unwrap();
         let stored = super::model_store(&link);
+        let expected = blobs.canonicalize().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(stored.unwrap(), blobs.canonicalize().unwrap_or(blobs));
+        assert_eq!(stored.unwrap(), expected);
     }
 }
