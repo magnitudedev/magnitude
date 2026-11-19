@@ -1881,7 +1881,7 @@ impl ManagedLocalModels {
             for path in enabled {
                 let now = std::fs::read_dir(&path).is_ok();
                 if readable.insert(path.clone(), now) == Some(false) && now {
-                    affected.insert(crate::inventory::canonical_or_self(&path));
+                    affected.insert(crate::identity::stable_path(&path));
                 }
             }
         }
@@ -8862,7 +8862,7 @@ mod tests {
         // As when the platform refuses the watch: no watcher, the location recorded as unwatched.
         *fixture.local.watcher.lock().unwrap() = None;
         *fixture.local.unwatched.lock().unwrap() =
-            BTreeSet::from([crate::inventory::canonical_or_self(&folder)]);
+            BTreeSet::from([crate::identity::stable_path(&folder)]);
         write_model(&folder.join("model.gguf"), "model");
 
         Arc::clone(&fixture.local).recheck_roots(false).await;

@@ -8,7 +8,7 @@ use magnitude_service_contracts::{
     ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel,
 };
 
-use crate::inventory::{LinkedFiles, ManagedModelStore, hf_repo_dir};
+use crate::inventory::{LinkedFiles, ManagedModelStore};
 use crate::snapshot_blobs::{BlobStorage, RepositoryBlobs};
 use crate::store_fs::{Garbage, RepositoryGarbage, StoredFile, finish, model_store, repository_record, snapshot_entry};
 
@@ -113,7 +113,7 @@ pub(crate) fn resolve_components(
                 repository, commit, ..
             },
         ) => {
-            let repository_root = root.join("hub").join(hf_repo_dir(repository));
+            let repository_root = root.join(repository_record(repository));
             (
                 repository_root.join("snapshots").join(commit),
                 Some(repository_root),
@@ -373,13 +373,14 @@ fn plan_managed_delete(
         ));
     };
     let entries = managed_snapshot_entries(root, repository, commit, components)?;
+    let repository_root = root.join(repository_record(repository));
     for (component, ManagedSnapshotEntry { link, blob }) in components.iter().zip(entries.entries) {
         paths.push(link);
         if entries.referenced.contains(&blob) {
             retained = retained.saturating_add(component.size_bytes);
         } else {
             reclaimable = reclaimable.saturating_add(component.size_bytes);
-            paths.push(blob);
+            paths.push(repository_root.join(blob));
         }
     }
     Ok(DeletePlan {
@@ -394,8 +395,10 @@ fn plan_managed_delete(
 
 /// The garbage of removing `removals`' components ([`Garbage`]): every entry must resolve to a
 /// blob of its repository, and a blob another entry still publishes stays. Its caller holds the
-/// repositories' records.
+/// repositories' records. Each path is named under the store's root by the store's layout, as
+/// given, whatever links the root or the repository is reached through.
 fn garbage(root: &Path, removals: &[(InventoryModel, Vec<ModelComponent>)]) -> Result<Garbage, InventoryError> {
+    // By repository record: its blobs, the entries removed, and their blobs within it.
     let mut opened = BTreeMap::<PathBuf, (RepositoryBlobs, BTreeSet<PathBuf>, BTreeSet<PathBuf>)>::new();
     for (model, owned) in removals {
         let ModelSource::HuggingFace { repository, commit, .. } = &model.source else {
@@ -410,21 +413,18 @@ fn garbage(root: &Path, removals: &[(InventoryModel, Vec<ModelComponent>)]) -> R
             }
         };
         for component in owned {
-            let link = root.join(snapshot_entry(repository, commit, &component.path));
-            removed.insert(repository_blob(blobs, &link)?);
-            entries.insert(link);
+            let entry = snapshot_entry(repository, commit, &component.path);
+            removed.insert(repository_blob(blobs, &root.join(&entry))?);
+            entries.insert(entry);
         }
     }
-    let relative = |path: &PathBuf| path.strip_prefix(root).expect("a path of the store").to_owned();
     let mut garbage = Garbage::default();
-    for (record, (blobs, entries, mut removed)) in opened {
+    for (record, (blobs, entries, removed)) in opened {
+        let links = entries.iter().map(|entry| root.join(entry)).collect::<BTreeSet<_>>();
         let mut referenced = BTreeSet::new();
-        collect_other_snapshot_blobs(&root.join(&record).join("snapshots"), &blobs, &entries, &mut referenced)?;
-        removed.retain(|blob| !referenced.contains(blob));
-        garbage.0.insert(record, RepositoryGarbage {
-            entries: entries.iter().map(relative).collect(),
-            blobs: removed.iter().map(relative).collect(),
-        });
+        collect_other_snapshot_blobs(&root.join(&record).join("snapshots"), &blobs, &links, &mut referenced)?;
+        let freed = removed.difference(&referenced).map(|blob| record.join(blob)).collect();
+        garbage.0.insert(record, RepositoryGarbage { entries, blobs: freed });
     }
     Ok(garbage)
 }
@@ -447,7 +447,7 @@ fn managed_snapshot_entries(
     commit: &str,
     components: &[magnitude_service_contracts::ModelComponent],
 ) -> Result<ManagedSnapshotEntries, InventoryError> {
-    let repo_root = root.join("hub").join(hf_repo_dir(repository));
+    let repo_root = root.join(repository_record(repository));
     let snapshot = repo_root.join("snapshots").join(commit);
     let blobs = RepositoryBlobs::open(&repo_root).map_err(io_error)?;
     let entries = components
@@ -475,8 +475,8 @@ fn managed_snapshot_entries(
     })
 }
 
-/// The blob a managed snapshot entry owns. Magnitude deletes only bytes its repository keeps
-/// itself, never a blob store shared with other repositories.
+/// The blob a managed snapshot entry owns, by its path within its repository. Magnitude deletes
+/// only bytes its repository keeps itself, never a blob store shared with other repositories.
 fn repository_blob(blobs: &RepositoryBlobs, link: &Path) -> Result<PathBuf, InventoryError> {
     let blob = blobs.resolve(link).map_err(io_error)?.ok_or_else(|| {
         InventoryError::DeletionUnsafe(format!(
@@ -485,7 +485,7 @@ fn repository_blob(blobs: &RepositoryBlobs, link: &Path) -> Result<PathBuf, Inve
         ))
     })?;
     match blob.storage {
-        BlobStorage::Repository => Ok(blob.entry),
+        BlobStorage::Repository => Ok(blob.within_repository()),
         BlobStorage::Shared => Err(InventoryError::DeletionUnsafe(format!(
             "snapshot entry links into a shared blob store: {}",
             link.display()
@@ -557,6 +557,7 @@ fn io_error(error: impl std::fmt::Display) -> InventoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inventory::hf_repo_dir;
     use magnitude_service_contracts::{
         ComponentRole, ContentId, ContentIdentity, Integrity, InventoryEntryId,
         InventoryProperties, ModelComponent,
@@ -634,30 +635,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        let model = InventoryModel {
-            id: InventoryEntryId("mdl_split".to_owned()),
-            content_id: ContentId("content_split".to_owned()),
-            created: 1,
-            name: "split".to_owned(),
-            supported_parameters: Vec::new(),
-            availability: ModelAvailability::Available { ready_at: 1 },
-            source: ModelSource::HuggingFace {
-                repository: repository.to_owned(),
-                requested_revision: commit.to_owned(),
-                commit: commit.to_owned(),
-                metadata: None,
-            },
-            location: ModelLocation::MagnitudeCache {
-                components,
-                total_bytes: 28,
-                integrity: Integrity::Verified {
-                    method: "test".to_owned(),
-                },
-            },
-            properties: InventoryProperties::Pending,
-            operations: Vec::new(),
-            updated_at: 1,
-        };
+        let model = managed_model(repository, commit, components);
 
         let resolved = resolve_components(root.path(), &model).expect("resolve shards");
 
@@ -667,6 +645,89 @@ mod tests {
             resolved[0].path,
             resolved[0].path.canonicalize().expect("canonical blob")
         );
+    }
+
+    /// A removal names the files it deletes under the store's root, as the store lays them out,
+    /// whatever form their blobs resolve in: through a link to the models folder, and on Windows
+    /// in the verbatim form (`\\?\C:\…`) every resolved path takes there and a root as given
+    /// never does. The snapshot entries are hard links, as Windows makes them.
+    #[test]
+    fn garbage_names_the_store_files_whatever_form_the_root_resolves_in() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let store = temporary.path().join("store");
+        #[cfg(unix)]
+        let root = {
+            let root = temporary.path().join("models");
+            std::os::unix::fs::symlink(&store, &root).expect("models folder link");
+            root
+        };
+        #[cfg(not(unix))]
+        let root = store.clone();
+        let repository = "owner/repo";
+        let record = repository_record(repository);
+        let blobs = store.join(&record).join("blobs");
+        fs::create_dir_all(&blobs).expect("blobs");
+        fs::write(blobs.join("weights"), b"weights").expect("weights blob");
+        fs::write(blobs.join("projector"), b"projector").expect("projector blob");
+        // The older snapshot still publishes the projector, so its blob stays.
+        for (commit, file, blob) in [
+            ("commit", "model.gguf", "weights"),
+            ("commit", "mmproj.gguf", "projector"),
+            ("older", "mmproj.gguf", "projector"),
+        ] {
+            let entry = store.join(snapshot_entry(repository, commit, Path::new(file)));
+            fs::create_dir_all(entry.parent().expect("snapshot")).expect("snapshot");
+            fs::hard_link(blobs.join(blob), entry).expect("snapshot entry");
+        }
+        let components = [("model.gguf", ComponentRole::Weights), ("mmproj.gguf", ComponentRole::Projector)]
+            .map(|(file, role)| ModelComponent {
+                path: PathBuf::from(file),
+                role,
+                size_bytes: 7,
+                content: ContentIdentity::Sha256 {
+                    value: "0".repeat(64),
+                },
+                shard_index: None,
+                relationship: None,
+            })
+            .to_vec();
+        let model = managed_model(repository, "commit", components.clone());
+
+        let garbage = garbage(&root, &[(model, components)]).expect("garbage");
+
+        let removed = &garbage.0[&record];
+        assert_eq!(
+            removed.entries,
+            BTreeSet::from(["model.gguf", "mmproj.gguf"].map(|file| snapshot_entry(repository, "commit", Path::new(file))))
+        );
+        assert_eq!(removed.blobs, BTreeSet::from([record.join("blobs").join("weights")]));
+    }
+
+    fn managed_model(repository: &str, commit: &str, components: Vec<ModelComponent>) -> InventoryModel {
+        InventoryModel {
+            id: InventoryEntryId("mdl_managed".to_owned()),
+            content_id: ContentId("content_managed".to_owned()),
+            created: 1,
+            name: "managed".to_owned(),
+            supported_parameters: Vec::new(),
+            availability: ModelAvailability::Available { ready_at: 1 },
+            source: ModelSource::HuggingFace {
+                repository: repository.to_owned(),
+                requested_revision: commit.to_owned(),
+                commit: commit.to_owned(),
+                metadata: None,
+            },
+            location: ModelLocation::MagnitudeCache {
+                total_bytes: components.iter().map(|component| component.size_bytes).sum(),
+                components,
+                integrity: Integrity::Verified {
+                    method: "test".to_owned(),
+                },
+            },
+            properties: InventoryProperties::Pending,
+            operations: Vec::new(),
+            updated_at: 1,
+        }
     }
 
     #[test]

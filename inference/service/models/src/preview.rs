@@ -2071,7 +2071,7 @@ impl ManagedModelStore {
                 root.enabled
                     && root.kind == magnitude_service_contracts::models::ModelRootKind::Ollama
             })
-            .map(|root| crate::inventory::canonical_or_self(&root.path))
+            .map(|root| crate::identity::stable_path(&root.path))
             .collect()
     }
 }

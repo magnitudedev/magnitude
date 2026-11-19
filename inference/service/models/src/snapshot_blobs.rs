@@ -9,6 +9,7 @@
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -28,14 +29,24 @@ pub(crate) enum BlobStorage {
 /// The repository blob entry a snapshot entry publishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepositoryBlob {
-    pub(crate) entry: PathBuf,
+    /// The entry under the repository's blobs as resolved, a form only the resolver's own paths
+    /// share; the store names the blob by [`Self::within_repository`].
+    entry: PathBuf,
     pub(crate) storage: BlobStorage,
 }
 
 impl RepositoryBlob {
     /// The entry's name, which the Hub layout makes the file's content hash.
-    pub(crate) fn name(&self) -> Option<&str> {
-        self.entry.file_name().and_then(|value| value.to_str())
+    pub(crate) fn name(&self) -> &OsStr {
+        self.entry
+            .file_name()
+            .expect("invariant violated: a repository blob is an entry named in its blobs")
+    }
+
+    /// The entry's path within its repository, `blobs/<name>`, whatever links lead to the
+    /// repository or the store holding it.
+    pub(crate) fn within_repository(&self) -> PathBuf {
+        Path::new("blobs").join(self.name())
     }
 }
 
@@ -98,7 +109,7 @@ impl RepositoryBlobs {
             };
             entries
                 .filter_map(Result::ok)
-                .filter_map(|entry| roots.blob_at(entry.path()).ok().flatten())
+                .filter_map(|entry| roots.blob_at(&entry.file_name()).ok().flatten())
                 .filter_map(|blob| {
                     Handle::from_path(&blob.entry)
                         .ok()
@@ -119,10 +130,10 @@ impl Roots {
                 return Ok(None);
             };
             let parent = parent.canonicalize()?;
-            let located = parent.join(name);
             if parent == self.blobs {
-                return self.blob_at(located);
+                return self.blob_at(name);
             }
+            let located = parent.join(name);
             if !fs::symlink_metadata(&located)?.file_type().is_symlink() {
                 return Ok(None);
             }
@@ -131,9 +142,10 @@ impl Roots {
         Ok(None)
     }
 
-    /// The blob at an entry of the repository's blobs, when its bytes are a regular file inside
-    /// the hub.
-    fn blob_at(&self, entry: PathBuf) -> io::Result<Option<RepositoryBlob>> {
+    /// The blob at the entry `name` of the repository's blobs, when its bytes are a regular file
+    /// inside the hub.
+    fn blob_at(&self, name: &OsStr) -> io::Result<Option<RepositoryBlob>> {
+        let entry = self.blobs.join(name);
         let target = entry.canonicalize()?;
         if !target.starts_with(&self.hub) || !target.is_file() {
             return Ok(None);
@@ -258,7 +270,8 @@ mod tests {
                 storage: BlobStorage::Shared,
             }
         );
-        assert_eq!(resolved.name(), Some(hub_hash.as_str()));
+        assert_eq!(resolved.name(), hub_hash.as_str());
+        assert_eq!(resolved.within_repository(), Path::new("blobs").join(&hub_hash));
     }
 
     #[cfg(unix)]
