@@ -513,24 +513,26 @@ fn a_vgpu_slice_is_the_device_its_apis_expose() {
     );
 }
 
-/// A Metal device whose memory is not the host's is unavailable, and places
-/// nothing.
+/// A Metal device whose memory is its own runs as every such device does:
+/// device work's own buffers in its private storage, in that memory under
+/// the working set Metal reports as its size, and what the host maps in
+/// shared storage, in host RAM.
 #[test]
-fn a_metal_device_without_unified_memory_is_unavailable_with_its_reason() {
+fn a_metal_device_without_unified_memory_places_in_its_own_memory() {
     let topology = topology(&m4_pro_without_unified_memory());
     show("Discrete Metal GPU", &topology);
     let registry = PhysicalIdentity::Registry(M4_PRO_REGISTRY);
     let metal = executor(&topology, BackendName::Metal, &registry);
-    assert!(matches!(
-        metal.availability(),
-        Availability::Unavailable { .. }
-    ));
-    assert!(metal.paths(Contract::DeviceOnly).is_empty());
-    let cpu = topology.resolve(ExecutorSelector::HostCpu).unwrap();
+    assert_eq!(*metal.availability(), Availability::Available);
+    let own = StoreKind::DeviceMemory(metal.physical());
     assert_eq!(
-        placement(&topology, cpu, Contract::DeviceOnly),
-        [(StoreKind::HostRam, None)]
+        placement(&topology, metal, Contract::DeviceOnly),
+        [(own, Some(Reported::new(M4_PRO_WORKING_SET, ReportedBy::MetalRecommendedWorkingSet)))]
     );
+    for contract in [Contract::Upload, Contract::Shared, Contract::Words] {
+        assert_eq!(placement(&topology, metal, contract), [(StoreKind::HostRam, None)], "{contract:?}");
+    }
+    assert_consistent(&topology);
 }
 
 /// An integrated device's kinds are each charged along every path of its

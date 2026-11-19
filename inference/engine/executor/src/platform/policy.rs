@@ -1327,11 +1327,10 @@ mod tests {
     }
 
     /// Storage demanded of an executor that places none (Metal on a device
-    /// whose memory is not the host's) is refused as unplaced, never fitted
-    /// as zero.
+    /// the backend refused) is refused as unplaced, never fitted as zero.
     #[test]
     fn demand_on_an_unavailable_executor_is_unplaced() {
-        let topology = recorded::m4_pro_without_unified_memory();
+        let topology = recorded::m4_pro_with_metal_refused();
         let unopened = status(host(16 * GIB));
         let fit = Fit::new(&topology, &unopened);
         let metal = executor(&topology, BackendName::Metal);

@@ -212,7 +212,7 @@ impl MetalSubmission {
             .retain(|pending| !pending.words.overlaps(&words));
         completed?;
         // The schedule plans the word table as this submission's own input.
-        unsafe { words.buffer.write_device_bytes(words.bytes.start, &bytes) };
+        unsafe { words.buffer.write_device_bytes(words.bytes.start, &bytes) }?;
         Ok(words)
     }
 
@@ -378,8 +378,7 @@ impl MetalSubmission {
         self.device
             .read(source.buffer, source.byte_offset, &mut data)?;
         // The schedule plans the destination as written by this command.
-        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) };
-        Ok(())
+        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) }
     }
     fn fill(
         &self,
@@ -395,8 +394,7 @@ impl MetalSubmission {
             *byte = pattern[index % pattern.len()];
         }
         // The schedule plans the destination as written by this command.
-        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) };
-        Ok(())
+        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) }
     }
     fn scalar_read(
         &self,

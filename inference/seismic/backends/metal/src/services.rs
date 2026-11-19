@@ -300,10 +300,8 @@ pub(crate) fn acquire(
     let execution_started = Instant::now();
     // The probe's buffer is the device's own, charged to its store's own
     // entry while the profile is measured.
-    let buffer = device.allocate_bytes(4 * 1024 * 1024, &device.store().own()).map_err(|error| {
-        seismic_compiler::errors::TargetError::DeviceUnavailable(error.to_string())
-    })?;
-    buffer.write_bytes(0, &vec![0u8; 4 * 1024 * 1024]);
+    let buffer = device.allocate_own(4 * 1024 * 1024, &device.store().own()).map_err(unavailable)?;
+    buffer.write_bytes(0, &vec![0u8; 4 * 1024 * 1024]).map_err(unavailable)?;
 
     let mut definitions = core_services(device, &buffer)?;
     let mut f32_observation = None;
@@ -1490,7 +1488,7 @@ fn core_service(
             ServiceAccuracyClass::MemoryOrTransfer,
             || {
                 let mut bytes = [0u8; 4];
-                buffer.read_bytes(0, &mut bytes);
+                buffer.read_bytes(0, &mut bytes).map_err(unavailable)?;
                 std::hint::black_box(bytes);
                 Ok(())
             },
@@ -1501,7 +1499,8 @@ fn core_service(
             Ok(())
         }),
         // A reached instance's backing, as the executor acquires one: the
-        // device service's allocation of a shared buffer, released after.
+        // device service's allocation of a buffer of the device's own
+        // memory, released after.
         // Charged, like the probe's buffer, to the device's store's own entry.
         CoreService::AllocationInstance => {
             let entry = device.store().own();
@@ -1512,7 +1511,7 @@ fn core_service(
                 || {
                     let instance = <crate::device::MetalDevice as seismic_compiler::executable::DeviceService<crate::Metal>>::allocate(
                         device,
-                        crate::topology::SHARED_KIND,
+                        crate::topology::own_kind(device.handle().has_unified_memory()),
                         seismic_estimator::ALLOCATION_INSTANCE_BYTES,
                         1,
                         &entry,
@@ -1575,6 +1574,12 @@ fn time_operations(
     Ok(unsafe { clock_gettime_nsec_np(clock_id) }.saturating_sub(start))
 }
 
+/// A host access of the profile's buffer that failed: the device could not
+/// be measured.
+fn unavailable(error: seismic_compiler::errors::ExecutionError) -> seismic_compiler::errors::TargetError {
+    seismic_compiler::errors::TargetError::DeviceUnavailable(error.to_string())
+}
+
 fn host_transfer_definition(
     class: ServiceClassId,
     probe: &'static str,
@@ -1590,17 +1595,17 @@ fn host_transfer_definition(
     for (index, byte) in temporary.iter_mut().enumerate() {
         *byte = pattern[index % pattern.len()];
     }
-    let mut execute = |count: u64, bytes: usize| {
+    let mut execute = |count: u64, bytes: usize| -> Result<u64, seismic_compiler::errors::TargetError> {
         let start = Instant::now();
         for _ in 0..count {
             if copy {
-                buffer.read_bytes(0, &mut temporary[..bytes]);
-                buffer.write_bytes(512 * 1024, &temporary[..bytes]);
+                buffer.read_bytes(0, &mut temporary[..bytes]).map_err(unavailable)?;
+                buffer.write_bytes(512 * 1024, &temporary[..bytes]).map_err(unavailable)?;
             } else {
-                buffer.write_bytes(0, &temporary[..bytes]);
+                buffer.write_bytes(0, &temporary[..bytes]).map_err(unavailable)?;
             }
         }
-        start.elapsed().as_nanos() as u64
+        Ok(start.elapsed().as_nanos() as u64)
     };
     let acquisition_started = Instant::now();
     let timer_resolution = host_timer_resolution(CLOCK_MONOTONIC_RAW);
@@ -1613,27 +1618,27 @@ fn host_transfer_definition(
     let mut amplification = seismic_estimator::calibrate_observation_units::<
         seismic_compiler::errors::TargetError,
     >(required_ns, |count| {
-        let small = execute(count, SMALL);
-        Ok(execute(count, LARGE).saturating_sub(small))
+        let small = execute(count, SMALL)?;
+        Ok(execute(count, LARGE)?.saturating_sub(small))
     })?;
     let mut setup_amplification = seismic_estimator::calibrate_observation_units::<
         seismic_compiler::errors::TargetError,
-    >(required_ns, |count| Ok(execute(count, 0)))?;
+    >(required_ns, |count| execute(count, 0))?;
     let mut accepted = None;
     let mut last_intervals = None;
     for _ in 0..MAX_HOST_ACQUISITION_ROUNDS {
         let round = Instant::now();
         let workload_units = (LARGE - SMALL) as u64 * amplification;
-        execute(amplification, LARGE);
+        execute(amplification, LARGE)?;
         let mut rates = Vec::with_capacity(STOCHASTIC_HOST_REPEATS);
         let mut setups =
             Vec::with_capacity(STOCHASTIC_HOST_REPEATS * SETUP_REPEATS_PER_TRANSFER_OBSERVATION);
         for _ in 0..STOCHASTIC_HOST_REPEATS {
             for _ in 0..SETUP_REPEATS_PER_TRANSFER_OBSERVATION {
-                setups.push(execute(setup_amplification, 0));
+                setups.push(execute(setup_amplification, 0)?);
             }
-            let small = execute(amplification, SMALL);
-            let large = execute(amplification, LARGE);
+            let small = execute(amplification, SMALL)?;
+            let large = execute(amplification, LARGE)?;
             rates.push(large.checked_sub(small).ok_or_else(|| {
                 seismic_compiler::errors::TargetError::DeviceUnavailable(
                     "host transfer probe timestamps were not monotone".into(),

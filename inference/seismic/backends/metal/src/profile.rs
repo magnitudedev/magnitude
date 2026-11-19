@@ -118,12 +118,13 @@ fn discover_device(
         language,
         max_threads_per_threadgroup: [size.width as u64, size.height as u64, size.depth as u64],
         max_buffer_bytes: handle.max_allocation_bytes(),
-        buffer_alignment: raw
-            .heapBufferSizeAndAlignWithLength_options(
-                1,
-                objc2_metal::MTLResourceOptions::StorageModeShared,
-            )
-            .align as u64,
+        // What every buffer the device allocates satisfies: the least of its
+        // kinds' alignments.
+        buffer_alignment: crate::topology::kinds(handle.has_unified_memory())
+            .iter()
+            .map(|kind| raw.heapBufferSizeAndAlignWithLength_options(1, crate::device::storage(kind.id)).align as u64)
+            .min()
+            .expect("a Metal device has a kind"),
         scalar_collective_dtypes,
         bfloat_arithmetic,
         matrix_dtypes,

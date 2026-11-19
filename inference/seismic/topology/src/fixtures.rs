@@ -43,7 +43,8 @@ fn cpu_kind() -> KindReport {
     }
 }
 
-/// Metal's shared storage mode, its one kind (`seismic_metal::kind`).
+/// Metal's shared storage mode, its one kind on a unified device
+/// (`seismic_metal::topology::kinds`).
 fn metal_kind() -> KindReport {
     KindReport {
         id: 0,
@@ -122,9 +123,15 @@ pub mod recorded {
 
     /// The m4-pro report with `hasUnifiedMemory` false: the rule's input for
     /// a discrete Metal GPU (no host of ours has one), whose Metal executor
-    /// is unavailable.
+    /// places in the device's own memory.
     pub fn m4_pro_without_unified_memory() -> DeviceTopology {
         super::topology(&super::m4_pro_without_unified_memory())
+    }
+
+    /// The m4-pro report with its Metal device refused by the backend: the
+    /// rule's input for an unavailable executor, which places nothing.
+    pub fn m4_pro_with_metal_refused() -> DeviceTopology {
+        super::topology(&super::m4_pro_with_metal_refused())
     }
 
     /// rtx3090 (Linux, RTX 3090): CPU, and CUDA and Vulkan on the 3090.
@@ -445,16 +452,30 @@ pub fn m4_pro() -> Reports {
         tensor_operations: false,
         working_set: M4_PRO_WORKING_SET,
         max_allocation: M4_PRO_MAX_BUFFER,
-        kind: metal_kind(),
+        kinds: vec![metal_kind()],
     });
     reports
 }
 
-/// The m4-pro report with `hasUnifiedMemory` false, the rule's input (no
-/// host of ours has a discrete Metal GPU).
+/// The m4-pro report with `hasUnifiedMemory` false, its kinds those Metal
+/// reports for a device whose memory is its own, private storage before
+/// shared (`seismic_metal::topology::kinds`): the rule's input (no host of
+/// ours has a discrete Metal GPU).
 pub fn m4_pro_without_unified_memory() -> Reports {
     let mut reports = m4_pro();
     reports.metal[0].unified = false;
+    reports.metal[0].kinds.insert(
+        0,
+        KindReport { id: 1, name: "private storage".into(), reach: Reach::Device, memory: KindMemory::DeviceMemory },
+    );
+    reports
+}
+
+/// The m4-pro report with the Metal backend's admission of its device
+/// refused, as for a Metal language below the backend's floor.
+pub fn m4_pro_with_metal_refused() -> Reports {
+    let mut reports = m4_pro();
+    reports.metal[0].admission = Err("its Metal language is below the backend's floor".into());
     reports
 }
 
