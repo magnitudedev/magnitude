@@ -79,7 +79,7 @@ macOS, Linux, and Windows.
 
 ### Which models does it support?
 
-See the full list at [magnitude.dev/models](https://magnitude.dev/models). We write optimized kernels for the most popular open-weight families, which is how we beat generalist engines.
+Any GGUF model from Hugging Face in a supported family, including fine-tunes and other people’s quants. We write optimized kernels for each of the most popular open-weight families, which is how we beat generalist engines. See the families and the models we recommend at [magnitude.dev/models](https://magnitude.dev/models).
 
 ### Which agents work with it?
 

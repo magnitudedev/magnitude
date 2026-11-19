@@ -34,10 +34,10 @@ a starting point for choosing with the user, not a claim that one model is best 
   prompt and tools alone fill much of a smaller context. A request longer than the served context
   fails with `context_length_exceeded` rather than running the computer out of memory; connected
   harnesses are updated with the served context.
-- **Intelligence** is the model's Artificial Analysis Intelligence Index score. Magnitude displays
-  it with a percent sign, but it is an index score—not a probability or the percentage of questions
-  the model answers correctly. Quantized variants of the same source model generally share this
-  model-level score.
+- **Intelligence** is how well the model does on today's hardest benchmarks, as a percentage of the
+  best model in the world. 100% is the frontier model; 50% means the model is expected to score half
+  of what the frontier model scores on those benchmarks. Quantized variants of the same source model
+  share this model-level score.
 - **Quants** is the model's tested ladder, smallest to largest, each rung with its size, speed,
   context, placement and model ID; `*` marks the chosen one.
 - **Acceleration** identifies the speculative-decoding method Magnitude has prepared for that
@@ -55,30 +55,23 @@ context determine whether the model is practical on this computer, the quant's b
 how much quality the local format may give up, and capabilities determine whether it can do the job
 at all.
 
-## Artificial Analysis intelligence and reference points
+## How intelligence is measured
 
-The [Artificial Analysis Intelligence Index](https://artificialanalysis.ai/evaluations/artificial-analysis-intelligence-index)
-is an independently run composite of evaluations spanning areas such as mathematics, science,
-coding, knowledge, long-context work, and agentic tasks. Higher scores generally indicate stronger
-performance across that mixture, but the number is a broad comparison signal rather than a promise
-about one particular task.
+Magnitude's intelligence comes from [Epoch AI's Capabilities Index](https://epoch.ai/benchmarks/eci)
+(ECI). Epoch rates models on dozens of benchmarks and fits how hard each benchmark is, which places
+every model on one capability scale. From a model's place on that scale, Epoch's fit predicts its
+score on each benchmark. Intelligence is the model's average predicted score on the benchmarks Epoch
+rates that were released in the last two years, divided by the frontier model's. Older benchmarks
+drop out as they age, so the measure keeps tracking what is hard today.
 
-The frontier models below are useful reference points when a user wants to understand what a local
-model's Intelligence score means. For example, a local model near 52 is in the same general score
-region as GPT-5.6 Luna in this snapshot, while a score near 61 is around GPT-5.6 Sol. This does not
-mean the models behave identically; it gives the user a familiar yardstick for the index.
+Each model's place on the scale comes from one of three sources:
 
-These scores are a September 1, 2026 snapshot of Artificial Analysis Intelligence Index v4.1.1:
+- **Epoch published:** Epoch rates the model itself.
+- **From Epoch's data:** Epoch has run the model on enough of its benchmarks, and Magnitude fits its
+  place with Epoch's own benchmark difficulties.
+- **Bridged:** Epoch has not run the model, so Magnitude predicts its place from other published
+  evaluations, calibrated on models Epoch does rate. These carry the most uncertainty.
 
-| Reference model | Evaluated configuration | Score |
-| --- | --- | ---: |
-| [Claude Opus 5](https://artificialanalysis.ai/models/claude-opus-5) | Adaptive reasoning, max effort | 63 |
-| [Claude Fable 5](https://artificialanalysis.ai/models/claude-fable-5) | Adaptive reasoning, max effort, Opus 4.8 fallback | 62 |
-| [GPT-5.6 Sol](https://artificialanalysis.ai/models/gpt-5-6-sol) | Max effort | 61 |
-| [GPT-5.6 Terra](https://artificialanalysis.ai/models/gpt-5-6-terra) | Max effort | 57 |
-| [GPT-5.6 Luna](https://artificialanalysis.ai/models/gpt-5-6-luna) | Max effort | 52 |
-
-Compare scores from the same index version and similar reasoning settings when possible. Artificial
-Analysis may revise its methodology or results over time. Magnitude ships reviewed scores with the
-models it recommends rather than refreshing them from the network during recommendation, and clearly labels an
-authored estimate when a directly measured score is unavailable.
+The frontier model and the benchmark window are reviewed with each release. Magnitude ships the
+scores with the models it recommends rather than refreshing them from the network during
+recommendation.
