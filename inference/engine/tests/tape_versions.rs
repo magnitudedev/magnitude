@@ -31,11 +31,7 @@ const PROMPT: usize = 40;
 fn open_domain() -> Option<(Box<ExecutorDomain>, StateBindings, usize)> {
     let model = PathBuf::from(std::env::var_os("MAGNITUDE_TEST_MTP_GGUF")?);
     let resolved = EngineConfiguration {
-        package: PackageOptions {
-            target: model,
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+        package: PackageOptions::single(model, ProjectorSelection::Disabled, None),
         model: ModelPolicy {
             draft_policy: None,
             method: ModelMethod::Mtp,

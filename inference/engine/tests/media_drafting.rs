@@ -170,11 +170,11 @@ fn generate(
 
 fn run(arguments: &Arguments) -> Result<(), String> {
     let resolved = EngineConfiguration {
-        package: PackageOptions {
-            target: arguments.target.clone(),
-            projector: ProjectorSelection::Explicit(arguments.projector.clone()),
-            draft: arguments.draft.clone(),
-        },
+        package: PackageOptions::single(
+            arguments.target.clone(),
+            ProjectorSelection::Explicit(arguments.projector.clone()),
+            arguments.draft.clone(),
+        ),
         model: ModelPolicy::default(),
         context_tokens: Some(8192),
         service: standard_service_limits(),

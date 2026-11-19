@@ -210,12 +210,12 @@ fn parse() -> Result<Options, String> {
                 let component = |path: Option<&str>| {
                     path.filter(|path| !path.is_empty()).map(PathBuf::from)
                 };
-                models.push(ModelPackagePaths {
-                    target: PathBuf::from(components.next().expect("split yields one part")),
-                    projector: component(components.next()),
-                    draft: component(components.next()),
-                    method: ModelMethod::Auto,
-                });
+                models.push(ModelPackagePaths::single(
+                    PathBuf::from(components.next().expect("split yields one part")),
+                    component(components.next()),
+                    component(components.next()),
+                    ModelMethod::Auto,
+                ));
             }
         }
     }
@@ -350,10 +350,10 @@ fn run() -> Result<bool, String> {
     std::fs::create_dir_all(&options.kernels).map_err(|error| error.to_string())?;
     let mut served = vec![options.kernels.clone()];
     for model in &options.models {
-        let directory = std::path::absolute(&model.target)
+        let directory = std::path::absolute(model.target())
             .map_err(|error| error.to_string())?
             .parent()
-            .ok_or_else(|| format!("{} has no directory", model.target.display()))?
+            .ok_or_else(|| format!("{} has no directory", model.target().display()))?
             .to_path_buf();
         if !served.contains(&directory) {
             served.push(directory);
@@ -486,14 +486,14 @@ fn run() -> Result<bool, String> {
         match assessed {
             Ok(assessment) => {
                 let mut object = render(&setup, &assessment);
-                object["model"] = json!(model.target.display().to_string());
+                object["model"] = json!(model.target().display().to_string());
                 object["assessmentSeconds"] =
                     json!((preparation + started.elapsed()).as_secs_f64());
                 println!("{object}");
             }
             Err(error) => {
                 complete = false;
-                eprintln!("magnitude-assess: {}: {error}", model.target.display());
+                eprintln!("magnitude-assess: {}: {error}", model.target().display());
             }
         }
     }
@@ -676,7 +676,7 @@ fn print_breakdown(
     let Measurements::Measured { costs, .. } = &setup.measurements else {
         eprintln!(
             "magnitude-assess: {}: no breakdown without measurements",
-            model.target.display()
+            model.target().display()
         );
         return Ok(());
     };
@@ -685,7 +685,7 @@ fn print_breakdown(
     let host = &bounds.host_process;
     eprintln!(
         "magnitude-assess: {}: memory {}",
-        model.target.display(),
+        model.target().display(),
         json!({
             "exact_resident_bytes": charge.exact_resident_bytes,
             "state_bytes": charge.state_bytes,
@@ -718,7 +718,7 @@ fn print_breakdown(
     eprintln!(
         "magnitude-assess: {}: {} calls, {sequences} sequences, lookahead {}, activations at \
          {:.1} GB/s, uploads at {:.1} GB/s",
-        model.target.display(),
+        model.target().display(),
         demand.calls.len(),
         pricing.lookahead,
         pricing.activations(magnitude_executor::assessment::OperandStorage::Device) / 1e9,

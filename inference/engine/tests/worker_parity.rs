@@ -79,11 +79,11 @@ fn arguments() -> Result<Option<Arguments>, String> {
 
 fn configuration(arguments: &Arguments) -> EngineConfiguration {
     EngineConfiguration {
-        package: PackageOptions {
-            target: arguments.model.clone(),
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+        package: PackageOptions::single(
+            arguments.model.clone(),
+            ProjectorSelection::Disabled,
+            None,
+        ),
         model: ModelPolicy::default(),
         context_tokens: Some(4096),
         service: standard_service_limits(),

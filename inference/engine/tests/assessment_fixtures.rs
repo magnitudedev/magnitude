@@ -262,12 +262,14 @@ fn every_fixture_has_its_expected_verdict() {
     let mut failures = Vec::new();
     for fixture in &manifest.fixtures {
         let scratch = Scratch::new(&fixture.name);
-        let mut target = fixture
+        let target_shards = fixture
             .target
             .iter()
-            .map(|component| scratch.materialize(component));
+            .map(|component| scratch.materialize(component))
+            .collect::<Vec<_>>();
+        assert!(!target_shards.is_empty(), "a fixture has a target");
         let package = ModelPackagePaths {
-            target: target.next().expect("a fixture has a target"),
+            target_shards,
             projector: None,
             draft: fixture
                 .draft
@@ -275,7 +277,6 @@ fn every_fixture_has_its_expected_verdict() {
                 .map(|component| scratch.materialize(component)),
             method: fixture.method.into(),
         };
-        target.for_each(drop);
         let assessment = assess_model(&package, &setup, &[], PROFILE_SEQUENCES)
             .unwrap_or_else(|error| panic!("{}: operational failure: {error}", fixture.name));
         if let ModelAssessment::Unsupported { unsupported, .. } = &assessment {
@@ -461,12 +462,7 @@ fn a_qwen4exp_target_with_its_prediction_block_is_assessed_with_built_in_heads()
 
     let separate_target = scratch.materialize(&separate.target[0]);
     let ModelAssessment::Assessed { facts, .. } = assess_model(
-        &ModelPackagePaths {
-            target,
-            projector: None,
-            draft: None,
-            method: ModelMethod::Auto,
-        },
+        &ModelPackagePaths::single(target, None, None, ModelMethod::Auto),
         &cpu_setup(),
         &[],
         PROFILE_SEQUENCES,
@@ -517,12 +513,7 @@ fn a_separate_nemotron_head_names_its_drafter_architecture() {
     let draft = scratch.0.join("mtp-nemotron.gguf");
     std::fs::write(&draft, gguf_header(&head)).unwrap();
     let ModelAssessment::Assessed { facts, .. } = assess_model(
-        &ModelPackagePaths {
-            target,
-            projector: None,
-            draft: Some(draft),
-            method: ModelMethod::Auto,
-        },
+        &ModelPackagePaths::single(target, None, Some(draft), ModelMethod::Auto),
         &cpu_setup(),
         &[],
         PROFILE_SEQUENCES,
@@ -549,12 +540,12 @@ fn qwen36_35b(scratch: &Scratch) -> ModelPackagePaths {
         .iter()
         .find(|fixture| fixture.name == "qwen35moe-supported")
         .expect("the Qwen3.6 35B fixture");
-    ModelPackagePaths {
-        target: scratch.materialize(&fixture.target[0]),
-        projector: None,
-        draft: None,
-        method: ModelMethod::Plain,
-    }
+    ModelPackagePaths::single(
+        scratch.materialize(&fixture.target[0]),
+        None,
+        None,
+        ModelMethod::Plain,
+    )
 }
 
 /// On a discrete device, whose bank records the host does not read into,

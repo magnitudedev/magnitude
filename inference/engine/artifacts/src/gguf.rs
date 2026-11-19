@@ -1102,12 +1102,15 @@ impl HeaderSource for FileHeaders {
     }
 }
 
-/// Inspect the headers of the GGUF component `path` names: the file itself,
-/// or every shard when it is the first shard of a split GGUF (see
-/// [`split_paths`]). Tensor payloads need not exist. Returns the component
-/// directory and its files (absolute, in shard order) with their sizes.
-pub(crate) fn inspect_component_header(
-    path: &Path,
+/// Inspect the headers of one GGUF component whose files are `paths` (in shard
+/// order). A single path is either an unsplit GGUF or the first shard of a
+/// split GGUF (its sibling shards found by [`split_paths`]). Multiple paths
+/// are validated and merged as the explicit shards of a split GGUF without
+/// requiring standard shard filenames or a shared directory. Tensor payloads
+/// need not exist. Returns the component directory and its files (absolute,
+/// in shard order) with their sizes.
+pub fn inspect_component_headers(
+    paths: &[PathBuf],
     headers: &dyn HeaderSource,
 ) -> Result<(Directory, Vec<(PathBuf, u64)>), Error> {
     let read = |path: &Path| -> Result<(FileHeader, PathBuf), Error> {
@@ -1115,13 +1118,28 @@ pub(crate) fn inspect_component_header(
         header.directory.require_execution_byte_order()?;
         Ok((header, std::path::absolute(path)?))
     };
-    let (first, first_path) = read(path)?;
-    match split_paths(path, &first.directory)? {
-        None => Ok((first.directory, vec![(first_path, first.size)])),
-        Some(paths) => {
-            let mut files = vec![(first_path, first.size)];
-            let mut shards = vec![first.directory];
-            for shard in &paths[1..] {
+    match paths {
+        [] => Err(invalid("split GGUF has no shards")),
+        [path] => {
+            let (first, first_path) = read(path)?;
+            match split_paths(path, &first.directory)? {
+                None => Ok((first.directory, vec![(first_path, first.size)])),
+                Some(split) => {
+                    let mut files = vec![(first_path, first.size)];
+                    let mut shards = vec![first.directory];
+                    for shard in &split[1..] {
+                        let (header, path) = read(shard)?;
+                        files.push((path, header.size));
+                        shards.push(header.directory);
+                    }
+                    Ok((merge_shards(shards)?.0, files))
+                }
+            }
+        }
+        many => {
+            let mut files = Vec::with_capacity(many.len());
+            let mut shards = Vec::with_capacity(many.len());
+            for shard in many {
                 let (header, path) = read(shard)?;
                 files.push((path, header.size));
                 shards.push(header.directory);
@@ -1129,6 +1147,17 @@ pub(crate) fn inspect_component_header(
             Ok((merge_shards(shards)?.0, files))
         }
     }
+}
+
+/// Inspect the headers of the GGUF component `path` names: the file itself,
+/// or every shard when it is the first shard of a split GGUF (see
+/// [`split_paths`]). Tensor payloads need not exist. Returns the component
+/// directory and its files (absolute, in shard order) with their sizes.
+pub fn inspect_component_header(
+    path: &Path,
+    headers: &dyn HeaderSource,
+) -> Result<(Directory, Vec<(PathBuf, u64)>), Error> {
+    inspect_component_headers(&[path.to_path_buf()], headers)
 }
 
 fn read_file_directory(source: &FileSource, require_payload: bool) -> Result<Directory, Error> {
@@ -1434,45 +1463,55 @@ impl GgufArtifact {
     /// artifact lives as long as its model is loaded, so its directory is
     /// detached from the header bytes ([`Directory::detach`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let first = Arc::new(FileSource::open(path)?);
-        let directory = read_file_directory(&first, true)?;
-        let (mut directory, shards) = match split_paths(path, &directory)? {
-            None => {
-                let data_offset = directory.data_offset;
-                (
-                    directory,
-                    vec![Shard {
-                        source: first,
-                        data_offset,
-                        base: 0,
-                    }],
-                )
+        Self::open_shards(&[path.as_ref().to_path_buf()])
+    }
+
+    /// Open a GGUF component from its explicit shard paths (in shard order).
+    /// A single path is either an unsplit GGUF or the first shard of a split
+    /// GGUF (its sibling shards found by [`split_paths`]). Multiple paths are
+    /// opened directly as the shards of a split GGUF without requiring
+    /// standard shard filenames or a shared directory. The artifact lives as
+    /// long as its model is loaded, so its directory is detached from the
+    /// header bytes ([`Directory::detach`]).
+    pub fn open_shards(paths: &[PathBuf]) -> Result<Self, Error> {
+        let (mut directory, shards) = match paths {
+            [] => return Err(invalid("split GGUF has no shards")),
+            [path] => {
+                let first = Arc::new(FileSource::open(path)?);
+                let directory = read_file_directory(&first, true)?;
+                match split_paths(path, &directory)? {
+                    None => {
+                        let data_offset = directory.data_offset;
+                        (
+                            directory,
+                            vec![Shard {
+                                source: first,
+                                data_offset,
+                                base: 0,
+                            }],
+                        )
+                    }
+                    Some(split) => {
+                        let mut sources = vec![first];
+                        let mut directories = vec![directory];
+                        for shard in &split[1..] {
+                            let source = Arc::new(FileSource::open(shard)?);
+                            directories.push(read_file_directory(&source, true)?);
+                            sources.push(source);
+                        }
+                        assemble_shards(sources, directories)?
+                    }
+                }
             }
-            Some(paths) => {
-                let mut sources = vec![first];
-                let mut directories = vec![directory];
-                for shard in &paths[1..] {
+            many => {
+                let mut sources = Vec::with_capacity(many.len());
+                let mut directories = Vec::with_capacity(many.len());
+                for shard in many {
                     let source = Arc::new(FileSource::open(shard)?);
                     directories.push(read_file_directory(&source, true)?);
                     sources.push(source);
                 }
-                let offsets = directories
-                    .iter()
-                    .map(|directory| directory.data_offset)
-                    .collect::<Vec<_>>();
-                let (directory, bases) = merge_shards(directories)?;
-                let shards = sources
-                    .into_iter()
-                    .zip(offsets)
-                    .zip(bases)
-                    .map(|((source, data_offset), base)| Shard {
-                        source,
-                        data_offset,
-                        base,
-                    })
-                    .collect();
-                (directory, shards)
+                assemble_shards(sources, directories)?
             }
         };
         directory.detach()?;
@@ -1526,5 +1565,247 @@ impl GgufArtifact {
             shape: tensor.shape.clone(),
             encoding: tensor.encoding,
         })
+    }
+}
+
+fn assemble_shards(
+    sources: Vec<Arc<FileSource>>,
+    directories: Vec<Directory>,
+) -> Result<(Directory, Vec<Shard>), Error> {
+    let offsets = directories
+        .iter()
+        .map(|directory| directory.data_offset)
+        .collect::<Vec<_>>();
+    let (directory, bases) = merge_shards(directories)?;
+    let shards = sources
+        .into_iter()
+        .zip(offsets)
+        .zip(bases)
+        .map(|((source, data_offset), base)| Shard {
+            source,
+            data_offset,
+            base,
+        })
+        .collect();
+    Ok((directory, shards))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    fn temporary_directory(tag: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "magnitude-gguf-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_shard(
+        path: &Path,
+        split_no: u64,
+        split_count: u64,
+        split_tensors: Option<u64>,
+        name: Option<&str>,
+        tensors: &[(&str, Vec<u64>, Encoding)],
+        fill: u8,
+    ) -> PathBuf {
+        let mut metadata = vec![
+            StoredMetadata {
+                metadata: Metadata {
+                    name: SPLIT_INDEX.into(),
+                    value: Value::Scalar(Scalar::Unsigned(split_no)),
+                },
+                stored: StoredType::Scalar(ValueType::U16),
+            },
+            StoredMetadata {
+                metadata: Metadata {
+                    name: SPLIT_COUNT.into(),
+                    value: Value::Scalar(Scalar::Unsigned(split_count)),
+                },
+                stored: StoredType::Scalar(ValueType::U16),
+            },
+        ];
+        if let Some(count) = split_tensors {
+            metadata.push(StoredMetadata {
+                metadata: Metadata {
+                    name: SPLIT_TENSORS.into(),
+                    value: Value::Scalar(Scalar::Unsigned(count)),
+                },
+                stored: StoredType::Scalar(ValueType::U32),
+            });
+        }
+        if let Some(name) = name {
+            metadata.push(StoredMetadata {
+                metadata: Metadata {
+                    name: "general.name".into(),
+                    value: Value::Scalar(Scalar::String(name.into())),
+                },
+                stored: StoredType::Scalar(ValueType::String),
+            });
+        }
+        let header = StoredHeader::new(
+            3,
+            metadata,
+            tensors
+                .iter()
+                .map(|(name, shape, encoding)| ((*name).to_owned(), shape.clone(), *encoding)),
+        )
+        .unwrap();
+        let mut bytes = header.encode().unwrap();
+        let alignment = header.alignment().unwrap();
+        let data_offset = bytes.len() as u64;
+        for tensor in &header.tensors {
+            let start = (data_offset + tensor.offset) as usize;
+            if bytes.len() < start {
+                bytes.resize(start, 0);
+            }
+            bytes.resize(start + tensor.nbytes as usize, fill);
+        }
+        let end = aligned(bytes.len() as u64, alignment).unwrap() as usize;
+        bytes.resize(end, 0);
+        std::fs::write(path, bytes).unwrap();
+        path.to_path_buf()
+    }
+
+    #[test]
+    fn open_shards_and_inspect_headers_accept_arbitrary_cross_directory_shards() {
+        let root = temporary_directory("explicit-shards");
+        let sub = root.join("quant-subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let shard0 = write_shard(
+            &sub.join("meta-only.gguf"),
+            0,
+            3,
+            Some(2),
+            Some("arbitrary-split"),
+            &[],
+            0,
+        );
+        let shard1 = write_shard(
+            &sub.join("weights-a.gguf"),
+            1,
+            3,
+            None,
+            None,
+            &[("first", vec![2, 256], Encoding::Q4K)],
+            0x11,
+        );
+        let shard2 = write_shard(
+            &root.join("shared-embedding-shard.gguf"),
+            2,
+            3,
+            None,
+            None,
+            &[("second", vec![3, 32], Encoding::Q8_0)],
+            0x22,
+        );
+        let paths = vec![shard0, shard1, shard2];
+
+        let artifact = GgufArtifact::open_shards(&paths).unwrap();
+        assert_eq!(artifact.sources().len(), 3);
+        assert_eq!(
+            artifact.directory().value("general.name"),
+            Some(&Value::Scalar(Scalar::String("arbitrary-split".into())))
+        );
+        assert_eq!(
+            artifact
+                .directory()
+                .tensors
+                .iter()
+                .map(|tensor| tensor.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(artifact.tensor("first").unwrap().read().unwrap(), vec![0x11; 288]);
+        assert_eq!(artifact.tensor("second").unwrap().read().unwrap(), vec![0x22; 102]);
+
+        let (inspected, files) = inspect_component_headers(&paths, &FileHeaders).unwrap();
+        assert_eq!(inspected.tensors, artifact.directory().tensors);
+        assert_eq!(inspected.metadata, artifact.directory().metadata);
+        assert_eq!(files.len(), 3);
+        for ((file_path, _), expected) in files.iter().zip(&paths) {
+            assert_eq!(file_path, &std::path::absolute(expected).unwrap());
+        }
+
+        assert!(matches!(
+            GgufArtifact::open_shards(&[]),
+            Err(Error::Invalid(message)) if message.contains("no shards")
+        ));
+        assert!(matches!(
+            inspect_component_headers(&[], &FileHeaders),
+            Err(Error::Invalid(message)) if message.contains("no shards")
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_shards_and_inspect_headers_reject_mismatched_split_metadata() {
+        let root = temporary_directory("explicit-shards-invalid");
+        let shard0 = write_shard(
+            &root.join("a.gguf"),
+            0,
+            3,
+            Some(2),
+            Some("bad-order"),
+            &[],
+            0,
+        );
+        let shard1 = write_shard(
+            &root.join("b.gguf"),
+            1,
+            3,
+            None,
+            None,
+            &[("first", vec![2, 256], Encoding::Q4K)],
+            0x11,
+        );
+        let shard2 = write_shard(
+            &root.join("c.gguf"),
+            2,
+            3,
+            None,
+            None,
+            &[("second", vec![3, 32], Encoding::Q8_0)],
+            0x22,
+        );
+
+        let swapped = vec![shard0.clone(), shard2.clone(), shard1.clone()];
+        assert!(matches!(
+            GgufArtifact::open_shards(&swapped),
+            Err(Error::Invalid(message)) if message.contains("does not declare itself shard 2")
+        ));
+        assert!(matches!(
+            inspect_component_headers(&swapped, &FileHeaders),
+            Err(Error::Invalid(message)) if message.contains("does not declare itself shard 2")
+        ));
+
+        let bad_count = write_shard(
+            &root.join("bad-count.gguf"),
+            0,
+            3,
+            Some(5),
+            Some("bad-count"),
+            &[],
+            0,
+        );
+        let mismatched_tensors = vec![bad_count, shard1, shard2];
+        assert!(matches!(
+            GgufArtifact::open_shards(&mismatched_tensors),
+            Err(Error::Invalid(message)) if message.contains("declares 5 tensors")
+        ));
+        assert!(matches!(
+            inspect_component_headers(&mismatched_tensors, &FileHeaders),
+            Err(Error::Invalid(message)) if message.contains("declares 5 tensors")
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -18,7 +18,10 @@ use crate::census::AllocationCensus;
 use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /// The standalone engine's service limits. Loading and metadata-only
 /// assessment use the same token and time-share policy.
@@ -46,19 +49,44 @@ pub enum ProjectorSelection {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageOptions {
-    pub target: PathBuf,
+    /// Target GGUF file(s) in shard order: one file for an unsplit GGUF or a
+    /// standard-named split's first shard, or every shard explicitly.
+    pub target_shards: Vec<PathBuf>,
     pub projector: ProjectorSelection,
     /// A separate draft model (DFlash, DSpark) for the target.
     pub draft: Option<PathBuf>,
 }
 
 impl PackageOptions {
+    pub fn single(
+        target: PathBuf,
+        projector: ProjectorSelection,
+        draft: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            target_shards: vec![target],
+            projector,
+            draft,
+        }
+    }
+
+    pub fn target(&self) -> &Path {
+        self.target_shards
+            .first()
+            .map(PathBuf::as_path)
+            .unwrap_or_else(|| Path::new(""))
+    }
+
     pub fn open(&self) -> Result<Package, magnitude_artifacts::Error> {
         let package = match &self.projector {
-            ProjectorSelection::Discover => Package::open(&self.target),
-            ProjectorSelection::Disabled => Package::open_without_projector(&self.target),
+            ProjectorSelection::Discover => {
+                Package::open_target_shards_discovering_projector(&self.target_shards)
+            }
+            ProjectorSelection::Disabled => {
+                Package::open_target_shards(&self.target_shards, None)
+            }
             ProjectorSelection::Explicit(projector) => {
-                Package::open_with_projector(&self.target, projector)
+                Package::open_target_shards(&self.target_shards, Some(projector))
             }
         }?;
         match &self.draft {

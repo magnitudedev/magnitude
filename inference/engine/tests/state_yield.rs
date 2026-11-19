@@ -33,11 +33,7 @@ fn domain() -> (Box<ExecutorDomain>, StateBindings, usize, usize, usize) {
         std::env::var_os("MAGNITUDE_TEST_MTP_GGUF").expect("set MAGNITUDE_TEST_MTP_GGUF"),
     );
     let resolved = EngineConfiguration {
-        package: PackageOptions {
-            target: model,
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+        package: PackageOptions::single(model, ProjectorSelection::Disabled, None),
         model: ModelPolicy {
             draft_policy: None,
             method: ModelMethod::Plain,

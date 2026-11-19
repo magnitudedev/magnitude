@@ -83,14 +83,14 @@ fn packages(directory: &Path) -> Vec<(String, ModelPackagePaths)> {
             let name = fixture["name"].as_str().unwrap().to_owned();
             let directory = directory.join(&name);
             std::fs::create_dir_all(&directory).unwrap();
-            let target = fixture["target"]
+            let target_shards = fixture["target"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(materialize)
                 .collect::<Vec<_>>();
             let package = ModelPackagePaths {
-                target: target[0].clone(),
+                target_shards,
                 projector: None,
                 draft: fixture.get("draft").map(materialize),
                 method: match fixture.get("method").and_then(|method| method.as_str()) {

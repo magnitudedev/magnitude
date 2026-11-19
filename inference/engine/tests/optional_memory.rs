@@ -42,11 +42,7 @@ fn plain_owner(
         std::env::var_os("MAGNITUDE_TEST_MTP_GGUF").expect("set MAGNITUDE_TEST_MTP_GGUF"),
     );
     let resolved = EngineConfiguration {
-        package: PackageOptions {
-            target: model,
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+        package: PackageOptions::single(model, ProjectorSelection::Disabled, None),
         model: ModelPolicy {
             draft_policy: None,
             method: ModelMethod::Plain,
@@ -290,11 +286,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         std::env::var_os("MAGNITUDE_TEST_MTP_GGUF").expect("set MAGNITUDE_TEST_MTP_GGUF"),
     );
     let resolved = EngineConfiguration {
-        package: PackageOptions {
-            target: model,
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+        package: PackageOptions::single(model, ProjectorSelection::Disabled, None),
         model: ModelPolicy {
             draft_policy: None,
             method: ModelMethod::Mtp,
@@ -417,11 +409,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
     );
     let limits = magnitude_engine::options::standard_service_limits();
     let resolved = EngineConfiguration {
-        package: PackageOptions {
-            target: model,
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+        package: PackageOptions::single(model, ProjectorSelection::Disabled, None),
         model: ModelPolicy {
             draft_policy: None,
             method: ModelMethod::Mtp,
@@ -505,11 +493,7 @@ fn admission_reclaims_under_a_real_process_limit() {
         conversations: std::num::NonZeroUsize::MIN,
     };
     let resolved = EngineConfiguration {
-        package: PackageOptions {
-            target: model,
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
+        package: PackageOptions::single(model, ProjectorSelection::Disabled, None),
         model: ModelPolicy {
             draft_policy: None,
             method: ModelMethod::Plain,

@@ -355,7 +355,7 @@ impl HostArtifacts {
     /// Open and interpret a package at its declared context.
     pub fn open(package: &crate::options::PackageOptions) -> Result<Self, ResolveError> {
         let opened = package.open().map_err(|error| {
-            ResolveError::Artifact(ArtifactError::from_artifacts(error, &package.target))
+            ResolveError::Artifact(ArtifactError::from_artifacts(error, package.target()))
         })?;
         Self::interpret(opened, None, None)
     }
