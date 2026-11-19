@@ -3592,12 +3592,12 @@ mod tests {
 
     /// A committed removal is final whatever is left of its files: garbage that cannot be deleted
     /// now leaves the models gone, here and from every scan of the store (another process's
-    /// opening), and the repository's next holder deletes it once it can.
-    #[cfg(unix)]
+    /// opening), and the repository's next holder deletes it once it can. An entry that becomes
+    /// a non-empty directory once the removal has resolved its files cannot be deleted as a
+    /// file by any user, root included.
     #[tokio::test]
     async fn a_committed_removal_is_final_and_its_garbage_goes_with_the_repositorys_next_holder() {
         use magnitude_service_contracts::models::InstalledModelPackages as _;
-        use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
@@ -3611,10 +3611,20 @@ mod tests {
             installed_id(&manager, "owner/model", "a", "model.gguf").await,
             installed_id(&manager, "owner/model", "b", "model.gguf").await,
         ];
-        // The second snapshot's entry cannot be deleted.
+        // The second snapshot's entry cannot be deleted: it is replaced by a non-empty directory
+        // after the removal resolved it, before the commit.
         let snapshots = store.join("hub").join(hf_repo_dir("owner/model")).join("snapshots");
-        fs::set_permissions(snapshots.join("b"), fs::Permissions::from_mode(0o555)).unwrap();
-        manager.remove_installed_packages(&package_ids, alone()).await.expect("the removal commits");
+        let undeletable = snapshots.join("b/model.gguf");
+        let release = {
+            let undeletable = undeletable.clone();
+            Box::pin(async move {
+                fs::remove_file(&undeletable).unwrap();
+                fs::create_dir(&undeletable).unwrap();
+                fs::write(undeletable.join("kept"), b"kept").unwrap();
+                Ok::<(), InventoryError>(())
+            })
+        };
+        manager.remove_installed_packages(&package_ids, release).await.expect("the removal commits");
         assert!(snapshots.join("b/model.gguf").exists(), "what cannot be deleted is left");
         assert!(manager.list_installed().await.unwrap().packages.is_empty());
         for package_id in &package_ids {
@@ -3627,7 +3637,8 @@ mod tests {
         assert!(snapshots.join("b/model.gguf").exists());
         drop(reopened);
 
-        fs::set_permissions(snapshots.join("b"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&undeletable).unwrap();
+        fs::write(&undeletable, b"deletable").unwrap();
         let reopened = store_of(temporary.path(), &store, &installed).await;
         assert!(!snapshots.join("b/model.gguf").exists(), "the opening finishes the removal");
         assert!(reopened.list_installed().await.unwrap().packages.is_empty());
