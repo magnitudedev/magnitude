@@ -20,7 +20,7 @@ use crate::candidate_files::RecognizedArchitectures;
 use crate::identity::{content_id, inventory_entry_id};
 use crate::inventory::{
     ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, LinkedFiles, LocationScan,
-    ModelGroup, UnreadableDirectories, canonical_or_self, components_for_group, discover_groups,
+    ModelGroup, UnreadableDirectories, components_for_group, discover_groups,
     inspect_cached, io_error, modified_seconds, now, primary_path, read_dir_sorted,
     readable_entries, scan_hf_cache, split_shard_name,
 };
@@ -178,7 +178,7 @@ fn scan_lm_studio(
 ) -> Result<(), InventoryError> {
     for group in discover_groups(
         root,
-        &canonical_or_self(root),
+        root,
         LinkedFiles::Anywhere,
         cache,
         architectures,
@@ -256,7 +256,7 @@ fn scan_llama_cpp(
     };
     for group in discover_groups(
         root,
-        &canonical_or_self(root),
+        root,
         LinkedFiles::WithinRoot,
         cache,
         architectures,
@@ -706,7 +706,7 @@ fn scan_folder(
 ) -> Result<(), InventoryError> {
     for group in discover_groups(
         root,
-        &canonical_or_self(root),
+        root,
         LinkedFiles::Anywhere,
         cache,
         architectures,

@@ -28,9 +28,9 @@ use crate::catalog_affiliations::CatalogAffiliations;
 use crate::download::blob_key;
 use crate::gguf;
 use crate::hugging_face::HubCredential;
-use crate::identity::{content_id, fingerprint, inventory_entry_id};
+use crate::identity::{content_id, fingerprint, inventory_entry_id, stable_path};
 use crate::package_service::PrimaryEvidence;
-use crate::snapshot_blobs::{RepositoryBlob, RepositoryBlobs};
+use crate::snapshot_blobs::RepositoryBlobs;
 use crate::store_fs::ensure_store_layout;
 
 /// The failure code of a model whose files are in a format the engine can't read.
@@ -253,6 +253,10 @@ pub(crate) fn origin_precedence(origin: ModelPackageInstallationOrigin) -> u8 {
 /// supplies one at runtime: the model roots to scan, added models, hidden models and drafters.
 #[derive(Debug, Clone)]
 pub struct InventoryConfig {
+    /// The model store's root, as given. A store path is named under it by the store's layout
+    /// and only joined to it, never compared with a resolved path, which may reach the same file
+    /// through links or, on Windows, in the verbatim form: a comparison is between paths resolved
+    /// alike (`identity::stable_path`).
     pub root: PathBuf,
     pub cache_root: PathBuf,
     pub local_models: LocalModelsConfiguration,
@@ -842,7 +846,7 @@ impl ManagedModelStore {
                 .roots
                 .iter()
                 .filter(|root| !current.roots.contains(root))
-                .map(|root| canonical_or_self(&root.path))
+                .map(|root| stable_path(&root.path))
                 .collect::<BTreeSet<_>>();
             (
                 std::mem::replace(&mut *current, configuration.clone()),
@@ -1524,29 +1528,26 @@ fn scan(
     // Roots scan in precedence order, so the first occurrence of a path is the preferred one. A
     // root that cannot be read is skipped for this reconciliation rather than hiding every other
     // location's models; a directory inside a root that cannot be read is skipped and reported,
-    // rather than hiding the rest of its root.
-    let managed_hub = canonical_or_self(&config.root.join("hub"));
+    // rather than hiding the rest of its root. Each root is keyed by its path resolved once, so
+    // a link changed during the scan never splits one root's keys.
+    let managed_hub = stable_path(&config.root.join("hub"));
     let mut distinct = BTreeSet::new();
     let mut roots = local
         .roots
         .iter()
         .filter(|root| root.enabled)
-        .cloned()
+        .map(|root| ((root.kind, stable_path(&root.path)), root.clone()))
         .collect::<Vec<_>>();
-    roots.sort_by_key(|root| root.kind);
-    roots.retain(|root| {
-        let canonical = canonical_or_self(&root.path);
-        canonical != managed_hub && distinct.insert(canonical)
-    });
+    roots.sort_by_key(|((kind, _), _)| *kind);
+    roots.retain(|((_, resolved), _)| *resolved != managed_hub && distinct.insert(resolved.clone()));
     let mut root_scans = RootScans::new();
     let mut stale_roots = Vec::new();
-    for root in &roots {
-        let key = (root.kind, canonical_or_self(&root.path));
-        match scanned.reusable(&key, &config.root) {
+    for (key, root) in &roots {
+        match scanned.reusable(key, &config.root) {
             Some(scan) => {
-                root_scans.insert(key, scan.clone());
+                root_scans.insert(key.clone(), scan.clone());
             }
-            None => stale_roots.push(root.clone()),
+            None => stale_roots.push((key.clone(), root.clone())),
         }
     }
     let concurrency = config.scan_threads.get().min(8);
@@ -1554,7 +1555,7 @@ fn scan(
         let root_results = std::thread::scope(|scope| {
             roots
                 .iter()
-                .map(|root| {
+                .map(|(_, root)| {
                     let declared = &declared;
                     seismic_threads::spawn_scoped(scope, "inventory-scan", move || {
                         crate::local_roots::scan_root(
@@ -1568,7 +1569,7 @@ fn scan(
                 .collect::<Vec<_>>()
                 .into_iter()
                 .zip(roots)
-                .map(|(handle, root)| {
+                .map(|(handle, (_, root))| {
                     let result = handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     result.unwrap_or_else(|error| {
                         tracing::warn!(
@@ -1582,13 +1583,13 @@ fn scan(
                 })
                 .collect::<Vec<_>>()
         });
-        for (root, scan) in roots.iter().zip(root_results) {
-            root_scans.insert((root.kind, canonical_or_self(&root.path)), scan);
+        for ((key, _), scan) in roots.iter().zip(root_results) {
+            root_scans.insert(key.clone(), scan);
         }
     }
     let mut unreadable_directories = BTreeSet::new();
-    for root in &roots {
-        if let Some(scan) = root_scans.get(&(root.kind, canonical_or_self(&root.path))) {
+    for (key, root) in &roots {
+        if let Some(scan) = root_scans.get(key) {
             discovered.extend(scan.candidates.iter().cloned());
             unreadable_directories.extend(scan.unreadable.iter().map(|(path, detail)| {
                 UnreadableDirectory::of(root, path.clone(), detail.clone())
@@ -1617,8 +1618,7 @@ fn scan(
     let mut metadata_keys = BTreeMap::new();
     let mut stale = Vec::new();
     for candidate in discovered {
-        let path = candidate.primary_path().to_path_buf();
-        let canonical = path.canonicalize().unwrap_or(path);
+        let canonical = stable_path(candidate.primary_path());
         let path_is_distinct = match &candidate {
             DiscoveryCandidate::Artifact(candidate) => {
                 if matches!(candidate.location, ModelLocation::MagnitudeCache { .. }) {
@@ -2565,7 +2565,7 @@ pub(crate) fn discover_groups(
     let mut files = Vec::new();
     collect_gguf(
         root,
-        &canonical_or_self(containment_root),
+        &stable_path(containment_root),
         linked_files,
         0,
         &mut files,
@@ -2908,12 +2908,7 @@ fn broken_link_identity(path: &Path) -> Option<String> {
 
 fn file_identity(path: &Path, metadata: &fs::Metadata) -> String {
     let mut digest = Sha256::new();
-    digest.update(
-        path.canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .as_bytes(),
-    );
+    digest.update(stable_path(path).to_string_lossy().as_bytes());
     digest.update(metadata.len().to_le_bytes());
     if let Ok(modified) = metadata.modified()
         && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
@@ -2930,7 +2925,7 @@ fn content_identity_for_file(
 ) -> ContentIdentity {
     let blob = blobs.and_then(|blobs| blobs.resolve(path).ok().flatten());
     let in_blob_store = blob.is_some();
-    let name = blob.as_ref().and_then(RepositoryBlob::name);
+    let name = blob.as_ref().and_then(|blob| blob.name().to_str());
     if in_blob_store
         && let Some(value) = name.and_then(|value| value.strip_prefix("lfs-sha256-"))
         && value.len() == 64
@@ -2968,10 +2963,6 @@ pub(crate) fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub(crate) fn io_error(error: impl std::fmt::Display) -> InventoryError {
@@ -3601,12 +3592,12 @@ mod tests {
 
     /// A committed removal is final whatever is left of its files: garbage that cannot be deleted
     /// now leaves the models gone, here and from every scan of the store (another process's
-    /// opening), and the repository's next holder deletes it once it can.
-    #[cfg(unix)]
+    /// opening), and the repository's next holder deletes it once it can. An entry that becomes
+    /// a non-empty directory once the removal has resolved its files cannot be deleted as a
+    /// file by any user, root included.
     #[tokio::test]
     async fn a_committed_removal_is_final_and_its_garbage_goes_with_the_repositorys_next_holder() {
         use magnitude_service_contracts::models::InstalledModelPackages as _;
-        use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
@@ -3620,10 +3611,20 @@ mod tests {
             installed_id(&manager, "owner/model", "a", "model.gguf").await,
             installed_id(&manager, "owner/model", "b", "model.gguf").await,
         ];
-        // The second snapshot's entry cannot be deleted.
+        // The second snapshot's entry cannot be deleted: it is replaced by a non-empty directory
+        // after the removal resolved it, before the commit.
         let snapshots = store.join("hub").join(hf_repo_dir("owner/model")).join("snapshots");
-        fs::set_permissions(snapshots.join("b"), fs::Permissions::from_mode(0o555)).unwrap();
-        manager.remove_installed_packages(&package_ids, alone()).await.expect("the removal commits");
+        let undeletable = snapshots.join("b/model.gguf");
+        let release = {
+            let undeletable = undeletable.clone();
+            Box::pin(async move {
+                fs::remove_file(&undeletable).unwrap();
+                fs::create_dir(&undeletable).unwrap();
+                fs::write(undeletable.join("kept"), b"kept").unwrap();
+                Ok::<(), InventoryError>(())
+            })
+        };
+        manager.remove_installed_packages(&package_ids, release).await.expect("the removal commits");
         assert!(snapshots.join("b/model.gguf").exists(), "what cannot be deleted is left");
         assert!(manager.list_installed().await.unwrap().packages.is_empty());
         for package_id in &package_ids {
@@ -3636,7 +3637,8 @@ mod tests {
         assert!(snapshots.join("b/model.gguf").exists());
         drop(reopened);
 
-        fs::set_permissions(snapshots.join("b"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&undeletable).unwrap();
+        fs::write(&undeletable, b"deletable").unwrap();
         let reopened = store_of(temporary.path(), &store, &installed).await;
         assert!(!snapshots.join("b/model.gguf").exists(), "the opening finishes the removal");
         assert!(reopened.list_installed().await.unwrap().packages.is_empty());

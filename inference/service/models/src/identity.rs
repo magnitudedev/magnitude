@@ -3,11 +3,13 @@ use std::path::{Path, PathBuf};
 use magnitude_service_contracts::{ContentId, ContentIdentity, InventoryEntryId, ModelComponent};
 use sha2::{Digest, Sha256};
 
-/// Canonicalize the deepest existing ancestor and append the rest, so a location has the same
-/// identity before and after it is created (for example, a snapshot that is published only
-/// after its entry id is assigned).
-fn stable_location(location: &Path) -> PathBuf {
-    let mut existing = location;
+/// The one resolved form of a path, which the crate identifies and compares paths in: its deepest
+/// existing ancestor canonicalized (verbatim on Windows, `\\?\C:\…`, as every canonical path
+/// there), with the rest appended. A location so has the same form before and after it is created
+/// (a snapshot published only after its entry id is assigned, a configured location not made
+/// yet), and as watch events name it.
+pub(crate) fn stable_path(path: &Path) -> PathBuf {
+    let mut existing = path;
     let mut missing = Vec::new();
     loop {
         if let Ok(canonical) = existing.canonicalize() {
@@ -21,7 +23,7 @@ fn stable_location(location: &Path) -> PathBuf {
                 missing.push(name);
                 existing = parent;
             }
-            _ => return location.to_path_buf(),
+            _ => return path.to_path_buf(),
         }
     }
 }
@@ -31,7 +33,7 @@ pub fn inventory_entry_id(
     source_location: &Path,
     content_id: &ContentId,
 ) -> InventoryEntryId {
-    let canonical = stable_location(source_location);
+    let canonical = stable_path(source_location);
     let mut digest = Sha256::new();
     digest.update(b"magnitude-model-id-v1\0");
     digest.update(source_kind.as_bytes());

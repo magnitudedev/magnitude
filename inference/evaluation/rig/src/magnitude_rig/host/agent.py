@@ -1525,7 +1525,7 @@ class Runner:
         # What the current build's cargo steps reference (None before its first), and whether one
         # left it unknown (`_units`).
         self.units, self.unknown = None, False
-        self.tests = []  # the test executables the current build's cargo steps produced: (executable, manifest, target, kind)
+        self.tests = []  # the test executables the current build's cargo steps produced, resolved: (executable, manifest, target, kind)
         self.scripts = {}  # its build scripts' executables, by package id
         self.build_scripts = {}  # its build scripts' executables, by the output directory each run wrote
         self.outputs = {}  # side -> its build output's directory
@@ -1608,14 +1608,13 @@ class Runner:
         target, into = os.path.realpath(os.path.join(checkout, "target")), os.path.join(output, "target")
         staged = os.path.join(output, ".target.%d" % os.getpid())
         os.makedirs(staged)
-        tests = [(os.path.realpath(path), manifest, name, kind) for path, manifest, name, kind in tests]
         with open(proven) as stream:
             executables = set(json.load(stream)["kept"]) | {path for path, *_ in tests}
         for path in executables:
             relative = os.path.relpath(path, target)
             os.makedirs(os.path.dirname(os.path.join(staged, relative)), exist_ok=True)
             os.link(path, os.path.join(staged, relative))
-        source = os.path.join(checkout, "src")
+        source = os.path.realpath(os.path.join(checkout, "src"))
         listed = []
         for path, manifest, name, kind in tests:
             package = os.path.relpath(os.path.dirname(manifest), source)
@@ -1661,7 +1660,9 @@ class Runner:
                     self.scripts[message["package_id"]] = message["filenames"][0]
                 if message.get("executable") and message["profile"]["test"]:
                     target = message["target"]
-                    self.tests.append((message["executable"], message["manifest_path"], target["name"],
+                    # Resolved here, on the host they belong to: the controller reads them as they are.
+                    self.tests.append((os.path.realpath(message["executable"]),
+                                       os.path.realpath(message["manifest_path"]), target["name"],
                                        target_kind(target["kind"])))
             elif message.get("reason") == "build-script-executed":
                 paths.append(message["out_dir"])

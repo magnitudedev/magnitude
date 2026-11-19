@@ -149,12 +149,16 @@ def rows(results_dir: Path, job: Path, backend: str, configuration: str, doc: di
 
 def built(results_dir: Path, proof: dict) -> dict[str, str]:
     """The test executables a run's build produced (`TESTS`, as the agent wrote them), by key:
-    their file names."""
+    their file names. Their paths and the proof's roots are the host's, resolved there: they are
+    compared as written, never resolved against this machine's file system."""
     tests = json.loads((results_dir / TESTS.format(side="source")).read_text())["tests"]
     found = {}
     for path, manifest, name, kind in tests:
-        directory = os.path.realpath(os.path.dirname(manifest))
-        root = next(root for root in proof["roots"] if directory == root or directory.startswith(root + os.sep))
+        directory = os.path.dirname(manifest)
+        root = next((root for root in proof["roots"] if directory == root or directory.startswith(root + os.sep)), None)
+        if root is None:
+            raise AssertionError(f"invariant violated: test manifest {manifest} of {results_dir.name} "
+                                 f"is outside every source root {proof['roots']}")
         found[binary_key(os.path.relpath(directory, root), kind, name)] = os.path.basename(path)
     return found
 

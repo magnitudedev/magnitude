@@ -9,6 +9,7 @@ use magnitude_service_contracts::models::{
 };
 use notify::{EventKind, RecursiveMode, Watcher};
 
+use crate::identity::stable_path;
 use crate::local_roots::is_partial_download;
 
 /// How long a location must be quiet before a change is reconciled.
@@ -73,28 +74,6 @@ fn existing_target(path: &Path, recursive: bool) -> Option<WatchTarget> {
             recursive: false,
             interest,
         })
-}
-
-/// The canonical form of the deepest existing ancestor with the rest appended, which is how
-/// watch events name paths.
-fn stable_path(path: &Path) -> PathBuf {
-    let mut missing = Vec::new();
-    let mut existing = path;
-    loop {
-        if let Ok(canonical) = existing.canonicalize() {
-            return missing
-                .iter()
-                .rev()
-                .fold(canonical, |path, component| path.join(component));
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name);
-                existing = parent;
-            }
-            _ => return path.to_path_buf(),
-        }
-    }
 }
 
 /// Where an event happened, as `stable_path` names it but without following the path itself: a

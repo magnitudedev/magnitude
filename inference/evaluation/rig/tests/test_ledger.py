@@ -145,6 +145,26 @@ def test_outcomes_libtest_did_not_count_are_unreadable(results):
     assert not judged.ok and any(line.startswith("UNREADABLE: k:test:routed") for line in judged.lines)
 
 
+def test_a_hosts_paths_are_read_as_written_never_resolved_here(tmp_path):
+    """A host's test manifests and source roots are the host's, resolved there: where this machine
+    resolves the same path elsewhere (macOS's `/home` link), they still key the executable, and a
+    manifest outside every root is an invariant violation naming both."""
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "home").symlink_to(tmp_path / "elsewhere")
+    root = str(tmp_path / "home" / "src")
+    directory = tmp_path / "r1"
+    directory.mkdir()
+
+    def built(manifest: str) -> dict:
+        (directory / engine.TESTS.format(side="source")).write_text(json.dumps(
+            {"tests": [["/host/target/debug/deps/k-0123", manifest, "k", "lib"]], "build_scripts": {}}))
+        return ledger.built(directory, {"roots": [root]})
+
+    assert built(f"{root}/service/k/Cargo.toml") == {ledger.binary_key("service/k", "lib", "k"): "k-0123"}
+    with pytest.raises(AssertionError, match=r"/elsewhere/k/Cargo\.toml .*outside every source root"):
+        built(str(tmp_path / "elsewhere" / "k" / "Cargo.toml"))
+
+
 def test_stale_is_what_no_row_at_the_trees_sources_credits(results, tmp_path):
     """At the sources of a row, a test no row there credits (passed or outside the backend, on its
     hardware, in the configuration; a host test passed anywhere) is stale, ignored ones aside; one

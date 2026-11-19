@@ -1851,13 +1851,11 @@ async fn publish_snapshot_link(
     component: &ModelComponent,
 ) -> Result<(), DownloadError> {
     let destination = snapshot.join(&component.path);
-    if let Some(parent) = destination.parent() {
-        let relative = parent.strip_prefix(snapshot).map_err(download_io)?;
-        let mut current = snapshot.to_path_buf();
-        for component in relative.components() {
-            current.push(component.as_os_str());
-            ensure_owned_directory(&current).await?;
-        }
+    // A validated component path is relative, without `..`: its directories are the snapshot's.
+    let mut current = snapshot.to_path_buf();
+    for directory in component.path.parent().into_iter().flat_map(Path::components) {
+        current.push(directory);
+        ensure_owned_directory(&current).await?;
     }
     let blob = repo_root.join("blobs").join(blob_key(&component.content));
     let blob_metadata = tokio::fs::symlink_metadata(&blob)
