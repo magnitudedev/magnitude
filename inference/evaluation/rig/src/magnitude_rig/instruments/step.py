@@ -303,6 +303,9 @@ PAGE_FIELDS = ("expert_pages",)
 GROUP_FIELDS = ("layers", "groups", "sizes", "steps", "measured_ms", "bar_ms", "ratio", "bar_terms", "ceilings",
                 "achieved")
 LAYER_FIELDS = ("union", "conveyed", "pulled", "seeded", "parked_ms")
+CEILING_FIELDS = ("convert_us_per_record", "link_bytes_per_second")
+TERM_FIELDS = ("read_ms", "resident_ms", "convert_ms", "link_ms")
+ACHIEVED_FIELDS = ("convert_ms", "copy_ms", "copy_us_per_record")
 
 
 def _unmeasured(result: JobResult, *decode: str) -> str | None:
@@ -370,6 +373,11 @@ def _group(group: dict | None) -> list[str]:
         return ["  prompt groups: none (the prompt did not run whole in groups)"]
     missing = lacking(group, *GROUP_FIELDS) or sorted(
         {path for layer in group["layers"] for path in lacking(layer, *LAYER_FIELDS)}
+        | {f"ceilings.{path}" for path in lacking(group["ceilings"], *CEILING_FIELDS)}
+        | (set() if group["bar_terms"] is None else
+           {f"bar_terms.{path}" for path in lacking(group["bar_terms"], *TERM_FIELDS)})
+        | (set() if _unavailable(group["achieved"]) else
+           {f"achieved.{path}" for path in lacking(group["achieved"], *ACHIEVED_FIELDS)})
     )
     if missing:
         return [unrecorded("prompt groups", missing)]
