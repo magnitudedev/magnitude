@@ -134,6 +134,25 @@ The CPU backend is always available as the fallback.
 - **Results are identical across subgroup widths:** fixed-order reductions give identical
   results on 32- and 64-wide hardware.
 
+### Driver defects
+
+Drivers that meet the floor and still fail on a valid module. Each defect has a shape the kernels
+avoid, and formation refuses that shape where it can be recognised.
+
+- **NVIDIA 580 (GB10 on 580.159.03, Ada on 580.95.05), `seismic_sqrt_rn`'s digit steps as a
+  loop.** On Ada the numerics oracle's kernel with this loop hung the GPU (utilization 100%, no
+  completion in 38 minutes). On GB10 the restoring square root's 28 steps of 64-bit selects,
+  written as a constant-count loop (rolled or left to the driver), computed every odd exponent
+  as though the preceding parity shift were absent
+  (`sqrt(1)` gave `sqrt(2)`, 40820 of the oracle's 65537 cases), in the numerics oracle's kernel
+  (`abi/vulkan.rs`) with or without its early return. The same function inlined into another
+  kernel computed correctly, and the same steps unrolled (by `[[unroll]]` or written out)
+  computed correctly in the failing kernel. The shipped SPIR-V is correct. A neighbouring shape
+  computed correctly there: `seismic_narrow_divide`'s 32 steps of 64-bit selects as a kept
+  loop, and a constant-count loop of 32-bit selects. The prelude writes the steps
+  straight-line. Formation does not recognise the shape: no class is established beyond this
+  loop, so the oracle test on GB10 guards it.
+
 ### Optional tiers
 
 - **fp16 arithmetic,** together with fp16 round-to-nearest-even and preservation.

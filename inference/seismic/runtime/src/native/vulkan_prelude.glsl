@@ -418,6 +418,16 @@ float seismic_div_rn(float a, float b) {
     return seismic_div_core(a, b, q0);
 }
 
+// One digit step of `seismic_sqrt_rn`'s restoring square root, and four.
+#define SEISMIC_SQRT_STEP \
+    { \
+        const uint64_t trial = root + one; \
+        const bool take = rest >= trial; \
+        rest -= take ? trial : 0ul; \
+        root = (root >> 1) + (take ? one : 0ul); \
+        one >>= 2; \
+    }
+#define SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEP SEISMIC_SQRT_STEP SEISMIC_SQRT_STEP SEISMIC_SQRT_STEP
 float seismic_sqrt_rn(float x) {
     const uint bits = floatBitsToUint(x);
     if (isnan(x) || (x < 0.0))
@@ -428,23 +438,20 @@ float seismic_sqrt_rn(float x) {
     const uint significand = seismic_normalize(bits, exponent);
     // x = significand * 2^(exponent - 23) = M * 2^t with t even.
     int t = exponent - 23 - 30;
-    uint64_t m = uint64_t(significand) << 30;
-    if ((t & 1) != 0) {
-        m <<= 1;
-        t -= 1;
-    }
-    uint64_t rest = m, root = 0ul, one = 1ul << 62;
-    while (one > rest)
-        one >>= 2;
-    while (one != 0ul) {
-        if (rest >= root + one) {
-            rest -= root + one;
-            root = (root >> 1) + one;
-        } else {
-            root >>= 1;
-        }
-        one >>= 2;
-    }
+    // An odd t moves one factor of two into m.
+    const int odd = t & 1;
+    uint64_t m = uint64_t(significand) << (30 + odd);
+    t -= odd;
+    // m lies in [2^53, 2^55), so its leading power of four is at most 2^54:
+    // 28 digit steps from there (a leading step above the operand leaves the
+    // root 0). Each step's conditional subtraction is selects, not a branch
+    // (NVIDIA's 580 compiler crashes on a 64-bit subtraction under a 64-bit
+    // compare). The steps are straight-line, not a loop: on the loop form
+    // NVIDIA's 580 drivers computed odd exponents wrongly (GB10) or hung
+    // (Ada) (docs/compatibility.md, "Driver defects").
+    uint64_t rest = m, root = 0ul, one = 1ul << 54;
+    SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4
+    SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4 SEISMIC_SQRT_STEPS4
     bool sticky = rest != 0ul;
     int biased = 26 + t / 2 + 127;
     if (root >= (1ul << 27)) {
@@ -454,6 +461,8 @@ float seismic_sqrt_rn(float x) {
     }
     return seismic_round_pack(0u, biased, uint(root), sticky);
 }
+#undef SEISMIC_SQRT_STEPS4
+#undef SEISMIC_SQRT_STEP
 
 // Hardware approximations. Not correctly rounded: admitted only where an
 // entry's precision gate allows them. Their divisions are `seismic_div_rn`,
