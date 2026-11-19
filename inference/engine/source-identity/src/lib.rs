@@ -360,18 +360,13 @@ fn read_lock(path: &Path) -> Vec<Locked> {
     packages
 }
 
-/// Whether `path` is a build source: what a crate compiles, includes or
-/// generates code from. Hidden files (editor state, Finder metadata) are not.
+/// Whether `path` is a build source: every file of a package directory the
+/// walk reaches, whatever kind of input it is (a crate reads declaration
+/// files, fixtures and data as well as code), except hidden ones (editor
+/// state, Finder metadata). A file that builds nothing costs only a cache miss
+/// when it changes; one left out reuses what its change made stale.
 fn is_build_source(path: &Path) -> bool {
-    let hidden = path.file_name().and_then(|name| name.to_str()).is_none_or(|name| name.starts_with('.'));
-    !hidden
-        && matches!(
-            path.extension().and_then(|extension| extension.to_str()),
-            Some(
-                "rs" | "toml" | "seismic" | "metal" | "cu" | "cuh" | "glsl" | "comp" | "h" | "hpp" | "c"
-                    | "cc" | "cpp"
-            )
-        )
+    path.file_name().and_then(|name| name.to_str()).is_some_and(|name| !name.starts_with('.'))
 }
 
 /// Cargo's directories of development-only targets, which build no part of
@@ -379,13 +374,15 @@ fn is_build_source(path: &Path) -> bool {
 const DEVELOPMENT_TARGETS: [&str; 3] = ["tests", "benches", "examples"];
 
 /// Whether the walk leaves out the directory `path` of `package`: a hidden
-/// directory, build output, the package's development-only target
+/// directory, build output (Cargo's, and the bytecode Python writes beside a
+/// package's Python sources), the package's development-only target
 /// directories, and another package nested in this one's directory (its own
 /// closure membership decides whether it counts).
 fn excluded(package: &Path, path: &Path) -> bool {
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
     name.starts_with('.')
         || name == "target"
+        || name == "__pycache__"
         || (path.parent() == Some(package) && DEVELOPMENT_TARGETS.contains(&name))
         || (path != package && path.join("Cargo.toml").is_file())
 }
@@ -490,6 +487,47 @@ mod tests {
         assert!(linux.selects(r#"cfg(any(windows, target_family = "unix"))"#));
         assert!(linux.selects(r#"cfg(not(target_os = "macos"))"#));
         assert!(!macos().selects(r#"cfg(not(target_os = "macos"))"#));
+    }
+
+    /// Every file of a package's directory is a source, whatever its kind (a
+    /// declaration file the checker reads changes the kernels as code does),
+    /// except hidden files and what the walk leaves out: build output, Python's
+    /// bytecode, development-only targets and nested packages.
+    #[test]
+    fn a_package_reads_every_kind_of_file_as_a_source() {
+        let package = std::env::temp_dir().join(format!("source-identity-{}", std::process::id()));
+        let write = |relative: &str| {
+            let path = package.join(relative);
+            std::fs::create_dir_all(path.parent().expect("a file lies in a directory")).expect("a directory");
+            std::fs::write(&path, relative).expect("a file");
+        };
+        for relative in [
+            "Cargo.toml",
+            "src/lib.rs",
+            "native-library/cpu/producers.decl",
+            "fixtures/data.bin",
+            "src/.DS_Store",
+            ".hidden/kept.rs",
+            "target/debug/out.rs",
+            "python/__pycache__/module.cpython-312.pyc",
+            "tests/check.rs",
+            "nested/Cargo.toml",
+            "nested/src/lib.rs",
+        ] {
+            write(relative);
+        }
+        let mut files = Vec::new();
+        collect(&package, &package, &mut files);
+        let found = files
+            .iter()
+            .map(|path| path.strip_prefix(&package).expect("under the package").to_owned())
+            .collect::<BTreeSet<_>>();
+        std::fs::remove_dir_all(&package).expect("removing the package");
+        let expected = ["Cargo.toml", "fixtures/data.bin", "native-library/cpu/producers.decl", "src/lib.rs"]
+            .map(PathBuf::from)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(found, expected);
     }
 
     /// The workspace's own manifests and lockfile, read without a registry.
