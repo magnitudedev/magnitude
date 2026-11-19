@@ -32,8 +32,7 @@ const PackageFields = {
 const DebianOptions = Schema.Struct({ options: Schema.Struct({ ...PackageFields, compression: Schema.Literal("none"), depends: Schema.Array(Schema.String), scripts: Schema.Record({ key: Schema.String, value: Schema.String }) }) })
 const RpmOptions = Schema.Struct({ options: Schema.Struct({ ...PackageFields, requires: Schema.Array(Schema.String), license: Schema.String, specTemplate: Schema.String }) })
 
-/** `%u` passes an opened `magnitude://` link, which the MIME type routes here. */
-export const linuxDesktopEntry = `[Desktop Entry]\nName=Magnitude\nComment=Discover and run local models\nExec=${LINUX_DESKTOP_PACKAGE_NAME} %u\nIcon=${LINUX_DESKTOP_PACKAGE_NAME}\nType=Application\nTerminal=false\nStartupNotify=true\nStartupWMClass=${LINUX_DESKTOP_PACKAGE_NAME}\nCategories=Development;\nMimeType=x-scheme-handler/magnitude;\n`
+export const linuxDesktopEntry = `[Desktop Entry]\nName=Magnitude\nComment=Discover and run local models\nExec=${LINUX_DESKTOP_PACKAGE_NAME}\nIcon=${LINUX_DESKTOP_PACKAGE_NAME}\nType=Application\nTerminal=false\nStartupNotify=true\nStartupWMClass=${LINUX_DESKTOP_PACKAGE_NAME}\nCategories=Development;\n`
 const packageDescription = "Discover and run local models"
 const packageMaintainer = "Magnitude <founders@magnitude.dev>"
 const packageHomepage = "https://magnitude.dev"

@@ -48,10 +48,10 @@ describe("Linux package publisher-trust protection", () => {
 })
 
 describe("Linux desktop entry", () => {
-  it("handles magnitude:// links and passes the link to the launcher", () => {
+  it("starts the launcher and handles no link scheme", () => {
     const lines = linuxDesktopEntry.split("\n")
-    expect(lines).toContain("Exec=magnitude-desktop %u")
-    expect(lines).toContain("MimeType=x-scheme-handler/magnitude;")
+    expect(lines).toContain("Exec=magnitude-desktop")
+    expect(lines.some(line => line.startsWith("MimeType="))).toBe(false)
   })
   it("refreshes the desktop database after an RPM installs or removes the entry", () => {
     const spec = readFileSync(join(import.meta.dirname, "../../resources/linux/desktop.spec.ejs"), "utf8")

@@ -41,8 +41,7 @@ export const desktopPackagerOptions = (options: {
     buildVersion: platform === "win32" ? `${options.version.split(/[+-]/)[0]}.${options.revision}` : String(options.revision),
     ...(platform === "win32" ? { icon: join(root, "packages/release/resources/windows/Magnitude.ico"),
       win32metadata: { CompanyName: "Magnitude", ProductName: "Magnitude", FileDescription: "Magnitude", InternalName: "Magnitude", OriginalFilename: "Magnitude.exe" } } : {}),
-    ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET },
-      protocols: [{ name: "Magnitude", schemes: ["magnitude"] }] } : {}),
+    ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET } } : {}),
     asar: true, prune: false, overwrite: true,
     extraResource: [...options.extraResource],
   }

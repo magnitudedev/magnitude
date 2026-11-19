@@ -7,10 +7,10 @@ import { HostNoticeStack } from "./host-notices"
 const zLayers = (text: string) => [...text.matchAll(/\bz-(?:(\d+)|\[(\d+)\])/g)].map(match => Number(match[1] ?? match[2]))
 
 describe("host notices", () => {
-  const notice = { title: "Magnitude can’t open this link", description: "The link has an unknown parameter: x" }
-  it("layer above every dialog layer, so an invalid magnitude:// link notice isn't hidden under the Add dialog", () => {
+  const notice = { title: "Couldn’t install the command-line tool", description: "Magnitude couldn’t register its terminal command." }
+  it("layer above every dialog layer, so a notice isn't hidden under the Add dialog", () => {
     const html = renderToStaticMarkup(<HostNoticeStack notices={[notice]} onDismiss={() => {}} />)
-    expect(html).toContain("Magnitude can’t open this link")
+    expect(html).toContain("Couldn’t install the command-line tool")
     expect(html).toContain("Dismiss")
     const stack = html.match(/<div data-host-notices=""[^>]*>/)?.[0] ?? ""
     expect(stack).toContain("fixed")

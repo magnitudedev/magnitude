@@ -13,10 +13,6 @@ export const HostAction = Schema.Union(
   Schema.TaggedStruct("StopModel", {}),
   Schema.TaggedStruct("ShowNotice", { notice: HostNotice }),
   Schema.TaggedStruct("QuitFailed", {}),
-  Schema.TaggedStruct("OpenHuggingFaceModel", {
-    repository: HuggingFaceRepositoryIdSchema,
-    file: Schema.optionalWith(HuggingFaceArtifactSelectorSchema, { as: "Option", exact: true }),
-  }),
 )
 export type HostAction = typeof HostAction.Type
 /** What the Add model dialog opens on: a Hugging Face repository (optionally one file in it), or a search. */

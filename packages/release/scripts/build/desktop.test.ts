@@ -7,10 +7,7 @@ const options = (platform: "darwin" | "linux" | "win32") => desktopPackagerOptio
 })
 
 describe("desktop packaging", () => {
-  it("registers magnitude:// links in the macOS bundle", () => {
-    expect(options("darwin").protocols).toEqual([{ name: "Magnitude", schemes: ["magnitude"] }])
-  })
-  it.each(["linux", "win32"] as const)("leaves %s link registration to its installer", platform => {
+  it.each(["darwin", "linux", "win32"] as const)("registers no link scheme on %s", platform => {
     expect(options(platform).protocols).toBeUndefined()
   })
   it("keeps the bundle identity and versions", () => {

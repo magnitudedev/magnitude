@@ -54,8 +54,6 @@ import { resolveHarnessEnvironment } from "@magnitudedev/harness-connections"
 import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { MAGNITUDE_VERSION } from "@magnitudedev/version"
 import { desktopLogLayer } from "./desktop-log"
-import { deepLinkArgument, isDeepLinkArgument, parseDeepLink } from "./deep-link"
-import { registerDevelopmentProtocolClient } from "./protocol-registration"
 
 app.setName("Magnitude")
 if (process.platform === "win32") app.setAppUserModelId(WINDOWS_APPLICATION_ID)
@@ -89,13 +87,6 @@ app.on("before-quit", event => { if (!exiting) { event.preventDefault(); request
 // OS-requested termination must retire the owned service before Electron exits.
 if (process.platform !== "win32") process.on("SIGTERM", () => requestQuit())
 app.on("window-all-closed", () => {})
-// Windows and Linux pass a `magnitude://` link to a new launch; macOS delivers it as an event, even at
-// cold start, before the app is ready. A link received before the owner can open it waits, like
-// the requested page.
-const launchLink = deepLinkArgument(process.argv)
-let pendingLink = launchLink
-let receiveLink: (url: string) => void = url => { pendingLink = Option.some(url) }
-app.on("open-url", (event, url) => { event.preventDefault(); receiveLink(url) })
 const program = Effect.scoped(Effect.gen(function* () {
   const native = yield* NativeHost
   if (process.platform === "linux" && app.isPackaged) yield* adoptLinuxInstallationLease(addonPath)
@@ -106,10 +97,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const stateDir = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, override: Option.fromNullable(stateOverride) })
   yield* Effect.promise(() => app.whenReady())
   yield* Effect.sync(() => handleAppProtocol(resolveRendererDir(here)))
-  const owner = yield* acquireApplicationOwner(stateDir, { _tag: "Desktop", intent: Option.match(launchLink, {
-    onNone: () => background ? "EnsureRunning" as const : "ShowWindow" as const,
-    onSome: url => ({ _tag: "OpenUrl" as const, url }),
-  }) })
+  const owner = yield* acquireApplicationOwner(stateDir, { _tag: "Desktop", intent: background ? "EnsureRunning" : "ShowWindow" })
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }
   if (yield* isUpdateInstallationActive(stateDir)) return "Quit" as const
   if (app.isPackaged && !isolatedProfile) yield* absorbStandaloneInstallation({ home: homedir(), platform: process.platform }).pipe(Effect.provide(NodeContext.layer))
@@ -297,17 +285,6 @@ const program = Effect.scoped(Effect.gen(function* () {
     // Raising the retained window must preserve the renderer's current page.
     if (page !== undefined) yield* hostActions.navigate(page)
   })))
-  /** Links are validated again here: a forwarded one comes from another process. */
-  const openLink = (url: string) => Either.match(parseDeepLink(url), {
-    onLeft: error => Effect.logWarning(`Ignored link: ${error.message}`).pipe(
-      Effect.zipRight(show()),
-      Effect.zipRight(showNotice({ title: "Couldn’t open this link", description: error.message }))),
-    onRight: link => Effect.gen(function* () {
-      const action = { _tag: "OpenHuggingFaceModel" as const, repository: link.repository, file: link.file }
-      yield* show("models")
-      yield* hostActions.openModel(action)
-    }),
-  })
   const tray = Context.get(yield* Layer.build(TrayOwnerLive.pipe(Layer.provide(nativeTray))), TrayOwner)
   const refreshTray = Effect.gen(function* () {
     const current = yield* Ref.get(state)
@@ -368,7 +345,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     if (action === "discard") yield* updates.discard
     if (action === "install") yield* updates.requireReady
     return { state: yield* updates.state, afterReply: action === "install" ? Queue.offer(quit, "RestartUpdate").pipe(Effect.asVoid) : Effect.void }
-  }).pipe(Effect.mapError(error => new ApplicationUpdateControlFailed({ message: error.message }))), login: action => action === "read" ? loginStartup.read : loginStartup.set(action === "enable"), dispatch: intent => typeof intent === "object" ? openLink(intent.url) : intent === "Quit" ? Queue.offer(quit, "Quit").pipe(Effect.asVoid) : intent === "ShowWindow" ? show() : intent === "Retry" ? service.retry : Effect.void }
+  }).pipe(Effect.mapError(error => new ApplicationUpdateControlFailed({ message: error.message }))), login: action => action === "read" ? loginStartup.read : loginStartup.set(action === "enable"), dispatch: intent => intent === "Quit" ? Queue.offer(quit, "Quit").pipe(Effect.asVoid) : intent === "ShowWindow" ? show() : intent === "Retry" ? service.retry : Effect.void }
   if (process.platform === "win32") {
     const name = yield* Schema.decodeUnknown(WindowsPipeName)(owner.socketPath)
     yield* serveWindowsApplicationControl(name, control).pipe(Effect.provide(nativeWindowsPrivatePipesLayer(addonPath)))
@@ -453,9 +430,6 @@ const program = Effect.scoped(Effect.gen(function* () {
   const activate = () => run(show())
   app.on("activate", activate)
   yield* Effect.addFinalizer(() => Effect.sync(() => app.removeListener("activate", activate)))
-  receiveLink = url => run(openLink(url))
-  if (Option.isSome(pendingLink)) yield* openLink(pendingLink.value)
-  if (!app.isPackaged) yield* registerDevelopmentProtocolClient({ app, platform: process.platform, environment: process.env, argv: process.argv })
   if (wantsWindow) yield* show()
   if (cliLink && wantsWindow && !startupUpdateDeferred) yield* installCli.pipe(
     Effect.catchAll(error => Effect.logWarning("Could not install the magnitude command", error.message)),
@@ -492,9 +466,8 @@ Effect.runPromiseExit(program.pipe(
     if (intent === "Relaunch") {
       // The renderer dev server dies with this process; its supervising script performs the relaunch.
       if (rendererServedByDevServer(process.env)) { app.exit(developmentRelaunchExitCode({ showWindow: reopenAfterUpdate })); return }
-      // `args` replaces the argument list, so keep the original ones (the app directory in development),
-      // except a link the launch already opened.
-      const args = [...process.argv.slice(1).filter(argument => argument !== "--background" && !isDeepLinkArgument(argument)), ...(reopenAfterUpdate ? [] : ["--background"])]
+      // `args` replaces the argument list, so keep the original ones (the app directory in development).
+      const args = [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])]
       // The packaged Linux app must start through its launcher, which passes the installation admission it adopts,
       // and without Electron's relauncher, whose no-new-privileges flag leaves Chromium without a sandbox.
       if (process.platform === "linux" && app.isPackaged) relaunchLinuxPackage(LINUX_DESKTOP_EXECUTABLE_PATH, args)

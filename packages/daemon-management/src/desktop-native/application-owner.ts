@@ -3,7 +3,6 @@ import { dirname, join } from "node:path"
 import { Effect, Option, Schema } from "effect"
 import { NativeHost } from "./index"
 import { DataFolderUnusable, requestApplication } from "./application-control"
-import { ApplicationOpenUrl } from "@magnitudedev/sdk/desktop-host"
 import { isUpdateInstallationActive } from "./update-installation-lease"
 
 export class ApplicationOwnershipFailed extends Schema.TaggedError<ApplicationOwnershipFailed>()("ApplicationOwnershipFailed", { message: Schema.String }) {}
@@ -25,7 +24,7 @@ const applicationAlreadyRunning = (directory: string) => Effect.gen(function* ()
   }) })
 })
 export const ApplicationOwnerRequest = Schema.Union(
-  Schema.TaggedStruct("Desktop", { intent: Schema.Union(Schema.Literal("EnsureRunning", "ShowWindow"), ApplicationOpenUrl) }),
+  Schema.TaggedStruct("Desktop", { intent: Schema.Literal("EnsureRunning", "ShowWindow") }),
   Schema.TaggedStruct("Headless", {}),
 )
 export type ApplicationOwnerRequest = typeof ApplicationOwnerRequest.Type

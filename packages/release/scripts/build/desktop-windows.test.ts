@@ -50,19 +50,15 @@ describe("Windows installer file contract", () => {
   })
 })
 
-describe("Windows installer link handler", () => {
+describe("Windows installer link registration", () => {
   const script = Effect.runSync(renderWindowsInstaller(readFileSync(join(import.meta.dirname, "../../resources/windows/desktop.nsi"), "utf8"), input))
   const install = script.slice(script.indexOf('Section "Magnitude"'), script.indexOf("SectionEnd"))
   const uninstall = script.slice(script.indexOf('Section "Uninstall"'))
-  it("registers magnitude:// for the current user on every installation and update", () => {
-    expect(script).toContain('!define PROTOCOLKEY "Software\\Classes\\magnitude"')
+  it("registers no magnitude:// handler, and removes an earlier version's only while it names this installation", () => {
+    expect(script).not.toContain('WriteRegStr HKCU "${PROTOCOLKEY}"')
     const registration = install.slice(install.indexOf("installed:"))
-    expect(registration).toContain('WriteRegStr HKCU "${PROTOCOLKEY}" "URL Protocol" ""')
-    expect(registration).toContain(`WriteRegStr HKCU "\${PROTOCOLKEY}\\shell\\open\\command" "" '"$INSTDIR\\Magnitude.exe" "%1"'`)
-  })
-  it("removes the handler on uninstall only while it names this installation", () => {
-    expect(uninstall).toContain(`\${If} $9 == '"$INSTDIR\\Magnitude.exe" "%1"'\n    DeleteRegKey HKCU "\${PROTOCOLKEY}"`)
-    expect(install).not.toContain("DeleteRegKey")
+    expect(registration).toContain(`\${If} $9 == '"$INSTDIR\\Magnitude.exe" "%1"'\n    DeleteRegKey HKCU "\${PROTOCOLKEY}"`)
+    expect(uninstall).not.toContain("PROTOCOLKEY")
   })
 })
 

@@ -27,9 +27,7 @@ export const OwnedServiceState = Schema.Union(Starting, Ready, Failed, CleanupFa
 export type OwnedServiceState = typeof OwnedServiceState.Type
 
 /** A `magnitude://` link handed to a later launch, forwarded to the owner, which validates it again. */
-export const ApplicationOpenUrl = Schema.TaggedStruct("OpenUrl", { url: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(4096)) })
-export type ApplicationOpenUrl = typeof ApplicationOpenUrl.Type
-export const ApplicationIntent = Schema.Union(Schema.Literal("EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield"), ApplicationOpenUrl)
+export const ApplicationIntent = Schema.Literal("EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield")
 export type ApplicationIntent = typeof ApplicationIntent.Type
 export const ApplicationRequest = Schema.Struct({ version: Schema.Literal(1), intent: ApplicationIntent })
 export const TrayRegistration = Schema.Union(
