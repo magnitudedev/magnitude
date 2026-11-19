@@ -23,7 +23,7 @@ const run = Effect.scoped(Effect.gen(function* () {
   const { manifest: release } = yield* acquireRelease(baseUrl, version, join(directory, "manifest"))
   const manifests = yield* hostedDesktopManifests(release, commit)
   const privateKey = yield* decodePublisherPrivateKey(Redacted.value(yield* Config.redacted("DISTRIBUTION_PUBLISHER_PRIVATE_KEY")))
-  const publicKey = yield* decodePublisherPublicKey(yield* fs.readFileString(fileURLToPath(new URL("../resources/distribution/magnitude-2026-01.pub.pem", import.meta.url))))
+  const publicKey = yield* decodePublisherPublicKey(yield* fs.readFileString(fileURLToPath(new URL("../resources/distribution/cli-only-qa.pub.pem", import.meta.url))))
   if (!createPublicKey(privateKey).equals(publicKey)) return yield* new HostedCandidateInvalid({ message: "Publisher credential differs from application-embedded trust" })
   yield* verifyGithubRelease(manifests, Option.map(yield* Config.option(Config.redacted("GH_TOKEN")), Redacted.value))
   const databaseUrl = Redacted.value(yield* Config.redacted("DISTRIBUTION_PUBLISHER_DATABASE_URL"))
@@ -37,8 +37,8 @@ const run = Effect.scoped(Effect.gen(function* () {
     pool.on("error", () => { Runtime.runSync(runtime)(Effect.logWarning("Publisher database connection closed")) })
     return pool
   }, catch: () => new ReleasePublicationFailed({ stage: "database" }) }), pool => Effect.promise(() => pool.end()))
-  const envelopes = yield* publishHostedRelease({ artifacts: manifests, keyId: PublisherKeyId.make("magnitude-2026-01"), privateKey,
-  }).pipe(Effect.provideService(ReleasePublicationStore, postgresReleasePublicationStore(pool, "magnitude_distribution", new Map([["magnitude-2026-01", publicKey]]))))
+  const envelopes = yield* publishHostedRelease({ artifacts: manifests, keyId: PublisherKeyId.make("magnitude-qa"), privateKey,
+  }).pipe(Effect.provideService(ReleasePublicationStore, postgresReleasePublicationStore(pool, "magnitude_distribution", new Map([["magnitude-qa", publicKey]]))))
   yield* Effect.logInfo("Accepted desktop release published to Magnitude", { version, artifacts: envelopes.length })
 }))
 BunRuntime.runMain(run.pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])))

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs"
 import { acnExecutableRelativePath } from "../../src/macos-app"
 import { buildMacApp } from "../apple/build-app"
 import { buildDesktopApplication, DesktopBuildFailed } from "./desktop"
@@ -189,7 +190,7 @@ export const buildHostArtifacts = async (
     "run",
     resolve(PROJECT_ROOT, "packages/version/scripts/generate-version.ts"),
   ], { cwd: PROJECT_ROOT })
-  const cli = await buildCliBinary(host.bunTarget)
+  const cli = await buildCliBinary(host.bunTarget, readFileSync(resolve(import.meta.dir, "../../resources/distribution/cli-only-qa.pub.pem"), "utf8"))
   const acn = await buildAcnBinary(host.bunTarget)
   const inference = await buildInferenceBinary({ host, profile: "release", diagnostics: "all" })
   await verifyOwnedLoaderPaths({
