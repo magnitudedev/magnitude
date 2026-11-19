@@ -22,13 +22,29 @@ use std::sync::Arc;
 /// (`Machine::Still`), its drafter unbound until its first work: the
 /// directory its GGUF was written to, for the test to remove once the
 /// domain is dropped, the definition, the domain and its bindings.
-pub fn drafted(test: &str) -> (std::path::PathBuf, Rc<ModelDefinition>, ExecutorDomain, crate::StateBindings) {
+pub fn drafted(
+    test: &str,
+) -> (
+    std::path::PathBuf,
+    Rc<ModelDefinition>,
+    Box<ExecutorDomain>,
+    crate::StateBindings,
+) {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
     let (directory, definition, package) = fixture_with(test, mtp, crate::planning::fixtures::fixture_manifest);
     let method = PlannedMethod::Mtp { greedy_proposals: 2, sampled_proposals: 2, widths: crate::DraftWidths::Adaptive };
-    let (domain, bindings, _, _) =
-        load_read(&catalog, &definition, &package, seismic::BackendName::Cpu, limits(4, false, 1, 0), Banked::Resident, method, KvCodec::Dense, Machine::Still);
+    let (domain, bindings, _, _) = load_read(&LoadRequest {
+        catalog: &catalog,
+        definition: &definition,
+        package: &package,
+        backend: seismic::BackendName::Cpu,
+        limits: limits(4, false, 1, 0),
+        banked: Banked::Resident,
+        method,
+        codec: KvCodec::Dense,
+        machine: Machine::Still,
+    });
     (directory, definition, domain, bindings)
 }
 
@@ -37,18 +53,44 @@ pub fn drafted(test: &str) -> (std::path::PathBuf, Rc<ModelDefinition>, Executor
 /// owner's tests of a request writing toward a long context decode on. The
 /// directory its GGUF was written to, the definition, the domain and its
 /// bindings, as [`drafted`] gives them.
-pub fn plain(test: &str, context: u64) -> (std::path::PathBuf, Rc<ModelDefinition>, ExecutorDomain, crate::StateBindings) {
+pub fn plain(
+    test: &str,
+    context: u64,
+) -> (
+    std::path::PathBuf,
+    Rc<ModelDefinition>,
+    Box<ExecutorDomain>,
+    crate::StateBindings,
+) {
     chaining(test, context, 1)
 }
 
 /// [`plain`], its prompt groups chaining up to `chain_capacity` chunks.
-pub fn chaining(test: &str, context: u64, chain_capacity: usize) -> (std::path::PathBuf, Rc<ModelDefinition>, ExecutorDomain, crate::StateBindings) {
+pub fn chaining(
+    test: &str,
+    context: u64,
+    chain_capacity: usize,
+) -> (
+    std::path::PathBuf,
+    Rc<ModelDefinition>,
+    Box<ExecutorDomain>,
+    crate::StateBindings,
+) {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mut definition = crate::planning::fixtures::fixture_definition();
     definition.decoder.context_limit = context;
     let (directory, definition, package) = fixture_with(test, definition, crate::planning::fixtures::fixture_manifest);
-    let (domain, bindings, _, _) =
-        load_read(&catalog, &definition, &package, seismic::BackendName::Cpu, limits(4, false, chain_capacity, 0), Banked::Resident, PlannedMethod::Plain, KvCodec::Dense, Machine::Still);
+    let (domain, bindings, _, _) = load_read(&LoadRequest {
+        catalog: &catalog,
+        definition: &definition,
+        package: &package,
+        backend: seismic::BackendName::Cpu,
+        limits: limits(4, false, chain_capacity, 0),
+        banked: Banked::Resident,
+        method: PlannedMethod::Plain,
+        codec: KvCodec::Dense,
+        machine: Machine::Still,
+    });
     (directory, definition, domain, bindings)
 }
 
@@ -290,7 +332,7 @@ pub(crate) fn load(
     backend: seismic::BackendName,
     limits: ResourceLimits,
     banked: Banked,
-) -> (ExecutorDomain, crate::StateBindings, u64, Pricing) {
+) -> (Box<ExecutorDomain>, crate::StateBindings, u64, Pricing) {
     load_with(catalog, definition, package, backend, limits, banked, PlannedMethod::Plain)
 }
 
@@ -305,23 +347,18 @@ pub(crate) fn load_with(
     limits: ResourceLimits,
     banked: Banked,
     method: PlannedMethod,
-) -> (ExecutorDomain, crate::StateBindings, u64, Pricing) {
-    load_coded(catalog, definition, package, backend, limits, banked, method, KvCodec::Dense)
-}
-
-/// [`load_with`] keeping its history in `codec`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn load_coded(
-    catalog: &seismic::Devices,
-    definition: &Rc<ModelDefinition>,
-    package: &Arc<Package>,
-    backend: seismic::BackendName,
-    limits: ResourceLimits,
-    banked: Banked,
-    method: PlannedMethod,
-    codec: KvCodec,
-) -> (ExecutorDomain, crate::StateBindings, u64, Pricing) {
-    load_read(catalog, definition, package, backend, limits, banked, method, codec, Machine::Live)
+) -> (Box<ExecutorDomain>, crate::StateBindings, u64, Pricing) {
+    load_read(&LoadRequest {
+        catalog,
+        definition,
+        package,
+        backend,
+        limits,
+        banked,
+        method,
+        codec: KvCodec::Dense,
+        machine: Machine::Live,
+    })
 }
 
 /// What a loaded fixture's memory readings read.
@@ -335,22 +372,43 @@ pub(crate) enum Machine {
     Still,
 }
 
-/// [`load_coded`], its memory read as `machine`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn load_read(
-    catalog: &seismic::Devices,
-    definition: &Rc<ModelDefinition>,
-    package: &Arc<Package>,
-    backend: seismic::BackendName,
-    limits: ResourceLimits,
-    banked: Banked,
-    method: PlannedMethod,
-    codec: KvCodec,
-    machine: Machine,
-) -> (ExecutorDomain, crate::StateBindings, u64, Pricing) {
+/// A test load: `definition` from `package` on `backend`, an available one,
+/// within `limits`, its experts held as `banked`, serving `method`, its
+/// history kept in `codec` and its memory read as `machine`.
+pub(crate) struct LoadRequest<'a> {
+    pub(crate) catalog: &'a seismic::Devices,
+    pub(crate) definition: &'a Rc<ModelDefinition>,
+    pub(crate) package: &'a Arc<Package>,
+    pub(crate) backend: seismic::BackendName,
+    pub(crate) limits: ResourceLimits,
+    pub(crate) banked: Banked,
+    pub(crate) method: PlannedMethod,
+    pub(crate) codec: KvCodec,
+    pub(crate) machine: Machine,
+}
+
+/// `request` loaded as the engine's load does: its device opened, its plan
+/// compiled, its domain bound and priced. The domain, its bindings, the
+/// most rows a group's pass covers (`group_pass_rows`) and its pricing.
+pub(crate) fn load_read(request: &LoadRequest<'_>) -> (Box<ExecutorDomain>, crate::StateBindings, u64, Pricing) {
     // A hung step reports every owner and every thread's stack on SIGUSR1,
     // as the rig asks a job past its estimate.
     crate::diagnostics::install();
+    let (selected, device, release) = open_device(request.catalog, request.backend);
+    let (resident, draft) = plan(request, &selected);
+    let Compiled { planned, execution, programs, charges, pass_rows } = compile(request, &selected, &device, draft);
+    let (mut domain, mut bindings) = bind_domain(request, device, release, execution, programs, &charges);
+    let pricing = price(&mut domain, &mut bindings, request, resident, planned);
+    domain.observe_memory();
+    (domain, bindings, pass_rows, pricing)
+}
+
+/// `backend`'s device, selected and opened as the engine's load selects it,
+/// and the release rate it was selected by.
+fn open_device(
+    catalog: &seismic::Devices,
+    backend: seismic::BackendName,
+) -> (platform::SelectedDevice, Rc<seismic::Device>, platform::ReleaseRate) {
     let release = platform::ReleaseRate::of_machine(None);
     let selected = platform::select_device(
         catalog,
@@ -360,16 +418,21 @@ pub(crate) fn load_read(
     )
     .unwrap_or_else(|error| panic!("{backend:?}: an available device is selected: {error}"));
     let device = Rc::new(
-        crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
+        crate::test_support::open(catalog, catalog.resolve(selected.info.selector()).unwrap())
             .unwrap_or_else(|error| panic!("{backend:?}: the selected device opens: {error}")),
     );
-    let capacity = ResourceCapacity {
-        domain_bytes: crate::StableRoom::of_selected(&selected).capacity().unwrap().min(1024 * 1024 * 1024),
-        tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
-        allocations: seismic::NativeAllocations::EXACT,
-    };
+    (selected, device, release)
+}
+
+/// `request`'s plan on `selected`: the plan before any bank, and the plan
+/// holding its experts as `request.banked` does.
+fn plan(
+    request: &LoadRequest<'_>,
+    selected: &platform::SelectedDevice,
+) -> (crate::ExecutionPlanDraft, crate::ExecutionPlanDraft) {
+    let LoadRequest { package, definition, backend, limits, banked, method, codec, .. } = *request;
     let draft = ExecutionPlanner::prepare(
-        &selected,
+        selected,
         &package.manifest(),
         definition,
         ComponentSelection {
@@ -383,22 +446,64 @@ pub(crate) fn load_read(
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     let resident = draft.clone();
-    let draft = match banked {
-        Banked::Resident => draft,
-        Banked::Streamed { numerator, denominator } => {
-            let resident = draft.allocation_bytes(definition).unwrap();
-            draft
-                .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(resident * numerator / denominator)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
-                .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
-                .into_draft()
+    (resident, banked.apply(draft, definition, backend))
+}
+
+impl Banked {
+    /// `draft` holding its routed experts as this says.
+    fn apply(
+        self,
+        draft: crate::ExecutionPlanDraft,
+        definition: &ModelDefinition,
+        backend: seismic::BackendName,
+    ) -> crate::ExecutionPlanDraft {
+        match self {
+            Banked::Resident => draft,
+            Banked::Streamed { numerator, denominator } => {
+                let resident = draft.allocation_bytes(definition).unwrap();
+                draft
+                    .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(resident * numerator / denominator)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
+                    .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
+                    .into_draft()
+            }
+            Banked::Whole => draft.with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft(),
+            Banked::Half => {
+                let whole = draft.clone().with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft();
+                let bank = whole.load().expert_bank().unwrap_or_else(|| panic!("{backend:?}: the uncapped load banks its experts"));
+                let cap = whole.load().weight_bytes().unwrap() - bank.slot_bytes().unwrap() * (bank.widest().get() / 2);
+                draft.with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(cap)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft()
+            }
         }
-        Banked::Whole => draft.with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft(),
-        Banked::Half => {
-            let whole = draft.clone().with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft();
-            let bank = whole.load().expert_bank().unwrap_or_else(|| panic!("{backend:?}: the uncapped load banks its experts"));
-            let cap = whole.load().weight_bytes().unwrap() - bank.slot_bytes().unwrap() * (bank.widest().get() / 2);
-            draft.with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(cap)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft()
-        }
+    }
+}
+
+/// A plan compiled on its device ([`compile`]).
+struct Compiled {
+    /// The plan the load runs.
+    planned: crate::ExecutionPlanDraft,
+    execution: Rc<crate::ExecutionPlan>,
+    programs: Rc<AttestedPrograms>,
+    /// What the load allocates outside its claims: each store's own entry.
+    charges: seismic::Charges,
+    /// The most rows a group's pass covers.
+    pass_rows: u64,
+}
+
+/// `draft` compiled on `device` as a load compiles it: its state planned,
+/// its programs prepared, the plan finalized with their readout and sites,
+/// its graphs prepared and installed, and the plan admitted with their
+/// resources.
+fn compile(
+    request: &LoadRequest<'_>,
+    selected: &platform::SelectedDevice,
+    device: &Rc<seismic::Device>,
+    draft: crate::ExecutionPlanDraft,
+) -> Compiled {
+    let LoadRequest { definition, backend, limits, codec, .. } = *request;
+    let capacity = ResourceCapacity {
+        domain_bytes: crate::StableRoom::of_selected(selected).capacity().unwrap().min(1024 * 1024 * 1024),
+        tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
+        allocations: seismic::NativeAllocations::EXACT,
     };
     let state = ResourcePlanner::state_plan(
         definition,
@@ -409,8 +514,7 @@ pub(crate) fn load_read(
         capacity,
     )
     .unwrap();
-    // What the load allocates outside its claims: each store's own entry.
-    let charges = seismic::Charges::tally(&device);
+    let charges = seismic::Charges::tally(device);
     let mut programs = AttestedPrograms::prepare_draft(
         &draft,
         &charges,
@@ -428,12 +532,29 @@ pub(crate) fn load_read(
     // As a load finalizes it (`execution`): its readout, and the CPU sites
     // its qualification admitted, which its graphs encode.
     let draft = draft
-        .finalize_readout(definition, programs.readout_choices(), &crate::StableRoom::of_selected(&selected))
+        .finalize_readout(definition, programs.readout_choices(), &crate::StableRoom::of_selected(selected))
         .and_then(|draft| draft.finalize_sites(|bank| programs.sited_layers(bank)))
         .unwrap();
+    let (resources_plan, pass_rows) = prepare_graphs(request, device, &draft, &mut programs, state);
+    let planned = draft.clone();
+    let execution = Rc::new(draft.admit(resources_plan).unwrap());
+    Compiled { planned, execution, programs: Rc::new(programs), charges, pass_rows }
+}
+
+/// `draft`'s target, readout and auxiliary graphs prepared on `device` over
+/// `state` and installed in `programs`: the resources they plan and the most
+/// rows a group's pass covers.
+fn prepare_graphs(
+    request: &LoadRequest<'_>,
+    device: &Rc<seismic::Device>,
+    draft: &crate::ExecutionPlanDraft,
+    programs: &mut AttestedPrograms,
+    state: crate::StateResourcePlan,
+) -> (crate::ResourcePlan, u64) {
+    let LoadRequest { definition, backend, limits, method, .. } = *request;
     let target_graphs = programs
         .prepare_target_graphs(
-            &device,
+            device,
             draft.load(),
             &definition.decoder,
             &state,
@@ -444,11 +565,11 @@ pub(crate) fn load_read(
         )
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     let target_readout_graphs = programs
-        .prepare_target_readout_graphs(&device, draft.load(), &definition.decoder, limits)
+        .prepare_target_readout_graphs(device, draft.load(), &definition.decoder, limits)
         .unwrap();
     programs
         .prepare_auxiliary_graphs(
-            &device,
+            device,
             draft.load(),
             definition,
             draft.programs(),
@@ -469,24 +590,47 @@ pub(crate) fn load_read(
     let pass_rows = target_graphs.pass_rows();
     programs.install_target_graphs(target_graphs);
     programs.install_target_readout_graphs(target_readout_graphs);
-    let planned = draft.clone();
-    let execution = Rc::new(draft.admit(resources_plan).unwrap());
-    let identity = ResourceDomainId::new("ngram-steps").unwrap();
-    let programs = Rc::new(programs);
-    let (reading, ledgers): (Rc<dyn StatusReading>, _) = match machine {
+    (resources_plan, pass_rows)
+}
+
+/// The memory readings of a load on `device` as `machine` reads them, and
+/// the ledgers of the stores it reaches, first read by them.
+fn open_memory(
+    machine: Machine,
+    device: &Rc<seismic::Device>,
+    execution: &Rc<crate::ExecutionPlan>,
+) -> (Rc<dyn StatusReading>, crate::memory::ledger::DeviceLedgers) {
+    match machine {
         Machine::Live => {
             let live = Rc::new(seismic::Devices::discover(&[]).unwrap());
-            let ledgers = super::fixture_ledgers(&device, &execution, &*live);
+            let ledgers = super::fixture_ledgers(device, execution, &*live);
             (live, ledgers)
         }
         Machine::Still => {
             let clock = super::TestClock::new();
-            let still = Rc::new(super::StillHost::of(seismic::Devices::discover(&[]).unwrap(), &device, super::Pressed::default(), clock.clone()));
-            let ledgers = super::fixture_ledgers_at(&device, &execution, &*still, &clock);
+            let still = Rc::new(super::StillHost::of(seismic::Devices::discover(&[]).unwrap(), device, super::Pressed::default(), clock.clone()));
+            let ledgers = super::fixture_ledgers_at(device, execution, &*still, &clock);
             assert!(still.ledgers.set(ledgers.clone()).is_ok(), "a fixture opens its ledgers once");
             (still, ledgers)
         }
-    };
+    }
+}
+
+/// The domain of `execution` and `programs` on `device`, bound as the
+/// engine's load binds it: its arena allocated, the target imported under
+/// its claims, the drafter's loader, its states and constants, and its
+/// request slot. Its memory is read as `request.machine` reads it.
+fn bind_domain(
+    request: &LoadRequest<'_>,
+    device: Rc<seismic::Device>,
+    release: platform::ReleaseRate,
+    execution: Rc<crate::ExecutionPlan>,
+    programs: Rc<AttestedPrograms>,
+    charges: &seismic::Charges,
+) -> (Box<ExecutorDomain>, crate::StateBindings) {
+    let LoadRequest { definition, package, backend, method, machine, .. } = *request;
+    let identity = ResourceDomainId::new("ngram-steps").unwrap();
+    let (reading, ledgers) = open_memory(machine, &device, &execution);
     // As the engine's load records them: the arena it allocated, the
     // target's weights, each charged to its claim as it was made.
     let mut recorded = crate::memory::ledger::Recorded::default();
@@ -552,8 +696,8 @@ pub(crate) fn load_read(
         false => None,
     };
     let plan = execution.resources().clone();
-    let target_state = plan.allocate_target_state(&charges, pools.state.clone()).unwrap();
-    let head_state = plan.head_state().map(|state| state.allocate(&charges, pools.state.clone()).unwrap());
+    let target_state = plan.allocate_target_state(charges, pools.state.clone()).unwrap();
+    let head_state = plan.head_state().map(|state| state.allocate(charges, pools.state.clone()).unwrap());
     // The constants its domain binds, as the engine's load claims them.
     let constants = crate::memory::ClaimDemand {
         device: programs.target_graphs().unwrap().binding_constant_bytes().unwrap(),
@@ -566,7 +710,7 @@ pub(crate) fn load_read(
         .unwrap();
     let request_slot = crate::domain::fixtures::request_slot(resources.ledgers(), &device, &execution, 0);
     let reader = crate::DeviceReader::open(reading.clone(), release, device).unwrap();
-    let (mut domain, mut bindings) = ExecutorDomain::new(
+    let (domain, bindings) = ExecutorDomain::new(
         execution,
         definition.clone(),
         reader,
@@ -585,13 +729,24 @@ pub(crate) fn load_read(
     if let Machine::Still = machine {
         super::settle_ledgers(domain.domain.device(), domain.resources.ledgers(), &*reading);
     }
-    // As a load ends: priced on the costs it waited for, its memory read as
-    // the owner reads it before its first round.
-    let pricing = Pricing { definition: definition.clone(), resident, planned, costs: crate::assessment::synthetic::costs() };
+    (domain, bindings)
+}
+
+/// `domain` priced as a load ends, on the costs it waited for: the pricing
+/// of its plan before any bank (`resident`) and the plan it runs
+/// (`planned`).
+fn price(
+    domain: &mut ExecutorDomain,
+    bindings: &mut crate::StateBindings,
+    request: &LoadRequest<'_>,
+    resident: crate::ExecutionPlanDraft,
+    planned: crate::ExecutionPlanDraft,
+) -> Pricing {
+    let backend = request.backend;
+    let pricing = Pricing { definition: request.definition.clone(), resident, planned, costs: crate::assessment::synthetic::costs() };
     let pending = "not measured by the test";
     domain
-        .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.into()), crate::assessment::Priced::Pending(pending.into())), &mut bindings)
+        .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.into()), crate::assessment::Priced::Pending(pending.into())), bindings)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-    domain.observe_memory();
-    (domain, bindings, pass_rows, pricing)
+    pricing
 }

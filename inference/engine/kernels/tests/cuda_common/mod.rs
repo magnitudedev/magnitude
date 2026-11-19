@@ -264,10 +264,6 @@ pub fn expansion_bound(
         .unzip()
 }
 
-/// The largest row count the CUDA K1 GEMV serves (`projection::GEMV_ROWS`);
-/// larger counts run the GEMM.
-pub const GEMV_ROWS: usize = bound::gemv_rows(BackendName::Cuda);
-
 /// The largest row count the small-band GEMM serves
 /// (`projection::SMALL_GEMM_ROWS`); larger counts run the large-band GEMM.
 pub const SMALL_GEMM_ROWS: usize = 64;
@@ -466,17 +462,19 @@ pub fn expansion(
     )
 }
 
-/// The mappings of `m` rows that `admits` holds for ([`admitted`]).
+/// The mappings a test offers an entry at `m` rows: the GEMV's up to
+/// [`bound::gemv_rows`], else the GEMM's.
+pub fn candidates(m: usize) -> &'static [Mapping] {
+    if m <= bound::gemv_rows(BackendName::Cuda) {
+        &GEMV_MAPPINGS
+    } else {
+        &GEMM_MAPPINGS
+    }
+}
+
+/// The `candidates` of `m` rows that `admits` holds for ([`admitted`]).
 pub fn mappings(entry: &str, m: usize, admits: impl Fn(Mapping) -> bool) -> Vec<Mapping> {
-    admitted(
-        entry,
-        if m <= GEMV_ROWS {
-            &GEMV_MAPPINGS
-        } else {
-            &GEMM_MAPPINGS
-        },
-        admits,
-    )
+    admitted(entry, candidates(m), admits)
 }
 
 /// The `mappings` that `admits` holds for: those every entry a test

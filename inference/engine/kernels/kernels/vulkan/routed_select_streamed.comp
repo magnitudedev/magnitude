@@ -1,6 +1,7 @@
 // Expert streaming's decode general selection (`routed_select_streamed`) on the
 // `dense` projection operator, single over `router`, followed by selection and
 // resolve.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #include "lib/core/activation.glsl"
 #include "lib/projection/projection.glsl"
@@ -8,35 +9,19 @@
 #include "lib/routed/selection.glsl"
 #include "lib/routed/streamed.glsl"
 
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define SELECT_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define SELECT_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define SELECT_NORM ELEMENT_BF16
-#else
-#error "routed norm must be dense"
-#endif
-#if defined(SEISMIC_ROUTER_NORM_REPRESENTATION_F32)
-#define SELECT_ROUTER_NORM ELEMENT_F32
-#elif defined(SEISMIC_ROUTER_NORM_REPRESENTATION_F16)
-#define SELECT_ROUTER_NORM ELEMENT_F16
-#elif defined(SEISMIC_ROUTER_NORM_REPRESENTATION_BF16)
-#define SELECT_ROUTER_NORM ELEMENT_BF16
-#else
-#error "routed router norm must be dense"
-#endif
+#define SELECT_NORM ELEMENT_OF(SEISMIC_NORM)
+#define SELECT_ROUTER_NORM ELEMENT_OF(SEISMIC_ROUTER_NORM)
 
 #define SELECT_H uint(SEISMIC_DIM_H)
 
 projection_prologue projected_input(uint g) {
-    return projection_ordered_rms(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+    return projection_ordered_rms(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_ROUTER_NORM),
         SEISMIC_ROUTER_NORM_STRIDE_0, SELECT_ROUTER_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), SELECT_H, 0ul);
 }
 
 projection_prologue select_norm_input() {
-    return projection_ordered_rms(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+    return projection_ordered_rms(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
         SEISMIC_NORM_STRIDE_0, SELECT_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), SELECT_H, 0ul);
 }

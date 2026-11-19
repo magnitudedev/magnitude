@@ -113,7 +113,7 @@ pub fn erf(x: f32) -> f32 {
 /// The portable erf-form `gelu`: `0.5 * x * (1 + erf(x / sqrt(2)))`.
 #[inline(always)]
 pub fn gelu_erf(value: f32) -> f32 {
-    0.5 * value * (1.0 + erf(value * 0.707_106_781_186_547_6))
+    0.5 * value * (1.0 + erf(value * core::f32::consts::FRAC_1_SQRT_2))
 }
 
 /// The portable quick GELU: `x / (1 + exp(-1.702 x))`.

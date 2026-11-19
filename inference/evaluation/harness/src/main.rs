@@ -30,6 +30,8 @@
 //! executable, which searches them and exits. Each appends its tuning trace
 //! to `tuning.jsonl`.
 
+#![cfg_attr(test, allow(clippy::disallowed_methods, reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"))]
+
 mod artifacts;
 mod bar;
 mod development;

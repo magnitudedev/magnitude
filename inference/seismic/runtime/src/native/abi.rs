@@ -578,7 +578,7 @@ fn render_source_with(
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(features) => {
             // The conversions' tile rows as a signed literal, for the
-            // library's `#if`s (`lib/repack/repack.glsl`).
+            // library's `#if`s (`<seismic/repack.glsl>`).
             const { assert!(conversion::TILE_ROWS < 1 << 16, "the tile rows must be below 2^16, a Vulkan kernel divisor") };
             vulkan::header(features)
                 + vulkan::shared_views().as_str()
@@ -1593,6 +1593,18 @@ impl Axis for registry::RepresentationForm {
     }
 }
 
+impl Axis for registry::Layout {
+    const AXIS: &'static str = "LAYOUT";
+    const ALL: &'static [Self] = &registry::Layout::ALL;
+    fn name(self) -> &'static str {
+        self.as_str()
+    }
+
+    fn constant(self) -> String {
+        format!("SEISMIC_{}_{}", Self::AXIS, native_macro(self.as_str()))
+    }
+}
+
 impl Axis for registry::CodeKind {
     const AXIS: &'static str = "CODES";
     const ALL: &'static [Self] = &registry::CodeKind::ALL;
@@ -1857,8 +1869,10 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 32] = [
 /// Vulkan sources (`render_representation`): `<prefix>(F)` =
 /// `F(<TUPLE_AXES>, <CODING_AXES>)`, its representation's identity
 /// (its registry key, nonzero), its form (`SEISMIC_FORM_*`), a dense form's
-/// dtype (`SEISMIC_DTYPE_*`), its storage group (`_LOGICAL_GROUP`) and a row
-/// form's decode axes, 0 where it has none. A selector `SEISMIC_AXIS_<AXIS>`
+/// dtype (`SEISMIC_DTYPE_*`), its storage group (`_LOGICAL_GROUP`), whether
+/// products over it take NVFP4 activation rows (`_OPERANDS_NVFP4`, 0 or 1),
+/// its layout (`SEISMIC_LAYOUT_*`) and a row form's decode axes, 0 where it
+/// has none. A selector `SEISMIC_AXIS_<AXIS>`
 /// takes one of them, and `SEISMIC_AXES_NONE(F)` is the tuple of no tensor
 /// (`render_axis_constants`). Through the prefix a library reaches every
 /// value by expansion alone, so it can evaluate them in `#if`, where glslang
@@ -1885,8 +1899,10 @@ fn render_axes_tuple(out: &mut String, prefix: &str, info: &registry::Representa
         })
         .collect();
     out.push_str(&format!(
-        "#define {prefix}(F) F({id}, {}, {dtype}, {prefix}_LOGICAL_GROUP, {})\n",
+        "#define {prefix}(F) F({id}, {}, {dtype}, {prefix}_LOGICAL_GROUP, {}, {}, {})\n",
         form.constant(),
+        u32::from(info.operands == registry::OperandRecipe::Nvfp4Rows),
+        info.layout.constant(),
         axes.join(", ")
     ));
 }
@@ -1894,7 +1910,7 @@ fn render_axes_tuple(out: &mut String, prefix: &str, info: &registry::Representa
 /// The leading axes of a tensor's axes tuple (`render_axes_tuple`), before
 /// its decode axes.
 #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-const TUPLE_AXES: [&str; 4] = ["ID", "FORM", "DTYPE", "LOGICAL_GROUP"];
+const TUPLE_AXES: [&str; 6] = ["ID", "FORM", "DTYPE", "LOGICAL_GROUP", "OPERANDS_NVFP4", "LAYOUT"];
 
 /// The axis values every native source defines (storage forms, dtypes, code
 /// interpretations, coefficient structures and scale encodings), which a
@@ -1907,10 +1923,11 @@ fn render_axis_constants(out: &mut String, dialect: Dialect) {
     render_axis_values::<registry::BiasKind>(out);
     render_axis_values::<registry::ScaleEncoding>(out);
     render_axis_values::<registry::GridSigns>(out);
-    // The axes tuple's form and dtype values (`render_axes_tuple`).
+    // The axes tuple's form, layout and dtype values (`render_axes_tuple`).
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     if matches!(dialect, Dialect::Vulkan(_)) {
         render_axis_values::<registry::RepresentationForm>(out);
+        render_axis_values::<registry::Layout>(out);
         for (index, dtype) in seismic_lang::types::DType::ALL.into_iter().enumerate() {
             out.push_str(&format!(
                 "#define SEISMIC_DTYPE_{} {}\n",

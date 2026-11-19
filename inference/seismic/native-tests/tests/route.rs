@@ -3,6 +3,11 @@
 //! memory, conditional (`when`) launches and scratch, graphs with
 //! host-written inputs, asynchronous submission, measurement and tuning.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
+
 use seismic::measure::{measure, Measure, Stop};
 use seismic::{
     AllocationLimit, BackendName, CallError, Device, Element, Exclusion, ExecutionError,
@@ -540,24 +545,29 @@ fn every_admissible_split_sum_configuration_matches_the_reference() {
             .expect("split_sum has an implementation on every backend");
         // The declared domain, with what a CPU device adds of its own (each
         // launch's participant count and the tier) at its defaults.
-        let configurations = implementation
-            .admissible(&implementation.implementation().with_owned_defaults(statics(n as u64)))
+        let mut configurations = 0;
+        implementation
+            .walk_admissible(
+                &implementation.implementation().with_owned_defaults(statics(n as u64)),
+                |configuration| {
+                    configurations += 1;
+                    let kernel = split_sum::native_for_device(&device, configuration)
+                        .unwrap_or_else(|error| {
+                            panic!("{configuration:?} on {:?}: {error}", device.backend())
+                        });
+                    let result = kernel.call(&charges, split_sum::Args { x: &x }).expect("call");
+                    assert_eq!(
+                        read_f32(&result.value),
+                        [expected],
+                        "{configuration:?} on {:?}",
+                        device.backend()
+                    );
+                    true
+                },
+            )
             .expect("statics");
         // Three part counts by two widths, all admissible at N = 1000.
-        assert_eq!(configurations.len(), 6, "{}", device.backend().as_str());
-        for configuration in configurations {
-            let kernel =
-                split_sum::native_for_device(&device, &configuration).unwrap_or_else(|error| {
-                    panic!("{configuration:?} on {:?}: {error}", device.backend())
-                });
-            let result = kernel.call(&charges, split_sum::Args { x: &x }).expect("call");
-            assert_eq!(
-                read_f32(&result.value),
-                [expected],
-                "{configuration:?} on {:?}",
-                device.backend()
-            );
-        }
+        assert_eq!(configurations, 6, "{}", device.backend().as_str());
     }
 }
 
@@ -565,16 +575,19 @@ fn every_admissible_split_sum_configuration_matches_the_reference() {
 fn where_filters_configurations_at_small_static_values() {
     for device in seismic_native_tests::every_device() {
         let implementation = split_sum::native_implementation(&device).unwrap().unwrap();
-        let admissible = implementation
-            .admissible(&implementation.implementation().with_owned_defaults(statics(2)))
-            .unwrap();
         // PARTS <= N keeps parts 1 and 2 at N = 2.
-        assert_eq!(admissible.len(), 4);
-        assert!(
-            admissible
-                .iter()
-                .all(|configuration| configuration.param("PARTS") != Some(4))
-        );
+        let mut admissible = 0;
+        implementation
+            .walk_admissible(
+                &implementation.implementation().with_owned_defaults(statics(2)),
+                |configuration| {
+                    admissible += 1;
+                    assert_ne!(configuration.param("PARTS"), Some(4));
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(admissible, 4);
         let inadmissible = statics(2).with_param("PARTS", 4).with_param("WIDTH", 32);
         assert!(split_sum::native_for_device(&device, &inadmissible).is_err());
     }

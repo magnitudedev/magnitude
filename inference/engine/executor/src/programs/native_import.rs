@@ -310,8 +310,10 @@ mod tests {
 
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
+        // Every byte below 0x80, so no F32 word of the pattern is a NaN: a
+        // read returns each NaN as the registry's one NaN, not its bits.
         let values = (0..(1024 * 1024 + 16))
-            .map(|index| (index as u8).wrapping_mul(17))
+            .map(|index| (index as u8).wrapping_mul(17) & 0x7f)
             .collect::<Vec<_>>();
         let path = std::env::temp_dir().join(format!(
             "magnitude-staged-import-{}-{}",

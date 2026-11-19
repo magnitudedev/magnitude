@@ -17,6 +17,15 @@
 #define ELEMENT_PROBE_1 ~, 1
 #define ELEMENT_IS_ONE(value) ELEMENT_SECOND(ELEMENT_CAT(ELEMENT_PROBE_, value))
 #define ELEMENT_HAS(prefix, suffix) ELEMENT_IS_ONE(ELEMENT_CAT(prefix, suffix))
+// `(yes, no)` after it: `yes` where `flag` (a 0 or 1 token, such as
+// `ELEMENT_HAS`'s) is 1, else `no`; and `yes` where `<prefix><suffix>` is
+// defined as 1, else `no`. The other is dropped, so it may name a macro its
+// tensor does not define.
+#define ELEMENT_PICK_1(yes, no) yes
+#define ELEMENT_PICK_0(yes, no) no
+#define ELEMENT_PICK_(flag) ELEMENT_PICK_##flag
+#define ELEMENT_PICK(flag) ELEMENT_PICK_(flag)
+#define ELEMENT_WHEN(prefix, suffix, yes, no) ELEMENT_PICK(ELEMENT_HAS(prefix, suffix))(yes, no)
 
 #include <seismic/slab.cuh>
 
@@ -26,6 +35,17 @@ typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long long u64;
+
+// Whether A and B are one type, and T or F by a condition (the source loader
+// admits no `<cuda/std/...>` header).
+template <class A, class B> struct Same {
+    static constexpr bool value = false;
+};
+template <class A> struct Same<A, A> {
+    static constexpr bool value = true;
+};
+template <bool C, class T, class F> struct Select { typedef T type; };
+template <class T, class F> struct Select<false, T, F> { typedef F type; };
 
 struct Bf16 {
     typedef u16 storage;
@@ -81,6 +101,8 @@ template <class E> __device__ __forceinline__ void put2(u8 *base, u64 index, flo
     }
 }
 
+// How the dense surface reads its elements; kernels name what is outside it.
+namespace detail {
 // The elements of E in 32 bits (one f32 or two 16-bit elements) into `out`.
 template <class E> __device__ __forceinline__ void unpack(u32 bits, float *out) {
     if constexpr (E::bytes == 4) {
@@ -91,6 +113,7 @@ template <class E> __device__ __forceinline__ void unpack(u32 bits, float *out) 
         out[1] = pair.y;
     }
 }
+} // namespace detail
 
 // `N` contiguous elements starting at `index` into F32 registers, with the
 // widest aligned vector loads the span size allows. The span start is aligned
@@ -111,10 +134,10 @@ __device__ __forceinline__ void span(const u8 *base, u64 index, float (&out)[N])
             } else {
                 word = *reinterpret_cast<const uint4 *>(address + chunk * 16);
             }
-            unpack<E>(word.x, out + chunk * 4 * per_word + 0 * per_word);
-            unpack<E>(word.y, out + chunk * 4 * per_word + 1 * per_word);
-            unpack<E>(word.z, out + chunk * 4 * per_word + 2 * per_word);
-            unpack<E>(word.w, out + chunk * 4 * per_word + 3 * per_word);
+            detail::unpack<E>(word.x, out + chunk * 4 * per_word + 0 * per_word);
+            detail::unpack<E>(word.y, out + chunk * 4 * per_word + 1 * per_word);
+            detail::unpack<E>(word.z, out + chunk * 4 * per_word + 2 * per_word);
+            detail::unpack<E>(word.w, out + chunk * 4 * per_word + 3 * per_word);
         }
     } else if constexpr (bytes % 8 == 0) {
 #pragma unroll
@@ -125,15 +148,15 @@ __device__ __forceinline__ void span(const u8 *base, u64 index, float (&out)[N])
             } else {
                 word = *reinterpret_cast<const uint2 *>(address + chunk * 8);
             }
-            unpack<E>(word.x, out + chunk * 2 * per_word + 0 * per_word);
-            unpack<E>(word.y, out + chunk * 2 * per_word + 1 * per_word);
+            detail::unpack<E>(word.x, out + chunk * 2 * per_word + 0 * per_word);
+            detail::unpack<E>(word.y, out + chunk * 2 * per_word + 1 * per_word);
         }
     } else if constexpr (bytes % 4 == 0) {
 #pragma unroll
         for (int chunk = 0; chunk < bytes / 4; ++chunk) {
             const u32 word = NC ? seismic_ld_nc_u32(address + chunk * 4)
                                 : *reinterpret_cast<const u32 *>(address + chunk * 4);
-            unpack<E>(word, out + chunk * per_word);
+            detail::unpack<E>(word, out + chunk * per_word);
         }
     } else {
 #pragma unroll
@@ -373,21 +396,41 @@ template <class E> __device__ __forceinline__ SlabOut<E> abi_slab_out(const u8 *
 // An F32 scalar argument from its argument word.
 __device__ __forceinline__ float word_f32(u64 word) { return __uint_as_float(static_cast<u32>(word)); }
 
-// The element type of a dense representation kind: 0 = f32, 1 = bf16,
-// 2 = f16. Other kinds have none.
+// The dense representation kinds (`ELEMENT_KIND`), usable in `#if`; the
+// names every backend's library gives them.
+#define ELEMENT_F32 0
+#define ELEMENT_BF16 1
+#define ELEMENT_F16 2
+
+// The element type of a dense representation kind. Other kinds have none.
 template <int KIND> struct Of {
     static_assert(KIND >= 0, "a dense f32, bf16 or f16 representation is required");
 };
-template <> struct Of<0> { typedef F32 type; };
-template <> struct Of<1> { typedef Bf16 type; };
-template <> struct Of<2> { typedef F16 type; };
+template <> struct Of<ELEMENT_F32> { typedef F32 type; };
+template <> struct Of<ELEMENT_BF16> { typedef Bf16 type; };
+template <> struct Of<ELEMENT_F16> { typedef F16 type; };
 
 } // namespace element
 
+// The dense representation kind of the tensor or element parameter `prefix`
+// (`ELEMENT_F32`, `ELEMENT_BF16`, `ELEMENT_F16`), -1 for any other; usable in `#if`.
 #define ELEMENT_KIND(prefix)                                                                       \
-    (ELEMENT_HAS(prefix, _REPRESENTATION_F32)    ? 0                                               \
-     : ELEMENT_HAS(prefix, _REPRESENTATION_BF16) ? 1                                               \
-     : ELEMENT_HAS(prefix, _REPRESENTATION_F16)  ? 2                                               \
+    (ELEMENT_HAS(prefix, _REPRESENTATION_F32)    ? ELEMENT_F32                                \
+     : ELEMENT_HAS(prefix, _REPRESENTATION_BF16) ? ELEMENT_BF16                               \
+     : ELEMENT_HAS(prefix, _REPRESENTATION_F16)  ? ELEMENT_F16                                \
                                                  : -1)
 // The element type of the dense tensor or element parameter `prefix`.
 #define ELEMENT_OF(prefix) typename element::Of<ELEMENT_KIND(prefix)>::type
+
+// The bytes of one unit of tensor `prefix`'s strides: a row layout's stored
+// row, any other's packet (a dense element's packet is one element).
+#define ELEMENT_STRIDE_BYTES(prefix)                                                                    \
+    ((element::u64)(ELEMENT_WHEN(prefix, _KIND_PACKED,                                                  \
+        ELEMENT_WHEN(prefix, _LAYOUT_PACKET, ELEMENT_CAT(prefix, _PACKET_SIZE),                         \
+                     ELEMENT_CAT(prefix, _ROW_STRIDE_BYTES)),                                           \
+        ELEMENT_CAT(prefix, _PACKET_SIZE))))
+// The bytes of one step along tensor `prefix`'s axis 0, its stride 0 of
+// units: a stacked [*, N, K] tensor's matrix (a record), a rank-2 dense
+// tensor's row. The one statement of both, which every writer and reader of
+// a record addresses it by.
+#define ELEMENT_MATRIX_BYTES(prefix) ((element::u64)ELEMENT_CAT(prefix, _STRIDE_0) * ELEMENT_STRIDE_BYTES(prefix))

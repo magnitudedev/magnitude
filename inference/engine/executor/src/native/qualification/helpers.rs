@@ -137,6 +137,35 @@ impl SublayerRows {
     }
 }
 
+/// The entry an attention block's fixtures are made for.
+const ATTENTION: &str = "attention";
+
+/// A zeroed slab of `regions` in a fixture pool, two rows a slab over two
+/// logical rows: each region's logical tensor, and the store they lie in,
+/// which the caller holds while it binds them.
+pub(super) fn zeroed_slab<const N: usize>(
+    charges: &seismic::Charges,
+    regions: &[seismic::SlabRegion; N],
+    entry: &'static str,
+    label: &str,
+) -> Result<([Tensor; N], seismic::SlabTensor), CatalogFailure> {
+    let store = crate::experts::pooled_slabs(charges, seismic::Contract::DeviceOnly, 2, 2, regions, 1)
+        .map_err(|error| qualification_dynamic(entry, label, error))?;
+    store
+        .add_slab(seismic::SlabFill::Zeroed)
+        .map_err(|error| qualification_dynamic(entry, label, error))?;
+    let views = (0..N)
+        .map(|region| {
+            store
+                .logical_region(region)
+                .map_err(|error| qualification_dynamic(entry, label, error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let views = <[Tensor; N]>::try_from(views)
+        .unwrap_or_else(|_| unreachable!("a store gives one logical tensor of each of its regions"));
+    Ok((views, store))
+}
+
 /// One attention block in its binding's form (the kernels fix it
 /// statically) on one row, reading and joining `rows`: zero weights, a zero
 /// history row and the row's own fresh key, through both the decode and the
@@ -149,165 +178,237 @@ pub(super) fn qualify_attention(
     rows: SublayerRows,
     label: &str,
 ) -> Result<(), CatalogFailure> {
-    const ENTRY: &str = "attention";
-    let shape = binding.shape;
-    let (hidden, kv_heads, width, heads) =
-        (shape.widths.hidden, shape.widths.kv_heads, shape.widths.width, shape.heads());
-    let residual_values = (0..rows.residual_width(hidden))
-        .map(|index| (index % 7) as f32 - 3.0)
-        .collect::<Vec<_>>();
-    let residual = semantic_f32(
-        charges,
-        &[1, rows.residual_width(hidden)],
-        &residual_values,
-        ENTRY,
-        label,
-    )?;
-    let input = rows.input(charges, 1, hidden, ENTRY, label)?;
-    let inject = rows.inject(charges, 1, "attention_output", label)?;
-    let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, ENTRY, label);
-    let input_norm = rows.norm(charges, binding.norm, hidden, ENTRY, label)?;
-    // The query segment: the query rows, or a low-rank query's `qr` rows.
-    let query = zeros(binding.query_segment(), &[binding.query_segment_rows(), hidden])?;
-    let gate = zeros(binding.gate, &[shape.gate_rows(), hidden])?;
-    let key = zeros(binding.key, &[shape.key_rows(), hidden])?;
-    let value = zeros(binding.value, &[shape.value_rows(), hidden])?;
-    let (output_q, output_w) = binding.output_input();
-    let output = zeros(binding.output, &[hidden, output_q * output_w])?;
-    // A grouped output's zero `a` (G blocks of `rank` rows over `inputs`).
-    let grouped = binding
-        .grouped
-        .map(|grouped| {
-            let shape = grouped.shape;
-            zeros(grouped.element, &[shape.groups * shape.rank, shape.inputs])
+    let fixture = AttentionFixture::new(charges, &binding, rows, label)?;
+    let mixed = project_attention(charges, kernels, &binding, &fixture, label)?;
+    for (entry, gated) in mix_attention(charges, kernels, &binding, &fixture, &mixed, label)? {
+        qualify_attention_output(charges, kernels, &binding, &fixture, entry, &gated, label)?;
+    }
+    Ok(())
+}
+
+/// What every entry of one attention block reads but its own rows and
+/// history planes: its residual row and input, zero weights, norms, sinks
+/// and rotary tables, the row's coordinates and the entries' empty tables.
+struct AttentionFixture {
+    /// The residual row's values, which the block returns.
+    residual_values: Vec<f32>,
+    residual: Tensor,
+    input: Tensor,
+    inject: Tensor,
+    input_norm: Tensor,
+    /// The query segment: the query rows, or a low-rank query's `qr` rows.
+    query: Tensor,
+    gate: Tensor,
+    key: Tensor,
+    value: Tensor,
+    output: Tensor,
+    /// A grouped output's zero `a` (G blocks of `rank` rows over `inputs`).
+    grouped: Option<Tensor>,
+    query_norm: Tensor,
+    key_norm: Tensor,
+    value_norm: Tensor,
+    /// The sink logits (zero rows without sinks).
+    sinks: Tensor,
+    rotary_components: Tensor,
+    rotary_frequencies: Tensor,
+    rotary_amplitudes: Tensor,
+    coordinates: Tensor,
+    visible: Tensor,
+    fresh: Tensor,
+    destinations: Tensor,
+    /// The affine prefill kernel of a launch that lists no history row tiles.
+    history_tiles: Tensor,
+    /// The history's prefill reads every visible row: no WorkList bitmap, its
+    /// blocks of one key.
+    block_slots: Tensor,
+    /// The rotary layout, output rotary and stored-key values, carried by an
+    /// empty table's extents.
+    form: Tensor,
+    /// The dense entries' form, which also carries the key rounding (`KR`),
+    /// which the check runs at the layers' own rounding, and the absorbed
+    /// query (`AB`).
+    dense_form: Tensor,
+    /// The dense entries' index-list source: no picks (`[1, KS]`, each -1)
+    /// of no plane rows.
+    selected_rows: Tensor,
+    selected: Tensor,
+    selection: Tensor,
+}
+
+impl AttentionFixture {
+    fn new(
+        charges: &seismic::Charges,
+        binding: &AttentionBinding,
+        rows: SublayerRows,
+        label: &str,
+    ) -> Result<Self, CatalogFailure> {
+        let shape = binding.shape;
+        let (hidden, width, heads) = (shape.widths.hidden, shape.widths.width, shape.heads());
+        let residual_values = (0..rows.residual_width(hidden))
+            .map(|index| (index % 7) as f32 - 3.0)
+            .collect::<Vec<_>>();
+        let residual = semantic_f32(
+            charges,
+            &[1, rows.residual_width(hidden)],
+            &residual_values,
+            ATTENTION,
+            label,
+        )?;
+        let input = rows.input(charges, 1, hidden, ATTENTION, label)?;
+        let inject = rows.inject(charges, 1, "attention_output", label)?;
+        let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, ATTENTION, label);
+        let input_norm = rows.norm(charges, binding.norm, hidden, ATTENTION, label)?;
+        let query = zeros(binding.query_segment(), &[binding.query_segment_rows(), hidden])?;
+        let gate = zeros(binding.gate, &[shape.gate_rows(), hidden])?;
+        let key = zeros(binding.key, &[shape.key_rows(), hidden])?;
+        let value = zeros(binding.value, &[shape.value_rows(), hidden])?;
+        let (output_q, output_w) = binding.output_input();
+        let output = zeros(binding.output, &[hidden, output_q * output_w])?;
+        let grouped = binding
+            .grouped
+            .map(|grouped| {
+                let shape = grouped.shape;
+                zeros(grouped.element, &[shape.groups * shape.rank, shape.inputs])
+            })
+            .transpose()?;
+        let query_norm = zeros(Element::f32(), &[u64::from(shape.form.query_norm), width])?;
+        let key_norm = zeros(Element::f32(), &[u64::from(shape.form.key_norm), width])?;
+        let value_norm = zeros(Element::f32(), &[u64::from(shape.form.value_norm), width])?;
+        let sinks = zeros(Element::f32(), &[u64::from(shape.form.sinks), heads])?;
+        let pairs = [shape.widths.rotary_pairs];
+        let rotary_components = zeros(Element::i32(), &pairs)?;
+        let rotary_frequencies = zeros(Element::f32(), &pairs)?;
+        let rotary_amplitudes = zeros(Element::f32(), &pairs)?;
+        let coordinates = zeros(Element::i32(), &[1, 4])?;
+        let visible = semantic_i32(charges, &[1, 1, 2], &[0, 1], ATTENTION, label)?;
+        let fresh = semantic_i32(charges, &[1, 2], &[0, 1], ATTENTION, label)?;
+        let destinations = semantic_i32(charges, &[1], &[1], ATTENTION, label)?;
+        let history_tiles = semantic_i32(charges, &[0, 1], &[], ATTENTION, label)?;
+        let block_slots = semantic_i32(charges, &[0, 1], &[], ATTENTION, label)?;
+        let form = semantic_i32(
+            charges,
+            &[
+                0,
+                u64::from(shape.form.rotary_adjacent),
+                u64::from(shape.form.rotary_trailing),
+                u64::from(shape.form.output_rotary),
+                shape.stored_key(),
+            ],
+            &[],
+            ATTENTION,
+            label,
+        )?;
+        let dense_form = semantic_i32(
+            charges,
+            &[
+                0,
+                u64::from(shape.form.rotary_adjacent),
+                u64::from(shape.form.rotary_trailing),
+                u64::from(shape.form.output_rotary),
+                shape.stored_key(),
+                shape.rounds_keys(),
+                u64::from(shape.form.absorbed_query),
+            ],
+            &[],
+            ATTENTION,
+            label,
+        )?;
+        let selected_rows = semantic_i32(
+            charges,
+            &[1, shape.widths.picks],
+            &vec![-1; shape.widths.picks as usize],
+            ATTENTION,
+            label,
+        )?;
+        let selected = zeros(binding.activation, &[0, shape.widths.kv_heads, shape.widths.width])?;
+        let selection = Tensor::from_host(charges, Element::u32(), &[1, 0], &[])
+            .map_err(|error| qualification_dynamic(ATTENTION, label, error))?;
+        Ok(Self {
+            residual_values,
+            residual,
+            input,
+            inject,
+            input_norm,
+            query,
+            gate,
+            key,
+            value,
+            output,
+            grouped,
+            query_norm,
+            key_norm,
+            value_norm,
+            sinks,
+            rotary_components,
+            rotary_frequencies,
+            rotary_amplitudes,
+            coordinates,
+            visible,
+            fresh,
+            destinations,
+            history_tiles,
+            block_slots,
+            form,
+            dense_form,
+            selected_rows,
+            selected,
+            selection,
         })
-        .transpose()?;
-    let query_norm = zeros(Element::f32(), &[u64::from(shape.form.query_norm), width])?;
-    let key_norm = zeros(Element::f32(), &[u64::from(shape.form.key_norm), width])?;
-    let value_norm = zeros(Element::f32(), &[u64::from(shape.form.value_norm), width])?;
-    // The sink logits (zero rows without sinks).
-    let sinks = zeros(Element::f32(), &[u64::from(shape.form.sinks), heads])?;
-    let pairs = [shape.widths.rotary_pairs];
-    let rotary_components = zeros(Element::i32(), &pairs)?;
-    let rotary_frequencies = zeros(Element::f32(), &pairs)?;
-    let rotary_amplitudes = zeros(Element::f32(), &pairs)?;
-    let coordinates = zeros(Element::i32(), &[1, 4])?;
-    let visible = semantic_i32(charges, &[1, 1, 2], &[0, 1], ENTRY, label)?;
-    let fresh = semantic_i32(charges, &[1, 2], &[0, 1], ENTRY, label)?;
-    let destinations = semantic_i32(charges, &[1], &[1], ENTRY, label)?;
-    // The affine prefill kernel of a launch that lists no history row tiles.
-    let history_tiles = semantic_i32(charges, &[0, 1], &[], ENTRY, label)?;
-    // The history's prefill reads every visible row: no WorkList bitmap, its
-    // blocks of one key.
-    let block_slots = semantic_i32(charges, &[0, 1], &[], ENTRY, label)?;
-    // The rotary layout, output rotary and stored-key values, carried by an
-    // empty table's extents.
-    let form = semantic_i32(
-        charges,
-        &[
-            0,
-            u64::from(shape.form.rotary_adjacent),
-            u64::from(shape.form.rotary_trailing),
-            u64::from(shape.form.output_rotary),
-            shape.stored_key(),
-        ],
-        &[],
-        ENTRY,
-        label,
-    )?;
-    // The dense entries' form also carries the key rounding (`KR`), which
-    // the check runs at the layers' own rounding, and their index-list
-    // source takes no picks (`[1, KS]`, each -1) of no plane rows.
-    let rounding = shape.key_rounding;
-    let dense_form = semantic_i32(
-        charges,
-        &[
-            0,
-            u64::from(shape.form.rotary_adjacent),
-            u64::from(shape.form.rotary_trailing),
-            u64::from(shape.form.output_rotary),
-            shape.stored_key(),
-            shape.rounds_keys(),
-            u64::from(shape.form.absorbed_query),
-        ],
-        &[],
-        ENTRY,
-        label,
-    )?;
-    let selected_rows = semantic_i32(
-        charges,
-        &[1, shape.widths.picks],
-        &vec![-1; shape.widths.picks as usize],
-        ENTRY,
-        label,
-    )?;
-    let selected = zeros(binding.activation, &[0, shape.widths.kv_heads, shape.widths.width])?;
-    let selection = Tensor::from_host(charges, Element::u32(), &[1, 0], &[])
-        .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-    let scale = |name| unit_scale(charges, kernels.project.first(), name, ENTRY, label);
-    let projected = kernels
-        .project
-        .first()
+    }
+}
+
+/// An attention block's own rows per head, as its history entries mix
+/// them.
+struct MixInputs {
+    query: Tensor,
+    gate: Tensor,
+    key: Tensor,
+    value: Tensor,
+}
+
+/// The block's row projected to its query, gate, key and value rows per
+/// head: a low-rank query's through its up projection, an absorbed query's
+/// through its key projections.
+fn project_attention(
+    charges: &seismic::Charges,
+    kernels: &AttentionKernels,
+    binding: &AttentionBinding,
+    fixture: &AttentionFixture,
+    label: &str,
+) -> Result<MixInputs, CatalogFailure> {
+    let shape = binding.shape;
+    let (kv_heads, width, heads) = (shape.widths.kv_heads, shape.widths.width, shape.heads());
+    let kernel = kernels.project.first();
+    let scale = |name| unit_scale(charges, kernel, name, ATTENTION, label);
+    let projected = kernel
         .call(charges, attention_project::Args {
-            hidden: &input,
-            input_norm: &input_norm,
-            query_weight: &query,
-            gate_weight: &gate,
-            key_weight: &key,
-            value_weight: &value,
+            hidden: &fixture.input,
+            input_norm: &fixture.input_norm,
+            query_weight: &fixture.query,
+            gate_weight: &fixture.gate,
+            key_weight: &fixture.key,
+            value_weight: &fixture.value,
             epsilon: 1.0e-5,
             project_mode: 0,
             query_scale: &scale("QS")?,
             gate_scale: &scale("GS")?,
             key_scale: &scale("KS")?,
             value_scale: &scale("VS")?,
-            query_bound: &any_row_bound(charges, kernels.project.first(), "QB", ENTRY, label)?,
-            gate_bound: &any_row_bound(charges, kernels.project.first(), "GB", ENTRY, label)?,
-            key_bound: &any_row_bound(charges, kernels.project.first(), "KB", ENTRY, label)?,
-            value_bound: &any_row_bound(charges, kernels.project.first(), "VB", ENTRY, label)?,
+            query_bound: &any_row_bound(charges, kernel, "QB", ATTENTION, label)?,
+            gate_bound: &any_row_bound(charges, kernel, "GB", ATTENTION, label)?,
+            key_bound: &any_row_bound(charges, kernel, "KB", ATTENTION, label)?,
+            value_bound: &any_row_bound(charges, kernel, "VB", ATTENTION, label)?,
         })
         .map_err(|e| qualification_dynamic("attention_project", label, e))?;
     let per_head = |tensor: &Tensor, extents: &[u64]| {
         tensor
             .reshape(extents)
-            .map_err(|error| qualification_dynamic(ENTRY, label, error))
+            .map_err(|error| qualification_dynamic(ATTENTION, label, error))
     };
-    // A low-rank query's `qr` row, widened, normalized and projected to the
-    // query heads.
     let query_rows = match (binding.low_rank_query, &kernels.low_rank_query) {
         (None, None) => projected.r0,
         (Some(low_rank), Some(low_rank_kernels)) => {
-            let qr = low_rank_kernels
-                .widen
-                .call(charges, widen_rows::Args { rows: &projected.r0 })
-                .map_err(|e| qualification_dynamic("widen_rows", label, e))?
-                .value;
-            let up = zeros(binding.query, &[binding.query_rows(), low_rank.rank])?;
-            let empty = zeros(binding.query, &[0, low_rank.rank])?;
-            let kernel = low_rank_kernels.project.first();
-            let scale = |name| unit_scale(charges, kernel, name, ENTRY, label);
-            let bound = |name| any_row_bound(charges, kernel, name, ENTRY, label);
-            kernel
-                .call(charges, attention_project::Args {
-                    hidden: &qr,
-                    input_norm: &zeros(low_rank.norm, &[low_rank.rank])?,
-                    query_weight: &up,
-                    gate_weight: &empty,
-                    key_weight: &empty,
-                    value_weight: &empty,
-                    epsilon: 1.0e-5,
-                    project_mode: 0,
-                    query_scale: &scale("QS")?,
-                    gate_scale: &scale("GS")?,
-                    key_scale: &scale("KS")?,
-                    value_scale: &scale("VS")?,
-                    query_bound: &bound("QB")?,
-                    gate_bound: &bound("GB")?,
-                    key_bound: &bound("KB")?,
-                    value_bound: &bound("VB")?,
-                })
-                .map_err(|e| qualification_dynamic("attention_project", label, e))?
-                .r0
+            project_low_rank_query(charges, low_rank, low_rank_kernels, binding, &projected.r0, label)?
         }
         (low_rank, low_rank_kernels) => unreachable!(
             "preparation gives a low-rank query, and only one, its kernels: {low_rank:?} with \
@@ -315,130 +416,208 @@ pub(super) fn qualify_attention(
             low_rank_kernels.is_some()
         ),
     };
-    // An absorbed query's heads, each through its zero block of the key
-    // projections.
     let query_rows = match (binding.absorbed, &kernels.absorbed) {
         (None, None) => query_rows,
-        (Some(absorbed), Some(kernel)) => {
-            let shape = absorbed.shape;
-            let kernel = kernel.first();
-            kernel
-                .call(charges, project_rows::Args {
-                    source: &per_head(&query_rows, &[1, shape.heads * shape.width])?,
-                    weight: &zeros(absorbed.element, &[shape.heads * shape.keys, shape.width])?,
-                    weight_scale: &unit_scale(charges, kernel, "WS", "project_rows", label)?,
-                    weight_bound: &any_row_bound(charges, kernel, "WB", "project_rows", label)?,
-                })
-                .map_err(|e| qualification_dynamic("project_rows", label, e))?
-                .value
-        }
+        (Some(absorbed), Some(kernel)) => absorb_query(charges, absorbed, kernel, &query_rows, label)?,
         (absorbed, kernel) => unreachable!(
             "preparation gives an absorbed query, and only one, its kernel: {absorbed:?} with \
              kernel {}",
             kernel.is_some()
         ),
     };
-    let mixed_query = per_head(&query_rows, &[1, heads, width + shape.interleaved_gate()])?;
-    let mixed_gate = per_head(&projected.r1, &[1, heads, shape.separate_gate()])?;
+    let query = per_head(&query_rows, &[1, heads, width + shape.interleaved_gate()])?;
+    let gate = per_head(&projected.r1, &[1, heads, shape.separate_gate()])?;
     let fresh_rows = [u64::from(shape.form.fresh), 1, kv_heads * width];
-    let mixed_key = per_head(&projected.r2, &fresh_rows)?;
-    let mixed_value = match shape.form.values {
+    let key = per_head(&projected.r2, &fresh_rows)?;
+    let value = match shape.form.values {
         AttentionValues::Projected => per_head(&projected.r3, &fresh_rows)?,
         AttentionValues::RawKey => per_head(&projected.r2, &fresh_rows)?,
         // Stored-key values take no value of their own (`VK`).
-        AttentionValues::StoredKey => zeros(binding.activation, &[0, 1, kv_heads * width])?,
+        AttentionValues::StoredKey => {
+            semantic_zeros(charges, binding.activation, &[0, 1, kv_heads * width], ATTENTION, label)?
+        }
     };
-    // Every entry takes the same arguments but its history planes, which
-    // start zero (a zero key row and a zero value row). A plane of no rows
-    // is a stored-key history's absent value plane.
-    let value_rows = if shape.stored_key() == 1 { 0 } else { 2 };
-    macro_rules! mix {
-        ($kernel:expr, $module:ident, $($plane:ident: $element:expr, $elements:expr, $rows:expr),*) => {
-            mix!(@call $kernel, $module, {form: &form}, $($plane: $element, $elements, $rows),*)
-        };
-        (@call $kernel:expr, $module:ident, {$($extra:ident: $value:expr),*},
-            $($plane:ident: $element:expr, $elements:expr, $rows:expr),*) => {{
-            let mut slabs = Vec::new();
-            $(
-                let mut $plane = if $rows > 0 {
-                    let slab = crate::experts::pooled_slabs(charges, seismic::Contract::DeviceOnly, 2, 2, &[
-                        seismic::SlabRegion {
-                            element: $element,
-                            row_shape: vec![kv_heads, $elements],
-                        },
-                    ], 1)
-                    .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-                    slab.add_slab(seismic::SlabFill::Zeroed)
-                        .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-                    let region = slab
-                        .logical_region(0)
-                        .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-                    slabs.push(slab);
-                    region
-                } else {
-                    zeros($element, &[0, kv_heads, $elements])?
-                };
-            )*
-            $kernel
-                .call(charges, $module::Args {
-                    query: &mixed_query,
-                    gate: &mixed_gate,
-                    key: &mixed_key,
-                    value: &mixed_value,
-                    query_norm: &query_norm,
-                    key_norm: &key_norm,
-                    value_norm: &value_norm,
-                    sinks: &sinks,
-                    rotary_components: &rotary_components,
-                    rotary_frequencies: &rotary_frequencies,
-                    rotary_amplitudes: &rotary_amplitudes,
-                    coordinates: &coordinates,
-                    visible: &visible,
-                    fresh: &fresh,
-                    destinations: &destinations,
-                    slab_rows: 2,
-                    $($extra: $value,)*
-                    $($plane: &mut $plane,)*
-                    epsilon: 1.0e-5,
-                    scale: 1.0 / (width as f32).sqrt(),
-                    gate_function: 0,
-                })
-                .map_err(|e| qualification_dynamic(stringify!($module), label, e))?
-                .value
-        }};
+    Ok(MixInputs { query, gate, key, value })
+}
+
+/// A low-rank query's `qr` row, widened, normalized and projected to the
+/// query heads.
+fn project_low_rank_query(
+    charges: &seismic::Charges,
+    low_rank: crate::LowRankQueryBinding,
+    kernels: &LowRankQueryKernels,
+    binding: &AttentionBinding,
+    qr: &Tensor,
+    label: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let qr = kernels
+        .widen
+        .call(charges, widen_rows::Args { rows: qr })
+        .map_err(|e| qualification_dynamic("widen_rows", label, e))?
+        .value;
+    let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, ATTENTION, label);
+    let up = zeros(binding.query, &[binding.query_rows(), low_rank.rank])?;
+    let empty = zeros(binding.query, &[0, low_rank.rank])?;
+    let kernel = kernels.project.first();
+    let scale = |name| unit_scale(charges, kernel, name, ATTENTION, label);
+    let bound = |name| any_row_bound(charges, kernel, name, ATTENTION, label);
+    Ok(kernel
+        .call(charges, attention_project::Args {
+            hidden: &qr,
+            input_norm: &zeros(low_rank.norm, &[low_rank.rank])?,
+            query_weight: &up,
+            gate_weight: &empty,
+            key_weight: &empty,
+            value_weight: &empty,
+            epsilon: 1.0e-5,
+            project_mode: 0,
+            query_scale: &scale("QS")?,
+            gate_scale: &scale("GS")?,
+            key_scale: &scale("KS")?,
+            value_scale: &scale("VS")?,
+            query_bound: &bound("QB")?,
+            gate_bound: &bound("GB")?,
+            key_bound: &bound("KB")?,
+            value_bound: &bound("VB")?,
+        })
+        .map_err(|e| qualification_dynamic("attention_project", label, e))?
+        .r0)
+}
+
+/// An absorbed query's heads, each through its zero block of the key
+/// projections.
+fn absorb_query(
+    charges: &seismic::Charges,
+    absorbed: crate::AbsorbedQueryBinding,
+    kernel: &RangedKernels<project_rows::Entry>,
+    query_rows: &Tensor,
+    label: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let shape = absorbed.shape;
+    let kernel = kernel.first();
+    Ok(kernel
+        .call(charges, project_rows::Args {
+            source: &query_rows
+                .reshape(&[1, shape.heads * shape.width])
+                .map_err(|error| qualification_dynamic(ATTENTION, label, error))?,
+            weight: &semantic_zeros(
+                charges,
+                absorbed.element,
+                &[shape.heads * shape.keys, shape.width],
+                ATTENTION,
+                label,
+            )?,
+            weight_scale: &unit_scale(charges, kernel, "WS", "project_rows", label)?,
+            weight_bound: &any_row_bound(charges, kernel, "WB", "project_rows", label)?,
+        })
+        .map_err(|e| qualification_dynamic("project_rows", label, e))?
+        .value)
+}
+
+/// A history plane an attending entry reads and writes, which starts zero:
+/// zeroed slab rows of `[KV, elements]` values, or of a plane of no rows (a
+/// stored-key history's absent value plane) an empty table.
+enum HistoryPlane {
+    Slab {
+        region: Tensor,
+        /// The store the region lies in, held while it is.
+        _store: seismic::SlabTensor,
+    },
+    Empty(Tensor),
+}
+
+impl HistoryPlane {
+    fn new(
+        charges: &seismic::Charges,
+        element: Element,
+        kv_heads: u64,
+        elements: u64,
+        rows: u64,
+        label: &str,
+    ) -> Result<Self, CatalogFailure> {
+        if rows > 0 {
+            let ([region], store) = zeroed_slab(
+                charges,
+                &[seismic::SlabRegion {
+                    element,
+                    row_shape: vec![kv_heads, elements],
+                }],
+                ATTENTION,
+                label,
+            )?;
+            Ok(Self::Slab { region, _store: store })
+        } else {
+            semantic_zeros(charges, element, &[0, kv_heads, elements], ATTENTION, label).map(Self::Empty)
+        }
     }
-    let activation = binding.activation;
-    let mixed = match &kernels.history {
+
+    fn region(&mut self) -> &mut Tensor {
+        match self {
+            Self::Slab { region, .. } | Self::Empty(region) => region,
+        }
+    }
+}
+
+/// A dense history's key and value planes, each of a zero key row and a
+/// zero value row; a stored-key history has no value plane.
+fn dense_planes(
+    charges: &seismic::Charges,
+    binding: &AttentionBinding,
+    label: &str,
+) -> Result<[HistoryPlane; 2], CatalogFailure> {
+    let (kv_heads, width) = (binding.shape.widths.kv_heads, binding.shape.widths.width);
+    let value_rows = if binding.shape.stored_key() == 1 { 0 } else { 2 };
+    Ok([
+        HistoryPlane::new(charges, binding.activation, kv_heads, width, 2, label)?,
+        HistoryPlane::new(charges, binding.activation, kv_heads, width, value_rows, label)?,
+    ])
+}
+
+/// An affine K8V4 history's key and value codes and coefficients planes,
+/// each of a zero key row and a zero value row.
+fn affine_planes(
+    charges: &seismic::Charges,
+    kv_heads: u64,
+    geometry: &magnitude_state::AffineGeometry,
+    label: &str,
+) -> Result<[HistoryPlane; 4], CatalogFailure> {
+    let plane = |element, elements: usize| HistoryPlane::new(charges, element, kv_heads, elements as u64, 2, label);
+    Ok([
+        plane(Element::u32(), geometry.key_codes)?,
+        plane(Element::f16(), geometry.key_coefficients)?,
+        plane(Element::u32(), geometry.value_codes)?,
+        plane(Element::f16(), geometry.value_coefficients)?,
+    ])
+}
+
+/// The block's rows through each entry its history attends with, by
+/// entry: the decode entry (or the prefill entry tuned on the decode row
+/// classes), then the prefill entry.
+fn mix_attention(
+    charges: &seismic::Charges,
+    kernels: &AttentionKernels,
+    binding: &AttentionBinding,
+    fixture: &AttentionFixture,
+    mixed: &MixInputs,
+    label: &str,
+) -> Result<[(&'static str, Tensor); 2], CatalogFailure> {
+    Ok(match &kernels.history {
         AttentionHistoryKernels::Dense {
             decode, prefill, ..
         } => [
             match decode {
                 DenseDecodeKernels::Decode(decode) => (
                     "attention_decode",
-                    mix!(@call decode, attention_decode, {
-                        form: &dense_form, selected_rows: &selected_rows, selected: &selected,
-                        selected_slab_rows: 1, key_block: rounding.block, key_element: rounding.element,
-                        key_scale: rounding.scale, key_amax_floor: rounding.amax_floor()
-                    }, history_key: activation, width, 2, history_value: activation, width, value_rows),
+                    mix_dense_decode(charges, decode, binding, fixture, mixed, label)?,
                 ),
                 DenseDecodeKernels::Prefill(prefill) => (
                     "attention_prefill",
-                    mix!(@call prefill, attention_prefill, {
-                        selection: &selection, block_slots: &block_slots,
-                        form: &dense_form, selected_rows: &selected_rows, selected: &selected,
-                        selected_slab_rows: 1, key_block: rounding.block, key_element: rounding.element,
-                        key_scale: rounding.scale, key_amax_floor: rounding.amax_floor()
-                    }, history_key: activation, width, 2, history_value: activation, width, value_rows),
+                    mix_dense_prefill(charges, prefill, binding, fixture, mixed, label)?,
                 ),
             },
             (
                 "attention_prefill",
-                mix!(@call prefill, attention_prefill, {
-                    selection: &selection, block_slots: &block_slots,
-                    form: &dense_form, selected_rows: &selected_rows, selected: &selected,
-                    selected_slab_rows: 1, key_block: rounding.block, key_element: rounding.element,
-                    key_scale: rounding.scale, key_amax_floor: rounding.amax_floor()
-                }, history_key: activation, width, 2, history_value: activation, width, value_rows),
+                mix_dense_prefill(charges, prefill, binding, fixture, mixed, label)?,
             ),
         ],
         AttentionHistoryKernels::AffineK8V4 {
@@ -447,89 +626,287 @@ pub(super) fn qualify_attention(
             let geometry = binding
                 .history
                 .affine_geometry()
-                .map_err(|e| qualification_dynamic(ENTRY, label, e.to_string()))?;
+                .map_err(|e| qualification_dynamic(ATTENTION, label, e.to_string()))?;
             [
                 (
                     "attention_decode_k8v4",
-                    mix!(decode, attention_decode_k8v4,
-                        history_key_codes: Element::u32(), geometry.key_codes as u64, 2,
-                        history_key_coefficients: Element::f16(), geometry.key_coefficients as u64, 2,
-                        history_value_codes: Element::u32(), geometry.value_codes as u64, 2,
-                        history_value_coefficients: Element::f16(), geometry.value_coefficients as u64, 2),
+                    mix_affine_decode(charges, decode, binding, &geometry, fixture, mixed, label)?,
                 ),
                 (
                     "attention_prefill_k8v4",
-                    mix!(@call prefill, attention_prefill_k8v4,
-                        {selection: &selection, block_slots: &block_slots, history_tiles: &history_tiles, form: &form},
-                        history_key_codes: Element::u32(), geometry.key_codes as u64, 2,
-                        history_key_coefficients: Element::f16(), geometry.key_coefficients as u64, 2,
-                        history_value_codes: Element::u32(), geometry.value_codes as u64, 2,
-                        history_value_coefficients: Element::f16(), geometry.value_coefficients as u64, 2),
+                    mix_affine_prefill(charges, prefill, binding, &geometry, fixture, mixed, label)?,
                 ),
             ]
         }
+    })
+}
+
+/// The dense decode entry over the block's row and a dense history.
+fn mix_dense_decode(
+    charges: &seismic::Charges,
+    kernel: &NativeKernel<attention_decode::Entry>,
+    binding: &AttentionBinding,
+    fixture: &AttentionFixture,
+    mixed: &MixInputs,
+    label: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let [mut history_key, mut history_value] = dense_planes(charges, binding, label)?;
+    let rounding = binding.shape.key_rounding;
+    Ok(kernel
+        .call(charges, attention_decode::Args {
+            query: &mixed.query,
+            gate: &mixed.gate,
+            key: &mixed.key,
+            value: &mixed.value,
+            query_norm: &fixture.query_norm,
+            key_norm: &fixture.key_norm,
+            value_norm: &fixture.value_norm,
+            sinks: &fixture.sinks,
+            rotary_components: &fixture.rotary_components,
+            rotary_frequencies: &fixture.rotary_frequencies,
+            rotary_amplitudes: &fixture.rotary_amplitudes,
+            coordinates: &fixture.coordinates,
+            visible: &fixture.visible,
+            fresh: &fixture.fresh,
+            destinations: &fixture.destinations,
+            slab_rows: 2,
+            form: &fixture.dense_form,
+            selected_rows: &fixture.selected_rows,
+            selected: &fixture.selected,
+            selected_slab_rows: 1,
+            key_block: rounding.block,
+            key_element: rounding.element,
+            key_scale: rounding.scale,
+            key_amax_floor: rounding.amax_floor(),
+            history_key: history_key.region(),
+            history_value: history_value.region(),
+            epsilon: 1.0e-5,
+            scale: 1.0 / (binding.shape.widths.width as f32).sqrt(),
+            gate_function: 0,
+        })
+        .map_err(|e| qualification_dynamic("attention_decode", label, e))?
+        .value)
+}
+
+/// The dense prefill entry over the block's row and a dense history.
+fn mix_dense_prefill(
+    charges: &seismic::Charges,
+    kernel: &NativeKernel<attention_prefill::Entry>,
+    binding: &AttentionBinding,
+    fixture: &AttentionFixture,
+    mixed: &MixInputs,
+    label: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let [mut history_key, mut history_value] = dense_planes(charges, binding, label)?;
+    let rounding = binding.shape.key_rounding;
+    Ok(kernel
+        .call(charges, attention_prefill::Args {
+            query: &mixed.query,
+            gate: &mixed.gate,
+            key: &mixed.key,
+            value: &mixed.value,
+            query_norm: &fixture.query_norm,
+            key_norm: &fixture.key_norm,
+            value_norm: &fixture.value_norm,
+            sinks: &fixture.sinks,
+            rotary_components: &fixture.rotary_components,
+            rotary_frequencies: &fixture.rotary_frequencies,
+            rotary_amplitudes: &fixture.rotary_amplitudes,
+            coordinates: &fixture.coordinates,
+            visible: &fixture.visible,
+            fresh: &fixture.fresh,
+            destinations: &fixture.destinations,
+            slab_rows: 2,
+            selection: &fixture.selection,
+            block_slots: &fixture.block_slots,
+            form: &fixture.dense_form,
+            selected_rows: &fixture.selected_rows,
+            selected: &fixture.selected,
+            selected_slab_rows: 1,
+            key_block: rounding.block,
+            key_element: rounding.element,
+            key_scale: rounding.scale,
+            key_amax_floor: rounding.amax_floor(),
+            history_key: history_key.region(),
+            history_value: history_value.region(),
+            epsilon: 1.0e-5,
+            scale: 1.0 / (binding.shape.widths.width as f32).sqrt(),
+            gate_function: 0,
+        })
+        .map_err(|e| qualification_dynamic("attention_prefill", label, e))?
+        .value)
+}
+
+/// The affine K8V4 decode entry over the block's row and an affine
+/// history of `geometry`.
+fn mix_affine_decode(
+    charges: &seismic::Charges,
+    kernel: &NativeKernel<attention_decode_k8v4::Entry>,
+    binding: &AttentionBinding,
+    geometry: &magnitude_state::AffineGeometry,
+    fixture: &AttentionFixture,
+    mixed: &MixInputs,
+    label: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let [
+        mut history_key_codes,
+        mut history_key_coefficients,
+        mut history_value_codes,
+        mut history_value_coefficients,
+    ] = affine_planes(charges, binding.shape.widths.kv_heads, geometry, label)?;
+    Ok(kernel
+        .call(charges, attention_decode_k8v4::Args {
+            query: &mixed.query,
+            gate: &mixed.gate,
+            key: &mixed.key,
+            value: &mixed.value,
+            query_norm: &fixture.query_norm,
+            key_norm: &fixture.key_norm,
+            value_norm: &fixture.value_norm,
+            sinks: &fixture.sinks,
+            rotary_components: &fixture.rotary_components,
+            rotary_frequencies: &fixture.rotary_frequencies,
+            rotary_amplitudes: &fixture.rotary_amplitudes,
+            coordinates: &fixture.coordinates,
+            visible: &fixture.visible,
+            fresh: &fixture.fresh,
+            destinations: &fixture.destinations,
+            slab_rows: 2,
+            form: &fixture.form,
+            history_key_codes: history_key_codes.region(),
+            history_key_coefficients: history_key_coefficients.region(),
+            history_value_codes: history_value_codes.region(),
+            history_value_coefficients: history_value_coefficients.region(),
+            epsilon: 1.0e-5,
+            scale: 1.0 / (binding.shape.widths.width as f32).sqrt(),
+            gate_function: 0,
+        })
+        .map_err(|e| qualification_dynamic("attention_decode_k8v4", label, e))?
+        .value)
+}
+
+/// The affine K8V4 prefill entry of a launch that lists no history row
+/// tiles over the block's row and an affine history of `geometry`.
+fn mix_affine_prefill(
+    charges: &seismic::Charges,
+    kernel: &NativeKernel<attention_prefill_k8v4::Entry>,
+    binding: &AttentionBinding,
+    geometry: &magnitude_state::AffineGeometry,
+    fixture: &AttentionFixture,
+    mixed: &MixInputs,
+    label: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let [
+        mut history_key_codes,
+        mut history_key_coefficients,
+        mut history_value_codes,
+        mut history_value_coefficients,
+    ] = affine_planes(charges, binding.shape.widths.kv_heads, geometry, label)?;
+    Ok(kernel
+        .call(charges, attention_prefill_k8v4::Args {
+            query: &mixed.query,
+            gate: &mixed.gate,
+            key: &mixed.key,
+            value: &mixed.value,
+            query_norm: &fixture.query_norm,
+            key_norm: &fixture.key_norm,
+            value_norm: &fixture.value_norm,
+            sinks: &fixture.sinks,
+            rotary_components: &fixture.rotary_components,
+            rotary_frequencies: &fixture.rotary_frequencies,
+            rotary_amplitudes: &fixture.rotary_amplitudes,
+            coordinates: &fixture.coordinates,
+            visible: &fixture.visible,
+            fresh: &fixture.fresh,
+            destinations: &fixture.destinations,
+            slab_rows: 2,
+            selection: &fixture.selection,
+            block_slots: &fixture.block_slots,
+            history_tiles: &fixture.history_tiles,
+            form: &fixture.form,
+            history_key_codes: history_key_codes.region(),
+            history_key_coefficients: history_key_coefficients.region(),
+            history_value_codes: history_value_codes.region(),
+            history_value_coefficients: history_value_coefficients.region(),
+            epsilon: 1.0e-5,
+            scale: 1.0 / (binding.shape.widths.width as f32).sqrt(),
+            gate_function: 0,
+        })
+        .map_err(|e| qualification_dynamic("attention_prefill_k8v4", label, e))?
+        .value)
+}
+
+/// The block's output of `entry`'s `gated` rows, which zero weights leave
+/// the residual.
+fn qualify_attention_output(
+    charges: &seismic::Charges,
+    kernels: &AttentionKernels,
+    binding: &AttentionBinding,
+    fixture: &AttentionFixture,
+    entry: &'static str,
+    gated: &Tensor,
+    label: &str,
+) -> Result<(), CatalogFailure> {
+    let (heads, width) = (binding.shape.heads(), binding.shape.widths.width);
+    let (output_q, output_w) = binding.output_input();
+    // A grouped output's products are the rows its output projection
+    // reads.
+    let products = match (&kernels.grouped, &fixture.grouped) {
+        (None, None) => None,
+        (Some(kernel), Some(weight)) => Some(
+            kernel
+                .first()
+                .call(charges, project_rows::Args {
+                    source: &gated
+                        .reshape(&[1, heads * width])
+                        .map_err(|e| qualification_dynamic("project_rows", label, e))?,
+                    weight,
+                    weight_scale: &unit_scale(charges, kernel.first(), "WS", "project_rows", label)?,
+                    weight_bound: &any_row_bound(charges, kernel.first(), "WB", "project_rows", label)?,
+                })
+                .map_err(|e| qualification_dynamic("project_rows", label, e))?
+                .value
+                .reshape(&[1, output_q, output_w])
+                .map_err(|e| qualification_dynamic("project_rows", label, e))?,
+        ),
+        (kernel, weight) => unreachable!(
+            "preparation gives a grouped output, and only one, its kernels: kernels {} with \
+             weight {}",
+            kernel.is_some(),
+            weight.is_some()
+        ),
     };
-    for (entry, gated) in mixed.iter().map(|(entry, gated)| (*entry, gated)) {
-        // A grouped output's products are the rows its output projection
-        // reads.
-        let products = match (&kernels.grouped, &grouped) {
-            (None, None) => None,
-            (Some(kernel), Some(weight)) => Some(
-                kernel
-                    .first()
-                    .call(charges, project_rows::Args {
-                        source: &gated
-                            .reshape(&[1, heads * width])
-                            .map_err(|e| qualification_dynamic("project_rows", label, e))?,
-                        weight,
-                        weight_scale: &unit_scale(charges, kernel.first(), "WS", "project_rows", label)?,
-                        weight_bound: &any_row_bound(charges, kernel.first(), "WB", "project_rows", label)?,
-                    })
-                    .map_err(|e| qualification_dynamic("project_rows", label, e))?
-                    .value
-                    .reshape(&[1, output_q, output_w])
-                    .map_err(|e| qualification_dynamic("project_rows", label, e))?,
-            ),
-            (kernel, weight) => unreachable!(
-                "preparation gives a grouped output, and only one, its kernels: kernels {} with \
-                 weight {}",
-                kernel.is_some(),
-                weight.is_some()
-            ),
-        };
-        let gated = products.as_ref().unwrap_or(gated);
-        let result = match (&kernels.output, binding.tail) {
-            (SublayerOutput::Residual(output_kernel), SublayerTail::Residual) => {
-                let output_kernel = output_kernel.first();
-                output_kernel
-                    .call(charges, attention_output::Args {
-                        hidden: &residual,
-                        inject: &inject,
-                        gated,
-                        output_weight: &output,
-                        output_scale: &unit_scale(charges, output_kernel, "OS", ENTRY, label)?,
-                        output_bound: &any_row_bound(charges, output_kernel, "OB", ENTRY, label)?,
-                    })
-                    .map_err(|e| qualification_dynamic("attention_output", label, e))?
-                    .value
-            }
-            (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
-                let source = gated
-                    .reshape(&[1, output_q * output_w])
-                    .map_err(|e| qualification_dynamic("project_rows", label, e))?;
-                qualify_post_norm(charges, tail, &residual, &source, &output, norm, label)?
-            }
-            _ => {
-                return Err(qualification_dynamic(
-                    "attention_output",
-                    label,
-                    "attention output entries disagree with the binding's tail",
-                ));
-            }
-        };
-        require_f32_values(&result, &residual_values, entry, label)?;
-    }
-    Ok(())
+    let gated = products.as_ref().unwrap_or(gated);
+    let result = match (&kernels.output, binding.tail) {
+        (SublayerOutput::Residual(output_kernel), SublayerTail::Residual) => {
+            let output_kernel = output_kernel.first();
+            output_kernel
+                .call(charges, attention_output::Args {
+                    hidden: &fixture.residual,
+                    inject: &fixture.inject,
+                    gated,
+                    output_weight: &fixture.output,
+                    output_scale: &unit_scale(charges, output_kernel, "OS", ATTENTION, label)?,
+                    output_bound: &any_row_bound(charges, output_kernel, "OB", ATTENTION, label)?,
+                })
+                .map_err(|e| qualification_dynamic("attention_output", label, e))?
+                .value
+        }
+        (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
+            let source = gated
+                .reshape(&[1, output_q * output_w])
+                .map_err(|e| qualification_dynamic("project_rows", label, e))?;
+            qualify_post_norm(charges, tail, &fixture.residual, &source, &fixture.output, norm, label)?
+        }
+        _ => {
+            return Err(qualification_dynamic(
+                "attention_output",
+                label,
+                "attention output entries disagree with the binding's tail",
+            ));
+        }
+    };
+    require_f32_values(&result, &fixture.residual_values, entry, label)
 }
 
 /// A post-norm tail over one row: `source` projected to F32 by zero

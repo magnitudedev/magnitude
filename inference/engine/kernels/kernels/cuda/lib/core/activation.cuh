@@ -1,22 +1,18 @@
-// `element::Act`: the activation element `A`, for entries that bind one — the
-// engine's element-parameter convention over Seismic's dense element types
-// (<seismic/element.cuh>). The counterpart of `metal/lib/core/activation.h` and
-// `vulkan/lib/core/activation.glsl`.
+// `activation::Act`: the activation element `A`, for entries that bind one —
+// the engine's element-parameter convention over Seismic's dense element
+// types (<seismic/element.cuh>). The counterpart of
+// `metal/lib/core/activation.h` and `vulkan/lib/core/activation.glsl`.
+//
+// An entry with an A element binds it before including this file, as it
+// binds a weight slot:
+//     #define KERNEL_A SEISMIC_ELEMENT_A
+// so a header names only symbols every including entry has.
 
 #include <seismic/element.cuh>
 
-// The ABI prefix of the activation element A. It is pasted, not written out:
-// entries without an A element include this file too, and a header may name
-// only ABI symbols every including entry has.
-#define ELEMENT_A ELEMENT_CAT(SEISMIC, _ELEMENT_A)
-
-namespace element {
+namespace activation {
 // The activation element A, when the entry binds one.
-#if ELEMENT_HAS(ELEMENT_A, _REPRESENTATION_BF16)
-typedef Bf16 Act;
-#elif ELEMENT_HAS(ELEMENT_A, _REPRESENTATION_F16)
-typedef F16 Act;
-#elif ELEMENT_HAS(ELEMENT_A, _REPRESENTATION_F32)
-typedef F32 Act;
+#if defined(KERNEL_A)
+typedef ELEMENT_OF(KERNEL_A) Act;
 #endif
-} // namespace element
+} // namespace activation

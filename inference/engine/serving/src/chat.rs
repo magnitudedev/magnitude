@@ -1,5 +1,6 @@
 //! OpenAI Chat Completions (stream and non-stream) and chat template
 //! application.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::num::NonZeroU32;
@@ -55,269 +56,508 @@ const fn one() -> u32 {
     1
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ApplyTemplateRequest {
-    #[schema(nullable = false)]
-    pub model: Option<String>,
-    pub messages: Vec<ChatMessageRequest>,
-    #[schema(nullable = false)]
-    pub tools: Option<Vec<ChatToolRequest>>,
-    #[schema(nullable = false)]
-    pub tool_choice: Option<ToolChoiceRequest>,
-    #[schema(nullable = false)]
-    pub parallel_tool_calls: Option<bool>,
-    #[schema(nullable = false)]
-    pub response_format: Option<ResponseFormatRequest>,
-    #[schema(nullable = false)]
-    pub chat_template_kwargs: Option<BTreeMap<String, JsonValue>>,
-}
+pub use schema::{
+    AllowedToolRequest, AllowedToolsChoiceRequest, AllowedToolsModeRequest, AllowedToolsRequest,
+    AllowedToolsType, ApplyTemplateRequest, ApplyTemplateResponse, ChatCompletionChoice,
+    ChatCompletionChunk, ChatCompletionMessage, ChatCompletionProgress, ChatCompletionRequest,
+    ChatCompletionResponse, ChatContentPartRequest, ChatContentRequest, ChatMessageRequest,
+    ChatToolCallRequest, ChatToolRequest, ChunkChoice, ChunkDelta, ChunkFunctionDelta,
+    ChunkToolCall, CompletionFunctionCall, CompletionToolCall, CountResponse,
+    FunctionDefinitionRequest, FunctionNameRequest, FunctionToolChoiceRequest, FunctionType,
+    GrammarTriggerResponse, ImageUrlRequest, JsonSchemaRequest, NamedFunctionCallRequest,
+    PromptTokensDetails, ReasoningEffortRequest, ResponseFormatRequest, StopRequest, StreamOptions,
+    Timings, ToolChoiceModeRequest, ToolChoiceRequest, Usage,
+};
 
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ApplyTemplateResponse {
-    pub prompt: String,
-    pub generation_prompt: String,
-    pub grammar: String,
-    pub grammar_lazy: bool,
-    pub grammar_triggers: Vec<GrammarTriggerResponse>,
-    pub preserved_tokens: Vec<String>,
-    pub additional_stops: Vec<String>,
-    pub supports_thinking: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub thinking_start_tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub thinking_end_tag: Option<String>,
-    pub template_fingerprint: String,
-}
+/// The Chat Completions wire types, in a module of their own for the lint
+/// their derived schemas need.
+mod schema {
+    #![allow(
+        clippy::large_stack_frames,
+        reason = "utoipa's derived `ToSchema::schema` builds a whole type's schema in one generated frame, which this module cannot split; it runs only as the OpenAPI document is built"
+    )]
 
-/// Lazy grammar triggers. The engine's grammars are never lazy, so responses
-/// carry none; the shape remains part of the published contract.
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum GrammarTriggerResponse {
-    Token { value: String, token: i32 },
-    Word { value: String },
-    Pattern { value: String },
-    PatternFull { value: String },
-}
+    use super::*;
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ChatCompletionRequest {
-    #[schema(nullable = false)]
-    pub model: Option<String>,
-    pub messages: Vec<ChatMessageRequest>,
-    #[schema(nullable = false)]
-    pub max_tokens: Option<u32>,
-    #[schema(nullable = false)]
-    pub max_completion_tokens: Option<u32>,
-    #[schema(nullable = false)]
-    pub temperature: Option<f32>,
-    #[schema(nullable = false)]
-    pub top_p: Option<f32>,
-    /// Keep the `top_k` most likely tokens; 0 disables the filter.
-    #[schema(nullable = false)]
-    pub top_k: Option<u32>,
-    #[schema(nullable = false)]
-    pub min_p: Option<f32>,
-    #[schema(nullable = false)]
-    pub repetition_penalty: Option<f32>,
-    #[schema(nullable = false)]
-    pub presence_penalty: Option<f32>,
-    #[schema(nullable = false)]
-    pub frequency_penalty: Option<f32>,
-    #[schema(nullable = false)]
-    pub seed: Option<u32>,
-    /// Only one choice is generated.
-    #[serde(default = "one")]
-    #[schema(default = 1)]
-    pub n: u32,
-    #[schema(nullable = false)]
-    pub tools: Option<Vec<ChatToolRequest>>,
-    #[schema(nullable = false)]
-    pub tool_choice: Option<ToolChoiceRequest>,
-    #[schema(nullable = false)]
-    pub parallel_tool_calls: Option<bool>,
-    #[schema(nullable = false)]
-    pub store: Option<bool>,
-    #[schema(nullable = false)]
-    pub reasoning_effort: Option<ReasoningEffortRequest>,
-    #[schema(nullable = false)]
-    pub thinking_budget_tokens: Option<u32>,
-    #[schema(nullable = false)]
-    pub response_format: Option<ResponseFormatRequest>,
-    #[schema(nullable = false)]
-    pub chat_template_kwargs: Option<BTreeMap<String, JsonValue>>,
-    #[schema(nullable = false)]
-    pub stop: Option<StopRequest>,
-    #[serde(default)]
-    pub stream: bool,
-    #[schema(nullable = false)]
-    pub stream_options: Option<StreamOptions>,
-    #[serde(default = "default_true")]
-    #[schema(default = true)]
-    pub cache_prompt: bool,
-    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
-    #[schema(default = false)]
-    pub ignore_eos: bool,
-    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
-    #[schema(default = false)]
-    pub timings_per_token: bool,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "role", rename_all = "lowercase")]
-pub enum ChatMessageRequest {
-    System {
-        content: String,
-    },
-    Developer {
-        content: String,
-    },
-    User {
-        content: ChatContentRequest,
-    },
-    Assistant {
-        #[schema(nullable = true)]
-        content: Option<String>,
-        #[serde(default)]
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ApplyTemplateRequest {
         #[schema(nullable = false)]
-        reasoning_content: Option<String>,
+        pub model: Option<String>,
+        pub messages: Vec<ChatMessageRequest>,
+        #[schema(nullable = false)]
+        pub tools: Option<Vec<ChatToolRequest>>,
+        #[schema(nullable = false)]
+        pub tool_choice: Option<ToolChoiceRequest>,
+        #[schema(nullable = false)]
+        pub parallel_tool_calls: Option<bool>,
+        #[schema(nullable = false)]
+        pub response_format: Option<ResponseFormatRequest>,
+        #[schema(nullable = false)]
+        pub chat_template_kwargs: Option<BTreeMap<String, JsonValue>>,
+    }
+
+    #[derive(Debug, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ApplyTemplateResponse {
+        pub prompt: String,
+        pub generation_prompt: String,
+        pub grammar: String,
+        pub grammar_lazy: bool,
+        pub grammar_triggers: Vec<GrammarTriggerResponse>,
+        pub preserved_tokens: Vec<String>,
+        pub additional_stops: Vec<String>,
+        pub supports_thinking: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub thinking_start_tag: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub thinking_end_tag: Option<String>,
+        pub template_fingerprint: String,
+    }
+
+    /// Lazy grammar triggers. The engine's grammars are never lazy, so responses
+    /// carry none; the shape remains part of the published contract.
+    #[derive(Debug, Serialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum GrammarTriggerResponse {
+        Token { value: String, token: i32 },
+        Word { value: String },
+        Pattern { value: String },
+        PatternFull { value: String },
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ChatCompletionRequest {
+        #[schema(nullable = false)]
+        pub model: Option<String>,
+        pub messages: Vec<ChatMessageRequest>,
+        #[schema(nullable = false)]
+        pub max_tokens: Option<u32>,
+        #[schema(nullable = false)]
+        pub max_completion_tokens: Option<u32>,
+        #[schema(nullable = false)]
+        pub temperature: Option<f32>,
+        #[schema(nullable = false)]
+        pub top_p: Option<f32>,
+        /// Keep the `top_k` most likely tokens; 0 disables the filter.
+        #[schema(nullable = false)]
+        pub top_k: Option<u32>,
+        #[schema(nullable = false)]
+        pub min_p: Option<f32>,
+        #[schema(nullable = false)]
+        pub repetition_penalty: Option<f32>,
+        #[schema(nullable = false)]
+        pub presence_penalty: Option<f32>,
+        #[schema(nullable = false)]
+        pub frequency_penalty: Option<f32>,
+        #[schema(nullable = false)]
+        pub seed: Option<u32>,
+        /// Only one choice is generated.
+        #[serde(default = "one")]
+        #[schema(default = 1)]
+        pub n: u32,
+        #[schema(nullable = false)]
+        pub tools: Option<Vec<ChatToolRequest>>,
+        #[schema(nullable = false)]
+        pub tool_choice: Option<ToolChoiceRequest>,
+        #[schema(nullable = false)]
+        pub parallel_tool_calls: Option<bool>,
+        #[schema(nullable = false)]
+        pub store: Option<bool>,
+        #[schema(nullable = false)]
+        pub reasoning_effort: Option<ReasoningEffortRequest>,
+        #[schema(nullable = false)]
+        pub thinking_budget_tokens: Option<u32>,
+        #[schema(nullable = false)]
+        pub response_format: Option<ResponseFormatRequest>,
+        #[schema(nullable = false)]
+        pub chat_template_kwargs: Option<BTreeMap<String, JsonValue>>,
+        #[schema(nullable = false)]
+        pub stop: Option<StopRequest>,
         #[serde(default)]
-        tool_calls: Vec<ChatToolCallRequest>,
-    },
-    Tool {
-        tool_call_id: String,
-        content: ChatContentRequest,
+        pub stream: bool,
+        #[schema(nullable = false)]
+        pub stream_options: Option<StreamOptions>,
+        #[serde(default = "default_true")]
+        #[schema(default = true)]
+        pub cache_prompt: bool,
+        #[serde(default, deserialize_with = "deserialize_bool_or_false")]
+        #[schema(default = false)]
+        pub ignore_eos: bool,
+        #[serde(default, deserialize_with = "deserialize_bool_or_false")]
+        #[schema(default = false)]
+        pub timings_per_token: bool,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "role", rename_all = "lowercase")]
+    pub enum ChatMessageRequest {
+        System {
+            content: String,
+        },
+        Developer {
+            content: String,
+        },
+        User {
+            content: ChatContentRequest,
+        },
+        Assistant {
+            #[schema(nullable = true)]
+            content: Option<String>,
+            #[serde(default)]
+            #[schema(nullable = false)]
+            reasoning_content: Option<String>,
+            #[serde(default)]
+            tool_calls: Vec<ChatToolCallRequest>,
+        },
+        Tool {
+            tool_call_id: String,
+            content: ChatContentRequest,
+            #[schema(nullable = false)]
+            #[allow(dead_code)]
+            name: Option<String>,
+        },
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum ChatContentRequest {
+        Text(String),
+        Parts(Vec<ChatContentPartRequest>),
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ChatContentPartRequest {
+        Text { text: String },
+        ImageUrl { image_url: ImageUrlRequest },
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ImageUrlRequest {
+        pub url: String,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ChatToolCallRequest {
+        pub id: String,
+        #[allow(dead_code)]
+        pub r#type: FunctionType,
+        pub function: NamedFunctionCallRequest,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct NamedFunctionCallRequest {
+        pub name: String,
+        pub arguments: String,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ChatToolRequest {
+        #[allow(dead_code)]
+        pub r#type: FunctionType,
+        pub function: FunctionDefinitionRequest,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct FunctionDefinitionRequest {
+        pub name: String,
+        #[schema(nullable = false)]
+        pub description: Option<String>,
+        pub parameters: JsonValue,
         #[schema(nullable = false)]
         #[allow(dead_code)]
-        name: Option<String>,
-    },
-}
+        pub strict: Option<bool>,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ChatContentRequest {
-    Text(String),
-    Parts(Vec<ChatContentPartRequest>),
-}
+    #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+    #[serde(rename_all = "lowercase")]
+    pub enum FunctionType {
+        Function,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ChatContentPartRequest {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrlRequest },
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum ToolChoiceRequest {
+        Mode(ToolChoiceModeRequest),
+        Function(FunctionToolChoiceRequest),
+        AllowedTools(AllowedToolsChoiceRequest),
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ImageUrlRequest {
-    pub url: String,
-}
+    #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ToolChoiceModeRequest {
+        None,
+        Auto,
+        Required,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ChatToolCallRequest {
-    pub id: String,
-    #[allow(dead_code)]
-    pub r#type: FunctionType,
-    pub function: NamedFunctionCallRequest,
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct FunctionToolChoiceRequest {
+        #[allow(dead_code)]
+        pub r#type: FunctionType,
+        pub function: FunctionNameRequest,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct NamedFunctionCallRequest {
-    pub name: String,
-    pub arguments: String,
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct FunctionNameRequest {
+        pub name: String,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ChatToolRequest {
-    #[allow(dead_code)]
-    pub r#type: FunctionType,
-    pub function: FunctionDefinitionRequest,
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct AllowedToolsChoiceRequest {
+        #[allow(dead_code)]
+        pub r#type: AllowedToolsType,
+        pub allowed_tools: AllowedToolsRequest,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct FunctionDefinitionRequest {
-    pub name: String,
-    #[schema(nullable = false)]
-    pub description: Option<String>,
-    pub parameters: JsonValue,
-    #[schema(nullable = false)]
-    #[allow(dead_code)]
-    pub strict: Option<bool>,
-}
+    #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AllowedToolsType {
+        AllowedTools,
+    }
 
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum FunctionType {
-    Function,
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct AllowedToolsRequest {
+        pub mode: AllowedToolsModeRequest,
+        pub tools: Vec<AllowedToolRequest>,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ToolChoiceRequest {
-    Mode(ToolChoiceModeRequest),
-    Function(FunctionToolChoiceRequest),
-    AllowedTools(AllowedToolsChoiceRequest),
-}
+    #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+    #[serde(rename_all = "lowercase")]
+    pub enum AllowedToolsModeRequest {
+        Auto,
+        Required,
+    }
 
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolChoiceModeRequest {
-    None,
-    Auto,
-    Required,
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct AllowedToolRequest {
+        #[allow(dead_code)]
+        pub r#type: FunctionType,
+        pub function: FunctionNameRequest,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct FunctionToolChoiceRequest {
-    #[allow(dead_code)]
-    pub r#type: FunctionType,
-    pub function: FunctionNameRequest,
-}
+    #[derive(Debug, Clone, Deserialize, ToSchema)]
+    #[serde(transparent)]
+    pub struct ReasoningEffortRequest(pub String);
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct FunctionNameRequest {
-    pub name: String,
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ResponseFormatRequest {
+        Text,
+        JsonObject,
+        Grammar { grammar: String },
+        JsonSchema { json_schema: JsonSchemaRequest },
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct AllowedToolsChoiceRequest {
-    #[allow(dead_code)]
-    pub r#type: AllowedToolsType,
-    pub allowed_tools: AllowedToolsRequest,
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct JsonSchemaRequest {
+        pub name: String,
+        pub schema: JsonValue,
+        #[serde(default)]
+        pub strict: bool,
+    }
 
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AllowedToolsType {
-    AllowedTools,
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum StopRequest {
+        One(String),
+        Many(Vec<String>),
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct AllowedToolsRequest {
-    pub mode: AllowedToolsModeRequest,
-    pub tools: Vec<AllowedToolRequest>,
-}
+    #[derive(Debug, Default, Deserialize, ToSchema)]
+    pub struct StreamOptions {
+        #[schema(nullable = false)]
+        pub include_usage: Option<bool>,
+    }
 
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum AllowedToolsModeRequest {
-    Auto,
-    Required,
-}
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChatCompletionChunk {
+        pub id: String,
+        pub object: &'static str,
+        pub created: u64,
+        pub model: String,
+        pub choices: Vec<ChunkChoice>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub progress: Option<ChatCompletionProgress>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub usage: Option<Usage>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub timings: Option<Timings>,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct AllowedToolRequest {
-    #[allow(dead_code)]
-    pub r#type: FunctionType,
-    pub function: FunctionNameRequest,
-}
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(tag = "phase", rename_all = "snake_case")]
+    pub enum ChatCompletionProgress {
+        ModelLoading {
+            stage: ModelLoadStage,
+            fraction: f32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            #[schema(nullable = false)]
+            details: Option<ModelLoadDetails>,
+        },
+        Queued,
+        Preparing,
+        Prefill {
+            completed_tokens: u64,
+            total_tokens: u64,
+            cached_tokens: u64,
+        },
+        Generating,
+    }
 
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(transparent)]
-pub struct ReasoningEffortRequest(pub String);
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChunkChoice {
+        pub index: u32,
+        pub delta: ChunkDelta,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub finish_reason: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChunkDelta {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub role: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub content: Option<Option<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub reasoning_content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub tool_calls: Option<Vec<ChunkToolCall>>,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChunkToolCall {
+        pub index: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub r#type: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub function: Option<ChunkFunctionDelta>,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChunkFunctionDelta {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub arguments: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChatCompletionResponse {
+        pub id: String,
+        pub object: &'static str,
+        pub created: u64,
+        pub model: String,
+        pub choices: Vec<ChatCompletionChoice>,
+        pub usage: Usage,
+        pub timings: Timings,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChatCompletionChoice {
+        pub index: u32,
+        pub message: ChatCompletionMessage,
+        pub finish_reason: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ChatCompletionMessage {
+        pub role: &'static str,
+        pub content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub reasoning_content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub tool_calls: Option<Vec<CompletionToolCall>>,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CompletionToolCall {
+        pub id: String,
+        pub r#type: &'static str,
+        pub function: CompletionFunctionCall,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CompletionFunctionCall {
+        pub name: String,
+        pub arguments: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Usage {
+        pub prompt_tokens: u64,
+        pub completion_tokens: u64,
+        pub total_tokens: u64,
+        pub prompt_tokens_details: PromptTokensDetails,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PromptTokensDetails {
+        pub cached_tokens: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Timings {
+        pub cache_n: u64,
+        pub prompt_n: u64,
+        pub prompt_ms: f64,
+        pub time_to_first_token_ms: f64,
+        pub prompt_per_token_ms: f64,
+        pub prompt_per_second: f64,
+        pub predicted_n: u64,
+        pub predicted_ms: f64,
+        pub predicted_per_token_ms: f64,
+        pub predicted_per_second: f64,
+        /// Time spent inside the sampler for this request.
+        pub sampler_ms: f64,
+        /// Time spent incrementally parsing generated chat output for this request.
+        pub parser_ms: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub draft_n: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        pub draft_n_accepted: Option<u64>,
+    }
+
+    /// Input tokens a Chat Completions request occupies.
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct CountResponse {
+        pub prompt_tokens: u64,
+    }
+}
 
 impl ReasoningEffortRequest {
     /// The normalized public effort this spelling names.
@@ -326,55 +566,6 @@ impl ReasoningEffortRequest {
             ApiError::invalid(format!("unsupported reasoning_effort spelling: {}", self.0))
         })
     }
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseFormatRequest {
-    Text,
-    JsonObject,
-    Grammar { grammar: String },
-    JsonSchema { json_schema: JsonSchemaRequest },
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct JsonSchemaRequest {
-    pub name: String,
-    pub schema: JsonValue,
-    #[serde(default)]
-    pub strict: bool,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum StopRequest {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Debug, Default, Deserialize, ToSchema)]
-pub struct StreamOptions {
-    #[schema(nullable = false)]
-    pub include_usage: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChatCompletionChunk {
-    pub id: String,
-    pub object: &'static str,
-    pub created: u64,
-    pub model: String,
-    pub choices: Vec<ChunkChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub progress: Option<ChatCompletionProgress>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub usage: Option<Usage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub timings: Option<Timings>,
 }
 
 /// The data payload of a Chat Completions SSE frame. Successful frames are
@@ -416,26 +607,6 @@ impl ToSchema for ChatCompletionStreamEvent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "phase", rename_all = "snake_case")]
-pub enum ChatCompletionProgress {
-    ModelLoading {
-        stage: ModelLoadStage,
-        fraction: f32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schema(nullable = false)]
-        details: Option<ModelLoadDetails>,
-    },
-    Queued,
-    Preparing,
-    Prefill {
-        completed_tokens: u64,
-        total_tokens: u64,
-        cached_tokens: u64,
-    },
-    Generating,
-}
-
 impl ChatCompletionProgress {
     /// Model loading progress, as every streaming protocol reports it.
     pub(crate) fn model_loading(load: ModelLoadProgress) -> Self {
@@ -445,146 +616,6 @@ impl ChatCompletionProgress {
             details: load.details,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChunkChoice {
-    pub index: u32,
-    pub delta: ChunkDelta,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChunkDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<Option<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub tool_calls: Option<Vec<ChunkToolCall>>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChunkToolCall {
-    pub index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub r#type: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub function: Option<ChunkFunctionDelta>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChunkFunctionDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub arguments: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChatCompletionResponse {
-    pub id: String,
-    pub object: &'static str,
-    pub created: u64,
-    pub model: String,
-    pub choices: Vec<ChatCompletionChoice>,
-    pub usage: Usage,
-    pub timings: Timings,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChatCompletionChoice {
-    pub index: u32,
-    pub message: ChatCompletionMessage,
-    pub finish_reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChatCompletionMessage {
-    pub role: &'static str,
-    pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub tool_calls: Option<Vec<CompletionToolCall>>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CompletionToolCall {
-    pub id: String,
-    pub r#type: &'static str,
-    pub function: CompletionFunctionCall,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CompletionFunctionCall {
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Usage {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-    pub prompt_tokens_details: PromptTokensDetails,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PromptTokensDetails {
-    pub cached_tokens: u64,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Timings {
-    pub cache_n: u64,
-    pub prompt_n: u64,
-    pub prompt_ms: f64,
-    pub time_to_first_token_ms: f64,
-    pub prompt_per_token_ms: f64,
-    pub prompt_per_second: f64,
-    pub predicted_n: u64,
-    pub predicted_ms: f64,
-    pub predicted_per_token_ms: f64,
-    pub predicted_per_second: f64,
-    /// Time spent inside the sampler for this request.
-    pub sampler_ms: f64,
-    /// Time spent incrementally parsing generated chat output for this request.
-    pub parser_ms: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub draft_n: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub draft_n_accepted: Option<u64>,
 }
 
 pub(crate) fn chat_finish_reason(termination: &Termination) -> &'static str {
@@ -612,17 +643,21 @@ pub(crate) fn timing_values(snapshot: &TimingSnapshot) -> Timings {
         .prompt_tokens
         .saturating_sub(snapshot.cached_prompt_tokens);
     let timings = &snapshot.timings;
+    let (prompt_per_token_ms, prompt_per_second) = throughput(prompt_n, timings.prompt_ms);
+    // Decode produces every token after the first, which the prompt's pass produces.
+    let (predicted_per_token_ms, predicted_per_second) =
+        throughput(snapshot.generated_tokens.saturating_sub(1), timings.decode_ms);
     Timings {
         cache_n: snapshot.cached_prompt_tokens,
         prompt_n,
         prompt_ms: timings.prompt_ms,
         time_to_first_token_ms: timings.time_to_first_token_ms,
-        prompt_per_token_ms: per_token_ms(prompt_n, timings.prompt_ms),
-        prompt_per_second: rate(prompt_n, timings.prompt_ms),
+        prompt_per_token_ms,
+        prompt_per_second,
         predicted_n: snapshot.generated_tokens,
         predicted_ms: timings.decode_ms,
-        predicted_per_token_ms: per_token_ms(snapshot.generated_tokens, timings.decode_ms),
-        predicted_per_second: rate(snapshot.generated_tokens, timings.decode_ms),
+        predicted_per_token_ms,
+        predicted_per_second,
         sampler_ms: timings.sampler_ms,
         parser_ms: timings.parser_ms,
         draft_n: (timings.draft_tokens > 0).then_some(timings.draft_tokens),
@@ -630,19 +665,13 @@ pub(crate) fn timing_values(snapshot: &TimingSnapshot) -> Timings {
     }
 }
 
-fn per_token_ms(tokens: u64, elapsed_ms: f64) -> f64 {
-    if tokens == 0 {
-        0.0
-    } else {
-        elapsed_ms / tokens as f64
-    }
-}
-
-fn rate(tokens: u64, elapsed_ms: f64) -> f64 {
+/// `tokens` produced in `elapsed_ms` as milliseconds a token and tokens a second, each the other's
+/// inverse; both zero where nothing was produced or no time passed.
+fn throughput(tokens: u64, elapsed_ms: f64) -> (f64, f64) {
     if tokens == 0 || elapsed_ms <= 0.0 {
-        0.0
+        (0.0, 0.0)
     } else {
-        1_000.0 * tokens as f64 / elapsed_ms
+        (elapsed_ms / tokens as f64, 1_000.0 * tokens as f64 / elapsed_ms)
     }
 }
 
@@ -1718,12 +1747,6 @@ async fn stream_chat(
             return;
         }
     }
-}
-
-/// Input tokens a Chat Completions request occupies.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct CountResponse {
-    pub prompt_tokens: u64,
 }
 
 /// Count a Chat Completions request's input tokens with the same rendering

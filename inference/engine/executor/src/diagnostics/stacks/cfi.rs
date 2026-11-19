@@ -77,9 +77,10 @@ impl<T: gimli::ReaderOffset> UnwindContextStorage<T> for Inline {
     type Stack = [UnwindTableRow<T, Self>; 4];
 }
 
-/// The loaded images and an unwinding context, on the reporter's stack.
+/// The loaded images and an unwinding context, allocated as the reporter
+/// starts (`super::Scratch`) and read again by each report.
 pub(super) struct Images {
-    images: [Image; IMAGES],
+    images: Box<[Image]>,
     count: usize,
     context: UnwindContext<usize, Inline>,
 }
@@ -91,7 +92,11 @@ fn field(bytes: &[u8], at: usize, count: usize) -> u64 {
 
 impl Images {
     pub(super) fn new() -> Self {
-        Self { images: [Image::default(); IMAGES], count: 0, context: UnwindContext::new_in() }
+        Self {
+            images: vec![Image::default(); IMAGES].into_boxed_slice(),
+            count: 0,
+            context: UnwindContext::new_in(),
+        }
     }
 
     /// Read the loader's list of images and each one's segments and tables:
@@ -103,6 +108,7 @@ impl Images {
             let debug = std::ptr::addr_of!(_r_debug);
             (std::ptr::addr_of!((*debug).state).read_volatile(), std::ptr::addr_of!((*debug).map).read_volatile())
         };
+        self.count = 0;
         if state != CONSISTENT {
             return Err("the loader is changing its images");
         }

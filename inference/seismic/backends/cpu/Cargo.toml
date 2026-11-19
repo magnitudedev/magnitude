@@ -36,3 +36,6 @@ magnitude-source-identity = { path = "../../../engine/source-identity" }
 [dev-dependencies]
 # The recorded machines, whose CPU reports the backend is held to.
 seismic-topology = { workspace = true, features = ["fixtures"] }
+
+[lints]
+workspace = true

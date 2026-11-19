@@ -26,6 +26,7 @@
 #define ATTENTION_SINK_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_SINKS)
 // Both forms' shared code (an entry's includes expand once, whatever the
 // branch).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/attention/history.glsl"
 
 attention_history decode_history() {

@@ -1,4 +1,5 @@
 // draft_gated_rows: result = A(silu(gate) * up); one thread per element.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 
 extern "C" __global__ void draft_gated_rows(SEISMIC_KERNEL_PARAMS) {
@@ -11,7 +12,7 @@ extern "C" __global__ void draft_gated_rows(SEISMIC_KERNEL_PARAMS) {
     if (index >= (u64)SEISMIC_DIM_M * width)
         return;
     const u64 row = index / width, column = index % width;
-    const float a = element::at<element::Act>(gate, row * SEISMIC_GATE_STRIDE_0 + column * SEISMIC_GATE_STRIDE_1);
-    const float b = element::at<element::Act>(up, row * SEISMIC_UP_STRIDE_0 + column * SEISMIC_UP_STRIDE_1);
+    const float a = element::at<activation::Act>(gate, row * SEISMIC_GATE_STRIDE_0 + column * SEISMIC_GATE_STRIDE_1);
+    const float b = element::at<activation::Act>(up, row * SEISMIC_UP_STRIDE_0 + column * SEISMIC_UP_STRIDE_1);
     result.put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, a / (1.0f + expf(-a)) * b);
 }

@@ -1,32 +1,25 @@
 // vision_linear: one 64 x 64 GEMM tile of y = x . transpose(weight) over the
 // projection library with the Linear epilogue (`lib/vision/vision.glsl`): the
 // bias, the clamp, then the activation, the gate or the F32 residual.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/core/activation.glsl"
 #include "lib/vision/vision.glsl"
 
-#if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "vision_linear requires a bf16 or f16 activation"
 #endif
 
 
-#if defined(SEISMIC_BIAS_REPRESENTATION_BF16)
-#define BIAS_KIND ELEMENT_BF16
-#elif defined(SEISMIC_BIAS_REPRESENTATION_F16)
-#define BIAS_KIND ELEMENT_F16
-#elif defined(SEISMIC_BIAS_REPRESENTATION_F32)
-#define BIAS_KIND ELEMENT_F32
-#else
-#error "unsupported vision_linear bias representation"
-#endif
+#define BIAS_KIND ELEMENT_OF(SEISMIC_BIAS)
 
 
 void vision_linear() {
     const uint n = uint(SEISMIC_DIM_N), k = uint(SEISMIC_DIM_K);
-    const projection_prologue in_ = projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_X), SEISMIC_X_STRIDE_0, 1ul,
+    const projection_prologue in_ = projection_plain(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_X), SEISMIC_X_STRIDE_0, 1ul,
         k, 0ul);
     const bool clamped = SEISMIC_DIM_NC == 1;
-    const vision_epilogue out_ = vision_linear_epilogue(ELEMENT_ACT, int(SEISMIC_PARAM_ACTIVATION),
+    const vision_epilogue out_ = vision_linear_epilogue(ACTIVATION_A, int(SEISMIC_PARAM_ACTIVATION),
         SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_DIM_NB == 1,
         SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_GATE),

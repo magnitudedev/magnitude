@@ -87,7 +87,10 @@ export const AcnHardwareSummarySchema = Schema.Struct({
   gpuCount: NonNegativeSafeInteger,
   gpuUnusedReason: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   cpuModel: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
-  cpuCores: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
+  /** The cores the engine's CPU pool runs on. */
+  cpuPoolCores: PositiveSafeInteger,
+  /** The host's logical CPUs (hardware threads): a VM's vCPUs. */
+  logicalCpus: PositiveSafeInteger,
   memoryBytes: NonNegativeSafeInteger,
 })
 export type AcnHardwareSummary = typeof AcnHardwareSummarySchema.Type

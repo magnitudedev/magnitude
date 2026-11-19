@@ -19,7 +19,7 @@
         float selected = 0.0f;                                                                             \
         for (projection::u64 k = 0; k < join_k; ++k)                                                       \
             selected = __fmaf_rn(join_scores[(row) * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1], \
-                                 element::Act::load(__ldcg((row_published) + k * join_h + (n))), selected); \
+                                 activation::Act::load(__ldcg((row_published) + k * join_h + (n))), selected); \
         ROUTED_SITE_ADD(row, n, selected)                                                                  \
         projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(                                    \
             SEISMIC_RESULT_0_OUT.offset((row) * SEISMIC_RESULT_0_STRIDE_0),                                \
@@ -27,7 +27,7 @@
                 (row) * SEISMIC_RESIDUAL_STRIDE_0,                                                         \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT)) + (row) * SEISMIC_INJECT_STRIDE_0, \
             join_h, (n), selected,                                                                         \
-            element::Act::load(__ldcg((row_published) + join_k * join_h + (n))) *                                             \
+            activation::Act::load(__ldcg((row_published) + join_k * join_h + (n))) *                                             \
                 reinterpret_cast<const float *>(                                                           \
                     SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT))[(row) * SEISMIC_COEFFICIENT_STRIDE_0]);       \
     } while (0)

@@ -1971,13 +1971,36 @@ export const LocalInferenceModelStorageSchema = Schema.Struct({
 })
 export type LocalInferenceModelStorage = typeof LocalInferenceModelStorageSchema.Type
 
+/** The machine's enclosure, which supplements, but never determines, inference capabilities. */
+export const MachineFormFactor = Schema.Literal("Portable", "Desktop", "AllInOne", "MiniPc", "Server", "Unknown")
+export type MachineFormFactor = typeof MachineFormFactor.Type
+const FirmwareLabel = Schema.Trimmed.pipe(Schema.minLength(1), Schema.maxLength(255))
+export const MachineIdentity = Schema.Struct({
+  manufacturer: FirmwareLabel,
+  model: FirmwareLabel,
+  family: Schema.optionalWith(FirmwareLabel, { as: "Option", exact: true }),
+  version: Schema.optionalWith(FirmwareLabel, { as: "Option", exact: true }),
+  formFactor: MachineFormFactor,
+})
+/** The machine as its firmware names it: its maker and model where the firmware names both, and its enclosure. */
+export const MachineIdentityObservation = Schema.Union(
+  Schema.TaggedStruct("Identified", MachineIdentity.fields),
+  Schema.TaggedStruct("Unavailable", { formFactor: MachineFormFactor }),
+)
+export type MachineIdentityObservation = typeof MachineIdentityObservation.Type
+
 export const LocalInferenceHardwareSchema = Schema.Struct({
   platform: Schema.Literal("MacOS", "Linux", "Windows"),
   architecture: Schema.Literal("Arm64", "X64"),
   productName: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  identity: MachineIdentityObservation,
   processor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  physicalCores: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
-  logicalCores: PositiveSafeInteger,
+  /** The chip's cores of every kind, as its processor topology reports them, which identify its variant: a VM's virtual cores. Never what inference runs on (`cpuPoolCores`). */
+  chipCores: PositiveSafeInteger,
+  /** The host's logical CPUs (hardware threads): a VM's vCPUs. */
+  logicalCpus: PositiveSafeInteger,
+  /** The cores the engine's CPU pool runs on: the performance cores the service may run on, under its CPU quota. */
+  cpuPoolCores: PositiveSafeInteger,
   totalSystemMemoryBytes: NonNegativeSafeInteger,
   accelerators: Schema.Array(LocalInferenceAcceleratorSchema),
   /** The active device: the one a resident model runs on, and otherwise the service's serving device. */

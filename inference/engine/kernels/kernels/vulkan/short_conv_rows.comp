@@ -6,6 +6,7 @@
 // stride (it is capped at the 65535-group floor). Each output is the body's
 // tap-ascending F32 FMA chain times the gate, so every row class and backend
 // gives the same bits.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 #include "lib/recurrent/versions.glsl"
 

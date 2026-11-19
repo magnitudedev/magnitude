@@ -14,19 +14,18 @@
 // XS, or a streamed entry's fixed SOURCE_ROWS; and ROUTED_PROJECTED_PUT(m, k,
 // n, value), which stores slot k of row m's channel n in A through `Out`.
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define ROUTED_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "routed_output requires a bf16 or f16 activation"
 #endif
+#define ROUTED_ACT ACTIVATION_A
 // The down weights' operand rows (the product rows, or NVFP4 operands), each
 // weight's own, which each (row, choice)'s GEMV forms while staging them.
-#if defined(SEISMIC_EXPERT_DOWN_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_EXPERT_DOWN)
 #define EXPERT_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define EXPERT_OPERANDS PROJECTION_OPERANDS_ROUNDED
 #endif
-#if defined(SEISMIC_SHARED_DOWN_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_SHARED_DOWN)
 #define SHARED_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define SHARED_OPERANDS PROJECTION_OPERANDS_ROUNDED

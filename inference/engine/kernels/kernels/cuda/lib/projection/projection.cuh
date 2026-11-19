@@ -56,6 +56,7 @@
 // from this schedule; a row count does not grant activation quantization.
 #include "../core/activation.cuh"
 #include "../core/functions.cuh"
+#include <seismic/activation.cuh>
 #include <seismic/packets.cuh>
 #include "../core/reduce.cuh"
 #include "join.cuh"
@@ -66,10 +67,10 @@ using element::u8;
 using element::u16;
 using element::u32;
 using element::u64;
+using element::Same;
 using packets::Coefficients;
-using packets::Same;
 using packets::s8_times;
-typedef element::Act Act;
+typedef activation::Act Act;
 
 static_assert(Act::bytes == 2, "the CUDA projection family requires a bf16 or f16 activation element");
 using Op = typename packets::OperandOf<Act>::type;
@@ -369,6 +370,7 @@ struct NoWeight {
     static constexpr bool BIAS = false;
     static constexpr bool DENSE = false;
     static constexpr int CHUNKS = 0;
+    static constexpr int CHUNK_BYTES = 16;
     static constexpr int SUPER_WORDS = 0;
     struct Raw {};
     typedef Raw EntryRaw;
@@ -507,43 +509,18 @@ template <bool ONE_> struct IsS8Rows<S8Rows<ONE_>> {
 // A list of weight types.
 template <class... Ts> struct Types {};
 
-// The grid whose points weights W decode (`GridPlanes`), 0 for weights that
-// read none.
-template <class W, class = void> struct GridOf {
-    static constexpr u32 value = 0;
-};
-template <class W> struct GridOf<W, decltype(void(W::planes::codes::points::GRID))> {
-    static constexpr u32 value = W::planes::codes::points::GRID;
-};
-template <class G, class K> struct GridOf<packets::Records<G, K>> {
-    static constexpr u32 value = G::points::GRID;
-};
-// The points source of a GEMV block over weights Ws: its own copy where any
-// reads a grid (`stage_points`), else global memory.
+// The points source of a GEMV block over weights Ws (`packets::points_of`):
+// its own copy where any reads a grid (`stage_points`), else global memory.
 template <class... Ws> struct PointsOf {
-    typedef typename packets::Select<((GridOf<Ws>::value != 0) || ...), packets::BlockPoints,
-                                     packets::GlobalPoints>::type type;
+    typedef packets::points_of<Ws...> type;
 };
 template <class... Ws> struct PointsOf<Types<Ws...>> : PointsOf<Ws...> {};
-// Fill the block's copy of each distinct grid weights Ws read
-// (block-collective; the caller synchronizes the block before any read).
-template <u32... SEEN> struct PointsStager {
-    __device__ static __forceinline__ void run(Types<>) {}
-    template <class W, class... Rest> __device__ static __forceinline__ void run(Types<W, Rest...>) {
-        constexpr u32 GRID = GridOf<W>::value;
-        if constexpr (GRID != 0 && ((GRID != SEEN) && ...)) {
-            packets::stage_block_points<GRID>();
-            PointsStager<SEEN..., GRID>::run(Types<Rest...>{});
-        } else {
-            PointsStager<SEEN...>::run(Types<Rest...>{});
-        }
-    }
-};
-template <class... Ws> __device__ __forceinline__ void stage_points(Types<Ws...> weights) {
-    PointsStager<>::run(weights);
-}
+// Fill the block's copy of each distinct grid weights Ws read, and
+// synchronize the block, where any reads one (`packets::stage_points`;
+// block-collective).
+template <class... Ws> __device__ __forceinline__ void stage_points(Types<Ws...>) { packets::stage_points<Ws...>(); }
 
-// The order of weights W's int8 codes in the GEMV (`packets::Packed::S8_ENTRIES`):
+// The order of weights W's int8 codes in the GEMV (`W::S8_ENTRIES`):
 // 1 entry order (grid weights, which read slot order too), 0 slot order, -1
 // none (dense weights, no weight).
 template <class W, class = void> struct S8OrderOf {
@@ -569,9 +546,8 @@ template <bool S8, class... Ws> __host__ __device__ constexpr bool s8_entries_of
 template <bool ENTRIES, class... Ws> __host__ __device__ constexpr bool s8_order_read_by() {
     return !ENTRIES || ((S8OrderOf<Ws>::value != 0) && ...);
 }
-// The order of weights W's int8 codes in the GEMM (`packets::Packed::S8_GEMM_ENTRIES`,
-// `packets::s8_gemm_entries`): 1 entry order, 0 slot order, -1 none (dense
-// weights, no weight).
+// The order of weights W's int8 codes in the GEMM (`W::S8_GEMM_ENTRIES`): 1
+// entry order, 0 slot order, -1 none (dense weights, no weight).
 template <class W, class = void> struct S8GemmOrderOf {
     static constexpr int value = -1;
 };
@@ -775,7 +751,7 @@ template <class W> struct GemvPermuted<W, decltype((void)W::GEMV_PERMUTED)> {
 };
 
 // Whether a weight's GEMV stages its tiles' coefficient fields in shared
-// memory (`W::GEMV_STAGED`, see `packets::Direct::stage`).
+// memory (`W::GEMV_STAGED`, see `W::stage`).
 template <class W, class = void> struct GemvStaged {
     static constexpr bool value = false;
 };
@@ -801,18 +777,14 @@ template <class W> struct GemvEntries<W, decltype((void)W::GEMV_ENTRIES)> {
     static constexpr bool value = W::GEMV_ENTRIES;
 };
 
-// Whether a weight's GEMV reads its superblocks as records
-// (`packets::Records`, the decoder of a weight of form `GEMV_RECORDS`; see
-// `gemv_records_group`).
-template <class W> struct GemvRecords {
+// Whether a weight's GEMV reads its superblocks as records (`W::GEMV_RECORDS`,
+// a weight of form `GEMV_RECORDS`; see `gemv_records_group`).
+template <class W, class = void> struct GemvRecords {
     static constexpr bool value = false;
 };
-template <class G, class K> struct GemvRecords<packets::Records<G, K>> {
-    static constexpr bool value = true;
+template <class W> struct GemvRecords<W, decltype((void)W::GEMV_RECORDS)> {
+    static constexpr bool value = W::GEMV_RECORDS;
 };
-// A gathered view's (below) of its weight's.
-template <class W> struct Gathered;
-template <class W> struct GemvRecords<Gathered<W>> : GemvRecords<W> {};
 // The INT8 GEMV's superblocks of weights W (`W::S8Super`, `fetch_s8_superblock`:
 // a packed weight's lanes hold only the codes they multiply), else its whole
 // superblocks.
@@ -839,7 +811,7 @@ template <class W> struct S8Superblock<W, decltype(void(sizeof(typename W::S8Sup
 // (16-bit rows of records weights, which read the records' own table), else
 // both.
 template <bool S8, class WA, class WB> struct GemvPointReaders {
-    typedef typename packets::Select<!S8 && GemvRecords<WA>::value &&
+    typedef typename element::Select<!S8 && GemvRecords<WA>::value &&
                                          (Same<WB, NoWeight>::value || Same<WA, WB>::value),
                                      Types<>, Types<WA, WB>>::type type;
 };
@@ -943,8 +915,8 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
     constexpr bool S8_ONE = IsS8Rows<decltype(ready())>::ONE;
     // Codes and packed coefficients of one superblock of the group's tiles:
     // under S8 only what each lane multiplies (`S8Superblock`).
-    typedef typename packets::Select<S8, typename S8Superblock<WA>::type, typename WA::Super>::type SuperA;
-    typedef typename packets::Select<S8, typename S8Superblock<WB>::type, typename WB::Super>::type SuperB;
+    typedef typename element::Select<S8, typename S8Superblock<WA>::type, typename WA::Super>::type SuperA;
+    typedef typename element::Select<S8, typename S8Superblock<WB>::type, typename WB::Super>::type SuperB;
     struct Stage {
         SuperA ra[TPW];
         SuperB rb[TPW];
@@ -1353,9 +1325,9 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
 // weights' s8 codes) where the source is int8_rule rows (`S8Rows`), whatever
 // the weights' order; else `gemv_records_group` for records weights,
 // `gemv_entries_group` for entry-order weights, otherwise `gemv_mma_group`
-// (`staging`: see there). Grid points are read from Src (`BlockPoints` where
-// the block staged its weights' tables: `GemvShared::points`).
-template <int TPW, int KSPLIT, int NB, bool STAGING = false, class Src = packets::GlobalPoints, class Ready, class WA,
+// (`staging`: see there). Grid points are read from Src (the block's copy
+// where it staged its weights' tables: `GemvShared::points`).
+template <int TPW, int KSPLIT, int NB, bool STAGING = false, class Src = packets::points_of<>, class Ready, class WA,
           class WB, class Epi, class Barrier>
 __device__ __forceinline__ void gemv_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles, u64 rows,
                                            const WA &wa, const WB &wb, const Epi &epi, float *reduce,
@@ -1503,9 +1475,9 @@ template <class Shape, class... WS> __host__ __device__ constexpr u64 gemv_stagi
 
 // Shared memory of a GEMV block: the KSPLIT reduction of each tile group,
 // and its coefficient staging (STAGING bytes, `gemv_staging`). Its decoders
-// read grid points from Points: `packets::BlockPoints` where the block staged
-// its weights' tables (`stage_points`), else global memory.
-template <class Shape, class Pro, u64 STAGING = 0, class Points = packets::GlobalPoints> struct GemvShared {
+// read grid points from Points (`packets::points_of`): the block's copy where
+// it staged its weights' tables (`stage_points`), else global memory.
+template <class Shape, class Pro, u64 STAGING = 0, class Points = packets::points_of<>> struct GemvShared {
     float reduce[Shape::GROUPS][Shape::REDUCE];
     uint4 staging[Shape::GROUPS][STAGING > 0 ? STAGING / 16 : 1];
     static constexpr bool STAGED = STAGING > 0;
@@ -1630,19 +1602,6 @@ template <class Pro> __device__ __forceinline__ auto after_dependency(const Pro 
 // superblock's first k-block (or of the share's first). Each warp decodes its
 // own rows' coefficients of every k-block into its area (per row per stream
 // its k-block's coefficients padded to 16 B: `COEF_AREA`).
-// Bytes of one staged code chunk of W: 16, or `W::CHUNK_BYTES` (a
-// representation whose k-block's bytes are 8-byte pieces of its storage), or
-// its code planes' `chunk_bytes()` (planes whose rows are not whole 16 B).
-template <class W, class = void> struct ChunkBytes {
-    static constexpr int value = 16;
-};
-template <class W> struct ChunkBytes<W, decltype((void)W::CHUNK_BYTES)> {
-    static constexpr int value = W::CHUNK_BYTES;
-};
-template <class W> struct ChunkBytes<W, decltype((void)W::planes::chunk_bytes())> {
-    static constexpr int value = W::planes::chunk_bytes();
-};
-
 // Whether a warp's decoded coefficients (`gemm_decode_coefficients`) hold
 // each group's local multiplier: in the int8 GEMM (S8) of weights whose
 // local codes multiply their codes (`packets::int8_local`).
@@ -1682,7 +1641,7 @@ struct GemmShape {
     template <bool S8> static constexpr int A_PITCH = S8 ? 80 : 144;
     // Activation bytes per row per stage (s8 rows carry their groups).
     template <bool S8> static constexpr int A_ROW = S8 ? 96 : 144;
-    template <class W> static constexpr int TILE = W::CHUNKS * ChunkBytes<W>::value;
+    template <class W> static constexpr int TILE = W::CHUNKS * W::CHUNK_BYTES;
     template <class W> static constexpr int RECORD = (W::SUPER_WORDS * 4 + 15) / 16 * 16;
     // A warp's coefficient area per stream: its NJ * 16 rows' k-block
     // coefficients (`coefficient_words` a group), each row's padded to whole
@@ -1786,7 +1745,7 @@ __device__ __forceinline__ void cp_async_8_zfill(void *shared, const void *globa
                  "r"(source_bytes)
                  : "memory");
 }
-// One staged chunk of CHUNK bytes (`ChunkBytes`), zero when not `valid`.
+// One staged chunk of CHUNK bytes (`W::CHUNK_BYTES`), zero when not `valid`.
 template <int CHUNK> __device__ __forceinline__ void cp_async_chunk(u8 *shared, const u8 *global, bool valid) {
     static_assert(CHUNK == 16 || CHUNK == 8, "a staged chunk is 16 or 8 bytes");
     if constexpr (CHUNK == 16)
@@ -1795,29 +1754,17 @@ template <int CHUNK> __device__ __forceinline__ void cp_async_chunk(u8 *shared, 
         cp_async_8_zfill(shared, global, valid ? 8u : 0u);
 }
 
-// Weights `w` with their tiles renumbered from `tile`: the layout's own
-// start of tile `tile` (`tile_base`: `packets::Rows`, `packets::Records`)
-// becomes its start of tile 0, so a code chunk or record word of tile 0 of
-// the result, at any row within it, is that of tile `tile` of `w`. A row
-// within a tile stays the layout's to place (`chunk_source`, `super_word`):
-// a records layout does not place it at a multiple of the row stride.
-template <class W> __device__ __forceinline__ W gemm_tile_at(const W &w, u64 tile) {
-    W at = w;
-    at.base = w.tile_base(tile);
-    return at;
-}
-
 // One loader thread's copies of one weight stream into a GEMM's stages and
 // record buffers: the code chunks of SPAN consecutive k-blocks of tiles
 // [tile0, tile0 + 8) (STAGE bytes apart, TILE bytes a tile) and the records
 // (RECORD bytes a row) of a superblock of their 128 rows, chunk and word
 // c = first, first + STRIDE, ... Which chunks and words a thread copies, and
 // their tiles, are fixed for a segment, so their tiles' addresses are formed
-// once (`gemm_tile_at`) and a k-block's copy adds its k-block's offset alone.
+// once (`W::at_tile`) and a k-block's copy adds its k-block's offset alone.
 // Code chunks past `tiles` and words past it, or of k-blocks at or past
 // `kblocks` (a partial last superblock), read zeros.
 template <class W, int STRIDE, int SPAN, int TILE, int RECORD, int STAGE> struct GemmStreamLoader {
-    static constexpr int CHUNK = ChunkBytes<W>::value;
+    static constexpr int CHUNK = W::CHUNK_BYTES;
     static constexpr int CODES = SPAN * 8 * W::CHUNKS;
     static constexpr int WORDS = 128 * W::SUPER_WORDS;
     static constexpr int NC = (CODES + STRIDE - 1) / STRIDE;
@@ -1837,7 +1784,7 @@ template <class W, int STRIDE, int SPAN, int TILE, int RECORD, int STAGE> struct
                 const u32 c = first + i * STRIDE;
                 const u64 tile = tile0 + c / SPAN / W::CHUNKS;
                 code_valid[i] = c < (u32)CODES && tile < tiles;
-                code_tiles[i] = gemm_tile_at(w, code_valid[i] ? tile : tile0);
+                code_tiles[i] = w.at_tile(code_valid[i] ? tile : tile0);
             }
         if constexpr (WORDS > 0)
 #pragma unroll
@@ -1845,7 +1792,7 @@ template <class W, int STRIDE, int SPAN, int TILE, int RECORD, int STAGE> struct
                 const u32 c = first + i * STRIDE;
                 const u32 row = c / W::SUPER_WORDS;
                 word_valid[i] = c < (u32)WORDS && tile0 + row / 16 < tiles;
-                word_tiles[i] = gemm_tile_at(w, tile0 + (word_valid[i] ? row / 16 : 0));
+                word_tiles[i] = w.at_tile(tile0 + (word_valid[i] ? row / 16 : 0));
             }
     }
     // The code chunks of k-blocks [kblock, kblock + count) (count <= SPAN):
@@ -2266,38 +2213,20 @@ __device__ __forceinline__ void mma_fp4(float (&d)[4], const u32 (&a)[4], const 
 #endif
 }
 
-// acc[mi][h] += x . w over a staged k-block of NVFP4 weight tile `chunk`
-// (rows row0 .. row0 + 15 of the block tile, their scale records at
-// `records`) on FP4 tensor operations. The B fragment of 8-row half h is
-// gathered from the tile's mma16 chunks: its register r holds values
-// 8t .. 8t + 7 of 32r .. 32r + 31, half t % 2 of k16 step s = 2r + t / 2,
-// whose byte tt is lane (g, tt)'s step-s word's nibbles 2 (t % 2) + h and
-// 2 (t % 2) + h + 4 (registry `PackedRowLayout::code_bit`).
-template <class Shape, int RECORD>
+// acc[mi][h] += x . w over a staged k-block of NVFP4 weight tile `chunk` of
+// weights W (rows row0 .. row0 + 15 of the block tile, their scale records
+// at `records`, RECORD bytes a row) on FP4 tensor operations: each 8-row
+// half h's B fragment and scales (`W::fp4_fragments`) times every A fragment.
+template <class Shape, class W, int RECORD>
 __device__ __forceinline__ void gemm_tile_fp4(float acc[Shape::MI][2][4], const u8 *chunk, const u8 *records, u32 row0,
                                               u64 kblock, const u32 (&a)[Shape::MI][4], const u32 (&sa)[Shape::MI]) {
-    const u32 lane = threadIdx.x % 32;
-    const u32 g = lane / 4, t = lane % 4;
-    u32 words[2][4];
+    u32 b[2][2], sb[2];
+    W::template fp4_fragments<RECORD>(chunk, records, row0, kblock, threadIdx.x % 32, b, sb);
 #pragma unroll
-    for (int r = 0; r < 2; ++r)
-#pragma unroll
-        for (int tt = 0; tt < 4; ++tt)
-            words[r][tt] = *reinterpret_cast<const u32 *>(chunk + (g * 4 + tt) * 16 + 4 * (2 * r + t / 2));
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-        const u32 p = 4 * (2 * (t % 2) + h);
-        u32 b[2] = {0u, 0u};
-#pragma unroll
-        for (int r = 0; r < 2; ++r)
-#pragma unroll
-            for (int tt = 0; tt < 4; ++tt)
-                b[r] |= (((words[r][tt] >> p) & 0xFu) | ((words[r][tt] >> (p + 12)) & 0xF0u)) << (8 * tt);
-        const u32 sb = *reinterpret_cast<const u32 *>(records + (row0 + h * 8 + g) * RECORD + (kblock % 4) * 4);
+    for (int h = 0; h < 2; ++h)
 #pragma unroll
         for (int mi = 0; mi < Shape::MI; ++mi)
-            mma_fp4(acc[mi][h], a[mi], b, sa[mi], sb);
-    }
+            mma_fp4(acc[mi][h], a[mi], b[h], sa[mi], sb[h]);
 }
 
 // One warp's multiply of the share's staged k-block `index` (in stage
@@ -2333,11 +2262,11 @@ __device__ __forceinline__ void gemm_multiply_fp4(float (&acc)[2][Shape::NJ][Sha
 #pragma unroll
     for (int j = 0; j < NJ; ++j) {
         const u32 row0 = (wn * NJ + j) * 16;
-        gemm_tile_fp4<Shape, Weights::RECORD_A>(acc[0][j], weights.codes(stage, 0, wn * NJ + j), weights.records(kb, 0),
-                                                row0, kb, a, sa);
+        gemm_tile_fp4<Shape, decltype(weights.wa), Weights::RECORD_A>(
+            acc[0][j], weights.codes(stage, 0, wn * NJ + j), weights.records(kb, 0), row0, kb, a, sa);
         if constexpr (Weights::PAIR)
-            gemm_tile_fp4<Shape, Weights::RECORD_B>(acc[1][j], weights.codes(stage, 1, wn * NJ + j),
-                                                    weights.records(kb, 1), row0, kb, a, sa);
+            gemm_tile_fp4<Shape, decltype(weights.wb), Weights::RECORD_B>(
+                acc[1][j], weights.codes(stage, 1, wn * NJ + j), weights.records(kb, 1), row0, kb, a, sa);
     }
 }
 
@@ -2629,7 +2558,7 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
         // The half's registers (`s8_half`), in the rows' order: {row g low,
         // row g + 8 low, row g high, row g + 8 high}.
         u32 r[4];
-        w.template s8_half<packets::GlobalPoints, ENTRIES>(raw, h, r);
+        w.template s8_half<packets::points_of<>, ENTRIES>(raw, h, r);
         if constexpr (LOCAL) {
             // Each register times its row's local code of the group it holds.
             const u32 row = j_tile * 16 + lane / 4;
@@ -2954,8 +2883,8 @@ __device__ __forceinline__ void gemm_rows(u8 *shared, const Rows &source, u32 M,
     static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
                   "quantized activation GEMM requires the semantic operand policy");
     // The launch declares at least this layout's bytes: the 16-bit bound, or
-    // with two blocks an SM the weight's int8 layout bound
-    // (`form(W, INT8_SHARED)`, `dense.seismic`'s BLOCKS).
+    // with two blocks an SM the weights' int8 layout bound
+    // (`dense.seismic`'s INT8_LAYOUT, under BLOCKS).
     require_dynamic_shared(Shape::template LAYOUT_BYTES<WA, WB, S8>);
     if constexpr (S8)
         gemm_segment_s8<Shape>(shared, source, M, K, nblock, rows, wa, wb, epi, part, parts);

@@ -3,25 +3,9 @@
 // with the NS rows.
 #include <seismic/element.glsl>
 
-#if defined(SEISMIC_STANDARD_BIAS_REPRESENTATION_BF16)
-#define STANDARD_BIAS_KIND ELEMENT_BF16
-#elif defined(SEISMIC_STANDARD_BIAS_REPRESENTATION_F16)
-#define STANDARD_BIAS_KIND ELEMENT_F16
-#elif defined(SEISMIC_STANDARD_BIAS_REPRESENTATION_F32)
-#define STANDARD_BIAS_KIND ELEMENT_F32
-#else
-#error "unsupported vision_pool standard_bias representation"
-#endif
+#define STANDARD_BIAS_KIND ELEMENT_OF(SEISMIC_STANDARD_BIAS)
 
-#if defined(SEISMIC_STANDARD_SCALE_REPRESENTATION_BF16)
-#define STANDARD_SCALE_KIND ELEMENT_BF16
-#elif defined(SEISMIC_STANDARD_SCALE_REPRESENTATION_F16)
-#define STANDARD_SCALE_KIND ELEMENT_F16
-#elif defined(SEISMIC_STANDARD_SCALE_REPRESENTATION_F32)
-#define STANDARD_SCALE_KIND ELEMENT_F32
-#else
-#error "unsupported vision_pool standard_scale representation"
-#endif
+#define STANDARD_SCALE_KIND ELEMENT_OF(SEISMIC_STANDARD_SCALE)
 
 void vision_pool() {
     const uint64_t columns = SEISMIC_DIM_H;

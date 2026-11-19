@@ -2,15 +2,7 @@
 // the four table corners scaled by their coefficients, summed in order.
 #include <seismic/element.glsl>
 
-#if defined(SEISMIC_TABLE_REPRESENTATION_BF16)
-#define TABLE_KIND ELEMENT_BF16
-#elif defined(SEISMIC_TABLE_REPRESENTATION_F16)
-#define TABLE_KIND ELEMENT_F16
-#elif defined(SEISMIC_TABLE_REPRESENTATION_F32)
-#define TABLE_KIND ELEMENT_F32
-#else
-#error "unsupported vision_position table representation"
-#endif
+#define TABLE_KIND ELEMENT_OF(SEISMIC_TABLE)
 
 void vision_position() {
     const uint64_t columns = SEISMIC_DIM_H;

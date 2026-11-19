@@ -43,12 +43,50 @@ pub struct VisionKernel {
     pub statics: Vec<(&'static str, u64)>,
 }
 
+impl VisionKernel {
+    /// The static dimension `name`, where the kernel fixes it.
+    pub fn dimension(&self, name: &str) -> Option<u64> {
+        self.statics
+            .iter()
+            .find(|(bound, _)| *bound == name)
+            .map(|(_, value)| *value)
+    }
+}
+
 /// How many rows an operand has: one per tower row (the image's patches,
 /// after the stem's register rows), or one per merged cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VisionRows {
     Patches,
     Cells,
+}
+
+/// The tower's rows of one image: its register rows and patches, and its
+/// merged cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisionGeometry {
+    /// Patch rows per merged cell.
+    pub cell_rows: u64,
+    /// Register rows the tower holds ahead of each image's patch rows.
+    pub registers: u64,
+}
+
+impl VisionGeometry {
+    /// The rows of `rows` an image of `cells` merged cells has.
+    pub fn rows(&self, rows: VisionRows, cells: u64) -> u64 {
+        match rows {
+            VisionRows::Patches => cells * self.cell_rows + self.registers,
+            VisionRows::Cells => cells,
+        }
+    }
+}
+
+/// One invocation of a projecting vision entry: the rows it projects and
+/// the matrices it projects them through, in operand order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisionProjection {
+    pub rows: VisionRows,
+    pub weights: Vec<WeightRole>,
 }
 
 /// A value of the tower: a graph input, or the result of an earlier
@@ -248,6 +286,23 @@ impl<R> VisionOperands<R> {
             }
             Self::Position { table, .. } | Self::Registers { table, .. } => vec![*table],
             Self::PostNormResidual { norm, .. } => vec![*norm],
+        }
+    }
+
+    /// What the invocation projects: the patch stem's patch rows through
+    /// its frames, a linear's rows through its weight; none for another
+    /// entry.
+    pub fn projection(&self) -> Option<VisionProjection> {
+        match self {
+            Self::PatchStem { frame, next_frame, .. } => Some(VisionProjection {
+                rows: VisionRows::Patches,
+                weights: std::iter::once(*frame).chain(*next_frame).collect(),
+            }),
+            Self::Linear { rows, weight, .. } => Some(VisionProjection {
+                rows: *rows,
+                weights: vec![*weight],
+            }),
+            _ => None,
         }
     }
 }

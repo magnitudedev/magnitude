@@ -152,6 +152,195 @@ struct Experts {
     score: ScoreFunction,
 }
 
+/// What every layer's block reads of the model.
+struct Layers<'a> {
+    architecture: Architecture,
+    hidden: u64,
+    heads: u64,
+    width: u64,
+    head_rows: u64,
+    epsilon: f64,
+    convolution_width: u64,
+    experts: Option<Experts>,
+    leading_dense: u64,
+    dense_intermediate: Option<u64>,
+    metadata: &'a Metadata<'a>,
+}
+
+impl Layers<'_> {
+    /// Layer `index`'s block, its weights bound from `tensors`: a frame of
+    /// its own, since a block's descriptors are many and the definition's
+    /// frame would hold every one of them.
+    fn block(&self, tensors: &mut Tensors, index: usize, mixer: &Mixer) -> Result<Block, Error> {
+        let Self {
+            architecture,
+            hidden,
+            heads,
+            width,
+            head_rows,
+            epsilon,
+            convolution_width,
+            ref experts,
+            leading_dense,
+            dense_intermediate,
+            metadata: m,
+        } = *self;
+        let rms = |weight: WeightDescriptor| RmsNorm { weight, epsilon };
+        let p = format!("blk.{index}.");
+        let mut weight = |name: &str, shape: &[u64]| tensors.bind(&format!("{p}{name}"), shape);
+        let op = match mixer {
+            Mixer::Attention {
+                kv_heads,
+                domain,
+                rotary,
+            } => {
+                let kv_heads = *kv_heads;
+                if !heads.is_multiple_of(kv_heads) {
+                    return Err(invalid(format!(
+                        "LFM2 layer {index}: {heads} heads do not group over {kv_heads} key heads"
+                    )));
+                }
+                let kv_rows = product(&[kv_heads, width])?;
+                Operator::Attention(Box::new(Attention {
+                    heads,
+                    kv_heads,
+                    width,
+                    query: QueryProjection::Full(weight("attn_q.weight", &[head_rows, hidden])?),
+                    query_keys: QueryKeys::Direct,
+                    gate: match architecture {
+                        Architecture::Dense | Architecture::Routed => AttentionGate::None,
+                        Architecture::Lfm3 => AttentionGate::Separate {
+                            weight: weight("attn_gate.weight", &[heads, hidden])?,
+                            function: GateFunction::Sigmoid,
+                            granularity: GateGranularity::Head,
+                        },
+                    },
+                    query_norm: HeadNorm::Rms(rms(weight("attn_q_norm.weight", &[width])?)),
+                    history: vec![HistorySource::visible(HistoryRows::Own(
+                        RowProducer::Projected(ProjectedRows {
+                            key: weight("attn_k.weight", &[kv_rows, hidden])?,
+                            value: ValueSource::Projected(weight(
+                                "attn_v.weight",
+                                &[kv_rows, hidden],
+                            )?),
+                            key_norm: HeadNorm::Rms(rms(weight("attn_k_norm.weight", &[width])?)),
+                            value_norm: ValueNorm::None,
+                            domain: *domain,
+                            rounding: RowRounding::None,
+                        }),
+                    ))],
+                    rotary: rotary.clone(),
+                    scale: 1.0 / (width as f64).sqrt(),
+                    media_rows: MediaRowAttention::Causal,
+                    sinks: None,
+                    output: OutputProjection::Full(weight(
+                        "attn_output.weight",
+                        &[hidden, head_rows],
+                    )?),
+                }))
+            }
+            Mixer::ShortConv => {
+                // `in_proj` stores the B, C and X projections as consecutive
+                // row blocks of the hidden width.
+                let fused = weight(
+                    "shortconv.in_proj.weight",
+                    &[product(&[3, hidden])?, hidden],
+                )?;
+                let chunk = |block: u64| WeightDescriptor {
+                    name: fused.name.clone(),
+                    shape: vec![hidden, hidden],
+                    transforms: vec![ImportTransform::Rows(RowRange {
+                        start: block * hidden,
+                        rows: hidden,
+                    })],
+                };
+                Operator::ShortConv(Box::new(ShortConv {
+                    channels: hidden,
+                    width: convolution_width,
+                    input_gate: chunk(0),
+                    output_gate: chunk(1),
+                    value: chunk(2),
+                    convolution: weight("shortconv.conv.weight", &[hidden, convolution_width])?,
+                    output: weight("shortconv.out_proj.weight", &[hidden, hidden])?,
+                }))
+            }
+        };
+        let feed_forward = match &experts {
+            Some(e) if index as u64 >= leading_dense => Operator::RoutedFfn(Box::new(RoutedFfn {
+                experts: e.count,
+                selected: e.selected,
+                intermediate: e.intermediate,
+                // Scores rank on `score + bias`; the combine weights are the
+                // selected unbiased scores over their sum plus 1e-6 (the
+                // released model definition; llama.cpp clamps the sum at
+                // 6.1e-5 instead), with no scale.
+                router: Router {
+                    weight: weight("ffn_gate_inp.weight", &[e.count, hidden])?,
+                    input: RouterInput::Operator,
+                    score: e.score,
+                    selection: ExpertSelection::TopK {
+                        bias: Some(weight("exp_probs_b.bias", &[e.count])?),
+                    },
+                    media_bias: None,
+                    normalization: RouteNormalization::SumPlusEpsilon(1e-6),
+                    scale: 1.0,
+                },
+                expert_up: FeedForwardUp::Gated {
+                    activation: ActivationFunction::Silu,
+                    limit: None,
+                    gate: weight("ffn_gate_exps.weight", &[e.count, e.intermediate, hidden])?,
+                    up: weight("ffn_up_exps.weight", &[e.count, e.intermediate, hidden])?,
+                },
+                expert_down: weight("ffn_down_exps.weight", &[e.count, hidden, e.intermediate])?,
+                expert_scale: None,
+                latent: None,
+                shared: None,
+            })),
+            _ => {
+                let intermediate = dense_intermediate.ok_or_else(|| {
+                    let key = m.key("feed_forward_length");
+                    let detail = format!("missing LFM2 metadata {key} for dense layer {index}");
+                    Error::missing_metadata(key, detail)
+                })?;
+                Operator::DenseFfn(Box::new(DenseFfn {
+                    intermediate,
+                    up: FeedForwardUp::Gated {
+                        activation: ActivationFunction::Silu,
+                        limit: None,
+                        gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
+                        up: weight("ffn_up.weight", &[intermediate, hidden])?,
+                    },
+                    down: weight("ffn_down.weight", &[hidden, intermediate])?,
+                }))
+            }
+        };
+        // LFM3 normalizes each sublayer's output before the residual add.
+        let (operator_output, feed_forward_output) = match architecture {
+            Architecture::Dense | Architecture::Routed => {
+                (OutputForm::Residual, OutputForm::Residual)
+            }
+            Architecture::Lfm3 => (
+                OutputForm::PostNorm(rms(weight("post_attention_norm.weight", &[hidden])?)),
+                OutputForm::PostNorm(rms(weight("post_ffw_norm.weight", &[hidden])?)),
+            ),
+        };
+        Ok(Block {
+            sublayers: vec![
+                Sublayer {
+                    input: InputNorm::Rms(rms(weight("attn_norm.weight", &[hidden])?)),
+                    op,
+                    output: operator_output,
+                },
+                Sublayer {
+                    input: InputNorm::Rms(rms(weight("ffn_norm.weight", &[hidden])?)),
+                    op: feed_forward,
+                    output: feed_forward_output,
+                },
+            ],
+        })
+    }
+}
+
 /// Recognize the supported LFM2 architectures without interpreting their
 /// geometry or tensor roles.
 pub fn recognize(directory: &Directory) -> Result<Architecture, Error> {
@@ -356,160 +545,24 @@ pub fn inspect_components(
         .collect::<Result<Vec<_>, Error>>()?;
     let head_rows = product(&[heads, width])?;
 
-    let mut blocks = Vec::with_capacity(mixers.len());
-    for (index, mixer) in mixers.iter().enumerate() {
-        let p = format!("blk.{index}.");
-        let mut weight = |name: &str, shape: &[u64]| tensors.bind(&format!("{p}{name}"), shape);
-        let op = match mixer {
-            Mixer::Attention {
-                kv_heads,
-                domain,
-                rotary,
-            } => {
-                let kv_heads = *kv_heads;
-                if !heads.is_multiple_of(kv_heads) {
-                    return Err(invalid(format!(
-                        "LFM2 layer {index}: {heads} heads do not group over {kv_heads} key heads"
-                    )));
-                }
-                let kv_rows = product(&[kv_heads, width])?;
-                Operator::Attention(Box::new(Attention {
-                    heads,
-                    kv_heads,
-                    width,
-                    query: QueryProjection::Full(weight("attn_q.weight", &[head_rows, hidden])?),
-                    query_keys: QueryKeys::Direct,
-                    gate: match architecture {
-                        Architecture::Dense | Architecture::Routed => AttentionGate::None,
-                        Architecture::Lfm3 => AttentionGate::Separate {
-                            weight: weight("attn_gate.weight", &[heads, hidden])?,
-                            function: GateFunction::Sigmoid,
-                            granularity: GateGranularity::Head,
-                        },
-                    },
-                    query_norm: HeadNorm::Rms(rms(weight("attn_q_norm.weight", &[width])?)),
-                    history: vec![HistorySource::visible(HistoryRows::Own(
-                        RowProducer::Projected(ProjectedRows {
-                            key: weight("attn_k.weight", &[kv_rows, hidden])?,
-                            value: ValueSource::Projected(
-                                weight("attn_v.weight", &[kv_rows, hidden])?,
-                            ),
-                            key_norm: HeadNorm::Rms(rms(weight("attn_k_norm.weight", &[width])?)),
-                            value_norm: ValueNorm::None,
-                            domain: *domain,
-                            rounding: RowRounding::None,
-                        }),
-                    ))],
-                    rotary: rotary.clone(),
-                    scale: 1.0 / (width as f64).sqrt(),
-                    media_rows: MediaRowAttention::Causal,
-                    sinks: None,
-                    output: OutputProjection::Full(weight(
-                        "attn_output.weight",
-                        &[hidden, head_rows],
-                    )?),
-                }))
-            }
-            Mixer::ShortConv => {
-                // `in_proj` stores the B, C and X projections as consecutive
-                // row blocks of the hidden width.
-                let fused = weight(
-                    "shortconv.in_proj.weight",
-                    &[product(&[3, hidden])?, hidden],
-                )?;
-                let chunk = |block: u64| WeightDescriptor {
-                    name: fused.name.clone(),
-                    shape: vec![hidden, hidden],
-                    transforms: vec![ImportTransform::Rows(RowRange {
-                        start: block * hidden,
-                        rows: hidden,
-                    })],
-                };
-                Operator::ShortConv(Box::new(ShortConv {
-                    channels: hidden,
-                    width: convolution_width,
-                    input_gate: chunk(0),
-                    output_gate: chunk(1),
-                    value: chunk(2),
-                    convolution: weight("shortconv.conv.weight", &[hidden, convolution_width])?,
-                    output: weight("shortconv.out_proj.weight", &[hidden, hidden])?,
-                }))
-            }
-        };
-        let feed_forward = match &experts {
-            Some(e) if index as u64 >= leading_dense => Operator::RoutedFfn(Box::new(RoutedFfn {
-                experts: e.count,
-                selected: e.selected,
-                intermediate: e.intermediate,
-                // Scores rank on `score + bias`; the combine weights are the
-                // selected unbiased scores over their sum plus 1e-6 (the
-                // released model definition; llama.cpp clamps the sum at
-                // 6.1e-5 instead), with no scale.
-                router: Router {
-                    weight: weight("ffn_gate_inp.weight", &[e.count, hidden])?,
-                    input: RouterInput::Operator,
-                    score: e.score,
-                    selection: ExpertSelection::TopK {
-                        bias: Some(weight("exp_probs_b.bias", &[e.count])?),
-                    },
-                    media_bias: None,
-                    normalization: RouteNormalization::SumPlusEpsilon(1e-6),
-                    scale: 1.0,
-                },
-                expert_up: FeedForwardUp::Gated {
-                    activation: ActivationFunction::Silu,
-                    limit: None,
-                    gate: weight("ffn_gate_exps.weight", &[e.count, e.intermediate, hidden])?,
-                    up: weight("ffn_up_exps.weight", &[e.count, e.intermediate, hidden])?,
-                },
-                expert_down: weight("ffn_down_exps.weight", &[e.count, hidden, e.intermediate])?,
-                expert_scale: None,
-                latent: None,
-                shared: None,
-            })),
-            _ => {
-                let intermediate = dense_intermediate.ok_or_else(|| {
-                    let key = m.key("feed_forward_length");
-                    let detail = format!("missing LFM2 metadata {key} for dense layer {index}");
-                    Error::missing_metadata(key, detail)
-                })?;
-                Operator::DenseFfn(Box::new(DenseFfn {
-                    intermediate,
-                    up: FeedForwardUp::Gated {
-                        activation: ActivationFunction::Silu,
-                        limit: None,
-                        gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
-                        up: weight("ffn_up.weight", &[intermediate, hidden])?,
-                    },
-                    down: weight("ffn_down.weight", &[hidden, intermediate])?,
-                }))
-            }
-        };
-        // LFM3 normalizes each sublayer's output before the residual add.
-        let (operator_output, feed_forward_output) = match architecture {
-            Architecture::Dense | Architecture::Routed => {
-                (OutputForm::Residual, OutputForm::Residual)
-            }
-            Architecture::Lfm3 => (
-                OutputForm::PostNorm(rms(weight("post_attention_norm.weight", &[hidden])?)),
-                OutputForm::PostNorm(rms(weight("post_ffw_norm.weight", &[hidden])?)),
-            ),
-        };
-        blocks.push(Block {
-            sublayers: vec![
-                Sublayer {
-                    input: InputNorm::Rms(rms(weight("attn_norm.weight", &[hidden])?)),
-                    op,
-                    output: operator_output,
-                },
-                Sublayer {
-                    input: InputNorm::Rms(rms(weight("ffn_norm.weight", &[hidden])?)),
-                    op: feed_forward,
-                    output: feed_forward_output,
-                },
-            ],
-        });
-    }
+    let layers = Layers {
+        architecture,
+        hidden,
+        heads,
+        width,
+        head_rows,
+        epsilon,
+        convolution_width,
+        experts,
+        leading_dense,
+        dense_intermediate,
+        metadata: &m,
+    };
+    let blocks = mixers
+        .iter()
+        .enumerate()
+        .map(|(index, mixer)| layers.block(&mut tensors, index, mixer))
+        .collect::<Result<Vec<_>, Error>>()?;
     tensors.finish()?;
     let definition = ModelDefinition {
         family: FamilyId(family_id.into()),
@@ -535,7 +588,7 @@ pub fn inspect_components(
             },
         },
         head: None,
-        vision: vision.map(Box::new),
+        vision,
         draft: None,
     };
     definition

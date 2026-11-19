@@ -356,7 +356,7 @@ fn assessed(
             super::StructuralCharge::of(definition, draft).map(|charge| (charge, ())).map_err(|error| crate::PlanError::ResourcePlanning(format!("{error:?}")))
         })
         .map_err(|error| error.to_string())?;
-    let prepared = super::prepare_execution_assessment(definition, forms).map_err(|error| format!("{error:?}"))?;
+    let prepared = super::prepare_execution_assessment(definition.clone(), forms).map_err(|error| format!("{error:?}"))?;
     Ok(match super::assess_execution_fit(definition, &prepared, pricing, topology, status).map_err(|error| format!("{error:?}"))? {
         super::ExecutionAssessment::Fits(fit) => match fit.bank.as_ref().is_none_or(|bank| bank.whole()) {
             true => ("whole, fits".to_owned(), true),
@@ -662,7 +662,7 @@ fn glm_5_3_flash_at_32k_fits_on_an_rtx3090_by_windowing_its_scratch_and_not_on_a
         .expert_bank()
         .unwrap()
         .ceiling;
-    let prepared_3090 = super::prepare_execution_assessment(&definition, forms_3090).unwrap();
+    let prepared_3090 = super::prepare_execution_assessment(definition.clone(), forms_3090).unwrap();
     match super::assess_execution_fit(&definition, &prepared_3090, pricing_3090, &topology_3090, &status_3090).unwrap() {
         super::ExecutionAssessment::Fits(assessed) => {
             let alloc_3090 = assessed
@@ -775,7 +775,7 @@ fn glm_5_3_flash_at_32k_fits_on_an_rtx3090_by_windowing_its_scratch_and_not_on_a
                     .map_err(|error| crate::PlanError::ResourcePlanning(format!("{error:?}")))
             })
             .unwrap();
-        let prepared_16g = super::prepare_execution_assessment(&definition, forms_16g).unwrap();
+        let prepared_16g = super::prepare_execution_assessment(definition.clone(), forms_16g).unwrap();
         assert!(
             matches!(
                 super::assess_execution_fit(&definition, &prepared_16g, pricing_16g, &topology_16g, &status_16g).unwrap(),

@@ -5,6 +5,7 @@
 // position and weight once and the choice's 8 expert outputs as one 16-byte
 // load (the `routed_combine` gather without the shared expert).
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/routed/routed.h"
 
 // Threads of a threadgroup (8 columns each).

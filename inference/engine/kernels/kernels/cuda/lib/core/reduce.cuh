@@ -36,6 +36,22 @@ __device__ __forceinline__ float group_max(float value, float *partials) {
     return maximum;
 }
 
+// Maximum of one value per thread, each non-negative or NaN, NaN if any is
+// (a group's peak, `packets::peak_with`), as `group_max`: such values'
+// bits order as the values do with every NaN above +Inf, so integer maxima
+// reduce them, one `redux.sync` a warp.
+__device__ __forceinline__ float group_peak(float value, float *partials) {
+    unsigned bits = seismic_redux_max_u32(__float_as_uint(value));
+    const unsigned warps = blockDim.x / 32;
+    __syncthreads();
+    if (threadIdx.x % 32 == 0)
+        partials[threadIdx.x / 32] = __uint_as_float(bits);
+    __syncthreads();
+    for (unsigned w = 0; w < warps; ++w)
+        bits = max(bits, __float_as_uint(partials[w]));
+    return __uint_as_float(bits);
+}
+
 // Tie rules of an argmax: among candidates of equal score, the higher or the
 // lower index wins.
 struct HigherIndex {

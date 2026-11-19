@@ -1129,12 +1129,6 @@ impl ExpertBankPlan {
         Self { structured, block, ..self }
     }
 
-    /// This bank with `window_slots` scratch slots and its lending derived again.
-    pub(crate) fn with_window_slots(mut self, window_slots: u64) -> Result<Self, String> {
-        self.structured = self.structured.with_window_slots(window_slots)?;
-        Ok(self)
-    }
-
     /// The layer whose weights are of `scope` and its index, when the bank
     /// holds its experts.
     pub fn layer(&self, scope: WeightScope) -> Option<(usize, &BankLayer)> {

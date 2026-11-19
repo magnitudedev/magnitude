@@ -1,8 +1,9 @@
 // widen_rows: widened[row, column] = f32(rows[row, column]); one thread per
 // element on a (column, row) grid.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 
 kernel void widen_rows(
     device const uchar *rows [[buffer(SEISMIC_BUFFER_ROWS)]],
@@ -14,5 +15,5 @@ kernel void widen_rows(
     if (column >= SEISMIC_DIM_D || row >= SEISMIC_DIM_M) return;
     element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(widened).put(
         row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-        element::at<activation>(rows, row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1));
+        element::at<activation_element>(rows, row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1));
 }

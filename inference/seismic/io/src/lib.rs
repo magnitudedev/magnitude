@@ -114,6 +114,14 @@
 //! falls with a record's size (a random access per record), which a line
 //! through records of the size served carries in its `D`.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 pub mod accounting;
 pub mod destination;
 pub mod disk;

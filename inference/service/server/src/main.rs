@@ -1,3 +1,11 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -330,7 +338,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     volumes,
                     serving,
                     Arc::new(instances.clone()),
-                )))
+                ).map_err(anyhow::Error::msg)?))
                 .with_model_controller(Arc::new(instances.clone()));
             if let Some(auth_token) = auth_token {
                 state = state.with_authorization(auth_token);

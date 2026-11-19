@@ -5,13 +5,23 @@ consults either. The rig sets `RUSTC_WORKSPACE_WRAPPER` to a shim that runs `rus
 `wrap`, so every compilation of a workspace crate leaves a record beside its outputs:
 
     <out-dir>/<crate><extra-filename>.provenance.json
-    {"schema": "build-provenance-unit/2", "crate": ..., "sources": {path: sha256},
-     "outputs": {path: sha256}, "externs": {path: sha256}, "env": {name: value}}
+    {"schema": "build-provenance-unit/4", "crate": ..., "sources": {path: sha256},
+     "outputs": {path: sha256}, "externs": {path: sha256}, "env": {name: value},
+     "out_dir": OUT_DIR or null, "build_inputs": {path: digest}, "build_env": {name: value}}
 
 `sources` are the files rustc itself reports reading (its dep-info: modules, `include!`d and
 generated files) and `externs` the dependency artifacts it was given, all hashed when the
 compilation finished, and `env` the environment variables it read at compile time (`env!`,
-`option_env!`), each with its value or null when unset. `verify` then starts from an
+`option_env!`), each with its value or null when unset. A crate with a build script also
+records the script's output directory (`out_dir`) and what it reads, `build_inputs`: the
+package's manifest and each path the script names with `rerun-if-changed`, or its whole package
+directory where it names none, as cargo reruns it (`path_digest`: a directory's files whole).
+`build_env` is the environment the unit's build read that neither cargo nor the build sets: the
+rustc flags cargo takes from the environment (`RUSTFLAGS_VARIABLES`), each variable its build
+script names with `rerun-if-env-changed`, and each it read at compile time that cargo and its
+build script do not set (`CARGO_SET`, `rustc-env`); each with its value, those set alone. An
+executable's `environment` is all its units read, which keys its tests' results with the
+configuration (`ledger.configured`). `verify` then starts from an
 executable, finds the record whose output has the executable's bytes, and walks `externs`: the
 executable is `verified` when every unit it was linked from still has the outputs its record
 names, was compiled against the dependency bytes present now, and was compiled from sources
@@ -56,9 +66,9 @@ import shlex
 import subprocess
 import sys
 
-UNIT_SCHEMA = "build-provenance-unit/2"
+UNIT_SCHEMA = "build-provenance-unit/4"
 WRAPPER = f"provenance/{UNIT_SCHEMA}/rustc"  # under a checkout; `.cmd` added on Windows
-SCHEMA = "build-provenance/2"
+SCHEMA = "build-provenance/4"
 RECORD_SUFFIX = ".provenance.json"
 _UNESCAPED_SPACE = re.compile(r"(?<!\\) ")
 ENV_DEP = "# env-dep:"
@@ -150,6 +160,12 @@ class Unit:
     def write_record(self) -> None:
         outputs, sources, env = dep_info(self.dep_info)
         own = os.path.abspath(self.dep_info)
+        out_dir = os.environ.get("OUT_DIR")
+        manifest = os.environ.get("CARGO_MANIFEST_DIR")
+        inputs, script_env, script_set = build_inputs(out_dir, manifest) if out_dir and manifest else ([], [], [])
+        read = {name: os.environ.get(name) for name in (*RUSTFLAGS_VARIABLES, *script_env)}
+        read.update((name, value) for name, value in env.items()
+                    if not name.startswith("CARGO") and name not in CARGO_SET and name not in script_set)
         _write(
             self.record,
             {
@@ -159,8 +175,52 @@ class Unit:
                 "outputs": {p: digest(p) for p in map(os.path.abspath, outputs) if p != own},
                 "externs": {path: digest(path) for path in self.externs},
                 "env": env,
+                "out_dir": out_dir,
+                "build_inputs": {path: path_digest(path) for path in inputs},
+                "build_env": {name: value for name, value in sorted(read.items()) if value is not None},
             },
         )
+
+
+RERUN = ("cargo:rerun-if-changed=", "cargo::rerun-if-changed=")
+RERUN_ENV = ("cargo:rerun-if-env-changed=", "cargo::rerun-if-env-changed=")
+RUSTC_ENV = ("cargo:rustc-env=", "cargo::rustc-env=")
+# The environment cargo takes rustc's flags from (a target's `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`
+# is cargo's too, and starts with `CARGO`).
+RUSTFLAGS_VARIABLES = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS")
+# What cargo sets for a compilation beyond its `CARGO*` variables, which the tree and the
+# configuration decide.
+CARGO_SET = frozenset(("OUT_DIR", "TARGET", "HOST", "PROFILE", "OPT_LEVEL", "DEBUG", "NUM_JOBS", "RUSTC",
+                       "RUSTDOC", "RUSTC_LINKER", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"))
+
+
+def build_inputs(out_dir: str, manifest: str) -> tuple[list, list, list]:
+    """What the build script whose output directory is `out_dir` reads, as cargo decides
+    whether to rerun it, and what it sets: the package's manifest, and each path its output
+    (`<out_dir>/../output`) names with `rerun-if-changed`, relative to the package (the whole
+    package where it names none); the variables it names with `rerun-if-env-changed`; and those
+    it sets for the compilation (`rustc-env`)."""
+    with open(os.path.join(os.path.dirname(out_dir), "output")) as stream:
+        lines = [line.strip() for line in stream]
+    named = [line.split("=", 1)[1] for line in lines if line.startswith(RERUN)]
+    variables = [line.split("=", 1)[1] for line in lines if line.startswith(RERUN_ENV)]
+    set_by_script = [line.split("=", 1)[1].split("=", 1)[0] for line in lines if line.startswith(RUSTC_ENV)]
+    paths = [os.path.abspath(os.path.join(manifest, path)) for path in named] or [os.path.abspath(manifest)]
+    return list(dict.fromkeys([os.path.join(os.path.abspath(manifest), "Cargo.toml"), *paths])), variables, set_by_script
+
+
+def path_digest(path: str):
+    """`digest` of a file; of a directory, the `tree_digest` of every file under it (relative to
+    it); None when there is neither."""
+    if not os.path.isdir(path):
+        return digest(path)
+    files = {}
+    for directory, names, found in os.walk(path):
+        names.sort()
+        for name in found:
+            full = os.path.join(directory, name)
+            files[os.path.relpath(full, path)] = digest(full)
+    return tree_digest(files)
 
 
 def wrap(argv: list) -> int:
@@ -183,12 +243,15 @@ def install(root: str) -> str:
     and schema."""
     path = os.path.join(root, *WRAPPER.split("/"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    script = os.path.abspath(__file__)
+    # This file as the rig deploys it, a module of its host package's zip, which runs it by name;
+    # or, run from a source tree, the file itself.
+    archive = getattr(globals().get("__loader__"), "archive", None)
+    command = [sys.executable, archive, __name__] if archive else [sys.executable, os.path.abspath(__file__)]
     if os.name == "nt":
         path += ".cmd"
-        text = '@"%s" "%s" rustc %%*\r\n' % (sys.executable, script)
+        text = "%s rustc %%*\r\n" % " ".join('"%s"' % part for part in command)
     else:
-        text = '#!/bin/sh\nexec %s %s rustc "$@"\n' % (shlex.quote(sys.executable), shlex.quote(script))
+        text = '#!/bin/sh\nexec %s rustc "$@"\n' % shlex.join(command)
     temporary = "%s.%d.tmp" % (path, os.getpid())
     with open(temporary, "w") as stream:
         stream.write(text)
@@ -282,7 +345,38 @@ def _subdirectories(directory: str) -> list:
     return [os.path.join(directory, name) for name in names if os.path.isdir(os.path.join(directory, name))]
 
 
-def verify_executable(path: str, roots: list, digest=digest, records=_records) -> dict:
+def tree_digest(files: dict) -> str:
+    """The digest of a tree's files, `{path relative to its root: sha256 or None}`: equal for
+    equal bytes at equal paths, on any host and in any checkout of them."""
+    material = hashlib.sha256()
+    for path in sorted(files):
+        material.update(f"{path}\0{files[path]}\n".encode())
+    return material.hexdigest()
+
+
+def _rooted(path: str, roots: list):
+    """`path` relative to the first of `roots` it lies in, or None outside them."""
+    real = os.path.realpath(path)
+    return next((os.path.relpath(real, root) for root in roots if _within(real, [root])), None)
+
+
+WORKSPACE = "workspace"  # the files every unit of a root is built under, as a unit of `unit_sources`
+WORKSPACE_FILES = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")
+
+
+def verify_executable(path: str, roots: list, digest=digest, records=_records, units=None,
+                      build_scripts=None) -> dict:
+    """The provenance of one executable. Each workspace unit it was linked from, and each build
+    script one of them was built with (`build_scripts`, by its output directory: the agent's),
+    is entered in `units` (by its record's name: the sources and build inputs in `roots` it was
+    compiled from, relative to their root, with their digests) and named in its `linked`, with
+    the root's `WORKSPACE` files where `units` holds them; its `sources_digest` is the
+    `tree_digest` of all of them, what the ledger keys its tests' results by (`ledger.py`), and
+    its `environment` the `build_env` of all of them. A build script `build_scripts` does not
+    name (no build of the agent's ran it) leaves the unit unverified; one it names as None is
+    configuration's override of it (`links`), which nothing compiled."""
+    units = {} if units is None else units
+    build_scripts = {} if build_scripts is None else build_scripts
     sha256 = digest(path)
     root_unit = next(
         (record for record, unit in records(_units(path)) if sha256 in unit["outputs"].values()), None
@@ -291,8 +385,7 @@ def verify_executable(path: str, roots: list, digest=digest, records=_records) -
     if root_unit is None:
         reason = "no compilation record has this executable's bytes: it was not built by the rig"
         return {**result, "status": "unverified", "reasons": [reason]}
-    contradicted, unverified, reads = [], [], []
-    compiled = {}
+    contradicted, unverified, reads, linked, environment = [], [], [], [], {}
     pending, seen = [root_unit], {root_unit}
     while pending:
         record = pending.pop()
@@ -302,16 +395,41 @@ def verify_executable(path: str, roots: list, digest=digest, records=_records) -
         if unit["schema"] != UNIT_SCHEMA:
             unverified.append(f"{unit['crate']}: its record is of {unit['schema']}, not {UNIT_SCHEMA}")
             continue
+        own = os.path.basename(record)[:-len(RECORD_SUFFIX)]
+        linked.append(own)
         for name in source_tree_reads(unit["env"], roots):
             reads.append(f"{unit['crate']}: names its source tree through {name}: embed what it reads "
                          "(include_bytes!, include_str!) or take its path at run time")
         for output, recorded in unit["outputs"].items():
             if digest(output) != recorded:
                 unverified.append(f"{unit['crate']}: {output} is not the output its record names")
+        rooted = {}
         for source, recorded in unit["sources"].items():
-            compiled[source] = recorded
+            relative = _rooted(source, roots)
+            if relative is not None:
+                rooted[relative] = recorded
             if digest(source) != recorded:
                 contradicted.append(f"{unit['crate']}: compiled from other content of {source}")
+        for source, recorded in unit["build_inputs"].items():
+            relative = _rooted(source, roots)
+            if relative is not None:
+                rooted[relative] = recorded
+            if path_digest(source) != recorded:
+                contradicted.append(f"{unit['crate']}: built by a build script that read other content of {source}")
+        units[own] = rooted
+        environment.update(unit["build_env"])
+        if unit["out_dir"] and unit["out_dir"] not in build_scripts:
+            unverified.append(f"{unit['crate']}: no build of the agent ran its build script ({unit['out_dir']})")
+        script = build_scripts.get(unit["out_dir"]) if unit["out_dir"] else None
+        if script is not None:
+            built = digest(script)
+            found = next((other for other, record_of in records(os.path.dirname(script))
+                          if built in record_of["outputs"].values()), None)
+            if found is None:
+                unverified.append(f"{unit['crate']}: its build script {script} has no compilation record")
+            elif found not in seen:
+                seen.add(found)
+                pending.append(found)
         for extern, recorded in unit["externs"].items():
             if digest(extern) != recorded:
                 contradicted.append(f"{unit['crate']}: compiled against other bytes of {extern}")
@@ -333,23 +451,50 @@ def verify_executable(path: str, roots: list, digest=digest, records=_records) -
                     f"{unit['crate']}: dependency {extern} compiles synchronized sources "
                     "but has no compilation record"
                 )
-    material = hashlib.sha256()
-    for source in sorted(compiled):
-        material.update(f"{source}\0{compiled[source]}\n".encode())
-    result.update(sources=len(compiled), sources_digest=material.hexdigest())
+    if WORKSPACE in units:
+        linked.append(WORKSPACE)
+    tree = {relative: recorded for name in linked for relative, recorded in units[name].items()}
+    result.update(sources=len(tree), sources_digest=tree_digest(tree), linked=sorted(linked),
+                  environment=dict(sorted(environment.items())))
     status = ("contradicted" if contradicted else "reads-source-tree" if reads
               else "unverified" if unverified else "verified")
     return {**result, "status": status, "reasons": sorted(set(contradicted + reads + unverified))}
 
 
-def verify(texts: list, roots: list, target: str, tests: list = ()) -> dict:
+BUILD_SCRIPTS = "build-scripts.json"  # in a target: `build_scripts`
+
+
+def build_scripts(target: str, reported: dict) -> dict:
+    """The build script each output directory `target` holds was the run of (None for one
+    configuration overrides, `links`): those cargo `reported` to this build, and those it
+    reported to the target's earlier builds, kept in `BUILD_SCRIPTS` while their directories
+    remain. Cargo names a run's script only to the build it serves."""
+    path = os.path.join(target, BUILD_SCRIPTS)
+    try:
+        with open(path) as stream:
+            known = json.load(stream)
+    except FileNotFoundError:
+        known = {}
+    known = {out_dir: script for out_dir, script in {**known, **reported}.items() if os.path.isdir(out_dir)}
+    if os.path.isdir(target):
+        _write(path, known)
+    return known
+
+
+def verify(texts: list, roots: list, target: str, built: dict | None = None) -> dict:
     """The provenance of every cargo-built executable `texts` name and of the test executables
-    `tests` (`[executable, manifest]`, as the build's cargo steps produced them, which its jobs
-    run), and of every other one of `target` (`target_executables`), each of those not verified
+    the build's cargo steps produced (`built`, as the agent writes it: `tests`, each
+    `[executable, manifest, target, kind]`, which its jobs run, and the `build_scripts` that ran,
+    which `target` keeps with those earlier builds ran: `build_scripts`), and of every other one
+    of `target` (`target_executables`), each of those not verified
     withdrawn. `status` is `verified`, `no-built-executable` (none is named), or `refused`;
     `kept`, every executable of `target` left in place, which is what a build output holds of
-    its profile and example directories (`agent.Runner.materialize`)."""
+    its profile and example directories (`agent.Runner.materialize`); `unit_sources`, the
+    sources in `roots` of every unit the named executables were linked from, by unit
+    (`verify_executable`), from which the ledger digests a test executable's sources at any
+    tree without building it."""
     roots = [os.path.realpath(root) for root in roots]
+    built = {"tests": [], "build_scripts": {}} if built is None else built
     known, listed = {}, {}
 
     def once(path: str):  # units share dependencies; nothing changes until the withdrawal
@@ -362,10 +507,16 @@ def verify(texts: list, roots: list, target: str, tests: list = ()) -> dict:
             listed[deps] = _records(deps)
         return listed[deps]
 
-    named = list(dict.fromkeys([*built_executables(texts), *(os.path.realpath(path) for path, _ in tests)]))
-    executables = [verify_executable(path, roots, once, records) for path in named]
+    # Every unit an executable of the record was linked from (`verify_executable`), and the
+    # files every unit of the first root is built under.
+    linked: dict = {WORKSPACE: {name: path_digest(os.path.join(roots[0], name)) for name in WORKSPACE_FILES
+                                if os.path.exists(os.path.join(roots[0], name))}} if roots else {}
+    scripts = build_scripts(target, built["build_scripts"])
+    named = list(dict.fromkeys([*built_executables(texts),
+                                *(os.path.realpath(path) for path, *_ in built["tests"])]))
+    executables = [verify_executable(path, roots, once, records, linked, scripts) for path in named]
     found = target_executables(target)
-    others = [verify_executable(path, roots, once, records) for path in found if path not in named]
+    others = [verify_executable(path, roots, once, records, linked, scripts) for path in found if path not in named]
     withdrawn = [other for other in others if other["status"] != "verified"]
     units: set = set()  # an example's two names (`x`, `x-<hash>`) are one unit's outputs
     for executable in withdrawn:
@@ -378,7 +529,8 @@ def verify(texts: list, roots: list, target: str, tests: list = ()) -> dict:
         status = "refused"
     gone = {executable["path"] for executable in withdrawn}
     return {"schema": SCHEMA, "status": status, "roots": roots, "executables": executables,
-            "withdrawn": withdrawn, "kept": [path for path in found if path not in gone]}
+            "withdrawn": withdrawn, "kept": [path for path in found if path not in gone],
+            "unit_sources": {name: linked[name] for name in sorted({n for e in executables for n in e.get("linked", ())})}}
 
 
 def _withdraw(executable: dict, units: set) -> None:

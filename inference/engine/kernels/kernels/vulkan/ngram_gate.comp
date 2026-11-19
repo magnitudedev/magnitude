@@ -6,24 +6,8 @@
 #include <seismic/element.glsl>
 #include "lib/core/reduce.glsl"
 
-#if defined(SEISMIC_KEY_NORM_REPRESENTATION_F32)
-#define KEY_NORM ELEMENT_F32
-#elif defined(SEISMIC_KEY_NORM_REPRESENTATION_F16)
-#define KEY_NORM ELEMENT_F16
-#elif defined(SEISMIC_KEY_NORM_REPRESENTATION_BF16)
-#define KEY_NORM ELEMENT_BF16
-#else
-#error "ngram_gate requires a dense key norm"
-#endif
-#if defined(SEISMIC_QUERY_NORM_REPRESENTATION_F32)
-#define QUERY_NORM ELEMENT_F32
-#elif defined(SEISMIC_QUERY_NORM_REPRESENTATION_F16)
-#define QUERY_NORM ELEMENT_F16
-#elif defined(SEISMIC_QUERY_NORM_REPRESENTATION_BF16)
-#define QUERY_NORM ELEMENT_BF16
-#else
-#error "ngram_gate requires a dense query norm"
-#endif
+#define KEY_NORM ELEMENT_OF(SEISMIC_KEY_NORM)
+#define QUERY_NORM ELEMENT_OF(SEISMIC_QUERY_NORM)
 
 // Shared: one partial per subgroup (reduce_group_sum at float 0).
 void ngram_gate() {

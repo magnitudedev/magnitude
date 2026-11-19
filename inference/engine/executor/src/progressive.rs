@@ -14,11 +14,14 @@
 //! of each other.
 
 use magnitude_family_contracts::{ProgressiveCodeDepth, ProgressivePlane};
+use magnitude_kernels::constants::{PROGRESSIVE_GROUP, PROGRESSIVE_LANES};
 use seismic::{DType, Element, IntegerCodes, ScaledCodeRows};
 use std::num::NonZeroU32;
 
-/// Values per group (`ProgressivePlane::GROUP`).
-const GROUP: usize = ProgressivePlane::GROUP as usize;
+/// Values per group: the planes' bit order's (`readout.seismic`), which the
+/// family contract's plane shapes take (`ProgressivePlane::GROUP`).
+const GROUP: usize = PROGRESSIVE_GROUP as usize;
+const _: () = assert!(ProgressivePlane::GROUP == PROGRESSIVE_GROUP);
 /// Bits of a plane word: the bit planes are `u32` words.
 const WORD_BITS: u32 = u32::BITS;
 // A plane's bits of one group's codes are one plane word ([`bit_of`]).
@@ -26,11 +29,13 @@ const _: () = assert!(GROUP == WORD_BITS as usize);
 
 /// Where a bit plane (`Next`, each of `Rest`'s) holds its bit of code
 /// `column`: in the word of its group, `column / GROUP`, at bit
-/// `4 (i mod 8) + i / 8` for code `i` of the group.
+/// `GROUP / LANES (i mod LANES) + i / LANES` for code `i` of the group, as
+/// `readout.seismic`'s `progressive_view` reads it (held to it by
+/// `the_placement_is_the_references_bit_order`).
 fn bit_of(column: u32) -> (u32, u32) {
-    let group = GROUP as u32;
+    let (group, lanes) = (GROUP as u32, PROGRESSIVE_LANES as u32);
     let within = column % group;
-    (column / group, group / 8 * (within % 8) + within / 8)
+    (column / group, group / lanes * (within % lanes) + within / lanes)
 }
 /// The planes' scale (`ProgressivePlane::Scales`), as the source stores it.
 const SCALE: DType = DType::F16;
@@ -450,6 +455,107 @@ mod tests {
             assert_eq!(placed(ProgressivePlane::Next), expected(&next), "next, depth {bits}");
             assert_eq!(placed(ProgressivePlane::Rest), expected(&rest), "rest, depth {bits}");
             assert_eq!(placed(ProgressivePlane::Scales), scales, "scales, depth {bits}");
+        }
+    }
+
+    /// The placement is the bit order the reference reads: at each depth,
+    /// every view `readout.seismic`'s `progressive_view` (run by the
+    /// interpreter) takes of the placed planes is that view of the stored
+    /// codes ([`Views`]): the exact view the stored values, the coarse and
+    /// refined views their high bits with the missing bits at their midpoint.
+    #[test]
+    fn the_placement_is_the_references_bit_order() {
+        use seismic_lang::{
+            entry::ElementBindings,
+            failure::SourceTermination,
+            interp::{Arg, Interpreter, TensorData},
+            reference_math::ReferenceScalar,
+            types::DType as Scalar,
+        };
+        let module = crate::test_support::check_kernels();
+        let entry = module
+            .entry(module.entry_named("progressive_view").unwrap(), &ElementBindings::new())
+            .unwrap();
+        let (rows, columns) = (3usize, 96usize);
+        let groups = columns / GROUP;
+        for (bits, depth) in [(4u8, ProgressiveCodeDepth::Four), (8, ProgressiveCodeDepth::Eight)] {
+            // Random codes, each block's scale a finite f16.
+            let block_bytes = 2 + GROUP * usize::from(bits) / 8;
+            let mut state = 0x9e37_79b9u32 ^ u32::from(bits);
+            let mut bytes = (0..rows * groups * block_bytes)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state >> 24) as u8
+                })
+                .collect::<Vec<_>>();
+            for (block, stored) in bytes.chunks_exact_mut(block_bytes).enumerate() {
+                let scale = seismic::f16_bits(0.01 + 0.003 * block as f32 - 0.05 * (block % 2) as f32);
+                stored[..2].copy_from_slice(&scale.to_le_bytes());
+            }
+            // Code `k` of each row, offset-binary, and its group's scale.
+            let code = |r: usize, k: usize| {
+                let stored = &bytes[(r * groups + k / GROUP) * block_bytes..][..block_bytes];
+                let i = k % GROUP;
+                let u = if bits == 8 {
+                    stored[2 + i] ^ 0x80
+                } else {
+                    (stored[2 + i % 16] >> (4 * (i / 16))) & 15
+                };
+                let scale = seismic::f16_to_f32(u16::from_le_bytes([stored[0], stored[1]]));
+                (usize::from(u), f64::from(scale))
+            };
+            let planes = [
+                ProgressivePlane::Top,
+                ProgressivePlane::Next,
+                ProgressivePlane::Rest,
+                ProgressivePlane::Scales,
+            ]
+            .map(|part| plane_of(part, &bytes, columns, bits));
+            let p = usize::from(depth.rest_planes());
+            let views = Views::of(depth);
+            for view_bits in [p + 1, p + 2, 2 * (p + 1)] {
+                let mut interpreter = Interpreter::new(&entry);
+                let mut tensor = |dtype, shape: Vec<usize>, values: Vec<f64>| {
+                    Arg::Tensor(interpreter.add_tensor(TensorData::dense(dtype, shape, values)))
+                };
+                let plane_words = |plane: &[u8]| -> Vec<f64> { words(plane).into_iter().map(f64::from).collect() };
+                let scales: Vec<f64> = planes[3]
+                    .chunks_exact(2)
+                    .map(|scale| f64::from(seismic::f16_to_f32(u16::from_le_bytes([scale[0], scale[1]]))))
+                    .collect();
+                let arguments = [
+                    tensor(Scalar::U32, vec![rows, groups, p + 1], plane_words(&planes[0])),
+                    tensor(Scalar::U32, vec![rows, groups], plane_words(&planes[1])),
+                    tensor(Scalar::U32, vec![rows, groups, p], plane_words(&planes[2])),
+                    tensor(Scalar::F16, vec![rows, groups], scales),
+                    Arg::Scalar(ReferenceScalar::I32(view_bits as i32)),
+                    tensor(Scalar::F32, vec![rows, columns], vec![0.0; rows * columns]),
+                ];
+                let outcome = interpreter.run(&arguments).unwrap();
+                assert!(
+                    !matches!(outcome.termination(), SourceTermination::Failed(_)),
+                    "progressive_view failed"
+                );
+                let input = outcome.inputs().find(|input| input.ordinal() == 5).unwrap();
+                let view = input.tensor();
+                for r in 0..rows {
+                    for k in 0..columns {
+                        let (u, scale) = code(r, k);
+                        let missing = if view_bits == p + 1 {
+                            views.coarse[u]
+                        } else if view_bits == p + 2 {
+                            views.refined[u]
+                        } else {
+                            0.0
+                        };
+                        let expected = (scale * (views.exact[u] - missing)) as f32;
+                        let read = view.read(r * columns + k).unwrap() as f32;
+                        assert_eq!(read, expected, "depth {bits}, {view_bits}-bit view, row {r} column {k}");
+                    }
+                }
+            }
         }
     }
 

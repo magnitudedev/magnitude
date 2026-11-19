@@ -3,6 +3,7 @@
 // row m (`lib/routed/output_sum.h`) over the published projections of
 // `routed_output_project`, waiting as `routed_down_sited` waits.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/streaming/control.h"
 #include "../streaming/site.hpp"
 #include "lib/routed/routed.h"

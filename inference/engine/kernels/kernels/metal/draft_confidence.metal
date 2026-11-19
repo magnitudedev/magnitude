@@ -1,10 +1,11 @@
 // draft_confidence: one threadgroup per row reduces weight · [features ;
 // memory] + bias and marks the row's selection declined (status 3) when its
 // sigmoid is below the threshold.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/reduce.h"
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 
 kernel void draft_confidence(
     device const uchar *features [[buffer(SEISMIC_BUFFER_FEATURES)]],
@@ -21,11 +22,11 @@ kernel void draft_confidence(
     const ulong width = SEISMIC_DIM_D, rank = SEISMIC_DIM_R;
     float partial = 0.0f;
     for (ulong i = thread_index; i < width; i += 256u)
-        partial = metal::fma(element::at<activation>(features, ulong(row) * SEISMIC_FEATURES_STRIDE_0 +
+        partial = metal::fma(element::at<activation_element>(features, ulong(row) * SEISMIC_FEATURES_STRIDE_0 +
                                                                    i * SEISMIC_FEATURES_STRIDE_1),
             weight[i * SEISMIC_WEIGHT_STRIDE_0], partial);
     for (ulong i = thread_index; i < rank; i += 256u)
-        partial = metal::fma(element::at<activation>(memory, ulong(row) * SEISMIC_MEMORY_STRIDE_0 +
+        partial = metal::fma(element::at<activation_element>(memory, ulong(row) * SEISMIC_MEMORY_STRIDE_0 +
                                                                  i * SEISMIC_MEMORY_STRIDE_1),
             weight[(width + i) * SEISMIC_WEIGHT_STRIDE_0], partial);
     const float score = reduce::group_sum<8>(partial, partials, sg, lane) + bias[0];

@@ -14,6 +14,7 @@
 // A choice's gate/up accumulators carry its expert's second-level scales
 // (`gate_scale`, `up_scale`, static GS, US) before SiLU . mul where those
 // ports are present; the shared expert's none.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #define KERNEL_W2 SEISMIC_SHARED_GATE
@@ -92,8 +93,8 @@ __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
             SEISMIC_DIM_H);
         const Epi epi{SEISMIC_RESULT_0_OUT.offset(m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1), 0};
         projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
-                                ROUTED_RECORD(KERNEL_W0, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert)),
-                                ROUTED_RECORD(KERNEL_W1, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert)),
+                                PACKETS_RECORD(KERNEL_W0, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert)),
+                                PACKETS_RECORD(KERNEL_W1, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert)),
                                 EXPERT_SCALED(epi, expert));
         return;
     }
@@ -123,8 +124,8 @@ __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
         const projection::u64 expert = (projection::u64)table.expert;
         projection::gemv_segment<Shape>(
             shared, routed::GatheredRows{ROWS_OF(ROUTED_NVFP4), table.rows}, table.count, SEISMIC_DIM_H / 64, group,
-            SEISMIC_DIM_F, ROUTED_RECORD(KERNEL_W0, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert)),
-            ROUTED_RECORD(KERNEL_W1, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert)),
+            SEISMIC_DIM_F, PACKETS_RECORD(KERNEL_W0, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert)),
+            PACKETS_RECORD(KERNEL_W1, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert)),
             EXPERT_SCALED((routed::ChoiceRows<Epi>{Epi{SEISMIC_RESULT_0_OUT, 0}, table.products}),
                           expert));
         return;

@@ -886,8 +886,7 @@ fn scoped_projection_specialization_on<E: seismic::Entry>(
 
 /// `mapping`'s GEMV threadgroup on the Metal launches for three rows up to
 /// VERIFY_ROWS and for two rows of an entry that launches its GEMV per row
-/// count, and on a single projection's packed-rows launch, whose form
-/// (PACKED_ROWS) is off.
+/// count.
 fn with_gemv_rows<E: seismic::Entry>(
     device: &Device,
     specialization: NativeSpecialization,
@@ -896,13 +895,6 @@ fn with_gemv_rows<E: seismic::Entry>(
     if device.backend() != BackendName::Metal {
         return specialization;
     }
-    let specialization = match common::metal_launch_of::<E>("gemv_packed") {
-        Some(packed) => specialization
-            .with_param("PACKED_ROWS", 0)
-            .with_launch_param(packed, "SIMDGROUPS", mapping.simdgroups)
-            .with_launch_param(packed, "ROWS", mapping.rows),
-        None => specialization,
-    };
     ["gemv_rows", "gemv_pair"].into_iter().fold(specialization, |specialization, launch| {
         let launch = common::metal_launch::<E>(launch);
         specialization
@@ -1292,10 +1284,9 @@ const PAIRED_LAUNCHES: [&str; 14] = [
     "gemv", "batch", "gemm_small", "gemm", "tall", "quantize", "coefficients", "int8", "gemv_rows", "gemv_pair",
     "pack", "pack_coefficients", "packed", "unpacked",
 ];
-const SINGLE_LAUNCHES: [&str; 18] = [
+const SINGLE_LAUNCHES: [&str; 17] = [
     "gemv", "batch", "gemm_small", "reduce_small", "gemm", "reduce", "relayout", "tall", "quantize",
-    "coefficients", "int8", "gemv_rows", "gemv_packed", "gemv_pair", "pack", "pack_coefficients", "packed",
-    "unpacked",
+    "coefficients", "int8", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed", "unpacked",
 ];
 const SEGMENTED_LAUNCHES: [&str; 11] = [
     "gemv", "batch", "gemm_small", "gemm", "tall", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed",
@@ -2494,9 +2485,7 @@ fn dense_output_call(
 
 #[test]
 fn cpu_int8_dense_output_agrees_with_exact_projection() {
-    let Some(device) = devices().into_iter().find(is_cpu) else {
-        return;
-    };
+    let device = seismic_native_tests::cpu();
     let (h, f, rows) = (37, 512, 9);
     let down = weight(Repr::Q4k, h, f, 313, 1.0);
     let mut random = Rng::new(314);
@@ -2550,8 +2539,8 @@ fn cpu_int8_dense_output_agrees_with_exact_projection() {
 /// grid, which its scales are stored in (`int8_rule`): weights that read one
 /// column each (`int8_rule::probe_blocks`) make each output its column's
 /// `d * code` (rounded to BF16 by the projection's store), which matches the
-/// rule's on ties, their BF16 neighbours, subnormal scales, zero and NaN
-/// groups. Groups with F32 subnormal values are left out: Metal's F32
+/// rule's on ties, their BF16 neighbours, subnormal scales, zero groups and
+/// groups with a NaN or ±Inf (every output NaN). Groups with F32 subnormal values are left out: Metal's F32
 /// arithmetic flushes them. Devices without tensor operations run no INT8
 /// quantization.
 #[test]
@@ -2968,123 +2957,60 @@ fn metal_packed_dense_output_agrees_with_the_staged_form(format: Format) {
     }
 }
 
-/// Metal's packed-rows GEMV of the down projection (`PACKED_ROWS` = N, each
-/// N its weight's PACK_LANES offers): N activation rows packed per operand
-/// element against the codes of a format the packed form admits without
-/// residue bits, at the decode and verification row counts (a generated
-/// test a format), under the weight's packing bound. It checks structure,
-/// not error, which admission judges: a sum is its packed rows' and weight
-/// row's alone, the same bits under every mapping of one LANES; and each
-/// output is the GEMV's within the form's certified budget, half a code
-/// step a column (the held scale `packing.h` certifies, over its rows'
-/// norms and the bound) and, for a group's bottom row, the accumulator's n
-/// roundings of a run (`packing_lanes::exponent`), with F32 rounding beside.
-fn metal_packed_rows_dense_output_agrees_with_the_gemv(format: Format) {
+/// Metal's PACK form of the plain projection over a format the form admits
+/// (a generated test a format), on rows where some tokens' runs hold a NaN,
+/// +Inf or -Inf, alone among zeros or among values, beside finite partners
+/// and beside each other: each such token's products are all NaN, and every
+/// other token's are bit for bit those of the same rows with each such run
+/// zero, so a non-finite run touches no token it shares elements with.
+fn metal_packed_non_finite_runs_make_only_their_tokens_nan(format: Format) {
     let Some(device) = devices()
         .into_iter()
         .find(|device| device.backend() == BackendName::Metal)
     else {
         return;
     };
+    let act = Act::Bf16;
     let repr = Repr::of(format);
-    let Some(packing) = repr.resident(&device).metal_packing() else {
-        return;
-    };
-    if packing.residue {
+    if repr.resident(&device).metal_packing().is_none() {
         return;
     }
-    let act = Act::Bf16;
-    let (outputs, k) = (192, 1024);
-    let down = weight(repr, outputs, k, 93, 1.0);
-    let (bound, bound_extent) = down.bound(&device);
-    let squares = if bound_extent > 0 { read_f32(&bound) } else { Vec::new() };
-    let run = 32 / packing.folds as usize;
-    let n = run as f64;
-    let centre = f64::from(packing.centre);
-    for lanes in 2..=(packing.lanes as usize).min(3) {
-        let fields = packed::Fields::new(lanes, 0, n);
-        for rows in [2usize, 3, 5, 8] {
-            let mut rng = Rng::new(rows as u64 + 94);
-            let residual = (0..rows * outputs).map(|_| rng.symmetric()).collect::<Vec<_>>();
-            let product = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
-            let out_rows = (0..rows as i32).collect::<Vec<_>>();
-            let projected = |values: &[f32]| {
-                values
-                    .iter()
-                    .zip(&residual)
-                    .map(|(value, residual)| f64::from(value - residual))
-                    .collect::<Vec<_>>()
-            };
-            let exact = projected(&dense_output_native_arithmetic(
-                &device, act, &down, &residual, rows, &product, &out_rows, MAPPINGS[0], false,
-            ));
-            // An upper bound on a row's code step a run (its held scale
-            // times its code step, over 64), as `packing_lane_scales`
-            // certifies it: its lane's sum limit at code step s against |x|_1
-            // and, under the bound, |x|_2, capped by its codes against
-            // |x|_inf; the bottom lane may take even codes (s = 2). Its F32
-            // norms and the held rounding are covered by a 2^-7 margin.
-            let step = |m: usize, r: usize| {
-                let x = (0..run).map(|c| f64::from(act.round(product[m * k + r * run + c]))).collect::<Vec<_>>();
-                let l1 = x.iter().map(|v| v.abs()).sum::<f64>();
-                let peak = x.iter().fold(0.0f64, |a, v| a.max(v.abs()));
-                let l2 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
-                let lane = m % lanes;
-                let certified = |s: f64| {
-                    let bound = squares.get(r).map(|&b2| f64::from(b2));
-                    packed::certified_scale(&fields, lane, l1, l2 * l2, bound, centre, packing.folds as usize, s)
-                        .max(peak * 64.0 / fields.codes[lane])
-                };
-                let held = if lane == 0 { certified(1.0).max(2.0 * certified(2.0)) } else { certified(1.0) };
-                held * (1.0 + 2f64.powi(-7)) / 64.0
-            };
-            let mut first: Option<Vec<f32>> = None;
-            for mapping in MAPPINGS {
-                let specialization = with_matrix::<dense_output::Entry>(
-                    &device,
-                    dense_output_specialization_on(&device, &[("H", outputs), ("F", k)], mapping),
-                    &[("A", act.element()), ("DW", repr.resident(&device))],
-                )
-                .with_param("PACKED_ROWS", lanes as u64)
-                .with_param("TILED", 0)
-                .with_param("STAGE", 0)
-                .with_static("DB", bound_extent as u64);
-                let values = dense_output_call(
-                    &device, act, &down, &residual, rows, &product, &out_rows, &specialization, &bound,
-                );
-                if mapping.lanes == MAPPINGS[0].lanes {
-                    let first = first.get_or_insert_with(|| values.clone());
-                    assert!(
-                        first.iter().zip(&values).all(|(a, b)| a.to_bits() == b.to_bits()),
-                        "packed rows dense_output {repr:?} rows {rows} N {lanes} {mapping:?} differs across mappings"
-                    );
-                }
-                let packed = projected(&values);
-                for m in 0..rows {
-                    for j in 0..outputs {
-                        let w = &down.values[j * k..(j + 1) * k];
-                        let mut budget = 0.0;
-                        let mut magnitude = 0.0;
-                        for r in 0..k / run {
-                            let w = &w[r * run..(r + 1) * run];
-                            let step = step(m, r);
-                            let absolute = w.iter().map(|v| f64::from(v.abs())).sum::<f64>();
-                            budget += step * 0.5 * absolute;
-                            if m % lanes == 0 {
-                                budget += step * n * 2f64.powi(fields.exponent - 25) * packed::run_factor(w);
-                            }
-                            magnitude += (0..run)
-                                .map(|c| f64::from(w[c].abs()) * f64::from(product[m * k + r * run + c].abs()))
-                                .sum::<f64>();
-                        }
-                        let difference = (packed[m * outputs + j] - exact[m * outputs + j]).abs();
-                        assert!(
-                            difference <= budget + 1e-5 * magnitude,
-                            "packed rows dense_output {repr:?} rows {rows} N {lanes} {mapping:?}: output ({m}, {j}) differs from the GEMV by {difference:.3e}, beyond its certified {budget:.3e}"
-                        );
-                    }
-                }
-            }
+    let (outputs, k, rows) = (192, 1024, 128);
+    let weight = weight(repr, outputs, k, 93, 1.0);
+    let run = packed_operand(&device, repr, PACK_DEFAULT).run();
+    let mut rng = Rng::new(94);
+    let drawn = (0..rows * k).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>();
+    // (token, column, value, alone): tokens 2 e and 2 e + 1 share element e;
+    // 20 and 21 share their run's elements.
+    let cases = [
+        (5, 3, f32::NAN, false),
+        (6, 40, f32::INFINITY, true),
+        (9, 1000, f32::NEG_INFINITY, false),
+        (12, 517, f32::NAN, true),
+        (20, 64, f32::INFINITY, false),
+        (21, 70, f32::NAN, false),
+        (127, 1023, f32::NAN, false),
+    ];
+    let (mut x, mut zeroed) = (drawn.clone(), drawn);
+    for &(token, column, value, alone) in &cases {
+        let first = token * k + column / run * run;
+        zeroed[first..first + run].fill(0.0);
+        if alone {
+            x[first..first + run].fill(0.0);
+        }
+        x[token * k + column] = value;
+    }
+    let packed = project_rows_native(&device, act, &weight, &x, pack_mapping(), Some(PACK_DEFAULT));
+    let reference = project_rows_native(&device, act, &weight, &zeroed, pack_mapping(), Some(PACK_DEFAULT));
+    for token in 0..rows {
+        let (got, want) = (&packed[token * outputs..][..outputs], &reference[token * outputs..][..outputs]);
+        if cases.iter().any(|case| case.0 == token) {
+            assert!(got.iter().all(|value| value.is_nan()), "{repr:?}: token {token}'s products are not all NaN");
+        } else {
+            assert!(
+                got.iter().zip(want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{repr:?}: token {token} differs from its rows with the non-finite runs zero"
+            );
         }
     }
 }
@@ -4829,12 +4755,7 @@ fn vulkan_attention_scoped_launches_match_the_host() {
 
 #[test]
 fn cpu_attention_scoped_launches_match_the_host() {
-    let Some(device) = devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Cpu)
-    else {
-        return;
-    };
+    let device = seismic_native_tests::cpu();
     attention_projections_match_their_portable_bodies_and_the_host_reference_on(
         &device,
         Cases::Scoped,
@@ -6224,7 +6145,7 @@ gguf_format_tests! {
         embedding_rows_decode_exactly_as_the_portable_body
         metal_tall_and_packed_project_rows_agree_with_the_staged_form
         metal_packed_dense_output_agrees_with_the_staged_form
-        metal_packed_rows_dense_output_agrees_with_the_gemv
+        metal_packed_non_finite_runs_make_only_their_tokens_nan
         packing_bound_matches_its_portable_body
     ];
 }

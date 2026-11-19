@@ -5,6 +5,8 @@ import {
   LocalInferenceDeviceIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   type LocalInferenceHardware,
+  type MachineFormFactor,
+  type MachineIdentityObservation,
 } from "./model-state"
 import type { AcnHardwareSummary } from "./acn-health"
 
@@ -65,6 +67,22 @@ const resolveActive = (
   })
 }
 
+const formFactors = {
+  portable: "Portable", desktop: "Desktop", all_in_one: "AllInOne", mini_pc: "MiniPc", server: "Server", unknown: "Unknown",
+} as const satisfies Record<InferenceSchema.HardwareFormFactor, MachineFormFactor>
+
+/** The machine as the service's firmware reader names it. */
+const machineIdentity = (hardware: InferenceSchema.HardwareSnapshot): MachineIdentityObservation => {
+  const formFactor = formFactors[hardware.form_factor]
+  return Option.match(Option.flatMap(hardware.machine_identity, Option.fromNullable), {
+    onNone: (): MachineIdentityObservation => ({ _tag: "Unavailable", formFactor }),
+    onSome: ({ manufacturer, model, family, version }): MachineIdentityObservation => ({
+      _tag: "Identified", manufacturer, model, formFactor,
+      family: Option.flatMap(family, Option.fromNullable), version: Option.flatMap(version, Option.fromNullable),
+    }),
+  })
+}
+
 export const projectInferenceHardware = (
   hardware: InferenceSchema.HardwareSnapshot,
   instances: InferenceSchema.ModelInstancesSnapshot,
@@ -119,9 +137,11 @@ export const projectInferenceHardware = (
     platform,
     architecture,
     productName: Option.flatMap(hardware.system_product_name, Option.fromNullable),
+    identity: machineIdentity(hardware),
     processor: Option.flatMap(hardware.cpu_model, Option.fromNullable),
-    physicalCores: Option.filter(Option.flatMap(hardware.physical_cores, Option.fromNullable), count => count > 0),
-    logicalCores: Math.max(1, hardware.logical_cores),
+    chipCores: hardware.chip_cores,
+    logicalCpus: hardware.logical_cpus,
+    cpuPoolCores: hardware.cpu_pool_cores,
     totalSystemMemoryBytes: host.store.allocation_capacity_bytes,
     accelerators,
     activeDeviceId: LocalInferenceDeviceIdSchema.make(active.executor.id),
@@ -189,8 +209,8 @@ export const summarizeInferenceHardware = (
     gpuCount: hardware.physical_devices.filter(physical => physical.kind !== "cpu").length,
     gpuUnusedReason: unused ? Option.some(unusedReason(unused)) : Option.none(),
     cpuModel: Option.flatMap(hardware.cpu_model, Option.fromNullable).pipe(Option.filter(model => model.trim().length > 0)),
-    cpuCores: Option.flatMap(hardware.physical_cores, Option.fromNullable).pipe(Option.filter(count => count > 0),
-      Option.orElse(() => hardware.logical_cores > 0 ? Option.some(hardware.logical_cores) : Option.none())),
+    cpuPoolCores: hardware.cpu_pool_cores,
+    logicalCpus: hardware.logical_cpus,
     memoryBytes: hardware.host_ram.store.total_capacity_bytes,
   } satisfies AcnHardwareSummary
 })

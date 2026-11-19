@@ -6,47 +6,23 @@
 //
 // Shared: the joined row (2D A elements, 4D bytes), then 16 floats of
 // subgroup partials.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_TABLE
 #define KERNEL_W1 SEISMIC_COMBINE
 #include "lib/core/activation.glsl"
 #include "lib/core/gathered.glsl"
 #include <seismic/packets.glsl>
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define DRAFT_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "draft_rows requires a bf16 or f16 activation"
 #endif
-#if defined(SEISMIC_EMBEDDING_NORM_REPRESENTATION_F32)
-#define DRAFT_EMBEDDING_NORM ELEMENT_F32
-#elif defined(SEISMIC_EMBEDDING_NORM_REPRESENTATION_F16)
-#define DRAFT_EMBEDDING_NORM ELEMENT_F16
-#elif defined(SEISMIC_EMBEDDING_NORM_REPRESENTATION_BF16)
-#define DRAFT_EMBEDDING_NORM ELEMENT_BF16
-#else
-#error "draft_rows requires a dense embedding_norm"
-#endif
-#if defined(SEISMIC_HIDDEN_NORM_REPRESENTATION_F32)
-#define DRAFT_HIDDEN_NORM ELEMENT_F32
-#elif defined(SEISMIC_HIDDEN_NORM_REPRESENTATION_F16)
-#define DRAFT_HIDDEN_NORM ELEMENT_F16
-#elif defined(SEISMIC_HIDDEN_NORM_REPRESENTATION_BF16)
-#define DRAFT_HIDDEN_NORM ELEMENT_BF16
-#else
-#error "draft_rows requires a dense hidden_norm"
-#endif
+#define DRAFT_ACT ACTIVATION_A
+#define DRAFT_EMBEDDING_NORM ELEMENT_OF(SEISMIC_EMBEDDING_NORM)
+#define DRAFT_HIDDEN_NORM ELEMENT_OF(SEISMIC_HIDDEN_NORM)
 
 
 
-#if defined(SEISMIC_CONDITIONING_REPRESENTATION_F32)
-#define DRAFT_CONDITION ELEMENT_F32
-#elif defined(SEISMIC_CONDITIONING_REPRESENTATION_F16)
-#define DRAFT_CONDITION ELEMENT_F16
-#elif defined(SEISMIC_CONDITIONING_REPRESENTATION_BF16)
-#define DRAFT_CONDITION ELEMENT_BF16
-#else
-#error "draft_rows requires dense conditioning"
-#endif
+#define DRAFT_CONDITION ELEMENT_OF(SEISMIC_CONDITIONING)
 #define DRAFT_ROWS_PER_SUBGROUP 4u
 
 // Sum of one value per invocation in a fixed order: subgroup sums, then the
@@ -75,7 +51,7 @@ void draft_rows() {
     const packets_rows16 table_geometry = PACKETS_W0_ROWS;
     const int64_t held = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
         SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS), row * SEISMIC_TOKENS_STRIDE_0));
-    const uint64_t table_row = SEISMIC_PTR(SEISMIC_BUFFER_TABLE) + uint64_t(held) * table_geometry.stride;
+    const uint64_t table_row = packets_row(SEISMIC_PTR(SEISMIC_BUFFER_TABLE), table_geometry, uint64_t(held));
     float embedding_squares = 0.0;
     for (uint column = thread; held < 0l && column < width; column += threads)
         seismic_shared_u16[column] = uint16_t(element_store(DRAFT_ACT, 0.0));
@@ -128,7 +104,7 @@ void draft_rows() {
         const uint feature = gl_WorkGroupID.x * outputs_per_group + SEISMIC_SUBGROUP * DRAFT_ROWS_PER_SUBGROUP + r;
         if (feature >= width)
             break;
-        const uint64_t weight_row = combine + uint64_t(feature) * combine_geometry.stride;
+        const uint64_t weight_row = packets_row(combine, combine_geometry, uint64_t(feature));
         float sum = 0.0;
         for (uint p = SEISMIC_LANE; p * 32u < inputs; p += 32u) {
             const packets_packet packet = packets_load(PACKETS_W1, weight_row, combine_geometry, p, inputs);

@@ -4,6 +4,11 @@
 //! key records beside them. A recording that panics leaves its key whole:
 //! the next model of the key records it again.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
+
 use seismic::{
     BackendName, ClassFact, Dim, Element, NativeGraphClassSlice, NativeGraphMetadata, NativeGraphMetadataError,
     NativeGraphOutline, NativeGraphResourceTemplate, NativeGraphTraces, Reals,

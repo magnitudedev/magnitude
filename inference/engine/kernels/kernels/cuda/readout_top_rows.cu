@@ -4,6 +4,7 @@
 // `stage` forms the rows' final norm (`features`) with their lengths and
 // per-group sums; `planes` projects every vocabulary row onto the view and
 // publishes each row's threshold.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/readout/progressive.cuh"
 #include "lib/projection/operator.cuh"
 

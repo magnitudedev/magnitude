@@ -76,8 +76,9 @@ pub struct Declaration {
 }
 
 /// An axis of a weight's native decode ABI that a requirement reads
-/// (`SEISMIC_AXIS_<NAME>` in a backend's axes tuple).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// (`SEISMIC_AXIS_<NAME>` in a backend's axes tuple), and a native
+/// declaration (`axis(W, NAME)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Axis {
     Codes,
     CodeLowBits,
@@ -124,6 +125,11 @@ impl Axis {
             Self::CoeffCarried => "COEFF_CARRIED",
             Self::LogicalGroup => "LOGICAL_GROUP",
         }
+    }
+
+    /// The axis the ABI names `name`.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|axis| axis.name() == name)
     }
 }
 
@@ -357,10 +363,7 @@ impl Parser<'_> {
                 }
                 None => self.lets.get(&token).cloned().unwrap_or_else(|| {
                     Expr::Axis(
-                        Axis::ALL
-                            .into_iter()
-                            .find(|axis| axis.name() == token)
-                            .unwrap_or_else(|| panic!("no axis or name `{token}` in `{}`", self.text)),
+                        Axis::named(&token).unwrap_or_else(|| panic!("no axis or name `{token}` in `{}`", self.text)),
                     )
                 }),
             },

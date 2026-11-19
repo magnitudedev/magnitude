@@ -1327,3 +1327,25 @@ pub(super) fn device_node(location: crate::PciLocation) -> Result<crate::DeviceN
     let text = std::fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))?;
     crate::processors::parse_device_node(&text).map_err(|error| format!("{path}: {error}"))
 }
+
+/// The machine's names (`crate::machine`): DMI's system and chassis fields
+/// (`/sys/devices/virtual/dmi/id`), and a board's device-tree model
+/// (`/proc/device-tree/model`) as its name where DMI names no product. A field
+/// the host lacks reads as nothing.
+pub(super) fn machine() -> crate::machine::Firmware {
+    let read = |path: &str| std::fs::read(path).unwrap_or_default();
+    let dmi = |field: &str| read(&format!("/sys/devices/virtual/dmi/id/{field}"));
+    let model = dmi("product_name");
+    let name = match crate::machine::label(&model) {
+        Some(_) => Vec::new(),
+        None => read("/proc/device-tree/model"),
+    };
+    crate::machine::Firmware {
+        manufacturer: dmi("sys_vendor"),
+        model,
+        family: dmi("product_family"),
+        version: dmi("product_version"),
+        chassis_type: String::from_utf8_lossy(&dmi("chassis_type")).trim().parse().ok(),
+        name,
+    }
+}

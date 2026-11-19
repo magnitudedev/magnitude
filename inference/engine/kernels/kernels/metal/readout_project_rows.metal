@@ -7,21 +7,18 @@
 // `choice` (`gather_choice`): each feature row an expert of one choice, the
 // rows it selects that expert's matrix, a selection past the vocabulary
 // -inf.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 // A selection past the vocabulary reads row 0 (`projection::Weights`).
 #define PROJECTION_TABLE_ROWS SEISMIC_DIM_V
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
 #include "lib/projection/operator.h"
-#if defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_ROWS) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PAIR) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GATHER_CHOICE) || \
-    defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PACKED)
+#if defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_ROWS) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PAIR) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GATHER_CHOICE)
 #include "lib/projection/gemv.h"
 #endif
-#ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PACKED
-#include "lib/projection/gemv_packed.h"
-#endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 // The weight's operand rows (the feature rows, or NVFP4 operands): the GEMV
 // row classes form them while staging, the stage launch into the scratch
 // every other form reads.
@@ -61,13 +58,13 @@ typedef projection::operands<NVFP4> Operands;
 // the weight's first S rows.
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_S), k = uint(SEISMIC_DIM_D); \
-    const projection::Plain<activation, projection::AllRows> raw{features, SEISMIC_FEATURES_STRIDE_0, \
+    const projection::Plain<activation_element, projection::AllRows> raw{features, SEISMIC_FEATURES_STRIDE_0, \
         SEISMIC_FEATURES_STRIDE_1, k, {}};                                              \
-    const projection::Plain<activation, projection::AllRows> in = NVFP4                 \
-        ? projection::Plain<activation, projection::AllRows>{staged, k, 1, k, {}}       \
+    const projection::Plain<activation_element, projection::AllRows> in = NVFP4         \
+        ? projection::Plain<activation_element, projection::AllRows>{staged, k, 1, k, {}}       \
         : raw;                                                                          \
     const auto out = READOUT_LOGITS(element::Out<element::F32>(logits_cells));         \
-    projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k}
+    projection::Weights<packets::W0> w{{weight, KERNEL_W0_LAYOUT(k), k}}
 
 #define PROJECTION_GROUPS 1
 #define PROJECTION_GEMV_INPUT(x) const auto x = raw
@@ -109,10 +106,10 @@ kernel void readout_project_rows_gather_choice(PROJECTION_ARGUMENTS,
         return;
     const ulong m = group.y / SEISMIC_DIM_I, choice = group.y % SEISMIC_DIM_I;
     device const int *selected = token_rows + m * SEISMIC_TOKEN_ROWS_STRIDE_0 + choice * SEISMIC_TOKEN_ROWS_STRIDE_1;
-    const projection::Plain<activation, projection::AllRows> in{
-        features + m * SEISMIC_FEATURES_STRIDE_0 * activation::bytes,
+    const projection::Plain<activation_element, projection::AllRows> in{
+        features + m * SEISMIC_FEATURES_STRIDE_0 * activation_element::bytes,
         SEISMIC_FEATURES_STRIDE_0, SEISMIC_FEATURES_STRIDE_1, d, {}};
-    projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(d), d, selected, 0,
+    projection::Weights<packets::W0> w{{weight, KERNEL_W0_LAYOUT(d), d}, selected, 0,
         SEISMIC_TOKEN_ROWS_STRIDE_2};
     const element::Out<element::F32> row = element::Out<element::F32>(logits_cells).offset(m * SEISMIC_RESULT_0_STRIDE_0);
     const auto out = READOUT_LOGITS(row);
@@ -135,21 +132,15 @@ kernel void readout_project_rows_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUM
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_project_rows_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_project_rows_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
-}
-#endif
-#ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PACKED
-template <uint LANES, uint PACKED_ROWS, uint ROWS>
-kernel void readout_project_rows_gemv_packed(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
-    PROJECTION_SINGLE_GEMV_PACKED;
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_BATCH

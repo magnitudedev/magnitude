@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
+use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use getrandom::fill;
 use hf_hub::HFError;
@@ -2147,38 +2148,40 @@ impl ManagedModelStore {
 
 /// `resolve_package_once`, retried like a component's transfer while its failure is retryable: a
 /// connection dropped while the Hub resolves the revision would otherwise fail the download at once.
-async fn resolve_package(
-    client: &hf_hub::HFClient,
-    token: Option<&str>,
-    owner: &str,
-    name: &str,
-    repository: &str,
-    revision: &str,
-    components: &[ModelComponent],
-    control: &TransferControl,
-) -> Result<(hf_hub::HFRepository<hf_hub::RepoTypeModel>, String), DownloadError> {
-    for attempt in 0..MAX_ATTEMPTS {
-        match resolve_package_once(
-            client, token, owner, name, repository, revision, components, control,
-        )
-        .await
-        {
-            Err(error) if error.retryable() && attempt + 1 < MAX_ATTEMPTS => {
-                tracing::warn!(
-                    repository,
-                    revision,
-                    attempt = attempt + 1,
-                    error = %error,
-                    "resolving the model's revision failed; retrying"
-                );
-                control
-                    .backoff(Duration::from_secs(1_u64 << attempt.min(4)))
-                    .await?;
+fn resolve_package<'a>(
+    client: &'a hf_hub::HFClient,
+    token: Option<&'a str>,
+    owner: &'a str,
+    name: &'a str,
+    repository: &'a str,
+    revision: &'a str,
+    components: &'a [ModelComponent],
+    control: &'a TransferControl,
+) -> BoxFuture<'a, Result<(hf_hub::HFRepository<hf_hub::RepoTypeModel>, String), DownloadError>> {
+    Box::pin(async move {
+        for attempt in 0..MAX_ATTEMPTS {
+            match resolve_package_once(
+                client, token, owner, name, repository, revision, components, control,
+            )
+            .await
+            {
+                Err(error) if error.retryable() && attempt + 1 < MAX_ATTEMPTS => {
+                    tracing::warn!(
+                        repository,
+                        revision,
+                        attempt = attempt + 1,
+                        error = %error,
+                        "resolving the model's revision failed; retrying"
+                    );
+                    control
+                        .backoff(Duration::from_secs(1_u64 << attempt.min(4)))
+                        .await?;
+                }
+                result => return result,
             }
-            result => return result,
         }
-    }
-    unreachable!("bounded retry loop returns on its final attempt")
+        unreachable!("bounded retry loop returns on its final attempt")
+    })
 }
 
 async fn resolve_package_once(

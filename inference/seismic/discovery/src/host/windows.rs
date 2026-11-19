@@ -616,3 +616,22 @@ fn job_limits() -> Result<Vec<ProcessMemoryLimit>, ObservationError> {
 pub(super) fn device_node(_location: crate::PciLocation) -> Result<crate::DeviceNode, String> {
     Ok(crate::DeviceNode::Unknown)
 }
+
+/// The machine's names (`crate::machine`): the SMBIOS table
+/// `GetSystemFirmwareTable` returns (provider `RSMB`), after its eight-byte
+/// header (calling method, versions, then the table's length). A table the
+/// OS does not return reads as nothing.
+pub(super) fn machine() -> crate::machine::Firmware {
+    use windows_sys::Win32::System::SystemInformation::GetSystemFirmwareTable;
+    const RSMB: u32 = u32::from_be_bytes(*b"RSMB");
+    let size = unsafe { GetSystemFirmwareTable(RSMB, 0, std::ptr::null_mut(), 0) };
+    if !(8..=1 << 20).contains(&size) {
+        return crate::machine::Firmware::default();
+    }
+    let mut data = vec![0u8; size as usize];
+    if unsafe { GetSystemFirmwareTable(RSMB, 0, data.as_mut_ptr().cast(), size) } != size {
+        return crate::machine::Firmware::default();
+    }
+    let length = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    data.get(8..8 + length).map_or_else(crate::machine::Firmware::default, crate::machine::parse_smbios)
+}

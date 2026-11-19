@@ -24,6 +24,11 @@
 //! or within a boundary declared [`recoverable`], and arrives there as a
 //! [`Panic`], which carries its cause.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the one place the engine starts a thread or a runtime"
+)]
+
 use std::any::Any;
 use std::cell::Cell;
 use std::future::Future;
@@ -106,6 +111,16 @@ pub const PROGRAM_BYTES: usize = 1_728 << 10;
 /// was the decode. This holds the rest with the boxed frames' remaining
 /// locals.
 pub const LOAD_PATH_BYTES: usize = 256 << 10;
+
+/// The most stack one function's frame may take in an unoptimized build,
+/// which clippy's `large_stack_frames`, denied workspace-wide, holds every
+/// function to (clippy.toml's `stack-size-threshold`, which a test keeps
+/// equal to this). The overflowing load was a few frames holding plans,
+/// definitions and the executor domain by value (288 KB to 763 KB each);
+/// one type that large held by value again is refused where it is written.
+/// A quarter of [`LOAD_PATH_BYTES`]: no one frame takes the load path's
+/// budget, which holds every frame of it.
+pub const FRAME_BYTES: usize = LOAD_PATH_BYTES / 4;
 
 /// A platform compiler's peak stack: external code whose recursion follows
 /// the program and the driver, which nothing here bounds, so a measurement.
@@ -402,7 +417,8 @@ mod tests {
     fn deep(bytes: usize) -> u8 {
         #[inline(never)]
         fn frame(left: usize) -> u8 {
-            let mut page = [0u8; 64 << 10];
+            // Within the frame bound (`FRAME_BYTES`), as every frame is.
+            let mut page = [0u8; 16 << 10];
             page[left % page.len()] = left as u8;
             let below = if left > page.len() { frame(left - page.len()) } else { 0 };
             std::hint::black_box(&page)[0].wrapping_add(below)
@@ -578,6 +594,20 @@ mod tests {
             assert!(!stderr.contains("unwound past the panic"), "{case}: nothing unwinds: {stderr}");
             assert!(!stderr.contains("outlived"), "{case}: {stderr}");
         }
+    }
+
+    /// No frame may take more of the stack than [`FRAME_BYTES`]: clippy's
+    /// `large_stack_frames` holds every crate to the threshold clippy.toml
+    /// sets, which is this.
+    #[test]
+    fn the_frame_lint_holds_frames_to_the_frame_bound() {
+        let clippy = include_str!("../../../clippy.toml");
+        assert!(
+            clippy
+                .lines()
+                .any(|line| line.trim() == format!("stack-size-threshold = {FRAME_BYTES}")),
+            "clippy.toml's stack-size-threshold is FRAME_BYTES ({FRAME_BYTES})"
+        );
     }
 
     #[cfg(feature = "tokio")]

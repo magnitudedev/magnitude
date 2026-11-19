@@ -1,5 +1,6 @@
 // gated_delta_chunk: `lib/recurrent/chunk.h`'s launches over Gated DeltaNet's
 // gates (one decay per value head).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/chunk.h"
 
 kernel void gated_delta_chunk_inputs(
@@ -62,6 +63,6 @@ kernel void gated_delta_chunk_gate(
     uint item [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
     recurrent::gate_row(mixed, versions::covered_end(segments, seismic_words),
-        recurrent::projected_gate(projection, seismic_words), recurrent_norm, element::Out<element::Act>(gated),
+        recurrent::projected_gate(projection, seismic_words), recurrent_norm, element::Out<activation::Act>(gated),
         item / RCH_VALUE_HEADS, item % RCH_VALUE_HEADS, lane, seismic_words);
 }

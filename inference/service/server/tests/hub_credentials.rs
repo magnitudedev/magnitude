@@ -1,5 +1,7 @@
 //! Runs alone in its own process: it changes the environment.
 
+#![allow(clippy::disallowed_methods, reason = "a test starts threads of its own")]
+
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 

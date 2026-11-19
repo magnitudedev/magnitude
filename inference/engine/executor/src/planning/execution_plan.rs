@@ -119,13 +119,18 @@ impl ResolvedPolicy {
 
 /// The only startup value a program factory and allocator should consume.
 /// Every field is immutable after the checked constructor returns.
+///
+/// Its device, load, program and resource plans are boxed, the draft's
+/// boxes kept as it is admitted ([`ExecutionPlanDraft::admit`]): they are
+/// nearly all of a plan's bytes, which every frame that moves or clones a
+/// plan would otherwise hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionPlan {
-    device: PlannedDevice,
+    device: Box<PlannedDevice>,
     components: ComponentPlan,
-    load: ModelLoadPlan,
-    programs: ProgramPlan,
-    resources: ResourcePlan,
+    load: Box<ModelLoadPlan>,
+    programs: Box<ProgramPlan>,
+    resources: Box<ResourcePlan>,
     capabilities: CapabilityPlan,
     policy: ResolvedPolicy,
 }
@@ -164,12 +169,16 @@ impl BackendPlan {
 /// Model topology and device choice before physical storage admission. Native
 /// programs and their Seismic-owned graph storage can be prepared from this
 /// value; only `admit` constructs an executable plan with resource ownership.
+///
+/// Its device, load and program plans are boxed: they are nine tenths of a
+/// draft's bytes, which every frame that moves, clones or compares a draft
+/// (each candidate of a placement search) would otherwise hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionPlanDraft {
-    device: PlannedDevice,
+    device: Box<PlannedDevice>,
     components: ComponentPlan,
-    load: ModelLoadPlan,
-    programs: ProgramPlan,
+    load: Box<ModelLoadPlan>,
+    programs: Box<ProgramPlan>,
     capabilities: CapabilityPlan,
     policy: ResolvedPolicy,
 }
@@ -202,11 +211,12 @@ impl ExecutionPlanDraft {
         room: &impl SettleRoom,
     ) -> Result<Self, PlanError> {
         let canonical = self.clone();
-        self.load = self
-            .load
-            .finalize_readout(choices)
-            .map_err(PlanError::InvalidDefinition)?;
-        self.programs = self.load.program_plan(definition, self.policy.codec)?;
+        self.load = Box::new(
+            self.load
+                .finalize_readout(choices)
+                .map_err(PlanError::InvalidDefinition)?,
+        );
+        *self.programs = self.load.program_plan(definition, self.policy.codec)?;
         if !choices.is_empty() && room.fit_whole(&self, &self.memory_charge(definition)?)?.short.is_some() {
             return canonical.finalize_readout(definition, &[], room);
         }
@@ -561,9 +571,7 @@ impl ExecutionPlanDraft {
     ) -> Result<Result<(Self, C, T), NoBank>, E> {
         let mut settled = Self::settle_bank(&ceiling, definition, prices, held, room, confirm)?;
         if matches!(settled, Err(NoBank::Short { .. })) {
-            let w_hi = ceiling.whole.bank().window_slots();
-            let w_lo = ceiling.whole.bank().round_records();
-            for &w in &window_ladder(w_hi, w_lo)[1..] {
+            for &w in &ceiling.whole.bank().window_ladder()[1..] {
                 let candidate = match self.with_window(&ceiling.whole, definition, bound, w)? {
                     Ok(c) => Self::settle_bank(&c, definition, prices, held, room, confirm)?,
                     Err(no) => Err(no),
@@ -627,12 +635,18 @@ impl ExecutionPlanDraft {
             let load = self.load.clone().unbanked().with_expert_bank(
                 definition,
                 experts,
+                None,
                 places,
                 self.policy.limits.flights(),
                 substrate,
             )?;
             let programs = load.program_plan(definition, self.policy.codec)?;
-            Self { load, programs, ..self.clone() }.with_chain(places)
+            Self {
+                load: Box::new(load),
+                programs: Box::new(programs),
+                ..self.clone()
+            }
+            .with_chain(places)
         }) {
             Ok(whole) => whole,
             Err(error) => return unstreamed(error),
@@ -661,9 +675,14 @@ impl ExecutionPlanDraft {
     /// under `bound`, keeping its target program plan in sync.
     fn with_window(&self, whole: &Self, definition: &ModelDefinition, bound: HeldBound, window_slots: u64) -> Result<Result<BankCeiling, NoBank>, PlanError> {
         let places = whole.bank().places;
-        let load = whole.load.clone().with_window_slots(window_slots)?;
+        let load = whole.load.clone().banked_as(definition, whole.bank(), window_slots)?;
         let programs = load.program_plan(definition, whole.policy.codec)?;
-        let rebuilt = Self { load, programs, ..whole.clone() }.with_chain(places)?;
+        let rebuilt = Self {
+            load: Box::new(load),
+            programs: Box::new(programs),
+            ..whole.clone()
+        }
+        .with_chain(places)?;
         self.ceiling_of(rebuilt, bound, places)
     }
 
@@ -740,7 +759,10 @@ impl ExecutionPlanDraft {
     /// The draft's bank (of every expert, [`Self::bank_ceiling`]) at
     /// `slots` under `ceiling`, its passes of `pass` launches.
     fn resized(&self, slots: u64, ceiling: u64, pass: PassLaunches) -> Result<Self, PlanError> {
-        let mut draft = Self { load: self.load.clone().with_bank_slots(slots, ceiling)?, ..self.clone() };
+        let mut draft = Self {
+            load: Box::new(self.load.clone().with_bank_slots(slots, ceiling)?),
+            ..self.clone()
+        };
         draft.bank_mut().pass = pass;
         Ok(draft)
     }
@@ -977,7 +999,12 @@ impl ExecutionPlanDraft {
     fn held_whole_at(&self, definition: &ModelDefinition, places: u64) -> Result<Self, PlanError> {
         let load = self.load.clone().unbanked();
         let programs = load.program_plan(definition, self.policy.codec)?;
-        Self { load, programs, ..self.clone() }.with_chain(places)
+        Self {
+            load: Box::new(load),
+            programs: Box::new(programs),
+            ..self.clone()
+        }
+        .with_chain(places)
     }
 
     /// The draft holding its experts as `held` does, a plan of the same
@@ -991,19 +1018,14 @@ impl ExecutionPlanDraft {
         let draft = match held.load.bank.as_ref() {
             None => self.held_whole_at(definition, held.policy.limits.chain_capacity.get() as u64)?,
             Some(bank) => {
-                let mut load = self
-                    .load
-                    .clone()
-                    .unbanked()
-                    .with_expert_bank(definition, bank.slots, bank.places, bank.flights, bank.substrate())?;
-                if bank.window_slots() != bank.widest().get() {
-                    load = load.with_window_slots(bank.window_slots())?;
-                }
-                load = load.with_bank_slots(bank.slots, bank.ceiling)?;
-                let built = load.bank.as_mut().expect("the load was just banked");
-                (built.host_slots, built.pass, built.resident) = (bank.host_slots, bank.pass, bank.resident);
+                let load = self.load.clone().banked_as(definition, bank, bank.window_slots())?;
                 let programs = load.program_plan(definition, self.policy.codec)?;
-                Self { load, programs, ..self.clone() }.with_chain(bank.places)?
+                Self {
+                    load: Box::new(load),
+                    programs: Box::new(programs),
+                    ..self.clone()
+                }
+                .with_chain(bank.places)?
             }
         };
         assert_eq!(draft.load.bank, held.load.bank, "a plain plan's bank differs from its drafted plan's");
@@ -1045,7 +1067,7 @@ impl ExecutionPlanDraft {
             .load
             .clone()
             .unbanked()
-            .with_expert_bank(definition, ceiling, 1, self.policy.limits.flights(), substrate)?
+            .with_expert_bank(definition, ceiling, None, 1, self.policy.limits.flights(), substrate)?
             .with_bank_slots(slots, ceiling)?;
         let bank = load.bank.as_mut().expect("the load was just banked");
         bank.host_slots = host_slots;
@@ -1057,7 +1079,10 @@ impl ExecutionPlanDraft {
             .clone()
             .with_sites(refused)
             .map_err(PlanError::ResourcePlanning)?;
-        Ok(Self { load, ..self.clone() })
+        Ok(Self {
+            load: Box::new(load),
+            ..self.clone()
+        })
     }
 
     /// The draft with prompt groups of up to `chain` launches.
@@ -1087,7 +1112,10 @@ impl ExecutionPlanDraft {
     /// ceiling kept ([`ModelLoadPlan::with_load_slots`]): what the target
     /// import's claim admits of the slots planned.
     pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {
-        Ok(Self { load: self.load.with_load_slots(slots)?, ..self })
+        Ok(Self {
+            load: Box::new(self.load.with_load_slots(slots)?),
+            ..self
+        })
     }
 
     pub fn admit(self, resources: ResourcePlan) -> Result<ExecutionPlan, PlanError> {
@@ -1107,7 +1135,7 @@ impl ExecutionPlanDraft {
             components: self.components,
             load: self.load,
             programs: self.programs,
-            resources,
+            resources: Box::new(resources),
             capabilities: self.capabilities,
             policy: self.policy,
         })
@@ -1118,13 +1146,13 @@ impl ExecutionPlan {
     /// The plan of a component that opens no expert bank
     /// ([`ModelLoadPlan::without_expert_bank`]).
     pub fn without_expert_bank(self) -> Self {
-        Self { load: self.load.without_expert_bank(), ..self }
+        Self { load: Box::new(self.load.without_expert_bank()), ..self }
     }
 
     /// The plan committing `slots` of its expert bank at the load, its
     /// ceiling kept ([`ModelLoadPlan::with_load_slots`]).
     pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {
-        Ok(Self { load: self.load.with_load_slots(slots)?, ..self })
+        Ok(Self { load: Box::new(self.load.with_load_slots(slots)?), ..self })
     }
 
     pub fn device(&self) -> &PlannedDevice {
@@ -1913,10 +1941,9 @@ impl ExecutionPlanDraft {
                 let reserved = |slots| bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
                 let points = rising(bank.floor(), ceiling, &reserved)?;
                 let experts = bank.slots;
-                let (w_hi, w_lo) = (bank.window_slots(), bank.round_records());
                 let draft = whole.resized(ceiling, ceiling, PassLaunches::FLOOR)?;
                 let mut windowed = Vec::new();
-                for &w in &window_ladder(w_hi, w_lo)[1..] {
+                for &w in &bank.window_ladder()[1..] {
                     if let Ok(BankCeiling { whole: win_whole, ceiling: win_ceiling, .. }) = self.with_window(&whole, definition, bound, w)? {
                         let win_bank = win_whole.bank();
                         let win_reserved = |slots| win_bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
@@ -1973,6 +2000,15 @@ fn window_ladder(widest: u64, floor: u64) -> Vec<u64> {
         p = p.saturating_mul(2);
     }
     ladder
+}
+
+impl super::ExpertBankPlan {
+    /// The scratch-window ladder (`window_ladder`) from the bank's window
+    /// down to its round's records: the rungs a load and its assessment
+    /// walk below the bank, its own window first.
+    pub fn window_ladder(&self) -> Vec<u64> {
+        window_ladder(self.window_slots(), self.round_records())
+    }
 }
 
 /// The sizes of `from..=to` a holding steps through: the most of each
@@ -2085,7 +2121,7 @@ impl ExecutionPlanner {
             limits,
         )?;
         Ok(ExecutionPlanDraft {
-            device: PlannedDevice {
+            device: Box::new(PlannedDevice {
                 selector: device.info.selector(),
                 backend,
                 name: device.info.name().to_owned(),
@@ -2095,10 +2131,10 @@ impl ExecutionPlanner {
                 executor: device.info.clone(),
                 reading: device.reading.clone(),
                 graph_pricing: device.graph_cost,
-            },
+            }),
             components,
-            load,
-            programs,
+            load: Box::new(load),
+            programs: Box::new(programs),
             capabilities,
             policy,
         })
@@ -2691,7 +2727,7 @@ mod tests {
                 crate::assessment::StructuralCharge::of(definition, draft).map(|charge| (charge, ())).map_err(charge_error)
             })
             .unwrap();
-        let prepared = crate::assessment::prepare_execution_assessment(definition, forms).unwrap();
+        let prepared = crate::assessment::prepare_execution_assessment(definition.clone(), forms).unwrap();
         let FitReading { topology, status, .. } = &draft.device.reading;
         match crate::assessment::assess_execution_fit(definition, &prepared, draft.device.graph_pricing, topology, status).unwrap() {
             crate::assessment::ExecutionAssessment::Fits(fit) => fit.bank,
@@ -3199,15 +3235,27 @@ mod tests {
             .clone()
             .with_load_slots(full_bank.floor())
             .unwrap();
-        let full_floor_draft = ExecutionPlanDraft { load: full_floor_bytes, ..full.clone() };
+        let full_floor_draft = ExecutionPlanDraft {
+            load: Box::new(full_floor_bytes),
+            ..full.clone()
+        };
         let full_floor_alloc = full_floor_draft.allocation_bytes(&definition).unwrap();
 
-        let min_load = full.load().clone().with_window_slots(round).unwrap();
-        let min_floor_load = min_load.clone().with_load_slots(min_load.expert_bank().unwrap().floor()).unwrap();
-        let min_floor_programs = min_floor_load.program_plan(&definition, full.policy().codec()).unwrap();
-        let min_floor_alloc = ExecutionPlanDraft { load: min_floor_load, programs: min_floor_programs, ..full.clone() }
-            .allocation_bytes(&definition)
+        let min_load = full.load().clone().banked_as(&definition, full_bank, round).unwrap();
+        let min_floor_load = min_load
+            .clone()
+            .with_load_slots(min_load.expert_bank().unwrap().floor())
             .unwrap();
+        let min_floor_programs = min_floor_load
+            .program_plan(&definition, full.policy().codec())
+            .unwrap();
+        let min_floor_alloc = ExecutionPlanDraft {
+            load: Box::new(min_floor_load),
+            programs: Box::new(min_floor_programs),
+            ..full.clone()
+        }
+        .allocation_bytes(&definition)
+        .unwrap();
         assert!(min_floor_alloc < full_floor_alloc, "smaller W reduces floor allocation: {min_floor_alloc} < {full_floor_alloc}");
 
         // Place a cap halfway between W_min's floor and W_widest's floor.

@@ -459,7 +459,7 @@ vec2 projection_gemm_pair(uint q) {
         * vec2(seismic_shared_f32[scratch + 2u * pair], seismic_shared_f32[scratch + 2u * pair + 1u]);
 #else
     // Pair q's two accumulators are 2 q and 2 q + 1, written over `q` itself
-    // (`packets_coefficients`).
+    // (the packet decoder's coefficient order).
     const uint block = q / 16u, within = q % 16u;
     const uint at = 2u * q;
     return projection_gemm_scale[4u * (block / (PROJECTION_WN / 32u)) + within / 4u]

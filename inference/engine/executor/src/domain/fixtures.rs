@@ -256,7 +256,7 @@ pub fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
     crate::planning::fixtures::fixture_manifest(definition)
 }
 
-pub type Fixture = (ExecutorDomain<TestFamily>, StateBindings);
+pub type Fixture = (Box<ExecutorDomain<TestFamily>>, StateBindings);
 
 thread_local! {
     /// The stored-table reads the next target submission's output carries:
@@ -788,7 +788,9 @@ pub fn chained(device_request: platform::DeviceRequest) -> Fixture {
 
 /// The places a prompt group of four one-row chunks opened on `fixture`
 /// holds, its first chunk submitted with the rest planned behind it.
-pub fn group_places_opened<F: ProgramFamily>((mut domain, mut bindings): (ExecutorDomain<F>, StateBindings)) -> usize {
+pub fn group_places_opened<F: ProgramFamily>(
+    (mut domain, mut bindings): (Box<ExecutorDomain<F>>, StateBindings),
+) -> usize {
     let operations = group_opening(&mut domain, &mut bindings);
     let ReservedResources::Target(reservation) = domain.reserve(&mut bindings, &operations).unwrap().into_resources() else {
         panic!("a prompt chunk reserves a target group")

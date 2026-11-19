@@ -14,6 +14,7 @@
 //           row and the origin coordinates. Other rows publish a zero latent,
 //           block row -1 and zero coordinates.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/head.h"
 #include "lib/core/norm.h"
@@ -213,12 +214,12 @@ kernel void pool_rows_complete(
     // latent and the rotated row (`pooled.seismic`).
     const rounding::Rounding trained = rounding::of(uint(SEISMIC_PARAM_BLOCK), uint(SEISMIC_PARAM_ELEMENT),
         uint(SEISMIC_PARAM_SCALE), uint(SEISMIC_PARAM_AMAX_FLOOR));
-    rounding::hold_lanes<element::Act>(x, trained);
+    rounding::hold_lanes<activation::Act>(x, trained);
     // The latent: RMS-normed with `norm` (TN = 0); a token-normed row's is
     // the pooled row.
     if (!POOL_TOKEN_NORM) {
         head::rms_norm(x, norm, epsilon, lane);
-        rounding::hold_lanes<element::Act>(x, trained);
+        rounding::hold_lanes<activation::Act>(x, trained);
     }
     POOL_UNROLL
     for (uint i = 0; i < E; ++i)
@@ -232,7 +233,7 @@ kernel void pool_rows_complete(
         latent_coordinates[row * SEISMIC_RESULT_2_STRIDE_0 + lane * SEISMIC_RESULT_2_STRIDE_1] = origin[lane];
     const pooled::row_layout::table table(origin, rotary_components, rotary_frequencies, rotary_amplitudes, lane);
     pooled::row_layout::rotate(table, lane, x);
-    rounding::hold_lanes<element::Act>(x, trained);
+    rounding::hold_lanes<activation::Act>(x, trained);
     rounding::round_lanes<E>(x, trained);
     // Stored in the row element Y (A holds every rounded value; F32 keys
     // hold every value).

@@ -251,7 +251,7 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, required: b
     // not stream are refused with their reason.
     let banked = match recorded_substrate(&definition, backend) {
         Ok(substrate) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), substrate).and_then(|floor| {
-            load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate)
+            load.clone().with_expert_bank(&definition, floor, None, 1, LIMITS.flights(), substrate)
         })),
         // A required target that routes experts streams them on every backend
         // whose recorded device streams experts at all: only a fact of the
@@ -413,7 +413,7 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
             };
             let banked = load
                 .bank_floor(&definition, 1, LIMITS.flights(), substrate)
-                .and_then(|floor| load.with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate))
+                .and_then(|floor| load.with_expert_bank(&definition, floor, None, 1, LIMITS.flights(), substrate))
                 .unwrap_or_else(|error| panic!("{name}: its bank plans on {}: {error}", backend.as_str()));
             let bank = banked.expert_bank().expect("a banked load has a bank");
             for group in bank.groups() {

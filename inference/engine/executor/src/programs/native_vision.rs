@@ -251,10 +251,18 @@ fn record_vision_graph(
 /// The kernel a graph binds for invocation `index`: the prepared native
 /// kernel, or the element bindings of a metadata graph.
 trait VisionBindings<G: GraphDraft> {
-    fn patch_stem(&self, index: usize)
-    -> Result<G::Binding<'_, vision_patch_stem::Entry>, GraphError>;
+    /// The projecting entries bind the kernel of the range `rows` lie in.
+    fn patch_stem(
+        &self,
+        index: usize,
+        rows: &Dim,
+    ) -> Result<G::Binding<'_, vision_patch_stem::Entry>, GraphError>;
     fn norm(&self, index: usize) -> Result<G::Binding<'_, vision_norm::Entry>, GraphError>;
-    fn linear(&self, index: usize) -> Result<G::Binding<'_, vision_linear::Entry>, GraphError>;
+    fn linear(
+        &self,
+        index: usize,
+        rows: &Dim,
+    ) -> Result<G::Binding<'_, vision_linear::Entry>, GraphError>;
     fn clamp(&self, index: usize) -> Result<G::Binding<'_, vision_clamp::Entry>, GraphError>;
     fn attention(&self, index: usize)
     -> Result<G::Binding<'_, vision_attention::Entry>, GraphError>;
@@ -285,24 +293,28 @@ impl PreparedBindings<'_> {
     }
 }
 
-fn prepared<'a, E: seismic::Entry>(
-    kernels: &'a HashMap<VisionKernel, NativeKernel<E>>,
+fn prepared<'a, K>(
+    kernels: &'a HashMap<VisionKernel, K>,
     kernel: &VisionKernel,
-) -> Result<&'a NativeKernel<E>, GraphError> {
+) -> Result<&'a K, GraphError> {
     kernels
         .get(kernel)
         .ok_or_else(|| format!("vision kernel {kernel:?} was not prepared").into())
 }
 
 impl VisionBindings<NativeGraph> for PreparedBindings<'_> {
-    fn patch_stem(&self, index: usize) -> Result<&NativeKernel<vision_patch_stem::Entry>, GraphError> {
-        prepared(&self.kernels.patch_stem, self.kernel(index)?)
+    fn patch_stem(
+        &self,
+        index: usize,
+        rows: &Dim,
+    ) -> Result<&NativeKernel<vision_patch_stem::Entry>, GraphError> {
+        Ok(prepared(&self.kernels.patch_stem, self.kernel(index)?)?.for_rows(rows))
     }
     fn norm(&self, index: usize) -> Result<&NativeKernel<vision_norm::Entry>, GraphError> {
         prepared(&self.kernels.norm, self.kernel(index)?)
     }
-    fn linear(&self, index: usize) -> Result<&NativeKernel<vision_linear::Entry>, GraphError> {
-        prepared(&self.kernels.linear, self.kernel(index)?)
+    fn linear(&self, index: usize, rows: &Dim) -> Result<&NativeKernel<vision_linear::Entry>, GraphError> {
+        Ok(prepared(&self.kernels.linear, self.kernel(index)?)?.for_rows(rows))
     }
     fn clamp(&self, index: usize) -> Result<&NativeKernel<vision_clamp::Entry>, GraphError> {
         prepared(&self.kernels.clamp, self.kernel(index)?)
@@ -338,13 +350,13 @@ impl<R> VisionTopology<R> {
 }
 
 impl<R> VisionBindings<NativeGraphMetadata> for VisionTopology<R> {
-    fn patch_stem(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
+    fn patch_stem(&self, index: usize, _rows: &Dim) -> Result<&[(&str, Element)], GraphError> {
         self.elements(index)
     }
     fn norm(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
         self.elements(index)
     }
-    fn linear(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
+    fn linear(&self, index: usize, _rows: &Dim) -> Result<&[(&str, Element)], GraphError> {
         self.elements(index)
     }
     fn clamp(&self, index: usize) -> Result<&[(&str, Element)], GraphError> {
@@ -643,7 +655,7 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                     None => Dim::from(0u64),
                 };
                 let dims = [
-                    ("M", rows),
+                    ("M", rows.clone()),
                     ("C", c.clone()),
                     ("S", s),
                     ("P", p.clone()),
@@ -652,7 +664,7 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                     ("NB", statics("NB")?),
                     ("NT", statics("NT")?),
                 ];
-                let binding = self.bindings.patch_stem(index)?;
+                let binding = self.bindings.patch_stem(index, &rows)?;
                 let pixels = self.graph.input_for(binding, "pixels", &dims)?;
                 let indices = self.graph.input_for(binding, "indices", &dims)?;
                 let coefficients = self.graph.input_for(binding, "coefficients", &dims)?;
@@ -771,7 +783,7 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                     ("NG", statics("NG")?),
                     ("NC", statics("NC")?),
                 ];
-                let binding = self.bindings.linear(index)?;
+                let binding = self.bindings.linear(index, &m)?;
                 self.scope(*row_kind);
                 let x = self.value(*x, &[m.clone(), k.clone()])?;
                 let weight = self.weight(*weight, &[n.clone(), k])?;

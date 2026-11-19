@@ -209,11 +209,6 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the projection family's GEMV row classes, apart from `projection.h` so a library that runs no GEMV (a GEMM's, a batched GEMV's) compiles none of them: Metal compiles a launch's library whole",
     ),
     (
-        "lib/projection/gemv_packed",
-        &[BackendName::Metal],
-        "the packed-rows GEMV of a single projection's PACKED_ROWS form, over the token-packing GEMM's operand, apart from `gemv.h` so only its own launch's library compiles it",
-    ),
-    (
         "lib/core/head",
         &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
         "a lane-held head row's RMS norm (Metal's simdgroup, CUDA's warp, Vulkan's logical subgroup), shared by attention, pooled rows and the indexers; the CPU's natives norm a row in their own work item",
@@ -305,10 +300,6 @@ const STREAMING_LIBRARIES: &[(&str, &str)] = &[
         "decode router threadgroups of the `routed_route` contract, shared by `routed_route`, `routed_route_shared` and `routed_route_streamed`",
     ),
     (
-        "lib/repack/repack",
-        "the GGUF -> resident tile conversion over a binding (templates; on Vulkan, macros), so `repack_weight` and the streaming convert hold one conversion each per tensor pair; the CPU keeps it in `repack_weight`",
-    ),
-    (
         "lib/streaming/control",
         "expert streaming's backend shim (system-coherent accesses, system-scope fences, barriers, the spin wait, byte copies) under the protocol the GPU backends share in `kernels/streaming/`, for the streaming entries",
     ),
@@ -318,7 +309,7 @@ const STREAMING_LIBRARIES: &[(&str, &str)] = &[
     ),
     (
         "lib/streaming/window",
-        "expert streaming's windowed conversion of host-staged records over `lib/repack`, used by the landing launches",
+        "expert streaming's windowed conversion of host-staged records over the library's conversion (`<seismic/repack.*>`), used by the landing launches",
     ),
     (
         "lib/streaming/land",

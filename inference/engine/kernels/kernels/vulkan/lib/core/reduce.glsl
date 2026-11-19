@@ -45,6 +45,21 @@ float reduce_group_max(float value, const uint partials) {
     return maximum;
 }
 
+// Maximum of one unsigned value per invocation, as `reduce_group_max` (a
+// group's peak, `nvfp4_peak`: its bits order NaN above +Inf, which no
+// float maximum here keeps).
+uint reduce_group_max_u32(uint value, const uint partials) {
+    value = seismic_redux_max_u32(value);
+    barrier();
+    if (SEISMIC_LANE == 0u)
+        seismic_shared_f32[partials + SEISMIC_SUBGROUP] = uintBitsToFloat(value);
+    barrier();
+    uint maximum = floatBitsToUint(seismic_shared_f32[partials]);
+    for (uint s = 1u; s < SEISMIC_SUBGROUPS; ++s)
+        maximum = max(maximum, floatBitsToUint(seismic_shared_f32[partials + s]));
+    return maximum;
+}
+
 // Tie rules of an argmax: among candidates of equal score, the higher or the
 // lower index wins.
 #define REDUCE_HIGHER_INDEX 0

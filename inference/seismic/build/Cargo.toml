@@ -9,3 +9,6 @@ seismic-cpu-tiers.workspace = true
 seismic-lang.workspace = true
 seismic-std.workspace = true
 sha2 = "=0.11.0"
+
+[lints]
+workspace = true

@@ -775,7 +775,11 @@ impl AttestedPrograms {
             selection_limits,
             graph_demand: crate::programs::invocation_demand::GraphInvocationDemand::new(
                 method,
-                super::tuning::workload::terms(limits, &method.draft_widths()),
+                super::tuning::workload::terms(
+                    limits,
+                    &method.draft_widths(),
+                    topology.vision().is_some(),
+                ),
                 tuning.definition.draft.as_ref(),
                 selection_limits.max_launch_rows as u64,
             ),

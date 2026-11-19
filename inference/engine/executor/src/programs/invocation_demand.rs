@@ -100,9 +100,32 @@ pub(crate) struct GraphInvocationDemand {
     pub head_prefix: InvocationCounts,
     /// A separate draft model's launches: its prefill and its blocks.
     pub draft: InvocationCounts,
+    /// Each image term: its index and the image's merged cells.
+    pub images: Vec<(usize, u64)>,
 }
 
 impl GraphInvocationDemand {
+    /// The launches of a vision entry each image term makes: one image's,
+    /// whose calls of the entry take `rows` of its merged cells' rows each.
+    pub fn image_launches(&self, rows: impl Fn(u64) -> Vec<u64>) -> InvocationCounts {
+        let mut launches = InvocationCounts::default();
+        for &(term, cells) in &self.images {
+            for rows in rows(cells) {
+                launches.launch(
+                    Launch {
+                        term,
+                        rows,
+                        sequences: 1,
+                        history: 0,
+                        projected: 0,
+                    },
+                    1.,
+                );
+            }
+        }
+        launches
+    }
+
     /// The launches of every term of `terms` for a load that decodes by
     /// `method` and launches at most `max_rows` rows. A prompt is
     /// prefilled in launches of the largest row class, the remainder in
@@ -122,6 +145,7 @@ impl GraphInvocationDemand {
             head: InvocationCounts::default(),
             head_prefix: InvocationCounts::default(),
             draft: InvocationCounts::default(),
+            images: Vec::new(),
         };
         let chunk = crate::TUNING_ROWS
             .into_iter()
@@ -155,6 +179,7 @@ impl GraphInvocationDemand {
                         history += rows;
                     }
                 }
+                Phase::Vision => demand.images.push((term, metric.context)),
                 Phase::Decode => {
                     let (sequences, history) = (metric.sequences, metric.context);
                     match (method, spec.width) {
@@ -258,5 +283,50 @@ mod tests {
             .target
             .represented(|launch| (launch.rows <= 8).then_some(8));
         assert_eq!(represented.count(8), 1.);
+    }
+
+    /// An image term, searched apart from the text's units, leaves every
+    /// text launch, term and weight exactly as a load without images has
+    /// them, so every text unit's objective and share are the same: only a
+    /// vision entry launches in it, once per invocation at the image's rows.
+    #[test]
+    fn an_image_term_leaves_the_text_launches_as_without_images() {
+        let method = PlannedMethod::Mtp {
+            greedy_proposals: 3,
+            sampled_proposals: 1,
+            widths: crate::DraftWidths::Adaptive,
+        };
+        let limits = crate::TuningLimits {
+            max_rows: 512,
+            max_projected_rows: 8,
+            context_tokens: 8192,
+            image_cells: 64,
+        };
+        let demand = |images| {
+            GraphInvocationDemand::new(
+                method,
+                crate::native::tuning_workload::terms(limits, &[1, 3], images),
+                None,
+                512,
+            )
+        };
+        let (text, imaged) = (demand(false), demand(true));
+        assert_eq!(imaged.terms[..text.terms.len()], text.terms[..]);
+        assert_eq!(imaged.target, text.target);
+        assert_eq!(imaged.head, text.head);
+        assert_eq!(imaged.head_prefix, text.head_prefix);
+        assert_eq!(imaged.draft, text.draft);
+        assert!(text.images.is_empty());
+        let image = text.terms.len();
+        assert_eq!(imaged.images, [(image, 64)]);
+        // Two invocations of one vision entry: one over the image's patch
+        // rows (four per cell and a register row), one over its cells.
+        let launches = imaged
+            .image_launches(|cells| vec![4 * cells + 1, cells])
+            .launches()
+            .map(|(launch, count)| (launch.term, launch.rows, count))
+            .collect::<Vec<_>>();
+        assert_eq!(launches, [(image, 64, 1.), (image, 257, 1.)]);
+        assert_eq!(text.image_launches(|cells| vec![cells]), InvocationCounts::default());
     }
 }

@@ -196,7 +196,7 @@ fn a_prefill_round_finishes_at_most_the_selection_bound_and_defers_the_rest() {
 
 /// A plain native domain whose selection bound is `bound`, exporting logits
 /// for `exported` rows.
-fn plain_domain(bound: usize, exported: usize) -> (ExecutorDomain, StateBindings) {
+fn plain_domain(bound: usize, exported: usize) -> (Box<ExecutorDomain>, StateBindings) {
     let model = PathBuf::from(
         std::env::var_os("MAGNITUDE_TEST_MTP_GGUF").expect("set MAGNITUDE_TEST_MTP_GGUF"),
     );

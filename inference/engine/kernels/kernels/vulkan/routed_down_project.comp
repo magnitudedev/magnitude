@@ -5,6 +5,7 @@
 #define ROUTED_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
 #define ROUTED_PROJECTED_PUT(m, k, n, value) out_put(SEISMIC_RESULT_0_OUT, \
     (m) * SEISMIC_RESULT_0_STRIDE_0 + (k) * SEISMIC_RESULT_0_STRIDE_1 + (n) * SEISMIC_RESULT_0_STRIDE_2, value)
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/routed/down.glsl"
 
 void routed_down_project_summed() { routed_down_publish(); }

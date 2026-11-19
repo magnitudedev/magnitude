@@ -37,7 +37,7 @@
 #include <seismic/slab.glsl>
 
 // The prepared queries pack two activation elements per shared word.
-#if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "the vector attention form requires a bf16 or f16 activation"
 #endif
 
@@ -124,7 +124,7 @@ bool vector_read(attention_history h, inout attention_cursor c, inout Stored key
         }
         return false;
     }
-    const uint64_t head_bytes = uint64_t(ATTENTION_W) * uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
+    const uint64_t head_bytes = uint64_t(ATTENTION_W) * uint64_t(ELEMENT_BYTES(ACTIVATION_A));
     attention_load_row(history_address(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), uint64_t(pick),
         uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS), uint64_t(ATTENTION_KV) * head_bytes, head_bytes, kv_head),
         uint64_t(lane) * ATTENTION_E, k);
@@ -151,7 +151,7 @@ void vector_partial(attention_history h, uint kv_head, uint group, uint part, ui
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     const uint64_t row_coordinates = SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul;
-    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
+    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
 
     // Subgroup 0 appends the key, subgroup 1 the value (none for a
     // stored-key history).
@@ -192,7 +192,7 @@ void vector_partial(attention_history h, uint kv_head, uint group, uint part, ui
                 high[i] = 0.0;
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
             seismic_shared_u32[prepared + pair * W + lane * E + i] =
-                element_store(ELEMENT_ACT, low[i]) | (element_store(ELEMENT_ACT, high[i]) << 16u);
+                element_store(ACTIVATION_A, low[i]) | (element_store(ACTIVATION_A, high[i]) << 16u);
     }
     barrier();
     const uint head0 = attention_slice(sg) * ATTENTION_HEADS;
@@ -204,7 +204,7 @@ void vector_partial(attention_history h, uint kv_head, uint group, uint part, ui
         const uint head = head0 + g;
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
             const uint word = seismic_shared_u32[prepared + (head / 2u) * W + lane * E + i];
-            q[g][i] = element_load(ELEMENT_ACT, (word >> (16u * (head % 2u))) & 0xffffu) * query_scale;
+            q[g][i] = element_load(ACTIVATION_A, (word >> (16u * (head % 2u))) & 0xffffu) * query_scale;
             result[g][i] = 0.0;
         }
         maximum[g] = -ATTENTION_INF;
@@ -215,7 +215,7 @@ void vector_partial(attention_history h, uint kv_head, uint group, uint part, ui
     const uint first = range.x, last = range.y;
     attention_cursor c = attention_cursor_at(visible, fresh, row, spans, picks, first);
     // The cursor's slab's key and value rows.
-    Stored keys = stored_at_buffer(ELEMENT_ACT, 0ul), values = keys;
+    Stored keys = stored_at_buffer(ACTIVATION_A, 0ul), values = keys;
     // The row's visible keys, which the bitmap selects among; its picks follow.
     const uint visible_keys = total - picks;
     // The batches at fixed positions first + i * VECTOR_BATCH, from the one

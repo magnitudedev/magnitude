@@ -5,6 +5,7 @@
 // the source columns g * K .., through weight rows g * N .., into output
 // columns g * N ..: the same launches over its views. The staged forms run
 // one group (their declaration), so the stage launch stages group 0's rows.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/operator.cuh"
 

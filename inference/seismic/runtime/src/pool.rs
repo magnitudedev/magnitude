@@ -161,7 +161,7 @@ impl Blocks for PoolBlocks {
     fn allocate(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<PoolBlock, ExecutionError> {
         let charged = Arc::new(BlockEntry { entry: entry.clone(), charged: AtomicU64::new(0) });
         let through: Arc<dyn Entry> = charged.clone();
-        let allocation = self.device.kind.allocate_block(&self.kinds, bytes, &through, self.access.clone())?;
+        let allocation = self.device.allocate_block(&self.kinds, bytes, &through, self.access.clone())?;
         let address = self.device.allocation_address(&allocation, 0);
         assert!(
             address % BLOCK_ALIGNMENT == 0,

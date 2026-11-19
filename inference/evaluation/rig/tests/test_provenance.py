@@ -46,13 +46,29 @@ def workspace(directory: Path) -> Path:
 
 
 def cargo_build(source: Path, target: Path, wrapper: str | None, *extra: str) -> str:
+    """Build as the agent does, which reports the build scripts the build ran to `target`
+    (`provenance.build_scripts`); cargo's own output."""
     env = {k: v for k, v in os.environ.items() if k != engine.COMPILER}
     if wrapper is not None:
         env[engine.COMPILER] = wrapper
-    return subprocess.run(
-        ["cargo", "build", "--release", "--offline", "--target-dir", str(target), *extra],
+    built = subprocess.run(
+        ["cargo", "build", "--release", "--offline", "--message-format=json", "--target-dir", str(target), *extra],
         cwd=source, env=env, capture_output=True, text=True, check=True,
-    ).stderr
+    )
+    provenance.build_scripts(str(target), reported_scripts(built.stdout))
+    return built.stderr
+
+
+def reported_scripts(messages: str) -> dict:
+    """The build scripts cargo's JSON `messages` report runs of, by output directory, as the
+    agent keeps them."""
+    scripts, runs = {}, {}
+    for message in map(json.loads, messages.splitlines()):
+        if message.get("reason") == "compiler-artifact" and "custom-build" in message["target"]["kind"]:
+            scripts[message["package_id"]] = message["filenames"][0]
+        elif message.get("reason") == "build-script-executed":
+            runs[message["out_dir"]] = scripts.get(message["package_id"])
+    return runs
 
 
 def replace_keeping_cargo_fresh(path: Path, text: str) -> None:
@@ -115,8 +131,23 @@ def test_executable_built_through_the_wrapper_is_verified(tmp_path):
     record = provenance.verify([binary], [str(source)], str(target))
     assert record["status"] == "verified"
     (executable,) = record["executables"]
-    assert executable["units"] == 2 and executable["reasons"] == []
-    assert executable["sources"] == 4  # main.rs, lib.rs, part.rs and the generated include
+    assert executable["units"] == 3 and executable["reasons"] == [] and executable["environment"] == {}
+    # main.rs, lib.rs and part.rs, by their path in the root (the generated include is outside it),
+    # each under the unit it compiled into; the build script's source, and what it reruns for
+    # (its manifest and, naming nothing, its package); the workspace's manifest and lock.
+    assert executable["sources"] == 7 and len(executable["linked"]) == 4
+    assert sorted(path for unit in executable["linked"] for path in record["unit_sources"][unit]) == \
+        ["Cargo.lock", "Cargo.toml", "app/src/main.rs", "lib/Cargo.toml", "lib/build.rs", "lib/build.rs",
+         "lib/src/lib.rs", "lib/src/part.rs"]
+    # A build script no build of the agent's ran leaves the unit it built unverified.
+    (target / provenance.BUILD_SCRIPTS).unlink()
+    unobserved = provenance.verify_executable(binary, [str(source)], build_scripts={})
+    assert unobserved["status"] == "unverified" and unobserved["reasons"][0].startswith(
+        "my_lib: no build of the agent ran its build script")
+    provenance.build_scripts(str(target), {out: None for out in map(str, target.glob("release/build/*/out"))})
+    links = provenance.verify([binary], [str(source)], str(target))["executables"][0]  # `links` overrides it
+    assert links["status"] == "verified" and links["units"] == 2
+    cargo_build(source, target, wrapper)
     # A real change is rebuilt and verified again; its record follows the new bytes.
     (source / "lib/src/part.rs").write_text(SECOND)
     assert "Compiling my-lib" in cargo_build(source, target, wrapper)
@@ -185,14 +216,15 @@ def test_a_test_executable_the_build_produced_is_verified_and_refused_when_it_na
     wrapper = provenance.install(str(tmp_path / "root"))
     (source / "lib/tests").mkdir()
 
-    def tests() -> list:
+    def tests() -> dict:
         env = dict({k: v for k, v in os.environ.items() if k != engine.COMPILER}, **{engine.COMPILER: wrapper})
         messages = subprocess.run(
             ["cargo", "test", "--no-run", "--release", "--offline", "--message-format=json", "-p", "my-lib",
              "--test", "here", "--target-dir", str(target)],
             cwd=source, env=env, capture_output=True, text=True, check=True).stdout.splitlines()
-        return [[m["executable"], m["manifest_path"]] for m in map(json.loads, messages)
-                if m.get("reason") == "compiler-artifact" and m.get("executable") and m["profile"]["test"]]
+        return {"tests": [[m["executable"], m["manifest_path"]] for m in map(json.loads, messages)
+                          if m.get("reason") == "compiler-artifact" and m.get("executable") and m["profile"]["test"]],
+                "build_scripts": reported_scripts("\n".join(messages))}
 
     (source / "lib/tests/here.rs").write_text('#[test]\nfn here() { assert!(!env!("CARGO_MANIFEST_DIR").is_empty()); }\n')
     built = tests()
@@ -286,7 +318,7 @@ def test_a_run_refuses_a_binary_it_cannot_tie_to_the_sources(rig):
     assert outcome.codes == {"app": 0}
     assert "first generated" in (outcome.results / "logs" / "job-app.log").read_text()
     proof = json.loads((outcome.results / "provenance-source.json").read_text())
-    assert proof["status"] == "verified" and proof["executables"][0]["units"] == 2
+    assert proof["status"] == "verified" and proof["executables"][0]["units"] == 3
 
     # The same new bytes here and on the host, with a time older than the build outputs: the
     # mirror transfers nothing and cargo rebuilds nothing, so the old unit would be reused.
@@ -343,3 +375,45 @@ def test_every_build_step_compiles_through_the_checkouts_recording_wrapper(rig):
     wrapper = tmp_path / "alpha" / "checkouts" / "slot-0" / provenance.WRAPPER
     assert f"{wrapper}\n" in (outcome.results / "logs" / "build-source.log").read_text()
     assert os.access(wrapper, os.X_OK)
+
+
+def test_a_build_scripts_inputs_are_what_cargo_reruns_it_for(tmp_path):
+    """The manifest and each path the script names with rerun-if-changed, a directory by every
+    file under it; the whole package where it names none."""
+    package, out = tmp_path / "pkg", tmp_path / "target" / "build" / "pkg-1" / "out"
+    (package / "kernels").mkdir(parents=True)
+    out.mkdir(parents=True)
+    (package / "Cargo.toml").write_text("[package]\n")
+    (package / "kernels" / "a.seismic").write_text("a")
+    (out.parent / "output").write_text("cargo:rerun-if-changed=kernels\ncargo::rerun-if-changed=build.rs\ncargo:rustc-cfg=x\n"
+                                       "cargo:rerun-if-env-changed=KERNELS\ncargo:rustc-env=BUILT=/t/out/x\n")
+    assert provenance.build_inputs(str(out), str(package)) == (
+        [str(package / "Cargo.toml"), str(package / "kernels"), str(package / "build.rs")], ["KERNELS"], ["BUILT"])
+    before = provenance.path_digest(str(package / "kernels"))
+    (package / "kernels" / "b.seismic").write_text("b")  # a file added to a watched directory
+    assert provenance.path_digest(str(package / "kernels")) != before
+    assert provenance.path_digest(str(package / "build.rs")) is None
+    (out.parent / "output").write_text("cargo:rustc-cfg=x\n")
+    assert provenance.build_inputs(str(out), str(package)) == ([str(package / "Cargo.toml"), str(package)], [], [])
+
+
+def test_a_units_build_environment_is_what_it_read_that_neither_cargo_nor_its_script_set(tmp_path, monkeypatch):
+    """RUSTFLAGS, a variable the build script reruns for and one the unit read at compile time,
+    each where set; never cargo's own, the script's `rustc-env`, or an unset one."""
+    package, out = tmp_path / "pkg", tmp_path / "target" / "build" / "pkg-1" / "out"
+    package.mkdir()
+    out.mkdir(parents=True)
+    (out.parent / "output").write_text("cargo:rerun-if-env-changed=KERNELS\ncargo:rerun-if-env-changed=UNSET\n"
+                                       "cargo:rustc-env=BUILT=/t/out/x\n")
+    deps = tmp_path / "deps"
+    deps.mkdir()
+    (deps / "k-1.d").write_text(f"{deps}/k-1.rlib: {package}/lib.rs\n\n# env-dep:BUILT=/t/out/x\n"
+                                "# env-dep:CARGO_PKG_NAME=k\n# env-dep:OUT_DIR=/t/out\n# env-dep:MODE=fast\n")
+    for name, value in {"OUT_DIR": str(out), "CARGO_MANIFEST_DIR": str(package), "RUSTFLAGS": "-Copt-level=1",
+                        "KERNELS": "all"}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("UNSET", raising=False)
+    unit = provenance.Unit("k", str(deps), "-1", [])
+    unit.write_record()
+    record = json.loads(Path(unit.record).read_text())
+    assert record["build_env"] == {"KERNELS": "all", "MODE": "fast", "RUSTFLAGS": "-Copt-level=1"}

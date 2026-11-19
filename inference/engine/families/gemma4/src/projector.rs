@@ -137,7 +137,7 @@ fn permuted(mut weight: WeightDescriptor, order: &[u64]) -> WeightDescriptor {
 pub fn describe_projector(
     directory: &Directory,
     output_hidden: u64,
-) -> Result<VisionDescription, Error> {
+) -> Result<Box<VisionDescription>, Error> {
     #[derive(Clone, Copy)]
     enum Form {
         /// `gemma4v`.
@@ -196,7 +196,7 @@ pub fn describe_projector(
 /// `gemma4v`: patch convolution plus per-axis position tables, RMS sandwich
 /// blocks, 3×3 average pooling × √C, an optional standardization, an
 /// unweighted RMS and one linear.
-fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription, Error> {
+fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescription>, Error> {
     let hidden = reader.unsigned("clip.vision.embedding_length")?;
     let intermediate = reader.unsigned("clip.vision.feed_forward_length")?;
     let depth = reader.unsigned("clip.vision.block_count")?;
@@ -279,7 +279,7 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
     } else {
         None
     };
-    Ok(VisionDescription {
+    Ok(Box::new(VisionDescription {
         activation_dtype: ActivationDType::BF16,
         hidden,
         output_hidden,
@@ -323,13 +323,13 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
             feed_forward: None,
             output_norm: None,
         },
-    })
+    }))
 }
 
 /// `gemma4uv`: layer norm of the flattened 48-pixel patch (channel-major, as
 /// the converter stores its columns), a linear with bias, a layer norm, the
 /// per-axis position tables, a layer norm, an unweighted RMS and one linear.
-fn unified(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription, Error> {
+fn unified(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescription>, Error> {
     let hidden = reader.unsigned("clip.vision.embedding_length")?;
     let epsilon = reader.number("clip.vision.attention.layer_norm_epsilon")?;
     if reader.unsigned("clip.vision.block_count")? != 0 {
@@ -353,7 +353,7 @@ fn unified(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
     let projection_norm = layer_norm(reader, "v.patch_norm.2", hidden)?;
     let positions = directory_table(reader, hidden)?;
     let position_norm = layer_norm(reader, "v.patch_norm.3", hidden)?;
-    Ok(VisionDescription {
+    Ok(Box::new(VisionDescription {
         activation_dtype: ActivationDType::BF16,
         hidden,
         output_hidden,
@@ -393,7 +393,7 @@ fn unified(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
             feed_forward: None,
             output_norm: None,
         },
-    })
+    }))
 }
 
 /// The per-axis position tables `[2, length, H]`.

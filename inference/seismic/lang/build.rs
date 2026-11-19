@@ -4,7 +4,9 @@
 //! position + 1, so that 0 names none, which a bound element's decode axes
 //! name), each grid's points and each codebook's values (on Metal and
 //! Vulkan, which read them), and their bindings by id:
-//! `grids::table<ID>::points()` and `codebooks::table<ID>::values()` (Vulkan
+//! `grids::table<ID>::points()` and `codebooks::table<ID>::values()`, in the
+//! library's internals (`packets::detail::grids`, `packets::detail::codebooks`;
+//! Vulkan
 //! `GRIDS_TABLE_<ID>`, `CODEBOOKS_TABLE_<ID>`, arrays of the device's tables
 //! buffer: see `vulkan`; its layout is not an includable header). A `u32`
 //! grid point is one word and a `u64` point its (low, high) words;
@@ -105,6 +107,8 @@ impl Element {
 
 struct Dialect {
     file: &'static str,
+    /// The header's opening, into the library's internals
+    /// (`packets::detail`), and its closing.
     begin: &'static str,
     end: &'static str,
     /// The dialect's type of an element.
@@ -146,8 +150,8 @@ impl Dialect {
 const DIALECTS: [Dialect; 2] = [
     Dialect {
         file: "tables.h",
-        begin: "namespace grids { template <uint ID> struct table; template <uint ID> struct trits { static constant constexpr bool any = false; }; }\nnamespace codebooks { template <uint ID> struct table; template <uint ID> struct pairs; }\n\n",
-        end: "",
+        begin: "namespace packets {\nnamespace detail {\n\nnamespace grids { template <uint ID> struct table; template <uint ID> struct trits { static constant constexpr bool any = false; }; }\nnamespace codebooks { template <uint ID> struct table; template <uint ID> struct pairs; }\n\n",
+        end: "} // namespace detail\n} // namespace packets\n",
         ty: |element| match element {
             Element::Word => "uint",
             Element::Pair => "uint2",
@@ -185,8 +189,8 @@ const DIALECTS: [Dialect; 2] = [
     },
     Dialect {
         file: "tables.cuh",
-        begin: "#pragma once\n\nnamespace grids { template <unsigned ID> struct table; template <unsigned ID> struct magnitudes; }\nnamespace codebooks { template <unsigned ID> struct words; template <unsigned ID> struct e2m1; }\n\n",
-        end: "",
+        begin: "#pragma once\n\nnamespace packets {\nnamespace detail {\n\nnamespace grids { template <unsigned ID> struct table; template <unsigned ID> struct magnitudes; }\nnamespace codebooks { template <unsigned ID> struct words; template <unsigned ID> struct e2m1; }\n\n",
+        end: "} // namespace detail\n} // namespace packets\n",
         // NVRTC defines `uint2` but not `uint`.
         ty: |element| match element {
             Element::Word => "unsigned",
@@ -554,7 +558,9 @@ fn producers_header(backend: &str, decl: &producer_decl::Declaration, device: &s
 /// has a pattern for the slot's code kind and planes and its requirements
 /// hold. GLSL has no templates: the library reaches a bound slot's axes in
 /// `#if` alone, so the predicates are macros, not functions. Its forms
-/// (`DECODED`) are admission's (`forms`), which no library reads.
+/// (`DECODED`) are admission's (`forms`), which no library reads. With them,
+/// the NVFP4-operand query `PACKETS_OPERANDS_NVFP4(P)` of an element at
+/// prefix `P`, Metal's and CUDA's `ELEMENT_HAS(P, _OPERANDS_NVFP4)`.
 fn producers_glsl(decl: &producer_decl::Declaration) -> String {
     const KINDS: [&str; 7] = ["UNSIGNED", "TWOS", "OFFSET", "ODD", "TABLE", "GRID", "E4M3"];
     let axis = |name: producer_decl::Axis| format!("AXES(SEISMIC_AXIS_{})", name.name());
@@ -603,6 +609,9 @@ fn producers_glsl(decl: &producer_decl::Declaration) -> String {
         let body = std::iter::once(format!("({patterns})")).chain(requires).collect::<Vec<_>>().join(" \\\n    && ");
         writeln!(text, "#define PRODUCERS_{}(AXES) ({body})", producer.name.to_uppercase()).unwrap();
     }
+    text += "\n// Whether products over the element at prefix `P` take NVFP4 activation rows\n\
+             // (the registry's operand recipe): its axes tuple's `OPERANDS_NVFP4`.\n\
+             #define PACKETS_OPERANDS_NVFP4(P) (P(SEISMIC_AXIS_OPERANDS_NVFP4) != 0)\n";
     text
 }
 

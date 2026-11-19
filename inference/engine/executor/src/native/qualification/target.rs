@@ -35,43 +35,9 @@ impl<'a> QualificationView<'a> {
     /// Qualify the target's entries; each sited streamed block's site
     /// admission, by block index.
     pub(super) fn qualify_target(&self, charges: &seismic::Charges) -> Result<Vec<(usize, crate::assessment::Priced<()>)>, CatalogFailure> {
-        let out_rows = semantic_i32(charges, &[1], &[0], "target", "out_rows")?;
-        let hidden = self.geometry.hidden;
-        let hidden_values = vec![1.0_f32; hidden as usize];
-        let hidden_residual = semantic_f32(
-            charges,
-            &[1, hidden],
-            &hidden_values,
-            "target",
-            "hidden residual",
-        )?;
+        let fixture = TargetFixture::new(charges, self.geometry.hidden)?;
 
-        for binding in [self.plan.target().embedding()] {
-            let label = format!("{binding:?}");
-            let table = semantic_pattern(
-                charges,
-                binding.table,
-                &[1, hidden],
-                "embedding_rows",
-                &label,
-            )?;
-            let tokens = semantic_i32(charges, &[1, 2], &[0, 0], "embedding_rows", &label)?;
-            let direct = semantic_i32(charges, &[0, 1], &[], "embedding_rows", &label)?;
-            let result = self
-                .programs
-                .target
-                .embedding
-                .call(charges, embedding_rows::Args {
-                    table: &table,
-                    tokens: &tokens,
-                    directory: &direct,
-                    scale: 1.0,
-                    normalize: 0,
-                    epsilon: 0.0,
-                })
-                .map_err(|error| qualification_dynamic("embedding_rows", &label, error))?;
-            require_finite_nonzero_f32(&result.r1, "embedding_rows", &label)?;
-        }
+        self.qualify_embedding(charges)?;
 
         for ((slot, attested), block) in self
             .plan
@@ -107,318 +73,9 @@ impl<'a> QualificationView<'a> {
             };
             let label = format!("{binding:?}");
             let rows = self.mixer_rows(block, &label)?;
-            if !qualified.insert((binding, rows)) {
-                continue;
+            if qualified.insert((binding, rows)) {
+                qualify_recurrent(charges, kernels, binding, rows, fixture.hidden, &label)?;
             }
-            // The model's recurrent geometry (the entries fix it statically)
-            // over a two-bank arena: bank 0 is the zero seed the advance
-            // reads, bank 1 its successor. Zero weights leave the residual
-            // unchanged.
-            let w = binding.width;
-            let (norm_epsilon, gate_function) = (f32::from_bits(binding.key_norm_epsilon), binding.gate_function);
-            let (key_heads, value_heads) = (binding.key_heads, binding.value_heads);
-            let taps = binding.convolution_width;
-            let channels = (2 * key_heads + value_heads) * w;
-            let entry = "target_recurrent";
-            let norm = rows.norm(charges, binding.norm, hidden, entry, &label)?;
-            let input = rows.input(charges, 1, hidden, entry, &label)?;
-            let residual_values = vec![1.0_f32; rows.residual_width(hidden) as usize];
-            let residual = semantic_f32(
-                charges,
-                &[1, rows.residual_width(hidden)],
-                &residual_values,
-                entry,
-                &label,
-            )?;
-            let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, entry, &label);
-            let qkv = zeros(binding.qkv, &[channels, hidden])?;
-            let beta = zeros(binding.beta, &[value_heads, hidden])?;
-            let convolution = zeros(Element::f32(), &[channels, taps])?;
-            let rate = zeros(Element::f32(), &[value_heads])?;
-            let recurrent_norm = zeros(binding.recurrent_norm, &[w])?;
-            let output = zeros(binding.output, &[hidden, value_heads * w])?;
-            let segments =
-                semantic_i32(charges, &[2, 2], &[0, 1, 1, 1], "target_recurrent", &label)?;
-            let stop = semantic_i32(charges, &[1], &[1], "target_recurrent", &label)?;
-            let previous_bank = semantic_i32(charges, &[1], &[0], "target_recurrent", &label)?;
-            let previous_tape = semantic_i32(charges, &[1], &[0], "target_recurrent", &label)?;
-            let following_bank = semantic_i32(charges, &[1], &[1], "target_recurrent", &label)?;
-            let decays = value_heads * binding.decay_width;
-            // One tape row, the least a bank holds.
-            let banks = crate::experts::pooled_slabs(
-                charges,
-                seismic::Contract::DeviceOnly,
-                2,
-                2,
-                &[
-                    seismic::SlabRegion {
-                        element: binding.activation,
-                        row_shape: vec![taps, channels],
-                    },
-                    seismic::SlabRegion {
-                        element: Element::f32(),
-                        row_shape: vec![value_heads, w, w],
-                    },
-                    seismic::SlabRegion {
-                        element: Element::f32(),
-                        row_shape: vec![1, (value_heads + key_heads) * w + decays],
-                    },
-                ],
-                1,
-            )
-            .map_err(|error| qualification_dynamic("target_recurrent", &label, error))?;
-            banks
-                .add_slab(seismic::SlabFill::Zeroed)
-                .map_err(|error| qualification_dynamic("target_recurrent", &label, error))?;
-            let mut window = banks
-                .logical_region(0)
-                .map_err(|error| qualification_dynamic("target_recurrent", &label, error))?;
-            let mut delta = banks
-                .logical_region(1)
-                .map_err(|error| qualification_dynamic("target_recurrent", &label, error))?;
-            let mut tape = banks
-                .logical_region(2)
-                .map_err(|error| qualification_dynamic("target_recurrent", &label, error))?;
-            let gated = match &kernels.form {
-                RecurrentFormKernels::Gated {
-                    project,
-                    step,
-                    chunk,
-                } => {
-                    let gate = zeros(binding.gate, &[value_heads * w, hidden])?;
-                    let alpha = zeros(binding.alpha, &[value_heads, hidden])?;
-                    let time_bias = zeros(Element::f32(), &[value_heads])?;
-                    let project = project.first();
-                    let projection = project
-                        .call(charges, gated_delta_project::Args {
-                            hidden: &input,
-                            input_norm: &norm,
-                            qkv_weight: &qkv,
-                            gate_weight: &gate,
-                            alpha_weight: &alpha,
-                            beta_weight: &beta,
-                            epsilon: 1.0e-5,
-                            qkv_bound: &any_row_bound(charges, project, "QB", "gated_delta_project", &label)?,
-                            gate_bound: &any_row_bound(charges, project, "ZB", "gated_delta_project", &label)?,
-                        })
-                        .map_err(|error| qualification_dynamic("gated_delta_project", &label, error))?
-                        .value;
-                    let gated = match step {
-                        RecurrentStepKernels::Step(step) => {
-                            step.call(charges, gated_delta_step::Args {
-                                projection: &projection,
-                                convolution: &convolution,
-                                rate: &rate,
-                                time_bias: &time_bias,
-                                recurrent_norm: &recurrent_norm,
-                                segments: &segments,
-                                stop: &stop,
-                                previous_bank: &previous_bank,
-                                previous_tape: &previous_tape,
-                                following_bank: &following_bank,
-                                window: &mut window,
-                                delta: &mut delta,
-                                tape: &mut tape,
-                                norm_epsilon,
-                                epsilon: 1.0e-5,
-                                grouped: false,
-                                gate_function,
-                                slab_banks: 2,
-                            })
-                            .map_err(|error| qualification_dynamic("gated_delta_step", &label, error))?
-                            .value
-                        }
-                        RecurrentStepKernels::Convolved { project, step } => {
-                            let projected = project
-                                .first()
-                                .call(charges, gated_delta_project_convolved::Args {
-                                    hidden: &input,
-                                    input_norm: &norm,
-                                    qkv_weight: &qkv,
-                                    gate_weight: &gate,
-                                    alpha_weight: &alpha,
-                                    beta_weight: &beta,
-                                    convolution: &convolution,
-                                    segments: &segments,
-                                    stop: &stop,
-                                    previous_bank: &previous_bank,
-                                    previous_tape: &previous_tape,
-                                    following_bank: &following_bank,
-                                    window: &mut window,
-                                    epsilon: 1.0e-5,
-                                    slab_banks: 2,
-                                })
-                                .map_err(|error| {
-                                    qualification_dynamic("gated_delta_project_convolved", &label, error)
-                                })?;
-                            step.call(charges, gated_delta_step_convolved::Args {
-                                projection: &projected.r0,
-                                convolved: &projected.r1,
-                                rate: &rate,
-                                time_bias: &time_bias,
-                                recurrent_norm: &recurrent_norm,
-                                segments: &segments,
-                                stop: &stop,
-                                previous_bank: &previous_bank,
-                                previous_tape: &previous_tape,
-                                following_bank: &following_bank,
-                                delta: &mut delta,
-                                tape: &mut tape,
-                                norm_epsilon,
-                                epsilon: 1.0e-5,
-                                grouped: false,
-                                gate_function,
-                                slab_banks: 2,
-                            })
-                            .map_err(|error| {
-                                qualification_dynamic("gated_delta_step_convolved", &label, error)
-                            })?
-                            .value
-                        }
-                    };
-                    chunk
-                        .call(charges, gated_delta_chunk::Args {
-                            projection: &projection,
-                            convolution: &convolution,
-                            rate: &rate,
-                            time_bias: &time_bias,
-                            recurrent_norm: &recurrent_norm,
-                            segments: &segments,
-                            stop: &stop,
-                            previous_bank: &previous_bank,
-                            previous_tape: &previous_tape,
-                            following_bank: &following_bank,
-                            window: &mut window,
-                            delta: &mut delta,
-                            tape: &mut tape,
-                            norm_epsilon,
-                            epsilon: 1.0e-5,
-                            grouped: false,
-                            gate_function,
-                            slab_banks: 2,
-                        })
-                        .map_err(|error| qualification_dynamic("gated_delta_chunk", &label, error))?;
-                    gated
-                }
-                RecurrentFormKernels::Kimi(kimi) => {
-                    let RecurrentForm::PerChannel { decay_lower, gate_up, alpha_up, gate_rank, alpha_rank } = binding.form
-                    else {
-                        unreachable!("preparation gives a per-channel layer the Kimi entries")
-                    };
-                    let decay_lower = f32::from_bits(decay_lower);
-                    let gate = zeros(binding.gate, &[gate_rank, hidden])?;
-                    let alpha = zeros(binding.alpha, &[alpha_rank, hidden])?;
-                    let time_bias = zeros(Element::f32(), &[value_heads * w])?;
-                    let project = kimi.project.first();
-                    let scale = |name| unit_scale(charges, project, name, "attention_project", &label);
-                    let bound = |name| any_row_bound(charges, project, name, "attention_project", &label);
-                    let projected = project
-                        .call(charges, attention_project::Args {
-                            hidden: &input,
-                            input_norm: &norm,
-                            query_weight: &qkv,
-                            gate_weight: &gate,
-                            key_weight: &alpha,
-                            value_weight: &beta,
-                            epsilon: 1.0e-5,
-                            project_mode: 0,
-                            query_scale: &scale("QS")?,
-                            gate_scale: &scale("GS")?,
-                            key_scale: &scale("KS")?,
-                            value_scale: &scale("VS")?,
-                            query_bound: &bound("QB")?,
-                            gate_bound: &bound("GB")?,
-                            key_bound: &bound("KB")?,
-                            value_bound: &bound("VB")?,
-                        })
-                        .map_err(|error| qualification_dynamic("attention_project", &label, error))?;
-                    // The gate and decay inputs: the down products through
-                    // zero up projections.
-                    let expand = |kernel: &crate::native::RangedKernels<project_rows::Entry>, source: &Tensor, element, rank| {
-                        let kernel = kernel.first();
-                        kernel
-                            .call(charges, project_rows::Args {
-                                source,
-                                weight: &zeros(element, &[value_heads * w, rank])?,
-                                weight_scale: &unit_scale(charges, kernel, "WS", "project_rows", &label)?,
-                                weight_bound: &any_row_bound(charges, kernel, "WB", "project_rows", &label)?,
-                            })
-                            .map(|expanded| expanded.value)
-                            .map_err(|error| qualification_dynamic("project_rows", &label, error))
-                    };
-                    let gate_input = expand(&kimi.gate_up, &projected.r1, gate_up, gate_rank)?;
-                    let decay_input = expand(&kimi.alpha_up, &projected.r2, alpha_up, alpha_rank)?;
-                    let gated = kimi
-                        .step
-                        .call(charges, kimi_delta_step::Args {
-                            projection: &projected.r0,
-                            beta: &projected.r3,
-                            gate: &gate_input,
-                            decay: &decay_input,
-                            convolution: &convolution,
-                            rate: &rate,
-                            time_bias: &time_bias,
-                            recurrent_norm: &recurrent_norm,
-                            segments: &segments,
-                            stop: &stop,
-                            previous_bank: &previous_bank,
-                            previous_tape: &previous_tape,
-                            following_bank: &following_bank,
-                            window: &mut window,
-                            delta: &mut delta,
-                            tape: &mut tape,
-                            norm_epsilon,
-                            epsilon: 1.0e-5,
-                            decay_lower,
-                            grouped: false,
-                            gate_function,
-                            slab_banks: 2,
-                        })
-                        .map_err(|error| qualification_dynamic("kimi_delta_step", &label, error))?
-                        .value;
-                    kimi.chunk
-                        .call(charges, kimi_delta_chunk::Args {
-                            projection: &projected.r0,
-                            beta: &projected.r3,
-                            gate: &gate_input,
-                            decay: &decay_input,
-                            convolution: &convolution,
-                            rate: &rate,
-                            time_bias: &time_bias,
-                            recurrent_norm: &recurrent_norm,
-                            segments: &segments,
-                            stop: &stop,
-                            previous_bank: &previous_bank,
-                            previous_tape: &previous_tape,
-                            following_bank: &following_bank,
-                            window: &mut window,
-                            delta: &mut delta,
-                            tape: &mut tape,
-                            norm_epsilon,
-                            epsilon: 1.0e-5,
-                            decay_lower,
-                            grouped: false,
-                            gate_function,
-                            slab_banks: 2,
-                        })
-                        .map_err(|error| qualification_dynamic("kimi_delta_chunk", &label, error))?;
-                    gated
-                }
-            };
-            let result = kernels
-                .output
-                .first()
-                .call(charges, attention_output::Args {
-                    hidden: &residual,
-                    inject: &rows.inject(charges, 1, "attention_output", &label)?,
-                    gated: &gated,
-                    output_weight: &output,
-                    output_scale: &unit_scale(charges, kernels.output.first(), "OS", "attention_output", &label)?,
-                    output_bound: &any_row_bound(charges, kernels.output.first(), "OB", "attention_output", &label)?,
-                })
-                .map_err(|error| qualification_dynamic("attention_output", &label, error))?
-                .value;
-            require_f32_values(&result, &residual_values, "attention_output", &label)?;
         }
 
         let mut qualified = std::collections::HashSet::new();
@@ -435,7 +92,7 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             if qualified.insert(binding) {
-                qualify_state_space(charges, kernels, binding, &hidden_residual, &hidden_values)?;
+                qualify_state_space(charges, kernels, binding, &fixture.hidden_residual, &fixture.hidden_values)?;
             }
         }
 
@@ -453,7 +110,7 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             if qualified.insert(binding) {
-                qualify_short_conv(charges, kernels, binding, &hidden_residual, &hidden_values)?;
+                qualify_short_conv(charges, kernels, binding, &fixture.hidden_residual, &fixture.hidden_values)?;
             }
         }
 
@@ -486,74 +143,12 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             let intermediate = &dense.intermediate;
-            if !qualified.insert((binding, *intermediate)) {
-                continue;
+            if qualified.insert((binding, *intermediate)) {
+                qualify_dense(charges, kernels, binding, *intermediate, &fixture)?;
             }
-            let label = format!("{binding:?}");
-            let f = *intermediate;
-            let norm = semantic_zeros(charges, binding.norm, &[hidden], "target_dense", &label)?;
-            let gate = semantic_zeros(charges, binding.gate, &[f, hidden], "target_dense", &label)?;
-            let up = semantic_zeros(charges, binding.up, &[f, hidden], "target_dense", &label)?;
-            let down = semantic_zeros(charges, binding.down, &[hidden, f], "target_dense", &label)?;
-            let scale =
-                |extent| semantic_ones(charges, Element::f32(), &[extent], "target_dense", &label);
-            let product = kernels
-                .expand
-                .first()
-                .call(charges, dense_expand::Args {
-                    residual: &hidden_residual,
-                    norm: &norm,
-                    gate_weight: &gate,
-                    up_weight: &up,
-                    out_rows: &out_rows,
-                    eps: 1.0e-5,
-                    activation: 0,
-                    gate_scale: &scale(binding.scales.gate)?,
-                    up_scale: &scale(binding.scales.up)?,
-                    gate_bound: &any_row_bound(charges, kernels.expand.first(), "GB", "dense_expand", &label)?,
-                    up_bound: &any_row_bound(charges, kernels.expand.first(), "UB", "dense_expand", &label)?,
-                    glu_limit: &glu_limit(charges, binding.limit, "dense_expand", &label)?,
-                })
-                .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
-                .value;
-            let result = match (&kernels.output, binding.tail) {
-                (SublayerOutput::Residual(output), SublayerTail::Residual) => {
-                    let output = output.first();
-                    output
-                        .call(charges, dense_output::Args {
-                            residual: &hidden_residual,
-                            product: &product,
-                            down_weight: &down,
-                            out_rows: &out_rows,
-                            down_scale: &scale(binding.scales.down)?,
-                            down_bound: &any_row_bound(charges, output, "DB", "dense_output", &label)?,
-                        })
-                        .map_err(|error| qualification_dynamic("dense_output", &label, error))?
-                        .value
-                }
-                (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
-                    qualify_post_norm(
-                        charges,
-                        tail,
-                        &hidden_residual,
-                        &product,
-                        &down,
-                        norm,
-                        &label,
-                    )?
-                }
-                _ => {
-                    return Err(qualification_dynamic(
-                        "dense_output",
-                        &label,
-                        "dense output entries disagree with the binding's tail",
-                    ));
-                }
-            };
-            require_f32_values(&result, &hidden_values, "dense_output", &label)?;
         }
 
-        self.qualify_per_layer(charges, &hidden_residual, &hidden_values)?;
+        self.qualify_per_layer(charges, &fixture.hidden_residual, &fixture.hidden_values)?;
 
         let mut qualified = std::collections::HashSet::new();
         for ((slot, attested), block) in self
@@ -613,13 +208,48 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             if qualified.insert(binding) {
-                qualify_parallel(charges, binding, kernels, &hidden_residual, &hidden_values)?;
+                qualify_parallel(charges, binding, kernels, &fixture.hidden_residual, &fixture.hidden_values)?;
             }
         }
 
-        // Each streamed layer's bank entries, and its routed form's shared
-        // entries as the bank serves them; once per binding, each sited
-        // block's stored site verdict.
+        let admitted = self.qualify_banks(charges)?;
+        self.qualify_exit(charges, &fixture)?;
+        Ok(admitted)
+    }
+
+    /// The embedding's rows of a one-row table.
+    fn qualify_embedding(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
+        let binding = self.plan.target().embedding();
+        let label = format!("{binding:?}");
+        let table = semantic_pattern(
+            charges,
+            binding.table,
+            &[1, self.geometry.hidden],
+            "embedding_rows",
+            &label,
+        )?;
+        let tokens = semantic_i32(charges, &[1, 2], &[0, 0], "embedding_rows", &label)?;
+        let direct = semantic_i32(charges, &[0, 1], &[], "embedding_rows", &label)?;
+        let result = self
+            .programs
+            .target
+            .embedding
+            .call(charges, embedding_rows::Args {
+                table: &table,
+                tokens: &tokens,
+                directory: &direct,
+                scale: 1.0,
+                normalize: 0,
+                epsilon: 0.0,
+            })
+            .map_err(|error| qualification_dynamic("embedding_rows", &label, error))?;
+        require_finite_nonzero_f32(&result.r1, "embedding_rows", &label)
+    }
+
+    /// Each streamed layer's bank entries, and its routed form's shared
+    /// entries as the bank serves them; once per binding, each sited
+    /// block's stored site verdict, by block index.
+    fn qualify_banks(&self, charges: &seismic::Charges) -> Result<Vec<(usize, crate::assessment::Priced<()>)>, CatalogFailure> {
         let banks = std::time::Instant::now();
         let mut qualified = std::collections::HashMap::<_, Option<crate::assessment::Priced<()>>>::new();
         let mut admitted = Vec::new();
@@ -655,9 +285,14 @@ impl<'a> QualificationView<'a> {
             qualified.len(),
             banks.elapsed().as_secs_f64()
         );
+        Ok(admitted)
+    }
 
-        // The readout reads the decoder's exit: the final row under the exit
-        // norm, or the exit site's partials, unnormalized.
+    /// The readout and the features, which read the decoder's exit: the
+    /// final row under the exit norm, or the exit site's partials,
+    /// unnormalized.
+    fn qualify_exit(&self, charges: &seismic::Charges, fixture: &TargetFixture) -> Result<(), CatalogFailure> {
+        let hidden = fixture.hidden;
         let exit = crate::operators::InputForm::exit(self.geometry);
         let exit_rows = semantic_ones(
             charges,
@@ -666,119 +301,7 @@ impl<'a> QualificationView<'a> {
             "target_readout",
             "exit rows",
         )?;
-        for binding in [self.plan.target().readout()] {
-            let label = format!("{binding:?}");
-            let norm = semantic_ones(
-                charges,
-                binding.norm,
-                &[exit.norm_extent(hidden)],
-                "target_readout",
-                &label,
-            )?;
-            let kernel = &self.programs.target.readout.features;
-            let parts = readout_parts(
-                &exit_rows,
-                kernel.specialization().statics(),
-                "readout_features_rows",
-                &label,
-            )?;
-            let features = kernel
-                .call(charges, readout_features_rows::Args {
-                    hidden: &parts,
-                    norm: &norm,
-                    out_rows: &out_rows,
-                    epsilon: 1.0e-5,
-                })
-                .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
-                .value;
-            require_finite_nonzero(&features, "readout_features_rows", &label)?;
-            let vocabulary = self.geometry.vocabulary;
-            let readout = match &self.programs.target.readout.head {
-                ReadoutHeadKernels::Qualified {
-                    packed,
-                    progressive,
-                    ..
-                } => {
-                    qualify_progressive(
-                        charges,
-                        progressive,
-                        &exit_rows,
-                        &norm,
-                        &out_rows,
-                        (vocabulary, hidden),
-                        "target_readout",
-                        &label,
-                    )?;
-                    packed.as_ref()
-                }
-                readout => readout,
-            };
-            match (readout, binding.head) {
-                (
-                    ReadoutHeadKernels::Packed { head, selected },
-                    ReadoutHead::Packed {
-                        weight: element,
-                        weight_scale,
-                    }
-                    | ReadoutHead::Qualified {
-                        weight: element,
-                        weight_scale,
-                    },
-                ) => {
-                    let weight = semantic_zeros(
-                        charges,
-                        element,
-                        &[vocabulary, hidden],
-                        "target_readout",
-                        &label,
-                    )?;
-                    let logits = head
-                        .first()
-                        .call(charges, readout_head_rows::Args {
-                            hidden: &exit_rows,
-                            norm: &norm,
-                            weight: &weight,
-                            out_rows: &out_rows,
-                            epsilon: 1.0e-5,
-                            softcap: 0.0,
-                            weight_scale: &semantic_ones(
-                                charges,
-                                Element::f32(),
-                                &[weight_scale],
-                                "target_readout",
-                                &label,
-                            )?,
-                        })
-                        .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
-                        .value;
-                    require_zero_result(&logits, "readout_head_rows", &label)?;
-                    let rows = semantic_i32(charges, &[1], &[0], "readout_selected_rows", &label)?;
-                    let selected_result = selected
-                        .first()
-                        .call(charges, readout_selected_rows::Args {
-                            hidden: &exit_rows,
-                            norm: &norm,
-                            weight: &weight,
-                            out_rows: &out_rows,
-                            selected: &rows,
-                            epsilon: 1.0e-5,
-                            softcap: 0.0,
-                        })
-                        .map_err(|error| {
-                            qualification_dynamic("readout_selected_rows", &label, error)
-                        })?
-                        .value;
-                    require_zero_result(&selected_result, "readout_selected_rows", &label)?;
-                }
-                _ => {
-                    return Err(qualification_dynamic(
-                        "target_readout",
-                        &label,
-                        "the prepared head differs from the planned head",
-                    ));
-                }
-            }
-        }
+        self.qualify_readout(charges, exit, &exit_rows, fixture)?;
 
         if let (Some(binding), Some(kernel)) = (
             self.plan.target().features(),
@@ -802,15 +325,631 @@ impl<'a> QualificationView<'a> {
                 .call(charges, readout_features_rows::Args {
                     hidden: &parts,
                     norm: &norm,
-                    out_rows: &out_rows,
+                    out_rows: &fixture.out_rows,
                     epsilon: 1.0e-5,
                 })
                 .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
                 .value;
             require_finite_nonzero(&result, "readout_features_rows", &label)?;
         }
-        Ok(admitted)
+        Ok(())
     }
+
+    /// The readout's features and head over `exit_rows`, the exit's rows.
+    fn qualify_readout(
+        &self,
+        charges: &seismic::Charges,
+        exit: crate::operators::InputForm,
+        exit_rows: &Tensor,
+        fixture: &TargetFixture,
+    ) -> Result<(), CatalogFailure> {
+        let (hidden, out_rows) = (fixture.hidden, &fixture.out_rows);
+        let binding = self.plan.target().readout();
+        let label = format!("{binding:?}");
+        let norm = semantic_ones(
+            charges,
+            binding.norm,
+            &[exit.norm_extent(hidden)],
+            "target_readout",
+            &label,
+        )?;
+        let kernel = &self.programs.target.readout.features;
+        let parts = readout_parts(
+            exit_rows,
+            kernel.specialization().statics(),
+            "readout_features_rows",
+            &label,
+        )?;
+        let features = kernel
+            .call(charges, readout_features_rows::Args {
+                hidden: &parts,
+                norm: &norm,
+                out_rows,
+                epsilon: 1.0e-5,
+            })
+            .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
+            .value;
+        require_finite_nonzero(&features, "readout_features_rows", &label)?;
+        let vocabulary = self.geometry.vocabulary;
+        let readout = match &self.programs.target.readout.head {
+            ReadoutHeadKernels::Qualified {
+                packed,
+                progressive,
+                ..
+            } => {
+                qualify_progressive(
+                    charges,
+                    progressive,
+                    exit_rows,
+                    &norm,
+                    out_rows,
+                    (vocabulary, hidden),
+                    "target_readout",
+                    &label,
+                )?;
+                packed.as_ref()
+            }
+            readout => readout,
+        };
+        match (readout, binding.head) {
+            (
+                ReadoutHeadKernels::Packed { head, selected },
+                ReadoutHead::Packed {
+                    weight: element,
+                    weight_scale,
+                }
+                | ReadoutHead::Qualified {
+                    weight: element,
+                    weight_scale,
+                },
+            ) => {
+                let weight = semantic_zeros(
+                    charges,
+                    element,
+                    &[vocabulary, hidden],
+                    "target_readout",
+                    &label,
+                )?;
+                let logits = head
+                    .first()
+                    .call(charges, readout_head_rows::Args {
+                        hidden: exit_rows,
+                        norm: &norm,
+                        weight: &weight,
+                        out_rows,
+                        epsilon: 1.0e-5,
+                        softcap: 0.0,
+                        weight_scale: &semantic_ones(
+                            charges,
+                            Element::f32(),
+                            &[weight_scale],
+                            "target_readout",
+                            &label,
+                        )?,
+                    })
+                    .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
+                    .value;
+                require_zero_result(&logits, "readout_head_rows", &label)?;
+                let rows = semantic_i32(charges, &[1], &[0], "readout_selected_rows", &label)?;
+                let selected_result = selected
+                    .first()
+                    .call(charges, readout_selected_rows::Args {
+                        hidden: exit_rows,
+                        norm: &norm,
+                        weight: &weight,
+                        out_rows,
+                        selected: &rows,
+                        epsilon: 1.0e-5,
+                        softcap: 0.0,
+                    })
+                    .map_err(|error| {
+                        qualification_dynamic("readout_selected_rows", &label, error)
+                    })?
+                    .value;
+                require_zero_result(&selected_result, "readout_selected_rows", &label)
+            }
+            _ => Err(qualification_dynamic(
+                "target_readout",
+                &label,
+                "the prepared head differs from the planned head",
+            )),
+        }
+    }
+}
+
+/// What the target's sublayers over one plain hidden row read: the hidden
+/// width, an output row list of row 0, and a residual row of ones.
+struct TargetFixture {
+    hidden: u64,
+    out_rows: Tensor,
+    hidden_values: Vec<f32>,
+    hidden_residual: Tensor,
+}
+
+impl TargetFixture {
+    fn new(charges: &seismic::Charges, hidden: u64) -> Result<Self, CatalogFailure> {
+        let out_rows = semantic_i32(charges, &[1], &[0], "target", "out_rows")?;
+        let hidden_values = vec![1.0_f32; hidden as usize];
+        let hidden_residual = semantic_f32(
+            charges,
+            &[1, hidden],
+            &hidden_values,
+            "target",
+            "hidden residual",
+        )?;
+        Ok(Self {
+            hidden,
+            out_rows,
+            hidden_values,
+            hidden_residual,
+        })
+    }
+}
+
+/// A dense feed-forward of `intermediate` features over the hidden row:
+/// zero weights leave the residual unchanged.
+fn qualify_dense(
+    charges: &seismic::Charges,
+    kernels: &DenseKernels,
+    binding: crate::DenseBinding,
+    intermediate: u64,
+    fixture: &TargetFixture,
+) -> Result<(), CatalogFailure> {
+    let label = format!("{binding:?}");
+    let (hidden, f) = (fixture.hidden, intermediate);
+    let norm = semantic_zeros(charges, binding.norm, &[hidden], "target_dense", &label)?;
+    let gate = semantic_zeros(charges, binding.gate, &[f, hidden], "target_dense", &label)?;
+    let up = semantic_zeros(charges, binding.up, &[f, hidden], "target_dense", &label)?;
+    let down = semantic_zeros(charges, binding.down, &[hidden, f], "target_dense", &label)?;
+    let scale =
+        |extent| semantic_ones(charges, Element::f32(), &[extent], "target_dense", &label);
+    let product = kernels
+        .expand
+        .first()
+        .call(charges, dense_expand::Args {
+            residual: &fixture.hidden_residual,
+            norm: &norm,
+            gate_weight: &gate,
+            up_weight: &up,
+            out_rows: &fixture.out_rows,
+            eps: 1.0e-5,
+            activation: 0,
+            gate_scale: &scale(binding.scales.gate)?,
+            up_scale: &scale(binding.scales.up)?,
+            gate_bound: &any_row_bound(charges, kernels.expand.first(), "GB", "dense_expand", &label)?,
+            up_bound: &any_row_bound(charges, kernels.expand.first(), "UB", "dense_expand", &label)?,
+            glu_limit: &glu_limit(charges, binding.limit, "dense_expand", &label)?,
+        })
+        .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
+        .value;
+    let result = match (&kernels.output, binding.tail) {
+        (SublayerOutput::Residual(output), SublayerTail::Residual) => {
+            let output = output.first();
+            output
+                .call(charges, dense_output::Args {
+                    residual: &fixture.hidden_residual,
+                    product: &product,
+                    down_weight: &down,
+                    out_rows: &fixture.out_rows,
+                    down_scale: &scale(binding.scales.down)?,
+                    down_bound: &any_row_bound(charges, output, "DB", "dense_output", &label)?,
+                })
+                .map_err(|error| qualification_dynamic("dense_output", &label, error))?
+                .value
+        }
+        (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
+            qualify_post_norm(
+                charges,
+                tail,
+                &fixture.hidden_residual,
+                &product,
+                &down,
+                norm,
+                &label,
+            )?
+        }
+        _ => {
+            return Err(qualification_dynamic(
+                "dense_output",
+                &label,
+                "dense output entries disagree with the binding's tail",
+            ));
+        }
+    };
+    require_f32_values(&result, &fixture.hidden_values, "dense_output", &label)
+}
+
+/// What a recurrent layer's entries read: the model's recurrent geometry
+/// (the entries fix it statically) over a two-bank arena, bank 0 the zero
+/// seed the advance reads and bank 1 its successor, and zero weights, which
+/// leave the residual unchanged.
+struct RecurrentFixture {
+    hidden: u64,
+    norm: Tensor,
+    input: Tensor,
+    residual_values: Vec<f32>,
+    residual: Tensor,
+    qkv: Tensor,
+    beta: Tensor,
+    convolution: Tensor,
+    rate: Tensor,
+    recurrent_norm: Tensor,
+    output: Tensor,
+    segments: Tensor,
+    stop: Tensor,
+    previous_bank: Tensor,
+    previous_tape: Tensor,
+    following_bank: Tensor,
+    window: Tensor,
+    delta: Tensor,
+    tape: Tensor,
+    /// The banks' store, which `window`, `delta` and `tape` lie in, held
+    /// while they are.
+    _banks: seismic::SlabTensor,
+}
+
+impl RecurrentFixture {
+    fn new(
+        charges: &seismic::Charges,
+        binding: RecurrentBinding,
+        rows: SublayerRows,
+        hidden: u64,
+        label: &str,
+    ) -> Result<Self, CatalogFailure> {
+        let w = binding.width;
+        let (key_heads, value_heads) = (binding.key_heads, binding.value_heads);
+        let taps = binding.convolution_width;
+        let channels = (2 * key_heads + value_heads) * w;
+        let entry = "target_recurrent";
+        let norm = rows.norm(charges, binding.norm, hidden, entry, label)?;
+        let input = rows.input(charges, 1, hidden, entry, label)?;
+        let residual_values = vec![1.0_f32; rows.residual_width(hidden) as usize];
+        let residual = semantic_f32(
+            charges,
+            &[1, rows.residual_width(hidden)],
+            &residual_values,
+            entry,
+            label,
+        )?;
+        let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, entry, label);
+        let qkv = zeros(binding.qkv, &[channels, hidden])?;
+        let beta = zeros(binding.beta, &[value_heads, hidden])?;
+        let convolution = zeros(Element::f32(), &[channels, taps])?;
+        let rate = zeros(Element::f32(), &[value_heads])?;
+        let recurrent_norm = zeros(binding.recurrent_norm, &[w])?;
+        let output = zeros(binding.output, &[hidden, value_heads * w])?;
+        let segments = semantic_i32(charges, &[2, 2], &[0, 1, 1, 1], entry, label)?;
+        let stop = semantic_i32(charges, &[1], &[1], entry, label)?;
+        let previous_bank = semantic_i32(charges, &[1], &[0], entry, label)?;
+        let previous_tape = semantic_i32(charges, &[1], &[0], entry, label)?;
+        let following_bank = semantic_i32(charges, &[1], &[1], entry, label)?;
+        let decays = value_heads * binding.decay_width;
+        // One tape row, the least a bank holds.
+        let ([window, delta, tape], banks) = zeroed_slab(
+            charges,
+            &[
+                seismic::SlabRegion {
+                    element: binding.activation,
+                    row_shape: vec![taps, channels],
+                },
+                seismic::SlabRegion {
+                    element: Element::f32(),
+                    row_shape: vec![value_heads, w, w],
+                },
+                seismic::SlabRegion {
+                    element: Element::f32(),
+                    row_shape: vec![1, (value_heads + key_heads) * w + decays],
+                },
+            ],
+            entry,
+            label,
+        )?;
+        Ok(Self {
+            hidden,
+            norm,
+            input,
+            residual_values,
+            residual,
+            qkv,
+            beta,
+            convolution,
+            rate,
+            recurrent_norm,
+            output,
+            segments,
+            stop,
+            previous_bank,
+            previous_tape,
+            following_bank,
+            window,
+            delta,
+            tape,
+            _banks: banks,
+        })
+    }
+}
+
+/// A recurrent layer reading and joining `rows`: its projection, its state
+/// advance by step and by chunk, and its output, which zero weights leave
+/// the residual.
+fn qualify_recurrent(
+    charges: &seismic::Charges,
+    kernels: &RecurrentKernels,
+    binding: RecurrentBinding,
+    rows: SublayerRows,
+    hidden: u64,
+    label: &str,
+) -> Result<(), CatalogFailure> {
+    let mut fixture = RecurrentFixture::new(charges, binding, rows, hidden, label)?;
+    let gated = match &kernels.form {
+        RecurrentFormKernels::Gated {
+            project,
+            step,
+            chunk,
+        } => recurrent_gated(charges, project, step, chunk, binding, &mut fixture, label)?,
+        RecurrentFormKernels::Kimi(kimi) => recurrent_kimi(charges, kimi, binding, &mut fixture, label)?,
+    };
+    let result = kernels
+        .output
+        .first()
+        .call(charges, attention_output::Args {
+            hidden: &fixture.residual,
+            inject: &rows.inject(charges, 1, "attention_output", label)?,
+            gated: &gated,
+            output_weight: &fixture.output,
+            output_scale: &unit_scale(charges, kernels.output.first(), "OS", "attention_output", label)?,
+            output_bound: &any_row_bound(charges, kernels.output.first(), "OB", "attention_output", label)?,
+        })
+        .map_err(|error| qualification_dynamic("attention_output", label, error))?
+        .value;
+    require_f32_values(&result, &fixture.residual_values, "attention_output", label)
+}
+
+/// A Gated DeltaNet layer's projection, its step (`step`'s form) and its
+/// chunk over `fixture`: the step's gated rows.
+fn recurrent_gated(
+    charges: &seismic::Charges,
+    project: &RangedKernels<gated_delta_project::Entry>,
+    step: &RecurrentStepKernels,
+    chunk: &NativeKernel<gated_delta_chunk::Entry>,
+    binding: RecurrentBinding,
+    fixture: &mut RecurrentFixture,
+    label: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let (hidden, w, value_heads) = (fixture.hidden, binding.width, binding.value_heads);
+    let (norm_epsilon, gate_function) = (f32::from_bits(binding.key_norm_epsilon), binding.gate_function);
+    let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, "target_recurrent", label);
+    let gate = zeros(binding.gate, &[value_heads * w, hidden])?;
+    let alpha = zeros(binding.alpha, &[value_heads, hidden])?;
+    let time_bias = zeros(Element::f32(), &[value_heads])?;
+    let project = project.first();
+    let projection = project
+        .call(charges, gated_delta_project::Args {
+            hidden: &fixture.input,
+            input_norm: &fixture.norm,
+            qkv_weight: &fixture.qkv,
+            gate_weight: &gate,
+            alpha_weight: &alpha,
+            beta_weight: &fixture.beta,
+            epsilon: 1.0e-5,
+            qkv_bound: &any_row_bound(charges, project, "QB", "gated_delta_project", label)?,
+            gate_bound: &any_row_bound(charges, project, "ZB", "gated_delta_project", label)?,
+        })
+        .map_err(|error| qualification_dynamic("gated_delta_project", label, error))?
+        .value;
+    let gated = match step {
+        RecurrentStepKernels::Step(step) => {
+            step.call(charges, gated_delta_step::Args {
+                projection: &projection,
+                convolution: &fixture.convolution,
+                rate: &fixture.rate,
+                time_bias: &time_bias,
+                recurrent_norm: &fixture.recurrent_norm,
+                segments: &fixture.segments,
+                stop: &fixture.stop,
+                previous_bank: &fixture.previous_bank,
+                previous_tape: &fixture.previous_tape,
+                following_bank: &fixture.following_bank,
+                window: &mut fixture.window,
+                delta: &mut fixture.delta,
+                tape: &mut fixture.tape,
+                norm_epsilon,
+                epsilon: 1.0e-5,
+                grouped: false,
+                gate_function,
+                slab_banks: 2,
+            })
+            .map_err(|error| qualification_dynamic("gated_delta_step", label, error))?
+            .value
+        }
+        RecurrentStepKernels::Convolved { project, step } => {
+            let projected = project
+                .first()
+                .call(charges, gated_delta_project_convolved::Args {
+                    hidden: &fixture.input,
+                    input_norm: &fixture.norm,
+                    qkv_weight: &fixture.qkv,
+                    gate_weight: &gate,
+                    alpha_weight: &alpha,
+                    beta_weight: &fixture.beta,
+                    convolution: &fixture.convolution,
+                    segments: &fixture.segments,
+                    stop: &fixture.stop,
+                    previous_bank: &fixture.previous_bank,
+                    previous_tape: &fixture.previous_tape,
+                    following_bank: &fixture.following_bank,
+                    window: &mut fixture.window,
+                    epsilon: 1.0e-5,
+                    slab_banks: 2,
+                })
+                .map_err(|error| {
+                    qualification_dynamic("gated_delta_project_convolved", label, error)
+                })?;
+            step.call(charges, gated_delta_step_convolved::Args {
+                projection: &projected.r0,
+                convolved: &projected.r1,
+                rate: &fixture.rate,
+                time_bias: &time_bias,
+                recurrent_norm: &fixture.recurrent_norm,
+                segments: &fixture.segments,
+                stop: &fixture.stop,
+                previous_bank: &fixture.previous_bank,
+                previous_tape: &fixture.previous_tape,
+                following_bank: &fixture.following_bank,
+                delta: &mut fixture.delta,
+                tape: &mut fixture.tape,
+                norm_epsilon,
+                epsilon: 1.0e-5,
+                grouped: false,
+                gate_function,
+                slab_banks: 2,
+            })
+            .map_err(|error| {
+                qualification_dynamic("gated_delta_step_convolved", label, error)
+            })?
+            .value
+        }
+    };
+    chunk
+        .call(charges, gated_delta_chunk::Args {
+            projection: &projection,
+            convolution: &fixture.convolution,
+            rate: &fixture.rate,
+            time_bias: &time_bias,
+            recurrent_norm: &fixture.recurrent_norm,
+            segments: &fixture.segments,
+            stop: &fixture.stop,
+            previous_bank: &fixture.previous_bank,
+            previous_tape: &fixture.previous_tape,
+            following_bank: &fixture.following_bank,
+            window: &mut fixture.window,
+            delta: &mut fixture.delta,
+            tape: &mut fixture.tape,
+            norm_epsilon,
+            epsilon: 1.0e-5,
+            grouped: false,
+            gate_function,
+            slab_banks: 2,
+        })
+        .map_err(|error| qualification_dynamic("gated_delta_chunk", label, error))?;
+    Ok(gated)
+}
+
+/// A Kimi Delta Attention layer's projection, its gate's and decay's up
+/// projections, and its step and chunk over `fixture`: the step's gated
+/// rows.
+fn recurrent_kimi(
+    charges: &seismic::Charges,
+    kimi: &KimiKernels,
+    binding: RecurrentBinding,
+    fixture: &mut RecurrentFixture,
+    label: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let RecurrentForm::PerChannel { decay_lower, gate_up, alpha_up, gate_rank, alpha_rank } = binding.form
+    else {
+        unreachable!("preparation gives a per-channel layer the Kimi entries")
+    };
+    let (hidden, w, value_heads) = (fixture.hidden, binding.width, binding.value_heads);
+    let (norm_epsilon, gate_function) = (f32::from_bits(binding.key_norm_epsilon), binding.gate_function);
+    let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, "target_recurrent", label);
+    let decay_lower = f32::from_bits(decay_lower);
+    let gate = zeros(binding.gate, &[gate_rank, hidden])?;
+    let alpha = zeros(binding.alpha, &[alpha_rank, hidden])?;
+    let time_bias = zeros(Element::f32(), &[value_heads * w])?;
+    let project = kimi.project.first();
+    let scale = |name| unit_scale(charges, project, name, "attention_project", label);
+    let bound = |name| any_row_bound(charges, project, name, "attention_project", label);
+    let projected = project
+        .call(charges, attention_project::Args {
+            hidden: &fixture.input,
+            input_norm: &fixture.norm,
+            query_weight: &fixture.qkv,
+            gate_weight: &gate,
+            key_weight: &alpha,
+            value_weight: &fixture.beta,
+            epsilon: 1.0e-5,
+            project_mode: 0,
+            query_scale: &scale("QS")?,
+            gate_scale: &scale("GS")?,
+            key_scale: &scale("KS")?,
+            value_scale: &scale("VS")?,
+            query_bound: &bound("QB")?,
+            gate_bound: &bound("GB")?,
+            key_bound: &bound("KB")?,
+            value_bound: &bound("VB")?,
+        })
+        .map_err(|error| qualification_dynamic("attention_project", label, error))?;
+    // The gate and decay inputs: the down products through
+    // zero up projections.
+    let expand = |kernel: &RangedKernels<project_rows::Entry>, source: &Tensor, element, rank| {
+        let kernel = kernel.first();
+        kernel
+            .call(charges, project_rows::Args {
+                source,
+                weight: &zeros(element, &[value_heads * w, rank])?,
+                weight_scale: &unit_scale(charges, kernel, "WS", "project_rows", label)?,
+                weight_bound: &any_row_bound(charges, kernel, "WB", "project_rows", label)?,
+            })
+            .map(|expanded| expanded.value)
+            .map_err(|error| qualification_dynamic("project_rows", label, error))
+    };
+    let gate_input = expand(&kimi.gate_up, &projected.r1, gate_up, gate_rank)?;
+    let decay_input = expand(&kimi.alpha_up, &projected.r2, alpha_up, alpha_rank)?;
+    let gated = kimi
+        .step
+        .call(charges, kimi_delta_step::Args {
+            projection: &projected.r0,
+            beta: &projected.r3,
+            gate: &gate_input,
+            decay: &decay_input,
+            convolution: &fixture.convolution,
+            rate: &fixture.rate,
+            time_bias: &time_bias,
+            recurrent_norm: &fixture.recurrent_norm,
+            segments: &fixture.segments,
+            stop: &fixture.stop,
+            previous_bank: &fixture.previous_bank,
+            previous_tape: &fixture.previous_tape,
+            following_bank: &fixture.following_bank,
+            window: &mut fixture.window,
+            delta: &mut fixture.delta,
+            tape: &mut fixture.tape,
+            norm_epsilon,
+            epsilon: 1.0e-5,
+            decay_lower,
+            grouped: false,
+            gate_function,
+            slab_banks: 2,
+        })
+        .map_err(|error| qualification_dynamic("kimi_delta_step", label, error))?
+        .value;
+    kimi.chunk
+        .call(charges, kimi_delta_chunk::Args {
+            projection: &projected.r0,
+            beta: &projected.r3,
+            gate: &gate_input,
+            decay: &decay_input,
+            convolution: &fixture.convolution,
+            rate: &fixture.rate,
+            time_bias: &time_bias,
+            recurrent_norm: &fixture.recurrent_norm,
+            segments: &fixture.segments,
+            stop: &fixture.stop,
+            previous_bank: &fixture.previous_bank,
+            previous_tape: &fixture.previous_tape,
+            following_bank: &fixture.following_bank,
+            window: &mut fixture.window,
+            delta: &mut fixture.delta,
+            tape: &mut fixture.tape,
+            norm_epsilon,
+            epsilon: 1.0e-5,
+            decay_lower,
+            grouped: false,
+            gate_function,
+            slab_banks: 2,
+        })
+        .map_err(|error| qualification_dynamic("kimi_delta_chunk", label, error))?;
+    Ok(gated)
 }
 
 /// Where the shared routed entries read each choice's expert: the grouped
@@ -1537,24 +1676,16 @@ fn qualify_short_conv(
     let previous_tape = semantic_i32(charges, &[1], &[0], entry, &label)?;
     let following_bank = semantic_i32(charges, &[1], &[1], entry, &label)?;
     // One tape row, the least a bank holds.
-    let banks = crate::experts::pooled_slabs(
+    let (regions, _banks) = zeroed_slab(
         charges,
-        seismic::Contract::DeviceOnly,
-        2,
-        2,
         &[seismic::SlabRegion {
             element: Element::f32(),
             row_shape: vec![shape.convolution_width, shape.channels],
         }],
-        1,
-    )
-    .map_err(|error| qualification_dynamic(entry, &label, error))?;
-    banks
-        .add_slab(seismic::SlabFill::Zeroed)
-        .map_err(|error| qualification_dynamic(entry, &label, error))?;
-    let mut window = banks
-        .logical_region(0)
-        .map_err(|error| qualification_dynamic(entry, &label, error))?;
+        entry,
+        &label,
+    )?;
+    let [mut window] = regions;
     let projection = kernels
         .project
         .first()
@@ -1656,11 +1787,8 @@ fn qualify_state_space(
     let previous_tape = semantic_i32(charges, &[1], &[0], entry, &label)?;
     let following_bank = semantic_i32(charges, &[1], &[1], entry, &label)?;
     // One tape row, the least a bank holds.
-    let banks = crate::experts::pooled_slabs(
+    let (regions, _banks) = zeroed_slab(
         charges,
-        seismic::Contract::DeviceOnly,
-        2,
-        2,
         &[
             seismic::SlabRegion {
                 element: binding.activation,
@@ -1675,18 +1803,10 @@ fn qualify_state_space(
                 row_shape: vec![1, shape.tape_width()],
             },
         ],
-        1,
-    )
-    .map_err(|error| qualification_dynamic(entry, &label, error))?;
-    banks
-        .add_slab(seismic::SlabFill::Zeroed)
-        .map_err(|error| qualification_dynamic(entry, &label, error))?;
-    let region = |index| {
-        banks
-            .logical_region(index)
-            .map_err(|error| qualification_dynamic(entry, &label, error))
-    };
-    let (mut window, mut state, mut tape) = (region(0)?, region(1)?, region(2)?);
+        entry,
+        &label,
+    )?;
+    let [mut window, mut state, mut tape] = regions;
     let projection = kernels
         .project
         .first()

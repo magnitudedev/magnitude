@@ -22,10 +22,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import ab, dashboard, engine, gate, selectors, sources, state, store
+from . import ab, dashboard, engine, gate, ledger, selectors, sources, state, store
 from .connection import HostError, HostRun, connect, host_status, read, setup
 from .hosts import Hosts
 from .instruments import KINDS, REGISTRY, Instrument
+from .instruments import cargo as instruments_cargo
 from .results import CHILD, answer_fetched, follow, perform, record_answer
 
 
@@ -42,6 +43,7 @@ def _epilog() -> str:
         "  inspect    Who holds and waits on each host; or run a read-only command on one (no hold)",
         "  dashboard  A live local web page of every host: holds, queue, utilization, memory, thermals",
         "  runs       This machine's runs in flight: phase, host, time against estimate",
+        "  stale      The tests a source's changes reach: never passed, or changed since, per backend and hardware",
         "  logs RUN   Where a run's logs are, and the end of its current phase's",
         "  wait RUN   Follow a run past its estimate, with a new --estimate and its --justification",
         "  stop RUN   Stop a run (its host work is killed and its holds released)",
@@ -115,7 +117,7 @@ def _inspect(arguments) -> int:
                 continue
             ready = "ready" if remote.ready else "not set up"
             free = status["free_bytes"] / 1e9
-            print(f"{remote.alias} ({'/'.join(remote.backends)}, {ready}, {free:.0f} GB free)")
+            print(f"{remote.alias} ({'/'.join(remote.backends)}, {ready}, {free:.0f} GB free beyond its floor)")
             legacy = status["device_lock_held_elsewhere"]
             if legacy is not None:
                 print(f"  device held outside mrig by {legacy.get('who', '?')} (run {legacy.get('run', '?')})")
@@ -138,6 +140,32 @@ def _runs(arguments) -> int:
             f"{run['run']}  {run['host']}  {run['phase']}{waiting}  queued {engine.duration(queued)}, "
             f"{engine.duration(held)} of {engine.duration(run['estimate'])}  \"{run['purpose']}\""
         )
+    return 0
+
+
+def _stale(arguments) -> int:
+    """Each backend's stale tests at the source, by hardware class, in the configuration the
+    cargo arguments build (`ledger.py`)."""
+    from .instruments.test import stale_selection
+
+    own = arguments.cargo[1:] if arguments.cargo[:1] == ["--"] else arguments.cargo
+    with sources.opened(arguments.build) as source:
+        found = ledger.Ledger()
+        print(f"stale at {source.described()} as {instruments_cargo.configuration(own)}:")
+        for backend in arguments.backend or selectors.BACKENDS:
+            classes = found.classes(backend)
+            print(f"{backend}:")
+            for hardware, hosts in [*classes.items()] or [(None, [])]:
+                stale = stale_selection(found, own, source, backend, hardware)
+                where = f"{hardware} ({', '.join(hosts)})" if hardware else "no run recorded its hardware"
+                print(f"  {where}: {ledger.summary(stale)}")
+                never = [item for item in stale if item.why == "never run"]
+                for item in stale:
+                    if item.why != "never run" or arguments.all:
+                        tests = "" if item.tests is None else ": " + ", ".join(item.tests[:None if arguments.all else 8])
+                        print(f"    {item.binary.key}  {item.why}{tests}")
+                if never and not arguments.all:
+                    print(f"    {len(never)} executables never run (--all lists them)")
     return 0
 
 
@@ -301,6 +329,15 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(handler=_inspect)
     dashboard.configure(commands.add_parser("dashboard", help="live web page of hosts and their queues"))
     commands.add_parser("runs", help="this machine's runs in flight").set_defaults(handler=_runs)
+    command = commands.add_parser("stale", help="the tests a source's changes reach, by backend and hardware",
+                                  description=ledger.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    selectors.add(command, ("build",))
+    command.add_argument("--backend", choices=selectors.BACKENDS, action="append", help="(repeatable; default all)")
+    command.add_argument("--all", action="store_true", help="list every stale executable and test")
+    command.add_argument("cargo", nargs=argparse.REMAINDER,
+                         help="cargo test's arguments after --, as `mrig test --stale` takes them: the packages "
+                              "(-p) and the configuration (--release, features) to judge, e.g. -- -p seismic --release")
+    command.set_defaults(handler=_stale)
     command = commands.add_parser("logs", help="a run's logs")
     command.add_argument("run")
     command.add_argument("--lines", type=int, default=30)

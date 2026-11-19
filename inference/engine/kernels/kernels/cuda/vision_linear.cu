@@ -2,10 +2,11 @@
 // dense-weight tensor-core GEMM with the `Linear` epilogue
 // (lib/vision/vision.cuh): the bias, the clamp, then the activation, the gate
 // or the F32 residual.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/vision/vision.cuh"
 
 using vision::u32;
-typedef element::Act A;
+typedef activation::Act A;
 typedef ELEMENT_OF(SEISMIC_WEIGHT) Weight;
 typedef ELEMENT_OF(SEISMIC_BIAS) BiasElement;
 typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) Y;

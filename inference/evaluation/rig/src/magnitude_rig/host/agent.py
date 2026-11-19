@@ -87,7 +87,9 @@ in `logs/<phase>.log`:
                                               shares a checkout its tree is installed in;
                                               `tests` writes the test executables the
                                               build's cargo steps produced to PATH first
-                                              (`[[executable, manifest], ...]`)
+                                              (`{"tests": [[executable, manifest, target,
+                                              kind], ...], "build_scripts": {out_dir:
+                                              script or null}}`)
     {"op": "built", "side": S, "release": R,  complete the build's output (the executables
      "provenance": P}                         build provenance record P kept); record the
                                               units the build's cargo steps reference, trim
@@ -158,8 +160,9 @@ link keeps the bytes it was made of); the build's environment (`venv`) is synced
 build itself, without editable installs, so it names no checkout. When the build ends, the
 output gets every executable of the target's profile and example directories and every test
 executable the build's cargo steps produced, linked at their paths under its `target`, and the
-list of those test executables with their packages' directories in its `src` (`TESTS`), and is
-complete (`OUTPUT_DONE`): a run of the same tree and build that finds it complete reuses it.
+list of those test executables with their packages' directories and their ledger keys
+(`binary_key`) in its `src` (`TESTS`), and is complete (`OUTPUT_DONE`): a run of the same tree
+and build that finds it complete reuses it.
 Its `src` and `target` are each made aside and moved in under the guard, so the first run to
 finish one gives it and an output is never completed from parts; one no live run holds that
 is not complete was left by a run that died making it, and is discarded before it is held.
@@ -270,6 +273,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -334,6 +338,22 @@ CLAIMED = ("checkout:", "output:")
 # In `<root>/outputs/<tree>-<build>/`: a build's output (`Runner.materialize`), complete once
 # `OUTPUT_DONE` is there, kept while a live run holds it.
 OUTPUTS, OUTPUT_DONE, TESTS = "outputs", "complete", "tests.json"
+# Cargo's target kinds whose test executable is named by `--<kind> NAME`; every other kind (lib,
+# rlib, proc-macro, cdylib...) is the package's library, `--lib`.
+NAMED_KINDS = ("bin", "test", "bench", "example")
+
+
+def target_kind(kinds: list) -> str:
+    """The kind of a cargo target (its `kind` list, as cargo's messages and metadata give it):
+    one of `NAMED_KINDS`, or `lib`."""
+    return next((kind for kind in kinds if kind in NAMED_KINDS), "lib")
+
+
+def binary_key(package: str, kind: str, name: str) -> str:
+    """A test executable's name across builds: its package's directory in the workspace, its
+    target kind and its target name (`engine/kernels:test:routed`), the ledger's key
+    (`ledger.py`)."""
+    return "%s:%s:%s" % (package, kind, name)
 # In a checkout: the key of the source last installed into it, and the tree it holds once installed.
 SOURCE, TREE = "source", "tree"
 # In a checkout: for each build (`engine.build_key`) it keeps, the units its latest build
@@ -357,7 +377,7 @@ UPLIFTED_FROM = ("deps", "examples")
 # count still to come).
 UNRECORDED = "unrecorded"
 # The cargo commands whose units a build keeps (`Runner._units`).
-CARGO_BUILDS = ("build", "check", "test", "bench", "rustc")
+CARGO_BUILDS = ("build", "check", "clippy", "test", "bench", "rustc")
 # How warm a claimed checkout's target is for the run's source, so how long its build takes:
 # last installed from that source, from another source (rebuilds what differs), or built from
 # nothing (a new checkout).
@@ -801,7 +821,7 @@ class Session:
             held = held_checkouts(live)
             if (held | {keep}) - set(sizes):
                 return None
-            before = shutil.disk_usage(self.rig.root).free
+            before = room_free(self.rig.root)
             fallback = largest(self.rig.directory)
             entries = checkout_entries(live)
 
@@ -819,11 +839,11 @@ class Session:
             building = {key for key, runs in holders.items() if key not in mine and not runs <= later}
             others = {key: runs for key, runs in holders.items() if key in building and not runs & later}
             needed = sum(growth(key) for key in mine | building)
-            removed = _remove_least_recent(self.rig.root, live, keep, needed)
+            removed = _remove_least_recent(self.rig.root, live, {keep}, needed)
             return {
                 "removed": removed,
-                "free_bytes": shutil.disk_usage(self.rig.root).free,
-                "freed_bytes": shutil.disk_usage(self.rig.root).free - before,
+                "free_bytes": room_free(self.rig.root),
+                "freed_bytes": room_free(self.rig.root) - before,
                 "needed_bytes": needed,
                 "own_bytes": sum(growth(key) for key in own),
                 "releasable_bytes": sum(sizes[key] for key in others),
@@ -913,14 +933,16 @@ def _remove_tree(path: str) -> None:
     shutil.rmtree(path, **({"onexc": gone} if sys.version_info >= (3, 12) else {"onerror": gone}))
 
 
-def _least_recent(root: str, live: list, keep) -> list:
-    """The checkouts no live run holds (but `keep`) and the directories of gone runs, never an
-    ended one not yet fetched, least recently used first: each as `(kind, name)`. Call guarded."""
+def _least_recent(root: str, live: list, keep: set) -> list:
+    """What a run whose checkouts are `keep` may evict, the one owner of it (its eviction,
+    `_remove_least_recent`, and the room placement counts it to find, `room`): the checkouts
+    no live run holds, but its own, and the directories of gone runs, never an ended one not
+    yet fetched, least recently used first: each as `(kind, name)`. Call guarded."""
     base, runs = os.path.join(root, "checkouts"), os.path.join(root, "runs")
     held, running = held_checkouts(live), {e["run"] for e in live}
     candidates = [
         (_mtime(os.path.join(base, key, "used")), "checkouts", key)
-        for key in _directories(base) if key not in held and key != keep
+        for key in _directories(base) if key not in held and key not in keep
     ] + [
         (_mtime(os.path.join(runs, run)), "runs", run)
         for run in _directories(runs) if run not in running
@@ -942,12 +964,12 @@ def _unheld_outputs(root: str, live: list) -> list:
     return [key for key in _directories(os.path.join(root, OUTPUTS)) if key not in held]
 
 
-def _remove_least_recent(root: str, live: list, keep, wanted: float) -> list:
+def _remove_least_recent(root: str, live: list, keep: set, wanted: float) -> list:
     """Remove the least recently used of `_least_recent` until the volume has `wanted` bytes
-    free: the paths removed, relative to the root. Call guarded."""
+    free beyond its floor (`room_free`): the paths removed, relative to the root. Call guarded."""
     removed = []
     for kind, name in _least_recent(root, live, keep):
-        if shutil.disk_usage(root).free >= wanted:
+        if room_free(root) >= wanted:
             break
         _remove_tree(os.path.join(root, kind, name))
         removed.append("%s/%s" % (kind, name))
@@ -957,7 +979,7 @@ def _remove_least_recent(root: str, live: list, keep, wanted: float) -> list:
 def _move_least_recent(root: str, live: list, trash: str):
     """Move the least recently used checkout no live run holds into `trash` (no run takes it
     from there): its name and where it was moved, or None when there is none. Call guarded."""
-    for kind, name in _least_recent(root, live, None):
+    for kind, name in _least_recent(root, live, set()):
         if kind == "checkouts":
             os.makedirs(trash, exist_ok=True)
             aside = os.path.join(trash, "%s-%d-%d" % (name, os.getpid(), time.time_ns()))
@@ -1503,7 +1525,9 @@ class Runner:
         # What the current build's cargo steps reference (None before its first), and whether one
         # left it unknown (`_units`).
         self.units, self.unknown = None, False
-        self.tests = []  # the test executables the current build's cargo steps produced: (executable, manifest)
+        self.tests = []  # the test executables the current build's cargo steps produced: (executable, manifest, target, kind)
+        self.scripts = {}  # its build scripts' executables, by package id
+        self.build_scripts = {}  # its build scripts' executables, by the output directory each run wrote
         self.outputs = {}  # side -> its build output's directory
         self._phase_started = time.monotonic()
 
@@ -1578,23 +1602,26 @@ class Runner:
         its path under the output's `target`, and the list of the test executables with their
         packages' directories in the output's source (`TESTS`). The executables linked."""
         output, checkout = self.outputs[side], self.rig.checkout(self.checkouts[side])
-        tests, self.tests = self.tests, []
+        tests, self.tests, self.scripts, self.build_scripts = self.tests, [], {}, {}
         if os.path.exists(os.path.join(output, OUTPUT_DONE)):
             return 0
         target, into = os.path.realpath(os.path.join(checkout, "target")), os.path.join(output, "target")
         staged = os.path.join(output, ".target.%d" % os.getpid())
         os.makedirs(staged)
-        tests = [(os.path.realpath(path), manifest) for path, manifest in tests]
+        tests = [(os.path.realpath(path), manifest, name, kind) for path, manifest, name, kind in tests]
         with open(proven) as stream:
-            executables = set(json.load(stream)["kept"]) | {path for path, _ in tests}
+            executables = set(json.load(stream)["kept"]) | {path for path, *_ in tests}
         for path in executables:
             relative = os.path.relpath(path, target)
             os.makedirs(os.path.dirname(os.path.join(staged, relative)), exist_ok=True)
             os.link(path, os.path.join(staged, relative))
         source = os.path.join(checkout, "src")
-        listed = [{"executable": os.path.join(into, os.path.relpath(path, target)),
-                   "directory": os.path.join(output, "src", os.path.relpath(os.path.dirname(manifest), source))}
-                  for path, manifest in tests]
+        listed = []
+        for path, manifest, name, kind in tests:
+            package = os.path.relpath(os.path.dirname(manifest), source)
+            listed.append({"executable": os.path.join(into, os.path.relpath(path, target)),
+                           "directory": os.path.join(output, "src", package),
+                           "binary": binary_key(package, kind, name)})
         moved = self._move_in(staged, into, (os.path.join(output, TESTS), listed),
                               (os.path.join(output, OUTPUT_DONE), _now()))
         return len(executables) if moved else 0
@@ -1630,10 +1657,16 @@ class Runner:
                 self.events.output("stderr", message["message"]["rendered"])
             elif message.get("reason") == "compiler-artifact":
                 paths.extend(message["filenames"])
+                if "custom-build" in message["target"]["kind"]:
+                    self.scripts[message["package_id"]] = message["filenames"][0]
                 if message.get("executable") and message["profile"]["test"]:
-                    self.tests.append((message["executable"], message["manifest_path"]))
+                    target = message["target"]
+                    self.tests.append((message["executable"], message["manifest_path"], target["name"],
+                                       target_kind(target["kind"])))
             elif message.get("reason") == "build-script-executed":
                 paths.append(message["out_dir"])
+                # None where configuration overrides the script (`links`): nothing compiled it.
+                self.build_scripts[message["out_dir"]] = self.scripts.get(message["package_id"])
 
         return dict(request, argv=argv[:2] + [messages] + argv[2:]), output, paths
 
@@ -1695,7 +1728,8 @@ class Runner:
             short = (needed - free) / 1e9
             if free + evicted["releasable_bytes"] < evicted["own_bytes"]:
                 raise Failed(
-                    "%s: its building checkouts may grow by %.1f GB but only %.1f GB is free with "
+                    "%s: its building checkouts may grow by %.1f GB but only %.1f GB is free beyond "
+                    "the volume's floor (`SYSTEM_FLOOR`) with "
                     "every unheld checkout and ended run evicted (%.1f GB short), and the live runs' "
                     "checkouts would not cover its own %.1f GB as they end"
                     % (host, needed / 1e9, free / 1e9, short, evicted["own_bytes"] / 1e9))
@@ -1725,8 +1759,12 @@ class Runner:
         if "install" in op and op["install"] in self.shared:
             self.events.note("skipped `%s`: checkout %s holds this tree" % (" ".join(argv)[:160], self.checkouts[op["install"]]))
             return
+        short = short_volumes(self.rig.root, request["env"])
+        if short:
+            raise Failed(short_reason(short))
         if "tests" in op:  # the build's test executables, for its provenance step
-            _write_json(self._fill(op["tests"]), [list(test) for test in self.tests])
+            _write_json(self._fill(op["tests"]), {"tests": [list(test) for test in self.tests],
+                                                  "build_scripts": self.build_scripts})
         self.events.note("$ " + " ".join(argv))
         watch = None
         if "job" in op:
@@ -1758,7 +1796,9 @@ class Runner:
         if "job" in op:
             self.codes[op["job"]] = code
         elif op.get("check", True) and code != 0:
-            raise Failed("`%s` exited %d" % (" ".join(argv)[:160], code))
+            # Each path by its name, so the command shows what it ran whatever root it lies in.
+            named = " ".join(os.path.basename(argument) if os.path.isabs(argument) else argument for argument in argv)
+            raise Failed("`%s` exited %d" % (named[:160], code))
         if "install" in op:  # its output has the tree before any run can share the checkout
             self.snapshot(op["install"])
             self.session.installed(self.checkouts[op["install"]])
@@ -2120,8 +2160,9 @@ def fetched(arguments) -> int:
 def status(arguments) -> int:
     if not len(arguments.build) == len(arguments.tree) == len(arguments.source):
         raise SystemExit("status: one --tree and one --build for each --source")
-    found = report(arguments.root, list(zip(arguments.source, arguments.tree, arguments.build)), arguments.ahead_of)
-    print(json.dumps(dict(found, **capabilities(arguments.root, json.loads(arguments.env)))))
+    env = json.loads(arguments.env)
+    found = report(arguments.root, list(zip(arguments.source, arguments.tree, arguments.build)), arguments.ahead_of, env)
+    print(json.dumps(dict(found, **capabilities(arguments.root, env))))
     return 0
 
 
@@ -2149,7 +2190,7 @@ def waiting_request(live: list, run: str):
     return names[0] if names else None
 
 
-def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
+def report(root: str, sides: list, ahead_of: str | None = None, env: dict | None = None) -> dict:
     """The host's live entries, each with the time its run is expected to take still and how far
     it is past its estimate (`remaining`, `over`), the wait of a new request of each kind behind
     the runs holding or queued for a conflicting hold (each once, by its `remaining`: `waits`),
@@ -2159,7 +2200,9 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
     with its warmth for that source (None: none is free, a cold build), the commit it last built
     and whether it keeps that build (`built`); and the bytes its build may add as measured here (`need`,
     None when unmeasured), each build's measurements here (`measured`), the largest build of any
-    (`largest`), the slowest (`slowest`), and the room its builds would find (`room`). Given
+    (`largest`), the slowest (`slowest`), the room its builds would find (`room`), and the
+    volumes outside the rig root too full to run on, under the step environment `env`
+    (`short_volumes`, which a step refuses on: `short`). Given
     `ahead_of`, a run queued here, the host as that run sees it: only the other runs' entries
     that come before its waiting request (`comes_before`), and, while it waits for none, every
     other run, as a request it entered now would come after all of them."""
@@ -2195,9 +2238,12 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
                          need(rig.directory, None if name is None else os.path.join(base, name), build, None))
         # Only this protocol's runs record their waits.
         waited = {run: _waited(rig, run) for run in {e["run"] for e in live if e.get("protocol") == PROTOCOL}}
-        return live, live_runs, checkouts, needs, waited
+        # What its eviction could take: never the checkouts it would claim.
+        evictable = [name for kind, name in _least_recent(root, live, {c["name"] for c in checkouts if c})
+                     if kind == "checkouts"]
+        return live, live_runs, checkouts, needs, waited, evictable
 
-    entries, live_runs, checkouts, needs, waited = rig.guarded(read)
+    entries, live_runs, checkouts, needs, waited, evictable = rig.guarded(read)
     now = time.time()
     runs = {}  # run -> (remaining, over, queued, held), from any of its entries: each carries its run's info
     for e in entries:
@@ -2228,9 +2274,10 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
                     for e in entries],
         "waits": waits,
         "building": [owed for owed in (owing(entries, run, seconds, now) for run in live_runs) if owed > 0],
-        "room": room(root, entries, {run: left for run, (left, *_) in runs.items()}),
+        "room": room(root, entries, {run: left for run, (left, *_) in runs.items()}, evictable),
         "device_lock_held_elsewhere": legacy,
-        "free_bytes": shutil.disk_usage(root).free,
+        "free_bytes": room_free(root),
+        "short": short_volumes(root, env or {}),
         "checkouts": checkouts,
         "needs": needs,
         "measured": {build: _measured(rig.directory, build) for _, _, build in sides},
@@ -2240,9 +2287,59 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
     return found
 
 
-def room(root: str, live: list, left: dict) -> dict:
+# The bytes each volume a run writes keeps free: the rig root's, whose room is what lies beyond
+# it (`room_free`), and each other one (`short_volumes`). Below it, Metal's shader caches,
+# temporary files and crash reports fail to write, and a Metal process dies of it silently, with
+# no test failure.
+SYSTEM_FLOOR = 5 << 30
+DARWIN_USER_CACHE_DIR = 65538  # `confstr`'s `_CS_DARWIN_USER_CACHE_DIR`: where Metal caches
+
+
+def short_volumes(root: str, env: dict) -> list[dict]:
+    """The volumes a run writes on outside the rig root `root` that hold less than `SYSTEM_FLOOR`
+    free, each by the first of its directories a run writes (`path`) and its free bytes: the
+    temporary directory of the step environment `env` and, on macOS, the user's cache directory
+    (where the system names one) and its crash reports. The rig root's own volume is never one:
+    its floor is in its room (`room_free`), which its runs' builds and evictions keep."""
+    paths = [env.get("TMPDIR") or os.environ.get("TMPDIR") or tempfile.gettempdir()]
+    if sys.platform == "darwin":
+        paths += [os.confstr(DARWIN_USER_CACHE_DIR), os.path.expanduser("~/Library/Logs/DiagnosticReports")]
+    paths = [os.path.abspath(path) for path in paths if path]
+    seen, found = {volume(root)[0]}, []
+    for path in paths:
+        device, free = volume(path)
+        if device not in seen and free < SYSTEM_FLOOR:
+            found.append({"path": path, "free_bytes": free})
+        seen.add(device)
+    return found
+
+
+def volume(path: str) -> tuple[int, int]:
+    """The volume `path` lies on, or would be made on, and its free bytes."""
+    path = os.path.abspath(path)
+    while not os.path.exists(path):  # the root always exists, so this ends
+        path = os.path.dirname(path)
+    return os.stat(path).st_dev, shutil.disk_usage(path).free
+
+
+def room_free(root: str) -> int:
+    """The bytes the rig root's volume holds free beyond `SYSTEM_FLOOR`, which its runs write
+    there too: the room every build's need and eviction counts (`room`, `Session.evict`), below
+    zero where the floor is not kept."""
+    return volume(root)[1] - SYSTEM_FLOOR
+
+
+def short_reason(short: list[dict]) -> str:
+    """Why a host whose `short_volumes` are `short` runs nothing."""
+    return "; ".join("%s has %.1f GB free, under the %.1f GB a run needs there (Metal caches, temporary "
+                     "files, crash reports)" % (found["path"], found["free_bytes"] / 1e9, SYSTEM_FLOOR / 1e9)
+                     for found in short)
+
+
+def room(root: str, live: list, left: dict, evictable: list) -> dict:
     """The room a new run's builds would find (`evict`), by the time each live run is expected
-    to take still (`left`, by run): the bytes free and in unheld checkouts (`available`), what
+    to take still (`left`, by run): the bytes free and in the checkouts it may evict
+    (`available`: `evictable`, `_least_recent`'s for it, never its own), what
     the live checkouts' builds still owe (`owed`), and, the first ending first, each
     live checkout's run's end with the bytes that frees and the debt it ends (`ending`: each is
     evictable and owes nothing then). From the recorded sizes and needs, measuring nothing."""
@@ -2253,7 +2350,7 @@ def room(root: str, live: list, left: dict) -> dict:
     debt = lambda name: max(owed(entry, fallback) for entry in held[name])
     ends = lambda name: max(left[entry["run"]] for entry in held[name])  # once every holder has ended
     return {
-        "available": shutil.disk_usage(root).free + sum(size(name) for name in _directories(base) if name not in held),
+        "available": room_free(root) + sum(size(name) for name in evictable),
         "owed": sum(debt(name) for name in held),
         "ending": [[end, size(name), owes] for end, name, owes in sorted((ends(name), name, debt(name)) for name in held)],
     }

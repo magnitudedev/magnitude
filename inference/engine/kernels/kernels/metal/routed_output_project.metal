@@ -3,6 +3,7 @@
 // and gathered projections (`lib/routed/output.h`), published in A into
 // result 0 for `routed_output_sited`.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ROUTED_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
 #include "lib/routed/output.h"
 

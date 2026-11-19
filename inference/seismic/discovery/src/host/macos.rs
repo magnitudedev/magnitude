@@ -577,3 +577,26 @@ pub(super) fn pin(_cpus: &[usize]) -> Result<(), String> {
 pub(super) fn device_node(_location: crate::PciLocation) -> Result<crate::DeviceNode, String> {
     Ok(crate::DeviceNode::Unknown)
 }
+
+/// The machine's names (`crate::machine`): Apple and `hw.model` (an opaque
+/// identifier such as `Mac16,5`), and `system_profiler`'s marketing name
+/// (`SPHardwareDataType`'s `machine_name`, such as "MacBook Pro"). macOS
+/// reports no enclosure type. A field it does not report reads as nothing.
+pub(super) fn machine() -> crate::machine::Firmware {
+    let name = std::process::Command::new("/usr/sbin/system_profiler")
+        .args(["SPHardwareDataType", "-json"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+        .and_then(|document| {
+            let name = document.get("SPHardwareDataType")?.as_array()?.first()?.get("machine_name")?.as_str()?;
+            Some(name.as_bytes().to_vec())
+        });
+    crate::machine::Firmware {
+        manufacturer: b"Apple".to_vec(),
+        model: sysctl_bytes("hw.model").unwrap_or_default(),
+        name: name.unwrap_or_default(),
+        ..crate::machine::Firmware::default()
+    }
+}

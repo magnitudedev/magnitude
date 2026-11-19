@@ -442,11 +442,11 @@ pub struct OperandCarry {
     pub activation: RepresentationId,
 }
 
-/// The u32 words of one Q8 block (`forms::CPU_Q8_BYTES`) in a carry's
+/// The u32 words of one Q8 block (`cpu::CPU_Q8_BYTES`) in a carry's
 /// `quantized` port: its blocks are opaque words, as a call's scratch is
 /// bytes.
-pub const OPERAND_CARRY_BLOCK_WORDS: u64 = seismic_lang::forms::CPU_Q8_BYTES / 4;
-const _: () = assert!(seismic_lang::forms::CPU_Q8_BYTES % 4 == 0, "a Q8 block is whole u32 words");
+pub const OPERAND_CARRY_BLOCK_WORDS: u64 = seismic_lang::cpu::CPU_Q8_BYTES / 4;
+const _: () = assert!(seismic_lang::cpu::CPU_Q8_BYTES % 4 == 0, "a Q8 block is whole u32 words");
 
 /// The representation and extents of each port of a carry of `rows` rows of
 /// `width` values: its rows, then its Q8 blocks ([`OperandCarry`]).
@@ -457,7 +457,7 @@ pub fn operand_carry_ports(rows: u64, width: u64) -> [(RepresentationId, [u64; 2
         (representation("f32"), [rows, width]),
         (
             representation("u32"),
-            [rows, width.div_ceil(seismic_lang::forms::CPU_Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS],
+            [rows, width.div_ceil(seismic_lang::cpu::CPU_Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS],
         ),
     ]
 }

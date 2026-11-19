@@ -20,14 +20,16 @@ impl ModelLoadPlan {
         flights: FlightDepth,
         substrate: BankSubstrate,
     ) -> Result<u64, PlanError> {
-        let whole = self.clone().with_expert_bank(definition, routed_experts(definition)?, places, flights, substrate)?;
+        let whole = self.clone().with_expert_bank(definition, routed_experts(definition)?, None, places, flights, substrate)?;
         Ok(whole.bank.as_ref().expect("a banked plan holds its bank").floor())
     }
 
     /// The plan with every routed layer of the target's experts held in an
     /// expert bank of `slots` committed records per layer (at least its
     /// floor, [`ExpertBankPlan::floor`], at most the widest layer's experts)
-    /// for prompt groups of up to `places` chain places, on `substrate`:
+    /// for prompt groups of up to `places` chain places, its scratch
+    /// `window_slots` experts of a layer at once (`None`: the widest
+    /// layer's), on `substrate`:
     /// its records in its store's records pool, beside the host tier it holds (a bank streams only
     /// beside one). Each expert stack is planned `Banked`, its shape its
     /// group's records (their ceiling), charged its committed records (and
@@ -44,6 +46,7 @@ impl ModelLoadPlan {
         mut self,
         definition: &ModelDefinition,
         slots: u64,
+        window_slots: Option<u64>,
         places: u64,
         flights: FlightDepth,
         substrate: BankSubstrate,
@@ -122,7 +125,7 @@ impl ModelLoadPlan {
         // A conveyor or a scratch without a layout, or a pool without a
         // granule, is refused here, so every sizing past this may rely on
         // them (`ExpertBankPlan::prompt_records`, `ExpertBankPlan::granule`).
-        let structured = conveyor::Structured::new(selected, host, groups, layers, None)
+        let structured = conveyor::Structured::new(selected, host, groups, layers, window_slots)
             .map_err(PlanError::InvalidDefinition)?;
         // Every stored table whose slots the host fills in place, held in
         // granules of the bank's pool: only where the host writes it.
@@ -226,25 +229,19 @@ impl ModelLoadPlan {
         Ok(load)
     }
 
-    /// The plan with its expert bank's scratch bounded to `window_slots`,
-    /// updating its lending, each banked stack's shape, and its committed
-    /// records (clamped to at least the new floor).
-    pub(crate) fn with_window_slots(mut self, window_slots: u64) -> Result<Self, PlanError> {
-        let bank = self.bank.take().ok_or(PlanError::Topology("a plan without a bank has no window"))?;
-        let bank = bank.with_window_slots(window_slots).map_err(PlanError::InvalidDefinition)?;
-        for weight in &mut self.target {
-            let Some((_, layer)) = bank.layer(weight.role.scope) else {
-                continue;
-            };
-            if RoutedTensor::of(weight.role.kind).is_none() {
-                continue;
-            }
-            weight.shape[0] = bank.records(layer.group);
-        }
-        let slots = bank.slots.max(bank.floor()).min(bank.ceiling);
-        let ceiling = bank.ceiling;
-        self.bank = Some(bank);
-        self.with_bank_slots(slots, ceiling)
+    /// The plan with its experts banked as `bank` holds them, at its slots,
+    /// ceiling, host slots, launches and residency, its scratch
+    /// `window_slots` experts of a layer at once: the bank
+    /// [`Self::with_expert_bank`] builds of this plan's weights unbanked,
+    /// whose floor is of that window from the first.
+    pub(crate) fn banked_as(self, definition: &ModelDefinition, bank: &ExpertBankPlan, window_slots: u64) -> Result<Self, PlanError> {
+        let mut load = self
+            .unbanked()
+            .with_expert_bank(definition, bank.slots, Some(window_slots), bank.places, bank.flights, bank.substrate())?
+            .with_bank_slots(bank.slots, bank.ceiling)?;
+        let built = load.bank.as_mut().expect("the load was just banked");
+        (built.host_slots, built.pass, built.resident) = (bank.host_slots, bank.pass, bank.resident);
+        Ok(load)
     }
 
     /// The plan without its expert bank: each banked expert stack planned

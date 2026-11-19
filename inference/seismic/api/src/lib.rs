@@ -32,7 +32,17 @@ pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
     use super::{Availability, BackendName, DeviceTopology, Executor};
 
-    pub use seismic_lang::registry::requested_test_backend as requested_backend;
+    /// The backend the test runner requests
+    /// ([`seismic_lang::registry::requested_test_backend`]), recorded as the
+    /// current test asking it: a test that chooses its devices by it is a
+    /// device test, judged by what it ran
+    /// ([`seismic_lang::registry::record_test_asked`]).
+    pub fn requested_backend() -> Option<BackendName> {
+        let requested = seismic_lang::registry::requested_test_backend();
+        seismic_lang::registry::record_test_asked(requested);
+        requested
+    }
+    pub use seismic_lang::registry::record_test_selected_none as record_selected_none;
     pub use seismic_lang::registry::{
         test_setup_only as setup_only, TEST_SETUP_CHECKED as SETUP_CHECKED,
         TEST_SETUP_UNCHECKED as SETUP_UNCHECKED,
@@ -104,7 +114,9 @@ pub mod testing {
 
     /// [`selected`] under the backend `requested`.
     fn selected_under(requested: Option<BackendName>, topology: &DeviceTopology, backend: BackendName) -> Option<&Executor> {
-        if requested.is_some_and(|requested| requested != backend) {
+        if let Some(requested) = requested.filter(|requested| *requested != backend) {
+            // Selecting `backend`, the test selects none of the backend the run requests.
+            seismic_lang::registry::record_test_selected_none(requested);
             return None;
         }
         let found = topology
@@ -119,6 +131,9 @@ pub mod testing {
                 .map(|executor| format!("{}: {:?}", executor.selector(), executor.availability()))
                 .collect::<Vec<_>>();
             panic!("the run requests {backend:?}, and this host has no available {backend:?} executor: {listed:?}");
+        }
+        if found.is_none() {
+            seismic_lang::registry::record_test_selected_none(backend);
         }
         found
     }
@@ -370,7 +385,7 @@ pub fn device_block_packing(backend: BackendName) -> Option<DeviceBlockPacking> 
 mod slab;
 pub use seismic_discovery::{
     device_node, host_sample, pin, place_process, volume_available, volume_identity, Core, DeviceNode, DiscoveryError,
-    Counted, Harm, HostSample, Inventory, Lag, MemoryNode, ObservationError, OwnCold, OwnReclaimed, PciLocation,
+    Counted, Harm, HostSample, Inventory, Lag, Machine, MachineFormFactor, MachineIdentity, MemoryNode, ObservationError, OwnCold, OwnReclaimed, PciLocation,
     PressureEvents, PressureLevel, PressureWaker, ProcessPlacement, Processors, ProcessorsReportedBy, RuntimeStatus,
     Sample, Status, Supply, Wake, WiredFigures, WiredLimit,
 };
@@ -2287,6 +2302,13 @@ pub unsafe trait Entry: 'static {
     fn workflow_outputs(results: Self::WorkflowResults) -> Vec<generated::WorkflowResultRef>;
 }
 
+/// An entry none of whose native implementations, on any backend, declares
+/// a tuning parameter: its static values alone specialize it, so it is
+/// prepared without a tuning case. `seismic-build` implements it for every
+/// such entry and for no other, so preparing an entry that declares tuning
+/// parameters as an untuned one does not compile.
+pub trait Untuned: Entry {}
+
 /// A prepared kernel for one entry on one device under one precision
 /// policy. `call` validates, selects, allocates, and executes (§14.4).
 pub struct Kernel<E: Entry> {
@@ -4197,7 +4219,7 @@ impl NativeGraphMetadata {
         width: Dim,
         activation: Element,
     ) -> Result<OperandCarry, NativeGraphMetadataError> {
-        let blocks = width.ceil_div(seismic_lang::forms::CPU_Q8_VALUES)
+        let blocks = width.ceil_div(seismic_lang::cpu::CPU_Q8_VALUES)
             * seismic_runtime::native::graph::OPERAND_CARRY_BLOCK_WORDS;
         let shape = [rows.recorded(), width.recorded()];
         Ok(OperandCarry {

@@ -51,9 +51,11 @@ pub struct EngineConfiguration {
 
 /// The two authorities produced by host resolution: host artifacts (chat
 /// semantics) stay on the host, while the owned, serializable manifest is the
-/// only value a numerical worker needs.
+/// only value a numerical worker needs. The host artifacts are shared from
+/// resolution on: every engine and configuration that serves them holds them
+/// so, and a resolution moved through its callers moves only the manifest.
 pub struct ResolvedEngineConfiguration {
-    pub host: HostArtifacts,
+    pub host: Arc<HostArtifacts>,
     pub manifest: ExecutionManifest,
 }
 
@@ -88,7 +90,7 @@ impl EngineConfiguration {
             self.release,
         )
         .map_err(invalid)?;
-        Ok(ResolvedEngineConfiguration { host, manifest })
+        Ok(ResolvedEngineConfiguration { host: Arc::new(host), manifest })
     }
 }
 
@@ -240,7 +242,9 @@ pub fn settle_prices(manifest: &ExecutionManifest) -> Result<u64, LoadError> {
             .map(drop)
             .map_err(|stopped| internal(format!("the plan's prices are pending, and {stopped}")))
     };
-    now(priced(
+    // Settled once the preview is no longer pending: what it then previews
+    // is the load's to report, not this.
+    let _previewed = now(priced(
         || std::future::ready(manifest.preview(&catalog)),
         || std::future::ready(manifest.request_prices(&catalog).map_err(internal)),
         || std::future::ready(measured()),
@@ -328,7 +332,6 @@ pub fn start_in_process(
     progress: impl FnMut(LoadProgress),
 ) -> Result<ReadyEngine, LoadError> {
     let ResolvedEngineConfiguration { host, manifest } = resolved;
-    let host = Arc::new(host);
     // The load's attempts and the Prepare report to one observer, in turn.
     let progress = std::cell::RefCell::new(progress);
     let attempt = |unprepared| -> Result<LoadAttempt<ReadyEngine>, LoadError> {

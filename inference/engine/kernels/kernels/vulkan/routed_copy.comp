@@ -4,6 +4,7 @@
 // (streaming/list_copy.hpp), each record reached through its tensor's record
 // table.
 #include <seismic/slab.glsl>
+#include <seismic/repack.glsl>
 #include "lib/streaming/control.glsl"
 #include "../streaming/list.hpp"
 
@@ -13,10 +14,10 @@
 
 // The bytes of one unit of the source's strides: a row layout's stored row,
 // any other's packet (a dense element's packet is one element).
-#if defined(SEISMIC_SOURCE_KIND_PACKED) && !defined(SEISMIC_SOURCE_LAYOUT_PACKET)
-#define COPY_STRIDE_BYTES uint64_t(SEISMIC_SOURCE_ROW_STRIDE_BYTES)
+#if REPACK_ROWS(SEISMIC_SOURCE)
+#define COPY_STRIDE_BYTES uint64_t(REPACK_ROW_BYTES(SEISMIC_SOURCE))
 #else
-#define COPY_STRIDE_BYTES uint64_t(SEISMIC_SOURCE_PACKET_SIZE)
+#define COPY_STRIDE_BYTES uint64_t(REPACK_PACKET_BYTES(SEISMIC_SOURCE))
 #endif
 
 void routed_copy() {

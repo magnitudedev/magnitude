@@ -24,11 +24,14 @@ describe("local inference hardware projection", () => {
 })
 
 const GiB = 1024 ** 3
-const snapshot = (freeMemory: number, freeDisk: number, logicalCores = 8): LocalInferenceHardware =>
+const snapshot = (freeMemory: number, freeDisk: number, logicalCpus = 8): LocalInferenceHardware =>
   Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
     platform: "Linux",
     architecture: "X64",
-    logicalCores,
+    identity: { _tag: "Unavailable", formFactor: "Unknown" },
+    chipCores: 4,
+    logicalCpus,
+    cpuPoolCores: 4,
     totalSystemMemoryBytes: 32 * GiB,
     accelerators: [{ acceleratorId: "gpu", name: "Test GPU", executors: [{ deviceId: "primary", backend: "cuda", memoryDomainIds: ["cuda-0"] }] }],
     activeDeviceId: "primary",

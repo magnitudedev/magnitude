@@ -21,7 +21,7 @@ use crate::operators::attention::tests::selected::{self, CompressedForm};
 use magnitude_artifacts::{Package, gguf::Encoding};
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::KvCodec;
-use crate::domain::fixtures::loaded::{Banked, Pricing, fixture, fixture_of, fixture_stored, fixture_valued, fixture_with, limits, load, load_coded, load_with};
+use crate::domain::fixtures::loaded::{Banked, LoadRequest, Machine, Pricing, fixture, fixture_of, fixture_stored, fixture_valued, fixture_with, limits, load, load_read, load_with};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -236,16 +236,17 @@ fn a_verification_row_scores_its_history_as_plain_decode_does() {
         for (name, (_, definition, package), method, banked) in &loads {
             let banked = if STREAMING_BACKENDS.contains(&backend) { *banked } else { Banked::Resident };
             for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
-                let (mut domain, mut bindings, _, _) = load_coded(
-                    &catalog,
+                let (mut domain, mut bindings, _, _) = load_read(&LoadRequest {
+                    catalog: &catalog,
                     definition,
                     package,
                     backend,
-                    ResourceLimits { max_selected_rows: ROWS, ..limits(ROWS, false, 1, ROWS) },
+                    limits: ResourceLimits { max_selected_rows: ROWS, ..limits(ROWS, false, 1, ROWS) },
                     banked,
-                    *method,
+                    method: *method,
                     codec,
-                );
+                    machine: Machine::Live,
+                });
                 // `request`'s prompt, in launches of up to ROWS rows.
                 let prompted = |domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, request: RequestId| {
                     domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();

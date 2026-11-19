@@ -8,6 +8,7 @@
 // classes in a pass after their qkv projection, from the values the
 // threadgroup published. Channels of the window rows must be contiguous
 // (unit stride), as the step requires.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_QKV_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_ALPHA_WEIGHT
@@ -19,7 +20,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
 // The rows every weight takes (the normalized rows, or NVFP4 operands).
 constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
@@ -35,13 +36,13 @@ struct ConvolvedRow {
     long stop;
     long kept;
     long taped;
-    slab::Table<activation> source;
-    slab::Table<activation> target;
+    slab::Table<activation_element> source;
+    slab::Table<activation_element> target;
 };
 
 // Threads 0..M-1 resolve row `thread_index`'s slot into `rows`; the caller
 // barriers before the epilogue reads them.
-inline void convolved_rows(versions::Slots slots, device const slab::Table<activation> *window,
+inline void convolved_rows(versions::Slots slots, device const slab::Table<activation_element> *window,
     threadgroup ConvolvedRow *rows, uint thread_index, constant ulong *seismic_words) {
     if (thread_index >= SEISMIC_DIM_M)
         return;
@@ -80,7 +81,7 @@ inline float row_sum(thread const float (&sums)[N], ulong index) {
 }
 
 struct ConvolvedChannel {
-    element::Out<activation> projection;
+    element::Out<activation_element> projection;
     ulong projection0, projection1;
     element::Out<element::F32> convolved;
     ulong convolved0, convolved1;
@@ -101,18 +102,18 @@ struct ConvolvedChannel {
         const long taps = long(SEISMIC_DIM_C) - 1;
         const long local = long(m) - row.lo;
         const ulong channel = ulong(n);
-        device const activation::storage *source = slab::view(row.source);
+        device const activation_element::storage *source = slab::view(row.source);
         float sum = 0.0f;
         PROJECTION_UNROLL for (uint tap = 0; tap < SEISMIC_DIM_C; ++tap) {
             const long position = local + long(tap) - taps;
             const float input = position < 0
-                ? activation::load(source[ulong(row.taped + taps + position) * SEISMIC_WINDOW_STRIDE_1 + channel])
+                ? activation_element::load(source[ulong(row.taped + taps + position) * SEISMIC_WINDOW_STRIDE_1 + channel])
                 : value(ulong(row.lo + position));
             sum = metal::fma(convolution[channel * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1],
                 input, sum);
         }
         out.put(0, sum / (1.0f + metal::exp(-sum)));
-        const element::Out<activation> target = slab::out(row.target);
+        const element::Out<activation_element> target = slab::out(row.target);
         const long kept = local - row.stop + taps;
         if (kept >= 0 && kept < row.kept)
             target.put(ulong(kept) * SEISMIC_WINDOW_STRIDE_1 + channel, value(ulong(m)));
@@ -134,7 +135,7 @@ struct ConvolvedChannel {
     template <uint N>
     void store_column(uint m, uint n, thread const float (&sums)[N]) const {
         projection.put(ulong(m) * projection0 + ulong(n) * projection1, row_sum(sums, m));
-        convolve(m, n, [&](ulong j) { return activation::round(row_sum(sums, j)); });
+        convolve(m, n, [&](ulong j) { return activation_element::round(row_sum(sums, j)); });
     }
 
     // The GEMV classes' pass after their projection of channels first ..
@@ -178,27 +179,27 @@ struct ConvolvedChannel {
 // rows of the matrix GEMV; the qkv segment's epilogue convolves, from the
 // rows' slots (`slot_rows`, resolved by its threadgroups first).
 #define RECURRENT_PROJECT_RAW                                                           \
-    projection::InputOf<activation, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+    projection::InputOf<activation_element, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
         raw{hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, input_norm,        \
         SEISMIC_INPUT_NORM_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}}
 #define PROJECTION_OPERANDS                                                             \
     const uint m = uint(SEISMIC_DIM_M), k = uint(SEISMIC_DIM_H);                        \
     RECURRENT_PROJECT_RAW;                                                              \
-    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    const projection::Plain<activation_element, projection::AllRows> in{normalized, k, 1, k, {}}; \
     threadgroup ConvolvedRow slot_rows[16];                                             \
-    projection::Weights<packets::W0> w0{qkv_weight, KERNEL_W0_LAYOUT(k), k};            \
-    projection::Weights<packets::W1> w1{gate_weight, KERNEL_W1_LAYOUT(k), k};           \
-    projection::Weights<packets::W2> w2{alpha_weight, KERNEL_W2_LAYOUT(k), k};          \
-    projection::Weights<packets::W3> w3{beta_weight, KERNEL_W3_LAYOUT(k), k};           \
-    ConvolvedChannel out0{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
+    projection::Weights<packets::W0> w0{{qkv_weight, KERNEL_W0_LAYOUT(k), k}};          \
+    projection::Weights<packets::W1> w1{{gate_weight, KERNEL_W1_LAYOUT(k), k}};         \
+    projection::Weights<packets::W2> w2{{alpha_weight, KERNEL_W2_LAYOUT(k), k}};        \
+    projection::Weights<packets::W3> w3{{beta_weight, KERNEL_W3_LAYOUT(k), k}};         \
+    ConvolvedChannel out0{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, element::Out<element::F32>(convolved_cells),         \
         SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, convolution, slot_rows,   \
         seismic_words};                                                                 \
-    projection::Store<activation> out1{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+    projection::Store<activation_element> out1{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
         PROJECTION_FIRST_1};                                                            \
-    projection::Store<activation> out2{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+    projection::Store<activation_element> out2{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
         PROJECTION_FIRST_2};                                                            \
-    projection::Store<activation> out3{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+    projection::Store<activation_element> out3{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
         PROJECTION_FIRST_3}
 
 // The GEMV's rows: the norm applied as they stage, from their sums of

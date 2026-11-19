@@ -1,5 +1,6 @@
 // dense_output: the down projection of the product rows plus the F32
 // residual, the forms of the `dense` projection (`lib/projection/operator.cuh`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #include "lib/projection/operator.cuh"
 

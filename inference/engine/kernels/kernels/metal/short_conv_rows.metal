@@ -6,6 +6,7 @@
 // and backend gives the same bits. The successor window is no slot's source,
 // so the publishing threads run beside the row threads.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/recurrent/versions.h"
 
@@ -54,7 +55,7 @@ kernel void short_conv_rows(
     const long row = long(group.y);
     const ulong slot_index = versions::slot_index_of_row(slots, row, seismic_words);
     const ulong out = ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
-    const element::Out<element::Act> result(gated);
+    const element::Out<activation::Act> result(gated);
     if (slot_index == SEISMIC_DIM_B) {
         result.put(out, 0.0f);
         return;

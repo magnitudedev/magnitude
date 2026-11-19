@@ -20,6 +20,15 @@
 #define ELEMENT_PROBE_1 ~, 1
 #define ELEMENT_IS_ONE(value) ELEMENT_SECOND(ELEMENT_CAT(ELEMENT_PROBE_, value))
 #define ELEMENT_HAS(prefix, suffix) ELEMENT_IS_ONE(ELEMENT_CAT(prefix, suffix))
+// `(yes, no)` after it: `yes` where `flag` (a 0 or 1 token, such as
+// `ELEMENT_HAS`'s) is 1, else `no`; and `yes` where `<prefix><suffix>` is
+// defined as 1, else `no`. The other is dropped, so it may name a macro its
+// tensor does not define.
+#define ELEMENT_PICK_1(yes, no) yes
+#define ELEMENT_PICK_0(yes, no) no
+#define ELEMENT_PICK_(flag) ELEMENT_PICK_##flag
+#define ELEMENT_PICK(flag) ELEMENT_PICK_(flag)
+#define ELEMENT_WHEN(prefix, suffix, yes, no) ELEMENT_PICK(ELEMENT_HAS(prefix, suffix))(yes, no)
 
 namespace element {
 
@@ -213,19 +222,38 @@ inline void span(device const typename E::native *from, thread float (&x)[N]) {
         x[i] = float(from[i]);
 }
 
-// The element type of a dense representation kind: 0 = f32, 1 = bf16,
-// 2 = f16. Other kinds have none.
+// The dense representation kinds (`ELEMENT_KIND`), usable in `#if`; the
+// names every backend's library gives them.
+#define ELEMENT_F32 0
+#define ELEMENT_BF16 1
+#define ELEMENT_F16 2
+
+// The element type of a dense representation kind. Other kinds have none.
 template <int KIND> struct Of;
-template <> struct Of<0> { typedef F32 type; };
-template <> struct Of<1> { typedef Bf16 type; };
-template <> struct Of<2> { typedef F16 type; };
+template <> struct Of<ELEMENT_F32> { typedef F32 type; };
+template <> struct Of<ELEMENT_BF16> { typedef Bf16 type; };
+template <> struct Of<ELEMENT_F16> { typedef F16 type; };
 
 } // namespace element
 
+// The dense representation kind of the tensor or element parameter `prefix`
+// (`ELEMENT_F32`, `ELEMENT_BF16`, `ELEMENT_F16`), -1 for any other; usable in `#if`.
 #define ELEMENT_KIND(prefix)                                                                       \
-    (ELEMENT_HAS(prefix, _REPRESENTATION_F32)    ? 0                                               \
-     : ELEMENT_HAS(prefix, _REPRESENTATION_BF16) ? 1                                               \
-     : ELEMENT_HAS(prefix, _REPRESENTATION_F16)  ? 2                                               \
+    (ELEMENT_HAS(prefix, _REPRESENTATION_F32)    ? ELEMENT_F32                                     \
+     : ELEMENT_HAS(prefix, _REPRESENTATION_BF16) ? ELEMENT_BF16                                    \
+     : ELEMENT_HAS(prefix, _REPRESENTATION_F16)  ? ELEMENT_F16                                     \
                                                  : -1)
 // The element type of the dense tensor or element parameter `prefix`.
 #define ELEMENT_OF(prefix) typename element::Of<ELEMENT_KIND(prefix)>::type
+
+// The bytes of one unit of tensor `prefix`'s strides: a row layout's stored
+// row, any other's packet (a dense element's packet is one element).
+#define ELEMENT_STRIDE_BYTES(prefix)                                                                    \
+    ulong(ELEMENT_WHEN(prefix, _KIND_PACKED,                                                            \
+        ELEMENT_WHEN(prefix, _LAYOUT_PACKET, ELEMENT_CAT(prefix, _PACKET_SIZE),                         \
+                     ELEMENT_CAT(prefix, _ROW_STRIDE_BYTES)),                                           \
+        ELEMENT_CAT(prefix, _PACKET_SIZE)))
+// The bytes of one step along tensor `prefix`'s axis 0, its stride 0 of
+// units: a stacked [*, N, K] tensor's matrix (a record). The one statement,
+// which every writer and reader of a record addresses it by.
+#define ELEMENT_MATRIX_BYTES(prefix) (ulong(ELEMENT_CAT(prefix, _STRIDE_0)) * ELEMENT_STRIDE_BYTES(prefix))

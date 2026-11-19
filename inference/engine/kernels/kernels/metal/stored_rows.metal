@@ -2,6 +2,7 @@
 // representation, through the packet decoders, a thread per value, and round
 // once to the activation element. Slot s is row s % P of record s / P, read
 // where its storage holds the record (`records (slots)`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_SLOTS
 #include "lib/projection/projection.h"
 #include "lib/core/gathered.h"
@@ -15,7 +16,7 @@ kernel void stored_rows(
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
-    const element::Out<element::Act> rows(rows_cells);
+    const element::Out<activation::Act> rows(rows_cells);
     const ulong row = group.x;
     const uint column = group.y * 256u + thread_index;
     const uint width = uint(SEISMIC_DIM_W);
@@ -31,7 +32,7 @@ kernel void stored_rows(
     }
     const ulong per = ulong(SEISMIC_DIM_P);
     projection::Weights<packets::W0> table{
-        slab::region<uchar>(slots, ulong(held) / per), KERNEL_W0_LAYOUT(width), width, nullptr};
+        {slab::region<uchar>(slots, ulong(held) / per), KERNEL_W0_LAYOUT(width), width}, nullptr};
     typename packets::W0::packet packet = table.packet(uint(ulong(held) % per), column / 32u);
     rows.put(out, packets::value_at<packets::W0>(packet, column % 32u));
 }

@@ -81,7 +81,7 @@ fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
 pub fn describe_projector(
     directory: &Directory,
     target_width: u64,
-) -> Result<VisionDescription, Error> {
+) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("lfm3vl", ())], target_width)?;
     if let Some(entry) = directory
         .metadata
@@ -252,7 +252,7 @@ pub fn describe_projector(
         },
     ];
     tensors.finish()?;
-    let description = VisionDescription {
+    let description = Box::new(VisionDescription {
         // f16 intermediates around an F32 residual stream, the precision the
         // vision kernel family measured for its towers.
         activation_dtype: ActivationDType::F16,
@@ -288,7 +288,7 @@ pub fn describe_projector(
             feed_forward: None,
             output_norm: None,
         },
-    };
+    });
     description
         .validate()
         .map_err(|error| invalid(error.to_string()))?;

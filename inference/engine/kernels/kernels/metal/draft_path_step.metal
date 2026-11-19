@@ -1,10 +1,11 @@
 // draft_path_step: one threadgroup of 256 threads per row reduces each
 // candidate's score unary + (predecessor * hidden) . successor, then selects
 // the first highest-scoring candidate.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/reduce.h"
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 
 kernel void draft_path_step(
     device const int *candidates [[buffer(SEISMIC_BUFFER_CANDIDATES)]],
@@ -27,10 +28,10 @@ kernel void draft_path_step(
         float partial = 0.0f;
         for (ulong r = thread_index; r < rank; r += 256u) {
             const float joint =
-                element::at<activation>(predecessor, ulong(row) * SEISMIC_PREDECESSOR_STRIDE_0 + r * SEISMIC_PREDECESSOR_STRIDE_1) *
-                element::at<activation>(hidden, ulong(row) * SEISMIC_HIDDEN_STRIDE_0 + r * SEISMIC_HIDDEN_STRIDE_1);
+                element::at<activation_element>(predecessor, ulong(row) * SEISMIC_PREDECESSOR_STRIDE_0 + r * SEISMIC_PREDECESSOR_STRIDE_1) *
+                element::at<activation_element>(hidden, ulong(row) * SEISMIC_HIDDEN_STRIDE_0 + r * SEISMIC_HIDDEN_STRIDE_1);
             partial = metal::fma(joint,
-                element::at<activation>(successor, at * SEISMIC_SUCCESSOR_STRIDE_0 + r * SEISMIC_SUCCESSOR_STRIDE_1), partial);
+                element::at<activation_element>(successor, at * SEISMIC_SUCCESSOR_STRIDE_0 + r * SEISMIC_SUCCESSOR_STRIDE_1), partial);
         }
         const float score = reduce::group_sum<8>(partial, partials, sg, lane) +
             unary[ulong(row) * SEISMIC_UNARY_STRIDE_0 + candidate * SEISMIC_UNARY_STRIDE_1];

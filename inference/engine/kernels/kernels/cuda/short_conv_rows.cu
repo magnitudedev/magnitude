@@ -7,6 +7,7 @@
 // gives the same bits. The successor window is no slot's source, so the
 // publishing threads run beside the row threads.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 #include "lib/recurrent/versions.cuh"
 
@@ -18,7 +19,7 @@ struct Operands {
     const float *projection;
     const float *convolution;
     element::SlabOut<element::F32> window;
-    element::Out<element::Act> gated;
+    element::Out<activation::Act> gated;
     versions::Slots slots;
 };
 

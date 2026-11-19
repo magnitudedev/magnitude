@@ -2,6 +2,7 @@
 // representation, through the packet decoders, a thread per value, and round
 // once to the activation element. Slot s is row s % P of record s / P, read
 // where its storage holds the record (`records (slots)`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_SLOTS
 #include "lib/core/activation.glsl"
 #include "lib/core/gathered.glsl"
@@ -31,7 +32,7 @@ void stored_rows() {
         uint64_t record_at, slot_at;
         seismic_split(uint(held), per, record_at, slot_at);
         const uint64_t record = slab_region(slots, record_at);
-        const packets_packet packet = packets_load(PACKETS_W0, record + slot_at * geometry.stride,
+        const packets_packet packet = packets_load(PACKETS_W0, packets_row(record, geometry, slot_at),
             geometry, column / 32u, width);
         out_put(rows, at, packets_value_at(PACKETS_W0, packet, column % 32u));
     }

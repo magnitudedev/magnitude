@@ -37,10 +37,11 @@ kernel void copy_rows(
     slab::out_region(rows, ulong(destination_row) / slab_rows).move_stored(destination_offset,
         slab::out_region(rows, ulong(source_row) / slab_rows), source_offset, 1);
 #else
+    // An integer plane, of elements `unit` bytes each (its stride unit).
+    constexpr ulong unit = ELEMENT_STRIDE_BYTES(SEISMIC_ROWS);
     device const uchar *source = slab::region<uchar>(rows, ulong(source_row) / slab_rows);
     device uchar *target = slab::region<uchar>(rows, ulong(destination_row) / slab_rows);
-    for (ulong byte = 0; byte < SEISMIC_ROWS_PACKET_SIZE; ++byte)
-        target[destination_offset * SEISMIC_ROWS_PACKET_SIZE + byte]
-            = source[source_offset * SEISMIC_ROWS_PACKET_SIZE + byte];
+    for (ulong byte = 0; byte < unit; ++byte)
+        target[destination_offset * unit + byte] = source[source_offset * unit + byte];
 #endif
 }

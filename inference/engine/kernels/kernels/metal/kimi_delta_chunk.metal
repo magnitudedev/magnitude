@@ -1,5 +1,6 @@
 // kimi_delta_chunk: `lib/recurrent/chunk.h`'s launches over Kimi Delta
 // Attention's gates (one log decay per key channel).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/chunk.h"
 #include "lib/recurrent/kimi.h"
 
@@ -69,6 +70,6 @@ kernel void kimi_delta_chunk_gate(
     uint item [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
     recurrent::gate_row(mixed, versions::covered_end(segments, seismic_words), kimi::gate_input(gate, seismic_words),
-        recurrent_norm, element::Out<element::Act>(gated), item / RCH_VALUE_HEADS, item % RCH_VALUE_HEADS, lane,
+        recurrent_norm, element::Out<activation::Act>(gated), item / RCH_VALUE_HEADS, item % RCH_VALUE_HEADS, lane,
         seismic_words);
 }

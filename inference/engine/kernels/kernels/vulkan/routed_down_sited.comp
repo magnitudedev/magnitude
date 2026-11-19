@@ -4,6 +4,7 @@
 // published projections. The Vulkan form of `metal/routed_down_sited.metal`:
 // invocation 0 reads the CPU's answer when a choice is the CPU's
 // (`lib/routed/sited.glsl`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 #include "lib/streaming/control.glsl"
 #include "../streaming/site.hpp"

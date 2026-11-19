@@ -1,11 +1,12 @@
 // General expert selection (`routed_select`) on the `dense` projection
 // operator, single over `router` in the CPU 8-lane reference order; `norm` and
 // `router_norm` share the row's RMS inverse.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #include "lib/projection/projection.h"
 #include "lib/routed/selection.h"
 
-typedef element::Act Act;
+typedef activation::Act Act;
 typedef ELEMENT_OF(SEISMIC_NORM) Norm;
 typedef ELEMENT_OF(SEISMIC_ROUTER_NORM) RouterNorm;
 
@@ -36,7 +37,7 @@ typedef ELEMENT_OF(SEISMIC_ROUTER_NORM) RouterNorm;
         residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm,               \
         SEISMIC_NORM_STRIDE_0, eps, k, {}};                                                 \
     const projection::Plain<Act, projection::AllRows> in{staged, k, 1, k, {}};              \
-    const projection::Weights<packets::W0> w{router, KERNEL_W0_LAYOUT(k), k};               \
+    const projection::Weights<packets::W0> w{{router, KERNEL_W0_LAYOUT(k), k}};             \
     const projection::CoherentStore out{logits, SEISMIC_DIM_E, 1ul, 0ul}
 
 #define PROJECTION_GEMV_INPUT(x) const auto x = router_raw

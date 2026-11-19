@@ -2,7 +2,7 @@
 // multiply-adds into i32, in UNROLL independent accumulators seeded apart,
 // each one vector register of its tier's quantized dots
 // (`Isa::QUANTIZED_DOTS`), the instructions the INT8 form's dots issue
-// (`seismic::cpu::weights::quantized_dot`: `vpdpbusd` where the tier has
+// (`seismic::cpu::quantized_dot`: `vpdpbusd` where the tier has
 // VNNI, on whole 512-bit registers where the tier has them; AVX2 byte pair
 // products otherwise; NEON `sdot`; a tier with none is refused) in loop
 // iterations of ROUNDS rounds of every accumulator, so the loop's own
@@ -46,7 +46,7 @@ fn dots<L: Isa, const C: usize>(byte: i8, steps: usize) -> u32 {
             for _ in 0..steps / (64 * C * ROUNDS) {
                 for _ in 0..ROUNDS {
                     for sum in sums.iter_mut() {
-                        *sum = seismic::cpu::weights::quantized_dot_wide::<L>(*sum, operand, operand);
+                        *sum = seismic::cpu::quantized_dot_wide::<L>(*sum, operand, operand);
                     }
                 }
             }
@@ -72,7 +72,7 @@ fn dots<L: Isa, const C: usize>(byte: i8, steps: usize) -> u32 {
                         // opaquely, else they would be hoisted out of the
                         // loop and shared between accumulators.
                         let weights = if L::QUANTIZED_DOTS == 1 { std::hint::black_box(operand) } else { operand };
-                        *sum = seismic::cpu::weights::quantized_dot::<L>(*sum, weights, operand);
+                        *sum = seismic::cpu::quantized_dot::<L>(*sum, weights, operand);
                     }
                 }
             }
@@ -92,7 +92,7 @@ fn dots<L: Isa, const C: usize>(byte: i8, steps: usize) -> u32 {
             for _ in 0..steps / (16 * C * ROUNDS) {
                 for _ in 0..ROUNDS {
                     for sum in sums.iter_mut() {
-                        *sum = seismic::cpu::weights::quantized_dot_neon(*sum, operand, operand);
+                        *sum = seismic::cpu::quantized_dot_neon(*sum, operand, operand);
                     }
                 }
             }

@@ -67,3 +67,6 @@ seismic-std.workspace = true
 
 [build-dependencies]
 magnitude-source-identity = { path = "../source-identity" }
+
+[lints]
+workspace = true

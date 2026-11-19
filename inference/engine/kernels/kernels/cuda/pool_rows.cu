@@ -18,6 +18,7 @@
 //
 // Dynamic extents, strides and parameters read `seismic_words`.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 #include "lib/core/head.cuh"
 #include "lib/core/norm.cuh"
@@ -30,7 +31,7 @@ namespace pooled {
 
 typedef unsigned int u32;
 typedef unsigned long long u64;
-typedef element::Act Act;
+typedef activation::Act Act;
 // The row element Y: A for a history source's rows, F32 for indexer keys.
 typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) Row;
 

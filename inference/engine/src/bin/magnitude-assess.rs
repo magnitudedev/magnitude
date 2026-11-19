@@ -669,12 +669,10 @@ fn print_breakdown(
     setup: &AssessmentSetup,
     options: &Options,
 ) -> Result<(), magnitude_engine::assessment::ModelAssessmentError> {
-    let PreparedModelAssessment::Planned {
-        definition, execution, ..
-    } = prepared
-    else {
+    let PreparedModelAssessment::Planned { execution, .. } = prepared else {
         return Ok(());
     };
+    let definition = execution.definition();
     let Measurements::Measured { costs, .. } = &setup.measurements else {
         eprintln!(
             "magnitude-assess: {}: no breakdown without measurements",

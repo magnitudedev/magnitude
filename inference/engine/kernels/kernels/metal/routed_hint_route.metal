@@ -1,6 +1,7 @@
 // Ahead-of-step expert hints (`routed_hint_route`) on the `dense` projection
 // operator, segmented over `(next_router, after_router)` in the CPU 8-lane
 // reference order; segment 1 is zeroed when `AHEAD < 2`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_NEXT_ROUTER
 #define KERNEL_W1 SEISMIC_AFTER_ROUTER
 #define PROJECTION_N0 SEISMIC_DIM_EN
@@ -12,7 +13,7 @@
 #include "lib/streaming/control.h"
 #include "../streaming/hint.hpp"
 
-typedef element::Act Act;
+typedef activation::Act Act;
 typedef ELEMENT_OF(SEISMIC_NEXT_NORM) Norm;
 
 #define PROJECTION_ARGUMENTS                                                                \
@@ -38,8 +39,8 @@ typedef ELEMENT_OF(SEISMIC_NEXT_NORM) Norm;
         uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT)>::type raw1{                             \
         residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, after_norm,         \
         SEISMIC_AFTER_NORM_STRIDE_0, eps, k, {}};                                           \
-    const projection::Weights<packets::W0> w0{next_router, KERNEL_W0_LAYOUT(k), k};         \
-    const projection::Weights<packets::W1> w1{after_router, KERNEL_W1_LAYOUT(k), k};        \
+    const projection::Weights<packets::W0> w0{{next_router, KERNEL_W0_LAYOUT(k), k}};       \
+    const projection::Weights<packets::W1> w1{{after_router, KERNEL_W1_LAYOUT(k), k}};      \
     const projection::CoherentStore out0{logits, SEISMIC_DIM_EN, 1ul, 0ul}; \
     const projection::CoherentStore out1{logits + SEISMIC_DIM_M * SEISMIC_DIM_EN, SEISMIC_DIM_EN, 1ul, 0ul}
 

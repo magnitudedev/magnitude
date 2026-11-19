@@ -1818,7 +1818,8 @@ async fn streams_reasoning_content_tool_calls_finish_usage_and_timings() {
     assert_eq!(chunks[6]["usage"]["completion_tokens"], 7);
     assert_eq!(chunks[6]["usage"]["total_tokens"], 18);
     assert_eq!(chunks[6]["timings"]["prompt_ms"], 2.0);
-    assert_eq!(chunks[6]["timings"]["predicted_per_second"], 7_000.0 / 3.0);
+    assert_eq!(chunks[6]["timings"]["predicted_per_second"], 6_000.0 / 3.0);
+    assert_eq!(chunks[6]["timings"]["predicted_per_token_ms"], 3.0 / 6.0);
 }
 
 #[tokio::test]

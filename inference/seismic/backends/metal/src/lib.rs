@@ -15,6 +15,13 @@
 //!
 //! Metal exists on macOS only; the crate is empty elsewhere.
 #![cfg(target_os = "macos")]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
 
 pub mod model;
 

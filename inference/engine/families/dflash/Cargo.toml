@@ -16,3 +16,6 @@ magnitude-family-llama = { path = "../llama" }
 magnitude-family-lfm2 = { path = "../lfm2" }
 magnitude-family-muse-glimmer = { path = "../muse_glimmer" }
 magnitude-family-nemotron-h = { path = "../nemotron_h" }
+
+[lints]
+workspace = true

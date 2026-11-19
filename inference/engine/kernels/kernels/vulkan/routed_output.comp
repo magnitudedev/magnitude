@@ -7,6 +7,7 @@
 #define ROUTED_PROJECTED_INDEX(m, k, n) (((m) * (SEISMIC_DIM_K + 1ul) + (k)) * SEISMIC_DIM_H + (n))
 #define ROUTED_PROJECTED_PUT(m, k, n, value) \
     out_put(out_over_scratch(ROUTED_PROJECTED_KIND, ROUTED_PROJECTED_BASE), ROUTED_PROJECTED_INDEX(m, k, n), value)
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/routed/output.glsl"
 #include "lib/routed/output_sum.glsl"
 

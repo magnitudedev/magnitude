@@ -112,6 +112,7 @@ pub(crate) fn submit(
     domain: &Arc<Allocation>,
     steps: &[MoveStep<'_>],
 ) -> Result<Option<Arc<dyn DeviceCompletion>>, ExecutionError> {
+    device.ran_work();
     for step in steps {
         step.check(domain);
     }

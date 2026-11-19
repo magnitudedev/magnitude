@@ -53,13 +53,15 @@ fn advances(source: &str, bos: &str, choice: ToolChoice, output: &str, end: bool
 
 #[test]
 fn minicpm5_answers_in_text_or_calls_under_auto() {
-    // The generation prompt opens reasoning, which closes before the turn ends.
+    // The generation prompt opens reasoning. Without a required call the
+    // output may end inside it, read as reasoning; a required call follows
+    // it closed.
     let (text, call) = (
         "No tool needed.\n</think>\n\nHello!",
         "List them.\n</think>\n\n<function name=\"bash\"><param name=\"command\">ls</param></function>",
     );
     assert!(admits(MINICPM5, "<s>", ToolChoice::Auto, text));
-    assert!(!admits(MINICPM5, "<s>", ToolChoice::Auto, "Hello!"));
+    assert!(admits(MINICPM5, "<s>", ToolChoice::Auto, "Hello!"));
     assert!(admits(MINICPM5, "<s>", ToolChoice::Auto, call));
     assert!(!admits(MINICPM5, "<s>", ToolChoice::Required, text));
     assert!(admits(MINICPM5, "<s>", ToolChoice::Required, call));
@@ -67,8 +69,8 @@ fn minicpm5_answers_in_text_or_calls_under_auto() {
 
 #[test]
 fn lfm2_answers_in_text_or_calls_under_auto() {
-    // The generation prompt opens reasoning, which closes before the turn
-    // ends: the parser reads text that opens with it as reasoning.
+    // The generation prompt opens reasoning: without a required call the
+    // output may end inside it, the call's text read as reasoning there.
     let (text, call) = (
         "No tool needed.</think>Hello!",
         "<|tool_call_start|>[bash(command=\"ls\")]<|tool_call_end|>",
@@ -76,21 +78,23 @@ fn lfm2_answers_in_text_or_calls_under_auto() {
     let reasoned = format!("List them.</think>{call}");
     assert!(admits(LFM25, "<|startoftext|>", ToolChoice::Auto, text));
     assert!(admits(LFM25, "<|startoftext|>", ToolChoice::Auto, &reasoned));
-    assert!(!admits(LFM25, "<|startoftext|>", ToolChoice::Auto, "Hello!"));
-    assert!(!admits(LFM25, "<|startoftext|>", ToolChoice::Auto, call));
+    assert!(admits(LFM25, "<|startoftext|>", ToolChoice::Auto, "Hello!"));
+    assert!(admits(LFM25, "<|startoftext|>", ToolChoice::Auto, call));
     assert!(!admits(LFM25, "<|startoftext|>", ToolChoice::Required, text));
     assert!(admits(LFM25, "<|startoftext|>", ToolChoice::Required, &reasoned));
 }
 
-/// Reasoning the generation prompt opens closes before the turn ends: the
-/// parser streams it as reasoning, and a constraint that read it as content
-/// instead would let the turn end with that reasoning never closed.
+/// Reasoning the generation prompt opens is streamed as reasoning. Without
+/// a required call the turn may end inside it; a required call needs it
+/// closed first, so a constraint that read it as content could never
+/// end the turn.
 #[test]
-fn reasoning_opened_by_the_prompt_closes_before_the_turn_ends() {
+fn reasoning_opened_by_the_prompt_closes_before_a_required_call() {
     let call =
         "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
+    assert!(admits(QWEN35, "", ToolChoice::Auto, "Still thinking <here>."));
+    assert!(!admits(QWEN35, "", ToolChoice::Required, "Still thinking <here>."));
     for choice in [ToolChoice::Auto, ToolChoice::Required] {
-        assert!(!admits(QWEN35, "", choice.clone(), "Still thinking <here>."));
         assert!(admits(QWEN35, "", choice.clone(), &format!("List them.\n{call}")));
         assert!(admits(
             QWEN35,

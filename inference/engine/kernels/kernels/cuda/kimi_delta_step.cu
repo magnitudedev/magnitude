@@ -2,6 +2,7 @@
 // row-sequential Kimi delta rule with its preparation fused
 // (`recurrent::step` over `kimi::ChannelGates`).
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/kimi.cuh"
 
 #ifdef SEISMIC_FORMING_KIMI_DELTA_STEP

@@ -18,6 +18,7 @@
 // rows before its first -1): padding rows are neither read nor published,
 // and a row tile or warp holding only padding does no work. Every launch but
 // the grids is the body of one block of its written grid (`_block`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #define KERNEL_W2 SEISMIC_EXPERT_DOWN
@@ -38,7 +39,7 @@
                                       SEISMIC_STEP_STRIDE_0),                                              \
                        expert)
 
-using element::Act;
+using activation::Act;
 
 // The declared shared bytes of the two launches (`routed.seismic`).
 constexpr int EXPAND_SHARED = 3 * (32 * 144 + 2 * 10240) + 2 * 4096;
@@ -127,10 +128,10 @@ __device__ void routed_experts_expand_block(SEISMIC_KERNEL_PARAMS) {
         order, SEISMIC_ORDER_STRIDE_1);
     routed::routed_gemm<EXPAND_SHARED, S8, Operands>(
         reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H, blockIdx.x, SEISMIC_DIM_F,
-        ROUTED_MATRIX(KERNEL_W0, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_GATE),
+        PACKETS_MATRIX(KERNEL_W0, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_GATE),
                                                     SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE)}
                                       .matrix(slab::Source{slot}))),
-        ROUTED_MATRIX(KERNEL_W1, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP),
+        PACKETS_MATRIX(KERNEL_W1, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP),
                                                     SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP)}
                                       .matrix(slab::Source{slot}))),
         epi);
@@ -186,7 +187,7 @@ __device__ void routed_experts_down_block(SEISMIC_KERNEL_PARAMS) {
         SEISMIC_DIM_F);
     routed::routed_gemm<DOWN_SHARED, S8, Operands>(
         reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F, blockIdx.x, SEISMIC_DIM_H,
-        ROUTED_MATRIX(KERNEL_W2, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
+        PACKETS_MATRIX(KERNEL_W2, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
                                                     SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN)}
                                       .matrix(slab::Source{slot}))),
         projection::NoWeight{}, epi);

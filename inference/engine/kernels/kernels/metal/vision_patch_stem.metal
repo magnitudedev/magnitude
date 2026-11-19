@@ -5,10 +5,10 @@
 // f16 (a relative rounding of 2^-11).
 #include "lib/vision/vision.h"
 
-typedef vision::dense_packet<ELEMENT_KIND(SEISMIC_FRAME_WEIGHT)>::type weight_0_packet;
-typedef vision::dense_packet<ELEMENT_KIND(SEISMIC_NEXT_FRAME_WEIGHT)>::type weight_1_packet;
 typedef ELEMENT_OF(SEISMIC_FRAME_WEIGHT) weight_0_element;
 typedef ELEMENT_OF(SEISMIC_NEXT_FRAME_WEIGHT) weight_1_element;
+typedef packets::Dense<weight_0_element> weight_0_packet;
+typedef packets::Dense<weight_1_element> weight_1_packet;
 typedef ELEMENT_OF(SEISMIC_BIAS) bias_element;
 typedef ELEMENT_OF(SEISMIC_TABLE) table_element;
 
@@ -101,7 +101,7 @@ kernel void vision_patch_stem_first(STEM_ARGUMENTS,
     STEM_PIXELS(0);
     const uint h = uint(SEISMIC_DIM_H);
     output_partial out{partial, h};
-    auto w = vision::weight<weight_0_packet>(frame_weight, SEISMIC_FRAME_WEIGHT_STRIDE_0, weight_0_element::bytes, k);
+    auto w = vision::weight<weight_0_element>(frame_weight, SEISMIC_FRAME_WEIGHT_STRIDE_0, k);
     projection::gemm<weight_0_packet, vision::TILE_M, vision::TILE_N>(in, out, w, uint(SEISMIC_DIM_M), h, k,
         tile.y, tile.x, shared, sg, lane);
 }
@@ -116,13 +116,11 @@ kernel void vision_patch_stem_last(STEM_ARGUMENTS,
     const uint h = uint(SEISMIC_DIM_H);
     output_stem out{element::Out<element::F32>(result), SEISMIC_RESULT_0_STRIDE_0, partial, bias, table, indices, coefficients, h};
     if (SEISMIC_DIM_S == 1) {
-        auto w = vision::weight<weight_1_packet>(next_frame_weight, SEISMIC_NEXT_FRAME_WEIGHT_STRIDE_1,
-            weight_1_element::bytes, k);
+        auto w = vision::weight<weight_1_element>(next_frame_weight, SEISMIC_NEXT_FRAME_WEIGHT_STRIDE_1, k);
         projection::gemm<weight_1_packet, vision::TILE_M, vision::TILE_N>(in, out, w, uint(SEISMIC_DIM_M), h, k,
             tile.y, tile.x, shared, sg, lane);
     } else {
-        auto w = vision::weight<weight_0_packet>(frame_weight, SEISMIC_FRAME_WEIGHT_STRIDE_0,
-            weight_0_element::bytes, k);
+        auto w = vision::weight<weight_0_element>(frame_weight, SEISMIC_FRAME_WEIGHT_STRIDE_0, k);
         projection::gemm<weight_0_packet, vision::TILE_M, vision::TILE_N>(in, out, w, uint(SEISMIC_DIM_M), h, k,
             tile.y, tile.x, shared, sg, lane);
     }

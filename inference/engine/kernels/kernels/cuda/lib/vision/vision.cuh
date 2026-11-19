@@ -18,17 +18,11 @@
 
 namespace vision {
 
+using element::Same;
 using element::u16;
 using element::u32;
 using element::u64;
 using element::u8;
-
-template <class A, class B> struct Same {
-    static constexpr bool value = false;
-};
-template <class A> struct Same<A, A> {
-    static constexpr bool value = true;
-};
 
 // ---------------------------------------------------------------------------
 // Scalar functions.

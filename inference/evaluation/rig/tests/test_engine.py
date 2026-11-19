@@ -111,6 +111,26 @@ def test_a_run_reads_what_its_caller_staged_and_never_waits_on_it(rig):
     assert not list(outcome.results.glob("stage-*"))
 
 
+def test_every_host_step_runs_the_controllers_host_package_whatever_tree_it_builds(rig):
+    """The host steps (build provenance, a job's `record`) run the host package this controller
+    deployed when it connected, never the one in the tree being built: a tree whose host package
+    speaks another protocol still runs, and its own package never runs."""
+    hosts, source, _ = rig
+    measured = source.directory / "evaluation" / "rig" / "src" / "magnitude_rig" / "host" / "__main__.py"
+    measured.write_text('raise SystemExit("the host package of the measured tree ran")\n')
+    run = request(source, jobs=[("job", engine.Step("job", (PY, "-c", "print('ran')")))], host="alpha")
+    work = run.work("alpha")
+    remote = connect(hosts.host("alpha"))
+    candidate = engine.Candidate(remote, {}, work, {engine.build_key(work, side): 0 for side in work.sides}, 0.0,
+                                 (60.0,))
+    steps = [op for op in engine.plan_for(run, candidate, "planned").ops
+             if op["op"] == "run" and "magnitude_rig.host" in op["argv"]]
+    assert steps and all(op["argv"][1] == remote.package for op in steps)
+    assert all(op["env"].get("PYTHONPATH", remote.package) == remote.package for op in steps)
+    outcome = engine.execute(run, engine.new_run_id("test"), hosts=hosts, announce=lambda line: None)
+    assert outcome.codes == {"job": 0} and "ran" in (outcome.results / "logs" / "job-job.log").read_text()
+
+
 def test_a_timed_run_gates_with_its_hosts_temperature_setting(rig):
     """A timed run plans the thermal gate before its jobs, passing whether its host has
     temperature sensors."""
@@ -296,7 +316,7 @@ def test_a_build_needs_its_measured_size_and_a_host_that_cannot_fit_it_ranks_las
     fits.status["waits"]["build"] = 7200.0  # however busy the host that fits
     assert min([never, fits], key=engine._start) is fits
     # The start line counts the rig's own checkouts as room: 13 GB free and 11 GB to reclaim.
-    assert engine._room(fits.status) == "room 13.0 GB free + 11.0 GB of the rig's own to reclaim"
+    assert engine._room(fits.status) == "room 13.0 GB free beyond the volume's floor + 11.0 GB of the rig's own to reclaim"
 
 
 def test_a_build_unmeasured_on_a_host_takes_its_size_from_hosts_of_its_platform_alone():
@@ -571,6 +591,13 @@ def test_placement_connects_a_healthy_host_once_and_one_whose_read_failed_again(
     connected.clear()
     candidates, skipped, unreadable = engine._candidates(asked, (hosts.host("alpha"),), "run")
     assert candidates == [] and unreadable == set() and "not set up" in skipped[0] and connected == []
+    ready.with_suffix(".away").rename(ready)
+    # A volume its runs write outside the rig root too full to run on (`agent.short_volumes`): its
+    # steps would refuse, so placement leaves it out, saying why.
+    short = [{"path": "/tmp", "free_bytes": 0}]
+    monkeypatch.setattr(engine, "host_status", lambda remote, *arguments: dict(read(remote, *arguments), short=short))
+    candidates, skipped, unreadable = engine._candidates(asked, (hosts.host("alpha"),), "run")
+    assert candidates == [] and unreadable == set() and skipped == [f"alpha: {agent.short_reason(short)}"]
 
 
 def test_a_reply_that_does_not_parse_is_the_agents_failure_and_never_ends_placing_again(monkeypatch):

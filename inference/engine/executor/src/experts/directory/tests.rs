@@ -85,7 +85,7 @@ fn the_directory_names_map_words_at_the_plans_homes() {
     let host = crate::planning::HostTier::Unified(crate::planning::Parking::InKernels);
     let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
     let floor = resident.bank_floor(&definition, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
-    let load = resident.with_expert_bank(&definition, floor, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
+    let load = resident.with_expert_bank(&definition, floor, None, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
     let plan = load.expert_bank().unwrap();
     let records = (0..plan.groups().len()).map(|group| plan.records(group) as usize).collect::<Vec<_>>();
     let groups = plan.layers().iter().map(|layer| layer.group).collect::<Vec<_>>();

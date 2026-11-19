@@ -170,7 +170,7 @@ impl Reader<'_> {
 pub fn describe_projector(
     directory: &Directory,
     target_width: u64,
-) -> Result<VisionDescription, Error> {
+) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("nemotron_omni", ())], target_width)
         .map_err(Error::ProjectorIdentity)?;
     if let Some(entry) = directory
@@ -338,7 +338,7 @@ pub fn describe_projector(
         merge,
     };
     r.tensors.finish()?;
-    let description = VisionDescription {
+    let description = Box::new(VisionDescription {
         // The squared ReLU publishes the square of its input, which f16
         // (at most 65504) holds only below 256; bf16 intermediates around
         // the F32 residual stream keep the released bf16 forward's range.
@@ -350,7 +350,7 @@ pub fn describe_projector(
         window: None,
         blocks,
         merger,
-    };
+    });
     description.validate()?;
     Ok(description)
 }

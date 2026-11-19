@@ -1,6 +1,11 @@
 //! Routed (mixture-of-experts) entries: the portable bodies define the
 //! contract; native implementations are checked against them.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
+
 mod common;
 mod declared;
 

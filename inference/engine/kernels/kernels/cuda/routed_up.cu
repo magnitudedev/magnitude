@@ -13,6 +13,7 @@
 //   (`routed::gather`), so each chosen expert streams once. A GEMV
 //   row's result does not depend on the other rows, so every choice gets its
 //   one-row bits.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_EXPERT_UP
 #include "lib/routed/routed.cuh"
 
@@ -58,7 +59,7 @@ __launch_bounds__(routed::DECODE_THREADS) __global__ void routed_up_choice(SEISM
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,
                                  SEISMIC_UP_SCALE_STRIDE_0, expert), 1.0f);
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
-                                    ROUTED_MATRIX(KERNEL_W0, weights), projection::NoWeight{}, epi);
+                                    PACKETS_MATRIX(KERNEL_W0, weights), projection::NoWeight{}, epi);
 }
 #endif
 
@@ -109,6 +110,6 @@ __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
         1.0f);
     projection::gemv_segment<Shape>(shared, routed::GatheredRows{GATHERED_ROWS, table.rows}, table.count,
                                     SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
-                                    ROUTED_MATRIX(KERNEL_W0, weights), projection::NoWeight{}, epi);
+                                    PACKETS_MATRIX(KERNEL_W0, weights), projection::NoWeight{}, epi);
 }
 #endif

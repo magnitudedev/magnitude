@@ -7,6 +7,7 @@
 // routed projection's `choice` (`gather_choice`): each feature row an expert
 // of one choice, the rows it selects that expert's matrix
 // (`projection::Gathered`), a selection past the vocabulary -inf.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/operator.cuh"
 #include "lib/routed/decode.cuh"

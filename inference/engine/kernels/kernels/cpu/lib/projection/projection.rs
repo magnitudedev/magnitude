@@ -20,7 +20,6 @@
 // reassociation every native backend is qualified under.
 
 use super::super::core::{activation, reduce};
-use seismic::cpu::components::ROW_BLOCKS;
 use seismic::cpu::quant::{self, Q8Block, Q8Tile};
 use seismic::cpu::{Dense, Scratch, Tensor, Weights};
 use std::ops::Range;
@@ -30,9 +29,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// pair's sixteen rows (`form(W, INT8_AMX)`).
 pub const MAX_ROWS: usize = 16;
 
-/// The largest component row block (`ROW_BLOCKS`): an `mma16` tile's
+/// The largest dot row block (`Weights::MAX_ROW_BLOCK`): an `mma16` tile's
 /// (`Weights::row_block`).
-pub const MAX_BLOCK: usize = ROW_BLOCKS[ROW_BLOCKS.len() - 1];
+pub const MAX_BLOCK: usize = Weights::MAX_ROW_BLOCK;
 
 /// Quantized activation rows as a stage launch leaves them for a projection
 /// ([`quantize_row`], [`quantized`]): each row's blocks, which the one-row
@@ -127,9 +126,9 @@ pub unsafe fn quantized<'a>(scratch: Scratch<'a>, at: usize, m: usize, k: usize,
 /// `stage`); where `quantized` (the consumer forms Q8 blocks), their Q8
 /// blocks without tiles ([`quantize_row`]) follow; then, where `nvfp4`
 /// (the consumer's rows are NVFP4 operands), the rows in place as NVFP4
-/// operands ([`nvfp4_row`]). The same calls in the same order on the same
-/// row, so the operand has the bits of the consumer's own. A paired
-/// consumer always forms its rows, so the rows' word gates the call.
+/// operands ([`quant::nvfp4::row`]). The same calls in the same order on
+/// the same row, so the operand has the bits of the consumer's own. A
+/// paired consumer always forms its rows, so the rows' word gates the call.
 ///
 /// One counter a row (`arrivals`' word `row`) counts columns, not work
 /// items, so what completes the row is independent of how a launch's items
@@ -172,7 +171,7 @@ pub unsafe fn emit(
         unsafe { quantize_row(formed, row, false, quantized, 0) };
     }
     if nvfp4 {
-        nvfp4_row(formed);
+        quant::nvfp4::row(formed);
     }
 }
 
@@ -269,12 +268,12 @@ pub unsafe fn form<W: Recipe + ?Sized>(
         unsafe { quantize_columns(staged, row % m, columns.start, width, operand.tiles, quantized, row / m * quantized_bytes(m, width)) };
     }
     if nvfp4 == operand.weights.len() {
-        nvfp4_row(staged);
+        quant::nvfp4::row(staged);
     } else if nvfp4 > 0 {
         // SAFETY: the copy of row `row` is this item's alone.
         let apart = unsafe { operand.staged.slice_mut::<f32>(4 * (operand.rows + row) * width, width) };
         apart.copy_from_slice(staged);
-        nvfp4_row(apart);
+        quant::nvfp4::row(apart);
     }
 }
 
@@ -477,7 +476,6 @@ pub fn project_arithmetic(
     if let Some(q8) = q8 {
         assert_eq!(q8.len(), m * blocks, "quantized blocks of {m} activation rows");
     }
-    let most = weights.row_block();
     let mut done = 0;
     // One row's whole 16-row tiles in one call (`Weights::dot_q8_tiles`).
     if let Some(q8) = q8.filter(|_| m == 1 && n >= MAX_BLOCK) {
@@ -497,12 +495,7 @@ pub fn project_arithmetic(
     }
     let mut sums = [0.0f32; MAX_BLOCK * MAX_ACTIVATIONS];
     while done < n {
-        let block = ROW_BLOCKS
-            .iter()
-            .rev()
-            .copied()
-            .find(|block| *block <= (n - done).min(most))
-            .expect("the one-row block fits any remainder");
+        let block = weights.dot_block(n - done);
         for from in (0..m).step_by(MAX_ACTIVATIONS) {
             let rows = from..(from + MAX_ACTIVATIONS).min(m);
             let sums = &mut sums[..rows.len() * block];
@@ -642,5 +635,5 @@ fn pair_chunks<const BLOCK: usize>(
 }
 
 pub use super::stage::{
-    form_input, form_input_columns, nvfp4_row, operand_row, rms_row, stage, Recipe,
+    form_input, form_input_columns, operand_row, rms_row, stage, Recipe,
 };

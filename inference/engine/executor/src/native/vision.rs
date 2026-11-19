@@ -1,3 +1,4 @@
+use super::RangedKernels;
 use crate::{CatalogFailure, VisionEntry, VisionKernel};
 use magnitude_kernels::{
     post_norm_residual, vision_attention, vision_clamp, vision_gated_convolution, vision_linear,
@@ -25,13 +26,13 @@ pub(super) fn element(
 }
 
 /// Immutable vision-stage specializations, one per distinct kernel of the
-/// projector's vision program, prepared before any projector weight is
-/// imported.
+/// projector's vision program (the projecting entries' by the rows their
+/// launches take), prepared before any projector weight is imported.
 #[derive(Clone, Debug, Default)]
 pub struct VisionKernels {
-    pub(crate) patch_stem: HashMap<VisionKernel, NativeKernel<vision_patch_stem::Entry>>,
+    pub(crate) patch_stem: HashMap<VisionKernel, RangedKernels<vision_patch_stem::Entry>>,
     pub(crate) norm: HashMap<VisionKernel, NativeKernel<vision_norm::Entry>>,
-    pub(crate) linear: HashMap<VisionKernel, NativeKernel<vision_linear::Entry>>,
+    pub(crate) linear: HashMap<VisionKernel, RangedKernels<vision_linear::Entry>>,
     pub(crate) clamp: HashMap<VisionKernel, NativeKernel<vision_clamp::Entry>>,
     pub(crate) attention: HashMap<VisionKernel, NativeKernel<vision_attention::Entry>>,
     pub(crate) gated_convolution:

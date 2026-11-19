@@ -1,7 +1,8 @@
 // vision_clamp: one thread per element, A(clamp(x, minimum, maximum)).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
 
-typedef element::Act A;
+typedef activation::Act A;
 
 extern "C" __global__ void vision_clamp(SEISMIC_KERNEL_PARAMS) {
     const element::u64 index = (element::u64)blockIdx.x * blockDim.x + threadIdx.x;

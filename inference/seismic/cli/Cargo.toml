@@ -12,3 +12,6 @@ path = "src/main.rs"
 seismic-lang.workspace = true
 seismic-std.workspace = true
 seismic-threads.workspace = true
+
+[lints]
+workspace = true

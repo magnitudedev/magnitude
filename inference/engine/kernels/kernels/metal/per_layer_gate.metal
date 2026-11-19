@@ -1,18 +1,16 @@
 // per_layer_gate: `stage` rounds the F32 hidden rows to A in scratch; the
 // `dense` projection (single) projects them through the gate rows with the
 // activated-product epilogue A(A(act(A(gate))) * inputs[m, layer, p]).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
 #include "lib/projection/operator.h"
-#if defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_ROWS) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PAIR) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PACKED)
+#if defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_ROWS) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PAIR)
 #include "lib/projection/gemv.h"
 #endif
-#ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PACKED
-#include "lib/projection/gemv_packed.h"
-#endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 // The gate weight's operand rows (the rounded rows, or NVFP4 operands),
 // which `stage` writes and every other launch reads.
 constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
@@ -43,15 +41,15 @@ typedef projection::operands<NVFP4> Operands;
 // `raw` and `in` are the rounded rows every form reads.
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_P), k = uint(SEISMIC_DIM_D); \
-    const projection::Plain<activation, projection::AllRows> raw{rounded, SEISMIC_DIM_D, 1, k, {}}; \
+    const projection::Plain<activation_element, projection::AllRows> raw{rounded, SEISMIC_DIM_D, 1, k, {}}; \
     const auto in = raw;                                                                \
     const auto out = projection::scaling<(SEISMIC_DIM_GS != 0)>::wrap(                  \
-        projection::ActivatedMul<activation>{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
+        projection::ActivatedMul<activation_element>{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
             SEISMIC_RESULT_0_STRIDE_1, inputs + ulong(int(SEISMIC_PARAM_LAYER)) * SEISMIC_INPUTS_STRIDE_1, \
             SEISMIC_INPUTS_STRIDE_0, \
             SEISMIC_INPUTS_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)},                    \
         projection::scale_factor(gate_scale, SEISMIC_DIM_GS, 0, 0), 1.0f);              \
-    projection::Weights<packets::W0> w{gate_weight, KERNEL_W0_LAYOUT(k), k}
+    projection::Weights<packets::W0> w{{gate_weight, KERNEL_W0_LAYOUT(k), k}}
 
 #define PROJECTION_GROUPS 1
 #define PROJECTION_GEMV_INPUT(x) const auto x = raw
@@ -70,15 +68,15 @@ kernel void per_layer_gate_stage(PROJECTION_ARGUMENTS,
     if constexpr (NVFP4) {
         PROJECTION_NORMALIZE_SHARED(maxima);
         // The hidden rows rounded to A (one part, no norm).
-        const projection::Summed<activation, activation, projection::AllRows, 1> source{hidden,
+        const projection::Summed<activation_element, activation_element, projection::AllRows, 1> source{hidden,
             SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, nullptr, 0, 0.0f, uint(SEISMIC_DIM_D), {}};
         projection::operands<true>::form<256>(source, item, rounded, uint(SEISMIC_DIM_D), maxima, thread_index);
         return;
     }
-    device typename activation::storage *row =
-        reinterpret_cast<device typename activation::storage *>(rounded) + ulong(item) * SEISMIC_DIM_D;
+    device typename activation_element::storage *row =
+        reinterpret_cast<device typename activation_element::storage *>(rounded) + ulong(item) * SEISMIC_DIM_D;
     for (uint i = thread_index; i < uint(SEISMIC_DIM_D); i += 256u)
-        row[i] = activation::store(hidden[ulong(item) * SEISMIC_HIDDEN_STRIDE_0 + ulong(i) * SEISMIC_HIDDEN_STRIDE_1]);
+        row[i] = activation_element::store(hidden[ulong(item) * SEISMIC_HIDDEN_STRIDE_0 + ulong(i) * SEISMIC_HIDDEN_STRIDE_1]);
 }
 #endif
 
@@ -90,21 +88,15 @@ kernel void per_layer_gate_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) 
 }
 #endif
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void per_layer_gate_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void per_layer_gate_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
-}
-#endif
-#ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PACKED
-template <uint LANES, uint PACKED_ROWS, uint ROWS>
-kernel void per_layer_gate_gemv_packed(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
-    PROJECTION_SINGLE_GEMV_PACKED;
 }
 #endif
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_BATCH

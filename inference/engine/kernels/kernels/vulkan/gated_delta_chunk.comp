@@ -1,6 +1,7 @@
 // gated_delta_chunk (large row classes): the same contract as
 // `gated_delta_step`, in `lib/recurrent/chunk.glsl`'s launches over Gated
 // DeltaNet's gates (one decay per value head).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/recurrent.glsl"
 #include "lib/recurrent/chunk.glsl"
 

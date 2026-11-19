@@ -7,16 +7,28 @@
 //! - [`element`]: the dense element types and their conversions;
 //! - [`tensor`]: typed views of the tensors a kernel receives;
 //! - [`reduce`], [`math`]: defined-order reductions and scalar functions;
-//! - [`weights`]: weight elements, their row geometry and the bodies of
-//!   their components;
-//! - [`components`]: the compiled component instances and their resolution;
+//! - [`Weights`]: a bound weight operand and its products, the readers a
+//!   kernel calls;
+//! - [`quant`]: the per-group activation rules (Q8 blocks, NVFP4 rows);
 //! - [`repack`]: exact conversions of external weights into resident rows.
+//!
+//! How a weight element is laid out and decoded is the library's own: the
+//! bodies of its components (`weights`) and their compiled instances
+//! (`components`) are crate-private, reached only through [`Weights`].
 //!
 //! Everything a kernel calls is `#[inline(always)]` and compiles with the
 //! features of the generated tier boundary it inlines into; only component
 //! calls cross a function boundary.
 
-pub mod components;
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
+pub(crate) mod components;
 pub mod element;
 pub mod isa;
 pub mod math;
@@ -25,14 +37,19 @@ pub mod reduce;
 pub mod repack;
 pub mod slab;
 pub mod tensor;
-pub mod weights;
+pub(crate) mod weights;
 
-pub use components::WeightKernels;
 pub use element::{Bf16, Dense, Element, F16, F32, I32, Slot, Store, Stored, U32, U64};
 pub use isa::{Isa, Tier};
 pub use repack::{External, Packed};
 pub use tensor::{Scalars, Scratch, Tensor};
-pub use weights::RowGeometry;
+#[cfg(all(target_arch = "x86_64", feature = "machine-line"))]
+pub use weights::{quantized_dot, quantized_dot_wide};
+#[cfg(all(target_arch = "aarch64", feature = "machine-line"))]
+pub use weights::quantized_dot_neon;
+
+use components::WeightKernels;
+use weights::RowGeometry;
 
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
@@ -286,6 +303,27 @@ impl<'a> Weights<'a> {
     /// share their code bytes; eight rows of every other layout.
     pub fn row_block(&self) -> usize {
         self.geometry.placement.row_block()
+    }
+
+    /// The most rows of any block [`Weights::dot`] and [`Weights::dot_q8`]
+    /// take (`components::ROW_BLOCKS`): an `mma16` tile's.
+    pub const MAX_ROW_BLOCK: usize = components::ROW_BLOCKS[components::ROW_BLOCKS.len() - 1];
+
+    /// Rows of the largest block [`Weights::dot`] and [`Weights::dot_q8`]
+    /// take (`components::ROW_BLOCKS`) within `rows` rows and the
+    /// operand's [`Weights::row_block`].
+    ///
+    /// # Panics
+    /// Where `rows` is zero.
+    #[inline(always)]
+    pub fn dot_block(&self, rows: usize) -> usize {
+        let most = rows.min(self.row_block());
+        components::ROW_BLOCKS
+            .iter()
+            .rev()
+            .copied()
+            .find(|block| *block <= most)
+            .expect("a dot block of at least one row")
     }
 
     /// The `k` values of row `row`.

@@ -31,7 +31,7 @@ constexpr bool SHARED_NVFP4 = projection::OperandRecipe<packets::W1_OPERANDS_NVF
                                        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, (m), (k), (expert))))
 
 struct PublishEpi {
-    element::Out<element::Act> published;
+    element::Out<activation::Act> published;
     projection::u64 s2;
     __device__ __forceinline__ void operator()(unsigned, projection::u64 n, float value, float) const {
         published.put(n * s2, value);
@@ -39,7 +39,7 @@ struct PublishEpi {
 };
 
 struct GatheredPublishEpi {
-    element::Out<element::Act> published;
+    element::Out<activation::Act> published;
     const projection::u64 *offsets;
     projection::u64 s2;
     __device__ __forceinline__ void operator()(unsigned m, projection::u64 n, float value, float) const {
@@ -88,7 +88,7 @@ struct GatheredPublishEpi {
                           projection::AllRows{}};                                                                  \
             projection::gemv_segment_ready<Shape>(shared, projection::shared_row_after_dependency(pro, SEISMIC_DIM_F), \
                                                   1u, SEISMIC_DIM_F / 64, group, H,                                \
-                                                  ROUTED_MATRIX(KERNEL_W0, down),                       \
+                                                  PACKETS_MATRIX(KERNEL_W0, down),                       \
                                                   projection::NoWeight{}, epi);                                    \
         }                                                                                                          \
     } else {                                                                                                       \
@@ -110,7 +110,7 @@ struct GatheredPublishEpi {
     const projection::u64 m = blockIdx.y / (K + 1), slot = blockIdx.y % (K + 1);                                   \
     const projection::u64 group = Shape::tile_group();                                                             \
     const projection::u64 s2 = ROUTED_PUBLISHED_S2;                                                                \
-    const element::Out<element::Act> published = ROUTED_PUBLISHED_OUT;                                             \
+    const element::Out<activation::Act> published = ROUTED_PUBLISHED_OUT;                                             \
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                         \
     const unsigned choice = (unsigned)(m * K + slot);                                                              \
     const bool projects = slot < K                                                                                 \
@@ -148,7 +148,7 @@ struct GatheredPublishEpi {
                 const routed::GatheredRows rows{EXPERT_ROWS, rows_at};                                             \
                 projection::gemv_segment_ready<Shape>(                                                             \
                     shared, projection::after_dependency(rows), count, SEISMIC_DIM_F / 64, group, H,               \
-                    ROUTED_MATRIX(KERNEL_W0, down), projection::NoWeight{}, epi);                       \
+                    PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{}, epi);                       \
             }                                                                                                      \
         } else {                                                                                                   \
             const routed::GatheredRows rows{SHARED_ROWS, rows_at};                                                 \

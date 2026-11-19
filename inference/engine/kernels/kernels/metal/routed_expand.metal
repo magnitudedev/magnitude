@@ -12,7 +12,8 @@
 // bank's home records alike, the expert itself its record. Nothing lands in
 // either while it runs, so plain loads read them.
 
-#define PACKETS_PLAIN_RECORDS
+#define KERNEL_A SEISMIC_ELEMENT_A
+#define PACKETS_CONFIG_PLAIN_RECORDS
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #define KERNEL_W2 SEISMIC_SHARED_GATE

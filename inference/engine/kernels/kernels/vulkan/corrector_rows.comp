@@ -5,15 +5,7 @@
 #include <seismic/element.glsl>
 #include "lib/core/reduce.glsl"
 
-#if defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F32)
-#define ROWS_Y ELEMENT_F32
-#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_BF16)
-#define ROWS_Y ELEMENT_BF16
-#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F16)
-#define ROWS_Y ELEMENT_F16
-#else
-#error "corrector_rows requires a dense published element"
-#endif
+#define ROWS_Y ELEMENT_OF(SEISMIC_ELEMENT_Y)
 
 float rows_biased(uint64_t values, uint64_t bias, uint64_t row, uint64_t column) {
     return element_f32_at(values + (row * SEISMIC_VALUES_STRIDE_0 + column * SEISMIC_VALUES_STRIDE_1) * 4ul)

@@ -1,6 +1,7 @@
 // dense_expand: the gate and up projections of the normalized rows combined
 // by the GLU epilogue, the forms of the `dense` projection
 // (`lib/projection/operator.cuh`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
 // The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue

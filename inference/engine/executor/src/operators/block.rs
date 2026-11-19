@@ -5,8 +5,8 @@
 //! the mixer, the feed-forward and the per-layer input in order.
 
 use super::attention::graph::{
-    AttentionGraphEntries, AttentionOperands, CheckedAttentionEntries, HistoryTilesPort,
-    IndexerControlPorts, IndexerStatePorts, attention, attention_weights,
+    AttentionGraphEntries, AttentionWeights, CheckedAttentionEntries, HistoryTilesPort,
+    IndexerControlPorts, IndexerStatePorts, attention,
 };
 use super::attention::split::{
     AttentionBlock, AttentionSite, AttentionTopology, SelectionSite, split as attention_split,
@@ -1071,11 +1071,15 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 MixerNumbers::Attention(numbers),
                 MixerEntries::Attention(entries),
             ) => {
-                let operands =
-                    AttentionOperands::planned(graph, planned, scope, topology, numbers, true, weights, constants)?;
-                let attention_weights = attention_weights(topology, numbers, form, true, operands, |kind| {
-                    weight(graph, planned, scope, kind, weights)
-                })?;
+                let attention_weights = AttentionWeights::planned(
+                    graph,
+                    planned,
+                    scope,
+                    (topology, numbers),
+                    (form, true),
+                    None,
+                    (&mut *weights, &mut *constants),
+                )?;
                 let (mixed, ports, controls) =
                     attention(graph, entries, topology, numbers, &attention_weights, constants, input, hidden, &join)?;
                 (

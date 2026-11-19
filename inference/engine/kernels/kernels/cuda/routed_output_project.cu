@@ -2,6 +2,7 @@
 // (`routed_output_project` in routed.seismic): `routed_output`'s projections
 // (`lib/routed/output.cuh`), published into the result for
 // `routed_output_sited`; no block joins.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ROUTED_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
 #define ROUTED_PUBLISHED_OUT SEISMIC_RESULT_0_OUT
 #define ROUTED_PUBLISHED_S0 SEISMIC_RESULT_0_STRIDE_0

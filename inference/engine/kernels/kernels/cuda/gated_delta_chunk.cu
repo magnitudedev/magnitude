@@ -3,6 +3,7 @@
 // over `recurrent::HeadGates`: one decay per head, factored out of the
 // products), then the gate launch.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/chunk.cuh"
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_CHUNK_PREPARE

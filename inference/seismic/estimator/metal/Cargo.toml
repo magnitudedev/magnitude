@@ -8,3 +8,6 @@ license.workspace = true
 seismic-ir.workspace = true
 seismic-lang.workspace = true
 seismic-estimator.workspace = true
+
+[lints]
+workspace = true

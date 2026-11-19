@@ -1,6 +1,5 @@
 import { Option, Schema } from "effect"
 import type { LocalInferenceHardware } from "@magnitudedev/sdk"
-import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import { deriveHardwareRoles, formatLocalInferenceBackend, formatMemorySize } from "@magnitudedev/client-common"
 import { hardwarePresentation, normalizeGpuName, normalizeHardwareName } from "./hardware-photos"
 import facts from "../../../assets/hardware/facts.json"
@@ -31,12 +30,12 @@ const findHardwareFacts = (target: typeof CatalogEntry.Type.target, name: string
   const normalize = target === "Accelerator" ? normalizeGpuName : target === "Processor" ? normalizeProcessorName : normalizeHardwareName
   return hardwareFactsCatalog.find(entry => entry.target === target && entry.names.some(candidate => normalize(candidate) === normalize(name)))
 }
-const publishedFacts = (target: typeof CatalogEntry.Type.target, name: string, physicalCores: Option.Option<number> = Option.none(), dedicatedMemoryBytes: Option.Option<number> = Option.none()) => {
+const publishedFacts = (target: typeof CatalogEntry.Type.target, name: string, chipCores: Option.Option<number> = Option.none(), dedicatedMemoryBytes: Option.Option<number> = Option.none()) => {
   const entry = findHardwareFacts(target, name)
   if (!entry) return []
-  const variant = Option.flatMap(physicalCores, cores => Option.flatMap(entry.variants, variants =>
+  const variant = Option.flatMap(chipCores, cores => Option.flatMap(entry.variants, variants =>
     Option.fromNullable(variants.find(variant => variant.physicalCpuCores === cores))))
-  const common = entry.facts.filter(fact => Option.isNone(physicalCores) || fact.label !== "CPU core options (spec)")
+  const common = entry.facts.filter(fact => Option.isNone(chipCores) || fact.label !== "CPU core options (spec)")
   // Physical device totals can exclude small driver reservations. Require a unique
   // capacity within 1%; never use free memory, allocator budgets, or shared RAM.
   const memoryVariants = Option.match(dedicatedMemoryBytes, {
@@ -49,21 +48,16 @@ const publishedFacts = (target: typeof CatalogEntry.Type.target, name: string, p
 }
 
 /** A view of existing observations and exact published specifications; no probing or benchmarking. */
-export const hardwareDetails = (identity: MachineIdentityObservation | null, hardware: LocalInferenceHardware) => {
+export const hardwareDetails = (hardware: LocalInferenceHardware) => {
   const roles = deriveHardwareRoles(hardware)
   const dedicated = roles.devices.filter(device => Option.isSome(device.dedicatedMemoryBytes))
-  const presentation = hardwarePresentation(identity, dedicated.map(({ accelerator }) => accelerator.name), hardware.processor)
+  const presentation = hardwarePresentation(hardware.identity, dedicated.map(({ accelerator }) => accelerator.name), hardware.processor)
   const unified = roles.unifiedMemory
-  const processorFacts = Option.match(hardware.processor, { onNone: () => [], onSome: name => publishedFacts("Processor", name, hardware.physicalCores) })
-  const fixedCoreCount = processorFacts.find(fact => fact.label === "CPU cores / processor (spec)")
-  const cpuCores = Option.match(hardware.physicalCores, {
-    onSome: cores => [{ label: "CPU cores", value: String(cores) }],
-    // A per-processor catalog count cannot establish a multi-socket server's total.
-    onNone: () => fixedCoreCount && presentation.category !== "Server" ? [{ label: "CPU cores", value: fixedCoreCount.value }] : [],
-  })
+  const processorFacts = Option.match(hardware.processor, { onNone: () => [], onSome: name => publishedFacts("Processor", name, Option.some(hardware.chipCores)) })
   const summary = [
     { label: unified ? "Unified memory" : "System RAM", value: formatMemorySize(hardware.totalSystemMemoryBytes) },
-    ...cpuCores,
+    { label: "CPU cores", value: String(hardware.chipCores) },
+    { label: "logical CPUs", value: String(hardware.logicalCpus) },
     ...processorFacts.filter(fact => !fact.label.startsWith("CPU core")),
     ...Option.match(presentation.deviceId, { onNone: () => [], onSome: id => publishedFacts("Device", id) }),
   ]

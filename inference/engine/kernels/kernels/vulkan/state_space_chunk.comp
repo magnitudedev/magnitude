@@ -16,6 +16,7 @@
 // chunked, and the rows after a stop row advance row-sequentially from the
 // published state, both with `state_space_step`'s bits. ROWS never changes
 // result bits.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/state_space.glsl"
 
 // Shared floats of a piece: x rows of the workgroup's state rows, the weights

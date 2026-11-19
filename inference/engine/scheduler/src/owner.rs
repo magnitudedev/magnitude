@@ -735,8 +735,7 @@ enum Provisioned {
 
 /// Everything the owner holds except its pipeline.
 struct Service<F: ProgramFamily> {
-    /// Boxed: a domain is tens of kilobytes, which every owner, and every
-    /// frame that builds or moves one, would otherwise hold by value.
+    /// Boxed as it is made (`ExecutorDomain::with_family`).
     domain: Box<ExecutorDomain<F>>,
     scheduler: Scheduler,
     /// Requests outside the pipeline.
@@ -849,7 +848,7 @@ pub struct Owner<F: ProgramFamily = NativeFamily> {
 
 impl<F: ProgramFamily> Owner<F> {
     pub fn new(
-        domain: ExecutorDomain<F>,
+        domain: Box<ExecutorDomain<F>>,
         bindings: StateBindings,
         limits: ServiceLimits,
         wakes: Arc<dyn Wakes>,
@@ -864,7 +863,7 @@ impl<F: ProgramFamily> Owner<F> {
     }
 
     pub fn with_prefix_cache_capacity(
-        domain: ExecutorDomain<F>,
+        domain: Box<ExecutorDomain<F>>,
         bindings: StateBindings,
         limits: ServiceLimits,
         capacity: PrefixCacheCapacity,
@@ -874,7 +873,7 @@ impl<F: ProgramFamily> Owner<F> {
         domain.watch_pressure(wakes.pressure());
         Ok(Self {
             service: Service {
-                domain: Box::new(domain),
+                domain,
                 scheduler: Scheduler::new(limits)?,
                 requests: BTreeMap::new(),
                 epoch: AvailabilityEpoch::default(),
@@ -890,7 +889,7 @@ impl<F: ProgramFamily> Owner<F> {
     }
 
     pub fn with_resource_plan(
-        domain: ExecutorDomain<F>,
+        domain: Box<ExecutorDomain<F>>,
         bindings: StateBindings,
         limits: ServiceLimits,
         plan: &ResourcePlan,

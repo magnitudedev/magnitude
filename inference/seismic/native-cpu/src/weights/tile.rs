@@ -293,25 +293,12 @@ impl<C: Codes, K: Coefficients, V: Vectors> Spans<C, K, V> {
     /// rows are never `Row::panel_tile`).
     const PANEL: PanelCodes = match C::PANEL {
         Some(panel) => panel,
-        None => PanelCodes { low: 8, high: 0, table: None, offset: 0 },
+        None => PanelCodes { low: 8, high: 0, values: CodeValues::Affine { double: false, offset: 0 } },
     };
 
     /// The x86 operand of each raw code: its value, less [`least`].
     #[cfg(target_arch = "x86_64")]
-    const OPERANDS: [i8; 16] = {
-        let (mut operands, mut raw) = ([0i8; 16], 0);
-        while raw < 16 {
-            if let Some(table) = Self::PANEL.table {
-                operands[raw] = (table[raw] as i32 - least::<C, K, V>()) as u8 as i8;
-            }
-            raw += 1;
-        }
-        operands
-    };
-
-    /// The x86 operand's offset from an untabled raw code.
-    #[cfg(target_arch = "x86_64")]
-    const OFFSET: i8 = (Self::PANEL.offset as i32 - least::<C, K, V>()) as u8 as i8;
+    const OPERANDS: CodeValues = Self::PANEL.values.less(least::<C, K, V>());
 }
 
 impl<C: Codes, K: Coefficients, V: Vectors> Source for Spans<C, K, V> {
@@ -326,13 +313,7 @@ impl<C: Codes, K: Coefficients, V: Vectors> Source for Spans<C, K, V> {
                 let high = packed_x86::panel_step(self.high, step, panel.high);
                 raw = _mm256_or_si256(raw, _mm256_sll_epi16(high, _mm_cvtsi32_si128(panel.low as i32)));
             }
-            if panel.table.is_some() {
-                _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_loadu_si128(Self::OPERANDS.as_ptr().cast())), raw)
-            } else if Self::OFFSET != 0 {
-                _mm256_add_epi8(raw, _mm256_set1_epi8(Self::OFFSET))
-            } else {
-                raw
-            }
+            Self::OPERANDS.x86(raw)
         }
     }
 
@@ -347,13 +328,7 @@ impl<C: Codes, K: Coefficients, V: Vectors> Source for Spans<C, K, V> {
                 let high = x86::panel_pair(self.high, pair, panel.high);
                 raw = _mm512_or_si512(raw, _mm512_sll_epi16(high, _mm_cvtsi32_si128(panel.low as i32)));
             }
-            if panel.table.is_some() {
-                _mm512_shuffle_epi8(_mm512_broadcast_i32x4(_mm_loadu_si128(Self::OPERANDS.as_ptr().cast())), raw)
-            } else if Self::OFFSET != 0 {
-                _mm512_add_epi8(raw, _mm512_set1_epi8(Self::OFFSET))
-            } else {
-                raw
-            }
+            Self::OPERANDS.x86_wide(raw)
         }
     }
 
@@ -368,10 +343,7 @@ impl<C: Codes, K: Coefficients, V: Vectors> Source for Spans<C, K, V> {
                 let high = packed_neon::panel_step(self.high, step, quad, panel.high);
                 raw = vorrq_u8(raw, vshlq_u8(high, vdupq_n_s8(panel.low as i8)));
             }
-            match panel.table {
-                Some(table) => vqtbl1q_s8(vld1q_s8(table.as_ptr()), raw),
-                None => vaddq_s8(vreinterpretq_s8_u8(raw), vdupq_n_s8(panel.offset)),
-            }
+            panel.values.neon(vreinterpretq_s8_u8(raw))
         }
     }
 
@@ -783,7 +755,7 @@ unsafe fn convert<C: Codes, const STORAGE: usize, V: Vectors>(rows: &[Row; 8], b
                 if codes.high > 0 {
                     code |= raw(high, codes.high, step, byte) << codes.low;
                 }
-                panel.0[step][byte] = codes.value(code);
+                panel.0[step][byte] = codes.values.value(code);
             }
         }
         return;

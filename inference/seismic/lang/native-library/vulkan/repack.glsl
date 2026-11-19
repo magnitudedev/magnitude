@@ -1,7 +1,8 @@
-// The registered `repack` of an external GGUF source into rows16 storage, the
-// Vulkan resident layout, one row tile's place at a time: the
-// one placement `repack_weight` imports by and expert streaming's
-// conversions write slots by (lib/streaming/window.glsl), so a slot holds
+// Seismic native library (Vulkan): the registered `repack` of an external
+// GGUF source into rows16 storage, the Vulkan resident layout, one row
+// tile's place at a time. `#include <seismic/repack.glsl>`. The one
+// placement the resident import (`repack_weight`) and expert streaming's
+// conversions (the kernels' streaming windows) write by, so a slot holds
 // exactly the bytes a resident import places.
 //
 // The conversion is data: its word form (`seismic_lang::repack::WordTable`,
@@ -31,10 +32,37 @@
 // column0)`, the same placement from the packet at byte offset `packet` of
 // the group memory (a copy of the source, the packet at a multiple of its
 // alignment: the conversion's `_SHARED` code). Placing reads no other invocation's words, so any invocations may
-// place any rows' tiles. The includer checks that `S` is external and `D`
-// rows16 with no padding groups (`SEISMIC_ELEMENT_<U>_GROUP_MULTIPLE` 1):
-// every stored tile holds source packets.
+// place any rows' tiles. `D` is rows16 with no padding groups, so every
+// stored tile holds source packets: `REPACK_ROWS16(P)`, a preprocessor
+// condition, is whether a binding is, and a kernel placing into rows16
+// declines (`#error`) any other with it; `REPACK_TILE` fails to compile
+// otherwise, an invariant violation.
+//
+// A tensor's or element's geometry, which a conversion's or a copy's
+// addressing reads, is read through its ABI prefix `P` outside `#if`
+// (glslang pastes no tokens there): `REPACK_GROUP(P)` (its storage group's
+// elements), `REPACK_PACKET_BYTES(P)` (a packet's bytes, a dense element's
+// one element's), `REPACK_ROW_BYTES(P)` and `REPACK_ROW_GROUPS(P)` (a row
+// layout's stored row and its groups), and a GGUF source's grid of scales,
+// `REPACK_PLANAR(P)`, `REPACK_GRID_SCALE_BYTES(P)`,
+// `REPACK_GRID_TILE_ROWS(P)` and `REPACK_GRID_TILE_COLUMNS(P)`; and the
+// strides of a [*, N, K] tensor's matrix, `REPACK_STRIDE_1(P)` (its rows) and
+// `REPACK_STRIDE_2(P)` (its columns). A row layout's strides count rows, any
+// other's packets: `REPACK_ROWS(P)`, a preprocessor condition.
 #include <seismic/element.glsl>
+
+#define REPACK_GROUP(P) P##_LOGICAL_GROUP
+#define REPACK_PACKET_BYTES(P) P##_PACKET_SIZE
+#define REPACK_ROW_BYTES(P) P##_ROW_STRIDE_BYTES
+#define REPACK_ROW_GROUPS(P) P##_ROW_GROUPS
+#define REPACK_PLANAR(P) (P##_GRID_PLANAR != 0)
+#define REPACK_GRID_SCALE_BYTES(P) P##_GRID_SCALE_BYTES
+#define REPACK_GRID_TILE_ROWS(P) P##_GRID_TILE_ROWS
+#define REPACK_GRID_TILE_COLUMNS(P) P##_GRID_TILE_COLUMNS
+#define REPACK_ROWS(P) (P(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS)
+#define REPACK_ROWS16(P) (P(SEISMIC_AXIS_LAYOUT) == SEISMIC_LAYOUT_ROWS16)
+#define REPACK_STRIDE_1(P) P##_STRIDE_1
+#define REPACK_STRIDE_2(P) P##_STRIDE_2
 
 // The rows of a conversion's tile as the code computes with them: unsigned.
 // `REPACK_TILE_ROWS_INT`, the same count as a signed literal for a
@@ -88,13 +116,13 @@
 
 // What a conversion reads its source by: a planar source (`S_GRID_PLANAR`)
 // its packet's codes and its tile's scale, any other its packet.
-#define REPACK_PLANAR_1(planar, plain) planar
-#define REPACK_PLANAR_0(planar, plain) plain
-#define REPACK_PLANAR_(flag) REPACK_PLANAR_##flag
-#define REPACK_PLANAR(flag) REPACK_PLANAR_(flag)
+#define REPACK_DETAIL_PLANAR_1(planar, plain) planar
+#define REPACK_DETAIL_PLANAR_0(planar, plain) plain
+#define REPACK_DETAIL_PLANAR_(flag) REPACK_DETAIL_PLANAR_##flag
+#define REPACK_DETAIL_PLANAR(flag) REPACK_DETAIL_PLANAR_(flag)
 
 // `count` bytes at `place`, zero.
-void repack_zero_bytes(uint64_t place, uint64_t count) {
+void repack_detail_zero_bytes(uint64_t place, uint64_t count) {
     for (uint64_t at = 0ul; at < count; ++at)
         element_u8_put(place + at, 0u);
 }
@@ -105,6 +133,11 @@ void repack_zero_bytes(uint64_t place, uint64_t count) {
 // C, S and D are complete ABI prefixes; paste their suffixes here so
 // conversion presence flags are not expanded while forwarding a prefix.
 #define REPACK_TILE(NAME, C, S, D) \
+    /* `D` is rows16 (an undefined name otherwise) with no padding groups. */ \
+    struct NAME##_binding { \
+        int rows16[D##_LAYOUT_ROWS16]; \
+        int unpadded[D##_GROUP_MULTIPLE == 1 ? 1 : -1]; \
+    }; \
     void NAME##_store(uint64_t place, uint words[C##_WORDS], uint first, uint bytes, uint unit) { \
         if (unit == 16u) { \
             [[unroll]] for (uint at = 0u; at < bytes / 4u; at += 4u) \
@@ -146,22 +179,22 @@ void repack_zero_bytes(uint64_t place, uint64_t count) {
     /* The row's alignment tails, zero, by its last tile. */ \
     void NAME##_place_tails(uint64_t row, uint column0) { \
         if (uint64_t(column0 + NAME##_tile_columns()) == uint64_t(D##_ROW_GROUPS) * uint(S##_LOGICAL_GROUP)) { \
-            repack_zero_bytes(row + D##_ROW_CODES + D##_ROW_CODES_BYTES, D##_ROW_CODES_TAIL); \
-            repack_zero_bytes(row + D##_ROW_HIGH + D##_ROW_HIGH_BYTES, D##_ROW_HIGH_TAIL); \
-            repack_zero_bytes(row + D##_ROW_SCALES + D##_ROW_SCALES_BYTES, \
+            repack_detail_zero_bytes(row + D##_ROW_CODES + D##_ROW_CODES_BYTES, D##_ROW_CODES_TAIL); \
+            repack_detail_zero_bytes(row + D##_ROW_HIGH + D##_ROW_HIGH_BYTES, D##_ROW_HIGH_TAIL); \
+            repack_detail_zero_bytes(row + D##_ROW_SCALES + D##_ROW_SCALES_BYTES, \
                 D##_ROW_SCALES_TAIL); \
-            repack_zero_bytes(row + D##_ROW_SUPERS + D##_ROW_SUPERS_BYTES, \
+            repack_detail_zero_bytes(row + D##_ROW_SUPERS + D##_ROW_SUPERS_BYTES, \
                 D##_ROW_SUPERS_TAIL); \
         } \
     } \
     void NAME##_place(uint64_t packet, uint64_t scale, uint64_t row, uint column0) { \
         const uint within = column0 % uint(S##_LOGICAL_GROUP); \
         uint words[C##_WORDS]; \
-        REPACK_PLANAR(S##_GRID_PLANAR)(C##_UNIT(packet, scale, within / NAME##_tile_columns(), words), \
+        REPACK_DETAIL_PLANAR(S##_GRID_PLANAR)(C##_UNIT(packet, scale, within / NAME##_tile_columns(), words), \
             C##_UNIT(packet, within / NAME##_tile_columns(), words)); \
         NAME##_place_unit(row, column0, words); \
         if (within == 0u) { \
-            REPACK_PLANAR(S##_GRID_PLANAR)(C##_FIXED(packet, scale, words), C##_FIXED(packet, words)); \
+            REPACK_DETAIL_PLANAR(S##_GRID_PLANAR)(C##_FIXED(packet, scale, words), C##_FIXED(packet, words)); \
             NAME##_place_fixed(row, column0, words); \
         } \
         NAME##_place_tails(row, column0); \
@@ -169,11 +202,11 @@ void repack_zero_bytes(uint64_t place, uint64_t count) {
     void NAME##_place_shared(uint packet, uint scale, uint64_t row, uint column0) { \
         const uint within = column0 % uint(S##_LOGICAL_GROUP); \
         uint words[C##_WORDS]; \
-        REPACK_PLANAR(S##_GRID_PLANAR)(C##_UNIT_SHARED(packet, scale, within / NAME##_tile_columns(), words), \
+        REPACK_DETAIL_PLANAR(S##_GRID_PLANAR)(C##_UNIT_SHARED(packet, scale, within / NAME##_tile_columns(), words), \
             C##_UNIT_SHARED(packet, within / NAME##_tile_columns(), words)); \
         NAME##_place_unit(row, column0, words); \
         if (within == 0u) { \
-            REPACK_PLANAR(S##_GRID_PLANAR)(C##_FIXED_SHARED(packet, scale, words), C##_FIXED_SHARED(packet, words)); \
+            REPACK_DETAIL_PLANAR(S##_GRID_PLANAR)(C##_FIXED_SHARED(packet, scale, words), C##_FIXED_SHARED(packet, words)); \
             NAME##_place_fixed(row, column0, words); \
         } \
         NAME##_place_tails(row, column0); \

@@ -11,11 +11,11 @@
 // GROUP / E neighbouring lanes.
 // ---------------------------------------------------------------------------
 
-#define ATTENTION_KEY_BITS (32 * ATTENTION_KEY_CODE_WORDS / ATTENTION_W)
-#define ATTENTION_VALUE_BITS (32 * ATTENTION_VALUE_CODE_WORDS / ATTENTION_W)
-// Columns per (scale, zero) pair: the codec's group (model-state
-// `AFFINE_GROUP`).
-#define ATTENTION_GROUP (2 * ATTENTION_W / ATTENTION_KEY_COEFFICIENTS)
+// The codec's geometry (attention.seismic's AFFINE_*): key and value code
+// bits, and the columns per (scale, zero) pair.
+#define ATTENTION_KEY_BITS SEISMIC_CONST_AFFINE_KEY_BITS
+#define ATTENTION_VALUE_BITS SEISMIC_CONST_AFFINE_VALUE_BITS
+#define ATTENTION_GROUP SEISMIC_CONST_AFFINE_GROUP
 
 template <uint B>
 struct lane_codes {
@@ -168,7 +168,7 @@ inline lane_encoding<KEY ? ATTENTION_KEY_BITS : ATTENTION_VALUE_BITS> held_encod
     float rounded[ATTENTION_E];
     ATTENTION_UNROLL
     for (uint i = 0; i < ATTENTION_E; ++i)
-        rounded[i] = element::Act::round(x[i]);
+        rounded[i] = activation::Act::round(x[i]);
     return quantize<KEY ? ATTENTION_KEY_BITS : ATTENTION_VALUE_BITS>(rounded);
 }
 
@@ -180,6 +180,37 @@ inline lane_encoding<KEY ? ATTENTION_KEY_BITS : ATTENTION_VALUE_BITS> held_encod
 inline half2 decode_pair(uint codes, half2 pair) {
     const half2 exact = as_type<half2>(codes | 0x64006400u) - half2(1024.0h);
     return metal::fma(exact, half2(pair.x), half2(pair.y));
+}
+
+// A code piece (16 bytes, `words`: 128 / B codes, within one group) decoded
+// with its group's `pair` to F16 (`decode_pair`), element pairs with the low
+// element in the low half. Every staged F16 tile of affine history, and
+// DIRECT's history reads, decode through it.
+template <uint B>
+inline void decode_piece(uint4 words, half2 pair, thread uint (&packed)[64 / B]) {
+    constexpr uint PER = 128 / B;
+    constexpr uint MASK = (1u << B) - 1u;
+    static_assert(ATTENTION_GROUP % PER == 0, "a code piece lies in one group");
+    ATTENTION_UNROLL
+    for (uint i = 0; i < PER; i += 2) {
+        const uint word = words[i * B / 32];
+        const uint shift = (i * B) % 32;
+        packed[i / 2] =
+            as_type<uint>(decode_pair(((word >> shift) & MASK) | (((word >> (shift + B)) & MASK) << 16), pair));
+    }
+}
+
+// Code piece c of one vector's code row `codes`, with its pairs at
+// `coefficients`, decoded (`decode_piece`). DIRECT reads history through it
+// and fresh rows through `held`, which decodes with the same `decode_pair`:
+// one F16 FMA, a single rounding of code * scale + zero, so a key reads the
+// same bits before and after its append.
+template <uint B>
+inline void read_piece(device const uint *codes, device const half *coefficients, uint c,
+    thread uint (&packed)[64 / B]) {
+    constexpr uint PER = 128 / B;
+    decode_piece<B>(*reinterpret_cast<device const uint4 *>(codes + c * 4),
+        *reinterpret_cast<device const half2 *>(coefficients + (c * PER / ATTENTION_GROUP) * 2), packed);
 }
 
 // This lane's columns of a vector's encoding, decoded (`decode_pair`).

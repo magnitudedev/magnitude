@@ -2,35 +2,27 @@
 // segmented projection: the u segment pairs the B and X streams into
 // u = B * X (F32, columns 0..CH), the C segment stores C (F32, columns
 // CH..2CH). The Vulkan form of `metal/short_conv_project.metal`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_B_WEIGHT
 #define KERNEL_W1 SEISMIC_C_WEIGHT
 #define KERNEL_W2 SEISMIC_X_WEIGHT
 // The projection's decoding launches stage their weights' tables (`packets.glsl`).
-#define PACKETS_STAGED_TABLES 1
+#define PACKETS_CONFIG_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_BS != 0 || SEISMIC_STATIC_CS != 0 || SEISMIC_STATIC_XS != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define CONV_ACT ELEMENT_ACT
-#else
+#if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "short_conv_project requires a bf16 or f16 activation"
 #endif
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define CONV_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define CONV_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define CONV_NORM ELEMENT_BF16
-#else
-#error "short_conv_project requires a dense norm"
-#endif
+#define CONV_ACT ACTIVATION_A
+#define CONV_NORM ELEMENT_OF(SEISMIC_NORM)
 // The rows the three weights take (the normalized rows, or NVFP4 operands):
 // the GEMV forms them while staging, the stage launch into the GEMM's
 // scratch.
-#if defined(SEISMIC_B_WEIGHT_OPERANDS_NVFP4)
+#if PACKETS_OPERANDS_NVFP4(SEISMIC_B_WEIGHT)
 #define CONV_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define CONV_OPERANDS PROJECTION_OPERANDS_ROUNDED

@@ -2141,6 +2141,7 @@ mod tests {
                     max_rows: 8,
                     max_projected_rows: 8,
                     context_tokens: 4096,
+                    image_cells: 0,
                 };
                 let statics = mix
                     .statics()
@@ -2266,6 +2267,7 @@ mod tests {
                     max_rows: 8,
                     max_projected_rows: 8,
                     context_tokens,
+                    image_cells: 0,
                 };
                 let starts = decode_starts(
                     &mix,
@@ -2359,6 +2361,7 @@ mod tests {
                     max_rows,
                     max_projected_rows: max_rows,
                     context_tokens: 65536,
+                    image_cells: 0,
                 };
                 let statics = mix
                     .statics()
@@ -2467,6 +2470,7 @@ mod tests {
         max_rows: 8,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
 
     /// The rows each logical launch of `rows` rows is priced at in `tuning`
@@ -2544,7 +2548,7 @@ mod tests {
             sampled_proposals: (VERIFY_ROWS - 1) as u8,
             widths: crate::DraftWidths::Adaptive,
         };
-        let terms = super::super::workload::terms(DECODE_LIMITS, &method.draft_widths());
+        let terms = super::super::workload::terms(DECODE_LIMITS, &method.draft_widths(), false);
         let graph = crate::programs::invocation_demand::GraphInvocationDemand::new(
             method,
             terms.clone(),
@@ -2653,6 +2657,7 @@ mod tests {
             max_rows: 512,
             max_projected_rows: 512,
             context_tokens: picked.context,
+            image_cells: 0,
         };
         let points = tuning.points(limits);
         let served = tuning.served_dimensions(&points);
@@ -2752,6 +2757,7 @@ mod tests {
             max_rows: 512,
             max_projected_rows: 512,
             context_tokens: 65536,
+            image_cells: 0,
         };
         let points = tuning.points(limits);
         let served = tuning.served_dimensions(&points);

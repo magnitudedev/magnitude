@@ -7,15 +7,7 @@
 #include <seismic/element.glsl>
 #include "lib/core/reduce.glsl"
 
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define TAIL_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define TAIL_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define TAIL_NORM ELEMENT_BF16
-#else
-#error "moe_tail requires dense norms"
-#endif
+#define TAIL_NORM ELEMENT_OF(SEISMIC_NORM)
 
 // f[i] of one row: both branches normalized with their inverses and norms.
 float moe_tail_combined(const uint64_t dense, const uint64_t routed, const float dense_inverse,

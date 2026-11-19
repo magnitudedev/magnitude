@@ -205,12 +205,21 @@ native readout_selected_rows for cpu from "cpu/readout_selected_rows.rs":
 #   scales[v, g]    the f16 scale of codes 32g..32g+31.
 # (A plane word shifted right by q and masked to 0x11111111 holds the bits of
 # codes 32g + 8q..8q+7 in the nibbles `top` holds their high bits in.)
+# A group is PROGRESSIVE_GROUP codes, one word of each bit plane: code i of a
+# group at bit (PROGRESSIVE_GROUP / PROGRESSIVE_LANES) (i % PROGRESSIVE_LANES)
+# + i / PROGRESSIVE_LANES, the word's PROGRESSIVE_LANES nibbles each one
+# lane's. `progressive_view` is the bit order's reference; each native reader
+# reads these constants (`SEISMIC_CONST_*`), and the executor's placement
+# (`progressive.rs`) is held to the reference by its round-trip test.
 # A view of the top b bits takes each code's missing low bits at their
 # midpoint: the 4-bit view is `s · (16·H − 120.5)`, the 5-bit view
 # `s · (16·H + 8·b3 − 124.5)`. `radius[v, 0]` and `radius[v, 1]` bound
 # |exact − view| of row v per unit length of the normalized row, F32 rounding
 # of both products included.
 #
+const PROGRESSIVE_GROUP = 32
+const PROGRESSIVE_LANES = 8
+
 # A certified selection runs the views in turn. A selection row scores a
 # vocabulary row as `logit / temperature + noise` (`gumbel_rows`: the
 # sampler's own noise, zero for greedy rows); a row competes when its row is
@@ -268,26 +277,26 @@ fn gumbel_rows[O, V](draws: &tensor[O, 6] u32, noise: &mut tensor[O, V] f32):
 # The head rows of the view of the top `bits` bits (4, 5 or 8) as F32 values.
 fn progressive_view[V, D, P](top: &tensor[V, (D + 31) / 32, P + 1] u32, bit3: &tensor[V, (D + 31) / 32] u32,
     rest: &tensor[V, (D + 31) / 32, P] u32, scales: &tensor[V, (D + 31) / 32] f16, bits: i32,
-    view: &mut tensor[V, D] f32) where D % 32 == 0 and P >= 1 and P <= 3 and P % 2 == 1:
+    view: &mut tensor[V, D] f32) where D % PROGRESSIVE_GROUP == 0 and P >= 1 and P <= 3 and P % 2 == 1:
     parallel for v in 0..V:
         parallel for k in 0..D:
-            let shift = u32(4 * (k % 8) + (k % 32) / 8)
+            let shift = u32((PROGRESSIVE_GROUP / PROGRESSIVE_LANES) * (k % PROGRESSIVE_LANES) + (k % PROGRESSIVE_GROUP) / PROGRESSIVE_LANES)
             let coarse_bits = P + 1
             let missing_scale = u32(1) << u32(coarse_bits)
             let mut high = u32(0)
             if P == 1:
-                high = (top[v, k / 32, (k % 32) / 16] >> u32(2 * (k % 16))) & 3
+                high = (top[v, k / PROGRESSIVE_GROUP, (k % PROGRESSIVE_GROUP) / 16] >> u32(2 * (k % 16))) & 3
             if P == 3:
-                high = (top[v, k / 32, (k % 32) / 8] >> u32(4 * (k % 8))) & 15
+                high = (top[v, k / PROGRESSIVE_GROUP, (k % PROGRESSIVE_GROUP) / 8] >> u32(4 * (k % 8))) & 15
             let mut code = f32(high * missing_scale) + f32(missing_scale - 1) * 0.5
             if bits >= i32(P + 2):
-                code = code - f32(u32(1) << u32(P - 1)) + f32((bit3[v, k / 32] >> shift) & 1) * f32(u32(1) << u32(P))
+                code = code - f32(u32(1) << u32(P - 1)) + f32((bit3[v, k / PROGRESSIVE_GROUP] >> shift) & 1) * f32(u32(1) << u32(P))
             if bits == i32(2 * (P + 1)):
                 let mut low = u32(0)
                 for plane in 0..P:
-                    low = low | (((rest[v, k / 32, plane] >> shift) & 1) << u32(P - 1 - plane))
+                    low = low | (((rest[v, k / PROGRESSIVE_GROUP, plane] >> shift) & 1) << u32(P - 1 - plane))
                 code = code - f32((u32(1) << u32(P)) - 1) * 0.5 + f32(low)
-            view[v, k] = f32(scales[v, k / 32]) * (code - f32(u32(1) << u32(2 * P + 1)))
+            view[v, k] = f32(scales[v, k / PROGRESSIVE_GROUP]) * (code - f32(u32(1) << u32(2 * P + 1)))
 
 # One certified level: each competing row's score bounds from its `view`
 # logits and `radius`, the rows whose upper bound reaches the threshold (the

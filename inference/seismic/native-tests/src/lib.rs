@@ -161,6 +161,7 @@ fn tallied_devices(
     let selected = seismic::testing::requested_backend();
     if let Some(backend) = selected.filter(|backend| !backends.contains(backend)) {
         eprintln!("native test backends: none, {backend:?} is outside this test's backend domain");
+        seismic::testing::record_selected_none(backend);
         return Vec::new();
     }
     let discovery = Devices::discover(&[]).expect("test device discovery");
@@ -182,6 +183,16 @@ fn tallied_devices(
 /// memory sees only its own work.
 pub fn fresh_device(backend: seismic::BackendName) -> Option<seismic::Device> {
     tallied_device(backend).map(|(device, _)| device)
+}
+
+/// The host's CPU, whatever backend the runner requests: the device of a
+/// test of the CPU's own forms, which every host opens, so no request
+/// skips it.
+pub fn cpu() -> seismic::Device {
+    let discovery = seismic::Devices::discover(&[]).expect("test device discovery");
+    seismic::testing::open_backend_tallied(&discovery, seismic::BackendName::Cpu, seismic::DeviceOptions::default())
+        .unwrap_or_else(|error| panic!("the CPU test device must open: {error}"))
+        .0
 }
 
 /// [`fresh_device`] with its device store's tally, which the test reads and

@@ -20,3 +20,6 @@ tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"
 # Equality of header values, for the tests that compare them.
 magnitude-artifacts = { path = "../artifacts", features = ["equality"] }
 flate2.workspace = true
+
+[lints]
+workspace = true

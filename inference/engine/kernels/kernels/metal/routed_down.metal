@@ -5,11 +5,12 @@
 // threadgroup of a channel tile to arrive (`arrivals`) sums the tile's
 // channels of every row.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #if defined(SEISMIC_FORMING_ROUTED_DOWN_WHOLE) || defined(SEISMIC_FORMING_ROUTED_DOWN_RESIDENT)                   \
     || defined(SEISMIC_FORMING_ROUTED_DOWN_GATHERED_WHOLE) || defined(SEISMIC_FORMING_ROUTED_DOWN_GATHERED_RESIDENT)
 // A whole or a resident layer's: nothing lands in its records while it runs,
 // so plain loads read them (8% of the launch at Gemma 26B's shape).
-#define PACKETS_PLAIN_RECORDS
+#define PACKETS_CONFIG_PLAIN_RECORDS
 #endif
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
 #include "lib/routed/down.h"

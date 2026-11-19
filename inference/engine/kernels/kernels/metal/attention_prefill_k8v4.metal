@@ -1,7 +1,5 @@
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ATTENTION_AFFINE_HISTORY 1
-#define ATTENTION_KEY_CODE_WORDS SEISMIC_DIM_KC
-#define ATTENTION_VALUE_CODE_WORDS SEISMIC_DIM_VC
-#define ATTENTION_KEY_COEFFICIENTS SEISMIC_DIM_KP
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_I SEISMIC_DIM_I
 #define ATTENTION_U SEISMIC_DIM_U
@@ -187,7 +185,7 @@ kernel void attention_prefill_k8v4_attend(
         value_coefficients, ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads();
 #endif
     attention::prefill_attend<SEISMIC_TUNE_QT>(history,
-        query, gate, visible, fresh, element::Out<element::Act>(result_cells), queries, keys, values, partials,
+        query, gate, visible, fresh, element::Out<activation::Act>(result_cells), queries, keys, values, partials,
         PREFILL_STATISTICS(scratch),
         PREFILL_COUNTS(scratch), SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane,
@@ -215,7 +213,7 @@ kernel void attention_prefill_k8v4_fold(
         attention::decoded_history::of(window,
             attention::held_tiles{tiles, window.words[attention::history_window::TILES]}, round,
             uint(SEISMIC_PARAM_SLAB_ROWS)).held(),
-        round, query, gate, element::Out<element::Act>(result_cells), partials, PREFILL_STATISTICS(scratch),
+        round, query, gate, element::Out<activation::Act>(result_cells), partials, PREFILL_STATISTICS(scratch),
         PREFILL_COUNTS(scratch), SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 #endif
 }
@@ -238,7 +236,7 @@ kernel void attention_prefill_k8v4_merge(
     if (window.rounds(window.words[attention::history_window::TILES]) > 1)
         return;
 #endif
-    attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, element::Out<element::Act>(result_cells), partials,
+    attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, element::Out<activation::Act>(result_cells), partials,
         PREFILL_STATISTICS(scratch), PREFILL_COUNTS(scratch), SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }
 
@@ -277,6 +275,6 @@ kernel void attention_prefill_k8v4_rotate(
     uint pair [[thread_index_in_threadgroup]]) {
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
-    attention::output_rotary(element::Out<element::Act>(result_cells), coordinates, rotary_components,
+    attention::output_rotary(element::Out<activation::Act>(result_cells), coordinates, rotary_components,
         rotary_frequencies, rotary_amplitudes, group.x, group.y, pair);
 }

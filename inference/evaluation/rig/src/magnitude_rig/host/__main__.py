@@ -9,7 +9,7 @@
     python3 -m magnitude_rig.host compiler --root ROOT
     python3 -m magnitude_rig.host provenance --output FILE --source DIR... --target DIR [--tests FILE] -- TEXT...
     python3 -m magnitude_rig.host header-artifacts --export DIR --model REF --output FILE
-    python3 -m magnitude_rig.host tests --list FILE -- ARGS...
+    python3 -m magnitude_rig.host tests --list FILE --ran FILE [--selection FILE] -- ARGS...
 
 `record` writes `host.json`, records `thermal.jsonl` around the job, and completes the
 job's `result.json` (when it wrote one) with the host facts and the thermal trace path.
@@ -23,7 +23,9 @@ and withdraws every other executable of the target it cannot verify (see `proven
 `fresh` runs a job that reads its model from storage (see `fresh.py`). `tests` runs a cargo suite's test executables from a build output instead of
 cargo: each one FILE lists (`host/agent.py`), with ARGS, from its package's directory with
 `CARGO_MANIFEST_DIR` naming it, as cargo runs them; it exits with the first failure's code, 0
-when every one passed.
+when every one passed. With `--selection` (`{binary key: [test names] or null}`) it runs only
+the executables the selection keys, each on its named tests alone, or all of them for null.
+It writes what each executable ran to `--ran` as it goes (`ran_record`).
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ import time
 from dataclasses import asdict, fields
 from pathlib import Path
 
-from . import agent, facts, fresh, gate, provenance, trace
+from . import agent, facts, fresh, gate, libtest, provenance, trace
 from .probes import open_probe
 
 GATE_TIMEOUT_EXIT = 3
@@ -51,8 +53,8 @@ def _compiler(arguments) -> int:
 
 
 def _provenance(arguments) -> int:
-    tests = json.loads(Path(arguments.tests).read_text()) if arguments.tests is not None else []
-    record = provenance.verify(arguments.texts, arguments.source, arguments.target, tests)
+    built = json.loads(Path(arguments.tests).read_text()) if arguments.tests is not None else None
+    record = provenance.verify(arguments.texts, arguments.source, arguments.target, built)
     trace.atomic(Path(arguments.output), record)
     for executable in record["executables"]:
         for reason in executable["reasons"]:
@@ -65,17 +67,84 @@ def _provenance(arguments) -> int:
     return 1 if record["status"] == "refused" else 0
 
 
+# The name an executable without the libtest harness runs as, one test, on its main thread.
+WHOLE, MAIN = "", "main"
+EVENTS = {"ask": "asked", "open": "opened", "run": "ran", "none": "none"}  # a test record's events, as `ran_record` keeps them
+
+
 def _tests(arguments) -> int:
-    failed = 0
+    selection = json.loads(Path(arguments.selection).read_text()) if arguments.selection else None
+    ran_path = Path(arguments.ran)
+    records = ran_path.parent / "test-records"
+    records.mkdir(parents=True, exist_ok=True)
+    ran, failed = [], 0
     for test in json.loads(Path(arguments.list).read_text()):
+        if selection is not None and test["binary"] not in selection:
+            continue
+        names = selection[test["binary"]] if selection is not None else None
+        argv = list(arguments.argv) if names is None else ["--exact", *names, *arguments.argv]
+        record = records / os.path.basename(test["executable"])
+        if record.exists():
+            record.unlink()
+        env = dict(os.environ, CARGO_MANIFEST_DIR=test["directory"], SEISMIC_TEST_RECORD=str(record))
         sys.stdout.write("     Running %s\n" % test["executable"])
         sys.stdout.flush()
-        code = subprocess.run([test["executable"], *arguments.argv], cwd=test["directory"],
-                              env=dict(os.environ, CARGO_MANIFEST_DIR=test["directory"])).returncode
+        process = subprocess.Popen([test["executable"], *argv], cwd=test["directory"], env=env,
+                                   stdout=subprocess.PIPE, text=True, errors="replace")
+        lines = []
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            lines.append(line.rstrip("\n"))
+        code = process.wait()
         # A test binary a signal ended exits as a shell reports it, 128 + the signal: an exit
         # status never negative, and never 0.
-        failed = failed or (128 - code if code < 0 else code)
+        code = 128 - code if code < 0 else code
+        failed = failed or code
+        listing = None
+        if libtest.harness(lines):
+            listing = (_listed(test, env, []), _listed(test, env, ["--ignored"]))
+        events = record.read_text().splitlines() if record.exists() else []
+        ran.append(ran_record(test, code, lines, listing, events))
+        trace.atomic(ran_path, ran)
+    if not ran:
+        trace.atomic(ran_path, ran)
     return failed
+
+
+def _listed(test: dict, env: dict, more: list) -> list:
+    """The tests a libtest executable has (with `--ignored`, those it ignores)."""
+    listed = subprocess.run([test["executable"], "--list", *more], cwd=test["directory"], env=env,
+                            capture_output=True, text=True, errors="replace")
+    if listed.returncode != 0:
+        raise SystemExit("%s --list %s exited %d: %s" % (test["executable"], " ".join(more), listed.returncode,
+                                                         listed.stderr.strip()))
+    return libtest.listed(listed.stdout.splitlines())
+
+
+def ran_record(test: dict, code: int, lines: list, listing, events: list) -> dict:
+    """What one test executable ran: its exit code; each test's outcome, as libtest printed it,
+    and the counts libtest totalled, which the outcomes must match; the tests it has and those
+    it ignores (`listing`, None for an executable without the libtest harness, which runs as
+    one test, `WHOLE`); and, from its test record (`events`, the lines
+    `seismic_lang::registry` appended: `ask|open|run|none BACKEND TEST`), by test the backends
+    it asked for (`any` where the runner requests none), those whose devices it opened, those it
+    did work on, and those it selected none of. A record's test is the thread that asked,
+    opened or selected none, or did the work on a device its test opened, so one no test of the
+    executable has is device use outside the tests."""
+    harness = listing is not None
+    outcomes = libtest.outcomes(lines) if harness else {WHOLE: "ok" if code == 0 else "FAILED"}
+    executions = {}
+    for line in events:
+        event, backend, name = (line.split(" ", 2) + [""])[:3]
+        name = WHOLE if not harness and name == MAIN else name
+        backends = executions.setdefault(name, {kept: [] for kept in EVENTS.values()})[EVENTS[event]]
+        if backend not in backends:
+            backends.append(backend)
+    return {"binary": test["binary"], "executable": os.path.basename(test["executable"]), "code": code,
+            "outcomes": outcomes, "counts": libtest.totals(lines) if harness else None,
+            "listed": listing[0] if harness else [WHOLE], "ignored": listing[1] if harness else [],
+            "executions": executions}
 
 
 def _header_artifacts(arguments) -> int:
@@ -258,6 +327,8 @@ def main(argv=None) -> int:
     command.set_defaults(handler=_header_artifacts)
     command = commands.add_parser("tests")
     command.add_argument("--list", required=True)
+    command.add_argument("--ran", required=True)
+    command.add_argument("--selection")
     command.add_argument("argv", nargs=argparse.REMAINDER)
     command.set_defaults(handler=_tests)
     command = commands.add_parser("compiler")

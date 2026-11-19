@@ -766,8 +766,6 @@ impl<B: seismic_native_target::TargetFamily> Inference<'_, '_, '_, '_, '_, B> {
                 }
             }
             NodeView::Unary { op, operand } => {
-                let op = op;
-                let operand = operand;
                 let interval = self.expression(operand)?;
                 match op {
                     ExprUnary::IntFromNat | ExprUnary::IntFromScalar => Ok(interval),

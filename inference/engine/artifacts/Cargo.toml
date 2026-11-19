@@ -22,3 +22,6 @@ libc = "0.2"
 [dev-dependencies]
 magnitude-artifacts = { path = ".", features = ["equality"] }
 serde_json.workspace = true
+
+[lints]
+workspace = true

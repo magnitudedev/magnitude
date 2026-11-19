@@ -1,6 +1,7 @@
 // per_layer_gate: the gate projection of the rounded hidden rows, the forms
 // of the `dense` projection (`lib/projection/operator.cuh`) over rows the
 // stage launch always forms.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #include "lib/projection/operator.cuh"
 

@@ -5,6 +5,7 @@
 // owns columns of the head and accumulates the softmax-weighted biased
 // values in key order, divides by the total and publishes the head rounded
 // once to A. Mirrors `cpu/corrector_attention.rs`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 // Shared: the N scores from float 32 (floats 0..32 reserved, unused).

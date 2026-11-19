@@ -26,7 +26,7 @@ pub use term::{CodeLevels, Neighbours, Term, TermError, Variable};
 
 use crate::entry::{LogicalEntry, ParameterKind};
 use crate::ids::RepresentationId;
-use crate::registry::{self, DecodeStep, PlaneEncoding, PlaneField, RepresentationKind};
+use crate::registry::{self, PlaneEncoding, PlaneField, RepresentationKind};
 use crate::types::DType;
 use term::Node;
 use trace::Trace;
@@ -440,61 +440,16 @@ fn packed(
         })
         .collect();
 
-    // The decoded value over what each plane read yields: a code read is its
-    // interpreted value, so interpretation steps pass it through.
-    let mut codes: Vec<(Term, PlaneField, u32, CodeLevels)> = Vec::new();
-    let mut temporaries: Vec<Option<Term>> = vec![None; recipe.temporary_count()];
-    for step in recipe.steps() {
-        let get = |temp| {
-            temporaries[recipe.ordinal(temp)]
-                .clone()
-                .expect("a decode step reads temporaries defined before it")
-        };
-        let value = match step {
-            DecodeStep::ReadPlaneField { plane, field, .. } => {
-                let schema = recipe
-                    .planes()
-                    .iter()
-                    .find(|schema| schema.ordinal == *plane)
-                    .expect("a decode step reads a plane of its recipe");
-                let read = Term::variable(Variable::Plane {
-                    parameter: parameter.to_owned(),
-                    plane: schema.field,
-                    field: *field,
-                    index: index.clone(),
-                });
-                if let Lattice::Codes(levels) = lattice(&schema.encoding) {
-                    codes.push((read.clone(), schema.field, *field, levels));
-                }
-                read
-            }
-            // A function of the element's position alone.
-            DecodeStep::ReadPlaneLane { .. } => {
-                Term::opaque(index.last().map(Term::dependencies).unwrap_or_default())
-            }
-            // A signed code is its plane read's value, the read's sign its
-            // own (`PlaneEncoding::SignedLocal`).
-            DecodeStep::InterpretCode { raw: from, .. }
-            | DecodeStep::SignedCode { code: from, .. }
-            | DecodeStep::InterpretGridCode { raw: from, .. }
-            | DecodeStep::DecodeFloatCode { raw: from, .. }
-            | DecodeStep::ConvertToF32 { from, .. } => get(*from),
-            DecodeStep::Constant { value, .. } => Term::constant(value.to_f64()),
-            DecodeStep::Cast { from, to, .. } => Term::round(*to, get(*from)),
-            DecodeStep::Multiply { left, right, .. } => get(*left).mul(get(*right)),
-            DecodeStep::Negate { from, .. } => Term::unary(term::Unary::Neg, get(*from)),
-            DecodeStep::MultiplyAdd {
-                factor,
-                multiplicand,
-                addend,
-                ..
-            } => get(*factor).mul(get(*multiplicand)).add(get(*addend)),
-        };
-        temporaries[recipe.ordinal(step.defines())] = Some(value);
-    }
-    let decoded = temporaries[recipe.ordinal(recipe.output())]
-        .clone()
-        .expect("a decode recipe defines its output");
+    let mut domain = DecodeTerms {
+        parameter,
+        index: &index,
+        codes: Vec::new(),
+    };
+    let Ok(decoded) = recipe.decode(
+        &mut domain,
+        registry::DecodeComponent::Temporary(recipe.output()),
+    );
+    let codes = domain.codes;
     let grids = codes
         .into_iter()
         .map(|(code, plane, field, levels)| {
@@ -513,4 +468,110 @@ fn packed(
         })
         .collect();
     (planes, grids)
+}
+
+/// The decoded value over what each plane read yields, for the element at
+/// `index` of `parameter`: a code read is its interpreted value, so
+/// interpretation steps pass it through. `codes` gathers each code read.
+struct DecodeTerms<'a> {
+    parameter: &'a str,
+    index: &'a [Term],
+    codes: Vec<(Term, PlaneField, u32, CodeLevels)>,
+}
+
+impl registry::DecodeDomain for DecodeTerms<'_> {
+    type Value = Term;
+    type Error = std::convert::Infallible;
+
+    fn read_plane_field(
+        &mut self,
+        plane: &registry::PlaneSchema,
+        field: u32,
+    ) -> Result<Term, Self::Error> {
+        let read = Term::variable(Variable::Plane {
+            parameter: self.parameter.to_owned(),
+            plane: plane.field,
+            field,
+            index: self.index.to_vec(),
+        });
+        if let Lattice::Codes(levels) = lattice(&plane.encoding) {
+            self.codes.push((read.clone(), plane.field, field, levels));
+        }
+        Ok(read)
+    }
+
+    /// A function of the element's position alone.
+    fn read_plane_lane(&mut self, _: &registry::PlaneSchema) -> Result<Term, Self::Error> {
+        Ok(Term::opaque(
+            self.index
+                .last()
+                .map(Term::dependencies)
+                .unwrap_or_default(),
+        ))
+    }
+
+    fn interpret_code(
+        &mut self,
+        raw: &Term,
+        _: u32,
+        _: u32,
+        _: &registry::CodeInterpretation,
+    ) -> Result<Term, Self::Error> {
+        Ok(raw.clone())
+    }
+
+    /// A signed code is its plane read's value, the read's sign its own
+    /// (`PlaneEncoding::SignedLocal`).
+    fn signed_code(&mut self, code: &Term, _: &Term, _: u32) -> Result<Term, Self::Error> {
+        Ok(code.clone())
+    }
+
+    fn interpret_grid_code(
+        &mut self,
+        raw: &Term,
+        _: &Term,
+        _: &'static registry::GridCodes,
+    ) -> Result<Term, Self::Error> {
+        Ok(raw.clone())
+    }
+
+    fn decode_float_code(
+        &mut self,
+        raw: &Term,
+        _: registry::FloatCodeFormat,
+    ) -> Result<Term, Self::Error> {
+        Ok(raw.clone())
+    }
+
+    fn convert_to_f32(&mut self, from: &Term, _: DType) -> Result<Term, Self::Error> {
+        Ok(from.clone())
+    }
+
+    fn constant(
+        &mut self,
+        value: crate::reference_math::ReferenceScalar,
+    ) -> Result<Term, Self::Error> {
+        Ok(Term::constant(value.to_f64()))
+    }
+
+    fn multiply(&mut self, left: &Term, right: &Term) -> Result<Term, Self::Error> {
+        Ok(left.clone().mul(right.clone()))
+    }
+
+    fn negate(&mut self, from: &Term) -> Result<Term, Self::Error> {
+        Ok(Term::unary(term::Unary::Neg, from.clone()))
+    }
+
+    fn multiply_add(
+        &mut self,
+        factor: &Term,
+        multiplicand: &Term,
+        addend: &Term,
+    ) -> Result<Term, Self::Error> {
+        Ok(factor.clone().mul(multiplicand.clone()).add(addend.clone()))
+    }
+
+    fn cast(&mut self, from: &Term, _: DType, to: DType) -> Result<Term, Self::Error> {
+        Ok(Term::round(to, from.clone()))
+    }
 }

@@ -6,10 +6,11 @@
 // `gate_scale`/`up_scale` where those ports are present (static GS, US).
 // Every row of a choice with no record is zero.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #if defined(SEISMIC_FORMING_ROUTED_GATE_UP_RESIDENT) || defined(SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED_RESIDENT)
 // A resident layer's: nothing lands in its records while it runs, so plain
 // loads read them.
-#define PACKETS_PLAIN_RECORDS
+#define PACKETS_CONFIG_PLAIN_RECORDS
 #endif
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP

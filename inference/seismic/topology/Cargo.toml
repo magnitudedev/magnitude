@@ -14,3 +14,6 @@ serde_json.workspace = true
 [features]
 # The recorded machines (`fixtures::recorded`), for other crates' tests.
 fixtures = []
+
+[lints]
+workspace = true

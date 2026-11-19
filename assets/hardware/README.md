@@ -28,10 +28,4 @@ Run `python assets/hardware/tools/audit.py` with Pillow to check image decoding,
 
 From `desktop`, run `bunx --bun vitest run src/hardware-photos.test.ts src/hardware-details.test.ts`. The real hardware component has acceptance fixtures at `desktop/test/hardware/index.html` (append `?dark` for dark mode), served by the existing loading-test Vite server. Test every supported identity plus unknown, shared-memory, laptop-GPU, external-GPU, multiple-GPU, and ambiguous-name cases.
 
-Native parser fixtures can be run from the repository root:
-
-```sh
-cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined packages/daemon-management/native/test/machine-identity.c -o /tmp/magnitude-machine-identity-test
-/tmp/magnitude-machine-identity-test
-bunx --bun vitest run packages/daemon-management/src/desktop-native/machine-identity.test.ts
-```
+The firmware reader that names the machine is seismic-discovery's `machine` module; its SMBIOS parser fixtures run with `cargo test --manifest-path inference/Cargo.toml -p seismic-discovery machine`.

@@ -3,6 +3,7 @@
 // gathered projections (`lib/routed/down.h`), published in A into result 0
 // for `routed_down_sited`.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ROUTED_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
 #include "lib/routed/down.h"
 

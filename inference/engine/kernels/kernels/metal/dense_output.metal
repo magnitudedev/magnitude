@@ -1,17 +1,15 @@
 // dense_output: the down projection of the product rows plus the
 // residual rows they were gathered from (`out_rows`).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
 #include "lib/projection/operator.h"
-#if defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV) || defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV_ROWS) || defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV_PAIR) || defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV_PACKED)
+#if defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV) || defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV_ROWS) || defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV_PAIR)
 #include "lib/projection/gemv.h"
 #endif
-#ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_PACKED
-#include "lib/projection/gemv_packed.h"
-#endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 // The down weight's operand rows (the product rows, or NVFP4 operands): the
 // GEMV row classes form them while staging, the stage launch into the
 // scratch every other form reads.
@@ -45,17 +43,17 @@ typedef projection::operands<NVFP4> Operands;
 // `raw` is the product rows; `in` the rows every form past the GEMV reads.
 #define PROJECTION_OPERANDS(group)                                                      \
     const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_H), k = uint(SEISMIC_DIM_F); \
-    const projection::Plain<activation, projection::AllRows> raw{product, SEISMIC_PRODUCT_STRIDE_0, \
+    const projection::Plain<activation_element, projection::AllRows> raw{product, SEISMIC_PRODUCT_STRIDE_0, \
         SEISMIC_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_F), {}};                             \
-    const projection::Plain<activation, projection::AllRows> in = NVFP4                 \
-        ? projection::Plain<activation, projection::AllRows>{staged, SEISMIC_DIM_F, 1, uint(SEISMIC_DIM_F), {}} \
+    const projection::Plain<activation_element, projection::AllRows> in = NVFP4         \
+        ? projection::Plain<activation_element, projection::AllRows>{staged, SEISMIC_DIM_F, 1, uint(SEISMIC_DIM_F), {}} \
         : raw;                                                                          \
     const auto out = projection::scaling<(SEISMIC_DIM_DS != 0)>::wrap(                  \
-        projection::Residual<activation, projection::SelectedRows>{element::Out<element::F32>(result_cells), \
+        projection::Residual<activation_element, projection::SelectedRows>{element::Out<element::F32>(result_cells), \
             SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, residual, SEISMIC_RESIDUAL_STRIDE_0, \
             SEISMIC_RESIDUAL_STRIDE_1, {out_rows}},                                     \
         projection::scale_factor(down_scale, SEISMIC_DIM_DS, 0, 0), 1.0f);              \
-    projection::Weights<packets::W0> w{down_weight, KERNEL_W0_LAYOUT(SEISMIC_DIM_F), uint(SEISMIC_DIM_F)}
+    projection::Weights<packets::W0> w{{down_weight, KERNEL_W0_LAYOUT(SEISMIC_DIM_F), uint(SEISMIC_DIM_F)}}
 
 // The product rows as NVFP4 operands into `staged`, one row a threadgroup.
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_STAGE
@@ -86,21 +84,15 @@ kernel void dense_output_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
 }
 #endif
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void dense_output_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void dense_output_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
-}
-#endif
-#ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_PACKED
-template <uint LANES, uint PACKED_ROWS, uint ROWS>
-kernel void dense_output_gemv_packed(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
-    PROJECTION_SINGLE_GEMV_PACKED;
 }
 #endif
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_BATCH

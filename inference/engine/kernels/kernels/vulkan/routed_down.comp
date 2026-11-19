@@ -4,6 +4,7 @@
 // launch. The Vulkan form of `metal/routed_down.metal`. The running selection
 // lives in every lane's registers and one lane stores the channel.
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/routed/down.glsl"
 #include "lib/routed/down_sum.glsl"
 

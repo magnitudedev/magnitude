@@ -437,7 +437,7 @@ pub(crate) struct AllocationCharge<'a> {
 
 impl Charges {
     /// A fixed buffer of `contract` through these
-    /// ([`crate::backends::OpenedKind::allocate_contract`]), ordered by
+    /// ([`crate::api::device::DeviceInner::allocate_contract`]), ordered by
     /// `access`'s hazard domain where given, else by a domain of its own.
     pub(crate) fn allocate_contract(
         &self,
@@ -446,7 +446,7 @@ impl Charges {
         alignment: u64,
         access: Option<Arc<crate::driver::AccessGroup>>,
     ) -> Result<Arc<crate::driver::Allocation>, ExecutionError> {
-        self.device.kind.allocate_contract(self.of(contract, bytes)?, bytes, alignment, access)
+        self.device.allocate_contract(self.of(contract, bytes)?, bytes, alignment, access)
     }
 
     /// Device storage through these, in `access`'s hazard domain where given.

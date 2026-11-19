@@ -107,6 +107,11 @@ impl Devices {
             if stores.as_ref().is_some_and(|stores| !device.memory.opened_with(stores)) {
                 return Err(OpenError::StoreConflict(info.selector()));
             }
+            // A test that shares an open device opened it too, and is credited with the work
+            // its threads do on it (`seismic_lang::registry::TestDevice`).
+            if let Some(test) = &device.test {
+                test.reopened();
+            }
             return Ok(device);
         }
         if let Availability::Unavailable { reason } = info.availability() {

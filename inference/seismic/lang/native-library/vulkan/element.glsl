@@ -10,25 +10,31 @@
 // `element_round`, round to nearest even; bf16, and `element_round`'s f16
 // decode, in integer code).
 //
-// glslang's preprocessor has no variadic macros and does not evaluate token
-// pasting inside `#if`, so the Metal/CUDA `ELEMENT_HAS` probe cannot exist
-// here: a kind is read from the ABI prefix only by a `defined(...)` ladder
-// over the full prefix name, and the build admits only the including
-// entry's ABI names, so a ladder lives where its element exists, in the
-// kernel library that names the element; an entry reads the kind of any other
-// dense element or tensor with its own ladder:
-//     #if defined(SEISMIC_ELEMENT_E_REPRESENTATION_F32)
-//     #define IMPORT_SOURCE_KIND ELEMENT_F32
-//     #elif ...
+// A tensor's or element's kind is read through its ABI prefix `P`:
+// `ELEMENT_OF(P)` in code, which fails to compile where `P` is no dense
+// f32, bf16 or f16 element, and `ELEMENT_KIND(P)` in `#if` (a dense float
+// element's kind, any other value otherwise):
+//     #define IMPORT_SOURCE_KIND ELEMENT_OF(SEISMIC_ELEMENT_E)
+//     #if ELEMENT_KIND(SEISMIC_ELEMENT_A) == ELEMENT_F32
+// glslang's preprocessor pastes no tokens inside `#if`, so both read the
+// prefix's axes tuple (seismic/runtime native ABI `render_axes_tuple`): a
+// kind is its dtype's axis value (`SEISMIC_DTYPE_*`).
 //
 // Memory is addressed by 64-bit byte addresses (`SEISMIC_PTR(...)` plus
 // offsets). `element_at`/`element_put` index a tensor in elements of its own
 // kind; the raw accessors (`element_u32_at`, `element_uvec4_at`, ...) load and
 // store whole words at a byte address aligned to the word.
 
-#define ELEMENT_F32 0
-#define ELEMENT_BF16 1
-#define ELEMENT_F16 2
+#define ELEMENT_F32 SEISMIC_DTYPE_F32
+#define ELEMENT_BF16 SEISMIC_DTYPE_BF16
+#define ELEMENT_F16 SEISMIC_DTYPE_F16
+
+#define ELEMENT_KIND(P) P(SEISMIC_AXIS_DTYPE)
+// The kind as a constant expression, indexing the one-element array at -1,
+// a compile-time error, where it is no dense float kind.
+#define ELEMENT_DETAIL_FLOAT(kind) ((kind) == ELEMENT_F32 || (kind) == ELEMENT_BF16 || (kind) == ELEMENT_F16)
+const int element_detail_float[1] = int[1](0);
+#define ELEMENT_OF(P) (ELEMENT_KIND(P) + element_detail_float[ELEMENT_DETAIL_FLOAT(ELEMENT_KIND(P)) ? 0 : -1])
 
 // Bytes of one element of a kind.
 #define ELEMENT_BYTES(kind) ((kind) == ELEMENT_F32 ? 4u : 2u)
@@ -46,26 +52,26 @@
 // put, or to move it across the barrier: an exchange that way is exact on
 // one driver and loses words on another (GB10's `candidate_rows`).
 
-layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer element_ro_u8 { uint8_t v; };
-layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer element_ro_i8 { int8_t v; };
-layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer element_ro_u16 { uint16_t v; };
-layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer element_ro_u32 { uint v; };
-layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer element_ro_u64 { uint64_t v; };
-layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer element_ro_uvec2 { uvec2 v; };
-layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer element_ro_uvec4 { uvec4 v; };
-layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer element_ro_f32 { float v; };
-layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer element_ro_vec4 { vec4 v; };
+layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer element_detail_ro_u8 { uint8_t v; };
+layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer element_detail_ro_i8 { int8_t v; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer element_detail_ro_u16 { uint16_t v; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer element_detail_ro_u32 { uint v; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer element_detail_ro_u64 { uint64_t v; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer element_detail_ro_uvec2 { uvec2 v; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer element_detail_ro_uvec4 { uvec4 v; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer element_detail_ro_f32 { float v; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer element_detail_ro_vec4 { vec4 v; };
 
-uint element_u8_at(uint64_t address) { return uint(element_ro_u8(address).v); }
-int element_i8_at(uint64_t address) { return int(element_ro_i8(address).v); }
-uint element_u16_at(uint64_t address) { return uint(element_ro_u16(address).v); }
-uint element_u32_at(uint64_t address) { return element_ro_u32(address).v; }
-int element_i32_at(uint64_t address) { return int(element_ro_u32(address).v); }
-uint64_t element_u64_at(uint64_t address) { return element_ro_u64(address).v; }
-uvec2 element_uvec2_at(uint64_t address) { return element_ro_uvec2(address).v; }
-uvec4 element_uvec4_at(uint64_t address) { return element_ro_uvec4(address).v; }
-float element_f32_at(uint64_t address) { return element_ro_f32(address).v; }
-vec4 element_vec4_at(uint64_t address) { return element_ro_vec4(address).v; }
+uint element_u8_at(uint64_t address) { return uint(element_detail_ro_u8(address).v); }
+int element_i8_at(uint64_t address) { return int(element_detail_ro_i8(address).v); }
+uint element_u16_at(uint64_t address) { return uint(element_detail_ro_u16(address).v); }
+uint element_u32_at(uint64_t address) { return element_detail_ro_u32(address).v; }
+int element_i32_at(uint64_t address) { return int(element_detail_ro_u32(address).v); }
+uint64_t element_u64_at(uint64_t address) { return element_detail_ro_u64(address).v; }
+uvec2 element_uvec2_at(uint64_t address) { return element_detail_ro_uvec2(address).v; }
+uvec4 element_uvec4_at(uint64_t address) { return element_detail_ro_uvec4(address).v; }
+float element_f32_at(uint64_t address) { return element_detail_ro_f32(address).v; }
+vec4 element_vec4_at(uint64_t address) { return element_detail_ro_vec4(address).v; }
 
 void element_u8_put(uint64_t address, uint value) { seismic_u8(address).v = uint8_t(value); }
 void element_u16_put(uint64_t address, uint value) { seismic_u16(address).v = uint16_t(value); }
@@ -74,6 +80,26 @@ void element_i32_put(uint64_t address, int value) { seismic_i32(address).v = val
 void element_f32_put(uint64_t address, float value) { seismic_f32(address).v = value; }
 void element_uvec4_put(uint64_t address, uvec4 value) { seismic_uvec4(address).v = value; }
 void element_uvec2_put(uint64_t address, uvec2 value) { seismic_uvec2(address).v = value; }
+
+// The sizes a stored element has, and the position of `bytes` among them:
+// -1 for any other, which as a constant index fails to compile.
+const uint element_detail_sizes[4] = uint[4](1u, 2u, 4u, 8u);
+#define ELEMENT_DETAIL_SIZE(bytes) ((bytes) == 1u ? 0 : (bytes) == 2u ? 1 : (bytes) == 4u ? 2 : (bytes) == 8u ? 3 : -1)
+void element_detail_copy(const uint bytes, uint64_t to, uint64_t from) {
+    if (bytes == 8u)
+        element_uvec2_put(to, element_uvec2_at(from));
+    else if (bytes == 4u)
+        element_u32_put(to, element_u32_at(from));
+    else if (bytes == 2u)
+        element_u16_put(to, element_u16_at(from));
+    else
+        element_u8_put(to, element_u8_at(from));
+}
+
+// One stored element of `bytes` bytes (a constant: a dense element's 1, 2, 4
+// or 8, at an address aligned to them; any other fails to compile) moved
+// from `from` to `to` bit for bit.
+#define ELEMENT_COPY(bytes, to, from) element_detail_copy(element_detail_sizes[ELEMENT_DETAIL_SIZE(bytes)], to, from)
 
 // Element `index` of an i32 tensor (index maps, token ids).
 int element_i32_index(uint64_t base, uint64_t index) { return element_i32_at(base + index * 4ul); }

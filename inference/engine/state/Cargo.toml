@@ -6,8 +6,13 @@ license.workspace = true
 
 [dependencies]
 magnitude-family-contracts = { path = "../families/contracts" }
+# The KV codecs' geometry, which the kernels define (`constants`).
+magnitude-kernels = { path = "../kernels" }
 seismic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 seismic = { workspace = true, features = ["fixtures"] }
+
+[lints]
+workspace = true

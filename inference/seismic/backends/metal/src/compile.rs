@@ -47,7 +47,7 @@ pub(crate) fn form_kernel(
     let rendered = render::render(0, kernel, layout);
     let text = format!(
         "{}{}{}",
-        render::LIBRARY_PRELUDE,
+        render::library_prelude(),
         render::SOFTFLOAT_PRELUDE,
         rendered.source
     );

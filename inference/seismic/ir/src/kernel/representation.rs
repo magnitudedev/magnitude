@@ -4,7 +4,7 @@ use super::internals::{PlaceEntry, PortableBuilder, PortableValue};
 use super::ops::{BinaryOp, UnaryOp, ValueType};
 use crate::physical_target::PhysicalDialect;
 use seismic_lang::reference_math;
-use seismic_lang::registry::{self, DecodeStep};
+use seismic_lang::registry;
 use seismic_lang::types::DType;
 
 pub(super) fn read<B: PhysicalDialect>(
@@ -24,94 +24,160 @@ pub(super) fn read_component<B: PhysicalDialect>(
     let info = registry::representation_info(place.representation);
     let recipe = registry::decode_recipe(place.representation, info.decoded)
         .expect("registered packed representation has a decode sequence");
-    if let Some(registry::DecodeComponent::Constant(value)) =
-        component.and_then(|role| recipe.component(role))
-    {
-        return builder.constant(
+    let target = recipe
+        .target(component)
+        .expect("checked representation supports role");
+    let Ok(value) = recipe.decode(
+        &mut Lowering {
+            builder,
+            place,
+            indices,
+        },
+        target,
+    );
+    value
+}
+
+/// A decode's IR: plane reads are physical reads of `place` at `indices`;
+/// every numerical step is a scalar recipe or a primitive op.
+struct Lowering<'b, 'p, 'i, B: PhysicalDialect> {
+    builder: &'b mut PortableBuilder<'p, B>,
+    place: PlaceEntry,
+    indices: &'i [PortableValue],
+}
+
+impl<B: PhysicalDialect> registry::DecodeDomain for Lowering<'_, '_, '_, B> {
+    type Value = PortableValue;
+    type Error = std::convert::Infallible;
+
+    fn dtype(value: &PortableValue) -> Option<DType> {
+        match value.ty {
+            ValueType::Scalar(dtype) => Some(dtype),
+            other => panic!("a decode step lowered to a value of type {other:?}"),
+        }
+    }
+
+    fn read_plane_field(
+        &mut self,
+        plane: &registry::PlaneSchema,
+        field: u32,
+    ) -> Result<PortableValue, Self::Error> {
+        Ok(self
+            .builder
+            .read_plane_field(self.place, self.indices, plane.ordinal, field))
+    }
+
+    fn read_plane_lane(
+        &mut self,
+        plane: &registry::PlaneSchema,
+    ) -> Result<PortableValue, Self::Error> {
+        Ok(self
+            .builder
+            .read_plane_lane(self.place, self.indices, plane.ordinal))
+    }
+
+    fn interpret_code(
+        &mut self,
+        raw: &PortableValue,
+        _: u32,
+        bits: u32,
+        interpretation: &registry::CodeInterpretation,
+    ) -> Result<PortableValue, Self::Error> {
+        let scalar = reference_math::code_recipe(interpretation, bits);
+        Ok(super::reference_math::expand_total_recipe(
+            self.builder,
+            &scalar,
+            &[*raw],
+        ))
+    }
+
+    fn signed_code(
+        &mut self,
+        code: &PortableValue,
+        raw: &PortableValue,
+        bit: u32,
+    ) -> Result<PortableValue, Self::Error> {
+        let scalar = reference_math::signed_code_recipe(bit);
+        Ok(super::reference_math::expand_total_recipe(
+            self.builder,
+            &scalar,
+            &[*code, *raw],
+        ))
+    }
+
+    fn interpret_grid_code(
+        &mut self,
+        raw: &PortableValue,
+        lane: &PortableValue,
+        grid: &'static registry::GridCodes,
+    ) -> Result<PortableValue, Self::Error> {
+        let scalar = reference_math::grid_code_recipe(grid);
+        Ok(super::reference_math::expand_total_recipe(
+            self.builder,
+            &scalar,
+            &[*raw, *lane],
+        ))
+    }
+
+    fn decode_float_code(
+        &mut self,
+        raw: &PortableValue,
+        format: registry::FloatCodeFormat,
+    ) -> Result<PortableValue, Self::Error> {
+        let scalar = reference_math::float_code_recipe(format);
+        Ok(super::reference_math::expand_total_recipe(
+            self.builder,
+            &scalar,
+            &[*raw],
+        ))
+    }
+
+    fn convert_to_f32(
+        &mut self,
+        from: &PortableValue,
+        _: DType,
+    ) -> Result<PortableValue, Self::Error> {
+        Ok(self.builder.cast(*from, ValueType::Scalar(DType::F32)))
+    }
+
+    fn constant(
+        &mut self,
+        value: reference_math::ReferenceScalar,
+    ) -> Result<PortableValue, Self::Error> {
+        Ok(self.builder.constant(
             super::ops::ConstantValue::from_scalar(value),
             ValueType::Scalar(value.dtype()),
-        );
+        ))
     }
-    let mut values = Vec::with_capacity(recipe.temporary_count());
-    for step in recipe.steps() {
-        let get = |temp| values[recipe.ordinal(temp)];
-        let value = match step {
-            DecodeStep::ReadPlaneField { plane, field, .. } => {
-                builder.read_plane_field(place, indices, *plane, *field)
-            }
-            DecodeStep::InterpretCode {
-                raw,
-                bits,
-                interpretation,
-                ..
-            } => {
-                let scalar = reference_math::code_recipe(interpretation, *bits);
-                super::reference_math::expand_total_recipe(builder, &scalar, &[get(*raw)])
-            }
-            DecodeStep::SignedCode { code, raw, bit, .. } => {
-                let scalar = reference_math::signed_code_recipe(*bit);
-                super::reference_math::expand_total_recipe(
-                    builder,
-                    &scalar,
-                    &[get(*code), get(*raw)],
-                )
-            }
-            DecodeStep::ReadPlaneLane { plane, .. } => {
-                builder.read_plane_lane(place, indices, *plane)
-            }
-            DecodeStep::InterpretGridCode {
-                raw, lane, grid, ..
-            } => {
-                let scalar = reference_math::grid_code_recipe(grid);
-                super::reference_math::expand_total_recipe(
-                    builder,
-                    &scalar,
-                    &[get(*raw), get(*lane)],
-                )
-            }
-            DecodeStep::DecodeFloatCode { raw, format, .. } => {
-                let scalar = reference_math::float_code_recipe(*format);
-                super::reference_math::expand_total_recipe(builder, &scalar, &[get(*raw)])
-            }
-            DecodeStep::ConvertToF32 { from, .. } => {
-                builder.cast(get(*from), ValueType::Scalar(DType::F32))
-            }
-            DecodeStep::Constant { value, .. } => builder.constant(
-                super::ops::ConstantValue::from_scalar(*value),
-                ValueType::Scalar(value.dtype()),
-            ),
-            DecodeStep::Multiply { left, right, .. } => {
-                builder.binary(BinaryOp::Mul, get(*left), get(*right))
-            }
-            DecodeStep::Negate { from, .. } => builder.unary(UnaryOp::Neg, get(*from)),
-            DecodeStep::MultiplyAdd {
-                factor,
-                multiplicand,
-                addend,
-                ..
-            } => builder.fma(get(*factor), get(*multiplicand), get(*addend)),
-            DecodeStep::Cast { from, to, .. } => builder.cast(get(*from), ValueType::Scalar(*to)),
-        };
-        assert_eq!(
-            recipe.ordinal(step.defines()),
-            values.len(),
-            "decode sequence has ordered definitions"
-        );
-        assert_eq!(value.ty, ValueType::Scalar(recipe.dtype(step.defines())));
-        values.push(value);
+
+    fn multiply(
+        &mut self,
+        left: &PortableValue,
+        right: &PortableValue,
+    ) -> Result<PortableValue, Self::Error> {
+        Ok(self.builder.binary(BinaryOp::Mul, *left, *right))
     }
-    match component {
-        None => values[recipe.ordinal(recipe.output())],
-        Some(role) => match recipe
-            .component(role)
-            .expect("checked representation supports role")
-        {
-            registry::DecodeComponent::Temporary(temp) => values[recipe.ordinal(temp)],
-            registry::DecodeComponent::Constant(value) => builder.constant(
-                super::ops::ConstantValue::from_scalar(value),
-                ValueType::Scalar(value.dtype()),
-            ),
-        },
+
+    fn negate(&mut self, from: &PortableValue) -> Result<PortableValue, Self::Error> {
+        Ok(self.builder.unary(UnaryOp::Neg, *from))
+    }
+
+    fn multiply_add(
+        &mut self,
+        factor: &PortableValue,
+        multiplicand: &PortableValue,
+        addend: &PortableValue,
+    ) -> Result<PortableValue, Self::Error> {
+        Ok(self.builder.fma(*factor, *multiplicand, *addend))
+    }
+
+    fn cast(
+        &mut self,
+        from: &PortableValue,
+        _: DType,
+        to: DType,
+    ) -> Result<PortableValue, Self::Error> {
+        Ok(self.builder.cast(*from, ValueType::Scalar(to)))
     }
 }
 

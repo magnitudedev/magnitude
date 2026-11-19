@@ -28,6 +28,10 @@
 #define PROGRESSIVE_OFFSET (1u << (2u * PROGRESSIVE_HALF_BITS - 1u))
 #define PROGRESSIVE_COARSE_SCALE (1u << PROGRESSIVE_HALF_BITS)
 #define PROGRESSIVE_COARSE_BIAS (0.5f * float(PROGRESSIVE_COARSE_SCALE - 1u) - float(PROGRESSIVE_OFFSET))
+// Every reader here is written for the planes' bit order (`readout.seismic`):
+// a plane word per group of 32 codes, its 8 lanes the quarters' nibbles.
+static_assert(SEISMIC_CONST_PROGRESSIVE_GROUP == 32 && SEISMIC_CONST_PROGRESSIVE_LANES == 8,
+    "a plane word is one group, its nibbles the quarters' codes");
 
 inline uint4 progressive_high(device const uint *row, uint group) {
     if constexpr (PROGRESSIVE_LOW_PLANES == 3u)
@@ -52,7 +56,7 @@ inline uint4 progressive_high(device const uint *row, uint group) {
 // The two views of a progressive head as projection-library packets, so the
 // library's GEMV, batched GEMV and GEMM project its planes. A packet is one
 // group of 32 codes, consumed in four steps (quarters) of 8.
-namespace packets {
+namespace readout {
 
 // The 4-bit view: the top plane's nibbles H, in q4k's low-nibble order, at
 // scale 16 s and bias -120.5 s (the code's missing bits at their midpoint).
@@ -67,13 +71,13 @@ struct ProgressiveTop {
     // Step `step`'s eight values, fma(scale, H, bias), and two of them.
     static void values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         uint e, o;
-        split_nibbles(k.low[step], e, o);
-        even = metal::fma(float4(k.scale), unsigned_bytes(e), float4(k.bias));
-        odd = metal::fma(float4(k.scale), unsigned_bytes(o), float4(k.bias));
+        packets::split_nibbles(k.low[step], e, o);
+        even = metal::fma(float4(k.scale), packets::unsigned_bytes(e), float4(k.bias));
+        odd = metal::fma(float4(k.scale), packets::unsigned_bytes(o), float4(k.bias));
     }
     static float2 pair_values(thread const packet &k, uint step, uint j) {
         uint b = (k.low[step] >> (8u * j)) & 0xffu;
-        return metal::fma(float2(k.scale), code_pair((b & 15u) | ((b >> 4) << 16), 1024.0h), float2(k.bias));
+        return metal::fma(float2(k.scale), packets::code_pair((b & 15u) | ((b >> 4) << 16), 1024.0h), float2(k.bias));
     }
     // The factored form the library's GEMV sums (`projection::gemv_factored`):
     // step `step`'s eight values over `factor`, H + bias / scale, each exact in
@@ -119,38 +123,38 @@ struct ProgressiveExact {
     static void values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         uint e, o;
         bytes(k, step, e, o);
-        even = k.scale * byte_floats(e, half(1024u + PROGRESSIVE_OFFSET));
-        odd = k.scale * byte_floats(o, half(1024u + PROGRESSIVE_OFFSET));
+        even = k.scale * packets::byte_floats(e, half(1024u + PROGRESSIVE_OFFSET));
+        odd = k.scale * packets::byte_floats(o, half(1024u + PROGRESSIVE_OFFSET));
     }
     static float2 pair_values(thread const packet &k, uint step, uint j) {
         uint e, o;
         bytes(k, step, e, o);
         return k.scale
-            * code_pair(((e >> (8u * j)) & 0xffu) | (((o >> (8u * j)) & 0xffu) << 16), half(1024u + PROGRESSIVE_OFFSET));
+            * packets::code_pair(((e >> (8u * j)) & 0xffu) | (((o >> (8u * j)) & 0xffu) << 16), half(1024u + PROGRESSIVE_OFFSET));
     }
 };
 
-} // namespace packets
+} // namespace readout
 
 namespace projection {
 
 // A progressive head's planes as the library's weights of each view.
 template <>
-struct Weights<packets::ProgressiveTop> {
+struct Weights<readout::ProgressiveTop> {
     device const uint *top;
     ulong top_stride;
     device const half *scales;
     ulong scale_stride;
-    packets::ProgressiveTop::packet packet(uint n, uint p) const {
+    readout::ProgressiveTop::packet packet(uint n, uint p) const {
         const float s = float(scales[ulong(n) * scale_stride + p]);
         return {progressive_high(top + ulong(n) * top_stride, p), float(PROGRESSIVE_COARSE_SCALE) * s,
             PROGRESSIVE_COARSE_BIAS * s};
     }
     // The planes keep no coefficient run (every packet has its own scale)
     // and no row tiles.
-    packets::Block<packets::ProgressiveTop>::state run(uint, uint) const { return {}; }
-    packets::ProgressiveTop::packet packet(uint n, uint p,
-        thread packets::Block<packets::ProgressiveTop>::state &) const {
+    packets::Block<readout::ProgressiveTop>::state run(uint, uint) const { return {}; }
+    readout::ProgressiveTop::packet packet(uint n, uint p,
+        thread packets::Block<readout::ProgressiveTop>::state &) const {
         return packet(n, p);
     }
     uint tile() const { return 1u; }
@@ -166,12 +170,12 @@ struct Weights<packets::ProgressiveTop> {
 // once, so its batched GEMV decodes by quarter (`gemv_batch_quarters`): a
 // pair alone costs the whole step.
 template <>
-struct gemv_batch_quarters<packets::ProgressiveExact> {
+struct gemv_batch_quarters<readout::ProgressiveExact> {
     static constant constexpr bool value = true;
 };
 
 template <>
-struct Weights<packets::ProgressiveExact> {
+struct Weights<readout::ProgressiveExact> {
     device const uint *top;
     ulong top_stride;
     device const uint *bit3;
@@ -180,16 +184,16 @@ struct Weights<packets::ProgressiveExact> {
     ulong rest_row, rest_group, rest_plane;
     device const half *scales;
     ulong scale_stride;
-    packets::ProgressiveExact::packet packet(uint n, uint p) const {
+    readout::ProgressiveExact::packet packet(uint n, uint p) const {
         device const uint *low = rest + ulong(n) * rest_row + ulong(p) * rest_group;
         return {progressive_high(top + ulong(n) * top_stride, p),
             uint4(bit3[ulong(n) * bit3_stride + p], low[0], PROGRESSIVE_LOW_PLANES == 3u ? low[rest_plane] : 0u, PROGRESSIVE_LOW_PLANES == 3u ? low[2u * rest_plane] : 0u),
             float(scales[ulong(n) * scale_stride + p])};
     }
     // The planes keep no coefficient run: every packet has its own scale.
-    packets::Block<packets::ProgressiveExact>::state run(uint, uint) const { return {}; }
-    packets::ProgressiveExact::packet packet(uint n, uint p,
-        thread packets::Block<packets::ProgressiveExact>::state &) const {
+    packets::Block<readout::ProgressiveExact>::state run(uint, uint) const { return {}; }
+    readout::ProgressiveExact::packet packet(uint n, uint p,
+        thread packets::Block<readout::ProgressiveExact>::state &) const {
         return packet(n, p);
     }
     uint tile() const { return 1u; }
@@ -204,7 +208,7 @@ struct Weights<packets::ProgressiveExact> {
 
 namespace progressive {
 
-typedef element::Act activation;
+typedef activation::Act activation;
 static_assert(activation::bytes == 2, "the progressive readout requires a bf16 or f16 activation element");
 
 // Order-preserving key of an F32 (larger float, larger key; every key of a
@@ -235,13 +239,13 @@ struct Codes {
 };
 
 // The group's exact signed codes c = u - 128: the exact view's code bytes
-// (`packets::ProgressiveExact`) as exact floats, by half subtraction rather
+// (`readout::ProgressiveExact`) as exact floats, by half subtraction rather
 // than integer conversion.
-inline Codes exact_codes(thread const packets::ProgressiveExact::packet &group) {
+inline Codes exact_codes(thread const readout::ProgressiveExact::packet &group) {
     Codes codes;
     for (uint q = 0; q < 4u; ++q) {
         uint even, odd;
-        packets::ProgressiveExact::bytes(group, q, even, odd);
+        readout::ProgressiveExact::bytes(group, q, even, odd);
         codes.even[q] = packets::byte_floats(even, half(1024u + PROGRESSIVE_OFFSET));
         codes.odd[q] = packets::byte_floats(odd, half(1024u + PROGRESSIVE_OFFSET));
     }
@@ -364,7 +368,7 @@ struct Planes {
     uint third(uint v, uint g) const {
         return bit3[ulong(v) * bit3_stride + g];
     }
-    packets::ProgressiveExact::packet group(uint v, uint g) const {
+    readout::ProgressiveExact::packet group(uint v, uint g) const {
         device const uint *low = rest + ulong(v) * rest_row + ulong(g) * rest_group;
         return {high(v, g), uint4(third(v, g), low[0], PROGRESSIVE_LOW_PLANES == 3u ? low[rest_plane] : 0u,
             PROGRESSIVE_LOW_PLANES == 3u ? low[2u * rest_plane] : 0u), scale(v, g)};
@@ -464,12 +468,12 @@ namespace projection {
 
 // The exact view at the GEMV's rows: the exact level's recipe.
 template <>
-struct gemv_recipe<packets::ProgressiveExact> {
+struct gemv_recipe<readout::ProgressiveExact> {
     static constant constexpr bool value = true;
-    static progressive::Codes decode(thread const packets::ProgressiveExact::packet &packet) {
+    static progressive::Codes decode(thread const readout::ProgressiveExact::packet &packet) {
         return progressive::exact_codes(packet);
     }
-    static float dot(thread const packets::ProgressiveExact::packet &packet, thread const progressive::Codes &codes,
+    static float dot(thread const readout::ProgressiveExact::packet &packet, thread const progressive::Codes &codes,
         thread const float4 (&even)[4], thread const float4 (&odd)[4]) {
         return progressive::exact(packet.scale, codes, even, odd);
     }

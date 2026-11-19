@@ -296,7 +296,7 @@ void chunk_scan_rows(recurrent_inputs in_, recurrent_slot slot, uint head, uint 
             }
             attended = reduce_lanes_sum(attended, L);
             if (part == 0u && chunk_active())
-                element_put(ELEMENT_ACT, mixed, recurrent_raw_index(uint64_t(first + r), head, block_row + local_row),
+                element_put(ACTIVATION_A, mixed, recurrent_raw_index(uint64_t(first + r), head, block_row + local_row),
                     attended);
         }
     }

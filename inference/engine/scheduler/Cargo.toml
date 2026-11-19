@@ -17,3 +17,6 @@ tracing.workspace = true
 # The controlled execution domain (`fixtures`), for the owner's tests.
 magnitude-executor = { path = "../executor", features = ["fixtures"] }
 serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -197,6 +197,8 @@ pub enum FloatCodeFormat {
 }
 
 impl FloatCodeFormat {
+    pub const ALL: [Self; 4] = [Self::E2M1, Self::E4M3, Self::UE4M3, Self::E8M0];
+
     /// A value code's ggml codebook and the exponent its values are scaled
     /// by: E2M1 is ggml's `kvalues_mxfp4` (E2M1 doubled, −0 as +0) times
     /// `2^-1`. Scale codes have none.
@@ -211,6 +213,27 @@ impl FloatCodeFormat {
         match self {
             Self::E2M1 => 4,
             Self::E4M3 | Self::UE4M3 | Self::E8M0 => 8,
+        }
+    }
+
+    /// The bit fields a native decode reads; `decode` is their reference.
+    pub const fn fields(self) -> FloatCodeFields {
+        match self {
+            Self::E2M1 => FloatCodeFields::Minifloat(Minifloat {
+                signed: true,
+                exponent_bits: 2,
+                mantissa_bits: 1,
+                bias: 1,
+                nan: false,
+            }),
+            Self::E4M3 | Self::UE4M3 => FloatCodeFields::Minifloat(Minifloat {
+                signed: matches!(self, Self::E4M3),
+                exponent_bits: 4,
+                mantissa_bits: 3,
+                bias: 7,
+                nan: true,
+            }),
+            Self::E8M0 => FloatCodeFields::Exponent,
         }
     }
 
@@ -254,6 +277,63 @@ impl FloatCodeFormat {
         }
     }
 }
+
+/// The bit fields of a closed floating code (`FloatCodeFormat::fields`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatCodeFields {
+    /// Sign, exponent and mantissa fields (`Minifloat`).
+    Minifloat(Minifloat),
+    /// An F32 exponent byte (E8M0): `2^(raw - 127)`, raw 0 the F32 subnormal
+    /// `2^-127` (`EXPONENT_ZERO_BITS`), raw 255 NaN.
+    Exponent,
+}
+
+impl FloatCodeFields {
+    /// The F32 bits of an `Exponent` code of 0.
+    pub const EXPONENT_ZERO_BITS: u32 = 0x0040_0000;
+}
+
+/// A minifloat code, low to high: `mantissa_bits` of mantissa, then
+/// `exponent_bits` of exponent under bias `bias`, then the sign bit
+/// (ignored where not `signed`). A zero exponent is subnormal,
+/// `mantissa * 2^(1 - bias - mantissa_bits)`; otherwise the value is
+/// `(1 + mantissa / 2^mantissa_bits) * 2^(exponent - bias)`. Under `nan`,
+/// every exponent and mantissa bit set is NaN (E4M3: no infinity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Minifloat {
+    pub signed: bool,
+    pub exponent_bits: u32,
+    pub mantissa_bits: u32,
+    pub bias: u32,
+    pub nan: bool,
+}
+
+impl Minifloat {
+    /// The sign bit's position.
+    pub const fn sign_bit(self) -> u32 {
+        self.exponent_bits + self.mantissa_bits
+    }
+
+    pub const fn exponent_mask(self) -> u32 {
+        (1 << self.exponent_bits) - 1
+    }
+
+    pub const fn mantissa_mask(self) -> u32 {
+        (1 << self.mantissa_bits) - 1
+    }
+
+    /// What a normal code's exponent field adds to become the F32 one.
+    pub const fn f32_exponent_offset(self) -> u32 {
+        127 - self.bias
+    }
+
+    /// A subnormal code's value per unit of mantissa, `2^(1 - bias -
+    /// mantissa_bits)`: a normal F32.
+    pub const fn subnormal_scale(self) -> f32 {
+        f32::from_bits((self.f32_exponent_offset() + 1 - self.mantissa_bits) << 23)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Plane {
     pub(crate) name: &'static str,
@@ -879,6 +959,113 @@ impl DecodeStep {
     }
 }
 
+/// What a decode recipe's steps mean in one domain: reference values, terms,
+/// IR nodes or native code. `DecodeRecipe::decode` walks a recipe and owns
+/// its bookkeeping (the temporaries, their ordinals and dtypes, the plane
+/// schemas, the step order); a domain states each step kind's meaning over
+/// the step's resolved operands, in operand order.
+pub trait DecodeDomain {
+    type Value;
+    type Error;
+
+    /// The dtype a value carries, for a domain whose values are typed: the
+    /// walker holds it to the dtype the recipe declares for the step's
+    /// temporary.
+    fn dtype(_value: &Self::Value) -> Option<DType> {
+        None
+    }
+
+    /// Field `field` of `plane`'s entry for the logical value being decoded,
+    /// in the plane's `storage_dtype` (`DecodeStep::ReadPlaneField`).
+    fn read_plane_field(
+        &mut self,
+        plane: &PlaneSchema,
+        field: u32,
+    ) -> Result<Self::Value, Self::Error>;
+
+    /// The logical value's lane in its entry of `plane`, a `u32`
+    /// (`DecodeStep::ReadPlaneLane`).
+    fn read_plane_lane(&mut self, plane: &PlaneSchema) -> Result<Self::Value, Self::Error>;
+
+    /// The low `bits` bits of `raw`, which holds `raw_bits` bits, read
+    /// through `interpretation` (`DecodeStep::InterpretCode`).
+    fn interpret_code(
+        &mut self,
+        raw: &Self::Value,
+        raw_bits: u32,
+        bits: u32,
+        interpretation: &CodeInterpretation,
+    ) -> Result<Self::Value, Self::Error>;
+
+    /// `code`, negated where bit `bit` of `raw` is set
+    /// (`DecodeStep::SignedCode`).
+    fn signed_code(
+        &mut self,
+        code: &Self::Value,
+        raw: &Self::Value,
+        bit: u32,
+    ) -> Result<Self::Value, Self::Error>;
+
+    /// `grid.code(raw, lane)` (`DecodeStep::InterpretGridCode`).
+    fn interpret_grid_code(
+        &mut self,
+        raw: &Self::Value,
+        lane: &Self::Value,
+        grid: &'static GridCodes,
+    ) -> Result<Self::Value, Self::Error>;
+
+    /// `raw`'s exact `f32` value as a `format` code
+    /// (`DecodeStep::DecodeFloatCode`).
+    fn decode_float_code(
+        &mut self,
+        raw: &Self::Value,
+        format: FloatCodeFormat,
+    ) -> Result<Self::Value, Self::Error>;
+
+    /// `from`, of dtype `from_dtype`, converted by value to `f32`
+    /// (`DecodeStep::ConvertToF32`).
+    fn convert_to_f32(
+        &mut self,
+        from: &Self::Value,
+        from_dtype: DType,
+    ) -> Result<Self::Value, Self::Error>;
+
+    /// The constant `value` (`DecodeStep::Constant`, and a component the
+    /// recipe states as a constant).
+    fn constant(
+        &mut self,
+        value: crate::reference_math::ReferenceScalar,
+    ) -> Result<Self::Value, Self::Error>;
+
+    /// `left * right` in `f32`, rounded once (`DecodeStep::Multiply`).
+    fn multiply(
+        &mut self,
+        left: &Self::Value,
+        right: &Self::Value,
+    ) -> Result<Self::Value, Self::Error>;
+
+    /// `-from` in `f32` (`DecodeStep::Negate`).
+    fn negate(&mut self, from: &Self::Value) -> Result<Self::Value, Self::Error>;
+
+    /// `factor * multiplicand + addend` in `f32`, rounded once
+    /// (`DecodeStep::MultiplyAdd`).
+    fn multiply_add(
+        &mut self,
+        factor: &Self::Value,
+        multiplicand: &Self::Value,
+        addend: &Self::Value,
+    ) -> Result<Self::Value, Self::Error>;
+
+    /// `from`, of dtype `from_dtype`, converted by value to `to` with the
+    /// registry cast rounding (`DecodeStep::Cast`).
+    fn cast(
+        &mut self,
+        from: &Self::Value,
+        from_dtype: DType,
+        to: DType,
+    ) -> Result<Self::Value, Self::Error>;
+}
+
 /// Semantic coefficient roles in the registry-owned affine decode. These do
 /// not name a physical plane or permit a caller to reinterpret storage bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -1110,6 +1297,82 @@ impl DecodeRecipe {
         })
     }
 
+    /// What a decode yields: the decoded value, or component `role` of it;
+    /// `None` for a role this representation has no component for.
+    pub fn target(&self, role: Option<QuantizedComponent>) -> Option<DecodeComponent> {
+        match role {
+            None => Some(DecodeComponent::Temporary(self.output)),
+            Some(role) => self.component(role),
+        }
+    }
+
+    /// `target` (`Self::target`) in `domain`. A constant is the domain's
+    /// constant, and no step is walked; a temporary walks every step in
+    /// order, each over the values of the temporaries it reads.
+    pub fn decode<D: DecodeDomain>(
+        &self,
+        domain: &mut D,
+        target: DecodeComponent,
+    ) -> Result<D::Value, D::Error> {
+        let target = match target {
+            DecodeComponent::Constant(value) => return domain.constant(value),
+            DecodeComponent::Temporary(temp) => self.ordinal(temp),
+        };
+        // Sealing proved every temporary is defined by the step at its
+        // ordinal and read only after it.
+        let mut values: Vec<D::Value> = Vec::with_capacity(self.steps.len());
+        for step in &self.steps {
+            let get = |temp: DecodeTemp| &values[temp.ordinal as usize];
+            let value = match step {
+                DecodeStep::ReadPlaneField { plane, field, .. } => {
+                    domain.read_plane_field(&self.planes[*plane as usize], *field)
+                }
+                DecodeStep::ReadPlaneLane { plane, .. } => {
+                    domain.read_plane_lane(&self.planes[*plane as usize])
+                }
+                DecodeStep::InterpretCode {
+                    raw,
+                    bits,
+                    interpretation,
+                    ..
+                } => domain.interpret_code(get(*raw), self.read_bits(*raw), *bits, interpretation),
+                DecodeStep::SignedCode { code, raw, bit, .. } => {
+                    domain.signed_code(get(*code), get(*raw), *bit)
+                }
+                DecodeStep::InterpretGridCode {
+                    raw, lane, grid, ..
+                } => domain.interpret_grid_code(get(*raw), get(*lane), grid),
+                DecodeStep::DecodeFloatCode { raw, format, .. } => {
+                    domain.decode_float_code(get(*raw), *format)
+                }
+                DecodeStep::ConvertToF32 { from, .. } => {
+                    domain.convert_to_f32(get(*from), from.dtype)
+                }
+                DecodeStep::Constant { value, .. } => domain.constant(*value),
+                DecodeStep::Multiply { left, right, .. } => {
+                    domain.multiply(get(*left), get(*right))
+                }
+                DecodeStep::Negate { from, .. } => domain.negate(get(*from)),
+                DecodeStep::MultiplyAdd {
+                    factor,
+                    multiplicand,
+                    addend,
+                    ..
+                } => domain.multiply_add(get(*factor), get(*multiplicand), get(*addend)),
+                DecodeStep::Cast { from, to, .. } => domain.cast(get(*from), from.dtype, *to),
+            }?;
+            if let Some(dtype) = D::dtype(&value) {
+                assert_eq!(
+                    dtype,
+                    step.defines().dtype,
+                    "a decode domain's value differs from its step's dtype"
+                );
+            }
+            values.push(value);
+        }
+        Ok(values.swap_remove(target))
+    }
+
     pub fn planes(&self) -> &[PlaneSchema] {
         &self.planes
     }
@@ -1126,10 +1389,9 @@ impl DecodeRecipe {
     /// all 32. An `InterpretCode` of fewer bits reads the low ones.
     pub fn read_bits(&self, raw: DecodeTemp) -> u32 {
         self.assert_owns(raw);
-        match self.steps.iter().find(|step| step.defines() == raw) {
-            Some(DecodeStep::ReadPlaneField { plane, .. }) => {
-                self.planes[*plane as usize].entry_bits
-            }
+        // Sealing put each temporary's definition at its ordinal.
+        match &self.steps[raw.ordinal as usize] {
+            DecodeStep::ReadPlaneField { plane, .. } => self.planes[*plane as usize].entry_bits,
             _ => u32::BITS,
         }
     }
@@ -2989,73 +3251,153 @@ mod tests {
     /// as `f64`, with plane contents supplied per (ordinal, entry): a packed
     /// entry is its raw code, a dense entry its value.
     fn evaluate(recipe: &DecodeRecipe, value: u64, plane_entry: &dyn Fn(u32, u64) -> f64) -> f64 {
-        let mut temporaries: Vec<f64> = Vec::with_capacity(recipe.temporary_count());
-        let get = |temporaries: &[f64], temp: DecodeTemp| temporaries[recipe.ordinal(temp)];
-        for step in recipe.steps() {
-            let result = match step {
-                DecodeStep::ReadPlaneField { plane, field, .. } => {
-                    let schema = &recipe.planes()[*plane as usize];
-                    plane_entry(*plane, schema.entry(value, *field))
-                }
-                DecodeStep::InterpretCode {
-                    raw,
-                    bits,
-                    interpretation,
-                    ..
-                } => f64::from(interpretation.decode(get(&temporaries, *raw) as u32, *bits)),
-                DecodeStep::SignedCode { code, raw, bit, .. } => {
-                    let code = get(&temporaries, *code);
-                    if (get(&temporaries, *raw) as u32 >> bit) & 1 == 1 {
-                        -code
-                    } else {
-                        code
-                    }
-                }
-                DecodeStep::ReadPlaneLane { plane, .. } => {
-                    f64::from(recipe.planes()[*plane as usize].lane(value))
-                }
-                DecodeStep::InterpretGridCode {
-                    raw, lane, grid, ..
-                } => f64::from(grid.code(
-                    get(&temporaries, *raw) as u32,
-                    get(&temporaries, *lane) as u32,
-                )),
-                DecodeStep::DecodeFloatCode { raw, format, .. } => {
-                    f64::from(format.decode(get(&temporaries, *raw) as u32))
-                }
-                DecodeStep::ConvertToF32 { from, .. } => get(&temporaries, *from) as f32 as f64,
-                DecodeStep::Constant { value, .. } => match value {
-                    crate::reference_math::ReferenceScalar::F32(bits) => {
-                        f64::from(f32::from_bits(*bits))
-                    }
-                    other => panic!("the test evaluator has no {other:?} constant"),
-                },
-                DecodeStep::Multiply { left, right, .. } => {
-                    (get(&temporaries, *left) * get(&temporaries, *right)) as f32 as f64
-                }
-                DecodeStep::Negate { from, .. } => -get(&temporaries, *from),
-                DecodeStep::MultiplyAdd {
-                    factor,
-                    multiplicand,
-                    addend,
-                    ..
-                } => {
-                    (get(&temporaries, *factor) * get(&temporaries, *multiplicand)
-                        + get(&temporaries, *addend)) as f32 as f64
-                }
-                DecodeStep::Cast { from, to, .. } => {
-                    assert_eq!(*to, DType::F32, "the test evaluator casts to f32 only");
-                    get(&temporaries, *from) as f32 as f64
-                }
-            };
-            let into = step.defines();
-            assert!(
-                recipe.ordinal(into) == temporaries.len(),
-                "sealed recipe definition order changed"
-            );
-            temporaries.push(result);
+        let Ok(decoded) = recipe.decode(
+            &mut Synthetic { value, plane_entry },
+            DecodeComponent::Temporary(recipe.output()),
+        );
+        decoded
+    }
+
+    /// Logical value `value` of planes whose entries `plane_entry` gives.
+    struct Synthetic<'a> {
+        value: u64,
+        plane_entry: &'a dyn Fn(u32, u64) -> f64,
+    }
+
+    impl DecodeDomain for Synthetic<'_> {
+        type Value = f64;
+        type Error = std::convert::Infallible;
+
+        fn read_plane_field(
+            &mut self,
+            plane: &PlaneSchema,
+            field: u32,
+        ) -> Result<f64, Self::Error> {
+            Ok((self.plane_entry)(
+                plane.ordinal,
+                plane.entry(self.value, field),
+            ))
         }
-        get(&temporaries, recipe.output())
+
+        fn read_plane_lane(&mut self, plane: &PlaneSchema) -> Result<f64, Self::Error> {
+            Ok(f64::from(plane.lane(self.value)))
+        }
+
+        fn interpret_code(
+            &mut self,
+            raw: &f64,
+            _: u32,
+            bits: u32,
+            interpretation: &CodeInterpretation,
+        ) -> Result<f64, Self::Error> {
+            Ok(f64::from(interpretation.decode(*raw as u32, bits)))
+        }
+
+        fn signed_code(&mut self, code: &f64, raw: &f64, bit: u32) -> Result<f64, Self::Error> {
+            Ok(if (*raw as u32 >> bit) & 1 == 1 {
+                -code
+            } else {
+                *code
+            })
+        }
+
+        fn interpret_grid_code(
+            &mut self,
+            raw: &f64,
+            lane: &f64,
+            grid: &'static GridCodes,
+        ) -> Result<f64, Self::Error> {
+            Ok(f64::from(grid.code(*raw as u32, *lane as u32)))
+        }
+
+        fn decode_float_code(
+            &mut self,
+            raw: &f64,
+            format: FloatCodeFormat,
+        ) -> Result<f64, Self::Error> {
+            Ok(f64::from(format.decode(*raw as u32)))
+        }
+
+        fn convert_to_f32(&mut self, from: &f64, _: DType) -> Result<f64, Self::Error> {
+            Ok(*from as f32 as f64)
+        }
+
+        fn constant(
+            &mut self,
+            value: crate::reference_math::ReferenceScalar,
+        ) -> Result<f64, Self::Error> {
+            Ok(match value {
+                crate::reference_math::ReferenceScalar::F32(bits) => {
+                    f64::from(f32::from_bits(bits))
+                }
+                other => panic!("the test evaluator has no {other:?} constant"),
+            })
+        }
+
+        fn multiply(&mut self, left: &f64, right: &f64) -> Result<f64, Self::Error> {
+            Ok((left * right) as f32 as f64)
+        }
+
+        fn negate(&mut self, from: &f64) -> Result<f64, Self::Error> {
+            Ok(-from)
+        }
+
+        fn multiply_add(
+            &mut self,
+            factor: &f64,
+            multiplicand: &f64,
+            addend: &f64,
+        ) -> Result<f64, Self::Error> {
+            Ok((factor * multiplicand + addend) as f32 as f64)
+        }
+
+        fn cast(&mut self, from: &f64, _: DType, to: DType) -> Result<f64, Self::Error> {
+            assert_eq!(to, DType::F32, "the test evaluator casts to f32 only");
+            Ok(*from as f32 as f64)
+        }
+    }
+
+    /// Each floating code's fields, decoded as the native decodes read them,
+    /// give the reference value of every code.
+    #[test]
+    fn float_code_fields_decode_as_the_reference() {
+        for format in FloatCodeFormat::ALL {
+            for raw in 0..1u32 << format.bits() {
+                let bits = match format.fields() {
+                    FloatCodeFields::Exponent => match raw {
+                        0 => FloatCodeFields::EXPONENT_ZERO_BITS,
+                        255 => f32::NAN.to_bits(),
+                        exponent => exponent << 23,
+                    },
+                    FloatCodeFields::Minifloat(fields) => {
+                        let exponent = (raw >> fields.mantissa_bits) & fields.exponent_mask();
+                        let mantissa = raw & fields.mantissa_mask();
+                        let magnitude = if fields.nan
+                            && exponent == fields.exponent_mask()
+                            && mantissa == fields.mantissa_mask()
+                        {
+                            f32::NAN.to_bits()
+                        } else if exponent == 0 {
+                            (mantissa as f32 * fields.subnormal_scale()).to_bits()
+                        } else {
+                            (mantissa << (23 - fields.mantissa_bits))
+                                | ((exponent + fields.f32_exponent_offset()) << 23)
+                        };
+                        let sign = if fields.signed {
+                            (raw >> fields.sign_bit()) << 31
+                        } else {
+                            0
+                        };
+                        magnitude ^ sign
+                    }
+                };
+                let (decoded, reference) = (f32::from_bits(bits), format.decode(raw));
+                assert!(
+                    bits == reference.to_bits() || (decoded.is_nan() && reference.is_nan()),
+                    "{format:?} code {raw:#x}: fields give {decoded}, the reference {reference}"
+                );
+            }
+        }
     }
 
     /// Deterministic plane contents for a representation: packed entries

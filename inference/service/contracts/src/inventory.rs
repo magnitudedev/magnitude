@@ -7,12 +7,581 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
-/// Stable identity of one store, a place bytes live: `system` for host RAM, otherwise the
-/// store's own identity (a device's memory by its physical device).
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct MemoryDomainId(String);
+pub use schema::{
+    ContentIdentity, DownloadFailure, DownloadStage, ExecutionBackend, HardwareAccessPath,
+    HardwareBackendDiagnostic, HardwareDeviceId, HardwareDeviceKind, HardwareDeviceMemory,
+    HardwareDiagnosticSource, HardwareExecutor, HardwareExecutorAvailability, HardwareFormFactor,
+    HardwareGrant, HardwareHostRam, HardwareMachineIdentity, HardwarePhysicalDevice, HardwarePhysicalDeviceId, HardwareReportedBy,
+    HardwareSnapshot, HardwareStore, HardwareTransferPath, HardwareVolume, HardwareVolumeRole,
+    HuggingFaceAccess, HuggingFaceBaseRelation, HuggingFaceCredential, HuggingFaceModelBase,
+    HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult, HuggingFaceModelSearchResults,
+    HuggingFaceRecommendedVersion, HuggingFaceRepositoryCheck, HuggingFaceRepositoryCheckRequest,
+    HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
+    MemoryDomainId,
+};
+
+/// The inventory contract types, in a module of their own for the lint their
+/// derived schemas need.
+mod schema {
+    #![cfg_attr(
+        feature = "openapi",
+        allow(
+            clippy::large_stack_frames,
+            reason = "utoipa's derived `ToSchema::schema` builds a whole type's schema in one generated frame, which this module cannot split; it runs only as the OpenAPI document is built"
+        )
+    )]
+
+    use super::*;
+
+    /// Stable identity of one store, a place bytes live: `system` for host RAM, otherwise the
+    /// store's own identity (a device's memory by its physical device).
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct MemoryDomainId(pub(super) String);
+
+    /// Stable cross-process identity of one execution device: the serialized Seismic device
+    /// selector (for example `metal:<registry-id>`, `cuda:<uuid>`, `vulkan:<uuid>`, `host-cpu`).
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct HardwareDeviceId(pub(super) String);
+
+    /// Stable cross-process identity of one piece of hardware: the serialized Seismic physical
+    /// identity (`host`, `registry:<id>` or `uuid:<uuid>`), which every executor viewing it shares.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct HardwarePhysicalDeviceId(pub(super) String);
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum ContentIdentity {
+        Sha256 { value: String },
+        GitOid { value: String },
+        Xet { value: String },
+        FileIdentity { value: String },
+        Unknown,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum DownloadStage {
+        Queued,
+        Resolving,
+        CheckingSpace,
+        Downloading,
+        Verifying,
+        Publishing,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum HardwareDeviceKind {
+        Cpu,
+        Gpu,
+        IntegratedGpu,
+        Accelerator,
+        Unknown,
+    }
+
+    /// One backend's handle on a physical device.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareExecutor {
+        pub id: HardwareDeviceId,
+        pub backend: ExecutionBackend,
+        pub name: String,
+        pub description: String,
+        /// The access paths device storage is allocated from, in order.
+        pub device_placement: Vec<u32>,
+        /// The access paths upload storage is allocated from, in order.
+        pub upload_placement: Vec<u32>,
+        pub availability: HardwareExecutorAvailability,
+    }
+
+    /// Whether an executor can run: with its device placement's stable fit, or
+    /// the reason it cannot.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum HardwareExecutorAvailability {
+        Available { stable_capacity_bytes: u64 },
+        Unavailable { reason: String },
+    }
+
+    /// An execution backend compiled into the inference engine.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ExecutionBackend {
+        Cpu,
+        Metal,
+        Cuda,
+        Vulkan,
+    }
+
+    /// One piece of hardware, with every executor that views it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwarePhysicalDevice {
+        pub id: HardwarePhysicalDeviceId,
+        pub kind: HardwareDeviceKind,
+        pub executors: Vec<HardwareExecutor>,
+    }
+
+    /// A place bytes live, and what the service plans against in it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareStore {
+        pub id: MemoryDomainId,
+        pub total_capacity_bytes: u64,
+        /// The interface that reported the capacity.
+        pub capacity_basis: HardwareReportedBy,
+        /// The capacity within process limits.
+        pub allocation_capacity_bytes: u64,
+    }
+
+    /// Host RAM, memory the OS manages, with what the OS reports of it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareHostRam {
+        pub store: HardwareStore,
+        /// What the OS can give this process within its binding scope (the
+        /// host, or the limit that binds): free pages above its target, clean
+        /// file cache and reclaimable cold pages.
+        pub current_free_bytes: u64,
+    }
+
+    /// What the service keeps on a volume.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum HardwareVolumeRole {
+        ModelStore,
+        KernelCache,
+    }
+
+    /// A volume, with the space the OS reports available to this process and what the service
+    /// keeps on it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareVolume {
+        pub store: HardwareStore,
+        pub current_free_bytes: u64,
+        pub roles: Vec<HardwareVolumeRole>,
+    }
+
+    /// Memory the OS does not manage, owned by one physical device. Its headroom
+    /// is what opened executors leave, which only a resident worker reads.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareDeviceMemory {
+        pub physical_device_id: HardwarePhysicalDeviceId,
+        pub store: HardwareStore,
+        pub current_free_bytes: Option<u64>,
+    }
+
+    /// The interface, and the figure of it, a reported value comes from.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum HardwareReportedBy {
+        LinuxMemTotal,
+        MacOsMemsize,
+        WindowsTotalPhys,
+        LinuxMemAvailable,
+        MachMovablePages,
+        MacOsFreePages,
+        WindowsPhysicalAndCommit,
+        CpuAddressSpace,
+        MetalMaxBufferLength,
+        MetalRecommendedWorkingSet,
+        MetalWorkingSetUnallocated,
+        CudaTotalMemory,
+        CudaUsableMemory,
+        CudaFree,
+        VulkanHeap,
+        VulkanHeapBudget,
+        VulkanHeaps,
+        VulkanHeapsBeyondDedicated,
+        VulkanMaxAllocation,
+        CudaTotalBeyondDedicated,
+        MetalWorkingSetBeyondDedicated,
+        DxgiDedicatedMemory,
+        LinuxSysfsCache,
+        MacOsSysctlCache,
+        WindowsProcessorCache,
+        CudaL2Cache,
+        FilesystemSize,
+        FilesystemAvailable,
+    }
+
+    /// An executor reading and writing a store directly, under its grant.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareAccessPath {
+        /// Index in this snapshot's access paths; placements reference this index.
+        pub id: u32,
+        pub executor: HardwareDeviceId,
+        pub store: MemoryDomainId,
+        pub grant: Option<HardwareGrant>,
+    }
+
+    /// What an executor's driver lets this process place along one path.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareGrant {
+        pub bytes: u64,
+        /// The interface that reported the grant.
+        pub basis: HardwareReportedBy,
+        /// What is left of the grant, where a reading without an opened
+        /// executor reports it.
+        pub remaining_bytes: Option<u64>,
+    }
+
+    /// Bytes moved between two stores by an executor's copy mechanism.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareTransferPath {
+        pub from: MemoryDomainId,
+        pub to: MemoryDomainId,
+        pub executor: HardwareDeviceId,
+    }
+
+    /// The machine's maker and model, as its firmware names them; a snapshot has none where its
+    /// firmware does not name both.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareMachineIdentity {
+        pub manufacturer: String,
+        pub model: String,
+        pub family: Option<String>,
+        pub version: Option<String>,
+    }
+
+    /// The machine's enclosure, from its firmware's chassis type.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum HardwareFormFactor {
+        Portable,
+        Desktop,
+        AllInOne,
+        MiniPc,
+        Server,
+        Unknown,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareSnapshot {
+        pub captured_at: u64,
+        pub platform: String,
+        pub architecture: String,
+        /// What people call the machine: macOS's marketing name, elsewhere its model.
+        #[serde(default)]
+        pub system_product_name: Option<String>,
+        pub machine_identity: Option<HardwareMachineIdentity>,
+        pub form_factor: HardwareFormFactor,
+        pub cpu_model: Option<String>,
+        /// The chip's cores of every kind, as the host's processor topology reports them, whatever
+        /// this process may run on: what identifies the chip's variant. A virtual machine's are its
+        /// hypervisor's virtual cores.
+        pub chip_cores: usize,
+        /// The host's logical CPUs (hardware threads) in that topology: a VM's vCPUs.
+        pub logical_cpus: usize,
+        /// The cores the engine's CPU pool runs on: the performance cores this process may run
+        /// on, under its CPU quota, one thread each.
+        pub cpu_pool_cores: usize,
+        /// Engine build identity: engine version plus kernel bundle identity.
+        pub native_build: String,
+        /// Backends that discovery could not enumerate on this machine, with the engine's own reason,
+        /// for example an absent driver or a backend this build lacks. Empty when every backend
+        /// enumerated.
+        #[serde(default)]
+        pub backend_diagnostics: Vec<HardwareBackendDiagnostic>,
+        pub topology_fingerprint: String,
+        pub physical_devices: Vec<HardwarePhysicalDevice>,
+        /// The serving device: the executor the service selected once over its topology, which it
+        /// assesses every model on and loads every model on. The service does not run without one.
+        pub selected_executor: HardwareDeviceId,
+        /// Memory the OS manages; every machine has it.
+        pub host_ram: HardwareHostRam,
+        pub device_memory: Vec<HardwareDeviceMemory>,
+        /// The filesystems of the model store and the kernel cache, each tagged with its roles.
+        pub volumes: Vec<HardwareVolume>,
+        pub access_paths: Vec<HardwareAccessPath>,
+        pub transfer_paths: Vec<HardwareTransferPath>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareBackendDiagnostic {
+        pub source: HardwareDiagnosticSource,
+        pub message: String,
+    }
+
+    /// What a discovery diagnostic is about: one backend's enumeration, or the
+    /// OS's adapter interface (DXGI).
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum HardwareDiagnosticSource {
+        Backend { backend: ExecutionBackend },
+        Adapters,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceModelSearchRequest {
+        pub query: String,
+        pub limit: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub cursor: Option<String>,
+    }
+
+    /// How a repository derives from its base model, as the Hub's `baseModels` states it; `unknown`
+    /// when only its GGUF names the base.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum HuggingFaceBaseRelation {
+        Quantized,
+        Finetune,
+        Merge,
+        Adapter,
+        Unknown,
+    }
+
+    /// The model a repository derives from.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceModelBase {
+        pub repository: String,
+        pub relation: HuggingFaceBaseRelation,
+    }
+
+    /// A repository's recommended version, chosen and assessed as candidate inspection chooses and
+    /// assesses it. `download_bytes` is what adding it downloads, its projector included; zero when it
+    /// is already on this computer.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceRecommendedVersion {
+        pub label: String,
+        pub model_id: crate::models::ModelId,
+        pub size_bytes: u64,
+        pub download_bytes: u64,
+        pub assessment: crate::models::ModelAssessment,
+    }
+
+    /// One repository as the Hub lists it, before any of its files is read. `architecture` is the
+    /// Hub's, from the GGUF it describes the repository by. `developer` is told by the repository's
+    /// name. `version_count` is how many GGUFs the repository's file list offers (split shards counted
+    /// once, projectors excluded), approximate since drafters are not told apart. `base` is the Hub's
+    /// `baseModels`. What the repository holds on this machine is its check
+    /// (`HuggingFaceRepositoryCheck`).
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceModelSearchResult {
+        pub repository: String,
+        pub commit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub last_modified: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub downloads: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub likes: Option<u64>,
+        pub gated: bool,
+        pub private: bool,
+        pub tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub architecture: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub developer: Option<crate::models::ModelDeveloper>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, minimum = 1))]
+        pub version_count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub base: Option<HuggingFaceModelBase>,
+    }
+
+    /// A listed repository to check: what the search listed it as. `architecture` is the Hub's,
+    /// which decides only when the repository's model file can't be read; `restricted` is whether the
+    /// listing is gated or private, so its reads are kept for the credential that made them.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceRepositoryCheckRequest {
+        pub repository: String,
+        pub commit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub architecture: Option<String>,
+        pub restricted: bool,
+    }
+
+    /// What a listed repository holds on this machine, from its model file's header and the version
+    /// candidate inspection would recommend. `NotAModel` is a repository of drafters or projectors
+    /// alone: nothing in it is offered. For a `Model`, `unsupported` is empty when the engine runs it;
+    /// `architecture` is its header's, absent when the header couldn't be read; `variant_of` is the
+    /// catalog model whose shape fingerprint it has; `base` is the Hub's `baseModels`, else its model
+    /// file's `general.base_model.*`; `recommended` is the version inspection recommends, absent when
+    /// the versions couldn't be assessed in time.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum HuggingFaceRepositoryCheck {
+        NotAModel,
+        #[serde(rename_all = "camelCase")]
+        Model {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            architecture: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            variant_of: Option<crate::models::ModelId>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            developer: Option<crate::models::ModelDeveloper>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            base: Option<HuggingFaceModelBase>,
+            unsupported: Vec<crate::models::UnsupportedReason>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            recommended: Option<HuggingFaceRecommendedVersion>,
+        },
+    }
+
+    /// One page of the Hub's results, most downloaded first; catalog repositories excluded. `next_cursor` requests the page after it, absent on the last.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceModelSearchResults {
+        pub results: Vec<HuggingFaceModelSearchResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub next_cursor: Option<String>,
+    }
+
+    /// The Hugging Face token presented on every later Hub request; without one, Hub requests are
+    /// anonymous. It is write-only: no response carries it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceCredential {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub token: Option<String>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceRepositoryRequest {
+        pub repository: String,
+        pub revision: String,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceRepositoryFile {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        pub path: PathBuf,
+        pub size_bytes: u64,
+        pub content: ContentIdentity,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct HuggingFaceRepositorySnapshot {
+        pub repository: String,
+        pub commit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub last_modified: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub downloads: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub likes: Option<u64>,
+        pub gated: bool,
+        pub private: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub license: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub license_url: Option<String>,
+        pub base_models: Vec<String>,
+        pub tags: Vec<String>,
+        pub gguf_files: Vec<HuggingFaceRepositoryFile>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum DownloadFailure {
+        Interrupted,
+        #[serde(rename_all = "camelCase")]
+        InsufficientDiskSpace {
+            required_bytes: u64,
+            available_bytes: u64,
+        },
+        #[serde(rename_all = "camelCase")]
+        SourceUnavailable,
+        NetworkUnavailable,
+        LocalStorageFailure,
+        CorruptDownload,
+        #[serde(rename_all = "camelCase")]
+        HuggingFaceAccessRequired {
+            access: HuggingFaceAccess,
+        },
+        #[serde(rename_all = "camelCase")]
+        Internal {
+            message: String,
+        },
+    }
+
+    /// What Hugging Face needs before it serves a refused repository's files: a signed-in account
+    /// (no token, or one it rejected), or that the signed-in account accept the repository's terms.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum HuggingFaceAccess {
+        SignIn,
+        AcceptTerms,
+    }
+}
 
 impl MemoryDomainId {
     const SYSTEM: &'static str = "system";
@@ -44,13 +613,6 @@ impl std::fmt::Display for MemoryDomainId {
     }
 }
 
-/// Stable cross-process identity of one execution device: the serialized Seismic device
-/// selector (for example `metal:<registry-id>`, `cuda:<uuid>`, `vulkan:<uuid>`, `host-cpu`).
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HardwareDeviceId(String);
-
 impl HardwareDeviceId {
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
@@ -68,13 +630,6 @@ impl std::fmt::Display for HardwareDeviceId {
         self.0.fmt(formatter)
     }
 }
-
-/// Stable cross-process identity of one piece of hardware: the serialized Seismic physical
-/// identity (`host`, `registry:<id>` or `uuid:<uuid>`), which every executor viewing it shares.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HardwarePhysicalDeviceId(String);
 
 impl HardwarePhysicalDeviceId {
     #[must_use]
@@ -143,17 +698,6 @@ pub enum ComponentRole {
     Auxiliary,
     Draft,
     Mtp,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ContentIdentity {
-    Sha256 { value: String },
-    GitOid { value: String },
-    Xet { value: String },
-    FileIdentity { value: String },
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,18 +888,6 @@ pub enum ModelAvailability {
     },
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DownloadStage {
-    Queued,
-    Resolving,
-    CheckingSpace,
-    Downloading,
-    Verifying,
-    Publishing,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CapabilitySupport {
@@ -504,242 +1036,6 @@ pub enum InventoryProperties {
     },
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HardwareDeviceKind {
-    Cpu,
-    Gpu,
-    IntegratedGpu,
-    Accelerator,
-    Unknown,
-}
-
-/// One backend's handle on a physical device.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareExecutor {
-    pub id: HardwareDeviceId,
-    pub backend: ExecutionBackend,
-    pub name: String,
-    pub description: String,
-    /// The access paths device storage is allocated from, in order.
-    pub device_placement: Vec<u32>,
-    /// The access paths upload storage is allocated from, in order.
-    pub upload_placement: Vec<u32>,
-    pub availability: HardwareExecutorAvailability,
-}
-
-/// Whether an executor can run: with its device placement's stable fit, or
-/// the reason it cannot.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HardwareExecutorAvailability {
-    Available { stable_capacity_bytes: u64 },
-    Unavailable { reason: String },
-}
-
-/// An execution backend compiled into the inference engine.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionBackend {
-    Cpu,
-    Metal,
-    Cuda,
-    Vulkan,
-}
-
-/// One piece of hardware, with every executor that views it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwarePhysicalDevice {
-    pub id: HardwarePhysicalDeviceId,
-    pub kind: HardwareDeviceKind,
-    pub executors: Vec<HardwareExecutor>,
-}
-
-/// A place bytes live, and what the service plans against in it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareStore {
-    pub id: MemoryDomainId,
-    pub total_capacity_bytes: u64,
-    /// The interface that reported the capacity.
-    pub capacity_basis: HardwareReportedBy,
-    /// The capacity within process limits.
-    pub allocation_capacity_bytes: u64,
-}
-
-/// Host RAM, memory the OS manages, with what the OS reports of it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareHostRam {
-    pub store: HardwareStore,
-    /// What the OS can give this process within its binding scope (the
-    /// host, or the limit that binds): free pages above its target, clean
-    /// file cache and reclaimable cold pages.
-    pub current_free_bytes: u64,
-}
-
-/// What the service keeps on a volume.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HardwareVolumeRole {
-    ModelStore,
-    KernelCache,
-}
-
-/// A volume, with the space the OS reports available to this process and what the service
-/// keeps on it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareVolume {
-    pub store: HardwareStore,
-    pub current_free_bytes: u64,
-    pub roles: Vec<HardwareVolumeRole>,
-}
-
-/// Memory the OS does not manage, owned by one physical device. Its headroom
-/// is what opened executors leave, which only a resident worker reads.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareDeviceMemory {
-    pub physical_device_id: HardwarePhysicalDeviceId,
-    pub store: HardwareStore,
-    pub current_free_bytes: Option<u64>,
-}
-
-/// The interface, and the figure of it, a reported value comes from.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HardwareReportedBy {
-    LinuxMemTotal,
-    MacOsMemsize,
-    WindowsTotalPhys,
-    LinuxMemAvailable,
-    MachMovablePages,
-    MacOsFreePages,
-    WindowsPhysicalAndCommit,
-    CpuAddressSpace,
-    MetalMaxBufferLength,
-    MetalRecommendedWorkingSet,
-    MetalWorkingSetUnallocated,
-    CudaTotalMemory,
-    CudaUsableMemory,
-    CudaFree,
-    VulkanHeap,
-    VulkanHeapBudget,
-    VulkanHeaps,
-    VulkanHeapsBeyondDedicated,
-    VulkanMaxAllocation,
-    CudaTotalBeyondDedicated,
-    MetalWorkingSetBeyondDedicated,
-    DxgiDedicatedMemory,
-    LinuxSysfsCache,
-    MacOsSysctlCache,
-    WindowsProcessorCache,
-    CudaL2Cache,
-    FilesystemSize,
-    FilesystemAvailable,
-}
-
-/// An executor reading and writing a store directly, under its grant.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareAccessPath {
-    /// Index in this snapshot's access paths; placements reference this index.
-    pub id: u32,
-    pub executor: HardwareDeviceId,
-    pub store: MemoryDomainId,
-    pub grant: Option<HardwareGrant>,
-}
-
-/// What an executor's driver lets this process place along one path.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareGrant {
-    pub bytes: u64,
-    /// The interface that reported the grant.
-    pub basis: HardwareReportedBy,
-    /// What is left of the grant, where a reading without an opened
-    /// executor reports it.
-    pub remaining_bytes: Option<u64>,
-}
-
-/// Bytes moved between two stores by an executor's copy mechanism.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareTransferPath {
-    pub from: MemoryDomainId,
-    pub to: MemoryDomainId,
-    pub executor: HardwareDeviceId,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareSnapshot {
-    pub captured_at: u64,
-    pub platform: String,
-    pub architecture: String,
-    #[serde(default)]
-    pub system_product_name: Option<String>,
-    pub cpu_model: Option<String>,
-    /// OS-reported physical CPU cores, independent of process scheduling limits.
-    pub physical_cores: Option<usize>,
-    pub logical_cores: usize,
-    /// Engine build identity: engine version plus kernel bundle identity.
-    pub native_build: String,
-    /// Backends that discovery could not enumerate on this machine, with the engine's own reason,
-    /// for example an absent driver or a backend this build lacks. Empty when every backend
-    /// enumerated.
-    #[serde(default)]
-    pub backend_diagnostics: Vec<HardwareBackendDiagnostic>,
-    pub topology_fingerprint: String,
-    pub physical_devices: Vec<HardwarePhysicalDevice>,
-    /// The serving device: the executor the service selected once over its topology, which it
-    /// assesses every model on and loads every model on. The service does not run without one.
-    pub selected_executor: HardwareDeviceId,
-    /// Memory the OS manages; every machine has it.
-    pub host_ram: HardwareHostRam,
-    pub device_memory: Vec<HardwareDeviceMemory>,
-    /// The filesystems of the model store and the kernel cache, each tagged with its roles.
-    pub volumes: Vec<HardwareVolume>,
-    pub access_paths: Vec<HardwareAccessPath>,
-    pub transfer_paths: Vec<HardwareTransferPath>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareBackendDiagnostic {
-    pub source: HardwareDiagnosticSource,
-    pub message: String,
-}
-
-/// What a discovery diagnostic is about: one backend's enumeration, or the
-/// OS's adapter interface (DXGI).
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HardwareDiagnosticSource {
-    Backend { backend: ExecutionBackend },
-    Adapters,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelPreviewSource {
@@ -777,139 +1073,6 @@ impl ModelPreviewComponentRole {
     }
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceModelSearchRequest {
-    pub query: String,
-    pub limit: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub cursor: Option<String>,
-}
-
-/// How a repository derives from its base model, as the Hub's `baseModels` states it; `unknown`
-/// when only its GGUF names the base.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HuggingFaceBaseRelation {
-    Quantized,
-    Finetune,
-    Merge,
-    Adapter,
-    Unknown,
-}
-
-/// The model a repository derives from.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceModelBase {
-    pub repository: String,
-    pub relation: HuggingFaceBaseRelation,
-}
-
-/// A repository's recommended version, chosen and assessed as candidate inspection chooses and
-/// assesses it. `download_bytes` is what adding it downloads, its projector included; zero when it
-/// is already on this computer.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceRecommendedVersion {
-    pub label: String,
-    pub model_id: crate::models::ModelId,
-    pub size_bytes: u64,
-    pub download_bytes: u64,
-    pub assessment: crate::models::ModelAssessment,
-}
-
-/// One repository as the Hub lists it, before any of its files is read. `architecture` is the
-/// Hub's, from the GGUF it describes the repository by. `developer` is told by the repository's
-/// name. `version_count` is how many GGUFs the repository's file list offers (split shards counted
-/// once, projectors excluded), approximate since drafters are not told apart. `base` is the Hub's
-/// `baseModels`. What the repository holds on this machine is its check
-/// (`HuggingFaceRepositoryCheck`).
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceModelSearchResult {
-    pub repository: String,
-    pub commit: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub last_modified: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub downloads: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub likes: Option<u64>,
-    pub gated: bool,
-    pub private: bool,
-    pub tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub architecture: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub developer: Option<crate::models::ModelDeveloper>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false, minimum = 1))]
-    pub version_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub base: Option<HuggingFaceModelBase>,
-}
-
-/// A listed repository to check: what the search listed it as. `architecture` is the Hub's,
-/// which decides only when the repository's model file can't be read; `restricted` is whether the
-/// listing is gated or private, so its reads are kept for the credential that made them.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceRepositoryCheckRequest {
-    pub repository: String,
-    pub commit: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub architecture: Option<String>,
-    pub restricted: bool,
-}
-
-/// What a listed repository holds on this machine, from its model file's header and the version
-/// candidate inspection would recommend. `NotAModel` is a repository of drafters or projectors
-/// alone: nothing in it is offered. For a `Model`, `unsupported` is empty when the engine runs it;
-/// `architecture` is its header's, absent when the header couldn't be read; `variant_of` is the
-/// catalog model whose shape fingerprint it has; `base` is the Hub's `baseModels`, else its model
-/// file's `general.base_model.*`; `recommended` is the version inspection recommends, absent when
-/// the versions couldn't be assessed in time.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum HuggingFaceRepositoryCheck {
-    NotAModel,
-    #[serde(rename_all = "camelCase")]
-    Model {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        architecture: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        variant_of: Option<crate::models::ModelId>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        developer: Option<crate::models::ModelDeveloper>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        base: Option<HuggingFaceModelBase>,
-        unsupported: Vec<crate::models::UnsupportedReason>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        recommended: Option<HuggingFaceRecommendedVersion>,
-    },
-}
-
 impl HuggingFaceRepositoryCheck {
     /// Whether the check found what the repository is: not a model, or a model that doesn't run
     /// or whose recommended version was found. An incomplete check is one whose reads or
@@ -923,28 +1086,6 @@ impl HuggingFaceRepositoryCheck {
     }
 }
 
-/// One page of the Hub's results, most downloaded first; catalog repositories excluded. `next_cursor` requests the page after it, absent on the last.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceModelSearchResults {
-    pub results: Vec<HuggingFaceModelSearchResult>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub next_cursor: Option<String>,
-}
-
-/// The Hugging Face token presented on every later Hub request; without one, Hub requests are
-/// anonymous. It is write-only: no response carries it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceCredential {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub token: Option<String>,
-}
-
 impl std::fmt::Debug for HuggingFaceCredential {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -952,52 +1093,6 @@ impl std::fmt::Debug for HuggingFaceCredential {
             .field("token", &self.token.as_ref().map(|_| "***"))
             .finish()
     }
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceRepositoryRequest {
-    pub repository: String,
-    pub revision: String,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceRepositoryFile {
-    #[cfg_attr(feature = "openapi", schema(value_type = String))]
-    pub path: PathBuf,
-    pub size_bytes: u64,
-    pub content: ContentIdentity,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HuggingFaceRepositorySnapshot {
-    pub repository: String,
-    pub commit: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub last_modified: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub downloads: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub likes: Option<u64>,
-    pub gated: bool,
-    pub private: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub license: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub license_url: Option<String>,
-    pub base_models: Vec<String>,
-    pub tags: Vec<String>,
-    pub gguf_files: Vec<HuggingFaceRepositoryFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1090,40 +1185,6 @@ pub struct DownloadFileProgress {
     pub path: PathBuf,
     pub completed_bytes: u64,
     pub total_bytes: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum DownloadFailure {
-    Interrupted,
-    #[serde(rename_all = "camelCase")]
-    InsufficientDiskSpace {
-        required_bytes: u64,
-        available_bytes: u64,
-    },
-    #[serde(rename_all = "camelCase")]
-    SourceUnavailable,
-    NetworkUnavailable,
-    LocalStorageFailure,
-    CorruptDownload,
-    #[serde(rename_all = "camelCase")]
-    HuggingFaceAccessRequired {
-        access: HuggingFaceAccess,
-    },
-    #[serde(rename_all = "camelCase")]
-    Internal {
-        message: String,
-    },
-}
-
-/// What Hugging Face needs before it serves a refused repository's files: a signed-in account
-/// (no token, or one it rejected), or that the signed-in account accept the repository's terms.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HuggingFaceAccess {
-    SignIn,
-    AcceptTerms,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

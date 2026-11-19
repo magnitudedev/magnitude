@@ -3,10 +3,11 @@
 // key, scaled, plus the head's additive bias) into shared memory; the
 // threadgroup reduces their maximum and softmax denominator, then each thread
 // accumulates whole columns of the weighted biased values, published to A.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/reduce.h"
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 
 #define CORRECTOR_THREADS 256u
 
@@ -21,7 +22,7 @@ kernel void corrector_attention(
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    const element::Out<activation> result(result_cells);
+    const element::Out<activation_element> result(result_cells);
     const ulong nodes = SEISMIC_DIM_N, width = SEISMIC_DIM_W;
     // The block's scores, then the reduction partials (N * 4 + 64 bytes).
     threadgroup float *scores = shared;

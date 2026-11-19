@@ -1852,10 +1852,7 @@ fn check_natives_against(
 /// decode configuration.
 #[test]
 fn cpu_output_reads_the_operand_the_decode_emits() {
-    let Some(device) = devices().into_iter().find(|device| device.backend() == BackendName::Cpu) else {
-        return;
-    };
-    let device = &device;
+    let device = &seismic_native_tests::cpu();
     let charges = seismic::Charges::tally(device);
     let case = Case::new(QWEN_SMALL, 64, decode_rows(5)[..1].to_vec(), 16, 1.0, 1.0 / (32f32).sqrt(), 11);
     let (heads, w, d) = (case.form.heads(), case.form.w(), 64usize);

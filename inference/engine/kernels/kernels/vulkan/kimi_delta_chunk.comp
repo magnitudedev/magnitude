@@ -1,6 +1,7 @@
 // kimi_delta_chunk (large row classes): the same contract as
 // `kimi_delta_step`, in `lib/recurrent/chunk.glsl`'s launches over Kimi's
 // gates (one decay factor per key column).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/kimi.glsl"
 #include "lib/recurrent/chunk.glsl"
 

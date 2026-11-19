@@ -97,7 +97,7 @@ uint64_t recurrent_raw_index(uint64_t row, uint head, uint state_row) {
 }
 
 float recurrent_projection(recurrent_inputs in_, uint64_t row, uint64_t column) {
-    return element_at(ELEMENT_ACT, in_.projection, row * SEISMIC_PROJECTION_STRIDE_0 + column);
+    return element_at(ACTIVATION_A, in_.projection, row * SEISMIC_PROJECTION_STRIDE_0 + column);
 }
 
 Out recurrent_window_at(recurrent_inputs in_, int bank, int tap, uint64_t channel) {
@@ -385,7 +385,7 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
                 [[unroll]] for (uint s = 1u; s < RECURRENT_MAX_ROWS; ++s)
                     if (s < rows && lane == s)
                         value = outputs[s];
-                element_put(ELEMENT_ACT, mixed, recurrent_raw_index(uint64_t(row), head, first_row + lane), value);
+                element_put(ACTIVATION_A, mixed, recurrent_raw_index(uint64_t(row), head, first_row + lane), value);
             }
             if (row + 1 == publish)
                 recurrent_store_rows(in_, rows, slot.target, head, first_row, state);
@@ -417,20 +417,12 @@ void recurrent_sequential(const uint rows) {
 // with raw the stored raw output, z column RECURRENT_GATE_FIRST + head * W + i
 // of the row's `recurrent_gate_input` and inverse = rsqrt(sum_head raw^2 / W + epsilon).
 
-#if defined(SEISMIC_RECURRENT_NORM_REPRESENTATION_F32)
-#define RECURRENT_NORM ELEMENT_F32
-#elif defined(SEISMIC_RECURRENT_NORM_REPRESENTATION_F16)
-#define RECURRENT_NORM ELEMENT_F16
-#elif defined(SEISMIC_RECURRENT_NORM_REPRESENTATION_BF16)
-#define RECURRENT_NORM ELEMENT_BF16
-#else
-#error "the gated-delta entries require a dense recurrent_norm"
-#endif
+#define RECURRENT_NORM ELEMENT_OF(SEISMIC_RECURRENT_NORM)
 
 // The raw output (row, head, i): stored by the advance in a slot's row, zero
 // in a row no slot covers (`covered`, the first such row).
 float recurrent_raw(uint64_t mixed, int covered, uint64_t row, uint head, uint i) {
-    return row < uint64_t(covered) ? element_at(ELEMENT_ACT, mixed, recurrent_raw_index(row, head, i)) : 0.0;
+    return row < uint64_t(covered) ? element_at(ACTIVATION_A, mixed, recurrent_raw_index(row, head, i)) : 0.0;
 }
 
 // The inputs of columns i..i+7 of (row, head) as (even, odd): raw outputs,
@@ -457,7 +449,7 @@ recurrent_gated8 recurrent_gated_inputs8(recurrent_inputs in_, uint64_t mixed, i
 
 // The output gate of z by the entry's `gate_function` (`functions_output_gate`), rounded to A.
 float recurrent_gate_rounded(float z) {
-    return element_round(ELEMENT_ACT, functions_output_gate(int(SEISMIC_PARAM_GATE_FUNCTION), z));
+    return element_round(ACTIVATION_A, functions_output_gate(int(SEISMIC_PARAM_GATE_FUNCTION), z));
 }
 
 // Stores the gated columns i..i+7 of (row, head) given the head's inverse.
@@ -467,9 +459,9 @@ void recurrent_store_gated8(recurrent_gated8 v, float inverse, uint64_t row, uin
     const vec4 e = v.me * inverse * v.ne, o = v.mo * inverse * v.no;
     [[unroll]] for (uint j = 0u; j < 4u; ++j) {
         out_put(gated, at + uint64_t(i + 2u * j) * SEISMIC_RESULT_0_STRIDE_2,
-            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, e[j]) * recurrent_gate_rounded(v.ze[j])));
+            element_round(ACTIVATION_A, element_round(ACTIVATION_A, e[j]) * recurrent_gate_rounded(v.ze[j])));
         out_put(gated, at + uint64_t(i + 2u * j + 1u) * SEISMIC_RESULT_0_STRIDE_2,
-            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, o[j]) * recurrent_gate_rounded(v.zo[j])));
+            element_round(ACTIVATION_A, element_round(ACTIVATION_A, o[j]) * recurrent_gate_rounded(v.zo[j])));
     }
 }
 

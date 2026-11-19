@@ -14,6 +14,7 @@
 // `int8_coefficients`, `int8`) or PACK (`pack`, `pack_coefficients`,
 // `packed`, `unpacked`), the down's the same launches `down_` named.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_EXPERT_UP
 #define KERNEL_W1 SEISMIC_EXPERT_DOWN
 #include "lib/routed/routed.h"
@@ -219,7 +220,7 @@ kernel void routed_experts_up_int8_rows(EXPERTS_UP_ARGUMENTS, PROJECTION_THREADG
     EXPERTS_UP_BLOCK(index / uint(SEISMIC_DIM_T));
     (void)source;
     const routed::Grouped in = EXPERTS_UP_ROWS(0);
-    projection::int8_quantize<projection::int8_codes<packets::W0>::interleaved>(in,
+    projection::int8_quantize<packets::int8<packets::W0>::interleaved>(in,
         EXPERTS_UP_INT8_OPERAND(uint(SEISMIC_DIM_H)), uint(SEISMIC_DIM_B) * uint(SEISMIC_DIM_T), uint(SEISMIC_DIM_H),
         index, thread_index, lane, 1.0f);
 }
@@ -398,7 +399,7 @@ kernel void routed_experts_up_down_int8_rows(EXPERTS_UP_ARGUMENTS, PROJECTION_TH
     EXPERTS_UP_BLOCK(index / uint(SEISMIC_DIM_T));
     (void)source;
     const routed::GroupedProducts in = EXPERTS_UP_PRODUCT_ROWS;
-    projection::int8_quantize<projection::int8_codes<packets::W1>::interleaved>(in,
+    projection::int8_quantize<packets::int8<packets::W1>::interleaved>(in,
         EXPERTS_UP_INT8_OPERAND(uint(SEISMIC_DIM_F)), uint(SEISMIC_DIM_B) * uint(SEISMIC_DIM_T), uint(SEISMIC_DIM_F),
         index, thread_index, lane, 1.0f);
 }

@@ -1,6 +1,7 @@
 // gated_delta_project: the qkv, z, alpha and beta projections of the
 // normalized input rows, the forms of the `dense` projection
 // (`lib/projection/operator.cuh`), segmented.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_QKV_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_ALPHA_WEIGHT

@@ -14,6 +14,7 @@
 // position and score once and the choice's 8 expert outputs as one 16-byte
 // load, so the gather moves whole rows of expert output.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_SHARED_DOWN
 #define KERNEL_W1 SEISMIC_SHARED_GATE
 #define KERNEL_W2 SEISMIC_SHARED_UP
@@ -113,7 +114,7 @@ kernel void routed_combine_int8_rows(COMBINE_ARGUMENTS, PROJECTION_THREADGROUP_A
     if constexpr (!projection::int8_path<packets::W1, packets::W2>())
         return;
     COMBINE_EXPANSION;
-    projection::int8_quantize<projection::int8_codes<packets::W1>::interleaved>(in, COMBINE_INT8_OPERAND, m, k,
+    projection::int8_quantize<packets::int8<packets::W1>::interleaved>(in, COMBINE_INT8_OPERAND, m, k,
         index, thread_index, lane, 1.0f);
 }
 #endif
@@ -228,7 +229,7 @@ kernel void routed_combine_down_int8_rows(COMBINE_ARGUMENTS, PROJECTION_THREADGR
     if constexpr (!projection::int8_path<packets::W0>())
         return;
     COMBINE_DOWN;
-    projection::int8_quantize<projection::int8_codes<packets::W0>::interleaved>(in, COMBINE_INT8_OPERAND, m, k,
+    projection::int8_quantize<packets::int8<packets::W0>::interleaved>(in, COMBINE_INT8_OPERAND, m, k,
         index, thread_index, lane, 1.0f);
 }
 #endif

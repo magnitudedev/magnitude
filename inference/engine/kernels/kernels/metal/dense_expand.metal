@@ -1,6 +1,7 @@
 // dense_expand: RMS prologue over the `out_rows` residual rows, the
 // paired gate/up projection, and act(gate)·up (`activation`: SiLU or
 // GELU-tanh).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
 // The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
@@ -15,7 +16,7 @@
 #include "lib/projection/gemv.h"
 #endif
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 // The rows both weights take (the normalized rows, or NVFP4 operands): the
 // GEMV row classes form them while staging, the normalize launches into
@@ -56,17 +57,17 @@ typedef projection::operands<NVFP4> Operands;
 // form past the GEMV reads.
 #define PROJECTION_OPERANDS                                                             \
     const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_F), k = uint(SEISMIC_DIM_H); \
-    projection::Rms<activation, norm_element, projection::SelectedRows> raw{residual,   \
+    projection::Rms<activation_element, norm_element, projection::SelectedRows> raw{residual,   \
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0, \
         as_type<float>(uint(SEISMIC_PARAM_EPS)), k, {out_rows}};                        \
-    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    const projection::Plain<activation_element, projection::AllRows> in{normalized, k, 1, k, {}}; \
     const auto out = projection::scaling<(SEISMIC_DIM_GS != 0 || SEISMIC_DIM_US != 0)>::wrap( \
-        projection::Glu<activation>{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
+        projection::Glu<activation_element>{element::Out<activation_element>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
             SEISMIC_RESULT_0_STRIDE_1, int(SEISMIC_PARAM_ACTIVATION)},                  \
         projection::scale_factor(gate_scale, SEISMIC_DIM_GS, 0, 0),                     \
         projection::scale_factor(up_scale, SEISMIC_DIM_US, 0, 0));                      \
-    projection::Weights<packets::W0> w0{gate_weight, KERNEL_W0_LAYOUT(k), k};           \
-    projection::Weights<packets::W1> w1{up_weight, KERNEL_W1_LAYOUT(k), k}
+    projection::Weights<packets::W0> w0{{gate_weight, KERNEL_W0_LAYOUT(k), k}};         \
+    projection::Weights<packets::W1> w1{{up_weight, KERNEL_W1_LAYOUT(k), k}}
 
 // The norm prologue: the GEMV normalizes its rows while staging them, and
 // the normalize launches into `normalized`, in the tall GEMM's order where
@@ -101,7 +102,7 @@ kernel void dense_expand_normalize_tall(PROJECTION_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     PROJECTION_OPERANDS;
-    Operands::normalize<256, projection::TallOrder<activation>>(raw, item, normalized, k, norms, thread_index);
+    Operands::normalize<256, projection::TallOrder<activation_element>>(raw, item, normalized, k, norms, thread_index);
 }
 #endif
 

@@ -47,8 +47,8 @@ native silu_f32 for metal from "metal/silu_f32.metal":
         threads_per_threadgroup (256, 1, 1)
 
 # One checked operation prepared under different concrete element bindings.
-# Its native implementation uses the generated representation descriptors
-# rather than assuming a storage type from the logical shape.
+# Its native implementation reads the bound element through the library's
+# element surface rather than assuming a storage type from the logical shape.
 fn read_first[N](x: &tensor[N] E, result: &mut tensor[1] f32):
     result[0] = f32(x[0])
 

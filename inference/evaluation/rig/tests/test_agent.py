@@ -535,12 +535,14 @@ def test_eviction_counts_what_every_building_checkout_may_still_add(tmp_path):
 
 
 def _volume(monkeypatch, root: Path, others: int) -> None:
-    """The rig root's volume as a test sets it: `others` bytes free beside the rig, less what the
-    root's checkouts hold by their recorded sizes, so an eviction frees its checkout's size."""
+    """The rig root's volume as a test sets it: `others` bytes free beside the rig beyond the
+    volume's floor (`agent.room_free`), less what the root's checkouts hold by their recorded
+    sizes, so an eviction frees its checkout's size."""
     def usage(path):
         held = sum(int((checkout / "size").read_text()) for checkout in (root / "checkouts").iterdir()
                    if (checkout / "size").exists())
-        return shutil._ntuple_diskusage(10**13, 10**13 - others + held, others - held)
+        free = others - held + agent.SYSTEM_FLOOR
+        return shutil._ntuple_diskusage(10**13, 10**13 - free, free)
 
     monkeypatch.setattr(agent.shutil, "disk_usage", usage)
 
@@ -596,6 +598,20 @@ def test_room_is_made_from_the_rigs_own_stale_checkouts_least_recently_used_firs
     assert sorted(path.name for path in (tmp_path / "checkouts").iterdir()) == ["held", "mine", "recent"]
     end(holding)
     end(building)
+
+
+def test_the_room_a_run_is_placed_by_is_what_its_eviction_can_free(tmp_path, monkeypatch):
+    """The room a host reports for a new run counts the unheld checkouts that run may evict,
+    never the one it would claim: its eviction keeps that one, so placement never ranks a host
+    by room the run cannot free."""
+    gb = 10**9
+    _stale(tmp_path, "warm", 24 * gb, 1000)
+    (tmp_path / "checkouts" / "warm" / agent.SOURCE).write_text("source")  # the run's warm checkout
+    _stale(tmp_path, "cold", 5 * gb, 1001)
+    _volume(monkeypatch, tmp_path, others=42 * gb)  # 13 GB free beside the rig's 29 GB
+    found = agent.report(str(tmp_path), [("source", "source-tree", BUILD)])
+    assert found["checkouts"][0]["name"] == "warm"
+    assert found["room"]["available"] == 13 * gb + 5 * gb
 
 
 def test_a_build_is_refused_only_when_what_the_rig_does_not_own_leaves_no_room(tmp_path, monkeypatch):
@@ -1338,7 +1354,8 @@ def _build_plan(stage: Path, tree: str, *after: dict, kept: tuple = ()) -> list:
     """Claim, install `stage`, build the crate's tests and record the build, its provenance keeping
     the executables `kept`, then run the tests from the output: a run of tree `tree`."""
     src, env = "{checkout:s}/src", {"CARGO_TARGET_DIR": "{checkout:s}/target"}
-    tests = run_op([sys.executable, "-m", "magnitude_rig.host", "tests", "--list", "{output:s}/tests.json"],
+    tests = run_op([sys.executable, "-m", "magnitude_rig.host", "tests", "--list", "{output:s}/tests.json",
+                    "--ran", "{output:s}/ran.json"],
                    stage, job="tests")
     tests["env"] = {"PYTHONPATH": str(AGENT.parents[2])}
     return [*_claim_and_install(stage, tree),
@@ -1401,6 +1418,7 @@ def test_a_build_runs_from_its_output_releases_its_checkout_and_trims_what_no_ke
     output = tmp_path / "outputs" / "t2-b"
     listed = json.loads((output / agent.TESTS).read_text())  # its library's unit tests and its `here`
     assert len(listed) == 2 and {test["directory"] for test in listed} == {str(output / "src" / "lib")}
+    assert {test["binary"] for test in listed} == {"lib:lib:my_lib", "lib:test:here"}
     assert all(test["executable"].startswith(str(output / "target" / "release" / "deps")) for test in listed)
     held = {e["kind"] for e in status(tmp_path)["entries"] if e["run"] == "second"}
     assert "output:t2-b" in held and not any(kind.startswith("checkout:") for kind in held)  # released at its build's end
@@ -1514,22 +1532,57 @@ def test_a_run_sharing_a_checkout_neither_trims_nor_records_it_nor_makes_room(tm
     assert ended(tmp_path, "holder")["failed"] is None
 
 
-def test_a_suite_run_from_its_output_fails_with_its_first_failure(tmp_path):
+LIBTEST = """#!{python}
+import os, sys
+if sys.argv[1:2] == ["--list"]:
+    print(*(["c: test"] if "--ignored" in sys.argv else ["a: test", "b: test", "c: test"]), sep="\\n")
+    raise SystemExit(0)
+with open(os.environ["SEISMIC_TEST_RECORD"], "a") as record:
+    record.write("ask metal a\\nopen metal a\\nrun metal a\\nask metal b\\nnone metal b\\nopen metal \\n")
+print(os.getcwd() == os.environ["CARGO_MANIFEST_DIR"], sys.argv[1:])
+print("running 3 tests", "test a ... ok", "test b ... ok", "test c ... ignored",
+      "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out", sep="\\n")
+"""
+
+
+def test_a_suite_run_from_its_output_records_what_each_executable_ran(tmp_path):
     """`tests` runs each listed executable from its directory with CARGO_MANIFEST_DIR naming it,
-    and exits with the first failure."""
+    exits with the first failure, and records what each ran: libtest's outcomes and listing, and
+    from each test's record the backends it asked for, opened, worked on and selected none of, device use
+    on a thread no test names under that thread's name (here unnamed). An executable
+    without the libtest harness is one test, on its main thread; a selection runs only the
+    executables it keys, each on the tests it names."""
     host = lambda *argv: subprocess.run([sys.executable, "-m", "magnitude_rig.host", *argv], capture_output=True,
                                         text=True, env=dict(os.environ, PYTHONPATH=str(AGENT.parents[2])))
     (tmp_path / "pkg").mkdir()
     listed = []
-    for name, code in (("passes", 0), ("fails", 7)):
+    scripts = {"libtest": LIBTEST.format(python=sys.executable),
+               "bare": f"#!{sys.executable}\nimport os\nopen(os.environ['SEISMIC_TEST_RECORD'], 'a')"
+                       ".write('open cpu main\\nrun cpu main\\n')\nraise SystemExit(7)\n",
+               "unselected": f"#!{sys.executable}\nraise SystemExit(9)\n"}
+    for name, text in scripts.items():
         script = tmp_path / name
-        script.write_text(f"#!{sys.executable}\nimport os, sys\nprint(os.getcwd() == os.environ['CARGO_MANIFEST_DIR'], "
-                          f"sys.argv[1:])\nraise SystemExit({code})\n")
+        script.write_text(text)
         script.chmod(0o755)
-        listed.append({"executable": str(script), "directory": str(tmp_path / "pkg")})
+        listed.append({"executable": str(script), "directory": str(tmp_path / "pkg"), "binary": f"pkg:test:{name}"})
     (tmp_path / "tests.json").write_text(json.dumps(listed))
-    ran = host("tests", "--list", str(tmp_path / "tests.json"), "--", "filter")
-    assert ran.returncode == 7 and ran.stdout.count("True ['filter']") == 2
+    ran = host("tests", "--list", str(tmp_path / "tests.json"), "--ran", str(tmp_path / "ran.json"), "--", "filter")
+    assert ran.returncode == 7 and ran.stdout.count("True ['filter']") == 1
+    libtest, bare, _ = json.loads((tmp_path / "ran.json").read_text())
+    assert libtest == {"binary": "pkg:test:libtest", "executable": "libtest", "code": 0,
+                       "outcomes": {"a": "ok", "b": "ok", "c": "ignored"}, "counts": [2, 0, 1],
+                       "listed": ["a", "b", "c"], "ignored": ["c"],
+                       "executions": {"a": {"asked": ["metal"], "opened": ["metal"], "ran": ["metal"], "none": []},
+                                      "b": {"asked": ["metal"], "opened": [], "ran": [], "none": ["metal"]},
+                                      "": {"asked": [], "opened": ["metal"], "ran": [], "none": []}}}
+    assert bare["outcomes"] == {"": "FAILED"} and bare["listed"] == [""] and bare["counts"] is None
+    assert bare["executions"] == {"": {"asked": [], "opened": ["cpu"], "ran": ["cpu"], "none": []}}
+    (tmp_path / "selection.json").write_text(json.dumps({"pkg:test:libtest": ["a"], "pkg:test:bare": None}))
+    ran = host("tests", "--list", str(tmp_path / "tests.json"), "--ran", str(tmp_path / "ran.json"),
+               "--selection", str(tmp_path / "selection.json"), "--", "--include-ignored")
+    assert ran.returncode == 7 and "True ['--exact', 'a', '--include-ignored']" in ran.stdout
+    assert [record["binary"] for record in json.loads((tmp_path / "ran.json").read_text())] == \
+        ["pkg:test:libtest", "pkg:test:bare"]
 
 
 def test_the_disk_owner_removes_every_build_output_no_live_run_holds(tmp_path):
@@ -1555,3 +1608,57 @@ def test_an_output_a_dead_run_left_incomplete_is_discarded_and_a_complete_one_re
     assert partial.is_dir() and not (partial / "src").exists()  # held anew, empty
     assert (complete / "src").is_dir()
     end(holding)
+
+
+def test_a_step_refuses_a_volume_it_writes_outside_the_rig_root_too_full_to_run_on(tmp_path, monkeypatch):
+    """The step environment's TMPDIR (and on macOS the user's cache directory and crash reports)
+    on a volume of its own under `SYSTEM_FLOOR` is what the host's status reports and what a
+    step refuses on, naming it; the rig root's own volume, whose room `room` counts, never."""
+    root, scratch = tmp_path / "root", tmp_path / "scratch"
+    root.mkdir()
+    free = {str(root): (1, 1 << 30), str(scratch): (2, 1 << 30)}
+    monkeypatch.setattr(agent, "volume", lambda path: free.get(path, (1, 1 << 30)))
+    monkeypatch.setattr(agent.sys, "platform", "linux")
+    assert agent.short_volumes(str(root), {"TMPDIR": str(root)}) == []  # the rig root's: room's
+    short = agent.short_volumes(str(root), {"TMPDIR": str(scratch)})
+    assert short == [{"path": str(scratch), "free_bytes": 1 << 30}]
+    assert agent.short_reason(short).startswith(f"{scratch} has 1.1 GB free, under the 5.4 GB a run needs there")
+    free[str(scratch)] = (2, agent.SYSTEM_FLOOR)
+    assert agent.short_volumes(str(root), {"TMPDIR": str(scratch)}) == []
+    assert agent.report(str(root), [], env={"TMPDIR": str(scratch)})["short"] == []
+    free[str(scratch)] = (2, 0)
+    assert agent.report(str(root), [], env={"TMPDIR": str(scratch)})["short"][0]["free_bytes"] == 0
+    # A real volume with no room: the device filesystem, of its own and never free.
+    full = "/dev/rig-scratch" if os.uname().sysname == "Darwin" else "/proc/rig-scratch"
+    start(root, "full", [run_op([sys.executable, "-c", "print('ran')"], tmp_path, job="j", env={"TMPDIR": full})])
+    refused = ended(root, "full")
+    assert refused["codes"] == {} and refused["failed"]["detail"].startswith(f"{full} has 0.0 GB free")
+
+
+def test_the_rig_roots_volume_keeps_the_floor_out_of_its_room(tmp_path, monkeypatch):
+    """The rig root's volume, where a Mac's runs write their caches too, keeps `SYSTEM_FLOOR` free:
+    its room, which placement and eviction both count, is what lies beyond it, so a build that
+    fits only by eating the floor evicts first."""
+    gb = 10**9
+    _stale(tmp_path, "oldest", 6 * gb, 1000)
+    (tmp_path / "checkouts" / "mine").mkdir()
+    (tmp_path / "checkouts" / "mine" / agent.SOURCE).write_text("source")
+    _volume(monkeypatch, tmp_path, others=10 * gb)  # 4 GB beyond the floor beside the rig's 6 GB
+    assert agent.room_free(str(tmp_path)) == 4 * gb
+    assert agent.report(str(tmp_path), [("source", "tree", BUILD)])["room"]["available"] == 10 * gb
+    measured(tmp_path, size=5 * gb)  # fits in what is free only by eating the floor
+    building = session(tmp_path, "building")
+    assert claim(building, "source") == "mine"
+    evicted = building.evict("mine")
+    assert evicted["removed"] == ["checkouts/oldest"] and evicted["free_bytes"] == 10 * gb
+    end(building)
+
+
+def test_a_volume_is_found_for_any_path_a_step_environment_names(tmp_path, monkeypatch):
+    """A relative TMPDIR that does not exist is the volume of where it would be made, from the
+    working directory; a cache directory the system does not name is none."""
+    monkeypatch.chdir(tmp_path)
+    assert agent.volume("not/made/yet") == agent.volume(str(tmp_path))
+    monkeypatch.setattr(agent.sys, "platform", "darwin")
+    monkeypatch.setattr(agent.os, "confstr", lambda name: None)
+    assert agent.short_volumes(str(tmp_path), {"TMPDIR": "relative"}) == []

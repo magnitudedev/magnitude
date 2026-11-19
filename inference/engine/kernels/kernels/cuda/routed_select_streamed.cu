@@ -1,6 +1,7 @@
 // Expert streaming's decode general selection (`routed_select_streamed`) on the
 // `dense` projection operator, single over `router`, followed by resolve and
 // assignment in the selecting block.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #include "lib/projection/operator.cuh"
 #include "lib/routed/selection.cuh"

@@ -14,13 +14,13 @@ use magnitude_artifacts::{ArtifactIdentity, Package, PackageIdentity};
 use magnitude_batching::Demand;
 use crate::planning::Holding;
 use magnitude_executor::{
-    AttestedPrograms, ComponentLoader, DEFAULT_KERNEL_CACHE_BYTES, DeviceReader, MachineReading,
-    ExecutionPlanDraft, ExecutorDomain, KernelCache, ModelLoadPlan, Operation, RequestId, ReservedResources,
-    LoadPools, ResidencyStore, ResourceAllocator, ResourceCapacity, ResourceDomainId,
+    AllocatedResources, AttestedPrograms, ComponentLoader, DEFAULT_KERNEL_CACHE_BYTES, DeviceReader, MachineReading,
+    ExecutionPlan, ExecutionPlanDraft, ExecutorDomain, KernelCache, ModelLoadPlan, Operation, RequestId, ReservedResources,
+    LoadPools, ResidencyStore, ResidentTarget, ResourceAllocator, ResourceCapacity, ResourceDomainId,
     CatalogError, CatalogFailure, PlanError, ResourcePlan, ResourcePlanner, StateResourcePlan, SEARCH_VERSION, StateBindings,
     TokenId, TracedWork, TunedEntry, TuningCacheKey, TuningContext, TuningEvent, TuningObserver,
     TuningOrigin, TuningSettings, TuningTrace, UnpreparedUnits, WorkKind,
-    memory::{ClaimDemand, ledger::{CommittedKind, DeviceLedgers, DeviceReading, Held, Ledgers, LoadShape, OpenChange, Recorded, Short}},
+    memory::{ClaimDemand, ledger::{Claim, CommittedKind, DeviceLedgers, DeviceReading, Held, Ledgers, LoadShape, OpenChange, Recorded, Short}},
     platform::{self, DeviceRequest, OpenedPlatform, PlatformConfig, PlatformError},
 };
 use magnitude_family_contracts::{HeadHistory, InputLayout, PreparedModelInput, TokenPlan};
@@ -31,7 +31,7 @@ use std::time::Instant;
 
 /// A constructed executor domain with the facts readiness reports.
 pub(crate) struct NativeDomain {
-    pub domain: ExecutorDomain,
+    pub domain: Box<ExecutorDomain>,
     /// The domain's one right to change its stores' bindings.
     pub bindings: StateBindings,
     pub plan: ResourcePlan,
@@ -60,7 +60,7 @@ pub fn load_native_domain(
     manifest: &ExecutionManifest,
     package: Arc<Package>,
     unprepared: UnpreparedUnits,
-) -> Result<LoadAttempt<(ExecutorDomain, StateBindings, ResourcePlan)>, LoadError> {
+) -> Result<LoadAttempt<(Box<ExecutorDomain>, StateBindings, ResourcePlan)>, LoadError> {
     let catalog = Devices::discover(&[]).map_err(|error| internal(error.to_string()))?;
     Ok(
         match build(catalog, manifest, package, unprepared, Rc::new(|_| {}))? {
@@ -77,7 +77,7 @@ pub fn load_native_domain(
 pub fn build_native_domain(
     manifest: &ExecutionManifest,
     package: Arc<Package>,
-) -> Result<(ExecutorDomain, StateBindings, ResourcePlan), LoadError> {
+) -> Result<(Box<ExecutorDomain>, StateBindings, ResourcePlan), LoadError> {
     match load_native_domain(manifest, package, UnpreparedUnits::ServeDefaults)? {
         LoadAttempt::Loaded(built) => Ok(*built),
         LoadAttempt::Unprepared => Err(internal(
@@ -627,7 +627,12 @@ enum Built {
     Unheld(LoadError),
 }
 
-/// [`build`] of a plan holding its experts as `holding` says.
+/// [`build`] of a plan holding its experts as `holding` says: its programs
+/// prepared ([`prepare`]), their graphs sealed and the plan admitted
+/// ([`seal_graphs`]), the target imported ([`import_target`]) and the
+/// domain made and warmed up ([`assemble_domain`]). Each phase is a frame
+/// of its own: a load's values are many and large, and one frame would hold
+/// every phase's at once.
 fn build_held(
     catalog: Rc<Devices>,
     manifest: &ExecutionManifest,
@@ -640,8 +645,44 @@ fn build_held(
     // leaves behind has dropped: the owner reads between its allocations,
     // each recorded as it is made, and a failed load's frees are part of it.
     let _load = OpenChange::begin(Ledgers::process().changes());
+    let prepared = match prepare(catalog, manifest, &package, unprepared, progress.clone(), holding)? {
+        LoadAttempt::Loaded(prepared) => prepared,
+        LoadAttempt::Unprepared => return Ok(Built::Attempt(LoadAttempt::Unprepared)),
+    };
+    let sealed = seal_graphs(prepared, manifest)?;
+    let imported = match import_target(sealed, manifest, &package, &progress)? {
+        TargetImport::Imported(imported) => imported,
+        TargetImport::Unheld(refused) => return Ok(Built::Unheld(refused)),
+    };
+    let domain = assemble_domain(imported, manifest, package, &progress)?;
+    Ok(Built::Attempt(LoadAttempt::Loaded(domain)))
+}
+
+/// A load whose graphs are sealed and whose plan is admitted on the device
+/// it opened ([`seal_graphs`]): what its target import starts from.
+struct SealedLoad {
+    startup: Startup,
+    /// The plan before the weight cap: every expert resident.
+    resident: ExecutionPlanDraft,
+    /// The plan the load runs, which its pricing derives its step from
+    /// ([`LoadPricing`]).
+    planned: ExecutionPlanDraft,
+    execution_plan: ExecutionPlan,
+    device: Rc<seismic::Device>,
+    device_selector: ExecutorSelector,
+    programs: Rc<AttestedPrograms>,
+    resource_identity: ResourceDomainId,
+    site_requests: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
+    head_enabled: bool,
+    phase_started: Instant,
+}
+
+/// The load's graphs prepared, planned and sealed, and its plan admitted
+/// at the resources they need: the load's preparation off the calling
+/// thread ends here.
+fn seal_graphs(prepared: Box<PreparedPrograms>, manifest: &ExecutionManifest) -> Result<SealedLoad, LoadError> {
     let PreparedPrograms {
-        mut startup,
+        startup,
         draft,
         resident,
         opened,
@@ -651,10 +692,7 @@ fn build_held(
         state,
         held_pass,
         workers,
-    } = match prepare(catalog, manifest, &package, unprepared, progress.clone(), holding)? {
-        LoadAttempt::Loaded(prepared) => *prepared,
-        LoadAttempt::Unprepared => return Ok(Built::Attempt(LoadAttempt::Unprepared)),
-    };
+    } = *prepared;
     let limits = draft.policy().limits();
     let head_enabled = draft.policy().selection().head;
     let mut phase_started = Instant::now();
@@ -701,93 +739,12 @@ fn build_held(
             .as_ref(),
     )
     .map_err(internal)?;
-    let seal = target_graphs.seal_report();
-    tracing::info!(
-        "sealed {} target graph classes ({} graphs) in {:.2} s; a group's pass covers at most {} rows; workspace arena {} bytes",
-        seal.classes,
-        seal.sealed_graphs,
-        seal.seconds,
-        target_graphs.pass_rows(),
-        resources.arena_bytes()
+    report_sealed_graphs(
+        &target_graphs,
+        &programs,
+        opened.device().graph_cost(),
+        resources.arena_bytes(),
     );
-    // What the target's graphs are made of, beside what they cost on this
-    // device: what each launch in flight beside another holds, its
-    // decode launches' pinned graphs, as the family is charged for it
-    // (`LaunchGraphs::pinned`), and its largest launch
-    // class's, which the family's live slots hold of its device's graph
-    // budget.
-    let family = target_graphs.family();
-    let census = family.census();
-    let graph_cost = opened.device().graph_cost();
-    // The family was charged at this cost, so its every census prices.
-    let cost = |graphs: seismic::GraphCensus| {
-        let bytes = graph_cost.bytes(graphs).expect("a charged family's graphs price at its device's cost");
-        bytes.device + bytes.upload
-    };
-    let pinned = family.graphs().pinned;
-    // Every plan of a family runs in one of its launches, so it has one.
-    let largest = census.launches.iter().copied().max_by_key(|graphs| cost(*graphs)).expect("a target family has a launch class");
-    tracing::info!(
-        "target graph census: {} layouts; of {} launch classes, each launch in flight beside another replays {} graphs of {} launches ({} bytes charged), the largest {} of {} ({} bytes charged)",
-        census.layouts,
-        census.launches.len(),
-        pinned.graphs,
-        pinned.launches,
-        cost(pinned),
-        largest.graphs,
-        largest.launches,
-        cost(largest),
-    );
-    // What the sealed graphs hold on the host against what the plan held
-    // them to before any was sealed, from both sides: one line of JSON,
-    // beside the memory moments around it (`programs prepared`, `graphs
-    // planned`). Each heap is requested bytes, its allocations, and the
-    // bound of the allocator's rounding of them, which no plan counts.
-    let heap = |heap: seismic::HostHeap| {
-        serde_json::json!({
-            "bytes": heap.bytes,
-            "allocations": heap.allocations,
-            "rounding_bound": heap.rounding,
-        })
-    };
-    let graphs = |graphs: &magnitude_executor::SealedGraphsHeap| {
-        serde_json::json!({
-            "graphs": graphs.graphs,
-            "plans": heap(graphs.plans),
-            "storage": heap(graphs.storage),
-            "owned": heap(graphs.owned),
-        })
-    };
-    let held = seal.held();
-    let total = |graphs: &magnitude_executor::SealedGraphsHeap, constants: seismic::HostHeap| {
-        graphs
-            .heap()
-            .and_then(|graphs| graphs.plus(constants))
-            .map(heap)
-    };
-    tracing::info!(
-        "sealed graph host heap {}",
-        serde_json::json!({
-            "planned_exact": seal.planned.exact(),
-            "planned_at_most": graphs(&seal.planned.at_most),
-            "planned_at_least": graphs(&seal.planned.at_least),
-            "planned_constants": heap(seal.planned.constants),
-            "planned_at_most_total": total(&seal.planned.at_most, seal.planned.constants),
-            "planned_at_least_total": total(&seal.planned.at_least, seal.planned.constants),
-            "held": graphs(&held),
-            "held_constants": heap(seal.constants),
-            "held_total": total(&held, seal.constants),
-        })
-    );
-    if let Some(state_graphs) = programs.state_graphs() {
-        tracing::info!(
-            "state copy graph host heap {}",
-            serde_json::json!({
-                "planned": heap(state_graphs.planned_host_heap()),
-                "held": heap(state_graphs.host_heap()),
-            })
-        );
-    }
     programs.install_target_graphs(target_graphs);
     programs.install_target_readout_graphs(target_readout_graphs);
     // The plan the load runs, which its pricing derives its step from
@@ -796,7 +753,6 @@ fn build_held(
     let execution_plan = draft
         .admit(resources)
         .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
-    let plan = execution_plan.resources().clone();
     // The load's preparation off the calling thread is over: its threads
     // are taken back from the device and joined.
     opened.device().staff(None);
@@ -822,8 +778,79 @@ fn build_held(
         opened.selector(),
     ))
     .map_err(internal)?;
-    let device = Rc::new(opened.into_device());
-    let programs = Rc::new(programs);
+    Ok(SealedLoad {
+        startup,
+        resident,
+        planned,
+        execution_plan,
+        device: Rc::new(opened.into_device()),
+        device_selector,
+        programs: Rc::new(programs),
+        resource_identity,
+        site_requests,
+        head_enabled,
+        phase_started,
+    })
+}
+
+/// What a load's target import made ([`import_target`]): the target
+/// imported, or the refusal of a plan holding its experts whole that could
+/// stream them ([`Built::Unheld`]).
+enum TargetImport {
+    Imported(ImportedTarget),
+    Unheld(LoadError),
+}
+
+/// A load whose resources are allocated and whose target is imported
+/// ([`import_target`]): what its domain is made of.
+struct ImportedTarget {
+    startup: Startup,
+    execution_plan: ExecutionPlan,
+    /// The plan before the weight cap: every expert resident.
+    resident: ExecutionPlanDraft,
+    /// The plan the load runs, at the slots its import admitted.
+    planned: ExecutionPlanDraft,
+    plan: ResourcePlan,
+    device: Rc<seismic::Device>,
+    device_selector: ExecutorSelector,
+    programs: Rc<AttestedPrograms>,
+    resources: AllocatedResources,
+    resource_identity: ResourceDomainId,
+    pools: LoadPools,
+    residency: ResidencyStore,
+    target: ResidentTarget,
+    state_tables: Held,
+    constants_claim: Held,
+    request_slot: Claim,
+    site_requests: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
+    head_enabled: bool,
+}
+
+/// The sealed load's resources allocated and every allocation after the
+/// target import claimed, then the target imported at what its claim
+/// admits; a plan holding its experts whole that the memory free now does
+/// not hold is handed back where its experts can stream
+/// ([`streams_instead`]).
+fn import_target(
+    sealed: SealedLoad,
+    manifest: &ExecutionManifest,
+    package: &Arc<Package>,
+    progress: &Rc<dyn Fn(LoadProgress)>,
+) -> Result<TargetImport, LoadError> {
+    let SealedLoad {
+        mut startup,
+        resident,
+        planned,
+        execution_plan,
+        device,
+        device_selector,
+        programs,
+        resource_identity,
+        site_requests,
+        head_enabled,
+        mut phase_started,
+    } = sealed;
+    let plan = execution_plan.resources().clone();
     let target_graphs = programs
         .target_graphs()
         .ok_or_else(|| internal("qualified program set has no target graphs"))?;
@@ -914,18 +941,7 @@ fn build_held(
         ),
         // A plan holding its experts whole that the memory free now does
         // not hold streams them, where they can stream.
-        Imported::Unheld(refused) => {
-            let room = magnitude_executor::PlanningRoom::new(&startup.reading, &startup.ledgers);
-            return match planned.streaming::<magnitude_executor::AssessmentMemoryCharge>(
-                &manifest.definition,
-                manifest.model.weight_bound,
-                &room,
-            ) {
-                Ok(_) => Ok(Built::Unheld(refused)),
-                Err(PlanError::Unstreamed(_) | PlanError::WeightBound { .. } | PlanError::Resource(_)) => Err(refused),
-                Err(error) => Err(internal(error.to_string())),
-            };
-        }
+        Imported::Unheld(refused) => return streams_instead(planned, manifest, &startup, refused),
     };
     // The served file's volume as the job probed it; with no record it reads
     // at its bounds until a later load's.
@@ -965,7 +981,7 @@ fn build_held(
             .load_target(
                 charges,
                 &manifest.definition,
-                &package,
+                package,
                 &host_tables,
                 Box::new(move |completed_bytes, total_bytes| {
                     import_progress(LoadProgress::ImportingWeights {
@@ -998,7 +1014,79 @@ fn build_held(
         );
     }
     report_load_memory("target imported", &device);
-    phase_started = Instant::now();
+    Ok(TargetImport::Imported(ImportedTarget {
+        startup,
+        execution_plan,
+        resident,
+        planned,
+        plan,
+        device,
+        device_selector,
+        programs,
+        resources,
+        resource_identity,
+        pools,
+        residency,
+        target,
+        state_tables,
+        constants_claim,
+        request_slot,
+        site_requests,
+        head_enabled,
+    }))
+}
+
+/// A plan holding its experts whole that the target import's claim
+/// refused (`refused`): handed back where the experts can stream
+/// (`ExecutionPlanDraft::streaming`), the load to stream them instead;
+/// the refusal where they cannot.
+fn streams_instead(
+    planned: ExecutionPlanDraft,
+    manifest: &ExecutionManifest,
+    startup: &Startup,
+    refused: LoadError,
+) -> Result<TargetImport, LoadError> {
+    let room = magnitude_executor::PlanningRoom::new(&startup.reading, &startup.ledgers);
+    match planned.streaming::<magnitude_executor::AssessmentMemoryCharge>(
+        &manifest.definition,
+        manifest.model.weight_bound,
+        &room,
+    ) {
+        Ok(_) => Ok(TargetImport::Unheld(refused)),
+        Err(PlanError::Unstreamed(_) | PlanError::WeightBound { .. } | PlanError::Resource(_)) => Err(refused),
+        Err(error) => Err(internal(error.to_string())),
+    }
+}
+
+/// The imported load's domain: its optional components' loaders and its
+/// state allocated, the domain made of them, warmed up and priced.
+fn assemble_domain(
+    imported: ImportedTarget,
+    manifest: &ExecutionManifest,
+    package: Arc<Package>,
+    progress: &Rc<dyn Fn(LoadProgress)>,
+) -> Result<Box<NativeDomain>, LoadError> {
+    let ImportedTarget {
+        mut startup,
+        execution_plan,
+        resident,
+        planned,
+        plan,
+        device,
+        device_selector,
+        programs,
+        resources,
+        resource_identity,
+        pools,
+        residency,
+        target,
+        mut state_tables,
+        constants_claim,
+        request_slot,
+        site_requests,
+        head_enabled,
+    } = imported;
+    let mut phase_started = Instant::now();
     progress(LoadProgress::Finalizing);
     let definition = Rc::new(manifest.definition.clone());
     let head_loader = head_enabled
@@ -1075,13 +1163,118 @@ fn build_held(
         .measure_load(load_measures(&pricing).map_err(internal)?, &mut bindings)
         .map_err(|error| internal(error.to_string()))?;
     phase.enter("serving");
-    Ok(Built::Attempt(LoadAttempt::Loaded(Box::new(NativeDomain {
+    Ok(Box::new(NativeDomain {
         domain,
         bindings,
         plan,
         device: device_selector,
         pricing,
-    }))))
+    }))
+}
+
+/// The load's sealed target graphs, reported: the seal, the census beside
+/// what it costs on the device, and the host heap the graphs hold against
+/// what the plan held them to. A frame of its own: the report's values are
+/// many, and the load's frame would hold each one.
+fn report_sealed_graphs(
+    target_graphs: &magnitude_executor::PreparedTargetGraphs,
+    programs: &AttestedPrograms,
+    graph_cost: seismic::GraphCost,
+    arena_bytes: u64,
+) {
+    let seal = target_graphs.seal_report();
+    tracing::info!(
+        "sealed {} target graph classes ({} graphs) in {:.2} s; a group's pass covers at most {} rows; workspace arena {} bytes",
+        seal.classes,
+        seal.sealed_graphs,
+        seal.seconds,
+        target_graphs.pass_rows(),
+        arena_bytes
+    );
+    // What the target's graphs are made of, beside what they cost on this
+    // device: what each launch in flight beside another holds, its
+    // decode launches' pinned graphs, as the family is charged for it
+    // (`LaunchGraphs::pinned`), and its largest launch
+    // class's, which the family's live slots hold of its device's graph
+    // budget.
+    let family = target_graphs.family();
+    let census = family.census();
+    // The family was charged at this cost, so its every census prices.
+    let cost = |graphs: seismic::GraphCensus| {
+        let bytes = graph_cost
+            .bytes(graphs)
+            .expect("a charged family's graphs price at its device's cost");
+        bytes.device + bytes.upload
+    };
+    let pinned = family.graphs().pinned;
+    // Every plan of a family runs in one of its launches, so it has one.
+    let largest = census
+        .launches
+        .iter()
+        .copied()
+        .max_by_key(|graphs| cost(*graphs))
+        .expect("a target family has a launch class");
+    tracing::info!(
+        "target graph census: {} layouts; of {} launch classes, each launch in flight beside another replays {} graphs of {} launches ({} bytes charged), the largest {} of {} ({} bytes charged)",
+        census.layouts,
+        census.launches.len(),
+        pinned.graphs,
+        pinned.launches,
+        cost(pinned),
+        largest.graphs,
+        largest.launches,
+        cost(largest),
+    );
+    // What the sealed graphs hold on the host against what the plan held
+    // them to before any was sealed, from both sides: one line of JSON,
+    // beside the memory moments around it (`programs prepared`, `graphs
+    // planned`). Each heap is requested bytes, its allocations, and the
+    // bound of the allocator's rounding of them, which no plan counts.
+    let heap = |heap: seismic::HostHeap| {
+        serde_json::json!({
+            "bytes": heap.bytes,
+            "allocations": heap.allocations,
+            "rounding_bound": heap.rounding,
+        })
+    };
+    let graphs = |graphs: &magnitude_executor::SealedGraphsHeap| {
+        serde_json::json!({
+            "graphs": graphs.graphs,
+            "plans": heap(graphs.plans),
+            "storage": heap(graphs.storage),
+            "owned": heap(graphs.owned),
+        })
+    };
+    let held = seal.held();
+    let total = |graphs: &magnitude_executor::SealedGraphsHeap, constants: seismic::HostHeap| {
+        graphs
+            .heap()
+            .and_then(|graphs| graphs.plus(constants))
+            .map(heap)
+    };
+    tracing::info!(
+        "sealed graph host heap {}",
+        serde_json::json!({
+            "planned_exact": seal.planned.exact(),
+            "planned_at_most": graphs(&seal.planned.at_most),
+            "planned_at_least": graphs(&seal.planned.at_least),
+            "planned_constants": heap(seal.planned.constants),
+            "planned_at_most_total": total(&seal.planned.at_most, seal.planned.constants),
+            "planned_at_least_total": total(&seal.planned.at_least, seal.planned.constants),
+            "held": graphs(&held),
+            "held_constants": heap(seal.constants),
+            "held_total": total(&held, seal.constants),
+        })
+    );
+    if let Some(state_graphs) = programs.state_graphs() {
+        tracing::info!(
+            "state copy graph host heap {}",
+            serde_json::json!({
+                "planned": heap(state_graphs.planned_host_heap()),
+                "held": heap(state_graphs.host_heap()),
+            })
+        );
+    }
 }
 
 /// What a load unpriced without a kernel cache lacks: where the executor's

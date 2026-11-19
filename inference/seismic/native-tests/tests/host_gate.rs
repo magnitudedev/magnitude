@@ -4,6 +4,11 @@
 //! on every available device; the CPU backend runs a submission on the
 //! submitting thread, so its gate blocks that thread until another opens it.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
+
 use seismic::{
     BackendName, Element, NativeGraphFamily, NativeGraphMetadata,
     NativeSpecialization, Tensor, Timeline,

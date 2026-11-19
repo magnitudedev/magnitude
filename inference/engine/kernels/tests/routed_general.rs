@@ -5,6 +5,11 @@
 //! real routing shapes (LFM2-MoE, Laguna, Gemma 4 26B, Nemotron Lightning and
 //! Super).
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
+
 mod common;
 mod declared;
 mod mapped;

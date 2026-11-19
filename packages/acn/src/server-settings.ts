@@ -1,6 +1,5 @@
 import { FileSystem } from "@effect/platform"
 import { Context, Effect, Layer, Option } from "effect"
-import { createRequire } from "node:module"
 import { isIP } from "node:net"
 import { homedir, networkInterfaces } from "node:os"
 import { dirname, isAbsolute, join, normalize, parse } from "node:path"
@@ -33,7 +32,6 @@ import {
   type NetworkAccessConfig,
 } from "@magnitudedev/storage"
 import { AcnChanges } from "./changes"
-import { readMachineIdentity } from "./machine-identity"
 import { containerNetworkConfig, type ContainerInstallation } from "./container"
 
 /** Facts about this ACN process fixed at startup: where it keeps data, what it serves, and whether a container runs it. */
@@ -84,8 +82,6 @@ export const servedAddresses = (active: NetworkAccess, interfaces: ReadonlyArray
     : active.bind === ALL_INTERFACES_BIND ? interfaces.map(entry => entry.address)
     : isLoopbackAddress(active.bind) ? [] : [active.bind]
 
-const nativeHostPath = () => process.env.MAGNITUDE_NATIVE_HOST ?? join(dirname(process.execPath), "desktop-host.node")
-
 export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const host = yield* AcnHost
@@ -127,9 +123,7 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
     Effect.mapError(() => new ServerSettingsFailed({ message: "The onboarding state could not be read. Check access to the Magnitude configuration and try again." })),
   )
 
-  const machine = yield* Effect.cached(readMachineIdentity(() => createRequire(import.meta.url)(nativeHostPath())).pipe(
-    Effect.map((identity): ServerMachine => ({ platform: process.platform, identity })),
-  ))
+  const machine = Effect.succeed<ServerMachine>({ platform: process.platform })
 
   return ServerSettings.of({
     modelStorage: readModelsDirectory.pipe(

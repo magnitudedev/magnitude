@@ -1,5 +1,6 @@
 // Routing (`routed_route`) on the `dense` projection operator, segmented over
 // `(router, shared_router)` in the CPU 8-lane reference order.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_ROUTER
 #define KERNEL_W1 SEISMIC_SHARED_ROUTER
 #include "lib/projection/operator.cuh"

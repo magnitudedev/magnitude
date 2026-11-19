@@ -4,6 +4,11 @@
 //! class and mapping) against the host reference at the catalog's real
 //! widths (Gemma 4 E2B/E4B/26B, LFM2, Nemotron-H Lightning and Super).
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
+
 mod common;
 mod mapped;
 

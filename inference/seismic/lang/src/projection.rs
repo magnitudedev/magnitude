@@ -2237,11 +2237,13 @@ fn substitute_values(expr: Expr, values: &BTreeMap<String, u64>) -> Expr {
 }
 
 /// The leading arguments of a call to `callee` (of `count`) that are
-/// expressions: all but `form(E, NAME)`'s NAME, a form of the backend, not a
-/// parameter that shares its name.
+/// expressions: all but the names an element query reads by
+/// (`form(E, NAME)`'s form of the backend, `axis(E, NAME)`'s decode axis,
+/// `row_bytes(E, PART, VALUES)`'s planes and count), not parameters that
+/// share their names.
 fn read_arguments(callee: &Expr, count: usize) -> usize {
     match &callee.kind {
-        ExprKind::Name(name) if name.name == "form" => count.min(1),
+        ExprKind::Name(name) if matches!(name.name.as_str(), "form" | "axis" | "row_bytes") => count.min(1),
         _ => count,
     }
 }
@@ -2493,7 +2495,7 @@ impl Instance<'_> {
                     Some(weight) if weight.planes => {
                         return Err(error(
                             self.span(expr.span),
-                            "a plane set has no element: its `W` is read only by `form`, `operands` or `bound`",
+                            "a plane set has no element: its `W` is read only by `form`, `operands`, `axis`, `row_bytes`, `dense_bytes` or `bound`",
                         ));
                     }
                     Some(weight) => ExprKind::Name(Ident {
@@ -2525,8 +2527,9 @@ impl Instance<'_> {
                 };
                 match quantifier {
                     "each" | "any" | "agree" | "sum" | "most" | "tiles" => return self.quantify(quantifier, args, weight, expr.span),
-                    // A plane set takes no form a producer delivers and has no dense storage.
-                    "form" | "operands" | "dense_bytes"
+                    // A plane set takes no form a producer delivers, and has
+                    // neither decode axes, packed rows nor dense storage.
+                    "form" | "operands" | "axis" | "row_bytes" | "dense_bytes"
                         if weight.is_some_and(|weight| weight.planes)
                             && args.first().is_some_and(|arg| matches!(&arg.value.kind, ExprKind::Name(name) if name.name == "W")) =>
                     {

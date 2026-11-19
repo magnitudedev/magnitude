@@ -1,8 +1,9 @@
 // tap_rows: taps[row, index[0] * D + column] = A(residual[row, column]); one
 // thread per copied element on a (column, row) grid, so no thread divides.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 
-typedef element::Act activation;
+typedef activation::Act activation_element;
 
 kernel void tap_rows(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
@@ -15,6 +16,6 @@ kernel void tap_rows(
     const ulong row = ulong(position.y);
     if (column >= width || row >= SEISMIC_DIM_M) return;
     const ulong tap = ulong(tap_index[0]);
-    element::Out<activation>(taps).put(row * SEISMIC_TAPS_STRIDE_0 + (tap * width + column) * SEISMIC_TAPS_STRIDE_1,
+    element::Out<activation_element>(taps).put(row * SEISMIC_TAPS_STRIDE_0 + (tap * width + column) * SEISMIC_TAPS_STRIDE_1,
         residual[row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1]);
 }

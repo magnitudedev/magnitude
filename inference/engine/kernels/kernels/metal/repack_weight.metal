@@ -1,5 +1,5 @@
 // `repack_weight`: the exact GGUF -> resident conversion (the Seismic
-// registry's registered `repack`, lib/repack/repack.h) of a whole weight: E
+// registry's registered `repack`, <seismic/repack.h>) of a whole weight: E
 // is the GGUF source, U the resident (representation, layout). The entry
 // sees every weight as a [B, N, K] view, threadgroup z its matrix; each
 // threadgroup (32 threads) places one row tile. The result is a record port
@@ -15,7 +15,7 @@
 #endif
 
 #include <seismic/slab.h>
-#include "lib/repack/repack.h"
+#include <seismic/repack.h>
 
 REPACK_BINDING(RepackBinding, SEISMIC_CONVERSION_E_U, SEISMIC_SOURCE, SEISMIC_RESULT_0, SEISMIC_DIM_N, SEISMIC_DIM_K)
 

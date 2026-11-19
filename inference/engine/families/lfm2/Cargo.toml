@@ -11,3 +11,6 @@ magnitude-family-contracts = { path = "../contracts" }
 
 [dev-dependencies]
 magnitude-family-common = { path = "../common", features = ["catalog-headers"] }
+
+[lints]
+workspace = true

@@ -12,58 +12,2087 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{DownloadFailure, DownloadStage, InventoryError, ResolvedModel};
 
-macro_rules! string_id {
-    ($name:ident) => {
-        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(pub String);
-    };
+pub use schema::{
+    AddedModel, AssessmentEnvironmentId, AttachedDrafter, AttachedDrafterState, CandidateDrafter,
+    CandidateFile, CandidateInspection, CandidateInspectionEvent, CandidateInspectionPhase,
+    CandidateInspectionProgress, CandidateInspectionRequest, CandidateSource, CandidateVersion,
+    CandidateVersionProgress, CatalogBaseId, CatalogComponent, CatalogDiagnostic, CatalogDrafter,
+    CatalogInstallationAdmission, CatalogInstallationOperation, CatalogInstallationOperationId,
+    CatalogInstallationOperationState, CatalogInstallationProgress, CatalogInstallationRemoval,
+    CatalogInstallationRetentionReason, CatalogInstallationsResponse, CatalogMissingComponent,
+    CatalogModel, CatalogModelSelection, CatalogModelState, CatalogModelUpdate,
+    CatalogModelsResponse, CatalogOptimizationProgress, CatalogOptimizationStage,
+    CatalogPackageAffiliation, CatalogPackageRole, CatalogQuant, CatalogSupport, CatalogUpdatePart,
+    CatalogVariantId, ColdExperts, CustomModel, CustomModelCatalogAttribution, CustomModelFile,
+    CustomModelOrigin, CustomModelPart, CustomModelState, DrafterAttachment, DrafterCandidate,
+    DrafterCandidatesRequest, DrafterCandidatesResponse, DrafterCategory, DrafterChoice,
+    DrafterLineage, DrafterPruning, DrafterReference, DrafterVerdict, EffectiveModel, FoundSource,
+    HuggingFaceArtifactSelector, HuggingFaceRepositoryId, InstalledCatalogAttribution,
+    InstalledModelPackage, InstalledModelPackagesResponse, KernelStatic, KnownUnsupportedReason,
+    LabId, LocalModelHash, LocalModelLabel, LocalModelRemoval, LocalModelsConfiguration,
+    LocalModelsResponse, MeasurementState, MemoryAssessment, MemoryBreakdown, MemoryShortage,
+    ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntry,
+    ModelAssessmentEntryState, ModelAssessmentId, ModelAssessmentProfile, ModelAssessmentSubject,
+    ModelAssessmentsSnapshot, ModelBundleInput, ModelCandidate, ModelCapabilities, ModelDeveloper,
+    ModelDownload, ModelDownloadId, ModelDownloadState, ModelDownloadsResponse, ModelFailure,
+    ModelFamily, ModelFamilyStatus, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
+    ModelFingerprint, ModelId, ModelInstallation, ModelInstallationOwnership, ModelInstance,
+    ModelInstanceAllocation, ModelInstanceFailure, ModelInstanceId, ModelInstanceLifecycle,
+    ModelInstanceMemoryDomain, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice,
+    ModelLoadPlan, ModelLoadStage, ModelMetadata, ModelPackage, ModelPackageId,
+    ModelPackageInstallationOrigin, ModelPackageOperand, ModelPackageProperties,
+    ModelPackageSource, ModelParameterization, ModelPerformance, ModelPlacement,
+    ModelReasoningCapabilities, ModelReleaseDate, ModelReleaseReason, ModelResidency, ModelRoot,
+    ModelRootKind, ModelServingConfiguration, ModelStoppingAllocation, ModelStreamingStatus,
+    PackageValidation, PerformanceEvidence, ProjectorVerdict, PromptGroupPlaces, ReadyModel,
+    RecommendableModel, RecommendableModelCatalog, ResolvedModelInstallation, ServableModelBundle,
+    ServingProfile, SpeculativeDraftSource,
+    SpeculativeDraftSourceInput, SpeculativeMethod, StartModelDownloadRequest,
+    StartModelDownloadResponse, StreamedBank, StreamingHostStatus, StreamingResize,
+    StreamingTableStatus, StreamingTierStatus, UnrecognizedUnsupportedReason,
+    UnsupportedLocalModel, WeightTypeCount,
+};
+
+/// The model contract types, in a module of their own for the lint their
+/// derived schemas need.
+mod schema {
+    #![cfg_attr(
+        feature = "openapi",
+        allow(
+            clippy::large_stack_frames,
+            reason = "utoipa's derived `ToSchema::schema` builds a whole type's schema in one generated frame, which this module cannot split; it runs only as the OpenAPI document is built"
+        )
+    )]
+
+    use super::*;
+
+    macro_rules! string_id {
+        ($name:ident) => {
+            #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+            #[derive(
+                Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+            )]
+            #[serde(transparent)]
+            pub struct $name(pub String);
+        };
+    }
+
+    string_id!(ModelFileId);
+    string_id!(ModelPackageId);
+    string_id!(ModelDownloadId);
+    string_id!(ModelAssessmentId);
+    string_id!(AssessmentEnvironmentId);
+    string_id!(ModelInstanceId);
+    string_id!(CatalogInstallationOperationId);
+    string_id!(LabId);
+
+    /// A model's identity. Two `local:` IDs are the same model exactly when their hashes match: the
+    /// label is for reading only, so equality, order and hashing ignore it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+    #[derive(Debug, Clone)]
+    pub struct ModelId(pub(super) String);
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct CatalogBaseId(pub(super) String);
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct CatalogVariantId(pub(super) String);
+
+    /// A canonical Hugging Face model repository (`owner/repository`).
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct HuggingFaceRepositoryId(pub(super) String);
+
+    /// The repository-relative GGUF weights selector used in a Hugging Face model identity.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct HuggingFaceArtifactSelector(pub(super) String);
+
+    /// The identity of a custom model with no Hugging Face identity: the first
+    /// [`LocalModelHash::LENGTH`] lowercase hex characters of its content digest.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct LocalModelHash(pub(super) String);
+
+    /// The readable part of a `local:` ID (`<name>-<quant>`), which never identifies the model.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct LocalModelLabel(pub(super) String);
+
+    #[cfg_attr(
+        feature = "openapi",
+        derive(utoipa::ToSchema),
+        schema(value_type = String, format = Date)
+    )]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct ModelReleaseDate(pub(super) String);
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelInstanceMemoryDomain {
+        pub memory_domain_id: crate::MemoryDomainId,
+        pub model_bytes: u64,
+        pub context_bytes: u64,
+        pub compute_bytes: u64,
+        pub auxiliary_bytes: u64,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelInstanceAllocation {
+        pub context_window_tokens: u32,
+        /// The engine heap's observed standing per memory domain at the last observation. Memory is
+        /// elastic, so this is not a fixed reservation.
+        pub memory_domains: Vec<ModelInstanceMemoryDomain>,
+        /// The places granted to the load's prompt groups at the last observation.
+        pub prompt_group_places: PromptGroupPlaces,
+        /// Where an elastic expert bank's experts are; absent for a load without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub streaming: Option<ModelStreamingStatus>,
+    }
+
+    /// The places a prompt group holds now, of the most it may take: each place runs one chunk of
+    /// a prompt in the group's pass. It holds at most its capacity.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "PromptGroupPlacesParts")]
+    pub struct PromptGroupPlaces {
+        #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+        pub(super) held: NonZeroU64,
+        #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+        pub(super) capacity: NonZeroU64,
+    }
+
+    /// Where an elastic expert bank's routed experts are at the last observation: the experts of
+    /// each routed layer it holds (its slots), between the floor it never shrinks below and the
+    /// ceiling it never grows past, at most every expert; its bytes in each memory domain; the
+    /// host-RAM tier holding cold experts beside it; the bytes of the experts in neither, read
+    /// from the model file on demand; the stored tables it holds; and its experts' last resize.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "ModelStreamingStatusParts")]
+    pub struct ModelStreamingStatus {
+        /// Each routed layer's experts.
+        #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+        pub(super) experts: NonZeroU64,
+        pub(super) slots: u64,
+        pub(super) floor_slots: u64,
+        pub(super) ceiling_slots: u64,
+        /// The memory domains holding the bank, device memory first.
+        pub(super) tiers: Vec<StreamingTierStatus>,
+        /// The host-RAM tier a discrete device's bank keeps its cold experts in,
+        /// exclusive of the bank; absent on unified memory.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub(super) host: Option<StreamingHostStatus>,
+        /// The experts in neither the bank nor the host tier, as the model file
+        /// stores them.
+        pub(super) disk_bytes: u64,
+        /// The stored tables (n-gram tables) the bank holds beside its experts.
+        pub(super) tables: Vec<StreamingTableStatus>,
+        /// The experts' last resize; absent before their first.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub(super) last_resize: Option<StreamingResize>,
+    }
+
+    /// A stored table an expert bank holds: the records its slots use now, between the floor and
+    /// ceiling it resizes within; the bytes they hold; and its last resize.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "StreamingTableStatusParts")]
+    pub struct StreamingTableStatus {
+        pub(super) records: u64,
+        pub(super) floor_records: u64,
+        #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+        pub(super) ceiling_records: NonZeroU64,
+        pub(super) bytes: u64,
+        /// Absent before the table's first resize.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub(super) last_resize: Option<StreamingResize>,
+    }
+
+    /// A discrete device's host-RAM tier, in its memory domain: its host slots now (each an expert
+    /// of every streamed layer) up to its ceiling, the host memory its records take, and its last
+    /// resize.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "StreamingHostStatusParts")]
+    pub struct StreamingHostStatus {
+        pub(super) memory_domain_id: crate::MemoryDomainId,
+        pub(super) slots: u64,
+        /// At most every expert; none beside the landing reserve where a
+        /// weight cap leaves the tier no slots.
+        pub(super) ceiling_slots: u64,
+        pub(super) bytes: u64,
+        /// Absent before the tier's first resize.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub(super) last_resize: Option<StreamingResize>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct StreamingTierStatus {
+        pub memory_domain_id: crate::MemoryDomainId,
+        pub bytes: u64,
+    }
+
+    /// A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs`
+    /// (milliseconds since the Unix epoch): shrunk by `by` to `to` as memory grew short, or grown
+    /// by `by` from `from` into free memory. Each changes its size by at least one.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum StreamingResize {
+        #[serde(rename_all = "camelCase")]
+        Shrank {
+            to: u64,
+            #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+            by: NonZeroU64,
+            at_unix_ms: u64,
+        },
+        #[serde(rename_all = "camelCase")]
+        Grew {
+            from: u64,
+            #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+            by: NonZeroU64,
+            at_unix_ms: u64,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ModelReleaseReason {
+        UserStop,
+        IdleTimeout,
+        Replacement,
+        MemoryPressure,
+        Failure,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ModelStoppingAllocation {
+        Planned {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            allocation: Option<ModelLoadPlan>,
+        },
+        Resident {
+            allocation: ModelInstanceAllocation,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ModelInstanceFailure {
+        Operation {
+            code: String,
+            message: String,
+            retryable: bool,
+        },
+        /// The model fits this machine but could not be given its memory now.
+        MemoryShortage {
+            code: String,
+            message: String,
+            retryable: bool,
+            shortage: MemoryShortage,
+        },
+    }
+
+    /// Why a model that fits the machine could not be given its memory.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum MemoryShortage {
+        /// Memory that cannot be moved is in the way of the load's claim in its limiting memory
+        /// domain. `available_bytes` is what the domain's ledger could give the claim there once
+        /// every cache yielded.
+        #[serde(rename_all = "camelCase")]
+        Blocked {
+            required_bytes: u64,
+            available_bytes: u64,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ModelInstanceLifecycle {
+        #[serde(rename_all = "camelCase")]
+        Loading {
+            stage: ModelLoadStage,
+            /// The load's completed fraction in `[0, 1]`, by measured work: tuning, when the load
+            /// tunes, is the first half and weight import the rest. Monotonic within a load; only
+            /// `Ready` means the load is complete.
+            fraction: f32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            planned_allocation: Option<ModelLoadPlan>,
+        },
+        Ready {
+            allocation: ModelInstanceAllocation,
+            /// The device the worker opened and serves on.
+            device: ModelLoadDevice,
+        },
+        #[serde(rename_all = "camelCase")]
+        Stopping {
+            reason: ModelReleaseReason,
+            allocation: ModelStoppingAllocation,
+        },
+        Stopped {
+            reason: ModelReleaseReason,
+        },
+        Failed {
+            failure: ModelInstanceFailure,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelInstance {
+        pub id: ModelInstanceId,
+        pub model_id: ModelId,
+        pub lifecycle: ModelInstanceLifecycle,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelInstancesSnapshot {
+        pub revision: u64,
+        /// Instances in lifecycle-update order, oldest first. The final matching
+        /// instance is therefore the current attempt for a model.
+        pub instances: Vec<ModelInstance>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelInstancesInvalidation {
+        pub revision: u64,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ModelFileRole {
+        Weights,
+        Projector,
+        Draft,
+        Mtp,
+        Auxiliary,
+    }
+
+    /// Native algorithm used by a speculative decoding stage.
+    ///
+    /// Method and artifact packaging are intentionally independent. The enclosing speculative bundle
+    /// declares whether the selected method is embedded in the target or supplied by a separate draft
+    /// package.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum SpeculativeMethod {
+        Mtp,
+        DFlash,
+        DFlash2,
+        DSpark,
+        LiLiCorr,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelFile {
+        pub id: ModelFileId,
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        pub path: PathBuf,
+        pub role: ModelFileRole,
+        pub size_bytes: u64,
+        /// Exact encoded tensor storage, when bounded GGUF inspection succeeded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tensor_storage_bytes: Option<u64>,
+        pub sha256: String,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ModelPackageSource {
+        HuggingFace {
+            repository: String,
+            revision: String,
+        },
+        Local {
+            #[cfg_attr(feature = "openapi", schema(value_type = String))]
+            path: PathBuf,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum ModelFileRelationship {
+        #[serde(rename_all = "camelCase")]
+        Shard {
+            file_id: ModelFileId,
+            index: u32,
+            count: u32,
+        },
+        #[serde(rename_all = "camelCase")]
+        ProjectorFor {
+            projector_file_id: ModelFileId,
+            weights_file_id: ModelFileId,
+        },
+        #[serde(rename_all = "camelCase")]
+        MtpFor {
+            mtp_file_id: ModelFileId,
+            weights_file_id: ModelFileId,
+        },
+        #[serde(rename_all = "camelCase")]
+        DraftFor {
+            draft_file_id: ModelFileId,
+            weights_file_id: ModelFileId,
+            method: SpeculativeMethod,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelPackageProperties {
+        pub format: String,
+        pub quantization: String,
+        pub quantization_name: String,
+        pub architecture: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub maximum_context_length: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub intrinsic_model_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub intrinsic_quality_id: Option<String>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelPackage {
+        pub id: ModelPackageId,
+        pub source: ModelPackageSource,
+        pub files: Vec<ModelFile>,
+        pub relationships: Vec<ModelFileRelationship>,
+        pub properties: ModelPackageProperties,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelFailure {
+        pub code: String,
+        pub message: String,
+        pub retryable: bool,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum PackageValidation {
+        Pending,
+        Valid,
+        Invalid { failure: ModelFailure },
+        Unsupported { failure: ModelFailure },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum ModelPackageInstallationOrigin {
+        Magnitude,
+        HuggingFaceCache,
+        LmStudio,
+        LlamaCpp,
+        Ollama,
+        Folder,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum CatalogPackageRole {
+        Target,
+        Dependency,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogPackageAffiliation {
+        pub model_id: CatalogBaseId,
+        pub variant_id: CatalogVariantId,
+        pub package_id: ModelPackageId,
+        pub repository: String,
+        pub role: CatalogPackageRole,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct InstalledModelPackage {
+        pub package: ModelPackage,
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        pub path: PathBuf,
+        pub origin: ModelPackageInstallationOrigin,
+        pub validation: PackageValidation,
+        pub catalog_attribution: InstalledCatalogAttribution,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum InstalledCatalogAttribution {
+        NotCatalogTarget,
+        #[serde(rename_all = "camelCase")]
+        Attributed {
+            model_id: CatalogBaseId,
+            variant_id: CatalogVariantId,
+        },
+        Failed {
+            failure: ModelFailure,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct InstalledModelPackagesResponse {
+        pub revision: u64,
+        pub reconciliation_complete: bool,
+        pub packages: Vec<InstalledModelPackage>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum ServableModelBundle {
+        Standalone {
+            package: ModelPackage,
+        },
+        #[serde(rename_all = "camelCase")]
+        SpeculativeDecoding {
+            target: ModelPackage,
+            draft_source: SpeculativeDraftSource,
+            method: SpeculativeMethod,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum SpeculativeDraftSource {
+        Embedded,
+        Separate { draft: ModelPackage },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ServingProfile {
+        pub context_length: u32,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelServingConfiguration {
+        pub bundle: ServableModelBundle,
+        pub profile: ServingProfile,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelReasoningCapabilities {
+        pub supported: bool,
+        pub efforts: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub default_effort: Option<String>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelCapabilities {
+        pub vision: bool,
+        pub tools: bool,
+        pub structured_output: bool,
+        pub reasoning: ModelReasoningCapabilities,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelMetadata {
+        pub format: String,
+        pub architecture: String,
+        pub quantization: String,
+        pub quantization_name: String,
+        pub storage_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub maximum_context_length: Option<u32>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ReadyModel {
+        pub metadata: ModelMetadata,
+        pub profile: ServingProfile,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub speculative_method: Option<SpeculativeMethod>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum EffectiveModel {
+        Ready { model: ReadyModel },
+        Unavailable { failure: ModelFailure },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum ModelInstallationOwnership {
+        Magnitude,
+        External,
+        Mixed,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ModelInstallation {
+        #[serde(rename_all = "camelCase")]
+        Resolved {
+            installed_bytes: u64,
+            #[cfg_attr(feature = "openapi", schema(value_type = String))]
+            primary_path: PathBuf,
+            ownership: ModelInstallationOwnership,
+        },
+        #[serde(rename_all = "camelCase")]
+        Unresolved {
+            installed_bytes: u64,
+            ownership: ModelInstallationOwnership,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ResolvedModelInstallation {
+        #[serde(rename_all = "camelCase")]
+        Resolved {
+            installed_bytes: u64,
+            #[cfg_attr(feature = "openapi", schema(value_type = String))]
+            primary_path: PathBuf,
+            ownership: ModelInstallationOwnership,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "architecture", rename_all = "camelCase", deny_unknown_fields)]
+    pub enum ModelParameterization {
+        Dense {
+            #[serde(rename = "totalParameters")]
+            total_parameters: u64,
+        },
+        MixtureOfExperts {
+            #[serde(rename = "totalParameters")]
+            total_parameters: u64,
+            #[serde(rename = "activeParameters")]
+            active_parameters: u64,
+        },
+    }
+
+    /// What the release promises for a catalog model, with its `intelligence`: its Artificial
+    /// Analysis score as a percentage of the frontier's, which only a disabled model may lack. It is
+    /// independent of assessment, which says what one device can do with it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "level", rename_all = "camelCase", deny_unknown_fields)]
+    pub enum CatalogSupport {
+        /// Intended to be available as a supported catalog model.
+        Supported { intelligence: u32 },
+        /// Temporarily unavailable or not yet supported. Never installed or loaded.
+        Disabled {
+            reason: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            intelligence: Option<u32>,
+        },
+        /// Never offered for new installs and never loaded. An installed copy stays identifiable and
+        /// removable, and points at its replacement.
+        #[serde(rename_all = "camelCase")]
+        Deprecated {
+            since: String,
+            replacement: ModelId,
+            reason: String,
+            intelligence: u32,
+        },
+    }
+
+    /// The lab that develops a model, from the catalog's lab table. `country` is its ISO 3166-1
+    /// alpha-2 code.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelDeveloper {
+        pub lab: LabId,
+        pub name: String,
+        pub country: String,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct RecommendableModel {
+        pub model_id: CatalogBaseId,
+        pub variant_id: CatalogVariantId,
+        pub configuration: ModelServingConfiguration,
+        pub display_name: String,
+        pub variant_label: String,
+        pub description: String,
+        pub release_date: ModelReleaseDate,
+        pub license: String,
+        pub parameterization: ModelParameterization,
+        pub developer: ModelDeveloper,
+        pub support: CatalogSupport,
+        pub quant: CatalogQuant,
+        pub quantization_aware: bool,
+    }
+
+    /// The quant a catalog model is: the repository that publishes it and its file quant name (for
+    /// example `UD-Q4_K_XL`), which states its bit width.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogQuant {
+        pub repository: String,
+        pub name: String,
+    }
+
+    /// A catalog model's separately packaged drafter: its method, the repository that publishes it
+    /// and the bytes it adds to the download.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogDrafter {
+        pub method: SpeculativeMethod,
+        pub repository: String,
+        pub size_bytes: u64,
+    }
+
+    /// Whether Magnitude runs a model family now or will.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ModelFamilyStatus {
+        Supported,
+        ComingSoon,
+    }
+
+    /// A family of models Magnitude runs, by the GGUF architectures its models declare; fine-tunes and
+    /// re-uploads of these architectures run too.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelFamily {
+        pub name: String,
+        pub developer: ModelDeveloper,
+        pub architectures: Vec<String>,
+        pub status: ModelFamilyStatus,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogDiagnostic {
+        pub model_id: CatalogBaseId,
+        pub variant_id: CatalogVariantId,
+        pub failure: ModelFailure,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CatalogModelUpdate {
+        Current,
+        #[serde(rename_all = "camelCase")]
+        Available {
+            required_download_bytes: u64,
+            parts: Vec<CatalogUpdatePart>,
+        },
+    }
+
+    /// What a catalog update brings: new model weights, a new projector (image input), or a new drafter.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    pub enum CatalogUpdatePart {
+        Model,
+        Projector,
+        Drafter,
+    }
+
+    /// A part of a catalog model's bundle that can be fetched on its own: the projector that gives
+    /// its target image input, or its separate drafter.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    pub enum CatalogComponent {
+        Projector,
+        Drafter,
+    }
+
+    /// A catalog component absent from this computer while the model's exact target weights are
+    /// found elsewhere. It is not an update: the model serves without it until it is fetched.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogMissingComponent {
+        pub component: CatalogComponent,
+        pub download_bytes: u64,
+    }
+
+    /// A catalog model's state here. `stored_components`: the parts
+    /// Magnitude stores for a model whose weights are only in another app's location (its projector
+    /// package and drafter), which Remove deletes while the found weights stay and keep serving.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CatalogModelState {
+        NotInstalled,
+        #[serde(rename_all = "camelCase")]
+        Installed {
+            effective: EffectiveModel,
+            installation: ModelInstallation,
+            update_state: CatalogModelUpdate,
+            missing_components: Vec<CatalogMissingComponent>,
+            stored_components: Vec<CatalogComponent>,
+        },
+    }
+
+    /// A catalog variant and its state on this computer. `desired`: the model installing it fetches
+    /// and serves here. `drafter_withheld`: it fits this computer only without its catalog drafter (or
+    /// not at all), so it is fetched, served and assessed without it, installed or not: it loads when
+    /// it fits without it, and otherwise is refused with its own shortfall. `aliases` are the `hf:` IDs
+    /// its target's files found in an external location (a Hugging Face cache) would have as custom
+    /// models, which clients resolve to this model, so references made before the file was attributed
+    /// keep working.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogModel {
+        pub id: ModelId,
+        pub desired: ReadyModel,
+        pub drafter_withheld: bool,
+        pub display_name: String,
+        pub variant_label: String,
+        pub description: String,
+        pub release_date: ModelReleaseDate,
+        pub license: String,
+        pub source_urls: Vec<String>,
+        pub parameterization: ModelParameterization,
+        pub developer: ModelDeveloper,
+        pub support: CatalogSupport,
+        pub quant: CatalogQuant,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub drafter: Option<CatalogDrafter>,
+        pub quantization_aware: bool,
+        pub local_state: CatalogModelState,
+        #[serde(default)]
+        pub aliases: Vec<ModelId>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogModelsResponse {
+        pub revision: u64,
+        pub reconciliation_complete: bool,
+        pub models: Vec<CatalogModel>,
+        pub families: Vec<ModelFamily>,
+    }
+
+    /// Where a scanned custom model was found.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum FoundSource {
+        HuggingFaceCache,
+        LmStudio,
+        LlamaCpp,
+        Ollama,
+        Folder {
+            #[cfg_attr(feature = "openapi", schema(value_type = String))]
+            path: PathBuf,
+        },
+    }
+
+    /// How a custom model came to be on this computer, which decides who owns its files.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CustomModelOrigin {
+        Added {
+            repository: HuggingFaceRepositoryId,
+            commit: String,
+        },
+        Found {
+            source: FoundSource,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CustomModelFile {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        pub path: PathBuf,
+        pub size_bytes: u64,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CustomModelCatalogAttribution {
+        NotInCatalog,
+        Failed { failure: ModelFailure },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CustomModelState {
+        NotInstalled,
+        #[serde(rename_all = "camelCase")]
+        Ready {
+            installation: ResolvedModelInstallation,
+            model: ReadyModel,
+            catalog_attribution: CustomModelCatalogAttribution,
+        },
+        #[serde(rename_all = "camelCase")]
+        Unavailable {
+            installation: ResolvedModelInstallation,
+            failure: ModelFailure,
+        },
+    }
+
+    /// A reason the engine raises, typed where it raises it. `DraftArchitecture` is a separate drafter
+    /// whose architecture no drafter family binds, such as a Nemotron-H MTP file. `UnsupportedFormat`
+    /// is the service's own: a found model whose files are not GGUF, such as an Ollama model stored for
+    /// its MLX runner.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum KnownUnsupportedReason {
+        Architecture {
+            architecture: String,
+        },
+        WeightTypes {
+            types: Vec<WeightTypeCount>,
+        },
+        RopeScaling {
+            kind: String,
+        },
+        UnrecognizedTensor {
+            name: String,
+        },
+        UnrecognizedMetadata {
+            key: String,
+        },
+        MissingMetadata {
+            key: String,
+        },
+        Tokenizer {
+            model: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            pre: Option<String>,
+        },
+        ChatTemplate,
+        KernelDomain {
+            backend: String,
+            entry: String,
+            statics: Vec<KernelStatic>,
+        },
+        Backend {
+            backend: String,
+        },
+        TargetMismatch {
+            detail: String,
+        },
+        TiedOutputHead,
+        DraftArchitecture {
+            architecture: String,
+        },
+        Unreadable,
+        UnsupportedFormat,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct UnrecognizedUnsupportedReason {
+        #[serde(rename = "_tag")]
+        pub tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub detail: Option<String>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct WeightTypeCount {
+        pub ggml_type: String,
+        pub tensor_count: u32,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct KernelStatic {
+        pub name: String,
+        pub value: u64,
+    }
+
+    /// The shape a drafter binds to. Requantizations, finetunes and abliterations keep it, so it
+    /// matches a model to its parent catalog model when nothing else does.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelFingerprint {
+        pub architecture: String,
+        pub block_count: u32,
+        pub embedding_length: u32,
+        pub head_count: u32,
+        pub head_count_kv: u32,
+        pub key_length: u32,
+        pub vocab_size: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub expert_count: Option<u32>,
+        pub tokenizer_digest: String,
+    }
+
+    /// Whether the engine binds a model's drafter. `None` means no drafter was configured.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum DrafterVerdict {
+        None,
+        #[serde(rename_all = "camelCase")]
+        Bound {
+            method: SpeculativeMethod,
+            memory_bytes: u64,
+        },
+        Rejected {
+            reasons: Vec<UnsupportedReason>,
+            detail: String,
+        },
+    }
+
+    /// Whether the engine binds a model's projector. `None` means the model has no projector; a
+    /// `Rejected` projector leaves the model assessed and served without it, taking text input only.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ProjectorVerdict {
+        None,
+        Bound,
+        Rejected {
+            reasons: Vec<UnsupportedReason>,
+            detail: String,
+        },
+    }
+
+    /// A drafter's files, independent of which model uses it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum DrafterReference {
+        #[serde(rename_all = "camelCase")]
+        Catalog {
+            model_id: ModelId,
+        },
+        Embedded,
+        HuggingFace {
+            repository: HuggingFaceRepositoryId,
+            commit: String,
+            path: String,
+        },
+        Local {
+            #[cfg_attr(feature = "openapi", schema(value_type = String))]
+            path: PathBuf,
+        },
+    }
+
+    /// Where a drafter candidate comes from, in the order automatic choice prefers: a separate drafter
+    /// in the model's own repository or folder, the matched catalog model's drafter, MTP heads built
+    /// into the model, then a drafter the user entered, which is never chosen automatically.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum DrafterCategory {
+        NextToModel,
+        CatalogDrafter,
+        BuiltIn,
+        Other,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum DrafterLineage {
+        Exact,
+        Lineage,
+        Fingerprint,
+        None,
+    }
+
+    /// One drafter a model may use. `automatic` says whether automatic choice may take it: the engine
+    /// binds it, the user didn't enter it, and with it the model still fits when it fits without one.
+    /// The first automatic candidate, in order, is the preselected drafter.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct DrafterCandidate {
+        pub category: DrafterCategory,
+        pub reference: DrafterReference,
+        pub name: String,
+        pub label: String,
+        pub size_bytes: u64,
+        pub lineage: DrafterLineage,
+        pub verdict: DrafterVerdict,
+        pub automatic: bool,
+        pub on_this_computer: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub method: Option<SpeculativeMethod>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum AttachedDrafterState {
+        Ready,
+        NotInstalled,
+        Rejected {
+            reasons: Vec<UnsupportedReason>,
+            detail: String,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct AttachedDrafter {
+        pub reference: DrafterReference,
+        /// How the engine binds it; a drafter it rejects has no method.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub method: Option<SpeculativeMethod>,
+        pub state: AttachedDrafterState,
+        pub update_available: bool,
+    }
+
+    /// The drafter a custom model should use: the recommended one, none, or an exact reference, whose
+    /// method the engine works out from the drafter and the model.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum DrafterChoice {
+        Auto,
+        None,
+        Reference { reference: DrafterReference },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct DrafterAttachment {
+        pub model_id: ModelId,
+        pub drafter: DrafterChoice,
+    }
+
+    /// A model on this computer that is not a catalog model. `drafter_pending`: its drafter choice is
+    /// automatic and its automatic drafter isn't worked out yet, so it has no drafter for now rather
+    /// than none. `update_commit` is set only for an added model whose repository's `main` has moved to
+    /// a commit where its target file has other content.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CustomModel {
+        pub model_id: ModelId,
+        pub origin: CustomModelOrigin,
+        pub display_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub variant_label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub variant_of: Option<ModelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub developer: Option<ModelDeveloper>,
+        pub files: Vec<CustomModelFile>,
+        pub size_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub projector: Option<CustomModelFile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub drafter: Option<AttachedDrafter>,
+        pub drafter_pending: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub recommended_drafter: Option<DrafterCandidate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub license: Option<String>,
+        pub profile: ServingProfile,
+        pub state: CustomModelState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub update_commit: Option<String>,
+    }
+
+    /// A GGUF found on this computer that the engine cannot execute, or a directory inside a model
+    /// location that Magnitude can't read, which may hold more models.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct UnsupportedLocalModel {
+        pub display_name: String,
+        pub origin: CustomModelOrigin,
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        pub path: PathBuf,
+        pub reasons: Vec<UnsupportedReason>,
+        pub detail: String,
+    }
+
+    /// `models` are the custom models to offer and assess; `hidden` are the ones the configuration
+    /// hides, listed so a client can unhide them, and never assessed. `unsupported` are GGUF groups
+    /// that cannot be read at all, and directories inside a location that cannot be read (the rest of
+    /// the location is still listed); a readable model the engine rejects stays in `models` with an
+    /// `Unsupported` assessment.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct LocalModelsResponse {
+        pub revision: u64,
+        pub reconciliation_complete: bool,
+        pub models: Vec<CustomModel>,
+        pub hidden: Vec<CustomModel>,
+        pub unsupported: Vec<UnsupportedLocalModel>,
+    }
+
+    /// The result of removing an added model's Magnitude-owned files. Files in external locations
+    /// are never touched, so the model may remain as found.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct LocalModelRemoval {
+        pub model_id: ModelId,
+        pub removed: bool,
+        pub freed_bytes: u64,
+    }
+
+    /// Magnitude-owned drafter packages removed because no model uses them any more.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct DrafterPruning {
+        pub removed: Vec<ModelPackageId>,
+        pub freed_bytes: u64,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum ModelRootKind {
+        HuggingFaceCache,
+        LmStudio,
+        LlamaCpp,
+        Ollama,
+        Folder,
+    }
+
+    /// One resolved location ICN scans. ACN resolves the paths; ICN never guesses them.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelRoot {
+        pub kind: ModelRootKind,
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        pub path: PathBuf,
+        pub enabled: bool,
+    }
+
+    /// A model added from Hugging Face: its repository and the path of its first shard, which its
+    /// `hf:` ID names (the other shards of a split model follow from that shard's name), the pinned
+    /// commit, and a projector path in the repository at it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct AddedModel {
+        pub repository: HuggingFaceRepositoryId,
+        pub path: HuggingFaceArtifactSelector,
+        pub revision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub projector: Option<String>,
+    }
+
+    /// The whole local-models configuration ACN owns and hands to ICN, at spawn and after every
+    /// change. Applying it is idempotent.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct LocalModelsConfiguration {
+        pub roots: Vec<ModelRoot>,
+        pub added: Vec<AddedModel>,
+        pub hidden: Vec<ModelId>,
+        pub drafters: Vec<DrafterAttachment>,
+    }
+
+    /// Files not yet added: a Hugging Face repository at a commit, or a local directory.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CandidateSource {
+        HuggingFace {
+            repository: HuggingFaceRepositoryId,
+            commit: String,
+        },
+        Local {
+            #[cfg_attr(feature = "openapi", schema(value_type = String))]
+            path: PathBuf,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CandidateFile {
+        pub path: String,
+        pub size_bytes: u64,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CandidateDrafter {
+        pub reference: DrafterReference,
+        pub method: SpeculativeMethod,
+    }
+
+    /// A target (shards in order), projector and drafter, by paths relative to `source`.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelCandidate {
+        pub source: CandidateSource,
+        pub target: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub projector: Option<CandidateFile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub drafter: Option<CandidateDrafter>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CandidateInspectionRequest {
+        HuggingFace {
+            repository: HuggingFaceRepositoryId,
+            revision: String,
+        },
+        Local {
+            #[cfg_attr(feature = "openapi", schema(value_type = String))]
+            path: PathBuf,
+        },
+    }
+
+    /// One version of a candidate. `download_bytes` is what adding it downloads before any drafter:
+    /// its files and the repository's projector, or nothing when it is already on this computer or
+    /// is a local file used in place. `catalog_model` is the catalog model this version exactly is (the
+    /// same repository, commit and file), installed or not: adding the version installs that model.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CandidateVersion {
+        pub label: String,
+        pub model_id: ModelId,
+        pub files: Vec<CandidateFile>,
+        pub size_bytes: u64,
+        pub download_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub assessment: Option<ModelAssessment>,
+        pub recommended: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub catalog_model: Option<ModelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub on_this_computer: Option<ModelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub drafter: Option<DrafterCandidate>,
+    }
+
+    /// The repository step: every version with the engine's verdict, or why none can run.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CandidateInspection {
+        pub source: CandidateSource,
+        pub display_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub license: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub variant_of: Option<ModelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub developer: Option<ModelDeveloper>,
+        pub versions: Vec<CandidateVersion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub projector: Option<CandidateFile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub unsupported_architecture: Option<Vec<UnsupportedReason>>,
+    }
+
+    /// What an inspection is doing, with how much of it is done: reading each file's GGUF header,
+    /// checking each version against this computer, then checking the drafters of the version it
+    /// recommends. A drafter total counts the drafter checks known so far, so it can grow.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CandidateInspectionPhase {
+        ReadingHeaders { completed: u32, total: u32 },
+        CheckingVersions { completed: u32, total: u32 },
+        CheckingDrafters { version: String, completed: u32, total: u32 },
+    }
+
+    /// A version as an inspection in progress knows it: its label and size, and its plain verdict
+    /// once checked. While headers are read, the rows are the repository's GGUFs named by their files;
+    /// from the version checks on, they are the versions the inspection returns.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CandidateVersionProgress {
+        pub label: String,
+        pub size_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub assessment: Option<ModelAssessment>,
+    }
+
+    /// How far an inspection has got, each version's verdict included as soon as it is known.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CandidateInspectionProgress {
+        pub phase: CandidateInspectionPhase,
+        pub versions: Vec<CandidateVersionProgress>,
+    }
+
+    /// One event of an inspection's stream: progress, in order, then the inspection itself.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CandidateInspectionEvent {
+        Progress { progress: CandidateInspectionProgress },
+        Inspected { inspection: CandidateInspection },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum DrafterCandidatesRequest {
+        Candidate {
+            candidate: ModelCandidate,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            other: Option<String>,
+        },
+        #[serde(rename_all = "camelCase")]
+        Model {
+            model_id: ModelId,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            other: Option<String>,
+        },
+    }
+
+    /// Drafter candidates for one target, in the product's category order. `entered` is the listed
+    /// reference the request's different drafter resolves to: a listed candidate that is the same file
+    /// (a catalog drafter by its package, otherwise the same repository, commit and path), else the
+    /// different drafter's own Other row; absent without a different drafter.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct DrafterCandidatesResponse {
+        pub candidates: Vec<DrafterCandidate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub entered: Option<DrafterReference>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CatalogInstallationAdmission {
+        Current,
+        #[serde(rename_all = "camelCase")]
+        Admitted {
+            operation_id: CatalogInstallationOperationId,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogInstallationProgress {
+        pub stage: DownloadStage,
+        pub completed_bytes: u64,
+        pub total_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub bytes_per_second: Option<u64>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CatalogOptimizationStage {
+        Waiting,
+        Preparing,
+        Tuning,
+    }
+
+    /// Kernel tuning after a verified download, in tuning work units. `Waiting` has not finished and
+    /// waits for the device, which a resident or loading model holds (0 of 0); `Preparing` opens the
+    /// device and counts the units (0 of 0); `device` is the device a load would select, once
+    /// previewed. A load of the model whose own Prepare tunes reports that Prepare's progress.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogOptimizationProgress {
+        pub stage: CatalogOptimizationStage,
+        pub completed: u64,
+        pub total: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub device: Option<ModelLoadDevice>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CatalogInstallationOperationState {
+        Pending {
+            progress: CatalogInstallationProgress,
+        },
+        Running {
+            progress: CatalogInstallationProgress,
+        },
+        Optimizing {
+            progress: CatalogOptimizationProgress,
+        },
+        Completed,
+        Failed {
+            progress: CatalogInstallationProgress,
+            failure: DownloadFailure,
+            acknowledged: bool,
+        },
+        Cancelled {
+            progress: CatalogInstallationProgress,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CatalogInstallationOperation {
+        pub operation_id: CatalogInstallationOperationId,
+        pub model_id: ModelId,
+        pub state: CatalogInstallationOperationState,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct CatalogInstallationsResponse {
+        pub operations: Vec<CatalogInstallationOperation>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum CatalogInstallationRetentionReason {
+        SharedMaterial,
+        ExternalOwnership,
+    }
+
+    /// `kept_components`: the parts Magnitude stores for a model whose weights are found elsewhere
+    /// that the removal kept, because another model on this computer needs them.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum CatalogInstallationRemoval {
+        #[serde(rename_all = "camelCase")]
+        Removed {
+            reclaimed_bytes: u64,
+            kept_components: Vec<CatalogComponent>,
+        },
+        Retained {
+            reason: CatalogInstallationRetentionReason,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct RecommendableModelCatalog {
+        pub models: Vec<RecommendableModel>,
+        pub diagnostics: Vec<CatalogDiagnostic>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum ModelPackageOperand {
+        #[serde(rename_all = "camelCase")]
+        Installed { package_id: ModelPackageId },
+        #[serde(rename_all = "camelCase")]
+        SourceBacked { package: ModelPackage },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum ModelBundleInput {
+        #[serde(rename_all = "camelCase")]
+        Standalone { package: ModelPackageOperand },
+        #[serde(rename_all = "camelCase")]
+        SpeculativeDecoding {
+            target: ModelPackageOperand,
+            draft_source: SpeculativeDraftSourceInput,
+            method: SpeculativeMethod,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum SpeculativeDraftSourceInput {
+        Embedded,
+        Separate { draft: ModelPackageOperand },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelAssessmentProfile {
+        pub profile: ServingProfile,
+        pub performance_context_tokens: Vec<u32>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum CatalogModelSelection {
+        Desired,
+        Effective,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ModelAssessmentSubject {
+        #[serde(rename_all = "camelCase")]
+        Catalog {
+            model_id: ModelId,
+            selection: CatalogModelSelection,
+        },
+        #[serde(rename_all = "camelCase")]
+        Custom { model_id: ModelId },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct MemoryAssessment {
+        pub memory_domain_id: crate::MemoryDomainId,
+        pub capacity_bytes: u64,
+        pub required_bytes: u64,
+        pub remaining_bytes: i64,
+    }
+
+    /// What a fitting model's required memory holds across every domain: its weights, the
+    /// conversation's state at the served context, and everything else the load holds.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct MemoryBreakdown {
+        pub weights_bytes: u64,
+        pub context_bytes: u64,
+        pub overhead_bytes: u64,
+    }
+
+    /// Where a fitting model's weights are held as it runs, as its files store them, so the four sum
+    /// to its weights: `device_bytes` in the serving device's memory (GPU memory, or unified memory on
+    /// Apple silicon); `host_bytes` in host RAM beside a discrete device; `disk_bytes` the routed
+    /// experts neither holds, streamed from the model file as steps miss them; `lookup_disk_bytes` the
+    /// rows of tables read by row (an embedding) that host RAM has no room to cache beside the model,
+    /// which each token looks up a few rows of on disk. What it holds beside its weights is its memory
+    /// breakdown's.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelPlacement {
+        pub device_bytes: u64,
+        pub host_bytes: u64,
+        pub disk_bytes: u64,
+        pub lookup_disk_bytes: u64,
+    }
+
+    /// An estimated decode speed at one context depth, in tokens per second per conversation, from
+    /// the costs measured of this machine's selected executor: what the engine's own kernels achieve
+    /// on it.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct PerformanceEvidence {
+        pub context_tokens: u32,
+        pub estimated_tokens_per_second: f64,
+    }
+
+    /// A fitting model's speed estimates from this machine's measurements.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ModelPerformance {
+        /// This machine's measurements do not exist yet: the measurement job has not stored them.
+        Pending,
+        /// A measurement the estimate needs could not be taken on this machine.
+        Unavailable { failure: ModelFailure },
+        /// One decode-speed estimate per requested depth, ascending.
+        Estimated { samples: Vec<PerformanceEvidence> },
+    }
+
+    /// How a fitting model holds its weights, and its decode speed held that way.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ModelResidency {
+        /// Every weight in memory.
+        Resident { performance: ModelPerformance },
+        /// The routed experts streamed through an expert bank (`bank`). `performance` is at the
+        /// bank's slots; `floor_performance` is at its floor.
+        #[serde(rename_all = "camelCase")]
+        Streamed {
+            bank: StreamedBank,
+            performance: ModelPerformance,
+            floor_performance: ModelPerformance,
+        },
+    }
+
+    /// A streamed fit's expert bank: of each routed layer's `experts`, at least `floorSlots` in
+    /// memory, growing to `slots` where this machine's memory allows, fewer than every expert; and
+    /// where the experts it lacks are kept (`coldExperts`).
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "StreamedBankParts")]
+    pub struct StreamedBank {
+        #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+        pub(super) experts: NonZeroU64,
+        pub(super) slots: u64,
+        pub(super) floor_slots: u64,
+        pub(super) cold_experts: ColdExperts,
+    }
+
+    /// Where a streamed fit keeps the experts its bank lacks.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ColdExperts {
+        /// Read from the model file on demand (unified memory).
+        Disk,
+        /// In a host-RAM tier as host memory lets it grow, the rest read from the model file (a
+        /// discrete device). `cache_bytes` is what the tier holds past its floor: cache the load
+        /// grows into free host RAM, which no memory domain's required bytes count.
+        #[serde(rename_all = "camelCase")]
+        HostRam { cache_bytes: u64 },
+    }
+
+    /// The state of the measurement job, which measures this machine's selected executor in a
+    /// worker process of its own, so that speed estimates can be made. It runs while no model is
+    /// loading or being optimized, and while no request holds a loaded model, beside which it runs
+    /// once that model has made room for it. It moves from `Unmeasured` to `Measuring`, then to
+    /// `Measured`, or to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when
+    /// a load or a request preempts the job.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum MeasurementState {
+        /// Measurements are missing and no job has run yet: it waits for the device to be free.
+        Unmeasured,
+        /// A job is measuring this machine.
+        Measuring,
+        /// Every measurement that estimates read is stored, or recorded as unobtainable on this
+        /// machine.
+        Measured,
+        /// The last job did not store every measurement; the next starts at `retry_at`
+        /// (milliseconds since the Unix epoch).
+        #[serde(rename_all = "camelCase")]
+        Failed { retry_at: u64 },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum ModelAssessment {
+        /// A fitting model at `served`, the largest context tier within `profile` at which its
+        /// standard workload fits this computer, where it is placed by tier, how it holds its weights,
+        /// and its decode-speed estimates held that way up to `served`.
+        #[serde(rename_all = "camelCase")]
+        Fits {
+            profile: ServingProfile,
+            served: ServingProfile,
+            assessment_id: ModelAssessmentId,
+            memory: Vec<MemoryAssessment>,
+            memory_breakdown: MemoryBreakdown,
+            placement: ModelPlacement,
+            residency: ModelResidency,
+            projector: ProjectorVerdict,
+            drafter: DrafterVerdict,
+        },
+        /// A model that fits at no context tier: `deficit_bytes` is its shortfall at the smallest,
+        /// `shortfall`.
+        #[serde(rename_all = "camelCase")]
+        DoesNotFit {
+            profile: ServingProfile,
+            shortfall: ServingProfile,
+            assessment_id: ModelAssessmentId,
+            memory: Vec<MemoryAssessment>,
+            limiting_resource: String,
+            deficit_bytes: u64,
+            projector: ProjectorVerdict,
+            drafter: DrafterVerdict,
+        },
+        /// The engine cannot execute a custom model, with every reason it found. A catalog model is
+        /// never unsupported: the pool drops a catalog target the engine cannot execute as a release
+        /// defect. An unreadable file has no serving profile.
+        Unsupported {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            profile: Option<ServingProfile>,
+            reasons: Vec<UnsupportedReason>,
+            detail: String,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum ModelAssessmentEntryState {
+        Assessing,
+        #[serde(rename_all = "camelCase")]
+        Assessed {
+            capabilities: ModelCapabilities,
+            template_fingerprint: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            fingerprint: Option<ModelFingerprint>,
+            profiles: Vec<ModelAssessment>,
+        },
+        Dropped,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelAssessmentEntry {
+        pub subject: ModelAssessmentSubject,
+        pub state: ModelAssessmentEntryState,
+    }
+
+    /// One source's assessments. `Pending` until the source has been read (and, for custom models,
+    /// reconciled).
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+    pub enum ModelAssessmentDomainSnapshot {
+        #[serde(rename_all = "camelCase")]
+        Pending { source_revision: u64 },
+        #[serde(rename_all = "camelCase")]
+        Available {
+            source_revision: u64,
+            entries: Vec<ModelAssessmentEntry>,
+        },
+    }
+
+    /// Every model assessment in the service's current environment: its structure is established at
+    /// service start, and its identity changes when the measurement job stores this machine's
+    /// measurements.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelAssessmentsSnapshot {
+        pub revision: u64,
+        pub environment_id: AssessmentEnvironmentId,
+        pub catalog: ModelAssessmentDomainSnapshot,
+        pub custom: ModelAssessmentDomainSnapshot,
+        /// Whether this machine's measurements, which speed estimates read, exist.
+        pub measurement: MeasurementState,
+    }
+
+    /// A download of a custom model's `part`, by intent: the service works out its files from the
+    /// local-models configuration and keeps the request until it ends, resolving it again after a
+    /// restart. Every `ModelDownload` it produces is for `model_id`.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct StartModelDownloadRequest {
+        pub model_id: ModelId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub part: Option<CustomModelPart>,
+    }
+
+    /// Which part of a custom model a download fetches: without one, an added model's files at its
+    /// pinned commit with the drafter it downloads with; `Drafter`, only the drafter its choice
+    /// resolves to; `Update`, an added model's files at the commit its repository has moved to.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum CustomModelPart {
+        Drafter,
+        Update,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "_tag", rename_all = "PascalCase")]
+    pub enum ModelDownloadState {
+        #[serde(rename_all = "camelCase")]
+        Pending {
+            completed_bytes: u64,
+            total_bytes: u64,
+        },
+        #[serde(rename_all = "camelCase")]
+        Downloading {
+            stage: DownloadStage,
+            completed_bytes: u64,
+            total_bytes: u64,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            bytes_per_second: Option<u64>,
+        },
+        Completed,
+        #[serde(rename_all = "camelCase")]
+        Failed {
+            completed_bytes: u64,
+            total_bytes: u64,
+            failure: DownloadFailure,
+            acknowledged: bool,
+        },
+        #[serde(rename_all = "camelCase")]
+        Cancelled {
+            completed_bytes: u64,
+            total_bytes: u64,
+        },
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelDownload {
+        pub id: ModelDownloadId,
+        pub bundle: ServableModelBundle,
+        pub for_model: ModelId,
+        pub state: ModelDownloadState,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StartModelDownloadResponse {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pub download: Option<ModelDownload>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ModelDownloadsResponse {
+        pub downloads: Vec<ModelDownload>,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelLoadPlan {
+        /// The engine-resolved supported maximum context: the serving ceiling.
+        pub context_window_tokens: u32,
+        /// The load's startup peak claim in the selected device's allocation domain (system RAM or
+        /// dedicated VRAM). It excludes future context growth, which is claimed as history grows.
+        pub required_memory_bytes: u64,
+        pub device: ModelLoadDevice,
+    }
+
+    /// The execution device a model load uses.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct ModelLoadDevice {
+        pub id: crate::HardwareDeviceId,
+        pub backend: crate::ExecutionBackend,
+    }
+
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ModelLoadStage {
+        /// Waiting for memory admission.
+        Queued,
+        /// Resolving, planning, opening the device and preparing programs.
+        Preparing,
+        /// Tuning kernels for the device; only a load that tunes enters it.
+        Optimizing,
+        LoadingWeights,
+        /// State allocation, warm-up and readiness verification.
+        Finalizing,
+    }
 }
-
-string_id!(ModelFileId);
-string_id!(ModelPackageId);
-string_id!(ModelDownloadId);
-string_id!(ModelAssessmentId);
-string_id!(AssessmentEnvironmentId);
-string_id!(ModelInstanceId);
-string_id!(CatalogInstallationOperationId);
-string_id!(LabId);
-
-/// A model's identity. Two `local:` IDs are the same model exactly when their hashes match: the
-/// label is for reading only, so equality, order and hashing ignore it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
-#[derive(Debug, Clone)]
-pub struct ModelId(String);
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CatalogBaseId(String);
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CatalogVariantId(String);
-
-/// A canonical Hugging Face model repository (`owner/repository`).
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HuggingFaceRepositoryId(String);
-
-/// The repository-relative GGUF weights selector used in a Hugging Face model identity.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HuggingFaceArtifactSelector(String);
-
-/// The identity of a custom model with no Hugging Face identity: the first
-/// [`LocalModelHash::LENGTH`] lowercase hex characters of its content digest.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LocalModelHash(String);
-
-/// The readable part of a `local:` ID (`<name>-<quant>`), which never identifies the model.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LocalModelLabel(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid model ID: {message}")]
@@ -618,14 +2647,6 @@ mod model_id_tests {
     }
 }
 
-#[cfg_attr(
-    feature = "openapi",
-    derive(utoipa::ToSchema),
-    schema(value_type = String, format = Date)
-)]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ModelReleaseDate(String);
-
 impl ModelReleaseDate {
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
@@ -717,33 +2738,6 @@ mod model_release_date_tests {
     }
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelInstanceMemoryDomain {
-    pub memory_domain_id: crate::MemoryDomainId,
-    pub model_bytes: u64,
-    pub context_bytes: u64,
-    pub compute_bytes: u64,
-    pub auxiliary_bytes: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelInstanceAllocation {
-    pub context_window_tokens: u32,
-    /// The engine heap's observed standing per memory domain at the last observation. Memory is
-    /// elastic, so this is not a fixed reservation.
-    pub memory_domains: Vec<ModelInstanceMemoryDomain>,
-    /// The places granted to the load's prompt groups at the last observation.
-    pub prompt_group_places: PromptGroupPlaces,
-    /// Where an elastic expert bank's experts are; absent for a load without one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub streaming: Option<ModelStreamingStatus>,
-}
-
 /// A contract bound a value breaks: the rule, in words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutOfBounds(pub &'static str);
@@ -763,18 +2757,6 @@ impl OutOfBounds {
     }
 }
 
-/// The places a prompt group holds now, of the most it may take: each place runs one chunk of
-/// a prompt in the group's pass. It holds at most its capacity.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "PromptGroupPlacesParts")]
-pub struct PromptGroupPlaces {
-    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
-    held: NonZeroU64,
-    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
-    capacity: NonZeroU64,
-}
-
 /// [`PromptGroupPlaces`]' fields, before their bound is checked.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -791,39 +2773,6 @@ impl TryFrom<PromptGroupPlacesParts> for PromptGroupPlaces {
         OutOfBounds::check(held <= capacity, "a prompt group holds at most its capacity")?;
         Ok(Self { held, capacity })
     }
-}
-
-/// Where an elastic expert bank's routed experts are at the last observation: the experts of
-/// each routed layer it holds (its slots), between the floor it never shrinks below and the
-/// ceiling it never grows past, at most every expert; its bytes in each memory domain; the
-/// host-RAM tier holding cold experts beside it; the bytes of the experts in neither, read
-/// from the model file on demand; the stored tables it holds; and its experts' last resize.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "ModelStreamingStatusParts")]
-pub struct ModelStreamingStatus {
-    /// Each routed layer's experts.
-    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
-    experts: NonZeroU64,
-    slots: u64,
-    floor_slots: u64,
-    ceiling_slots: u64,
-    /// The memory domains holding the bank, device memory first.
-    tiers: Vec<StreamingTierStatus>,
-    /// The host-RAM tier a discrete device's bank keeps its cold experts in,
-    /// exclusive of the bank; absent on unified memory.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    host: Option<StreamingHostStatus>,
-    /// The experts in neither the bank nor the host tier, as the model file
-    /// stores them.
-    disk_bytes: u64,
-    /// The stored tables (n-gram tables) the bank holds beside its experts.
-    tables: Vec<StreamingTableStatus>,
-    /// The experts' last resize; absent before their first.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    last_resize: Option<StreamingResize>,
 }
 
 /// [`ModelStreamingStatus`]' fields, before their bounds are checked.
@@ -866,23 +2815,6 @@ impl TryFrom<ModelStreamingStatusParts> for ModelStreamingStatus {
     }
 }
 
-/// A stored table an expert bank holds: the records its slots use now, between the floor and
-/// ceiling it resizes within; the bytes they hold; and its last resize.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "StreamingTableStatusParts")]
-pub struct StreamingTableStatus {
-    records: u64,
-    floor_records: u64,
-    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
-    ceiling_records: NonZeroU64,
-    bytes: u64,
-    /// Absent before the table's first resize.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    last_resize: Option<StreamingResize>,
-}
-
 /// [`StreamingTableStatus`]' fields, before their bounds are checked.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -908,25 +2840,6 @@ impl TryFrom<StreamingTableStatusParts> for StreamingTableStatus {
     }
 }
 
-/// A discrete device's host-RAM tier, in its memory domain: its host slots now (each an expert
-/// of every streamed layer) up to its ceiling, the host memory its records take, and its last
-/// resize.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "StreamingHostStatusParts")]
-pub struct StreamingHostStatus {
-    memory_domain_id: crate::MemoryDomainId,
-    slots: u64,
-    /// At most every expert; none beside the landing reserve where a
-    /// weight cap leaves the tier no slots.
-    ceiling_slots: u64,
-    bytes: u64,
-    /// Absent before the tier's first resize.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    last_resize: Option<StreamingResize>,
-}
-
 /// [`StreamingHostStatus`]' fields, before their bound is checked.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -947,37 +2860,6 @@ impl TryFrom<StreamingHostStatusParts> for StreamingHostStatus {
         OutOfBounds::check(slots <= ceiling_slots, "a host tier holds at most its ceiling")?;
         Ok(Self { memory_domain_id, slots, ceiling_slots, bytes, last_resize })
     }
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StreamingTierStatus {
-    pub memory_domain_id: crate::MemoryDomainId,
-    pub bytes: u64,
-}
-
-/// A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs`
-/// (milliseconds since the Unix epoch): shrunk by `by` to `to` as memory grew short, or grown
-/// by `by` from `from` into free memory. Each changes its size by at least one.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum StreamingResize {
-    #[serde(rename_all = "camelCase")]
-    Shrank {
-        to: u64,
-        #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
-        by: NonZeroU64,
-        at_unix_ms: u64,
-    },
-    #[serde(rename_all = "camelCase")]
-    Grew {
-        from: u64,
-        #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
-        by: NonZeroU64,
-        at_unix_ms: u64,
-    },
 }
 
 #[cfg(test)]
@@ -1079,17 +2961,6 @@ mod model_streaming_status_tests {
     }
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelReleaseReason {
-    UserStop,
-    IdleTimeout,
-    Replacement,
-    MemoryPressure,
-    Failure,
-}
-
 #[cfg(test)]
 mod model_release_reason_tests {
     use super::ModelReleaseReason;
@@ -1113,53 +2984,6 @@ mod model_release_reason_tests {
     }
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelStoppingAllocation {
-    Planned {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        allocation: Option<ModelLoadPlan>,
-    },
-    Resident {
-        allocation: ModelInstanceAllocation,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelInstanceFailure {
-    Operation {
-        code: String,
-        message: String,
-        retryable: bool,
-    },
-    /// The model fits this machine but could not be given its memory now.
-    MemoryShortage {
-        code: String,
-        message: String,
-        retryable: bool,
-        shortage: MemoryShortage,
-    },
-}
-
-/// Why a model that fits the machine could not be given its memory.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum MemoryShortage {
-    /// Memory that cannot be moved is in the way of the load's claim in its limiting memory
-    /// domain. `available_bytes` is what the domain's ledger could give the claim there once
-    /// every cache yielded.
-    #[serde(rename_all = "camelCase")]
-    Blocked {
-        required_bytes: u64,
-        available_bytes: u64,
-    },
-}
-
 impl From<ModelFailure> for ModelInstanceFailure {
     fn from(failure: ModelFailure) -> Self {
         Self::Operation {
@@ -1168,277 +2992,6 @@ impl From<ModelFailure> for ModelInstanceFailure {
             retryable: failure.retryable,
         }
     }
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelInstanceLifecycle {
-    #[serde(rename_all = "camelCase")]
-    Loading {
-        stage: ModelLoadStage,
-        /// The load's completed fraction in `[0, 1]`, by measured work: tuning, when the load
-        /// tunes, is the first half and weight import the rest. Monotonic within a load; only
-        /// `Ready` means the load is complete.
-        fraction: f32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        planned_allocation: Option<ModelLoadPlan>,
-    },
-    Ready {
-        allocation: ModelInstanceAllocation,
-        /// The device the worker opened and serves on.
-        device: ModelLoadDevice,
-    },
-    #[serde(rename_all = "camelCase")]
-    Stopping {
-        reason: ModelReleaseReason,
-        allocation: ModelStoppingAllocation,
-    },
-    Stopped {
-        reason: ModelReleaseReason,
-    },
-    Failed {
-        failure: ModelInstanceFailure,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelInstance {
-    pub id: ModelInstanceId,
-    pub model_id: ModelId,
-    pub lifecycle: ModelInstanceLifecycle,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelInstancesSnapshot {
-    pub revision: u64,
-    /// Instances in lifecycle-update order, oldest first. The final matching
-    /// instance is therefore the current attempt for a model.
-    pub instances: Vec<ModelInstance>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelInstancesInvalidation {
-    pub revision: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelFileRole {
-    Weights,
-    Projector,
-    Draft,
-    Mtp,
-    Auxiliary,
-}
-
-/// Native algorithm used by a speculative decoding stage.
-///
-/// Method and artifact packaging are intentionally independent. The enclosing speculative bundle
-/// declares whether the selected method is embedded in the target or supplied by a separate draft
-/// package.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum SpeculativeMethod {
-    Mtp,
-    DFlash,
-    DFlash2,
-    DSpark,
-    LiLiCorr,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelFile {
-    pub id: ModelFileId,
-    #[cfg_attr(feature = "openapi", schema(value_type = String))]
-    pub path: PathBuf,
-    pub role: ModelFileRole,
-    pub size_bytes: u64,
-    /// Exact encoded tensor storage, when bounded GGUF inspection succeeded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tensor_storage_bytes: Option<u64>,
-    pub sha256: String,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelPackageSource {
-    HuggingFace {
-        repository: String,
-        revision: String,
-    },
-    Local {
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        path: PathBuf,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelFileRelationship {
-    #[serde(rename_all = "camelCase")]
-    Shard {
-        file_id: ModelFileId,
-        index: u32,
-        count: u32,
-    },
-    #[serde(rename_all = "camelCase")]
-    ProjectorFor {
-        projector_file_id: ModelFileId,
-        weights_file_id: ModelFileId,
-    },
-    #[serde(rename_all = "camelCase")]
-    MtpFor {
-        mtp_file_id: ModelFileId,
-        weights_file_id: ModelFileId,
-    },
-    #[serde(rename_all = "camelCase")]
-    DraftFor {
-        draft_file_id: ModelFileId,
-        weights_file_id: ModelFileId,
-        method: SpeculativeMethod,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelPackageProperties {
-    pub format: String,
-    pub quantization: String,
-    pub quantization_name: String,
-    pub architecture: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maximum_context_length: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intrinsic_model_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intrinsic_quality_id: Option<String>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelPackage {
-    pub id: ModelPackageId,
-    pub source: ModelPackageSource,
-    pub files: Vec<ModelFile>,
-    pub relationships: Vec<ModelFileRelationship>,
-    pub properties: ModelPackageProperties,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelFailure {
-    pub code: String,
-    pub message: String,
-    pub retryable: bool,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum PackageValidation {
-    Pending,
-    Valid,
-    Invalid { failure: ModelFailure },
-    Unsupported { failure: ModelFailure },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum ModelPackageInstallationOrigin {
-    Magnitude,
-    HuggingFaceCache,
-    LmStudio,
-    LlamaCpp,
-    Ollama,
-    Folder,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum CatalogPackageRole {
-    Target,
-    Dependency,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogPackageAffiliation {
-    pub model_id: CatalogBaseId,
-    pub variant_id: CatalogVariantId,
-    pub package_id: ModelPackageId,
-    pub repository: String,
-    pub role: CatalogPackageRole,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InstalledModelPackage {
-    pub package: ModelPackage,
-    #[cfg_attr(feature = "openapi", schema(value_type = String))]
-    pub path: PathBuf,
-    pub origin: ModelPackageInstallationOrigin,
-    pub validation: PackageValidation,
-    pub catalog_attribution: InstalledCatalogAttribution,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum InstalledCatalogAttribution {
-    NotCatalogTarget,
-    #[serde(rename_all = "camelCase")]
-    Attributed {
-        model_id: CatalogBaseId,
-        variant_id: CatalogVariantId,
-    },
-    Failed {
-        failure: ModelFailure,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InstalledModelPackagesResponse {
-    pub revision: u64,
-    pub reconciliation_complete: bool,
-    pub packages: Vec<InstalledModelPackage>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ServableModelBundle {
-    Standalone {
-        package: ModelPackage,
-    },
-    #[serde(rename_all = "camelCase")]
-    SpeculativeDecoding {
-        target: ModelPackage,
-        draft_source: SpeculativeDraftSource,
-        method: SpeculativeMethod,
-    },
 }
 
 impl ServableModelBundle {
@@ -1454,165 +3007,6 @@ impl ServableModelBundle {
     }
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum SpeculativeDraftSource {
-    Embedded,
-    Separate { draft: ModelPackage },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ServingProfile {
-    pub context_length: u32,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelServingConfiguration {
-    pub bundle: ServableModelBundle,
-    pub profile: ServingProfile,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelReasoningCapabilities {
-    pub supported: bool,
-    pub efforts: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_effort: Option<String>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelCapabilities {
-    pub vision: bool,
-    pub tools: bool,
-    pub structured_output: bool,
-    pub reasoning: ModelReasoningCapabilities,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelMetadata {
-    pub format: String,
-    pub architecture: String,
-    pub quantization: String,
-    pub quantization_name: String,
-    pub storage_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub maximum_context_length: Option<u32>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReadyModel {
-    pub metadata: ModelMetadata,
-    pub profile: ServingProfile,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub speculative_method: Option<SpeculativeMethod>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum EffectiveModel {
-    Ready { model: ReadyModel },
-    Unavailable { failure: ModelFailure },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum ModelInstallationOwnership {
-    Magnitude,
-    External,
-    Mixed,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelInstallation {
-    #[serde(rename_all = "camelCase")]
-    Resolved {
-        installed_bytes: u64,
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        primary_path: PathBuf,
-        ownership: ModelInstallationOwnership,
-    },
-    #[serde(rename_all = "camelCase")]
-    Unresolved {
-        installed_bytes: u64,
-        ownership: ModelInstallationOwnership,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ResolvedModelInstallation {
-    #[serde(rename_all = "camelCase")]
-    Resolved {
-        installed_bytes: u64,
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        primary_path: PathBuf,
-        ownership: ModelInstallationOwnership,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "architecture", rename_all = "camelCase", deny_unknown_fields)]
-pub enum ModelParameterization {
-    Dense {
-        #[serde(rename = "totalParameters")]
-        total_parameters: u64,
-    },
-    MixtureOfExperts {
-        #[serde(rename = "totalParameters")]
-        total_parameters: u64,
-        #[serde(rename = "activeParameters")]
-        active_parameters: u64,
-    },
-}
-
-/// What the release promises for a catalog model, with its `intelligence`: its Artificial
-/// Analysis score as a percentage of the frontier's, which only a disabled model may lack. It is
-/// independent of assessment, which says what one device can do with it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "level", rename_all = "camelCase", deny_unknown_fields)]
-pub enum CatalogSupport {
-    /// Intended to be available as a supported catalog model.
-    Supported { intelligence: u32 },
-    /// Temporarily unavailable or not yet supported. Never installed or loaded.
-    Disabled {
-        reason: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        intelligence: Option<u32>,
-    },
-    /// Never offered for new installs and never loaded. An installed copy stays identifiable and
-    /// removable, and points at its replacement.
-    #[serde(rename_all = "camelCase")]
-    Deprecated {
-        since: String,
-        replacement: ModelId,
-        reason: String,
-        intelligence: u32,
-    },
-}
-
 impl CatalogSupport {
     #[must_use]
     pub fn is_deprecated(&self) -> bool {
@@ -1623,251 +3017,6 @@ impl CatalogSupport {
     pub fn is_available(&self) -> bool {
         matches!(self, Self::Supported { .. })
     }
-}
-
-/// The lab that develops a model, from the catalog's lab table. `country` is its ISO 3166-1
-/// alpha-2 code.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelDeveloper {
-    pub lab: LabId,
-    pub name: String,
-    pub country: String,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RecommendableModel {
-    pub model_id: CatalogBaseId,
-    pub variant_id: CatalogVariantId,
-    pub configuration: ModelServingConfiguration,
-    pub display_name: String,
-    pub variant_label: String,
-    pub description: String,
-    pub release_date: ModelReleaseDate,
-    pub license: String,
-    pub parameterization: ModelParameterization,
-    pub developer: ModelDeveloper,
-    pub support: CatalogSupport,
-    pub quant: CatalogQuant,
-    pub quantization_aware: bool,
-}
-
-/// The quant a catalog model is: the repository that publishes it and its file quant name (for
-/// example `UD-Q4_K_XL`), which states its bit width.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogQuant {
-    pub repository: String,
-    pub name: String,
-}
-
-/// A catalog model's separately packaged drafter: its method, the repository that publishes it
-/// and the bytes it adds to the download.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogDrafter {
-    pub method: SpeculativeMethod,
-    pub repository: String,
-    pub size_bytes: u64,
-}
-
-/// Whether Magnitude runs a model family now or will.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ModelFamilyStatus {
-    Supported,
-    ComingSoon,
-}
-
-/// A family of models Magnitude runs, by the GGUF architectures its models declare; fine-tunes and
-/// re-uploads of these architectures run too.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelFamily {
-    pub name: String,
-    pub developer: ModelDeveloper,
-    pub architectures: Vec<String>,
-    pub status: ModelFamilyStatus,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogDiagnostic {
-    pub model_id: CatalogBaseId,
-    pub variant_id: CatalogVariantId,
-    pub failure: ModelFailure,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CatalogModelUpdate {
-    Current,
-    #[serde(rename_all = "camelCase")]
-    Available {
-        required_download_bytes: u64,
-        parts: Vec<CatalogUpdatePart>,
-    },
-}
-
-/// What a catalog update brings: new model weights, a new projector (image input), or a new drafter.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum CatalogUpdatePart {
-    Model,
-    Projector,
-    Drafter,
-}
-
-/// A part of a catalog model's bundle that can be fetched on its own: the projector that gives
-/// its target image input, or its separate drafter.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum CatalogComponent {
-    Projector,
-    Drafter,
-}
-
-/// A catalog component absent from this computer while the model's exact target weights are
-/// found elsewhere. It is not an update: the model serves without it until it is fetched.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogMissingComponent {
-    pub component: CatalogComponent,
-    pub download_bytes: u64,
-}
-
-/// A catalog model's state here. `stored_components`: the parts
-/// Magnitude stores for a model whose weights are only in another app's location (its projector
-/// package and drafter), which Remove deletes while the found weights stay and keep serving.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CatalogModelState {
-    NotInstalled,
-    #[serde(rename_all = "camelCase")]
-    Installed {
-        effective: EffectiveModel,
-        installation: ModelInstallation,
-        update_state: CatalogModelUpdate,
-        missing_components: Vec<CatalogMissingComponent>,
-        stored_components: Vec<CatalogComponent>,
-    },
-}
-
-/// A catalog variant and its state on this computer. `desired`: the model installing it fetches
-/// and serves here. `drafter_withheld`: it fits this computer only without its catalog drafter (or
-/// not at all), so it is fetched, served and assessed without it, installed or not: it loads when
-/// it fits without it, and otherwise is refused with its own shortfall. `aliases` are the `hf:` IDs
-/// its target's files found in an external location (a Hugging Face cache) would have as custom
-/// models, which clients resolve to this model, so references made before the file was attributed
-/// keep working.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogModel {
-    pub id: ModelId,
-    pub desired: ReadyModel,
-    pub drafter_withheld: bool,
-    pub display_name: String,
-    pub variant_label: String,
-    pub description: String,
-    pub release_date: ModelReleaseDate,
-    pub license: String,
-    pub source_urls: Vec<String>,
-    pub parameterization: ModelParameterization,
-    pub developer: ModelDeveloper,
-    pub support: CatalogSupport,
-    pub quant: CatalogQuant,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub drafter: Option<CatalogDrafter>,
-    pub quantization_aware: bool,
-    pub local_state: CatalogModelState,
-    #[serde(default)]
-    pub aliases: Vec<ModelId>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogModelsResponse {
-    pub revision: u64,
-    pub reconciliation_complete: bool,
-    pub models: Vec<CatalogModel>,
-    pub families: Vec<ModelFamily>,
-}
-
-/// Where a scanned custom model was found.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum FoundSource {
-    HuggingFaceCache,
-    LmStudio,
-    LlamaCpp,
-    Ollama,
-    Folder {
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        path: PathBuf,
-    },
-}
-
-/// How a custom model came to be on this computer, which decides who owns its files.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CustomModelOrigin {
-    Added {
-        repository: HuggingFaceRepositoryId,
-        commit: String,
-    },
-    Found {
-        source: FoundSource,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CustomModelFile {
-    #[cfg_attr(feature = "openapi", schema(value_type = String))]
-    pub path: PathBuf,
-    pub size_bytes: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CustomModelCatalogAttribution {
-    NotInCatalog,
-    Failed { failure: ModelFailure },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CustomModelState {
-    NotInstalled,
-    #[serde(rename_all = "camelCase")]
-    Ready {
-        installation: ResolvedModelInstallation,
-        model: ReadyModel,
-        catalog_attribution: CustomModelCatalogAttribution,
-    },
-    #[serde(rename_all = "camelCase")]
-    Unavailable {
-        installation: ResolvedModelInstallation,
-        failure: ModelFailure,
-    },
 }
 
 /// Why the engine cannot execute a model. The engine updates independently of its clients, so the
@@ -1927,546 +3076,11 @@ impl From<KnownUnsupportedReason> for UnsupportedReason {
     }
 }
 
-/// A reason the engine raises, typed where it raises it. `DraftArchitecture` is a separate drafter
-/// whose architecture no drafter family binds, such as a Nemotron-H MTP file. `UnsupportedFormat`
-/// is the service's own: a found model whose files are not GGUF, such as an Ollama model stored for
-/// its MLX runner.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum KnownUnsupportedReason {
-    Architecture {
-        architecture: String,
-    },
-    WeightTypes {
-        types: Vec<WeightTypeCount>,
-    },
-    RopeScaling {
-        kind: String,
-    },
-    UnrecognizedTensor {
-        name: String,
-    },
-    UnrecognizedMetadata {
-        key: String,
-    },
-    MissingMetadata {
-        key: String,
-    },
-    Tokenizer {
-        model: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        pre: Option<String>,
-    },
-    ChatTemplate,
-    KernelDomain {
-        backend: String,
-        entry: String,
-        statics: Vec<KernelStatic>,
-    },
-    Backend {
-        backend: String,
-    },
-    TargetMismatch {
-        detail: String,
-    },
-    TiedOutputHead,
-    DraftArchitecture {
-        architecture: String,
-    },
-    Unreadable,
-    UnsupportedFormat,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnrecognizedUnsupportedReason {
-    #[serde(rename = "_tag")]
-    pub tag: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub detail: Option<String>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WeightTypeCount {
-    pub ggml_type: String,
-    pub tensor_count: u32,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct KernelStatic {
-    pub name: String,
-    pub value: u64,
-}
-
-/// The shape a drafter binds to. Requantizations, finetunes and abliterations keep it, so it
-/// matches a model to its parent catalog model when nothing else does.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelFingerprint {
-    pub architecture: String,
-    pub block_count: u32,
-    pub embedding_length: u32,
-    pub head_count: u32,
-    pub head_count_kv: u32,
-    pub key_length: u32,
-    pub vocab_size: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub expert_count: Option<u32>,
-    pub tokenizer_digest: String,
-}
-
-/// Whether the engine binds a model's drafter. `None` means no drafter was configured.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum DrafterVerdict {
-    None,
-    #[serde(rename_all = "camelCase")]
-    Bound {
-        method: SpeculativeMethod,
-        memory_bytes: u64,
-    },
-    Rejected {
-        reasons: Vec<UnsupportedReason>,
-        detail: String,
-    },
-}
-
-/// Whether the engine binds a model's projector. `None` means the model has no projector; a
-/// `Rejected` projector leaves the model assessed and served without it, taking text input only.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ProjectorVerdict {
-    None,
-    Bound,
-    Rejected {
-        reasons: Vec<UnsupportedReason>,
-        detail: String,
-    },
-}
-
-/// A drafter's files, independent of which model uses it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum DrafterReference {
-    #[serde(rename_all = "camelCase")]
-    Catalog {
-        model_id: ModelId,
-    },
-    Embedded,
-    HuggingFace {
-        repository: HuggingFaceRepositoryId,
-        commit: String,
-        path: String,
-    },
-    Local {
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        path: PathBuf,
-    },
-}
-
-/// Where a drafter candidate comes from, in the order automatic choice prefers: a separate drafter
-/// in the model's own repository or folder, the matched catalog model's drafter, MTP heads built
-/// into the model, then a drafter the user entered, which is never chosen automatically.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum DrafterCategory {
-    NextToModel,
-    CatalogDrafter,
-    BuiltIn,
-    Other,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum DrafterLineage {
-    Exact,
-    Lineage,
-    Fingerprint,
-    None,
-}
-
-/// One drafter a model may use. `automatic` says whether automatic choice may take it: the engine
-/// binds it, the user didn't enter it, and with it the model still fits when it fits without one.
-/// The first automatic candidate, in order, is the preselected drafter.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DrafterCandidate {
-    pub category: DrafterCategory,
-    pub reference: DrafterReference,
-    pub name: String,
-    pub label: String,
-    pub size_bytes: u64,
-    pub lineage: DrafterLineage,
-    pub verdict: DrafterVerdict,
-    pub automatic: bool,
-    pub on_this_computer: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub method: Option<SpeculativeMethod>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum AttachedDrafterState {
-    Ready,
-    NotInstalled,
-    Rejected {
-        reasons: Vec<UnsupportedReason>,
-        detail: String,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AttachedDrafter {
-    pub reference: DrafterReference,
-    /// How the engine binds it; a drafter it rejects has no method.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub method: Option<SpeculativeMethod>,
-    pub state: AttachedDrafterState,
-    pub update_available: bool,
-}
-
-/// The drafter a custom model should use: the recommended one, none, or an exact reference, whose
-/// method the engine works out from the drafter and the model.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum DrafterChoice {
-    Auto,
-    None,
-    Reference { reference: DrafterReference },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DrafterAttachment {
-    pub model_id: ModelId,
-    pub drafter: DrafterChoice,
-}
-
-/// A model on this computer that is not a catalog model. `drafter_pending`: its drafter choice is
-/// automatic and its automatic drafter isn't worked out yet, so it has no drafter for now rather
-/// than none. `update_commit` is set only for an added model whose repository's `main` has moved to
-/// a commit where its target file has other content.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CustomModel {
-    pub model_id: ModelId,
-    pub origin: CustomModelOrigin,
-    pub display_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub variant_label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub variant_of: Option<ModelId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub developer: Option<ModelDeveloper>,
-    pub files: Vec<CustomModelFile>,
-    pub size_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub projector: Option<CustomModelFile>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub drafter: Option<AttachedDrafter>,
-    pub drafter_pending: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub recommended_drafter: Option<DrafterCandidate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub license: Option<String>,
-    pub profile: ServingProfile,
-    pub state: CustomModelState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub update_commit: Option<String>,
-}
-
-/// A GGUF found on this computer that the engine cannot execute, or a directory inside a model
-/// location that Magnitude can't read, which may hold more models.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct UnsupportedLocalModel {
-    pub display_name: String,
-    pub origin: CustomModelOrigin,
-    #[cfg_attr(feature = "openapi", schema(value_type = String))]
-    pub path: PathBuf,
-    pub reasons: Vec<UnsupportedReason>,
-    pub detail: String,
-}
-
-/// `models` are the custom models to offer and assess; `hidden` are the ones the configuration
-/// hides, listed so a client can unhide them, and never assessed. `unsupported` are GGUF groups
-/// that cannot be read at all, and directories inside a location that cannot be read (the rest of
-/// the location is still listed); a readable model the engine rejects stays in `models` with an
-/// `Unsupported` assessment.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LocalModelsResponse {
-    pub revision: u64,
-    pub reconciliation_complete: bool,
-    pub models: Vec<CustomModel>,
-    pub hidden: Vec<CustomModel>,
-    pub unsupported: Vec<UnsupportedLocalModel>,
-}
-
-/// The result of removing an added model's Magnitude-owned files. Files in external locations
-/// are never touched, so the model may remain as found.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LocalModelRemoval {
-    pub model_id: ModelId,
-    pub removed: bool,
-    pub freed_bytes: u64,
-}
-
-/// Magnitude-owned drafter packages removed because no model uses them any more.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DrafterPruning {
-    pub removed: Vec<ModelPackageId>,
-    pub freed_bytes: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum ModelRootKind {
-    HuggingFaceCache,
-    LmStudio,
-    LlamaCpp,
-    Ollama,
-    Folder,
-}
-
-/// One resolved location ICN scans. ACN resolves the paths; ICN never guesses them.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelRoot {
-    pub kind: ModelRootKind,
-    #[cfg_attr(feature = "openapi", schema(value_type = String))]
-    pub path: PathBuf,
-    pub enabled: bool,
-}
-
-/// A model added from Hugging Face: its repository and the path of its first shard, which its
-/// `hf:` ID names (the other shards of a split model follow from that shard's name), the pinned
-/// commit, and a projector path in the repository at it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AddedModel {
-    pub repository: HuggingFaceRepositoryId,
-    pub path: HuggingFaceArtifactSelector,
-    pub revision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub projector: Option<String>,
-}
-
 impl AddedModel {
     #[must_use]
     pub fn model_id(&self) -> ModelId {
         ModelId::hugging_face(&self.repository, &self.path)
     }
-}
-
-/// The whole local-models configuration ACN owns and hands to ICN, at spawn and after every
-/// change. Applying it is idempotent.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LocalModelsConfiguration {
-    pub roots: Vec<ModelRoot>,
-    pub added: Vec<AddedModel>,
-    pub hidden: Vec<ModelId>,
-    pub drafters: Vec<DrafterAttachment>,
-}
-
-/// Files not yet added: a Hugging Face repository at a commit, or a local directory.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CandidateSource {
-    HuggingFace {
-        repository: HuggingFaceRepositoryId,
-        commit: String,
-    },
-    Local {
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        path: PathBuf,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CandidateFile {
-    pub path: String,
-    pub size_bytes: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CandidateDrafter {
-    pub reference: DrafterReference,
-    pub method: SpeculativeMethod,
-}
-
-/// A target (shards in order), projector and drafter, by paths relative to `source`.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelCandidate {
-    pub source: CandidateSource,
-    pub target: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub projector: Option<CandidateFile>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub drafter: Option<CandidateDrafter>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CandidateInspectionRequest {
-    HuggingFace {
-        repository: HuggingFaceRepositoryId,
-        revision: String,
-    },
-    Local {
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        path: PathBuf,
-    },
-}
-
-/// One version of a candidate. `download_bytes` is what adding it downloads before any drafter:
-/// its files and the repository's projector, or nothing when it is already on this computer or
-/// is a local file used in place. `catalog_model` is the catalog model this version exactly is (the
-/// same repository, commit and file), installed or not: adding the version installs that model.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CandidateVersion {
-    pub label: String,
-    pub model_id: ModelId,
-    pub files: Vec<CandidateFile>,
-    pub size_bytes: u64,
-    pub download_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub assessment: Option<ModelAssessment>,
-    pub recommended: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub catalog_model: Option<ModelId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub on_this_computer: Option<ModelId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub drafter: Option<DrafterCandidate>,
-}
-
-/// The repository step: every version with the engine's verdict, or why none can run.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CandidateInspection {
-    pub source: CandidateSource,
-    pub display_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub license: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub variant_of: Option<ModelId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub developer: Option<ModelDeveloper>,
-    pub versions: Vec<CandidateVersion>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub projector: Option<CandidateFile>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub unsupported_architecture: Option<Vec<UnsupportedReason>>,
-}
-
-/// What an inspection is doing, with how much of it is done: reading each file's GGUF header,
-/// checking each version against this computer, then checking the drafters of the version it
-/// recommends. A drafter total counts the drafter checks known so far, so it can grow.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CandidateInspectionPhase {
-    ReadingHeaders { completed: u32, total: u32 },
-    CheckingVersions { completed: u32, total: u32 },
-    CheckingDrafters { version: String, completed: u32, total: u32 },
-}
-
-/// A version as an inspection in progress knows it: its label and size, and its plain verdict
-/// once checked. While headers are read, the rows are the repository's GGUFs named by their files;
-/// from the version checks on, they are the versions the inspection returns.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CandidateVersionProgress {
-    pub label: String,
-    pub size_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub assessment: Option<ModelAssessment>,
-}
-
-/// How far an inspection has got, each version's verdict included as soon as it is known.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CandidateInspectionProgress {
-    pub phase: CandidateInspectionPhase,
-    pub versions: Vec<CandidateVersionProgress>,
-}
-
-/// One event of an inspection's stream: progress, in order, then the inspection itself.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CandidateInspectionEvent {
-    Progress { progress: CandidateInspectionProgress },
-    Inspected { inspection: CandidateInspection },
 }
 
 /// Where an inspection reports its progress; `none` discards it.
@@ -2506,87 +3120,6 @@ impl fmt::Debug for CandidateInspectionProgressSink {
     }
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum DrafterCandidatesRequest {
-    Candidate {
-        candidate: ModelCandidate,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        other: Option<String>,
-    },
-    #[serde(rename_all = "camelCase")]
-    Model {
-        model_id: ModelId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        other: Option<String>,
-    },
-}
-
-/// Drafter candidates for one target, in the product's category order. `entered` is the listed
-/// reference the request's different drafter resolves to: a listed candidate that is the same file
-/// (a catalog drafter by its package, otherwise the same repository, commit and path), else the
-/// different drafter's own Other row; absent without a different drafter.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DrafterCandidatesResponse {
-    pub candidates: Vec<DrafterCandidate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub entered: Option<DrafterReference>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CatalogInstallationAdmission {
-    Current,
-    #[serde(rename_all = "camelCase")]
-    Admitted {
-        operation_id: CatalogInstallationOperationId,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogInstallationProgress {
-    pub stage: DownloadStage,
-    pub completed_bytes: u64,
-    pub total_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub bytes_per_second: Option<u64>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CatalogOptimizationStage {
-    Waiting,
-    Preparing,
-    Tuning,
-}
-
-/// Kernel tuning after a verified download, in tuning work units. `Waiting` has not finished and
-/// waits for the device, which a resident or loading model holds (0 of 0); `Preparing` opens the
-/// device and counts the units (0 of 0); `device` is the device a load would select, once
-/// previewed. A load of the model whose own Prepare tunes reports that Prepare's progress.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogOptimizationProgress {
-    pub stage: CatalogOptimizationStage,
-    pub completed: u64,
-    pub total: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub device: Option<ModelLoadDevice>,
-}
-
 impl CatalogOptimizationProgress {
     #[must_use]
     pub const fn waiting(device: Option<ModelLoadDevice>) -> Self {
@@ -2609,137 +3142,6 @@ impl CatalogOptimizationProgress {
     }
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CatalogInstallationOperationState {
-    Pending {
-        progress: CatalogInstallationProgress,
-    },
-    Running {
-        progress: CatalogInstallationProgress,
-    },
-    Optimizing {
-        progress: CatalogOptimizationProgress,
-    },
-    Completed,
-    Failed {
-        progress: CatalogInstallationProgress,
-        failure: DownloadFailure,
-        acknowledged: bool,
-    },
-    Cancelled {
-        progress: CatalogInstallationProgress,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogInstallationOperation {
-    pub operation_id: CatalogInstallationOperationId,
-    pub model_id: ModelId,
-    pub state: CatalogInstallationOperationState,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatalogInstallationsResponse {
-    pub operations: Vec<CatalogInstallationOperation>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum CatalogInstallationRetentionReason {
-    SharedMaterial,
-    ExternalOwnership,
-}
-
-/// `kept_components`: the parts Magnitude stores for a model whose weights are found elsewhere
-/// that the removal kept, because another model on this computer needs them.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CatalogInstallationRemoval {
-    #[serde(rename_all = "camelCase")]
-    Removed {
-        reclaimed_bytes: u64,
-        kept_components: Vec<CatalogComponent>,
-    },
-    Retained {
-        reason: CatalogInstallationRetentionReason,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RecommendableModelCatalog {
-    pub models: Vec<RecommendableModel>,
-    pub diagnostics: Vec<CatalogDiagnostic>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelPackageOperand {
-    #[serde(rename_all = "camelCase")]
-    Installed { package_id: ModelPackageId },
-    #[serde(rename_all = "camelCase")]
-    SourceBacked { package: ModelPackage },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelBundleInput {
-    #[serde(rename_all = "camelCase")]
-    Standalone { package: ModelPackageOperand },
-    #[serde(rename_all = "camelCase")]
-    SpeculativeDecoding {
-        target: ModelPackageOperand,
-        draft_source: SpeculativeDraftSourceInput,
-        method: SpeculativeMethod,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum SpeculativeDraftSourceInput {
-    Embedded,
-    Separate { draft: ModelPackageOperand },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelAssessmentProfile {
-    pub profile: ServingProfile,
-    pub performance_context_tokens: Vec<u32>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum CatalogModelSelection {
-    Desired,
-    Effective,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelAssessmentSubject {
-    #[serde(rename_all = "camelCase")]
-    Catalog {
-        model_id: ModelId,
-        selection: CatalogModelSelection,
-    },
-    #[serde(rename_all = "camelCase")]
-    Custom { model_id: ModelId },
-}
-
 impl ModelAssessmentSubject {
     #[must_use]
     pub fn model_id(&self) -> &ModelId {
@@ -2747,99 +3149,6 @@ impl ModelAssessmentSubject {
             Self::Catalog { model_id, .. } | Self::Custom { model_id } => model_id,
         }
     }
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MemoryAssessment {
-    pub memory_domain_id: crate::MemoryDomainId,
-    pub capacity_bytes: u64,
-    pub required_bytes: u64,
-    pub remaining_bytes: i64,
-}
-
-/// What a fitting model's required memory holds across every domain: its weights, the
-/// conversation's state at the served context, and everything else the load holds.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MemoryBreakdown {
-    pub weights_bytes: u64,
-    pub context_bytes: u64,
-    pub overhead_bytes: u64,
-}
-
-/// Where a fitting model's weights are held as it runs, as its files store them, so the four sum
-/// to its weights: `device_bytes` in the serving device's memory (GPU memory, or unified memory on
-/// Apple silicon); `host_bytes` in host RAM beside a discrete device; `disk_bytes` the routed
-/// experts neither holds, streamed from the model file as steps miss them; `lookup_disk_bytes` the
-/// rows of tables read by row (an embedding) that host RAM has no room to cache beside the model,
-/// which each token looks up a few rows of on disk. What it holds beside its weights is its memory
-/// breakdown's.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelPlacement {
-    pub device_bytes: u64,
-    pub host_bytes: u64,
-    pub disk_bytes: u64,
-    pub lookup_disk_bytes: u64,
-}
-
-/// An estimated decode speed at one context depth, in tokens per second per conversation, from
-/// the costs measured of this machine's selected executor: what the engine's own kernels achieve
-/// on it.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PerformanceEvidence {
-    pub context_tokens: u32,
-    pub estimated_tokens_per_second: f64,
-}
-
-/// A fitting model's speed estimates from this machine's measurements.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelPerformance {
-    /// This machine's measurements do not exist yet: the measurement job has not stored them.
-    Pending,
-    /// A measurement the estimate needs could not be taken on this machine.
-    Unavailable { failure: ModelFailure },
-    /// One decode-speed estimate per requested depth, ascending.
-    Estimated { samples: Vec<PerformanceEvidence> },
-}
-
-/// How a fitting model holds its weights, and its decode speed held that way.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelResidency {
-    /// Every weight in memory.
-    Resident { performance: ModelPerformance },
-    /// The routed experts streamed through an expert bank (`bank`). `performance` is at the
-    /// bank's slots; `floor_performance` is at its floor.
-    #[serde(rename_all = "camelCase")]
-    Streamed {
-        bank: StreamedBank,
-        performance: ModelPerformance,
-        floor_performance: ModelPerformance,
-    },
-}
-
-/// A streamed fit's expert bank: of each routed layer's `experts`, at least `floorSlots` in
-/// memory, growing to `slots` where this machine's memory allows, fewer than every expert; and
-/// where the experts it lacks are kept (`coldExperts`).
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "StreamedBankParts")]
-pub struct StreamedBank {
-    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
-    experts: NonZeroU64,
-    slots: u64,
-    floor_slots: u64,
-    cold_experts: ColdExperts,
 }
 
 /// [`StreamedBank`]'s fields, before their bounds are checked.
@@ -2863,20 +3172,6 @@ impl TryFrom<StreamedBankParts> for StreamedBank {
         )?;
         Ok(Self { experts, slots, floor_slots, cold_experts })
     }
-}
-
-/// Where a streamed fit keeps the experts its bank lacks.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ColdExperts {
-    /// Read from the model file on demand (unified memory).
-    Disk,
-    /// In a host-RAM tier as host memory lets it grow, the rest read from the model file (a
-    /// discrete device). `cache_bytes` is what the tier holds past its floor: cache the load
-    /// grows into free host RAM, which no memory domain's required bytes count.
-    #[serde(rename_all = "camelCase")]
-    HostRam { cache_bytes: u64 },
 }
 
 #[cfg(test)]
@@ -2959,247 +3254,9 @@ mod model_residency_tests {
     }
 }
 
-/// The state of the measurement job, which measures this machine's selected executor in a
-/// worker process of its own, so that speed estimates can be made. It runs while no model is
-/// loading or being optimized, and while no request holds a loaded model, beside which it runs
-/// once that model has made room for it. It moves from `Unmeasured` to `Measuring`, then to
-/// `Measured`, or to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when
-/// a load or a request preempts the job.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum MeasurementState {
-    /// Measurements are missing and no job has run yet: it waits for the device to be free.
-    Unmeasured,
-    /// A job is measuring this machine.
-    Measuring,
-    /// Every measurement that estimates read is stored, or recorded as unobtainable on this
-    /// machine.
-    Measured,
-    /// The last job did not store every measurement; the next starts at `retry_at`
-    /// (milliseconds since the Unix epoch).
-    #[serde(rename_all = "camelCase")]
-    Failed { retry_at: u64 },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelAssessment {
-    /// A fitting model at `served`, the largest context tier within `profile` at which its
-    /// standard workload fits this computer, where it is placed by tier, how it holds its weights,
-    /// and its decode-speed estimates held that way up to `served`.
-    #[serde(rename_all = "camelCase")]
-    Fits {
-        profile: ServingProfile,
-        served: ServingProfile,
-        assessment_id: ModelAssessmentId,
-        memory: Vec<MemoryAssessment>,
-        memory_breakdown: MemoryBreakdown,
-        placement: ModelPlacement,
-        residency: ModelResidency,
-        projector: ProjectorVerdict,
-        drafter: DrafterVerdict,
-    },
-    /// A model that fits at no context tier: `deficit_bytes` is its shortfall at the smallest,
-    /// `shortfall`.
-    #[serde(rename_all = "camelCase")]
-    DoesNotFit {
-        profile: ServingProfile,
-        shortfall: ServingProfile,
-        assessment_id: ModelAssessmentId,
-        memory: Vec<MemoryAssessment>,
-        limiting_resource: String,
-        deficit_bytes: u64,
-        projector: ProjectorVerdict,
-        drafter: DrafterVerdict,
-    },
-    /// The engine cannot execute a custom model, with every reason it found. A catalog model is
-    /// never unsupported: the pool drops a catalog target the engine cannot execute as a release
-    /// defect. An unreadable file has no serving profile.
-    Unsupported {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        profile: Option<ServingProfile>,
-        reasons: Vec<UnsupportedReason>,
-        detail: String,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelAssessmentEntryState {
-    Assessing,
-    #[serde(rename_all = "camelCase")]
-    Assessed {
-        capabilities: ModelCapabilities,
-        template_fingerprint: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        fingerprint: Option<ModelFingerprint>,
-        profiles: Vec<ModelAssessment>,
-    },
-    Dropped,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelAssessmentEntry {
-    pub subject: ModelAssessmentSubject,
-    pub state: ModelAssessmentEntryState,
-}
-
-/// One source's assessments. `Pending` until the source has been read (and, for custom models,
-/// reconciled).
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelAssessmentDomainSnapshot {
-    #[serde(rename_all = "camelCase")]
-    Pending { source_revision: u64 },
-    #[serde(rename_all = "camelCase")]
-    Available {
-        source_revision: u64,
-        entries: Vec<ModelAssessmentEntry>,
-    },
-}
-
-/// Every model assessment in the service's current environment: its structure is established at
-/// service start, and its identity changes when the measurement job stores this machine's
-/// measurements.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelAssessmentsSnapshot {
-    pub revision: u64,
-    pub environment_id: AssessmentEnvironmentId,
-    pub catalog: ModelAssessmentDomainSnapshot,
-    pub custom: ModelAssessmentDomainSnapshot,
-    /// Whether this machine's measurements, which speed estimates read, exist.
-    pub measurement: MeasurementState,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelAssessmentsInvalidation {
     pub revision: u64,
-}
-
-/// A download of a custom model's `part`, by intent: the service works out its files from the
-/// local-models configuration and keeps the request until it ends, resolving it again after a
-/// restart. Every `ModelDownload` it produces is for `model_id`.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StartModelDownloadRequest {
-    pub model_id: ModelId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub part: Option<CustomModelPart>,
-}
-
-/// Which part of a custom model a download fetches: without one, an added model's files at its
-/// pinned commit with the drafter it downloads with; `Drafter`, only the drafter its choice
-/// resolves to; `Update`, an added model's files at the commit its repository has moved to.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum CustomModelPart {
-    Drafter,
-    Update,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelDownloadState {
-    #[serde(rename_all = "camelCase")]
-    Pending {
-        completed_bytes: u64,
-        total_bytes: u64,
-    },
-    #[serde(rename_all = "camelCase")]
-    Downloading {
-        stage: DownloadStage,
-        completed_bytes: u64,
-        total_bytes: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        bytes_per_second: Option<u64>,
-    },
-    Completed,
-    #[serde(rename_all = "camelCase")]
-    Failed {
-        completed_bytes: u64,
-        total_bytes: u64,
-        failure: DownloadFailure,
-        acknowledged: bool,
-    },
-    #[serde(rename_all = "camelCase")]
-    Cancelled {
-        completed_bytes: u64,
-        total_bytes: u64,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelDownload {
-    pub id: ModelDownloadId,
-    pub bundle: ServableModelBundle,
-    pub for_model: ModelId,
-    pub state: ModelDownloadState,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StartModelDownloadResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub download: Option<ModelDownload>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelDownloadsResponse {
-    pub downloads: Vec<ModelDownload>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelLoadPlan {
-    /// The engine-resolved supported maximum context: the serving ceiling.
-    pub context_window_tokens: u32,
-    /// The load's startup peak claim in the selected device's allocation domain (system RAM or
-    /// dedicated VRAM). It excludes future context growth, which is claimed as history grows.
-    pub required_memory_bytes: u64,
-    pub device: ModelLoadDevice,
-}
-
-/// The execution device a model load uses.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelLoadDevice {
-    pub id: crate::HardwareDeviceId,
-    pub backend: crate::ExecutionBackend,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelLoadStage {
-    /// Waiting for memory admission.
-    Queued,
-    /// Resolving, planning, opening the device and preparing programs.
-    Preparing,
-    /// Tuning kernels for the device; only a load that tunes enters it.
-    Optimizing,
-    LoadingWeights,
-    /// State allocation, warm-up and readiness verification.
-    Finalizing,
 }
 
 #[derive(Clone)]

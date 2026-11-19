@@ -1,5 +1,6 @@
 // vision_clamp: one invocation per element (grid-stride), A(clamp(x,
 // minimum, maximum)).
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 void vision_clamp() {
@@ -9,7 +10,7 @@ void vision_clamp() {
     const float maximum = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MAXIMUM));
     for (seismic_walk at = seismic_walk_grid(total, u64vec3(1ul, 1ul, columns)); at.index < total; seismic_walk_next(at)) {
         const uint64_t row = at.axes.x, column = at.axes.w;
-        const float value = element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_X), row * SEISMIC_X_STRIDE_0 + column);
+        const float value = element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_X), row * SEISMIC_X_STRIDE_0 + column);
         out_put(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0 + column,
             min(max(value, minimum), maximum));
     }

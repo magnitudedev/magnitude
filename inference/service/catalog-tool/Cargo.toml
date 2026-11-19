@@ -19,3 +19,5 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 
+[lints]
+workspace = true

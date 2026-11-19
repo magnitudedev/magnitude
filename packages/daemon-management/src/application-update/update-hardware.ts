@@ -27,7 +27,7 @@ export const updateHardwareFromSummary = (summary: AcnHardwareSummary): UpdateHa
     gpu_count: Option.some(summary.gpuCount),
     gpu_unused_reason: label(summary.gpuUnusedReason, 200),
     cpu_model: label(summary.cpuModel, 96),
-    cpu_cores: summary.cpuCores,
+    cpu_cores: Option.some(summary.cpuPoolCores),
     memory_gb: Option.some(gigabytes(summary.memoryBytes)),
   }
 }

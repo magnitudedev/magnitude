@@ -1,7 +1,5 @@
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define ATTENTION_AFFINE_HISTORY 1
-#define ATTENTION_KEY_CODE_WORDS SEISMIC_DIM_KC
-#define ATTENTION_VALUE_CODE_WORDS SEISMIC_DIM_VC
-#define ATTENTION_KEY_COEFFICIENTS SEISMIC_DIM_KP
 // Sink logits (SK): the merge adds each head's sink to its merged denominator
 // (`attention::normalizer`).
 #define ATTENTION_SINKS SEISMIC_DIM_SK

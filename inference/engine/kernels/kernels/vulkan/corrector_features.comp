@@ -4,6 +4,7 @@
 // invocation per candidate), then publishes silu(up · normed + up_bias) for
 // every (candidate, column), rounded once to A. Mirrors
 // `cpu/corrector_features.rs`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 #include "lib/core/reduce.glsl"
 

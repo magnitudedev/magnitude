@@ -24,7 +24,7 @@ struct Decay {
 
     float log_at(ulong row, ulong head, ulong channel, constant ulong *seismic_words) const {
         const ulong index = head * SEISMIC_DIM_W + channel;
-        const float shifted = element::Act::load(input[row * SEISMIC_DECAY_STRIDE_0 + index])
+        const float shifted = activation::Act::load(input[row * SEISMIC_DECAY_STRIDE_0 + index])
             + time_bias[index * SEISMIC_TIME_BIAS_STRIDE_0];
         return lower / (1.0f + metal::exp(rate[head * SEISMIC_RATE_STRIDE_0] * shifted));
     }
@@ -37,7 +37,7 @@ inline Decay decay_of(device const Storage *input, device const float *rate, dev
 
 // beta = sigmoid(b) of value head `head` at `row`.
 inline float beta_at(device const Storage *beta, ulong row, ulong head, constant ulong *seismic_words) {
-    const float input = element::Act::load(beta[row * SEISMIC_BETA_STRIDE_0 + head * SEISMIC_BETA_STRIDE_1]);
+    const float input = activation::Act::load(beta[row * SEISMIC_BETA_STRIDE_0 + head * SEISMIC_BETA_STRIDE_1]);
     return 1.0f / (1.0f + metal::exp(-input));
 }
 

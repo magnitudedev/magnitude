@@ -204,7 +204,11 @@ fn the_loads_own_commit_never_spends_the_guarantee() {
 
 /// A tiny domain whose `holder` opened on the request slot, with `idle`, an
 /// idle drafter of 4 KiB, held as cache beside it.
-fn holding_an_idle_drafter() -> (crate::domain::ExecutorDomain<crate::domain::fixtures::TestFamily>, crate::domain::StateBindings, Ledger) {
+fn holding_an_idle_drafter() -> (
+    Box<crate::domain::ExecutorDomain<crate::domain::fixtures::TestFamily>>,
+    crate::domain::StateBindings,
+    Ledger,
+) {
     use crate::domain::fixtures::{fixture_over, limits, tiny_definition, tiny_manifest};
     use crate::memory::ledger::CacheKind;
     let (mut domain, mut bindings) = fixture_over(

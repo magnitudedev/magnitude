@@ -4,6 +4,14 @@
 //! router-independent and reach models only through [`ServedModels`]; the
 //! service and the standalone engine each mount [`router`] with their own
 //! source.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 pub mod anthropic;
 pub mod chat;
 pub mod engine;

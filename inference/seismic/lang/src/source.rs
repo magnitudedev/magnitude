@@ -46,6 +46,12 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/metal/packets.h"),
     ),
     ("slab.h", include_str!("../native-library/metal/slab.h")),
+    ("forms.h", include_str!("../native-library/metal/forms.h")),
+    (
+        "activation.h",
+        include_str!("../native-library/metal/activation.h"),
+    ),
+    ("repack.h", include_str!("../native-library/metal/repack.h")),
     ("producers.h", include_str!(concat!(env!("OUT_DIR"), "/producers.h"))),
     ("tables.h", include_str!(concat!(env!("OUT_DIR"), "/tables.h"))),
     (
@@ -70,6 +76,18 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/cuda/rows16.cuh"),
     ),
     (
+        "gather.cuh",
+        include_str!("../native-library/cuda/gather.cuh"),
+    ),
+    (
+        "activation.cuh",
+        include_str!("../native-library/cuda/activation.cuh"),
+    ),
+    (
+        "repack.cuh",
+        include_str!("../native-library/cuda/repack.cuh"),
+    ),
+    (
         "element.glsl",
         include_str!("../native-library/vulkan/element.glsl"),
     ),
@@ -80,6 +98,14 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
     (
         "slab.glsl",
         include_str!("../native-library/vulkan/slab.glsl"),
+    ),
+    (
+        "activation.glsl",
+        include_str!("../native-library/vulkan/activation.glsl"),
+    ),
+    (
+        "repack.glsl",
+        include_str!("../native-library/vulkan/repack.glsl"),
     ),
     (
         "producers.glsl",

@@ -1,12 +1,11 @@
 import { Option } from "effect"
 import type { LocalInferenceHardware } from "@magnitudedev/sdk"
-import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import { deriveHardwareRoles } from "@magnitudedev/client-common"
 import { hardwarePresentation } from "../hardware-photos"
 import type { MachineView } from "./view"
 
-/** The machine card's view of the service's hardware report and the machine's identity. */
-export const machineView = (hardware: LocalInferenceHardware, identity: MachineIdentityObservation | null): MachineView => {
+/** The machine card's view of the service's hardware report, the machine's identity among it. */
+export const machineView = (hardware: LocalInferenceHardware): MachineView => {
   const domains = new Map(hardware.memoryDomains.map(domain => [domain.memoryDomainId, domain]))
   const gpus = hardware.accelerators.flatMap(accelerator => {
     const own = accelerator.executors.flatMap(executor => executor.memoryDomainIds)
@@ -19,7 +18,7 @@ export const machineView = (hardware: LocalInferenceHardware, identity: MachineI
     }]
   })
   const unified = hardware.memoryDomains.find(domain => domain.kind === "UnifiedMemory")
-  const presentation = hardwarePresentation(identity, gpus.map(gpu => gpu.name), hardware.processor)
+  const presentation = hardwarePresentation(hardware.identity, gpus.map(gpu => gpu.name), hardware.processor)
   return {
     name: Option.getOrElse(presentation.name, () => deriveHardwareRoles(hardware).machineName),
     chip: Option.getOrNull(hardware.processor),

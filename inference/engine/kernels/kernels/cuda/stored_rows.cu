@@ -1,11 +1,11 @@
 // Read directory-selected slots, rows16 rows of the table's resident
-// representation, through the rows16 decoders, a thread per value, and round
-// once to the activation element. Slot s is row s % P of record s / P, read
+// representation, through the gather decoders (<seismic/gather.cuh>), a
+// thread per value, and round once to the activation element. Slot s is row s % P of record s / P, read
 // where its storage holds the record (`records (slots)`).
-#define ROWS16_T SEISMIC_SLOTS
+#define KERNEL_T SEISMIC_SLOTS
 #include "lib/core/activation.cuh"
 #include "lib/core/gathered.cuh"
-#include <seismic/rows16.cuh>
+#include <seismic/gather.cuh>
 #include <seismic/slab.cuh>
 
 using element::u64;
@@ -28,6 +28,6 @@ extern "C" __global__ void stored_rows(SEISMIC_KERNEL_PARAMS) {
         }
         const u64 slot = (u64)held, per = SEISMIC_DIM_P;
         rows.put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-                 ROWS16_T_AT(slab::region(slots, slot / per)).value(slot % per, column));
+                 packets::gather_value(KERNEL_T_AT(slab::region(slots, slot / per)), slot % per, column));
     }
 }

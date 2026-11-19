@@ -30,13 +30,14 @@ extern "C" __global__ void copy_rows(SEISMIC_KERNEL_PARAMS) {
     rows.row((u64)destination_row, SEISMIC_PARAM_SLAB_ROWS, SEISMIC_ROWS_STRIDE_0)
         .move_stored(at, rows.view_row((u64)source_row, SEISMIC_PARAM_SLAB_ROWS, SEISMIC_ROWS_STRIDE_0).offset(at));
 #else
-    // An integer plane.
+    // An integer plane, of elements `unit` bytes each (its stride unit).
+    constexpr u64 unit = ELEMENT_STRIDE_BYTES(SEISMIC_ROWS);
     const unsigned int *table = reinterpret_cast<const unsigned int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROWS));
     const unsigned char *src = slab::row(table, (u64)source_row, SEISMIC_PARAM_SLAB_ROWS,
-        SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE);
+        SEISMIC_ROWS_STRIDE_0 * unit);
     unsigned char *dst = slab::row(table, (u64)destination_row, SEISMIC_PARAM_SLAB_ROWS,
-        SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE);
-    for (u64 byte = 0; byte < SEISMIC_ROWS_PACKET_SIZE; ++byte)
-        dst[at * SEISMIC_ROWS_PACKET_SIZE + byte] = src[at * SEISMIC_ROWS_PACKET_SIZE + byte];
+        SEISMIC_ROWS_STRIDE_0 * unit);
+    for (u64 byte = 0; byte < unit; ++byte)
+        dst[at * unit + byte] = src[at * unit + byte];
 #endif
 }

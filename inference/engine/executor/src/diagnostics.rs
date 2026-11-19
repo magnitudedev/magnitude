@@ -128,6 +128,7 @@ pub fn install() {
         WAKE.store(fds[1] as u64, Ordering::Relaxed);
         let reader = fds[0];
         seismic::threads::spawn("diagnostics", move || {
+            let mut scratch = stacks::Scratch::new();
             let mut byte = 0u8;
             // SAFETY: reading one byte into a local from the pipe's read end.
             while unsafe { libc::read(reader, (&mut byte as *mut u8).cast(), 1) } == 1 {
@@ -136,7 +137,7 @@ pub fn install() {
                     FAULTED => (2, Some(stacks::Fault::load())),
                     other => unreachable!("the diagnostics pipe carries {ASKED} or {FAULTED}, not {other}"),
                 };
-                stacks::write(out, fault.as_ref());
+                stacks::write(out, fault.as_ref(), &mut scratch);
                 write_all(out, format!("{}\n", report()).as_bytes());
                 // A fault report closes with why the process ends, where a
                 // panic ended it: a reader of its last lines (the service's

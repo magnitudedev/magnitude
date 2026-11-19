@@ -1,6 +1,7 @@
 // Ahead-of-step general-selection hints (`routed_hint_select`) on the `dense`
 // projection operator, segmented over `(next_router, after_router)` in the CPU
 // 8-lane reference order; segment 1 is zeroed when `AHEAD < 2`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_NEXT_ROUTER
 #define KERNEL_W1 SEISMIC_AFTER_ROUTER
 #include "lib/projection/operator.cuh"
@@ -44,7 +45,7 @@ extern "C" __global__ void routed_hint_select_ordered_gemv(SEISMIC_KERNEL_PARAMS
     const unsigned ordered_tiles = static_cast<unsigned>(
         projection::op::ordered_gemv_segmented_each<false, SEISMIC_DIM_H>(
             reinterpret_cast<projection::u8 *>(dynamic_shared), HintPro{raw0, raw1}, raw0, nullptr,
-            element::Out<element::Act>(nullptr), 0, 1, m, segs, zero_mask));
+            element::Out<activation::Act>(nullptr), 0, 1, m, segs, zero_mask));
     __shared__ unsigned last;
     unsigned *arrivals = reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS));
     if (!arrive::last(arrivals, ordered_tiles, &last))

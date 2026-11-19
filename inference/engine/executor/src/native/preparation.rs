@@ -1,4 +1,4 @@
-use super::specialization::{Specializer, Tuning};
+use super::specialization::{Specializer, Tuning, UntunedEntries};
 use super::readout::{ReadoutRecipe, RecipePreparation};
 use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
@@ -37,6 +37,7 @@ use super::tuning::{
         StateSpaceChunkTuning, StateSpaceOutputTuning, StateSpaceProjectTuning, StateSpaceState,
         StateSpaceStepTuning,
     },
+    vision::{VisionLinearTuning, VisionPatchStemTuning},
 };
 use super::*;
 use crate::operators::attention::pooled::Pooling;
@@ -107,8 +108,8 @@ pub(super) struct PreparationInputs<'a> {
     pub graph_demand: GraphInvocationDemand,
 }
 
-/// Prepare one entry that has no tuning case. Evaluates to `Option`: `None`
-/// during a count or a listing.
+/// Prepare one entry without tuning parameters ([`seismic::Untuned`]).
+/// Evaluates to `Option`: `None` during a count or a listing.
 macro_rules! fixed {
     ($spec:expr, $module:ident, $bindings:expr, $elements:expr) => {
         fixed!($spec, $module, $bindings, $elements, statics & [])
@@ -217,32 +218,24 @@ impl NativePreparationCache {
         } = inputs;
         let device = &charges.device();
         let began = std::time::Instant::now();
-        let recipe_states = ReadoutRecipeStates::default();
         let mut spec = Specializer::new(device);
         let import = imports(&mut spec, plan)?;
         let owner = AttestedPrograms::owner(charges)?;
-        let epsilon = epsilon(tuning.definition)?;
-        let invocations = invocation_demand(
-            device,
+        let objective = super::tuning::Objective::new(graph_demand.terms.clone());
+        let walks = Walks {
             plan,
-            load,
+            definition: tuning.definition,
             limits,
-            tuning,
-            selection_limits,
-            &graph_demand,
-            epsilon,
-            &recipe_states,
-        )?;
+            epsilon: epsilon(tuning.definition)?,
+            recipe_states: ReadoutRecipeStates::default(),
+            selection_limits: Some(selection_limits),
+            graph_demand: Some(Rc::new(graph_demand)),
+        };
+        let invocations = invocation_demand(&walks, device, load, objective)?;
         let demanded = began.elapsed();
         let forming = device.programs_formed();
         let (glue, target, head, shared_head, draft, vision, tuned, unprepared, readout_choices) = {
-            let mut preparation = Preparation::new(
-                plan,
-                tuning.definition,
-                limits,
-                epsilon,
-                recipe_states.clone(),
-                Some(selection_limits),
+            let mut preparation = walks.preparation(
                 spec,
                 Tuning::Tuner(Tuner::serve(
                     charges,
@@ -253,7 +246,6 @@ impl NativePreparationCache {
                     unprepared,
                 )),
             );
-            preparation.graph_demand = Some(graph_demand);
             let glue = preparation.walk(plan)?;
             let Preparation {
                 tuning,
@@ -317,6 +309,11 @@ impl NativePreparationCache {
     /// with its walk: the tuner, which borrows the import kernels, passes on
     /// to the next. No walk prepares the choices for serving: a load does,
     /// from the records. Returns every unit's outcome.
+    ///
+    /// The vision projections, whose objective term is their own, are
+    /// searched apart, after the text's units and within a tuning budget of
+    /// their own, as the second search of the one tuning run: the text's
+    /// search is the same with or without a vision program ([`Search`]).
     pub(super) fn search_programs(
         inputs: PreparationInputs<'_>,
     ) -> Result<Vec<TunedEntry>, CatalogFailure> {
@@ -331,104 +328,56 @@ impl NativePreparationCache {
             graph_demand,
         } = inputs;
         let device = &charges.device();
-        let recipe_states = ReadoutRecipeStates::default();
         // The search imports the weights its units measure through the
         // import kernels.
         let import = imports(&mut Specializer::new(device), plan)?;
-        let epsilon = epsilon(tuning.definition)?;
-        let invocations = invocation_demand(
-            device,
+        let objective = super::tuning::Objective::new(graph_demand.terms.clone());
+        let walks = Walks {
             plan,
-            load,
+            definition: tuning.definition,
             limits,
-            tuning,
-            selection_limits,
-            &graph_demand,
-            epsilon,
-            &recipe_states,
-        )?;
-        let mut tuner = Tuner::count(
+            epsilon: epsilon(tuning.definition)?,
+            recipe_states: ReadoutRecipeStates::default(),
+            selection_limits: Some(selection_limits),
+            graph_demand: Some(Rc::new(graph_demand)),
+        };
+        let invocations = invocation_demand(&walks, device, load, objective)?;
+        let mut formed = HashSet::new();
+        let mut rounds = |mut tuner, search: Search| {
+            // The search runs in rounds on one tuning clock and budget. A
+            // round whose search replaced a choice a dependant was counted
+            // at (`Tuner::stale`) is followed by one that counts it at the
+            // replacement and forms and searches it there; nothing else is
+            // counted again.
+            loop {
+                let (searched, round_formed) =
+                    walks.search_round(device, tuner, std::mem::take(&mut formed), search)?;
+                formed = round_formed;
+                if !searched.stale() {
+                    break Ok::<_, CatalogFailure>(searched);
+                }
+                tuner = searched.recount();
+            }
+        };
+        // One tuning run: the text search, then the vision search of a
+        // model that sees images, each within the tuning budget from when it
+        // begins, on one clock whose progress is over both.
+        let searches = if plan.vision().is_some() { 2 } else { 1 };
+        let tuner = Tuner::count(
             charges,
             tuning,
             limits,
             TuningWeights::new(charges, load, tuning.weights, &import),
             invocations,
         )
-        .held_to(room);
-        let mut formed = HashSet::new();
-        // The search runs in rounds on one tuning clock and budget. A round
-        // whose search replaced a choice a dependant was counted at
-        // (`Tuner::stale`) is followed by one that counts it at the
-        // replacement and forms and searches it there; nothing else is
-        // counted again.
-        let searched = loop {
-            // The count also collects every entry without tuning
-            // parameters: the mandatory phase forms them with the units'
-            // canonical programs, so a load after the search forms nothing
-            // the search did not.
-            let (counted, untuned) = {
-                let mut count = Preparation::new(
-                    plan,
-                    tuning.definition,
-                    limits,
-                    epsilon,
-                    recipe_states.clone(),
-                    Some(selection_limits),
-                    Specializer::count_untuned(device, formed),
-                    Tuning::Tuner(tuner),
-                );
-                count.graph_demand = Some(graph_demand.clone());
-                count.walk(plan)?;
-                let Preparation { spec, tuning, .. } = count;
-                (tuning.into_tuner(), spec.into_untuned())
-            };
-            formed = untuned.formed();
-            let censused = {
-                let mut census = Preparation::new(
-                    plan,
-                    tuning.definition,
-                    limits,
-                    epsilon,
-                    recipe_states.clone(),
-                    Some(selection_limits),
-                    Specializer::count(device),
-                    Tuning::Tuner(counted.census(untuned)?),
-                );
-                census.graph_demand = Some(graph_demand.clone());
-                census.walk(plan)?;
-                census.tuning.into_tuner()
-            };
-            let searched = censused.search()?;
-            // A development survey measures the units it owns in the search's
-            // process, after the round's search: one walk that forms nothing
-            // and reads every settled unit's published choice, before checking
-            // whether a prerequisite's choice left a dependant stale.
-            #[cfg(feature = "tuning-survey")]
-            let searched = if !super::tuning::survey::installed() {
-                searched
-            } else {
-                let mut survey = Preparation::new(
-                    plan,
-                    tuning.definition,
-                    limits,
-                    epsilon,
-                    recipe_states.clone(),
-                    Some(selection_limits),
-                    Specializer::count(device),
-                    Tuning::Tuner(searched),
-                );
-                survey.graph_demand = Some(graph_demand.clone());
-                survey.walk(plan)?;
-                survey.tuning.into_tuner()
-            };
-            if !searched.stale() {
-                break searched;
-            }
-            tuner = searched.recount();
-        };
+        .held_to(room)
+        .searches(searches);
+        let mut searched = rounds(tuner, Search::Text)?;
+        if plan.vision().is_some() {
+            searched = rounds(searched.next_search(), Search::Vision)?;
+        }
         // The tuner borrows the import kernels: it ends here, before them.
-        let tuned = searched.conclude();
-        Ok(tuned)
+        Ok(searched.conclude())
     }
 }
 
@@ -437,39 +386,23 @@ impl NativePreparationCache {
 /// under the same settings, so every key it records is the key the tuner
 /// looks up. Physical weight provenance is absent from this map's role and
 /// frequency decisions.
-#[allow(clippy::too_many_arguments)]
 fn invocation_demand(
+    walks: &Walks<'_>,
     device: &Device,
-    plan: &ProgramPlan,
     load: &ModelLoadPlan,
-    limits: TuningLimits,
-    tuning: TuningContext<'_>,
-    selection_limits: crate::ResourceLimits,
-    graph_demand: &GraphInvocationDemand,
-    epsilon: f32,
-    recipe_states: &ReadoutRecipeStates,
+    objective: super::tuning::Objective,
 ) -> Result<super::specialization::InvocationDemand, CatalogFailure> {
-    let mut demand = Preparation::new(
-        plan,
-        tuning.definition,
-        limits,
-        epsilon,
-        recipe_states.clone(),
-        Some(selection_limits),
+    let model = ModelInputs {
+        definition: walks.definition,
+        limits: walks.limits,
+        load,
+    };
+    let (_, demand) = walks.walk(
         Specializer::count(device),
-        Tuning::demand(
-            ModelInputs {
-                definition: tuning.definition,
-                limits,
-                load,
-            },
-            device,
-            super::tuning::Objective::new(graph_demand.terms.clone()),
-        ),
-    );
-    demand.graph_demand = Some(graph_demand.clone());
-    demand.walk(plan)?;
-    Ok(demand.tuning.into_invocations())
+        Tuning::demand(model, device, objective),
+        None,
+    )?;
+    Ok(demand.into_invocations())
 }
 
 /// The requests of the native kernels preparing `plan` on `backend` prepares,
@@ -484,24 +417,26 @@ pub(crate) fn kernel_requests(
 ) -> Result<Vec<KernelRequest>, CatalogFailure> {
     let mut spec = Specializer::list(backend);
     imports(&mut spec, plan)?;
-    let mut listing = Preparation::new(
+    let walks = Walks {
         plan,
         definition,
         limits,
-        epsilon(definition)?,
-        ReadoutRecipeStates::default(),
-        None,
+        epsilon: epsilon(definition)?,
+        recipe_states: ReadoutRecipeStates::default(),
+        selection_limits: None,
+        graph_demand: None,
+    };
+    let (spec, _) = walks.walk(
         spec,
         Tuning::Listing(ModelInputs {
             definition,
             limits,
             load,
         }),
-    );
-    listing.walk(plan)?;
+        None,
+    )?;
     let mut seen = HashSet::new();
-    Ok(listing
-        .spec
+    Ok(spec
         .into_requests()
         .into_iter()
         .filter(|request| seen.insert(request.clone()))
@@ -594,9 +529,147 @@ fn selected_row_classes(bound: usize) -> Vec<u64> {
         .collect()
 }
 
+/// What every walk of one preparation shares: the program and model it
+/// walks, the settings each walk is prepared under, and the launches a
+/// tuned walk's units are weighed by. The one maker of a [`Preparation`].
+struct Walks<'p> {
+    plan: &'p ProgramPlan,
+    definition: &'p ModelDefinition,
+    limits: TuningLimits,
+    epsilon: f32,
+    recipe_states: ReadoutRecipeStates,
+    selection_limits: Option<crate::ResourceLimits>,
+    /// None for a listing, which weighs nothing.
+    graph_demand: Option<Rc<GraphInvocationDemand>>,
+}
+
+impl Walks<'_> {
+    /// The preparation of one walk under `spec` and `tuning`.
+    fn preparation<'a>(&self, spec: Specializer<'a>, tuning: Tuning<'a>) -> Preparation<'a> {
+        Preparation {
+            limits: self.limits,
+            graph_demand: self.graph_demand.clone(),
+            spec,
+            tuning,
+            recipe_states: self.recipe_states.clone(),
+            selection_limits: self.selection_limits,
+            readout_choices: Vec::new(),
+            readout_packed: HashSet::new(),
+            epsilon: self.epsilon,
+            hidden: self.definition.decoder.hidden,
+            vocabulary: self.definition.decoder.vocabulary,
+            target: TargetKernels::default(),
+            resident_routes: HashMap::new(),
+            resident_selects: HashMap::new(),
+            resident_outputs: HashMap::new(),
+            resident_downs: HashMap::new(),
+            head: self.plan.head().map(|_| HeadKernels::default()),
+            shared_head: self.plan.shared_head().map(|_| SharedHeadKernels::default()),
+            draft: self.plan.draft().map(|_| DraftKernels::default()),
+            vision: self.plan.vision().map(|_| VisionKernels::default()),
+            search: None,
+        }
+    }
+
+    /// One walk that keeps none of the kernels it meets: its specializer
+    /// and tuning, walked over the entries of `search`, or every entry.
+    fn walk<'a>(
+        &self,
+        spec: Specializer<'a>,
+        tuning: Tuning<'a>,
+        search: Option<Search>,
+    ) -> Result<(Specializer<'a>, Tuning<'a>), CatalogFailure> {
+        let mut preparation = self.preparation(spec, tuning);
+        preparation.search = search;
+        match search {
+            None | Some(Search::Text) => preparation.walk(self.plan).map(drop)?,
+            Some(Search::Vision) => preparation.vision(self.plan)?,
+        }
+        let Preparation { spec, tuning, .. } = preparation;
+        Ok((spec, tuning))
+    }
+
+    /// One round of the search, each of its walks in a frame of its own:
+    /// the count, which also collects every entry without tuning parameters
+    /// but those of `formed`; the census; the search of the censused units;
+    /// and, with a development survey installed, the survey; each over the
+    /// entries of `search`. Returns the searched tuner and every entry formed
+    /// by this round or those before.
+    fn search_round<'a>(
+        &self,
+        device: &'a Device,
+        tuner: Tuner<'a>,
+        formed: HashSet<KernelRequest>,
+        search: Search,
+    ) -> Result<(Tuner<'a>, HashSet<KernelRequest>), CatalogFailure> {
+        let (counted, untuned) = self.count(device, tuner, formed, search)?;
+        let formed = untuned.formed();
+        let searched = self.census(device, counted, untuned, search)?.search()?;
+        #[cfg(feature = "tuning-survey")]
+        let searched = if !super::tuning::survey::installed() {
+            searched
+        } else {
+            self.survey(device, searched, search)?
+        };
+        Ok((searched, formed))
+    }
+
+    /// A round's count: it also collects every entry without tuning
+    /// parameters but those of `formed`, which the mandatory phase forms
+    /// with the units' canonical programs, so a load after the search forms
+    /// nothing the search did not.
+    fn count<'a>(
+        &self,
+        device: &'a Device,
+        tuner: Tuner<'a>,
+        formed: HashSet<KernelRequest>,
+        search: Search,
+    ) -> Result<(Tuner<'a>, UntunedEntries<'a>), CatalogFailure> {
+        let (spec, tuning) = self.walk(
+            Specializer::count_untuned(device, formed),
+            Tuning::Tuner(tuner),
+            Some(search),
+        )?;
+        Ok((tuning.into_tuner(), spec.into_untuned()))
+    }
+
+    /// A round's census of the units with optional work, once the count's
+    /// mandatory phase formed `untuned` and every unit's canonical default.
+    fn census<'a>(
+        &self,
+        device: &Device,
+        counted: Tuner<'a>,
+        untuned: UntunedEntries<'a>,
+        search: Search,
+    ) -> Result<Tuner<'a>, CatalogFailure> {
+        let (_, tuning) = self.walk(
+            Specializer::count(device),
+            Tuning::Tuner(counted.census(untuned)?),
+            Some(search),
+        )?;
+        Ok(tuning.into_tuner())
+    }
+
+    /// A development survey measures the units it owns in the search's
+    /// process, after the round's search: one walk that forms nothing and
+    /// reads every settled unit's published choice, before the search checks
+    /// whether a prerequisite's choice left a dependant stale.
+    #[cfg(feature = "tuning-survey")]
+    fn survey<'a>(
+        &self,
+        device: &Device,
+        searched: Tuner<'a>,
+        search: Search,
+    ) -> Result<Tuner<'a>, CatalogFailure> {
+        let (_, tuning) =
+            self.walk(Specializer::count(device), Tuning::Tuner(searched), Some(search))?;
+        Ok(tuning.into_tuner())
+    }
+}
+
 struct Preparation<'a> {
     limits: TuningLimits,
-    graph_demand: Option<GraphInvocationDemand>,
+    graph_demand: Option<Rc<GraphInvocationDemand>>,
     spec: Specializer<'a>,
     tuning: Tuning<'a>,
     recipe_states: ReadoutRecipeStates,
@@ -628,43 +701,25 @@ struct Preparation<'a> {
     shared_head: Option<SharedHeadKernels>,
     draft: Option<DraftKernels>,
     vision: Option<VisionKernels>,
+    /// The search whose units the walk prepares; none for a walk of every
+    /// entry (a load's, a demand walk or a listing).
+    search: Option<Search>,
+}
+
+/// One search of the units of a load. The vision projections tune by an
+/// objective term of their own, so they are searched apart from the text's
+/// units, after them and within a tuning budget of their own
+/// (`search_programs`): the text's search is the same with or without a
+/// vision program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Search {
+    /// Every entry but the vision projections.
+    Text,
+    /// The vision projections alone.
+    Vision,
 }
 
 impl<'a> Preparation<'a> {
-    fn new(
-        plan: &ProgramPlan,
-        definition: &ModelDefinition,
-        limits: TuningLimits,
-        epsilon: f32,
-        recipe_states: ReadoutRecipeStates,
-        selection_limits: Option<crate::ResourceLimits>,
-        spec: Specializer<'a>,
-        tuning: Tuning<'a>,
-    ) -> Self {
-        Self {
-            limits,
-            graph_demand: None,
-            spec,
-            tuning,
-            recipe_states,
-            selection_limits,
-            readout_choices: Vec::new(),
-            readout_packed: HashSet::new(),
-            epsilon,
-            hidden: definition.decoder.hidden,
-            vocabulary: definition.decoder.vocabulary,
-            target: TargetKernels::default(),
-            resident_routes: HashMap::new(),
-            resident_selects: HashMap::new(),
-            resident_outputs: HashMap::new(),
-            resident_downs: HashMap::new(),
-            head: plan.head().map(|_| HeadKernels::default()),
-            shared_head: plan.shared_head().map(|_| SharedHeadKernels::default()),
-            draft: plan.draft().map(|_| DraftKernels::default()),
-            vision: plan.vision().map(|_| VisionKernels::default()),
-        }
-    }
-
     /// Store `scope` as its planes when its head admits them and the
     /// backend has their kernels (`super::readout`): this reader's
     /// selections of up to the backend's `certified_rows` run the certified
@@ -3822,19 +3877,26 @@ impl<'a> Preparation<'a> {
             .expect("a draft plan creates the draft group")
     }
 
+    /// The vision group's kernels, which a vision plan creates.
+    fn vision_kernels(&mut self) -> &mut VisionKernels {
+        self.vision.as_mut().expect("a vision plan creates the vision group")
+    }
+
     fn vision(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
-        if let Some(demand) = &self.graph_demand {
-            self.tuning.set_invocations(demand.target.clone(), true);
-        }
         let Some(vision_plan) = plan.vision() else {
             return Ok(());
         };
-        let spec = &mut self.spec;
-        let vision = self
-            .vision
-            .as_mut()
-            .expect("a vision plan creates the vision group");
+        let geometry = vision_plan.geometry();
         for kernel in vision_plan.kernels() {
+            let projects = matches!(kernel.entry, VisionEntry::PatchStem | VisionEntry::Linear);
+            let walked = match self.search {
+                None => true,
+                Some(Search::Text) => !projects,
+                Some(Search::Vision) => projects,
+            };
+            if !walked {
+                continue;
+            }
             let label = format!("{kernel:?}");
             let statics = kernel.statics.as_slice();
             macro_rules! element {
@@ -3845,23 +3907,36 @@ impl<'a> Preparation<'a> {
             macro_rules! prepare {
                 ($module:ident, $map:ident, $elements:expr) => {{
                     let elements = $elements;
-                    if let Some(native) = fixed!(spec, $module, label, elements, statics & statics)
+                    if let Some(native) =
+                        fixed!(self.spec, $module, label, elements, statics & statics)
                     {
-                        vision.$map.insert(kernel.clone(), native);
+                        self.vision_kernels().$map.insert(kernel.clone(), native);
+                    }
+                }};
+            }
+            // A projecting entry's kernels by rows (`Self::projection`). Its
+            // demand is each image term's image: one launch per invocation,
+            // at the rows the invocation takes.
+            macro_rules! project {
+                ($map:ident, $case:ident) => {{
+                    let projections = vision_plan.projections(kernel);
+                    if let Some(demand) = &self.graph_demand {
+                        let calls = demand.image_launches(|cells| {
+                            projections
+                                .iter()
+                                .map(|projection| geometry.rows(projection.rows, cells))
+                                .collect()
+                        });
+                        self.tuning.set_invocations(calls, false);
+                    }
+                    let case = $case::new(kernel, projections, geometry)?;
+                    if let Some(kernels) = self.projection(case)? {
+                        self.vision_kernels().$map.insert(kernel.clone(), kernels);
                     }
                 }};
             }
             match kernel.entry {
-                VisionEntry::PatchStem => prepare!(
-                    vision_patch_stem,
-                    patch_stem,
-                    vision_patch_stem::Elements {
-                        W0: element!(vision_patch_stem, "W0"),
-                        W1: element!(vision_patch_stem, "W1"),
-                        B: element!(vision_patch_stem, "B"),
-                        PE: element!(vision_patch_stem, "PE"),
-                    }
-                ),
+                VisionEntry::PatchStem => project!(patch_stem, VisionPatchStemTuning),
                 VisionEntry::Norm => prepare!(
                     vision_norm,
                     norm,
@@ -3871,16 +3946,7 @@ impl<'a> Preparation<'a> {
                         Y: element!(vision_norm, "Y"),
                     }
                 ),
-                VisionEntry::Linear => prepare!(
-                    vision_linear,
-                    linear,
-                    vision_linear::Elements {
-                        A: element!(vision_linear, "A"),
-                        W: element!(vision_linear, "W"),
-                        B: element!(vision_linear, "B"),
-                        Y: element!(vision_linear, "Y"),
-                    }
-                ),
+                VisionEntry::Linear => project!(linear, VisionLinearTuning),
                 VisionEntry::Clamp => prepare!(
                     vision_clamp,
                     clamp,

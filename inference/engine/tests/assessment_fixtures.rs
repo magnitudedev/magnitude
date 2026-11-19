@@ -19,7 +19,8 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::{
-    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, HeldBound, PlanError, PlanPrices, PlanRoom, StableRoom, WeightBound,
+    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, ExpertBankPlan, HeldBound, PlanError, PlanPrices, PlanRoom, StableRoom,
+    WeightBound,
     assessment::{AssessmentError, ColdSource, ExecutionFit, ExpertShares, Priced, Residency, execution_memory_charge, synthetic},
     platform::{DeviceRequest, DomainRole, ReleaseRate},
 };
@@ -575,11 +576,12 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
         },
         standard_service_limits(),
     );
-    let PreparedModelAssessment::Planned { definition, execution, .. } = prepare_model_assessment(&package, &setup.structure)
+    let PreparedModelAssessment::Planned { execution, .. } = prepare_model_assessment(&package, &setup.structure)
         .unwrap_or_else(|error| panic!("operational failure: {error}"))
     else {
         panic!("Qwen3.6 35B is planned streamed on the RTX 3090 under the cap");
     };
+    let definition = execution.definition();
     let draft = execution.draft();
     let bank = draft.load().expert_bank().expect("a capped load streams").clone();
     let conveyor = bank.conveyor();
@@ -593,7 +595,7 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
             .load()
             .clone()
             .unbanked()
-            .with_expert_bank(&definition, slots, bank.places, bank.flights, bank.substrate())
+            .with_expert_bank(&definition, slots, Some(bank.window_slots()), bank.places, bank.flights, bank.substrate())
             .unwrap()
             .weight_bytes()
             .unwrap()
@@ -630,25 +632,29 @@ fn a_capped_streamed_load_fits_with_its_graphs_priced() {
     for backend in [BackendName::Cuda, BackendName::Vulkan] {
         let policy = ModelPolicy { weight_bound: Some(WeightBound::Cap(6_890_894_474)), ..ModelPolicy::default() };
         let setup = rtx3090_setup(backend, ReleaseRate::of_machine(None), policy, standard_service_limits());
-        let (definition, execution) = match prepare_model_assessment(&package, &setup.structure) {
-            Ok(PreparedModelAssessment::Planned { definition, execution, .. }) => (definition, execution),
+        let execution = match prepare_model_assessment(&package, &setup.structure) {
+            Ok(PreparedModelAssessment::Planned { execution, .. }) => execution,
             Ok(PreparedModelAssessment::Unsupported { unsupported, .. }) => {
                 panic!("{backend:?}: Qwen3.6 35B streams on the RTX 3090 under the cap: {unsupported:?}")
             }
             Err(error) => panic!("{backend:?}: Qwen3.6 35B is planned on the RTX 3090 under the cap: {error}"),
         };
         assert!(execution.draft().load().expert_bank().is_some(), "{backend:?}: a capped load streams");
-        let charge = execution.memory_charge(&definition, setup.structure.selected.graph_cost).unwrap();
+        let charge = execution.memory_charge(execution.definition(), setup.structure.selected.graph_cost).unwrap();
         let graphs = charge.bounds.recorded_graph_bytes;
         assert!(0 < graphs && graphs < charge.allocation_bytes / 8, "{backend:?}: startup graphs {graphs} bytes");
     }
 }
 
-/// A weight cap grants the largest expert bank its weights hold, each
-/// bank's weights the plan's own at its slots: a cap of them grants that
-/// bank, a byte fewer the bank a slot smaller, and a byte below the floor's
-/// none, a configuration refusal. Qwen3.6 35B on the M4 Pro's Metal, at the floor and at 128 and
-/// 240 slots.
+/// A weight cap grants the largest expert bank its weights hold at any
+/// scratch window of the bank's ladder, each bank's weights the plan's own
+/// at its slots and window: the granted bank holds at least its window's
+/// floor and its weights are within the cap, and no rung holds a slot more
+/// within it (a rung whose floor is above that, or a bank of every expert,
+/// holds none); a byte below the floor's weights grants none, a
+/// configuration refusal. Qwen3.6 35B on the M4 Pro's Metal, under caps of
+/// the floor bank's weights at the floor and at 128 and 240 slots, and a
+/// byte fewer.
 #[test]
 fn a_weight_cap_grants_the_largest_bank_it_holds() {
     let scratch = Scratch::new("qwen36-weight-cap");
@@ -670,12 +676,10 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
         prepare_model_assessment(&package, &setup.structure)
     };
     let prepare = |weight_cap| assess(weight_cap).unwrap_or_else(|error| panic!("operational failure: {error}"));
-    let PreparedModelAssessment::Planned {
-        definition, execution, ..
-    } = prepare(None)
-    else {
+    let PreparedModelAssessment::Planned { execution, .. } = prepare(None) else {
         panic!("Qwen3.6 35B is planned resident");
     };
+    let definition = execution.definition();
     let draft = execution.draft();
     let Err(PlanError::WeightBound {
         needed: floor_weights,
@@ -687,22 +691,32 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     let floor = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(floor_weights)), &synthetic_prices()).unwrap().into_draft();
     let bank = floor.load().expert_bank().unwrap().clone();
     assert_eq!(bank.slots, bank.floor());
-    // A bank's weights at `slots`, its record tensors reserved as the
-    // device reserves.
-    let weights = |slots: u64| {
+    // The load with `bank`'s structure at `slots` and `window_slots`, its
+    // record tensors reserved as the device reserves, and its weights.
+    let banked = |bank: &ExpertBankPlan, slots: u64, window_slots: u64| {
         draft
             .load()
             .clone()
             .unbanked()
-            .with_expert_bank(&definition, slots, bank.places, bank.flights, bank.substrate())
-            .unwrap()
-            .weight_bytes()
+            .with_expert_bank(&definition, slots, Some(window_slots), bank.places, bank.flights, bank.substrate())
             .unwrap()
     };
-    assert_eq!(weights(bank.floor()), floor_weights);
+    let weights = |bank: &ExpertBankPlan, slots: u64, window_slots: u64| banked(bank, slots, window_slots).weight_bytes().unwrap();
+    // Every rung of the ladder the plan walks, from the window of a bank of
+    // every expert, with that rung's floor.
+    let experts = bank.widest().get();
+    let rungs = banked(&bank, experts, experts)
+        .expert_bank()
+        .unwrap()
+        .window_ladder()
+        .into_iter()
+        .map(|window| (window, banked(&bank, experts, window).expert_bank().unwrap().floor()))
+        .collect::<Vec<_>>();
+    assert_eq!(weights(&bank, bank.floor(), bank.window_slots()), floor_weights);
+    // The bank a cap grants, at the window the plan settles on for it.
     let granted = |cap: u64| match prepare(Some(cap)) {
         PreparedModelAssessment::Planned { execution, .. } => {
-            execution.draft().load().expert_bank().expect("a capped load streams").slots
+            execution.draft().load().expert_bank().expect("a capped load streams").clone()
         }
         PreparedModelAssessment::Unsupported { unsupported, .. } => {
             panic!("a cap of {cap} bytes: {unsupported:?}")
@@ -715,10 +729,25 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
         Err(ModelAssessmentError::WeightBound(error)) if error.needed == floor_weights
     ));
     for slots in [bank.floor(), 128, 240] {
-        let cap = weights(slots);
-        assert_eq!(granted(cap), slots, "a cap of {cap} bytes");
-        if slots > bank.floor() {
-            assert_eq!(granted(cap - 1), slots - 1, "a cap of {} bytes", cap - 1);
+        let cap = weights(&bank, slots, bank.window_slots());
+        for cap in [cap, cap - 1].into_iter().filter(|&cap| cap >= floor_weights) {
+            let grant = granted(cap);
+            let (held, window) = (grant.slots, grant.window_slots());
+            assert!(rungs.iter().any(|&(rung, _)| rung == window), "a cap of {cap} bytes settles on window {window}, a rung");
+            assert!(grant.floor() <= held && held <= grant.ceiling, "a cap of {cap} bytes grants {held} slots");
+            assert!(weights(&grant, held, window) <= cap, "a cap of {cap} bytes grants {held} slots beyond it");
+            for &(rung, rung_floor) in &rungs {
+                let more = held + 1;
+                // A bank of every expert holds no slot more, and a rung
+                // whose floor is above it holds none of that size.
+                if more > experts || more < rung_floor {
+                    continue;
+                }
+                assert!(
+                    weights(&grant, more, rung) > cap,
+                    "a cap of {cap} bytes grants {held} slots at window {window}, but window {rung} holds {more}"
+                );
+            }
         }
     }
 }
@@ -747,9 +776,10 @@ fn a_linked_bank_streams_only_beside_its_tiers_landing_reserve() {
     // The structure is prepared whatever the room; a plan of it settles
     // its tier into the host's room, here none.
     let roomless = prepare(Some(0));
-    let PreparedModelAssessment::Planned { definition, execution, .. } = roomless else {
+    let PreparedModelAssessment::Planned { execution, .. } = roomless else {
         panic!("a capped load is prepared from its structure");
     };
+    let definition = execution.definition();
     let draft = execution.draft().clone();
     let Err(PlanError::Unstreamed(reason)) = draft.with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(6_890_894_474)), &synthetic_prices()) else {
         panic!("no host room leaves the experts unstreamed");
@@ -775,7 +805,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
         let prepared = prepare_model_assessment(&package, &setup.structure)
             .unwrap_or_else(|error| panic!("operational failure: {error}"));
         match prepared {
-            PreparedModelAssessment::Planned { definition, execution, .. } => (setup, definition, execution.draft().clone()),
+            PreparedModelAssessment::Planned { execution, .. } => (setup, execution.definition().clone(), execution.draft().clone()),
             PreparedModelAssessment::Unsupported { unsupported, .. } => {
                 panic!("Qwen3.6 35B streams on the RTX 3090 under the cap: {unsupported:?}")
             }
@@ -938,9 +968,10 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     let mut setup = rtx3090_setup(BackendName::Cuda, ReleaseRate::of_machine(None), ModelPolicy::default(), standard_service_limits());
     setup.measurements = synthetic_measurements();
     let prepared = prepare_model_assessment(&package, &setup.structure).unwrap_or_else(|error| panic!("operational failure: {error}"));
-    let PreparedModelAssessment::Planned { definition, execution, .. } = &prepared else {
+    let PreparedModelAssessment::Planned { execution, .. } = &prepared else {
         panic!("Qwen3.6 35B is planned on the RTX 3090");
     };
+    let definition = execution.definition();
     let draft = execution.draft();
     let structure = &setup.structure;
     let device = structure.topology.resolve(draft.device().selector()).unwrap();
@@ -1115,9 +1146,10 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));
     assert!(shares.floor() <= shares.slots() && shares.slots() < shares.experts().get());
     assert!(shares.floor_share() <= shares.share() && shares.share() < 1.0);
-    let PreparedModelAssessment::Planned { definition, execution, .. } = &prepared else {
+    let PreparedModelAssessment::Planned { execution, .. } = &prepared else {
         unreachable!("the model was assessed");
     };
+    let definition = execution.definition();
     let draft = execution.draft();
     let Err(PlanError::WeightBound { needed: floor_weights, .. }) =
         draft.clone().with_bank::<AssessmentMemoryCharge>(definition, Some(WeightBound::Cap(0)), &synthetic_prices())

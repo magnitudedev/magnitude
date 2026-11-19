@@ -414,22 +414,15 @@ impl<'a> Specializer<'a> {
         }
     }
 
-    /// Prepare an entry without tuning parameters; `None` during a count or
-    /// a listing.
-    pub fn fixed<E: Entry>(
+    /// Prepare an entry without tuning parameters on any backend
+    /// ([`seismic::Untuned`]); `None` during a count or a listing.
+    pub fn fixed<E: seismic::Untuned>(
         &mut self,
         bindings: &str,
         values: &[(&str, u64)],
         entry: BoundEntry<E>,
     ) -> Result<Option<NativeKernel<E>>, CatalogFailure> {
         let implementation = self.implementation(&entry, bindings)?;
-        if implementation.has_tuning_parameters() {
-            return Err(failure(
-                E::NAME,
-                bindings,
-                "the implementation declares tuning parameters, but its call site registers no tuning case".into(),
-            ));
-        }
         let specialization = domain_statics(implementation, E::NAME, bindings, values)?;
         if let Mode::CountUntuned(device, untuned) = &mut self.mode {
             untuned.add(*device, entry, bindings, specialization);

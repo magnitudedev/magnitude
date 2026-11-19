@@ -12,10 +12,10 @@
 // channel 0 beta = sigmoid(b).
 void recurrent_row_gates(recurrent_inputs in_, uint64_t row, uint head, uint channel, out float beta,
     out float decay) {
-    beta = channel == 0u ? seismic_div_rn(1.0, 1.0 + exp(-element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_BETA),
+    beta = channel == 0u ? seismic_div_rn(1.0, 1.0 + exp(-element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_BETA),
         row * SEISMIC_BETA_STRIDE_0 + uint64_t(head) * SEISMIC_BETA_STRIDE_1))) : 0.0;
     const uint index = head * RECURRENT_W + channel;
-    const float a = element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_DECAY),
+    const float a = element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_DECAY),
         row * SEISMIC_DECAY_STRIDE_0 + uint64_t(index) * SEISMIC_DECAY_STRIDE_1);
     const float shifted = a + element_f32_at(in_.time_bias + uint64_t(index) * SEISMIC_TIME_BIAS_STRIDE_0 * 4ul);
     const float rate = element_f32_at(in_.rate + uint64_t(head) * SEISMIC_RATE_STRIDE_0 * 4ul);
@@ -24,5 +24,5 @@ void recurrent_row_gates(recurrent_inputs in_, uint64_t row, uint head, uint cha
 
 // z column `column` of the gate row `row`.
 float recurrent_gate_input(recurrent_inputs in_, uint64_t row, uint64_t column) {
-    return element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_GATE), row * SEISMIC_GATE_STRIDE_0 + column);
+    return element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_GATE), row * SEISMIC_GATE_STRIDE_0 + column);
 }

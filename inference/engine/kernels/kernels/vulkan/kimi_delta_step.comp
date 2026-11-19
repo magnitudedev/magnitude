@@ -9,6 +9,7 @@
 // `kimi_delta_step_gate` then gates each (head, row) from the gate operand
 // (`recurrent_gate`: the GEMV staging's lane order to 8 rows, the staging
 // launch's order beyond). ROWS and WARPS never change result bits.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/kimi.glsl"
 
 #if SEISMIC_TUNE_ROWS > RECURRENT_MAX_ROWS

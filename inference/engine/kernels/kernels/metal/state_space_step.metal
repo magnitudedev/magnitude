@@ -8,6 +8,7 @@
 // overlaps the state traffic. Grid z = B zeroes the mixed rows no slot
 // covers. ROWS never changes bits, and `state_space_chunk` gives its short
 // slots the same bits.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define SSS_LANE_ROWS (SEISMIC_TUNE_ROWS / 4)
 // Rows whose inputs are staged at once: 8 KiB each of B and C.
 #define SSS_SPAN (2048 / SEISMIC_DIM_N)
@@ -42,7 +43,7 @@ kernel void state_space_step(
     threadgroup float delta_block[SSS_SPAN];
     threadgroup float decay_block[SSS_SPAN];
     const state_space::Operands in{projection, convolution, convolution_bias, rate, time_bias, skip, window, state,
-        tape, element::Out<element::Act>(mixed), seismic_words};
+        tape, element::Out<activation::Act>(mixed), seismic_words};
     const versions::Slots slots{segments, stop, previous_bank, previous_tape, following_bank};
     const uint head = group.x;
     const ulong block_row0 = ulong(group.y) * SEISMIC_TUNE_ROWS;

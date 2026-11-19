@@ -3,9 +3,10 @@
 // (`lib/routed/output_sum.cuh`) a thread a channel of a row over the
 // published projections of `routed_output_project`, its block waiting for
 // the CPU's answer (`lib/routed/sited.cuh`) before it joins.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/routed/routed.cuh"
 #include "lib/routed/sited.cuh"
-#define ROUTED_PUBLISHED reinterpret_cast<const element::Act::storage *>(SEISMIC_PTR(SEISMIC_BUFFER_PUBLISHED))
+#define ROUTED_PUBLISHED reinterpret_cast<const activation::Act::storage *>(SEISMIC_PTR(SEISMIC_BUFFER_PUBLISHED))
 #include "lib/routed/output_sum.cuh"
 
 // Thread (n, m): row m's channel n.

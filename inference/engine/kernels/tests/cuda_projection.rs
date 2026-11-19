@@ -230,17 +230,20 @@ fn grouped_project_rows_match_host_model(format: Format) {
         },
     );
     for o in ROWS {
+        if format.operands == OperandRecipe::Nvfp4Rows {
+            assert!(
+                candidates(o)
+                    .iter()
+                    .all(|&mapping| !projection.admits(&device, mapping)),
+                "{format:?} O={o}: a grouped NVFP4-operand projection is refused"
+            );
+            continue;
+        }
         let source: Vec<f32> = (0..o * groups * k)
             .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
             .collect();
         let source_tensor = bf16_tensor(&device, &[o as u64, (groups * k) as u64], &source);
-        let mappings = mappings("project_rows", o, |mapping| projection.admits(&device, mapping));
-        assert_eq!(
-            mappings.is_empty(),
-            format.operands == OperandRecipe::Nvfp4Rows,
-            "{format:?} O={o}: grouped mappings"
-        );
-        for mapping in mappings {
+        for mapping in mappings("project_rows", o, |mapping| projection.admits(&device, mapping)) {
             let mut expected = vec![0.0; o * groups * n];
             let mut tolerance = vec![0.0; o * groups * n];
             for group in 0..groups {
@@ -278,7 +281,8 @@ fn grouped_project_rows_match_host_model(format: Format) {
 /// CUDA's INT8 staging (`stage_row_s8`) codes every activation group by the
 /// CPU's rule: weights that read one column each (`int8_rule::probe_blocks`)
 /// make each output its column's `d * code`, which matches the CPU's on
-/// ties, their BF16 neighbours, subnormal scales, zero and NaN groups.
+/// ties, their BF16 neighbours, subnormal scales, zero groups and groups
+/// with a NaN or ±Inf (every output NaN).
 #[test]
 fn cuda_int8_activations_follow_the_cpu_rule() {
     let Some(device) = cuda() else { return };
@@ -311,7 +315,7 @@ fn cuda_int8_activations_follow_the_cpu_rule() {
     let mapping = GEMM_MAPPINGS[1];
     assert!(mapping.quantizes() && projection.admits(&device, mapping));
     for (at, groups) in int8_rule::blocks().chunks(SMALL_GEMM_ROWS).enumerate() {
-        let rows = groups.len().max(GEMV_ROWS + 1);
+        let rows = groups.len().max(bound::gemv_rows(BackendName::Cuda) + 1);
         let mut source = vec![0.0f32; rows * k];
         for (row, group) in groups.iter().enumerate() {
             source[row * k..row * k + int8_rule::GROUP].copy_from_slice(group);

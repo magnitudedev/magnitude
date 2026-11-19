@@ -16,6 +16,7 @@
 //   its link bytes again for each (measured on an RTX 3090: 4.2x / 8.0x at 4
 //   / 8 rows naming one host expert). A GEMV row's result does not depend on
 //   the other rows, so every choice gets its one-row bits.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 // The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
@@ -81,8 +82,8 @@ __global__ void routed_gate_up_choice(SEISMIC_KERNEL_PARAMS) {
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,
                                  SEISMIC_UP_SCALE_STRIDE_0, expert));
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
-                                    ROUTED_MATRIX(KERNEL_W0, weights.gate),
-                                    ROUTED_MATRIX(KERNEL_W1, weights.up), epi);
+                                    PACKETS_MATRIX(KERNEL_W0, weights.gate),
+                                    PACKETS_MATRIX(KERNEL_W1, weights.up), epi);
 }
 #endif
 
@@ -134,7 +135,7 @@ __global__ void routed_gate_up_gathered(SEISMIC_KERNEL_PARAMS) {
                                  expert));
     projection::gemv_segment<Shape>(shared, routed::GatheredRows{GATHERED_ROWS, table.rows}, table.count,
                                     SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
-                                    ROUTED_MATRIX(KERNEL_W0, weights.gate),
-                                    ROUTED_MATRIX(KERNEL_W1, weights.up), epi);
+                                    PACKETS_MATRIX(KERNEL_W0, weights.gate),
+                                    PACKETS_MATRIX(KERNEL_W1, weights.up), epi);
 }
 #endif

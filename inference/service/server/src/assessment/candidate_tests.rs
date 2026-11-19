@@ -1034,33 +1034,35 @@ struct Fixture {
     catalog_id: ModelId,
 }
 
-async fn hugging_face_package(
-    models: &Arc<ManagedModelStore>,
-    repository: &str,
-    path: &str,
-) -> magnitude_service_contracts::models::ModelPackage {
-    let snapshot = refresh_hugging_face_repository(
-        models,
-        HuggingFaceRepositoryRequest {
-            repository: repository.to_owned(),
-            revision: "main".to_owned(),
-        },
-    )
-    .await
-    .expect("stub snapshot");
-    models
-        .hugging_face_package(
-            &ModelPreviewSource {
+fn hugging_face_package<'a>(
+    models: &'a Arc<ManagedModelStore>,
+    repository: &'a str,
+    path: &'a str,
+) -> BoxFuture<'a, magnitude_service_contracts::models::ModelPackage> {
+    Box::pin(async move {
+        let snapshot = refresh_hugging_face_repository(
+            models,
+            HuggingFaceRepositoryRequest {
                 repository: repository.to_owned(),
-                revision: snapshot.commit.clone(),
-                primary_gguf: PathBuf::from(path),
-                additional_components: Vec::new(),
+                revision: "main".to_owned(),
             },
-            &snapshot,
         )
         .await
-        .expect("stub package")
-        .0
+        .expect("stub snapshot");
+        models
+            .hugging_face_package(
+                &ModelPreviewSource {
+                    repository: repository.to_owned(),
+                    revision: snapshot.commit.clone(),
+                    primary_gguf: PathBuf::from(path),
+                    additional_components: Vec::new(),
+                },
+                &snapshot,
+            )
+            .await
+            .expect("stub package")
+            .0
+    })
 }
 
 fn cpu_environment() -> Arc<AssessmentEnvironment> {
@@ -1174,86 +1176,88 @@ async fn fixture_with(
 
 /// A fixture over every option: with `qwen`, the hub also serves the real Qwen repositories and
 /// the catalog also lists Qwen3.5 4B, Qwen3.6 35B-A3B and Qwen3.8 27B with their drafters.
-async fn fixture_from(
+fn fixture_from(
     custom: Vec<CustomModel>,
     local_models: LocalModelsConfiguration,
     other_catalog_model: bool,
     extra_repositories: BTreeMap<String, StubRepository>,
     qwen: bool,
     environment: Arc<AssessmentEnvironment>,
-) -> Fixture {
-    let mut stub = hub();
-    stub.repositories.extend(extra_repositories);
-    if qwen {
-        stub.repositories.extend(qwen_repositories());
-        stub.repositories.extend(qwen_generation_repositories());
-    }
-    let (endpoint, hub) = stub.serve();
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let mut config = InventoryConfig::with_roots(
-        directory.path().join("models"),
-        directory.path().join("cache"),
-    )
-    .expect("inventory config");
-    config.hub_endpoint = Some(endpoint);
-    config.local_models = local_models.clone();
-    config.architectures = super::engine_architectures();
-    let models = Arc::new(ManagedModelStore::open(config, std::sync::Arc::new(|_| Ok::<u64, std::convert::Infallible>(u64::MAX))).await.expect("model store"));
-    models
-        .ensure_model_inventory()
-        .await
-        .expect("location scan");
-    let (catalog, catalog_id) = llama_test_catalog(&models).await;
-    let mut catalog = catalog;
-    if other_catalog_model {
-        let mut other = catalog.models[0].clone();
-        other.model_id =
-            magnitude_service_contracts::models::CatalogBaseId::new("other-llama").unwrap();
-        other.display_name = "Other Llama".to_owned();
-        other.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
-            target: hugging_face_package(&models, OTHER_SHAPE, "llama-Q8_0.gguf").await,
-            draft_source: SpeculativeDraftSource::Separate {
-                draft: hugging_face_package(&models, OTHER_SHAPE, "dflash-narrow.gguf").await,
-            },
-            method: SpeculativeMethod::DFlash,
-        };
-        catalog.models.insert(0, other);
-    }
-    if qwen {
-        catalog.models.push(qwen_catalog_model(&models).await);
-        catalog.models.push(qwen36_catalog_model(&models).await);
-        catalog.models.push(qwen38_catalog_model(&models).await);
-    }
-    let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
-    let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
-    let weight_samples = qwen_generation_weight_samples(&catalog);
-    let assessor = Arc::new(ModelAssessor::new(
-        Arc::clone(&models),
-        resolver,
-        Arc::new(
-            ReleaseCatalog::without_material(catalog)
-                .expect("release catalog")
-                .with_target_weight_samples(weight_samples),
-        ),
-        environment,
-    ));
-    let candidates = ManagedModelCandidates::new(
-        Arc::clone(&assessor),
-        Arc::clone(&lineage),
-        super::engine_architectures(),
-        Arc::new(StubCatalog),
-        Arc::new(StubLocal(custom, local_models)),
-        crate::assessment::HostDevice::new(&crate::device_lock::DeviceLock::default(), false),
-    );
-    Fixture {
-        _directory: directory,
-        hub,
-        assessor,
-        models,
-        lineage,
-        candidates,
-        catalog_id,
-    }
+) -> BoxFuture<'static, Fixture> {
+    Box::pin(async move {
+        let mut stub = hub();
+        stub.repositories.extend(extra_repositories);
+        if qwen {
+            stub.repositories.extend(qwen_repositories());
+            stub.repositories.extend(qwen_generation_repositories());
+        }
+        let (endpoint, hub) = stub.serve();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut config = InventoryConfig::with_roots(
+            directory.path().join("models"),
+            directory.path().join("cache"),
+        )
+        .expect("inventory config");
+        config.hub_endpoint = Some(endpoint);
+        config.local_models = local_models.clone();
+        config.architectures = super::engine_architectures();
+        let models = Arc::new(ManagedModelStore::open(config, std::sync::Arc::new(|_| Ok::<u64, std::convert::Infallible>(u64::MAX))).await.expect("model store"));
+        models
+            .ensure_model_inventory()
+            .await
+            .expect("location scan");
+        let (catalog, catalog_id) = llama_test_catalog(&models).await;
+        let mut catalog = catalog;
+        if other_catalog_model {
+            let mut other = catalog.models[0].clone();
+            other.model_id =
+                magnitude_service_contracts::models::CatalogBaseId::new("other-llama").unwrap();
+            other.display_name = "Other Llama".to_owned();
+            other.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+                target: hugging_face_package(&models, OTHER_SHAPE, "llama-Q8_0.gguf").await,
+                draft_source: SpeculativeDraftSource::Separate {
+                    draft: hugging_face_package(&models, OTHER_SHAPE, "dflash-narrow.gguf").await,
+                },
+                method: SpeculativeMethod::DFlash,
+            };
+            catalog.models.insert(0, other);
+        }
+        if qwen {
+            catalog.models.push(qwen_catalog_model(&models).await);
+            catalog.models.push(qwen36_catalog_model(&models).await);
+            catalog.models.push(qwen38_catalog_model(&models).await);
+        }
+        let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
+        let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
+        let weight_samples = qwen_generation_weight_samples(&catalog);
+        let assessor = Arc::new(ModelAssessor::new(
+            Arc::clone(&models),
+            resolver,
+            Arc::new(
+                ReleaseCatalog::without_material(catalog)
+                    .expect("release catalog")
+                    .with_target_weight_samples(weight_samples),
+            ),
+            environment,
+        ));
+        let candidates = ManagedModelCandidates::new(
+            Arc::clone(&assessor),
+            Arc::clone(&lineage),
+            super::engine_architectures(),
+            Arc::new(StubCatalog),
+            Arc::new(StubLocal(custom, local_models)),
+            crate::assessment::HostDevice::new(&crate::device_lock::DeviceLock::default(), false),
+        );
+        Fixture {
+            _directory: directory,
+            hub,
+            assessor,
+            models,
+            lineage,
+            candidates,
+            catalog_id,
+        }
+    })
 }
 
 /// A real file's weight sample, from the assessment fixtures.
@@ -4026,27 +4030,29 @@ async fn live_fixture_reaching(
 impl LiveFixture {
     /// Resolves the model for loading and opens its material as a worker does, returning the
     /// target and draft files it reads.
-    async fn load_files(&self, model_id: &ModelId) -> (PathBuf, Option<PathBuf>) {
-        let configuration = self
-            .resolver
-            .serving_configuration(model_id)
-            .expect("serving configuration");
-        let resolved = self
-            .configurations
-            .resolve(&configuration)
-            .await
-            .expect("the model resolves for loading");
-        magnitude_artifacts::Package::open_manifest(&resolved.manifest.package)
-            .expect("the worker opens the files it is given");
-        (
-            resolved.manifest.package.target.path().to_path_buf(),
-            resolved
-                .manifest
-                .package
-                .draft
-                .as_ref()
-                .map(|draft| draft.path().to_path_buf()),
-        )
+    fn load_files<'a>(&'a self, model_id: &'a ModelId) -> BoxFuture<'a, (PathBuf, Option<PathBuf>)> {
+        Box::pin(async move {
+            let configuration = self
+                .resolver
+                .serving_configuration(model_id)
+                .expect("serving configuration");
+            let resolved = self
+                .configurations
+                .resolve(&configuration)
+                .await
+                .expect("the model resolves for loading");
+            magnitude_artifacts::Package::open_manifest(&resolved.manifest.package)
+                .expect("the worker opens the files it is given");
+            (
+                resolved.manifest.package.target.path().to_path_buf(),
+                resolved
+                    .manifest
+                    .package
+                    .draft
+                    .as_ref()
+                    .map(|draft| draft.path().to_path_buf()),
+            )
+        })
     }
 
     /// Rescans every location, as a watch event does, then waits until the attached drafter of the
@@ -4939,7 +4945,47 @@ impl Requirements {
             panic!("everything fits the standard host");
         };
         let capacity = memory.first().expect("a memory domain").capacity_bytes;
-        let at_floor = |drafter: Option<CandidateDrafter>| async move {
+        let plain = Self::required_at_floor(file, capacity, None).await;
+        let heads = Self::required_at_floor(
+            file,
+            capacity,
+            Some(CandidateDrafter {
+                reference: DrafterReference::Embedded,
+                method: SpeculativeMethod::Mtp,
+            }),
+        )
+        .await;
+        let dflash = Self::required_at_floor(
+            file,
+            capacity,
+            Some(CandidateDrafter {
+                reference: DrafterReference::Catalog {
+                    model_id: qwen_catalog_id(),
+                },
+                method: SpeculativeMethod::DFlash,
+            }),
+        )
+        .await;
+        assert!(
+            plain < heads.min(dflash),
+            "the heads and the drafter each need more than the model served plain"
+        );
+        Self {
+            plain,
+            heads,
+            dflash,
+        }
+    }
+
+    /// What `file` needs with `drafter` at the smallest served context: from a host that may use
+    /// `capacity`, each budget is set just below what the last assessment required, until the
+    /// model is served at the floor.
+    fn required_at_floor(
+        file: &str,
+        capacity: u64,
+        drafter: Option<CandidateDrafter>,
+    ) -> BoxFuture<'_, u64> {
+        Box::pin(async move {
             let mut budget = capacity;
             loop {
                 let fixture = fixture_from(
@@ -4968,29 +5014,7 @@ impl Requirements {
                 }
                 budget = required - 1;
             }
-        };
-        let plain = at_floor(None).await;
-        let heads = at_floor(Some(CandidateDrafter {
-            reference: DrafterReference::Embedded,
-            method: SpeculativeMethod::Mtp,
-        }))
-        .await;
-        let dflash = at_floor(Some(CandidateDrafter {
-            reference: DrafterReference::Catalog {
-                model_id: qwen_catalog_id(),
-            },
-            method: SpeculativeMethod::DFlash,
-        }))
-        .await;
-        assert!(
-            plain < heads.min(dflash),
-            "the heads and the drafter each need more than the model served plain"
-        );
-        Self {
-            plain,
-            heads,
-            dflash,
-        }
+        })
     }
 
     /// A CPU environment whose host may use halfway between serving plain and serving with the

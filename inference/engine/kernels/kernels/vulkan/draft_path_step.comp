@@ -2,6 +2,7 @@
 // candidate's score unary + (predecessor * hidden) . successor, then selects
 // the first highest-scoring candidate. The Vulkan form of
 // `metal/draft_path_step.metal`.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 #include "lib/core/reduce.glsl"
 
@@ -21,10 +22,10 @@ void draft_path_step() {
         float partial = 0.0;
         for (uint64_t r = gl_LocalInvocationIndex; r < SEISMIC_DIM_R; r += gl_WorkGroupSize.x) {
             const float joint =
-                element_at(ELEMENT_ACT, predecessor, row * SEISMIC_PREDECESSOR_STRIDE_0 + r * SEISMIC_PREDECESSOR_STRIDE_1)
-                * element_at(ELEMENT_ACT, hidden, row * SEISMIC_HIDDEN_STRIDE_0 + r * SEISMIC_HIDDEN_STRIDE_1);
+                element_at(ACTIVATION_A, predecessor, row * SEISMIC_PREDECESSOR_STRIDE_0 + r * SEISMIC_PREDECESSOR_STRIDE_1)
+                * element_at(ACTIVATION_A, hidden, row * SEISMIC_HIDDEN_STRIDE_0 + r * SEISMIC_HIDDEN_STRIDE_1);
             partial = seismic_fma_rn(joint,
-                element_at(ELEMENT_ACT, successor, at * SEISMIC_SUCCESSOR_STRIDE_0 + r * SEISMIC_SUCCESSOR_STRIDE_1),
+                element_at(ACTIVATION_A, successor, at * SEISMIC_SUCCESSOR_STRIDE_0 + r * SEISMIC_SUCCESSOR_STRIDE_1),
                 partial);
         }
         const float score = reduce_group_sum(partial, 0u)

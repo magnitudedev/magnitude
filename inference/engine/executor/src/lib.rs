@@ -1,5 +1,20 @@
 //! Family-neutral model execution contracts and implementations.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::large_stack_frames,
+        reason = "libtest's generated main holds a description of each of the crate's tests in its one frame"
+    )
+)]
+
 /// The executor build identity: the package version and a digest of the
 /// executor's dependency closure (`build.rs`). What the executor alone decides
 /// is stored under it.

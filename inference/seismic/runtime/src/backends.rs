@@ -392,7 +392,9 @@ pub(crate) fn open(
         #[cfg(not(target_os = "macos"))]
         OpenedKind::Vulkan(opened) => seismic_lang::device::DeviceProperties::Vulkan(*opened.service().properties()),
     };
+    let test = seismic_lang::registry::TestDevice::opened(info.backend());
     Ok(Arc::new(DeviceInner {
+        test,
         info,
         topology,
         memory,
@@ -624,6 +626,44 @@ impl DevicePrograms {
 /// CPU device's pool (`seismic_cpu::open_host`). Never the process's thread
 /// share: the pool's size is part of the CPU device's identity, which every
 /// process of the machine, serving or measuring, must open alike.
+/// A device's memory comes only through these, so each allocation is work its
+/// test did on it ([`DeviceInner::ran_work`]).
+impl DeviceInner {
+    /// [`OpenedKind::allocate_contract`] on this device.
+    pub(crate) fn allocate_contract(
+        &self,
+        charge: AllocationCharge<'_>,
+        bytes: u64,
+        alignment: u64,
+        access: Option<Arc<driver::AccessGroup>>,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        self.ran_work();
+        self.kind.allocate_contract(charge, bytes, alignment, access)
+    }
+
+    /// [`OpenedKind::allocate_block`] on this device.
+    pub(crate) fn allocate_block(
+        &self,
+        kinds: &[u32],
+        bytes: u64,
+        entry: &Arc<dyn crate::memory::Entry>,
+        access: Arc<driver::AccessGroup>,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        self.ran_work();
+        self.kind.allocate_block(kinds, bytes, entry, access)
+    }
+
+    /// [`OpenedKind::map_read_only_host_region`] on this device.
+    pub(crate) fn map_read_only_host_region(
+        &self,
+        region: crate::api::HostRegion,
+        alignment: u64,
+    ) -> Result<Arc<driver::Allocation>, crate::api::TensorError> {
+        self.ran_work();
+        self.kind.map_read_only_host_region(region, alignment).map_err(crate::api::TensorError::Execution)
+    }
+}
+
 pub(crate) fn host_cores() -> Result<std::num::NonZeroUsize, String> {
     seismic_discovery::Processors::discover()
         .map_err(|error| format!("the host's processors: {error}"))?
@@ -788,7 +828,7 @@ impl OpenedKind {
     /// kinds with room and lying along that kind's path, ordered by
     /// `access`'s hazard domain where given (a slab store's address table,
     /// its pool's).
-    pub(crate) fn allocate_contract(
+    fn allocate_contract(
         &self,
         charge: AllocationCharge<'_>,
         bytes: u64,
@@ -812,7 +852,7 @@ impl OpenedKind {
     /// the path of the kind it landed in (`driver::Opened::allocate_block`).
     /// A refusal by `entry` is the last kind's refusal: every kind charges
     /// the same store.
-    pub(crate) fn allocate_block(
+    fn allocate_block(
         &self,
         kinds: &[u32],
         bytes: u64,
@@ -865,7 +905,7 @@ impl OpenedKind {
         Ok(allocation)
     }
 
-    pub(crate) fn map_read_only_host_region(
+    fn map_read_only_host_region(
         &self,
         region: crate::api::HostRegion,
         alignment: u64,

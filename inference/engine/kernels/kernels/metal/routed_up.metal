@@ -4,10 +4,11 @@
 // record) with the activated epilogue
 // A(act(A(up))). Every row of a choice with no record is zero.
 
+#define KERNEL_A SEISMIC_ELEMENT_A
 #if defined(SEISMIC_FORMING_ROUTED_UP_RESIDENT) || defined(SEISMIC_FORMING_ROUTED_UP_GATHERED_RESIDENT)
 // A resident layer's: nothing lands in its records while it runs, so plain
 // loads read them.
-#define PACKETS_PLAIN_RECORDS
+#define PACKETS_CONFIG_PLAIN_RECORDS
 #endif
 #define KERNEL_W0 SEISMIC_EXPERT_UP
 #include "lib/routed/routed.h"

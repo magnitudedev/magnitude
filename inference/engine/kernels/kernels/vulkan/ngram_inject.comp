@@ -7,15 +7,7 @@
 #include <seismic/element.glsl>
 #include "lib/recurrent/versions.glsl"
 
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define NGRAM_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define NGRAM_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define NGRAM_NORM ELEMENT_BF16
-#else
-#error "ngram_inject requires a dense norm"
-#endif
+#define NGRAM_NORM ELEMENT_OF(SEISMIC_NORM)
 
 // u at launch row `row`, channel (`stream`, `column`).
 float ngram_u(uint64_t row, uint64_t stream, uint64_t column) {

@@ -349,9 +349,9 @@ impl SealedBlockGraph {
         let mut banks = Vec::new();
         let mut parks = Vec::new();
         let bank = layer_bank(stage, handle.bank.as_ref().map(BankGraphEntries::from), &mut banks, &mut parks);
-        let (shape, numbers) =
-            inputs.split(slot, &bank, tap.as_ref().map(|(width, tap)| (*width, tap.positions))).map_err(text)?;
-        let (shape, numbers) = (constant_reals(shape).tables(Table::from).formed(forms)?, constant(numbers));
+        let (shape, numbers) = inputs
+            .constant_split(slot, &bank, tap.as_ref().map(|(width, tap)| (*width, tap.positions)), forms)
+            .map_err(text)?;
         let hidden = numbers
             .input
             .clone()
@@ -719,6 +719,39 @@ impl<'a> BlockGraphInputs<'a> {
                 sublayers: numbers,
             },
         ))
+    }
+
+    /// The block graph's split (`split`) as a graph is built from it at the
+    /// model's own numbers: its reals and tables constant, its carries in
+    /// the forms `forms` gives (`BlockCarries::formed`), its numbers
+    /// constant. Each whole conversion of the split stays in this frame.
+    fn constant_split<G: GraphDraft>(
+        &self,
+        slot: TargetBlockProgramSlot,
+        bank: &LayerBank<'_, '_, G>,
+        tap: Option<(u64, TapPositions)>,
+        forms: impl FnMut(u32) -> Result<G::Forms, String>,
+    ) -> Result<(BlockShape<Argument<f64>, Table, G::Forms>, BlockNumbers), GraphError> {
+        let (shape, numbers) = self.split(slot, bank, tap)?;
+        Ok((constant_reals(shape).tables(Table::from).formed(forms)?, constant(numbers)))
+    }
+
+    /// The block graph's split (`split`) as its topology key holds it: its
+    /// numbers as facts of `facts`, each class dimension one fact, the
+    /// block's, which its classes vary, wherever an operator reads it
+    /// (`SublayersNumbers::share_classes`); its reals and tables indexed.
+    /// Each whole conversion of the split stays in this frame.
+    fn indexed_split<G: GraphDraft>(
+        &self,
+        slot: TargetBlockProgramSlot,
+        bank: &LayerBank<'_, '_, G>,
+        tap: Option<(u64, TapPositions)>,
+        facts: &mut FactSink,
+    ) -> Result<(BlockShape<RealIndex, TableIndex>, BlockNumbers<FactIndex>), GraphError> {
+        let (shape, numbers) = self.split(slot, bank, tap)?;
+        let mut numbers = facts.index(numbers);
+        numbers.sublayers = numbers.sublayers.share_classes();
+        Ok((facts.index_reals(shape).tables(|bytes| facts.table(bytes)), numbers))
     }
 }
 
@@ -1215,15 +1248,29 @@ pub(super) fn certify_block<L: Certified>(
     classes: &[(Option<&'static str>, &'static str, ClassNumber)],
     slice_sets: &[Vec<NativeGraphClassSlice>],
 ) -> Result<Vec<(L, (Vec<GraphConstant>, HostHeap))>, GraphError> {
+    with_block_key(backend, slot, tap, inputs, classes, |key, facts, classes| {
+        L::traced_each(&BLOCK_TRACES, key, facts, classes, slice_sets, record_block)
+    })
+}
+
+/// `trace` over the topology key of the block graph `inputs` names of
+/// `slot` on `backend`, with its draft taps (`tap`): the key, the facts it
+/// is split into, and the facts its classes vary, whose dimensions
+/// `classes` names. The key holds the block's checked entries, which live
+/// in this frame alone.
+fn with_block_key<T>(
+    backend: BackendName,
+    slot: TargetBlockProgramSlot,
+    tap: Option<(u64, TapPositions)>,
+    inputs: BlockGraphInputs<'_>,
+    classes: &[(Option<&'static str>, &'static str, ClassNumber)],
+    trace: impl FnOnce(&BlockKey, &FactSink, &[ClassFact]) -> Result<T, GraphError>,
+) -> Result<T, GraphError> {
     let entries = CheckedBlockEntries::new(inputs.state, backend, slot)?;
     let (mut banks, mut parks) = (Vec::new(), Vec::new());
     let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
-    let (shape, numbers) = inputs.split(slot, &bank, tap)?;
     let mut facts = FactSink::new();
-    // Shared once indexed, each class dimension is one fact: the block's,
-    // which its classes vary, wherever an operator reads it.
-    let mut numbers = facts.index(numbers);
-    numbers.sublayers = numbers.sublayers.share_classes();
+    let (shape, numbers) = inputs.indexed_split(slot, &bank, tap, &mut facts)?;
     // The key names what the block reads relative to it (`relative_scope`),
     // as its graph does.
     let block = inputs.block()?;
@@ -1244,9 +1291,8 @@ pub(super) fn certify_block<L: Certified>(
             ClassFact { fact: fact.position(), scope, dimension }
         })
         .collect::<Vec<_>>();
-    let shape = facts.index_reals(shape).tables(|bytes| facts.table(bytes));
     let key = BlockKey { backend, entries, shape, numbers, weights };
-    L::traced_each(&BLOCK_TRACES, &key, &facts, &classes, slice_sets, record_block)
+    trace(&key, &facts, &classes)
 }
 
 /// The metadata graph of block `inputs` names of `slot`, with its draft taps
@@ -1262,9 +1308,9 @@ pub(super) fn checked_block_graph_draft(
     let entries = CheckedBlockEntries::new(inputs.state, graph.backend(), slot)?;
     let (mut banks, mut parks) = (Vec::new(), Vec::new());
     let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
-    let (shape, numbers) = inputs.split(slot, &bank, tap)?;
+    let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
     let planned = inputs.weights()?;
-    checked_block_graph(graph, &entries, &constant_reals(shape).tables(Table::from), &constant(numbers), &planned)
+    checked_block_graph(graph, &entries, &shape, &numbers, &planned)
 }
 
 #[cfg(test)]

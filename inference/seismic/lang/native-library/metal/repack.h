@@ -1,5 +1,6 @@
-// Exact GGUF -> resident conversion (the Seismic registry's registered
-// `repack`), as templates over a binding `B` (`REPACK_BINDING`, below): the
+// Seismic native library (Metal): exact GGUF -> resident conversion (the
+// Seismic registry's registered `repack`), `#include <seismic/repack.h>`, as
+// templates over a binding `B` (`REPACK_BINDING`, below): the
 // conversion of one source element into one resident element (representation,
 // layout), and the geometry of the two tensors it converts between, so one
 // kernel holds any number of conversions (`repack_weight`: one;
@@ -30,8 +31,10 @@
 // The source is read through an addressing policy `A`, `A::packet` giving a
 // packet's address from the source handle: `Strided<B>` reads the bound
 // source tensor (the handle its pointer); an includer that stages the source
-// first (lib/streaming/window.h) addresses its copy (the handle the copy's
-// geometry).
+// first (a kernel's streaming window) addresses its copy (the handle the
+// copy's geometry), by the binding's accessors (`B::group()`,
+// `B::source_packet_size()`, `B::planar()`, `planar::*`, the strides).
+// Where a tile places its records is this file's (`repack::detail`).
 
 #include <seismic/element.h>
 
@@ -118,6 +121,8 @@ template <class B> struct Strided {
         }
     }
 };
+
+namespace detail {
 
 // `bytes` bytes of `words` (little-endian) at `out`, in stores of `unit`
 // bytes (a power of two, to 16, that `bytes` and `out` keep: the record's
@@ -421,6 +426,8 @@ REPACK_INLINE void row_tile(In source, device uchar *destination, constant ulong
     }
 }
 
+} // namespace detail
+
 // Place row tile `tile` (columns x, rows y) of matrix `b`, reading the
 // source handle `source` through `A`; `lane` is the thread's index in its
 // 32-thread group, `staged` the group's `exchange_words` exchange words.
@@ -434,9 +441,9 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
     static_assert(B::layout() != Layout::other, "repack writes packet, rows16, mma16 or rows32 storage");
     static_assert(!B::records(), "repack does not write mma16 records (CUDA's iq2xxs storage)");
     if constexpr (B::layout() == Layout::packet)
-        packet_tile<B, A>(source, destination, seismic_words, b, tile, lane);
+        detail::packet_tile<B, A>(source, destination, seismic_words, b, tile, lane);
     else
-        row_tile<B, A>(source, destination, seismic_words, b, tile, lane, staged);
+        detail::row_tile<B, A>(source, destination, seismic_words, b, tile, lane, staged);
 }
 
 } // namespace repack
@@ -452,20 +459,10 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
 // and code (`unit`, `fixed`). `C` is defined (as 1) when the conversion is
 // registered, so the binding names its macros only by pasting onto it (an
 // operand of `##` is not expanded) and reads it bare as the probe. A macro a
-// binding does not define is never named (`REPACK_WHEN` and `REPACK_IF` keep
+// binding does not define is never named (`ELEMENT_WHEN` and `REPACK_IF` keep
 // only the branch their probe selects). A binding of two dense float tensors
 // has no conversion (`dense()`: the includer converts each element).
 
-#define REPACK_PLANAR_1(planar, plain) planar
-#define REPACK_PLANAR_0(planar, plain) plain
-#define REPACK_PLANAR_(flag) REPACK_PLANAR_##flag
-#define REPACK_PLANAR(flag) REPACK_PLANAR_(flag)
-#define REPACK_PICK_1(yes, no) yes
-#define REPACK_PICK_0(yes, no) no
-#define REPACK_PICK_(flag) REPACK_PICK_##flag
-#define REPACK_PICK(flag) REPACK_PICK_(flag)
-// `yes` when `<P><suffix>` is defined as 1, else `no`.
-#define REPACK_WHEN(P, suffix, yes, no) REPACK_PICK(ELEMENT_HAS(P, suffix))(yes, no)
 // The tokens that follow, in parentheses, when `flag` is 1; else nothing.
 #define REPACK_KEEP(...) __VA_ARGS__
 #define REPACK_DROP(...)
@@ -475,15 +472,7 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
 // A row-layout geometry word, or 0 for a packet layout or a dense
 // representation (which have no row words).
 #define REPACK_ROW_WORD(D, WORD)                                                                            \
-    REPACK_WHEN(D, _KIND_PACKED, REPACK_WHEN(D, _LAYOUT_PACKET, 0ul, ulong(ELEMENT_CAT(D, WORD))), 0ul)
-// The bytes of one unit of tensor P's strides: a row layout's stored row,
-// any other's packet (a dense element's packet is one element).
-#define REPACK_STRIDE_BYTES(P)                                                                              \
-    REPACK_WHEN(P, _KIND_PACKED,                                                                            \
-        REPACK_WHEN(P, _LAYOUT_PACKET, ulong(ELEMENT_CAT(P, _PACKET_SIZE)), ulong(ELEMENT_CAT(P, _ROW_STRIDE_BYTES))), \
-        ulong(ELEMENT_CAT(P, _PACKET_SIZE)))
-// The bytes between the matrices of a stacked [*, N, K] tensor P (a record).
-#define REPACK_MATRIX_BYTES(P) (ulong(ELEMENT_CAT(P, _STRIDE_0)) * REPACK_STRIDE_BYTES(P))
+    ELEMENT_WHEN(D, _KIND_PACKED, ELEMENT_WHEN(D, _LAYOUT_PACKET, 0ul, ulong(ELEMENT_CAT(D, WORD))), 0ul)
 
 #define REPACK_BINDING(Name, C, S, D, DIM_N, DIM_K)                                                         \
     struct Name {                                                                                           \
@@ -496,13 +485,13 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
         /* A source under a companion grid (`planar`): its scales' bytes and the tile of values each */    \
         /* scales, 0 without; its packets' codes are the rest. */                                          \
         static constexpr uint grid_scale_bytes() {                                                          \
-            return REPACK_WHEN(S, _KIND_EXTERNAL, uint(ELEMENT_CAT(S, _GRID_SCALE_BYTES)), 0u);             \
+            return ELEMENT_WHEN(S, _KIND_EXTERNAL, uint(ELEMENT_CAT(S, _GRID_SCALE_BYTES)), 0u);             \
         }                                                                                                   \
         static constexpr uint grid_tile_rows() {                                                            \
-            return REPACK_WHEN(S, _KIND_EXTERNAL, uint(ELEMENT_CAT(S, _GRID_TILE_ROWS)), 0u);               \
+            return ELEMENT_WHEN(S, _KIND_EXTERNAL, uint(ELEMENT_CAT(S, _GRID_TILE_ROWS)), 0u);               \
         }                                                                                                   \
         static constexpr uint grid_tile_columns() {                                                         \
-            return REPACK_WHEN(S, _KIND_EXTERNAL, uint(ELEMENT_CAT(S, _GRID_TILE_COLUMNS)), 0u);            \
+            return ELEMENT_WHEN(S, _KIND_EXTERNAL, uint(ELEMENT_CAT(S, _GRID_TILE_COLUMNS)), 0u);            \
         }                                                                                                   \
         static constexpr bool planar() { return grid_scale_bytes() != 0u; }                                 \
         static constexpr uint code_bytes() { return source_packet_size() - grid_scale_bytes(); }            \
@@ -517,29 +506,29 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
         /* A rows32 tile's rows; mma16's facts and placement rules (`PackedRowLayout`), 1 or 0 in */        \
         /* another layout, whose branches never reach them. */                                              \
         static constexpr ulong stored_tile_rows() {                                                         \
-            return REPACK_WHEN(D, _LAYOUT_ROWS32, ulong(ELEMENT_CAT(D, _TILE_ROWS)), 1ul);                  \
+            return ELEMENT_WHEN(D, _LAYOUT_ROWS32, ulong(ELEMENT_CAT(D, _TILE_ROWS)), 1ul);                  \
         }                                                                                                   \
         static constexpr uint kblock_columns() {                                                            \
-            return REPACK_WHEN(D, _LAYOUT_MMA16, uint(ELEMENT_CAT(D, _MMA_KBLOCK)), 1u);                    \
+            return ELEMENT_WHEN(D, _LAYOUT_MMA16, uint(ELEMENT_CAT(D, _MMA_KBLOCK)), 1u);                    \
         }                                                                                                   \
         static constexpr uint step_columns() {                                                              \
-            return REPACK_WHEN(D, _LAYOUT_MMA16, uint(ELEMENT_CAT(D, _MMA_STEP)), 1u);                      \
+            return ELEMENT_WHEN(D, _LAYOUT_MMA16, uint(ELEMENT_CAT(D, _MMA_STEP)), 1u);                      \
         }                                                                                                   \
         static constexpr uint step_slots() {                                                                \
-            return REPACK_WHEN(D, _LAYOUT_MMA16, uint(ELEMENT_CAT(D, _MMA_STEP_SLOTS)), 0u);                \
+            return ELEMENT_WHEN(D, _LAYOUT_MMA16, uint(ELEMENT_CAT(D, _MMA_STEP_SLOTS)), 0u);                \
         }                                                                                                   \
         static REPACK_INLINE uint fragment_row(uint lane, uint slot) {                                      \
-            return REPACK_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _MMA_FRAGMENT_ROW)(lane, slot), 0u);        \
+            return ELEMENT_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _MMA_FRAGMENT_ROW)(lane, slot), 0u);        \
         }                                                                                                   \
         static REPACK_INLINE uint fragment_column(uint lane, uint slot) {                                   \
-            return REPACK_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _MMA_FRAGMENT_COLUMN)(lane, slot), 0u);     \
+            return ELEMENT_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _MMA_FRAGMENT_COLUMN)(lane, slot), 0u);     \
         }                                                                                                   \
         static REPACK_INLINE ulong fragment_byte(ulong block, ulong lane, ulong bits, ulong step) {         \
-            return REPACK_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _MMA_FRAGMENT_BYTE)(block, lane, bits, step), 0ul); \
+            return ELEMENT_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _MMA_FRAGMENT_BYTE)(block, lane, bits, step), 0ul); \
         }                                                                                                   \
         static constexpr bool records() { return ELEMENT_HAS(D, _PLANE_RECORDS); }                          \
         static constexpr uint packet_size() {                                                               \
-            return REPACK_WHEN(D, _LAYOUT_PACKET, uint(ELEMENT_CAT(D, _PACKET_SIZE)), 0u);                  \
+            return ELEMENT_WHEN(D, _LAYOUT_PACKET, uint(ELEMENT_CAT(D, _PACKET_SIZE)), 0u);                  \
         }                                                                                                   \
         static ulong n(constant ulong *seismic_words) { return ulong(DIM_N); }                              \
         static ulong k(constant ulong *seismic_words) { return ulong(DIM_K); }                              \
@@ -590,57 +579,57 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
             /* The alignments the record's bytes are stored in. */                                         \
             static constexpr uint codes_alignment() { return C##_CODES_ALIGNMENT; }                         \
             static constexpr uint leading_alignment() {                                                     \
-                return REPACK_WHEN(D, _LAYOUT_PACKET, uint(C##_LEADING_ALIGNMENT), 0u);                     \
+                return ELEMENT_WHEN(D, _LAYOUT_PACKET, uint(C##_LEADING_ALIGNMENT), 0u);                     \
             }                                                                                               \
             static constexpr uint trailing_alignment() {                                                    \
-                return REPACK_WHEN(D, _LAYOUT_PACKET, uint(C##_TRAILING_ALIGNMENT), 0u);                    \
+                return ELEMENT_WHEN(D, _LAYOUT_PACKET, uint(C##_TRAILING_ALIGNMENT), 0u);                    \
             }                                                                                               \
             /* Row layouts' code units: a 32-column chunk's columns, bytes and alignment per code */       \
             /* role; mma16's k-block bytes and fragment store units. */                                    \
             static constexpr uint chunk_columns() {                                                         \
-                return REPACK_WHEN(D, _LAYOUT_PACKET, 1u, uint(C##_CHUNK_COLUMNS));                         \
+                return ELEMENT_WHEN(D, _LAYOUT_PACKET, 1u, uint(C##_CHUNK_COLUMNS));                         \
             }                                                                                               \
             static constexpr uint codes_chunk_bytes() {                                                     \
-                return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_CODES_CHUNK_BYTES));                     \
+                return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_CODES_CHUNK_BYTES));                     \
             }                                                                                               \
             static constexpr uint codes_chunk_alignment() {                                                 \
-                return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_CODES_CHUNK_ALIGNMENT));                 \
+                return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_CODES_CHUNK_ALIGNMENT));                 \
             }                                                                                               \
             static constexpr uint high_chunk_bytes() {                                                      \
-                return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_HIGH_CHUNK_BYTES));                      \
+                return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_HIGH_CHUNK_BYTES));                      \
             }                                                                                               \
             static constexpr uint high_chunk_alignment() {                                                  \
-                return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_HIGH_CHUNK_ALIGNMENT));                  \
+                return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_HIGH_CHUNK_ALIGNMENT));                  \
             }                                                                                               \
             static constexpr uint kblock_bytes() {                                                          \
-                return REPACK_WHEN(D, _LAYOUT_MMA16, uint(C##_KBLOCK_BYTES), 0u);                           \
+                return ELEMENT_WHEN(D, _LAYOUT_MMA16, uint(C##_KBLOCK_BYTES), 0u);                           \
             }                                                                                               \
             static constexpr uint codes_fragment_alignment() {                                              \
-                return REPACK_WHEN(D, _LAYOUT_MMA16, uint(C##_CODES_FRAGMENT_ALIGNMENT), 0u);               \
+                return ELEMENT_WHEN(D, _LAYOUT_MMA16, uint(C##_CODES_FRAGMENT_ALIGNMENT), 0u);               \
             }                                                                                               \
             static constexpr uint high_fragment_alignment() {                                               \
-                return REPACK_WHEN(D, _LAYOUT_MMA16, uint(C##_HIGH_FRAGMENT_ALIGNMENT), 0u);                \
+                return ELEMENT_WHEN(D, _LAYOUT_MMA16, uint(C##_HIGH_FRAGMENT_ALIGNMENT), 0u);                \
             }                                                                                               \
             /* A group role's share: its first record word, bytes and alignment. */                        \
-            static constexpr uint scales_word() { return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SCALES_WORD)); } \
-            static constexpr uint scales_bytes() { return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SCALES_BYTES)); } \
+            static constexpr uint scales_word() { return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SCALES_WORD)); } \
+            static constexpr uint scales_bytes() { return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SCALES_BYTES)); } \
             static constexpr uint scales_alignment() {                                                      \
-                return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SCALES_ALIGNMENT));                      \
+                return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SCALES_ALIGNMENT));                      \
             }                                                                                               \
-            static constexpr uint supers_word() { return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SUPERS_WORD)); } \
-            static constexpr uint supers_bytes() { return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SUPERS_BYTES)); } \
+            static constexpr uint supers_word() { return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SUPERS_WORD)); } \
+            static constexpr uint supers_bytes() { return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SUPERS_BYTES)); } \
             static constexpr uint supers_alignment() {                                                      \
-                return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SUPERS_ALIGNMENT));                      \
+                return ELEMENT_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SUPERS_ALIGNMENT));                      \
             }                                                                                               \
             /* The record's code words of unit `index` of the source packet at `in`; its other words. */   \
             /* A planar source reads the packet's codes at `in` and the tile's scale at `scale`. */       \
             template <typename In>                                                                          \
             static REPACK_INLINE void unit(In in, In scale, uint index, thread uint *words) {               \
-                REPACK_PLANAR(ELEMENT_CAT(S, _GRID_PLANAR))(C##_UNIT(in, scale, index, words),              \
+                ELEMENT_PICK(ELEMENT_CAT(S, _GRID_PLANAR))(C##_UNIT(in, scale, index, words),              \
                                                             C##_UNIT(in, index, words));                    \
             }                                                                                               \
             template <typename In> static REPACK_INLINE void fixed(In in, In scale, thread uint *words) {   \
-                REPACK_PLANAR(ELEMENT_CAT(S, _GRID_PLANAR))(C##_FIXED(in, scale, words),                    \
+                ELEMENT_PICK(ELEMENT_CAT(S, _GRID_PLANAR))(C##_FIXED(in, scale, words),                    \
                                                             C##_FIXED(in, words));                          \
             }                                                                                               \
         )                                                                                                   \

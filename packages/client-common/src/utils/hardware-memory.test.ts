@@ -6,7 +6,7 @@ import { deriveHardwareMemoryView, deriveHardwareRoles } from "./hardware-memory
 const GiB = 1024 ** 3
 const hardware = (available: number | null = 8 * GiB, discrete = false, bothBackends = false) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
   platform: discrete ? "Linux" : "MacOS", architecture: discrete ? "X64" : "Arm64",
-  logicalCores: 8, totalSystemMemoryBytes: 16 * GiB,
+  identity: { _tag: "Unavailable", formFactor: "Unknown" }, chipCores: 4, logicalCpus: 8, cpuPoolCores: 4, totalSystemMemoryBytes: 16 * GiB,
   accelerators: [
     { acceleratorId: "gpu", name: "Test GPU", executors: [
       { deviceId: "primary", backend: discrete ? "cuda" : "metal", memoryDomainIds: [discrete ? "gpu" : "system"] },
@@ -61,7 +61,7 @@ describe("hardware roles", () => {
   // An iGPU that can place in host RAM, and a discrete GPU serving. Host RAM is the iGPU's memory, not the serving device's.
   const hybrid = (overrides: Record<string, unknown> = {}) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
     platform: "Windows", architecture: "X64", productName: "Zenbook Pro", processor: "AMD Ryzen 9 7940HS",
-    logicalCores: 16, totalSystemMemoryBytes: 32 * GiB,
+    identity: { _tag: "Unavailable", formFactor: "Unknown" }, chipCores: 8, logicalCpus: 16, cpuPoolCores: 8, totalSystemMemoryBytes: 32 * GiB,
     accelerators: [
       { acceleratorId: "igpu", name: "AMD Radeon(TM) Graphics", executors: [{ deviceId: "vulkan:0", backend: "vulkan", memoryDomainIds: ["system"] }] },
       { acceleratorId: "dgpu", name: "NVIDIA GeForce RTX 4060", executors: [

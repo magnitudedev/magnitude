@@ -1,8 +1,8 @@
 import { useState } from "react"
 import { Option } from "effect"
-import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Result, useAtomSet } from "@effect-atom/atom-react"
 import type { CatalogFormModelId, CustomLocalModel } from "@magnitudedev/sdk"
-import { deriveHardwareRoles, formatStorageSize, useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
+import { deriveHardwareRoles, formatStorageSize, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { useSession } from "../../session"
 import { useServiceObservation } from "../../service-view"
 import { discoveredModel, onThisComputer, unrunnableFile } from "./data"
@@ -13,11 +13,9 @@ import { recommendationsSettled, recommendedForYourMachine, useRecommendations }
 
 /** First run on the service's data: the machine, models already found, and the top recommendations that run well here. */
 export function OnboardingScreen() {
-  const client = useAgentClient()
   const session = useSession()
   const complete = useAtomSet(session.completeOnboarding)
   const hardware = useLocalInferenceHardware()
-  const machine = useAtomValue(client.Configuration.GetServerMachine({})).result
   const models = useLocalModels()
   const { install } = useLocalModelMutations()
   const [usOnly, setUsOnly] = useState(false)
@@ -45,7 +43,7 @@ export function OnboardingScreen() {
     : progress.map((step, index) => ({ label: step.label, detail: step.detail, fraction: step.fraction, state: step.done ? "done" : index === active ? "active" : "pending" }))
   const measuring = steps !== null
   return <Onboarding
-    machine={Result.isSuccess(hardware) ? machineView(hardware.value, Result.isSuccess(machine) ? machine.value.identity : null) : null}
+    machine={Result.isSuccess(hardware) ? machineView(hardware.value) : null}
     preparation={steps}
     discovered={found.flatMap(model => { const view = discoveredModel(model); return view ? [view] : [] })}
     unrunnable={(local?.unsupported ?? []).map(unrunnableFile)}

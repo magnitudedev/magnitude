@@ -1,28 +1,18 @@
 // Decode forms a joined input inside each output group. Prefill forms each
 // row/stream once, then uses the shared tiled projection to reuse weights.
-// A streamed table's slots are rows16 rows (<seismic/rows16.cuh>), a table
-// held whole is mma16; both give every value the same bits.
-#if defined(SEISMIC_TABLE_KIND_PACKED) && defined(SEISMIC_TABLE_LAYOUT_ROWS16)
-#define ROWS16_T SEISMIC_TABLE
-#else
-#define KERNEL_W0 SEISMIC_TABLE
-#endif
+// The table row is gathered (<seismic/gather.cuh>: a streamed table's slots
+// are rows16 rows, a table held whole is mma16; both give every value the
+// same bits).
+#define KERNEL_A SEISMIC_ELEMENT_A
+#define KERNEL_T SEISMIC_TABLE
 #define KERNEL_W1 SEISMIC_COMBINE
 #include "lib/projection/projection.cuh"
 #include "lib/core/gathered.cuh"
-#include <seismic/rows16.cuh>
-
-#if defined(ROWS16_T)
-typedef rows16::T DraftTable;
-#define DRAFT_TABLE_AT(pointer) ROWS16_T_AT(pointer)
-#else
-typedef packets::W0 DraftTable;
-#define DRAFT_TABLE_AT(pointer) KERNEL_W0_AT(pointer)
-#endif
+#include <seismic/gather.cuh>
 
 namespace {
 
-using element::Act;
+using activation::Act;
 using element::u32;
 using element::u64;
 
@@ -32,17 +22,15 @@ constexpr unsigned DRAFT_ROWS_PER_WARP = 4;
 } // namespace
 
 struct DraftInput {
-    DraftTable table;
-    const unsigned char *table_bytes, *conditioning, *embedding_norm, *hidden_norm;
-    u64 table_row_stride, table_column_stride;
+    packets::T table;
+    const unsigned char *conditioning, *embedding_norm, *hidden_norm;
     u64 conditioning_row_stride, conditioning_column_stride;
     u64 embedding_norm_stride, hidden_norm_stride;
 };
 
-#define DRAFT_INPUT DraftInput{DRAFT_TABLE_AT(SEISMIC_PTR(SEISMIC_BUFFER_TABLE)), \
-    SEISMIC_PTR(SEISMIC_BUFFER_TABLE), SEISMIC_PTR(SEISMIC_BUFFER_CONDITIONING), \
-    SEISMIC_PTR(SEISMIC_BUFFER_EMBEDDING_NORM), SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN_NORM), \
-    SEISMIC_TABLE_STRIDE_0, SEISMIC_TABLE_STRIDE_1, SEISMIC_CONDITIONING_STRIDE_0, \
+#define DRAFT_INPUT DraftInput{KERNEL_T_AT(SEISMIC_PTR(SEISMIC_BUFFER_TABLE)), \
+    SEISMIC_PTR(SEISMIC_BUFFER_CONDITIONING), SEISMIC_PTR(SEISMIC_BUFFER_EMBEDDING_NORM), \
+    SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN_NORM), SEISMIC_CONDITIONING_STRIDE_0, \
     SEISMIC_CONDITIONING_STRIDE_1, SEISMIC_EMBEDDING_NORM_STRIDE_0, SEISMIC_HIDDEN_NORM_STRIDE_0}
 
 __device__ __forceinline__ void draft_join(const DraftInput &input, long long held, u64 row, u64 stream,
@@ -56,40 +44,12 @@ __device__ __forceinline__ void draft_join(const DraftInput &input, long long he
     const u64 token = (u64)held;
     for (u64 column = threadIdx.x; held < 0 && column < D; column += blockDim.x)
         joined[column] = 0.0f;
-#if defined(SEISMIC_TABLE_KIND_PACKED)
-    const auto table = input.table;
-    for (u64 item = threadIdx.x; held >= 0 && item < D / 64 * 4; item += blockDim.x) {
-        const u64 kb = item / 4;
-        const u32 t = (u32)(item % 4);
-        const u32 offsets[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
-        float values[16];
-#if defined(ROWS16_T)
-#pragma unroll
-        for (int s = 0; s < 4; ++s)
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                values[4 * s + j] = table.value(token, kb * 64 + 16 * s + offsets[j]);
-#else
-        packets::row_values16(table, token, kb, t, values);
-#endif
-#pragma unroll
-        for (int s = 0; s < 4; ++s)
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float value = Act::round(values[4 * s + j]);
-                joined[kb * 64 + 16 * s + offsets[j]] = value;
-                embedding_squares = seismic_fma_rn(value, value, embedding_squares);
-            }
-    }
-#else
-    using Table = ELEMENT_OF(SEISMIC_TABLE);
-    for (u64 column = threadIdx.x; held >= 0 && column < D; column += blockDim.x) {
-        const float value = Act::round(element::at<Table>(
-            input.table_bytes, token * input.table_row_stride + column * input.table_column_stride));
-        joined[column] = value;
-        embedding_squares = seismic_fma_rn(value, value, embedding_squares);
-    }
-#endif
+    if (held >= 0)
+        packets::gather_row(input.table, token, 0, D, [&](u64 column, float decoded) {
+            const float value = Act::round(decoded);
+            joined[column] = value;
+            embedding_squares = seismic_fma_rn(value, value, embedding_squares);
+        });
     // The conditioning stream (activation or raw F32) and its sum of squares.
     float hidden_squares = 0.0f;
     for (u64 column = threadIdx.x; column < D; column += blockDim.x) {
@@ -132,36 +92,18 @@ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
     // Four combine rows per warp over the 2D joined inputs.
     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const auto result = SEISMIC_RESULT_0_OUT;
-#if defined(SEISMIC_COMBINE_KIND_PACKED)
     const auto combine = KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_COMBINE));
-#else
-    using Combine = ELEMENT_OF(SEISMIC_COMBINE);
-#endif
     for (unsigned r = 0; r < DRAFT_ROWS_PER_WARP; ++r) {
         const u64 output = (u64)blockIdx.x * DRAFT_WARPS * DRAFT_ROWS_PER_WARP
                            + warp * DRAFT_ROWS_PER_WARP + r;
         if (output >= D)
             break;
+        // The row by the warp's lanes (a packed row by lane chunks, a dense
+        // one by columns), in the library's visit order.
         float sum = 0.0f;
-#if defined(SEISMIC_COMBINE_KIND_PACKED)
-        for (u64 item = lane; item < 2 * D / 64 * 4; item += 32) {
-            const u64 kb = item / 4;
-            const u32 t = (u32)(item % 4);
-            float values[16];
-            packets::row_values16(combine, output, kb, t, values);
-            const u32 offsets[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
-#pragma unroll
-            for (int s = 0; s < 4; ++s)
-#pragma unroll
-                for (int j = 0; j < 4; ++j)
-                    sum = seismic_fma_rn(values[4 * s + j], joined[kb * 64 + 16 * s + offsets[j]], sum);
-        }
-#else
-        for (u64 column = lane; column < 2 * D; column += 32)
-            sum = seismic_fma_rn(element::at<Combine>(SEISMIC_PTR(SEISMIC_BUFFER_COMBINE),
-                                                      output * SEISMIC_COMBINE_STRIDE_0 + column * SEISMIC_COMBINE_STRIDE_1),
-                                 joined[column], sum);
-#endif
+        packets::gather_row_lanes(combine, output, 0, 2 * D, lane, [&](u64 column, float value) {
+            sum = seismic_fma_rn(value, joined[column], sum);
+        });
         sum = seismic_warp_sum_f32(sum);
         if (lane == 0)
             result.put(row * SEISMIC_RESULT_0_STRIDE_0 + (stream * D + output) * SEISMIC_RESULT_0_STRIDE_1, sum);

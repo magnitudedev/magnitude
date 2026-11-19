@@ -12,25 +12,9 @@
 
 
 
-#if defined(SEISMIC_BIAS_REPRESENTATION_BF16)
-#define BIAS_KIND ELEMENT_BF16
-#elif defined(SEISMIC_BIAS_REPRESENTATION_F16)
-#define BIAS_KIND ELEMENT_F16
-#elif defined(SEISMIC_BIAS_REPRESENTATION_F32)
-#define BIAS_KIND ELEMENT_F32
-#else
-#error "unsupported vision_patch_stem bias representation"
-#endif
+#define BIAS_KIND ELEMENT_OF(SEISMIC_BIAS)
 
-#if defined(SEISMIC_TABLE_REPRESENTATION_BF16)
-#define TABLE_KIND ELEMENT_BF16
-#elif defined(SEISMIC_TABLE_REPRESENTATION_F16)
-#define TABLE_KIND ELEMENT_F16
-#elif defined(SEISMIC_TABLE_REPRESENTATION_F32)
-#define TABLE_KIND ELEMENT_F32
-#else
-#error "unsupported vision_patch_stem table representation"
-#endif
+#define TABLE_KIND ELEMENT_OF(SEISMIC_TABLE)
 
 #define STEM_FRAMES (1u + uint(SEISMIC_DIM_S))
 #define STEM_AREA uint(SEISMIC_DIM_P * SEISMIC_DIM_P)

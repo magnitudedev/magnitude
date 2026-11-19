@@ -20,21 +20,15 @@
 
 namespace vision {
 
-// The projection packet of a dense weight representation kind (0 = f32,
-// 1 = bf16, 2 = f16).
-template <int KIND> struct dense_packet;
-template <> struct dense_packet<0> { typedef packets::Dense<element::F32> type; };
-template <> struct dense_packet<1> { typedef packets::Dense<element::Bf16> type; };
-template <> struct dense_packet<2> { typedef packets::Dense<element::F16> type; };
-
 // GEMM tiles of every vision projection.
 constant constexpr uint TILE_M = 64;
 constant constexpr uint TILE_N = 64;
 
-// Rows of dense weight `base` ([N, K] row-major, `stride` elements per row).
-template <typename W>
-inline projection::Weights<W> weight(device const uchar *base, ulong stride, uint bytes, uint k) {
-    return projection::Weights<W>{base, packets::Rows16{stride * bytes, 0, 0, 0, 0, 1, 0}, k, nullptr};
+// Rows of dense weight `base` ([N, K] row-major in element E, `stride`
+// elements per row).
+template <typename E>
+inline projection::Weights<packets::Dense<E>> weight(device const uchar *base, ulong stride, uint k) {
+    return projection::Weights<packets::Dense<E>>{{base, PACKETS_ROWS16_DENSE(E, stride), k}, nullptr};
 }
 
 // ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ struct space<true> {
 
 #define SLAB_SPACE(P) slab::space<ELEMENT_HAS(P, _HOST_WRITTEN)>
 
+namespace detail {
 // The pointer to T in the space and constness of byte pointer P.
 template <typename T, typename P> struct rebound;
 template <typename T> struct rebound<T, device uchar *> { typedef device T *type; };
@@ -38,10 +39,11 @@ template <typename T> struct rebound<T, volatile coherent(system) device uchar *
 template <typename T> struct rebound<T, volatile coherent(system) device const uchar *> {
     typedef volatile coherent(system) device const T *type;
 };
+} // namespace detail
 
 template <typename T, typename P>
-inline typename rebound<T, P>::type as(P bytes) {
-    return reinterpret_cast<typename rebound<T, P>::type>(bytes);
+inline typename detail::rebound<T, P>::type as(P bytes) {
+    return reinterpret_cast<typename detail::rebound<T, P>::type>(bytes);
 }
 
 template <typename T, typename S = space<false>>

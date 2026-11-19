@@ -2,7 +2,6 @@ import { useId, useState } from "react"
 import { Option } from "effect"
 import type { LocalInferenceHardware } from "@magnitudedev/sdk"
 import { deriveHardwareRoles } from "@magnitudedev/client-common"
-import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import { CaretDownIcon, CaretRightIcon, LaptopIcon, DesktopTowerIcon, ComputerTowerIcon, HardDrivesIcon, MonitorIcon, CpuIcon, GraphicsCardIcon, MemoryIcon } from "@phosphor-icons/react"
 import { hardwareDetails } from "./hardware-details"
 
@@ -10,12 +9,10 @@ const GiB = 1024 ** 3
 const capacity = (bytes: number) => `${Number((bytes / GiB).toFixed(1))} GiB`
 export function HardwareSummary({
   value,
-  identity,
   expanded,
   onExpandedChange,
 }: {
   value: LocalInferenceHardware
-  identity: MachineIdentityObservation | null
   expanded?: boolean
   onExpandedChange?: (expanded: boolean) => void
 }) {
@@ -23,7 +20,7 @@ export function HardwareSummary({
   const open = expanded ?? localOpen
   const setOpen = onExpandedChange ?? setLocalOpen
   const id = useId()
-  const details = hardwareDetails(identity, value)
+  const details = hardwareDetails(value)
   const category = details.category.toLowerCase()
   const Icon = /laptop|tablet|mobile/.test(category)
     ? LaptopIcon
@@ -51,9 +48,9 @@ export function HardwareSummary({
     ? gpuSummary
     : Option.getOrElse(value.processor, () => "Processor not identified")
   const machine = Option.getOrElse(details.name, () =>
-    identity?.formFactor === "Desktop"
+    value.identity.formFactor === "Desktop"
       ? "Desktop"
-      : identity?.formFactor === "Server"
+      : value.identity.formFactor === "Server"
       ? "Server"
       : "This computer"
   )
