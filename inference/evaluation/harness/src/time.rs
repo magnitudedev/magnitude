@@ -2103,7 +2103,7 @@ fn assessment(artifacts: &Artifacts, options: &EngineOptions) -> Result<Assessme
     let storage = magnitude_artifacts::model_store(&artifacts.target).map_err(|error| format!("{}: {error}", artifacts.target.display()))?;
     let measurements = structure.stored_measurements(cache, &storage);
     let package = ModelPackagePaths {
-        target: artifacts.target.clone(),
+        target_shards: vec![artifacts.target.clone()],
         projector: None,
         draft: None,
         method: ModelMethod::Plain,
