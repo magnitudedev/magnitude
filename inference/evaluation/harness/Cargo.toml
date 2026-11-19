@@ -19,6 +19,7 @@ magnitude-chat = { path = "../../engine/chat" }
 # The engine's development tuning tools (pins and the survey), which only the
 # harness enables; a served engine is built without them.
 magnitude-engine = { path = "../../engine", features = ["tuning-survey", "expert-routing", "machine-line"] }
+magnitude-cost-model = { path = "../../engine/cost-model" }
 magnitude-executor = { path = "../../engine/executor" }
 magnitude-family-contracts = { path = "../../engine/families/contracts" }
 magnitude-generation = { path = "../../engine/generation" }
@@ -41,6 +42,8 @@ tracing-subscriber.workspace = true
 # The controlled execution domain (`magnitude_executor::fixtures`) the
 # harness's step boundary is tested over.
 magnitude-executor = { path = "../../engine/executor", features = ["fixtures"] }
+# The reference expert lines the bar's tests are measured against.
+magnitude-cost-model = { path = "../../engine/cost-model", features = ["fixtures"] }
 
 [lints]
 workspace = true

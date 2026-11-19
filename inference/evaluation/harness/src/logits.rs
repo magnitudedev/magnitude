@@ -150,6 +150,7 @@ pub fn run(
             decode_rows: rows_per_step,
             exported_logits_rows: rows_per_step.max(PREFILL_ROWS),
             lookahead: false,
+            record_routes: false,
         },
     )?;
     let vocabulary = engine.vocabulary;
@@ -356,7 +357,7 @@ fn score(
             continue;
         }
         for ((walk, start), outcome) in advancing.iter().zip(starts).zip(outcomes) {
-            let Outcome::Forward { rows } = outcome else {
+            let Outcome::Forward { rows, .. } = outcome else {
                 return Err("a scored step returned a non-forward outcome".into());
             };
             for (offset, result) in rows.iter().enumerate() {
@@ -400,6 +401,8 @@ fn scored(sequence: &Sequence, forced: Vec<TokenId>) -> Operation {
         committed: forced.len(),
         tokens: forced,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 

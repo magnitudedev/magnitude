@@ -13,9 +13,10 @@ use crate::engine::{self, Engine, EngineOptions, Load, PREFILL_ROWS, text};
 use crate::render::Rendered;
 use magnitude_engine::options::{ModelMethod, ResolvedMethod};
 use magnitude_executor::{
-    Demand, DraftForm, FeatureReader, FeatureSpan, HeadPhase, Operation, Outcome, PhysicalDecision,
-    ReservedResources, TokenId, WorkKind,
+    Demand, DraftForm, FeatureReader, FeatureSpan, HeadPhase, Operation, Outcome,
+    ReservedResources, Rows, Sampling, Shaping, TokenId, WorkKind,
 };
+use magnitude_generation::RoundState;
 use magnitude_family_contracts::HeadHistory;
 use seismic::{TraceDetail, host_seconds};
 use serde_json::{Value, json};
@@ -60,6 +61,7 @@ pub fn run(
             decode_rows: magnitude_executor::StepAllowances::EVALUATION_DRAFTING.decode_tokens,
             exported_logits_rows: 0,
             lookahead: false,
+            record_routes: false,
         },
     )?;
     let drafter = Drafter::of(engine.method)
@@ -131,42 +133,6 @@ struct Drafted {
     attribution: Value,
 }
 
-/// Submit one drafter operation and reconcile `accepted` rows of it.
-fn head(engine: &mut Engine, operation: Operation, accepted: usize) -> Result<Outcome, String> {
-    let operations = [operation];
-    let mut bindings = engine.bindings();
-    engine.provision(&mut bindings, &operations)?;
-    let ReservedResources::Head(workspace, output, advances) = engine
-        .domain
-        .reserve(&mut bindings, &operations)
-        .map_err(text)?
-        .into_resources()
-    else {
-        return Err("a drafter operation runs on the head lane".into());
-    };
-    let flight = engine
-        .domain
-        .submit_head(bindings, &operations, workspace, output, advances)
-        .map_err(|failure| failure.error().to_string())?;
-    let (pending, bindings) = engine.domain.finish_head(flight).map_err(text)?;
-    engine.bindings = Some(bindings);
-    let mut outcome = None;
-    for pending in pending {
-        outcome = Some(pending.outcome().clone());
-        engine
-            .domain
-            .reconcile(
-                pending,
-                PhysicalDecision {
-                    accepted_rows: accepted,
-                },
-            )
-            .map_err(text)?;
-    }
-    engine.between_steps()?;
-    outcome.ok_or_else(|| "a drafter operation returned no outcome".into())
-}
-
 /// How the loaded drafter enters history and drafts, as the served method
 /// drives it.
 #[derive(Clone, Copy)]
@@ -221,7 +187,7 @@ fn draft_at(
             Demand::FEATURES,
         );
         let (_, outcomes) = engine.step(vec![operation], &mut [&mut sequence], None)?;
-        let [Outcome::Forward { rows }] = outcomes.as_slice() else {
+        let [Outcome::Forward { rows, .. }] = outcomes.as_slice() else {
             return Err("a prefill returns forward rows".into());
         };
         let features = rows
@@ -251,7 +217,7 @@ fn draft_at(
             proposals: Vec::new(),
             form: drafter.form,
         };
-        head(engine, operation, end - start)?;
+        engine.head(operation, end - start)?;
     }
     let (last_start, last_rows) = conditioning
         .last()
@@ -294,7 +260,7 @@ fn draft_at(
         }))
     };
     let draft_start = host_seconds();
-    let Outcome::Head { proposals, .. } = head(engine, operation, 1)? else {
+    let Outcome::Head { proposals, .. } = engine.head(operation, 1)? else {
         return Err("a draft returns proposals".into());
     };
     let proposals = proposals
@@ -302,22 +268,21 @@ fn draft_at(
         .map(|selected| selected.token)
         .collect::<Vec<_>>();
     let draft_phase = phase(draft_start)?;
-    // The target verifies the anchor and the proposals greedily.
-    let mut verified = vec![tokens[anchor]];
-    verified.extend_from_slice(&proposals);
-    let operations = [Operation::Forward {
-        request: sequence.request,
-        kind: WorkKind::Verify,
-        select: (0..verified.len())
-            .map(|row| Engine::greedy(anchor + row + 1))
-            .collect(),
-        tokens: verified,
-        position: anchor,
-        conditioning: None,
-        demand: Demand::SELECT,
-        committed: 1,
-        prime: None,
-    }];
+    // The target verifies the anchor and the proposals greedily, in the
+    // round generation runs (`RoundState::pass`), which accepts its rows.
+    let round = RoundState::pass(
+        tokens[anchor],
+        Rows::Exact { acceptable: proposals.clone() },
+        anchor + 1,
+        &[],
+        None,
+        Sampling::Greedy,
+        Shaping::default(),
+        0,
+        Demand::NONE,
+        None,
+    )?;
+    let operations = [round.forward().clone().into_operation(sequence.request, anchor, None)?];
     let verify_start = host_seconds();
     let mut bindings = engine.bindings();
     engine.provision(&mut bindings, &operations)?;
@@ -338,28 +303,13 @@ fn draft_at(
     let mut target = Vec::new();
     let mut accepted = 0;
     for pending in pending {
-        let Outcome::Forward { rows } = pending.outcome() else {
+        let Outcome::Forward { rows, .. } = pending.outcome() else {
             return Err("verification returns forward rows".into());
         };
-        target = rows
-            .iter()
-            .map(|row| row.selected.as_ref().map(|selected| selected.token))
-            .collect::<Option<Vec<_>>>()
-            .ok_or("a verification row has no selection")?;
-        accepted = proposals
-            .iter()
-            .zip(&target)
-            .take_while(|(proposal, sampled)| proposal == sampled)
-            .count();
-        engine
-            .domain
-            .reconcile(
-                pending,
-                PhysicalDecision {
-                    accepted_rows: accepted + 1,
-                },
-            )
-            .map_err(text)?;
+        target = round.forward().samples(rows)?;
+        let acceptance = round.clone().reconcile(&target, &Default::default())?;
+        accepted = acceptance.accepted_proposals;
+        engine.domain.reconcile(pending, acceptance.decision()).map_err(text)?;
     }
     engine.between_steps()?;
     let verify_phase = phase(verify_start)?;

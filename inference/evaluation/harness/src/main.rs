@@ -45,6 +45,7 @@ mod memory;
 mod record;
 mod render;
 mod rest;
+mod routes;
 mod selection;
 mod steps;
 mod time;
@@ -133,6 +134,18 @@ enum Command {
         /// efficiency is measured, the one timing a resident load adds.
         #[arg(long)]
         untimed: bool,
+        /// The decode cells of each context and concurrency, in order, in
+        /// the one loaded process: `plain`, or `two-row` (each pass an exact
+        /// row and a front row a token ahead of it, every token its exact
+        /// row's; concurrency 1).
+        #[arg(long, value_delimiter = ',', default_value = "plain")]
+        decode_modes: Vec<time::DecodeMode>,
+        /// Record each decode cell's routes into the run directory's
+        /// `routes/`: every step's choices and selection key of every expert
+        /// at each streamed layer, its front rows' verdicts and the tokens (a
+        /// diagnostic of a streamed load's one-sequence decode).
+        #[arg(long)]
+        record_routes: bool,
     },
     /// One load's host memory against its charge, in a worker process
     /// (`memory`).
@@ -605,6 +618,8 @@ fn run(command: Command) -> Result<(), String> {
             lookahead,
             resident_decode,
             untimed,
+            decode_modes,
+            record_routes,
         } => {
             let inputs = Inputs::read(&run, "harness.time")?;
             let (options, development) = engine_options(&engine, &inputs)?;
@@ -630,6 +645,8 @@ fn run(command: Command) -> Result<(), String> {
                     lookahead,
                     resident_decode,
                             untimed,
+                            modes: decode_modes,
+                            routes: record_routes.then(|| inputs.run.path("routes")),
                 },
             )?;
             development.finish()?;
@@ -657,6 +674,7 @@ fn run(command: Command) -> Result<(), String> {
                 decode_rows: 1,
                 exported_logits_rows: 0,
                 lookahead: true,
+                record_routes: false,
             };
             // The check reads the device's register limits, which Vulkan's
             // probes establish.
@@ -786,3 +804,24 @@ fn run(command: Command) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One `time` invocation alternates its decode cells' modes in the
+    /// order given, in one loaded process.
+    #[test]
+    fn a_time_run_takes_its_decode_modes_in_order() {
+        let parsed = |modes: &[&str]| {
+            let arguments = ["magnitude-harness", "time", "--artifacts", "a.json", "--fixtures", "f.jsonl", "--output", "out"];
+            match Cli::try_parse_from(arguments.iter().chain(modes)).expect("the arguments parse").command {
+                Command::Time { decode_modes, .. } => decode_modes,
+                _ => unreachable!("a time command"),
+            }
+        };
+        use time::DecodeMode::{Plain, TwoRow};
+        assert_eq!(parsed(&[]), [Plain]);
+        assert_eq!(parsed(&["--decode-modes", "plain,two-row,two-row,plain"]), [Plain, TwoRow, TwoRow, Plain]);
+        assert!(Cli::try_parse_from(["magnitude-harness", "time", "--artifacts", "a", "--fixtures", "f", "--output", "o", "--decode-modes", "three-row"]).is_err());
+    }
+}
