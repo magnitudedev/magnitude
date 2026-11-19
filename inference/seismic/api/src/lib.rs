@@ -4221,13 +4221,14 @@ impl NativeGraphMetadata {
         width: Dim,
         activation: Element,
     ) -> Result<OperandCarry, NativeGraphMetadataError> {
-        let blocks = width.ceil_div(seismic_lang::cpu::CPU_Q8_VALUES)
-            * seismic_runtime::native::graph::OPERAND_CARRY_BLOCK_WORDS;
         let shape = [rows.recorded(), width.recorded()];
+        let [(rows_repr, rows_extents), (quantized_repr, quantized_extents)] =
+            seismic_runtime::native::graph::operand_carry_ports(self.backend, rows, width);
         Ok(OperandCarry {
-            rows: self.port(Element::f32(), &[rows.clone(), width])?,
-            quantized: self.port(Element::u32(), &[rows, blocks])?,
+            rows: self.port(Element(rows_repr), &rows_extents)?,
+            quantized: self.port(Element(quantized_repr), &quantized_extents)?,
             activation,
+            backend: self.backend,
             shape,
         })
     }
@@ -4431,6 +4432,12 @@ impl NativePort {
     }
 }
 
+impl seismic_runtime::native::graph::CarryExtent for Dim {
+    fn ceil_div_mul(&self, divisor: u64, factor: u64) -> Self {
+        self.ceil_div(divisor) * factor
+    }
+}
+
 pub use seismic_runtime::native::graph::OperandForms;
 
 /// An operand carried from one graph to the next
@@ -4446,11 +4453,14 @@ pub use seismic_runtime::native::graph::OperandForms;
 pub struct OperandCarry {
     /// F32 `[ROWS, WIDTH]`: the formed rows.
     pub rows: NativePort,
-    /// U32 words `[ROWS, ceil(WIDTH / 256) * Q8_BYTES / 4]`: the rows' Q8
-    /// blocks.
+    /// U32 words `[q_rows, ceil(WIDTH / 256) * Q8_BYTES / 4]`: the rows' Q8
+    /// blocks, where `q_rows` is `ROWS` rounded up to the backend's Q8 row
+    /// tile (`operand_carry_row_tile`).
     pub quantized: NativePort,
     /// The activation element both ends bind, which the rows are rounded to.
     pub activation: Element,
+    /// The backend whose carry port layout this carry was declared for.
+    backend: BackendName,
     /// Its rows and width, which its tensors take.
     shape: [u64; 2],
 }
@@ -4466,7 +4476,7 @@ impl OperandCarry {
     /// blocks.
     pub fn allocate(&self, charges: &Charges) -> Result<[Tensor; 2], TensorError> {
         let [(rows, rows_extents), (quantized, quantized_extents)] =
-            seismic_runtime::native::graph::operand_carry_ports(self.shape[0], self.shape[1]);
+            seismic_runtime::native::graph::operand_carry_ports(self.backend, self.shape[0], self.shape[1]);
         Ok([
             Tensor::zeros(charges, Element(rows), &rows_extents)?,
             Tensor::zeros(charges, Element(quantized), &quantized_extents)?,
@@ -4645,6 +4655,7 @@ impl NativeGraph {
         width: u64,
         activation: Element,
     ) -> Result<OperandCarry, TensorError> {
+        let backend = self.inner.backend();
         let inner = self.inner.operand_carry(rows, width, activation.id())?;
         let port = |inner: seismic_runtime::native::graph::NativePort| NativePort {
             tensor: WorkflowTensor { inner: inner.reference() },
@@ -4654,6 +4665,7 @@ impl NativeGraph {
             rows: port(inner.rows),
             quantized: port(inner.quantized),
             activation,
+            backend,
             shape: [rows, width],
         })
     }

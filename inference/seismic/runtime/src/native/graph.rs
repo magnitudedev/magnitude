@@ -415,8 +415,9 @@ fn emission_word(rows: bool, formed: bool, nvfp4: bool) -> u64 {
 pub struct OperandCarry {
     /// F32 `[ROWS, WIDTH]`: the formed rows.
     pub rows: NativePort,
-    /// U32 words `[ROWS, ceil(WIDTH / Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS]`:
-    /// the rows' Q8 blocks.
+    /// U32 words `[q_rows, ceil(WIDTH / Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS]`:
+    /// the rows' Q8 blocks, where `q_rows` is `ROWS` rounded up to the
+    /// backend's Q8 row tile ([`operand_carry_row_tile`]).
     pub quantized: NativePort,
     /// The activation element both sides bind
     /// ([`super::OPERAND_ACTIVATION`]), which the rows are rounded to.
@@ -426,20 +427,50 @@ pub struct OperandCarry {
 /// The u32 words of one Q8 block (`cpu::CPU_Q8_BYTES`) in a carry's
 /// `quantized` port: its blocks are opaque words, as a call's scratch is
 /// bytes.
-pub const OPERAND_CARRY_BLOCK_WORDS: u64 = seismic_lang::cpu::CPU_Q8_BYTES / 4;
+const OPERAND_CARRY_BLOCK_WORDS: u64 = seismic_lang::cpu::CPU_Q8_BYTES / 4;
 const _: () = assert!(seismic_lang::cpu::CPU_Q8_BYTES % 4 == 0, "a Q8 block is whole u32 words");
 
+/// The row tile alignment of a backend's carried Q8 operand buffer: CPU
+/// tiled projections size their Q8 scratch in whole `CPU_Q8_ROWS` strips,
+/// while GPU backends do not tile CPU Q8 blocks.
+pub fn operand_carry_row_tile(backend: BackendName) -> u64 {
+    match backend {
+        BackendName::Cpu => seismic_lang::cpu::CPU_Q8_ROWS,
+        BackendName::Metal | BackendName::Cuda | BackendName::Vulkan => 1,
+    }
+}
+
+/// An extent of an operand carry's ports: concrete (`u64`) in the runtime,
+/// or symbolic (`Dim`) in metadata templates.
+pub trait CarryExtent: Clone {
+    /// `ceil(self / divisor) * factor`.
+    fn ceil_div_mul(&self, divisor: u64, factor: u64) -> Self;
+}
+
+impl CarryExtent for u64 {
+    fn ceil_div_mul(&self, divisor: u64, factor: u64) -> Self {
+        self.div_ceil(divisor) * factor
+    }
+}
+
 /// The representation and extents of each port of a carry of `rows` rows of
-/// `width` values: its rows, then its Q8 blocks ([`OperandCarry`]).
-pub fn operand_carry_ports(rows: u64, width: u64) -> [(RepresentationId, [u64; 2]); 2] {
+/// `width` values on `backend`: its rows, then its Q8 blocks
+/// ([`OperandCarry`]). Generic over concrete (`u64`) and symbolic (`Dim`)
+/// extents so runtime graphs, carry allocation, validation, and metadata
+/// templates all share one owner.
+pub fn operand_carry_ports<D: CarryExtent>(
+    backend: BackendName,
+    rows: D,
+    width: D,
+) -> [(RepresentationId, [D; 2]); 2] {
     let representation =
         |name| seismic_lang::registry::representation(name).expect("the registry holds every dense dtype");
+    let tile = operand_carry_row_tile(backend);
+    let quantized_rows = if tile == 1 { rows.clone() } else { rows.ceil_div_mul(tile, tile) };
+    let quantized_cols = width.ceil_div_mul(seismic_lang::cpu::CPU_Q8_VALUES, OPERAND_CARRY_BLOCK_WORDS);
     [
         (representation("f32"), [rows, width]),
-        (
-            representation("u32"),
-            [rows, width.div_ceil(seismic_lang::cpu::CPU_Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS],
-        ),
+        (representation("u32"), [quantized_rows, quantized_cols]),
     ]
 }
 
@@ -478,6 +509,7 @@ enum CarryEnd {
 /// names; a carried out result is one of its nodes', carried out once; a
 /// carried in tensor and norm are its ports.
 fn add_carry<F>(
+    backend: BackendName,
     identity: u64,
     ports: &[PortSpec],
     nodes: usize,
@@ -517,7 +549,7 @@ fn add_carry<F>(
     };
     let rows = &ports[carry.rows.reference.result as usize];
     let [rows_port, quantized_port] = match rows.extents[..] {
-        [count, width] => operand_carry_ports(count, width),
+        [count, width] => operand_carry_ports(backend, count, width),
         _ => return Err(mismatch(carry.rows)),
     };
     for (port, (representation, extents)) in [(carry.rows, rows_port), (carry.quantized, quantized_port)] {
@@ -808,6 +840,11 @@ impl NativeGraphDraft {
         )
     }
 
+    /// The backend of the device this graph drafts for.
+    pub fn backend(&self) -> BackendName {
+        super::backend_name(&self.device.kind)
+    }
+
     /// Declare a carry of `rows` rows of `width` values, its rows rounded
     /// to `activation`: two external ports of the shapes
     /// [`operand_carry_ports`] gives, which each run binds.
@@ -817,7 +854,8 @@ impl NativeGraphDraft {
         width: u64,
         activation: RepresentationId,
     ) -> Result<OperandCarry, TensorError> {
-        let [(rows_element, rows_extents), (quantized_element, quantized_extents)] = operand_carry_ports(rows, width);
+        let [(rows_element, rows_extents), (quantized_element, quantized_extents)] =
+            operand_carry_ports(self.backend(), rows, width);
         Ok(OperandCarry {
             rows: self.port(rows_element, &rows_extents)?,
             quantized: self.port(quantized_element, &quantized_extents)?,
@@ -834,7 +872,7 @@ impl NativeGraphDraft {
         carry: &OperandCarry,
         forms: OperandForms,
     ) -> Result<(), WorkflowError> {
-        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, CarryEnd::Out(result))
+        add_carry(self.backend(), self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, CarryEnd::Out(result))
     }
 
     /// Each consumer of `hidden`'s whole tensor whose operand is normed by
@@ -851,7 +889,7 @@ impl NativeGraphDraft {
         epsilon: f32,
     ) -> Result<(), WorkflowError> {
         let end = CarryEnd::In { hidden, norm, epsilon };
-        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, end)
+        add_carry(self.backend(), self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, end)
     }
 
     /// Seal the graph as a plan whose runs replay graphs: on CUDA graphs
@@ -1536,7 +1574,7 @@ impl NativeGraphMetadataDraft {
     /// the graph reserves for them is the same in every form
     /// ([`OperandForms`]).
     pub fn carry_out(&mut self, result: WorkflowResultRef, carry: &OperandCarry) -> Result<(), WorkflowError> {
-        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), CarryEnd::Out(result))
+        add_carry(self.backend, self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), CarryEnd::Out(result))
     }
 
     /// `NativeGraphDraft::carry_in`, in no form.
@@ -1548,7 +1586,7 @@ impl NativeGraphMetadataDraft {
         epsilon: f32,
     ) -> Result<(), WorkflowError> {
         let end = CarryEnd::In { hidden, norm, epsilon };
-        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), end)
+        add_carry(self.backend, self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), end)
     }
 
     pub fn seal(mut self) -> Result<NativeGraphStorageBytes, WorkflowError> {
@@ -6455,7 +6493,7 @@ mod operand_pairing_tests {
     /// in no workspace; a layout certifies the carry with its topology.
     #[test]
     fn carried_operands_lie_on_their_ports() {
-        let [(rows, rows_extents), (blocks, blocks_extents)] = operand_carry_ports(1, 256);
+        let [(rows, rows_extents), (blocks, blocks_extents)] = operand_carry_ports(BackendName::Cpu, 1, 256);
         let name = |id| seismic_lang::registry::representation_info(id).name;
         let ports = [
             port("f32", &[1, 256], false),
@@ -6489,6 +6527,89 @@ mod operand_pairing_tests {
             Some(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology)),
             "a layout of a carry certifies no graph without it"
         );
+    }
+
+    /// The quantized port of an operand carry rounds its row extent up to
+    /// `CPU_Q8_ROWS` on CPU (covering the tiled projection's Q8 scratch for
+    /// `rows = 1` and other non-multiples) and stays unpadded on GPU backends.
+    #[test]
+    fn operand_carry_quantized_port_rounds_rows_per_backend() {
+        use seismic_lang::cpu::{CPU_Q8_BYTES, CPU_Q8_ROWS, CPU_Q8_VALUES};
+        let name = |id| seismic_lang::registry::representation_info(id).name;
+        let native_port = |ordinal: u32| NativePort {
+            reference: WorkflowResultRef { workflow: WORKFLOW, node: INPUT_NODE, result: ordinal },
+        };
+        let backends = [
+            (BackendName::Cpu, CPU_Q8_ROWS),
+            (BackendName::Metal, 1),
+            (BackendName::Cuda, 1),
+            (BackendName::Vulkan, 1),
+        ];
+        for (backend, tile) in backends {
+            assert_eq!(operand_carry_row_tile(backend), tile);
+            for rows in [1u64, 2, 7, 8, 9, 15, 16] {
+                for width in [1u64, 256, 257, 2048] {
+                    let [(rows_repr, rows_extents), (q_repr, q_extents)] = operand_carry_ports(backend, rows, width);
+                    let expected_q_rows = rows.next_multiple_of(tile);
+                    let expected_blocks = width.div_ceil(CPU_Q8_VALUES);
+                    assert_eq!(rows_extents, [rows, width]);
+                    assert_eq!(q_extents, [expected_q_rows, expected_blocks * OPERAND_CARRY_BLOCK_WORDS]);
+                    let q_port = port(name(q_repr), &q_extents, false);
+                    let expected_bytes = expected_q_rows * expected_blocks * CPU_Q8_BYTES;
+                    assert_eq!(q_port.byte_len, expected_bytes);
+
+                    let ports = [
+                        port("f32", &[rows, width], false),
+                        port("f32", &[width], false),
+                        port(name(rows_repr), &rows_extents, false),
+                        q_port,
+                    ];
+                    let carry = OperandCarry {
+                        rows: native_port(2),
+                        quantized: native_port(3),
+                        activation: bf16().unwrap(),
+                    };
+                    let mut carries = Vec::new();
+                    add_carry(
+                        backend,
+                        WORKFLOW,
+                        &ports,
+                        0,
+                        &mut carries,
+                        &carry,
+                        (),
+                        CarryEnd::In { hidden: native_port(0), norm: native_port(1), epsilon: 1e-6 },
+                    )
+                    .unwrap();
+
+                    if rows % CPU_Q8_ROWS != 0 {
+                        let wrong_rows = if backend == BackendName::Cpu {
+                            rows
+                        } else {
+                            rows.next_multiple_of(CPU_Q8_ROWS)
+                        };
+                        let mut mismatched = ports;
+                        mismatched[3] = port(name(q_repr), &[wrong_rows, expected_blocks * OPERAND_CARRY_BLOCK_WORDS], false);
+                        let mut carries = Vec::new();
+                        assert_eq!(
+                            add_carry(
+                                backend,
+                                WORKFLOW,
+                                &mismatched,
+                                0,
+                                &mut carries,
+                                &carry,
+                                (),
+                                CarryEnd::In { hidden: native_port(0), norm: native_port(1), epsilon: 1e-6 },
+                            )
+                            .err(),
+                            Some(WorkflowError::NativePortMismatch { port: 3 }),
+                            "mismatched quantized rows={wrong_rows} for backend={backend:?} rows={rows} must be rejected"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// What a carry or pair does not hold is refused: a carry nothing
