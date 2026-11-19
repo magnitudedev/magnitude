@@ -12,7 +12,7 @@ import { containerImage } from "@magnitudedev/daemon-management/application-upda
 import { isDevelopmentBuild } from "../runtime/environment"
 import { CLI_VERSION } from "../version"
 import { announceAvailableUpdates, announceFailedUpdates, idleInstallationSystem, initializeContainerUpdates, initializeServeUpdates, makeAvailableNotice, makeDownloadedNotice, makeIdleInstallation, makeImageNotice, prepareServeStartup } from "../server/serve-updates"
-import { recordResidentModels, resumeResidentModels } from "../server/model-resumption"
+import { recordModelsBeforeUpdate, recordResidentModels, resumeResidentModels } from "../server/model-resumption"
 import { isContainer, renderNodeHint, requireWritableDataDirectory, unopenableRenderNodes } from "../server/container"
 import { resolveServeOwner } from "../server/serve-owner"
 import { readServerReach, renderServeReady } from "../server/server-reach"
@@ -87,11 +87,17 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const retried = yield* Ref.make(false)
   const awaitTurn = Effect.gen(function* () {
     let announced = false
-    while (Option.isSome(yield* blocker)) {
+    let recorded = 0
+    for (let current = yield* blocker; Option.isSome(current); current = yield* blocker) {
       if (!announced) yield* notify("Another Magnitude app is serving on this machine; this server will resume when it stops.")
       announced = true
       yield* Ref.set(waited, true)
       if (yield* Deferred.isDone(stopped)) return false
+      // What this account's desktop app has loaded is loaded again once this server resumes; one that does not answer keeps the last record.
+      if (current.value === "Desktop" && Date.now() - recorded >= 10_000) {
+        recorded = Date.now()
+        yield* recordResidentModels(profile.endpoint, stateDirectory, "Desktop").pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.ignore)
+      }
       yield* Effect.raceFirst(Effect.sleep("2 seconds"), Deferred.await(stopped))
     }
     return !(yield* Deferred.isDone(stopped))
@@ -127,7 +133,7 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
       : reason === "InstallUpdate" ? "Stopping the service to install the downloaded update; clients reconnect when it is back.\n"
       : "Stopping the Magnitude server.\n") }).pipe(
       // The version that starts after the update loads the same models again.
-      Effect.zipRight(reason === "InstallUpdate" ? recordResidentModels(profile.endpoint, stateDirectory).pipe(Effect.provideService(FileSystem.FileSystem, fs)) : Effect.void)),
+      Effect.zipRight(reason === "InstallUpdate" ? recordModelsBeforeUpdate(profile.endpoint, stateDirectory).pipe(Effect.provideService(FileSystem.FileSystem, fs)) : Effect.void)),
     stop: Deferred.await(stopped), observe: state => Ref.getAndSet(ready, state._tag === "Ready").pipe(Effect.flatMap(wasReady =>
       state._tag === "Ready" && !wasReady
         ? readServerReach({ endpoint: profile.endpoint, dataDirectory: profile.dataDirectory, service: owner === "service" }).pipe(
