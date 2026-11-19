@@ -2683,6 +2683,7 @@ impl TuningInputs<'_, '_> {
                     previous_tape: 0,
                     following_bank: (slots + slot) as i32 + 1,
                     stop: count as i32,
+                    front: 0,
                 }
             })
             .collect::<Vec<_>>();

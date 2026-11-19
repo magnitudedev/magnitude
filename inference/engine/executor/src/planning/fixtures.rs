@@ -142,9 +142,12 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
 }
 
 /// `definition` with an MTP head of its own history, stored in the target
-/// component: its first block (attention, dense) under head names, between
-/// the head's own norms and combine, reading out through the target's
-/// vocabulary projection and chaining its output.
+/// component: the planning fixture's block (attention, dense) at the
+/// decoder's width under head names, between the head's own norms and
+/// combine, reading out through the target's vocabulary projection and
+/// chaining its output. Over the planning fixture it is that decoder's own
+/// first block; over any other decoder (streams, routed or recurrent
+/// blocks) the head keeps that one plain block over a single residual.
 pub(crate) fn with_mtp_head(mut definition: ModelDefinition) -> ModelDefinition {
     use magnitude_family_contracts::{
         Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout,
@@ -156,7 +159,7 @@ pub(crate) fn with_mtp_head(mut definition: ModelDefinition) -> ModelDefinition 
         weight: named(name, &[hidden]),
         epsilon: 1e-6,
     };
-    let mut head_layer = definition.decoder.blocks[0].clone();
+    let mut head_layer = fixture_definition_of(hidden).decoder.blocks[0].clone();
     let rename = |weight: &mut WeightDescriptor| weight.name = format!("head_{}", weight.name);
     for sublayer in &mut head_layer.sublayers {
         if let InputNorm::Rms(norm) = &mut sublayer.input {
@@ -193,7 +196,7 @@ pub(crate) fn with_mtp_head(mut definition: ModelDefinition) -> ModelDefinition 
                 }
                 rename(&mut dense.down);
             }
-            _ => unreachable!("the fixture's first block is attention then dense"),
+            _ => unreachable!("the planning fixture's block is attention then dense"),
         }
     }
     definition.head = Some(Head {

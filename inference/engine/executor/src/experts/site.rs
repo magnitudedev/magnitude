@@ -366,7 +366,7 @@ impl SiteLayer {
         let (shape, slot) = (self.shape, self.shape.slot(step));
         assert!(entries.len() <= shape.rows * shape.choices && rows.len() == shape.rows * shape.hidden, "a request of the layer's extents");
         for (index, &(row, record, weight, expert)) in entries.iter().enumerate() {
-            let at = constants::SITE_ENTRIES + constants::SITE_ENTRY_WORDS * index as u64;
+            let at = constants::SITE_ENTRY(index as u64);
             let words = [
                 (constants::SITE_ROW, row as i32),
                 (constants::SITE_TIER_RECORD, record as i32),
@@ -434,7 +434,7 @@ impl SiteLayer {
             .unwrap_or_else(|| panic!("a site request of {count} entries"));
         (0..count)
             .map(|entry| {
-                let at = constants::SITE_ENTRIES + constants::SITE_ENTRY_WORDS * entry as u64;
+                let at = constants::SITE_ENTRY(entry as u64);
                 let field = |word| self.slots.load(step, 0, at + word);
                 let (row, record, expert) = (field(constants::SITE_ROW), field(constants::SITE_TIER_RECORD), field(constants::SITE_EXPERT));
                 Requested {
@@ -1694,7 +1694,7 @@ pub(crate) fn measure(
     layer: SiteLayer,
     threads: &super::ComputeThreads,
     requests: &[(usize, usize)],
-) -> Result<Vec<crate::assessment::Sample>, String> {
+) -> Result<Vec<magnitude_cost_model::Sample>, String> {
     let shape = layer.shape;
     let records = layer.tensors.read().expect("site tensors").up.count();
     for &(experts, rows) in requests {
@@ -1745,7 +1745,7 @@ pub(crate) fn measure(
         .filter(|measured| !matches!(measured, Ok((true, _))))
         .map(|measured| {
             let (_, times) = measured?;
-            crate::assessment::Sample::of(&times).ok_or_else(|| format!("a site measurement of {} samples has no resolution", times.len()))
+            magnitude_cost_model::Sample::of(&times).ok_or_else(|| format!("a site measurement of {} samples has no resolution", times.len()))
         })
         .collect()
 }

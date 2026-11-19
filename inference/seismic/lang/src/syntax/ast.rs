@@ -137,6 +137,7 @@ pub struct Ident {
 pub struct File {
     pub decls: Vec<Decl>,
     pub constants: Vec<ConstDecl>,
+    pub constant_functions: Vec<ConstFnDecl>,
 }
 
 /// `const NAME = INTEGER`: a module constant. Every file of a source set
@@ -146,6 +147,20 @@ pub struct File {
 pub struct ConstDecl {
     pub name: Ident,
     pub value: u64,
+    pub span: Span,
+}
+
+/// `const NAME(PARAMETER, ..) = EXPR`: a module constant function, a native
+/// expression over its parameters (and module constants). Every file of a
+/// source set sees it, a native expression calling it `NAME(ARG, ..)` is its
+/// body at those arguments, and the generated Rust API exports it as a
+/// `const fn`, so a quantity a declaration states and its host derives has
+/// one definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstFnDecl {
+    pub name: Ident,
+    pub parameters: Vec<Ident>,
+    pub body: Expr,
     pub span: Span,
 }
 

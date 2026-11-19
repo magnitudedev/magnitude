@@ -76,6 +76,7 @@ typedef projection::operands<NVFP4> Operands;
     if (ulong(tile) * simdgroups * ROWS * (32u / LANES) >= SEISMIC_DIM_F)                                              \
         return;                                                                                                        \
     const routed::Gathered chosen = routed::gather(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,           \
+        sources, SEISMIC_DIM_XS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,                                   \
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), group.y, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);       \
     if (chosen.count == 0)                                                                                             \
         return;                                                                                                        \

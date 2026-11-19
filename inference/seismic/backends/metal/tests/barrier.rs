@@ -24,13 +24,16 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLDispatchType, MTLFence, MTLLibrary, MTLResource, MTLResourceOptions, MTLResourceUsage,
-    MTLSize,
+    MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLCounterSet,
+    MTLComputePipelineState, MTLCounterDontSample, MTLCounterSampleBuffer,
+    MTLCounterSampleBufferDescriptor, MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType,
+    MTLFence, MTLLibrary, MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize,
+    MTLStorageMode,
 };
+use seismic_metal::host_seconds;
 use std::ptr::NonNull;
 
 const SOURCE: &str = "#include <metal_stdlib>\nusing namespace metal;\n\
@@ -71,7 +74,11 @@ enum Link {
 }
 
 struct Bench {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    /// The first encoder's start (sample 0) and the last one's end (1):
+    /// the device time of a run, from GPU timestamp samples.
+    samples: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     fence: Retained<ProtocolObject<dyn MTLFence>>,
@@ -80,12 +87,35 @@ struct Bench {
 
 type Encoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 
+/// Which of a run's samples an encoder takes: the run's start when it is
+/// the run's first, its end when its last.
+#[derive(Clone, Copy)]
+struct Ends {
+    first: bool,
+    last: bool,
+}
+
 impl Bench {
-    /// A concurrent encoder, declaring the order buffer when `link` chains.
-    fn open(&self, command: &ProtocolObject<dyn MTLCommandBuffer>, link: Link) -> Encoder {
-        let encoder = command
-            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-            .unwrap();
+    /// An encoder of `dispatch` type, declaring the order buffer when
+    /// `link` chains, taking the run's samples `ends` names: only those, so
+    /// the samples add nothing to the encoder boundaries measured.
+    fn open(
+        &self,
+        command: &ProtocolObject<dyn MTLCommandBuffer>,
+        link: Link,
+        dispatch: MTLDispatchType,
+        ends: Ends,
+    ) -> Encoder {
+        let pass = MTLComputePassDescriptor::computePassDescriptor();
+        pass.setDispatchType(dispatch);
+        // SAFETY: index 0 always exists; both samples lie in the buffer.
+        unsafe {
+            let attachment = pass.sampleBufferAttachments().objectAtIndexedSubscript(0);
+            attachment.setSampleBuffer(Some(&self.samples));
+            attachment.setStartOfEncoderSampleIndex(if ends.first { 0 } else { MTLCounterDontSample });
+            attachment.setEndOfEncoderSampleIndex(if ends.last { 1 } else { MTLCounterDontSample });
+        }
+        let encoder = command.computeCommandEncoderWithDescriptor(&pass).unwrap();
         if link == Link::Chained {
             encoder.useResource_usage(
                 ProtocolObject::from_ref(&*self.order),
@@ -96,13 +126,14 @@ impl Bench {
         encoder
     }
 
-    /// End `encoder` and open the next concurrent one after it by `link`.
-    fn next(&self, command: &ProtocolObject<dyn MTLCommandBuffer>, encoder: &mut Encoder, link: Link) {
+    /// End `encoder` and open the next concurrent one after it by `link`,
+    /// the run's last when `last`.
+    fn next(&self, command: &ProtocolObject<dyn MTLCommandBuffer>, encoder: &mut Encoder, link: Link, last: bool) {
         if link == Link::Fenced {
             encoder.updateFence(&self.fence);
         }
         encoder.endEncoding();
-        *encoder = self.open(command, link);
+        *encoder = self.open(command, link, MTLDispatchType::Concurrent, Ends { first: false, last });
         if link == Link::Fenced {
             encoder.waitForFence(&self.fence);
         }
@@ -124,29 +155,73 @@ impl Bench {
                     .unwrap()
             })
             .collect();
+        let counters = device
+            .counterSets()
+            .and_then(|sets| {
+                // SAFETY: a static Metal string constant.
+                let wanted = unsafe { MTLCommonCounterSetTimestamp };
+                sets.iter().find(|set| &*set.name() == wanted)
+            })
+            .expect("a timestamp counter set");
+        let descriptor = MTLCounterSampleBufferDescriptor::new();
+        descriptor.setCounterSet(Some(&counters));
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        // SAFETY: Metal validates the count when forming the buffer.
+        unsafe { descriptor.setSampleCount(2) };
+        let samples = device.newCounterSampleBufferWithDescriptor_error(&descriptor).unwrap();
         Self {
             queue: device.newCommandQueue().unwrap(),
+            samples,
             pipeline,
             buffers,
             fence: device.newFence().unwrap(),
             order: device
                 .newBufferWithLength_options(16, MTLResourceOptions::StorageModePrivate)
                 .unwrap(),
+            device,
         }
+    }
+
+    /// The GPU and host clocks together.
+    fn clocks(&self) -> (u64, f64) {
+        let (mut cpu, mut gpu) = (0u64, 0u64);
+        let before = host_seconds();
+        // SAFETY: both pointers are valid for one write.
+        unsafe { self.device.sampleTimestamps_gpuTimestamp(NonNull::from(&mut cpu), NonNull::from(&mut gpu)) };
+        (gpu, (before + host_seconds()) / 2.0)
+    }
+
+    /// Commit `command`, wait for it, and return its run's device seconds:
+    /// from its first encoder's start sample to its last one's end.
+    fn run(&self, command: &ProtocolObject<dyn MTLCommandBuffer>) -> f64 {
+        let early = self.clocks();
+        command.commit();
+        command.waitUntilCompleted();
+        let late = self.clocks();
+        // SAFETY: both samples lie in the buffer; the device wrote them.
+        let data = unsafe { self.samples.resolveCounterRange(NSRange::new(0, 2)) }.unwrap().to_vec();
+        let tick = |at: usize| u64::from_le_bytes(data[8 * at..8 * at + 8].try_into().unwrap());
+        let (start, end) = (tick(0), tick(1));
+        assert!(start != u64::MAX && end != u64::MAX && start <= end, "Metal dropped a run's sample");
+        (end - start) as f64 * (late.1 - early.1) / (late.0 - early.0) as f64
     }
 
     /// Device seconds of `launches` launches of `bytes` each, ordered by
     /// `order`: a chain, each launch reading the previous one's output.
     fn seconds(&self, order: Order, bytes: usize, launches: usize) -> f64 {
         let command = self.queue.commandBuffer().unwrap();
+        // Whether each launch has an encoder of its own.
+        let apart = matches!(
+            order,
+            Order::Encoders | Order::FencedEncoders | Order::Chained | Order::ChainedIndependent
+        );
+        let ends = Ends { first: true, last: !apart || launches == 1 };
         let mut encoder = match order {
-            Order::Serial => {
-                let encoder = command.computeCommandEncoder().unwrap();
-                encoder.setComputePipelineState(&self.pipeline);
-                encoder
+            Order::Serial => self.open(&command, Link::Tracked, MTLDispatchType::Serial, ends),
+            Order::Chained | Order::ChainedIndependent => {
+                self.open(&command, Link::Chained, MTLDispatchType::Concurrent, ends)
             }
-            Order::Chained | Order::ChainedIndependent => self.open(&command, Link::Chained),
-            _ => self.open(&command, Link::Tracked),
+            _ => self.open(&command, Link::Tracked, MTLDispatchType::Concurrent, ends),
         };
         for launch in 0..launches {
             let (input, output) = match order {
@@ -171,10 +246,10 @@ impl Bench {
                             )
                         }
                     }
-                    Order::Encoders => self.next(&command, &mut encoder, Link::Tracked),
-                    Order::FencedEncoders => self.next(&command, &mut encoder, Link::Fenced),
+                    Order::Encoders => self.next(&command, &mut encoder, Link::Tracked, launch + 1 == launches),
+                    Order::FencedEncoders => self.next(&command, &mut encoder, Link::Fenced, launch + 1 == launches),
                     Order::Chained | Order::ChainedIndependent => {
-                        self.next(&command, &mut encoder, Link::Chained)
+                        self.next(&command, &mut encoder, Link::Chained, launch + 1 == launches)
                     }
                     Order::Serial | Order::Independent => {}
                 }
@@ -198,9 +273,7 @@ impl Bench {
             );
         }
         encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        command.GPUEndTime() - command.GPUStartTime()
+        self.run(&command)
     }
 }
 
@@ -223,14 +296,13 @@ enum Pairs {
 impl Bench {
     fn pairs(&self, encoding: Pairs, bytes: usize, pairs: usize) -> f64 {
         let command = self.queue.commandBuffer().unwrap();
+        // Whether each pair has an encoder of its own.
+        let apart = matches!(encoding, Pairs::Encoders | Pairs::FencedEncoders | Pairs::Chained);
+        let ends = Ends { first: true, last: !apart || pairs == 1 };
         let mut encoder = match encoding {
-            Pairs::Serial => {
-                let encoder = command.computeCommandEncoder().unwrap();
-                encoder.setComputePipelineState(&self.pipeline);
-                encoder
-            }
-            Pairs::Chained => self.open(&command, Link::Chained),
-            _ => self.open(&command, Link::Tracked),
+            Pairs::Serial => self.open(&command, Link::Tracked, MTLDispatchType::Serial, ends),
+            Pairs::Chained => self.open(&command, Link::Chained, MTLDispatchType::Concurrent, ends),
+            _ => self.open(&command, Link::Tracked, MTLDispatchType::Concurrent, ends),
         };
         for pair in 0..pairs {
             // Pair p reads buffers 2(p mod 2), +1 and writes the other two.
@@ -239,9 +311,9 @@ impl Bench {
             if pair != 0 {
                 match encoding {
                     Pairs::Barriers => encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers),
-                    Pairs::Encoders => self.next(&command, &mut encoder, Link::Tracked),
-                    Pairs::FencedEncoders => self.next(&command, &mut encoder, Link::Fenced),
-                    Pairs::Chained => self.next(&command, &mut encoder, Link::Chained),
+                    Pairs::Encoders => self.next(&command, &mut encoder, Link::Tracked, pair + 1 == pairs),
+                    Pairs::FencedEncoders => self.next(&command, &mut encoder, Link::Fenced, pair + 1 == pairs),
+                    Pairs::Chained => self.next(&command, &mut encoder, Link::Chained, pair + 1 == pairs),
                     Pairs::Serial => {}
                 }
             }
@@ -266,9 +338,7 @@ impl Bench {
             }
         }
         encoder.endEncoding();
-        command.commit();
-        command.waitUntilCompleted();
-        command.GPUEndTime() - command.GPUStartTime()
+        self.run(&command)
     }
 }
 

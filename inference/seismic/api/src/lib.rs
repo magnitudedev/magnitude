@@ -755,6 +755,13 @@ impl Device {
     pub fn forms_tensor_operations(&self) -> bool {
         self.inner.forms_tensor_operations()
     }
+    /// Ensure the device's command queue can hold at least `count` uncompleted
+    /// command buffers at once. On Metal, sizes or grows the idle
+    /// `MTLCommandQueue` when its capacity is unset or below `count`; no-op on
+    /// backends without a fixed command-buffer ceiling.
+    pub fn ensure_command_buffer_capacity(&self, count: usize) -> Result<(), ExecutionError> {
+        self.inner.ensure_command_buffer_capacity(count)
+    }
     /// Record every native submission on this device until the returned
     /// trace is dropped (measurement only; see `TraceDetail`).
     pub fn trace_submissions(&self, detail: TraceDetail) -> Result<SubmissionTrace, TraceError> {

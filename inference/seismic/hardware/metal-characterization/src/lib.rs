@@ -269,7 +269,7 @@ impl CharacterizationProtocol {
                 protocol_revision: PROTOCOL_REVISION,
                 fact_algebra_revision: CURRENT_FACT_ALGEBRA_REVISION,
                 probe_library_digest,
-                measurement_endpoint: "MTLCommandBuffer.GPUStartTime/GPUEndTime",
+                measurement_endpoint: "MTLCounterSampleBuffer timestamps at encoder start and end",
             },
             budget,
             manifest,

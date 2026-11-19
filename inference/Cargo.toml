@@ -13,6 +13,7 @@ members = [
   "engine/batching",
   "engine/families/contracts",
   "engine/families/common",
+  "engine/cost-model",
   "engine/executor",
   "engine/source-identity",
   "engine/kernels",

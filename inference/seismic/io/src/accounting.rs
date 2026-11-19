@@ -2,8 +2,12 @@
 //! consumed: every reader of a count takes the difference of two looks
 //! ([`Totals::since`]), so readers never take counts from each other.
 //!
-//! Per volume: the seconds it held any piece in flight (its busy time) and
-//! its pieces in flight integrated over time (its depth); for due pieces
+//! Per volume: the seconds it held any piece in flight (its busy time), its
+//! pieces in flight integrated over time (its depth), and the seconds it
+//! held due pieces and pieces read ahead at once (its shared time: in
+//! decode the time reads ahead held the volume beside a parked read, the
+//! most they delayed it, the knee bounding them, "Order and depth"); for
+//! due pieces
 //! and for pieces read ahead (not due when a worker took them, [`Want`]):
 //! the bytes and requests (pieces) that ended, read or failed, the seconds
 //! a piece of the kind was in flight and its depth, and each ended
@@ -19,6 +23,13 @@
 //! book under its queue's lock, which it holds wherever a piece is taken
 //! or ends, so counting takes no lock of its own; a look ([`totals`])
 //! takes that lock once.
+//!
+//! The counts are the one owner of a volume's drive line ([`Totals::line`]):
+//! what reading an expert costs a step that waits on it, `λ + b/D`, fitted
+//! from the volume's own busy time and its due requests' waits. Every
+//! consumer of what a read takes (admission of a read ahead, a step's
+//! drive time, a prompt group's size) reads this line, and none fits its
+//! own.
 
 #[cfg(doc)]
 use crate::Want;
@@ -55,6 +66,9 @@ pub struct Totals {
     pub busy: f64,
     /// The pieces in flight, integrated over time (piece-seconds).
     pub depth: f64,
+    /// The seconds a due piece and a piece read ahead were in flight at
+    /// once.
+    pub shared: f64,
     /// Of the pieces due when a worker took them, and of those read ahead.
     pub due: Class,
     pub ahead: Class,
@@ -86,7 +100,63 @@ pub struct Waits {
     pub device: f64,
 }
 
+/// A volume's drive line ([`Totals::line`]): a read of `b` bytes a step
+/// waits on takes `latency + b · byte_seconds`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Line {
+    pub latency: f64,
+    pub byte_seconds: f64,
+}
+
+impl Line {
+    /// The seconds a read of `bytes` a step waits on takes.
+    pub fn seconds(&self, bytes: u64) -> f64 {
+        self.latency + bytes as f64 * self.byte_seconds
+    }
+}
+
+impl std::iter::Sum for Totals {
+    /// Several volumes' counts as one, field by field: the counts of the
+    /// reads a load makes across the volumes its files lie on.
+    fn sum<I: Iterator<Item = Self>>(totals: I) -> Self {
+        let class = |left: Class, right: Class| Class {
+            bytes: left.bytes + right.bytes,
+            requests: left.requests + right.requests,
+            busy: left.busy + right.busy,
+            depth: left.depth + right.depth,
+            waits: Waits {
+                requests: left.waits.requests + right.waits.requests,
+                behind_ahead: left.waits.behind_ahead + right.waits.behind_ahead,
+                behind_due: left.waits.behind_due + right.waits.behind_due,
+                device: left.waits.device + right.waits.device,
+            },
+        };
+        totals.fold(Self::default(), |left, right| Self {
+            busy: left.busy + right.busy,
+            depth: left.depth + right.depth,
+            shared: left.shared + right.shared,
+            due: class(left.due, right.due),
+            ahead: class(left.ahead, right.ahead),
+        })
+    }
+}
+
 impl Totals {
+    /// The volume's drive line: its bytes at its own rate while busy
+    /// ([`Self::rate`]: no request's time gives it, as a request's holds
+    /// the bytes ahead of it), and of its latency what its due requests'
+    /// time in flight took beyond their bytes at that rate (a request's
+    /// time queued is the drive's other work, not its own), at least none.
+    /// None before a due request ended or the volume was busy.
+    pub fn line(&self) -> Option<Line> {
+        let byte_seconds = self.rate().filter(|&rate| rate > 0.)?.recip();
+        let waits = &self.due.waits;
+        (waits.requests > 0).then(|| Line {
+            latency: ((waits.device - self.due.bytes as f64 * byte_seconds) / waits.requests as f64).max(0.),
+            byte_seconds,
+        })
+    }
+
     /// Both kinds, due first.
     fn kinds(&self) -> [&Class; 2] {
         [&self.due, &self.ahead]
@@ -134,6 +204,7 @@ impl Totals {
         Self {
             busy: self.busy - earlier.busy,
             depth: self.depth - earlier.depth,
+            shared: self.shared - earlier.shared,
             due: class(&self.due, &earlier.due),
             ahead: class(&self.ahead, &earlier.ahead),
         }
@@ -217,6 +288,9 @@ impl Book {
         if self.flight[1] > 0 {
             self.ahead += seconds;
         }
+        if self.flight[0] > 0 && self.flight[1] > 0 {
+            self.totals.shared += seconds;
+        }
     }
 }
 
@@ -295,5 +369,29 @@ impl Wait {
             book.waited(self.due, self.waits);
         }
         ended
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line's rate is the volume's busy rate, and its latency what the
+    /// due requests' time in flight took beyond their bytes at it, their
+    /// time queued apart: 4 MB in 1 ms busy (4 GB/s), two due requests of
+    /// 1 MB in flight 0.9 ms between them beyond their bytes' 0.5 ms,
+    /// 0.2 ms each. None before a due request ended.
+    #[test]
+    fn a_volumes_line_is_its_busy_rate_and_its_due_waits_beyond_it() {
+        let waits = Waits { requests: 2, behind_ahead: 0.1e-3, behind_due: 0.2e-3, device: 0.9e-3 };
+        let due = Class { bytes: 2_000_000, requests: 8, waits, ..Class::default() };
+        let ahead = Class { bytes: 2_000_000, requests: 8, ..Class::default() };
+        let totals = Totals { busy: 1e-3, due, ahead, ..Totals::default() };
+        let line = totals.line().expect("a line");
+        assert!((line.byte_seconds - 0.25e-9).abs() < 1e-18, "{line:?}");
+        assert!((line.latency - 0.2e-3).abs() < 1e-12, "{line:?}");
+        assert!((line.seconds(1_000_000) - 0.45e-3).abs() < 1e-12);
+        assert_eq!(Totals { due: Class { waits: Waits::default(), ..due }, ..totals }.line(), None);
+        assert_eq!([totals, totals].into_iter().sum::<Totals>().line(), Some(line), "two like volumes read as one");
     }
 }

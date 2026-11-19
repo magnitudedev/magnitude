@@ -44,10 +44,11 @@
 //! so an answer opens its park with no thread between. The keeper, a thread
 //! of its own, settles what no answer does (a park whose slot was answered
 //! before the device reached it, or one that waits for nothing). While the
-//! head is unreached it looks again within the request service's rest
-//! (`requests::IDLE`, rested precisely: `seismic_io::waited_on`), as the
-//! service looks at the device's words where kernels wait in place: the one poll of serving,
-//! which the hardware forces here too. A blocking wait on the timeline
+//! head is unreached it looks again within its own rest (`requests::Rest`,
+//! priced on its own looks and the arrivals they found, rested precisely:
+//! `seismic_io::waited_on`), as the request service looks at the device's
+//! words where kernels wait in place: the one poll of serving, which the
+//! hardware forces here too. A blocking wait on the timeline
 //! (`vkWaitSemaphores`) returns 25 to 97 µs after the device reached the
 //! value on GB10 (`seismic_vulkan`'s `the_keepers_wait_is_measured`), and a
 //! landing launch's or a round's request is the host's only from then.
@@ -67,7 +68,8 @@
 //! to read, and one the device reaches without the host.
 
 use super::Step;
-use super::scratch::round_lane;
+use super::requests::{Looked, Phase, Rest, Rested};
+use magnitude_kernels::constants;
 use crate::experts::ExchangeTable;
 use crate::experts::events::Events;
 use std::collections::VecDeque;
@@ -123,7 +125,7 @@ impl ParkLayer {
     fn lane(&self, kind: ParkKind) -> Option<(&ExchangeTable, u64, bool)> {
         match kind {
             ParkKind::Land => Some((&self.file, 0, false)),
-            ParkKind::Round(round) => Some((&self.scratch, round_lane(round), true)),
+            ParkKind::Round(round) => Some((&self.scratch, constants::ROUND_LANE(round), true)),
             ParkKind::Site => self.site.as_ref().map(|site| (site, 0, false)),
         }
     }
@@ -162,6 +164,40 @@ struct Pending {
     value: u64,
     sequence: Step,
     site: ParkSite,
+}
+
+/// The keeper's rest while a head is unreached ([`Parks::look`]), and the
+/// latest step of each phase whose park it polled for, by which a phase's
+/// start is told: a park's phase is its kind's (a scratch round's is a
+/// prompt's, a landing launch's and a sited combine's a decode's), and a
+/// phase starts again where its park is of a step past the other phase's
+/// latest, which itself came past this phase's latest. Prompt groups and
+/// decode steps begun behind them interleave their parks, but not their
+/// steps' order, so the boundary is the steps', not the parks' arrival.
+struct Keeping {
+    rest: Rest,
+    latest: [Option<Step>; 2],
+}
+
+impl Keeping {
+    fn new(rested: Rested) -> Self {
+        Self { rest: Rest::new(rested), latest: [None; 2] }
+    }
+
+    /// The phase `head`, unreached, is polled for, its start begun where
+    /// it is one.
+    fn polls(&mut self, head: &Pending) -> Phase {
+        let (phase, at, other) = match head.site.kind {
+            ParkKind::Round(_) => (Phase::Prompt, 0, 1),
+            ParkKind::Land | ParkKind::Site => (Phase::Decode, 1, 0),
+        };
+        let starts = self.latest[other].is_some_and(|other| head.sequence > other && self.latest[at].is_none_or(|latest| latest < other));
+        if starts {
+            self.rest.begin(phase);
+        }
+        self.latest[at] = Some(self.latest[at].map_or(head.sequence, |latest| latest.max(head.sequence)));
+        phase
+    }
 }
 
 /// Where settling stopped: what the parks wait on next.
@@ -219,6 +255,8 @@ pub(crate) struct Parks {
     /// ([`Self::lost`]), and the keeper ends. Set only under the parks'
     /// lock ([`Self::lose`]), read without it.
     loss: std::sync::OnceLock<String>,
+    /// The keeper's rest while the head is unreached ([`Self::look`]).
+    rested: Rested,
 }
 
 impl Parks {
@@ -246,7 +284,13 @@ impl Parks {
             state: Mutex::new(State { pending: VecDeque::new(), announced: 0, stopped: false }),
             changed: Condvar::new(),
             loss: std::sync::OnceLock::new(),
+            rested: Rested::default(),
         }
+    }
+
+    /// The keeper's rest now, for the exchange's watchdog.
+    pub(super) fn rested(&self) -> Rested {
+        self.rested.clone()
     }
 
     /// Why the device was lost under the parks, where it was: serving
@@ -466,18 +510,29 @@ impl Parks {
     /// wait for what may settle the parks further, decided under the same
     /// lock as the settling, so no arrival between the two is missed: the
     /// device reaching the value the head waits for while it is unreached
-    /// (a rest of `requests::IDLE`, after which it looks again); else a
-    /// registration, an answer, a retirement or the load stopping (an
-    /// answerer settles what its answer opens). False once the load
-    /// stopped or the device was lost ([`Self::lose`]): a loss is recorded
-    /// under the same lock, here last before the wait, so the keeper either
-    /// sees it or is waiting when it is notified.
-    fn look(&self) -> bool {
+    /// (its rest, `keeping`, after which it looks again: a settling that
+    /// found nothing is a look's price, one that found the device arrived
+    /// a notice, of the head's phase); else a registration, an answer, a retirement or the load
+    /// stopping (an answerer settles what its answer opens). False once the
+    /// load stopped or the device was lost ([`Self::lose`]): a loss is
+    /// recorded under the same lock, here last before the wait, so the
+    /// keeper either sees it or is waiting when it is notified.
+    fn look(&self, keeping: &mut Keeping) -> bool {
         let mut state = self.state();
         if state.stopped || self.loss.get().is_some() {
             return false;
         }
+        let looking = std::time::Instant::now();
         let Settled { answer, announces, stop } = self.settle_held(&mut state);
+        let looked = match answer.is_some() || announces {
+            true => Looked::Changed { noticed: 1 },
+            false => Looked::Empty(looking.elapsed()),
+        };
+        let polls = match stop {
+            Stop::Unreached => state.pending.front().map(|head| keeping.polls(head)),
+            Stop::Unanswered(_) | Stop::Empty => None,
+        };
+        let rested = keeping.rest.looked(looked, polls);
         if announces {
             self.events.notify();
         }
@@ -491,7 +546,7 @@ impl Parks {
         match stop {
             Stop::Unreached => {
                 drop(state);
-                std::thread::sleep(super::requests::IDLE);
+                std::thread::sleep(rested.expect("an unreached head is looked at again by time"));
             }
             // Its own settling may have lost the device.
             Stop::Unanswered(_) | Stop::Empty if self.loss.get().is_some() => return false,
@@ -561,7 +616,8 @@ impl Parks {
     pub(super) fn keep(parks: Arc<Self>) -> Result<JoinHandle<()>, String> {
         seismic::threads::spawn("expert-parks", move || {
             seismic_io::waited_on();
-            while parks.look() {}
+            let mut keeping = Keeping::new(parks.rested());
+            while parks.look(&mut keeping) {}
         })
         .map_err(|error| format!("expert parks' keeper: {error}"))
     }
@@ -664,8 +720,8 @@ mod tests {
         parks.timeline.reach(values[2]).unwrap();
         assert!(!parks.settle());
         let scratch = &parks.layers[0].scratch;
-        assert!(scratch.requested(8, round_lane(1)), "the keeper requests a round as the device arrives");
-        scratch.answer(8, round_lane(1), false);
+        assert!(scratch.requested(8, constants::ROUND_LANE(1)), "the keeper requests a round as the device arrives");
+        scratch.answer(8, constants::ROUND_LANE(1), false);
         assert!(parks.settle());
         assert!(parks.timeline.answered(values[2]).unwrap());
         assert!(parks.settled());
@@ -791,11 +847,12 @@ mod tests {
                 parks.register(1, 7, ParkSite { layer: 0, kind: ParkKind::Land });
             })
         };
-        assert!(parks.look(), "a registration ends the wait");
+        let mut keeping = Keeping::new(parks.rested());
+        assert!(parks.look(&mut keeping), "a registration ends the wait");
         register.join().unwrap();
         assert_eq!(parks.state().pending.len(), 1);
         parks.stop();
-        assert!(!parks.look(), "stopped, the keeper ends");
+        assert!(!parks.look(&mut keeping), "stopped, the keeper ends");
     }
 
     /// The keeper answers every park whatever moment the device reaches it,
@@ -844,13 +901,13 @@ mod tests {
             // The request service: it looks at the round's lane on each event.
             loop {
                 let seen = parks.events.seen();
-                if scratch.requested(step, round_lane(0)) {
+                if scratch.requested(step, constants::ROUND_LANE(0)) {
                     break;
                 }
                 parks.events.wait_at_most(seen, std::time::Duration::from_secs(1));
                 assert_ne!(parks.events.seen(), seen, "step {step}'s round arrived and no event announced it");
             }
-            scratch.answer(step, round_lane(0), false);
+            scratch.answer(step, constants::ROUND_LANE(0), false);
             parks.settle();
             assert!(answered_within(&parks.timeline, value, std::time::Duration::from_secs(1)), "park {value} answered and never opened");
         }

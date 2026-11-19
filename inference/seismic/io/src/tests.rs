@@ -25,9 +25,9 @@ fn temporary_volume() -> std::sync::MutexGuard<'static, ()> {
     TEMPORARY_VOLUME.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Expected an hour from now: read ahead.
+/// Read ahead.
 fn ahead() -> Want {
-    Want::expected(Instant::now() + Duration::from_secs(3600), 0.)
+    Want::expected(0, 0.)
 }
 
 fn temporary(name: &str, bytes: &[u8]) -> PathBuf {
@@ -506,10 +506,11 @@ fn queued_on(volume: &VolumeReads, spans: &[(u64, u64)]) -> Queued {
     request
 }
 
-/// Pieces are taken by want (the earlier deadline, then the greater value
-/// of one deadline, an undated request after every dated one), then by
-/// submission, then in their request's order; a reprice moves a request
-/// ahead, or behind.
+/// Pieces are taken by want (due first; of reads ahead, a dated one before
+/// every undated one, of the dated the sooner step, then the greater value,
+/// the likelier used), then by submission, then in their request's order; a
+/// reprice moves a request ahead, or behind. Each piece ends as it is
+/// taken, so none waits on a parked one in flight.
 #[test]
 fn pieces_are_taken_most_urgent_first() {
     let mut queue = Queue::default();
@@ -519,19 +520,22 @@ fn pieces_are_taken_most_urgent_first() {
         states.push(state);
         queue.push(request, want).0
     };
-    let later = Instant::now() + Duration::from_secs(3600);
-    let at = |seconds: u64, value: f64| Want::expected(later + Duration::from_secs(seconds), value);
-    // A load's request, though submitted first, is read behind every dated one.
+    // A load's request, though submitted first, is read behind every
+    // expected one.
     push(&mut queue, &mut states, Want::undated(0.), 1);
-    push(&mut queue, &mut states, at(2, 0.), 1);
-    push(&mut queue, &mut states, at(1, 1.), 2);
-    push(&mut queue, &mut states, at(1, 5.), 1);
+    push(&mut queue, &mut states, Want::expected(1, 0.), 1);
+    push(&mut queue, &mut states, Want::expected(1, 0.3), 2);
+    push(&mut queue, &mut states, Want::expected(1, 0.5), 1);
     push(&mut queue, &mut states, Want::now(), 1);
-    let last = push(&mut queue, &mut states, at(3, 0.), 1);
-    let demoted = push(&mut queue, &mut states, at(0, 0.), 1);
-    // Each take as (the request's index in submission, the piece).
+    let last = push(&mut queue, &mut states, Want::expected(1, 0.), 1);
+    let demoted = push(&mut queue, &mut states, Want::expected(1, 0.), 1);
+    push(&mut queue, &mut states, Want::expected(1, 0.9), 1);
+    push(&mut queue, &mut states, Want::expected(2, 1.), 1);
+    push(&mut queue, &mut states, Want::expected(0, 0.1), 1);
+    // Each take as (the request's index in submission, the piece), ended.
     let take = |queue: &mut Queue, states: &[Arc<RequestState>]| {
         let taken = queue.take().unwrap();
+        queue.ended(taken.returned(Instant::now()));
         let request = states.iter().position(|known| Arc::ptr_eq(known, &taken.state));
         (request.unwrap(), taken.piece.start)
     };
@@ -539,29 +543,32 @@ fn pieces_are_taken_most_urgent_first() {
     queue.reprice(last, Want::now());
     queue.reprice(demoted, Want::undated(0.));
     assert_eq!(take(&mut queue, &states), (5, 0), "repriced to now: due");
-    assert_eq!(take(&mut queue, &states), (3, 0), "of one deadline, the greater value");
+    assert_eq!(take(&mut queue, &states), (9, 0), "the soonest step's read ahead, though the least likely and submitted last");
+    assert_eq!(take(&mut queue, &states), (7, 0), "then the next step's likeliest, though submitted last of it");
+    assert_eq!(take(&mut queue, &states), (3, 0), "then the likelier");
     assert_eq!(take(&mut queue, &states), (2, 0));
     assert_eq!(take(&mut queue, &states), (2, 1));
-    assert_eq!(take(&mut queue, &states), (1, 0));
+    assert_eq!(take(&mut queue, &states), (1, 0), "of one step and value, the first submitted");
+    assert_eq!(take(&mut queue, &states), (8, 0), "a later step's, though certain");
     assert_eq!(take(&mut queue, &states), (0, 0));
     assert_eq!(take(&mut queue, &states), (6, 0), "repriced undated: behind the earlier undated one");
     assert!(queue.take().is_none());
 }
 
-/// A prediction whose instant has passed stays read ahead ("Order and
-/// depth"): a step parked on a read submitted after it reads first, and the
-/// prediction is then taken as a read ahead, counted against the knee, not
-/// the due depth.
+/// A certain read ahead stays read ahead ("Order and depth"): a step parked
+/// on a read submitted after it reads first, and the read ahead is then
+/// taken as one, counted against the knee, not the due depth.
 #[test]
-fn a_passed_expectation_stays_read_ahead() {
+fn a_certain_expectation_stays_read_ahead() {
     let mut queue = Queue::default();
     let (expected, _) = queued(1);
-    queue.push(expected, Want::expected(Instant::now(), 1.));
+    queue.push(expected, Want::expected(0, 1.));
     let (parked, parked_state) = queued(1);
     queue.push(parked, Want::now());
     let first = queue.take().unwrap();
     assert!(Arc::ptr_eq(&first.state, &parked_state) && first.standing.due(), "the parked read first");
-    assert!(!queue.take().unwrap().standing.due(), "a passed expectation parks nothing");
+    queue.ended(first.returned(Instant::now()));
+    assert!(!queue.take().unwrap().standing.due(), "an expectation parks nothing");
 }
 
 /// A cancelled request gives up the pieces no worker took, a started one
@@ -776,8 +783,9 @@ fn recorded(lines: &[(u64, &[(u64, f64)])]) -> Vec<Point> {
 /// the wider. The M4 Pro's flattens at 4.02 GB/s 8 deep in 256 KiB reads,
 /// 128 KiB ones never reach it: 2 MiB ahead. GB10's 128 KiB line reaches
 /// 10.09 GB/s at 8 MiB and is flat after: with no request it reads ahead
-/// 8 MiB deep; a request's knee is its range line's, and its due depth the
-/// 128 KiB line's widest, 32 MiB.
+/// 8 MiB deep; a request's knee is its range line's (10.0 GB/s at best, 1.2
+/// one range deep: 9 ranges), and its due depth the 128 KiB line's widest,
+/// 32 MiB.
 #[test]
 fn a_links_depths_come_from_its_curve() {
     let mib = 1024 * 1024;
@@ -800,7 +808,7 @@ fn a_links_depths_come_from_its_curve() {
     let expert = Urgent { parts: vec![589_824, 589_824, 720_896], records: 1 };
     let ranges = range_line(&expert, &[(1, 1.2), (2, 2.3), (4, 4.2), (8, 7.0), (16, 9.9), (32, 10.0)]);
     let shape = Shape::of(&gb10, Some(Request { urgent: &expert, lone: &lone, ranges: &ranges }));
-    assert_eq!((shape.ahead_read, shape.knee, shape.due_read, shape.due), (8 * LEAST_READ, 16 * expert.range(), LEAST_READ, 32 * mib));
+    assert_eq!((shape.ahead_read, shape.knee, shape.due_read, shape.due), (8 * LEAST_READ, 9 * expert.span(), LEAST_READ, 32 * mib));
 }
 
 /// A due depth holds a step's whole request: where the due size's line
@@ -820,12 +828,17 @@ fn a_due_depth_holds_a_steps_whole_request() {
     assert_eq!(Shape::of(&internal, Some(Request { urgent: &one, lone: &lone, ranges: &ranges })).due, 4 * mib, "the line's full-rate window holds one");
 }
 
-/// A request's knee is its range line's: an M4 Pro's internal drive reads
-/// its 580–710 KiB ranges at full rate 4 deep through the engine, about
-/// 2.5 MB, where its 1 MiB reads' line peaks at 4 MiB; its reads ahead are
-/// cut whole, each range one piece, as the line read them.
+/// A request's knee is its range line's: the fewest ranges whose transfers
+/// at the line's best rate cover one range's latency, `⌈D/R₁⌉`, wherever
+/// its noise flattens. An M4 Pro's internal drive reads its 580–710 KiB
+/// ranges at 1.9 GB/s alone and 3.95 at best, so 3 ranges, though its line
+/// is within the noise of its best only 4 deep, and its 1 MiB reads' line
+/// peaks at 4 MiB; a drive whose lone range reads at more than half its
+/// best rate (a latency under one range's transfer) reads ahead 2 deep.
+/// Its reads ahead are cut whole, each range one piece, as the line read
+/// them.
 #[test]
-fn a_requests_knee_is_its_range_lines() {
+fn a_requests_knee_covers_one_ranges_latency() {
     let mib = 1024 * 1024;
     let read = 8 * LEAST_READ;
     let internal = recorded(&[(read, &[(1, 2.1), (2, 3.6), (4, 5.05), (8, 4.6), (16, 4.5), (32, 4.5)])]);
@@ -834,7 +847,10 @@ fn a_requests_knee_is_its_range_lines() {
     assert_eq!(Shape::of(&internal, None).knee, 4 * mib, "the 1 MiB reads' knee");
     let ranges = range_line(&step, &[(1, 1.9), (2, 3.2), (4, 3.9), (8, 3.95), (16, 3.9), (32, 3.9)]);
     let shape = Shape::of(&internal, Some(Request { urgent: &step, lone: &lone, ranges: &ranges }));
-    assert_eq!((shape.knee, shape.ahead_read), (4 * step.range(), read), "four ranges, each one piece");
+    assert_eq!((shape.knee, shape.ahead_read), (3 * step.span(), read), "three ranges, each one piece");
+    let quick = range_line(&step, &[(1, 2.2), (2, 3.9), (3, 4.0), (4, 4.05), (5, 4.05)]);
+    let shape = Shape::of(&internal, Some(Request { urgent: &step, lone: &lone, ranges: &quick }));
+    assert_eq!(shape.knee, 2 * step.span(), "4.05 over 2.2: two ranges");
     assert_eq!(step.depths(), vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 18, 22, 27, 33, 41], "every depth to 8, a quarter more past it, to 32 MiB of 704 KiB ranges");
 }
 
@@ -876,7 +892,7 @@ fn a_requests_probe_reads_its_range_line() {
     assert!(urgent.depths().starts_with(&depths) && !depths.is_empty(), "{depths:?}: its depths in order, to its first flat one");
     assert!(curve.ranges.iter().all(|point| point.rate > 0.), "{:?}", curve.ranges);
     let shape = link_shape(&source, Some(&urgent)).unwrap();
-    assert_eq!(shape.knee % urgent.range(), 0, "a knee of whole ranges");
+    assert_eq!(shape.knee % urgent.span(), 0, "a knee of whole ranges");
     assert_eq!(shape.ahead_read, LEAST_READ, "the least read holding the widest range");
     std::fs::remove_file(path).unwrap();
 }
@@ -916,13 +932,15 @@ fn a_range_past_the_widest_window_probes_only_sizes_a_window_holds() {
     assert!(reads.iter().all(|read| grid.iter().any(|(probed, _)| probed == read)));
 }
 
-/// Nothing read ahead starts while a due piece is queued, however much
-/// room its own depths leave: behind a due piece in flight at the due depth
-/// (4 of 4), a second due piece waits, and a read ahead of 2 waits behind
-/// it though the knee (8) holds it; once the first ends,
-/// the second due piece goes first, then the read ahead.
+/// Nothing read ahead starts while a parked piece is queued, however much
+/// room the knee leaves, and a read ahead may start beside parked pieces
+/// already in flight: behind a due piece in flight at the due depth (4 of
+/// 4), a second due piece waits, and a read ahead of 2 waits behind it
+/// though the knee (8) holds it; once the first ends the second due piece
+/// goes, nothing parked is queued, and the read ahead starts beside it
+/// (4 + 2 within the knee).
 #[test]
-fn a_piece_read_ahead_never_starts_while_a_due_one_is_queued() {
+fn a_read_ahead_overlaps_parked_pieces_in_flight_but_never_starts_while_one_is_queued() {
     let link = volume(9, (4, 8), 4);
     let mut queue = Queue::default();
     queue.push(queued_on(&link, &[(0, 4), (4, 8)]), Want::now());
@@ -933,8 +951,57 @@ fn a_piece_read_ahead_never_starts_while_a_due_one_is_queued() {
     queue.ended(first.returned(Instant::now()));
     let second = queue.take().expect("the second due piece");
     assert_eq!((second.piece.start, second.standing.due()), (4, true));
-    let ahead = queue.take().expect("the read ahead, beside due work within the knee");
+    let ahead = queue.take().expect("the read ahead, beside the parked piece in flight within the knee");
     assert_eq!((ahead.piece.start, ahead.standing.due()), (8, false));
+}
+
+/// As a park's pieces drain, the reads ahead queued refill the link to its
+/// knee at each end, the soonest wanted step first whatever its value:
+/// with the parked bytes at the knee (8 of 8) none starts; the first parked
+/// piece's end leaves room for step 1's two pieces (4 + 2 + 2), though
+/// step 2's and step 3's are likelier; the second's, for step 2's and
+/// step 3's (4 + 2 + 2). So the drive never idles while a named read is
+/// queued, and no parked bytes wait behind more than the knee.
+#[test]
+fn a_draining_park_refills_the_knee_from_reads_ahead_soonest_step_first() {
+    let link = volume(17, (8, 8), 4);
+    let mut queue = Queue::default();
+    queue.push(queued_on(&link, &[(0, 4), (4, 8)]), Want::now());
+    let parked = [queue.take().unwrap(), queue.take().unwrap()];
+    queue.push(queued_on(&link, &[(20, 22)]), Want::expected(3, 0.9));
+    queue.push(queued_on(&link, &[(10, 12), (12, 14)]), Want::expected(1, 0.3));
+    queue.push(queued_on(&link, &[(16, 18)]), Want::expected(2, 0.8));
+    assert!(queue.take().is_none(), "the parked bytes fill the knee");
+    let [first, second] = parked;
+    queue.ended(first.returned(Instant::now()));
+    let taken = [(); 3].map(|_| queue.take().map(|taken| (taken.piece.start, taken.standing)));
+    assert_eq!(taken, [Some((10, Standing::Ahead)), Some((12, Standing::Ahead)), None], "step 1's, to the knee");
+    queue.ended(second.returned(Instant::now()));
+    let taken = [(); 3].map(|_| queue.take().map(|taken| taken.piece.start));
+    assert_eq!(taken, [Some(16), Some(20), None], "step 2's then step 3's, to the knee");
+}
+
+/// A parked request preempts the unbegun pieces of a read ahead and shares
+/// the knee with those begun: they run on, the parked one starts at once
+/// beside them (4 parked and 4 ahead fill the knee of 8), and the read
+/// ahead resumes beside the parked one in flight as its begun pieces end,
+/// to the knee again.
+#[test]
+fn a_parked_read_preempts_the_unbegun_pieces_of_a_read_ahead() {
+    let link = volume(16, (8, 8), 4);
+    let mut queue = Queue::default();
+    queue.push(queued_on(&link, &[(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]), ahead());
+    let begun = [queue.take().unwrap(), queue.take().unwrap()];
+    queue.push(queued_on(&link, &[(16, 20)]), Want::now());
+    let parked = queue.take().expect("the parked piece, beside the reads ahead begun");
+    assert_eq!((parked.piece.start, parked.standing), (16, Standing::Parked));
+    assert!(queue.take().is_none(), "an unbegun piece read ahead started past the knee");
+    for piece in begun {
+        queue.ended(piece.returned(Instant::now()));
+    }
+    let taken = [(); 2].map(|_| queue.take().map(|taken| (taken.piece.start, taken.standing)));
+    assert_eq!(taken, [Some((4, Standing::Ahead)), Some((6, Standing::Ahead))], "the read ahead resumes beside the parked piece in flight");
+    assert!(queue.take().is_none(), "4 parked and 4 ahead fill the knee");
 }
 
 /// A stream's due reads hold back nothing read ahead: a prompt group's
@@ -961,7 +1028,8 @@ fn a_streams_due_reads_leave_the_fill_its_knee() {
 
 /// A parked step's due read still holds back everything read ahead beside
 /// a stream: once a parked piece is queued behind the stream's at the due
-/// depth, no fill piece starts, though the knee holds it.
+/// depth, no fill piece starts, though the knee holds it; once it starts,
+/// the fill starts beside it within the knee.
 #[test]
 fn a_parked_read_holds_the_fill_back_beside_a_stream() {
     let link = volume(15, (4, 8), 4);
@@ -976,10 +1044,10 @@ fn a_parked_read_holds_the_fill_back_beside_a_stream() {
     assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.standing)), Some((8, Standing::Ahead)), "within the knee once nothing parked is queued");
 }
 
-/// A piece read ahead starts only while everything in flight, due and
-/// ahead, leaves it room under the knee: beside a due piece of 4 (knee 8),
-/// two reads ahead of 2 start and a third waits; once the due piece ends,
-/// two more start. Another link is held by none of it.
+/// A piece read ahead starts only while everything in flight, parked and
+/// ahead, leaves it room under the knee: beside a parked piece of 4 (knee
+/// 8), two reads ahead of 2 start and a third waits; once the parked piece
+/// ends, two more start. Another link is held by none of it.
 #[test]
 fn a_piece_read_ahead_starts_only_while_everything_in_flight_fits_the_knee() {
     let link = volume(10, (8, 8), 4);
@@ -1015,7 +1083,7 @@ fn a_due_piece_starts_beside_a_full_knee() {
 }
 
 /// A read ahead a consumer comes to wait on starts as due once repriced:
-/// held back beside a due piece past the knee, it starts at the due
+/// held back beside a parked piece past the knee, it starts at the due
 /// depth from its reprice, and a worker is woken for it.
 #[test]
 fn a_repriced_request_starts_at_its_new_depth() {
@@ -1054,8 +1122,9 @@ fn close(left: f64, right: f64) -> bool {
 /// a piece of the kind was in flight (the union of overlapping pieces'
 /// spans), its pieces in flight integrated over time (their sum), and each
 /// piece's bytes at its end; the device's busy time is the union over both,
-/// none while idle. A look counts the time running to its instant and
-/// consumes nothing: a later look counts it again, with what followed.
+/// none while idle, and its shared time their intersection. A look counts
+/// the time running to its instant and consumes nothing: a later look
+/// counts it again, with what followed.
 #[test]
 fn a_volumes_book_counts_busy_time_depth_and_bytes_due_and_ahead() {
     let at = Instant::now();
@@ -1067,6 +1136,7 @@ fn a_volumes_book_counts_busy_time_depth_and_bytes_due_and_ahead() {
     // A look while the piece read ahead is in flight: counted to 5 ms.
     let middle = book.totals_at(ms(5));
     assert!(close(middle.busy, 0.005) && close(middle.depth, 0.007), "{middle:?}");
+    assert!(close(middle.shared, 0.002), "due and ahead in flight from 2 to 4 ms: {middle:?}");
     let due = middle.due;
     assert_eq!((due.bytes, due.requests), (1_000_000, 1));
     assert!(close(due.busy, 0.004) && close(due.depth, 0.004), "{due:?}");
@@ -1083,6 +1153,7 @@ fn a_volumes_book_counts_busy_time_depth_and_bytes_due_and_ahead() {
     assert!(close(later.ahead.busy, 0.010) && close(later.due.busy, 0.004), "{later:?}");
     let span = later.since(&middle);
     assert!(close(span.busy, 0.007) && span.bytes() == 750_000, "{span:?}");
+    assert!(close(span.shared, 0.), "reads ahead alone after 4 ms: {span:?}");
     assert_eq!(book.totals_at(ms(40)), later, "a look takes nothing");
 }
 

@@ -184,6 +184,14 @@ pub struct ExecutionPlanDraft {
 }
 
 impl ExecutionPlanDraft {
+    /// The draft of a load that traces its routes: the bank it streams
+    /// through records each decode-form step's choices and keys, which every
+    /// layer's route writes (`ExpertBankPlan::recording`).
+    pub fn recording_routes(mut self) -> Self {
+        self.load.recorded_routes = true;
+        self
+    }
+
     pub fn device(&self) -> &PlannedDevice {
         &self.device
     }
@@ -396,7 +404,7 @@ impl ExecutionPlanDraft {
     ) -> Result<ChargedDraft<C>, PlanError> {
         let device = self.device.clone();
         let room = StableRoom::of(&device);
-        match self.placed(definition, bound, &room)? {
+        match self.placed(definition, bound, prices, &room)? {
             Placed::Whole(whole) => Ok(whole),
             Placed::Short(short) => short.streamed(definition, prices, &room),
         }
@@ -411,12 +419,13 @@ impl ExecutionPlanDraft {
         self,
         definition: &ModelDefinition,
         bound: Option<WeightBound>,
+        prices: &Priced<super::PlanPrices>,
         room: &impl SettleRoom,
     ) -> Result<Placed<C>, PlanError> {
         let mut held = HeldCharges::default();
         let capacity = room.capacity()?;
-        let Placement { figures, outcome } =
-            self.place(definition, HeldBound::of(bound, capacity), &mut held, room, &mut load_confirm(room, bound))?;
+        let held_bound = HeldBound::of(bound, capacity);
+        let Placement { figures, outcome } = self.place(definition, held_bound, prices, &mut held, room, &mut load_confirm(room, bound))?;
         figures.report();
         Ok(match outcome {
             Placing::Whole { draft, charge, found: () } => Placed::Whole(ChargedDraft { draft, charge }),
@@ -436,7 +445,7 @@ impl ExecutionPlanDraft {
         room: &impl SettleRoom,
     ) -> Result<Unplaced<C>, PlanError> {
         let capacity = room.capacity()?;
-        match self.bank_ceiling(definition, HeldBound::of(bound, capacity))? {
+        match self.bank_ceiling(definition, HeldBound::of(bound, capacity), None)? {
             Ok(ceiling) => Ok(Unplaced { draft: self, ceiling, bound, held: HeldCharges::default() }),
             Err(no) => Err(refusal(no, capacity)),
         }
@@ -461,7 +470,7 @@ impl ExecutionPlanDraft {
         mut confirm: impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
     ) -> Result<Result<(ChargedDraft, T), NoBank>, E> {
         let mut held = HeldCharges::<AssessmentMemoryCharge>::default();
-        let ceiling = match self.place(definition, bound, &mut held, &room, &mut confirm)?.outcome {
+        let ceiling = match self.place(definition, bound, prices, &mut held, &room, &mut confirm)?.outcome {
             Placing::Whole { draft, charge, found } => return Ok(Ok((ChargedDraft { draft, charge }, found))),
             Placing::Short(ceiling) => ceiling,
             Placing::None(no) => return Ok(Err(no)),
@@ -482,17 +491,22 @@ impl ExecutionPlanDraft {
     /// the bound, whether the device holds them `confirm`'s. A banked
     /// draft whose growth stops short of every expert keeps its bank, as
     /// its ceiling never rises. Each whole plan is confirmed by `confirm`.
+    /// Its bank carries the path records priced at its ceiling from `prices`
+    /// ([`Self::bank_ceiling`]), so a whole bank a later cut streams reads
+    /// ahead on derived records, and a bound refusal names the exact floor
+    /// that admits.
     fn place<C: HeldCharge, T, E: From<PlanError>>(
         &self,
         definition: &ModelDefinition,
         bound: HeldBound,
+        prices: &Priced<super::PlanPrices>,
         held: &mut HeldCharges<C>,
         room: &impl SettleRoom,
         confirm: &mut impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
     ) -> Result<Placement<C, T>, E> {
         let mut figures = PlacementFigures { pricing: self.device.graph_pricing, form: None, bank: None, resident: None };
         let placed = |figures, outcome| Ok(Placement { figures, outcome });
-        let ceiling = match self.bank_ceiling(definition, bound)? {
+        let ceiling = match self.bank_ceiling(definition, bound, Some(prices))? {
             Ok(ceiling) => ceiling,
             Err(NoBank::Unstreamed(reason)) => {
                 let Some(chains) = self.whole_chains(definition, bound)? else {
@@ -552,7 +566,8 @@ impl ExecutionPlanDraft {
 
     /// The second stage, for experts no whole plan holds: the bank the room
     /// holds beside the arena from `ceiling`, at the pass `prices` settle
-    /// ([`Self::settle_bank`]), and
+    /// ([`Self::settle_bank`]), with the free records its model store's
+    /// path needs at the slots it settles at ([`Self::with_paths`]), and
     /// its host tier ([`Self::with_host_tier`]),
     /// whose size leaves the charge as it is: the charge holds the tier at
     /// its floor. Experts the host cannot stream beside their tier are held
@@ -569,10 +584,112 @@ impl ExecutionPlanDraft {
         room: &impl SettleRoom,
         confirm: &mut impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
     ) -> Result<Result<(Self, C, T), NoBank>, E> {
-        let mut settled = Self::settle_bank(&ceiling, definition, prices, held, room, confirm)?;
+        let (ceiling, settled) = match self.with_paths(ceiling, bound, definition, prices, held, room, confirm)? {
+            Ok(settled) => settled,
+            Err(no) => return Ok(Err(no)),
+        };
+        let reason = match settled {
+            Ok((draft, charge, found)) => match draft.with_host_tier(charge.charge(), room)? {
+                Ok(draft) => return Ok(Ok((draft, charge, found))),
+                Err(reason) => reason,
+            },
+            Err(NoBank::Unstreamed(reason)) => reason,
+            Err(no) => return Ok(Err(no)),
+        };
+        let Some(resident) = ceiling.whole.held_whole_within(definition, bound)? else {
+            return Ok(Err(NoBank::Unstreamed(reason)));
+        };
+        let charge = held.charge(definition, &resident)?;
+        Ok(match confirm(&resident, charge.charge())? {
+            Ok(found) => Ok((resident, charge, found)),
+            Err(_) => Err(NoBank::Unstreamed(reason)),
+        })
+    }
+
+    /// The bank settled from `ceiling` ([`Self::settled_in`]) with the path
+    /// its model store's moves need at the slots it settles at
+    /// ([`bank_paths`]), and the ceiling it settled from. The records and
+    /// the slots fix each other, so they are a fixed point: from the path of
+    /// a bank holding every slot its ceiling allows, each settle prices the
+    /// path at the slots it settled at, until a settle keeps the path it was
+    /// planned at. Each path is one of a slot count's in the ceiling's
+    /// range, so the settles end within that range's size: a path seen
+    /// before and not kept is a cycle, which the model's records and slots
+    /// never make (an invariant violation).
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn with_paths<C: HeldCharge, T, E: From<PlanError>>(
+        &self,
+        mut ceiling: BankCeiling,
+        bound: HeldBound,
+        definition: &ModelDefinition,
+        prices: &Priced<super::PlanPrices>,
+        held: &mut HeldCharges<C>,
+        room: &impl SettleRoom,
+        confirm: &mut impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
+    ) -> Result<Result<(BankCeiling, Result<(Self, C, T), NoBank>), NoBank>, E> {
+        let bank_prices = super::prices::measured(match prices {
+            Priced::Measured(prices) => prices.of_bank(&ceiling.whole, definition)?,
+            Priced::Pending(reason) => Priced::Pending(reason.clone()),
+            Priced::Unavailable(reason) => Priced::Unavailable(reason.clone()),
+        })?;
+        if ceiling.whole.bank().paths == super::BankPaths::Unpriced {
+            let whole = ceiling.whole.clone();
+            ceiling = match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Priced(&bank_prices), Ok)? {
+                Ok(ceiling) => ceiling,
+                Err(no) => return Ok(Err(no)),
+            };
+        }
+        let mut paths = bank_paths(&bank_prices, ceiling.whole.bank(), ceiling.ceiling)?;
+        let mut seen = Vec::new();
+        loop {
+            if ceiling.whole.bank().paths != paths {
+                let whole = ceiling.whole.clone();
+                ceiling = match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Fixed, |load| load.with_bank_paths(paths))? {
+                    Ok(ceiling) => ceiling,
+                    Err(no) => return Ok(Err(no)),
+                };
+            }
+            let settled = self.settled_in(&ceiling, bound, definition, prices, held, room, confirm)?;
+            let Ok((draft, ..)) = &settled else {
+                return Ok(Ok((ceiling, settled)));
+            };
+            let slots = draft.bank().slots;
+            let next = bank_paths(&bank_prices, draft.bank(), slots)?;
+            if next == paths {
+                let records = paths.records();
+                tracing::info!(
+                    slots,
+                    ahead = records.ahead,
+                    reserve = records.reserve,
+                    settles = seen.len() + 1,
+                    "the bank's path records are settled"
+                );
+                return Ok(Ok((ceiling, settled)));
+            }
+            assert!(!seen.contains(&next), "invariant violated: a bank's path records and slots cycle through {seen:?} without a fixed point");
+            seen.push(paths);
+            paths = next;
+        }
+    }
+
+    /// The bank the room holds from `ceiling` at the pass `prices` settle
+    /// ([`Self::settle_bank`]), or, short, at the first narrower scratch
+    /// window that holds one; else the least short.
+    #[allow(clippy::too_many_arguments)]
+    fn settled_in<C: HeldCharge, T, E: From<PlanError>>(
+        &self,
+        ceiling: &BankCeiling,
+        bound: HeldBound,
+        definition: &ModelDefinition,
+        prices: &Priced<super::PlanPrices>,
+        held: &mut HeldCharges<C>,
+        room: &impl SettleRoom,
+        confirm: &mut impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
+    ) -> Result<Result<(Self, C, T), NoBank>, E> {
+        let mut settled = Self::settle_bank(ceiling, definition, prices, held, room, confirm)?;
         if matches!(settled, Err(NoBank::Short { .. })) {
             for &w in &ceiling.whole.bank().window_ladder()[1..] {
-                let candidate = match self.with_window(&ceiling.whole, definition, bound, w)? {
+                let candidate = match self.with_window(&ceiling.whole, definition, bound, w, CeilingPaths::Fixed)? {
                     Ok(c) => Self::settle_bank(&c, definition, prices, held, room, confirm)?,
                     Err(no) => Err(no),
                 };
@@ -592,22 +709,7 @@ impl ExecutionPlanDraft {
                 }
             }
         }
-        let reason = match settled {
-            Ok((draft, charge, found)) => match draft.with_host_tier(charge.charge(), room)? {
-                Ok(draft) => return Ok(Ok((draft, charge, found))),
-                Err(reason) => reason,
-            },
-            Err(NoBank::Unstreamed(reason)) => reason,
-            Err(no) => return Ok(Err(no)),
-        };
-        let Some(resident) = ceiling.whole.held_whole_within(definition, bound)? else {
-            return Ok(Err(NoBank::Unstreamed(reason)));
-        };
-        let charge = held.charge(definition, &resident)?;
-        Ok(match confirm(&resident, charge.charge())? {
-            Ok(found) => Ok((resident, charge, found)),
-            Err(_) => Err(NoBank::Unstreamed(reason)),
-        })
+        Ok(settled)
     }
 
     /// The structure every plan of the draft's bank is granted from: its
@@ -625,7 +727,7 @@ impl ExecutionPlanDraft {
     /// single allocation. Its prompt groups chain every chunk of a
     /// whole-context prompt (`with_chain`): a group's places are granted
     /// when it opens.
-    fn bank_ceiling(&self, definition: &ModelDefinition, bound: HeldBound) -> Result<Result<BankCeiling, NoBank>, PlanError> {
+    fn bank_ceiling(&self, definition: &ModelDefinition, bound: HeldBound, prices: Option<&Priced<super::PlanPrices>>) -> Result<Result<BankCeiling, NoBank>, PlanError> {
         let substrate = match bank_substrate(self.device.backend, self.device.executor.limits().allocations(), self.device.host_tier(), definition) {
             Ok(substrate) => substrate,
             Err(error) => return unstreamed(error),
@@ -651,15 +753,23 @@ impl ExecutionPlanDraft {
             Ok(whole) => whole,
             Err(error) => return unstreamed(error),
         };
+        let bank_prices = match prices {
+            Some(Priced::Measured(prices)) => match prices.of_bank(&whole, definition)? {
+                Priced::Measured(bank_prices) => Some(bank_prices),
+                Priced::Pending(_) | Priced::Unavailable(_) => None,
+            },
+            _ => None,
+        };
+        let mode = bank_prices.as_ref().map_or(CeilingPaths::Fixed, CeilingPaths::Priced);
         let w_hi = self.load.bank.as_ref().map_or(whole.bank().window_slots(), |bank| bank.window_slots());
         let w_lo = whole.bank().round_records();
         let mut res = match w_hi == whole.bank().window_slots() {
-            true => self.ceiling_of(whole.clone(), bound, places)?,
-            false => self.with_window(&whole, definition, bound, w_hi)?,
+            true => self.ceiling_of(whole.clone(), definition, bound, places, mode)?,
+            false => self.with_window(&whole, definition, bound, w_hi, mode)?,
         };
         if matches!(res, Err(NoBank::Bound { .. } | NoBank::Unstreamed(UnstreamedExperts::Allocation { .. }))) {
             for &w in &window_ladder(w_hi, w_lo)[1..] {
-                match self.with_window(&whole, definition, bound, w)? {
+                match self.with_window(&whole, definition, bound, w, mode)? {
                     Ok(found) => {
                         res = Ok(found);
                         break;
@@ -673,9 +783,23 @@ impl ExecutionPlanDraft {
 
     /// Rebuild `whole` with `window_slots` and compute its [`BankCeiling`]
     /// under `bound`, keeping its target program plan in sync.
-    fn with_window(&self, whole: &Self, definition: &ModelDefinition, bound: HeldBound, window_slots: u64) -> Result<Result<BankCeiling, NoBank>, PlanError> {
+    fn with_window(&self, whole: &Self, definition: &ModelDefinition, bound: HeldBound, window_slots: u64, mode: CeilingPaths<'_>) -> Result<Result<BankCeiling, NoBank>, PlanError> {
+        self.rebuilt_from(whole, definition, bound, mode, |load| load.banked_as(definition, whole.bank(), window_slots))
+    }
+
+    /// `whole` with its load plan changed by `change` and its target
+    /// program plan and chain planned again, and its [`BankCeiling`] under
+    /// `bound`.
+    fn rebuilt_from(
+        &self,
+        whole: &Self,
+        definition: &ModelDefinition,
+        bound: HeldBound,
+        mode: CeilingPaths<'_>,
+        change: impl FnOnce(ModelLoadPlan) -> Result<ModelLoadPlan, PlanError>,
+    ) -> Result<Result<BankCeiling, NoBank>, PlanError> {
         let places = whole.bank().places;
-        let load = whole.load.clone().banked_as(definition, whole.bank(), window_slots)?;
+        let load = change((*whole.load).clone())?;
         let programs = load.program_plan(definition, whole.policy.codec)?;
         let rebuilt = Self {
             load: Box::new(load),
@@ -683,35 +807,60 @@ impl ExecutionPlanDraft {
             ..whole.clone()
         }
         .with_chain(places)?;
-        self.ceiling_of(rebuilt, bound, places)
+        self.ceiling_of(rebuilt, definition, bound, places, mode)
     }
 
-    /// Compute the [`BankCeiling`] of `whole` under `bound`.
-    fn ceiling_of(&self, whole: Self, bound: HeldBound, places: u64) -> Result<Result<BankCeiling, NoBank>, PlanError> {
-        let bank = whole.bank();
-        let (experts, floor) = (bank.slots, bank.floor());
+    /// Compute the [`BankCeiling`] of `whole` under `bound`, pricing each
+    /// slot count's path records per `mode` so both refusal (`needed`) and
+    /// admission (`ceiling`) evaluate the same function.
+    fn ceiling_of(
+        &self,
+        mut whole: Self,
+        definition: &ModelDefinition,
+        bound: HeldBound,
+        places: u64,
+        mode: CeilingPaths<'_>,
+    ) -> Result<Result<BankCeiling, NoBank>, PlanError> {
+        let (experts, floor) = (whole.bank().slots, whole.bank().floor());
         // A banked draft's re-planning never raises its ceiling.
         let top = self.load.bank.as_ref().map_or(experts, |bank| bank.ceiling);
-        let reserved = |slots| bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
         // Its pooled records are granules of blocks the backend sizes within
         // its allocations; each lent allocation is one allocation.
-        let (lent, most) = (bank.largest_lent().map_err(PlanError::ResourcePlanning)?, self.device.max_allocation_bytes);
+        let (lent, most) = (whole.bank().largest_lent().map_err(PlanError::ResourcePlanning)?, self.device.max_allocation_bytes);
         if lent > most {
             return Ok(Err(NoBank::Unstreamed(UnstreamedExperts::Allocation { lent, most })));
         }
-        // The weights of the bank at `slots`.
-        let (whole_bytes, whole_charge) = (weight_bytes(&whole.load)?, reserved(experts)?);
-        let weights_at = |slots| -> Result<u64, PlanError> {
-            let reserved = reserved(slots)?;
-            whole_bytes
-                .checked_sub(whole_charge)
-                .and_then(|bytes| bytes.checked_add(reserved))
-                .ok_or(PlanError::Arithmetic("a bank's weights hold less than its record reservations' charge"))
+        // The weights of the bank at `slots` with its path records at those
+        // slots, cached per distinct `BankPaths` (which varies monotonically
+        // across only a handful of levels).
+        let mut cached: Option<(super::BankPaths, super::ExpertBankPlan, u64)> = None;
+        let mut weights_at = |slots: u64| -> Result<(u64, super::BankPaths), PlanError> {
+            let paths = match mode {
+                CeilingPaths::Fixed => whole.bank().paths,
+                CeilingPaths::Priced(prices) => bank_paths(prices, whole.bank(), slots)?,
+            };
+            if cached.as_ref().is_none_or(|(of, _, _)| *of != paths) {
+                let load = match paths == whole.bank().paths {
+                    true => (*whole.load).clone(),
+                    false => (*whole.load).clone().with_bank_paths(paths)?,
+                };
+                let bank = load.bank.as_ref().expect("a streamed plan holds its bank").clone();
+                let base = weight_bytes(&load)?
+                    .checked_sub(bank.resident_charge(experts).map_err(PlanError::ResourcePlanning)?)
+                    .ok_or(PlanError::Arithmetic("a bank's weights hold less than its record reservations' charge"))?;
+                cached = Some((paths, bank, base));
+            }
+            let (_, bank, base) = cached.as_ref().expect("just populated");
+            let reserved = bank.resident_charge(slots).map_err(PlanError::ResourcePlanning)?;
+            let bytes = base
+                .checked_add(reserved)
+                .ok_or(PlanError::Arithmetic("a bank's weights overflow"))?;
+            Ok((bytes, paths))
         };
         // The load's own bound (a cap or a device room) below the floor's
         // weights holds no bank. The machine's room below them refuses
         // nothing here: the plan's settle finds it short.
-        let needed = weights_at(floor)?;
+        let (needed, floor_paths) = weights_at(floor)?;
         if let Some(limit) = bound.limit.filter(|limit| needed > limit.bytes()) {
             return Ok(Err(NoBank::Bound { bound: limit, needed }));
         }
@@ -721,16 +870,31 @@ impl ExecutionPlanDraft {
         // (`settle_bank`).
         let device = bound.device();
         let mut ceiling = floor;
-        while ceiling < top.min(most) && weights_at(ceiling + 1)? <= device {
+        let mut ceiling_bytes = needed;
+        let mut ceiling_paths = floor_paths;
+        while ceiling < top.min(most) {
+            let (bytes, paths) = weights_at(ceiling + 1)?;
+            if bytes > device {
+                break;
+            }
             ceiling += 1;
+            ceiling_bytes = bytes;
+            ceiling_paths = paths;
         }
+        if whole.bank().paths != ceiling_paths {
+            let load = (*whole.load).clone().with_bank_paths(ceiling_paths)?;
+            let programs = load.program_plan(definition, whole.policy.codec)?;
+            whole.load = Box::new(load);
+            whole.programs = Box::new(programs);
+        }
+        let bank = whole.bank();
         // A cap bounds every weight byte the load holds: a host tier holds
         // what it leaves beside the bank at its ceiling, its landing
         // reserve (the tier at no slots) aside, as staging is. A banked
         // draft's re-planning never raises the cap it was planned under.
         let capped = match (bound, bank.host_ceiling()) {
             (HeldBound { limit: Some(WeightBound::Cap(cap)), .. }, Some(_)) => {
-                let left = cap - weights_at(ceiling)?;
+                let left = cap - ceiling_bytes;
                 let host = |slots: u64| bank.host_charge(slots).map_err(PlanError::ResourcePlanning);
                 let (empty, widest) = (host(0)?, bank.widest().get());
                 let mut cap = 0;
@@ -746,7 +910,6 @@ impl ExecutionPlanDraft {
             (Some(capped), Some(planned)) => Some(capped.min(planned)),
             (capped, planned) => capped.or(planned),
         };
-        let mut whole = whole;
         whole.bank_mut().host_cap = host_cap;
         let places = usize::try_from(places)
             .ok()
@@ -846,9 +1009,9 @@ impl ExecutionPlanDraft {
             let free = room.room(&mandatory, &charge, mandatory_bytes)?;
             let slots = count(slots_within(free.free.min(free.ceiling), (points[0], *ceiling), &reserved)?)?;
             // The smallest pass leaves the most slots.
-            let most = *most.get_or_insert(crate::assessment::HeldSlots { slots, host });
-            let seconds = rates.decode_steps_per_s * prices.step_seconds(crate::assessment::HeldSlots::bank(slots))
-                + rates.requests_per_s * prices.prompt_seconds(pass, most);
+            let most = *most.get_or_insert(magnitude_cost_model::HeldSlots { slots, host });
+            let seconds = rates.decode_steps_per_s * prices.step_seconds(magnitude_cost_model::HeldSlots::bank(slots))
+                + rates.requests_per_s * prices.prompt_seconds(pass.get() as u64, most);
             if chosen.as_ref().is_none_or(|(_, _, least)| seconds <= *least) {
                 chosen = Some((pass, mandatory_bytes, seconds));
             }
@@ -1186,6 +1349,95 @@ impl ExecutionPlan {
     pub fn policy(&self) -> &ResolvedPolicy {
         &self.policy
     }
+
+    /// Upper bound on uncompleted command buffers this load can keep live on
+    /// the device's ordered command queue at once.
+    pub fn command_buffer_capacity(&self) -> usize {
+        command_buffer_capacity(&self.programs, &self.load, self.policy.limits())
+    }
+}
+
+/// Exact upper bound on uncompleted command buffers a load can keep live on a
+/// device's single ordered command queue at once.
+///
+/// Derived from the plan's own owners with zero chosen constants:
+/// - Per-step target decode: `SubmissionChunks::count(blocks + 2)` base
+///   submissions (entry + blocks + exit) + `host_tables` gate cuts + per
+///   streamed layer `2` cuts (`1` host-gate `wait_event` cut + `1` AGX
+///   indirect-dispatch cut) + `1` site-gate cut per CPU-sited layer.
+/// - Pipelined target decode: `decode_step_cbs * limits.flights().groups()`.
+/// - Streamed/chained prefill: `SubmissionChunks::count(places * (blocks + 2))`
+///   base submissions + `places * host_tables` gate cuts + per streamed layer
+///   `windows * (1 + 2 * window_rounds + 1 + has_host_tier) + 1` fill/cut CBs +
+///   `(groups - 1) * decode_step_cbs` for any concurrent pipelined step.
+/// - Concurrent non-target submissions from `limits.class_slots(places,
+///   fronts)`: readout + drafter (if enabled) + vision (if enabled) + state +
+///   `1` synchronous staging/service CB.
+fn command_buffer_capacity(
+    programs: &ProgramPlan,
+    load: &ModelLoadPlan,
+    limits: ResourceLimits,
+) -> usize {
+    use crate::programs::native_target::SubmissionChunks;
+
+    let groups = limits.flights().groups();
+    let blocks = programs.target().blocks().len();
+    let host_tables = load.host_tables().len();
+    let bank = load.expert_bank();
+    let places = bank.map_or(limits.chain_capacity.get(), |bank| {
+        usize::try_from(bank.places).unwrap_or(usize::MAX)
+    });
+
+    let runs_per_step = blocks.saturating_add(2);
+    let decode_chunks = SubmissionChunks::count(runs_per_step);
+    let streamed_decode_cuts = bank.map_or(0, |bank| {
+        let layers = bank.layers().len();
+        let sited = (0..layers).filter(|&layer| bank.sited(layer)).count();
+        layers.saturating_mul(2).saturating_add(sited)
+    });
+    let decode_step_cbs = decode_chunks
+        .saturating_add(host_tables)
+        .saturating_add(streamed_decode_cuts);
+    let decode_in_flight = decode_step_cbs.saturating_mul(groups);
+
+    let chain_runs = places.saturating_mul(runs_per_step);
+    let chain_chunks = SubmissionChunks::count(chain_runs);
+    let streamed_chain_cuts = bank.map_or(0, |bank| {
+        let layers = bank.layers().len();
+        let windows = usize::try_from(bank.windows()).unwrap_or(usize::MAX);
+        let rounds = usize::try_from(bank.window_rounds()).unwrap_or(usize::MAX);
+        let tier_indirect = usize::from(bank.host_slots > 0);
+        let per_window = 1usize
+            .saturating_add(rounds.saturating_mul(2))
+            .saturating_add(1)
+            .saturating_add(tier_indirect);
+        let per_layer = windows.saturating_mul(per_window).saturating_add(1);
+        layers.saturating_mul(per_layer)
+    });
+    let chain_in_flight = chain_chunks
+        .saturating_add(places.saturating_mul(host_tables))
+        .saturating_add(streamed_chain_cuts)
+        .saturating_add(decode_step_cbs.saturating_mul(groups.saturating_sub(1)));
+
+    let target_cbs = decode_in_flight.max(chain_in_flight);
+
+    let slots = limits.class_slots(places, load.fronts());
+    let readout_cbs = slots.readout.activations;
+    let drafter_cbs = if programs.head().is_some() || programs.draft().is_some() {
+        slots.head.activations
+    } else {
+        0
+    };
+    let vision_cbs = usize::from(programs.vision().is_some());
+    let state_cbs = slots.state.activations;
+    let service_cbs = 1;
+
+    target_cbs
+        .saturating_add(readout_cbs)
+        .saturating_add(drafter_cbs)
+        .saturating_add(vision_cbs)
+        .saturating_add(state_cbs)
+        .saturating_add(service_cbs)
 }
 
 /// The charge of each way [`ExecutionPlanDraft::with_held_experts`] holds
@@ -1935,7 +2187,7 @@ impl ExecutionPlanDraft {
             let (structure, more) = structure(&draft)?;
             Ok(HeldForm { draft, structure, more })
         };
-        let bank = match self.bank_ceiling(definition, bound)? {
+        let bank = match self.bank_ceiling(definition, bound, None)? {
             Ok(BankCeiling { whole, ceiling, .. }) => {
                 let bank = whole.bank();
                 let reserved = |slots| bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
@@ -1944,7 +2196,7 @@ impl ExecutionPlanDraft {
                 let draft = whole.resized(ceiling, ceiling, PassLaunches::FLOOR)?;
                 let mut windowed = Vec::new();
                 for &w in &bank.window_ladder()[1..] {
-                    if let Ok(BankCeiling { whole: win_whole, ceiling: win_ceiling, .. }) = self.with_window(&whole, definition, bound, w)? {
+                    if let Ok(BankCeiling { whole: win_whole, ceiling: win_ceiling, .. }) = self.with_window(&whole, definition, bound, w, CeilingPaths::Fixed)? {
                         let win_bank = win_whole.bank();
                         let win_reserved = |slots| win_bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
                         let win_points = rising(win_bank.floor(), win_ceiling, &win_reserved)?;
@@ -1972,6 +2224,29 @@ impl ExecutionPlanDraft {
             (Err(reason), None) => Err(PlanError::Unstreamed(reason).into()),
         }
     }
+}
+
+/// The path `bank` carries, priced on `prices` at `slots` held of each
+/// layer (`BankPrices::paths`): its least move's stored bytes along the
+/// stored read line.
+fn bank_paths(prices: &magnitude_cost_model::BankPrices, bank: &super::ExpertBankPlan, slots: u64) -> Result<super::BankPaths, PlanError> {
+    let bytes = bank.least_move_bytes().map_err(PlanError::ResourcePlanning)?;
+    let slots = usize::try_from(slots).map_err(|_| PlanError::Arithmetic("a bank's slots exceed usize"))?;
+    let records = prices
+        .paths(bytes, magnitude_cost_model::HeldSlots::bank(slots), super::HINT_LEADS)
+        .unwrap_or(magnitude_cost_model::PathRecords::NONE);
+    Ok(super::BankPaths::Priced { line: prices.read(), records })
+}
+
+/// How [`ExecutionPlanDraft::ceiling_of`] prices a bank's path records at
+/// each slot count.
+#[derive(Clone, Copy)]
+enum CeilingPaths<'a> {
+    /// Held fixed at the bank's own `paths` (an unpriced plan, or one
+    /// iteration of [`ExecutionPlanDraft::with_paths`]).
+    Fixed,
+    /// Priced at each slot count from the machine's measured bank prices.
+    Priced(&'a magnitude_cost_model::BankPrices),
 }
 
 /// What every plan of a bank is granted from ([`ExecutionPlanDraft::bank_ceiling`]).
@@ -2292,6 +2567,12 @@ impl ExecutionPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No measured figures: a placement from memory alone, its bank's path
+    /// unpriced.
+    fn memory_alone() -> Priced<crate::planning::PlanPrices> {
+        Priced::Unavailable("the test places from memory alone".into())
+    }
 
     /// The plan's prices on the synthetic machine's measurements.
     fn synthetic() -> Priced<super::super::PlanPrices> {
@@ -2704,12 +2985,12 @@ mod tests {
         let (definition, draft) = prepare(&card, 4097, kl);
         let planned = draft.device().clone();
         assert!(
-            matches!(draft.placed::<AssessmentMemoryCharge>(&definition, None, &StableRoom::of(&planned)).unwrap(), Placed::Short(_)),
+            matches!(draft.placed::<AssessmentMemoryCharge>(&definition, None, &memory_alone(), &StableRoom::of(&planned)).unwrap(), Placed::Short(_)),
             "the KL harness's eight conversations stream the experts"
         );
         let (definition, draft) = prepare(&card, 4096, served);
         let planned = draft.device().clone();
-        match draft.placed::<AssessmentMemoryCharge>(&definition, None, &StableRoom::of(&planned)).unwrap() {
+        match draft.placed::<AssessmentMemoryCharge>(&definition, None, &memory_alone(), &StableRoom::of(&planned)).unwrap() {
             Placed::Whole(placed) => {
                 assert!(placed.draft.load().expert_bank().is_none_or(|bank| bank.whole()), "the served load holds every expert");
                 assert_eq!(placed.draft.policy.limits.chain_capacity.get(), 8, "the served load chains every chunk of its 4,096-token prompt");
@@ -2774,7 +3055,7 @@ mod tests {
             let whole_bank = |draft: &ExecutionPlanDraft| {
                 let mut held = HeldCharges::<AssessmentMemoryCharge>::default();
                 let bound = HeldBound::of(None, StableRoom::of(&draft.device).capacity().unwrap());
-                let BankCeiling { whole, ceiling, .. } = draft.bank_ceiling(&definition, bound).unwrap().unwrap();
+                let BankCeiling { whole, ceiling, .. } = draft.bank_ceiling(&definition, bound, None).unwrap().unwrap();
                 let experts = whole.bank().slots;
                 assert_eq!(ceiling, experts, "{backend:?}: the bound holds a bank of every expert");
                 let reserved = |slots| whole.bank().resident_charge(slots).map_err(PlanError::ResourcePlanning);
@@ -2869,7 +3150,7 @@ mod tests {
     /// bank none).
     fn half_the_experts(draft: &ExecutionPlanDraft, definition: &ModelDefinition) -> (u64, u64) {
         let bound = HeldBound::of(None, StableRoom::of(draft.device()).capacity().unwrap());
-        let BankCeiling { whole, .. } = draft.bank_ceiling(definition, bound).unwrap().expect("a routed load banks its experts");
+        let BankCeiling { whole, .. } = draft.bank_ceiling(definition, bound, None).unwrap().expect("a routed load banks its experts");
         let bank = whole.bank();
         (whole.load().weight_bytes().unwrap(), bank.slot_bytes().unwrap() * (bank.widest().get() / 2))
     }
@@ -3068,6 +3349,59 @@ mod tests {
         let found = format!("{} slots (floor {}, a tenth {tenth}), ceiling {}, {:?} of {} places", capped.slots, capped.floor(), capped.ceiling, capped.pass, capped.places);
         assert!(capped.ceiling < tenth && capped.places == 128, "{found}");
         assert!(capped.pass > PassLaunches::FLOOR, "{found}");
+    }
+
+    /// A streamed bank settles its path records at its slots, carries them
+    /// priced on the stored line, and its load logs them.
+    #[test]
+    fn a_streamed_bank_logs_the_path_records_it_settles_at() {
+        let mut capped = None;
+        let messages = logged(|| capped = Some(far_larger_bank(|capacity| HeldBound::of(Some(WeightBound::Cap(29_000_000_000)), capacity))));
+        let capped = capped.expect("the load planned");
+        let crate::planning::BankPaths::Priced { records, .. } = capped.paths else {
+            panic!("a streamed bank's path is priced: {:?}", capped.paths);
+        };
+        let settled = messages.iter().filter(|message| message.contains("the bank's path records are settled")).collect::<Vec<_>>();
+        let fields = format!("slots={} ahead={} reserve={}", capped.slots, records.ahead, records.reserve);
+        assert!(settled.iter().any(|message| message.contains(&fields)), "{fields} in {messages:?}");
+        assert!(records.ahead > 0 && records.reserve >= records.ahead, "{records:?}");
+    }
+
+    /// Every event `run` logs on this thread: its message and fields, as
+    /// `message key=value ...`.
+    fn logged(run: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "message" => self.0.insert_str(0, &format!("{value:?}")),
+                    name => self.0.push_str(&format!(" {name}={value:?}")),
+                }
+            }
+        }
+        struct Events(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Events {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Events(events.clone()), run);
+        let logged = events.lock().unwrap().clone();
+        logged
     }
 
     /// Item 5: uncapped, with room beside its mandatory part for 20 GB at
@@ -3274,5 +3608,97 @@ mod tests {
             "expected W in [{round}, {widest}), got {}",
             chosen_bank.window_slots()
         );
+    }
+
+    #[test]
+    fn command_buffer_capacity_scales_with_streamed_layers_and_flight_depth() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+        use crate::programs::native_target::SubmissionChunks;
+
+        assert_eq!(SubmissionChunks::count(0), 0);
+        assert_eq!(SubmissionChunks::count(1), 1);
+        assert_eq!(SubmissionChunks::count(2), 2);
+        assert_eq!(SubmissionChunks::count(3), 3);
+        assert_eq!(SubmissionChunks::count(4), 3);
+        assert_eq!(SubmissionChunks::count(5), 4);
+        assert_eq!(SubmissionChunks::count(50), 11);
+
+        let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let room = StableRoom::of_selected(&device);
+
+        let streamed_draft = |layers: u64, lookahead: bool| {
+            let mut definition = routed_fixture_definition(RoutedShape {
+                layers,
+                experts: 16,
+                selected: 2,
+                hidden: 256,
+                intermediate: 256,
+            });
+            definition.decoder.context_limit = 512;
+            let manifest = gemma_moe_fixture_manifest(&definition);
+            let limits = ResourceLimits { lookahead, ..LIMITS };
+            let resident = ExecutionPlanner::prepare(
+                &device,
+                &manifest,
+                &definition,
+                ComponentSelection { head: false, vision: false },
+                ExecutionPath::Native,
+                PlannedMethod::Plain,
+                KvCodec::Dense,
+                limits,
+            )
+            .unwrap();
+            let streamed = resident
+                .clone()
+                .streaming::<AssessmentMemoryCharge>(&definition, None, &room)
+                .unwrap()
+                .streamed(&definition, &synthetic(), &room)
+                .unwrap()
+                .into_draft();
+            (resident, streamed)
+        };
+
+        let (resident_4, streamed_4_serial) = streamed_draft(4, false);
+        let (_, streamed_4_pipelined) = streamed_draft(4, true);
+        let (_, streamed_48_pipelined) = streamed_draft(48, true);
+        let (_, streamed_160_pipelined) = streamed_draft(160, true);
+
+        let cap = |draft: &ExecutionPlanDraft| {
+            command_buffer_capacity(draft.programs(), draft.load(), draft.policy().limits())
+        };
+
+        let cap_resident_4 = cap(&resident_4);
+        let cap_4_serial = cap(&streamed_4_serial);
+        let cap_4_pipelined = cap(&streamed_4_pipelined);
+        let cap_48_pipelined = cap(&streamed_48_pipelined);
+        let cap_160_pipelined = cap(&streamed_160_pipelined);
+
+        // Streamed loads require strictly more command buffers than resident
+        // loads of the same depth.
+        assert!(cap_4_serial > cap_resident_4, "{cap_4_serial} > {cap_resident_4}");
+        // Deeper pipelining (`lookahead: true`, 2 groups vs 1) strictly grows
+        // the derived bound.
+        assert!(cap_4_pipelined > cap_4_serial, "{cap_4_pipelined} > {cap_4_serial}");
+        // More streamed layers strictly grow the derived bound, including past
+        // 128 layers with no hardcoded ceiling.
+        assert!(cap_48_pipelined > cap_4_pipelined, "{cap_48_pipelined} > {cap_4_pipelined}");
+        assert!(cap_160_pipelined > cap_48_pipelined, "{cap_160_pipelined} > {cap_48_pipelined}");
+
+        // Never under-provisions a streamed load: covers at least
+        // (submission_chunks(layers + 2) + 2 cuts/layer) * groups + service CB.
+        for (draft, layers) in [
+            (&streamed_4_serial, 4usize),
+            (&streamed_4_pipelined, 4usize),
+            (&streamed_48_pipelined, 48usize),
+            (&streamed_160_pipelined, 160usize),
+        ] {
+            let groups = draft.policy().limits().flights().groups();
+            let decode_minimum = (SubmissionChunks::count(layers + 2) + layers * 2) * groups + 1;
+            let derived = cap(draft);
+            assert!(
+                derived >= decode_minimum,
+                "layers={layers}, groups={groups}: derived {derived} < decode minimum {decode_minimum}"
+            );
+        }
     }
 }

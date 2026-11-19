@@ -6,7 +6,7 @@ use crate::{
     NativeGraphOutputLease, NativeGraphWorkspaceLease, PoolClass, ResourceDomainId,
     TargetGraphOutputLease, TargetGraphWorkspaceLease,
 };
-use crate::operation::LaunchWork;
+use crate::operation::{FrontKind, Guess, LaunchWork, Operation, RequestId};
 use magnitude_batching::ValidatedTargetBatch;
 use magnitude_state::{StateStore, TentativeAdvance};
 use std::rc::Rc;
@@ -16,15 +16,67 @@ use std::rc::Rc;
 pub enum TargetTokens {
     /// The batch's host tokens, written into the step's upload region.
     Host,
-    /// The previous step's selections (`[rows, 2]` token, status rows in slot
-    /// order), read on the device: the step continues that one.
-    Selected(GraphOutputTensor),
+    /// Tokens the device selected for it (`[rows, 2]` token, status rows in
+    /// batch row order), read on the device: the step continues the step
+    /// before, each of its rows a front pass's exact token or the guess of
+    /// the chain made behind that step (`guess_chain`'s `next_selected`);
+    /// and of a load that fronts, its front rows' guesses (`[rows, 2]`
+    /// guess, kind rows, `guess_chain`'s `next_guesses`), whose kinds the
+    /// step's words carry (`routed_step`).
+    Selected {
+        selected: GraphOutputTensor,
+        guesses: Option<GraphOutputTensor>,
+    },
+}
+
+/// The host's guesses a launch slot's front rows run on, by depth: of a
+/// launch of host tokens, the guess each of its operation's front rows
+/// carries ([`FrontKind::Host`]), none of an idle row ([`FrontKind::Idle`]),
+/// whose kinds the step's words read (`routed_step`); empty of a slot of no
+/// front row, and of every slot of selected tokens, whose guesses the
+/// device reads ([`TargetTokens::Selected`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotGuess {
+    front: Vec<Option<Guess>>,
+}
+
+impl SlotGuess {
+    /// The host's guesses of a launch's slot of `operation`: its front
+    /// rows' where `host` builds the launch's tokens (the operation's
+    /// [`FrontKind::Host`], each its front row's token, and
+    /// [`FrontKind::Idle`], none), none otherwise ([`FrontKind::Device`]).
+    /// Any other pairing, or another operation than a forward, is the
+    /// caller's broken invariant.
+    pub fn of(operation: &Operation, host: bool) -> Self {
+        let Operation::Forward { tokens, front: front_rows, .. } = operation else {
+            panic!("a target launch's slot runs a forward");
+        };
+        let first = tokens.len() - front_rows.len();
+        let front = front_rows
+            .iter()
+            .zip(&tokens[first..])
+            .filter_map(|(row, &token)| match (row.kind, host) {
+                (FrontKind::Device, false) => None,
+                (FrontKind::Host(kind), true) => Some(Some(Guess { token, kind })),
+                (FrontKind::Idle, true) => Some(None),
+                (kind, host) => panic!("a front row's guess of {kind:?} in a launch whose tokens the host builds: {host}"),
+            })
+            .collect();
+        Self { front }
+    }
+
+    /// Every slot of a launch of `operations`.
+    pub fn launch(operations: &[Operation], host: bool) -> Vec<Self> {
+        operations.iter().map(|operation| Self::of(operation, host)).collect()
+    }
 }
 
 pub struct TargetLaunchInputs {
     batch: ValidatedTargetBatch,
     /// What its rows are (`LaunchWork::of` its requests' kinds).
     work: LaunchWork,
+    /// Per slot, the request whose rows it runs.
+    requests: Vec<RequestId>,
     tokens: TargetTokens,
     advances: Vec<TentativeAdvance>,
     conditioning: Vec<Option<ConditioningRef>>,
@@ -34,6 +86,8 @@ pub struct TargetLaunchInputs {
     /// first row, oldest first, as many as the model's row rules read (none
     /// of a model without one): the host's form of the n-gram token window.
     preceding: Vec<Vec<u64>>,
+    /// Per slot, the host's guesses its front rows run on ([`SlotGuess`]).
+    guesses: Vec<SlotGuess>,
     graph_workspace: TargetGraphWorkspaceLease,
     /// The launch's place in its chain's output rotation
     /// (`TargetProgram::submit`).
@@ -54,18 +108,22 @@ impl TargetLaunchInputs {
     pub fn new(
         batch: ValidatedTargetBatch,
         work: LaunchWork,
+        requests: Vec<RequestId>,
         tokens: TargetTokens,
         advances: Vec<TentativeAdvance>,
         conditioning: Vec<Option<ConditioningRef>>,
         conditioning_slices: Vec<Vec<ConditioningSlice>>,
+        operations: &[Operation],
         graph_workspace: TargetGraphWorkspaceLease,
         graph_output: TargetGraphOutputLease,
         readout_workspace: NativeGraphWorkspaceLease,
         readout_output: NativeGraphOutputLease,
     ) -> Self {
+        let guesses = SlotGuess::launch(operations, matches!(tokens, TargetTokens::Host));
         Self {
             batch,
             work,
+            requests,
             tokens,
             advances,
             conditioning,
@@ -76,6 +134,7 @@ impl TargetLaunchInputs {
             readout_output: Some(readout_output),
             boundary: None,
             preceding: Vec::new(),
+            guesses,
         }
     }
 
@@ -138,22 +197,42 @@ impl TargetLaunchInputs {
         }
         let slots = self.batch.actual_slots();
         if slots != self.advances.len()
+            || slots != self.requests.len()
             || slots != self.conditioning.len()
             || slots != self.conditioning_slices.len()
             || !(self.preceding.is_empty() || self.preceding.len() == slots)
+            || slots != self.guesses.len()
         {
             return Err(invalid(
                 "slot, advance, and conditioning counts disagree".into(),
             ));
         }
-        if let TargetTokens::Selected(selected) = &self.tokens {
+        // Selected tokens continue a decode pass: each slot is one exact
+        // row, then its front rows, each row's token the selection of its
+        // predecessor's row at its batch row.
+        let front = self.batch.upload().front;
+        let fronts = |slot: &magnitude_batching::TargetBatchSlot<'_>| front[slot.span()].iter().filter(|&&front| front).count();
+        let host = matches!(self.tokens, TargetTokens::Host);
+        if self
+            .batch
+            .slots()
+            .zip(&self.guesses)
+            .any(|(slot, guess)| guess.front.len() != if host { fronts(&slot) } else { 0 })
+        {
+            return Err(invalid("front rows' guesses are the host's exactly where it builds the tokens".into()));
+        }
+        if let TargetTokens::Selected { selected, .. } = &self.tokens {
             let rows = self.batch.class().rows() as u64;
+            let front = self.batch.upload().front;
             if selected.tensor().extents() != [rows, 2]
-                || self.batch.slots().any(|slot| slot.rows() != 1)
+                || self
+                    .batch
+                    .slots()
+                    .any(|slot| slot.rows() - front[slot.span()].iter().filter(|&&front| front).count() != 1)
                 || self.conditioning.iter().any(Option::is_some)
             {
                 return Err(invalid(
-                    "selected tokens differ from the launch's one-row slots".into(),
+                    "selected tokens differ from the launch's decode passes".into(),
                 ));
             }
         }
@@ -385,12 +464,14 @@ impl ValidatedTargetLaunch {
         let TargetLaunchInputs {
             batch,
             work,
+            requests,
             tokens,
             advances,
             conditioning,
             conditioning_slices,
             boundary,
             preceding,
+            guesses,
             graph_workspace,
             graph_output,
             readout_workspace,
@@ -400,12 +481,14 @@ impl ValidatedTargetLaunch {
             core: TargetLaunchCore {
                 batch,
                 work,
+                requests,
                 tokens,
                 advances,
                 conditioning,
                 conditioning_slices,
                 boundary,
                 preceding,
+                guesses,
                 store: store.clone(),
                 domain: domain.clone(),
             },
@@ -426,6 +509,11 @@ impl ValidatedTargetLaunch {
 
     pub(crate) fn work(&self) -> LaunchWork {
         self.core.work
+    }
+
+    /// Per slot, the request whose rows it runs.
+    pub(crate) fn requests(&self) -> &[RequestId] {
+        &self.core.requests
     }
 
     pub fn domain(&self) -> &ResourceDomainId {
@@ -488,6 +576,8 @@ pub struct TargetLaunchCore {
     /// What its rows are: policy that tells a prompt from generation reads
     /// this, never the launch's form.
     work: LaunchWork,
+    /// Per slot, the request whose rows it runs.
+    requests: Vec<RequestId>,
     /// Selected tokens stay held until the launch that reads them completes.
     tokens: TargetTokens,
     advances: Vec<TentativeAdvance>,
@@ -495,6 +585,7 @@ pub struct TargetLaunchCore {
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
     boundary: Option<FeatureRef>,
     preceding: Vec<Vec<u64>>,
+    guesses: Vec<SlotGuess>,
     /// The store every advance belongs to: it names each attention layer's
     /// history domain and the layer whose regions it binds.
     store: Rc<StateStore>,
@@ -539,6 +630,27 @@ impl TargetLaunchCore {
     /// empty of a model without one.
     pub fn preceding(&self) -> &[Vec<u64>] {
         &self.preceding
+    }
+
+    /// The host's guesses its front rows run on (`[rows, 2]` guess, kind
+    /// rows over the class's rows, `routed_step`'s `guesses`, as
+    /// `guess_chain` writes them), of a launch of host tokens: each front
+    /// row's at the row before it; every other row's zero (an idle row's
+    /// included), which the device reads for front rows alone.
+    pub fn host_guesses(&self) -> Vec<[i32; 2]> {
+        let upload = self.batch.upload();
+        let mut rows = vec![[0; 2]; upload.class.rows()];
+        for (slot, guess) in self.batch.slots().zip(&self.guesses) {
+            let front = slot.span().filter(|&row| upload.front[row]).collect::<Vec<_>>();
+            assert_eq!(guess.front.len(), front.len(), "each front row of host tokens runs the host's guess");
+            // An idle row's stays zero: it guessed nothing.
+            for (row, guess) in front.into_iter().zip(&guess.front) {
+                if let Some(guess) = guess {
+                    rows[row - 1] = [i32::try_from(guess.token.0).expect("a token fits i32"), guess.kind.word()];
+                }
+            }
+        }
+        rows
     }
 
     pub fn into_parts(

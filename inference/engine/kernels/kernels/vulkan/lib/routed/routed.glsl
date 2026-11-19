@@ -41,34 +41,73 @@ projection_weights routed_expert_matrix(slab_experts experts, slab_source source
 
 // The gathered decode form's tables (`routed_gather`): ROUTED_GATHER_WORDS
 // I32 a choice, from `table` + choice * ROUTED_GATHER_WORDS * 4: the count of
-// the choices of the choice's expert where it is its expert's first choice
-// in choice order (row-major), else 0; then those choices' rows (each its
-// GEMV row's activation row, at most one a row); then their products'
-// element offsets. A gathered GEMV reads each chosen expert's records once a
-// step, for every row that names it: a host tier record read once per row
-// would cost its link bytes again for each.
+// the choices reading the choice's record where it is the first of them in
+// choice order (row-major), else 0; then those choices' rows (each its GEMV
+// row's activation row, at most one a row); then their products' element
+// offsets. A choice reading no record (-1) is its own group. A gathered GEMV
+// reads each chosen record once a step, for every row that reads it: a host
+// tier record read once per row would cost its link bytes again for each.
 #define ROUTED_GATHER_WORDS (1u + 2u * uint(SEISMIC_CONST_VERIFY_ROWS))
 
+// Whether flat choice `choice`, reading `source`, runs in this pass: a
+// two-pass entry defines ROUTED_CHOICE_ACTIVE(choice, source) before
+// including this file; otherwise every choice runs.
+#ifndef ROUTED_CHOICE_ACTIVE
+#define ROUTED_CHOICE_ACTIVE(choice, source) true
+#endif
+
+// The source choice `choice` of `routes` reads (`routed_decode_source`).
+slab_source routed_choice_source(uint64_t routes, uint64_t routes0, uint64_t routes1, uint64_t sources,
+    uint64_t source_rows, uint64_t source0, uint64_t source1, uint64_t source2, uint slots, uint choice) {
+    const uint64_t m = uint64_t(choice / slots), k = uint64_t(choice % slots);
+    return routed_decode_source(sources, source_rows, source0, source1, source2, m, k,
+        element_i32_at(routes + (m * routes0 + k * routes1) * 4ul));
+}
+
+// The expert choice `choice` of `routes` names.
+int routed_choice_expert(uint64_t routes, uint64_t routes0, uint64_t routes1, uint slots, uint choice) {
+    const uint64_t m = uint64_t(choice / slots), k = uint64_t(choice % slots);
+    return element_i32_at(routes + (m * routes0 + k * routes1) * 4ul);
+}
+
 // Writes the tables of the `rows` x `slots` choices of `routes` (strides
-// `routes0`, `routes1`) whose products lie at element strides `product0`,
-// `product1`, an invocation a choice. The form runs at most VERIFY_ROWS rows,
-// each naming an expert once, so a choice's count never reaches the bound;
-// the bound (Metal's `routed::gather`'s) keeps the tables in bounds where
-// routes break that invariant, since Vulkan has no trap.
-void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint rows, uint slots, uint64_t product0,
+// `routes0`, `routes1`; sources as `routed_decode_source`) whose products lie
+// at element strides `product0`, `product1`, an invocation a choice. Choices
+// group where they name one expert in one record, as CUDA's and Metal's
+// gathers do. Only
+// active choices (ROUTED_CHOICE_ACTIVE) group: an inactive one has count 0
+// and joins no group, so it neither runs nor shadows an active choice of its
+// record. The form runs at most VERIFY_ROWS rows, a row's choices distinct
+// records, so a choice's count never reaches the bound; the bound (Metal's
+// `routed::gather`'s) keeps the tables in bounds where routes break that
+// invariant, since Vulkan has no trap.
+void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint64_t sources, uint64_t source_rows,
+    uint64_t source0, uint64_t source1, uint64_t source2, uint rows, uint slots, uint64_t product0,
     uint64_t product1, uint64_t table) {
     for (uint choice = gl_LocalInvocationIndex; choice < rows * slots; choice += gl_WorkGroupSize.x) {
-        const int expert = element_i32_at(routes + (uint64_t(choice / slots) * routes0
-            + uint64_t(choice % slots) * routes1) * 4ul);
+        const slab_source source = routed_choice_source(routes, routes0, routes1, sources, source_rows, source0,
+            source1, source2, slots, choice);
+        const int record = source.code;
+        const int expert = routed_choice_expert(routes, routes0, routes1, slots, choice);
         const uint64_t at = table + uint64_t(choice) * ROUTED_GATHER_WORDS * 4ul;
-        bool first = true;
-        for (uint c = 0u; c < choice; ++c)
-            first = first && element_i32_at(routes + (uint64_t(c / slots) * routes0
-                + uint64_t(c % slots) * routes1) * 4ul) != expert;
+        bool first = ROUTED_CHOICE_ACTIVE(choice, source);
+        for (uint c = 0u; c < choice && record != -1; ++c) {
+            const slab_source other = routed_choice_source(routes, routes0, routes1, sources, source_rows, source0,
+                source1, source2, slots, c);
+            first = first && !(other.code == record
+                && routed_choice_expert(routes, routes0, routes1, slots, c) == expert && ROUTED_CHOICE_ACTIVE(c, other));
+        }
         uint count = 0u;
         for (uint c = choice; first && c < rows * slots && count < uint(SEISMIC_CONST_VERIFY_ROWS); ++c) {
             const uint64_t m = uint64_t(c / slots), k = uint64_t(c % slots);
-            if (element_i32_at(routes + (m * routes0 + k * routes1) * 4ul) == expert) {
+            bool joins = c == choice;
+            if (!joins && record != -1) {
+                const slab_source other = routed_choice_source(routes, routes0, routes1, sources, source_rows,
+                    source0, source1, source2, slots, c);
+                joins = other.code == record && routed_choice_expert(routes, routes0, routes1, slots, c) == expert
+                    && ROUTED_CHOICE_ACTIVE(c, other);
+            }
+            if (joins) {
                 element_i32_put(at + uint64_t(1u + count) * 4ul, int(m));
                 element_i32_put(at + uint64_t(1u + uint(SEISMIC_CONST_VERIFY_ROWS) + count) * 4ul,
                     int(m * product0 + k * product1));
@@ -77,6 +116,11 @@ void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint row
         }
         element_i32_put(at, int(count));
     }
+}
+
+void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint rows, uint slots, uint64_t product0,
+    uint64_t product1, uint64_t table) {
+    routed_gather(routes, routes0, routes1, 0ul, 0ul, 0ul, 0ul, 0ul, rows, slots, product0, product1, table);
 }
 
 // The GEMV rows of choice `choice` in the tables at `table`

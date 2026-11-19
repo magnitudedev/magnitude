@@ -24,21 +24,24 @@ fn a_promotion_is_carried_while_a_scratch_request_awaits_its_arrival() {
 /// A group's hit stays a hit for the group's steps when a promotion evicts
 /// it meanwhile: the promotion unmaps it only from the first step not yet
 /// begun, so the group's pass reads it where the bank held it and nothing
-/// fills its scratch slot. The hit weighs its landing read and the group's
-/// (one read, at the latest step logged), the want two reads, the later at
-/// that step and the earlier after the hit's landing: the want outweighs
-/// the hit at every half-life. The group's last step therefore never seeds
-/// it, though the bank no longer holds it: its seed copy would copy the
-/// slot, which holds no byte of it, and map that record as the expert.
+/// fills its scratch slot. Decode reads 5 and 6 at every step after they
+/// land, then 6 and 7: 7, read as 5 and 6 were at their first reads, which
+/// every later step read again, is expected at nearly every step of the
+/// turnover, and outweighs 5, whose one expected use is the group's read. The group's last step therefore never seeds it,
+/// though the bank no longer holds it: its seed copy would copy the slot,
+/// which holds no byte of it, and map that record as the expert.
 #[test]
 fn a_hit_a_promotion_evicts_during_its_group_is_never_seeded() {
     let harness = promoting("seed-hit", 2, TIER);
     let map = &harness.layer.0;
     harness.promoted(0, &[5, 6]);
     let five = map.held(5).expect("5 is banked");
-    // Two decode steps reading 7, begun before the group: their reads are
-    // ranked once they end, which every step before them has.
-    let sevens = [harness.request(&[7]), harness.request(&[7])];
+    for _ in 0..8 {
+        harness.request(&[5, 6]).complete().unwrap();
+    }
+    // Two decode steps reading 6 and 7, begun before the group: their
+    // reads are ranked once they end, which every step before them has.
+    let sevens = [harness.request(&[6, 7]), harness.request(&[6, 7])];
     let steps = harness.group(&[StepRoute::Grouped; 2]);
     // Step 0 routes 5, a hit: read where the bank holds it.
     harness.publish(&steps[0], 0, &[5]);
@@ -61,29 +64,26 @@ fn a_hit_a_promotion_evicts_during_its_group_is_never_seeded() {
     }
 }
 
-/// A prompt group reserves its lent bank records as its steps begin, while
-/// promotions with victims in them are planned: whether a promotion copied
-/// before the group began (the group's claim then evicts it) or was still
-/// draining (it then never copies, its victim unmapped from a step before
-/// the group's first), no hit lies in a lent record, every routed expert's
-/// scratch slot holds the file's bytes, and no promoted expert lies in a
-/// lent record while the group holds them. Experts 0 and 1 hold the lent
-/// records 0 and 1, 2 and 3 records 2 and 3; decode reads of 2, 3, 6 and 7
-/// rank 6 and 7 into the layer's share of four, so their promotions take
-/// 0's and 1's records, and the group begins at once, routing 0 and 5.
-/// Repeated, the group begins on either side of the promotions' copies.
+/// No promotion takes a lent bank record, the scratch's: decode's reads
+/// promote into the records past them alone, however the ranking moves
+/// while a prompt group begins, so the group's lease takes the lent records
+/// at once, no hit lies in one, every routed expert's scratch slot holds
+/// the file's bytes, and no promoted expert lies in a lent record. Experts
+/// 2 and 3 hold records 2 and 3, the pool of two; decode reads of 6 and 7
+/// rank them above 2 and 3, so their promotions take those records as the
+/// group begins, routing 0 and 5. Repeated, the group begins on either side
+/// of the promotions' copies.
 #[test]
-fn a_group_beginning_beside_promotions_into_its_lent_records_reads_no_hit_there() {
+fn promotions_beside_a_group_beginning_take_no_lent_record() {
     for round in 0..8 {
         let harness = lending_bank(&format!("lent-promotion-{round}"), EXPERTS, 4, 1, STAGING, WHOLE, TIER, Placer::Tier, true, 2, false);
         let map = &harness.layer.0;
         let lent = |record: u32| harness.watcher.bank_lent(0, record);
-        harness.promoted(0, &[0, 1]);
         harness.promoted(0, &[2, 3]);
-        assert_eq!((0..4).map(|expert| map.held(expert)).collect::<Vec<_>>(), [Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!((0..4).map(|expert| map.held(expert)).collect::<Vec<_>>(), [None, None, Some(2), Some(3)]);
         for _ in 0..3 {
             let step = harness.step();
-            harness.request_at(&step, 0, &[2, 3, 6, 7]);
+            harness.request_at(&step, 0, &[6, 7]);
             step.complete().unwrap();
         }
         let step = harness.prompt_step();
@@ -128,9 +128,9 @@ fn after_a_prefill_decode_keeps_the_rankings_top_share() {
 
 /// A prompt group reads every expert of `harness`'s one layer, expert 3
 /// its most chosen, then 24 decode steps read 5, 6 and 7: the ranking puts
-/// 3 first of the experts only the prompt read, and what the layer's map
-/// holds comes to be decode's working set and the ranking's most reused of
-/// the rest, none held ranked below one lacked.
+/// every expert only the prompt read below decode's, and what the layer's
+/// map holds comes to be decode's working set and the ranking's most
+/// reused of the rest, none held ranked below one lacked.
 fn decode_keeps_the_rankings_top_share(harness: &Harness) {
     let step = harness.prompt_step();
     // The group's pass counts its choices (`BankPart::GroupReads`), at its
@@ -156,7 +156,7 @@ fn decode_keeps_the_rankings_top_share(harness: &Harness) {
         let (kept, depths) = (kept(), depths());
         let lacked = (0..EXPERTS).filter(|expert| !kept.contains(expert));
         let deepest = kept.iter().map(|&expert| depths[expert]).max().unwrap_or(0);
-        let prompt_only = [0, 1, 2, 4].iter().all(|&expert| depths[3] < depths[expert]);
+        let prompt_only = [0, 1, 2, 3, 4].iter().all(|&expert| [5, 6, 7].iter().all(|&decoded| depths[decoded] < depths[expert]));
         prompt_only && [5, 6, 7].iter().all(|expert| kept.contains(expert)) && lacked.into_iter().all(|expert| depths[expert] >= deepest)
     };
     eventually("the kept are the ranking's most reused", ranked);
@@ -165,11 +165,11 @@ fn decode_keeps_the_rankings_top_share(harness: &Harness) {
 /// The host promotes what the ranking keeps, off every step's path: a step
 /// that read an expert from the tier completes, and the expert is copied
 /// into a free bank record and mapped from the first step not yet begun;
-/// the next step's route finds it in the bank. Once the bank is full, an
+/// the next steps' routes find them in the bank. Once the bank is full, an
 /// expert read after the others earns a copy over the least weighed of
-/// them, and the release takes the least ranked: one read least and
-/// longest ago, the least at every half-life, so it is both whichever
-/// measure ranks. That read is by a step that ends while a later one runs:
+/// them, and the release takes the least ranked: the one no read since
+/// expects, so it is both. That read is by a step that ends while a later
+/// one runs:
 /// the evicted entry is unmapped from the first step not yet begun, while a step begun before
 /// still reads it and its record keeps its bytes until that step has
 /// completed; then the copy takes the record and its expert is mapped.
@@ -184,7 +184,10 @@ fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_complet
     let shared = harness.watcher.shared();
     let map = &harness.layer.0;
     let step = |sequence: &ExpertStep| sequence.sequence();
-    // 5, then 6, read from the tier, each promoted into a free record.
+    // 5, then 6, read from the tier, each promoted into a free record, then
+    // 6 read from the bank past `DEPTHS` so the turnover horizon spans into
+    // `history` (ranking 6 well above 5) and the ranking learns an expert
+    // just read repeats at the next step, while the second record never hits.
     let landing = harness.request(&[5]);
     let landed = step(&landing);
     landing.complete().unwrap();
@@ -194,14 +197,16 @@ fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_complet
     assert_eq!([0, 1, 2].map(|kind| harness.banked(kind, five)), [5, 105, 205]);
     harness.request(&[6]).complete().unwrap();
     eventually("6 was never promoted", || map.held(6).is_some());
-    let next = harness.step();
-    assert_eq!(harness.route_at(&next, 0, &[6]), [-1 - 6], "the bank holds 6");
-    next.complete().unwrap();
-    // 7, read after both, outweighs 5 over any stay (one read each, 5's
-    // older; the copy is priced at nothing), and 5, read once before 6's
-    // two reads, is the least ranked at every half-life: 7 evicts it, while
-    // a step begun before the eviction still runs and reads 5's record:
-    // begun before 7's read ends, so before the ranking learns it.
+    for _ in 0..12 {
+        let next = harness.step();
+        assert_eq!(harness.route_at(&next, 0, &[6]), [-1 - 6], "the bank holds 6");
+        next.complete().unwrap();
+    }
+    // 7, read alone as 6 was before its repeats, is expected again from the
+    // top of the stack while 5, unread since, is not (the copy is priced at
+    // nothing): 7 evicts 5, while a step begun before the eviction still
+    // runs and reads 5's record: begun before 7's read ends, so before the
+    // ranking learns it.
     let seven = harness.step();
     let running = harness.step();
     harness.request_at(&seven, 0, &[7]);
@@ -230,21 +235,19 @@ fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_complet
     assert_eq!((map.held(6), map.held(7)), (None, Some(five)), "6 released into the reserve, 7 kept");
 }
 
-/// The promotions the ranking asks together copy together: every one
-/// drained by then in one batch of the transfer queue. At one record a
-/// batch the bank took the ranking's share at one queue round trip a
-/// record, and on an RTX 3090 (48 of 256 experts) that held decode at 246.7
-/// tier misses a step against the ranking's 44: the ranking asked ~40
-/// promotions a step, and its replay misses what the run did only with
-/// the copies capped at 15-20 a step.
+/// The promotions the ranking asks together copy one batch each, in due
+/// order, as many in flight as the transfer queue's measured depth keeps
+/// the link full (`TierCopyCosts::depth`, one beside the latency a record's
+/// copy hides): no record waits a round trip for the one before it. The
+/// harness prices no latency, so each posts as the one before it lands.
 #[test]
-fn the_promotions_asked_together_copy_in_one_batch() {
+fn the_promotions_asked_together_copy_each_as_its_own_batch() {
     let harness = promoting("one-batch", 4, TIER);
     let map = &harness.layer.0;
     let experts = [2, 3, 5, 6];
     harness.request(&experts).complete().unwrap();
     eventually("every expert read was never promoted", || experts.iter().all(|&expert| map.held(expert).is_some()));
-    assert_eq!(harness.copies.posted(), 1, "one batch: {}", harness.copies.describe());
+    assert_eq!(harness.copies.posted(), experts.len() as u64, "each its own batch: {}", harness.copies.describe());
     for expert in experts {
         let record = map.held(expert).unwrap();
         assert_eq!([0, 1, 2].map(|kind| harness.banked(kind, record)), [0, 100, 200].map(|base| (base + expert) as u8));

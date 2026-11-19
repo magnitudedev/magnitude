@@ -289,6 +289,14 @@ impl ResourceLimits {
             .expect("a launch takes a row and no more than a class holds") as u64
     }
 
+    /// The most rows a launch of chained decode passes holds, exact and
+    /// front: the decode form's rows ([`crate::CHAINED_ROWS`]) within the
+    /// selection bound, as each of its rows selects. A pass the host builds
+    /// and the pass queued behind its predecessor are both held to it.
+    pub fn chained_rows(&self) -> usize {
+        self.max_selected_rows.min(crate::CHAINED_ROWS)
+    }
+
     /// The in-flight depth these limits plan for: the one authority every
     /// per-step copy count reads.
     pub const fn flights(&self) -> FlightDepth {
@@ -309,11 +317,12 @@ impl ResourceLimits {
         self.flights().groups().max(self.chain_capacity.get().min(2))
     }
 
-    /// The graph slots a load commits at startup: its prompt groups' floor
-    /// of one place (`class_slots`). Nothing below it is ever released, so
-    /// a group always runs, in Reclaim too, without allocating.
-    pub fn startup_slots(&self) -> StartupSlots {
-        self.class_slots(1)
+    /// The graph slots a load commits at startup, `fronts` where it does
+    /// (`ModelLoadPlan::fronts`): its prompt groups' floor of one place
+    /// (`class_slots`). Nothing below it is ever released, so a group always
+    /// runs, in Reclaim too, without allocating.
+    pub fn startup_slots(&self, fronts: bool) -> StartupSlots {
+        self.class_slots(1, fronts)
     }
 
     /// The graph slots prompt groups of `places` launches hold: what one
@@ -327,9 +336,15 @@ impl ResourceLimits {
     /// after it, so the longest chain's rotation serves every launch.
     /// Outputs a request retains after its launch completes (readout
     /// features, head drafts, encoded images) start at one request's need
-    /// and grow one slot at a time under a heap claim.
-    pub fn class_slots(&self, places: usize) -> StartupSlots {
+    /// and grow one slot at a time under a heap claim. A load that `fronts`
+    /// (`ModelLoadPlan::fronts`) runs a front head launch behind each
+    /// chained step, which its step's head launch slots cover, but the
+    /// prompt's closing chunk runs its drafter entry's and its front one at
+    /// once: one launch more than its target launches, as only the chain's
+    /// holder closes its prompt in flight.
+    pub fn class_slots(&self, places: usize, fronts: bool) -> StartupSlots {
         let launches = self.flights().launches(places);
+        let head = launches + usize::from(fronts);
         StartupSlots {
             target: GraphSlots {
                 activations: launches,
@@ -339,11 +354,12 @@ impl ResourceLimits {
                 activations: launches,
                 output: 1 + launches,
             },
-            // A prompt chunk's drafter entry rides with each target launch
-            // in flight.
+            // A prompt chunk's drafter entry, or a chained step's front head
+            // launch, rides with each target launch in flight, and the
+            // closing chunk's front launch beside its drafter entry.
             head: GraphSlots {
-                activations: launches,
-                output: 1 + launches,
+                activations: head,
+                output: 1 + head,
             },
             // Vision holds nothing until an image arrives: a text-only
             // session never uses it. An encode claims storage of its image's
@@ -1561,7 +1577,7 @@ impl ResourcePlanner {
     ) -> Result<ResourcePlan, String> {
         let load = &state.load;
         let limits = state.limits;
-        let slots = limits.startup_slots();
+        let slots = limits.startup_slots(load.fronts());
         let target_graph = NativeGraphCharge::from_prepared(target_graphs, slots.target)?;
         let target_readout_graph = NativeGraphCharge::from_footprint(
             FamilyFootprint::serial(target_readout_graphs.family()),
@@ -1899,10 +1915,17 @@ mod slab_plan_tests {
             conversations: NonZeroUsize::MIN,
         };
         let slots = |lookahead, places| {
-            let slots = limits(lookahead, 128).class_slots(places);
+            let slots = limits(lookahead, 128).class_slots(places, false);
             (slots.target, slots.readout.activations)
         };
-        assert_eq!(limits(true, 128).startup_slots(), limits(true, 128).class_slots(1));
+        assert_eq!(limits(true, 128).startup_slots(false), limits(true, 128).class_slots(1, false));
+        // A load that fronts holds one head launch more: the closing chunk's
+        // front launch beside its drafter entry.
+        for (lookahead, places) in [(false, 1), (true, 1), (true, 4)] {
+            let (plain, fronting) = (limits(lookahead, 128).class_slots(places, false), limits(lookahead, 128).class_slots(places, true));
+            assert_eq!((fronting.head.activations, fronting.head.output), (plain.head.activations + 1, plain.head.output + 1));
+            assert_eq!((fronting.target, fronting.readout), (plain.target, plain.readout));
+        }
         let target = |activations, output| GraphSlots {
             activations,
             output,

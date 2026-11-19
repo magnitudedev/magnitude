@@ -954,6 +954,19 @@ pub mod device {
                 _ => None,
             }
         }
+        /// Ensure the device's command queue can hold at least `count`
+        /// uncompleted command buffers at once. On Metal, sizes or grows the
+        /// idle `MTLCommandQueue` with
+        /// `newCommandQueueWithMaxCommandBufferCount:`; no-op on backends
+        /// whose queues have no fixed command-buffer ceiling.
+        pub fn ensure_command_buffer_capacity(&self, count: usize) -> Result<(), super::ExecutionError> {
+            let _ = count;
+            match &self.kind {
+                #[cfg(target_os = "macos")]
+                OpenedKind::Metal(opened) => opened.service().ensure_command_buffer_capacity(count),
+                _ => Ok(()),
+            }
+        }
         /// The most [`Self::allocated`] has been since the last
         /// [`Self::restart_high_water`].
         pub fn high_water(&self) -> u64 {

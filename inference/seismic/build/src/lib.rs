@@ -20,7 +20,10 @@
 //! static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = ...;
 //! pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError>;
 //! pub const IDENTITY: &str = "<hex digest of sources + compiler semantic version>";
-//! pub mod constants { pub const <NAME>: u64 = <value>; .. }   // every `const NAME = INTEGER`
+//! pub mod constants {
+//!     pub const <NAME>: u64 = <value>; ..                    // every `const NAME = INTEGER`
+//!     pub const fn <NAME>(<P>: u64, ..) -> u64; ..           // every `const NAME(P, ..) = EXPR`
+//! }
 //!
 //! pub mod <entry> {                       // one per exported entry (every portable family)
 //!     pub struct Args<'a> {               // source parameter order, source names
@@ -481,7 +484,7 @@ mod internals {
                 // Included files are validated against the including entry's
                 // ABI, exactly like the asset itself. The ABI is independent
                 // of the file, so build its symbol set once for this entry.
-                let allowed = match native_abi_symbols(entry, definition, dialect, module.constants()) {
+                let allowed = match native_abi_symbols(entry, definition, dialect, module.constants(), module.constant_functions()) {
                     Ok(allowed) => allowed,
                     Err(error) => {
                         violations.push(error);
@@ -996,15 +999,17 @@ mod internals {
         definition: &NativeImplementation,
         dialect: SourceDialect,
         constants: &[(String, u64)],
+        functions: &[seismic_lang::checked::ConstantFunction],
     ) -> Result<HashMap<String, Visibility>, BuildError> {
         let mut abi = AbiSymbols {
             entry: &entry.name,
             symbols: HashMap::new(),
         };
-        // Every module constant, which the rendered source defines when named.
-        for (name, _) in constants {
+        // Every module constant and constant function, which the rendered
+        // source defines when named.
+        for name in constants.iter().map(|(name, _)| name.as_str()).chain(functions.iter().map(|function| function.name())) {
             abi.define(
-                AbiMeaning::Constant(name.clone()),
+                AbiMeaning::Constant(name.to_owned()),
                 Symbols::surface([format!("SEISMIC_CONST_{}", native_macro(name))]),
             )?;
         }
@@ -1583,9 +1588,12 @@ mod internals {
         );
         out.push_str("pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
         out.push_str(&format!("pub const IDENTITY: &str = {:?};\n", identity));
-        out.push_str("/// The module constants (`const NAME = INTEGER`), which natives read as `SEISMIC_CONST_NAME`.\npub mod constants {\n");
+        out.push_str("/// The module constants (`const NAME = INTEGER`) and constant functions (`const NAME(P, ..) = EXPR`), which natives read as `SEISMIC_CONST_NAME`.\npub mod constants {\n");
         for (name, value) in module.constants() {
             out.push_str(&format!("  pub const {name}: u64 = {value};\n"));
+        }
+        for function in module.constant_functions() {
+            render_constant_function(&mut out, function);
         }
         out.push_str("}\n");
         if let Some(library) = cpu_library {
@@ -2204,26 +2212,72 @@ mod internals {
         }
     }
 
-    /// `expression` as a CPU kernel's `u64`, its dimensions and parameters
-    /// read from `cx`; `None` for one that reads an element or the device,
-    /// which a formation's shape never does.
+    /// `expression` as a Rust `u64` expression, `const` wherever `read`'s
+    /// are, `read` writing each name it reads (`None`: one it cannot). Its
+    /// arithmetic is the checker's (`NativeNatExpr::evaluate`): an overflow
+    /// or a zero divisor, which fails evaluation there, panics here.
+    fn rust_nat(
+        expression: &seismic_lang::checked::NativeNatExpr,
+        read: &dyn Fn(&seismic_lang::checked::NativeNatExpr) -> Option<String>,
+    ) -> Option<String> {
+        use seismic_lang::checked::NativeNatExpr as E;
+        let pair = |left: &E, right: &E| Some((rust_nat(left, read)?, rust_nat(right, read)?));
+        let checked = |left: &E, right: &E, operation: &str| {
+            pair(left, right).map(|(l, r)| {
+                format!("({l}).checked_{operation}({r}).expect(\"native arithmetic stays within u64\")")
+            })
+        };
+        let select = |left: &E, right: &E, keeps: &str| {
+            pair(left, right).map(|(l, r)| {
+                format!("({{ let (left, right) = ({l}, {r}); if left {keeps} right {{ left }} else {{ right }} }})")
+            })
+        };
+        match expression {
+            E::Constant(value) => Some(format!("{value}u64")),
+            E::Dimension(_) | E::Parameter(_) | E::Element(..) | E::Device(_) => read(expression),
+            E::Add(left, right) => checked(left, right, "add"),
+            E::Sub(left, right) => checked(left, right, "sub"),
+            E::Mul(left, right) => checked(left, right, "mul"),
+            E::Div(left, right) => checked(left, right, "div"),
+            E::Rem(left, right) => checked(left, right, "rem"),
+            E::CeilDiv(left, right) => pair(left, right).map(|(l, r)| format!("({l}).div_ceil({r})")),
+            E::Min(left, right) => select(left, right, "<="),
+            E::Max(left, right) => select(left, right, ">="),
+        }
+    }
+
+    /// `expression` as a CPU kernel's `u64` ([`rust_nat`]), its dimensions
+    /// and parameters read from `cx`; `None` for one that reads an element
+    /// or the device, which a formation's shape never does.
     fn cpu_nat(expression: &seismic_lang::checked::NativeNatExpr) -> Option<String> {
         use seismic_lang::checked::NativeNatExpr as E;
-        let pair = |left: &E, right: &E| Some((cpu_nat(left)?, cpu_nat(right)?));
-        Some(match expression {
-            E::Constant(value) => format!("{value}u64"),
-            E::Dimension(name) => format!("cx.dim_{}()", ident(name).to_lowercase()),
-            E::Parameter(name) => format!("cx.param_{}()", ident(name).to_lowercase()),
-            E::Element(..) | E::Device(_) => return None,
-            E::Add(left, right) => pair(left, right).map(|(l, r)| format!("({l} + {r})"))?,
-            E::Sub(left, right) => pair(left, right).map(|(l, r)| format!("({l} - {r})"))?,
-            E::Mul(left, right) => pair(left, right).map(|(l, r)| format!("({l} * {r})"))?,
-            E::Div(left, right) => pair(left, right).map(|(l, r)| format!("({l} / {r})"))?,
-            E::Rem(left, right) => pair(left, right).map(|(l, r)| format!("({l} % {r})"))?,
-            E::CeilDiv(left, right) => pair(left, right).map(|(l, r)| format!("{l}.div_ceil({r})"))?,
-            E::Min(left, right) => pair(left, right).map(|(l, r)| format!("{l}.min({r})"))?,
-            E::Max(left, right) => pair(left, right).map(|(l, r)| format!("{l}.max({r})"))?,
+        rust_nat(expression, &|read| match read {
+            E::Dimension(name) => Some(format!("cx.dim_{}()", ident(name).to_lowercase())),
+            E::Parameter(name) => Some(format!("cx.param_{}()", ident(name).to_lowercase())),
+            _ => None,
         })
+    }
+
+    /// A module constant function as a `const fn` of its parameters
+    /// ([`rust_nat`]), so a host derives what a declaration calls it for by
+    /// the declaration's own definition.
+    fn render_constant_function(out: &mut String, function: &seismic_lang::checked::ConstantFunction) {
+        use seismic_lang::checked::NativeNatExpr as E;
+        let parameters = function
+            .parameters()
+            .iter()
+            .map(|parameter| format!("{}: u64", ident(parameter)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = rust_nat(&function.body().nat(), &|read| match read {
+            E::Dimension(name) => Some(ident(name)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("constant function `{}` reads only its parameters", function.name()));
+        out.push_str(&format!(
+            "  #[allow(non_snake_case)]\n  pub const fn {}({parameters}) -> u64 {{\n    {body}\n  }}\n",
+            ident(function.name())
+        ));
     }
 
     /// `condition` as a CPU kernel's `bool` ([`cpu_nat`]).
@@ -3737,7 +3791,7 @@ mod native_tests {
     fn module_constants_are_generated_and_admitted_by_name() {
         let root = fixture("constants");
         let source = root.join("ops.seismic");
-        fs::write(&source, "const WIDTH = 256\n\nfn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n").unwrap();
+        fs::write(&source, "const WIDTH = 256\nconst GROUPS(STAGED) = 1 + STAGED * (WIDTH - 1)\n\nfn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n").unwrap();
         let asset = root.join("native/scale.metal");
         let build = |text: &str, name: &str| {
             fs::write(&asset, text).unwrap();
@@ -3753,7 +3807,13 @@ mod native_tests {
         )
         .expect("a declared module constant is part of the ABI");
         let generated = fs::read_to_string(&built.bindings).unwrap();
-        assert!(generated.contains("pub mod constants {\n  pub const WIDTH: u64 = 256;\n}"));
+        let checked = |operation: &str, left: &str, right: &str| {
+            format!("({left}).checked_{operation}({right}).expect(\"native arithmetic stays within u64\")")
+        };
+        let groups = checked("add", "1u64", &checked("mul", "STAGED", &checked("sub", "256u64", "1u64")));
+        assert!(generated.contains(&format!(
+            "pub mod constants {{\n  pub const WIDTH: u64 = 256;\n  #[allow(non_snake_case)]\n  pub const fn GROUPS(STAGED: u64) -> u64 {{\n    {groups}\n  }}\n}}"
+        )));
         match build(
             "kernel void scale(uint index [[thread_position_in_grid]]) { if (index < SEISMIC_CONST_HEIGHT) {} }\n",
             "unknown",

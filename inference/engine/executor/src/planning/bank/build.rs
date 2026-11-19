@@ -1,4 +1,4 @@
-use super::{BankGroup, BankLayer, BankLayers, BankSites, BankSubstrate, BankTable, ExpertBankPlan, HintWeight, NonEmpty, RecordForm, RoutedTensor, routed_experts};
+use super::{BankGroup, BankLayer, BankLayers, BankPaths, BankSites, BankSubstrate, BankTable, ExpertBankPlan, HintWeight, NonEmpty, RecordForm, RoutedTensor, routed_experts};
 use super::conveyor;
 use super::records::{record_tensor, routed_layers};
 use super::table::stored_table_heads;
@@ -7,7 +7,7 @@ use crate::operators::routed::{hint_kinds, is_fused};
 use crate::planning::ModelLoadPlan;
 use crate::planning::resources::FlightDepth;
 use crate::planning::weights::Holding;
-use magnitude_family_contracts::{ExpertSelection, ModelDefinition, RouterInput, WeightRole};
+use magnitude_family_contracts::{ExpertSelection, ModelDefinition, RouterInput, WeightKind, WeightRole};
 
 impl ModelLoadPlan {
     /// The floor of the expert bank [`Self::with_expert_bank`] holds of
@@ -111,12 +111,16 @@ impl ModelLoadPlan {
                     groups.len() - 1
                 }
             };
+            let shared_down = is_fused(routed)
+                .then(|| planned(WeightKind::SharedDown).map(|plan| (plan.resident, plan.resident_bytes, plan.shape.clone())))
+                .flatten();
             layers.push(BankLayer {
                 scope,
                 group,
                 experts: routed.experts,
                 resident,
                 hinted,
+                shared_down,
             });
         }
         let (_, selected) = shape.ok_or(PlanError::Unstreamed(UnstreamedExperts::Unrouted))?;
@@ -167,6 +171,8 @@ impl ModelLoadPlan {
             flights,
             tables,
             sites: BankSites::Unadmitted,
+            paths: BankPaths::Unpriced,
+            recording: self.recorded_routes,
         };
         for weight in &mut self.target {
             let Some((_, layer)) = bank.layer(weight.role.scope) else {
@@ -182,7 +188,7 @@ impl ModelLoadPlan {
             weight.holding = Holding::Banked { group: layer.group };
         }
         self.bank = Some(bank);
-        self.with_bank_slots(slots, slots)
+        self.with_front_stagings().with_bank_slots(slots, slots)
     }
 
     /// The plan with its expert bank at `slots` committed records per
@@ -229,15 +235,37 @@ impl ModelLoadPlan {
         Ok(load)
     }
 
-    /// The plan with its experts banked as `bank` holds them, at its slots,
-    /// ceiling, host slots, launches and residency, its scratch
+    /// The plan with its expert bank's path `paths` (`ExpertBankPlan::paths`):
+    /// its staging, its tier's reserve, and each banked stack's shape and
+    /// committed records (clamped to at least the bank's floor) with them.
+    pub(crate) fn with_bank_paths(mut self, paths: BankPaths) -> Result<Self, PlanError> {
+        let mut bank = self.bank.take().ok_or(PlanError::Topology("a plan without a bank has no path"))?;
+        bank.paths = paths;
+        for weight in &mut self.target {
+            let Some((_, layer)) = bank.layer(weight.role.scope) else {
+                continue;
+            };
+            if RoutedTensor::of(weight.role.kind).is_none() {
+                continue;
+            }
+            weight.shape[0] = bank.records(layer.group);
+        }
+        let slots = bank.slots.max(bank.floor()).min(bank.ceiling);
+        let ceiling = bank.ceiling;
+        self.bank = Some(bank);
+        self.with_front_stagings().with_bank_slots(slots, ceiling)
+    }
+
+    /// The plan with its experts banked as `bank` holds them, at its path,
+    /// slots, ceiling, host slots, launches and residency, its scratch
     /// `window_slots` experts of a layer at once: the bank
     /// [`Self::with_expert_bank`] builds of this plan's weights unbanked,
-    /// whose floor is of that window from the first.
+    /// whose floor is of that window and path from the first.
     pub(crate) fn banked_as(self, definition: &ModelDefinition, bank: &ExpertBankPlan, window_slots: u64) -> Result<Self, PlanError> {
         let mut load = self
             .unbanked()
             .with_expert_bank(definition, bank.slots, Some(window_slots), bank.places, bank.flights, bank.substrate())?
+            .with_bank_paths(bank.paths)?
             .with_bank_slots(bank.slots, bank.ceiling)?;
         let built = load.bank.as_mut().expect("the load was just banked");
         (built.host_slots, built.pass, built.resident) = (bank.host_slots, bank.pass, bank.resident);
@@ -258,6 +286,6 @@ impl ModelLoadPlan {
                 *weight = table.fixed.clone();
             }
         }
-        self
+        self.with_front_stagings()
     }
 }

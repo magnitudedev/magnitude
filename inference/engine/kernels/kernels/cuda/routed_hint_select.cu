@@ -56,7 +56,6 @@ extern "C" __global__ void routed_hint_select_ordered_gemv(SEISMIC_KERNEL_PARAMS
     const float *after_bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_AFTER_BIAS));
     const int *step = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP));
     int *rings = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_RINGS));
-    const int seq = step[SEISMIC_CONST_STEP_LOW * SEISMIC_STEP_STRIDE_0];
     const unsigned lane = threadIdx.x % 32, warp = threadIdx.x / 32, warps = blockDim.x / 32;
     constexpr unsigned K = static_cast<unsigned>(SEISMIC_DIM_K);
     for (unsigned lead = 0; lead < static_cast<unsigned>(SEISMIC_DIM_AHEAD); ++lead) {
@@ -70,12 +69,14 @@ extern "C" __global__ void routed_hint_select_ordered_gemv(SEISMIC_KERNEL_PARAMS
                 score_fn, [&](unsigned e) { return __ldcg(row_logits + e); },
                 [&](int e) { return bias_p[static_cast<unsigned long long>(e) * bias_s]; }, lane);
             if (lane == 0) {
-                for (unsigned c = 0; c < K; ++c)
+                for (unsigned c = 0; c < K; ++c) {
                     words[STREAMING_HINT_CHOSEN(row) + c] = sel.winners[K - 1 - c];
+                    words[STREAMING_HINT_WEIGHT(m, row) + c] = __float_as_int(sel.chosen[K - 1 - c]);
+                }
             }
         }
         streaming_hint(m, rings + static_cast<unsigned long long>(lead) * SEISMIC_RINGS_STRIDE_0,
-                       SEISMIC_RINGS_STRIDE_1, seq, words, threadIdx.x, blockDim.x);
+                       SEISMIC_RINGS_STRIDE_1, step, SEISMIC_STEP_STRIDE_0, words, threadIdx.x, blockDim.x);
         streaming_barrier();
     }
 }

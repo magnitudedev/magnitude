@@ -80,7 +80,7 @@ STREAMING_FN void streaming_list_chunk(STREAMING_SYSTEM_READ list, u64 stride, u
     if (entry < first || entry >= first + staged) {
         const u32 count = min(entries - entry, u32(SEISMIC_CONST_LIST_CHUNK));
         const u32 words = count * u32(SEISMIC_CONST_LIST_ENTRY_WORDS);
-        const u64 base = SEISMIC_CONST_LIST_ENTRIES + SEISMIC_CONST_LIST_ENTRY_WORDS * u64(entry);
+        const u64 base = SEISMIC_CONST_LIST_ENTRY(u64(entry));
         streaming_barrier();
         for (u32 word = tid; word < words; word += threads)
             STREAMING_GROUP(SEISMIC_CONST_LIST_GROUP_CHUNK + int(word)) =
@@ -112,8 +112,8 @@ STREAMING_FN void streaming_list_stage(STREAMING_SYSTEM_READ list, u64 stride, i
     }
     const u32 words = u32(entries) * u32(SEISMIC_CONST_LIST_ENTRY_WORDS);
     for (u32 word = tid; word < words; word += threads)
-        streaming_device_store(STREAMING_AT(staged, (SEISMIC_CONST_LIST_ENTRIES + u64(word)) * staged_stride),
-            streaming_load(STREAMING_AT(list, (SEISMIC_CONST_LIST_ENTRIES + u64(word)) * stride)));
+        streaming_device_store(STREAMING_AT(staged, (SEISMIC_CONST_LIST_ENTRY(0) + u64(word)) * staged_stride),
+            streaming_load(STREAMING_AT(list, (SEISMIC_CONST_LIST_ENTRY(0) + u64(word)) * stride)));
 }
 
 // The launch grid over a list's entries (`routed_list_grid`), at `grid`

@@ -37,8 +37,8 @@ fn counts(candidates: &[ComputeThreads]) -> Vec<usize> {
 
 /// A request's time from a recorded line: `expert` µs an expert of a
 /// decode request's eight, a 20 µs handshake, resolved to `resolution` µs.
-fn line(expert: f64, resolution: f64) -> crate::assessment::Sample {
-    crate::assessment::Sample { seconds: (20. + 8. * expert) * 1e-6, resolution: resolution * 1e-6 }
+fn line(expert: f64, resolution: f64) -> magnitude_cost_model::Sample {
+    magnitude_cost_model::Sample { seconds: (20. + 8. * expert) * 1e-6, resolution: resolution * 1e-6 }
 }
 
 /// Sized on the EPYC's line (cold, an expert: 48.7 µs at 4 threads, 47.7
@@ -255,7 +255,7 @@ fn the_most_urgent_job_runs_first_in_submission_order() {
     // The worker holds the gate's one piece.
     until(|| handle.inner.jobs.lock().unwrap().iter().all(|job| job.next.load(Ordering::Acquire) == 1));
     let order = Arc::new(AtomicUsize::new(0));
-    let ahead = Some(Want::expected(std::time::Instant::now() + std::time::Duration::from_secs(3600), 0.));
+    let ahead = Some(Want::expected(0, 0.));
     let kinds = [ahead, None, ahead, ahead, None];
     let jobs = kinds.map(|ahead| Counted::ordered(2, ahead, order.clone()));
     for job in &jobs {

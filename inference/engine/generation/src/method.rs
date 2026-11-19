@@ -1,7 +1,7 @@
 use crate::{DraftOutlook, TimedLaunch};
 use magnitude_executor::{
-    Demand, FeatureReader, FeatureRef, FeatureRows, LaunchDuration, Operation, Outcome, RequestId, SelectSpec,
-    TokenId, WeakFeatureRef,
+    ChainEntry, Demand, FeatureReader, FeatureRef, FeatureRows, FrontGrant, LaunchDuration, Operation, Outcome,
+    RequestId, SelectSpec, TokenId, WeakFeatureRef,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,16 +46,25 @@ pub enum MethodCheckpoint {
 }
 
 impl MethodCheckpoint {
-    /// Whether a generation under `choice` can resume from this checkpoint:
-    /// it was taken under the same method, so the drafter history the
-    /// retained state holds (or lacks) is the one the generation needs.
-    pub fn resumes(&self, choice: MethodChoice) -> bool {
-        matches!(
-            (choice, self),
-            (MethodChoice::Plain, Self::Plain)
-                | (MethodChoice::Mtp { .. }, Self::Mtp(_))
-                | (MethodChoice::DFlash { .. }, Self::DFlash(_))
-        )
+    /// Whether a generation under `choice` resumes from this checkpoint
+    /// taken at `rows` target rows, where its path holds `successor` next
+    /// (none past its path's end): it was taken under the same method, so
+    /// the drafter history the retained state holds (or lacks) is the one
+    /// the generation needs; a drafter's accounts for exactly those rows;
+    /// and one that entered the successor of its rows
+    /// (`DraftTail::Entered`) entered this path's.
+    pub fn resumes(&self, choice: MethodChoice, rows: usize, successor: Option<TokenId>) -> bool {
+        match (choice, self) {
+            (MethodChoice::Plain, Self::Plain) => true,
+            (MethodChoice::Mtp { .. }, Self::Mtp(state)) | (MethodChoice::DFlash { .. }, Self::DFlash(state)) => {
+                state.target_rows() == rows
+                    && match state.tail {
+                        DraftTail::Trailing { .. } => true,
+                        DraftTail::Entered(entered) => successor == Some(entered),
+                    }
+            }
+            _ => false,
+        }
     }
 
     /// Whether the checkpoint accounts for exactly `rows` target rows, so it
@@ -77,14 +86,60 @@ impl MethodCheckpoint {
 }
 
 /// A target-conditioned drafter's reconciled state at a numerical boundary:
-/// its position and the target-conditioned rows it has not yet entered.
+/// its position, where its history ends against the target's rows, and the
+/// target rows its history omits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraftCheckpoint {
     pub(crate) position: usize,
-    pub(crate) pending: Option<PendingRows>,
-    pub(crate) open: Option<OpenFeature>,
+    pub(crate) tail: DraftTail,
     /// Target rows the drafter's history omits (`DrafterState::skipped`).
     pub(crate) skipped: usize,
+}
+
+/// Where a drafter's history ends against the target's rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DraftTail {
+    /// Short of the target's rows: `pending` pairs, read on the host, await
+    /// entry, then `open`, the target's last row's feature, awaits its
+    /// successor token. Both none only before the first chunk, or where
+    /// every pair is entered and no feature is held.
+    Trailing {
+        pending: Option<PendingRows>,
+        open: Option<OpenFeature>,
+    },
+    /// Level with them: the head entered the successor of the target's last
+    /// row, this token, with that row's feature. A head decoding in front
+    /// passes enters each selecting step's selection on the device behind
+    /// it (`FrontState`), so its history holds a token of its path the
+    /// target's rows do not.
+    Entered(TokenId),
+}
+
+impl DraftTail {
+    /// Nothing awaits entry.
+    pub(crate) const EMPTY: Self = Self::Trailing { pending: None, open: None };
+
+    /// Target rows past the head's entered ones it accounts for: each
+    /// pending pair and the open feature.
+    fn rows(&self) -> usize {
+        match self {
+            Self::Trailing { pending, open } => {
+                pending.as_ref().map_or(0, |rows| rows.tokens.len()) + usize::from(open.is_some())
+            }
+            Self::Entered(_) => 0,
+        }
+    }
+
+    /// Host bytes it holds.
+    pub(crate) fn host_bytes(&self) -> usize {
+        match self {
+            Self::Trailing { pending, open } => {
+                pending.as_ref().map_or(0, |rows| rows.features.bytes().len())
+                    + open.as_ref().map_or(0, OpenFeature::host_bytes)
+            }
+            Self::Entered(_) => 0,
+        }
+    }
 }
 
 /// One target feature awaiting its successor token. Device rows are owned by
@@ -112,27 +167,50 @@ pub(crate) struct PendingRows {
     pub(crate) features: FeatureRows,
 }
 
+impl PendingRows {
+    /// `pending` with the pairs of `tokens` and their `features` after it.
+    pub(crate) fn joined(pending: Option<Self>, tokens: Vec<TokenId>, features: FeatureRows) -> Result<Self, String> {
+        if tokens.len() != features.rows() {
+            return Err("drafter pairs differ from their feature rows".into());
+        }
+        Ok(match pending {
+            None => Self { tokens, features },
+            Some(mut pending) => {
+                pending.features = pending.features.concat(&features).map_err(|error| error.to_string())?;
+                pending.tokens.extend(tokens);
+                pending
+            }
+        })
+    }
+
+    /// Its pairs but the last, and the last pair's feature: the pairs of a
+    /// retained prefix whose last row's successor, the last pair's token,
+    /// lies past it.
+    pub(crate) fn opened(self) -> (Option<Self>, FeatureRows) {
+        let last = self.tokens.len() - 1;
+        let open = self.features.slice(last, 1).expect("pending row shape");
+        let rest = (last > 0).then(|| Self {
+            tokens: self.tokens[..last].to_vec(),
+            features: self.features.slice(0, last).expect("pending row shape"),
+        });
+        (rest, open)
+    }
+}
+
 impl DraftCheckpoint {
     pub const fn position(&self) -> usize {
         self.position
     }
 
-    /// Target rows this state accounts for: every entered head row, every
-    /// pending pair, the open feature, and the rows whose pairs it omits.
+    /// Target rows this state accounts for: every entered head row (each
+    /// pairs a target row's feature with its successor), every pending
+    /// pair, the open feature, and the rows whose pairs it omits.
     pub fn target_rows(&self) -> usize {
-        self.position
-            + self.pending.as_ref().map_or(0, |rows| rows.tokens.len())
-            + usize::from(self.open.is_some())
-            + self.skipped
+        self.position + self.tail.rows() + self.skipped
     }
 
     pub fn retained_bytes(&self) -> u64 {
-        let pending = self
-            .pending
-            .as_ref()
-            .map_or(0, |rows| rows.features.bytes().len());
-        let open = self.open.as_ref().map_or(0, OpenFeature::host_bytes);
-        (pending + open) as u64
+        self.tail.host_bytes() as u64
     }
 }
 
@@ -172,6 +250,26 @@ pub struct MethodEffects {
     pub operations: Vec<Operation>,
 }
 
+/// The next round of a method decoding in front passes
+/// ([`MethodState::front`]), by the form its grant gives and where the
+/// head's history ends.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FrontEntry {
+    /// The head holds every pair up to the pass's pending token, and the
+    /// grant is a front pass's: the pass enters its exact row's selection
+    /// behind it on the device, from here.
+    Chain(ChainEntry),
+    /// The head holds every pair up to the pass's pending token, and the
+    /// grant is a verify pass's: the pass enters nothing behind it, its
+    /// accepted rows' pairs reaching the head through the host
+    /// ([`MethodState::observe`]).
+    Verify,
+    /// The head trails the target: the head transaction that enters the
+    /// pairs it lacks on the host and drafts the next pass's chain from the
+    /// last; the pass follows it, by its own grant.
+    Pending(Vec<Operation>),
+}
+
 pub trait Method: Send + Sync {
     /// Whether each entered head row consumes its target feature's successor token.
     fn priming_requires_successor(&self) -> bool { false }
@@ -185,6 +283,15 @@ pub trait Method: Send + Sync {
     fn proposals(&self) -> usize;
     fn create(&self, checkpoint: Option<&MethodCheckpoint>)
     -> Result<Box<dyn MethodState>, String>;
+    /// Whether its generations decode in front passes
+    /// (`magnitude_executor::TwoRowDecode`) on the chain the MTP head makes,
+    /// each in the form its launch grants, and never propose on their own:
+    /// the MTP method of a head of its own history on a load that fronts
+    /// ([`crate::Mtp::fronting`]). Any other drafts, or decodes plainly,
+    /// one row a pass.
+    fn decodes_two_rows(&self) -> bool {
+        false
+    }
 }
 
 /// Per-request method state remains confined to its owner thread.
@@ -215,8 +322,29 @@ pub trait MethodState {
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String>;
     /// Propose one token per selection (keyed by the target's position), or
-    /// return the executor work that drafts them.
+    /// return the executor work that drafts them. A state decoding in front
+    /// passes proposes nothing and is never asked ([`Self::front`]).
     fn propose(&mut self, request: RequestId, selects: &[SelectSpec]) -> Propose;
+    /// The next round of a state decoding in front passes
+    /// ([`Method::decodes_two_rows`]), of pending token `pending`, its pass
+    /// in the form `grant` gives; where its head trails the target, the
+    /// head transaction drafting the chain first, a proposal per `selects`.
+    /// It is asked in place of [`Self::propose`]; any other state never is.
+    fn front(
+        &mut self,
+        _request: RequestId,
+        _pending: TokenId,
+        _grant: FrontGrant,
+        _selects: &[SelectSpec],
+    ) -> Result<FrontEntry, String> {
+        unreachable!("a drafting method's decode proposes, decoding in no front pass")
+    }
+    /// Whether its head trails the target, so that its next decode round
+    /// is the head transaction drafting the chain ([`Self::front`]), of a
+    /// state decoding in front passes. Any other state is never asked.
+    fn trails(&self) -> bool {
+        unreachable!("a drafting method's head drafts no chain for a front pass")
+    }
     fn observe(
         &mut self,
         request: RequestId,
@@ -260,7 +388,7 @@ pub trait MethodState {
 
 #[cfg(test)]
 mod tests {
-    use super::{DraftCheckpoint, MethodCheckpoint};
+    use super::{DraftCheckpoint, DraftTail, MethodCheckpoint};
 
     /// A drafter's checkpoint resumes only beside a target state of exactly
     /// the rows it accounts for (its entered rows and the rows it omits): a
@@ -268,7 +396,7 @@ mod tests {
     /// resume point. A plain request's checkpoint accounts for any rows.
     #[test]
     fn a_checkpoint_accounts_only_for_its_own_rows() {
-        let draft = DraftCheckpoint { position: 70, pending: None, open: None, skipped: 2 };
+        let draft = DraftCheckpoint { position: 70, tail: DraftTail::EMPTY, skipped: 2 };
         for checkpoint in [MethodCheckpoint::Mtp(draft.clone()), MethodCheckpoint::DFlash(draft)] {
             assert!(checkpoint.accounts_for(72), "{checkpoint:?}");
             assert!(!checkpoint.accounts_for(70), "{checkpoint:?}: rows it omits are still its own");

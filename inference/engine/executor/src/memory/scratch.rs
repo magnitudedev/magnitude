@@ -12,7 +12,7 @@ use std::num::NonZeroU64;
 /// What a group's scratch is sized from: the bank's header-derived counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScratchShape {
-    /// The decode step's set, which the floor holds (`WorkingSet::lent`).
+    /// The decode step's set, which the floor holds.
     pub decode: u64,
     /// The widest streamed layer's cold need: the records a prompt converts
     /// a layer through in one pass.

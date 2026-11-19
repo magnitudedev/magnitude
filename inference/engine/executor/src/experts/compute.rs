@@ -84,6 +84,16 @@ impl Urgency {
         self.0.lock().expect("a job's urgency").1
     }
 
+    /// Its read is repriced as `want` (the ledger's aggregate): a job no step
+    /// waits on follows its read's want, up or down; one a step waits on
+    /// stays due.
+    pub(in crate::experts) fn set(&self, want: Want) {
+        let mut urgency = self.0.lock().expect("a job's urgency");
+        if !urgency.1 {
+            urgency.0 = want;
+        }
+    }
+
     /// A step waits on it from now: due, if not due before.
     pub(in crate::experts) fn hasten(&self) {
         let mut urgency = self.0.lock().expect("a job's urgency");
@@ -228,7 +238,7 @@ impl Machine {
     /// of the fewest workers within the least's resolution ([`fewest_at_least`]).
     pub(crate) fn sized(
         &self,
-        mut stage: impl FnMut(&ComputeThreads) -> Result<crate::assessment::Sample, String>,
+        mut stage: impl FnMut(&ComputeThreads) -> Result<magnitude_cost_model::Sample, String>,
     ) -> Result<ComputeThreads, String> {
         let candidates = self.candidates();
         if candidates.is_empty() {
@@ -261,7 +271,7 @@ impl Machine {
 /// The index of the least stage time of `samples` (fewest workers first),
 /// or of the fewest workers within its resolution: on a flat curve, more
 /// workers buy nothing a measurement resolves and cost the quota.
-fn fewest_at_least(samples: &[crate::assessment::Sample]) -> usize {
+fn fewest_at_least(samples: &[magnitude_cost_model::Sample]) -> usize {
     let least = samples.iter().min_by(|a, b| a.seconds.total_cmp(&b.seconds)).expect("a sample of each candidate");
     samples.iter().position(|sample| sample.seconds <= least.seconds + least.resolution).expect("the least is within its own resolution")
 }

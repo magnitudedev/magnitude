@@ -44,11 +44,19 @@ struct Ranked {
     int winners[K];
 };
 
+// Where a selection's keys go (`keys(expert, key)`, each held expert's
+// ranked value, before its rounds): nowhere, but in a recording load's
+// streamed route (the routing record's keys, streaming/resolve.hpp).
+struct NoKeys {
+    inline void operator()(uint, float) const {}
+};
+
 // The ranking of one row by one simdgroup, reading the row's logit of expert
-// `e` as `logit_of(e)`: softmax over `EXPERTS` experts, then K rounds of
-// simdgroup argmax (`precedes`).
-template <uint EXPERTS, uint K, typename LogitOf>
-inline Ranked<K> rank_row(LogitOf logit_of, uint lane) {
+// `e` as `logit_of(e)`: softmax over `EXPERTS` experts, each held expert's
+// ranked probability given to `keys`, then K rounds of simdgroup argmax
+// (`precedes`).
+template <uint EXPERTS, uint K, typename LogitOf, typename Keys = NoKeys>
+inline Ranked<K> rank_row(LogitOf logit_of, uint lane, Keys keys = Keys{}) {
     constexpr uint per_lane = (EXPERTS + 31u) / 32u;
     const uint held = candidates<EXPERTS>(lane);
     float probability[per_lane];
@@ -71,6 +79,10 @@ inline Ranked<K> rank_row(LogitOf logit_of, uint lane) {
     _Pragma("clang loop unroll(full)")
     for (uint i = 0; i < per_lane; ++i)
         probability[i] = i < held ? ranked(probability[i] / total) : out;
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < per_lane; ++i)
+        if (i < held)
+            keys(lane + 32u * i, probability[i]);
 
     Ranked<K> result;
     _Pragma("clang loop unroll(full)")

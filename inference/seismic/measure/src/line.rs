@@ -11,7 +11,10 @@
 //!   term apart: their normal matrix has full rank, to rounding.
 //! - **Seeds and observations** ([`Line`]): seeds are isolated measurements
 //!   (a measurement job's points), observations the timings real work
-//!   already takes; seeds weigh what their caller says.
+//!   already takes. The observations place every direction of the costs
+//!   they tell apart; the seeds settle only those the observations leave
+//!   undetermined (their normal matrix's null space), and the whole line
+//!   before any observation.
 //!
 //! What the terms and the time are, which lines exist and what feeds them,
 //! is the caller's: this crate knows nothing of why it is asked.
@@ -22,6 +25,9 @@ use std::fmt;
 /// construction ([`Self::new`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Terms<const N: usize>([f64; N]);
+
+/// Every term is finite ([`Terms::new`]), so equality is total.
+impl<const N: usize> Eq for Terms<N> {}
 
 /// Costs that make no line: one negative or not finite.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,46 +136,93 @@ impl<const N: usize> Sums<N> {
     /// points (module doc). None of points that do not tell every term
     /// apart; costs that are not a line's where a time is not finite.
     pub fn fit(&self) -> Option<Result<Terms<N>, InvalidLine>> {
+        self.settled_by(&Self::default())
+    }
+
+    /// The costs of no negative term that fit these points best and, of
+    /// those, fit `settling`'s best: `settling` decides only the directions
+    /// these points leave undetermined (their normal matrix's null space),
+    /// never one they place. None where both together do not tell every
+    /// term apart; costs that are not a line's where a time is not finite.
+    fn settled_by(&self, settling: &Self) -> Option<Result<Terms<N>, InvalidLine>> {
         // A time no clock gives (not finite) makes no line, nor is solved.
-        if let Some(term) = (0..N).find(|&term| !self.xt[term].is_finite() || self.xx[term].iter().any(|value| !value.is_finite())) {
-            return Some(Err(InvalidLine { term, cost: self.xt[term] }));
+        for sums in [self, settling] {
+            if let Some(term) = (0..N).find(|&term| !sums.xt[term].is_finite() || sums.xx[term].iter().any(|value| !value.is_finite())) {
+                return Some(Err(InvalidLine { term, cost: sums.xt[term] }));
+            }
         }
-        if !(self.weight > 0.) || !full_rank(&self.xx) {
+        if !(self.weight > 0.) || independent(&self.joined(*settling).xx, &[true; N]).len() < N {
             return None;
         }
-        Some(Terms::new(non_negative(&self.xx, &self.xt)))
+        Some(Terms::new(non_negative(self, settling)))
     }
 }
 
-/// Whether the symmetric `matrix` has full rank, to rounding: each pivot of
-/// its symmetric elimination exceeds its diagonal's rounding.
-fn full_rank<const N: usize>(matrix: &[[f64; N]; N]) -> bool {
+/// The terms of `of` whose columns of the symmetric positive semi-definite
+/// `matrix` are independent, to rounding: symmetric elimination over them,
+/// each pivot the term whose remaining diagonal is the largest share of its
+/// own. A term whose largest share is within rounding is dependent on those
+/// chosen before it, as is every term left: each of the at most `N` updates
+/// to a remaining diagonal is bounded by it (Cauchy–Schwarz, in a
+/// semi-definite Schur complement) and rounds to about `2ε` of it.
+fn independent<const N: usize>(matrix: &[[f64; N]; N], of: &[bool; N]) -> Vec<usize> {
+    let share = |reduced: &[[f64; N]; N], term: usize| match matrix[term][term] > 0. {
+        true => reduced[term][term] / matrix[term][term],
+        false => 0.,
+    };
     let mut reduced = *matrix;
-    for pivot in 0..N {
-        let value = reduced[pivot][pivot];
-        if !(value > matrix[pivot][pivot] * f64::EPSILON * N as f64) {
-            return false;
+    let mut left = (0..N).filter(|&term| of[term]).collect::<Vec<_>>();
+    let mut chosen = Vec::with_capacity(left.len());
+    while let Some(at) = (0..left.len()).max_by(|&a, &b| share(&reduced, left[a]).total_cmp(&share(&reduced, left[b]))) {
+        let pivot = left.swap_remove(at);
+        if !(share(&reduced, pivot) > 4. * N as f64 * f64::EPSILON) {
+            break;
         }
-        for row in pivot + 1..N {
+        let value = reduced[pivot][pivot];
+        for &row in &left {
             let factor = reduced[row][pivot] / value;
-            for column in pivot..N {
+            for &column in &left {
                 reduced[row][column] -= factor * reduced[pivot][column];
             }
         }
+        chosen.push(pivot);
     }
-    true
+    chosen
 }
 
-/// The solution of `matrix · z = right` over the terms `free`, every other
-/// term zero: Gaussian elimination with partial pivoting over the free
-/// terms, whose matrix a full-rank normal matrix keeps regular.
-fn solve<const N: usize>(matrix: &[[f64; N]; N], right: &[f64; N], free: &[bool; N]) -> [f64; N] {
+/// The costs over the terms `free`, every other term zero, that solve the
+/// primary's normal equations over them and, of those, best fit
+/// `settling`: by Lagrange, `[[S, Bᵀ], [B, 0]] · [c, λ] = [s, b]` over the
+/// free terms, `B` and `b` the primary's rows independent there
+/// ([`independent`]; the rest follow from them), `S` and `s` the settling
+/// sums'. Regular where both sums together tell the free terms apart: `B`
+/// has full row rank, and `S` is definite on its null space.
+fn solve<const N: usize>(primary: &Sums<N>, settling: &Sums<N>, free: &[bool; N]) -> [f64; N] {
     let terms = (0..N).filter(|&term| free[term]).collect::<Vec<_>>();
-    let size = terms.len();
-    let mut system = terms
-        .iter()
-        .map(|&row| terms.iter().map(|&column| matrix[row][column]).chain([right[row]]).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
+    let rows = independent(&primary.xx, free);
+    let mut system = Vec::with_capacity(terms.len() + rows.len());
+    for &row in &terms {
+        let settled = terms.iter().map(|&column| settling.xx[row][column]);
+        let multipliers = rows.iter().map(|&constraint| primary.xx[constraint][row]);
+        system.push(settled.chain(multipliers).chain([settling.xt[row]]).collect::<Vec<_>>());
+    }
+    for &constraint in &rows {
+        let placed = terms.iter().map(|&column| primary.xx[constraint][column]);
+        system.push(placed.chain(rows.iter().map(|_| 0.)).chain([primary.xt[constraint]]).collect());
+    }
+    let solved = eliminate(system);
+    let mut costs = [0.; N];
+    for (index, &term) in terms.iter().enumerate() {
+        costs[term] = solved[index];
+    }
+    costs
+}
+
+/// The solution of the regular system of `system`'s rows, each its
+/// coefficients then its right side: Gaussian elimination with partial
+/// pivoting.
+fn eliminate(mut system: Vec<Vec<f64>>) -> Vec<f64> {
+    let size = system.len();
     for pivot in 0..size {
         let best = (pivot..size).max_by(|&a, &b| system[a][pivot].abs().total_cmp(&system[b][pivot].abs())).expect("a pivot row");
         system.swap(pivot, best);
@@ -185,32 +238,56 @@ fn solve<const N: usize>(matrix: &[[f64; N]; N], right: &[f64; N], free: &[bool;
         let known = (row + 1..size).map(|column| system[row][column] * solved[column]).sum::<f64>();
         solved[row] = (system[row][size] - known) / system[row][row];
     }
-    let mut costs = [0.; N];
-    for (index, &term) in terms.iter().enumerate() {
-        costs[term] = solved[index];
-    }
-    costs
+    solved
 }
 
-/// The non-negative least-squares solution of the normal equations
-/// `matrix · c = right` (Lawson–Hanson's active set): terms join the free
-/// set while the gradient favours them, and a step that would turn a free
-/// term negative stops at the boundary and returns it to zero.
-fn non_negative<const N: usize>(matrix: &[[f64; N]; N], right: &[f64; N]) -> [f64; N] {
+/// Whether freeing `term` beside the terms `free`, whose costs are the
+/// primary's best over them, is a direction only `settling` decides (it
+/// adds no column independent of theirs to the primary's) and one its
+/// trial prices above none.
+fn settles<const N: usize>(primary: &Sums<N>, settling: &Sums<N>, free: &[bool; N], term: usize) -> bool {
+    let mut with = *free;
+    with[term] = true;
+    !adds_column(primary, free, term) && solve(primary, settling, &with)[term] > 0.
+}
+
+/// Whether freeing `term` beside the terms `free` adds a column of the
+/// primary independent of theirs ([`independent`]).
+fn adds_column<const N: usize>(primary: &Sums<N>, free: &[bool; N], term: usize) -> bool {
+    let mut with = *free;
+    with[term] = true;
+    independent(&primary.xx, &with).len() > independent(&primary.xx, free).len()
+}
+
+/// The costs of no negative term that fit the primary sums best and, of
+/// those, `settling`'s best (Lawson–Hanson's active set, over that order):
+/// terms join the free set while the primary's gradient favours them, or,
+/// where the primary is indifferent to all, while one is a direction only
+/// `settling` decides and favours ([`settles`]); a step that would turn a
+/// free term negative stops at the boundary and returns it to zero. The
+/// gradient admits only a term that adds a column independent of the free
+/// terms': a dependent one's gradient is rounding (the primary is already
+/// best over its direction), and admitting it by that rounding could enter
+/// and leave it every pass; it is `settles`'s to decide.
+fn non_negative<const N: usize>(primary: &Sums<N>, settling: &Sums<N>) -> [f64; N] {
     let mut costs = [0.; N];
     let mut free = [false; N];
-    let scale = right.iter().fold(0f64, |most, value| most.max(value.abs())).max(f64::MIN_POSITIVE);
+    let scale = primary.xt.iter().fold(0f64, |most, value| most.max(value.abs())).max(f64::MIN_POSITIVE);
     let tolerance = scale * f64::EPSILON * (N * N) as f64;
     // Each pass frees one term; each inner step fixes one: at most 3N steps
     // in exact arithmetic, bounded for rounding.
     for _ in 0..4 * N + 4 {
-        let gradient: [f64; N] = std::array::from_fn(|row| right[row] - (0..N).map(|column| matrix[row][column] * costs[column]).sum::<f64>());
-        let Some(entering) = (0..N).filter(|&term| !free[term] && gradient[term] > tolerance).max_by(|&a, &b| gradient[a].total_cmp(&gradient[b])) else {
+        let gradient: [f64; N] = std::array::from_fn(|row| primary.xt[row] - (0..N).map(|column| primary.xx[row][column] * costs[column]).sum::<f64>());
+        let Some(entering) = (0..N)
+            .filter(|&term| !free[term] && gradient[term] > tolerance && adds_column(primary, &free, term))
+            .max_by(|&a, &b| gradient[a].total_cmp(&gradient[b]))
+            .or_else(|| (0..N).find(|&term| !free[term] && settles(primary, settling, &free, term)))
+        else {
             break;
         };
         free[entering] = true;
         loop {
-            let trial = solve(matrix, right, &free);
+            let trial = solve(primary, settling, &free);
             if (0..N).all(|term| !free[term] || trial[term] > 0.) {
                 costs = trial;
                 break;
@@ -284,9 +361,9 @@ impl<const N: usize> Line<N> {
     }
 
     /// A seed: a piece of work paying each term `x[k]` times took `t`,
-    /// measured in isolation, weighing `weight` observations.
-    pub fn seed(&mut self, x: [f64; N], t: f64, weight: f64) {
-        self.seeds.add(x, t, weight);
+    /// measured in isolation.
+    pub fn seed(&mut self, x: [f64; N], t: f64) {
+        self.seeds.add(x, t, 1.);
     }
 
     /// An observation of real work paying each term `x[k]` times that took
@@ -295,18 +372,15 @@ impl<const N: usize> Line<N> {
         self.observed.add(x, t, 1.);
     }
 
-    /// The line now: pending while its points do not tell every term apart,
-    /// observed once an observation is among them, else seeded; why its
-    /// points' times make no line.
+    /// The line now: pending while its points do not tell every term apart;
+    /// seeded, the seeds' fit, before any observation; observed after, the
+    /// observations' fit with the seeds settling only the directions they
+    /// leave undetermined (module doc); why its points' times make no line.
     pub fn state(&self) -> Result<LineState<Terms<N>>, InvalidLine> {
-        let fit = match self.seeds.joined(self.observed).fit() {
-            None => return Ok(LineState::Pending),
-            Some(fit) => fit?,
-        };
-        Ok(match self.observed.weight > 0. {
-            true => LineState::Observed(fit),
-            false => LineState::Seeded(fit),
-        })
+        if self.observed.weight <= 0. {
+            return Ok(self.seeds.fit().transpose()?.map_or(LineState::Pending, LineState::Seeded));
+        }
+        Ok(self.observed.settled_by(&self.seeds).transpose()?.map_or(LineState::Pending, LineState::Observed))
     }
 }
 
@@ -399,25 +473,26 @@ mod tests {
     }
 
     /// A line is pending until its points place one, seeded by seeds alone,
-    /// observed once real work is among them, and a light seed places only
+    /// observed once real work is among them, and the seeds place only
     /// what the observations leave unplaced.
     #[test]
     fn a_lines_state_follows_its_points() {
         let mut line = Line::<2>::new();
         assert_eq!(line.state(), Ok(LineState::Pending));
-        line.seed([1., 1.], 3., 0.1);
+        line.seed([1., 1.], 3.);
         assert_eq!(line.state(), Ok(LineState::Pending));
-        line.seed([1., 2.], 5., 0.1);
+        line.seed([1., 2.], 5.);
         let LineState::Seeded(seeded) = line.state().unwrap() else { panic!("seeded") };
         close(seeded.slope(), 2.);
-        // Observations of one count, slower than seeded: the seed at the
-        // other count keeps the line's spread, the observations move it to
-        // them.
+        // Observations of one count, slower than seeded: they place the line
+        // at their count exactly, whatever the seeds there say, and the
+        // seed at the other count, the one direction they leave, its spread.
         for _ in 0..64 {
             line.observe([1., 1.], 4.);
         }
         let LineState::Observed(observed) = line.state().unwrap() else { panic!("observed") };
-        assert!((observed.at([1., 1.]) - 4.).abs() < 0.05, "{observed:?}");
+        close(observed.at([1., 1.]), 4.);
+        close(observed.at([1., 2.]), 5.);
         // A line weighs every observation alike.
         let mut even = Line::<2>::new();
         for (x, t) in [(1., 2.), (3., 6.), (1., 4.)] {

@@ -36,7 +36,8 @@
 use crate::check::ir::{Definition, Family};
 use crate::checked::internals::Module;
 use crate::checked::{
-    CheckedModule, EntryInfo, NativeImplementation, SourceFile, SourceSet, check_source_with,
+    CheckedModule, ConstantFunction, EntryInfo, NativeImplementation, SourceFile, SourceSet,
+    check_source_with,
 };
 use crate::registry::BackendName;
 use crate::wire::{self, Scope};
@@ -45,7 +46,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 
 /// Format version of the bundle wire schema. Bumped on any wire change.
-pub const BUNDLE_FORMAT_VERSION: u32 = 15;
+pub const BUNDLE_FORMAT_VERSION: u32 = 16;
 
 /// Semantic version of the checker whose output this crate can decode.
 /// Bundles produced under a different semantic version are incompatible.
@@ -229,6 +230,7 @@ struct CheckedFields<'a> {
     definitions: &'a [Definition],
     families: &'a [Family],
     constants: &'a [(String, u64)],
+    constant_functions: &'a [ConstantFunction],
 }
 
 impl<'a> CheckedFields<'a> {
@@ -246,6 +248,7 @@ impl<'a> CheckedFields<'a> {
             definitions,
             families,
             constants,
+            constant_functions,
         } = module;
         Self {
             entries,
@@ -254,6 +257,7 @@ impl<'a> CheckedFields<'a> {
             definitions,
             families,
             constants,
+            constant_functions,
         }
     }
 }
@@ -271,6 +275,7 @@ struct CheckedParts {
     #[serde(serialize_with = "wire::serialize_scoped", deserialize_with = "wire::deserialize_scoped")]
     families: Vec<(Family, Scope)>,
     constants: Vec<(String, u64)>,
+    constant_functions: Vec<ConstantFunction>,
 }
 
 impl CheckedParts {
@@ -289,6 +294,7 @@ impl CheckedParts {
             definitions,
             families,
             constants,
+            constant_functions,
         } = self;
         let within = |reached: u32, length: usize| reached as usize <= length;
         let valid = within(decoded.entries, entries.len())
@@ -300,7 +306,12 @@ impl CheckedParts {
                 .all(|(ordinal, entry)| entry.id.index() == ordinal)
             && unique(entries.iter().map(|entry| entry.name.as_str()))
             && unique(entries.iter().map(|entry| entry.stable))
-            && unique(constants.iter().map(|(name, _)| name.as_str()))
+            && unique(
+                constants
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .chain(constant_functions.iter().map(ConstantFunction::name)),
+            )
             && entry_families.len() == entries.len()
             && entry_families.iter().all(|family| *family < families.len())
             && entries
@@ -359,6 +370,7 @@ impl CheckedParts {
                 .collect(),
             families: families.into_iter().map(|(family, _)| family).collect(),
             constants,
+            constant_functions,
         })
     }
 }
@@ -552,6 +564,60 @@ mod tests {
         assert!(check_source(SourceSet::new(vec![words.clone(), twice])).is_err());
         let clash = file("clash.seismic", "fn FIRST() -> i32:\n    return 1\n");
         assert!(check_source(SourceSet::new(vec![words, clash])).is_err());
+    }
+
+    /// A module constant function declared in one file is its body at the
+    /// arguments wherever an expression of another calls it, a portable
+    /// one's or a native one's, the checked module exports it, and its
+    /// bundle carries it. Two of one
+    /// name (or one named like a constant or a function), a call of another
+    /// arity, and a body reading anything but its parameters are refused.
+    #[test]
+    fn module_constant_functions_are_called_by_natives_and_carried_by_the_bundle() {
+        use crate::checked::ConstantBody as B;
+        let file = |path: &str, text: &str| SourceFile { path: path.into(), text: text.into() };
+        let shapes = file("shapes.seismic", "const WIDE = 64\nconst GROUPS(STAGED) = 1 + STAGED * (WIDE - 1)\n");
+        let native = |call: &str| {
+            file(
+                "scale.seismic",
+                &format!("fn scale[N](x: &tensor[N] f32, output: &mut tensor[N] f32) where N >= GROUPS(0):\n    parallel for i in 0..N:\n        output[i] = x[i]\n\nnative scale for metal from \"scale.metal\":\n    launch scale:\n        threadgroups ({call}, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"),
+            )
+        };
+        let module = check_source(SourceSet::new(vec![shapes.clone(), native("GROUPS(min(N, 1))")])).unwrap();
+        let expected = [ConstantFunction::new(
+            "GROUPS".to_owned(),
+            vec!["STAGED".to_owned()],
+            B::Add(
+                Box::new(B::Constant(1)),
+                Box::new(B::Mul(
+                    Box::new(B::Parameter("STAGED".to_owned())),
+                    Box::new(B::Sub(Box::new(B::Constant(64)), Box::new(B::Constant(1)))),
+                )),
+            ),
+        )
+        .unwrap()];
+        assert_eq!(module.constant_functions(), expected);
+        let scale = module.entry_named("scale").unwrap();
+        let groups = &module.native_implementation(scale, BackendName::Metal).unwrap().launches[0].groups[0];
+        for (n, value) in [(0, 1), (3, 64)] {
+            assert_eq!(groups.evaluate(&|name| (name == "N").then_some(n), &|_| None), Ok(value));
+        }
+        let decoded = decode_checked_bundle(embedded(encode_checked_bundle(&module))).unwrap();
+        assert_eq!(decoded.constant_functions(), expected);
+        for refused in [
+            vec![shapes.clone(), native("GROUPS(N, 1)")],
+            vec![shapes.clone(), file("twice.seismic", "const GROUPS(A) = A\n")],
+            vec![shapes.clone(), file("constant.seismic", "const WIDE(A) = A\n")],
+            vec![shapes.clone(), file("function.seismic", "fn GROUPS() -> i32:\n    return 1\n")],
+            vec![file("reads.seismic", "const SPAN(A) = A + B\n")],
+            vec![file("parameters.seismic", "const SPAN(A, A) = A\n")],
+            vec![file("repeats.seismic", "const SPAN(A) = A * A\n")],
+            vec![file("ceil.seismic", "const SPAN(A) = ceil_div(A, 4)\n")],
+            vec![file("least.seismic", "const SPAN(A) = min(A, 4)\n")],
+            vec![file("most.seismic", "const SPAN(A) = max(A, 4)\n")],
+        ] {
+            assert!(check_source(SourceSet::new(refused)).is_err());
+        }
     }
 
     /// The checked section's owned form writes exactly the bytes it was read

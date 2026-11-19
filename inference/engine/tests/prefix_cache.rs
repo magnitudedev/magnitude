@@ -63,6 +63,7 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
             exported_logits_rows: 512,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(CONTEXT),
         service: limits(),
@@ -618,7 +619,7 @@ fn encode(
         let (pending, next) = domain.finish_vision(flight).unwrap();
         bindings = next;
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 0 })
+            .reconcile(pending, PhysicalDecision::rows(0))
             .unwrap();
     }
     bindings
@@ -643,6 +644,8 @@ fn forward(
         select: Vec::new(),
         committed: rows,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     };
     let operations = [operation];
     let ReservedResources::Target(reservation) = domain
@@ -658,14 +661,14 @@ fn forward(
     let (pending, bindings) = domain.finish_target(flight).unwrap();
     let mut logits = Vec::new();
     for pending in pending {
-        let Outcome::Forward { rows: results } = pending.outcome().clone() else {
+        let Outcome::Forward { rows: results, .. } = pending.outcome().clone() else {
             panic!("a forward returns forward rows")
         };
         for row in results.iter().filter_map(|row| row.logits.as_ref()) {
             logits = row.read_to_host().unwrap();
         }
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: rows })
+            .reconcile(pending, PhysicalDecision::rows(rows))
             .unwrap();
     }
     assert!(!logits.is_empty());

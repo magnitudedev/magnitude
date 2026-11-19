@@ -13,7 +13,7 @@ use seismic_native_cpu::{Tier, WeightOperand};
 
 use super::trace::host_seconds;
 use super::timeline::{TimelineAction, TimelineKind};
-use super::{Dispatch, DispatchList, NativeRoute};
+use super::{Dispatch, DispatchList, LaunchGeometry, NativeRoute};
 use crate::backends::CpuOpened;
 use crate::driver::typed_buffer;
 
@@ -238,8 +238,8 @@ impl NativeSteps for Steps<'_> {
 /// timeline boundary where it has any, and at launch detail (`per_launch`)
 /// into a job per launch, so a launch's interval is the device time of that
 /// launch alone. Returns the outcome, the interval the run took and, at
-/// launch detail, each launch's interval in encode order (`None` for an
-/// inactive launch), on the [`host_seconds`] clock.
+/// launch detail, each launch's interval in encode order (`None` for a
+/// launch it does not run, [`launched`]), on the [`host_seconds`] clock.
 pub(super) fn run(
     opened: &Arc<CpuOpened>,
     list: &impl DispatchList,
@@ -302,7 +302,7 @@ pub(super) fn run(
                 }
                 Some(intervals) => {
                     let mut steps = steps.into_iter();
-                    for launch in run.iter().flat_map(|call| call.0.launches) {
+                    for launch in run.iter().flat_map(launched) {
                         if launch.is_none() {
                             intervals.push(None);
                             continue;
@@ -332,8 +332,17 @@ pub(super) fn run(
 }
 
 /// One call of a submission: its dispatch, the range of its buffers in the
-/// [`Tables`], and its scalar-result storage.
-type Call<'l> = (Dispatch<'l>, std::ops::Range<usize>, *mut u64);
+/// [`Tables`], its scalar-result storage, and whether the submission
+/// encodes each of its launches, by ordinal ([`DispatchList::encodes`]).
+type Call<'l> = (Dispatch<'l>, std::ops::Range<usize>, *mut u64, Vec<bool>);
+
+/// Each launch of `call` by ordinal where the submission runs it: active,
+/// and every launch condition it carries holding as the host holds its
+/// words now; else `None`.
+fn launched<'a>(call: &'a Call<'_>) -> impl Iterator<Item = Option<&'a LaunchGeometry>> {
+    let (dispatch, _, _, encoded) = call;
+    dispatch.launches.iter().zip(encoded).map(|(launch, &encoded)| launch.as_ref().filter(|_| encoded))
+}
 
 /// The per-buffer tables of a submission's calls.
 #[derive(Clone, Copy)]
@@ -387,19 +396,22 @@ fn calls<'l>(
         let scalars = dispatch.kernel.scalar_slots().map_or(std::ptr::null_mut(), |slots| {
             typed_buffer::<Cpu, Executor>(slots).data_pointer().cast::<u64>()
         });
-        calls.push((dispatch, first..pointers.len(), scalars));
+        let encoded = (0..dispatch.launches.len()).map(|ordinal| list.encodes(index, ordinal)).collect();
+        calls.push((dispatch, first..pointers.len(), scalars, encoded));
     }
     calls
 }
 
-/// The active launches of `calls` on a pool of `participants`.
+/// The launches of `calls` the submission runs ([`launched`]) on a pool of
+/// `participants`.
 fn steps<'a>(
     calls: &'a [Call<'_>],
     tables: Tables<'a>,
     participants: usize,
 ) -> Result<Vec<Step<'a>>, ExecutionError> {
     let mut steps = Vec::new();
-    for (dispatch, range, scalars) in calls {
+    for call in calls {
+        let (dispatch, range, scalars, _) = call;
         let NativeRoute::Cpu(route) = &dispatch.kernel.route else {
             unreachable!("one device has one native route");
         };
@@ -407,7 +419,7 @@ fn steps<'a>(
             .launches
             .iter()
             .zip(&route.workers)
-            .zip(dispatch.launches)
+            .zip(launched(call))
         {
             let Some(launch) = launch else { continue };
             let items = launch.groups[0]

@@ -67,6 +67,7 @@ void routed_route_streamed_ordered_gemv4() { projection_segmented_ordered_gemv_m
 void routed_route_streamed_ordered_gemv8() { projection_segmented_ordered_gemv_mixed(8u, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES); }
 
 void routed_route_finish(const bool whole) {
+    routed_open_keys();
     // Rounds of SEISMIC_SUBGROUPS rows, steered while a logical subgroup holds
     // a row: a logical subgroup past the rows on a 64-lane hardware subgroup
     // ranks the last row again and stores nothing.
@@ -76,7 +77,7 @@ void routed_route_finish(const bool whole) {
         const uint64_t placed = base + uint64_t(SEISMIC_SUBGROUP);
         route_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), live ? placed : SEISMIC_DIM_M - 1ul, live);
     }
-    routed_resolve(whole);
+    routed_resolve(whole, out_stored(SEISMIC_OUT_SCORES, 0ul), SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1);
 }
 
 void routed_route_streamed_select() { routed_route_finish(false); }

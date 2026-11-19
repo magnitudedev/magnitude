@@ -264,3 +264,23 @@ fn an_open_unloads_a_component_an_earlier_claim_took() {
     assert_eq!(ledger.estimate().cache_of(CacheKind::Drafter), 0);
     drop(taken);
 }
+
+/// A pass the host builds runs up to the regime's depth: no request
+/// fronts before a pass is timed.
+#[test]
+fn a_built_pass_fronts_nothing_before_a_pass_is_timed() {
+    use crate::RequestId;
+    let requests = [RequestId(1), RequestId(2), RequestId(3)];
+    let pricing = super::TwoRowPricing {
+        measured: None,
+        prices: crate::domain::fixtures::load_costs(None).prices,
+        depth: 1,
+        rows: crate::CHAINED_ROWS,
+        verifies: 0,
+        overhead: None,
+    };
+    assert_eq!(
+        pricing.built(&requests, &requests).unwrap(),
+        crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() }
+    );
+}

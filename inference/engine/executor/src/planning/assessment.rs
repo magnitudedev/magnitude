@@ -611,7 +611,7 @@ impl AssessmentGraphResourceBounds {
             limits,
             load.pass(limits),
         )?;
-        Ok(TargetGraphBounds::of(target, limits.startup_slots().target)?)
+        Ok(TargetGraphBounds::of(target, limits.startup_slots(load.fronts()).target)?)
     }
 
     /// These bounds of a load that differs from theirs only in its pass
@@ -671,7 +671,7 @@ impl AssessmentGraphResourceBounds {
             limits,
             load.pass(limits),
         )?;
-        let slots = limits.startup_slots().target;
+        let slots = limits.startup_slots(load.fronts()).target;
         let target = TargetGraphBounds::of(target, slots)?;
         let vision = Self::vision(definition, load, &plan, limits, backend)?;
         let bounds = Self::of_target(definition, load, &plan, state, method, limits, backend, target, vision.clone())?;
@@ -700,7 +700,7 @@ impl AssessmentGraphResourceBounds {
                     patch_rows,
                 )?;
                 Ok(Some(VisionGraphBounds {
-                    charge: NativeGraphCharge::serial(vision_graph.storage, vision_graph.graphs, limits.startup_slots().vision)?,
+                    charge: NativeGraphCharge::serial(vision_graph.storage, vision_graph.graphs, limits.startup_slots(load.fronts()).vision)?,
                     binding_constant_bytes: vision_graph.binding_constant_bytes,
                 }))
             }
@@ -743,7 +743,7 @@ impl AssessmentGraphResourceBounds {
         vision: Option<VisionGraphBounds>,
     ) -> Result<Self, GraphError> {
         // The same startup slots a load commits: one request's need.
-        let slots = limits.startup_slots();
+        let slots = limits.startup_slots(load.fronts());
         let (readout_storage, readout_graphs) =
             crate::programs::graph::readout::checked_readout_storage(backend, load, &definition.decoder, limits)?;
         let readout = NativeGraphCharge::serial(readout_storage, readout_graphs, slots.readout)?;
@@ -821,6 +821,7 @@ impl AssessmentGraphResourceBounds {
                             limits,
                             head_state.head_geometry()?,
                             method.draft_rows(),
+                            load.fronts(),
                         )?,
                     )?;
                     (

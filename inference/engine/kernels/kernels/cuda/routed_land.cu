@@ -1,6 +1,8 @@
 // Expert streaming: a streamed decode layer's landing launch (`routed_land`
-// in routed.seismic); the CUDA form of `metal/routed_land.metal`. Where the
-// bank places (V > 0), every block converts the layer's file misses from
+// in routed.seismic); the CUDA form of `metal/routed_land.metal`, the body
+// of one block of the grid its route wrote (`_block`: its blocks where the
+// step requested its slot, none otherwise). Where the bank places (V > 0),
+// every block converts the layer's file misses from
 // staging into the bank's records as their reads land (streaming/land.hpp
 // over `lib/streaming/land.cuh`), its thread 0 spinning on the host's count
 // of the step's slot of the layer's file table; then block 0 writes the
@@ -17,7 +19,8 @@ REPACK_BINDING(DownBinding, SEISMIC_CONVERSION_SD_UD, SEISMIC_STAGING_DOWN, SEIS
 #include "lib/streaming/land.cuh"
 #include "../streaming/tier_wait.hpp"
 
-extern "C" __global__ void routed_land(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_ROUTED_LAND
+__device__ void routed_land_block(SEISMIC_KERNEL_PARAMS) {
     const int *step = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP));
     int *file = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_FILE));
     const u64 q = streaming_step(step, SEISMIC_STEP_STRIDE_0);
@@ -39,3 +42,4 @@ extern "C" __global__ void routed_land(SEISMIC_KERNEL_PARAMS) {
                             SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, threadIdx.x, blockDim.x,
                             seismic_words_value);
 }
+#endif

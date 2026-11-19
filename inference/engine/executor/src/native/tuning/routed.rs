@@ -22,11 +22,12 @@ use crate::operators::routed::fused_graph::{TILE_ROWS, grouped_blocks};
 use crate::planning::{BankBinding, HINT_LEADS, HintWeight, RoutedBinding};
 use magnitude_family_contracts::{GluLimit, Operator, RouteNormalization, WeightKind, WeightScope};
 use magnitude_kernels::constants::{
-    MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_LOW, STEP_WORDS, VERIFY_ROWS,
+    MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_WORDS, VERIFY_ROWS,
 };
 use magnitude_kernels::{
-    routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_hint_route,
-    routed_output, routed_output_project, routed_route, routed_route_shared, routed_route_streamed,
+    routed_combine, routed_expand, routed_experts, routed_gate_up, routed_gate_up_part, routed_group,
+    routed_hint_route, routed_output, routed_output_project, routed_route, routed_route_shared,
+    routed_route_streamed,
 };
 use seismic::{BuildError, Element, Tensor};
 use std::ops::Range;
@@ -501,6 +502,13 @@ pub(crate) struct BankOperands {
     pub file: CaseState,
     pub sources: CaseState,
     pub routing: CaseState,
+    /// The key records (`BankPart::Keys`), of its binding's experts.
+    pub keys: CaseState,
+    pub front: CaseState,
+    /// The landing launch's grid the route writes, of `land_groups`
+    /// threadgroups while it lands (`Placer::land_groups`).
+    pub land_grid: CaseState,
+    pub land_groups: i32,
 }
 
 impl BankOperands {
@@ -510,11 +518,13 @@ impl BankOperands {
         rows: u64,
     ) -> Result<Self, BuildError> {
         let step = words(inputs, &[STEP_WORDS])?;
-        step.store_release(4 * STEP_LOW, 1)?;
+        for (word, value) in magnitude_kernels::step_words(1, 0).into_iter().enumerate() {
+            step.store_release(4 * word as u64, u32::from_ne_bytes(value.to_ne_bytes()))?;
+        }
         // Priced, over zero lines: a sited route's assignment runs.
         let policy = words(inputs, &[POLICY_WORDS])?;
         policy.store_release(4 * POLICY_PRICED, 1)?;
-        let flight = bank.words.flight;
+        let (flight, ring) = (bank.words.flight, bank.words.ring_words());
         Ok(Self {
             map: unmapped(inputs, &[bank.experts, MAP_WORDS], MAP_WORDS, MAP_RECORD)?,
             tier: unmapped(inputs, &[tier_experts(bank)], 1, 0)?,
@@ -524,14 +534,21 @@ impl BankOperands {
             file: written(inputs, words(inputs, &bank.words.file().extents())?)?,
             sources: written(inputs, inputs.scratch(Element::i32(), &[SOURCE_ROWS, rows, bank.selected])?)?,
             routing: written(inputs, words(inputs, &[flight, bank.words.routing_words()])?)?,
+            keys: written(inputs, words(inputs, &[flight, magnitude_kernels::constants::VERIFY_ROWS, bank.experts])?)?,
+            front: written(inputs, words(inputs, &[ring])?)?,
+            land_grid: written(inputs, words(inputs, &[3])?)?,
+            land_groups: bank.placer.land_groups(),
         })
     }
 
-    pub fn states(&self) -> [(&'static str, &CaseState); 3] {
+    pub fn states(&self) -> [(&'static str, &CaseState); 6] {
         [
             ("file", &self.file),
             ("sources", &self.sources),
             ("routing", &self.routing),
+            ("keys", &self.keys),
+            ("front", &self.front),
+            ("land_grid", &self.land_grid),
         ]
     }
 }
@@ -673,6 +690,10 @@ impl EntryTuning for RoutedRouteStreamedTuning {
             file: bank.file.tensor_mut(),
             sources: bank.sources.tensor_mut(),
             routing: bank.routing.tensor_mut(),
+            keys: bank.keys.tensor_mut(),
+            front: bank.front.tensor_mut(),
+            land_grid: bank.land_grid.tensor_mut(),
+            land_groups: bank.land_groups,
         }
     }
 
@@ -755,7 +776,9 @@ impl EntryTuning for RoutedHintRouteTuning {
                     [&route.norm, &route.router],
                 )?;
                 let step = words(inputs, &[STEP_WORDS])?;
-                step.store_release(4 * STEP_LOW, 1)?;
+                for (word, value) in magnitude_kernels::step_words(1, 0).into_iter().enumerate() {
+                    step.store_release(4 * word as u64, u32::from_ne_bytes(value.to_ne_bytes()))?;
+                }
                 Ok(RoutedHintRouteCase {
                     residual: route.residual,
                     activation: inputs.scratch(self.resident.activation, &[0, self.resident.shape.selected])?,
@@ -1221,11 +1244,25 @@ impl EntryTuning for RoutedChoicesTuning {
         }
     }
 
-    generated_entry!(routed_gate_up, this => routed_gate_up::Elements {
-        EGW: this.expert_gate,
-        EUW: this.expert_up,
-        A: this.activation,
-    });
+    generated_entry!(routed_gate_up, this => this.elements());
+}
+
+impl ResidentGateUp for RoutedChoicesTuning {
+    fn over(&self, layers: &[WeightScope]) -> Self {
+        Self { scopes: layers.to_vec(), ..self.clone() }
+    }
+
+    fn routing(&self) -> RoutedShape {
+        RoutedShape { experts: self.experts, ..self.shape }
+    }
+
+    fn elements(&self) -> routed_gate_up::Elements {
+        routed_gate_up::Elements {
+            EGW: self.expert_gate,
+            EUW: self.expert_up,
+            A: self.activation,
+        }
+    }
 }
 
 /// `routed_output`: the selected experts' down projections in slot
@@ -1458,6 +1495,139 @@ impl EntryTuning for RoutedOutputProjectTuning {
         EDW: this.resident.expert_down,
         SDW: this.resident.shared_down,
         A: this.resident.activation,
+    });
+}
+
+/// A resident decode gate/up (`routed_gate_up`) whose unit a streamed
+/// layer's gate/up passes follow ([`RoutedGateUpPartTuning`]): the fused
+/// form's choices ([`RoutedChoicesTuning`]) or a general gated layer's
+/// (`general_routed::RoutedGateUpTuning`).
+pub(crate) trait ResidentGateUp: EntryTuning<Entry = routed_gate_up::Entry> {
+    /// The same case over `layers` alone.
+    fn over(&self, layers: &[WeightScope]) -> Self;
+    /// Its routing geometry at the experts its launches read: the synthetic
+    /// tables' and the product's.
+    fn routing(&self) -> RoutedShape;
+    fn elements(&self) -> routed_gate_up::Elements;
+}
+
+/// `routed_gate_up_part`: a streamed gated layer's gate/up in two passes,
+/// its held choices before the tier wait and the choices the wait sourced
+/// after it, each its resident gate/up's launches over one product. It
+/// follows the resident gate/up's unit (`Specializer::tuned_following`):
+/// its arithmetic parameters (Metal's LANES, CUDA's KSPLIT)
+/// are the resident choice's, so each choice's product carries the
+/// resident's bits; its launch shape is searched over the streamed layers.
+/// Its cases are the resident's over those layers with every choice's
+/// source its expert's record (`bank_sources`), timed in the early pass,
+/// which computes every choice the route resolved: here all of them.
+#[derive(Clone)]
+pub(crate) struct RoutedGateUpPartTuning<R> {
+    /// The resident gate/up it follows, over every layer of the binding: its
+    /// static values are the passes'.
+    pub resident: R,
+    /// The streamed layers that launch it.
+    pub layers: Vec<WeightScope>,
+    pub bank: BankBinding,
+}
+
+pub(crate) struct RoutedGateUpPartCase<C> {
+    gate_up: C,
+    /// Every choice's source the record of its expert.
+    sources: Tensor,
+    /// The step's routing record (`BankPart::Routing`) and its step.
+    routing: Tensor,
+    step: Tensor,
+    product: CaseState,
+}
+
+impl<R: ResidentGateUp> EntryTuning for RoutedGateUpPartTuning<R> {
+    type Entry = routed_gate_up_part::Entry;
+    type Case = RoutedGateUpPartCase<R::Case>;
+
+    fn launches(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn bindings(&self) -> String {
+        self.resident.bindings()
+    }
+
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        self.resident.statics(inputs)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, BuildError> {
+        let shape = self.resident.routing();
+        let rows = point.rows;
+        let table = routes(rows, shape);
+        let activation = self.resident.elements().A;
+        let region = self.bank.words;
+        self.resident
+            .over(&self.layers)
+            .rotation(inputs, point)?
+            .into_iter()
+            .map(|gate_up| {
+                Ok(RoutedGateUpPartCase {
+                    gate_up,
+                    sources: bank_sources(inputs, rows, shape.selected, &table)?,
+                    routing: words(inputs, &[region.flight, region.routing_words()])?,
+                    step: words(inputs, &[STEP_WORDS])?,
+                    product: written(inputs, inputs.scratch(activation, &[rows, shape.selected, shape.features])?)?,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> routed_gate_up_part::Args<'a> {
+        let RoutedGateUpPartCase { gate_up, sources, routing, step, product } = case;
+        let routed_gate_up::Args {
+            normalized,
+            routes,
+            sources: _,
+            expert_gate,
+            expert_up,
+            tier_gate,
+            tier_up,
+            activation,
+            gate_scale,
+            up_scale,
+            glu_limit,
+        } = R::args(gate_up);
+        routed_gate_up_part::Args {
+            normalized,
+            routes,
+            sources,
+            expert_gate,
+            expert_up,
+            tier_gate,
+            tier_up,
+            activation,
+            gate_scale,
+            up_scale,
+            glu_limit,
+            routing,
+            step,
+            late: 0,
+            product: product.tensor_mut(),
+        }
+    }
+
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("product", &case.product)]
+    }
+
+    generated_entry!(routed_gate_up_part, this => {
+        let resident = this.resident.elements();
+        routed_gate_up_part::Elements { EGW: resident.EGW, EUW: resident.EUW, A: resident.A }
     });
 }
 

@@ -312,7 +312,7 @@ fn row(
         Err(error) => return failed("assessment", error),
     };
     let assessment_ms = assessing.elapsed().as_secs_f64() * 1e3;
-    let verdict = match draft.placed::<AssessmentMemoryCharge>(&definition, None, &room) {
+    let verdict = match draft.placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &room) {
         Ok(Placed::Whole(placed)) => {
             let fits = match room.fit(placed.charge()) {
                 Ok(fit) => need(&fit).2,
@@ -376,7 +376,7 @@ fn placed_chain(target: &(String, ModelDefinition, magnitude_artifacts::PackageM
     let device = crate::platform::selected(topology, &status, &release, executor.clone(), pricing(machine, backend).unwrap());
     let mut definition = target.1.clone();
     definition.decoder.context_limit = context;
-    match plan(&definition, &target.2, &device, service(backend, &definition)).unwrap().placed::<AssessmentMemoryCharge>(&definition, None, &StableRoom::of_selected(&device)).unwrap() {
+    match plan(&definition, &target.2, &device, service(backend, &definition)).unwrap().placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &StableRoom::of_selected(&device)).unwrap() {
         Placed::Whole(placed) => Some(placed.draft().policy().limits().chain_capacity.get()),
         Placed::Short(_) => None,
     }
@@ -579,7 +579,7 @@ fn qwen3_6_with_its_draft_is_placed_on_an_m4_pro_and_an_rtx3090() {
         )
         .unwrap_or_else(|error| panic!("{machine}: {error}"));
         let planned = draft.device().clone();
-        if let Err(error) = draft.placed::<crate::AssessmentMemoryCharge>(&definition, None, &StableRoom::of(&planned)) {
+        if let Err(error) = draft.placed::<crate::AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &StableRoom::of(&planned)) {
             panic!("{machine}: {error}");
         }
     }
@@ -622,7 +622,7 @@ fn glm_5_3_flash_at_32k_fits_on_an_rtx3090_by_windowing_its_scratch_and_not_on_a
     };
 
     let prices = crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices());
-    let placed_3090 = match draft_3090.clone().placed::<AssessmentMemoryCharge>(&definition, None, &room_3090).unwrap() {
+    let placed_3090 = match draft_3090.clone().placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &room_3090).unwrap() {
         Placed::Short(short) => short.streamed(&definition, &prices, &room_3090).unwrap(),
         Placed::Whole(_) => panic!("GLM-5.3-Flash FP8 cannot fit whole on a 24 GB RTX 3090"),
     };

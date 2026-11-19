@@ -62,8 +62,12 @@ fn a_hinted_experts_read_still_running_answers_its_request() {
     let layer = costs.layers[1];
     // The first step's request read on demand.
     assert_eq!((layer.reading, layer.unanticipated, layer.lead), (1, 1, 1));
-    // Its hint named the miss, and had not landed before the route.
-    assert_eq!((costs.hints.named, costs.hints.early), (1, 0));
+    // Its hint named the miss, and had not landed before the route, once the
+    // service learns the step's outcomes.
+    eventually("the step's outcomes were never learned", || {
+        let hints = harness.watcher.shared().costs().hints;
+        (hints.named, hints.early) == (1, 0)
+    });
     ahead.finish();
 }
 
@@ -182,26 +186,28 @@ fn a_hint_of_a_layer_routed_without_a_request_reads_nothing() {
 
 /// Hints are read in the ring's order, best ranked first: where the records
 /// beyond the demand reserve hold one (staging of a request's choices and
-/// one more), the ring's first is read and the ring's second reads nothing;
-/// the ring is read before the step's requests, which then find the first
-/// read ahead.
+/// one more), the ring's first is read and the ring's second stays wanted in
+/// the ledger, read only as a record frees; the ring is read before the
+/// step's requests, which then find the first read ahead.
 #[test]
 fn hints_are_read_in_the_rings_order() {
+    let _alone = alone();
     let harness = layered("hint-order", EXPERTS, 12, 2, WORDS.choices as u32 + 1);
     harness.demand_step(4);
     harness.staging_free();
     harness.tier_ready();
+    let ahead = Ahead::queue("hint-order-ahead");
     let step = harness.step();
     harness.hint(&step, 0, &[6, 5]);
     eventually("the ring was never read", || harness.watcher.shared().costs().hints.reads == 1);
+    ahead.finish();
     harness.request_at(&step, 0, &[4]);
     harness.request_at(&step, 1, &[6]);
     step.complete().unwrap();
+    eventually("the step's outcomes were never learned", || harness.watcher.shared().costs().hints.candidates == 2);
     let costs = harness.watcher.shared().costs();
-    assert_eq!((costs.hints.candidates, costs.hints.reads), (2, 1));
     // Only the first step's one: expert 6 was read ahead.
     assert_eq!(costs.layers[1].unanticipated, 1);
-    assert_eq!(harness.in_tier(1, 5), None, "the ring's second read nothing");
 }
 
 /// Hints take only records beyond the demand reserve: with none beyond
@@ -240,4 +246,32 @@ fn a_lead_counts_layer_runs_in_the_devices_order() {
     assert_eq!(at(3, 0).runs_until(at(3, 1)), 2);
     // Past the chain: step 5 follows both steps' every layer.
     assert_eq!(at(4, 2).runs_until(at(5, 0)), 1);
+}
+
+/// A hint's names resolve against their step's exact row once the step
+/// completes, read or not, each counting into its lead's precision for its
+/// rank (`Ledger::resolve`): the one count the ledger publishes the lead's
+/// next names at, and the hints' recall and precision count.
+#[test]
+fn a_completed_steps_routes_calibrate_its_hints() {
+    use crate::experts::interest::{Combination, Look, Source};
+    let harness = layered("hint-calibrated", EXPERTS, 12, 2, 4 + 4);
+    harness.demand_step(4);
+    harness.staging_free();
+    harness.tier_ready();
+    let key = Combination { nearest: Look::of(Source::Lead { distance: 1, row: None }), rank: 0, looks: 1 };
+    let precision = || residency::lock(&harness.watcher.state).prefetch.rate(1, key);
+    assert_eq!(precision(), 1., "its bound before any outcome");
+    let step = harness.step();
+    harness.hint(&step, 0, &[5, 6, 7]);
+    eventually("the hints were never read", || harness.watcher.shared().costs().hints.reads == 3);
+    harness.route_at(&step, 0, &[]);
+    harness.request_at(&step, 1, &[5]);
+    step.complete().unwrap();
+    // One of three names chosen, once the service learns the step's routes.
+    eventually("the step's outcomes were never learned", || (precision() - 1. / 3.).abs() < 1e-12);
+    eventually("the step's hints were never counted", || {
+        let hints = harness.watcher.shared().costs().hints;
+        (hints.candidates, hints.named) == (3, 1)
+    });
 }

@@ -25,9 +25,9 @@
 //! - `records`: the bank's records, the one owner of what each holds and
 //!   of the map entries naming them: every change is one of its
 //!   transitions.
-//! - `reuse`: each expert's reuse as the routes' reads measure it, its
-//!   half-life among them: the one ranking of every residency decision,
-//!   which the directory owns.
+//! - `reuse`: each expert's expected uses within its group's turnover, as
+//!   every row's router keys and their measured carry forward give them:
+//!   the one ranking of every residency decision, which the directory owns.
 //! - `staging`: the landing pool, records that keep the stored form they
 //!   were read into until reused.
 //! - `exchange`: the one protocol by which the device asks the host for
@@ -54,7 +54,10 @@ mod copies;
 mod directory;
 mod events;
 mod exchange;
+mod horizon;
 mod host_records;
+#[allow(dead_code)]
+mod interest;
 mod landing;
 mod map;
 mod records;
@@ -65,17 +68,20 @@ mod staging;
 mod watcher;
 mod yielding;
 
-pub use bank::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
+pub use bank::{GroupLend, ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, RecordedRoutes, RoutedStep, StepCost, STEP_TRACE};
 pub(crate) use directory::Ranks;
+pub(crate) use horizon::{Tally, Window};
 pub(crate) use compute::{Compute, ComputeThreads, HostCompute, Machine};
 pub(crate) use site::{SiteLayer, SiteRecords, SiteScales, SiteShape, SiteTensors, gated, measure as measure_site, measure_cpu_site};
 pub use site::{SITE_TERM_NAMES, SiteServed};
 #[cfg(test)]
 pub(crate) use site::{Answered, ExpertValues, reference as site_reference};
 pub(crate) use exchange::ExchangeTable;
-pub(crate) use watcher::{ParkKind, ParkSite, Parks};
+pub(crate) use watcher::{AheadOf, DecodeRow, DEPTHS, Measured, ParkKind, ParkSite, Parks, ScratchGroup, Step};
 pub(crate) use bank::ChainServing;
-pub(crate) use bank::{cache, derived};
+pub(crate) use bank::derived;
+#[cfg(any(test, feature = "fixtures"))]
+pub(crate) use bank::cache;
 pub(crate) use source::Records;
 pub use directory::{LayerCurve, MissCurve, RoutedRead};
 #[cfg(feature = "expert-routing")]
@@ -84,7 +90,7 @@ pub use bank::LoadPools;
 pub(crate) use bank::Places;
 pub(crate) use bank::{ExpertBank, ExpertStep, HeldTable, PooledRecords, Recording, ServedBank, StepFailure, StepRoute, fixture_pool, pooled_records, pooled_slabs};
 
-use magnitude_kernels::{constants, list_extent};
+use magnitude_kernels::constants;
 
 /// The records a list's entries may name: each entry's from record below
 /// `from` and its to record below `to`, the leading extents of the tensors
@@ -134,6 +140,22 @@ impl Words {
                 .map_err(|error| format!("bank word {index}: {error}"))?;
         }
         Ok(words)
+    }
+
+    /// `len` host-addressed `i32` words on a CPU `device` aligned to 8 bytes,
+    /// even when the host carver sits at an odd word or `len` is odd.
+    #[cfg(test)]
+    pub(crate) fn aligned_cpu_tensor(device: &seismic::Device, len: u64) -> seismic::Tensor {
+        let padded = (len + 1).next_multiple_of(2);
+        let raw = seismic::Tensor::words(&seismic::Charges::tally(device), seismic::Element::i32(), &[padded]).unwrap();
+        let offset = (raw.shared_address().unwrap().as_ptr() as usize % 8) as u64;
+        raw.region(seismic::Element::i32(), &[len], offset).unwrap()
+    }
+
+    /// `len` host-shared words on a CPU `device`, each `initial`, 8-byte aligned.
+    #[cfg(test)]
+    pub(crate) fn on_cpu(device: &seismic::Device, len: u64, initial: i32) -> Self {
+        Self::new(Self::aligned_cpu_tensor(device, len), len, initial).unwrap()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -206,14 +228,14 @@ impl Words {
     /// pairs than the list holds, is an invariant violation.
     pub(crate) fn write_list(&self, pairs: &[(i32, i32)], bounds: ListBounds) {
         assert!(
-            list_extent(pairs.len() as u64) as usize <= self.len,
+            constants::LIST_ENTRY(pairs.len() as u64) as usize <= self.len,
             "a list of {} entries in {} words",
             pairs.len(),
             self.len
         );
         for (index, &(from, to)) in pairs.iter().enumerate() {
             assert!(bounds.admits(from, to), "list entry {index}, ({from}, {to}), outside {bounds:?}");
-            let entry = list_extent(index as u64) as usize;
+            let entry = constants::LIST_ENTRY(index as u64) as usize;
             self.store(entry + constants::LIST_FROM as usize, from);
             self.store(entry + constants::LIST_TO as usize, to);
         }

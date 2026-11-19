@@ -13,7 +13,7 @@ use super::{
     },
     entry::{
         EntryTokens, PerLayerEntryGraphSource, PreparedPerLayerEntryGraph,
-        PreparedTargetEntryGraph, notice_bytes, notice_rows, notifies_selection,
+        PreparedTargetEntryGraph, notice_bytes, notice_rows,
     },
     heap::{GraphCounts, PlannedSealedGraphs, SealedGraphsHeap, SealedHeap, block_graph_storage},
 };
@@ -623,8 +623,8 @@ impl PreparedTargetGraphs {
         let trace = std::env::var_os("MAGNITUDE_V4_TRACE_GRAPH_SEAL").is_some();
         let began_all = Instant::now();
         let mut sealed_graphs = 0usize;
-        let notice = match notifies_selection(load) {
-            true => Some(notice.ok_or("a stored table without the selection notice")?),
+        let notice = match load.copies_token_rows() {
+            true => Some(notice.ok_or("a load copying token rows without the copy entry")?),
             false => None,
         };
         for &rows in &outline.row_classes {

@@ -17,6 +17,7 @@ magnitude-scheduler = { path = "scheduler" }
 magnitude-templates = { path = "templates" }
 magnitude-batching = { path = "batching" }
 magnitude-family-contracts = { path = "families/contracts" }
+magnitude-cost-model = { path = "cost-model" }
 magnitude-executor = { path = "executor" }
 magnitude-family-registry = { path = "families/registry" }
 magnitude-family-qwen35 = { path = "families/qwen35" }

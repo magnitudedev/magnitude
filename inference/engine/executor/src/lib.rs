@@ -34,8 +34,8 @@ mod error;
 mod execution_path;
 mod experts;
 pub use experts::{
-    ExpertCosts, GroupCost as PromptGroupCost, GroupLayer as PromptGroupLayer, LayerTimeline as PromptLayerTimeline, Span as PromptSpan, StepTimeline as PromptStepTimeline, LayerCost as ExpertLayerCost, LayerExperts,
-    SITE_TERM_NAMES, SiteServed, StepCost as ExpertStepCost, STEP_TRACE as EXPERT_STEP_TRACE, LayerCurve, MissCurve, RoutedRead,
+    GroupLend as ExpertGroupLend, ExpertCosts, GroupCost as PromptGroupCost, GroupLayer as PromptGroupLayer, LayerTimeline as PromptLayerTimeline, Span as PromptSpan, StepTimeline as PromptStepTimeline, LayerCost as ExpertLayerCost, LayerExperts,
+    RecordedRoutes, RoutedStep, SITE_TERM_NAMES, SiteServed, StepCost as ExpertStepCost, STEP_TRACE as EXPERT_STEP_TRACE, LayerCurve, MissCurve, RoutedRead,
 };
 #[cfg(feature = "expert-routing")]
 pub use experts::{Recency as EvictionRecency, replay as replay_routing};
@@ -59,6 +59,7 @@ pub mod programs;
 mod progressive;
 mod slot_directory;
 mod storage_thread;
+mod two_row;
 mod stored_table;
 mod streamed_table;
 pub use programs::{
@@ -86,8 +87,8 @@ pub use device_resources::{
     ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, PlanningRoom, DomainError, DomainRequirements, DomainReservation, ExecutorDomain, Unchained,
-    ExpertMeasures, LoadCosts, LoadMeasures, ExpertCover, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent, DecodeStep,
+    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, FrontRegime, TwoRowPricing, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, PlanningRoom, DomainError, DomainRequirements, DomainReservation, ExecutorDomain, Unchained,
+    ExpertMeasures, LoadCosts, LoadMeasures, ExpertCover, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent,
     ExpertTargets, HeadFlight, LaunchDuration, LoadCharge, MemoryRead, MemoryReading, MemoryResponse, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
     ReservedResources, ResumeState, RunningBegun, RunningPressure, StateBindings, StateBytes, StoreAllocation, StoreStateBytes, SubmitFailure, request_slot_bytes,
@@ -106,8 +107,8 @@ pub use kernel_cache::{
 };
 pub use lanes::ConditioningSlice;
 pub use lanes::{
-    HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs,
-    ResidentWeightSlot, StateLaunchCore, StateLaunchInputs, StateWork, TargetHistoryRead,
+    FrontFeatures, FrontReads, HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs,
+    ResidentWeightSlot, SlotGuess, StateLaunchCore, StateLaunchInputs, StateWork, TargetHistoryRead,
     TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetReads, TargetTokens,
     ValidatedHeadLaunch, ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
     ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs,
@@ -130,10 +131,11 @@ pub use native::{
     ZeroTuningWeights, attention_points, row_points,
 };
 pub use operation::{
-    CommittedClass, DraftForm, DraftShape, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey,
-    HeadPhase, Operation, OperationError, Outcome, Priming, ProgramIdentity, RequestId,
-    ResourceDomainId, RowResult, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
+    AheadVerdict, ChainEntry, CommittedClass, DraftForm, DraftShape, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, FrontKind, FrontRow, FrontRows, Guess, GuessKind,
+    GroupKey, HeadPhase, Operation, OperationError, Outcome, Priming, ProgramIdentity, RequestId,
+    ResourceDomainId, RowResult, Rows, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };
+pub use two_row::{BuiltForm, CHAINED_ROWS, FrontGrant, FrontPass, TwoRowDecode, fronted_requests};
 pub use operators::routed::{
     Expansion, ExpertScales, GeneralRoutedBinding, GeneralRoutedScales, GeneralRoutedShape,
 };
@@ -158,7 +160,7 @@ pub use planning::{
     LowRankQueryBinding, PickedBinding,
     PooledBinding, MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding,
     MixerProgramSlot, ModelLoadPlan, NGramBinding, NGramGateForm, NGramTaps, NoBank, PlanRoom, SettleRoom, StableRoom, WholeFit, NativeGraphCharge, ParallelBinding,
-    PassLaunches, PlanPrices, PlanSteps, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
+    PassLaunches, PlanForms, PlanPrices, PlanSteps, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
     ReadoutBinding, ReadoutClassChoice, ReadoutHead, RecurrentBinding, RecurrentForm, ResolvedPolicy,
     ResourceBytes, ResourceCapacity, ResourceLimits, StepAllowances, EVALUATION_PREFILL_ROWS, ResourcePlan, ResourcePlanner, RoutedBinding,
     AbsorbedQueryBinding, AbsorbedQueryShape, GroupedOutputBinding, GroupedOutputShape, ScalableWeight, SealedGraphHostBytes,

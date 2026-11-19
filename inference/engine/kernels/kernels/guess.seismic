@@ -1,0 +1,138 @@
+# Two-row decode's chain (executor two_row.rs): the tokens a sequence's next
+# pass's front rows run on, made on the device from the pass's selections
+# alone. A front pass of a sequence runs its exact row on the pending token
+# x, then front rows 1 to k on guesses g_1 to g_k, and selects y (the exact
+# row's, the sequence's true next token) and f_1 to f_k. Its consistent
+# front rows (front row j is where y is verified and every front row i to j
+# selected, on a verified token row, on g_i = n_(i-1)) chain: the next pass
+# runs on their selections, then on the MTP head's selection on the deepest
+# consistent row, its prediction of the token after that row's selection.
+# So the head lengthens a chain by exactly one per pass, and after a fall
+# at depth j the chain is j long and refills one depth per pass. The chain
+# runs at the tail of the head launch right behind the pass (`guess_chain`),
+# and writes the guesses the host reads and the token rows and kinds of the
+# pass queued behind.
+
+# A guess's kind, its word in `guess_chain`'s guesses and in a step's
+# STEP_GUESSES field (streaming_words.seismic); 0 for no guess.
+const GUESS_CHAINED = 1
+const GUESS_HEAD = 2
+
+# A row of `guess_chain`'s `chaining`, host-written per selected row of the
+# pass: the selected row's token row t, -1 where the row does not chain
+# (CHAINING_ROW), and k, the front rows behind it, 0 of the prompt's closing
+# chunk (CHAINING_FRONT).
+const CHAINING_ROW = 0
+const CHAINING_FRONT = 1
+const CHAINING_WORDS = 2
+
+# A row of `guess_chain`'s `continuing`, host-written per token row of the
+# pass queued behind: the selected row s of the slot it continues, -1 where
+# it continues none (CONTINUING_SLOT), and its depth, 0 for its exact row, j
+# for its front row j (CONTINUING_DEPTH).
+const CONTINUING_SLOT = 0
+const CONTINUING_DEPTH = 1
+const CONTINUING_WORDS = 2
+
+# The chain (GUESS), at the tail of a front head launch. A chaining row s
+# of the pass's S selected rows (`chaining[s, CHAINING_ROW]` = t >= 0) is a
+# slot's exact row: token row t of the pass's M token rows `tokens` is its
+# token x, `selected[s]` its selection y. The pass ran k =
+# `chaining[s, CHAINING_FRONT]` front rows behind it: front row j (1 to k)
+# at token row t + j and selection s + j, which the host guarantees exist
+# (the bounds below only state that for the index proof), ran on g_j and
+# selected f_j. Front row j is consistent (c_j) where c_(j-1) (c_0: y and
+# its token row verified), f_j selected, its token row verified and g_j =
+# n_(j-1). With c the deepest consistent depth, the next pass's guess n_d at
+# depth d is
+# - GUESS_CHAINED: f_d, where d <= c;
+# - GUESS_HEAD: at d = c + 1, the head's selection on entry row c
+#   (`drafted[s + c]`, its prediction of the token after selected[s + c]),
+#   where the head selected (status 0);
+# - none (0): otherwise, and deeper.
+# An unverified y chains nothing. It writes (n_d, kind) to
+# `guesses[s + d - 1]`, rows of the slot's own, which the host reads as the
+# pass's next guesses. Then each of the N token rows r of the pass queued
+# behind that continues a slot (`continuing[r, CONTINUING_SLOT]` = s >= 0)
+# at depth j: its exact row (j = 0) runs on `selected[s]` (token, status);
+# its front row j on (n_j, 0) where the chain holds n_j, else on (y, 0), an
+# idle row of no guess; and a front row's kind is (n_j, kind), else (0, 0),
+# at `next_guesses[r - 1]`, the row of the guess a step's front row r reads
+# (`routed_step`). Every output row is cleared before any slot writes.
+fn guess_chain[S, M, N](tokens: &tensor[M, 2] i32, chaining: &tensor[S, CHAINING_WORDS] i32,
+    selected: &tensor[S, 2] i32, drafted: &tensor[S, 2] i32,
+    continuing: &tensor[N, CONTINUING_WORDS] i32,
+    guesses: &mut tensor[S, 2] i32, next_selected: &mut tensor[N, 2] i32,
+    next_guesses: &mut tensor[N, 2] i32):
+    for s in 0..S:
+        guesses[s, 0] = 0
+        guesses[s, 1] = 0
+    for r in 0..N:
+        next_selected[r, 0] = 0
+        next_selected[r, 1] = 0
+        next_guesses[r, 0] = 0
+        next_guesses[r, 1] = 0
+    for s in 0..S:
+        let t = chaining[s, CHAINING_ROW]
+        let front = chaining[s, CHAINING_FRONT]
+        if t >= 0 and t < i32(M) and selected[s, 1] == 0 and tokens[t, 1] == 0:
+            let mut last = selected[s, 0]
+            let mut going = true
+            for d in 0..S:
+                if going and s + d < S:
+                    let depth = i32(d) + 1
+                    let mut stands = false
+                    if depth <= front and s + d + 1 < S and t + depth < i32(M):
+                        if selected[s + d + 1, 1] == 0 and tokens[t + depth, 1] == 0 and tokens[t + depth, 0] == last:
+                            stands = true
+                            last = selected[s + d + 1, 0]
+                            guesses[s + d, 0] = last
+                            guesses[s + d, 1] = GUESS_CHAINED
+                    if not stands:
+                        going = false
+                        if drafted[s + d, 1] == 0:
+                            guesses[s + d, 0] = drafted[s + d, 0]
+                            guesses[s + d, 1] = GUESS_HEAD
+    for r in 0..N:
+        let s = continuing[r, CONTINUING_SLOT]
+        let depth = continuing[r, CONTINUING_DEPTH]
+        if s >= 0 and s < i32(S):
+            if depth == 0:
+                next_selected[r, 0] = selected[s, 0]
+                next_selected[r, 1] = selected[s, 1]
+            else:
+                let row = s + depth - 1
+                let held = chaining[s, CHAINING_ROW] >= 0 and depth >= 1 and depth <= chaining[s, CHAINING_FRONT] + 1 and row < i32(S)
+                let mut token = selected[s, 0]
+                let mut guess = i32(0)
+                let mut kind = i32(0)
+                if held:
+                    if guesses[row, 1] != 0:
+                        token = guesses[row, 0]
+                        guess = token
+                        kind = guesses[row, 1]
+                next_selected[r, 0] = token
+                next_selected[r, 1] = 0
+                if r >= 1:
+                    next_guesses[r - 1, 0] = guess
+                    next_guesses[r - 1, 1] = kind
+
+native guess_chain for metal from "metal/guess_chain.metal":
+    launch guess_chain:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native guess_chain for cuda from "cuda/guess_chain.cu":
+    launch guess_chain:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native guess_chain for vulkan from "vulkan/guess_chain.comp":
+    launch guess_chain:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native guess_chain for cpu from "cpu/guess_chain.rs":
+    launch guess_chain:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

@@ -102,29 +102,62 @@ struct Gathered {
     uint products[SEISMIC_CONST_VERIFY_ROWS];
 };
 
-// The choices of choice `at`'s expert over `m_rows` rows of `slots` choices
-// (`routes` at strides `s0`, `s1`), in flat order, their product rows at
-// strides `p0`, `p1`; none where an earlier choice names the expert. Every
-// thread computes the same. The form is admitted at M <= VERIFY_ROWS, and a
-// row names an expert once, so the bound on `count` never binds; it keeps
-// the tables in bounds.
-inline Gathered gather(device const int *routes, ulong s0, ulong s1, uint m_rows, uint slots, uint at, ulong p0,
-    ulong p1) {
+// The active choices sharing choice `at`'s expert and record source over
+// `m_rows` rows of `slots` choices (`routes` at strides `s0`, `s1`; `sources`
+// of `source_rows` rows at strides `src1`, `src2`), in flat order, their
+// product rows at strides `p0`, `p1`; none where `at` is inactive or an
+// earlier active choice shares its expert and source, and `at` alone where its
+// source is none (for instance a front row's skipped choice beside an exact
+// row's record). Every thread computes the same. The form is admitted at
+// M <= VERIFY_ROWS, and a row names an expert once, so the bound on `count`
+// never binds; it keeps the tables in bounds.
+template <typename Active>
+inline Gathered gather(device const int *routes, ulong s0, ulong s1, device const int *sources, ulong source_rows,
+    ulong src1, ulong src2, uint m_rows, uint slots, uint at, ulong p0, ulong p1, Active active) {
     Gathered chosen;
-    chosen.expert = routes[ulong(at / slots) * s0 + ulong(at % slots) * s1];
+    const uint at_m = at / slots, at_k = at % slots;
+    chosen.expert = routes[ulong(at_m) * s0 + ulong(at_k) * s1];
     chosen.count = 0;
+    const slab::Source at_source = decode_source(sources, source_rows, src1, src2, at_m, at_k, chosen.expert);
+    if (!active(at, at_source))
+        return chosen;
+    if (at_source.none()) {
+        chosen.rows[0] = at_m;
+        chosen.products[0] = uint(ulong(at_m) * p0 + ulong(at_k) * p1);
+        chosen.count = 1;
+        return chosen;
+    }
+    // Whether choice c (row m, slot k) is an active choice of `at`'s expert
+    // and source.
+    auto shares = [&](uint c, uint m, uint k) {
+        if (routes[ulong(m) * s0 + ulong(k) * s1] != chosen.expert)
+            return false;
+        const slab::Source source = decode_source(sources, source_rows, src1, src2, m, k, chosen.expert);
+        return source.code == at_source.code && active(c, source);
+    };
     for (uint c = 0; c < at; ++c)
-        if (routes[ulong(c / slots) * s0 + ulong(c % slots) * s1] == chosen.expert)
+        if (shares(c, c / slots, c % slots))
             return chosen;
     for (uint c = at; c < m_rows * slots && chosen.count < uint(SEISMIC_CONST_VERIFY_ROWS); ++c) {
         const uint m = c / slots, k = c % slots;
-        if (routes[ulong(m) * s0 + ulong(k) * s1] == chosen.expert) {
+        if (shares(c, m, k)) {
             chosen.rows[chosen.count] = m;
             chosen.products[chosen.count] = uint(ulong(m) * p0 + ulong(k) * p1);
             ++chosen.count;
         }
     }
     return chosen;
+}
+
+inline Gathered gather(device const int *routes, ulong s0, ulong s1, device const int *sources, ulong source_rows,
+    ulong src1, ulong src2, uint m_rows, uint slots, uint at, ulong p0, ulong p1) {
+    return gather(routes, s0, s1, sources, source_rows, src1, src2, m_rows, slots, at, p0, p1,
+        [](uint, slab::Source) { return true; });
+}
+
+inline Gathered gather(device const int *routes, ulong s0, ulong s1, uint m_rows, uint slots, uint at, ulong p0,
+    ulong p1) {
+    return gather(routes, s0, s1, nullptr, 0, 0, 0, m_rows, slots, at, p0, p1);
 }
 
 // The activation rows a gathered GEMV reads: row r is `rows[r]`.
@@ -184,11 +217,13 @@ inline void publish_slot(OutPublishedSlots<SLOTS> published, uint row, uint firs
 }
 
 template <uint TILE, uint K, uint SLOTS, uint H, typename Published, typename Project>
-inline void project_gathered(device const int *routes, ulong s0, ulong s1, uint m_rows, uint m, uint sg,
-    uint first, uint lane, threadgroup float *region, Published published, Project project) {
+inline void project_gathered(device const int *routes, ulong s0, ulong s1, device const int *sources, ulong source_rows,
+    ulong src1, ulong src2, uint m_rows, uint m, uint sg, uint first, uint lane, threadgroup float *region,
+    Published published, Project project) {
     if (sg < K) {
         // Each choice's place is its published row, m * SLOTS + k.
-        const Gathered chosen = gather(routes, s0, s1, m_rows, K, m * K + sg, SLOTS, 1);
+        const Gathered chosen =
+            gather(routes, s0, s1, sources, source_rows, src1, src2, m_rows, K, m * K + sg, SLOTS, 1);
         for (uint r = 0; r < chosen.count; ++r) {
             project(ulong(chosen.rows[r]), chosen.products[r] - chosen.rows[r] * SLOTS, region);
             publish_slot<TILE, H>(published, chosen.products[r], first, region, lane);

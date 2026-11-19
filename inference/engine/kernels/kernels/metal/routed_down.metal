@@ -69,6 +69,7 @@
     const uint first = group.x * TILE;                                                                            \
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);                                          \
     routed::project_gathered<TILE, SLOTS, SLOTS, H>(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,     \
+        sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,                          \
         uint(SEISMIC_DIM_M), group.y, sg, first, lane, projected[sg], published,                                  \
         [&](ulong m, uint k, threadgroup float *region) {                                                         \
             routed::down_project<ROWS, LANES>(product, routes, sources, expert_down, tier_down, m, first, k, lane, \

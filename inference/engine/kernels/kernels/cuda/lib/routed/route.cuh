@@ -10,9 +10,9 @@ namespace route {
 
 using Ranked = selection::Ranked<SEISMIC_DIM_K>;
 
-template <unsigned EXPERTS = SEISMIC_DIM_E, class Logit>
-__device__ __forceinline__ Ranked rank_row(Logit logit, unsigned lane) {
-    return selection::rank_row<EXPERTS, SEISMIC_DIM_K>(logit, lane);
+template <unsigned EXPERTS = SEISMIC_DIM_E, class Logit, class Keys = selection::NoKeys>
+__device__ __forceinline__ Ranked rank_row(Logit logit, unsigned lane, Keys keys = Keys{}) {
+    return selection::rank_row<EXPERTS, SEISMIC_DIM_K>(logit, lane, keys);
 }
 
 struct Selection {
@@ -37,11 +37,12 @@ struct Selection {
             SEISMIC_EXPERT_SCALE_STRIDE_0                                                                 \
     }
 
-template <class Logit>
+// One row's selection by one warp (`rank_row`, its keys to `keys`).
+template <class Logit, class Keys = selection::NoKeys>
 __device__ __forceinline__ void select_row(Logit logit, const Selection &out, unsigned long long row, unsigned lane,
-                                           const seismic_words_t &seismic_words_value) {
+                                           const seismic_words_t &seismic_words_value, Keys keys = Keys{}) {
     constexpr unsigned K = SEISMIC_DIM_K;
-    const Ranked ranked = rank_row(logit, lane);
+    const Ranked ranked = rank_row(logit, lane, keys);
     float denominator = 0.0f;
     if (out.normalize)
         for (unsigned slot = 0; slot < K; ++slot)

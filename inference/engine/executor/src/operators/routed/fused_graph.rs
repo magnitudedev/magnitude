@@ -17,8 +17,8 @@ use crate::programs::native_constants::GraphConstant;
 use super::grouped::{ExpertsPass, Grouped};
 use super::split::{BackCrossing, Crossing, PassPorts, SharedInput, Split};
 use super::streamed::{
-    BankCombineEntry, BankForm, BankNumbers, BankRoute, LayerBank, DecodeReads, DecodeShape, RouteLocals,
-    StreamedLayer, LandPorts,
+    BankCombineEntry, BankForm, BankNumbers, BankRoute, LayerBank, DecodeReads, ResidentGateUp, RouteLocals, RoutedStep, StepChoices, StepInputs,
+    StreamedLayer,
 };
 use crate::planning::RecordTensors;
 use crate::programs::graph::facts::Numbers;
@@ -41,6 +41,40 @@ use magnitude_kernels::{
 use seismic::{
     Argument, BackendName, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, OperandCarry, WorkflowTensor,
 };
+
+/// The choices' gate/up arguments (`routed_gate_up`: SiLU and unclamped,
+/// the fused form's experts, `is_fused`) of `normalized` over `routes`,
+/// each choice read where `reads` names (`tier_gate` its gate tier), from
+/// the gate and up `stacks` at their `scales`; `glu_limit` the unclamped
+/// host port.
+fn choices_args<'t>(
+    normalized: &'t WorkflowTensor,
+    routes: &'t WorkflowTensor,
+    reads: &'t DecodeReads,
+    tier_gate: &'t seismic::WorkflowTensorView,
+    [gate, up]: [&'t WorkflowTensor; 2],
+    [gate_scale, up_scale]: [&'t WeightScale; 2],
+    glu_limit: &'t seismic::WorkflowTensorView,
+) -> routed_gate_up::WorkflowArgs<'t> {
+    routed_gate_up::WorkflowArgs {
+        normalized: normalized.into(),
+        routes: routes.into(),
+        sources: (&reads.sources).into(),
+        expert_gate: gate.into(),
+        expert_up: up.into(),
+        tier_gate: tier_gate.into(),
+        tier_up: (&reads.tier.up).into(),
+        activation: (super::FUSED_ACTIVATION).into(),
+        gate_scale: (&gate_scale.tensor).into(),
+        up_scale: (&up_scale.tensor).into(),
+        glu_limit: glu_limit.into(),
+    }
+}
+
+/// A fused layer's gate tier records, which its reads hold.
+fn tier_gate(reads: &DecodeReads) -> Result<&seismic::WorkflowTensorView, GraphError> {
+    Ok(reads.tier.gate.as_ref().ok_or("a fused layer's reads lack its gate")?)
+}
 
 /// How a backend runs the decode rows' expansions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,7 +554,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     epsilon: Argument<f32>,
     split: Option<Split<'_>>,
     operand: Option<OperandOut<'_, G::Forms>>,
-) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
+) -> Result<(WorkflowTensor, Option<StepInputs>), GraphError> {
     let part = bank.stacks();
     let mut streamed = StreamedLayer::of(planned, &topology.bank, shape.bank.as_ref(), scope, bank)?;
     let decode = decodes(rows);
@@ -543,7 +577,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             graph.store(&normalized, into)?;
             graph.store(&coefficient, into_coefficient)?;
             let sequence = match layer {
-                Some(layer) => layer.request(graph, routes.tensor(), rows)?,
+                Some(layer) => layer.request(graph, routes.tensor(), rows, constants)?,
                 None => None,
             };
             return Ok((residual.clone(), sequence));
@@ -655,13 +689,34 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 route,
                 choices: gate_up,
             } => {
-                // The route's normalized rows, coefficient and shared
+                // The choices' gate/up dimensions, reading `E` experts where
+                // `reads` names each choice.
+                let gate_up_dimensions = |reads: &DecodeReads, experts: &Dim| {
+                    [
+                        [
+                            ("M", rows.clone()),
+                            ("H", shape.hidden.clone()),
+                            ("E", experts.clone()),
+                            ("K", shape.selected.clone()),
+                            ("F", shape.intermediate.clone()),
+                            ("GS", gate_scale.extent.clone()),
+                            ("US", up_scale.extent.clone()),
+                            ("LB", Dim::from(magnitude_family_contracts::GluLimit::word(None))),
+                        ]
+                        .as_slice(),
+                        &reads.dimensions(),
+                    ]
+                    .concat()
+                };
+                // The fused form's experts are unclamped (`is_fused`).
+                let glu_limit = crate::operators::glu_limit(routes.tensor(), None);
+                // The choices' product, the route's coefficient and shared
                 // product, and where the gate/up and output read each
                 // choice: a resident layer's stacks by expert; a
                 // bank-served one's sources (`E` = `BANK`): its group's
                 // records, which its fill and promotion commit, or its
                 // tier's.
-                let (normalized, coefficient, shared, reads, experts, sequence, sited) =
+                let (expert_product, coefficient, shared, reads, experts, sequence, sited) =
                     match &mut streamed {
                         None => {
                             let routed = graph.enqueue(
@@ -691,13 +746,31 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                 },
                             )?;
                             let reads = resident(graph, constants)?;
-                            (routed.r0, routed.r1, routed.r2, reads, shape.count.clone(), None, None)
+                            let experts = shape.count.clone();
+                            let product = graph
+                                .enqueue(
+                                    G::pick(gate_up, rows),
+                                    &gate_up_dimensions(&reads, &experts),
+                                    choices_args(
+                                        &routed.r0,
+                                        routes.tensor(),
+                                        &reads,
+                                        tier_gate(&reads)?,
+                                        [gate_records.tensor(), up_records.tensor()],
+                                        [&gate_scale, &up_scale],
+                                        &glu_limit,
+                                    ),
+                                )?
+                                .value;
+                            (product, routed.r1, routed.r2, reads, experts, None, None)
                         }
                         Some(layer) => {
                             let bank = layer.numbers();
-                            let mut ports = layer.decode_ports(graph)?;
+                            let mut ports = layer.decode_ports(graph, rows, constants)?;
                             let mut routing = layer.part(graph, BankPart::Routing)?;
+                            let mut front = layer.part(graph, BankPart::Front)?;
                             let tier = layer.route_tier(graph, &ports, constants)?;
+                            let mut keys = layer.route_keys(graph)?;
                             let route_dims = [
                                 ("M", rows.clone()),
                                 ("H", shape.hidden.clone()),
@@ -709,6 +782,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                 ("ES", expert_scale.extent.clone()),
                                 ("FW", bank.file_width.clone()),
                                 ("FLIGHT", bank.flight.clone()),
+                                ("RING", bank.ring_words.clone()),
                                 ("P", bank.choices.clone()),
                                 ("GM", bank.map_words.clone()),
                                 ("TM", tier.experts.clone()),
@@ -743,6 +817,10 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                     file: ports.file.tensor_mut().into(),
                                     sources: locals.sources.tensor_mut().into(),
                                     routing: routing.tensor_mut().into(),
+                                    keys: keys.tensor_mut().into(),
+                                    front: front.tensor_mut().into(),
+                                    land_grid: ports.land_grid.tensor_mut().into(),
+                                    land_groups: layer.land_groups().into(),
                                 },
                             )?;
                             if let Some(mut hints) = layer.hints(
@@ -764,7 +842,9 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                     ("RING", bank.ring_words.clone()),
                                     ("EN", bank.next_experts.clone()),
                                 ];
-                                graph.enqueue(
+                                // Encoded while the layer's hints pay
+                                // (POLICY_HINTS).
+                                graph.enqueue_under(
                                     hint,
                                     &hint_dims,
                                     routed_hint_route::WorkflowArgs {
@@ -779,71 +859,46 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                         next_policy: (&hints.policy).into(),
                                         rings: hints.rings.tensor_mut().into(),
                                     },
+                                    &ports.policy,
+                                    magnitude_kernels::constants::POLICY_HINTS,
+                                    LaunchEncoding::WhileSet,
                                 )?;
                             }
-                            let decode_shape = DecodeShape { rows };
-                            let mut sources = locals.sources.tensor().clone();
-                            layer.land(
+                            // The gate/up in two passes around the wait, the
+                            // site request between them: the step's CPU
+                            // choices of the snapshot, weighed by their scores
+                            // (`StreamedLayer::gate_up`).
+                            let reads = layer.reads(graph, &ports, &locals, constants)?;
+                            let experts = bank.records.clone();
+                            let dimensions = gate_up_dimensions(&reads, &experts);
+                            let (expert_gate, expert_up) = (gate_records.tensor().clone(), up_records.tensor().clone());
+                            let gate_tier = tier_gate(&reads)?;
+                            let args = || {
+                                choices_args(
+                                    &routed.r0,
+                                    routes.tensor(),
+                                    &reads,
+                                    gate_tier,
+                                    [&expert_gate, &expert_up],
+                                    [&gate_scale, &up_scale],
+                                    &glu_limit,
+                                )
+                            };
+                            let mut step = RoutedStep { ports, locals, routing };
+                            let product = layer.gate_up(
                                 graph,
-                                LandPorts {
-                                    decode: &mut ports,
-                                    sources: &mut sources,
-                                    records: RecordTensors { gate: Some(&mut gate_records), up: &mut up_records, down: &mut down_records },
-                                },
-                                &decode_shape,
+                                &mut step,
+                                ResidentGateUp { args, dimensions: &dimensions },
+                                RecordTensors { gate: Some(&mut gate_records), up: &mut up_records, down: &mut down_records },
+                                &StepChoices { routes: routes.tensor(), weights: scores.tensor(), input: &routed.r0, rows },
                                 constants,
                             )?;
-                            // The site request, before the gate/up: the step's
-                            // CPU choices of the snapshot, weighed by their scores.
-                            layer.site_request(
-                                graph,
-                                &mut ports,
-                                routes.tensor(),
-                                scores.tensor(),
-                                &locals.snapshot(),
-                                &routed.r0,
-                                &decode_shape,
-                            )?;
-                            let reads = layer.reads(graph, &ports, &locals, constants)?;
-                            let sequence = ports.sequence.take();
+                            let mut ports = step.ports;
+                            let sequence = ports.inputs.take();
                             let sited = ports.site.is_some().then_some(ports);
-                            (routed.r0, routed.r1, routed.r2, reads, bank.records.clone(), sequence, sited)
+                            (product, routed.r1, routed.r2, reads, experts, sequence, sited)
                         }
                     };
-                let expert_product = graph
-                    .enqueue(
-                        G::pick(gate_up, rows),
-                        &[
-                            [
-                                ("M", rows.clone()),
-                                ("H", shape.hidden.clone()),
-                                ("E", experts.clone()),
-                                ("K", shape.selected.clone()),
-                                ("F", shape.intermediate.clone()),
-                                ("GS", gate_scale.extent.clone()),
-                                ("US", up_scale.extent.clone()),
-                                ("LB", Dim::from(magnitude_family_contracts::GluLimit::word(None))),
-                            ]
-                            .as_slice(),
-                            &reads.dimensions(),
-                        ]
-                        .concat(),
-                        routed_gate_up::WorkflowArgs {
-                            normalized: (&normalized).into(),
-                            routes: routes.tensor().into(),
-                            sources: (&reads.sources).into(),
-                            expert_gate: gate_records.tensor().into(),
-                            expert_up: up_records.tensor().into(),
-                            tier_gate: (reads.tier.gate.as_ref().ok_or("a fused layer's reads lack its gate")?).into(),
-                            tier_up: (&reads.tier.up).into(),
-                            activation: (super::FUSED_ACTIVATION).into(),
-                            gate_scale: (&gate_scale.tensor).into(),
-                            up_scale: (&up_scale.tensor).into(),
-                            // The fused form's experts are unclamped (`is_fused`).
-                            glu_limit: (&crate::operators::glu_limit(routes.tensor(), None)).into(),
-                        },
-                    )?
-                    .value;
                 (expert_product, shared, coefficient, reads, experts, sequence, sited)
             }
         };

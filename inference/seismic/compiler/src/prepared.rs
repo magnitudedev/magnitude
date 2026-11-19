@@ -311,7 +311,8 @@ pub struct InvocationContract {
 
 #[derive(Debug)]
 enum ParameterContract {
-    Tensor { axes: Vec<CompiledNat> },
+    /// Its extents are checked by the contract's dimension inference.
+    Tensor,
     Scalar,
     Index { bound: CompiledNat },
     Range { bound: CompiledNat },
@@ -341,9 +342,7 @@ impl InvocationContract {
             .parameters()
             .iter()
             .map(|parameter| match &parameter.kind {
-                ParameterKind::Tensor { axes, .. } => ParameterContract::Tensor {
-                    axes: axes.iter().map(|axis| arena.compile_nat(*axis)).collect(),
-                },
+                ParameterKind::Tensor { .. } => ParameterContract::Tensor,
                 ParameterKind::Scalar { .. } => ParameterContract::Scalar,
                 ParameterKind::Index { bound, .. } => ParameterContract::Index {
                     bound: arena.compile_nat(*bound),
@@ -378,12 +377,7 @@ impl InvocationContract {
             .parameters()
             .iter()
             .map(|parameter| match &parameter.kind {
-                ParameterKind::Tensor { axes, .. } => ParameterContract::Tensor {
-                    axes: axes
-                        .iter()
-                        .map(|axis| arena.compile_nat_with(*axis, fixed))
-                        .collect(),
-                },
+                ParameterKind::Tensor { .. } => ParameterContract::Tensor,
                 ParameterKind::Scalar { .. } => ParameterContract::Scalar,
                 ParameterKind::Index { bound, .. } => ParameterContract::Index {
                     bound: arena.compile_nat_with(*bound, fixed),
@@ -442,8 +436,9 @@ mod internals {
         let mut values = InvocationValues::new();
 
         // Observe every input tensor axis in the schema's canonical order,
-        // then execute the sealed construction-time elimination plan. There
-        // is no runtime search and no caller-supplied shape metadata.
+        // then execute the sealed construction-time elimination plan, which
+        // checks every axis against its extent. There is no runtime search
+        // and no caller-supplied shape metadata.
         let mut observations = Vec::new();
         for (parameter, argument) in schema.parameters().iter().zip(arguments) {
             match (&parameter.kind, argument) {
@@ -513,15 +508,9 @@ mod internals {
         {
             match (&parameter.kind, argument, expected) {
                 (
-                    ParameterKind::Tensor {
-                        representation,
-                        axes,
-                        ..
-                    },
+                    ParameterKind::Tensor { representation, .. },
                     ArgumentValue::Tensor(tensor),
-                    ParameterContract::Tensor {
-                        axes: expected_axes,
-                    },
+                    ParameterContract::Tensor,
                 ) => {
                     if tensor.device != device {
                         return Err(InvocationError::WrongDevice {
@@ -533,29 +522,10 @@ mod internals {
                             parameter: parameter_label(parameter),
                         });
                     }
-                    if expected_axes.len() != axes.len() {
-                        panic!("compiled tensor-axis contract disagrees with its call schema");
-                    }
                     if !valid_tensor_descriptor(tensor) {
                         return Err(InvocationError::InvalidTensorDescriptor {
                             parameter: parameter_label(parameter),
                         });
-                    }
-                    for (axis, (actual, expected)) in
-                        tensor.extents.iter().zip(expected_axes).enumerate()
-                    {
-                        let expected = expected.evaluate(&values).map_err(|_| {
-                            InvocationError::ShapeMismatch {
-                                parameter: parameter_label(parameter),
-                                axis: u32::try_from(axis).unwrap_or(u32::MAX),
-                            }
-                        })?;
-                        if seismic_lang::expr::BigUint::from(*actual) != expected {
-                            return Err(InvocationError::ShapeMismatch {
-                                parameter: parameter_label(parameter),
-                                axis: u32::try_from(axis).unwrap_or(u32::MAX),
-                            });
-                        }
                     }
                 }
                 (ParameterKind::Scalar { .. }, _, ParameterContract::Scalar) => {}

@@ -1,8 +1,8 @@
-//! Metal command-buffer timestamps share the system mach clock. A duration
-//! is evidence only when its endpoints lie inside the command's lifetime.
+//! Metal device timestamps, mapped onto the system mach clock, are evidence
+//! of device time only when they lie inside the work's submission envelope.
 
-/// Seconds on the system mach clock used by MTLCommandBuffer GPUStartTime
-/// and GPUEndTime. CLOCK_UPTIME_RAW is mach_absolute_time in nanoseconds.
+/// Seconds on the system mach clock, which GPU timestamp samples are
+/// mapped onto. CLOCK_UPTIME_RAW is mach_absolute_time in nanoseconds.
 pub fn host_seconds() -> f64 {
     unsafe extern "C" {
         fn clock_gettime_nsec_np(clock_id: std::ffi::c_int) -> u64;
@@ -12,32 +12,25 @@ pub fn host_seconds() -> f64 {
     unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) as f64 / 1e9 }
 }
 
-/// The lower endpoint of a submission envelope: the host clock immediately
-/// before the first commit of the work it bounds.
-pub(crate) struct SubmissionTime {
+/// `[start, end]`, device timestamps on the [`host_seconds`] clock, when it
+/// lies inside the submission envelope `[before, after]`: from the host
+/// clock immediately before the work's first commit to a reading after it
+/// completed, widened on each side by `uncertainty`, how far the mapping of
+/// device timestamps onto the host clock may err. Missing or stale
+/// timestamps are an error, not zero time or host time.
+pub(crate) fn checked_interval(
     before: f64,
-}
-
-impl SubmissionTime {
-    /// Call immediately before the first commit, never after it.
-    pub(crate) fn before_commit() -> Self {
-        Self { before: host_seconds() }
-    }
-
-    /// Read after completion and after retrieving both device endpoints.
-    /// Missing or stale timestamps are an error, not zero time or host time.
-    pub(crate) fn interval(&self, start: f64, end: f64) -> Result<(f64, f64), String> {
-        checked_interval(self.before, start, end, host_seconds())
-    }
-}
-
-fn checked_interval(before: f64, start: f64, end: f64, after: f64) -> Result<(f64, f64), String> {
+    start: f64,
+    end: f64,
+    after: f64,
+    uncertainty: f64,
+) -> Result<(f64, f64), String> {
     if start.is_finite() && end.is_finite() && start > 0.0
-        && before <= start && start <= end && end <= after {
+        && before - uncertainty <= start && start <= end && end <= after + uncertainty {
         Ok((start, end))
     } else {
-        Err(format!("Metal command-buffer timestamp interval [{start}, {end}] is invalid \
-            within submission envelope [{before}, {after}] on the system mach clock"))
+        Err(format!("Metal device timestamp interval [{start}, {end}] is invalid \
+            within submission envelope [{before}, {after}] ± {uncertainty} s on the system mach clock"))
     }
 }
 
@@ -57,12 +50,16 @@ mod tests {
             (9.0, 12.0),
             (11.0, 14.0),
         ] {
-            let error = checked_interval(10.0, start, end, 13.0).unwrap_err();
+            let error = checked_interval(10.0, start, end, 13.0, 0.0).unwrap_err();
             assert!(error.contains(&format!("[{start}, {end}]")));
             assert!(error.contains("[10, 13]"));
         }
-        assert_eq!(checked_interval(10.0, 10.0, 13.0, 13.0), Ok((10.0, 13.0)));
-        assert_eq!(checked_interval(10.0, 11.0, 11.0, 13.0), Ok((11.0, 11.0)));
-        assert_eq!(checked_interval(10.0, 11.0, 12.0, 13.0), Ok((11.0, 12.0)));
+        assert_eq!(checked_interval(10.0, 10.0, 13.0, 13.0, 0.0), Ok((10.0, 13.0)));
+        assert_eq!(checked_interval(10.0, 11.0, 11.0, 13.0, 0.0), Ok((11.0, 11.0)));
+        assert_eq!(checked_interval(10.0, 11.0, 12.0, 13.0, 0.0), Ok((11.0, 12.0)));
+        // The mapping's error widens the envelope, and only by itself.
+        assert_eq!(checked_interval(10.0, 9.5, 13.5, 13.0, 0.5), Ok((9.5, 13.5)));
+        assert!(checked_interval(10.0, 9.4, 13.0, 13.0, 0.5).is_err());
+        assert!(checked_interval(10.0, 10.0, 13.6, 13.0, 0.5).is_err());
     }
 }

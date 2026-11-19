@@ -107,6 +107,11 @@ pub struct ExpertBankKernels {
     /// qualified, the precision system admits its arithmetic
     /// ([`BankSite::admitted`]).
     pub site: Option<BankSite>,
+    /// A gated layer's decode gate/up in two passes over one product
+    /// (`routed_gate_up_part`): its held choices before its tier wait, the
+    /// choices the wait sourced after it. None of up-only experts, whose
+    /// expansion (`routed_up`) runs once after the wait.
+    pub gate_up: Option<RangedKernels<magnitude_kernels::routed_gate_up_part::Entry>>,
 }
 
 /// A streamed layer's CPU site entries (streaming_words.seismic's request
@@ -236,7 +241,7 @@ impl ExpertBankKernels {
         form: BankRouteForm,
     ) -> Result<bool, seismic::CheckedBundleError> {
         use magnitude_kernels::{
-            routed_copy, routed_hint_route, routed_hint_select, routed_land, routed_list_grid,
+            routed_copy, routed_gate_up_part, routed_hint_route, routed_hint_select, routed_land, routed_list_grid,
             routed_pass_map, routed_round, routed_route_streamed, routed_scratch_grids, routed_scratch_request,
             routed_seed_commit, routed_select_streamed, routed_step,
         };
@@ -248,10 +253,11 @@ impl ExpertBankKernels {
             BankRouteForm::Fused => (declares::<routed_route_streamed::Entry>, declares::<routed_hint_route::Entry>),
             BankRouteForm::General => (declares::<routed_select_streamed::Entry>, declares::<routed_hint_select::Entry>),
         };
-        let bank: [Declares; 11] = [
+        let bank: [Declares; 12] = [
             route,
             hint,
             declares::<routed_land::Entry>,
+            declares::<routed_gate_up_part::Entry>,
             declares::<routed_step::Entry>,
             declares::<routed_scratch_request::Entry>,
             declares::<routed_round::Entry>,

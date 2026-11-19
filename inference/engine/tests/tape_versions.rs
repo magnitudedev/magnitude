@@ -41,6 +41,7 @@ fn open_domain() -> Option<(Box<ExecutorDomain>, StateBindings, usize)> {
             exported_logits_rows: 64,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {
@@ -99,6 +100,8 @@ fn advance(
         select: Vec::new(),
         committed,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     };
     let operations = [operation];
     let ReservedResources::Target(reservation) = domain
@@ -113,15 +116,13 @@ fn advance(
         .unwrap_or_else(|failure| panic!("{}", failure.error()));
     let (mut pending, bindings) = domain.finish_target(flight).unwrap();
     let pending = pending.pop().unwrap();
-    let Outcome::Forward { rows } = pending.outcome().clone() else {
+    let Outcome::Forward { rows, .. } = pending.outcome().clone() else {
         panic!("a forward returns forward rows");
     };
     domain
         .reconcile(
             pending,
-            PhysicalDecision {
-                accepted_rows: accepted,
-            },
+            PhysicalDecision::rows(accepted),
         )
         .unwrap();
     sequence.position += accepted;

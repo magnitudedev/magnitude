@@ -52,6 +52,7 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
             exported_logits_rows: 0,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -207,6 +208,7 @@ fn plain_domain(bound: usize, exported: usize) -> (Box<ExecutorDomain>, StateBin
             exported_logits_rows: exported,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {
@@ -271,6 +273,8 @@ fn finishing(
         }],
         committed: tokens.len(),
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 

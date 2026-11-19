@@ -265,9 +265,9 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     pub per_layer: Option<NativePort>,
     /// What each step binds of a block with an n-gram input.
     pub ngram: Option<NGramStepPorts>,
-    /// The step sequence a run writes of a graph that sets its step word
-    /// (`StreamedLayer::step`).
-    pub sequence: Option<NativePort>,
+    /// What a run binds of a graph that sets its step word: its sequence and,
+    /// of a decode graph, its token rows (`StreamedLayer::step`).
+    pub step_inputs: Option<crate::operators::routed::streamed::StepInputs>,
     /// The ports of a split block's stage of the values it crosses, which
     /// each run binds to its chain region's rows of the crossing buffers
     /// and a pass to its rows of them, and of the merged values a back
@@ -416,7 +416,7 @@ impl SealedBlockGraph {
                     taps: parts.taps,
                     per_layer: parts.per_layer,
                     ngram: parts.ngram,
-                    sequence: parts.sequence,
+                    step_inputs: parts.step_inputs,
                     ports: $ports,
                     residual: parts.residual,
                     output: parts.output,
@@ -807,8 +807,8 @@ struct BlockGraphParts<F> {
     per_layer: Option<NativePort>,
     /// What each step binds of a block with an n-gram input.
     ngram: Option<NGramStepPorts>,
-    /// The step sequence a run of a graph that sets its step word writes.
-    sequence: Option<NativePort>,
+    /// What a run of a graph that sets its step word binds (`StepInputs`).
+    step_inputs: Option<crate::operators::routed::streamed::StepInputs>,
     ports: StagePorts,
     /// The span marks at the ends of a whole block whose routed layer
     /// streams, which a sampled decode step's run times its block between
@@ -887,7 +887,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
                 taps: None,
                 per_layer: None,
                 ngram: None,
-                sequence: None,
+                step_inputs: None,
                 ports,
                 span: None,
                 operand: None,
@@ -991,7 +991,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             Ok::<_, GraphError>((side, CarryPorts { carry, forms: side.reader, norm }, port))
         })
         .transpose()?;
-    let (output, sequence) = sublayers.feed_forward(
+    let (output, step_inputs) = sublayers.feed_forward(
         graph,
         feed_forward,
         streams_entries,
@@ -1017,7 +1017,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             taps: taps.map(|taps| taps.ports),
             per_layer: None,
             ngram: None,
-            sequence,
+            step_inputs,
             ports,
             span: None,
             operand,
@@ -1080,7 +1080,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         taps: taps.map(|taps| taps.ports),
         per_layer,
         ngram,
-        sequence,
+        step_inputs,
         ports,
         span,
         operand,

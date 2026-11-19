@@ -47,59 +47,65 @@ __device__ __forceinline__ GroupedRows<Rows> grouped_rows(const Rows &rows, cons
     return GroupedRows<Rows>{rows, order, order_stride};
 }
 
-// Decode choices that share an expert (M <= VERIFY_ROWS rows of K choices, a row's
-// choices distinct experts). Choice c = m * K + k computes when it is its
-// expert's first choice in that order, once for every choice of the expert:
-// a GEMV row per choice, whose result does not depend on its neighbours, so
-// each choice's bits are those of its own one-row GEMV. Routes are read from
-// L2 (another launch wrote them).
+// Decode choices that read one record (M <= VERIFY_ROWS rows of K choices, a row's
+// choices distinct records). A choice's record is named by `record(c)` for choice
+// c = m * K + k (`decode_source`: a bank or tier record, or -1 for none). Choice c
+// computes when it is the first of the choices reading its record, once for every
+// choice reading it: a GEMV row per choice, whose result does not depend on its
+// neighbours, so each choice's bits are those of its own one-row GEMV. A choice
+// reading no record is its own group (it zeroes its product, whatever other rows
+// do). Routes are read from L2 (another launch wrote them).
 __device__ __forceinline__ int route(const int *routes, u64 row_stride, u64 slot_stride, u32 slots, u32 choice) {
     return __ldcg(routes + (choice / slots) * row_stride + (choice % slots) * slot_stride);
 }
 
-// Whether `choice`, of `expert`, is its expert's first choice: no earlier
-// row names the expert (its own row names it once).
-__device__ __forceinline__ bool first_of(const int *routes, u64 row_stride, u64 slot_stride, u32 slots, u32 choice,
-                                         int expert) {
-    for (u32 c = 0; c < choice / slots * slots; ++c)
-        if (route(routes, row_stride, slot_stride, slots, c) == expert)
+// A choice's grouping identity in a gathered decode launch: its expert, the
+// record code it reads (-1 for none), and whether it is active in this pass.
+struct ChoiceKey {
+    int expert;
+    int record;
+    bool active;
+};
+
+// Whether `choice` is the first active choice of its (expert, record) group
+// (inactive choices do not run and do not shadow active ones; an active choice
+// reading no record is its own singleton group).
+template <class Key> __device__ __forceinline__ bool first_choice(Key key, u32 choice) {
+    const ChoiceKey mine = key(choice);
+    if (!mine.active)
+        return false;
+    if (mine.record == -1)
+        return true;
+    for (u32 c = 0; c < choice; ++c) {
+        const ChoiceKey other = key(c);
+        if (other.active && other.expert == mine.expert && other.record == mine.record)
             return false;
+    }
     return true;
 }
 
-// Whether `choice` is its expert's first choice.
-__device__ __forceinline__ bool first_choice(const int *routes, u64 row_stride, u64 slot_stride, u32 slots,
-                                             u32 choice) {
-    return first_of(routes, row_stride, slot_stride, slots, choice,
-                    route(routes, row_stride, slot_stride, slots, choice));
-}
-
-// The choices of `expert` from `choice` (one of its) in order, one a row:
-// `choice`, then each later row's that names it, into `chosen`; returns
-// their count. The forms run at most VERIFY_ROWS rows, each naming an expert
-// once, so `chosen` is never full when another choice is found; one found
-// then breaks that invariant, and the block traps rather than drop it.
-__device__ __forceinline__ u32 choices_of(const int *routes, u64 row_stride, u64 slot_stride, u32 rows, u32 slots,
-                                          u32 choice, int expert, u32 (&chosen)[SEISMIC_CONST_VERIFY_ROWS]) {
+// The active choices sharing `choice`'s (expert, record) in order (`choice`
+// alone when it reads no record), into `chosen`; returns their count. The
+// forms run at most VERIFY_ROWS rows, a row's choices distinct records, so
+// `chosen` is never full when another choice is found; one found then breaks
+// that invariant, and the block traps rather than drop it.
+template <class Key>
+__device__ __forceinline__ u32 record_choices(Key key, u32 choices, u32 choice,
+                                              u32 (&chosen)[SEISMIC_CONST_VERIFY_ROWS]) {
+    const ChoiceKey mine = key(choice);
     u32 count = 0;
     chosen[count++] = choice;
-    for (u32 m = choice / slots + 1; m < rows; ++m)
-        for (u32 k = 0; k < slots; ++k)
-            if (route(routes, row_stride, slot_stride, slots, m * slots + k) == expert) {
-                if (count == SEISMIC_CONST_VERIFY_ROWS)
-                    __trap();
-                chosen[count++] = m * slots + k;
-                break;
-            }
+    if (mine.record == -1)
+        return count;
+    for (u32 c = choice + 1; c < choices; ++c) {
+        const ChoiceKey other = key(c);
+        if (other.active && other.expert == mine.expert && other.record == mine.record) {
+            if (count == SEISMIC_CONST_VERIFY_ROWS)
+                __trap();
+            chosen[count++] = c;
+        }
+    }
     return count;
-}
-
-// The choices of `choice`'s expert in order (at most one per row), into
-// `chosen`; returns their count.
-__device__ __forceinline__ u32 expert_choices(const int *routes, u64 row_stride, u64 slot_stride, u32 rows,
-                                              u32 slots, u32 choice, u32 (&chosen)[SEISMIC_CONST_VERIFY_ROWS]) {
-    return choices_of(routes, row_stride, slot_stride, rows, slots, choice,
-                      route(routes, row_stride, slot_stride, slots, choice), chosen);
 }
 
 // A gathered choice's expert and the GEMV rows of its choices, in the
@@ -113,19 +119,19 @@ struct Gathered {
 };
 
 // Block-collective, by every thread before any leaves: whether `choice` is
-// its expert's first choice, and where it is, its expert and every choice
-// of it into `table`: choice (m, k) reads activation row m at m *
-// `row_stride` and publishes at m * `product0` + k * `product1`. At one row
-// every choice is its expert's first and gathers its own row alone.
-__device__ __forceinline__ bool gather(Gathered &table, const int *routes, u64 routes0, u64 routes1, u32 rows,
-                                       u32 slots, u32 choice, u64 row_stride, u64 product0, u64 product1) {
-    const int expert = route(routes, routes0, routes1, slots, choice);
-    if (!first_of(routes, routes0, routes1, slots, choice, expert))
+// the first active choice of its (expert, record), and where it is, its expert
+// and every active choice sharing it into `table`: choice (m, k) reads
+// activation row m at m * `row_stride` and publishes at m * `product0` +
+// k * `product1`.
+template <class Key>
+__device__ __forceinline__ bool gather(Gathered &table, Key key, const int *routes, u64 routes0, u64 routes1,
+                                       u32 rows, u32 slots, u32 choice, u64 row_stride, u64 product0, u64 product1) {
+    if (!first_choice(key, choice))
         return false;
     if (threadIdx.x == 0) {
         u32 chosen[SEISMIC_CONST_VERIFY_ROWS];
-        table.expert = expert;
-        table.count = choices_of(routes, routes0, routes1, rows, slots, choice, expert, chosen);
+        table.expert = route(routes, routes0, routes1, slots, choice);
+        table.count = record_choices(key, rows * slots, choice, chosen);
         for (u32 r = 0; r < table.count; ++r) {
             const u64 m = chosen[r] / slots, k = chosen[r] % slots;
             table.rows[r] = m * row_stride;

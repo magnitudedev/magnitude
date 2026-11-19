@@ -16,7 +16,10 @@ use magnitude_family_contracts::{Decoder, EmbeddingScale, WeightKind, WeightRole
 use magnitude_kernels::{embedding_rows, selection_notice};
 #[cfg(test)]
 use seismic::NativeGraphStorageBytes;
-use seismic::{Argument, BackendName, ClassFact, NativeGraphClassSlice, NativeGraphMetadata, NativeGraphResourceTemplate, NativeGraphTraces};
+use seismic::{
+    Argument, BackendName, ClassFact, NativeGraphClassSlice, NativeGraphMetadata, NativeGraphResourceTemplate,
+    NativeGraphTraces,
+};
 use seismic::{
     Device, Dim, Element, NativeGraphLayout, NativeGraphPlan, NativePort, NativeTimelinePort,
     WorkflowTensor,
@@ -111,14 +114,21 @@ pub(crate) struct PreparedTargetEntryGraph {
     /// Of a step uploading the host's tokens in a model whose blocks read
     /// the step's token rows: where it keeps them.
     pub kept_tokens: Option<KeptTokens>,
+    /// Of a step uploading the host's tokens in a load that fronts
+    /// (`ModelLoadPlan::fronts`): the host's guesses its front rows run on
+    /// (`[rows, 2]` guess, kind rows, `TargetLaunchCore::host_guesses`),
+    /// kept as its tokens are (`GroupBuffers::kept_guesses`), which its step
+    /// words read (`routed_step`).
+    pub kept_guesses: Option<KeptTokens>,
     /// Of a step reading selected tokens of a table with landing slots: its
     /// landed read's ports.
     pub landed: Option<LandedReadPorts>,
 }
 
-/// An entry graph's kept token rows (`keeps_token_rows`): the host's token
-/// rows uploaded in the `sample_rows` layout, and the bound token rows
-/// (`GroupBuffers::token_rows`) the entry copies them to for the blocks.
+/// An entry graph's kept token rows (`ModelLoadPlan::keeps_token_rows`):
+/// the host's token rows uploaded in the `sample_rows` layout, and the bound
+/// token rows (`GroupBuffers::token_rows`) the entry copies them to for the
+/// graphs after it.
 #[derive(Clone)]
 pub(crate) struct KeptTokens {
     pub uploaded: NativePort,
@@ -140,7 +150,7 @@ impl PreparedTargetEntryGraph {
     pub(super) fn prepare(
         device: &Device,
         embedding: &seismic::NativeKernel<embedding_rows::Entry>,
-        notice: Option<&seismic::NativeKernel<selection_notice::Entry>>,
+        copy: Option<&seismic::NativeKernel<selection_notice::Entry>>,
         landing: Option<&crate::native::AttestedLanding>,
         load: &ModelLoadPlan,
         geometry: &Decoder,
@@ -151,9 +161,11 @@ impl PreparedTargetEntryGraph {
         let draft = entry_graph_topology(
             device.native_graph_with_layout(layout),
             embedding,
-            notice,
+            copy,
+            load.notifies_selection(),
             landing.map(LandingEntries::native),
-            keeps_token_rows(load),
+            load.keeps_token_rows(),
+            load.fronts(),
             &load.weight(TARGET_TABLE).map_err(|error| error.to_string())?,
             EntryWidth { hidden: &Dim::from(geometry.hidden), transform: transform_arguments(embedding_transform(geometry)) },
             &Dim::from(rows),
@@ -168,6 +180,7 @@ impl PreparedTargetEntryGraph {
             hidden: draft.hidden,
             notice: draft.notice,
             kept_tokens: draft.kept_tokens,
+            kept_guesses: draft.kept_guesses,
             landed: draft.landed,
         })
     }
@@ -179,17 +192,11 @@ pub(crate) const TARGET_TABLE: WeightRole = WeightRole {
     kind: WeightKind::Embedding,
 };
 
-/// Whether the steps of `load` that read selected tokens notify the host of
-/// them (`EntryNotice`): its target has a stored table.
-pub(super) fn notifies_selection(load: &ModelLoadPlan) -> bool {
-    load.weights().any(crate::WeightPlan::stored_in_slots)
-}
-
 /// The rows of each copy of the selection notice (`SelectionNotice`) a load
 /// whose steps read selected tokens of a stored table binds: the largest row
 /// class; none without a stored table.
 pub(super) fn notice_rows(load: &ModelLoadPlan, largest_rows: u64) -> Option<u64> {
-    notifies_selection(load).then_some(largest_rows)
+    load.notifies_selection().then_some(largest_rows)
 }
 
 /// What the selection notice of `rows` rows (`notice_rows`) holds, its
@@ -202,18 +209,10 @@ pub(super) fn notice_bytes(rows: Option<u64>) -> Result<u64, String> {
     })
 }
 
-/// Whether blocks of `load` read the step's token rows past the entry: its
-/// target has an n-gram input. Its steps of host tokens then keep them in
-/// the bound token rows.
-pub(super) fn keeps_token_rows(load: &ModelLoadPlan) -> bool {
-    load.weights()
-        .any(|weight| weight.role.kind == WeightKind::NGramTable)
-}
-
 /// The `[rows, 2]` I32 extents of the token rows a model that keeps them
 /// binds, over `rows` rows.
 pub(super) fn token_rows_extents(load: &ModelLoadPlan, rows: u64) -> Option<[u64; 2]> {
-    keeps_token_rows(load).then_some([rows, 2])
+    load.keeps_token_rows().then_some([rows, 2])
 }
 
 /// The view of the target's planned weight of `kind`.
@@ -230,28 +229,43 @@ pub(super) struct EntryGraphDraft<G> {
     hidden: WorkflowTensor,
     notice: Option<EntryNotice>,
     kept_tokens: Option<KeptTokens>,
+    kept_guesses: Option<KeptTokens>,
     landed: Option<LandedReadPorts>,
 }
 
-/// The entry graph: the step's token rows embedded. `notice` (of a model
-/// with a stored table) copies selected tokens for the host first. With
+/// The entry graph: the step's token rows embedded, `copy` the token row
+/// copy entry of a model that copies them
+/// (`ModelLoadPlan::copies_token_rows`). Where it
+/// `notifies` (a model with a stored table) it copies selected tokens for
+/// the host first. With
 /// `keeps_tokens` (a model whose blocks read the step's token rows) the
 /// host's uploaded tokens are copied into the bound token rows
-/// (`kept_tokens`), so later graphs read a device tensor of the step's token
-/// rows whatever their source, as they read a selection. Selected tokens of
-/// a table with landing slots are a landed read (`landed_read`, `landing`).
+/// (`keep_tokens`), so later graphs read a device tensor of the step's token
+/// rows whatever their source, as they read a selection. With
+/// `keeps_guesses` (a load that fronts, which keeps its token rows) the
+/// host's guesses of a step of its tokens are kept alike, for its step words.
+/// Selected tokens of a table with landing slots are a landed read
+/// (`landed_read`, `landing`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
     embedding: G::Binding<'a, embedding_rows::Entry>,
-    notice: Option<G::Binding<'a, selection_notice::Entry>>,
+    copy: Option<G::Binding<'a, selection_notice::Entry>>,
+    notifies: bool,
     landing: Option<LandingEntries<'a, G>>,
     keeps_tokens: bool,
+    keeps_guesses: bool,
     weight: &WeightView,
     width: EntryWidth<'_>,
     rows: &Dim,
     source: EntryTokens,
 ) -> Result<EntryGraphDraft<G>, GraphError> {
+    if copy.is_some() != (notifies || keeps_tokens) {
+        return Err("the token row copy entry is given exactly where token rows are copied".into());
+    }
+    if keeps_guesses && !keeps_tokens {
+        return Err("a load that fronts keeps its token rows".into());
+    }
     let table = graph.port(weight.resident, &weight.shape)?;
     let two = Dim::from(2);
     // Uploaded tokens are the host's: of a streamed table it writes their
@@ -270,11 +284,8 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     // Selected tokens reach the host first, as early in the step as they
     // can: the filler of a stored table learns from them the rows the step
     // names while the device runs the blocks before the table's gate.
-    // The token row copy entry (`selection_notice`), which the kept token
-    // rows use too.
-    let copy_entry = notice;
-    let notice = match (notice, source) {
-        (Some(entry), EntryTokens::Selected) => {
+    let notice = match (copy, notifies, source) {
+        (Some(entry), true, EntryTokens::Selected) => {
             let mut copied = graph.port_with_class_extent(Element::i32(), &[rows, &two], 0, "M")?;
             graph.enqueue::<selection_notice::Entry>(
                 entry,
@@ -291,26 +302,17 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
         }
         _ => None,
     };
-    // The host's tokens themselves (the embedding's uploaded rows are its
-    // table's indices, a streamed table's slots), copied into the bound
-    // token rows.
     let kept_tokens = match (keeps_tokens, source) {
         (true, EntryTokens::Uploaded) => {
-            let copy = copy_entry.ok_or("kept token rows need the token row copy entry")?;
-            let uploaded = graph.input_for(copy, "selection", &[("M", rows)])?;
-            let mut rows_port = graph.port_with_class_extent(Element::i32(), &[rows, &two], 0, "M")?;
-            graph.enqueue::<selection_notice::Entry>(
-                copy,
-                &[("M", rows)],
-                selection_notice::WorkflowArgs {
-                    selection: uploaded.tensor().into(),
-                    notice: rows_port.tensor_mut().into(),
-                },
-            )?;
-            Some(KeptTokens {
-                uploaded,
-                rows: rows_port,
-            })
+            let copy = copy.ok_or("kept token rows need the token row copy entry")?;
+            Some(keep_tokens(&mut graph, copy, rows)?)
+        }
+        _ => None,
+    };
+    let kept_guesses = match (keeps_guesses, source) {
+        (true, EntryTokens::Uploaded) => {
+            let copy = copy.ok_or("kept guesses need the token row copy entry")?;
+            Some(keep_tokens(&mut graph, copy, rows)?)
         }
         _ => None,
     };
@@ -356,8 +358,28 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
         hidden: result.r1,
         notice,
         kept_tokens,
+        kept_guesses,
         landed,
     })
+}
+
+/// The host's `[rows, 2]` rows of a step of `rows` rows (its tokens, the
+/// embedding's uploaded rows being its table's indices, a streamed table's
+/// slots; or its guesses), copied into the bound rows by `copy`.
+pub(super) fn keep_tokens<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    copy: G::Binding<'a, selection_notice::Entry>,
+    rows: &Dim,
+) -> Result<KeptTokens, GraphError> {
+    let uploaded = graph.input_for(copy, "selection", &[("M", rows)])?;
+    let mut copied = graph.port_with_class_extent(Element::i32(), &[rows, &Dim::from(2)], 0, "M")?;
+    let dimensions = [("M", rows)];
+    let args = selection_notice::WorkflowArgs {
+        selection: uploaded.tensor().into(),
+        notice: copied.tensor_mut().into(),
+    };
+    graph.enqueue::<selection_notice::Entry>(copy, &dimensions, args)?;
+    Ok(KeptTokens { uploaded, rows: copied })
 }
 
 /// What decides a target entry graph's topology: everything it is built
@@ -371,6 +393,7 @@ pub(super) struct EntryTopology {
     notifies: bool,
     landing: Option<CheckedLandingEntries>,
     keeps_tokens: bool,
+    fronts: bool,
     transform: (RealIndex, i32, RealIndex),
     table: WeightView<FactIndex>,
     rows: FactIndex,
@@ -393,9 +416,11 @@ fn record_entry(
     let draft = entry_graph_topology(
         NativeGraphMetadata::new_template(topology.backend),
         &elements,
-        topology.notifies.then_some(&[][..]),
+        (topology.notifies || topology.keeps_tokens).then_some(&[][..]),
+        topology.notifies,
         topology.landing.as_ref().map(CheckedLandingEntries::entries),
         topology.keeps_tokens,
+        topology.fronts,
         &weight,
         EntryWidth { hidden: &facts.dim(topology.hidden), transform: (facts.real(scale).f32(), normalize, facts.real(epsilon).f32()) },
         &facts.dim(topology.rows),
@@ -421,9 +446,10 @@ pub(super) fn certify_entry<L: Certified>(
         backend,
         source,
         activation: activation(geometry),
-        notifies: notifies_selection(load),
+        notifies: load.notifies_selection(),
         landing: CheckedLandingEntries::of(load, TARGET_TABLE)?,
-        keeps_tokens: keeps_token_rows(load),
+        keeps_tokens: load.keeps_token_rows(),
+        fronts: load.fronts(),
         transform: (facts.real(f64::from(scale)), normalize, facts.real(f64::from(epsilon))),
         table: facts.index(WeightView::planned(load, TARGET_TABLE)?),
         rows: facts.fact(largest_rows),
@@ -481,9 +507,11 @@ pub(crate) fn checked_entry_graph_storage(
     let draft = entry_graph_topology(
         NativeGraphMetadata::new(backend),
         &elements,
-        notifies_selection(load).then_some(&[][..]),
+        load.copies_token_rows().then_some(&[][..]),
+        load.notifies_selection(),
         landing.as_ref().map(CheckedLandingEntries::entries),
-        keeps_token_rows(load),
+        load.keeps_token_rows(),
+        load.fronts(),
         &weight,
         EntryWidth { hidden: &Dim::from(geometry.hidden), transform: transform_arguments(embedding_transform(geometry)) },
         &Dim::from(rows),

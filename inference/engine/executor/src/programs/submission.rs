@@ -42,17 +42,27 @@ impl<S> SubmittedTarget for ReadySubmission<crate::TargetLaunchCore, S, crate::T
 /// entry of a prompt chunk queued behind it follows its advances.
 pub trait SubmittedHead {
     fn launch(&self) -> &crate::HeadLaunchCore;
+    /// Its output, readable on the device while it executes: the step
+    /// queued behind a front launch reads its chain's rows
+    /// ([`crate::programs::FrontOutput`]).
+    fn output(&self) -> &crate::programs::HeadOutput;
 }
 
-impl<S, O> SubmittedHead for DeviceSubmission<crate::HeadLaunchCore, S, O> {
+impl<S> SubmittedHead for DeviceSubmission<crate::HeadLaunchCore, S, crate::programs::HeadOutput> {
     fn launch(&self) -> &crate::HeadLaunchCore {
         &self.launch
     }
+    fn output(&self) -> &crate::programs::HeadOutput {
+        &self.output
+    }
 }
 
-impl<S, O> SubmittedHead for ReadySubmission<crate::HeadLaunchCore, S, O> {
+impl<S> SubmittedHead for ReadySubmission<crate::HeadLaunchCore, S, crate::programs::HeadOutput> {
     fn launch(&self) -> &crate::HeadLaunchCore {
         &self.launch
+    }
+    fn output(&self) -> &crate::programs::HeadOutput {
+        &self.output
     }
 }
 

@@ -6,17 +6,19 @@
 #include "../core/arrive.cuh"
 #include "select.cuh"
 
-template <class Logit>
+// One row's selection by one warp (`select::rank_row`, its keys to `keys`).
+template <class Logit, class Keys = selection::NoKeys>
 __device__ __forceinline__ void select_row(unsigned long long row, Logit logit, const float *bias,
                                            const float *expert_scale, int *routes,
                                            const element::Out<element::F32> &weights,
-                                           const seismic_words_t &seismic_words_value) {
+                                           const seismic_words_t &seismic_words_value, Keys keys = Keys{}) {
     constexpr unsigned K = SEISMIC_DIM_K;
     const unsigned lane = threadIdx.x % 32;
     const select::Selected<K> selected = select::rank_row<static_cast<unsigned>(SEISMIC_DIM_E), K>(
         static_cast<int>(SEISMIC_PARAM_SCORE),
         [&](unsigned expert) { return logit(expert); },
-        [&](int expert) { return bias[static_cast<unsigned long long>(expert) * SEISMIC_BIAS_STRIDE_0]; }, lane);
+        [&](int expert) { return bias[static_cast<unsigned long long>(expert) * SEISMIC_BIAS_STRIDE_0]; }, lane,
+        keys);
     float denominator = 0.0f;
     for (unsigned slot = 0; slot < K; ++slot)
         denominator = seismic_add_rn(denominator, selected.chosen[slot]);

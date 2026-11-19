@@ -15,6 +15,82 @@ pub(super) struct HostTurn {
     requests: Vec<RequestId>,
 }
 
+/// The host's turns after verify passes (§7.1): a verify pass's verdict
+/// decides the next pass's tokens, so nothing is queued behind it, and from
+/// its completion to the next target launch of one of its requests (the
+/// host reconciling it, drafting the next guesses in a head transaction and
+/// preparing that launch) the device idles on the host. The mean of the
+/// turns over the bank-wide turnover's epoch window
+/// (`experts::Window<Turns>` rolling on `bank_epoch`) is the regime's `O`
+/// (`magnitude_cost_model::Regime::overhead`). A turn the owner idled in,
+/// or another launch ended first, is no verify pass's; a turn of a load
+/// with no expert bank prices no regime and is not timed.
+#[derive(Debug)]
+pub(super) struct VerifyTurns {
+    open: Option<(Instant, Vec<RequestId>)>,
+    latest: crate::experts::Window<Turns>,
+}
+
+impl Default for VerifyTurns {
+    fn default() -> Self {
+        Self { open: None, latest: crate::experts::Window::new(0) }
+    }
+}
+
+/// Timed turns' seconds and how many, counted per bank-wide epoch in a
+/// [`Window`](crate::experts::Window).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Turns {
+    seconds: f64,
+    turns: u64,
+}
+
+impl crate::experts::Tally for Turns {
+    fn is_empty(&self) -> bool {
+        self.turns == 0
+    }
+}
+
+impl VerifyTurns {
+    /// A verify pass of `requests` completed at `since`.
+    pub(super) fn begin(&mut self, since: Instant, requests: Vec<RequestId>) {
+        self.open = Some((since, requests));
+    }
+
+    /// A target launch of `requests` submitted at `started` ends the open
+    /// turn: timed where it carries one of the turn's requests, counted into
+    /// the bank-wide turnover's `epoch` (none without a bank).
+    pub(super) fn launched(&mut self, requests: &[RequestId], started: Instant, epoch: Option<u64>) {
+        let Some((since, turned)) = self.open.take() else {
+            return;
+        };
+        let Some(epoch) = epoch else {
+            return;
+        };
+        if requests.iter().any(|request| turned.contains(request)) {
+            let seconds = started.saturating_duration_since(since).as_secs_f64();
+            let tally = self.latest.count(epoch);
+            tally.seconds += seconds;
+            tally.turns += 1;
+        }
+    }
+
+    /// The open turn ends untimed: the owner idled, or the device ran
+    /// other work.
+    pub(super) fn interrupt(&mut self) {
+        self.open = None;
+    }
+
+    /// `O`: a turn's mean over the bank-wide epoch window at `epoch`; none
+    /// before one is timed there.
+    pub(super) fn mean(&self, epoch: u64) -> Option<f64> {
+        let (first, second) = self.latest.snapshot(epoch)?;
+        let seconds = first.seconds + second.map_or(0.0, |t| t.seconds);
+        let turns = first.turns + second.map_or(0, |t| t.turns);
+        (turns > 0).then(|| (seconds / turns as f64).max(0.))
+    }
+}
+
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// A finished flight of `requests` hands the host its turn.
     pub(super) fn begin_host_turn(&mut self, requests: impl IntoIterator<Item = RequestId>) {
@@ -49,9 +125,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// The owner has no work: time until its next launch is idle, not service.
+    /// The owner has no work: time until its next launch is idle, not
+    /// service, and no verify pass's turn.
     pub fn host_idle(&mut self) {
         self.host_turn = None;
+        self.verify_turns.interrupt();
     }
 }
 
@@ -103,6 +181,117 @@ pub(super) struct PrimingFlight<H> {
     pub(super) continuation: Option<Option<SequenceState>>,
 }
 
+/// A front head launch's parts secured before it launches, behind a target
+/// step whose forwards chain (`crate::two_row`): per slot of its step, in
+/// slot order, its request, its head advance `A` (one committed entry row,
+/// then a scratch row per front row of the slot) and its entry rows'
+/// selections; and its launch leases. A step launched first secures
+/// [`HeldFront`]; a step queued behind another, successors of its
+/// predecessor's head advances or of its drafter entry, which drop with it
+/// where nobody claims it, its launch never run.
+pub(super) struct FrontHead<A> {
+    pub(super) slots: Vec<SecuredFrontSlot<A>>,
+    pub(super) graph_workspace: NativeGraphWorkspaceLease,
+    pub(super) graph_output: NativeGraphOutputLease,
+}
+
+pub(super) struct SecuredFrontSlot<A> {
+    pub(super) request: RequestId,
+    pub(super) advance: A,
+    pub(super) selects: Vec<crate::SelectSpec>,
+}
+
+impl<A> FrontHead<A> {
+    /// The same launch, each slot's advance `advance`'s of it.
+    pub(super) fn map<B>(self, mut advance: impl FnMut(A) -> B) -> FrontHead<B> {
+        let Self { slots, graph_workspace, graph_output } = self;
+        FrontHead {
+            slots: slots
+                .into_iter()
+                .map(|slot| SecuredFrontSlot { request: slot.request, advance: advance(slot.advance), selects: slot.selects })
+                .collect(),
+            graph_workspace,
+            graph_output,
+        }
+    }
+}
+
+/// A front head launch's advances that join nothing as it finishes, each
+/// holding what its outcome commits: a launched step's, as its reservation
+/// secures them (`reserve_front`), or a claimed closing chunk's.
+pub(super) enum HeldFront {
+    /// A decode launch's: each slot's advance over its request's accepted
+    /// head state, taken out of the domain, which its outcome commits
+    /// (`FrontAdvance::Step`).
+    Accepted(FrontHead<OwnedStateAdvance>),
+    /// The prompt's closing chunk's: its advance following the chunk's
+    /// drafter entry, which its outcome joins once that commits
+    /// (`FrontAdvance::Entry`).
+    Entry(FrontHead<OwnedSuccessorAdvance>),
+}
+
+impl HeldFront {
+    /// Return what it secured, unlaunched, to `head`: an advance over a
+    /// request's accepted head state returns that state; one following a
+    /// drafter entry drops, its rows and bank with it.
+    pub(super) fn release(self, head: &mut BTreeMap<RequestId, SequenceState>) {
+        match self {
+            Self::Accepted(front) => {
+                for slot in front.slots {
+                    head.insert(slot.request, slot.advance.abort());
+                }
+            }
+            Self::Entry(front) => drop(front),
+        }
+    }
+}
+
+/// The front head launch behind a step just launched or claimed: it
+/// launches right behind the step, before the step queued behind it, once
+/// that step's rows are known (`ExecutorDomain::queue_successor`). Its
+/// advances' kind is paired with what they join as it finishes.
+pub(super) enum DueFront {
+    /// Its advances join nothing ([`HeldFront`]).
+    Held(HeldFront),
+    /// A claimed queued decode pass's: each slot's advance following its
+    /// predecessor's, and per slot the accepted head state that advance
+    /// attaches to as it finishes, none of a slot nobody claimed (its rows
+    /// are discarded).
+    Claimed(FrontHead<OwnedSuccessorAdvance>, Vec<Option<SequenceState>>),
+}
+
+impl DueFront {
+    /// Its slots, their advances as the head lane takes them, and its
+    /// leases; and what those advances join as it finishes.
+    pub(super) fn into_launch(self) -> (FrontHead<TentativeAdvance>, FrontJoins) {
+        match self {
+            Self::Held(HeldFront::Accepted(head)) => (head.map(TentativeAdvance::Accepted), FrontJoins::Accepted),
+            Self::Held(HeldFront::Entry(head)) => (head.map(TentativeAdvance::Successor), FrontJoins::Entry),
+            Self::Claimed(head, states) => (head.map(TentativeAdvance::Successor), FrontJoins::Claimed(states)),
+        }
+    }
+}
+
+/// What the head advances of a front head launch on the device join as it
+/// finishes (`finish_front`), by the kind of advance it launched
+/// ([`DueFront::into_launch`]).
+pub(super) enum FrontJoins {
+    /// Advances over accepted head states ([`HeldFront::Accepted`]).
+    Accepted,
+    /// The closing chunk's advance following its drafter entry
+    /// ([`HeldFront::Entry`]).
+    Entry,
+    /// A claimed decode pass's successor advances, and the states they
+    /// attach to ([`DueFront::Claimed`]).
+    Claimed(Vec<Option<SequenceState>>),
+}
+
+/// A front head launch on the device.
+pub(super) struct FrontFlight<H> {
+    pub(super) submission: H,
+    pub(super) joins: FrontJoins,
+}
+
 /// One submitted target step: a group's flight, or a step queued behind one
 /// (`queue`).
 pub(super) struct TargetWork<F: ProgramFamily> {
@@ -116,6 +305,10 @@ pub(super) struct TargetWork<F: ProgramFamily> {
     pub(super) submission: F::TargetSubmission,
     /// The drafter entry of the step's prompt chunk, when it primes one.
     pub(super) priming: Option<PrimingFlight<F::HeadSubmission>>,
+    /// The front head launch on the device behind the step, when its
+    /// forwards chain and it launched: a queued step's launches as it is
+    /// claimed (`QueuedStep`).
+    pub(super) front: Option<FrontFlight<F::HeadSubmission>>,
     /// Optional attribution for one prefill flight selected by diagnostics.
     pub(super) launch_trace: Option<seismic::SubmissionTrace>,
     pub(super) started: Instant,
@@ -132,6 +325,10 @@ pub(super) struct TargetWork<F: ProgramFamily> {
     /// For a claimed queued step, per slot, what its advance continues at
     /// finish. `None` for an ordinary step.
     pub(super) continuation: Option<Vec<Source>>,
+    /// Whether it runs a verify pass (`ExecutorDomain::verify_pass`): the
+    /// host's turn after it is a verify turn (`VerifyTurns`). A queued step
+    /// never is.
+    pub(super) verifies: bool,
 }
 
 /// What a claimed queued step's slot continues at finish.

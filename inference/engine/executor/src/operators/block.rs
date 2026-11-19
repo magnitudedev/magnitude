@@ -1235,7 +1235,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         constants: &mut Vec<GraphConstant>,
         split: Option<Split<'_>>,
         operand: Option<routed_graph::OperandOut<'_, G::Forms>>,
-    ) -> Result<(ResidualCarry<WorkflowTensor>, Option<NativePort>), GraphError> {
+    ) -> Result<(ResidualCarry<WorkflowTensor>, Option<crate::operators::routed::streamed::StepInputs>), GraphError> {
         let FeedForwardGraph { entries, bank } = feed_forward;
         let (planned, rows, scope) = (self.weights, &self.numbers.rows, self.scope(1));
         let epsilon = self.topology.epsilon.f32();

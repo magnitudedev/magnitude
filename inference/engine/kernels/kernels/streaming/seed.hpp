@@ -24,7 +24,7 @@ STREAMING_FN void streaming_seed_commit(STREAMING_SYSTEM_READ list, STREAMING_DE
         const u64 w = u64(u32(streaming_device_load(window)));
         const u64 rounds = u64(u32(SEISMIC_PARAM_ROUNDS));
         const u64 last = streaming_scratch_lane(
-            q, u64(SEISMIC_CONST_SCRATCH_ROUND) + w * rounds + rounds - 1 STREAMING_WORDS_ARG);
+            q, SEISMIC_CONST_ROUND_LANE(w * rounds + rounds - 1) STREAMING_WORDS_ARG);
         const bool answered = streaming_load_u64_acquire(STREAMING_AT(scratch,
                                   last + SEISMIC_CONST_SLOT_ANSWER * SEISMIC_SCRATCH_STRIDE_1))
             == q;
@@ -37,7 +37,7 @@ STREAMING_FN void streaming_seed_commit(STREAMING_SYSTEM_READ list, STREAMING_DE
     streaming_device_barrier();
     const int entries = STREAMING_GROUP(0);
     for (int entry = int(tid); entry < entries; entry += int(threads)) {
-        const u64 at = SEISMIC_CONST_LIST_ENTRIES + SEISMIC_CONST_LIST_ENTRY_WORDS * u64(entry);
+        const u64 at = SEISMIC_CONST_LIST_ENTRY(u64(entry));
         const int record = streaming_load(STREAMING_AT(list, (at + SEISMIC_CONST_LIST_TO) * stride));
         streaming_store(STREAMING_AT(commits, u64(record) * SEISMIC_COMMITS_STRIDE_0), sequence);
     }

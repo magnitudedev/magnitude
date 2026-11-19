@@ -12,10 +12,10 @@ mod imports;
 pub(crate) use imports::ImportPlan;
 mod programs;
 mod prices;
-pub use prices::{PlanPrices, PlanSteps};
-pub(crate) use prices::Prior;
+pub use prices::{PlanForms, PlanPrices, PlanSteps};
+pub(crate) use prices::prior;
 mod prompt_room;
-pub(crate) use prompt_room::{pass_ladder, routed_prompt_seconds};
+pub(crate) use prompt_room::pass_ladder;
 mod resources;
 mod weights;
 
@@ -26,14 +26,16 @@ pub use assessment::{
 };
 pub(crate) use assessment::fit_depth;
 pub(crate) use resources::{DomainRows, HeadHistoryGeometry};
+#[cfg(test)]
+pub use bank::BankLayers;
 pub use bank::{
-    BankAllocation, BankBinding, BankCounts, BankLayers, BankTable, BankLayout, BankPart, ConveyorCarrier,
+    BankAllocation, BankBinding, BankCounts, BankPaths, BankTable, BankLayout, BankPart, ConveyorCarrier,
     Lender,
     HintWeight, HINT_LEADS, PlacedAllocations, RegionWords,
     ExpertBankPlan, RecordTensor, RecordTensors, RoutedTensor, StagingPool, StoredPart, StoredStack,
     growth_target, BankSubstrate, BankTier, HostTier, LayerSite, Parking, Placer, PoolSlab,
 };
-pub(crate) use bank::{decode_set, layer_homes, releasing};
+pub(crate) use bank::{layer_homes, releasing};
 #[cfg(test)]
 pub(crate) use bank::routed_experts;
 pub use capabilities::{
@@ -146,7 +148,7 @@ pub(crate) mod tests {
                 fill,
             })
         };
-        let flights = super::weights::TableFlights { flights: crate::planning::fixtures::LIMITS.flights(), lanes: 1 };
+        let flights = super::weights::TableFlights { flights: crate::planning::fixtures::LIMITS.flights(), lanes: 1, fronts: false };
         table.holding = rows(super::weights::TableFill::Imported(flights));
         let ordinary = weight(
             WeightRole {

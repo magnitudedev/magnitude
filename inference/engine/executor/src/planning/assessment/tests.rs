@@ -329,9 +329,15 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         limits,
         geometry,
         method.draft_rows(),
+        load.fronts(),
     )
     .unwrap();
-    assert!(classes.iter().any(|class| class.steps == 1 && class.shaped));
+    assert!(classes.iter().any(|class| class.steps() == 1
+        && matches!(
+            class.launch,
+            crate::programs::native_head::HeadLaunchClass::Transaction { shaped: true, .. }
+                | crate::programs::native_head::HeadLaunchClass::Front { shaped: true, .. }
+        )));
     assert!(
         classes
             .iter()
@@ -437,6 +443,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
             limits,
             geometry,
             method.draft_rows(),
+            load.fronts(),
         )
         .unwrap();
         let family = crate::programs::native_head::checked_head_family_storage(
@@ -561,6 +568,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
             limits,
             geometry,
             method.draft_rows(),
+            load.fronts(),
         )
         .unwrap(),
     )
@@ -667,6 +675,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         limits,
         geometry,
         method.draft_rows(),
+        load.fronts(),
     )
     .unwrap();
     for backend in [BackendName::Cpu, BackendName::Cuda] {
@@ -1519,6 +1528,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
             residual_conditioning: None,
             target: Vec::new(),
             head: None,
+            own_history_head: false,
             vision: Some(weights),
             host_tables: Vec::new(),
             readout_candidates: Vec::new(),
@@ -1526,6 +1536,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
             unplaced_output: Vec::new(),
             bank: None,
             record_ports: None,
+            recorded_routes: false,
         };
         let program =
             crate::operators::vision::vision_program(&description, &|_| Ok(f32)).unwrap();
@@ -2476,6 +2487,7 @@ fn glm_mtp_heads_general_routed_graphs_certify_on_every_backend() {
             limits,
             geometry,
             method.draft_rows(),
+            load.fronts(),
         )
         .unwrap();
         let family = crate::programs::native_head::checked_head_family_storage(

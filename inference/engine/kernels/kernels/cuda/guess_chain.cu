@@ -1,0 +1,21 @@
+// guess_chain (guess.seismic): each chaining row's next guesses and each
+// continuing row's token row and kind, by one thread (two_row/guess.hpp).
+#include "lib/two_row/guess.cuh"
+
+extern "C" __global__ void guess_chain(SEISMIC_KERNEL_PARAMS) {
+    if (threadIdx.x != 0)
+        return;
+    guess_chain_rows(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS)), SEISMIC_TOKENS_STRIDE_0,
+        SEISMIC_TOKENS_STRIDE_1, reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_CHAINING)),
+        SEISMIC_CHAINING_STRIDE_0, SEISMIC_CHAINING_STRIDE_1,
+        reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED)), SEISMIC_SELECTED_STRIDE_0,
+        SEISMIC_SELECTED_STRIDE_1, reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DRAFTED)),
+        SEISMIC_DRAFTED_STRIDE_0, SEISMIC_DRAFTED_STRIDE_1,
+        reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_CONTINUING)), SEISMIC_CONTINUING_STRIDE_0,
+        SEISMIC_CONTINUING_STRIDE_1, reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_GUESSES)),
+        SEISMIC_GUESSES_STRIDE_0, SEISMIC_GUESSES_STRIDE_1,
+        reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_NEXT_SELECTED)), SEISMIC_NEXT_SELECTED_STRIDE_0,
+        SEISMIC_NEXT_SELECTED_STRIDE_1, reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_NEXT_GUESSES)),
+        SEISMIC_NEXT_GUESSES_STRIDE_0, SEISMIC_NEXT_GUESSES_STRIDE_1, static_cast<unsigned>(SEISMIC_DIM_S),
+        static_cast<unsigned>(SEISMIC_DIM_M), static_cast<unsigned>(SEISMIC_DIM_N));
+}

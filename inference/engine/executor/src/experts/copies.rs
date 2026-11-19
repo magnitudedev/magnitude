@@ -1,12 +1,14 @@
 //! The device's transfer queue (`seismic::Transfer`), the one owner of what
-//! queues on it: the bank's promotions from a host tier, every one drained
-//! by then in one batch, posted only while no batch runs. Nothing a step
-//! waits on queues here: every datum a device wait awaits is read by device
-//! work already in the graph behind it, so a batch held in the driver
-//! behind a parked step delays only a promotion. A scratch-served prompt
-//! group's begin waits, on the host before its steps exist, for a batch
-//! copying into the lent bank records (`watcher::lent`); none into them
-//! queues while it waits, so it waits on at most the batch running.
+//! queues on it: the bank's promotions from a host tier, each its own
+//! batch, posted in the order they are due while fewer than the queue's
+//! depth are in flight (`TierCopyCosts::depth`, measured on the device):
+//! the queue never idles between batches, and a copy a route waits for
+//! waits behind at most that depth, never behind every promotion asked.
+//! Nothing a step waits on queues here: every datum a device wait awaits is
+//! read by device work already in the graph behind it, so a batch held in
+//! the driver behind a parked step delays only a promotion. No promotion
+//! copies into a lent bank record (`BankRecords::usable`), so a prompt
+//! group's scratch, which a parked step waits on, never waits on a copy.
 //!
 //! An owner of serving posts a batch and never issues it: the queue's
 //! issuer, a thread of its own, issues each in order ([`Copies::start`]).
@@ -82,6 +84,14 @@ struct State {
     fault: Option<String>,
 }
 
+impl State {
+    /// The batches posted and not complete: waiting, being issued, or
+    /// running.
+    fn flight(&self) -> usize {
+        self.waiting.len() + usize::from(self.issuing.is_some()) + self.running.len()
+    }
+}
+
 impl Copies {
     pub fn new(transfer: Transfer, events: Arc<Events>) -> Self {
         Self { inner: Arc::new(Inner { transfer, events, state: Mutex::default() }) }
@@ -107,18 +117,19 @@ impl Copies {
         ticket
     }
 
-    /// Post the batch `form` forms, only while no batch is posted and not
-    /// complete, formed only
-    /// then: what `form` returned beside its runs, with its ticket; none
-    /// while one is (the caller offers it again once that one's completion
-    /// is announced). Why the queue faulted.
-    pub fn background<T>(&self, form: impl FnOnce() -> (Vec<Run>, T)) -> Result<Option<(T, u64)>, String> {
+    /// Post the batch `form` forms, only while fewer than `depth` batches
+    /// are posted and not complete, formed only then: what `form` returned
+    /// beside its runs, with its ticket; none while as many are (the caller
+    /// offers it again once one's completion is announced). Why the queue
+    /// faulted.
+    pub fn post_within<T>(&self, depth: usize, form: impl FnOnce() -> (Vec<Run>, T)) -> Result<Option<(T, u64)>, String> {
+        assert!(depth > 0, "a transfer queue keeps a batch in flight");
         {
             let state = self.state();
             if let Some(fault) = &state.fault {
                 return Err(fault.clone());
             }
-            if !state.waiting.is_empty() || !state.running.is_empty() {
+            if state.flight() >= depth {
                 return Ok(None);
             }
         }
@@ -126,11 +137,16 @@ impl Copies {
         Ok(Some((formed, self.post(runs))))
     }
 
+    /// The batches posted and not complete.
+    pub fn flight(&self) -> usize {
+        self.state().flight()
+    }
+
     /// Whether no batch is posted and not complete.
     pub fn idle(&self) -> bool {
-        let state = self.state();
-        state.waiting.is_empty() && state.running.is_empty() && state.issuing.is_none()
+        self.flight() == 0
     }
+
 
     /// The batches posted so far.
     #[cfg(test)]
@@ -266,7 +282,9 @@ impl Copies {
             };
             match self.inner.transfer.wait(value, BOUND) {
                 Ok(false) => continue,
-                Ok(true) => drop(self.state().running.pop_front()),
+                Ok(true) => {
+                    self.state().running.pop_front();
+                }
                 Err(error) => self.state().fault = Some(error.to_string()),
             }
             events.notify();

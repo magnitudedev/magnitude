@@ -70,8 +70,21 @@ pub trait ElasticBank {
 
     /// Each streamed layer's lines from now on, the GPU's priced, or none
     /// where the executor's costs do not price them: what the route's
-    /// policy words are written from (`ExpertLines::policy`).
-    fn price(&self, lines: Option<std::sync::Arc<[crate::assessment::ExpertLines]>>, pass: Option<crate::assessment::ExpertPass>);
+    /// policy words are written from (`ExpertLines::policy`); its routed
+    /// pass's price; and the load's launch prices, which its front gates
+    /// price their values by, none where nothing keeps the load's costs.
+    fn price(&self, lines: Option<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>, pass: Option<magnitude_cost_model::ExpertPass>, prices: Option<magnitude_cost_model::LaunchPrices>);
+    /// Request `request`'s pass of step `step`, which ran rows ahead, was
+    /// decided: its guessed rows fared as `verdict` says (none, where it
+    /// judged none), which its reads ahead follow (a wrong guess's rows'
+    /// reads that have not begun cancel).
+    fn decided(&self, step: crate::experts::Step, request: crate::operation::RequestId, verdict: &crate::AheadVerdict);
+    /// Request `request`'s pass of step `step`, which ran rows ahead, was
+    /// discarded (a queued pass orphaned, an outcome aborted): no verdict
+    /// will judge it, and the names it published are wanted by none.
+    fn discarded(&self, step: crate::experts::Step, request: crate::operation::RequestId);
+    /// Request `request` closed: nothing it named is wanted any more.
+    fn closed(&self, request: crate::operation::RequestId);
     /// A tier copy costs `costs` from now on: the blocks it takes, and
     /// the price a promotion's copy is weighed at.
     fn tier_copy(&self, costs: &crate::assessment::TierCopyCosts) -> Result<(), super::DomainError>;
@@ -90,7 +103,7 @@ pub trait ElasticBank {
     /// ends first, or that the load stops.
     fn wait_traffic_quiet(&self) -> Result<(), super::DomainError>;
     /// Each bank group's device convert takes its `lines` from now on.
-    fn device_convert(&self, lines: &[crate::assessment::RecordLine]);
+    fn device_convert(&self, lines: &[magnitude_cost_model::RecordLine]);
     /// The landings the device has converted.
     #[cfg(test)]
     fn device_landed(&self) -> u64;
@@ -133,7 +146,7 @@ pub trait ElasticBank {
     /// its misses stop falling on `price` (its ceiling before the load is
     /// priced). The domain derives their targets from its ledgers
     /// (`experts::derived::derive`).
-    fn targets(&self, price: Option<&crate::assessment::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, super::DomainError>;
+    fn targets(&self, price: Option<&magnitude_cost_model::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, super::DomainError>;
 
     /// The experts' slots a shrink releasing `bytes` reaches: the shallowest
     /// size that does, down to the floor; none at the floor. A test's way
@@ -143,11 +156,20 @@ pub trait ElasticBank {
 
     /// What the load's counted decode read and ran so far, which its decode
     /// is priced on; none before it counted a step.
-    fn live(&self) -> Option<crate::assessment::LiveDecode>;
+    fn live(&self) -> Option<magnitude_cost_model::LiveDecode>;
+
+    /// What the decode's passes measured, which the regime bit is decided
+    /// on (`TwoRowPricing::regime`); none before a pass is timed.
+    fn measured(&self) -> Option<crate::experts::Measured>;
+
+    /// The bank-wide turnover's current epoch (`experts::horizon::Times::bank_epoch`):
+    /// what the domain's own live rates (the host's turns after verify passes)
+    /// roll on.
+    fn bank_epoch(&self) -> u64;
 
     /// The bank's streamed layers, each priced by its `lines`, which its
     /// decode is priced on.
-    fn streamed_layers(&self, lines: std::sync::Arc<[crate::assessment::ExpertLines]>) -> crate::assessment::StreamedLayers;
+    fn streamed_layers(&self, lines: std::sync::Arc<[magnitude_cost_model::ExpertLines]>) -> magnitude_cost_model::StreamedLayers;
 
     /// Begin one growth of `holding` to `to`, its derived target
     /// (`ExecutorDomain::follow_cache_targets`), at a flight boundary, unless a
@@ -183,6 +205,12 @@ pub trait ElasticBank {
     /// the watcher. Steps begin and end on the owner's thread, so a gap it
     /// sees holds until it begins one.
     fn in_gap(&self) -> bool;
+
+    /// Whether the bank waits for a gap between flights: residency staged
+    /// policy words, written only where no step runs, at the next step's
+    /// begin (`Shared::stage_policy`). No step is queued behind another
+    /// meanwhile, so a pipeline of queued steps breaks for it.
+    fn wants_gap(&self) -> bool;
 
     /// Where the load's routed experts are now ([`ExpertResidency`]), each
     /// holding with its last finished resize ([`Self::record_resize`]).
@@ -589,6 +617,18 @@ impl NativeFamily {
     /// experts are held whole.
     pub fn experts_held(&self) -> Option<Vec<Vec<usize>>> {
         self.resident.bank.as_ref().map(|bank| bank.held())
+    }
+
+    /// Each expert group's lend and decode capacity; `None` of a load
+    /// whose experts are held whole.
+    pub fn expert_lend(&self) -> Option<Vec<crate::experts::GroupLend>> {
+        self.resident.bank.as_ref().map(|bank| bank.lend())
+    }
+
+    /// What a load recording its routes recorded since last taken; `None`
+    /// of a load that records none.
+    pub fn take_routes(&self) -> Option<crate::experts::RecordedRoutes> {
+        self.resident.bank.as_ref().and_then(|bank| bank.take_routes())
     }
 
     /// The family of `resident`, its bank's memory carved from what the

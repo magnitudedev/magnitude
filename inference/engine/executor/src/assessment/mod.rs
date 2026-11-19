@@ -28,7 +28,6 @@ pub(crate) mod fixtures;
 pub mod launches;
 #[cfg(feature = "machine-line")]
 pub mod line;
-pub mod miss_model;
 pub mod misses;
 #[cfg(test)]
 mod parity;
@@ -36,7 +35,6 @@ mod parity;
 mod target_outlines;
 pub mod priced;
 pub mod requests;
-pub mod step;
 pub mod streamed;
 pub mod streaming;
 pub mod streaming_costs;
@@ -46,42 +44,35 @@ mod vision_traces;
 pub mod synthetic;
 
 pub use assess::{
-    assess_execution_fit, decode_demand, decode_pricing, decode_step, estimate_execution, execution_memory_charge, StructuralCharge,
+    assess_execution_fit, decode_demand, estimate_execution, launch_prices, lookahead, execution_memory_charge, StructuralCharge,
     prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit, ExecutionAssessment,
     ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, MemoryBreakdown, ModelPlacement, PreparedExecutionAssessment, Residency,
 };
-pub use demand::{Bytes, Call, DecodeDemand, Experts, Flops, HistoryRead, Work};
-pub use estimate::{
-    estimate_decode, form_seconds, performance_depths, step_seconds, CallSeconds, ExpertPass, PerformanceEstimate, Pricing,
-    StepSeconds,
-};
+pub use demand::{format_of, layout_of, Call, DecodeDemand};
+pub use estimate::{estimate_decode, expert_pass, performance_depths, PerformanceEstimate};
 pub use executor_costs::{
-    ChainCost, CostWalk, Derived, ExecutorCosts, ExecutorCostsError, FormatRates, Held, HistoryCosts, HistoryLine,
-    MatrixCosts, MeasuredCost, Measurement, OperandStorage, Placement, Placements, Required, RouteCosts, StoredCosts,
+    ChainCost, CostWalk, Derived, ExecutorCosts, ExecutorCostsError, FormatRates, Held, HistoryCosts,
+    MatrixCosts, MeasuredCost, Measurement, Placement, Placements, Required, RouteCosts, StoredCosts,
     WeightRate, HISTORY_LAYOUTS, MEASUREMENT_SECONDS,
 };
 pub use launches::{Declarations, Kernel, Launches, Words};
 #[cfg(feature = "machine-line")]
 pub use line::{Line, MachineLine, MachineLineError, Operand, Peak, Rate, Rows, Stream, Sweep};
-pub use cost::{
-    BankLines, CpuLines, CpuLinesError, StoredCpuSite, ExpertLines, Exposed, GpuLines, Hits, HostLines, HostLinesError, LandingLine, LineError, Miss, Nanoseconds, Pass,
-    PassLine, RowCost, RowLine, Sample, ServedMisses, Site, SiteLines,
-};
+pub use cost::{copy_hits, copy_nanoseconds, expert_lines, host_lines, BankLines, Beside, HostLinesError, StoredCpuSite, POLICY_LAYOUT};
 pub use priced::Priced;
 pub(crate) use streaming_costs::CpuForm;
 #[cfg(feature = "machine-line")]
 pub use requests::line_outstanding;
 pub use requests::{Outstanding, PointRequest, PointRequests, SiteRequest, Waiter};
-pub use step::{LayerLoad, Lead, ReadAhead, StepInputs, StepTime};
-pub use streamed::{DecodePrice, FormSeconds, LayerReads, LiveDecode, StreamedError, StreamedFigures, StreamedLayers};
-pub use misses::{Anticipated, HeldSlots, HintCounts, LayerStep, StreamedStep, TableCurve, TableRange};
+pub use streamed::{streamed_layers, StreamedError, StreamedFigures};
+pub use misses::{Anticipated, HintCounts, LayerStep, TableCurve, TableRange};
 pub use streaming::{
     GroupLayerTerms, GroupUnion, Notice, Stages,
 };
 pub use streaming_costs::{
-    CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, RecordLine,
+    CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError,
     CONVERTED_RECORDS,
-    CpuCosts, GraphMemory, ReadLine, ReadLineError, RequestReads, StorageCosts, StorageError, TierCopyCosts, TierCopyError, TierCopyPoint, StoredVolume, VolumeCosts,
+    CpuCosts, GraphMemory, RequestReads, StorageCosts, StorageError, TierCopyCosts, TierCopyError, TierCopyPoint, StoredVolume, VolumeCosts,
 };
 
 use crate::GraphError;
@@ -137,3 +128,11 @@ impl From<crate::PlanError> for AssessmentError {
 }
 
 impl std::error::Error for AssessmentError {}
+
+/// A price's refusal as a demand failure, its reason as the cost model
+/// states it.
+impl From<seismic::measure::pricing::PriceError> for AssessmentError {
+    fn from(error: seismic::measure::pricing::PriceError) -> Self {
+        Self::Demand(error.to_string())
+    }
+}

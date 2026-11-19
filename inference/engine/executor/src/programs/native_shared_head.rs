@@ -17,7 +17,7 @@
 //! the head keeps none.
 
 use super::native_draft::widen;
-use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
+use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelected, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::block::{
     BlockLane, BlockState, BlockSublayers, CheckedFeedForwardEntries, CheckedMixerEntries,
@@ -1571,7 +1571,7 @@ impl NativeSharedHeadProgram {
         Ok((
             completion,
             HeadOutput {
-                selections: Some(selections),
+                selected: HeadSelected::Proposals(selections),
                 landed_reads,
             },
         ))

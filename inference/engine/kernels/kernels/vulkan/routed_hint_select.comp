@@ -66,11 +66,14 @@ void routed_hint_select_publish() {
         int winners[SELECT_K];
         select_rank_at(plane, bias_ptr, bias_s0, score_fn, row, chosen, winners);
         if (live && SEISMIC_LANE == 0u)
-            for (uint r = 0u; r < SELECT_K; ++r)
+            for (uint r = 0u; r < SELECT_K; ++r) {
                 seismic_shared_i32[uint(STREAMING_HINT_CHOSEN(uint(row))) + r] = winners[SELECT_K - 1u - r];
+                seismic_shared_i32[uint(STREAMING_HINT_WEIGHT(uint(SEISMIC_DIM_M), uint(row))) + r] =
+                    floatBitsToInt(chosen[SELECT_K - 1u - r]);
+            }
     }
     streaming_hint(uint(SEISMIC_DIM_M), SEISMIC_PTR(SEISMIC_BUFFER_RINGS) + uint64_t(lead) * SEISMIC_RINGS_STRIDE_0 * 4ul,
         SEISMIC_RINGS_STRIDE_1,
-        streaming_device_load(SEISMIC_PTR(SEISMIC_BUFFER_STEP) + SEISMIC_CONST_STEP_LOW * SEISMIC_STEP_STRIDE_0 * 4ul),
+        SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0,
         0u, SEISMIC_THREAD, gl_WorkGroupSize.x);
 }

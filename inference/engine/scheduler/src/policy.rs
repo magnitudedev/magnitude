@@ -91,12 +91,14 @@ impl Selection {
     pub fn contended(&self) -> bool {
         self.contended
     }
-    /// Capacity preparation may drop trailing members without changing phase.
-    pub fn truncate(&mut self, count: usize) -> Result<(), String> {
-        if count == 0 || count > self.requests.len() {
-            return Err("invalid prepared batch size".into());
+    /// Preparation keeps `kept`, members in selection order, without
+    /// changing phase: those it drops wait uncharged.
+    pub fn retain(&mut self, kept: &[RequestId]) -> Result<(), String> {
+        let mut members = self.requests.iter();
+        if kept.is_empty() || !kept.iter().all(|id| members.any(|member| member == id)) {
+            return Err("invalid prepared batch".into());
         }
-        self.requests.truncate(count);
+        self.requests = kept.to_vec();
         Ok(())
     }
 }

@@ -45,6 +45,7 @@ fn domain() -> (Box<ExecutorDomain>, StateBindings, usize, usize, usize) {
             exported_logits_rows: 64,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(8192),
         service: ServiceLimits {
@@ -105,6 +106,8 @@ fn forward(
         select: Vec::new(),
         committed: count,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     };
     let operations = [operation];
     let ReservedResources::Target(reservation) = domain
@@ -119,7 +122,7 @@ fn forward(
         .unwrap_or_else(|failure| panic!("{}", failure.error()));
     let (mut pending, bindings) = domain.finish_target(flight).unwrap();
     let pending = pending.pop().unwrap();
-    let Outcome::Forward { rows } = pending.outcome().clone() else {
+    let Outcome::Forward { rows, .. } = pending.outcome().clone() else {
         panic!("a forward returns rows")
     };
     let result = logits.then(|| {
@@ -137,9 +140,7 @@ fn forward(
     domain
         .reconcile(
             pending,
-            PhysicalDecision {
-                accepted_rows: count,
-            },
+            PhysicalDecision::rows(count),
         )
         .unwrap();
     (result, bindings)

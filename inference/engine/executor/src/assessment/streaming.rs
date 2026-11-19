@@ -3,9 +3,7 @@
 //! experts are in the GPU's memory, is priced by the one cost function
 //! ([`ExpertLines::staged`], [`super::cost`]), as decode is.
 
-use super::cost::{ExpertLines, Miss};
-use super::estimate::ExpertPass;
-use super::streaming_costs::ReadLine;
+use magnitude_cost_model::{ExpertLines, ExpertPass, Miss, ReadLine};
 
 /// One streamed layer of a prompt group, as [`Stages`] takes it: the
 /// compute of one of the group's steps there, measured on the run, and the
@@ -212,13 +210,15 @@ mod tests {
     /// of 2.76 ms. Nothing cold, the group merges.
     #[test]
     fn a_lone_first_back_is_taken_only_where_it_saves_more_than_its_pass() {
-        let bf16 = seismic::Element::bf16();
+        let (costs, bf16) = (crate::assessment::fixtures::costs(), crate::assessment::format_of(seismic::Element::bf16()));
         let pass = ExpertPass::new(
-            crate::assessment::fixtures::costs(),
+            costs.rates(&[bf16], &[]),
             vec![(
-                vec![crate::assessment::Bytes { format: bf16, bytes: 3_000_000 }],
-                vec![crate::assessment::Flops { format: bf16, flops: 1 }],
+                magnitude_cost_model::RoutedKind(0),
+                vec![seismic::measure::pricing::Bytes { format: bf16, bytes: 3_000_000 }],
+                vec![seismic::measure::pricing::Flops { format: bf16, flops: 1 }],
             ); 2],
+            costs.host_reads(),
         );
         let union = GroupUnion::new(4, 4, (0..64).map(|expert| (expert, 2)).collect());
         let unions = [&union, &union];

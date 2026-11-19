@@ -7,7 +7,7 @@
 use super::*;
 use magnitude_kernels::SlotTable;
 use seismic::{BackendName, Devices, Element, Tensor};
-use crate::assessment::ReadLine;
+use magnitude_cost_model::ReadLine;
 use crate::watched::VolumeBound;
 use seismic_io::{EngineWork, Flight, Volume};
 use std::collections::HashMap;
@@ -130,7 +130,7 @@ fn an_unanswered_lane_of_each_kind_trips_with_its_report() {
     for (kind, table, lane) in [
         (Kind::File, SlotTable::file(4, 2), 0),
         (Kind::Site, SlotTable::site(2, 4), 0),
-        (Kind::Scratch, SlotTable::scratch(4, 3), constants::SCRATCH_ROUND + 1),
+        (Kind::Scratch, SlotTable::scratch(4, 3), constants::ROUND_LANE(1)),
     ] {
         let slots = slots(table);
         // Step 6 requests the lane and is never answered; step 5's request

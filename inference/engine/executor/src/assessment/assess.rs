@@ -7,10 +7,12 @@
 //! measured kernel costs).
 
 use super::demand::DecodeDemand;
-use super::estimate::{estimate_decode, form_seconds, launch_seconds, performance_depths, PerformanceEstimate, Pricing};
+use super::estimate::{estimate_decode, performance_depths, PerformanceEstimate};
+use magnitude_cost_model::{LaunchPrices, TargetCensus};
+use seismic::measure::pricing::Pricing;
 use super::executor_costs::ExecutorCosts;
 use super::launches::Declarations;
-use super::misses::HeldSlots;
+use magnitude_cost_model::HeldSlots;
 use super::AssessmentError;
 use crate::platform::{DomainRole, ReleaseRate};
 use crate::{
@@ -328,11 +330,14 @@ impl PreparedExecutionAssessment {
         &self.primary().draft
     }
 
-    /// The plan's decode step at `depth` over `sequences` sequences in each
-    /// form ([`form_seconds`]): its experts held whole, and as the plan holds
-    /// them.
-    pub fn form_seconds(&self, pricing: &Pricing<'_>, sequences: u64, depth: u32) -> Result<super::FormSeconds, AssessmentError> {
-        form_seconds(self.whole.as_ref().unwrap_or(&self.demand), &self.demand, pricing, sequences, depth)
+    /// The plan's censuses as they pair ([`TargetCensus::of`]): of a plan
+    /// banking its experts, its census holding them whole beside its own;
+    /// of one holding them whole, its own.
+    pub fn censuses(&self) -> TargetCensus {
+        match &self.whole {
+            Some(whole) => TargetCensus::of(whole.census(), Some(self.demand.census())),
+            None => TargetCensus::of(self.demand.census(), None),
+        }
     }
 
     /// The charge of the primary plan at `definition`'s context, its
@@ -742,43 +747,30 @@ pub fn assess_execution_fit(
     }
 }
 
-/// A banked plan's launch of some rows at some depth in each form
-/// ([`crate::DecodeStep`]): `resident`'s demand, the plan holding its
-/// experts whole, and `banked`'s, the plan as it banks them, whose streamed
-/// layers decode in their streamed form ([`decode_demand`]), each on
-/// `costs` under `resident`'s lookahead, which the two share; a decode step
-/// within the decode row classes, a prefill launch beyond
-/// ([`launch_seconds`]). Each launch is priced once: the step is a function
-/// of its rows and depth alone, so a launch priced again reads what it
-/// priced the first time.
-pub fn decode_step(
+/// The prices of every launch of a load of `definition` planned as
+/// `planned`, `resident` its plan holding its experts whole
+/// ([`LaunchPrices`]): each plan's decode census ([`decode_demand`]), on
+/// `costs`' figures under `resident`'s lookahead, which the two share; at
+/// the point `planned` runs, its bank's slots where it banks its experts,
+/// up to `definition`'s context. No drafter is censused.
+pub fn launch_prices(
     definition: &ModelDefinition,
     resident: &ExecutionPlanDraft,
-    banked: &ExecutionPlanDraft,
-    costs: ExecutorCosts,
-) -> Result<Box<crate::DecodeStep>, AssessmentError> {
-    let (whole, streamed) = (decode_demand(definition, resident)?, decode_demand(definition, banked)?);
-    let lookahead = decode_pricing(resident, &costs).lookahead;
-    let priced = std::cell::RefCell::new(std::collections::HashMap::new());
-    Ok(Box::new(move |rows, depth| {
-        if let Some(&seconds) = priced.borrow().get(&(rows, depth)) {
-            return Ok(seconds);
-        }
-        let pricing = Pricing { costs: &costs, lookahead };
-        let launch = |demand| launch_seconds(demand, &pricing, u64::from(rows), depth).map(|launch| launch.total());
-        let seconds = super::FormSeconds { resident: launch(&whole)?, streamed: launch(&streamed)? };
-        priced.borrow_mut().insert((rows, depth), seconds);
-        Ok(seconds)
-    }))
+    planned: &ExecutionPlanDraft,
+    costs: &ExecutorCosts,
+) -> Result<LaunchPrices, AssessmentError> {
+    let streamed = match planned.load().expert_bank() {
+        Some(_) => Some(decode_demand(definition, planned)?.census()),
+        None => None,
+    };
+    let target = TargetCensus::of(decode_demand(definition, resident)?.census(), streamed);
+    let figures = costs.figures(&target.censuses());
+    Ok(LaunchPrices::new(target, figures, lookahead(resident)))
 }
 
-/// What the draft's decode is priced with on `costs`: its resolved
-/// lookahead policy.
-pub fn decode_pricing<'a>(draft: &ExecutionPlanDraft, costs: &'a ExecutorCosts) -> Pricing<'a> {
-    Pricing {
-        costs,
-        lookahead: draft.policy().limits().flights().pipelines(),
-    }
+/// Whether the draft's decode runs with lookahead: its resolved policy's.
+pub fn lookahead(draft: &ExecutionPlanDraft) -> bool {
+    draft.policy().limits().flights().pipelines()
 }
 
 /// One prepared model's decode speed at each requested depth, from the
@@ -788,9 +780,11 @@ pub fn estimate_execution(
     costs: &ExecutorCosts,
     request: &AssessmentRequest,
 ) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
+    let census = prepared.demand.census();
+    let figures = costs.figures(&[&census]);
     estimate_decode(
-        &prepared.demand,
-        &decode_pricing(prepared.draft(), costs),
+        &census,
+        &Pricing { figures: &figures, lookahead: lookahead(prepared.draft()) },
         u64::from(request.sequences),
         &performance_depths(request.context_limit, &request.performance_depths),
     )

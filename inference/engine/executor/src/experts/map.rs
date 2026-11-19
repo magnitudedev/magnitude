@@ -28,7 +28,8 @@
 //! access, so no reader assembles a step the host never held.
 
 use super::Words;
-use super::watcher::{Step, Steps, Unbegun};
+use super::directory::Point;
+use super::watcher::{MapStep, Step, Steps, Unbegun, UnmapStep};
 use magnitude_kernels::constants::{MAP_FROM, MAP_RECORD, MAP_UNTIL, MAP_WORDS};
 
 /// UNTIL while mapped: every step.
@@ -125,25 +126,44 @@ impl StampedMap {
     }
 
     /// Map `expert` to `record` for every step from `from` on.
-    pub fn map(&self, expert: usize, record: usize, from: Step) {
+    pub fn map(&self, expert: usize, record: usize, from: MapStep) {
+        self.store_map(expert, record, from.step());
+    }
+
+    /// Store `expert`'s entry naming `record` from step `from` on: RECORD,
+    /// FROM, then UNTIL all ones.
+    fn store_map(&self, expert: usize, record: usize, from: Step) {
         let record = i32::try_from(record).expect("bank records fit i32");
         self.store(expert, MAP_RECORD, record);
         self.store_step(expert, MAP_FROM, from);
         self.store_step(expert, MAP_UNTIL, ALWAYS);
     }
 
+    /// Map `expert` to `record`, which holds it whole, from `from` on, or
+    /// from its entry's FROM where its entry covers an earlier step: a step
+    /// its old mapping covers may yet resolve the layer (a prompt step whose
+    /// hit the host planned at its request reads no scratch slot), and it
+    /// reads the expert in its new record, as does a step between the old
+    /// UNTIL and `from` that resolves the layer after this. The entry's
+    /// FROM, which its release reads, so covers every step that may read
+    /// the record.
+    pub fn map_covering(&self, expert: usize, record: usize, from: MapStep) {
+        let (covered, until, from) = (self.view.from(expert), self.view.until(expert), from.step());
+        self.store_map(expert, record, if covered < until { from.min(covered) } else { from });
+    }
+
     /// Unmap `expert` for every step from `until` on.
-    pub fn unmap(&self, expert: usize, until: Step) {
-        self.store_step(expert, MAP_UNTIL, until);
+    pub fn unmap(&self, expert: usize, until: UnmapStep) {
+        self.store_step(expert, MAP_UNTIL, until.step());
     }
 
     /// Unmap `expert` from `until` on where its entry names `record` for a
     /// later step: an unmapping only ever ends an entry earlier, and never
     /// one that names another record (its expert mapped since, whose old
     /// record no resolution after that store names).
-    pub fn unmap_record(&self, expert: usize, record: usize, until: Step) {
+    pub fn unmap_record(&self, expert: usize, record: usize, until: UnmapStep) {
         let names = usize::try_from(self.view.load(expert, MAP_RECORD)).is_ok_and(|named| named == record);
-        if names && until < self.view.load_step(expert, MAP_UNTIL) {
+        if names && until.step() < self.view.load_step(expert, MAP_UNTIL) {
             self.unmap(expert, until);
         }
     }
@@ -176,43 +196,56 @@ impl LandingMap {
         match self {
             Self::Tier(tier) => tier.store(expert, record.map_or(-1, |record| record as i32)),
             Self::Bank { map, .. } => {
-                let at = at.expect("a stamped map is stored from the first step not yet begun").next();
+                let at = at.expect("a stamped map is stored from the first step not yet begun");
                 match record {
-                    Some(record) => map.map(expert, record as usize, at),
-                    None => map.unmap(expert, at),
+                    Some(record) => map.map(expert, record as usize, at.into()),
+                    None => map.unmap(expert, at.into()),
                 }
             }
         }
     }
 
-    /// Map `expert` to `record`, its bytes whole, from step `from` on where
-    /// given, the first step of the parked step's group or a later one
-    /// whose resolution of the map's layer the device has not reached
-    /// (`Park::unresolved`, a parked step's landing's), so a step begun that
-    /// has yet to resolve the layer hits it; else from the first step not
-    /// yet begun. A plain word, for every resolution from now.
-    pub fn map_from(&self, expert: usize, record: u32, from: Option<Step>) {
+    /// Map `expert` to `record`, its bytes whole, from the first step that
+    /// has yet to resolve the map's layer, `layer`, the device known at
+    /// `reached` (`Unresolved::from`, under the lock every step begins
+    /// under), so a step begun that reaches the layer after it hits it. A
+    /// plain word, for every resolution from now.
+    pub fn map_reached(&self, expert: usize, record: u32, reached: Point, layer: usize) {
         match self {
             Self::Tier(tier) => tier.store(expert, record as i32),
-            Self::Bank { map, steps } => {
-                steps.unbegun(|at| map.map(expert, record as usize, from.map_or(at.next(), |from| from.min(at.next()))))
-            }
+            Self::Bank { map, steps } => steps.unresolved(reached, |unresolved| map.map(expert, record as usize, unresolved.from(layer).into())),
         }
     }
 
-    /// Unmap `expert` from its record `record`, the device parked: from
-    /// step `from` on, the first step whose resolution of the map's layer
-    /// the device has not reached (`Park::unresolved`), or from the
-    /// first step not yet begun where that is earlier, where the entry still
-    /// names `record` ([`StampedMap::unmap_record`], under the lock a
-    /// landing's mapping takes too: a graced record's expert may have been
-    /// mapped anew since). A plain word, for every resolution from now: it
-    /// is unmapped only from a kept record, which it names (an unmapping of
-    /// it is read by every later resolution, so a grace needs no restamp).
-    pub fn unmap_from(&self, expert: usize, record: u32, from: Step) {
+    /// Map `expert` to `record`, its bytes whole, from step `from` on (a
+    /// park's, the first step of the parked step's group or a later one
+    /// whose resolution of the map's layer the device has not reached,
+    /// `Park::unresolved`, so a step begun that has yet to resolve the
+    /// layer hits it; or the step an entry taken back was mapped from), or
+    /// from the first step not yet begun where that is earlier. A plain
+    /// word, for every resolution from now.
+    pub fn map_from(&self, expert: usize, record: u32, from: MapStep) {
+        match self {
+            Self::Tier(tier) => tier.store(expert, record as i32),
+            Self::Bank { map, steps } => steps.unbegun(|at| map.map(expert, record as usize, from.min(at.into()))),
+        }
+    }
+
+    /// Unmap `expert` from its record `record` from step `from` on where
+    /// given (a park's, the first step whose resolution of the map's layer
+    /// the device has not reached, `Park::unresolved`, so the record is
+    /// free at once; or a prompt group's first, which runs after every step
+    /// before it), or from the first step not yet begun where that is
+    /// earlier or none is given, where the entry still names `record`
+    /// ([`StampedMap::unmap_record`], under the lock a landing's mapping
+    /// takes too: a graced record's expert may have been mapped anew
+    /// since). A plain word, for every resolution from now: it is unmapped
+    /// only from a kept record, which it names (an unmapping of it is read
+    /// by every later resolution, so a grace needs no restamp).
+    pub fn unmap_from(&self, expert: usize, record: u32, from: Option<UnmapStep>) {
         match self {
             Self::Tier(tier) => tier.store(expert, -1),
-            Self::Bank { map, steps } => steps.unbegun(|at| map.unmap_record(expert, record as usize, from.min(at.next()))),
+            Self::Bank { map, steps } => steps.unbegun(|at| map.unmap_record(expert, record as usize, from.map_or(at.into(), |from| from.min(at.into())))),
         }
     }
 }
@@ -235,10 +268,10 @@ mod tests {
         let map = map(3);
         let view = map.view().clone();
         assert_eq!((0..3).map(|expert| view.held(expert)).collect::<Vec<_>>(), [None; 3]);
-        map.map(1, 5, (1 << 33) + 2);
+        map.map(1, 5, MapStep::at((1 << 33) + 2));
         assert_eq!(view.held(1), Some(5));
         assert_eq!(view.load_step(1, MAP_FROM), (1 << 33) + 2);
-        map.unmap(1, (1 << 33) + 9);
+        map.unmap(1, UnmapStep::at((1 << 33) + 9));
         assert_eq!(view.held(1), None);
         assert_eq!(view.load_step(1, MAP_UNTIL), (1 << 33) + 9);
         assert_eq!(view.load(1, MAP_RECORD), 5, "an unmap leaves the record and FROM");

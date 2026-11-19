@@ -116,7 +116,7 @@ fn a_device_banks_shrink_lands_beside_its_running_chain() {
     let map = &harness.layer.0;
     let before = (0..4).map(|expert| map.held(expert)).collect::<Vec<_>>();
     let running = harness.prompt_step();
-    let chain = (running.sequence(), running.sequence());
+    let chain = running.scratch_group().expect("the running chain is scratch-served");
     let evicted = shared
         .shrink(Evicting::Bank, Candidates::one(2, vec![2]), Some(chain))
         .unwrap()
@@ -174,12 +174,17 @@ fn a_groups_places_are_served_from_the_words_handed_over_between_flights() {
     let steps = begin(&shared, &[StepRoute::Grouped; 2], false).unwrap();
     let record = steps[0].group_reads().unwrap();
     harness.reads[1].store((record * 2 + 1) * EXPERTS + 6, 1);
-    let last = steps[1].sequence();
     for step in steps {
         step.complete().unwrap();
     }
-    let read = shared.telemetry.last_read();
-    assert_eq!(read(1, 6), Some(last), "the group's reads, read from the new words");
+    assert!(shared.telemetry.group_union(1), "the group's reads, read from the new words");
+    let state = residency::lock(&harness.watcher.state);
+    let reuse = state.core.directory.reuse_now();
+    assert!(
+        reuse.rank(1, 6, crate::experts::horizon::Tier::Compute, crate::experts::horizon::Reader::Move, None)
+            > reuse.rank(1, 0, crate::experts::horizon::Tier::Compute, crate::experts::horizon::Reader::Move, None),
+        "expert 6 ranked above unrouted experts from the handed-over group_reads words"
+    );
 }
 
 /// A host tier's shrink keeps the records a prompt group the device is past
@@ -239,8 +244,8 @@ fn a_host_shrink_asked_with_a_landing_in_flight_answers_at_once() {
     let before = served();
     let step = harness.step();
     assert!(harness.ask_at(&step, 0, &[5]));
-    eventually("the request was never served", || served() > before);
     eventually("the demand never took a record", || !unevictable(&harness).is_empty());
+    eventually("the request was never served", || served() > before);
     harness.layer.1.answer(step.sequence(), 0, true);
     drop(step);
     let landing = match unevictable(&harness)[..] {
@@ -256,14 +261,13 @@ fn a_host_shrink_asked_with_a_landing_in_flight_answers_at_once() {
     assert!(!evicted.records[0].contains(&landing), "the landing's record is kept");
     assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), 1);
     ahead.finish();
-    eventually("the landing never retired", || unevictable(&harness).is_empty());
-    for kind in 0..3 {
-        assert_eq!(
-            harness.tiered(kind, landing as i32),
-            (100 * kind + 5) as u8,
-            "expert 5 landed in the record kept for it"
-        );
-    }
+    // At 1 record (< reserve 4), `refill_tier` immediately unmaps the landed
+    // record back into the ready reserve once residency settles its landing:
+    // its bytes are whole in `landing` and `landing` leaves flight.
+    eventually("the landing never ended in the record kept for it", || {
+        residency::lock(&harness.watcher.state).core.directory.host_evictions(0, 0) == [landing]
+            && (0..3).all(|kind| harness.tiered(kind, landing as i32) == (100 * kind + 5) as u8)
+    });
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
 }
 
@@ -338,7 +342,9 @@ fn a_growth_covering_the_tier_joins_at_once_and_starts_its_reads() {
 #[test]
 fn a_host_shrink_on_an_idle_load_answers_beside_a_landing_its_step_passed() {
     let _alone = alone();
-    let harness = layered("shrink-idle", EXPERTS, 4, 1, 4);
+    // 7 tier records with reserve 3: 3 incumbents plus the landing leave 3 ready
+    // records (== reserve), so `refill_tier` does not evict the landed record.
+    let harness = lending("shrink-idle", EXPERTS, 4, 1, 3, DECODE, 7, Placer::Tier, false);
     for expert in 0..3 {
         harness.request(&[expert]).complete().unwrap();
     }
@@ -432,11 +438,12 @@ fn an_eviction_beside_a_running_group_drops_all_it_has_not_decided() {
     let earlier = before.sequence();
     drop(before);
     let steps = harness.group(&[StepRoute::Grouped; 2]);
-    let (first, last) = (steps[0].sequence(), steps[1].sequence());
+    let chain = steps[0].scratch_group().expect("the group is scratch-served");
+    let (first, last) = (chain.first(), chain.last());
     // Step 0 routes `routed` at layer 0, a hit its pass reads in place.
     assert!(harness.scratch(&steps[0], 0, &[routed]).concat().is_empty(), "a hit is read in place");
     let candidates = Candidates { shallowest: 15, deepest: CUT, records: Box::new(|slots| vec![slots]) };
-    let evicted = shared.shrink(Evicting::Landed, candidates, Some((first, last))).unwrap().expect("the eviction keeps every record in flight");
+    let evicted = shared.shrink(Evicting::Landed, candidates, Some(chain)).unwrap().expect("the eviction keeps every record in flight");
     assert_eq!((evicted.slots, evicted.decided), (CUT, Some(0)), "the deepest candidate, its hits decided at layer 0");
     let mut records = evicted.records[0].clone();
     records.sort();
@@ -465,7 +472,7 @@ fn an_eviction_beside_a_running_group_drops_all_it_has_not_decided() {
     let chain = harness.group(&[StepRoute::Grouped; 2]);
     let later = begin(&shared, &[StepRoute::Decode], false).unwrap();
     let candidates = Candidates { shallowest: CUT, deepest: CUT, records: Box::new(|slots| vec![slots]) };
-    let evicted = shared.shrink(Evicting::Landed, candidates, Some((chain[0].sequence(), chain[1].sequence()))).unwrap();
+    let evicted = shared.shrink(Evicting::Landed, candidates, chain[0].scratch_group()).unwrap();
     assert!(evicted.is_none(), "a group began after the chain");
     assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), CUT as u32);
     drop((later, chain));
@@ -500,4 +507,38 @@ fn a_cut_of_a_whole_banks_reserve_alone_ends_its_resident_form() {
     }
     eventually("a layer stayed resident beside evicted records", || (0..2).all(|layer| whole(layer) == 0));
     assert_eq!(shared.life.ended(), None, "the watcher serves on");
+}
+
+/// Admission is decided once at the claim (design §3.7, §6): a landing
+/// whose step has ended before its read arrives still lands into the
+/// record it claimed and stays kept there without being tested again,
+/// even when its expert ranks below the tier's incumbents.
+#[test]
+fn a_landing_keeps_its_claimed_record() {
+    let _alone = alone();
+    // 7 tier records with reserve 3: 3 incumbents plus the landing leave 3 ready
+    // records (== reserve), so `refill_tier` does not evict the landed record.
+    let harness = lending("landing-keeps", EXPERTS, 4, 1, 3, DECODE, 7, Placer::Tier, false);
+    for _ in 0..5 {
+        for expert in 0..3 {
+            harness.request(&[expert]).complete().unwrap();
+        }
+    }
+    harness.tier_ready();
+    let ahead = Ahead::held("landing-keeps-ahead");
+    let served = || harness.watcher.shared().costs().layers[0].unanticipated;
+    let before = served();
+    let step = harness.step();
+    assert!(harness.ask_at(&step, 0, &[5]));
+    eventually("the demand never took a record", || !unevictable(&harness).is_empty());
+    eventually("the request was never served", || served() > before);
+    // The step gives up and ends while the read is still held; once it
+    // arrives, it lands into its claimed record (3) without re-testing.
+    harness.layer.1.answer(step.sequence(), 0, true);
+    drop(step);
+    ahead.finish();
+    eventually("the landing never kept its claimed record", || harness.in_tier(0, 5) == Some(3));
+    eventually("the landing past its request was left in flight", || unevictable(&harness).is_empty());
+    assert!((0..3).all(|expert| harness.in_tier(0, expert).is_some()), "incumbents stay kept");
+    assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
 }

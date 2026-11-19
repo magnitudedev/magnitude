@@ -11,7 +11,7 @@ use magnitude_artifacts::{
     gguf::{Encoding, TensorDescriptor},
 };
 use magnitude_family_contracts::{
-    ActivationDType, BlockElement, BlockScale, HeadComponent, ImportTransform, ModelDefinition,
+    ActivationDType, BlockElement, BlockScale, HeadComponent, HeadHistory, ImportTransform, ModelDefinition,
     ProgressiveCodeDepth, ProgressivePlane, RowRounding, ScaleCodes, ScaledActivations, VisionDescription,
     WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
@@ -109,6 +109,10 @@ pub struct StreamedRows {
 pub struct TableFlights {
     pub flights: super::FlightDepth,
     pub lanes: usize,
+    /// Whether the load fronts (`ModelLoadPlan::fronts`): its closing prompt
+    /// chunk runs its front head launch beside its drafter entry, one
+    /// launch beyond the lanes' own.
+    pub fronts: bool,
 }
 
 impl TableFlights {
@@ -121,7 +125,7 @@ impl TableFlights {
     /// The stagings a held class of `places` places has in flight
     /// ([`super::FlightDepth::capacity`]).
     pub fn stagings(self, places: usize) -> usize {
-        self.flights.capacity(places, self.lanes, Self::BRINGS)
+        self.flights.capacity(places, self.lanes, Self::BRINGS) + usize::from(self.fronts) * Self::BRINGS
     }
 }
 
@@ -1650,6 +1654,10 @@ pub struct ModelLoadPlan {
     pub(super) residual_conditioning: Option<u64>,
     pub(super) target: Vec<WeightPlan>,
     pub(super) head: Option<Vec<WeightPlan>>,
+    /// Whether the selected drafter is a draft head that keeps its own
+    /// history (`HeadHistory::Own`): an embedded head a front pass's chain
+    /// runs on (`Self::fronts`).
+    pub(super) own_history_head: bool,
     pub(super) vision: Option<Vec<WeightPlan>>,
     /// The target's host-resident gathered tables.
     pub(super) host_tables: Vec<HostTablePlan>,
@@ -1671,6 +1679,10 @@ pub struct ModelLoadPlan {
     /// (`WeightPlan::record_table_entries`); none of a load no native
     /// entry imports.
     pub(super) record_ports: Option<seismic::BackendName>,
+    /// Whether the load traces its routes: any expert bank it streams
+    /// through records them (`ExpertBankPlan::recording`), whatever bank a
+    /// plan builds of it.
+    pub(super) recorded_routes: bool,
 }
 
 /// Whether a readout scope's weights are planned with the head component's.
@@ -2017,6 +2029,7 @@ impl ModelLoadPlan {
             &self.host_tables,
             &self.readout_choices,
             self.bank.as_ref(),
+            self.copies_token_rows(),
             history,
         )
     }
@@ -2111,7 +2124,7 @@ impl ModelLoadPlan {
         // target's, and a drafter head's, whose embedding may be the
         // target's.
         let reads = TableReads {
-            flights: TableFlights { flights: limits.flights(), lanes: 1 + usize::from(selection.head) },
+            flights: TableFlights { flights: limits.flights(), lanes: 1 + usize::from(selection.head), fronts: false },
             selected_rows: selected_read_rows(definition, method, limits)?,
         };
         let target_component = ArtifactComponent {
@@ -2284,6 +2297,8 @@ impl ModelLoadPlan {
                 .map(|head| head.conditioning_width(&definition.decoder)),
             target,
             head,
+            own_history_head: selection.head
+                && definition.head.as_ref().is_some_and(|head| head.history == HeadHistory::Own),
             vision,
             host_tables,
             readout_candidates: Vec::new(),
@@ -2291,6 +2306,7 @@ impl ModelLoadPlan {
             unplaced_output: Vec::new(),
             bank: None,
             record_ports: None,
+            recorded_routes: false,
         })
     }
 
@@ -2595,6 +2611,55 @@ impl ModelLoadPlan {
             .iter()
             .chain(self.head.iter().flatten())
             .chain(self.vision.iter().flatten())
+    }
+
+    /// Whether its steps that read selected tokens notify the host of them
+    /// (`EntryNotice`): it has a stored table, whose filler learns from them
+    /// the rows a step names.
+    pub(crate) fn notifies_selection(&self) -> bool {
+        self.weights().any(WeightPlan::stored_in_slots)
+    }
+
+    /// Whether its steps of host tokens keep them in the bound token rows,
+    /// so a graph past the entry reads the step's token rows as a device
+    /// tensor whatever their source: an n-gram input's, or the chain's
+    /// (`Self::fronts`), whose head launch behind each pass reads the pass's
+    /// token rows (`guess_chain`).
+    pub(crate) fn keeps_token_rows(&self) -> bool {
+        self.weights().any(|weight| weight.role.kind == WeightKind::NGramTable) || self.fronts()
+    }
+
+    /// Whether its decode passes run front rows (two-row decode,
+    /// `crate::TwoRowDecode`): a load whose experts stream (a front row
+    /// names the experts of the pass a guess will be exact in) and whose
+    /// drafter is an embedded head of its own history, whose launch behind
+    /// each pass makes the next pass's chain (`guess_chain`). A host-token
+    /// step's front rows run on the host's guesses, whose kinds its step
+    /// words read (`routed_step`).
+    pub(crate) fn fronts(&self) -> bool {
+        self.bank.is_some() && self.own_history_head
+    }
+
+    /// The plan with each streamed table's stagings counting the front head
+    /// launch where it fronts (`TableFlights::fronts`): what attaching or
+    /// removing the expert bank decides.
+    pub(super) fn with_front_stagings(mut self) -> Self {
+        let fronts = self.fronts();
+        let weights = self.target.iter_mut().chain(self.head.iter_mut().flatten()).chain(self.vision.iter_mut().flatten());
+        for weight in weights {
+            if let Holding::Streamed(StreamedRows { fill: TableFill::Imported(flights), .. }) = &mut weight.holding {
+                flights.fronts = fronts;
+            }
+        }
+        self
+    }
+
+    /// Whether its steps' entries hold the token row copy
+    /// (`selection_notice`): it notifies selections
+    /// ([`Self::notifies_selection`]) or keeps host token rows
+    /// ([`Self::keeps_token_rows`]).
+    pub(crate) fn copies_token_rows(&self) -> bool {
+        self.notifies_selection() || self.keeps_token_rows()
     }
 }
 
@@ -3882,7 +3947,7 @@ mod stored_table_tests {
         push_gathered_table(&mut load.target, &inventory, component,
             WeightRole { scope: WeightScope::Target, kind: WeightKind::Embedding }, &descriptor,
             ResidentForm { activation: DType::F16, layout: Layout::Rows16 }, false, TableReads {
-                flights: TableFlights { flights: limits.flights(), lanes: 1 },
+                flights: TableFlights { flights: limits.flights(), lanes: 1, fronts: false },
                 selected_rows: selected_read_rows(&definition, super::super::PlannedMethod::Plain, limits).unwrap(),
             }).unwrap();
         let load = load.with_record_ports(BackendName::Vulkan);

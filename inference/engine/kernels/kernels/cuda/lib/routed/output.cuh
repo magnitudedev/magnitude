@@ -25,10 +25,14 @@ constexpr bool SHARED_NVFP4 = projection::OperandRecipe<packets::W1_OPERANDS_NVF
     (SHARED_NVFP4 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_DOWN_OPERANDS) : SEISMIC_PTR(SEISMIC_BUFFER_SHARED_PRODUCT))
 #define SHARED_STRIDE_0 (SHARED_NVFP4 ? SEISMIC_DIM_S : SEISMIC_SHARED_PRODUCT_STRIDE_0)
 
-#define DOWN_WEIGHTS(m, k, expert)                                                                                 \
-    (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)}                 \
-         .matrix(routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), ROUTED_SOURCE_ROWS,                    \
-                                       SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, (m), (k), (expert))))
+// Where choice (m, k) of `expert` reads its down weights: a bank record, or
+// its tier record in place. In the kernel's own scope, where its ports are.
+#define DOWN_SOURCE(m, k, expert)                                                                          \
+    routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1, \
+                          SEISMIC_SOURCES_STRIDE_2, (m), (k), (expert))
+#define DOWN_WEIGHTS(m, k, expert)                                                                         \
+    (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)}         \
+         .matrix(DOWN_SOURCE(m, k, expert)))
 
 struct PublishEpi {
     element::Out<activation::Act> published;
@@ -113,14 +117,15 @@ struct GatheredPublishEpi {
     const element::Out<activation::Act> published = ROUTED_PUBLISHED_OUT;                                             \
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                         \
     const unsigned choice = (unsigned)(m * K + slot);                                                              \
-    const bool projects = slot < K                                                                                 \
-        ? routed::first_choice(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, (unsigned)K, choice)      \
-        : m == 0;                                                                                                  \
+    const auto record = [&](unsigned c) {                                                                          \
+        const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, (unsigned)K, c);    \
+        return routed::ChoiceKey{ex, DOWN_SOURCE(c / (unsigned)K, c % (unsigned)K, ex).code, true};                \
+    };                                                                                                             \
+    const bool projects = slot < K ? routed::first_choice(record, choice) : m == 0;                                \
     if (projects && threadIdx.x == 0) {                                                                            \
         if (slot < K) {                                                                                            \
             projection::u32 chosen[SEISMIC_CONST_VERIFY_ROWS];                                                     \
-            count = routed::expert_choices(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, (unsigned)M, \
-                                           (unsigned)K, choice, chosen);                                           \
+            count = routed::record_choices(record, (unsigned)(M * K), choice, chosen);                             \
             for (unsigned r = 0; r < count; ++r) {                                                                 \
                 const projection::u64 row = chosen[r] / K, choice_slot = chosen[r] % K;                            \
                 rows_at[r] = row * EXPERT_STRIDE_0 + choice_slot * EXPERT_STRIDE_1;                                \
@@ -148,7 +153,7 @@ struct GatheredPublishEpi {
                 const routed::GatheredRows rows{EXPERT_ROWS, rows_at};                                             \
                 projection::gemv_segment_ready<Shape>(                                                             \
                     shared, projection::after_dependency(rows), count, SEISMIC_DIM_F / 64, group, H,               \
-                    PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{}, epi);                       \
+                    PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{}, epi);                                 \
             }                                                                                                      \
         } else {                                                                                                   \
             const routed::GatheredRows rows{SHARED_ROWS, rows_at};                                                 \

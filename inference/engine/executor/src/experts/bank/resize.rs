@@ -13,7 +13,7 @@
 use super::ExpertBank;
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, RunningBegun, RunningPressure, Trip};
 use crate::experts::source::Records;
-use crate::experts::watcher::{BankRecordViews, Candidates, Evicted, Evicting, Join};
+use crate::experts::watcher::{BankRecordViews, Candidates, Evicted, Evicting, Join, ScratchGroup};
 use crate::memory::ledger::Changes;
 use crate::planning::{BankTier, Placer};
 use crate::storage_thread::{Done, StorageThread};
@@ -781,8 +781,8 @@ impl ExpertBank {
         self.commitment().resizing()
     }
 
-    /// At a submission boundary of the scratch-served chain whose steps run
-    /// from `first` through `last`, every pass of its blocks through
+    /// At a submission boundary of the scratch-served chain, prompt group
+    /// `chain`'s steps, every pass of its blocks through
     /// `submitted` submitted (none where no block's is), the bank's release
     /// beside it, on every placement:
     /// - no resize running, where `pressure` finds the bank's storage short,
@@ -798,7 +798,7 @@ impl ExpertBank {
     ///
     /// The block whose passes' submission the release awaits, where one
     /// does.
-    pub(crate) fn release_running(&self, (first, last): (u64, u64), submitted: Option<usize>, pressure: &dyn Fn() -> Option<RunningPressure>) -> Option<usize> {
+    pub(crate) fn release_running(&self, chain: ScratchGroup, submitted: Option<usize>, pressure: &dyn Fn() -> Option<RunningPressure>) -> Option<usize> {
         let started = Instant::now();
         // Memory is read outside the commitment's lock.
         let short = {
@@ -809,7 +809,7 @@ impl ExpertBank {
         let mut commitment = self.commitment();
         if commitment.releasing.is_none() {
             let short = short.filter(|_| !commitment.resizing())?;
-            if let Err(reason) = self.evict_beside(&mut commitment, (first, last), short, started) {
+            if let Err(reason) = self.evict_beside(&mut commitment, chain, short, started) {
                 commitment.resize = Resize::Broken(reason);
                 return None;
             }
@@ -817,7 +817,7 @@ impl ExpertBank {
         let releasing = commitment.releasing.as_ref()?;
         // Due once every pass of the decided block is submitted, or at once
         // beside a later chain, whose steps resolve none of them.
-        let awaits = (releasing.last == last).then_some(releasing.after).flatten().filter(|&block| submitted.is_none_or(|through| through < block));
+        let awaits = (releasing.last == chain.last()).then_some(releasing.after).flatten().filter(|&block| submitted.is_none_or(|through| through < block));
         if awaits.is_some() {
             return awaits;
         }
@@ -829,8 +829,8 @@ impl ExpertBank {
         None
     }
 
-    /// Ask the watcher to evict the bank's records beside the running chain
-    /// whose steps run from `first` through `last`, its storage `short` as
+    /// Ask the watcher to evict the bank's records beside the running chain,
+    /// prompt group `chain`'s steps, its storage `short` as
     /// read at `started`: from the nearest slots that release storage
     /// toward those releasing what it is short of. Where it evicted, the
     /// commitment's slots follow at once (no step from then on resolves an
@@ -838,7 +838,7 @@ impl ExpertBank {
     /// ([`Self::take_running_begun`]), and the records wait for their
     /// release; where none releases storage or the watcher evicted nothing,
     /// nothing changes. Why the records broke, where they did.
-    fn evict_beside(&self, commitment: &mut Commitment, (first, last): (u64, u64), short: RunningPressure, started: Instant) -> Result<(), String> {
+    fn evict_beside(&self, commitment: &mut Commitment, chain: ScratchGroup, short: RunningPressure, started: Instant) -> Result<(), String> {
         let RunningPressure { bytes } = short;
         let (from, floor) = (commitment.slots.load(Ordering::Acquire), self.counts.floor());
         let decided = Instant::now();
@@ -849,7 +849,7 @@ impl ExpertBank {
         };
         let candidates = self.candidates(BankTier::Bank, (shallowest, deepest)).map_err(|error| format!("a shrink beside a running chain: {error}"))?;
         let charged = self.charged();
-        let Some(Evicted { slots, records, decided: layer, trip }) = self.watcher.shared().shrink(self.evicting(BankTier::Bank), candidates, Some((first, last)))? else {
+        let Some(Evicted { slots, records, decided: layer, trip }) = self.watcher.shared().shrink(self.evicting(BankTier::Bank), candidates, Some(chain))? else {
             return Ok(());
         };
         tracing::info!(from, shallowest, deepest, short = bytes, "the expert bank is shrunk beside a running chain");
@@ -858,7 +858,7 @@ impl ExpertBank {
         assert!(commitment.running.replace(RunningBegun { decided, held: started.elapsed() }).is_none(), "a running shrink's beginning is taken before the next begins");
         let after = layer.map(|layer| self.plan.layers()[layer].sublayer().block as usize);
         let begun = Begun { decided, queued: Duration::ZERO, planned: trip.picked + trip.served, trip };
-        commitment.releasing = Some(Releasing { from, to, charged, evicted: records, last, after, begun });
+        commitment.releasing = Some(Releasing { from, to, charged, evicted: records, last: chain.last(), after, begun });
         Ok(())
     }
 

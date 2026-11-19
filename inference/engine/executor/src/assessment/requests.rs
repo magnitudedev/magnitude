@@ -17,7 +17,7 @@
 //!   lines at its reference form ([`PointRequest::CpuSite`]) where a bank can
 //!   have a host tier, which a streamed load's bank is priced by, then the
 //!   rest of the walk. They are measured first, whatever a load asks: their
-//!   samples share [`MEASUREMENT_SECONDS`] of sampling among them alone
+//!   samples share [`MEASUREMENT_SECONDS`](super::executor_costs::MEASUREMENT_SECONDS) of sampling among them alone
 //!   ([`JobDeadlines`]), so no load moves them later or earlier, and
 //!   a point of them the job's time does not reach is left unrecorded for
 //!   the next job, never priced: what is recorded of a figure never follows
@@ -36,14 +36,14 @@
 //!   requests alone.
 //! - **The job** ([`measure`]) measures the outstanding requests in that
 //!   order: assessment's standing points, each sampling for its part of
-//!   what is left of [`MEASUREMENT_SECONDS`] beside the fewest passes
+//!   what is left of [`MEASUREMENT_SECONDS`](super::executor_costs::MEASUREMENT_SECONDS) beside the fewest passes
 //!   forecast of those after it; then the loads', each sampling for an
 //!   equal part of what is left of the job's time. It begins points until
 //!   its time ends, each begun timed to its end, and the next job resumes
 //!   the rest from the records stored. No load measures, and no load waits
 //!   on the job.
 
-use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, Visit, Walks, Whose, MEASUREMENT_SECONDS};
+use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, Visit, Walks, Whose};
 use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, StorageCosts, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
 use super::Priced;
 use crate::native::SiteForm;
@@ -290,7 +290,7 @@ fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn 
 /// CPU site's lines at its reference form where a bank can have a host tier
 /// (a discrete device); then the rest of the walk, whose figures are priced
 /// closer without it. Each is of the machine alone, so what is measured is
-/// fixed per backend, and their samples share [`MEASUREMENT_SECONDS`] of
+/// fixed per backend, and their samples share [`MEASUREMENT_SECONDS`](super::executor_costs::MEASUREMENT_SECONDS) of
 /// sampling ([`JobDeadlines`]).
 pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) -> Result<Vec<PointRequest>, String> {
     let tiered = !topology.shared_ranges_lie_in_device_memory(executor);
@@ -475,7 +475,7 @@ impl Outstanding {
 /// begins ([`Self::ends`]): a point begun is formed (its kernels' compiles,
 /// however long, kept as they end) and timed to its end, and one not begun
 /// is left unrecorded for the next job. The standing points' samples share
-/// [`MEASUREMENT_SECONDS`] of sampling, which nothing but sampling takes.
+/// [`MEASUREMENT_SECONDS`](super::executor_costs::MEASUREMENT_SECONDS) of sampling, which nothing but sampling takes.
 /// So a busy host stretches each sample, and fewer points begin in a job
 /// and fewer samples are read of each, but no point begun expires, none is
 /// priced for want of time, and what is recorded of one never follows from
@@ -556,6 +556,7 @@ pub fn measure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::executor_costs::MEASUREMENT_SECONDS;
 
     /// The host's CPU executor, its topology and identity: one every host
     /// derives kernel identities of.

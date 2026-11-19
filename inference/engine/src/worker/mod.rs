@@ -371,7 +371,7 @@ fn load(
         };
         let model = manifest.model.clone();
         let method = model
-            .factory(&manifest.package.identity.to_string())
+            .factory(&manifest.package.identity.to_string(), built.domain.fronts())
             .map_err(internal)?;
         if built.domain.execution_path() != manifest.path {
             return Err(

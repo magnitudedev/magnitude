@@ -24,8 +24,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         .map_err(|(_, error)| SubmitFailure::Failed(DomainError::Invariant(error)))?;
         let started = Instant::now();
         let epoch = self.launch_epoch();
-        // An encoder launch is no round's: the host turn before it ends.
+        // An encoder launch is no round's: the host turn before it ends,
+        // and the device runs it in a verify pass's turn.
         self.host_turn = None;
+        self.verify_turns.interrupt();
         let submission = self
             .family
             .submit_vision(launch)
@@ -133,12 +135,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             outcome: Outcome::Encode { features },
             advance: None,
             primed: None,
+            front: None,
             rows: 0,
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: duration,
             timed,
             image: Some(image),
+            awaited: None,
         };
         Ok((pending, bindings))
     }

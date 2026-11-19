@@ -1323,7 +1323,7 @@ fn every_served_head_outlines_its_graphs_from_traces(backend: BackendName) {
             panic!("{line}: a selected causal head plans no head program or state");
         };
         let geometry = head_state.head_geometry().unwrap_or_else(|error| panic!("{line}: {error}"));
-        let classes = head_graph_classes(LIMITS, geometry, HEAD_METHOD.draft_rows())
+        let classes = head_graph_classes(LIMITS, geometry, HEAD_METHOD.draft_rows(), load.fronts())
         .unwrap_or_else(|error| panic!("{line}: its head classes: {error}"));
         let binding = head_program.blocks()[0];
         let outlined = tally.outline(head_traces_recorded, || {

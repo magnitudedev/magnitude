@@ -23,6 +23,10 @@ pub struct TargetHostTiming {
     pub finish: Duration,
 }
 
+/// A finished front head launch (`ExecutorDomain::finish_front`): the guess
+/// its chain holds per entry row, and per slot its head advance.
+type FinishedFront = (Vec<Option<Guess>>, Vec<Option<FrontAdvance>>);
+
 impl<F: ProgramFamily> ExecutorDomain<F> {
     pub(super) fn trace_target_submission(
         &self,
@@ -77,6 +81,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
+    /// Whether `operation` is a verify pass (§7.1, `crate::BuiltForm::Verify`):
+    /// rows verified past its exact row, or, on a load that fronts, a
+    /// selecting decode pass demanding features and entering no head behind it
+    /// (`chain` none), as only a verify pass does, however few rows its chain
+    /// left it. A plain decode step (demanding only `SELECT`) is never a
+    /// verify pass, so its lookahead pipeline stays unbroken.
+    pub(super) fn verify_pass(&self, operation: &Operation) -> bool {
+        match operation {
+            Operation::Forward { kind: WorkKind::Verify, .. } => true,
+            Operation::Forward { kind: WorkKind::Decode, demand, select, prime: None, chain: None, .. } => {
+                self.fronts() && !select.is_empty() && demand.contains(crate::batching::Demand::FEATURES)
+            }
+            _ => false,
+        }
+    }
+
     /// Submit one target group with state advances already reserved, or
     /// claim the queued step it equals. The steps that run behind it
     /// (`behind`) queue in the domain (`queue`); the flight holds the
@@ -87,11 +107,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         operations: &[Operation],
         reservation: TargetGraphReservation,
     ) -> Result<TargetFlight<F>, SubmitFailure> {
-        let work = match reservation {
+        let (mut work, front) = match reservation {
             TargetGraphReservation::Claim(slots) => self.claim_queued(operations, slots),
             TargetGraphReservation::Launch(reservation) => {
                 match self.launch_target(operations, reservation) {
-                    Ok(work) => work,
+                    Ok(launched) => launched,
                     Err(failure) => return Err(failure.with(bindings)),
                 }
             }
@@ -102,15 +122,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if let Err(error) = self.feed_tokens(operations) {
             panic!("invariant violated: a reserved group's tokens do not follow its input: {error}");
         }
-        self.queue_successor(&work, operations)
-            .map_err(SubmitFailure::Failed)?;
+        // A verify pass verifies its round whatever rows its chain left it:
+        // no decode queues behind it (`queue::continuations`).
+        let verifying = operations.iter().filter(|operation| self.verify_pass(operation)).map(Operation::request).collect::<Vec<_>>();
+        self.verifying.extend(verifying);
+        let queued = self.queue_successor(&mut work, front, operations);
         // This launch was the round's verification: the next round's
         // drafter, if it proposes, marks its request again, as the next
         // round's method does a request whose round after prepares.
         for operation in operations {
-            self.proposed.remove(&operation.request());
+            self.verifying.remove(&operation.request());
             self.publishing.remove(&operation.request());
         }
+        queued.map_err(SubmitFailure::Failed)?;
         Ok(TargetFlight { work, bindings })
     }
 
@@ -128,15 +152,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Launch the group's target step as the first of a chain: alone, or with
     /// the rest of the chain it opens (`behind`), queued behind it. Then each
-    /// primed chunk's drafter entry behind its own step. A refused chain
-    /// restores the step's accepted states and drafter entry.
+    /// primed chunk's drafter entry behind its own step; the front head
+    /// launch behind chained forwards is due, to launch once what queues
+    /// behind the step is known (`queue_successor`). A refused chain
+    /// restores the step's accepted states, drafter entry and head states.
     fn launch_target(
         &mut self,
         operations: &[Operation],
         mut reservation: TargetLaunchReservation,
-    ) -> Result<TargetWork<F>, Unsubmitted> {
+    ) -> Result<(TargetWork<F>, Option<DueFront>), Unsubmitted> {
         let priming = reservation.priming.take();
-        let abort = |domain: &mut Self, priming: Option<PrimingReservation>| {
+        let front = reservation.front.take();
+        // The front head advances first: the closing chunk's follows its
+        // drafter entry's.
+        let abort = |domain: &mut Self, priming: Option<PrimingReservation>, front: Option<HeldFront>| {
+            if let Some(front) = front {
+                front.release(&mut domain.head);
+            }
             if let (Some(priming), [operation]) = (priming, operations) {
                 domain
                     .head
@@ -146,7 +178,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let (first, requests, spare) = match self.build_target_launch(operations, reservation) {
             Ok(built) => built,
             Err(failure) => {
-                abort(self, priming);
+                abort(self, priming, front);
                 return Err(failure);
             }
         };
@@ -162,7 +194,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let (core, _) = first.into_submission_parts();
                 let (_, advances, _, _) = core.into_parts();
                 self.restore_advances(requests, advances);
-                abort(self, priming);
+                abort(self, priming, front);
                 return Err(Unsubmitted::Failed(error));
             }
         };
@@ -195,16 +227,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let (core, _) = chain.split_first().0.into_submission_parts();
                 let (_, advances, _, _) = core.into_parts();
                 self.restore_advances(requests, advances);
-                abort(self, priming);
+                abort(self, priming, front);
                 return Err(Unsubmitted::Failed(error.into()));
             }
         };
         let flight_requests = requests.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
+        let bank_epoch = self.family.expert_bank().map(|bank| bank.bank_epoch());
+        self.verify_turns.launched(&flight_requests, started, bank_epoch);
         let work = TargetWork {
             runnable: self.service_start(&flight_requests, started),
+            verifies: operations.iter().any(|operation| self.verify_pass(operation)),
             requests,
             submission,
             priming: None,
+            front: None,
             launch_trace,
             started,
             epoch,
@@ -222,7 +258,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             )
             .map_err(Unsubmitted::Failed)?;
         }
-        Ok(work)
+        Ok((work, front.map(DueFront::Held)))
     }
 
     /// The group's drafter entry behind its launched step, when its prompt
@@ -241,45 +277,57 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         else {
             return Ok(work);
         };
-        let [
-            Operation::Forward {
-                request,
-                prime: Some(prime),
-                ..
-            },
-        ] = operations
-        else {
-            panic!("invariant violated: a drafter entry was reserved for an unprimed group");
+        let [chunk] = operations else {
+            panic!("invariant violated: a drafter entry was reserved for a group of other than one chunk");
         };
+        let previous = self
+            .input
+            .get(&chunk.request())
+            .and_then(|input| input.boundary.clone());
         self.launch_priming(
             work,
-            *request,
-            prime,
+            chunk,
             TentativeAdvance::Accepted(advance),
-            self.input
-                .get(request)
-                .and_then(|input| input.boundary.clone()),
+            previous,
             graph_workspace,
             graph_output,
         )
         .map_err(Unsubmitted::Failed)
     }
 
-    /// Draft `prime` behind `work` (whose lone slot is its prompt chunk),
-    /// conditioned by the step's feature output on the device, in the
-    /// drafter's form: a block drafter's rows inject, a chained head's rows
-    /// run its entry pass over the head history. `work` is on the device, so
-    /// every error is fatal.
+    /// Draft `chunk`'s drafter entry behind `work` (whose lone slot is the
+    /// chunk), conditioned by the step's feature output on the device, in
+    /// the drafter's form: a block drafter's rows inject, a chained head's
+    /// rows run its entry pass over the head history. `previous` is the
+    /// boundary feature before the chunk where one exists, which an entry
+    /// pairing its first token across it reads
+    /// ([`Priming::pairs_previous`]). `work` is on the device, so every
+    /// error is fatal.
     pub(super) fn launch_priming(
         &mut self,
         mut work: TargetWork<F>,
-        request: RequestId,
-        prime: &Priming,
+        chunk: &Operation,
         advance: TentativeAdvance,
         previous: Option<FeatureRef>,
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
     ) -> Result<TargetWork<F>, DomainError> {
+        let Operation::Forward {
+            request,
+            tokens,
+            prime: Some(prime),
+            ..
+        } = chunk
+        else {
+            panic!("invariant violated: a drafter entry of an unprimed chunk");
+        };
+        let request = *request;
+        let previous = match prime.pairs_previous(tokens.len()) {
+            true => Some(previous.expect(
+                "invariant violated: a drafter entry pairs across its chunk's boundary with no boundary feature",
+            )),
+            false => None,
+        };
         let features = work
             .submission
             .output()
@@ -313,7 +361,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }),
             None => Err("a drafter entry without a drafting method".into()),
         }
-        .map_err(DomainError::invariant)?;
+        .unwrap_or_else(|error| panic!("invariant violated: a drafter entry's batch: {error}"));
         // Entry rows every window drops before the first draft skip the
         // windowed layers (see `submit_head`).
         let windowed = super::head::skippable_window(&store)
@@ -323,7 +371,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             vec![advance],
             HeadConditioning::Features {
                 current: features,
-                previous: prime.boundary.then_some(previous).flatten(),
+                previous,
             },
             windowed,
             graph_workspace,
@@ -348,6 +396,151 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             continuation: None,
         });
         Ok(work)
+    }
+
+    /// Launch `front`, the front head launch due behind `step`, a target
+    /// step whose forwards chain, right behind it on the device: its entry
+    /// rows are the step's selected rows in selection order, each embedding
+    /// its selection and conditioned by its output feature (a decode pass's
+    /// feature rows, the closing chunk's boundary feature), and its chain
+    /// reads the token rows the step selected on; `continuing` names the
+    /// rows of the step queued behind it (`guess_chain`). The step is on the
+    /// device, so every error is fatal.
+    pub(super) fn launch_front(
+        &mut self,
+        step: &F::TargetSubmission,
+        front: DueFront,
+        continuing: &[Option<crate::batching::FrontContinuation>],
+    ) -> Result<FrontFlight<F::HeadSubmission>, DomainError> {
+        let broken = |detail: &str| -> ! { panic!("invariant violated: a front head launch: {detail}") };
+        let output = step.output();
+        let readout = output.readout.as_ref().unwrap_or_else(|| broken("its step reads nothing out"));
+        let selected = readout.selected.clone().unwrap_or_else(|| broken("its step selects nothing"));
+        let tokens = readout.token_rows.as_ref().unwrap_or_else(|| broken("its step exports no token rows"));
+        // Its entry rows are the step's selected rows, consecutive batch
+        // rows from the first; the token rows begin at the readout window's.
+        let upload = step.launch().batch().upload();
+        let rows = upload
+            .select_rows
+            .iter()
+            .map(|&index| {
+                let index = usize::try_from(index).ok()?;
+                usize::try_from(*upload.out_rows.get(index)?).ok().map(|row| (index, row))
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_else(|| broken("a selected row lies outside the step's output rows"));
+        let first = rows.first().map(|&(_, row)| row).unwrap_or_else(|| broken("its step selects no row"));
+        if rows.iter().enumerate().any(|(entry, &(_, row))| row != first + entry) {
+            broken("its step's selected rows are not consecutive");
+        }
+        let (FrontHead { slots, graph_workspace, graph_output }, joins) = front.into_launch();
+        let entries = slots.iter().map(|slot| slot.advance.rows()).sum::<usize>();
+        if entries != rows.len() || slots.iter().map(|slot| slot.selects.len()).sum::<usize>() != entries {
+            broken("its entry rows differ from its step's selected rows");
+        }
+        let start = first.checked_sub(readout.window).unwrap_or_else(|| broken("its step's first selected row precedes the readout window"));
+        let held = *tokens.tensor().extents().first().unwrap_or_else(|| broken("its step's token rows have no rows extent"));
+        let tokens = tokens.slice_leading(start as u64, held).unwrap_or_else(|error| broken(&error.to_string()));
+        let features = match &output.boundary {
+            // The closing chunk's lone entry row reads its boundary feature.
+            Some(boundary) => crate::FrontFeatures::Boundary(boundary.clone()),
+            // A decode pass's entry row `r` reads its feature output row `r`.
+            None if rows.iter().enumerate().all(|(entry, &(index, _))| index == entry) => {
+                crate::FrontFeatures::Rows(readout.features.clone())
+            }
+            None => broken("its step's feature rows are not its selected rows"),
+        };
+        let store = self.head_store.clone().unwrap_or_else(|| broken("a load without a head store"));
+        let mut requests = Vec::with_capacity(slots.len());
+        let mut selects = Vec::with_capacity(slots.len());
+        let mut advances = Vec::with_capacity(slots.len());
+        for slot in slots {
+            requests.push(slot.request);
+            selects.push(slot.selects);
+            advances.push(slot.advance);
+        }
+        let batch = self.front_head_batch(
+            &requests
+                .iter()
+                .zip(&advances)
+                .zip(&selects)
+                .map(|((&request, advance), selects)| super::head::FrontHeadSlot { request, advance, selects })
+                .collect::<Vec<_>>(),
+            continuing,
+        )?;
+        let inputs = HeadLaunchInputs::new(
+            batch,
+            advances,
+            HeadConditioning::Front(crate::FrontReads { selected, tokens, features }),
+            true,
+            graph_workspace,
+            graph_output,
+        );
+        let launch = ValidatedHeadLaunch::new(inputs, &store, self.domain.id(), self.head_conditioning_bytes())
+            .map_err(|(_, error)| DomainError::Invariant(error))?;
+        let submission = self.family.submit_head(launch).map_err(|(error, _)| DomainError::from(error))?;
+        Ok(FrontFlight { submission, joins })
+    }
+
+    /// Finish the front head launch behind a target step: the guess its
+    /// chain holds per entry row (`crate::programs::FrontOutput::read_guesses`),
+    /// and per slot of the step its head advance as its outcome commits it
+    /// (`FrontAdvance`): over the request's accepted head state, or, of the
+    /// closing chunk, following the chunk's drafter entry; none of a slot
+    /// nobody claimed, whose rows are discarded. The head lane returns the
+    /// advances it launched, so one of another kind than launched is a
+    /// broken invariant.
+    fn finish_front(
+        &mut self,
+        front: FrontFlight<F::HeadSubmission>,
+    ) -> Result<FinishedFront, DomainError> {
+        let completed = front.submission.finish().map_err(DomainError::Device)?;
+        let (core, output) = completed.into_parts();
+        let guesses = output
+            .front()
+            .expect("invariant violated: a front head launch makes no chain")
+            .read_guesses()?;
+        let (_, advances, _) = core.into_parts();
+        let returned = || -> ! { panic!("invariant violated: a front head launch returned another advance than it launched") };
+        let finished = match front.joins {
+            FrontJoins::Accepted => advances
+                .into_iter()
+                .map(|advance| match advance {
+                    TentativeAdvance::Accepted(advance) => Some(FrontAdvance::Step(advance)),
+                    TentativeAdvance::Successor(_) | TentativeAdvance::Chained(_) => returned(),
+                })
+                .collect(),
+            FrontJoins::Entry => advances
+                .into_iter()
+                .map(|advance| match advance {
+                    TentativeAdvance::Successor(advance) => Some(FrontAdvance::Entry(advance)),
+                    TentativeAdvance::Accepted(_) | TentativeAdvance::Chained(_) => returned(),
+                })
+                .collect(),
+            FrontJoins::Claimed(states) => {
+                assert_eq!(
+                    states.len(),
+                    advances.len(),
+                    "invariant violated: front head advances differ from their claimed slots"
+                );
+                advances
+                    .into_iter()
+                    .zip(states)
+                    .map(|(advance, state)| {
+                        let TentativeAdvance::Successor(successor) = advance else {
+                            returned();
+                        };
+                        state.map(|state| match successor.attach(state) {
+                            Ok(advance) => FrontAdvance::Step(advance),
+                            Err((_, error)) => panic!(
+                                "invariant violated: a claimed front head slot no longer follows its head state: {error}"
+                            ),
+                        })
+                    })
+                    .collect()
+            }
+        };
+        Ok((guesses, finished))
     }
 
     /// The group's target launch over its reserved advances and leases,
@@ -375,6 +568,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             readout_workspace,
             readout_output,
             priming: _,
+            front: _,
             boundary,
         } = reservation;
         let advances = advances
@@ -492,10 +686,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let inputs = TargetLaunchInputs::new(
             batch,
             work,
+            metadata.iter().map(|&(request, ..)| request).collect(),
             TargetTokens::Host,
             advances,
             conditioning,
             conditioning_slices,
+            operations,
             graph_workspace,
             graph_output,
             readout_workspace,
@@ -615,6 +811,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map(|priming| self.finish_priming_work(priming))
             .transpose()?
             .flatten();
+        // The front head launch behind a chained step follows it and its
+        // drafter entry on the device: the step's outcome is its chain.
+        let chained = flight.front.is_some();
+        let (chain, mut front_advances) = match flight.front {
+            None => (Vec::new(), Vec::new()),
+            Some(front) => self.finish_front(front)?,
+        };
         if let Some(trace) = &flight.launch_trace {
             let submissions = trace
                 .collect()
@@ -699,6 +902,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             boundary,
             failures,
             experts,
+            expert_step,
         } = output.complete(batch, super::recording(self.expert_measures(), core.work())).map_err(DomainError::Invariant)?;
         let interrupted = match experts {
             crate::programs::native_target::ExpertStepEnd::Ran => None,
@@ -710,6 +914,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         let upload = batch.upload();
+        // Which rows are front rows, as the batch packed them: each leaves
+        // its request's rows for its outcome's `front`.
+        let front_rows = upload.front.to_vec();
         if let Some(rows) = std::env::var_os("MAGNITUDE_TRACE_TARGET_BLOCK_ROWS") {
             self.trace_block_rows(&rows.to_string_lossy(), batch.actual_rows())
                 .map_err(DomainError::invariant)?;
@@ -729,6 +936,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.selection_read = Some(Instant::now());
             decode_selected(&bytes)?
         };
+        // The guesses of the chain made behind the step, per selected row:
+        // the front head launch's entry row of each (`guess_chain`'s
+        // `guesses`); none of a step that chains nothing.
+        let guesses = (0..selected.len()).map(|index| chain.get(index).copied().flatten()).collect::<Vec<_>>();
+        // Per batch row, the guess its selection made.
+        let mut guessed = vec![None; batch.actual_rows()];
         let mut physical = vec![RowResult::default(); batch.actual_rows()];
         for (projected_index, &output_index) in output
             .as_ref()
@@ -777,12 +990,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .get(index)
                     .expect("invariant violated: target selection count differs"),
             );
+            guessed[row] = *guesses.get(index).ok_or("target guess count differs")?;
         }
         let mut request_start = 0usize;
-        for (_, request_rows, _, _, _) in &flight.requests {
+        for (_, request_rows, _, kind, _) in &flight.requests {
             let request_end = request_start
                 .checked_add(*request_rows)
                 .expect("invariant violated: request row range overflows");
+            // A chained decode pass's features condition its front head
+            // launch on the device alone: no host reads them.
+            if chained && *kind == WorkKind::Decode {
+                request_start = request_end;
+                continue;
+            }
             let feature_outputs = upload
                 .out_rows
                 .iter()
@@ -836,20 +1056,38 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // carries, is owned by its outcome alone: what the flight was
         // submitted with is believed to hold, and a path that broke it would
         // drop states no other owner holds, so it is an invariant violation.
+        // The host's turn after a verify pass is a verify turn, whatever
+        // rows it verified.
+        let verified = flight.verifies;
         for (index, ((request, rows, _, kind, committed_rows), advance)) in
             flight.requests.into_iter().zip(advances).enumerate()
         {
             let end = offset.checked_add(rows).expect("invariant violated: a target request's rows overflow");
-            let result = physical
+            let mut result = physical
                 .get(offset..end)
                 .expect("invariant violated: a target request's rows exceed its batch")
                 .to_vec();
             offset = end;
+            // A pass that ran rows ahead in the bank's step awaits its
+            // verdict by that step.
+            let awaited = expert_step.filter(|_| rows > committed_rows);
+            // Front rows are its request's last (`Slot::front`): they leave
+            // the rows, their selections spent on the pass's guesses. The
+            // chain is guessed at its last committed row's (`guess_chain`: a
+            // decode pass's exact row, a prompt's final row) and the rows
+            // after it, by depth, one past its front rows at most, up to
+            // the first depth it made no guess at.
+            let fronts = front_rows[end - rows..end].iter().filter(|&&front| front).count();
+            result.truncate(rows - fronts);
+            let guesses = guessed[end - rows + committed_rows - 1..end].iter().map_while(|guess| *guess).collect::<Vec<_>>();
             let source = continuation
                 .as_mut()
                 .map(|sources| std::mem::replace(&mut sources[index], Source::Unclaimed));
             // The outcome owns its rows until reconciled or aborted: a
             // chain's chunks join it only as they reconcile.
+            // Its head advance in the front head launch behind the step,
+            // which a slot nobody claimed drops with its rows.
+            let front = front_advances.get_mut(index).and_then(Option::take);
             let advance = match (advance, source) {
                 (TentativeAdvance::Accepted(first), None) if opens_chain => {
                     Advance::Opens { flight: flight.id, first }
@@ -866,17 +1104,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         Err((_, error)) => panic!("invariant violated: a claimed queued slot no longer follows its state: {error}"),
                     }
                 }
-                // Nobody claimed this slot: its rows are discarded.
-                (TentativeAdvance::Successor(_), Some(Source::Unclaimed)) => continue,
+                // Nobody claimed this slot: its rows are discarded, and no
+                // verdict will judge its pass.
+                (TentativeAdvance::Successor(_), Some(Source::Unclaimed)) => {
+                    if let (Some(bank), Some(step)) = (self.family.expert_bank(), awaited) {
+                        bank.discarded(step, request);
+                    }
+                    continue;
+                }
                 _ => panic!("invariant violated: a target flight's advances differ from its continuation"),
             };
             let primed_here = primed.take_if(|(primed, _)| *primed == request).map(|(_, advance)| advance);
             // A chunk of a chain that failed or was interrupted is aborted as
             // any step's outcome is: its chain concludes with the chunks
-            // reconciled before it, its holder's state again.
+            // reconciled before it, its holder's state again, and its head
+            // advances return with it (`ExecutorDomain::abort`).
             let outcome = match (self.poisoned.get(&request), &interrupted) {
                 (Some(error), _) => Outcome::WeightReadFailed(error.clone()),
-                (None, None) => Outcome::Forward { rows: result },
+                (None, None) => Outcome::Forward { rows: result, guesses },
                 (None, Some(reason)) => Outcome::Interrupted { reason: reason.clone() },
             };
             pending.push(PendingOperationOutcome {
@@ -884,12 +1129,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 outcome,
                 advance: Some(advance),
                 primed: primed_here,
-                rows,
+                front,
+                // The rows a decision may accept: never a front row.
+                rows: rows - fronts,
                 committed_rows,
                 kind,
                 physical_duration,
                 timed,
                 image: None,
+                awaited,
             });
         }
         assert!(primed.is_none(), "invariant violated: a drafter entry's chunk is absent from its flight");
@@ -922,9 +1170,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // The queued step's service starts where this flight's ends, so the
         // finish is charged once: a backend whose reads queue behind the
         // queued step waits in it for that step's device work.
+        let selected = selected.into_iter().zip(guesses).collect::<Vec<_>>();
         self.predecessor_selected(flight.id, &selected, finished);
         self.target_timing = Some(timing);
         self.begin_host_turn(pending.iter().map(|item| item.request));
+        if verified {
+            self.verify_turns.begin(finish_started, pending.iter().map(|item| item.request).collect());
+        }
         Ok(pending)
     }
 
@@ -958,7 +1210,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         mut flight: TargetFlight<F>,
         final_prompt_chunk: bool,
     ) -> Result<(Vec<PendingOperationOutcome>, TargetContinuation<F>), DomainError> {
-        let priming = final_prompt_chunk
+        // A chained chunk's outcome is the chain its front head launch made
+        // behind its drafter entry, whose head advance follows the entry's
+        // (`FrontAdvance::Entry`): the entry finishes with the chunk.
+        let priming = (final_prompt_chunk && flight.work.front.is_none())
             .then(|| flight.detach_priming())
             .flatten();
         let (outcomes, bindings) = self.finish_target(flight)?;
@@ -1196,6 +1451,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 following_bank: i32::try_from(binding.following_bank)
                     .map_err(|_| "successor bank exceeds i32")?,
                 stop: i32::try_from(binding.stop).map_err(|_| "committed rows exceed i32")?,
+                front: operation.front_rows(),
             },
             slices,
         ))

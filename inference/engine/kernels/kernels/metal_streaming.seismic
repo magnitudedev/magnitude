@@ -102,16 +102,17 @@ native routed_output_sited for metal from "metal/routed_output_sited.metal":
 # threadgroup at a time polling the host's count (`streaming_land_poll`);
 # threadgroup 0 then writes each absent choice's sources
 # (`streaming/tier_wait.hpp`). Where the tier places, one threadgroup only
-# sources. Every threadgroup that sees no request returns at its first
-# look.
+# sources. It launches on the grid its route wrote: LAND_THREADGROUPS
+# where the step requested its slot, none otherwise.
 native routed_land for metal from "metal/routed_land.metal":
     static (K)
     records (staging_gate, staging_up, staging_down, gate, up, down)
     scratch counters bytes (4 * (LAND_ITEMS + L)) sync
     launch routed_land:
-        threadgroups (1 + min(V, 1) * (LAND_GROUPS - 1), 1, 1)
+        threadgroups (LAND_THREADGROUPS(min(V, 1)), 1, 1)
+        grid (grid)
         unless (policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
+        threads_per_threadgroup (WINDOW_THREADS, 1, 1)
         shared_bytes (WINDOW_BYTES)
 
 native routed_step for metal from "metal/routed_step.metal":
@@ -137,7 +138,7 @@ native routed_round for metal from "metal/routed_round.metal":
     launch routed_round:
         threadgroups (LAND_GROUPS, 1, 1)
         grid (grid)
-        threads_per_threadgroup (256, 1, 1)
+        threads_per_threadgroup (WINDOW_THREADS, 1, 1)
         shared_bytes (WINDOW_BYTES)
 
 native routed_scratch_grids for metal from "metal/routed_scratch_grids.metal":
@@ -160,7 +161,7 @@ native routed_pass_map for metal from "metal/routed_pass_map.metal":
 native routed_copy for metal from "metal/routed_copy.metal":
     records (source, destination)
     launch routed_copy:
-        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
+        threadgroups (LIST_BLOCKS(), 1, 1)
         grid (grid)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
 

@@ -25,9 +25,9 @@
 //! comes to read one the conveyor carries already (a failed step's) lists
 //! that record.
 //!
-//! Records its lender lends it are the store's between groups; a group
-//! claims them as its first request is taken, before any hit is
-//! (`Scratch::claim_lent`), so no hit lies in one, and they return empty once
+//! Records its lender lends it are the store's between groups; they are a
+//! group's lease, granted from its first request on, before any hit is
+//! taken (`Scratch::lease`), so no hit lies in one, and returned empty once
 //! the group is past: the conveyor holds the stored form, which
 //! `routed_round` repacks, so a claimed record holds no bank-form expert.
 //!
@@ -41,13 +41,14 @@
 //! Where the host addresses the scratch (unified memory), its slots carry
 //! experts too, at no memory: an expert may be read into the base of a
 //! scratch slot no step reads or converts into until the expert's round
-//! has converted it ([`Self::take`], `Scratch::lendable_slot`), and
+//! has converted it ([`Self::take`], `Scratch::lendable_slot`, once the
+//! group's lease holds the scratch), and
 //! its round converts it from there (`routed_round`'s negative `from`).
 //! A slot's record is `records + slot`, past the conveyor's own; it frees
 //! as a conveyor record does, and holds no bytes kept past the group.
 
 use super::source::{Outcome, Records, Ticket};
-use super::watcher::Step;
+use super::watcher::{ScratchGroup, Step};
 
 /// Where an expert is on its way into the conveyor: being read into
 /// conveyor record `record`, held whole in it, or listed for `lists`
@@ -60,29 +61,26 @@ pub(super) enum State {
     Listed { record: u32, lists: u32 },
 }
 
-/// The group the conveyor serves: its name and last step, whether the
-/// device is past it (the conveyor then clears once nothing of the group
-/// runs, `Scratch::clear_past`, and takes no later group's request before),
-/// and whether it holds every lent host record claimed: claims return
-/// only as it clears, so once it does it holds them until then, and
-/// nothing is left to claim (`Scratch::claim_lent`).
+/// The group the conveyor serves, a prompt group (its first step and its
+/// steps, as the steps that began it read them), and whether the device is
+/// past it (the conveyor then clears once nothing of the group runs,
+/// `Scratch::clear_past`, and takes no later group's request before). What
+/// of its lease it holds is its lender's host records' to say
+/// (`Directory::leased`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Serving {
-    pub group: Step,
-    pub last: Step,
+    pub group: ScratchGroup,
     pub past: bool,
-    pub claimed: bool,
 }
 
-/// The group lending the conveyor its bottom `records` host records
-/// (`planning::Lender`; on unified memory the scratch's too), claimed as a
-/// group begins (`Directory::claim_lent`), and where each staging pool's
-/// conveyor lies in them (`planning::ConveyorPlan`): pool `p`'s conveyor
-/// lies at `offset` bytes of its routed tensor's lent records
-/// ([`LentPool`]).
+/// The group lending the conveyor its bottom host records
+/// (`planning::Lender`; on unified memory the scratch's too), which are a
+/// prompt group's lease (`Directory::lease`, whose records count them,
+/// `HostRecords::lent`), and where each staging pool's conveyor lies in
+/// them (`planning::ConveyorPlan`): pool `p`'s conveyor lies at `offset`
+/// bytes of its routed tensor's lent records ([`LentPool`]).
 pub(super) struct Lending {
     pub group: usize,
-    pub records: usize,
     pub pools: Vec<LentPool>,
 }
 

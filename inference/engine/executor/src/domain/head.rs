@@ -2,11 +2,22 @@
 
 use super::*;
 use crate::DraftForm;
-use crate::batching::{HeadPasses, HeadSlot};
-use crate::programs::HeadOutput;
+use crate::batching::{FrontContinuation, FrontSlot, HeadPasses, HeadSlot, ValidatedHeadBatch};
+use crate::programs::{HeadOutput, HeadSelected};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static HEAD_LAUNCH_TRACED: AtomicBool = AtomicBool::new(false);
+
+/// One slot of a front launch ([`ExecutorDomain::front_head_batch`]).
+pub(super) struct FrontHeadSlot<'a> {
+    pub request: RequestId,
+    /// Its head advance, from the head position one past its exact row's
+    /// target position: the committed entry row of its exact selection,
+    /// then one scratch row per front row of the slot, never accepted.
+    pub advance: &'a TentativeAdvance,
+    /// One selection per entry row, in row order.
+    pub selects: &'a [SelectSpec],
+}
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Bytes of one head conditioning row: the target's normalized output
@@ -542,6 +553,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 previous_tape: 0,
                 following_bank: i32::try_from(slot + 1).map_err(|_| "head slot exceeds i32")?,
                 stop: 1,
+                front: 0,
             },
             chain: (1..steps).map(|_| row(0)).collect(),
             proposals: selections,
@@ -560,6 +572,50 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.head.insert(*request, advance.abort());
             }
         }
+    }
+
+    /// A front launch's batch: its slots in the target step's slot order,
+    /// so its entry rows are the step's rows, each slot's rows those of its
+    /// advance. `continuing` names, per token row of the step queued behind,
+    /// the slot it continues and its depth there. The launch runs behind a
+    /// step already on the device, so every error is fatal.
+    pub(super) fn front_head_batch(
+        &self,
+        slots: &[FrontHeadSlot<'_>],
+        continuing: &[Option<FrontContinuation>],
+    ) -> Result<ValidatedHeadBatch, DomainError> {
+        let slots = slots
+            .iter()
+            .map(|slot| {
+                let rows = slot.advance.rows();
+                let front = rows
+                    .checked_sub(1)
+                    .ok_or("a front head advance has no committed row")?;
+                // The device feeds the entry tokens: the step's selections.
+                let entry = self
+                    .head_slot(
+                        slot.request,
+                        &vec![TokenId(0); rows],
+                        slot.advance.position(),
+                        &[],
+                        slot.advance,
+                        0,
+                    )?
+                    .entry;
+                Ok(FrontSlot {
+                    entry: Slot { front, ..entry },
+                    selects: slot.selects.iter().map(super::target::select_row).collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(DomainError::invariant)?;
+        ValidatedHeadBatch::from_front_slots(
+            &slots,
+            continuing,
+            self.definition.decoder.vocabulary as usize,
+            self.head_class_limits(),
+        )
+        .map_err(|error| DomainError::invariant(error.to_string()))
     }
 
     /// The head rows of one transaction padded to `steps` selections: entry
@@ -656,6 +712,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 previous_tape: i32_of(binding.previous_tape, "tape rows")?,
                 following_bank: i32_of(binding.following_bank, "successor bank")?,
                 stop: i32_of(binding.stop, "committed rows")?,
+                front: 0,
             },
             chain,
             proposals: selections,
@@ -728,9 +785,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // later rounds find them there.
         output.complete_landed_reads().map_err(DomainError::Submit)?;
         let HeadOutput {
-            selections,
+            selected,
             landed_reads: _,
         } = output;
+        let selections = match selected {
+            HeadSelected::Causal => None,
+            HeadSelected::Proposals(selections) => Some(selections),
+            HeadSelected::Chain(_) => {
+                return Err(DomainError::invariant("a front head launch finished as a transaction"));
+            }
+        };
         let slots = core.batch().actual_slots();
         assert_eq!(slots, requests.len(), "invariant violated: a head flight's slots differ from its requests");
         let read = |tensor: &crate::GraphOutputTensor| {
@@ -825,12 +889,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     },
                     advance: advance.map(Advance::Step),
                     primed: None,
+                    front: None,
                     rows: advance_rows(passes, rows, proposals),
                     committed_rows: rows,
                     kind: WorkKind::Decode,
                     physical_duration: Duration::ZERO,
                     timed: Timed::Untimed,
                     image: None,
+                    awaited: None,
                 },
             )
             .collect();
@@ -844,7 +910,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         // A request whose drafter proposed verifies its round next: no
         // decode queues behind that launch (`queue::continuations`).
-        self.proposed.extend(
+        self.verifying.extend(
             pending
                 .iter()
                 .filter(|item| matches!(&item.outcome, Outcome::Head { proposals, .. } if !proposals.is_empty()))
@@ -887,6 +953,6 @@ pub(super) fn skippable_window(store: &StateStore) -> Option<usize> {
 fn advance_rows(passes: HeadPasses, entry: usize, proposals: usize) -> usize {
     match passes {
         HeadPasses::Chained => entry + proposals.saturating_sub(1),
-        HeadPasses::Block => entry,
+        HeadPasses::Block | HeadPasses::Front => entry,
     }
 }

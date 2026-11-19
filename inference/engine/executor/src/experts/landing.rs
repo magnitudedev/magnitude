@@ -40,7 +40,7 @@ use super::compute::Urgency;
 use super::host_records::Grant;
 use super::source::Records;
 use super::watcher::Step;
-use magnitude_kernels::{SlotTable, constants};
+use magnitude_kernels::constants;
 use seismic::cpu::repack::RowConversion;
 
 /// What a choice's source word (SOURCE_RECORD) names, by who places the
@@ -114,16 +114,19 @@ pub(in crate::experts) struct LandingList {
 }
 
 impl LandingList {
-    /// `words`, a landing list of every entry its words hold, naming
-    /// records within `bounds`.
+    /// `words`, a landing list of every entry its words hold
+    /// (LANDING_ENTRY), naming records within `bounds`. Words that end
+    /// within an entry are an invariant violation.
     pub fn new(words: super::Words, bounds: super::ListBounds) -> Self {
-        let entries = (words.len() - constants::LANDING_ENTRIES as usize) / constants::LANDING_ENTRY_WORDS as usize;
-        Self { words, bounds, entries, head: std::sync::Mutex::new((0, 0)) }
+        let (first, stride) = (constants::LANDING_ENTRY(0), constants::LANDING_ENTRY(1) - constants::LANDING_ENTRY(0));
+        let entries = (words.len() as u64 - first) / stride;
+        assert_eq!(constants::LANDING_ENTRY(entries), words.len() as u64, "a landing list's words hold whole entries");
+        Self { words, bounds, entries: entries as usize, head: std::sync::Mutex::new((0, 0)) }
     }
 
     /// The word `word` of entry `entry`.
     fn word(entry: usize, word: u64) -> usize {
-        (constants::LANDING_ENTRIES + constants::LANDING_ENTRY_WORDS * entry as u64 + word) as usize
+        (constants::LANDING_ENTRY(entry as u64) + word) as usize
     }
 
     /// Append `(from, to)` for step `sequence`: its entry, then the head
@@ -646,7 +649,7 @@ impl Answer {
         let sequence = self.sequence;
         self.steps.while_owned(sequence, |_| {
             for &choice in &self.choices {
-                self.file.store(sequence, 0, SlotTable::file_entry(choice as u64) + constants::FILE_RECORD, source);
+                self.file.store(sequence, 0, constants::FILE_ENTRY(choice as u64) + constants::FILE_RECORD, source);
             }
             let slot = self.pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1;
             if slot {

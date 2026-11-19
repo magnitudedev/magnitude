@@ -32,8 +32,8 @@ pub struct AttestedPrograms {
     pub(super) vision: Option<AttestedVision>,
     pub(super) state: AttestedState,
     pub(super) imports: Vec<(ImportProgramSlot, AttestedImport)>,
-    /// The copy of a read's selected rows for the host
-    /// (`ProgramPlan::notices_selection`).
+    /// The copy of a step's token rows
+    /// (`ProgramPlan::copies_token_rows`).
     pub(super) notice: Option<NativeKernel<selection_notice::Entry>>,
     target_graphs: Option<std::sync::Arc<crate::PreparedTargetGraphs>>,
     target_readout_graphs: Option<std::sync::Arc<crate::PreparedTargetReadoutGraphs>>,
@@ -51,6 +51,11 @@ pub(crate) struct AttestedTarget {
     pub features: Option<NativeKernel<readout_features_rows::Entry>>,
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
+    /// The copy of a step's token rows (`selection_notice`), of a load that
+    /// copies them (`ModelLoadPlan::copies_token_rows`): a fronting load's
+    /// selecting readout exports its token rows through it
+    /// (`TokenRowPorts`).
+    pub token_copy: Option<NativeKernel<selection_notice::Entry>>,
     /// A separate draft's taps, when one drafts.
     pub taps: Option<TapKernels>,
     /// The per-layer entry, when the model has per-layer inputs.
@@ -225,9 +230,13 @@ pub(crate) struct AttestedHead {
     /// Token selection over the draft vocabulary.
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
-    /// Each proposal's probability under the readout logits it was selected
-    /// from.
+    /// Each proposal's probability under the readout logits it was
+    /// selected from: a drafting transaction's.
     pub confidence: NativeKernel<token_confidence::Entry>,
+    /// Two-row decode's chain at a front launch's tail, of a load that
+    /// fronts (`ProgramPlan::fronts`), whose head also drafts the proposals
+    /// a verify pass runs on.
+    pub chain: Option<NativeKernel<magnitude_kernels::guess_chain::Entry>>,
 }
 
 #[derive(Clone)]
@@ -518,6 +527,7 @@ impl AttestedPrograms {
                 limits,
                 state.head_geometry()?,
                 proposals,
+                load.fronts(),
             )?;
             let landing = self.landing(load, TARGET_TABLE)?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Head(Rc::new(
@@ -1118,6 +1128,7 @@ impl AttestedPrograms {
                 .sample_rows
                 .clone()
                 .ok_or_else(|| missing("sample_rows", "fixed"))?,
+            token_copy: prepared.glue.selection_notice.clone(),
             taps: target_plan
                 .taps()
                 .map(|taps| {
@@ -1238,6 +1249,10 @@ impl AttestedPrograms {
                         .token_confidence
                         .clone()
                         .ok_or_else(|| missing("token_confidence", "head"))?,
+                    chain: match load.fronts() {
+                        true => Some(handles.chain.clone().ok_or_else(|| missing("guess_chain", "head"))?),
+                        false => None,
+                    },
                 })
             })
             .transpose()?;

@@ -152,7 +152,7 @@ fn windows_smaller_than_an_advance_write_every_row_then_trim() {
     assert_eq!(store.occupied_rows(WINDOW), 2);
     // A speculative advance longer than the window keeps only the rows
     // around its accepted prefix; rejected rows return.
-    let advance = OwnedStateAdvance::begin_speculative(state, 6, 1)
+    let advance = OwnedStateAdvance::begin_rows(state, 1, 5, 0)
         .ok()
         .unwrap();
     assert_eq!(store.occupied_rows(WINDOW), 8);

@@ -5,11 +5,14 @@
 //! decode rows:  [step] → route + resolve + assign (each choice's source by
 //!               the step-stamped map: a bank record, a host tier record
 //!               the GPU reads in place or the CPU computes, or absent) →
-//!               landing launch (convert each absent expert's record as
-//!               its read lands, where the bank places; source each
-//!               absent choice where it landed) → site request (the CPU's choices and the rows,
-//!               across a link) → the resident gate/up, each choice read
-//!               where its source names → the projections → the sum,
+//!               gated experts' early gate/up (the choices the route
+//!               sourced) → landing launch (convert each absent expert's
+//!               record as its read lands, where the bank places; source each
+//!               absent choice where it landed) → site request (the CPU's
+//!               choices and the rows, across a link) → the late gate/up
+//!               (the choices the landing sourced; up-only experts' whole
+//!               expansion), each choice read where its source names, by
+//!               the resident gate/up's arithmetic → the projections → the sum,
 //!               waiting for the CPU's answer and adding it (a whole
 //!               group's layer: the resident combine)
 //! larger rows:  front: route → scratch request
@@ -68,10 +71,10 @@ use crate::ModelLoadPlan;
 use crate::programs::native_target_graph::PlannedWeights;
 use magnitude_family_contracts::{WeightRole, WeightScope};
 use magnitude_kernels::{
-    routed_copy, routed_down_project, routed_down_sited, routed_hint_route, routed_hint_select, routed_land,
-    routed_list_grid, routed_output_project, routed_output_sited, routed_pass_map, routed_round,
-    routed_route_streamed, routed_scratch_grids, routed_scratch_request, routed_seed_commit, routed_select_streamed,
-    routed_site_request, routed_step,
+    routed_copy, routed_down_project, routed_down_sited, routed_gate_up, routed_gate_up_part,
+    routed_hint_route, routed_hint_select, routed_land, routed_list_grid, routed_output_project,
+    routed_output_sited, routed_pass_map, routed_round, routed_route_streamed, routed_scratch_grids,
+    routed_scratch_request, routed_seed_commit, routed_select_streamed, routed_site_request, routed_step,
 };
 use seismic::{
     Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
@@ -115,6 +118,10 @@ pub(crate) struct BankGraphEntries<'a, G: GraphDraft + 'a> {
     pub seeding: BankSeedingEntries<'a, G>,
     /// The CPU site's request and combine, where the layer has a site.
     pub site: Option<BankSiteEntries<'a, G>>,
+    /// A gated layer's gate/up passes, its held choices' before the tier
+    /// wait and the wait's after it (`native::ExpertBankKernels::gate_up`);
+    /// none of up-only experts.
+    pub gate_up: Option<G::Ranged<'a, routed_gate_up_part::Entry>>,
 }
 
 /// A streamed layer's CPU site entries (`native::BankSite`): its request
@@ -208,6 +215,7 @@ impl<'a> From<&'a ExpertBankKernels> for BankGraphEntries<'a, NativeGraph> {
                     crate::native::BankCombine::General { project, sited } => BankCombineEntry::General { project, sited },
                 },
             }),
+            gate_up: kernels.gate_up.as_ref(),
         }
     }
 }
@@ -239,6 +247,8 @@ pub(crate) struct CheckedBankEntries {
     /// The CPU site's request's and combine's, where the layer has a site
     /// (`native::BankSite::served`).
     site: Option<CheckedSite>,
+    /// The gate/up passes', of gated experts.
+    gate_up: Option<[(&'static str, Element); 3]>,
 }
 
 /// A CPU site's element assignments: its request's, and its combine's by
@@ -288,6 +298,17 @@ impl CheckedBankEntries {
                 ("A", binding.activation),
             ],
         };
+        let gate_up = match slot {
+            BankedFeedForward::Routed(binding) => {
+                Some([("EGW", binding.expert_gate), ("EUW", binding.expert_up), ("A", binding.activation)])
+            }
+            BankedFeedForward::GeneralRouted(binding) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: binding, .. }) => {
+                // An up-only layer has no passes; a gated one's gate
+                // element is its resident gate/up's.
+                let gate = binding.expert_gate.unwrap_or(binding.expert_up);
+                binding.shape.experts_expansion.gated.then_some([("EGW", gate), ("EUW", binding.expert_up), ("A", binding.activation)])
+            }
+        };
         let route = match slot {
             BankedFeedForward::Routed(binding) => CheckedRoute::Fused {
                 route: [
@@ -331,6 +352,7 @@ impl CheckedBankEntries {
             none: [],
             seed: bank.record.map(|_, tensor| [("U", tensor.resident)]),
             site,
+            gate_up,
         })
     }
 
@@ -370,6 +392,7 @@ impl CheckedBankEntries {
                     }
                 },
             }),
+            gate_up: self.gate_up.as_ref().map(|gate_up| &gate_up[..]),
         }
     }
 }
@@ -470,13 +493,18 @@ pub(crate) enum BankForm {
 
 /// What decides a streamed layer's graph beside its numbers
 /// ([`BankNumbers`]): whether it has a CPU site and sets its run's step,
-/// the lead its route predicts at (`AHEAD`), what each hint lead binds, the
-/// layer whose policy words its hints bind, who places into its bank, and
-/// its records' resident and stored elements.
+/// whether its load fronts, the lead its route predicts at (`AHEAD`), what
+/// each hint lead binds, the layer whose policy words its hints bind, who
+/// places into its bank, and its records' resident and stored elements.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BankTopology {
     pub sited: bool,
     pub sets_step: bool,
+    /// Whether its load's decode passes run front rows
+    /// (`ModelLoadPlan::fronts`): the predicate that gives a decode graph's
+    /// step its guesses port ([`StreamedLayer::step`]), as it gives a group
+    /// the kept guesses a host-token step binds there.
+    pub fronts: bool,
     pub ahead: u64,
     pub leads: Vec<HintLead>,
     /// The layer whose policy words its hints bind, relative to its block.
@@ -606,6 +634,7 @@ pub(crate) fn split<G: GraphDraft>(
     let topology = BankTopology {
         sited: plan.sited(index),
         sets_step: plan.sets_step(index),
+        fronts: load.fronts(),
         ahead: plan.ahead(index),
         leads,
         next_policy: plan.hints(index, 0).map(|next| relative_scope_of(plan.layers()[next].scope, scope)),
@@ -657,6 +686,14 @@ pub(crate) struct StreamedLayer<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + 
     parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
 }
 
+/// A gated layer's resident gate/up, which its streamed decode gate/up
+/// computes each choice by ([`StreamedLayer::gate_up`]): its arguments, at
+/// its dimensions.
+pub(crate) struct ResidentGateUp<'d, A> {
+    pub args: A,
+    pub dimensions: &'d [(&'static str, Dim)],
+}
+
 /// The extents a streamed layer's decode entries take beside its bank's.
 pub(crate) struct DecodeShape<'d> {
     /// `M`: the launch's rows.
@@ -691,6 +728,12 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         }
     }
 
+    /// Its landing launch's threadgroups while it lands
+    /// (`Placer::land_groups`).
+    pub(crate) fn land_groups(&self) -> i32 {
+        self.topology.placer.land_groups()
+    }
+
     /// Whether the layer sets its run's step word
     /// (`ExpertBankPlan::sets_step`), a scratch-served run's in its front.
     pub(crate) fn sets_step(&self) -> bool {
@@ -721,6 +764,12 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 map: GraphConstant::empty_of(graph, Element::i32(), &[0], constants)?,
             },
         })
+    }
+
+    /// The key records its decode route writes (`keys`): every row's key of
+    /// each of the layer's experts, which placement ranks by.
+    pub(crate) fn route_keys(&mut self, graph: &mut G) -> Result<NativePort, GraphError> {
+        self.part(graph, BankPart::Keys)
     }
 
     /// Where a decode launch reads each choice ([`DecodeReads`]): the
@@ -776,23 +825,45 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
 
     /// The run's step word (its chain place's), which every streamed entry
     /// of the run reads: set to the run's sequence (`routed_step`) where the
-    /// layer sets it, with the sequence input the run writes.
-    pub(crate) fn step(&mut self, graph: &mut G) -> Result<(NativePort, Option<NativePort>), GraphError> {
+    /// layer sets it, with the sequence input the run writes and, of a
+    /// decode graph of `rows` rows (`tokens`) of a load that fronts, the
+    /// guesses its front rows run on, whose kinds the step words carry; a
+    /// graph whose steps run no front row (a prompt's front, or any graph
+    /// of a load that does not front) has none.
+    pub(crate) fn step(
+        &mut self,
+        graph: &mut G,
+        tokens: Option<&Dim>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<(NativePort, Option<StepInputs>), GraphError> {
         let entries = self.entries;
         let mut step = self.part(graph, BankPart::Step)?;
         if !self.sets_step() {
             return Ok((step, None));
         }
-        let sequence = graph.input_for(entries.step, "sequence", &[] as &[(&str, u64)])?;
+        let tokens = tokens.filter(|_| self.topology.fronts);
+        // Every port of the entry and its launch are laid out at its one T:
+        // the graph's token rows, none (T = 0) where it has none.
+        let dimensions = [("T", tokens.cloned().unwrap_or_else(|| Dim::from(0)))];
+        let sequence = graph.input_for(entries.step, "sequence", &dimensions)?;
+        let guesses = match tokens {
+            Some(_) => Some(graph.port_for(entries.step, "guesses", &dimensions)?),
+            None => None,
+        };
+        let guessed = match &guesses {
+            Some(guesses) => guesses.tensor().clone(),
+            None => GraphConstant::empty_of(graph, Element::i32(), &[Dim::from(0), Dim::from(2)], constants)?,
+        };
         graph.enqueue(
             entries.step,
-            &[] as &[(&str, u64)],
+            &dimensions,
             routed_step::WorkflowArgs {
                 step: step.tensor_mut().into(),
                 sequence: sequence.tensor().into(),
+                guesses: (&guessed).into(),
             },
         )?;
-        Ok((step, Some(sequence)))
+        Ok((step, Some(StepInputs { sequence, guesses })))
     }
 
     /// The park node before this layer's call that waits for the host, of
@@ -828,8 +899,8 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
     /// Where the host tier places, it converts nothing (its staging and
     /// records views of none) and only sources. It declares the slot and
     /// the list host-written, so the experts after it read what it wrote on
-    /// every backend; one whose step requested nothing returns at its first
-    /// look.
+    /// every backend. It launches on the grid the route wrote (`land_grid`):
+    /// none where its step requested nothing.
     pub(crate) fn land(
         &mut self,
         graph: &mut G,
@@ -838,7 +909,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(), GraphError> {
         let numbers = self.numbers;
-        let LandPorts { decode: DecodePorts { step, policy, file, .. }, sources, records } = ports;
+        let LandPorts { decode: DecodePorts { step, policy, file, land_grid, .. }, sources, records } = ports;
         let mut list = self.part(graph, BankPart::LandingList)?;
         // Where the bank places, its staging and the bank's records; where
         // the tier places, views of none of either (`V`, `S` 0): graph
@@ -898,6 +969,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 gate: (&mut gate).into(),
                 up: (&mut destination.up).into(),
                 down: (&mut destination.down).into(),
+                grid: land_grid.tensor().into(),
             },
         )?;
         self.parked(ParkKind::Land, park);
@@ -956,6 +1028,104 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         Ok(())
     }
 
+    /// The decode launch's landing of the choices its route left absent
+    /// ([`Self::land`]), which converts the device's misses into `records`
+    /// as their reads land and sources every absent choice into the step's
+    /// sources, then its site request of `choices` ([`Self::site_request`]).
+    /// Every entry after it may read any choice.
+    pub(crate) fn settle(
+        &mut self,
+        graph: &mut G,
+        step: &mut RoutedStep,
+        records: RecordTensors<&mut NativePort>,
+        choices: &StepChoices<'_>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<(), GraphError> {
+        let shape = DecodeShape { rows: choices.rows };
+        let mut sources = step.locals.sources.tensor().clone();
+        self.land(graph, LandPorts { decode: &mut step.ports, sources: &mut sources, records }, &shape, constants)?;
+        let snapshot = step.locals.snapshot();
+        self.site_request(graph, &mut step.ports, choices.routes, choices.weights, &snapshot, choices.input, &shape)
+    }
+
+    /// A gated layer's decode gate/up around its landing ([`Self::settle`]), in
+    /// two passes of `routed_gate_up_part` over one product, which it
+    /// returns: the early pass before the landing, the first writer of the
+    /// product, computes the choices the route sourced, so they run while
+    /// the host reads the absent ones; the late pass after the landing
+    /// computes the choices the landing sourced, encoded only while
+    /// the layer's group is not resolved at its route
+    /// (`policy[POLICY_RESOLVED]` clear: a resolved group has none; this
+    /// condition is that rule's one owner). Each takes its resident
+    /// gate/up's `args` at its `dimensions`, and the step's routing record
+    /// and step. Each choice's product is computed once, by the resident
+    /// gate/up's arithmetic, so the product is its one pass's whatever the
+    /// bank held.
+    pub(crate) fn gate_up<'x>(
+        &mut self,
+        graph: &mut G,
+        step: &mut RoutedStep,
+        ResidentGateUp { args, dimensions }: ResidentGateUp<'_, impl Fn() -> routed_gate_up::WorkflowArgs<'x>>,
+        records: RecordTensors<&mut NativePort>,
+        choices: &StepChoices<'_>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<WorkflowTensor, GraphError> {
+        let entry = G::pick(self.entries.gate_up.expect("a gated streamed layer's bank holds its gate/up passes (`bank_gate_up`)"), choices.rows);
+        let numbers = self.numbers;
+        let dimensions =
+            [dimensions, &[("FLIGHT", numbers.flight.clone()), ("P", numbers.choices.clone())]].concat();
+        let mut product = graph.local_for(entry, "product", &dimensions)?;
+        let pass = |graph: &mut G, step: &RoutedStep, late: bool, product: &mut NativePort| {
+            let routed_gate_up::WorkflowArgs {
+                normalized,
+                routes,
+                sources,
+                expert_gate,
+                expert_up,
+                tier_gate,
+                tier_up,
+                activation,
+                gate_scale,
+                up_scale,
+                glu_limit,
+            } = args();
+            let args = routed_gate_up_part::WorkflowArgs {
+                normalized,
+                routes,
+                sources,
+                expert_gate,
+                expert_up,
+                tier_gate,
+                tier_up,
+                activation,
+                gate_scale,
+                up_scale,
+                glu_limit,
+                routing: step.routing.tensor().into(),
+                step: step.ports.step.tensor().into(),
+                late: i32::from(late).into(),
+                product: product.tensor_mut().into(),
+            };
+            match late {
+                false => graph.enqueue(entry, &dimensions, args).map(drop),
+                true => graph
+                    .enqueue_under(
+                        entry,
+                        &dimensions,
+                        args,
+                        &step.ports.policy,
+                        magnitude_kernels::constants::POLICY_RESOLVED,
+                        seismic::LaunchEncoding::WhileClear,
+                    )
+                    .map(drop),
+            }
+        };
+        pass(graph, step, false, &mut product)?;
+        self.settle(graph, step, records, choices, constants)?;
+        pass(graph, step, true, &mut product)?;
+        Ok(product.tensor().clone())
+    }
+
     /// The layer's combine with the CPU's answer and the dimensions of its
     /// site table (`FLIGHT`, `SW`), where the layer has a site: its
     /// projections, then its sum, which waits for the answer when a choice
@@ -975,14 +1145,15 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
 
     /// A scratch-served launch's front's request of the experts its `rows`
     /// rows' `routes` name, from its chain place's flags, in its step's slot
-    /// of the layer's scratch table, of the run's step (`step`): the
-    /// sequence input the run writes where the front sets it.
+    /// of the layer's scratch table, of the run's step (`step`): the step
+    /// inputs the run writes where the front sets it.
     pub(crate) fn request(
         &mut self,
         graph: &mut G,
         routes: &WorkflowTensor,
         rows: &Dim,
-    ) -> Result<Option<NativePort>, GraphError> {
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Option<StepInputs>, GraphError> {
         let entries = self.entries;
         let numbers = self.numbers;
         // The flags are the widest layer's (`BankPart::ScratchFlags`).
@@ -993,7 +1164,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             ("FLIGHT", numbers.scratch_slots.clone()),
             ("LANES", numbers.scratch_lanes.clone()),
         ];
-        let (step, sequence) = self.step(graph)?;
+        let (step, inputs) = self.step(graph, None, constants)?;
         let mut slots = self.part(graph, BankPart::ScratchTable)?;
         let mut flags = self.part(graph, BankPart::ScratchFlags)?;
         let resident = self.part(graph, BankPart::Resident)?;
@@ -1008,7 +1179,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 resident: resident.tensor().into(),
             },
         )?;
-        Ok(sequence)
+        Ok(inputs)
     }
 
     /// Where a merge set's pass reads the layer's experts: its group's
@@ -1395,14 +1566,27 @@ impl<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'_, 'a, G
     }
 }
 
+/// What a run binds of a graph that sets its step word (`routed_step`): the
+/// sequence it writes, and of a decode graph the guesses its front rows run
+/// on (`routed_step`'s `guesses`, `[T, 2]` (guess, kind) rows at each front
+/// row's exact row, T the graph's rows): the guesses of the chain made
+/// behind the step before (`guess_chain`), which its token rows follow, or
+/// the host's where it holds the guesses.
+#[derive(Clone, Debug)]
+pub(crate) struct StepInputs {
+    pub sequence: NativePort,
+    pub guesses: Option<NativePort>,
+}
+
 /// What a bank-served layer's route, landing launch and site bind, one port
-/// each: the step (set here when the layer sets it, with the run's
-/// sequence input), its group's map, its file table of the exchange, and
-/// where the bank has a host tier the layer's tier map and its group's
-/// tier records (the streaming header's requests in routed.seismic).
+/// each: the step (set here when the layer sets it, with the run's step
+/// inputs), its group's map, its file table of the exchange, the landing
+/// launch's grid the route writes, and where the bank has a host tier the
+/// layer's tier map and its group's tier records (the streaming header's
+/// requests in routed.seismic).
 pub(crate) struct DecodePorts {
     pub step: NativePort,
-    pub sequence: Option<NativePort>,
+    pub inputs: Option<StepInputs>,
     pub map: NativePort,
     pub tier: Option<TierPorts>,
     /// The layer's policy words (`BankPart::Policy`): while its POLICY_WHOLE
@@ -1411,6 +1595,8 @@ pub(crate) struct DecodePorts {
     pub policy: NativePort,
     /// The layer's file table (`BankPart::FileTable`).
     pub file: NativePort,
+    /// The layer's landing launch's grid (`BankPart::LandGrid`).
+    pub land_grid: NativePort,
     /// The layer's CPU site's words and buffers, where it has a site.
     pub site: Option<SitePorts>,
 }
@@ -1496,6 +1682,26 @@ impl RouteLocals {
     }
 }
 
+/// What a bank-served decode launch's route leaves its later entries: its
+/// decode ports, the sources it wrote (`locals`), and the step's
+/// routing record (`BankPart::Routing`), which the gate/up's late pass
+/// reads.
+pub(crate) struct RoutedStep {
+    pub ports: DecodePorts,
+    pub locals: RouteLocals,
+    pub routing: NativePort,
+}
+
+/// What a decode launch's site request names of its step
+/// ([`StreamedLayer::site_request`]): its choices' experts (`routes`) and
+/// weights, the rows its experts project (`input`), and its rows.
+pub(crate) struct StepChoices<'t> {
+    pub routes: &'t WorkflowTensor,
+    pub weights: &'t WorkflowTensor,
+    pub input: &'t WorkflowTensor,
+    pub rows: &'t Dim,
+}
+
 /// What a bank-served route binds of its layer's host tier: the tier map's
 /// words (`TM`: the layer's experts, none without a tier) and the tensor, a
 /// graph constant of no words without a tier.
@@ -1527,8 +1733,14 @@ pub(crate) fn resident_form(load: &ModelLoadPlan, scope: WeightScope) -> bool {
 }
 
 impl<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'_, 'a, G, W> {
-    pub(crate) fn decode_ports(&mut self, graph: &mut G) -> Result<DecodePorts, GraphError> {
-        let (step, sequence) = self.step(graph)?;
+    /// The ports of a decode graph of `rows` rows.
+    pub(crate) fn decode_ports(
+        &mut self,
+        graph: &mut G,
+        rows: &Dim,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<DecodePorts, GraphError> {
+        let (step, inputs) = self.step(graph, Some(rows), constants)?;
         let tier = match self.numbers.tier.is_zero() {
             true => None,
             false => Some(TierPorts {
@@ -1538,11 +1750,12 @@ impl<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'_, 'a, G
         };
         Ok(DecodePorts {
             step,
-            sequence,
+            inputs,
             map: self.part(graph, BankPart::Map)?,
             tier,
             policy: self.part(graph, BankPart::Policy)?,
             file: self.part(graph, BankPart::FileTable)?,
+            land_grid: self.part(graph, BankPart::LandGrid)?,
             site: match self.entries.site {
                 Some(_) => Some(SitePorts {
                     table: self.part(graph, BankPart::SiteTable)?,

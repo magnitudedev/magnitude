@@ -34,7 +34,7 @@ use magnitude_executor::{
     MemoryReading, StateBytes, StoreAllocation, NativeFamily, SizingTerm, SizingTerms,
     Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
     ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
-    SubmitFailure, WorkKind, Yielded,
+    BuiltForm, FrontGrant, FrontPass, GuessKind, SubmitFailure, WorkKind, Yielded,
 };
 use magnitude_executor::memory::ledger::Relief;
 use magnitude_family_contracts::PreparedModelInput;
@@ -218,11 +218,134 @@ fn selection_charge(operations: &[Operation]) -> usize {
     operations
         .iter()
         .map(|operation| match operation {
-            Operation::Forward { select, .. } => select.len(),
+            Operation::Forward { .. } => operation.selected_rows(),
             Operation::Head { proposals, .. } => usize::from(!proposals.is_empty()),
             Operation::Encode { .. } => 0,
         })
         .sum()
+}
+
+/// Whether `candidate`'s next round is a pass in the form its launch grants
+/// (`Generation::chains`): a front pass, entering the MTP head behind it,
+/// or a verify pass, entering nothing. A launch's forwards chain all or
+/// none (`ExecutorDomain::requirements`), and its passes are of the one
+/// form its regime prices ([`FrontRows`]), within a chained launch's rows
+/// (`ExecutorDomain::chained_rows`), so a decode launch takes the selected
+/// requests alike in this with the first.
+fn chained(candidate: &Candidate) -> bool {
+    matches!(candidate, Candidate::Ready(generation) if generation.chains())
+}
+
+/// A decode launch's guessed rows (front-row decode): front rows, or a
+/// verify pass's acceptable rows on the chain. A launch may have them only
+/// where every request it selected decodes in front passes ([`chained`]),
+/// so no request's rows, a drafting request's verify rows among them, are
+/// ever held for a guessed row. Such a launch reserves every request
+/// before it is priced ([`ReservedRound::reserve`]), so a request turned
+/// back, its publication full or closed, is neither counted nor granted:
+/// the launch is priced for the requests it builds, by
+/// `ExecutorDomain::front_pass`, which owns each pass's form and depth.
+/// Every request's round is held to its exact row and its guessed rows, so
+/// the launch never holds more rows than its grant counted.
+enum FrontRows {
+    /// A pass the host builds, every request's in the one `form` its regime
+    /// prices: of the requests whose round would run guessed rows
+    /// (`Generation::front_guess`; one that would fall back to one row runs
+    /// none, and is not counted), which run them and up to how deep, held
+    /// to the launch's decode row budget past a row a request
+    /// ([`Self::of`]); every other request runs its exact row alone in that
+    /// form, so a verify launch's forwards chain none, whether or not any
+    /// request is granted a guessed row.
+    /// Only a request holding a guess, or drafting its chain first, runs
+    /// guessed rows: first those whose first guess is chained, whose chain
+    /// of standing guesses a grant continues, then those of the head's
+    /// guess alone, each in request order, so a request keeps its guessed
+    /// rows from launch to launch while the cap allows, whatever order the
+    /// requests are selected in.
+    Built {
+        form: BuiltForm,
+        granted: BTreeMap<RequestId, usize>,
+    },
+    /// The claim of the pass queued behind the last, whose requests the
+    /// launch holds, each at its queued depth: its rows are that pass's,
+    /// held to its request's context and a chained launch's rows as it was
+    /// queued (`ExecutorDomain::chained_rows`, this launch's budget), its
+    /// chain's guesses then idle rows past them, so nothing here reshapes
+    /// it.
+    Claim(BTreeMap<RequestId, usize>),
+}
+
+impl FrontRows {
+    /// The guessed rows of a decode launch of the requests it reserved,
+    /// each with the kind of the first guess its round would run at the
+    /// deepest grant (`passes`), within `rows`, its decode row budget,
+    /// `fronts` granting each request's pass given the launch's requests
+    /// and those that could front, in the order they take them
+    /// (`ExecutorDomain::front_pass`): the claim of the queued pass, or a
+    /// pass the host builds, of one form. Of the latter, guessed rows take
+    /// rows of the budget beyond their request's one, so a grant is no
+    /// deeper than the budget holds past a row a request, and grants stop,
+    /// in that order, at the first the rows left do not hold. A launch
+    /// reserves no more requests than its rows (`Service::select`), a row
+    /// each.
+    fn of<E>(
+        passes: impl ExactSizeIterator<Item = (RequestId, Option<GuessKind>)>,
+        rows: usize,
+        fronts: impl FnOnce(&[RequestId], &[RequestId]) -> Result<FrontPass, E>,
+    ) -> Result<Self, E> {
+        let passes = passes.collect::<Vec<_>>();
+        let requests = passes.iter().map(|&(id, _)| id).collect::<Vec<_>>();
+        let mut fronted = passes
+            .iter()
+            .filter_map(|&(id, kind)| Some((kind? != GuessKind::Chained, id)))
+            .collect::<Vec<_>>();
+        // Chains of standing guesses continued first, then in request
+        // order.
+        fronted.sort_unstable();
+        let fronted = fronted.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+        let (form, depths) = match fronts(&requests, &fronted)? {
+            FrontPass::Claim(claim) => return Ok(Self::Claim(claim)),
+            FrontPass::Built { form, depths } => (form, depths),
+        };
+        // The budget past a row a request holds the grants.
+        let mut left = rows
+            .checked_sub(requests.len())
+            .unwrap_or_else(|| panic!("invariant violated: a launch of {rows} rows reserved {} requests", requests.len()));
+        let room = left;
+        let mut granted = BTreeMap::new();
+        for id in fronted {
+            let Some(depth) = depths.get(&id).map(|&depth| depth.min(room)).filter(|&depth| depth > 0) else {
+                continue;
+            };
+            if depth > left {
+                break;
+            }
+            left -= depth;
+            granted.insert(id, depth);
+        }
+        Ok(Self::Built { form, granted })
+    }
+
+    /// Request `id`'s grant of guessed rows, and the rows its round takes:
+    /// its exact row and the guessed rows granted, of a pass the host
+    /// builds in the launch's form (up to none, of none), or exactly its
+    /// queued depth of the claim. Together they take no more than the rows
+    /// the grants were held to ([`Self::of`]), so the depth priced is the
+    /// depth built.
+    fn grant(&self, id: RequestId) -> (FrontGrant, usize) {
+        match self {
+            Self::Built { form, granted } => {
+                let depth = granted.get(&id).copied().unwrap_or(0);
+                (form.grant(depth), 1 + depth)
+            }
+            Self::Claim(claim) => {
+                let depth = *claim
+                    .get(&id)
+                    .unwrap_or_else(|| panic!("invariant violated: {id:?} builds a claim of the queued pass it is not in"));
+                (FrontGrant::Exactly(depth), 1 + depth)
+            }
+        }
+    }
 }
 
 /// Whether `generation` is resident, unfinished, and not yet past `position`.
@@ -538,6 +661,266 @@ enum Start {
     Joined(Member, Vec<Operation>),
     /// It waits, or ended, outside the round.
     Returned(Request),
+}
+
+fn fail_generation(record: &mut Record, generation: &mut Generation, error: RequestError) {
+    // Accepted output still precedes the terminal failure on this
+    // request's stream. Its reserved permits must survive until that
+    // output has drained.
+    if generation.finish_reason().is_none() {
+        generation.fail();
+    }
+    record.error = Some(error);
+}
+
+/// `generation` failed to start its round on an engine invariant: it ends,
+/// outside the round.
+fn failed(mut record: Record, mut generation: Generation, detail: String) -> Request {
+    fail_generation(&mut record, &mut generation, invariant("generation round start")(detail));
+    Request {
+        record,
+        state: State::Between(generation, Stage::Ready),
+    }
+}
+
+/// How reserving a selected request's start ended (`Service::reserve`).
+enum Reservation {
+    /// Work composed before the round: it joins as it is.
+    Composed(Member, Vec<Operation>),
+    /// A round, everything that could turn it back passed: it joins.
+    Round(ReservedRound),
+    /// It waits, or ended, outside the round.
+    Returned(Request),
+}
+
+/// A request's next round reserved for its launch: room held for all a
+/// round of its allowance publishes, so building it within no more rows
+/// ([`Self::build`]) turns nothing back. A launch
+/// prices only the rounds it reserved ([`FrontRows`]), which are the rounds
+/// it builds.
+struct ReservedRound {
+    record: Record,
+    generation: Generation,
+    /// The most rows its round takes.
+    allowance: usize,
+}
+
+impl ReservedRound {
+    /// Reserve `generation`'s next round of at most `allowance` rows, with
+    /// `selections` of the round's selection bound left, or turn it back:
+    /// no row left it, its publication full (it awaits credit) or its
+    /// receiver closed (it is cancelled). A round of fewer rows publishes no
+    /// more, so the room held covers any round its launch builds.
+    fn reserve(
+        mut record: Record,
+        generation: Generation,
+        allowance: usize,
+        selections: usize,
+        epoch: &mut AvailabilityEpoch,
+    ) -> Reservation {
+        if owes_reconciliation(&record, &generation) {
+            return Reservation::Round(Self { record, generation, allowance });
+        }
+        // A prefill chunk ends exactly at each planned branch point, and at
+        // the prompt's retained boundary one row before its end.
+        let resident = generation.resident_position();
+        let allowance = next_stop(&record, &generation, resident)
+            .map_or(allowance, |stop| allowance.min(stop - resident));
+        // With the round's selection bound spent, a chunk that would reach
+        // the end of the prompt (and select there) stops one row short and
+        // finishes in a later round; with no row left before the end, the
+        // request waits. Decode never gets here with the bound spent.
+        let allowance = if selections == 0 {
+            allowance.min(
+                generation
+                    .resume_bound()
+                    .saturating_sub(1)
+                    .saturating_sub(resident),
+            )
+        } else {
+            allowance
+        };
+        if allowance == 0 {
+            return Reservation::Returned(Request {
+                record,
+                state: State::Between(generation, Stage::Ready),
+            });
+        }
+        let bound = match generation.publication_bound(allowance) {
+            Ok(bound) => bound,
+            Err(detail) => return Reservation::Returned(failed(record, generation, detail)),
+        };
+        if bound != 0 {
+            if let Some(sender) = &record.publication {
+                let slots = bound.div_ceil(record.publication_batch_limit);
+                match sender.reserve_outputs(slots) {
+                    Ok(permits) => record.publication_permits.extend(permits),
+                    Err(PublishError::Full) => {
+                        return Reservation::Returned(Request {
+                            record,
+                            state: State::Between(generation, Stage::AwaitingCredit),
+                        });
+                    }
+                    Err(PublishError::ReceiverClosed) => {
+                        let mut generation = generation;
+                        generation.cancel();
+                        generation.discard_output();
+                        record.release_publication();
+                        epoch.advance();
+                        return Reservation::Returned(Request {
+                            record,
+                            state: State::Between(generation, Stage::Ready),
+                        });
+                    }
+                }
+            }
+        }
+        Reservation::Round(Self { record, generation, allowance })
+    }
+
+    /// The kind of the first guess its round runs if granted every guessed
+    /// row it holds (`Generation::front_guess`), as the context allows.
+    fn front_guess(&self) -> Option<GuessKind> {
+        self.generation.front_guess()
+    }
+
+    fn into_request(self) -> Request {
+        Request {
+            record: self.record,
+            state: State::Between(self.generation, Stage::Ready),
+        }
+    }
+
+    /// Build request `id`'s round within `rows` of its rows, with the
+    /// guessed rows its `grant` gives, in the form it gives;
+    /// `publish_behind` takes whether the decode queued behind a target
+    /// round publishes its feature. Nothing turns it back: only its
+    /// generation failing an invariant leaves it out of the launch.
+    fn build(self, id: RequestId, rows: usize, grant: FrontGrant, publish_behind: impl FnOnce(bool)) -> Start {
+        let Self { record, generation, allowance } = self;
+        let allowance = allowance.min(rows);
+        if owes_reconciliation(&record, &generation) {
+            return match generation.start_reconciliation(allowance) {
+                Ok(round) => match lower_round(&round, id, round.generation().resident_position(), None) {
+                    Ok(operation) => Start::Joined(
+                        Member {
+                            record,
+                            state: Membership::Started(round),
+                        },
+                        vec![operation],
+                    ),
+                    Err(detail) => Start::Returned(failed(record, round.fail(), detail)),
+                },
+                Err((generation, detail)) => Start::Returned(failed(record, generation, detail)),
+            };
+        }
+        match generation.start_round(id, allowance, grant) {
+            Ok(RoundStart::Target(round)) => {
+                // Where the next round prepares to draft, the decode queued
+                // behind this one publishes its feature as that round.
+                publish_behind(round.publishes_behind());
+                match lower_round(&round, id, round.generation().resident_position(), None) {
+                    Ok(operation) => Start::Joined(
+                        Member {
+                            record,
+                            state: Membership::Started(round),
+                        },
+                        vec![operation],
+                    ),
+                    Err(detail) => Start::Returned(failed(record, round.fail(), detail)),
+                }
+            }
+            Ok(RoundStart::Method(generation, operations)) => {
+                if operations.iter().any(|operation| operation.request() != id) {
+                    Start::Returned(failed(
+                        record,
+                        generation,
+                        "method returned an operation for another request".into(),
+                    ))
+                } else {
+                    Start::Joined(
+                        Member {
+                            record,
+                            state: Membership::Generation(generation),
+                        },
+                        operations,
+                    )
+                }
+            }
+            Err((generation, detail)) => Start::Returned(failed(record, generation, detail)),
+        }
+    }
+}
+
+/// A round's launch as its requests join it: their members and work, the
+/// rows that work takes, and the selection bound it leaves.
+struct Launch {
+    members: BTreeMap<RequestId, Member>,
+    operations: Vec<Operation>,
+    rows: usize,
+    selections: usize,
+}
+
+impl Launch {
+    fn new(selections: usize) -> Self {
+        Self {
+            members: BTreeMap::new(),
+            operations: Vec::new(),
+            rows: 0,
+            selections,
+        }
+    }
+
+    /// Request `id` started (`start`): its work joins the launch, or it goes
+    /// back to `requests`. A member whose work passes the selection bound
+    /// left joins all the same, so the owner terminates it with that error.
+    fn join(
+        &mut self,
+        id: RequestId,
+        start: Start,
+        requests: &mut BTreeMap<RequestId, Request>,
+    ) -> Result<(), RequestError> {
+        let (member, mut work) = match start {
+            Start::Joined(member, work) => (member, work),
+            Start::Returned(request) => {
+                requests.insert(id, request);
+                return Ok(());
+            }
+        };
+        self.rows += work
+            .iter()
+            .filter(|operation| matches!(operation, Operation::Forward { .. } | Operation::Head { .. }))
+            .map(Operation::row_count)
+            .sum::<usize>();
+        let charge = selection_charge(&work);
+        self.members.insert(id, member);
+        self.operations.append(&mut work);
+        self.selections = self.selections.checked_sub(charge).ok_or_else(|| {
+            invariant("scheduler")("a started member exceeds the round's selection bound".into())
+        })?;
+        Ok(())
+    }
+
+    /// Build the rounds a launch that may pair reserved (`reserved`, in
+    /// selection order), `fronts` its front rows: each at its exact row and
+    /// the guessed rows granted it, or of a claim of the queued pass, at
+    /// that pass's rows ([`FrontRows::grant`]). Every round joins, past a
+    /// selection-bound violation too, the first of which it returns.
+    fn build(
+        &mut self,
+        reserved: Vec<(RequestId, ReservedRound)>,
+        fronts: &FrontRows,
+        requests: &mut BTreeMap<RequestId, Request>,
+        mut publish_behind: impl FnMut(RequestId, bool),
+    ) -> Result<(), RequestError> {
+        let mut joined = Ok(());
+        for (id, round) in reserved {
+            let (grant, rows) = fronts.grant(id);
+            let start = round.build(id, rows, grant, |publishes| publish_behind(id, publishes));
+            joined = joined.and(self.join(id, start, requests));
+        }
+        joined
+    }
 }
 
 fn classify_domain_error(error: DomainError) -> RequestError {
@@ -1492,16 +1875,6 @@ impl<F: ProgramFamily> Service<F> {
         }
     }
 
-    fn fail_generation(record: &mut Record, generation: &mut Generation, error: RequestError) {
-        // Accepted output still precedes the terminal failure on this
-        // request's stream. Its reserved permits must survive until that
-        // output has drained.
-        if generation.finish_reason().is_none() {
-            generation.fail();
-        }
-        record.error = Some(error);
-    }
-
     fn drive(&mut self, mut pipeline: Pipeline<F>, now: u64) -> Result<(Pipeline<F>, Ran), Fatal> {
         self.time(now).map_err(|error| (None, error))?;
         let mut unload = false;
@@ -2168,25 +2541,45 @@ impl<F: ProgramFamily> Service<F> {
             self.return_candidates(candidates);
             return Ok(Selected::Empty);
         };
+        // A decode launch's forwards chain all or none ([`chained`]): it
+        // takes the selected requests alike in this with the first, a
+        // chained launch within its rows (`ExecutorDomain::chained_rows`),
+        // the budget its queued pass was held to. Any other is left
+        // out of the selection, uncharged, so its wait carries it ahead of
+        // those the launch serves, and it leads a launch of its own kind.
+        let chaining = matches!(selection.phase(), Phase::Decode)
+            && selection.requests().first().is_some_and(|id| chained(&candidates[id].1));
+        let requests = selection
+            .requests()
+            .iter()
+            .copied()
+            .filter(|id| !matches!(selection.phase(), Phase::Decode) || chained(&candidates[id].1) == chaining)
+            .collect::<Vec<_>>();
         // Requests take rows from one phase-wide token budget in selection
         // order. Additional ready requests wait for the next round.
-        let mut remaining_rows = match selection.phase() {
+        let budget = match selection.phase() {
             Phase::Prefill => self.scheduler.limits().prefill_tokens,
+            Phase::Decode if chaining => self.domain.chained_rows(),
             Phase::Decode => self.scheduler.limits().decode_tokens,
         };
         // The round's vocabulary work: selected target rows and drafting
         // requests together stay within the selection bound. Every such
         // charge also takes a row from the decode budget, so only a prefill
         // round finishing more prompts than the bound meets it.
-        let mut remaining_selections = self.scheduler.limits().selection_bound();
+        let mut launch = Launch::new(self.scheduler.limits().selection_bound());
+        // Guessed rows, where every request decodes in front passes, in the
+        // form and as many and as deep as the domain grants (`FrontRows`): a
+        // claim of the pass queued behind the last, or one the host builds
+        // in the form and to the depth the regime prices least. Such a
+        // launch reserves every request before it is priced and builds them
+        // after (`Launch::build`), so it prices exactly the requests it
+        // builds.
+        let mut reserved = Vec::new();
         let mut attempted = 0;
-        let mut members = BTreeMap::new();
-        let mut operations = Vec::new();
         // Requests whose drafted blocks await verification share the launch
         // that verifies them: its rows go to the proposals most often right,
         // whichever request drafted them.
-        let drafted = selection
-            .requests()
+        let drafted = requests
             .iter()
             .filter_map(|id| Some((*id, candidates[id].1.generation().draft_outlook()?)))
             .collect::<Vec<_>>();
@@ -2196,7 +2589,7 @@ impl<F: ProgramFamily> Service<F> {
             .collect::<Vec<_>>();
         let shares = magnitude_generation::share_rows(
             &outlooks,
-            remaining_rows * drafted.len() / selection.requests().len().max(1),
+            budget * drafted.len() / requests.len().max(1),
         )
         .map(|shares| {
             drafted
@@ -2206,91 +2599,91 @@ impl<F: ProgramFamily> Service<F> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-        for &id in selection.requests() {
+        for &id in &requests {
+            // A reserved round holds a row, the fewest it takes, until its
+            // launch builds it.
+            let remaining_rows = budget.saturating_sub(launch.rows + reserved.len());
             if remaining_rows == 0 {
                 break;
             }
-            // Share the remaining rows across requests still eligible in this
-            // round. A lone request can use the whole budget, while peers get
-            // compatible chunks instead of the first request consuming it.
-            let allowance = shares
-                .get(&id)
-                .copied()
-                .unwrap_or_else(|| remaining_rows.div_ceil(selection.requests().len() - attempted))
-                .min(remaining_rows);
+            let allowance = if chaining {
+                // Built at its exact row and the guessed rows its launch
+                // grants it (`FrontRows::grant`), within these.
+                remaining_rows
+            } else {
+                // Share the remaining rows across requests still eligible in
+                // this round. A lone request can use the whole budget, while
+                // peers get compatible chunks instead of the first request
+                // consuming it.
+                shares
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_else(|| remaining_rows.div_ceil(requests.len() - attempted))
+                    .min(remaining_rows)
+            };
             attempted += 1;
             let (record, candidate) = candidates.remove(&id).expect("selected candidate");
-            // Work composed before this round joins as it is, or waits.
-            if candidate
-                .composed()
-                .is_some_and(|work| selection_charge(work) > remaining_selections)
-            {
-                self.requests.insert(
-                    id,
-                    Request {
-                        record,
-                        state: candidate.into_state(),
-                    },
-                );
-                continue;
-            }
             // On a fatal error every selected request, started or not, goes
             // back where the owner terminates it with that error: one held
             // here would be dropped without its outcome.
-            let started = match self.start(
-                id,
-                record,
-                candidate,
-                allowance,
-                remaining_selections,
-                bindings,
-            ) {
-                Ok(started) => started,
+            let reservation = match self.reserve(id, record, candidate, allowance, launch.selections, bindings) {
+                Ok(reservation) => reservation,
                 Err((_, error)) => {
                     self.return_candidates(candidates);
-                    return Err((Some(members), error));
+                    self.return_reserved(reserved);
+                    return Err((Some(launch.members), error));
                 }
             };
-            match started {
-                Start::Joined(member, mut next) => {
-                    let rows = next
-                        .iter()
-                        .filter(|operation| {
-                            matches!(operation, Operation::Forward { .. } | Operation::Head { .. })
-                        })
-                        .map(Operation::row_count)
-                        .sum::<usize>();
-                    remaining_rows = remaining_rows.saturating_sub(rows);
-                    let charge = selection_charge(&next);
-                    members.insert(id, member);
-                    let Some(left) = remaining_selections.checked_sub(charge) else {
-                        self.return_candidates(candidates);
-                        let error = invariant("scheduler")(
-                            "a started member exceeds the round's selection bound".into(),
-                        );
-                        return Err((Some(members), error));
-                    };
-                    remaining_selections = left;
-                    operations.append(&mut next);
+            let start = match reservation {
+                Reservation::Returned(request) => Start::Returned(request),
+                Reservation::Composed(member, work) => {
+                    assert!(!chaining, "a chaining launch selects only ready requests");
+                    Start::Joined(member, work)
                 }
-                Start::Returned(request) => {
-                    self.requests.insert(id, request);
+                Reservation::Round(round) if chaining => {
+                    reserved.push((id, round));
+                    continue;
                 }
+                Reservation::Round(round) => {
+                    round.build(id, allowance, FrontGrant::UpTo(0), |publishes| self.domain.publish_behind(id, publishes))
+                }
+            };
+            if let Err(error) = launch.join(id, start, &mut self.requests) {
+                self.return_candidates(candidates);
+                return Err((Some(launch.members), error));
             }
         }
         self.return_candidates(candidates);
+        if chaining {
+            let passes = reserved.iter().map(|(id, round)| (*id, round.front_guess()));
+            let fronts = FrontRows::of(passes, budget, |requests, fronted| self.domain.front_pass(requests, fronted));
+            let fronts = match fronts {
+                Ok(fronts) => fronts,
+                Err(error) => {
+                    self.return_reserved(reserved);
+                    return Err((None, classify_domain_error(error)));
+                }
+            };
+            let domain = &mut self.domain;
+            let built = launch.build(reserved, &fronts, &mut self.requests, |id, publishes| {
+                domain.publish_behind(id, publishes)
+            });
+            if let Err(error) = built {
+                return Err((Some(launch.members), error));
+            }
+        }
         selection
-            .truncate(attempted)
+            .retain(&requests[..attempted])
             .map_err(|error| (None, invariant("scheduler")(error)))?;
-        if operations.is_empty() {
+        if launch.operations.is_empty() {
             self.scheduler.completed(selection, 0);
             return Ok(Selected::Retry);
         }
         Ok(Selected::Round(Round {
             selection,
             started: self.now,
-            members,
-            groups: group(&self.domain, operations).into_iter().collect(),
+            members: launch.members,
+            groups: group(&self.domain, launch.operations).into_iter().collect(),
         }))
     }
 
@@ -2306,8 +2699,19 @@ impl<F: ProgramFamily> Service<F> {
         }
     }
 
-    /// Start a selected request: its pending work, residency, or a round.
-    fn start(
+    /// Requests reserved for a launch that then failed go back as they were
+    /// selected, ready.
+    fn return_reserved(&mut self, reserved: Vec<(RequestId, ReservedRound)>) {
+        for (id, round) in reserved {
+            self.requests.insert(id, round.into_request());
+        }
+    }
+
+    /// Reserve a selected request's start: everything that can turn it
+    /// back, its work's selection charge, its residency and its round's
+    /// ([`ReservedRound::reserve`]), so whatever it reserves joins the
+    /// launch.
+    fn reserve(
         &mut self,
         id: RequestId,
         mut record: Record,
@@ -2315,11 +2719,21 @@ impl<F: ProgramFamily> Service<F> {
         allowance: usize,
         selections: usize,
         bindings: &mut StateBindings,
-    ) -> Result<Start, Fatal> {
+    ) -> Result<Reservation, Fatal> {
+        // Work composed before this round joins as it is, or waits.
+        if candidate
+            .composed()
+            .is_some_and(|work| selection_charge(work) > selections)
+        {
+            return Ok(Reservation::Returned(Request {
+                record,
+                state: candidate.into_state(),
+            }));
+        }
         record.clock.serve(Instant::now());
         let generation = match candidate {
             Candidate::Parked(round, work) => {
-                return Ok(Start::Joined(
+                return Ok(Reservation::Composed(
                     Member {
                         record,
                         state: Membership::Started(round),
@@ -2328,7 +2742,7 @@ impl<F: ProgramFamily> Service<F> {
                 ));
             }
             Candidate::Pending(generation, work) => {
-                return Ok(Start::Joined(
+                return Ok(Reservation::Composed(
                     Member {
                         record,
                         state: Membership::Generation(generation),
@@ -2351,7 +2765,7 @@ impl<F: ProgramFamily> Service<F> {
                 match residency {
                     Residency::Resident(generation, encodes) => match Work::new(encodes) {
                         Some(work) => {
-                            return Ok(Start::Joined(
+                            return Ok(Reservation::Composed(
                                 Member {
                                     record,
                                     state: Membership::Generation(generation),
@@ -2362,13 +2776,13 @@ impl<F: ProgramFamily> Service<F> {
                         None => generation,
                     },
                     Residency::Waiting(generation, wait) => {
-                        return Ok(Start::Returned(Request {
+                        return Ok(Reservation::Returned(Request {
                             record,
                             state: State::Between(generation, Stage::NonResident(Some(wait))),
                         }));
                     }
                     Residency::Failed(generation) => {
-                        return Ok(Start::Returned(Request {
+                        return Ok(Reservation::Returned(Request {
                             record,
                             state: State::Between(generation, Stage::Ready),
                         }));
@@ -2376,133 +2790,7 @@ impl<F: ProgramFamily> Service<F> {
                 }
             }
         };
-        self.start_round(id, record, generation, allowance, selections)
-            .map_err(|error| (None, error))
-    }
-
-    fn start_round(
-        &mut self,
-        id: RequestId,
-        mut record: Record,
-        generation: Generation,
-        allowance: usize,
-        selections: usize,
-    ) -> Result<Start, RequestError> {
-        let fail = |mut record: Record, mut generation: Generation, detail: String| {
-            Self::fail_generation(
-                &mut record,
-                &mut generation,
-                invariant("generation round start")(detail),
-            );
-            Start::Returned(Request {
-                record,
-                state: State::Between(generation, Stage::Ready),
-            })
-        };
-        if owes_reconciliation(&record, &generation) {
-            return Ok(match generation.start_reconciliation(allowance) {
-                Ok(round) => match lower_round(&round, id, round.generation().resident_position(), None) {
-                    Ok(operation) => Start::Joined(
-                        Member {
-                            record,
-                            state: Membership::Started(round),
-                        },
-                        vec![operation],
-                    ),
-                    Err(detail) => fail(record, round.fail(), detail),
-                },
-                Err((generation, detail)) => fail(record, generation, detail),
-            });
-        }
-        // A prefill chunk ends exactly at each planned branch point, and at
-        // the prompt's retained boundary one row before its end.
-        let resident = generation.resident_position();
-        let allowance = next_stop(&record, &generation, resident)
-            .map_or(allowance, |stop| allowance.min(stop - resident));
-        // With the round's selection bound spent, a chunk that would reach
-        // the end of the prompt (and select there) stops one row short and
-        // finishes in a later round; with no row left before the end, the
-        // request waits. Decode never gets here with the bound spent.
-        let allowance = if selections == 0 {
-            allowance.min(
-                generation
-                    .resume_bound()
-                    .saturating_sub(1)
-                    .saturating_sub(resident),
-            )
-        } else {
-            allowance
-        };
-        if allowance == 0 {
-            return Ok(Start::Returned(Request {
-                record,
-                state: State::Between(generation, Stage::Ready),
-            }));
-        }
-        let bound = match generation.publication_bound(allowance) {
-            Ok(bound) => bound,
-            Err(detail) => return Ok(fail(record, generation, detail)),
-        };
-        if bound != 0 {
-            if let Some(sender) = &record.publication {
-                let slots = bound.div_ceil(record.publication_batch_limit);
-                match sender.reserve_outputs(slots) {
-                    Ok(permits) => record.publication_permits.extend(permits),
-                    Err(PublishError::Full) => {
-                        return Ok(Start::Returned(Request {
-                            record,
-                            state: State::Between(generation, Stage::AwaitingCredit),
-                        }));
-                    }
-                    Err(PublishError::ReceiverClosed) => {
-                        let mut generation = generation;
-                        generation.cancel();
-                        generation.discard_output();
-                        record.release_publication();
-                        self.epoch.advance();
-                        return Ok(Start::Returned(Request {
-                            record,
-                            state: State::Between(generation, Stage::Ready),
-                        }));
-                    }
-                }
-            }
-        }
-        Ok(match generation.start_round(id, allowance) {
-            Ok(RoundStart::Target(round)) => {
-                // Where the next round prepares to draft, the decode queued
-                // behind this one publishes its feature as that round.
-                self.domain.publish_behind(id, round.publishes_behind());
-                match lower_round(&round, id, round.generation().resident_position(), None) {
-                    Ok(operation) => Start::Joined(
-                        Member {
-                            record,
-                            state: Membership::Started(round),
-                        },
-                        vec![operation],
-                    ),
-                    Err(detail) => fail(record, round.fail(), detail),
-                }
-            }
-            Ok(RoundStart::Method(generation, operations)) => {
-                if operations.iter().any(|operation| operation.request() != id) {
-                    fail(
-                        record,
-                        generation,
-                        "method returned an operation for another request".into(),
-                    )
-                } else {
-                    Start::Joined(
-                        Member {
-                            record,
-                            state: Membership::Generation(generation),
-                        },
-                        operations,
-                    )
-                }
-            }
-            Err((generation, detail)) => fail(record, generation, detail),
-        })
+        Ok(ReservedRound::reserve(record, generation, allowance, selections, &mut self.epoch))
     }
 
     /// The single transition that makes a request resident: from the deepest
@@ -2563,7 +2851,7 @@ impl<F: ProgramFamily> Service<F> {
             Err(error) if is_fatal(&error) => return Err(fatal(classify_domain_error(error))),
             // Nothing of ours can make room: it fails at once.
             Err(error) => {
-                Self::fail_generation(record, &mut generation, refused_alone(error));
+                fail_generation(record, &mut generation, refused_alone(error));
                 return Ok(Residency::Failed(generation));
             }
         };
@@ -2577,7 +2865,7 @@ impl<F: ProgramFamily> Service<F> {
         if let Err(error) = resumed {
             return match self.domain.release_state(&[id]) {
                 Ok(()) => {
-                    Self::fail_generation(record, &mut generation, invariant("residency")(error));
+                    fail_generation(record, &mut generation, invariant("residency")(error));
                     Ok(Residency::Failed(generation))
                 }
                 Err(rollback) => Err(fatal(invariant("residency")(format!(
@@ -2989,7 +3277,7 @@ impl<F: ProgramFamily> Service<F> {
                         // (or re-prefills), unfailed.
                         Err((generation, RoundError::Interrupted(_))) => (Membership::Generation(generation), None),
                         Err((mut generation, RoundError::Logical(detail))) => {
-                            Self::fail_generation(
+                            fail_generation(
                                 &mut record,
                                 &mut generation,
                                 invariant("generation round")(detail),
@@ -3000,7 +3288,7 @@ impl<F: ProgramFamily> Service<F> {
                             (Membership::Generation(generation), Some(classify_domain_error(error)))
                         }
                         Err((mut generation, RoundError::Physical(error))) => {
-                            Self::fail_generation(
+                            fail_generation(
                                 &mut record,
                                 &mut generation,
                                 classify_domain_error(error),
@@ -3071,7 +3359,7 @@ impl<F: ProgramFamily> Service<F> {
             }
             if !correct {
                 self.domain.abort(item).map_err(classify_domain_error)?;
-                Self::fail_generation(
+                fail_generation(
                     &mut member.record,
                     generation,
                     invariant("service method flight")(
@@ -3092,7 +3380,7 @@ impl<F: ProgramFamily> Service<F> {
                 Ok(transition) => transition,
                 Err(detail) => {
                     self.domain.abort(item).map_err(classify_domain_error)?;
-                    Self::fail_generation(
+                    fail_generation(
                         &mut member.record,
                         generation,
                         invariant("generation method transition")(detail),
@@ -3102,13 +3390,11 @@ impl<F: ProgramFamily> Service<F> {
             };
             match self.domain.reconcile(
                 item,
-                PhysicalDecision {
-                    accepted_rows: transition.decision().accepted_rows,
-                },
+                transition.decision(),
             ) {
                 Ok(()) => generation.commit_method_transition(transition),
                 Err(error) if is_fatal(&error) => return Err(classify_domain_error(error)),
-                Err(error) => Self::fail_generation(
+                Err(error) => fail_generation(
                     &mut member.record,
                     generation,
                     classify_domain_error(error),
@@ -3139,7 +3425,7 @@ impl<F: ProgramFamily> Service<F> {
         if ended(member.state.generation()) {
             return self.domain.abort(item).map_err(classify_domain_error);
         }
-        match self.domain.reconcile(item, PhysicalDecision { accepted_rows: 0 }) {
+        match self.domain.reconcile(item, PhysicalDecision::rows(0)) {
             Ok(()) => Ok(()),
             Err(error) if is_fatal(&error) => Err(classify_domain_error(error)),
             Err(error) => {
@@ -3153,7 +3439,7 @@ impl<F: ProgramFamily> Service<F> {
     fn fail_member(round: &mut Round, request: RequestId, error: RequestError) {
         if let Some(Member { mut record, state }) = round.members.remove(&request) {
             let mut generation = state.terminate(false);
-            Self::fail_generation(&mut record, &mut generation, error);
+            fail_generation(&mut record, &mut generation, error);
             round.members.insert(
                 request,
                 Member {
@@ -3200,7 +3486,7 @@ impl<F: ProgramFamily> Service<F> {
                 // here lost its work: it fails.
                 Membership::Started(started) => {
                     let mut generation = started.fail();
-                    Self::fail_generation(
+                    fail_generation(
                         &mut record,
                         &mut generation,
                         invariant("service round")(
@@ -3780,28 +4066,33 @@ mod termination_tests {
         generation_with_limit(8)
     }
 
+    /// A test generation's options: at most `max_tokens`, by `method`.
+    pub(super) fn options(max_tokens: usize, method: MethodChoice) -> Options {
+        Options {
+            max_tokens,
+            output_capacity: 4,
+            context_limit: 32,
+            vocabulary: 100,
+            stop_tokens: BTreeSet::from([TokenId(99)]),
+            suppressed_tokens: BTreeSet::new(),
+            sampling: Sampling::Greedy,
+            shaping: Shaping {
+                temperature: 0.0,
+                ..Default::default()
+            },
+            seed: 42,
+            forced_quantum: 4,
+            method,
+            end_of_generation: EndOfGeneration::Stop,
+            reasoning_budget: None,
+        }
+    }
+
     pub(super) fn generation_with_limit(max_tokens: usize) -> Generation {
         let mut generation = Generation::new(
             vec![TokenId(1), TokenId(2)],
             InputLayout::new(2, vec![]).unwrap(),
-            Options {
-                max_tokens,
-                output_capacity: 4,
-                context_limit: 32,
-                vocabulary: 100,
-                stop_tokens: BTreeSet::from([TokenId(99)]),
-                suppressed_tokens: BTreeSet::new(),
-                sampling: Sampling::Greedy,
-                shaping: Shaping {
-                    temperature: 0.0,
-                    ..Default::default()
-                },
-                seed: 42,
-                forced_quantum: 4,
-                method: MethodChoice::Plain,
-                end_of_generation: EndOfGeneration::Stop,
-                reasoning_budget: None,
-            },
+            options(max_tokens, MethodChoice::Plain),
             None,
         )
         .unwrap();
@@ -3810,7 +4101,7 @@ mod termination_tests {
     }
 
     fn started() -> StartedRound {
-        match generation().start_round(magnitude_generation::RequestId(1), 4) {
+        match generation().start_round(magnitude_generation::RequestId(1), 4, magnitude_executor::FrontGrant::UpTo(0)) {
             Ok(RoundStart::Target(round)) => round,
             _ => panic!("expected a target round"),
         }
@@ -3832,7 +4123,7 @@ mod termination_tests {
         let forward = round.round_forward().clone();
         let generation = round.abandon();
         assert_eq!(generation.finish_reason(), None, "an abandoned round finishes its generation");
-        match generation.start_round(magnitude_generation::RequestId(1), 4) {
+        match generation.start_round(magnitude_generation::RequestId(1), 4, magnitude_executor::FrontGrant::UpTo(0)) {
             Ok(RoundStart::Target(again)) => assert_eq!(again.round_forward(), &forward, "the round starts again as it was"),
             _ => panic!("expected the target round again"),
         }
@@ -3970,12 +4261,10 @@ mod pending_retention_tests {
     #[test]
     fn terminal_replay_with_parked_priming_cannot_retain_or_retire() {
         let generation = super::termination_tests::generation_with_limit(1);
-        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4) else {
+        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4, FrontGrant::UpTo(0)) else {
             panic!("prompt round")
         };
-        let transition = round.prepare_round_transition(
-            RequestId(1), &[magnitude_generation::TokenId(3)], None, &mut NoFeatures,
-        ).unwrap();
+        let transition = round.prepare_round_transition(RequestId(1), &[magnitude_generation::TokenId(3)], Vec::new(), None, &mut NoFeatures).unwrap();
         let (mut generation, _) = round.commit(transition);
         generation.discard_output();
         assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
@@ -3984,7 +4273,7 @@ mod pending_retention_tests {
         let parked = State::Parked(round, Work::new(vec![work]).unwrap(), Some(Wait { at: AvailabilityEpoch::default(), on: WaitsOn::Memory }));
         assert!(parked.settled().is_none());
         let State::Parked(round, _, _) = parked else { unreachable!() };
-        let transition = round.prepare_round_transition(RequestId(1), &[], None, &mut NoFeatures).unwrap();
+        let transition = round.prepare_round_transition(RequestId(1), &[], Vec::new(), None, &mut NoFeatures).unwrap();
         let (generation, _) = round.commit(transition);
         // These are exactly the old publication predicates: all are satisfied
         // before the priming continuation has become eligible to run.
@@ -4418,5 +4707,541 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         }
         let ids = admitted.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "unique and in admission order across loads: {ids:?}");
+    }
+}
+
+#[cfg(test)]
+mod front_rows_tests {
+    use super::*;
+    use magnitude_executor::{FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Guess, GuessKind, ResourceDomainId};
+    use magnitude_generation::{RoundStart, StartedRound, TokenId};
+
+    struct NoFeatures;
+    impl FeatureReader for NoFeatures {
+        fn read(&mut self, _: &FeatureSpan) -> Result<FeatureRows, String> {
+            panic!("a front-decoding head reads no feature on the host")
+        }
+    }
+
+    /// The features a chained step returns, which the head entered on the
+    /// device behind it: none is read.
+    fn features() -> FeatureRef {
+        FeatureRef::logical(ResourceDomainId::new("front-rows").unwrap(), 2, 4).unwrap()
+    }
+
+    /// An MTP generation on a load that fronts of request `id` decoding
+    /// within `context_limit` tokens: its prompt closed, its first token
+    /// selected and no guess standing.
+    fn decoding(id: RequestId, context_limit: usize) -> Generation {
+        let options = magnitude_generation::Options {
+            context_limit,
+            output_capacity: 32,
+            ..super::termination_tests::options(32, magnitude_generation::MethodChoice::Mtp { proposals: 2 })
+        };
+        let layout = magnitude_generation::InputLayout::new(2, vec![]).unwrap();
+        let method = Arc::new(magnitude_generation::Mtp::new("fixture", 2).unwrap().fronting().unwrap());
+        let mut generation = Generation::new_with_method(vec![TokenId(1), TokenId(2)], layout, options, None, method).unwrap();
+        generation.resume_at(None).unwrap();
+        commit(id, started(id, generation, 4, FrontGrant::UpTo(0)), &[TokenId(3)], Vec::new())
+    }
+
+    fn started(id: RequestId, generation: Generation, allowance: usize, grant: FrontGrant) -> StartedRound {
+        match generation.start_round(id, allowance, grant) {
+            Ok(RoundStart::Target(round)) => round,
+            _ => panic!("expected a target round"),
+        }
+    }
+
+    /// `round` committed with `samples`, its exact row's selection, and
+    /// `chain`, the head launch behind it's.
+    fn commit(id: RequestId, round: StartedRound, samples: &[TokenId], chain: Vec<Guess>) -> Generation {
+        let transition = round.prepare_round_transition(id, samples, chain, Some(features()), &mut NoFeatures).unwrap();
+        round.commit(transition).0
+    }
+
+    fn guess(token: u32, kind: GuessKind) -> Guess {
+        Guess { token: TokenId(token), kind }
+    }
+
+    /// [`decoding`], then a first pass, of no guess, selecting 4, behind
+    /// which the head guessed 5: its next pass pairs on that guess, where
+    /// its rows fit the context.
+    fn guessing(id: RequestId, context_limit: usize) -> Generation {
+        let first = started(id, decoding(id, context_limit), 4, FrontGrant::UpTo(1));
+        assert_eq!(first.round_forward().tokens, [TokenId(3)], "a first pass holds no guess");
+        commit(id, first, &[TokenId(4)], vec![guess(5, GuessKind::Head)])
+    }
+
+    /// The domain's grant up to `depth` of a pass the host builds, with
+    /// every launch paying: as many of the requests that could front, first
+    /// first, as 8 rows hold beside every exact row.
+    fn granted(requests: &[RequestId], fronted: &[RequestId], depth: usize) -> Result<FrontPass, ()> {
+        let count = magnitude_executor::fronted_requests(magnitude_executor::CHAINED_ROWS, requests.len(), depth).min(fronted.len());
+        Ok(FrontPass::Built { form: BuiltForm::Front, depths: fronted[..count].iter().map(|&id| (id, depth)).collect() })
+    }
+
+    /// The domain's grant up to depth 1 ([`granted`]).
+    fn pairs(requests: &[RequestId], fronted: &[RequestId]) -> Result<FrontPass, ()> {
+        granted(requests, fronted, 1)
+    }
+
+    /// A request's record, its prefix uncached and no stream attached.
+    fn record() -> Record {
+        Record {
+            waiting_since: 0, service_ns: 0, clock: RequestClock::Waiting, error: None, preemption_debt: 0,
+            prefix_cache: false, prefix_source: None,
+            prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
+            publication: None, publication_batch_limit: 4, pending_publication: None,
+            publication_permits: VecDeque::new(),
+        }
+    }
+
+    /// Reserve `selected`, with `records`, as a launch of `rows` rows that
+    /// may pair does, in selection order: each within the rows no round
+    /// reserved before it holds. The rounds reserved; any other request is
+    /// turned back.
+    fn reserve_with(selected: Vec<(RequestId, Generation, Record)>, rows: usize) -> (Vec<(RequestId, ReservedRound)>, BTreeMap<RequestId, Request>) {
+        let mut epoch = AvailabilityEpoch::default();
+        let (mut reserved, mut returned) = (Vec::new(), BTreeMap::new());
+        for (id, generation, record) in selected {
+            match ReservedRound::reserve(record, generation, rows - reserved.len(), 1, &mut epoch) {
+                Reservation::Round(round) => reserved.push((id, round)),
+                Reservation::Returned(request) => {
+                    returned.insert(id, request);
+                }
+                Reservation::Composed(..) => panic!("a ready request reserves a round"),
+            }
+        }
+        (reserved, returned)
+    }
+
+    /// [`reserve_with`] `selected`, each with its own [`record`], every one
+    /// reserved.
+    fn reserve(selected: Vec<(RequestId, Generation)>, rows: usize) -> Vec<(RequestId, ReservedRound)> {
+        let (reserved, returned) = reserve_with(selected.into_iter().map(|(id, generation)| (id, generation, record())).collect(), rows);
+        assert!(returned.is_empty(), "every request reserves its round");
+        reserved
+    }
+
+    /// [`FrontRows::of`] the `reserved` rounds within a budget of `rows`
+    /// rows, `counted` taking what its pricing was asked.
+    fn fronts_counted(reserved: &[(RequestId, ReservedRound)], rows: usize, counted: &mut Option<(usize, usize)>) -> FrontRows {
+        FrontRows::of(reserved.iter().map(|(id, round)| (*id, round.front_guess())), rows, |requests, fronted| {
+            *counted = Some((requests.len(), fronted.len()));
+            pairs(requests, fronted)
+        })
+        .unwrap()
+    }
+
+    /// [`FrontRows::of`] the `reserved` rounds within a budget of `rows` rows.
+    fn fronts_within(reserved: &[(RequestId, ReservedRound)], rows: usize) -> FrontRows {
+        fronts_counted(reserved, rows, &mut None)
+    }
+
+    /// Whether `fronts` grants no request a guessed row.
+    fn grants_none(fronts: &FrontRows) -> bool {
+        matches!(fronts, FrontRows::Built { granted, .. } if granted.is_empty())
+    }
+
+    /// A launch's committed generations, and each request's rows and
+    /// whether it ran a front row ([`launch`]).
+    type Launched = (Vec<(RequestId, Generation)>, BTreeMap<RequestId, (usize, bool)>);
+
+    /// One launch of the `reserved` rounds, `fronts` its front rows, built
+    /// as the scheduler builds it ([`Launch::build`]), each chaining
+    /// its forward, and committed with its guess right: a pass that ran a
+    /// front row keeps a chained guess, and one that ran none gets the
+    /// head's. The requests that ran a front row, and the rows each took.
+    fn launch(reserved: Vec<(RequestId, ReservedRound)>, fronts: &FrontRows) -> Launched {
+        let mut built = Launch::new(usize::MAX);
+        let mut returned = BTreeMap::new();
+        built.build(reserved, fronts, &mut returned, |_, _| {}).unwrap();
+        assert!(returned.is_empty(), "every reserved round is built");
+        let after = |token: TokenId| TokenId(token.0 + 1);
+        let mut ran = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
+        for operation in &built.operations {
+            let Operation::Forward { request, tokens, front, .. } = operation else {
+                panic!("a decode round is a forward");
+            };
+            assert!(operation.chain().is_some(), "every forward of the launch chains");
+            let front = !front.is_empty();
+            // A pair's exact row selects its guess, and the head's chain
+            // continues it; one row selects the token after its own.
+            let outcome = match (tokens.as_slice(), front) {
+                (&[_, guess], true) => (guess, vec![Guess { token: after(guess), kind: GuessKind::Chained }]),
+                (&[pending], _) => (after(pending), vec![Guess { token: after(after(pending)), kind: GuessKind::Head }]),
+                other => panic!("a decode round of {other:?}"),
+            };
+            ran.insert(*request, (operation.row_count(), front));
+            outcomes.insert(*request, outcome);
+        }
+        assert_eq!(built.rows, ran.values().map(|&(rows, _)| rows).sum::<usize>());
+        let next = built
+            .members
+            .into_iter()
+            .map(|(id, member)| {
+                let Membership::Started(round) = member.state else {
+                    panic!("a decode round starts");
+                };
+                let (sample, chain) = outcomes.remove(&id).unwrap();
+                (id, commit(id, round, &[sample], chain))
+            })
+            .collect();
+        (next, ran)
+    }
+
+    /// `requests` requests from 1, decoding with guesses standing.
+    fn guessing_all(requests: u64) -> Vec<(RequestId, Generation)> {
+        (1..=requests).map(|id| (RequestId(id), guessing(RequestId(id), 32))).collect()
+    }
+
+    /// N requests decoding with guesses standing in a launch pairing
+    /// min(N, 8 - N) of them: those pair, two rows each, and the rest decode
+    /// one row, each held to it although allowed more, so the launch holds
+    /// the rows its pairing counted.
+    #[test]
+    fn requests_pair_only_as_their_launch_counted() {
+        for requests in [2u64, 4, 5, 7] {
+            let reserved = reserve(guessing_all(requests), 64);
+            let fronts = fronts_within(&reserved, 64);
+            let (_, ran) = launch(reserved, &fronts);
+            let left = magnitude_executor::fronted_requests(magnitude_executor::CHAINED_ROWS, requests as usize, 1);
+            let paired = ran.values().filter(|&&(rows, front)| (rows, front) == (2, true)).count();
+            let rows = ran.values().map(|&(rows, _)| rows).sum::<usize>();
+            assert_eq!((paired, rows), (left, requests as usize + left), "{requests} requests: {ran:?}");
+        }
+    }
+
+    /// N = 5 to 7 requests, selected in a rotating order over several
+    /// launches from decode's start: the same min(N, 8 - N) requests hold
+    /// front rows in every launch, the lowest first as none had a guess,
+    /// and from the second launch on each continues its chain of guesses
+    /// before the others' head guesses; none of them loses its front row to
+    /// another request selected before it.
+    #[test]
+    fn requests_keep_their_front_rows_across_launches() {
+        for requests in 5u64..=7 {
+            let left = magnitude_executor::fronted_requests(magnitude_executor::CHAINED_ROWS, requests as usize, 1);
+            let mut generations = (1..=requests).map(|id| (RequestId(id), decoding(RequestId(id), 32))).collect::<BTreeMap<_, _>>();
+            for turn in 0..4 {
+                let mut order = generations.keys().copied().collect::<Vec<_>>();
+                let rotation = turn % order.len();
+                order.rotate_left(rotation);
+                let selected = order.iter().map(|id| (*id, generations.remove(id).unwrap())).collect::<Vec<_>>();
+                let reserved = reserve(selected, 64);
+                let fronts = fronts_within(&reserved, 64);
+                assert_eq!(grants_none(&fronts), turn == 0, "only the first launch holds no guess");
+                let (next, ran) = launch(reserved, &fronts);
+                generations.extend(next);
+                if turn == 0 {
+                    continue;
+                }
+                let fronted = ran.iter().filter(|(_, &(_, front))| front).map(|(id, _)| id.0).collect::<Vec<_>>();
+                assert_eq!(fronted, (1..=left as u64).collect::<Vec<_>>(), "{requests} requests, launch {turn}: {ran:?}");
+                assert!(fronted.iter().all(|&id| ran[&RequestId(id)].0 == 2), "{requests} requests, launch {turn}: every front row pairs: {ran:?}");
+            }
+        }
+    }
+
+    /// A request whose two-row pass would not fit its context, so it would
+    /// decode in one row, is counted as no pair: its launch is priced for
+    /// the others alone, and it is granted no front row.
+    #[test]
+    fn a_request_falling_back_to_one_row_counts_as_no_pair() {
+        let short = guessing(RequestId(3), 4);
+        assert_eq!(short.front_guess(), None, "its pair's two rows pass its context");
+        let selected = vec![(RequestId(1), guessing(RequestId(1), 32)), (RequestId(2), guessing(RequestId(2), 32)), (RequestId(3), short)];
+        let reserved = reserve(selected, 64);
+        let mut counted = None;
+        let fronts = fronts_counted(&reserved, 64, &mut counted);
+        assert_eq!(counted, Some((3, 2)), "three requests, two of which could pair");
+        let (_, ran) = launch(reserved, &fronts);
+        assert_eq!(ran[&RequestId(3)], (1, false));
+        assert_eq!((ran[&RequestId(1)], ran[&RequestId(2)]), ((2, true), (2, true)));
+    }
+
+    /// A request its launch turns back, its publication full, is neither
+    /// priced nor granted a front row: the launch is priced for the requests
+    /// it reserved, and builds each pair it priced. Priced before the
+    /// reservation turned it back, the launch would have counted three
+    /// requests and granted it a pair it never builds.
+    #[test]
+    fn a_request_turned_back_is_neither_priced_nor_granted_a_front_row() {
+        let (sender, _receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
+        let _held = sender.reserve_outputs(1).unwrap();
+        let full = Record { publication: Some(sender), ..record() };
+        let selected = vec![
+            (RequestId(1), guessing(RequestId(1), 32), record()),
+            (RequestId(2), guessing(RequestId(2), 32), full),
+            (RequestId(3), guessing(RequestId(3), 32), record()),
+        ];
+        let (reserved, returned) = reserve_with(selected, 64);
+        assert!(matches!(returned[&RequestId(2)].state, State::Between(_, Stage::AwaitingCredit)), "its publication is full");
+        assert_eq!(returned.len(), 1);
+        let mut counted = None;
+        let fronts = fronts_counted(&reserved, 64, &mut counted);
+        assert_eq!(counted, Some((2, 2)), "the two requests reserved, both of which could pair");
+        let (_, ran) = launch(reserved, &fronts);
+        assert_eq!(ran, BTreeMap::from([(RequestId(1), (2, true)), (RequestId(3), (2, true))]));
+    }
+
+    /// A request whose receiver is closed is turned back by its reservation
+    /// too, so it is neither priced nor granted a front row.
+    #[test]
+    fn a_request_with_a_closed_receiver_is_neither_priced_nor_granted_a_front_row() {
+        let (sender, receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
+        drop(receiver);
+        let closed = Record { publication: Some(sender), ..record() };
+        let selected = vec![
+            (RequestId(1), guessing(RequestId(1), 32), record()),
+            (RequestId(2), guessing(RequestId(2), 32), closed),
+            (RequestId(3), guessing(RequestId(3), 32), record()),
+        ];
+        let (reserved, _) = reserve_with(selected, 64);
+        let mut counted = None;
+        let fronts = fronts_counted(&reserved, 64, &mut counted);
+        assert_eq!(counted, Some((2, 2)), "the two requests reserved, both of which could pair");
+        let (_, ran) = launch(reserved, &fronts);
+        assert_eq!(ran, BTreeMap::from([(RequestId(1), (2, true)), (RequestId(3), (2, true))]));
+    }
+
+    /// A decode row budget short of a row a request and a front row a pair
+    /// pairs only as many as it holds past a row a request, and each of
+    /// them pairs: no pair is granted that falls back to one row. A budget
+    /// of a row a request pairs none.
+    #[test]
+    fn a_short_decode_budget_pairs_only_what_it_holds() {
+        assert!(grants_none(&fronts_within(&reserve(guessing_all(4), 4), 4)), "a row a request leaves no front row room");
+        let reserved = reserve(guessing_all(4), 5);
+        let fronts = fronts_within(&reserved, 5);
+        let (_, ran) = launch(reserved, &fronts);
+        let fronted = ran.iter().filter(|(_, &(_, front))| front).map(|(id, &taken)| (id.0, taken)).collect::<Vec<_>>();
+        assert_eq!(fronted, [(1, (2, true))], "{ran:?}");
+        assert_eq!(ran.values().map(|&(rows, _)| rows).sum::<usize>(), 5);
+    }
+
+    /// A request whose chain of guesses runs keeps its front row before a
+    /// lower request that holds none: with room for one pair, the higher
+    /// request holding a guess is granted it, and pairs.
+    #[test]
+    fn a_standing_guess_is_granted_before_a_lower_request() {
+        let reserved = reserve(vec![(RequestId(1), decoding(RequestId(1), 32)), (RequestId(2), guessing(RequestId(2), 32))], 3);
+        let fronts = fronts_within(&reserved, 3);
+        let (_, ran) = launch(reserved, &fronts);
+        assert_eq!((ran[&RequestId(1)], ran[&RequestId(2)]), ((1, false), (2, true)), "{ran:?}");
+    }
+
+    /// A request granted the regime's depth runs as many front rows as its
+    /// chain holds within the budget, and a budget short of the depth
+    /// grants as deep as it holds: one sequence of a chain of two runs
+    /// three rows up to a depth of 7, and is granted 6 of a budget of 7.
+    #[test]
+    fn a_granted_depth_runs_the_chains_rows_within_the_budget() {
+        let id = RequestId(1);
+        let round = started(id, decoding(id, 32), 4, FrontGrant::UpTo(0));
+        let generation = commit(id, round, &[TokenId(4)], vec![guess(5, GuessKind::Chained), guess(6, GuessKind::Head)]);
+        let deep = |requests: &[RequestId], fronted: &[RequestId]| granted(requests, fronted, 7);
+        let reserved = reserve(vec![(id, generation)], 8);
+        let fronts = FrontRows::of(reserved.iter().map(|(id, round)| (*id, round.front_guess())), 8, deep).unwrap();
+        assert_eq!(fronts.grant(id), (FrontGrant::UpTo(7), 8));
+        let mut built = Launch::new(usize::MAX);
+        built.build(reserved, &fronts, &mut BTreeMap::new(), |_, _| {}).unwrap();
+        let rows = built.operations.iter().map(|operation| (operation.row_count(), operation.front_rows())).collect::<Vec<_>>();
+        assert_eq!(rows, [(3, 2)], "its chain's two front rows");
+        assert!(grants_none(&FrontRows::of([(id, None::<GuessKind>)].into_iter(), 7, deep).unwrap()), "no chain, no grant");
+        let short = reserve(vec![(id, guessing(id, 32))], 8);
+        let short = FrontRows::of(short.iter().map(|(id, round)| (*id, round.front_guess())), 7, deep).unwrap();
+        assert_eq!(short.grant(id), (FrontGrant::UpTo(6), 7), "a budget short of the depth");
+    }
+
+    /// A launch of the requests of the pass queued behind the last one
+    /// builds that pass's depths exactly, each request its own
+    /// (`ExecutorDomain::front_pass`): one queued shallower than its chain runs
+    /// no deeper, one queued deeper runs idle rows past its chain, one
+    /// queued with no front row runs one row, whatever its chain, and one
+    /// holding no guess runs its queued depth all idle, so the launch claims
+    /// the queued pass rather than orphan it.
+    #[test]
+    fn a_launch_of_the_queued_pass_builds_each_requests_queued_depth() {
+        let chained = |id: RequestId, chain: &[u32]| {
+            let round = started(id, decoding(id, 32), 4, FrontGrant::UpTo(0));
+            commit(id, round, &[TokenId(4)], chain.iter().map(|&token| guess(token, GuessKind::Chained)).collect())
+        };
+        let (single, shallower, deeper, unguessed) = (RequestId(1), RequestId(2), RequestId(3), RequestId(4));
+        let reserved = reserve(
+            vec![(single, chained(single, &[5, 6, 7])), (shallower, chained(shallower, &[5, 6, 7])), (deeper, chained(deeper, &[5])), (unguessed, chained(unguessed, &[]))],
+            64,
+        );
+        let queued = |requests: &[RequestId], fronted: &[RequestId]| {
+            assert_eq!((requests, fronted), (&[single, shallower, deeper, unguessed][..], &[single, shallower, deeper][..]), "every request of a guess could front");
+            Ok::<_, ()>(FrontPass::Claim(BTreeMap::from([(single, 0), (shallower, 1), (deeper, 2), (unguessed, 1)])))
+        };
+        let fronts = FrontRows::of(reserved.iter().map(|(id, round)| (*id, round.front_guess())), 64, queued).unwrap();
+        assert_eq!(fronts.grant(single), (FrontGrant::Exactly(0), 1));
+        assert_eq!((fronts.grant(shallower), fronts.grant(deeper)), ((FrontGrant::Exactly(1), 2), (FrontGrant::Exactly(2), 3)));
+        assert_eq!(fronts.grant(unguessed), (FrontGrant::Exactly(1), 2), "a request of no guess takes its queued depth");
+        let mut built = Launch::new(usize::MAX);
+        built.build(reserved, &fronts, &mut BTreeMap::new(), |_, _| {}).unwrap();
+        let rows = built.operations.iter().map(|operation| (operation.request(), operation.row_count(), operation.front_rows())).collect::<Vec<_>>();
+        assert_eq!(rows, [(single, 1, 0), (shallower, 2, 1), (deeper, 3, 2), (unguessed, 2, 1)], "each request's queued depth");
+    }
+
+    /// A claim of the queued pass runs that pass's rows, however unevenly
+    /// they fall among its requests: queued at depths 3, 0 and 0 within the
+    /// launch's 6 rows, the first runs its four rows and the others one
+    /// each.
+    #[test]
+    fn a_claim_runs_the_queued_rows() {
+        let ids = [RequestId(1), RequestId(2), RequestId(3)];
+        let reserved = reserve(ids.iter().map(|&id| (id, guessing(id, 32))).collect(), 6);
+        let queued = |_: &[RequestId], _: &[RequestId]| {
+            Ok::<_, ()>(FrontPass::Claim(BTreeMap::from([(ids[0], 3), (ids[1], 0), (ids[2], 0)])))
+        };
+        let fronts = FrontRows::of(reserved.iter().map(|(id, round)| (*id, round.front_guess())), 6, queued).unwrap();
+        let mut built = Launch::new(usize::MAX);
+        built.build(reserved, &fronts, &mut BTreeMap::new(), |_, _| {}).unwrap();
+        let rows = built.operations.iter().map(|operation| (operation.request(), operation.row_count(), operation.front_rows())).collect::<Vec<_>>();
+        assert_eq!(rows, [(ids[0], 4, 3), (ids[1], 1, 0), (ids[2], 1, 0)], "the queued pass's rows");
+    }
+
+    /// Reads every feature row as zeros: a verify pass's accepted pairs
+    /// cross to the host.
+    struct Zeros;
+    impl FeatureReader for Zeros {
+        fn read(&mut self, span: &FeatureSpan) -> Result<FeatureRows, String> {
+            FeatureRows::new(vec![0u8; 4 * span.count].into(), span.count).map_err(|error| error.to_string())
+        }
+    }
+
+    /// A launch the regime prices in verify rows builds every request's
+    /// pass in that form, so none of its forwards chains: a request granted
+    /// rows verifies its chain's guesses, and one granted none verifies its
+    /// exact row alone. A request whose verify pass left its accepted pairs
+    /// trailing the head runs guessed rows on the head's guesses, its round
+    /// first the head transaction entering them and drafting as deep as its
+    /// grant.
+    #[test]
+    fn a_verify_launch_builds_every_pass_unchained() {
+        let verifying = |requests: &[RequestId], fronted: &[RequestId]| {
+            let count = magnitude_executor::fronted_requests(magnitude_executor::CHAINED_ROWS, requests.len(), 2).min(fronted.len());
+            Ok::<_, ()>(FrontPass::Built { form: BuiltForm::Verify, depths: fronted[..count].iter().map(|&id| (id, 2)).collect() })
+        };
+        let chained = |id: RequestId, chain: &[u32]| {
+            let round = started(id, decoding(id, 32), 4, FrontGrant::UpTo(0));
+            commit(id, round, &[TokenId(4)], chain.iter().map(|&token| guess(token, GuessKind::Chained)).collect())
+        };
+        let (deep, unguessed) = (RequestId(1), RequestId(2));
+        let reserved = reserve(vec![(deep, chained(deep, &[5, 6])), (unguessed, chained(unguessed, &[]))], 64);
+        let fronts = FrontRows::of(reserved.iter().map(|(id, round)| (*id, round.front_guess())), 64, verifying).unwrap();
+        assert_eq!((fronts.grant(deep), fronts.grant(unguessed)), ((FrontGrant::Verify(2), 3), (FrontGrant::Verify(0), 1)));
+        let mut built = Launch::new(usize::MAX);
+        built.build(reserved, &fronts, &mut BTreeMap::new(), |_, _| {}).unwrap();
+        let rows = built
+            .operations
+            .iter()
+            .map(|operation| (operation.request(), operation.row_count(), operation.acceptable_rows(), operation.chain().is_some()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, [(deep, 3, 2, false), (unguessed, 1, 0, false)], "no forward of the launch chains");
+        // Its first guess stood and its second fell: the pairs of 5 and 9
+        // trail the head.
+        let Membership::Started(round) = built.members.remove(&deep).unwrap().state else {
+            panic!("a decode round starts");
+        };
+        let transition = round.prepare_round_transition(deep, &[TokenId(5), TokenId(9), TokenId(11)], Vec::new(), Some(features()), &mut Zeros).unwrap();
+        let generation = round.commit(transition).0;
+        assert_eq!(generation.generated(), [TokenId(3), TokenId(4), TokenId(5), TokenId(9)]);
+        assert_eq!(generation.front_guess(), Some(GuessKind::Head), "it drafts its chain first");
+        let reserved = reserve(vec![(deep, generation)], 64);
+        let fronts = FrontRows::of(reserved.iter().map(|(id, round)| (*id, round.front_guess())), 64, verifying).unwrap();
+        let mut built = Launch::new(usize::MAX);
+        built.build(reserved, &fronts, &mut BTreeMap::new(), |_, _| {}).unwrap();
+        let [Operation::Head { tokens, proposals, .. }] = built.operations.as_slice() else {
+            panic!("the head transaction: {:?}", built.operations);
+        };
+        assert_eq!((tokens.clone(), proposals.len()), (vec![TokenId(5), TokenId(9)], 2));
+    }
+
+    /// [`decoding`], then a first pass committed with `chain` standing.
+    fn with_chain(id: RequestId, chain: &[u32]) -> Generation {
+        let round = started(id, decoding(id, 32), 4, FrontGrant::UpTo(0));
+        commit(id, round, &[TokenId(4)], chain.iter().map(|&token| guess(token, GuessKind::Chained)).collect())
+    }
+
+    /// The domain's grant of a pass the host builds in verify rows, every
+    /// request that could front at depth 2.
+    fn verifying_all(_: &[RequestId], fronted: &[RequestId]) -> Result<FrontPass, ()> {
+        Ok(FrontPass::Built { form: BuiltForm::Verify, depths: fronted.iter().map(|&id| (id, 2)).collect() })
+    }
+
+    /// A launch the regime prices in verify rows builds every pass in that
+    /// form even where its rows hold no guessed row: two requests of chains
+    /// within two rows each verify their exact row alone, and neither
+    /// forward chains a head behind it, as a front pass would.
+    #[test]
+    fn a_verify_launch_granting_no_guessed_row_builds_verify_passes() {
+        let ids = [RequestId(1), RequestId(2)];
+        let reserved = reserve(ids.iter().map(|&id| (id, with_chain(id, &[5, 6]))).collect(), 2);
+        let fronts = FrontRows::of(reserved.iter().map(|(id, round)| (*id, round.front_guess())), 2, verifying_all).unwrap();
+        assert!(grants_none(&fronts), "a row a request leaves no guessed row room");
+        assert_eq!((fronts.grant(ids[0]), fronts.grant(ids[1])), ((FrontGrant::Verify(0), 1), (FrontGrant::Verify(0), 1)));
+        let mut built = Launch::new(usize::MAX);
+        built.build(reserved, &fronts, &mut BTreeMap::new(), |_, _| {}).unwrap();
+        let rows = built
+            .operations
+            .iter()
+            .map(|operation| (operation.request(), operation.row_count(), operation.chain().is_some()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, [(ids[0], 1, false), (ids[1], 1, false)], "verify passes, none chained");
+    }
+
+    /// Every round a launch reserved is built, whatever rows the rounds
+    /// built before it took: a request whose verify pass left two pairs
+    /// trailing its head enters both, a row past the one its grant counted,
+    /// and the request after it within the launch's two rows still decodes
+    /// its exact row rather than fail for want of a row.
+    #[test]
+    fn every_reserved_round_is_built_past_an_earlier_rounds_rows() {
+        let (trailing, other) = (RequestId(1), RequestId(2));
+        let reserved = reserve(vec![(trailing, with_chain(trailing, &[5, 6]))], 64);
+        let fronts = FrontRows::of(reserved.iter().map(|(id, round)| (*id, round.front_guess())), 64, verifying_all).unwrap();
+        let mut built = Launch::new(usize::MAX);
+        built.build(reserved, &fronts, &mut BTreeMap::new(), |_, _| {}).unwrap();
+        let Membership::Started(round) = built.members.remove(&trailing).unwrap().state else {
+            panic!("a decode round starts");
+        };
+        // Its first guess stood and its second fell: the pairs of 5 and 9
+        // trail the head.
+        let transition = round.prepare_round_transition(trailing, &[TokenId(5), TokenId(9), TokenId(11)], Vec::new(), Some(features()), &mut Zeros).unwrap();
+        let generation = round.commit(transition).0;
+        let reserved = reserve(vec![(trailing, generation), (other, with_chain(other, &[]))], 2);
+        let fronts = FrontRows::of(reserved.iter().map(|(id, round)| (*id, round.front_guess())), 2, verifying_all).unwrap();
+        let mut built = Launch::new(usize::MAX);
+        let mut returned = BTreeMap::new();
+        built.build(reserved, &fronts, &mut returned, |_, _| {}).unwrap();
+        assert!(returned.is_empty(), "no round is left out: {:?}", returned.keys().collect::<Vec<_>>());
+        let rows = built.operations.iter().map(|operation| (operation.request(), operation.row_count())).collect::<Vec<_>>();
+        assert_eq!(rows, [(trailing, 2), (other, 1)], "the head enters both pairs, and the other request its exact row");
+    }
+
+    /// A launch's forwards chain all or none: only a request decoding in
+    /// front passes whose next round is a decode chains. A plain request's
+    /// decode, a drafting request's, or a fronting request's prompt chunk
+    /// does not, so its rows are never held beside chained ones.
+    #[test]
+    fn only_a_front_pass_chains() {
+        assert!(chained(&Candidate::Ready(guessing(RequestId(1), 32))), "a front-decoding request's decode");
+        let layout = || magnitude_generation::InputLayout::new(2, vec![]).unwrap();
+        let mut plain = Generation::new(vec![TokenId(1), TokenId(2)], layout(), super::termination_tests::options(8, magnitude_generation::MethodChoice::Plain), None).unwrap();
+        plain.resume_at(None).unwrap();
+        let plain = commit(RequestId(2), started(RequestId(2), plain, 4, FrontGrant::UpTo(0)), &[TokenId(3)], Vec::new());
+        assert!(!chained(&Candidate::Ready(plain)), "a plain request's decode");
+        let options = || super::termination_tests::options(8, magnitude_generation::MethodChoice::Mtp { proposals: 2 });
+        let drafting = Generation::new_with_method(vec![TokenId(1), TokenId(2)], layout(), options(), None, Arc::new(magnitude_generation::Mtp::new("fixture", 2).unwrap())).unwrap();
+        assert!(!drafting.chains(), "a drafting request");
+        let fronting = Arc::new(magnitude_generation::Mtp::new("fixture", 2).unwrap().fronting().unwrap());
+        let mut prompting = Generation::new_with_method(vec![TokenId(1), TokenId(2)], layout(), options(), None, fronting).unwrap();
+        prompting.resume_at(None).unwrap();
+        assert!(!chained(&Candidate::Ready(prompting)), "a front-decoding request's prompt chunk");
     }
 }

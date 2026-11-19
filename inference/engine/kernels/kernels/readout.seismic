@@ -440,10 +440,14 @@ fn readout_planes_rows[M, O, V, D, PT, NM, P](hidden: &tensor[M, PT, D] f32, nor
             logits[row, token] = cap_logit(logits[row, token], softcap)
     return logits
 
-# Metal: the `dense` projection (`dense.seismic`), single, over the 4-bit
-# view's packets, each threadgroup normalizing its rows in place, with the
-# bound epilogue: each row's threshold rises over `bounds` (sync scratch:
-# eight keys, then the arrival counter). Its forms are a plane set's (the
+# Metal: `stage` forms the rows into `features` with their lengths, once a
+# row, a threadgroup of the GEMV's SIMDGROUPS (a length sums one part a
+# simdgroup, so its bits follow the threadgroup's simdgroups); the `dense` projection (`dense.seismic`), single, projects `features`
+# over the 4-bit view's packets with the bound epilogue, each threadgroup
+# raising the rows' keys in `bounds` (sync scratch: VERIFY_ROWS keys);
+# `publish` turns the keys into the thresholds and clears them. A threadgroup
+# of the vocabulary-wide grid thus only streams its weight rows: no norm, no
+# length and no arrival of its own. Its forms are a plane set's (the
 # projection's rule): the GEMV below VERIFY_ROWS rows and the batched rows
 # above it; the entry keeps one tile mapping for every GEMV row count
 # (SIMDGROUPS, ROWS and LANES entry-wide).
@@ -454,7 +458,14 @@ native readout_top_rows for metal from "metal/readout_top_rows.metal":
     restate SIMDGROUPS in [16, 8, 4, 2, 32] default 16
     restate ROWS in [1, 2, 4] default 1
     restate arithmetic LANES in [16, 32] default 16
-    scratch bounds bytes (36) sync
+    scratch bounds bytes (4 * VERIFY_ROWS) sync
+    launch readout_top_rows_stage before gemv:
+        staging
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+    launch readout_top_rows_publish:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
 
 # Metal, O <= VERIFY_ROWS: one simdgroup per 32 vocabulary rows; only the survivors'
 # bit-3 words are read.

@@ -11,8 +11,9 @@
 //! streamed form (`operators::routed::streamed`) while its bank lacks any
 //! expert, which its demand is: each such layer's route resolves and hints
 //! (`routed_route_streamed`, `routed_select_streamed`), the first sets the
-//! run's step word (`routed_step`), each lands its absent choices
-//! (`routed_land`), and a layer with a CPU site requests
+//! run's step word (`routed_step`), a gated layer's gate/up runs in two
+//! passes (`routed_gate_up_part`) around its landing launch for its absent
+//! choices (`routed_land`), and a layer with a CPU site requests
 //! the CPU's choices (`routed_site_request`) and combines with its answer
 //! (`routed_output_project` and `routed_output_sited`, or the general
 //! form's down), all at any misses, none included. Where the backend's
@@ -50,55 +51,20 @@ use magnitude_kernels as kernels;
 use magnitude_state::{HistoryDomainLayout, HistoryEncoding, KvCodec, LayerRef, ModelStateLayout};
 use seismic::{Element, OperandRecipe};
 use std::collections::HashMap;
-
-/// History one call reads for each token of context.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HistoryRead {
-    /// The layout an attention entry reads it in; none for an indexer's
-    /// F32 block keys and scores, which a selection call streams.
-    pub layout: Option<KvCodec>,
-    pub bytes_per_token: u64,
-    /// FLOPs of one row per token read: attention's bf16 score and value
-    /// products.
-    pub flops_per_token: u64,
-    /// The most tokens read: a window domain's window, or the blocks a
-    /// selected read reads and its tail. `None` reads every token.
-    pub window: Option<u64>,
-}
-
-impl HistoryRead {
-    /// The tokens read at `depth` tokens of context.
-    pub fn tokens_at(&self, depth: u32) -> u64 {
-        self.window
-            .map_or(u64::from(depth), |window| window.min(u64::from(depth)))
-    }
-}
-
-/// Matmul FLOPs over weights resident in one format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Flops {
-    pub format: Element,
-    pub flops: u64,
-}
-
-/// Weight bytes resident in one format, which its own weight rate prices.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Bytes {
-    pub format: Element,
-    pub bytes: u64,
-}
+use magnitude_cost_model::{Census, Kind, LaunchCounts, LayerCall, RoutedCall};
+use seismic::measure::pricing::{Bytes, Experts, Flops, Format, HistoryRead, Layout, Work};
 
 /// An amount of one weight format's, summed per format.
 trait PerFormat {
     /// What the amounts are, as an overflow names them.
     const WHAT: &'static str;
-    fn format(&self) -> Element;
+    fn format(&self) -> Format;
     fn amount(&mut self) -> &mut u64;
 }
 
 impl PerFormat for Bytes {
     const WHAT: &'static str = "weight bytes";
-    fn format(&self) -> Element {
+    fn format(&self) -> Format {
         self.format
     }
     fn amount(&mut self) -> &mut u64 {
@@ -108,7 +74,7 @@ impl PerFormat for Bytes {
 
 impl PerFormat for Flops {
     const WHAT: &'static str = "matmul FLOPs";
-    fn format(&self) -> Element {
+    fn format(&self) -> Format {
         self.format
     }
     fn amount(&mut self) -> &mut u64 {
@@ -141,7 +107,7 @@ fn weight_bytes(weights: &[&WeightPlan]) -> Result<Vec<Bytes>, AssessmentError> 
         add(
             &mut bytes,
             Bytes {
-                format: weight.resident,
+                format: format_of(weight.resident),
                 bytes: weight.resident_bytes,
             },
         )?;
@@ -149,43 +115,14 @@ fn weight_bytes(weights: &[&WeightPlan]) -> Result<Vec<Bytes>, AssessmentError> 
     Ok(bytes)
 }
 
-/// The expert slabs a routed call reads: `selected` of `experts` equal
-/// slabs per row, the union of the rows' choices once per step.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Experts {
-    pub experts: u64,
-    pub selected: u64,
-    /// One expert's bytes over every expert tensor the call reads, by
-    /// format.
-    pub slab_bytes: Vec<Bytes>,
-    /// One expert's FLOPs per row over those tensors, by format.
-    pub slab_flops: Vec<Flops>,
-}
-
-/// What one call reads and computes. Resident weights and per-sequence
-/// state are in device storage, as the load plan places them; the host
-/// writes upload rows (`Tensor::shared`, upload storage).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Work {
-    /// Weights read whole, once per step, by format.
-    pub weights: Vec<Bytes>,
-    pub experts: Option<Experts>,
-    /// Device bytes each row reads and writes.
-    pub row_bytes: u64,
-    /// Upload bytes each row reads.
-    pub upload_row_bytes: u64,
-    /// Each row's matmul FLOPs, by weight format.
-    pub row_flops: Vec<Flops>,
-    /// Device state each sequence reads and writes, whatever its depth.
-    pub sequence_bytes: u64,
-    pub history: Option<HistoryRead>,
-}
-
-/// One call of the step: its entry and its work.
+/// One call of the step: its entry, its work, and where it is a streamed
+/// layer's call its gates price (its routed picks or its hint launch),
+/// that layer's ([`LayerCall`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Call {
     pub launches: Launches,
     pub work: Work,
+    pub layer: Option<LayerCall>,
 }
 
 /// One plain target decode step, call by call.
@@ -196,6 +133,63 @@ pub struct DecodeDemand {
     /// layers' parks and publications where the backend's parks are
     /// submission boundaries, each a submit and a wait beside device time.
     pub boundaries: u64,
+}
+
+impl DecodeDemand {
+    /// The step's census ([`Census`]): each call's work, and its launches at
+    /// each decode row count as its entry's declaration counts them, each
+    /// entry's counted once; at a count its declaration gives no one count
+    /// of, why, which prices only a launch of those rows. A streamed layer's
+    /// routed calls carry its routed kind (`ExpertBankPlan::routed_kinds`),
+    /// the numbering its routed passes are priced by.
+    pub fn census(&self) -> Census {
+        let mut counted = Vec::<(&Launches, LaunchCounts)>::new();
+        let mut calls = Vec::with_capacity(self.calls.len());
+        for call in &self.calls {
+            let launches = match counted.iter().find(|(launches, _)| **launches == call.launches) {
+                Some((_, counts)) => counts.clone(),
+                None => {
+                    let counts = LaunchCounts::new((1..=DECODE_ROWS).map(|rows| call.launches.at(rows).map_err(demand_reason)).collect());
+                    counted.push((&call.launches, counts.clone()));
+                    counts
+                }
+            };
+            calls.push((Kind { work: call.work.clone(), launches }, call.layer));
+        }
+        Census::new(calls, self.boundaries, DECODE_ROWS)
+    }
+}
+
+/// The rows of a decode step's row classes, beyond which a launch runs its
+/// prefill forms (`VERIFY_ROWS`).
+const DECODE_ROWS: u64 = kernels::constants::VERIFY_ROWS;
+
+/// A weight format as the cost model keys it: its element's storage name.
+pub fn format_of(element: Element) -> Format {
+    Format(element.name())
+}
+
+/// The element a weight format names: its storage, registered under the
+/// name [`format_of`] keys it by.
+///
+/// # Panics
+/// Where no storage is registered under the name: every format is one
+/// [`format_of`] named.
+pub(crate) fn element_of(format: Format) -> Element {
+    Element::named(format.0).unwrap_or_else(|| panic!("invariant violated: format {:?} names no registered storage", format.0))
+}
+
+/// A history layout as the cost model keys it: its codec's identity.
+pub fn layout_of(codec: KvCodec) -> Layout {
+    Layout(codec.identity())
+}
+
+/// What a demand failure says, as the cost model names it.
+fn demand_reason(error: AssessmentError) -> String {
+    match error {
+        AssessmentError::Demand(reason) => reason,
+        other => other.to_string(),
+    }
 }
 
 /// The words a banked plan's decode is encoded under, its streamed form: no
@@ -231,7 +225,7 @@ fn matmul_flops(weight: &WeightPlan) -> Result<Option<Flops>, AssessmentError> {
         return Ok(None);
     }
     Ok(Some(Flops {
-        format: weight.resident,
+        format: format_of(weight.resident),
         flops: elements(weight)?
             .checked_mul(2)
             .ok_or_else(|| demand_error("matmul FLOPs overflow"))?,
@@ -287,11 +281,11 @@ fn slab(weight: &WeightPlan) -> Result<(Bytes, Flops), AssessmentError> {
     let bytes = weight.resident.canonical_byte_len(&[1, n, k]).map_err(|_| malformed())?;
     Ok((
         Bytes {
-            format: weight.resident,
+            format: format_of(weight.resident),
             bytes,
         },
         Flops {
-            format: weight.resident,
+            format: format_of(weight.resident),
             flops: 2 * n * k,
         },
     ))
@@ -378,7 +372,7 @@ struct Step<'a> {
 /// The operand recipe of the weights `work` reads, whole or as experts.
 fn work_recipe(work: &Work) -> OperandRecipe {
     let experts = work.experts.iter().flat_map(|experts| &experts.slab_bytes);
-    operand_recipe(work.weights.iter().chain(experts).map(|bytes| bytes.format))
+    operand_recipe(work.weights.iter().chain(experts).map(|bytes| element_of(bytes.format)))
 }
 
 impl Step<'_> {
@@ -433,8 +427,18 @@ impl Step<'_> {
                 launches
             }
         };
-        self.calls.push(Call { launches, work });
+        self.calls.push(Call { launches, work, layer: None });
         Ok(())
+    }
+
+    /// The call just made computes the routed picks of the layer of
+    /// `scope`: where a bank streams it, the call is that layer's routed
+    /// call, of its routed kind.
+    fn routed(&mut self, load: &ModelLoadPlan, scope: WeightScope) {
+        if let Some((bank, layer)) = streamed::served(load, scope) {
+            let call = self.calls.last_mut().expect("invariant violated: a routed call was made");
+            call.layer = Some(LayerCall::Routed(RoutedCall { kind: bank.routed_kinds()[layer], layer }));
+        }
     }
 
     /// A park or publication of a streamed layer: a submission boundary
@@ -657,7 +661,7 @@ fn sinkhorn_site(
     add(
         &mut work.row_flops,
         Flops {
-            format: Element::f32(),
+            format: format_of(Element::f32()),
             flops: (2 * u64::from(mixing.iterations)).saturating_sub(1) * 2 * streams * streams,
         },
     )?;
@@ -807,11 +811,10 @@ fn sources(load: &ModelLoadPlan, scope: WeightScope) -> [(&'static str, u64); 1]
 /// The routing of the routed layer of `scope` doing `work`: `resident` of a
 /// layer the load holds whole; of a streamed one its streamed form
 /// (`operators::routed::streamed`): the run's step word where the layer
-/// sets it (`routed_step`), its route `streamed` at its `AHEAD`, reading
+/// sets it (`routed_step`), and its route `streamed` at its `AHEAD`, reading
 /// beside `work` the hinted weights of each layer it predicts
-/// (`ExpertBankPlan::predicted`), its landing launch
-/// (`routed_land`), after its park, and where the layer has a CPU site
-/// its request (`routed_site_request`), before its publication.
+/// (`ExpertBankPlan::predicted`) in its hint launch, which its hint gate
+/// prices (`LayerCall::Hint`). Its landing follows ([`wait`]).
 fn route(
     step: &mut Step<'_>,
     load: &ModelLoadPlan,
@@ -838,7 +841,20 @@ fn route(
             .map(|(scope, kind, element)| planned(load, scope, kind, element))
             .collect::<Result<Vec<_>, _>>()?;
         step.call_with(hint, &[("AHEAD", ahead)], projection(&hinted)?)?;
+        step.calls.last_mut().expect("invariant violated: a hint launch was made").layer = Some(LayerCall::Hint(index));
     }
+    Ok(())
+}
+
+/// What the streamed routed layer of `scope` runs after its route and
+/// before the expert entries that read its absent choices: its landing
+/// launch (`routed_land`), after its park, and where the layer has a CPU
+/// site its request (`routed_site_request`), before its publication;
+/// nothing of a layer the load holds whole.
+fn wait(step: &mut Step<'_>, load: &ModelLoadPlan, scope: WeightScope) -> Result<(), AssessmentError> {
+    let Some((bank, index)) = streamed::served(load, scope) else {
+        return Ok(());
+    };
     step.park();
     // The landing launch converts the bank's records, from their stored
     // element into their resident one: its operands are the records', not a
@@ -853,6 +869,22 @@ fn route(
     Ok(())
 }
 
+/// The gated experts' gate/up of the routed layer of `scope` doing `work`,
+/// after its route: `routed_gate_up` of a layer the load holds whole; of a
+/// streamed one its two passes (`routed_gate_up_part`) around its wait
+/// ([`wait`]), the early one doing `work`, every choice held, the late one
+/// none, at no misses.
+fn gate_up(step: &mut Step<'_>, load: &ModelLoadPlan, scope: WeightScope, work: Work) -> Result<(), AssessmentError> {
+    if streamed::served(load, scope).is_none() {
+        return step.call_with(Kernel::of::<kernels::routed_gate_up::Entry>(), &sources(load, scope), work);
+    }
+    let part = Kernel::of::<kernels::routed_gate_up_part::Entry>();
+    step.call(part, work)?;
+    step.routed(load, scope);
+    wait(step, load, scope)?;
+    step.call(part, Work::default())
+}
+
 /// The combine of the routed layer of `scope` doing `work`: of a layer
 /// with a CPU site, its streamed form's projections (`project`) and their
 /// sum (`sited`) after its park, which waits for the CPU's answer; of any
@@ -865,14 +897,14 @@ fn combine(
     work: Work,
 ) -> Result<(), AssessmentError> {
     let sources = sources(load, scope);
-    match streamed::served(load, scope).filter(|(bank, index)| bank.sited(*index)) {
-        None => step.call_with(resident, &sources, work),
-        Some(_) => {
-            step.call_with(project, &sources, work)?;
-            step.park();
-            step.call(sited, Work::default())
-        }
+    let site = streamed::served(load, scope).is_some_and(|(bank, index)| bank.sited(index));
+    step.call_with(if site { project } else { resident }, &sources, work)?;
+    step.routed(load, scope);
+    if site {
+        step.park();
+        step.call(sited, Work::default())?;
     }
+    Ok(())
 }
 
 /// `operators::routed::graph` at decode rows in `scope`: the shared
@@ -881,8 +913,8 @@ fn combine(
 /// (`routed_select`), the latent projections (`project_rows`,
 /// `dense_output`), and the selected experts' expansion (`routed_gate_up`,
 /// or `routed_up` up-only) and down projection (`routed_down`), a streamed
-/// layer's selection and down in its streamed form ([`route`],
-/// [`combine`]). Its input is the caller's.
+/// layer's selection, expansion and down in its streamed form ([`route`],
+/// [`gate_up`] or [`wait`], [`combine`]). Its input is the caller's.
 fn general_routed(
     step: &mut Step<'_>,
     load: &ModelLoadPlan,
@@ -927,23 +959,21 @@ fn general_routed(
         )?;
     }
     let up = weight(WeightKind::ExpertUp, binding.expert_up)?;
-    let (expansion, tensors) = match binding.expert_gate {
-        Some(gate) => (
-            Kernel::of::<kernels::routed_gate_up::Entry>(),
-            vec![weight(WeightKind::ExpertGate, gate)?, up],
-        ),
-        None => (Kernel::of::<kernels::routed_up::Entry>(), vec![up]),
-    };
     let chosen = |tensors: &[&WeightPlan]| experts(tensors, shape.experts, shape.selected);
-    let sources = sources(load, scope);
-    step.call_with(
-        expansion,
-        &sources,
-        Work {
-            experts: Some(chosen(&tensors)?),
+    let expansion = |tensors: &[&WeightPlan]| {
+        Ok::<_, AssessmentError>(Work {
+            experts: Some(chosen(tensors)?),
             ..Work::default()
-        },
-    )?;
+        })
+    };
+    match binding.expert_gate {
+        Some(gate) => gate_up(step, load, scope, expansion(&[weight(WeightKind::ExpertGate, gate)?, up])?)?,
+        None => {
+            wait(step, load, scope)?;
+            step.call_with(Kernel::of::<kernels::routed_up::Entry>(), &sources(load, scope), expansion(&[up])?)?;
+            step.routed(load, scope);
+        }
+    }
     combine(
         step,
         load,
@@ -1194,7 +1224,7 @@ fn picked<'a>(
     Ok(Work {
         row_bytes: product(picks, plane_row, "picked row bytes")?,
         row_flops: vec![Flops {
-            format: activation,
+            format: format_of(activation),
             flops: product(picks, flops_per_pick, "picked row FLOPs")?,
         }],
         ..Work::default()
@@ -1536,7 +1566,7 @@ fn attention_mixer(
     let widths = shape.widths;
     let flops_per_token = 2 * widths.kv_heads * widths.group * (2 * widths.width);
     let read = |window| HistoryRead {
-        layout: Some(history_layout),
+        layout: Some(layout_of(history_layout)),
         bytes_per_token: row_bytes,
         flops_per_token,
         window,
@@ -1798,8 +1828,8 @@ fn dense_feed_forward(
 /// choices' and the shared expert's gate/up (`routed_expand`); or routing
 /// with the shared expert's gate/up (`routed_route_shared`), then the
 /// choices' (`routed_gate_up`). Then the choices' and the shared expert's
-/// down projections (`routed_output`). A streamed layer routes and combines
-/// in its streamed form ([`route`], [`combine`]).
+/// down projections (`routed_output`). A streamed layer routes, expands and
+/// combines in its streamed form ([`route`], [`gate_up`], [`combine`]).
 fn routed_feed_forward(
     step: &mut Step<'_>,
     sublayer: &Sublayer<'_>,
@@ -1825,7 +1855,6 @@ fn routed_feed_forward(
         )?),
         ..Work::default()
     };
-    let sources = sources(load, scope);
     match DecodeForm::of(step.declarations.backend()).map_err(demand_error)? {
         DecodeForm::Expand => {
             streamed::expand_form(streamed::streams(load, scope)).map_err(demand_error)?;
@@ -1847,11 +1876,7 @@ fn routed_feed_forward(
                 ],
                 join([router, shared])?,
             )?;
-            step.call_with(
-                Kernel::of::<kernels::routed_gate_up::Entry>(),
-                &sources,
-                choices,
-            )?;
+            gate_up(step, load, scope, choices)?;
         }
     }
     let down = Work {
@@ -2307,11 +2332,11 @@ pub(crate) mod tests {
             .map(bytes)
             .iter()
             .sum::<u64>();
-        assert_eq!(site.weights, vec![Bytes { format: Element::f32(), bytes: site_weights }]);
+        assert_eq!(site.weights, vec![Bytes { format: format_of(Element::f32()), bytes: site_weights }]);
         assert_eq!(site.row_bytes, 4 * (s * h + h + 2 * s + s * s));
         let projection = 2 * (2 + s) * s * s * h;
         let normalizations = 2 * iterations - 1;
-        assert_eq!(site.row_flops, vec![Flops { format: Element::f32(), flops: projection + normalizations * 2 * s * s }]);
+        assert_eq!(site.row_flops, vec![Flops { format: format_of(Element::f32()), flops: projection + normalizations * 2 * s * s }]);
         assert_eq!(call("stream_join").work.row_bytes, 4 * (2 * s * h + h));
         assert_eq!(call("stream_collapse").work.row_bytes, 4 * (s * h + h));
     }
@@ -2451,7 +2476,7 @@ pub(crate) mod tests {
         assert_eq!(
             histories(&dense),
             [HistoryRead {
-                layout: Some(KvCodec::Dense),
+                layout: Some(layout_of(KvCodec::Dense)),
                 bytes_per_token: 256,
                 flops_per_token,
                 window: None,
@@ -2463,7 +2488,7 @@ pub(crate) mod tests {
         assert_eq!(
             histories(&affine),
             [HistoryRead {
-                layout: Some(KvCodec::AffineK8V4),
+                layout: Some(layout_of(KvCodec::AffineK8V4)),
                 bytes_per_token: 64 + 32 + 2 * (2 * 2 * 2),
                 flops_per_token,
                 window: None,
@@ -2565,7 +2590,7 @@ pub(crate) mod tests {
     #[test]
     fn a_window_reads_at_most_its_tokens() {
         let read = HistoryRead {
-            layout: Some(KvCodec::Dense),
+            layout: Some(layout_of(KvCodec::Dense)),
             bytes_per_token: 10,
             flops_per_token: 0,
             window: Some(100),
@@ -2586,11 +2611,11 @@ pub(crate) mod tests {
                 experts: 8,
                 selected: 2,
                 slab_bytes: vec![Bytes {
-                    format: tensor.resident,
+                    format: format_of(tensor.resident),
                     bytes: 32 * 64 * 2,
                 }],
                 slab_flops: vec![Flops {
-                    format: tensor.resident,
+                    format: format_of(tensor.resident),
                     flops: 2 * 32 * 64,
                 }],
             }

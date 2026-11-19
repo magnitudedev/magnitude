@@ -1,4 +1,4 @@
-use crate::experts::reuse::{Evidence, Ranking, Reuse};
+use crate::experts::reuse::{Evidence, Ranking, Reuse, Rows, StepKeys};
 use crate::experts::watcher::Step;
 
 /// One step's routing at one streamed layer, as the device read it: the
@@ -21,9 +21,10 @@ pub struct CountedLaunch {
 }
 
 /// Each streamed layer's decode reads by the depth at which they found their
-/// experts in the ranking's stack ([`Stack`]), so the misses of a bank of every size at
-/// once: a bank of `s` slots misses a read whose depth bucket is `s` or more
-/// ([`LayerCurve::at`]).
+/// experts in their group's order by the ranking ([`Stack`]), so the misses
+/// of a bank of every size at once: a bank of `s` slots a layer (`s · L`
+/// records of a group of `L` layers) misses a read whose depth bucket is `s`
+/// or more ([`LayerCurve::at`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MissCurve {
     /// The decode steps counted.
@@ -32,9 +33,9 @@ pub struct MissCurve {
 }
 
 /// One layer's reads, `experts + 1` buckets each: an expert read at depth
-/// `d` (the group's experts read more recently, in placement's order) lies
-/// in bucket `d / L`, `L` the group's layers, since `s` slots are `s · L`
-/// records; a first read in the last.
+/// `d` (the group's experts that outrank it) lies in bucket `d / L`, `L` the
+/// group's layers, since `s` slots are `s · L` records; a first read in the
+/// last.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LayerCurve {
     /// Each expert read, by its depth.
@@ -62,11 +63,12 @@ impl LayerCurve {
     }
 }
 
-/// The reads of the bank's layers by their depth in the one ranking's stack
-/// ([`Reuse`]): its feed, in the device's order, and the miss curves
-/// that price every bank size by the ranking that decides what the
-/// bank holds. A layer's share of `s` slots holds its stack's top `s`, so a
-/// read misses it exactly when its expert lies `s` or more deep.
+/// The reads of the bank's layers by their depth in the one ranking's group
+/// order ([`Reuse`]): its feed, in the device's order, and the miss curves
+/// that price every bank size by the ranking that decides what the bank
+/// holds. A group's pool of `s · L` records holds its `s · L` most ranked
+/// experts where it admits only what outranks its least, so a read misses it
+/// when its expert lies `s` or more slots deep (`Reuse::depth`).
 pub struct Stack {
     ranking: Ranking,
     experts: usize,
@@ -211,30 +213,39 @@ impl Stack {
     }
 
     /// An empty stack over a ranking of its own of `layers` layers of
-    /// `experts` experts each, every layer's share `slots` records.
+    /// `experts` experts each, each layer a group of its own of `slots`
+    /// records.
     #[cfg(test)]
     pub fn alone(layers: usize, experts: usize, slots: usize) -> Self {
-        Self::new(Reuse::ranking(&vec![experts; layers], &(0..layers).collect::<Vec<_>>(), vec![slots; layers]), layers, experts)
+        let time = crate::experts::horizon::Time::new(&vec![vec![slots.max(1) as u64]; layers], 32);
+        Self::new(Reuse::ranking(&vec![experts; layers], &(0..layers).collect::<Vec<_>>(), &vec![slots; layers], time), layers, experts)
     }
 
     /// Step `read.sequence` read `read.experts` at `read.layer`, in the
-    /// device's order of reads: together, each expert at its depth before
-    /// any of them is ranked again. A decode read is counted where its
-    /// step's launch is given (`counted`), and so is its step, with that
-    /// launch, the first time one of its reads is (a group's steps first
-    /// read in sequence order, and groups in theirs).
-    pub fn read(&mut self, read: &RoutedRead, counted: Option<CountedLaunch>) {
+    /// device's order of reads, its rows' selection keys `keys` where its
+    /// launch wrote them: together, each expert at its depth before any of
+    /// them is ranked again. A decode read is counted where its step's
+    /// launch is given (`counted`), and so is its step, with that launch,
+    /// the first time one of its reads is (a group's steps first read in
+    /// sequence order, and groups in theirs).
+    pub fn read(&mut self, read: &RoutedRead, counted: Option<CountedLaunch>, keys: Option<&StepKeys>) {
+        self.read_at(read, counted, keys, None);
+    }
+
+    /// [`Self::read`] with a pre-captured token clock position `clock` for
+    /// `read.sequence` (`Reuse::read_at`).
+    pub(crate) fn read_at(
+        &mut self,
+        read: &RoutedRead,
+        counted: Option<CountedLaunch>,
+        keys: Option<&StepKeys>,
+        clock: Option<crate::experts::horizon::Tokens>,
+    ) {
         let mut experts = read.experts.clone();
         experts.sort_unstable();
-        // Each expert with its choices: the rows that chose it.
-        let mut routed = Vec::<(usize, u32)>::new();
-        for expert in experts {
-            match routed.last_mut() {
-                Some((last, choices)) if *last == expert => *choices += 1,
-                _ => routed.push((expert, 1)),
-            }
-        }
-        let depths = self.rank(read, routed, Evidence::Decode);
+        experts.dedup();
+        let rows = keys.map(|keys| std::sync::Arc::new(keys.rows(read.layer)));
+        let depths = Reuse::feeding(&self.ranking).read_at(&RoutedRead { experts, ..read.clone() }, rows, Evidence::Decode, clock);
         count(&mut self.decoded, &mut self.last_decoded, read, &depths);
         if let Some(launch) = counted {
             if count(&mut self.curve, &mut self.counted, read, &depths) {
@@ -244,35 +255,25 @@ impl Stack {
     }
 
     /// A prompt group's union `read`, read at its last step `read.sequence`
-    /// ([`Self::read`]) into the ranking: a bank of `s` slots holds the
-    /// union's experts less than `s` deep, `routed` each expert's choices
-    /// over the group's steps. Each expert's depth, in slots, in
-    /// `read.experts`' ascending order.
-    pub fn read_group(&mut self, read: &RoutedRead, routed: &[u32]) -> Vec<usize> {
-        assert!(read.experts.windows(2).all(|pair| pair[0] < pair[1]), "a group's union lists each expert once, ascending");
-        assert_eq!(read.experts.len(), routed.len(), "each expert of a group's union has its choices");
-        self.rank(read, read.experts.iter().copied().zip(routed.iter().copied()).collect(), Evidence::Prompt)
-    }
-
-    /// Read `read`'s experts into the ranking ([`Reuse::read`]) as
-    /// `evidence`, each at its depth before any of them is ranked again:
-    /// those depths, in slots, in the experts' ascending order.
-    fn rank(&mut self, read: &RoutedRead, routed: Vec<(usize, u32)>, evidence: Evidence) -> Vec<usize> {
-        let (experts, choices): (Vec<usize>, Vec<u32>) = routed.into_iter().unzip();
-        Reuse::feeding(&self.ranking).read(&RoutedRead { experts, ..read.clone() }, &choices, evidence)
+    /// ([`Self::read`]) into the ranking, its rows the union's choices
+    /// (`Rows::union`): a bank of `s` slots holds the union's experts less
+    /// than `s` deep. Each expert's depth, in slots, in `read.experts`'
+    /// ascending order.
+    pub fn read_group(&mut self, read: &RoutedRead, rows: Rows) -> Vec<usize> {
+        Reuse::feeding(&self.ranking).read(read, Some(std::sync::Arc::new(rows)), Evidence::Prompt)
     }
 
     /// What the load's counted decode read and ran ([`LiveDecode`]); none
     /// before it counted a step.
-    pub fn live(&self) -> Option<crate::assessment::LiveDecode> {
+    pub fn live(&self) -> Option<magnitude_cost_model::LiveDecode> {
         let steps = self.curve.steps;
         if steps == 0 {
             return None;
         }
         let rows = self.launches.rows as f64 / steps as f64;
         let depth = u32::try_from(self.launches.tokens / steps).expect("a decode's mean context fits a launch's");
-        let layers = self.curve.layers.iter().map(|layer| crate::assessment::LayerReads::of_depths(&layer.misses, &layer.requests)).collect();
-        Some(crate::assessment::LiveDecode { layers, steps, rows, depth })
+        let layers = self.curve.layers.iter().map(|layer| magnitude_cost_model::LayerReads::of_depths(&layer.misses, &layer.requests)).collect();
+        Some(magnitude_cost_model::LiveDecode { layers, steps, rows, depth })
     }
 
     /// Every decode step read since the load, counted into the record or

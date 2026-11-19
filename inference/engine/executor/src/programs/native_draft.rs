@@ -27,7 +27,7 @@
 //! Selections are step-major: proposal `k` of slot `s` is result row
 //! `k · slots + s`.
 
-use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
+use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelected, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::{self, InputForm, Join, Mixer, SublayerInput};
 use crate::{
@@ -4087,7 +4087,7 @@ impl NativeDraftProgram {
         Ok((
             completion,
             HeadOutput {
-                selections,
+                selected: selections.map_or(HeadSelected::Causal, HeadSelected::Proposals),
                 landed_reads: landed.into_iter().map(SelectedRead::submitted).collect(),
             },
         ))

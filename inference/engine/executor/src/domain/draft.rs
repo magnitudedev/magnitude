@@ -178,6 +178,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 previous_tape: i32_of(binding.previous_tape, "tape rows")?,
                 following_bank: i32_of(binding.following_bank, "successor bank")?,
                 stop: i32_of(binding.stop, "committed rows")?,
+                front: 0,
             },
             block,
         })

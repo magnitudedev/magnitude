@@ -53,12 +53,68 @@ pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, HeadOutput>;
 
 /// What a head step leaves the host.
 pub struct HeadOutput {
-    /// The step's selections, with the drafter's confidence in each; absent
-    /// for a causal-only head.
-    pub selections: Option<HeadSelections>,
+    /// What its selections make.
+    pub selected: HeadSelected,
     /// The step's landed reads of table rows its device work selected
     /// (`DeviceTable::read_selected`), completed once the step completed.
     pub landed_reads: Vec<crate::device_table::SubmittedRead>,
+}
+
+/// What a head step's selections make.
+pub enum HeadSelected {
+    /// Nothing: a causal-only step selects nothing.
+    Causal,
+    /// A drafting step's proposals, with the drafter's confidence in each.
+    Proposals(HeadSelections),
+    /// A front launch's chain (`guess_chain`), which alone reads its
+    /// selections.
+    Chain(FrontOutput),
+}
+
+/// What a front launch's chain (`guess_chain`) leaves: the pass's next
+/// guesses, and the token rows and guesses of the step queued behind it.
+pub struct FrontOutput {
+    /// `[entry row class, 2]` (guess, kind) rows: the chain of the slot
+    /// whose exact selection is entry row `s` holds its guess at depth `d`
+    /// in row `s + d - 1`, kind 0 where it holds none.
+    pub guesses: GraphOutputTensor,
+    /// `[VERIFY_ROWS, 2]` (token, status) rows, the token rows of the step
+    /// queued behind (`TargetTokens::Selected::selected`): row `r` the one
+    /// its `continuing` row `r` names, (0, 0) where it names none.
+    pub next_selected: GraphOutputTensor,
+    /// `[VERIFY_ROWS, 2]` (guess, kind) rows of the step queued behind
+    /// (`TargetTokens::Selected::guesses`): its front row `r` reads row
+    /// `r - 1` (`routed_step`).
+    pub next_guesses: GraphOutputTensor,
+}
+
+impl FrontOutput {
+    /// The chain's guesses, read once the launch completed: per entry row
+    /// of its class, the guess its row holds, none of kind 0.
+    pub fn read_guesses(&self) -> Result<Vec<Option<crate::Guess>>, SubmitError> {
+        let invalid = |detail: String| SubmitError::Invariant(InvariantError { context: "front guesses", detail });
+        let bytes = self
+            .guesses
+            .tensor()
+            .read_to_host()
+            .map_err(|error| SubmitError::Device(crate::DeviceError::Transfer(error.to_string())))?;
+        if !bytes.len().is_multiple_of(8) {
+            return Err(invalid("guess byte count is not a row multiple".into()));
+        }
+        bytes
+            .chunks_exact(8)
+            .map(|row| {
+                let word = |at: usize| i32::from_le_bytes(row[at..at + 4].try_into().expect("four bytes"));
+                crate::GuessKind::of_word(word(4))
+                    .map(|kind| {
+                        let token = u32::try_from(word(0))
+                            .map_err(|_| invalid(format!("guessed token {} is negative", word(0))))?;
+                        Ok(crate::Guess { token: crate::TokenId(token), kind })
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
 }
 
 /// A drafting head step's selections.
@@ -73,6 +129,14 @@ pub struct HeadSelections {
 }
 
 impl HeadOutput {
+    /// A front launch's chain; none of any other step.
+    pub fn front(&self) -> Option<&FrontOutput> {
+        match &self.selected {
+            HeadSelected::Chain(chain) => Some(chain),
+            HeadSelected::Causal | HeadSelected::Proposals(_) => None,
+        }
+    }
+
     /// The step completed: its landed reads bring the rows they landed into
     /// slots of their own (`SubmittedRead::complete`). Fails when one could
     /// not land its rows: the step read other rows.

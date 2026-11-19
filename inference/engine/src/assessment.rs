@@ -36,12 +36,12 @@ use magnitude_chat::{
 };
 use magnitude_executor::{
     assessment::{
-        assess_execution_fit, decode_pricing, estimate_execution, performance_depths,
+        assess_execution_fit, estimate_execution, lookahead, performance_depths, streamed_layers,
         prepare_execution_assessment, AssessmentError, StructuralCharge,
         AssessmentRequest,
         ExecutionAssessment, ExecutionFit, ExecutionShortfall,
         ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedExecutionAssessment,
-        PointRequests, Priced, Residency as FitResidency, StoredCosts, StreamedFigures, StreamedLayers,
+        PointRequests, Priced, Residency as FitResidency, StoredCosts, StreamedFigures,
     },
     platform::{self, DeviceRequest, GraphPricing, ReleaseRate, PlatformError, SelectedDevice},
     held_storage, resident_layout, scaled_source_element, stored_weights,
@@ -725,7 +725,7 @@ fn streamed_performance(
     preparation: &PreparedExecutionAssessment,
     bank: &ExpertBankPlan,
     request: &AssessmentRequest,
-    held: magnitude_executor::assessment::HeldSlots,
+    held: magnitude_cost_model::HeldSlots,
 ) -> Result<Performance, ModelAssessmentError> {
     match measurements {
         Measurements::Pending => Ok(Performance::Pending),
@@ -744,7 +744,8 @@ fn streamed_performance(
 /// step model ([`StreamedLayers::step_seconds`]) at the request's rows (a
 /// row a sequence), their file reads along the model store's read line, on
 /// `C` the step's estimate there in each form (`preparation` is the plan's,
-/// `draft` the plan, `PreparedExecutionAssessment::form_seconds`), `bank`
+/// `draft` the plan, `magnitude_cost_model::step_seconds` of each of its
+/// censuses, `PreparedExecutionAssessment::censuses`), `bank`
 /// the fit's: the plan's structure and the machine's stored figures alone.
 pub fn streamed_estimate(
     costs: &ExecutorCosts,
@@ -752,19 +753,21 @@ pub fn streamed_estimate(
     preparation: &PreparedExecutionAssessment,
     bank: &ExpertBankPlan,
     request: &AssessmentRequest,
-    held: magnitude_executor::assessment::HeldSlots,
+    held: magnitude_cost_model::HeldSlots,
 ) -> Result<Performance, ModelAssessmentError> {
-    let layers = match StreamedLayers::of_bank(bank, costs, figures) {
+    let layers = match streamed_layers(bank, costs, figures) {
         Priced::Measured(layers) => layers,
         Priced::Pending(_) => return Ok(Performance::Pending),
         Priced::Unavailable(reason) => return Ok(Performance::Unavailable { reason: format!("the streamed layers: {reason}") }),
     };
-    let pricing = decode_pricing(preparation.draft(), costs);
+    let target = preparation.censuses();
+    let priced = costs.figures(&target.censuses());
+    let pricing = seismic::measure::pricing::Pricing { figures: &priced, lookahead: lookahead(preparation.draft()) };
     let mut estimates = Vec::new();
     for depth in performance_depths(request.context_limit, &request.performance_depths) {
-        let compute = preparation
-            .form_seconds(&pricing, u64::from(request.sequences), depth)
-            .map_err(ModelAssessmentError::Assessment)?;
+        let compute = target
+            .each(|census| magnitude_cost_model::step_seconds(census, &pricing, u64::from(request.sequences), depth))
+            .map_err(|error| ModelAssessmentError::Assessment(error.into()))?;
         let step = layers.step_seconds(None, figures.read, held, f64::from(request.sequences), compute);
         estimates.push(PerformanceEstimate { context_tokens: depth, tokens_per_second: 1. / step.total_seconds });
     }

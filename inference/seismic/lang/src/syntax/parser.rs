@@ -3,16 +3,48 @@ use super::ast::*;
 use super::lexer::lex;
 use super::token::{Kw, Op, Tok, Token};
 use crate::check::ir::MAX_NESTING;
-use crate::checked::{DiagnosticRule, Encoded};
+use crate::checked::{ConstantBody, ConstantFunction, DiagnosticRule, Encoded};
 use crate::span::{Diagnostic, Span};
 use std::collections::BTreeMap;
 
 /// Parse one file of a source set whose module constants are `constants`
-/// (every file's `const` declarations): a name of one in an expression is
-/// its integer literal, and a binding may not take one's name.
-pub(crate) fn parse(text: &str, constants: &BTreeMap<String, u64>) -> Result<File, Diagnostic> {
+/// and constant functions `functions` (every file's `const` declarations): a
+/// name of a constant in an expression is its integer literal, and a binding
+/// may not take one's name; a call of a constant function is its body at the
+/// call's arguments.
+pub(crate) fn parse(
+    text: &str,
+    constants: &BTreeMap<String, u64>,
+    functions: &BTreeMap<String, ConstantFunction>,
+) -> Result<File, Diagnostic> {
     let tokens = lex(text)?;
-    Parser { tokens, pos: 0, constants: constants.clone(), open: 0 }.file()
+    Parser { tokens, pos: 0, constants: constants.clone(), functions: functions.clone(), open: 0 }.file()
+}
+
+/// `body`, a constant function's, as an expression at `span`, each of its
+/// parameters (`parameters`, in order) the argument in its place.
+fn called(body: &ConstantBody, parameters: &[String], arguments: &[Expr], span: Span) -> Expr {
+    let binary = |op, left: &ConstantBody, right: &ConstantBody| ExprKind::Binary {
+        op,
+        lhs: Box::new(called(left, parameters, arguments, span)),
+        rhs: Box::new(called(right, parameters, arguments, span)),
+    };
+    let kind = match body {
+        ConstantBody::Constant(value) => ExprKind::Int(*value),
+        ConstantBody::Parameter(name) => {
+            let parameter = parameters
+                .iter()
+                .position(|parameter| parameter == name)
+                .unwrap_or_else(|| panic!("a constant function reads only its parameters, not `{name}`"));
+            return arguments[parameter].clone();
+        }
+        ConstantBody::Add(left, right) => binary(BinaryOp::Add, left, right),
+        ConstantBody::Sub(left, right) => binary(BinaryOp::Sub, left, right),
+        ConstantBody::Mul(left, right) => binary(BinaryOp::Mul, left, right),
+        ConstantBody::Div(left, right) => binary(BinaryOp::Div, left, right),
+        ConstantBody::Rem(left, right) => binary(BinaryOp::Rem, left, right),
+    };
+    Expr { kind, span }
 }
 
 /// Binding powers, shared with the printer. Binary operators use twice their `precedence()`
@@ -28,6 +60,7 @@ struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     constants: BTreeMap<String, u64>,
+    functions: BTreeMap<String, ConstantFunction>,
     /// The statements, expressions, patterns and types open on the parse's
     /// path ([`Parser::nested`]).
     open: usize,
@@ -267,12 +300,16 @@ impl Parser {
     fn file(&mut self) -> PResult<File> {
         let mut decls = Vec::new();
         let mut constants = Vec::new();
+        let mut constant_functions = Vec::new();
         loop {
             while matches!(self.peek(), Tok::Newline) {
                 self.bump();
             }
             match self.peek() {
                 Tok::Eof => break,
+                Tok::Kw(Kw::Const) if matches!(self.peek_at(2), Tok::Op(Op::LParen)) => {
+                    constant_functions.push(self.const_fn_decl()?)
+                }
                 Tok::Kw(Kw::Const) => constants.push(self.const_decl()?),
                 Tok::Kw(Kw::Fn) => decls.push(Decl::Fn(self.fn_decl()?)),
                 Tok::Kw(Kw::Lower) => decls.push(Decl::Lower(self.lower_decl()?)),
@@ -293,7 +330,7 @@ impl Parser {
                 }
             }
         }
-        Ok(File { decls, constants })
+        Ok(File { decls, constants, constant_functions })
     }
 
     /// `const NAME = INTEGER`.
@@ -316,6 +353,20 @@ impl Parser {
         let span = start.to(self.prev_span());
         self.expect_newline()?;
         Ok(ConstDecl { name, value, span })
+    }
+
+    /// `const NAME(PARAMETER, ..) = EXPR`.
+    fn const_fn_decl(&mut self) -> PResult<ConstFnDecl> {
+        let start = self.expect_kw(Kw::Const)?;
+        let name = self.expect_name()?;
+        self.expect_op(Op::LParen)?;
+        let parameters = if self.at_op(Op::RParen) { Vec::new() } else { self.comma_list(Self::binding_name)? };
+        self.expect_op(Op::RParen)?;
+        self.expect_op(Op::Assign)?;
+        let body = self.expr()?;
+        let span = start.to(self.prev_span());
+        self.expect_newline()?;
+        Ok(ConstFnDecl { name, parameters, body, span })
     }
 
     /// A name a declaration binds (a parameter, a dimension, a `let` or
@@ -1847,6 +1898,30 @@ impl Parser {
         loop {
             let start = e.span;
             let kind = match self.peek() {
+                // A constant function's call is its body at the arguments.
+                Tok::Op(Op::LParen)
+                    if matches!(&e.kind, ExprKind::Name(name) if self.functions.contains_key(&name.name)) =>
+                {
+                    let ExprKind::Name(name) = &e.kind else { unreachable!("the guard matched a name") };
+                    let function = self.functions[&name.name].clone();
+                    let args = self.args()?;
+                    let span = start.to(self.prev_span());
+                    if args.len() != function.parameters().len() || args.iter().any(|arg| arg.name.is_some()) {
+                        return Err(Diagnostic::with_rule(
+                            DiagnosticRule::Resolution,
+                            span,
+                            format!(
+                                "`{}` takes {} positional arguments ({})",
+                                function.name(),
+                                function.parameters().len(),
+                                function.parameters().join(", ")
+                            ),
+                        ));
+                    }
+                    let arguments = args.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+                    e = called(function.body(), function.parameters(), &arguments, span);
+                    continue;
+                }
                 Tok::Op(Op::LParen) => ExprKind::Call {
                     callee: Box::new(e),
                     bindings: Vec::new(),
@@ -2016,12 +2091,12 @@ mod tests {
     /// A file parsed with its own constants, as the first of `check_closed`'s two passes
     /// gives them.
     fn parse(text: &str) -> Result<File, Diagnostic> {
-        let constants = super::parse(text, &BTreeMap::new())?
+        let constants = super::parse(text, &BTreeMap::new(), &BTreeMap::new())?
             .constants
             .iter()
             .map(|constant| (constant.name.name.clone(), constant.value))
             .collect();
-        super::parse(text, &constants)
+        super::parse(text, &constants, &BTreeMap::new())
     }
 
     /// A module constant is the integer it names wherever an expression names it, a
@@ -2047,6 +2122,20 @@ mod tests {
             assert!(parse(bound).unwrap_err().message.contains("module constant"), "{bound}");
         }
         assert!(parse("const N = M\n").is_err());
+    }
+
+    /// A module constant function's body reads module constants as their
+    /// integers, prints back to itself, and binds no constant's name.
+    #[test]
+    fn module_constant_functions_round_trip() {
+        let file = round_trip("const WIDE = 64\nconst GROUPS(STAGED) = 1 + STAGED * (WIDE - 1)\n");
+        let [function] = file.constant_functions.as_slice() else {
+            panic!("one constant function");
+        };
+        assert_eq!(function.name.name, "GROUPS");
+        assert_eq!(function.parameters.iter().map(|parameter| parameter.name.as_str()).collect::<Vec<_>>(), ["STAGED"]);
+        assert!(format!("{:?}", function.body).contains("Int(64)") && !format!("{:?}", function.body).contains("WIDE"));
+        assert!(parse("const N = 1\nconst F(N) = N\n").unwrap_err().message.contains("module constant"));
     }
 
 

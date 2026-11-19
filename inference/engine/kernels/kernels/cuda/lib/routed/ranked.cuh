@@ -44,8 +44,15 @@ struct Ranked {
     int winners[K];
 };
 
-template <unsigned EXPERTS, unsigned K, class Logit>
-__device__ __forceinline__ Ranked<K> rank_row(Logit logit, unsigned lane) {
+// Where a selection's keys go (`keys(expert, key)`, each held expert's
+// ranked value, before its rounds): nowhere, but in a recording load's
+// streamed route (the routing record's keys, streaming/resolve.hpp).
+struct NoKeys {
+    __device__ __forceinline__ void operator()(unsigned, float) const {}
+};
+
+template <unsigned EXPERTS, unsigned K, class Logit, class Keys = NoKeys>
+__device__ __forceinline__ Ranked<K> rank_row(Logit logit, unsigned lane, Keys keys = Keys{}) {
     constexpr unsigned per_lane = (EXPERTS + 31) / 32;
     const unsigned held = candidates<EXPERTS>(lane);
     float probability[per_lane];
@@ -68,6 +75,10 @@ __device__ __forceinline__ Ranked<K> rank_row(Logit logit, unsigned lane) {
 #pragma unroll
     for (unsigned i = 0; i < per_lane; ++i)
         probability[i] = i < held ? ranked(probability[i] / total) : out();
+#pragma unroll
+    for (unsigned i = 0; i < per_lane; ++i)
+        if (i < held)
+            keys(lane + 32 * i, probability[i]);
 
     Ranked<K> result;
 #pragma unroll

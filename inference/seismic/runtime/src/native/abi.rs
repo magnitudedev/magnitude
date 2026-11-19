@@ -11,7 +11,7 @@
 
 use super::plan::ParameterAddress;
 use seismic_lang::checked::{
-    LaunchGrid, NativeAsset, NativeImplementation, NativeSpecialization, PROJECTION_SEGMENTS, RecordPort,
+    ConstantBody, ConstantFunction, LaunchGrid, NativeAsset, NativeImplementation, NativeSpecialization, PROJECTION_SEGMENTS, RecordPort,
 };
 use seismic_lang::entry::{
     CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess, Writer,
@@ -1047,7 +1047,8 @@ fn written_grid_loop(
 const CONSTANT_PREFIX: &str = "SEISMIC_CONST_";
 
 /// `#define SEISMIC_CONST_<NAME> <value>` for each module constant the asset
-/// names, in module order. A source that names none renders as before the
+/// names, then [`constant_function_macro`] for each module constant function
+/// it names, in module order. A source that names none renders as before the
 /// module declared any, so the kernel digests tuning results are stored
 /// under keep.
 pub(super) fn constant_macros(prefix: &mut String, asset: NativeAsset<'_>) {
@@ -1058,6 +1059,33 @@ pub(super) fn constant_macros(prefix: &mut String, asset: NativeAsset<'_>) {
             prefix.push_str(&format!("#define {symbol} {value}\n"));
         }
     }
+    for function in asset.functions {
+        let symbol = format!("{CONSTANT_PREFIX}{}", native_macro(function.name()));
+        if named.contains(symbol.as_str()) {
+            prefix.push_str(&constant_function_macro(&symbol, function));
+        }
+    }
+}
+
+/// `#define <symbol>(P, ..) <body>`: a module constant function as a macro of
+/// every dialect's preprocessor, its arithmetic the caller's arguments' (a
+/// parameter read parenthesized, and read at most once, so each argument is
+/// evaluated once: [`ConstantFunction::new`]), so a native reads it as the
+/// declarations and the host do.
+pub(super) fn constant_function_macro(symbol: &str, function: &ConstantFunction) -> String {
+    fn body(expression: &ConstantBody) -> String {
+        let binary = |left: &ConstantBody, right: &ConstantBody, op: &str| format!("({} {op} {})", body(left), body(right));
+        match expression {
+            ConstantBody::Constant(value) => value.to_string(),
+            ConstantBody::Parameter(name) => format!("({name})"),
+            ConstantBody::Add(left, right) => binary(left, right, "+"),
+            ConstantBody::Sub(left, right) => binary(left, right, "-"),
+            ConstantBody::Mul(left, right) => binary(left, right, "*"),
+            ConstantBody::Div(left, right) => binary(left, right, "/"),
+            ConstantBody::Rem(left, right) => binary(left, right, "%"),
+        }
+    }
+    format!("#define {symbol}({}) {}\n", function.parameters().join(", "), body(function.body()))
 }
 
 /// Every whole identifier of `text` that starts with [`CONSTANT_PREFIX`], in
@@ -1983,7 +2011,7 @@ mod tests {
 
     /// An asset of a module that declares no constant.
     fn bare(text: &str) -> NativeAsset<'_> {
-        NativeAsset { text, constants: &[] }
+        NativeAsset { text, constants: &[], functions: &[] }
     }
 
     fn render_with(
@@ -2000,14 +2028,25 @@ mod tests {
     #[test]
     fn a_source_defines_the_module_constants_it_names() {
         let constants = [("FIRST".to_owned(), 2), ("SECOND".to_owned(), 3)];
+        let functions = [ConstantFunction::new(
+            "ENTRY".to_owned(),
+            vec!["E".to_owned()],
+            ConstantBody::Add(
+                Box::new(ConstantBody::Constant(2)),
+                Box::new(ConstantBody::Mul(Box::new(ConstantBody::Constant(3)), Box::new(ConstantBody::Parameter("E".to_owned())))),
+            ),
+        )
+        .unwrap()];
         let at = |text| {
-            let asset = NativeAsset { text, constants: &constants };
+            let asset = NativeAsset { text, constants: &constants, functions: &functions };
             render_asset(CUDA, "f32", NativeSpecialization::new().with_static("K", 64), asset)
         };
         let source = at("\nint x = SEISMIC_CONST_FIRST;\n");
         assert!(source.contains("#define SEISMIC_CONST_FIRST 2\n"));
         assert!(!source.contains("SEISMIC_CONST_SECOND"));
         assert!(!at("\nint x = SEISMIC_CONST_FIRSTLY;\n").contains("#define SEISMIC_CONST_FIRST "));
+        assert!(!source.contains("SEISMIC_CONST_ENTRY"));
+        assert!(at("\nint x = SEISMIC_CONST_ENTRY(4);\n").contains("#define SEISMIC_CONST_ENTRY(E) (2 + (3 * (E)))\n"));
         assert_eq!(at("\n// asset\n"), render(CUDA, "f32"));
     }
 

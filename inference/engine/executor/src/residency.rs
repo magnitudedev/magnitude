@@ -1174,7 +1174,7 @@ impl ResidencyStore {
         let sites = self.programs.expert_bank_sites(plan).map_err(invalid)?;
         // Each streamed layer's bank lines, which the bank completes with its
         // CPU pool's and landings' (`ExpertBank::lines`); the load's pricing
-        // adds what the measurement job stored (`HostLines::of_bank`).
+        // adds what the measurement job stored (`assessment::host_lines`).
         let lines = crate::assessment::BankLines::of_bank(plan).map_err(|error| invalid(error.to_string()))?;
         let bank = crate::experts::ExpertBank::open(charges, plan, artifact, &sites, lines, &self.cpu_site, self.pools.clone(), (self.changes.clone(), self.host_backing.take()))?;
         // Each stack through the entry a resident load imports it with, from

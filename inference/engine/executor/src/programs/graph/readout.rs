@@ -31,7 +31,7 @@ use magnitude_family_contracts::{
 use magnitude_kernels::{
     feature_rows, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
     readout_planes_rows, readout_project_rows, readout_refine_rows, readout_top_rows, sample_rows,
-    shape_rows, token_confidence,
+    selection_notice, shape_rows, token_confidence,
 };
 use seismic::{
     Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element, Entry, NativeGraphClassSlice,
@@ -397,6 +397,14 @@ pub(crate) struct ReadoutClass {
     pub kind: ReadoutKind,
 }
 
+/// What a readout class's graph exports beside its result: its logits (a
+/// diagnostic load's), and a selecting class's token rows.
+#[derive(Clone, Copy)]
+struct ReadoutExports {
+    logits: bool,
+    token_rows: bool,
+}
+
 /// Where a readout's features come from.
 #[derive(Clone, Copy)]
 enum FeatureSource<'p> {
@@ -433,12 +441,16 @@ struct ReadoutSource<'p> {
     /// Whether it prepares the features classes, or the projecting ones
     /// alone.
     features_classes: bool,
+    /// Whether its selecting classes export the step's token rows
+    /// (`ModelLoadPlan::fronts`, [`TokenRowPorts`]).
+    token_rows: bool,
 }
 
 impl<'p> ReadoutSource<'p> {
-    /// Every class from `features`.
-    fn whole(features: FeatureSource<'p>) -> Self {
-        Self { features, fuses: matches!(features, FeatureSource::Taps { .. }), features_classes: true }
+    /// Every class from `features`, exporting the step's token rows where
+    /// `token_rows`.
+    fn whole(features: FeatureSource<'p>, token_rows: bool) -> Self {
+        Self { features, fuses: matches!(features, FeatureSource::Taps { .. }), features_classes: true, token_rows }
     }
 
     /// Its classes of `classes`.
@@ -458,9 +470,9 @@ impl<'p> ReadoutSource<'p> {
 /// what a drafter-free load's readout runs, fusing nothing. A features class
 /// is demanded features, so it has no drafter-free one.
 fn readout_sources(load: &ModelLoadPlan) -> Vec<ReadoutSource<'_>> {
-    let own = ReadoutSource::whole(FeatureSource::of(load));
+    let own = ReadoutSource::whole(FeatureSource::of(load), load.fronts());
     match own.fuses {
-        true => vec![own, ReadoutSource { features: FeatureSource::Output, fuses: false, features_classes: false }],
+        true => vec![own, ReadoutSource { features: FeatureSource::Output, fuses: false, features_classes: false, token_rows: own.token_rows }],
         false => vec![own],
     }
 }
@@ -507,6 +519,21 @@ pub(crate) struct PreparedTargetReadoutGraph {
     /// The exported logits of a diagnostic load's projecting class.
     pub logits: Option<WorkflowTensor>,
     pub selected: Option<WorkflowTensor>,
+    /// The step's token rows, in a selecting class of a fronting load.
+    pub token_rows: Option<TokenRowPorts>,
+}
+
+/// A selecting readout's export of the step's `[rows, 2]` (token, status)
+/// token rows in its window (`selection_notice`'s copy), of a fronting load
+/// (`ModelLoadPlan::fronts`): the token row each selection was made on,
+/// which the front head launch behind the step reads (`guess_chain`'s
+/// `tokens`). Each run binds `tokens`, the step's token rows as a device
+/// tensor (the kept host rows, or the selection the step read), and
+/// `rows` is its exported copy, held as long as the readout's outputs.
+#[derive(Clone)]
+pub(crate) struct TokenRowPorts {
+    pub tokens: NativePort,
+    pub rows: WorkflowTensor,
 }
 
 #[derive(Clone)]
@@ -700,6 +727,7 @@ impl PreparedTargetReadoutGraphs {
                 source.features,
                 class,
                 exports_logits(limits),
+                source.token_rows,
                 layout,
             )?;
             plans.push((readout_decodes(class, limits), variant.plan.clone()));
@@ -883,8 +911,14 @@ impl PreparedTargetReadoutGraph {
         source: FeatureSource<'_>,
         class: ReadoutClass,
         export: bool,
+        token_rows: bool,
         layout: &NativeGraphLayout,
     ) -> Result<Self, String> {
+        let token_copy = match (token_rows, &target.token_copy) {
+            (true, Some(copy)) => Some(copy),
+            (false, _) => None,
+            (true, None) => return Err("a readout exporting token rows has no token row copy".into()),
+        };
         let entries = match (source, &target.taps) {
             (FeatureSource::Residual { .. }, _) => FeatureEntries::Residual(
                 target
@@ -915,6 +949,7 @@ impl PreparedTargetReadoutGraph {
         let mut logits = None;
         let mut selection = None;
         let mut selected = None;
+        let mut token_rows = None;
         if class.kind != ReadoutKind::Features {
             let rows = final_rows
                 .as_ref()
@@ -956,6 +991,7 @@ impl PreparedTargetReadoutGraph {
                 graph,
                 entries,
                 (&target.shape, &target.sample),
+                token_copy,
                 geometry,
                 (stored, weights),
                 class,
@@ -969,6 +1005,7 @@ impl PreparedTargetReadoutGraph {
             logits = projected.logits;
             selection = projected.selection;
             selected = projected.selected;
+            token_rows = projected.token_rows;
         }
         let plan = graph.seal().map_err(error)?;
         Ok(Self {
@@ -983,6 +1020,7 @@ impl PreparedTargetReadoutGraph {
             features,
             logits,
             selected,
+            token_rows,
         })
     }
 }
@@ -1646,6 +1684,7 @@ struct Projected<G> {
     logits: Option<WorkflowTensor>,
     selection: Option<SelectionPorts>,
     selected: Option<WorkflowTensor>,
+    token_rows: Option<TokenRowPorts>,
 }
 
 /// The projection of the class's projected rows (the head as placed, or a
@@ -1661,6 +1700,7 @@ fn head_topology<'a, G: GraphDraft + 'a>(
         G::Binding<'a, shape_rows::Entry>,
         G::Binding<'a, sample_rows::Entry>,
     ),
+    token_copy: Option<G::Binding<'a, selection_notice::Entry>>,
     geometry: &Decoder,
     (plans, weights): (StoredHead, &(impl PlannedWeights + ?Sized)),
     class: ReadoutClass,
@@ -1768,6 +1808,7 @@ fn head_topology<'a, G: GraphDraft + 'a>(
             logits: exported,
             selection: None,
             selected: None,
+            token_rows: None,
         });
     };
     let inputs = match certified {
@@ -1791,6 +1832,23 @@ fn head_topology<'a, G: GraphDraft + 'a>(
         inputs,
         result.tensor_mut().into(),
     )?;
+    // The step's token rows, copied out of the bound rows so they are held
+    // as long as the selection is.
+    let token_rows = match token_copy {
+        None => None,
+        Some(entry) => {
+            let rows = Dim::from(class.rows);
+            let tokens = graph.port_with_class_extent(Element::i32(), &[class.rows, 2], 0, "M")?;
+            let mut copied = graph.local_for(entry, "notice", &[("M", &rows)])?;
+            graph.enqueue::<selection_notice::Entry>(
+                entry,
+                &[("M", &rows)],
+                selection_notice::WorkflowArgs { selection: tokens.tensor().into(), notice: copied.tensor_mut().into() },
+            )?;
+            graph.export(copied.tensor())?;
+            Some(TokenRowPorts { tokens, rows: copied.tensor().clone() })
+        }
+    };
     graph.export(result.tensor())?;
     let selected = result.tensor().clone();
     Ok(Projected {
@@ -1800,6 +1858,7 @@ fn head_topology<'a, G: GraphDraft + 'a>(
         logits: exported,
         selection: Some(ports),
         selected: Some(selected),
+        token_rows,
     })
 }
 
@@ -1840,7 +1899,7 @@ fn checked_readout_class_storage<W: PlannedWeights + ?Sized>(
         head,
         FeatureSource::Output,
         class,
-        export,
+        ReadoutExports { logits: export, token_rows: false },
     )?
     .seal()?)
 }
@@ -1852,7 +1911,7 @@ fn checked_readout_class_draft<W: PlannedWeights + ?Sized>(
     head: Option<(HeadPlans<'_>, &W)>,
     source: FeatureSource<'_>,
     class: ReadoutClass,
-    export: bool,
+    ReadoutExports { logits: export, token_rows }: ReadoutExports,
 ) -> Result<NativeGraphMetadata, GraphError> {
     let activation = match geometry.activation_dtype {
         magnitude_family_contracts::ActivationDType::F16 => Element::f16(),
@@ -1906,6 +1965,7 @@ fn checked_readout_class_draft<W: PlannedWeights + ?Sized>(
         graph,
         entries,
         (&sample_elements[..], &sample_elements[..]),
+        token_rows.then_some(&sample_elements[..]),
         geometry,
         (head, weights),
         class,
@@ -2136,6 +2196,10 @@ fn certify_readout_regimes<L: Certified>(
                     let slice = NativeGraphClassSlice::new()
                         .dimension("M", [class.rows])
                         .scoped(features_entry, "O", [class.outputs]);
+                    // Its selection's rows: the sampler's.
+                    let selecting = |slice: NativeGraphClassSlice| {
+                        slice.scoped(sample_rows::Entry::NAME, "M", [class.selected])
+                    };
                     let scoped = |slice: NativeGraphClassSlice, entries: &[&'static str]| {
                         entries.iter().fold(slice, |slice, entry| {
                             slice.scoped(entry, "O", [class.projected])
@@ -2146,16 +2210,8 @@ fn certify_readout_regimes<L: Certified>(
                         ReadoutKind::Logits => scoped(slice, projecting),
                         ReadoutKind::Selection {
                             certified: true, ..
-                        } => scoped(slice, &certifying).scoped(
-                            sample_rows::Entry::NAME,
-                            "M",
-                            [class.selected],
-                        ),
-                        ReadoutKind::Selection { .. } => scoped(slice, projecting).scoped(
-                            sample_rows::Entry::NAME,
-                            "M",
-                            [class.selected],
-                        ),
+                        } => selecting(scoped(slice, &certifying)),
+                        ReadoutKind::Selection { .. } => selecting(scoped(slice, projecting)),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -2166,7 +2222,7 @@ fn certify_readout_regimes<L: Certified>(
                 Some((head, weights)),
                 source.features,
                 template,
-                exports_logits(limits),
+                ReadoutExports { logits: exports_logits(limits), token_rows: source.token_rows },
             )?
             .seal_template()
             .and_then(|template| L::of(&template, &slices))?;
@@ -2590,7 +2646,7 @@ mod resource_regime_tests {
             Some((selecting, &load)),
             FeatureSource::Output,
             uncertified,
-            false,
+            ReadoutExports { logits: false, token_rows: load.fronts() },
         )
         .unwrap();
         // Top-p, and a repetition penalty, at a sampling temperature.
@@ -2766,7 +2822,7 @@ mod resource_regime_tests {
                     &definition.decoder,
                     norm,
                     (head, &load),
-                    ReadoutSource::whole(FeatureSource::Output),
+                    ReadoutSource::whole(FeatureSource::Output, load.fronts()),
                     limits,
                 )
                 .unwrap();
@@ -2779,7 +2835,7 @@ mod resource_regime_tests {
                         Some((head, &load)),
                         FeatureSource::Output,
                         class,
-                        exports_logits(limits),
+                        ReadoutExports { logits: exports_logits(limits), token_rows: load.fronts() },
                     )
                     .unwrap()
                     .seal_with_layout(layout)
@@ -2862,7 +2918,7 @@ mod resource_regime_tests {
                 decoder,
                 None,
                 (head, &load),
-                ReadoutSource::whole(FeatureSource::Output),
+                ReadoutSource::whole(FeatureSource::Output, load.fronts()),
                 limits,
             )
             .unwrap();
@@ -2877,7 +2933,7 @@ mod resource_regime_tests {
                     Some((head, &load)),
                     FeatureSource::Output,
                     class,
-                    false,
+                    ReadoutExports { logits: false, token_rows: load.fronts() },
                 )
                 .unwrap()
                 .seal_with_layout(layout)

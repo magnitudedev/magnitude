@@ -28,9 +28,8 @@ use super::tuning::{
     },
     routed::{
         RoutedChoicesTuning, RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning,
-        RoutedGroupTuning, RoutedHintRouteTuning, RoutedOutputProjectTuning, RoutedOutputTuning,
-        RoutedRouteSharedTuning, RoutedRouteStreamedTuning,
-        RoutedRouteTuning, RoutedShape, DECODE_SERVED, GROUPED_SERVED,
+        RoutedGateUpPartTuning, RoutedGroupTuning, RoutedHintRouteTuning, RoutedOutputProjectTuning, RoutedOutputTuning,
+        RoutedRouteSharedTuning, RoutedRouteStreamedTuning, RoutedRouteTuning, RoutedShape, DECODE_SERVED, GROUPED_SERVED,
     },
     short_conv::{ShortConvOutputTuning, ShortConvProjectTuning},
     state_space::{
@@ -62,7 +61,7 @@ use magnitude_kernels::{
     ngram_inject, ngram_rows, pool_rows, rows_topk, unit_reads,
     packing_bound,
     per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
-    selection_notice, stored_rows, stream_collapse, stream_join, stream_mix_sinkhorn, tap_rows,
+    selection_notice, guess_chain, stored_rows, stream_collapse, stream_join, stream_mix_sinkhorn, tap_rows,
     token_confidence, widen_rows,
 };
 use seismic::KernelRequest;
@@ -563,6 +562,8 @@ impl Walks<'_> {
             resident_selects: HashMap::new(),
             resident_outputs: HashMap::new(),
             resident_downs: HashMap::new(),
+            resident_choices: HashMap::new(),
+            resident_gate_ups: HashMap::new(),
             head: self.plan.head().map(|_| HeadKernels::default()),
             shared_head: self.plan.shared_head().map(|_| SharedHeadKernels::default()),
             draft: self.plan.draft().map(|_| DraftKernels::default()),
@@ -697,6 +698,12 @@ struct Preparation<'a> {
     /// Each general binding's resident down over every row it serves, whose
     /// ranges a streamed layer's combine with the CPU site follows.
     resident_downs: HashMap<GeneralRoutedBinding, RoutedDownTuning>,
+    /// Each fused binding's resident choices' gate/up, which a streamed
+    /// layer's gate/up passes follow.
+    resident_choices: HashMap<RoutedBinding, RoutedChoicesTuning>,
+    /// Each gated general binding's resident gate/up, which a streamed
+    /// layer's gate/up passes follow.
+    resident_gate_ups: HashMap<GeneralRoutedBinding, RoutedGateUpTuning>,
     head: Option<HeadKernels>,
     shared_head: Option<SharedHeadKernels>,
     draft: Option<DraftKernels>,
@@ -901,12 +908,14 @@ impl<'a> Preparation<'a> {
                     vocabulary: self.vocabulary,
                 },
             )?,
+            // Every drafter's proposals, a fronting load's head's among
+            // them: it drafts a verify pass's (§7.1).
             token_confidence: match plan.drafts_with_head() || plan.draft().is_some() {
                 true => fixed!(self.spec, token_confidence, String::new()),
                 false => None,
             },
             conditioning_overlay: fixed!(self.spec, conditioning_overlay, "fixed"),
-            selection_notice: match plan.notices_selection() {
+            selection_notice: match plan.copies_token_rows() {
                 true => fixed!(self.spec, selection_notice, "fixed"),
                 false => None,
             },
@@ -2639,7 +2648,9 @@ impl<'a> Preparation<'a> {
             scopes: scopes.clone(),
         };
         let experts = if shape.experts_expansion.gated {
-            let decode = self.served_projection(DECODE_SERVED, RoutedGateUpTuning(decode()))?;
+            let resident_gate_up = RoutedGateUpTuning(decode());
+            let decode = self.served_projection(DECODE_SERVED, resident_gate_up.clone())?;
+            self.resident_gate_ups.insert(binding, resident_gate_up);
             let grouped = self.served_projection(GROUPED_SERVED, RoutedGatedTilesTuning(tiles()))?;
             decode
                 .zip(grouped)
@@ -2840,6 +2851,7 @@ impl<'a> Preparation<'a> {
         )?;
         let list_grid = spec.fixed(&bindings, &[], routed_list_grid::native_entry())?;
         let site = self.bank_site(slot, bank, layers, &bindings)?;
+        let gate_up = self.bank_gate_up(slot, bank, layers, &bindings)?;
         /// Every tensor's kernel, or none where one is a count or a listing.
         fn formed<T>(kernels: crate::planning::RecordTensors<Option<T>>) -> Option<crate::planning::RecordTensors<T>> {
             kernels.try_map(|_, kernel| kernel.ok_or(())).ok()
@@ -2867,6 +2879,10 @@ impl<'a> Preparation<'a> {
             Some(None) => return Ok(None),
             site => site.flatten(),
         };
+        let gate_up = match gate_up {
+            Some(None) => return Ok(None),
+            gate_up => gate_up.flatten(),
+        };
         Ok(Some(super::ExpertBankKernels {
             route,
             land,
@@ -2877,7 +2893,46 @@ impl<'a> Preparation<'a> {
             pass_map,
             placement,
             site,
+            gate_up,
         }))
+    }
+
+    /// The gate/up passes of a streamed layer of feed-forward `slot` whose
+    /// bank is `bank` (`routed_gate_up_part`), over its streamed `layers`:
+    /// none of up-only experts, whose expansion runs once after the tier
+    /// wait; `Some(None)` where it is a count or a listing. It follows the
+    /// binding's resident gate/up range by range
+    /// (`Specializer::tuned_ranges_following`), so each choice's product
+    /// keeps that gate/up's bits at every row.
+    fn bank_gate_up(
+        &mut self,
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        layers: &[WeightScope],
+        bindings: &str,
+    ) -> Result<Option<Option<RangedKernels<magnitude_kernels::routed_gate_up_part::Entry>>>, CatalogFailure> {
+        use crate::planning::BankedFeedForward;
+        let unprepared = || CatalogFailure::Preparation {
+            entry: "routed_gate_up_part",
+            bindings: bindings.to_owned(),
+            outcome: "a streamed layer's gate/up was not prepared before it".into(),
+        };
+        let layers = layers.to_vec();
+        match slot {
+            BankedFeedForward::Routed(b) => {
+                let resident = self.resident_choices.get(&b).cloned().ok_or_else(unprepared)?;
+                let case = RoutedGateUpPartTuning { resident: resident.clone(), layers, bank };
+                self.served_projection_following(DECODE_SERVED, case, resident).map(Some)
+            }
+            BankedFeedForward::GeneralRouted(b) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: b, .. }) => {
+                if !b.shape.experts_expansion.gated {
+                    return Ok(None);
+                }
+                let resident = self.resident_gate_ups.get(&b).cloned().ok_or_else(unprepared)?;
+                let case = RoutedGateUpPartTuning { resident: resident.clone(), layers, bank };
+                self.served_projection_following(DECODE_SERVED, case, resident).map(Some)
+            }
+        }
     }
 
     /// The CPU site entries of a streamed layer of feed-forward `slot` whose
@@ -3116,17 +3171,16 @@ impl<'a> Preparation<'a> {
                 };
                 let route = self.served_projection(DECODE_SERVED, shared_route.clone())?;
                 self.resident_routes.insert(b, shared_route);
-                let choices = self.served_projection(
-                    DECODE_SERVED,
-                    RoutedChoicesTuning {
-                        expert_gate: b.expert_gate,
-                        expert_up: b.expert_up,
-                        activation: b.activation,
-                        shape,
-                        scopes: scopes.clone(),
-                        experts: up_experts,
-                    },
-                )?;
+                let resident_choices = RoutedChoicesTuning {
+                    expert_gate: b.expert_gate,
+                    expert_up: b.expert_up,
+                    activation: b.activation,
+                    shape,
+                    scopes: scopes.clone(),
+                    experts: up_experts,
+                };
+                let choices = self.served_projection(DECODE_SERVED, resident_choices.clone())?;
+                self.resident_choices.insert(b, resident_choices);
                 route
                     .zip(choices)
                     .map(|(route, choices)| RoutedDecodeKernels::SharedRoute { route, choices })
@@ -3400,12 +3454,17 @@ impl<'a> Preparation<'a> {
         let sample = self
             .spec
             .tuned(&mut self.tuning, &SampleRowsTuning { vocabulary })?;
+        let chain = match self.tuning.model().load.fronts() {
+            true => fixed!(self.spec, guess_chain, "head"),
+            false => None,
+        };
         let head = self
             .head
             .as_mut()
             .expect("a head plan creates the head group");
         head.shape = shape;
         head.sample = sample;
+        head.chain = chain;
         Ok(())
     }
 

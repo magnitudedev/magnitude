@@ -672,7 +672,7 @@ impl<L: Certified> FamilyLayouts<L> {
             bound,
             constants: family.constant_heap()?,
         };
-        // The floor group's buffers and the pass's, and the selection notice,
+        // The floor group's buffers and the pass's and the selection notice,
         // which the family binds with its constants
         // (`PreparedTargetGraphs::binding_constant_bytes`).
         let mut resources = family.finish()?;

@@ -682,8 +682,19 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     let floor = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(floor_weights)), &synthetic_prices()).unwrap().into_draft();
     let bank = floor.load().expert_bank().unwrap().clone();
     assert_eq!(bank.slots, bank.floor());
+    assert_eq!(floor.load().weight_bytes().unwrap(), floor_weights);
+    assert!(matches!(
+        draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(floor_weights - 1)), &synthetic_prices()),
+        Err(PlanError::WeightBound { needed, .. }) if needed == floor_weights
+    ));
     // The load with `bank`'s structure at `slots` and `window_slots`, its
     // record tensors reserved as the device reserves, and its weights.
+    // `prepare_model_assessment` runs before measurements (`BankPaths::Unpriced`),
+    // matching `with_expert_bank`, so its floor is the unpriced floor.
+    let Err(ModelAssessmentError::WeightBound(unpriced)) = assess(Some(0)) else {
+        panic!("no unpriced bank holds no weights");
+    };
+    let unpriced_floor = unpriced.needed;
     let banked = |bank: &ExpertBankPlan, slots: u64, window_slots: u64| {
         draft
             .load()
@@ -703,7 +714,7 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
         .into_iter()
         .map(|window| (window, banked(&bank, experts, window).expert_bank().unwrap().floor()))
         .collect::<Vec<_>>();
-    assert_eq!(weights(&bank, bank.floor(), bank.window_slots()), floor_weights);
+    assert_eq!(weights(&bank, bank.floor(), bank.window_slots()), unpriced_floor);
     // The bank a cap grants, at the window the plan settles on for it.
     let granted = |cap: u64| match prepare(Some(cap)) {
         PreparedModelAssessment::Planned { execution, .. } => {
@@ -716,12 +727,12 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     // The caller's cap is a configuration it cannot have, naming the
     // floor's weights, not a model the backend does not support.
     assert!(matches!(
-        assess(Some(floor_weights - 1)),
-        Err(ModelAssessmentError::WeightBound(error)) if error.needed == floor_weights
+        assess(Some(unpriced_floor - 1)),
+        Err(ModelAssessmentError::WeightBound(error)) if error.needed == unpriced_floor
     ));
     for slots in [bank.floor(), 128, 240] {
         let cap = weights(&bank, slots, bank.window_slots());
-        for cap in [cap, cap - 1].into_iter().filter(|&cap| cap >= floor_weights) {
+        for cap in [cap, cap - 1].into_iter().filter(|&cap| cap >= unpriced_floor) {
             let grant = granted(cap);
             let (held, window) = (grant.slots, grant.window_slots());
             assert!(rungs.iter().any(|&(rung, _)| rung == window), "a cap of {cap} bytes settles on window {window}, a rung");
@@ -815,14 +826,17 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     assert!(matches!(shares.cold(), &ColdSource::HostTier { slots, .. } if slots == ceiling), "host RAM holds the tier's ceiling");
     // A load's re-plan of the draft keeps its tier at the cap's ceiling
     // where host RAM has room for it, which is then what its fit reports the cold experts
-    // lie in.
+    // lie in. Uses `StableRoom::of(draft.device())` so `with_host_tier` reads
+    // `within_host`'s host RAM limit (`unbounded`'s `host_left` returns `i64::MAX`,
+    // which previously passed only because `landing_records` was 80 >= 40 * 2).
     let replan = |draft: &magnitude_executor::ExecutionPlanDraft| {
+        let room = StableRoom::of(draft.device());
         draft
             .with_held_experts(
                 &definition,
-                HeldBound::of(None, magnitude_executor::StableRoom::of(draft.device()).capacity().unwrap()),
+                HeldBound::of(None, room.capacity().unwrap()),
                 &synthetic_prices(),
-                unbounded,
+                room,
                 |_, _| Ok::<_, AssessmentError>(Ok(())),
             )
             .unwrap()
@@ -847,7 +861,8 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
         .assess_fit(&structure.topology, device, &structure.status)
         .unwrap();
     let host = fit.domains.iter().find(|domain| domain.role == DomainRole::Staging).unwrap();
-    let growth = |slots| bank.host_charge(slots).unwrap() - bank.host_charge(0).unwrap();
+    let priced_bank = replanned.draft().load().expert_bank().unwrap().clone();
+    let growth = |slots| priced_bank.host_cache(slots).unwrap();
     let half = ceiling / 2;
     let (_, _, draft) = prepare(Some(host.required_bytes + growth(half)));
     let replanned = replan(&draft);
@@ -947,9 +962,9 @@ fn a_bank_shrunk_to_fit_keeps_its_host_tier() {
 /// 3090, uncapped, planned into the device's stable room beside its
 /// mandatory part (its arena among it), which holds one conversation's
 /// state at the model's whole 262,144-token context, and CUDA's blocks
-/// charged only the tails no allocation reuses: its ceiling every one of
-/// the 244 slots the card's weights hold at the records pool's uniform
-/// granule, and its slots the most the room admits beside an arena holding
+/// charged only the tails no allocation reuses: its ceiling the most slots
+/// the card's weights hold at the records pool's uniform granule, and its
+/// slots the most the room admits beside an arena holding
 /// a group of one place (a group's class beyond it is claimed as the group opens); a
 /// prompt pass covers at least 512 rows.
 #[test]
@@ -981,7 +996,21 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
         .unwrap()
         .unwrap_or_else(|no| panic!("Qwen3.6 35B streams on the RTX 3090: {no:?}"));
     let bank = planned.draft().load().expert_bank().expect("a routed load banks its experts");
-    assert_eq!(bank.ceiling, 244, "the bank's ceiling is the most slots the 24 GB card's weights hold");
+    let device_weights = |slots: u64| {
+        let load = planned.draft().load().clone().with_bank_slots(slots, slots).unwrap();
+        load.weight_bytes().unwrap() - load.host_tier_bytes().unwrap()
+    };
+    assert!(
+        bank.ceiling < bank.widest().get()
+            && device_weights(bank.ceiling) <= bound
+            && device_weights(bank.ceiling + 1) > bound,
+        "ceiling {} of {} is not the most slots whose device weights fit {bound} bytes ({} / {})",
+        bank.ceiling,
+        bank.widest().get(),
+        device_weights(bank.ceiling),
+        device_weights(bank.ceiling + 1),
+    );
+    assert!(bank.ceiling >= 230, "24 GB card holds almost every expert: {} of {}", bank.ceiling, bank.widest().get());
     assert!((186..=192).contains(&bank.slots), "{} slots: the bank holds the most slots the room admits", bank.slots);
     let limits = planned.draft().policy().limits();
     let region = *magnitude_executor::batching::row_classes(limits.max_launch_rows).last().unwrap() as u64;
@@ -996,7 +1025,8 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
 /// that bank.
 #[test]
 fn a_streamed_fit_is_priced_on_the_bank_it_was_held_in() {
-    use magnitude_executor::assessment::{Priced, ReadLine, StreamedFigures, synthetic};
+    use magnitude_cost_model::ReadLine;
+    use magnitude_executor::assessment::{Priced, StreamedFigures, synthetic};
     let scratch = Scratch::new("streamed-own-bank");
     let package = qwen36_35b(&scratch);
     let (_, _, resident) = assess_qwen36_35b(&package, None);
@@ -1066,11 +1096,6 @@ fn synthetic_measurements() -> Measurements {
         pending: false,
         streamed: Priced::Measured(synthetic::streamed_figures()),
     }
-}
-
-/// Room for every holding a plan offers.
-fn unbounded(_: u64) -> PlanRoom {
-    PlanRoom { free: u64::MAX, ceiling: u64::MAX }
 }
 
 /// Qwen3.6 35B on the M4 Pro, its host RAM bound to `room` where given

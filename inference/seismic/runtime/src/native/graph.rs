@@ -917,7 +917,7 @@ impl NativeGraphDraft {
         validate_park(&self.timelines, self.nodes.len(), false).map_err(CallError::Workflow)?;
         validate_used_ports(
             self.ports.len(),
-            self.nodes.iter().map(|node| &node.args),
+            self.nodes.iter().map(|node| (&node.args, node.condition.map(|condition| condition.port.reference.result))),
             &self.exports,
             &self.stores,
             &self.carries,
@@ -1660,7 +1660,7 @@ impl NativeGraphMetadataDraft {
         }
         validate_used_ports(
             self.ports.len(),
-            self.nodes.iter().map(|node| &*node.args),
+            self.nodes.iter().map(|node| (&*node.args, node.condition.map(|(port, _, _)| port))),
             &self.exports,
             &self.stores,
             &self.carries,
@@ -2090,17 +2090,21 @@ fn validate_export_reference(
     Ok(())
 }
 
-/// Every port is used: by a node's argument, an export, a store or a carry.
-/// A carry's ports are its alone: no node, export or store names them.
+/// Every port is used: by a node's argument or condition (the port whose
+/// word its launches are encoded under), an export, a store or a carry. A
+/// carry's ports are its alone: no node, export or store names them.
 fn validate_used_ports<'a, F>(
     port_count: usize,
-    nodes: impl Iterator<Item = &'a EncodedWorkflowArgs>,
+    nodes: impl Iterator<Item = (&'a EncodedWorkflowArgs, Option<u32>)>,
     exports: &[WorkflowResultRef],
     stores: &[Store],
     carries: &[Carry<F>],
 ) -> Result<(), WorkflowError> {
     let mut used = vec![false; port_count];
-    for node in nodes {
+    for (node, condition) in nodes {
+        if let Some(port) = condition {
+            used[port as usize] = true;
+        }
         for argument in node.arguments() {
             if let Some(reference) = argument_reference(argument) {
                 if reference.node == INPUT_NODE {

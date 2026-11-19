@@ -1452,16 +1452,11 @@ fn build_dimension_inference_plan(
                     }
                 })
                 .collect();
-            (
-                dimension,
-                observation,
-                observations[observation],
-                operations,
-            )
+            (dimension, observation, operations)
         })
         .collect();
 
-    Ok(DimensionInferencePlan::new(observations.len(), steps))
+    Ok(DimensionInferencePlan::new(observations, steps))
 }
 
 fn final_known(known: super::dimensions::InferenceKnown) -> DimensionInferenceKnown {

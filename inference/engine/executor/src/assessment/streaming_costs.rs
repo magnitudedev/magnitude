@@ -7,10 +7,9 @@
 //!   bytes takes `λ + b / D`, measured by the job on a probe file of its
 //!   own in the store, of no model: what assessment prices every streamed
 //!   model's file reads by.
-//! - **The served file's read line** ([`RequestReads::line`]): the same
-//!   line from a load's own reads of its served file, `D` the volume's bytes
-//!   over its busy time and `λ` what its demand reads took beyond that: a
-//!   run is judged by it.
+//! - **The served file's read line** is the drive's own
+//!   (`seismic_io::Totals::line`), from a load's reads of its volumes; a
+//!   load's demand reads are counted beside it ([`RequestReads`]).
 //! - **The landing line** ([`FileLine`]): what a request's file misses add
 //!   past their reads as the host lands them into a host tier (on unified
 //!   memory the device's convert prices it, `cost::LandingLine`).
@@ -22,7 +21,7 @@
 //!   slope through launches of one record and of [`CONVERTED_RECORDS`].
 //! - **The host memory's read line** ([`MemoryCosts`]), where a bank has a
 //!   host tier (a record's read from it,
-//!   [`super::cost::HostLines::memory`]): reading `b` bytes of host
+//!   [`magnitude_cost_model::HostLines::memory`]): reading `b` bytes of host
 //!   memory with every CPU at once takes `b · ρ` past the readers' start,
 //!   the slope through sweeps of none and of a span beyond the host's
 //!   caches.
@@ -53,103 +52,17 @@ use std::cell::OnceCell;
 use std::fmt;
 use std::path::Path;
 use std::time::Instant;
+use magnitude_cost_model::{ReadLine, RecordLine};
 
-/// Why the requests counted make no read line.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ReadLineError {
-    /// No request read, or the volume delivered nothing yet.
-    Unread { requests: u64 },
-    /// Times that are not finite or are negative (a broken clock or sum).
-    Terms(InvalidLine),
-}
-
-impl fmt::Display for ReadLineError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unread { requests } => write!(formatter, "{requests} demand requests make no read line yet"),
-            Self::Terms(invalid) => write!(formatter, "the requests' times: {invalid}"),
-        }
-    }
-}
-
-impl std::error::Error for ReadLineError {}
-
-/// A read line: a read of `b` bytes takes `λ + b / D`, `λ` (its latency)
-/// not negative and `1/D` (its seconds a byte) not negative, by
-/// construction ([`Self::new`]): a per-byte cost of zero is a path whose
-/// reads grow no slower with their bytes, as reads served from memory do.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(try_from = "ReadTerms", into = "ReadTerms")]
-pub struct ReadLine(Terms<2>);
-
-/// A read line as it is recorded.
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
-struct ReadTerms {
-    latency_seconds: f64,
-    seconds_per_byte: f64,
-}
-
-impl TryFrom<ReadTerms> for ReadLine {
-    type Error = InvalidLine;
-    fn try_from(terms: ReadTerms) -> Result<Self, InvalidLine> {
-        Self::new(terms.latency_seconds, terms.seconds_per_byte)
-    }
-}
-
-impl From<ReadLine> for ReadTerms {
-    fn from(line: ReadLine) -> Self {
-        Self { latency_seconds: line.latency_seconds(), seconds_per_byte: line.seconds_per_byte() }
-    }
-}
-
-impl ReadLine {
-    /// The line of latency `latency_seconds` and `seconds_per_byte`, or why
-    /// they make none.
-    pub const fn new(latency_seconds: f64, seconds_per_byte: f64) -> Result<Self, InvalidLine> {
-        match Terms::new([latency_seconds, seconds_per_byte]) {
-            Ok(terms) => Ok(Self(terms)),
-            Err(invalid) => Err(invalid),
-        }
-    }
-
-    /// `λ`.
-    pub const fn latency_seconds(&self) -> f64 {
-        self.0.fixed()
-    }
-
-    /// `1/D`.
-    pub const fn seconds_per_byte(&self) -> f64 {
-        self.0.slope()
-    }
-
-    /// The transfer term of a read of `bytes` bytes, `b/D`, beside its
-    /// latency `λ`; fractional bytes are an expectation's.
-    pub fn transfer_seconds(&self, bytes: f64) -> f64 {
-        bytes * self.seconds_per_byte()
-    }
-
-    /// What a read of `bytes` stored bytes costs, `λ + b/D`: the one price
-    /// of reading experts from the file, which a decode layer's and a prompt
-    /// group's file misses and a stored table's misses take.
-    pub fn seconds(&self, bytes: u64) -> f64 {
-        self.latency_seconds() + self.transfer_seconds(bytes as f64)
-    }
-}
-
-/// The served file's reads as a load's real work made them: its requests'
-/// demand reads, each its stored bytes and the seconds from a worker taking
-/// its first piece to its last's end, and what the volume read and how long
-/// it held a piece in flight (`seismic_io::accounting`). Sums of a
-/// window are the difference of the sums at its ends ([`Self::since`]).
+/// The served file's demand reads as a load's real work made them: each
+/// its stored bytes and the seconds from a worker taking its first piece to
+/// its last's end. Sums of a window are the difference of the sums at its
+/// ends ([`Self::since`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RequestReads {
     pub requests: u64,
     pub bytes: f64,
     pub seconds: f64,
-    /// Every read's bytes (demand, hint, fill), and the volume's busy
-    /// seconds over them.
-    pub delivered: f64,
-    pub busy_seconds: f64,
 }
 
 impl RequestReads {
@@ -160,125 +73,14 @@ impl RequestReads {
         self.seconds += seconds;
     }
 
-    /// Count `bytes` the volume read over `seconds` busy.
-    pub fn deliver(&mut self, bytes: u64, seconds: f64) {
-        self.delivered += bytes as f64;
-        self.busy_seconds += seconds;
-    }
-
     /// The reads of `self` and then `later`, of one served path.
     pub fn merge(&self, later: &Self) -> Self {
-        Self {
-            requests: self.requests + later.requests,
-            bytes: self.bytes + later.bytes,
-            seconds: self.seconds + later.seconds,
-            delivered: self.delivered + later.delivered,
-            busy_seconds: self.busy_seconds + later.busy_seconds,
-        }
+        Self { requests: self.requests + later.requests, bytes: self.bytes + later.bytes, seconds: self.seconds + later.seconds }
     }
 
     /// The reads counted after `earlier`.
     pub fn since(&self, earlier: &Self) -> Self {
-        Self {
-            requests: self.requests - earlier.requests,
-            bytes: self.bytes - earlier.bytes,
-            seconds: self.seconds - earlier.seconds,
-            delivered: self.delivered - earlier.delivered,
-            busy_seconds: self.busy_seconds - earlier.busy_seconds,
-        }
-    }
-
-    /// The read line of the file actually served: its bytes at the drive's
-    /// own rate, the volume's busy time over what it read (no job's time
-    /// gives it: a job's holds the bytes ahead of it), and of its latency
-    /// what the requests' demand reads took beyond that, at least none.
-    /// There is none until a request read and the volume delivered.
-    pub fn line(&self) -> Result<ReadLine, ReadLineError> {
-        if self.requests == 0 || self.delivered == 0. {
-            return Err(ReadLineError::Unread { requests: self.requests });
-        }
-        let byte_seconds = self.busy_seconds / self.delivered;
-        let latency = ((self.seconds - self.bytes * byte_seconds) / self.requests as f64).max(0.);
-        ReadLine::new(latency, byte_seconds).map_err(ReadLineError::Terms)
-    }
-
-    /// The read line once the reads measure one ([`Self::line`]): none
-    /// while unread, and an error only for times that make no line.
-    pub fn measured(&self) -> Result<Option<ReadLine>, ReadLineError> {
-        match self.line() {
-            Ok(line) => Ok(Some(line)),
-            Err(ReadLineError::Unread { .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-/// A per-record line: `n` records take `fixed_seconds + n · record_seconds`,
-/// neither term negative, by construction ([`Self::new`]).
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(try_from = "RecordTerms", into = "RecordTerms")]
-pub struct RecordLine(Terms<2>);
-
-/// A per-record line as it is recorded.
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
-struct RecordTerms {
-    fixed_seconds: f64,
-    record_seconds: f64,
-}
-
-impl TryFrom<RecordTerms> for RecordLine {
-    type Error = InvalidLine;
-    fn try_from(terms: RecordTerms) -> Result<Self, InvalidLine> {
-        Self::new(terms.fixed_seconds, terms.record_seconds)
-    }
-}
-
-impl From<RecordLine> for RecordTerms {
-    fn from(line: RecordLine) -> Self {
-        Self { fixed_seconds: line.0.fixed(), record_seconds: line.0.slope() }
-    }
-}
-
-impl RecordLine {
-    /// The line of `fixed_seconds` and `record_seconds`, or why they make
-    /// none.
-    pub const fn new(fixed_seconds: f64, record_seconds: f64) -> Result<Self, InvalidLine> {
-        match Terms::new([fixed_seconds, record_seconds]) {
-            Ok(terms) => Ok(Self(terms)),
-            Err(invalid) => Err(invalid),
-        }
-    }
-
-    /// The seconds of `records` records.
-    pub fn seconds(&self, records: u64) -> f64 {
-        self.0.at([1., records as f64])
-    }
-}
-
-/// What a layer's file misses cost beside their read (`λ + b/D`, the read
-/// line's) as the host lands them into a host tier: each miss is a read of
-/// its own, whose end submits its landing to the host compute executor,
-/// whose workers convert its pieces (`RowConversion`) beside the other
-/// landings', then map and answer it. A request's `n` landings end `fixed +
-/// n · record` after its last read's end: observed from a load's requests'
-/// own landings (`Telemetry::landings_ended`) on the one generic line. Not
-/// in it: the park's notice of the answer, an in-kernel poll of a host word
-/// where the park spins (one link read), unmeasured where a park is a
-/// submission boundary.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct FileLine {
-    pub landing: RecordLine,
-}
-
-impl FileLine {
-    /// The line of `terms`, a fixed part and a record's.
-    pub fn of(terms: Terms<2>) -> Self {
-        Self { landing: RecordLine(terms) }
-    }
-
-    /// What `misses` file misses of a layer add past their reads' end.
-    pub fn seconds(&self, misses: u64) -> f64 {
-        self.landing.seconds(misses)
+        Self { requests: self.requests - earlier.requests, bytes: self.bytes - earlier.bytes, seconds: self.seconds - earlier.seconds }
     }
 }
 
@@ -462,7 +264,7 @@ fn convert_point(
     let landing = [(constants::LANDING_HEAD, sequence), (constants::LANDING_HEAD + 1, converted as i32)]
         .into_iter()
         .chain((0..records).flat_map(|entry| {
-            let at = magnitude_kernels::landing_extent(entry);
+            let at = magnitude_kernels::constants::LANDING_ENTRY(entry);
             [(at + constants::LANDING_FROM, entry as i32), (at + constants::LANDING_TO, entry as i32)]
         }))
         .collect::<Vec<_>>();
@@ -472,7 +274,8 @@ fn convert_point(
     let mut file_port = port(Element::i32(), &table.extents())?;
     let mut sources = port(Element::i32(), &[constants::SOURCE_ROWS, 1, 1])?;
     let policy = port(Element::i32(), &[constants::POLICY_WORDS])?;
-    let mut list = port(Element::i32(), &[magnitude_kernels::landing_extent(records)])?;
+    let mut list = port(Element::i32(), &[magnitude_kernels::constants::LANDING_ENTRY(records)])?;
+    let grid = port(Element::i32(), &[3])?;
     // An up-only record's gate views hold no record, in its up's form.
     let RecordTensors { gate, up, down } = form.record;
     let tensors = [(gate.unwrap_or(up), if gate.is_some() { records } else { 0 }), (up, records), (down, records)];
@@ -506,6 +309,7 @@ fn convert_point(
             gate: gate_records.tensor_mut().into(),
             up: up_records.tensor_mut().into(),
             down: down_records.tensor_mut().into(),
+            grid: grid.tensor().into(),
         },
     )
     .map_err(|cause| error(&cause))?;
@@ -514,7 +318,10 @@ fn convert_point(
         (file_port, shared(&table.extents(), &file)?),
         (sources, shared(&[constants::SOURCE_ROWS, 1, 1], &[])?),
         (policy, shared(&[constants::POLICY_WORDS], &[])?),
-        (list, shared(&[magnitude_kernels::landing_extent(records)], &landing)?),
+        (list, shared(&[magnitude_kernels::constants::LANDING_ENTRY(records)], &landing)?),
+        // The grid the route writes of a step that requested: every group,
+        // where the bank places.
+        (grid, shared(&[3], &[(0, crate::planning::Placer::Bank.land_groups()), (1, 1), (2, 1)])?),
     ];
     let zeros = |(element, extents): (Element, [u64; 3])| Tensor::zeros(charges, element, &extents).map_err(|cause| error(&cause));
     for ((staging, records), (tensor, held)) in staging.into_iter().zip([gate_records, up_records, down_records]).zip(tensors) {
@@ -566,7 +373,7 @@ impl ConvertCosts {
         });
         let medians = [one?, most?];
         let line = rising(medians).ok_or(CeilingError::Flat { points: medians })?;
-        Ok(Self { record_seconds: line.slope(), line: RecordLine(line) })
+        Ok(Self { record_seconds: line.slope(), line: RecordLine::of(line) })
     }
 
     /// Each bank group's convert line of `plan`'s bank ([`Self::stored`]).
@@ -641,6 +448,15 @@ impl ConvertForm {
 /// longer. So the device's work, each run its own submission, is timed
 /// alone and beside such a copy ([`Self::stall_share`]), both kept in the
 /// record store.
+///
+/// The transfer queue's own line, a batch's latency and its seconds a byte
+/// ([`Self::transfer`]), is what a promotion's copy takes: timed from a
+/// batch's issue to its completion, of one of the probe's records and of
+/// all of them, so its depth (the batches a promotion keeps in flight,
+/// `Copies`) and its rate are the device's, never a constant. Its line the
+/// other way ([`Self::back`]), device memory into host memory, is what a
+/// release's write-back into the host tier takes, timed alike: a link's
+/// two directions need not run at one rate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TierCopyCosts {
     pub blocks: u32,
@@ -650,6 +466,31 @@ pub struct TierCopyCosts {
     /// from work queued beside it, for as long as the copy runs: `1 −
     /// alone / beside` of the probe's work submitted back to back.
     pub stall_share: f64,
+    /// The transfer queue's line: a batch's latency `λ` and its seconds a
+    /// byte, from host memory into device memory.
+    pub transfer: ReadLine,
+    /// The transfer queue's line the other way, from device memory into
+    /// host memory.
+    pub back: ReadLine,
+}
+
+/// Which way a transfer-queue batch copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// Host memory into device memory: a promotion's.
+    In,
+    /// Device memory into host memory: a write-back's.
+    Out,
+}
+
+impl Direction {
+    /// Its key's configuration name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::In => "transfer_copy",
+            Self::Out => "transfer_back",
+        }
+    }
 }
 
 /// Whether the stall probe's queued work runs alone or beside a copy on
@@ -690,13 +531,15 @@ const SCHEMA: (&str, u64) = ("schema", 2);
 /// the link's time to copy them (2.8 ms at 12 GB/s).
 pub const TIER_COPY_PROBE: (u64, u64) = (32, 1 << 20);
 
-/// A point of [`TierCopyCosts`]: the probe's copy on `blocks`, or the
-/// stall probe's work, alone or beside a copy on the transfer queue.
+/// A point of [`TierCopyCosts`]: the probe's copy on `blocks`, the stall
+/// probe's work, alone or beside a copy on the transfer queue, or one
+/// transfer-queue batch of `records` of the probe's records.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TierCopyPoint {
     Copy { blocks: u32 },
     StallAlone,
     StallBesideCopy,
+    Transfer { records: u64, direction: Direction },
 }
 
 impl fmt::Display for TierCopyPoint {
@@ -705,6 +548,8 @@ impl fmt::Display for TierCopyPoint {
             Self::Copy { blocks } => write!(formatter, "a tier copy on {blocks} blocks"),
             Self::StallAlone => formatter.write_str("the stall probe's work alone"),
             Self::StallBesideCopy => formatter.write_str("the stall probe's work beside a transfer-queue copy"),
+            Self::Transfer { records, direction: Direction::In } => write!(formatter, "a transfer-queue batch of {records} probe records into the device"),
+            Self::Transfer { records, direction: Direction::Out } => write!(formatter, "a transfer-queue batch of {records} probe records out of the device"),
         }
     }
 }
@@ -720,6 +565,9 @@ pub enum TierCopyError {
     /// The stall probe's work ran faster beside a copy than alone, beyond
     /// both timings' intervals: a bad measurement, never a stall of zero.
     FasterBeside { alone: f64, beside: f64 },
+    /// The transfer queue's batches make no line: the whole probe's batch
+    /// took less than one record's, or a term is not finite.
+    Transfer(InvalidLine),
 }
 
 impl fmt::Display for TierCopyError {
@@ -733,6 +581,7 @@ impl fmt::Display for TierCopyError {
                 formatter,
                 "the stall probe ran faster beside a copy ({beside:e} s) than alone ({alone:e} s), beyond both intervals: a bad measurement"
             ),
+            Self::Transfer(invalid) => write!(formatter, "the transfer queue's batches: {invalid}"),
         }
     }
 }
@@ -782,6 +631,18 @@ impl TierCopyCosts {
         })
     }
 
+    /// A transfer-queue batch's key: `records` of the probe's records
+    /// copied `direction`, no kernel taking part.
+    fn transfer_key(identity: &seismic::Identity, records: u64, direction: Direction) -> PointKey {
+        let (probe, bytes) = TIER_COPY_PROBE;
+        PointKey {
+            executor: identity.clone(),
+            kernels: Vec::new(),
+            configuration: named(&[(direction.name(), 1), ("records", probe), ("bytes", bytes), SCHEMA]),
+            point: named(&[("batch", records)]),
+        }
+    }
+
     /// The costs on `executor` that `store`'s records give, measuring and
     /// forming nothing; why there are none: a load copies on a list's whole
     /// grid until the job has measured them.
@@ -813,7 +674,18 @@ impl TierCopyCosts {
                 _ => 0.,
             },
         };
-        Ok(Self { blocks, whole_seconds: whole, stall_share })
+        // Each way's line through a batch of one record and one of every
+        // record: the records past the first are its slope, what the first
+        // leaves its latency.
+        let (records, bytes) = TIER_COPY_PROBE;
+        let line = |direction: Direction| {
+            let [lone, full] = [1, records].map(|batch| median(Self::transfer_key(&identity, batch, direction), TierCopyPoint::Transfer { records: batch, direction }));
+            let (lone, full) = (lone?, full?);
+            let byte_seconds = (full - lone) / ((records - 1) * bytes) as f64;
+            ReadLine::new((lone - bytes as f64 * byte_seconds).max(0.), byte_seconds).map_err(TierCopyError::Transfer)
+        };
+        let (transfer, back) = (line(Direction::In)?, line(Direction::Out)?);
+        Ok(Self { blocks, whole_seconds: whole, stall_share, transfer, back })
     }
 
     /// The link's ceiling, a byte's seconds: the whole grid's copy from
@@ -845,14 +717,26 @@ impl TierCopyCosts {
                 tier_copy_point(charges, kernel, blocks, Source::Host).map_err(Unformed::Now)
             });
         }
-        // The device's work queued alone, then beside a copy the transfer
-        // queue runs throughout its timing.
         let error = failed("the stall probe's copy");
         let transfer = seismic::Transfer::new(device).map_err(|cause| error(&cause))?;
         let (records, bytes) = TIER_COPY_PROBE;
         let shape = [records, 1, bytes];
         let copied = Tensor::shared(charges, Element::bool(), &shape).map_err(|cause| error(&cause))?;
         let into = Tensor::zeros(charges, Element::bool(), &shape).map_err(|cause| error(&cause))?;
+        // The transfer queue's batches each way, of one record and of every
+        // one, each timed from its issue to its completion.
+        for direction in [Direction::In, Direction::Out] {
+            let (source, destination) = match direction {
+                Direction::In => (&copied, &into),
+                Direction::Out => (&into, &copied),
+            };
+            for batch in [1, records] {
+                let transfer = &transfer;
+                walks.time_host(Self::transfer_key(&walks.identity(), batch, direction), move || Ok(TransferBatches { transfer, source, destination, records: batch }));
+            }
+        }
+        // The device's work queued alone, then beside a copy the transfer
+        // queue runs throughout its timing.
         for beside in [Beside::Alone, Beside::Copy] {
             let key = Self::stall_key(&walks.identity(), device.backend(), beside)?;
             let formed = &formed;
@@ -882,6 +766,17 @@ impl TierCopyCosts {
     /// from the work beside it ([`Self::stall_share`]), in `time`'s unit.
     pub fn stall(&self, time: f64) -> f64 {
         time * self.stall_share
+    }
+
+    /// The batches of one `bytes`-byte record each the transfer queue keeps
+    /// in flight so it never idles between them: one running, and enough
+    /// behind it to cover a batch's latency at the queue's rate,
+    /// `1 + ⌈λ / (b · s)⌉` ([`Self::transfer`]). A due copy then waits
+    /// behind at most that many records.
+    pub fn depth(&self, bytes: u64) -> usize {
+        let record = self.transfer.transfer_seconds(bytes as f64);
+        assert!(record > 0., "a record of {bytes} bytes crosses the transfer queue in no time");
+        1 + (self.transfer.latency_seconds() / record).ceil() as usize
     }
 }
 
@@ -934,6 +829,65 @@ impl RecordStore<PointKey> for Copying<'_> {
     }
 }
 
+/// Batches of `records` of [`TIER_COPY_PROBE`]'s records on the transfer
+/// queue, from host memory into device memory, one a pass, each waited out
+/// before the next is issued: what one batch of a promotion's copies takes.
+struct TransferBatches<'a> {
+    transfer: &'a seismic::Transfer,
+    source: &'a Tensor,
+    destination: &'a Tensor,
+    records: u64,
+}
+
+impl Work for TransferBatches<'_> {
+    type Error = String;
+    type Pending = Done;
+    /// The transfer queue holds no clock a gauge raises.
+    type Clock = ();
+
+    fn submit(&self, passes: usize) -> Result<Done, String> {
+        let bytes = TIER_COPY_PROBE.1;
+        let started = Instant::now();
+        for _ in 0..passes {
+            let items = (0..self.records)
+                .map(|record| {
+                    seismic::TransferItem::Run(seismic::TransferRun {
+                        source: self.source,
+                        source_offset: record * bytes,
+                        destination: self.destination,
+                        destination_offset: record * bytes,
+                        bytes,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let value = self.transfer.copy(&items).map_err(|error| error.to_string())?;
+            while !self.transfer.wait(value, std::time::Duration::from_secs(1)).map_err(|error| error.to_string())? {}
+        }
+        Ok(Done(started.elapsed().as_secs_f64()))
+    }
+
+    fn calls_per_pass(&self) -> usize {
+        1
+    }
+
+    /// A batch crosses the link, which no cache of the device's holds.
+    fn submit_cold(&self, passes: usize) -> Result<Done, String> {
+        self.submit(passes)
+    }
+
+    fn cold_calls_per_pass(&self) -> usize {
+        1
+    }
+
+    fn clock(&self) -> Option<()> {
+        None
+    }
+
+    fn gauge(&self) -> Result<Box<dyn Gauge<String>>, String> {
+        Err("transfer-queue batches hold no clock to gauge".into())
+    }
+}
+
 /// Where a copy point's records lie: in host memory the device reads in
 /// place over the link (a tier copy), or in device memory (the stall
 /// probe's work, which loads no link).
@@ -952,12 +906,13 @@ fn tier_copy_point(charges: &seismic::Charges, kernel: &NativeKernel<routed_copy
     let byte = Element::bool();
     let shape = [records, 1, bytes];
     let sequence = 1i32;
-    let words = magnitude_kernels::list_extent(records);
+    let step = magnitude_kernels::step_words(sequence as u64, 0);
+    let words = magnitude_kernels::constants::LIST_ENTRY(records);
     let mut list = vec![0i32; words as usize];
     list[constants::LIST_SEQUENCE as usize] = sequence;
     list[constants::LIST_COUNT as usize] = records as i32;
     for entry in 0..records {
-        let at = magnitude_kernels::list_extent(entry) as usize;
+        let at = magnitude_kernels::constants::LIST_ENTRY(entry) as usize;
         list[at + constants::LIST_FROM as usize] = entry as i32;
         list[at + constants::LIST_TO as usize] = entry as i32;
     }
@@ -970,7 +925,7 @@ fn tier_copy_point(charges: &seismic::Charges, kernel: &NativeKernel<routed_copy
         }
         .map_err(|cause| error(&cause))?,
         Tensor::from_host(charges, Element::i32(), &[words], &i32_bytes(&list)).map_err(|cause| error(&cause))?,
-        Tensor::from_host(charges, Element::i32(), &[constants::STEP_WORDS], &i32_bytes(&[sequence, 0])).map_err(|cause| error(&cause))?,
+        Tensor::from_host(charges, Element::i32(), &[constants::STEP_WORDS], &i32_bytes(&step)).map_err(|cause| error(&cause))?,
         Tensor::zeros(charges, byte, &shape).map_err(|cause| error(&cause))?,
         Tensor::from_host(charges, Element::i32(), &[3], &i32_bytes(&[blocks as i32, 1, 1])).map_err(|cause| error(&cause))?,
     ];
@@ -1399,7 +1354,7 @@ pub struct CpuForm {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CpuCosts {
     pub workers: usize,
-    pub lines: super::cost::CpuLines,
+    pub lines: magnitude_cost_model::CpuLines,
 }
 
 impl CpuForm {
@@ -1426,8 +1381,8 @@ impl CpuForm {
     /// `lines`, this form's site, for a record of `record_bytes` resident
     /// bytes: an expert's lines in proportion to the bytes it reads, the
     /// handshake as it is.
-    pub(crate) fn lines_of(&self, lines: super::cost::CpuLines, record_bytes: u64) -> Result<super::cost::CpuLines, ExecutorCostsError> {
-        use super::cost::{Nanoseconds, RowCost};
+    pub(crate) fn lines_of(&self, lines: magnitude_cost_model::CpuLines, record_bytes: u64) -> Result<magnitude_cost_model::CpuLines, ExecutorCostsError> {
+        use magnitude_cost_model::{Nanoseconds, RowCost};
         let bytes = self
             .record
             .iter()
@@ -1439,7 +1394,7 @@ impl CpuForm {
             RowCost::Measured(row) => RowCost::Measured(scale(row)?),
             RowCost::AtMost(row) => RowCost::AtMost(scale(row)?),
         };
-        Ok(super::cost::CpuLines { expert: super::cost::RowLine { one: scale(lines.expert.one)?, row }, handshake: lines.handshake })
+        Ok(magnitude_cost_model::CpuLines { expert: magnitude_cost_model::RowLine { one: scale(lines.expert.one)?, row }, handshake: lines.handshake })
     }
 
     /// The form of a site over `binding`, expanding as `form`.
@@ -1489,7 +1444,7 @@ impl CpuCosts {
         form: &CpuForm,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<Option<Self>, ExecutorCostsError> {
-        use super::cost::{CpuLines, Nanoseconds, RowCost, RowLine};
+        use magnitude_cost_model::{CpuLines, Nanoseconds, RowCost, RowLine};
         let identity = executor_identity(topology, executor)?;
         let error = failed("CPU site record");
         let term = |term: &str| measured(store, &form.key(&identity, term), "CPU site record");
@@ -1510,7 +1465,7 @@ impl CpuCosts {
 
     /// Size `form`'s pool and measure its lines in the job, stored.
     pub(super) fn measure(charges: &seismic::Charges, form: &CpuForm, store: &dyn RecordStore<PointKey>) -> Result<(), ExecutorCostsError> {
-        use super::cost::RowCost;
+        use magnitude_cost_model::RowCost;
         let error = failed("CPU site");
         let identity = executor_identity(charges.device().topology(), charges.device().info())?;
         let (workers, lines) = crate::experts::measure_cpu_site(charges, form).map_err(|cause| error(&cause))?;
@@ -1744,7 +1699,7 @@ mod tests {
     /// the bytes it reads, its handshake as the reference measured it.
     #[test]
     fn a_sited_record_reads_at_the_reference_site_by_its_bytes() {
-        use crate::assessment::cost::{CpuLines, Nanoseconds, RowCost, RowLine};
+        use magnitude_cost_model::{CpuLines, Nanoseconds, RowCost, RowLine};
         let form = CpuForm::reference(seismic::BackendName::Cuda).unwrap().unwrap();
         let bytes = form.record.iter().map(|(_, tensor)| tensor.record_bytes().unwrap()).sum::<u64>();
         let ns = |value: f64| Nanoseconds::of(value * 1e-9).unwrap();
@@ -1766,6 +1721,18 @@ mod tests {
             assert_eq!(shares.last().map_or(0, |share| share.end), length);
             assert_eq!(Sweeps::written(length, readers), (0..length as u64).collect::<Vec<_>>());
         }
+    }
+
+    /// The transfer queue keeps a batch running and enough behind it to
+    /// cover a batch's latency at its rate: a record of 3 MB at 12 GB/s
+    /// (250 µs) behind a latency of 90 µs keeps two in flight, one whose
+    /// transfer hides less than its latency more.
+    #[test]
+    fn the_transfer_queues_depth_covers_its_latency() {
+        let costs = |latency: f64| TierCopyCosts { blocks: 2, whole_seconds: 1e-3, stall_share: 0., transfer: ReadLine::new(latency, 1. / 12e9).unwrap(), back: ReadLine::new(latency, 1. / 12e9).unwrap() };
+        assert_eq!(costs(90e-6).depth(3_000_000), 2);
+        assert_eq!(costs(0.).depth(3_000_000), 1, "no latency to cover: one at a time keeps it busy");
+        assert_eq!(costs(300e-6).depth(3_000_000), 3);
     }
 
     #[test]
@@ -1847,30 +1814,23 @@ mod tests {
         assert!(stored.workers > 0 && stored.lines.expert.one.get() > 0., "{stored:?}");
     }
 
-    /// The read line's bytes run at what the volume delivered over its busy
-    /// time, its latency what requests took beyond that, none below zero;
-    /// no line stands before a request read and the volume delivered; a
-    /// window's sums give its own.
+    /// A window's demand reads are the difference of its ends' sums, and
+    /// merge back to them.
     #[test]
-    fn the_read_line_is_the_drives_rate_and_the_requests_excess() {
+    fn demand_reads_count_by_window() {
         let mut reads = RequestReads::default();
-        assert_eq!(reads.line(), Err(ReadLineError::Unread { requests: 0 }));
         reads.add(1_000, 1e-3);
-        assert_eq!(reads.line(), Err(ReadLineError::Unread { requests: 1 }));
-        reads.deliver(1_000_000, 0.5);
-        let line = reads.line().unwrap();
-        assert!((line.seconds_per_byte() - 5e-7).abs() < 1e-18);
-        assert!((line.latency_seconds() - 5e-4).abs() < 1e-12);
         let first = reads;
         reads.add(1_000, 1e-6);
-        assert_eq!(reads.since(&first).line(), Err(ReadLineError::Unread { requests: 1 }));
-        assert_eq!(reads.since(&first).merge(&first).requests, 2);
-        let mut quick = RequestReads::default();
-        quick.add(1_000, 1e-6);
-        quick.deliver(1_000, 1.);
-        assert_eq!(quick.line().unwrap().latency_seconds(), 0.);
+        let window = reads.since(&first);
+        assert_eq!(window.requests, 1);
+        assert_eq!(window.bytes, 1_000.);
+        assert!((window.seconds - 1e-6).abs() < 1e-18, "{}", window.seconds);
+        let merged = window.merge(&first);
+        assert_eq!(merged.requests, 2);
+        assert_eq!(merged.bytes, 2_000.);
+        assert!((merged.seconds - (1e-3 + 1e-6)).abs() < 1e-18, "{}", merged.seconds);
     }
-
 
     /// `routed_copy`'s device time at a prompt group's seed shape (Q4_K
     /// records of 589,824 bytes, copied as bytes): the seed copy of 256
@@ -1896,7 +1856,7 @@ mod tests {
         let identity = executor_identity(device.topology(), device.info()).unwrap();
         let error_rate = crate::SEARCH_SETTINGS.error_rate;
         let how = Measure { stop: Stop::Resolved { error_rate }, min_sample_seconds: crate::MIN_SAMPLE_SECONDS };
-        let step_words = (0..constants::STEP_WORDS).map(|word| i32::from(word == 0)).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
+        let step_words = magnitude_kernels::step_words(1, 0).iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
         let charges = seismic::Charges::tally(&device);
         let step = Tensor::from_host(&charges, Element::i32(), &[constants::STEP_WORDS], &step_words).unwrap();
         let (sources, destinations) = (256u64, 512u64);
@@ -1915,12 +1875,12 @@ mod tests {
             let (destination, _destination_store) = tensor(destination_pooled, destinations);
             let placed = |pooled: bool| if pooled { "pooled" } else { "device" };
             for (copied, sequence) in [(0u64, 0), (1, 1), (16, 1), (sources, 1)] {
-                let words = magnitude_kernels::list_extent(sources);
+                let words = magnitude_kernels::constants::LIST_ENTRY(sources);
                 let mut list = vec![0i32; words as usize];
                 list[constants::LIST_SEQUENCE as usize] = sequence;
                 list[constants::LIST_COUNT as usize] = copied.max(1) as i32;
                 for entry in 0..copied.max(1) {
-                    let at = magnitude_kernels::list_extent(entry) as usize;
+                    let at = magnitude_kernels::constants::LIST_ENTRY(entry) as usize;
                     list[at + constants::LIST_FROM as usize] = entry as i32;
                     list[at + constants::LIST_TO as usize] = entry as i32;
                 }
@@ -2041,7 +2001,7 @@ mod tests {
             assert!(ended.ended.is_empty() && ended.failures.is_empty(), "{backend:?}: {ended:?}");
             let costs = ConvertCosts::stored(device.topology(), device.info(), form, &store)
                 .unwrap_or_else(|error| panic!("{backend:?}: {error:?}: {visited:?}"));
-            assert!(costs.line.0.slope() > 0. && costs.record_seconds > 0., "{backend:?}: {:?}", costs.line);
+            assert!(costs.line.terms().slope() > 0. && costs.record_seconds > 0., "{backend:?}: {:?}", costs.line);
             std::fs::remove_dir_all(records).unwrap();
         }
     }

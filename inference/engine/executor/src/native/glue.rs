@@ -1,6 +1,6 @@
 use magnitude_kernels::{
-    conditioning_overlay, copy_rows, feature_copy, sample_rows, selection_notice, shape_rows,
-    token_confidence,
+    conditioning_overlay, copy_rows, feature_copy, sample_rows, selection_notice,
+    shape_rows, token_confidence,
 };
 use seismic::NativeKernel;
 
@@ -13,8 +13,8 @@ pub struct GlueKernels {
     /// Each proposal's probability under the readout logits it was selected
     /// from, of a load that drafts: one entry for every drafter's selections.
     pub(super) token_confidence: Option<NativeKernel<token_confidence::Entry>>,
-    /// The copy of a read's selected rows for the host, of a load whose
-    /// host fills a table for such reads (`ProgramPlan::notices_selection`).
+    /// The copy of a step's token rows, of a load that copies them
+    /// (`ProgramPlan::copies_token_rows`).
     pub(super) selection_notice: Option<NativeKernel<selection_notice::Entry>>,
     pub(super) conditioning_overlay: Option<NativeKernel<conditioning_overlay::Entry>>,
     pub(super) copy_rows_f32: Option<NativeKernel<copy_rows::Entry>>,

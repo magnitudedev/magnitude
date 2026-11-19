@@ -22,7 +22,7 @@ fn a_gap_between_steps_is_no_steps_time() {
 #[test]
 fn a_counted_decode_is_live_at_its_launches_rows_and_context() {
     let harness = harness("live", EXPERTS, 2);
-    let warm = harness.step().decoding([10; 4].into_iter());
+    let warm = harness.begun().decoding([row(10, None); 4].into_iter(), 0);
     harness.request_at(&warm, 0, &[0, 1]);
     warm.complete().unwrap();
     assert_eq!(harness.watcher.shared().live(), None, "a warm-up's step is not counted");
@@ -30,7 +30,7 @@ fn a_counted_decode_is_live_at_its_launches_rows_and_context() {
     for position in 0..steps {
         // Two experts a launch, cycling through every expert: each misses.
         let first = (2 * (position as usize + 1)) % EXPERTS;
-        let step = harness.step().decoding([1000 + position; 4].into_iter()).recorded(Recording);
+        let step = harness.begun().decoding([row(1000 + position, None); 4].into_iter(), 0).recorded(Recording);
         harness.request_at(&step, 0, &[first, first + 1]);
         step.complete().unwrap();
     }
@@ -41,6 +41,33 @@ fn a_counted_decode_is_live_at_its_launches_rows_and_context() {
     // Each launch's context is its rows' positions plus one.
     assert_eq!(live.depth, 1001 + (steps as u32 - 1) / 2);
     assert_eq!(live.layers.len(), 1);
+}
+
+/// A counted decode with front rows counts its exact rows alone
+/// (`RoutingRecord::exact`): a launch of an exact row and a front row (the
+/// next position's, as its pass places it) reads its exact row's choice
+/// alone and counts one row at its exact row's context.
+#[test]
+fn a_counted_decode_counts_its_exact_rows_alone() {
+    let harness = harness("exact", EXPERTS, 2);
+    let routed = || {
+        let costs = harness.watcher.shared().costs();
+        let (_, step) = costs.completed.expect("a step completed");
+        step.experts[0].routed.as_ref().expect("a decode step's routing").experts.clone()
+    };
+    let steps = 4u64;
+    for position in 0..steps {
+        let exact = (2 * position as usize) % EXPERTS;
+        let paired = harness.begun().decoding([row(1000 + position, None), row(1001 + position, front_row())].into_iter(), 0).recorded(Recording);
+        harness.request_at(&paired, 0, &[exact, exact + 1]);
+        paired.complete().unwrap();
+        assert_eq!(routed(), [exact], "the exact row's choice alone");
+    }
+    let shared = harness.watcher.shared();
+    eventually("the decode reads were never ranked", || shared.telemetry.fed_all());
+    let live = shared.live().expect("a counted decode");
+    assert_eq!((live.steps, live.rows), (steps, 1.));
+    assert_eq!(live.depth, 1001 + (steps as u32 - 1) / 2);
 }
 
 /// With two prompt groups in flight, the watcher counts the second's first

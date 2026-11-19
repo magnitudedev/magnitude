@@ -154,7 +154,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     rows: &Dim,
     epsilon: Argument<f32>,
     split: Option<Split<'_>>,
-) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
+) -> Result<(WorkflowTensor, Option<crate::operators::routed::streamed::StepInputs>), GraphError> {
     let [dense_scope, routed_scope] = DenseBesideRouted::scopes(sublayer);
     let front = matches!(split, Some(Split::Front(_)));
     let (routed, sequence) = general_routed(

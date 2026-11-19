@@ -3,9 +3,16 @@
 //! (`experts::map`). Every choice of what the bank keeps ranks by the one
 //! ranking ([`Reuse`], measured from the completed steps' reads, which its
 //! stack `Stack` feeds): a promotion's ([`Directory::promotions`]), which
-//! brings the ranking's share of each layer into the bank in place of what
+//! brings the ranking's pool of each group into the bank in place of what
 //! lies outside it, a prompt group's seeds' ([`Directory::seed`]) and a
-//! shrink's.
+//! shrink's. No layer has a share of its group's records: the ranking alone
+//! splits them across the group's layers, a prompt's seeds' among them.
+//!
+//! It builds the load's one [`Time`] (the token clock and each tier's
+//! turnover, `experts::horizon`) and feeds it every move of a record: a
+//! landing into a host record ([`Directory::landed`], a write-back's
+//! among them) and a promotion's completion ([`Directory::promoted`]);
+//! seeds, shrinks' evictions and lends are not moves.
 //!
 //! The vocabulary is `SlotDirectory`'s (slot, held, free); a record's life
 //! spans the device's steps, so it is a directory of its own.
@@ -27,12 +34,13 @@
 mod replay;
 mod stack;
 
-use super::host_records::{Claim, Demand, HostRecords, InboundTable, Kept, Located, Resolution, Taking};
+use super::host_records::{admitted, Admit, Claim, Demand, Grant, HostRecords, InboundTable, Kept, Located, Resolution, Taking};
 use super::map::{LandingMap, StampedMap};
-use super::records::{BankRecords, Lent, Record};
-use super::reuse::{Rank, Ranking, Reuse, Unlogged};
+use super::records::{Back, BankRecords, Record};
+use super::horizon::{Horizon, Reader, Tier, Time};
+use super::reuse::{Rank, Ranker, Ranking, Reuse, Unlogged};
 use super::staging::Staged;
-use super::watcher::{Lending, LentRecords, Step, Steps, Unbegun};
+use super::watcher::{ParkFrom, ScratchGroup, Step, Steps, Unbegun, UnmapStep};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 pub use stack::{CountedLaunch, LayerCurve, MissCurve, RoutedRead, Stack};
@@ -110,7 +118,7 @@ pub(super) struct Park {
     /// one whose resolution of the layer lies after the park (the parked
     /// step's own at its layer is done): every step of those groups below
     /// it has resolved the layer.
-    pub unresolved: Vec<Step>,
+    pub unresolved: Vec<ParkFrom>,
     /// Per layer, the steps of groups begun before the parked step's that
     /// have yet to resolve the layer, `(first, last)`: a group the parked
     /// one was cut in before, at that group's layers from the cut on.
@@ -122,7 +130,7 @@ impl Park {
     /// The first step whose resolution of `layer` is not before the park,
     /// of the parked step's group or a later one ([`Self::unresolved`]):
     /// what an unmapping or a landing at the park is stored from.
-    pub fn unresolved(&self, layer: usize) -> Step {
+    pub fn unresolved(&self, layer: usize) -> ParkFrom {
         self.unresolved[layer]
     }
 
@@ -199,40 +207,28 @@ impl<E: FnMut(Point) -> Ending> Settling<E> {
     }
 }
 
-/// The one seed policy ([`Directory::seed`]), over either store's records:
-/// `seeds`, the routed experts `layer` lacks, each at its place in the
-/// store's taking order (`owner`: the layer of the expert a place ranks),
-/// take the store's records (`records`: those a seed may take, in taking
-/// order, least first, each at its place, `None` for a free one; at least
-/// the first as many as `seeds` of the layer's own, and as many of the rest
-/// up to `room`). A record of the layer's own replaces one of its experts;
-/// a free one or another layer's grows the layer, which it takes only
-/// while the layer holds fewer experts than its share (`room`). The most
-/// ranked seed goes against the least ranked record, while it outranks it.
-/// Each seed taken, with its record and the record's place.
+/// The one seed policy ([`Directory::seed`]), over either store's records
+/// (design §3.7): `seeds`, the routed experts a layer lacks, each at its
+/// place in the store's taking order, take `records` (those a seed may
+/// take, each at its place, `None` for a free one): free records first,
+/// then the group's kept records of any layer, least ranked first, the
+/// most ranked seed against the least ranked record while `strictly_better`
+/// holds (strictly higher expected future uses, never evicting on a recency
+/// tie-breaker alone). Capacity is pooled across the group's layers, so no
+/// layer has a room of its own. Each seed taken, with its record and the
+/// record's place.
 fn seeding<P: Ord + Copy, R: Ord + Copy>(
-    layer: usize,
-    mut room: usize,
     mut seeds: Vec<P>,
-    records: Vec<(Option<P>, R)>,
-    owner: impl Fn(P) -> usize,
+    mut records: Vec<(Option<P>, R)>,
+    strictly_better: impl Fn(P, P) -> bool,
 ) -> Vec<(P, (Option<P>, R))> {
     seeds.sort_unstable_by(|a, b| b.cmp(a));
-    let wanted = seeds.len();
-    let mut records = records
-        .into_iter()
-        .filter(|&(held, _)| match held {
-            Some(held) if owner(held) == layer => true,
-            _ if room > 0 => {
-                room -= 1;
-                true
-            }
-            _ => false,
-        })
-        .take(wanted)
-        .collect::<Vec<_>>();
     records.sort_unstable();
-    seeds.into_iter().zip(records).take_while(|&(seed, (held, _))| held.is_none_or(|held| held < seed)).collect()
+    seeds
+        .into_iter()
+        .zip(records)
+        .take_while(|&(seed, (held, _))| held.is_none_or(|held| strictly_better(held, seed)))
+        .collect()
 }
 
 /// What a placement's experts took: per expert its record; and the experts
@@ -287,23 +283,22 @@ pub(super) struct Directory {
     /// Their read path's mirror of where every expert is.
     inbound: Arc<InboundTable>,
     /// The running prompt group's reads the ranking has not logged yet:
-    /// every expert its steps routed, each at its last step with the
-    /// choices routed to it so far ([`Self::read_pending`]), which every
-    /// taking ranks beside, so the store's landings and seeds follow the
-    /// prompt's use of each expert as its passes resolve.
+    /// every expert its steps routed, each at its last step
+    /// ([`Self::read_pending`]), which every taking ranks beside, a use at
+    /// that step, so the store's landings and seeds follow the prompt's use
+    /// of each expert as its passes resolve.
     prompt_reads: HashMap<Staged, Unlogged>,
     /// Who places into the bank: where the host does (the one store), a
     /// prompt group's scratch and seeds are its host records'.
     placer: crate::planning::Placer,
     /// The one ranking, which every choice of what to keep ranks by; its
-    /// feed is the stack's (`Stack`). Its shares are the records that keep
-    /// the bank's experts: the host tier's where it is the bank's own
-    /// records (the one store, unified memory: `placer`), else the bank's.
+    /// feed is the stack's (`Stack`). Its pools are each group's decode
+    /// capacity ([`Self::capacity`]) less the promotions' reserve.
     ranking: Ranking,
     /// Per layer, what the bank is short of and holds beyond the ranking's
-    /// share (`Reuse::in_top`), kept as either side changes
-    /// ([`Self::resettle`]): the experts among the share the bank lacks and
-    /// no placement takes (`wanted`), and those the bank holds outside it
+    /// pool (`Reuse::in_top`), kept as either side changes
+    /// ([`Self::resettle`]): the experts of the pool the bank lacks and no
+    /// placement takes (`wanted`), and those the bank holds outside it
     /// (`unwanted`), the records promotions take.
     wanted: Vec<BTreeSet<usize>>,
     unwanted: Vec<BTreeSet<usize>>,
@@ -318,29 +313,168 @@ pub(super) struct Directory {
     withheld: Option<u64>,
     /// Per group, the records it keeps free or releasing beyond its wants,
     /// so a promotion takes a record no step reads and copies at once
-    /// ([`Self::reserve`]); the ranking's shares are the records less it.
+    /// ([`Self::reserve`]); the ranking's pools are the capacity less it.
     reserve: Vec<usize>,
     /// The reads a promotion must expect beyond what it displaces to earn
     /// its copy, each layer's (`ExpertLines::copy_hits`): none where a hit
     /// saves nothing, so no promotion of the layer earns; zero, a copy
     /// costing nothing, until the lines are priced.
     copy_hits: Vec<Option<f64>>,
-    /// Per group, the promotions it asked since its first and that one's
-    /// step, none before it: what a stay in its bank lasts
-    /// ([`Self::stay`]). The one count of promotions asked.
-    asked: Vec<Option<Asked>>,
+    /// The promotions asked since the load ([`Self::asked`]).
+    asked: u64,
+    /// The load's time: the token clock, and the turnover of each group's
+    /// tiers (tier 0 the bank beside a host tier, or the one store; tier 1
+    /// the host tier beside a bank), each of its records present
+    /// ([`Self::tier_records`]). Built here, shared with the ranking, the
+    /// ledger and the steps' clock writers ([`Self::time`]); fed every move
+    /// here and only here.
+    time: Time,
+    /// Each layer's price of writing a released expert back into its host
+    /// tier ([`WriteBack`]), none until the passes and the copy line are
+    /// measured: no write-back is asked before.
+    write_backs: Vec<Option<WriteBack>>,
+    /// Each release's write-back in flight, by its bank record (group,
+    /// record): the grant of its tier record's landing, which maps it once
+    /// written, and the step that last read its expert, which ranks it in
+    /// the tier.
+    backs: HashMap<(usize, usize), (Grant, Option<Step>)>,
     /// Where the host places (the one store), each prompt group's seed not
     /// yet retired: its group, the host record it took, its expert and the
     /// point of its seeding step ([`Self::seed`], [`Self::retire`]).
     seeding: Vec<(usize, u32, Staged, Point)>,
 }
 
-/// A group's promotions asked: the step after the first was asked at, and
-/// how many it has asked since, that one included.
-#[derive(Clone, Copy, Debug)]
-struct Asked {
-    first: Step,
-    count: u64,
+/// What writing a released expert back into the host tier costs and saves,
+/// in the decode's terms (`magnitude_cost_model::Terms`, the passes' mean
+/// busy seconds a step on each resource, `watcher::passes::Passes::terms`):
+/// its copy holds the link `link` seconds once, and each use of it the tier
+/// then serves saves the drive one read, `drive` seconds; a use served from
+/// the tier costs what one served after its drive landing would, so only
+/// the read differs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WriteBack {
+    pub terms: magnitude_cost_model::Terms,
+    pub drive: f64,
+    pub link: f64,
+}
+
+impl WriteBack {
+    /// Whether a write-back of an expert expected `uses` times over a stay
+    /// of `stay` steps in the tier shortens the step: with its copy's link
+    /// time and the drive reads it saves spread over the stay, the
+    /// slowest term falls, `T(terms + Δ) < T(terms)` (`Terms::time`). It
+    /// pays only where the drive binds and the link stays below it: where
+    /// the link or another term binds, the copy shortens nothing.
+    pub fn pays(&self, uses: f64, stay: f64) -> bool {
+        assert!(stay > 0. && uses >= 0., "a stay of {stay} steps, {uses} uses");
+        let mut after = self.terms;
+        after.link += self.link / stay;
+        after.drive = (after.drive - uses * self.drive / stay).max(0.);
+        after.time() < self.terms.time()
+    }
+}
+
+/// Where a banked expert goes as it leaves the bank, as its one exit
+/// decides it ([`Exits::leaving`]): back into its host tier, ranked
+/// beside its last read (`Some`), where its write-back pays; else
+/// (`None`) to the copy its tier has yet to give up, or to the file.
+/// Only the decision makes one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Leaving {
+    staged: Staged,
+    back: Option<Option<Step>>,
+}
+
+impl Leaving {
+    /// Whether its write-back pays.
+    fn backs(&self) -> bool {
+        self.back.is_some()
+    }
+}
+
+/// A banked expert's exit as its record carries it out: the host tier
+/// record its write-back's landing took, none where it writes nothing back
+/// (its write-back does not pay, or the tier has no record ready for it).
+/// Only [`Directory::exit`] makes one, so every transition of a record
+/// that holds an expert (`BankRecords`, which takes one) is the one exit's.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Exit {
+    staged: Staged,
+    back: Option<HostRecord>,
+}
+
+impl Exit {
+    pub(super) fn staged(&self) -> Staged {
+        self.staged
+    }
+
+    pub(super) fn back(&self) -> Option<HostRecord> {
+        self.back
+    }
+
+    /// An exit that writes nothing back, where a test plays the bank.
+    #[cfg(test)]
+    pub(super) fn to_file(staged: Staged) -> Self {
+        Self { staged, back: None }
+    }
+
+    /// An exit written back into tier record `tier`, where a test plays
+    /// the bank.
+    #[cfg(test)]
+    pub(super) fn written_back(staged: Staged, tier: HostRecord) -> Self {
+        Self { staged, back: Some(tier) }
+    }
+}
+
+/// The one exit of a bank group's experts, by one hold of the ranking
+/// ([`Directory::exits`]): what every expert leaving it shares, the host
+/// tier's stay and what a write-back's landing would take, taken once.
+struct Exits<'a> {
+    directory: &'a Directory,
+    reuse: &'a Reuse,
+    group: usize,
+    /// The host tier's move τ (`Reader::Move`: a write-back is a move) in
+    /// decode steps, τ_1 / ā: what a write-back's copy is spread over. None
+    /// before the first decode step, or without a host tier of records.
+    stay: Option<f64>,
+    /// What a write-back's landing would take with the reserve's keep, at
+    /// τ_1 ([`HostRecords::displaced`]).
+    displaced: std::cell::OnceCell<Option<Option<(Kept, Rank)>>>,
+}
+
+impl Exits<'_> {
+    /// Whether `staged`, leaving the bank by any path (a release, a seed,
+    /// a lease or a shrink), is written back into its host tier. It is
+    /// where the placer keeps a host tier beside the bank, the tier lacks
+    /// it (no copy it has yet to give up, no landing of it in flight), its
+    /// write-back is priced ([`WriteBack`]) and its expected uses within
+    /// τ_1 (`Reuse::expected`, beside its reads) make the copy pay over the
+    /// stay ([`WriteBack::pays`]), and its landing's claim, with the
+    /// reserve as its keep, admits it: the same victim test at τ_1 as every
+    /// landing's ([`outranking`], [`admitted`]), which [`Directory::exit`]
+    /// then claims by. Before the passes and the copy line are measured,
+    /// and before the first decode step, no write-back is priced, so none
+    /// pays.
+    fn leaving(&self, staged @ (layer, expert): Staged) -> Leaving {
+        let Self { directory, reuse, group, .. } = *self;
+        let back = (|| {
+            let price = directory.write_backs[layer]?;
+            if directory.placer != crate::planning::Placer::Tier || directory.host[group].located(staged) != Located::Lacked {
+                return None;
+            }
+            let stay = self.stay?;
+            let ranker = reuse.ranker(group, Tier::Host, Reader::Move);
+            let read = beside(&directory.prompt_reads, staged, reuse.last(layer, expert));
+            if !price.pays(ranker.expected(layer, expert, read).uses(), stay) {
+                return None;
+            }
+            let admit = outranking(ranker, &directory.prompt_reads, ranker.rank(layer, expert, read));
+            let host = &directory.host[group];
+            let displaced = *self.displaced.get_or_init(|| host.displaced(|staged, read| admit.rank(staged, read), host.reserve()));
+            admitted(displaced, |kept, victim| admit.admits(kept, victim)).then(|| read.map(|read| read.step))
+        })();
+        Leaving { staged, back }
+    }
 }
 
 /// A record of a bank group's record tensors: what its bank map names, and
@@ -367,20 +501,44 @@ impl BankRecord {
 pub struct HostRecord(pub u32);
 
 /// The later of `read`, a read of `staged` at a step the log may not have
-/// brought yet (a landing's, whose choices are unknown), and the running
-/// prompt group's read of it with the choices its steps routed to it so
-/// far ([`Directory::read_pending`]): what every taking ranks it beside.
-/// Of one step the prompt's read, which knows its choices, wins.
+/// brought yet (a landing's), and the running prompt group's read of it
+/// ([`Directory::read_pending`]): what every taking ranks it beside.
 fn beside(prompt_reads: &HashMap<Staged, Unlogged>, staged: Staged, read: Option<Step>) -> Option<Unlogged> {
     read.map(Unlogged::at).max(prompt_reads.get(&staged).copied())
 }
 
-/// How the host records rank what they keep, by `reuse`, one hold of the
-/// ranking for the whole choice: an expert's whole rank beside its reads
-/// ([`beside`]), so experts the reads tie keep the order earlier reads gave
-/// them, never their indices'.
-fn store_rank<'a>(reuse: &'a Reuse, prompt_reads: &'a HashMap<Staged, Unlogged>) -> impl Fn(Staged, Option<Step>) -> Rank + Copy + 'a {
-    move |staged @ (layer, expert): Staged, read: Option<Step>| reuse.rank(layer, expert, beside(prompt_reads, staged, read))
+/// How the host records rank what they keep, by a lock-free `ranker`
+/// snapshotted once for the group at its tier's τ for `reader`: an expert's
+/// whole rank beside its reads ([`beside`]), so experts the reads tie rank
+/// by their last read, never by their indices.
+fn store_rank<'a>(ranker: Ranker<'a>, prompt_reads: &'a HashMap<Staged, Unlogged>) -> impl Fn(Staged, Option<Step>) -> Rank + Copy + 'a {
+    move |staged @ (layer, expert): Staged, read: Option<Step>| ranker.rank(layer, expert, beside(prompt_reads, staged, read))
+}
+
+/// How kept records are ranked during prompt seeding: uses the same
+/// `Expected` scale as [`Reuse::rank_union`] (no future-lead `p = 1.0`
+/// override from an in-flight prompt's `prompt_reads`), while preserving
+/// `last` from `prompt_reads` and `read` so never-routed records order
+/// before routed ones.
+fn seed_rank<'a>(
+    reuse: &'a Reuse,
+    ranker: Ranker<'a>,
+    prompt_reads: &'a HashMap<Staged, Unlogged>,
+) -> impl Fn(Staged, Option<Step>) -> Rank + Copy + 'a {
+    move |staged @ (layer, expert): Staged, read: Option<Step>| {
+        let expected = ranker.expected(layer, expert, None);
+        let last = reuse.last(layer, expert).max(beside(prompt_reads, staged, read).map(|u| u.step));
+        Rank::new(expected, last)
+    }
+}
+
+/// The victim test of a landing into `tier` whose claimant ranks
+/// `candidate` there at its move τ (design §3.7): the taking order's rank
+/// ([`store_rank`], `Reader::Move`), and the admission of the victim it
+/// names: a banked copy, whose unmapping costs no move (the bank serves its
+/// uses), or a kept expert the candidate outranks.
+fn outranking<'a>(ranker: Ranker<'a>, prompt_reads: &'a HashMap<Staged, Unlogged>, candidate: Rank) -> impl Admit<Key = Rank> + 'a {
+    (store_rank(ranker, prompt_reads), move |kept: Kept, victim: Rank| kept == Kept::Banked || victim < candidate)
 }
 
 /// A group's wanted experts as their copies price them
@@ -412,15 +570,9 @@ struct Ranked {
 
 /// The most records a group of `records` records and `members` member
 /// layers reserves: all but one a member layer, where it has one each, so
-/// every layer keeps a record of its share.
+/// its pool keeps a record for each layer's read.
 pub(super) fn most_reserved(records: usize, members: usize) -> usize {
     records.saturating_sub(members)
-}
-
-/// Each member layer's share of group `group`'s `records` records, of
-/// layers in the groups `layers` names: the records over its members.
-fn share(records: usize, layers: &[usize], group: usize) -> usize {
-    records / layers.iter().filter(|&&of| of == group).count()
 }
 
 /// What a bank's host tier starts from: each group's records, every one
@@ -431,6 +583,9 @@ fn share(records: usize, layers: &[usize], group: usize) -> usize {
 pub(in crate::experts) struct HostTier {
     pub records: Vec<u32>,
     pub lent: Vec<u32>,
+    /// The records each group's reserve keeps holding no expert mapped
+    /// (`ExpertBankPlan::tier_reserve`).
+    pub reserve: usize,
     pub placement: Placement,
 }
 
@@ -461,9 +616,16 @@ impl Placement {
 
 impl HostTier {
     /// `records` host records for each group, lending none, of a directory
-    /// of no device (`Placement::Replay`).
+    /// of no device (`Placement::Replay`), whose reads come one step at a
+    /// time (`FlightDepth::SERIAL`).
     pub fn replay(records: Vec<u32>) -> Self {
-        Self { lent: vec![0; records.len()], records, placement: Placement::Replay }
+        Self { lent: vec![0; records.len()], records, reserve: 0, placement: Placement::Replay }
+    }
+
+    /// It, each group's reserve `reserve` records.
+    #[cfg(test)]
+    pub fn reserving(self, reserve: usize) -> Self {
+        Self { reserve, ..self }
     }
 }
 
@@ -481,16 +643,8 @@ impl Directory {
         for (layer, (&group, home)) in layers.iter().zip(placed).enumerate() {
             homes[group].push((home as usize, layer));
         }
-        // The records that keep the bank's experts, which the ranking's
-        // shares are: the bank's own where the device places from a host
-        // tier; the host tier's where the host places, the tier then the
-        // bank's own records (the one store).
         let placer = host.placement.placer();
-        let kept = match placer {
-            crate::planning::Placer::Bank => host.records.iter().map(|&count| count as usize).collect(),
-            crate::planning::Placer::Tier => records.to_vec(),
-        };
-        let HostTier { records: host_records, lent: host_lent, placement } = host;
+        let HostTier { records: host_records, lent: host_lent, reserve: host_reserve, placement } = host;
         // The maps the host records write, one per layer, where the
         // placement writes any.
         let (bank_maps, maps) = match placement {
@@ -508,39 +662,96 @@ impl Directory {
             members[group].push((layer, experts, maps.as_mut().map(|maps| maps.next().expect("each layer has its map"))));
         }
         let inbound = Arc::new(InboundTable::new(experts));
+        let resolution = match placer {
+            crate::planning::Placer::Tier => Resolution::AfterStore,
+            crate::planning::Placer::Bank => Resolution::BeforeStamp,
+        };
+        let host = host_records
+            .iter()
+            .zip(members)
+            .zip(host_lent)
+            .map(|((&count, members), lent)| HostRecords::new(count, layers.len(), members, resolution, (lent, host_reserve), inbound.clone()))
+            .collect::<Vec<_>>();
+        let bank = BankRecords::new(records, &layers.iter().copied().zip(experts.iter().copied()).collect::<Vec<_>>(), bank_maps);
+        // The ranking's pools: each group's decode capacity
+        // ([`Self::capacity`]).
+        let kept: Vec<usize> = match placer {
+            crate::planning::Placer::Bank => host.iter().map(HostRecords::capacity).collect(),
+            crate::planning::Placer::Tier => (0..records.len()).map(|group| bank.capacity(group)).collect(),
+        };
+        let time = {
+            let directory = (&bank, &host[..], placer);
+            let tiers = (0..records.len()).map(|group| Self::tiers_of(placer).iter().map(|&tier| Self::records_of(directory, group, tier)).collect::<Vec<_>>()).collect::<Vec<_>>();
+            let behind = crate::planning::FlightDepth::PIPELINED.steps(super::DEPTHS as u64) as usize + super::DEPTHS;
+            Time::new(&tiers, behind)
+        };
         Self {
-            bank: BankRecords::new(records, &layers.iter().copied().zip(experts.iter().copied()).collect::<Vec<_>>(), bank_maps),
+            bank,
             homes,
             placer,
-            host: {
-                let (records, lent) = (host_records, host_lent);
-                let resolution = match placer {
-                    crate::planning::Placer::Tier => Resolution::AfterStore,
-                    crate::planning::Placer::Bank => Resolution::BeforeStamp,
-                };
-                records
-                    .iter()
-                    .zip(members)
-                    .zip(lent)
-                    .map(|((&count, members), lent)| HostRecords::new(count, layers.len(), members, resolution, lent, inbound.clone()))
-                    .collect()
-            },
+            host,
             inbound,
             prompt_reads: HashMap::new(),
-            ranking: Reuse::ranking(experts, layers, layers.iter().map(|&group| share(kept[group], layers, group)).collect()),
+            ranking: Reuse::ranking(experts, layers, &kept, time.clone()),
             wanted: vec![BTreeSet::new(); layers.len()],
             unwanted: vec![BTreeSet::new(); layers.len()],
             stirred: false,
             withheld: None,
             reserve: vec![0; records.len()],
             copy_hits: vec![Some(0.); layers.len()],
-            asked: vec![None; records.len()],
+            asked: 0,
+            time,
+            write_backs: vec![None; layers.len()],
+            backs: HashMap::new(),
             seeding: Vec::new(),
         }
     }
 
+    /// The tiers each group's records form under `placer`, in [`Time`]'s
+    /// order: the one store alone (tier 0), or the bank (tier 0) beside its
+    /// host tier (tier 1).
+    fn tiers_of(placer: crate::planning::Placer) -> &'static [Tier] {
+        match placer {
+            crate::planning::Placer::Bank => &[Tier::Compute],
+            crate::planning::Placer::Tier => &[Tier::Compute, Tier::Host],
+        }
+    }
+
+    /// The tier the host records are under `placer`: the one store, tier 0,
+    /// or the host tier beside the bank.
+    fn host_tier(&self) -> Tier {
+        match self.placer {
+            crate::planning::Placer::Bank => Tier::Compute,
+            crate::planning::Placer::Tier => Tier::Host,
+        }
+    }
+
+    /// The records group `group`'s `tier` holds storage for, its turnover's
+    /// K (design §3.2): a resize changes it, and nothing else does (a lend
+    /// or the promotions' reserve moves no record).
+    fn records_of((bank, host, placer): (&BankRecords, &[HostRecords], crate::planning::Placer), group: usize, tier: Tier) -> u64 {
+        match (placer, tier) {
+            (crate::planning::Placer::Tier, Tier::Compute) => bank.counts()[group] as u64,
+            (crate::planning::Placer::Bank, Tier::Compute) | (crate::planning::Placer::Tier, Tier::Host) => u64::from(host[group].records()),
+            (crate::planning::Placer::Bank, Tier::Host) => unreachable!("the one store has no host tier"),
+        }
+    }
+
+    /// Group `group`'s `tier` was resized: its turnover closes its epoch and
+    /// restarts at the records it holds now (design §3.2).
+    fn resized(&mut self, group: usize, tier: Tier) {
+        let records = Self::records_of((&self.bank, &self.host, self.placer), group, tier);
+        self.time.lock().resized(group, tier, records);
+    }
+
+    /// The load's time ([`Time`]), for the ranking's, the ledger's and the
+    /// clock writers' share of it.
+    pub(crate) fn time(&self) -> &Time {
+        &self.time
+    }
+
     /// Place `layer`'s `expert` in the wanted and unwanted sets by whether
-    /// the ranking's share holds it (`top`), the bank holds it, and a
+    /// the ranking's pool holds it (`top`), the bank holds it, and a
     /// placement takes a record for it.
     fn settle(&mut self, layer: usize, expert: usize, top: bool) {
         let held = self.bank.held(layer, expert).is_some();
@@ -560,7 +771,7 @@ impl Directory {
     }
 
     /// [`Self::settle`] `layer`'s `expert` after the bank's side of it
-    /// changed, by the ranking's share as it is now.
+    /// changed, by the ranking's pool as it is now.
     fn resettle(&mut self, layer: usize, expert: usize) {
         let top = Reuse::of(&self.ranking).in_top(layer, expert);
         self.settle(layer, expert, top);
@@ -572,44 +783,53 @@ impl Directory {
     }
 
     /// The ranking as it is now.
-    fn reuse_now(&self) -> std::sync::MutexGuard<'_, Reuse> {
+    pub(in crate::experts) fn reuse_now(&self) -> std::sync::MutexGuard<'_, Reuse> {
         Reuse::of(&self.ranking)
     }
 
-    /// Group `group` holds `records` records from now: its layers' shares
-    /// ([`share`]) of them less its reserve are the ranking's, its reserve
-    /// within the most a group reserves ([`most_reserved`]). A member's
-    /// share of none where the group has a record for each is an invariant
-    /// violation: the reserve took what the layers hold.
-    fn resized(&mut self, group: usize, records: usize) {
-        let groups = (0..self.bank.layers()).map(|layer| self.bank.group(layer)).collect::<Vec<_>>();
-        let members = groups.iter().filter(|&&of| of == group).count();
-        self.reserve[group] = self.reserve[group].min(most_reserved(records, members));
-        let kept = records - self.reserve[group];
-        assert!(
-            records < members || share(kept, &groups, group) > 0,
-            "group {group}'s reserve of {} leaves its {members} layers no record of its {records}",
-            self.reserve[group]
-        );
-        let mut ranking = Reuse::of(&self.ranking);
-        for layer in (0..groups.len()).filter(|&layer| groups[layer] == group) {
-            ranking.resize(layer, share(kept, &groups, group));
+    /// Decode's capacity in group `group`, the one count of the records
+    /// that keep the bank's experts: where the host places (the one
+    /// store), its host records' ([`HostRecords::capacity`]: present less
+    /// the lease and the reserve); beside a host tier, the bank's less its
+    /// lent records, the scratch's ([`BankRecords::capacity`]).
+    pub fn capacity(&self, group: usize) -> usize {
+        match self.placer {
+            crate::planning::Placer::Bank => self.host[group].capacity(),
+            crate::planning::Placer::Tier => self.bank.capacity(group),
         }
-        // The group's victims were prepared at the shares before.
+    }
+
+    /// Each group's decode capacity ([`Self::capacity`]), in group order:
+    /// what the load publishes as the records its experts are held in.
+    pub fn capacities(&self) -> Vec<usize> {
+        (0..self.homes.len()).map(|group| self.capacity(group)).collect()
+    }
+
+    /// Group `group`'s pool is its capacity as it is now ([`Self::capacity`])
+    /// less the promotions' reserve, that within the most a group reserves
+    /// ([`most_reserved`]): taken again as a store grows or shrinks, a
+    /// prompt group's lease is granted and returned, or the reserve
+    /// changes, the only events that change it.
+    fn resize_pool(&mut self, group: usize) {
+        let capacity = self.capacity(group);
+        let members = (0..self.bank.layers()).filter(|&layer| self.bank.group(layer) == group).count();
+        self.reserve[group] = self.reserve[group].min(most_reserved(capacity, members));
+        Reuse::of(&self.ranking).resize(group, capacity - self.reserve[group]);
+        // The group's victims were prepared for the pool before.
         self.host[group].unprepare();
     }
 
     /// Group `group` keeps `records` of its records free or releasing from
-    /// now, beyond what its wants take: the ranking's shares are its records
+    /// now, beyond what its wants take: the ranking's pool is its capacity
     /// less them. Only where promotions place from a host tier.
     pub fn reserve(&mut self, group: usize, records: usize) {
         assert!(self.placer == crate::planning::Placer::Tier, "the one store promotes nothing");
         let members = self.layer_groups().iter().filter(|&&of| of == group).count();
-        let count = self.bank.counts()[group];
-        let most = most_reserved(count, members);
-        assert!(records <= most, "a reserve of {records} of group {group}'s {count} records, beyond {most}");
+        let capacity = self.capacity(group);
+        let most = most_reserved(capacity, members);
+        assert!(records <= most, "a reserve of {records} of group {group}'s capacity of {capacity}, beyond {most}");
         if std::mem::replace(&mut self.reserve[group], records) != records {
-            self.resized(group, count);
+            self.resize_pool(group);
             self.stirred = true;
         }
     }
@@ -629,14 +849,6 @@ impl Directory {
         (0..self.bank.layers()).map(|layer| self.bank.group(layer)).collect()
     }
 
-    /// Each layer's share of its group's records under the ranking: its
-    /// records less its reserve, over its members.
-    pub fn shares(&self) -> Vec<usize> {
-        let groups = self.layer_groups();
-        let counts = self.bank.counts();
-        groups.iter().map(|&group| share(counts[group] - self.reserve[group], &groups, group)).collect()
-    }
-
     /// The read path's mirror of where every expert is
     /// ([`InboundTable`]), which a posted read claims beside residency.
     pub fn inbound(&self) -> Arc<InboundTable> {
@@ -648,6 +860,11 @@ impl Directory {
         &self.host[group]
     }
 
+    /// Every group's host records, in group order.
+    pub fn hosts(&self) -> &[HostRecords] {
+        &self.host
+    }
+
     /// The host records of `layer`'s group.
     fn tier(&mut self, layer: usize) -> &mut HostRecords {
         let group = self.bank.group(layer);
@@ -656,11 +873,25 @@ impl Directory {
 
     /// Claim a landing of `layer`'s `expert` in its group's host tier,
     /// leaving `keep` of the reserve's records or the experts still lacked
-    /// where fewer, the record taken as `taking` says
-    /// ([`HostRecords::claim`]): every landing of an expert, whoever lands
-    /// it, claims it here. Short without a tier.
-    pub fn claim_landing(&mut self, layer: usize, expert: usize, keep: usize, taking: Taking) -> Claim {
-        self.tier(layer).claim((layer, expert), keep, taking)
+    /// where fewer, the record taken as `taking` says, where `admit`'s
+    /// victim test admits it ([`HostRecords::claim`]). Every landing of an
+    /// expert, whoever lands it, claims it here, so no place test differs
+    /// from its claim. Short without a tier.
+    pub fn claim_landing(&mut self, layer: usize, expert: usize, keep: usize, taking: Taking, admit: impl Admit) -> Claim {
+        self.tier(layer).claim((layer, expert), keep, taking, admit)
+    }
+
+    /// Claim a read-ahead landing of `layer`'s `expert` named for `step`
+    /// with the ledger's probability `p` (design §3.7): [`Self::claim_landing`]
+    /// with the candidate's rank from `Reuse::expected_with` (replacing
+    /// `step`'s lead term by `p`, never mixing) tested against the victim
+    /// at the host records' move τ ([`outranking`]).
+    pub fn claim_ahead(&mut self, layer: usize, expert: usize, keep: usize, taking: Taking, step: Step, p: f64) -> Claim {
+        let (group, tier) = (self.bank.group(layer), self.host_tier());
+        let reuse = Reuse::of(&self.ranking);
+        let candidate = reuse.rank_of(layer, expert, reuse.expected_with(layer, expert, tier, step, p));
+        let ranker = reuse.ranker(group, tier, Reader::Move);
+        self.host[group].claim((layer, expert), keep, taking, outranking(ranker, &self.prompt_reads, candidate))
     }
 
     /// Where `layer`'s `expert` is in its group's host tier: lacked
@@ -758,9 +989,8 @@ impl Directory {
             return claim;
         }
         let reuse = Reuse::of(&self.ranking);
-        let rank = store_rank(&reuse, &self.prompt_reads);
-        let shares = self.store_shares(&reuse);
-        self.host[group].claim_demand((layer, expert), demand, rank, shares, read, park)
+        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads);
+        self.host[group].claim_demand((layer, expert), demand, rank, read, park)
     }
 
     /// The posted read of `layer`'s `expert`, which no record took, ended
@@ -769,26 +999,23 @@ impl Directory {
         self.tier(layer).unposted((layer, expert));
     }
 
-    /// The shares the host records hold each layer to (`Reuse::shares`):
-    /// the one store's records are the bank's, whose shares the ranking
-    /// measures; a host tier beside the bank's records holds none.
-    fn store_shares<'a>(&self, reuse: &'a Reuse) -> Option<&'a [usize]> {
-        (self.placer == crate::planning::Placer::Bank).then(|| reuse.shares())
-    }
-
     /// Prepare `layer`'s group's demand victims, `depth` of them
     /// ([`HostRecords::prepare_demand`]), at the ranking as it is now, at
     /// step `sequence`: where a claim took any, or they were prepared at an
     /// earlier step (the ranking moves by steps).
-    pub fn prepare_demand(&mut self, layer: usize, depth: usize, sequence: Step) {
+    pub fn prepare_demand(&mut self, layer: usize, needed: usize, sequence: Step) {
         let group = self.bank.group(layer);
-        if !self.host[group].unprepared(sequence) {
+        if !self.host[group].unprepared(sequence, needed) {
             return;
         }
+        // Prepare enough victims for every layer of this group in the step
+        // (capped at the group's extent), so a multi-layer decode step scans
+        // the group's records once rather than once per layer.
+        let layers = self.layer_groups().iter().filter(|&&of| of == group).count().max(1);
+        let depth = (needed * layers).min(self.host[group].records() as usize);
         let reuse = Reuse::of(&self.ranking);
-        let rank = store_rank(&reuse, &self.prompt_reads);
-        let shares = self.store_shares(&reuse);
-        self.host[group].prepare_demand(rank, shares, depth, sequence);
+        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads);
+        self.host[group].prepare_demand(rank, depth, sequence);
     }
 
     /// `layer`'s `expert` landed whole into tier record `record`, read at
@@ -796,13 +1023,17 @@ impl Directory {
     /// ranked by its reuse beside that read (none where no step read it). A
     /// copy of an expert the bank holds (a landing a promotion or seed
     /// committed during) is banked: the tier holds alone only what the bank
-    /// lacks.
+    /// lacks. The one move of the host records' tier (design §3.2: a landing
+    /// fills the record its claim took), a written write-back's among them
+    /// ([`Self::written_back`]).
     pub fn landed(&mut self, layer: usize, HostRecord(record): HostRecord, expert: usize, read: Option<Step>) {
         let kept = match self.bank.held(layer, expert) {
             Some(_) => Kept::Banked,
             None => Kept::Alone,
         };
         self.tier(layer).landed(record, (layer, expert), read, kept);
+        let (group, tier) = (self.bank.group(layer), self.host_tier());
+        self.time.lock().moved(group, tier);
         // A want its tier lacked is promotable from now.
         self.stirred |= self.wanted[layer].contains(&expert);
     }
@@ -813,28 +1044,36 @@ impl Directory {
         self.tier(layer).unlanded(record);
     }
 
-    /// Whether any group's host tier falls short of `reserve`
+    /// Whether any group's host tier falls short of its reserve
     /// ([`HostRecords::short_of`]): whether a refill may unmap anything.
-    pub fn refill_short(&self, reserve: usize) -> bool {
-        self.host.iter().any(|records| records.short_of(reserve, 0))
+    pub fn refill_short(&self) -> bool {
+        self.host.iter().any(|records| records.short_of(0))
     }
 
-    /// Each group's records its reserve of `reserve` tier records unmaps
-    /// now ([`HostRecords::refill_victims`]), the lent records among them
-    /// where `lent`: read from the ranking, changing nothing.
-    pub fn refill_victims(&self, reserve: usize, lent: bool) -> Vec<Vec<(u32, Staged)>> {
+    /// Each group's records its reserve unmaps now
+    /// ([`HostRecords::refill_victims`]), none of the lent records while
+    /// `lending`: read from the ranking, changing nothing.
+    pub fn refill_victims(&self, lending: bool) -> Vec<Vec<(u32, Staged)>> {
         let reuse = self.reuse_now();
-        let rank = store_rank(&reuse, &self.prompt_reads);
-        self.host.iter().map(|records| records.refill_victims(reserve, rank, self.store_shares(&reuse), lent)).collect()
+        let tier = self.host_tier();
+        self.host
+            .iter()
+            .enumerate()
+            .map(|(group, records)| {
+                let rank = store_rank(reuse.ranker(group, tier, Reader::Move), &self.prompt_reads);
+                records.refill_victims(rank, lending)
+            })
+            .collect()
     }
 
     /// Unmap each group's `victims` ([`HostRecords::refill`]), under the
     /// lock every step begins under, `at` the first step not yet begun, the
-    /// lent records only where `lent`.
-    pub fn refill(&mut self, victims: Vec<Vec<(u32, Staged)>>, lent: bool, at: &Unbegun) {
-        for (records, victims) in self.host.iter_mut().zip(victims) {
-            records.refill(victims, lent, at);
-        }
+    /// lent records only while no scratch-served group's lease is out.
+    pub fn refill(&mut self, victims: Vec<Vec<(u32, Staged)>>, at: &Unbegun) -> bool {
+        self.host
+            .iter_mut()
+            .zip(victims)
+            .fold(false, |unmapped, (records, victims)| unmapped | records.refill(victims, at))
     }
 
     /// Group `group`'s host tier sets `records` ready records aside for
@@ -896,16 +1135,11 @@ impl Directory {
         self.tier(layer).unhold(record);
     }
 
-    /// The half-life the reuse ranks by, in steps ([`Reuse::half_life`]).
-    #[cfg(test)]
-    pub fn half_life(&self) -> f64 {
-        self.reuse_now().half_life()
-    }
-
-    /// The rank of `layer`'s `expert` by `reuse`, beside a read at step
-    /// `read` the log may not have brought yet ([`beside`]).
-    fn ranked(&self, reuse: &Reuse, layer: usize, expert: usize, read: Option<Step>) -> Ranked {
-        Ranked { rank: reuse.rank(layer, expert, beside(&self.prompt_reads, (layer, expert), read)), layer, expert }
+    /// The rank of `layer`'s `expert` in the bank (tier 0) by a lock-free
+    /// `ranker`, beside a read at step `read` the log may not have brought
+    /// yet ([`beside`]).
+    fn ranked(&self, ranker: Ranker<'_>, layer: usize, expert: usize, read: Option<Step>) -> Ranked {
+        Ranked { rank: ranker.rank(layer, expert, beside(&self.prompt_reads, (layer, expert), read)), layer, expert }
     }
 
     /// Each record of group `group`, the step that last read the expert it
@@ -922,7 +1156,7 @@ impl Directory {
             .collect()
     }
 
-    /// Settle the ranking's changes of its shares (`Reuse::take_changes`):
+    /// Settle the ranking's changes of its pools (`Reuse::take_changes`):
     /// whether a promotion or a release may have become possible since they
     /// were last asked (a want or a victim gained or lost, [`Self::stirred`],
     /// a record freed or taken, [`BankRecords::take_changed`], or a read
@@ -937,7 +1171,7 @@ impl Directory {
         for (layer, expert, top) in changes {
             self.settle(layer, expert, top);
         }
-        self.stirred || self.bank.changed() || self.read_since_withheld()
+        self.stirred || self.bank.changed() || self.read_since_withheld() || self.host.iter().any(HostRecords::surrenders)
     }
 
     /// Whether the ranking logged a read since promotions last withheld a
@@ -947,30 +1181,41 @@ impl Directory {
     }
 
     /// What the ranking asks now, in time proportional to what changed:
-    /// the ranking's changes of its shares (`Reuse::take_changes`) are
+    /// the ranking's changes of its pools (`Reuse::take_changes`) are
     /// settled first, and only where a want, a victim or a free record was
     /// gained or lost since ([`Self::stirred`]) is anything asked. In each
-    /// group, each expert the ranking's share of its layer holds, the bank
-    /// lacks and its host tier keeps (`wanted`) takes a free record, which
-    /// no step reads, so its copy begins at once: the bank then holds each
-    /// layer's share, as the ranking's stack does (`Reuse`). Each record is
+    /// group, each expert the ranking's pool of it holds, the bank lacks and
+    /// its host tier keeps (`wanted`) takes a free record, which no step
+    /// reads, so its copy begins at once: the bank then holds the group's
+    /// pool, as the ranking does (`Reuse`). Each record is
     /// its promotion's from now until its copy has completed
     /// ([`Self::promoted`]) or failed ([`Self::unpromoted`]). Then, while the
     /// group's free and releasing records fall short of its reserve and the
     /// wants left without one, the record of its least reused expert
-    /// outside its own layer's share (`unwanted`) is released
+    /// outside the pool (`unwanted`) is released
     /// ([`Self::left_bank`]): free once every step that may read it has
-    /// ended ([`Self::drain`]). So a promotion never waits for a record to
+    /// ended ([`Self::drain`]), and written back into the host tier first
+    /// where that pays (its exit, [`Self::exit`]). Before anything, each host
+    /// tier gives up the copies of what the bank holds now
+    /// ([`HostRecords::surrender`]): the tiers are disjoint. So a promotion never waits for a record to
     /// drain while the reserve covers what the ranking asks meanwhile; only
     /// the records a promotion may take cover a want
-    /// ([`BankRecords::covering`]). Neither takes a lent record while a
-    /// prompt group holds them reserved (`lending`, under the steps' lock
-    /// with `at`, `watcher::lent`), whose lend unmaps what it holds
-    /// instead; the reservation's end asks again ([`Lending::take_freed`]).
-    pub fn promotions(&mut self, at: &Unbegun, lending: &mut Lending) -> Wants {
+    /// ([`BankRecords::covering`]). Neither ever takes a lent record, the
+    /// scratch's ([`BankRecords::usable`]).
+    pub fn promotions(&mut self, at: &Unbegun) -> Wants {
+        // The tier gives up what the bank holds now: its records ready for
+        // other experts once no step may still read them.
+        for host in &mut self.host {
+            host.surrender(at);
+        }
         self.settle_changes();
         let mut asked = Wants::default();
-        let stirred = std::mem::take(&mut self.stirred) | self.bank.take_changed() | lending.take_freed() | self.read_since_withheld();
+        // Promotion runs only for decode steps (design §3.2): before the
+        // first, no τ exists. What stirred stays stirred until then.
+        if self.time.lock().clock.through_latest() == super::horizon::Tokens::ZERO {
+            return asked;
+        }
+        let stirred = std::mem::take(&mut self.stirred) | self.bank.take_changed() | self.read_since_withheld();
         if !stirred {
             return asked;
         }
@@ -984,12 +1229,11 @@ impl Directory {
                 .collect::<Vec<_>>();
             // Earning weighs a holding displaced for each want, and releases
             // take at most a want's each and the reserve's: all ranked and
-            // weighed by one hold of the ranking.
-            let stay = self.stay(group, at.next());
+            // weighed by one hold of the ranking, at τ_0.
             let (victims, priced) = {
                 let reuse = Reuse::of(&self.ranking);
-                let victims = self.victims(&reuse, group, &members, lending, wanted.len() + self.reserve[group], stay);
-                let priced = self.earning(&reuse, group, wanted, &victims.floor, lending, stay);
+                let victims = self.victims(&reuse, group, &members, wanted.len() + self.reserve[group]);
+                let priced = self.earning(&reuse, group, wanted, &victims.floor);
                 (victims.released, priced)
             };
             withheld |= priced.withheld;
@@ -997,29 +1241,27 @@ impl Directory {
             let free = self
                 .bank
                 .free(group)
-                .filter(|&record| self.bank.usable(group, record, lending))
+                .filter(|&record| self.bank.usable(group, record))
                 .take(wanted.len())
                 .collect::<Vec<_>>();
             let short = wanted.len() - free.len();
             for ((layer, expert), record) in wanted.into_iter().zip(free) {
                 let promotion = Promotion { group, record: bank_record(record), layer, expert };
-                self.bank.promote(&promotion, lending);
-                self.asked[group].get_or_insert(Asked { first: at.next(), count: 0 }).count += 1;
+                self.bank.promote(&promotion);
+                self.asked += 1;
                 self.resettle(layer, expert);
                 asked.promotions.push(promotion);
             }
-            // A want left without a record releases one now, whatever the
-            // lent records a prompt group holds: none serves it meanwhile.
-            // The reserve counts those too, as they return free when the
-            // group ends: releasing for them would only be refilled then.
-            let (covering, returning) = (self.bank.covering(group, lending), self.bank.returning(group, lending));
-            let releases = short.saturating_sub(covering).max((self.reserve[group] + short).saturating_sub(covering + returning));
+            // A want left without a record releases one now.
+            let covering = self.bank.covering(group);
+            let releases = short.saturating_sub(covering).max((self.reserve[group] + short).saturating_sub(covering));
             if releases == 0 {
                 continue;
             }
             for (Ranked { layer, expert, .. }, record) in victims.into_iter().take(releases) {
+                let exit = self.exit_now(group, record, (layer, expert));
                 let record = bank_record(record);
-                self.bank.release(group, record, at, lending);
+                self.bank.release(group, record, at.into(), exit);
                 self.left_bank(layer, expert, None);
                 asked.releases.push(Release { group, record, layer, expert });
             }
@@ -1031,24 +1273,25 @@ impl Directory {
     }
 
     /// What group `group`'s promotions may displace, of each held expert
-    /// outside its layer's share (`unwanted`) whose record is usable, by
-    /// `reuse`: the `most` least ranked, in the order releases take them
-    /// (`released`), and the `most` least weights over the stay `stay`,
-    /// least first (`floor`, `Reuse::weighed` beside their reads,
-    /// [`beside`]), each selected before it is sorted. A release chooses
-    /// which record leaves now, by the order the ranking keeps; a copy
-    /// takes a record for its whole stay, and what the bank gives up for it
-    /// is the least any unwanted holding is worth over that stay, whichever
-    /// the ranking releases first.
-    fn victims(&self, reuse: &Reuse, group: usize, members: &[usize], lending: &Lending, most: usize, stay: Option<f64>) -> Victims {
+    /// outside the pool (`unwanted`) whose record is usable, by `reuse` at
+    /// τ_0 (`Reader::Move`: a promotion is a move): the `most` least ranked,
+    /// in the order releases take them (`released`), and the `most` least
+    /// expected uses within τ_0, least first (`floor`, `Reuse::expected`
+    /// beside their reads, [`beside`]), each selected before it is sorted.
+    /// A release chooses which record leaves now, by the order the ranking
+    /// keeps; a copy takes a record for its whole stay, and what the bank
+    /// gives up for it is the least any unwanted holding is worth within
+    /// τ_0, whichever the ranking releases first.
+    fn victims(&self, reuse: &Reuse, group: usize, members: &[usize], most: usize) -> Victims {
         let held = members
             .iter()
             .flat_map(|&layer| self.unwanted[layer].iter().map(move |&expert| (layer, expert)))
             .map(|staged @ (layer, expert)| (staged, self.bank.held(layer, expert).expect("an unwanted expert is held")))
-            .filter(|&(_, record)| self.bank.usable(group, record, lending))
+            .filter(|&(_, record)| self.bank.usable(group, record))
             .collect::<Vec<_>>();
-        let mut released = held.iter().map(|&((layer, expert), record)| (self.ranked(reuse, layer, expert, None), record)).collect::<Vec<_>>();
-        let mut floor = held.iter().map(|&(staged @ (layer, expert), _)| reuse.weighed(layer, expert, beside(&self.prompt_reads, staged, None).map(|read| read.step), stay)).collect::<Vec<_>>();
+        let ranker = reuse.ranker(group, Tier::Compute, Reader::Move);
+        let mut released = held.iter().map(|&((layer, expert), record)| (self.ranked(ranker, layer, expert, None), record)).collect::<Vec<_>>();
+        let mut floor = held.iter().map(|&(staged, _)| self.uses(ranker, staged)).collect::<Vec<_>>();
         if held.len() > most {
             released.select_nth_unstable(most);
             released.truncate(most);
@@ -1060,30 +1303,35 @@ impl Directory {
         Victims { released, floor }
     }
 
-    /// Of group `group`'s `wanted`, those whose copy pays over the stay
-    /// `stay` (`Self::price_copies`): the most read beyond its layer's
-    /// price first, each against what it would displace, a usable free
-    /// record past the reserve nothing, then each of the unwanted
-    /// holdings' weights least first (`floor`, `Self::victims`), all read
-    /// over the stay by one measure (`Reuse::weighed`, by `reuse`, beside
-    /// their reads, [`beside`]). What a copy costs and a hit saves are the
-    /// cost function's (`ExpertLines::copy_hits`).
-    fn earning(&self, reuse: &Reuse, group: usize, wanted: Vec<Staged>, floor: &[f64], lending: &Lending, stay: Option<f64>) -> Earning {
-        let weighed = |staged @ (layer, expert): Staged| reuse.weighed(layer, expert, beside(&self.prompt_reads, staged, None).map(|read| read.step), stay);
+    /// `staged`'s expected uses within τ_0 by a lock-free `ranker`, beside
+    /// its reads ([`beside`]): N at the bank's move τ (`Expected::uses`),
+    /// finite.
+    fn uses(&self, ranker: Ranker<'_>, staged @ (layer, expert): Staged) -> f64 {
+        ranker.expected(layer, expert, beside(&self.prompt_reads, staged, None)).uses()
+    }
+
+    /// Of group `group`'s `wanted`, those whose copy pays within τ_0
+    /// (`Self::price_copies`): the most used beyond its layer's price
+    /// first, each against what it would displace, a usable free record
+    /// past the reserve nothing, then each of the unwanted holdings' uses
+    /// least first (`floor`, `Self::victims`), all by one measure
+    /// ([`Self::uses`]); a want left with nothing to displace earns
+    /// nothing. What a copy costs and a hit saves are the cost function's
+    /// (`ExpertLines::copy_hits`).
+    fn earning(&self, reuse: &Reuse, group: usize, wanted: Vec<Staged>, floor: &[f64]) -> Earning {
         // A layer whose hit saves nothing earns no promotion at any read:
         // its wants wait for no read, so none is withheld; its lines'
         // repricing asks them again (`Self::price_copies`).
+        let ranker = reuse.ranker(group, Tier::Compute, Reader::Move);
         let mut ranked = wanted
             .into_iter()
-            .filter_map(|staged| self.copy_hits[staged.0].map(|hits| (weighed(staged) - hits, staged)))
+            .filter_map(|staged| self.copy_hits[staged.0].map(|hits| (self.uses(ranker, staged) - hits, staged)))
             .collect::<Vec<_>>();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
         // The records past the reserve displace nothing; a promotion into
         // the reserve is paid for by the release that refills it.
-        let free = self.bank.free(group).filter(|&record| self.bank.usable(group, record, lending)).count();
-        let displaced = std::iter::repeat_n(0., free.saturating_sub(self.reserve[group]))
-            .chain(floor.iter().copied())
-            .chain(std::iter::repeat(f64::INFINITY));
+        let free = self.bank.free(group).filter(|&record| self.bank.usable(group, record)).count();
+        let displaced = std::iter::repeat_n(0., free.saturating_sub(self.reserve[group])).chain(floor.iter().copied());
         let count = ranked.len();
         let earning = ranked
             .into_iter()
@@ -1094,20 +1342,105 @@ impl Directory {
         Earning { withheld: earning.len() < count, earning }
     }
 
-    /// The steps an expert stays in group `group`'s bank once promoted, as
-    /// the load measures it at step `now`: each promotion takes the place
-    /// of one held, so a record's stay is the group's records over its
-    /// promotions a step (Little's law); none before a promotion and a step
-    /// past it.
-    fn stay(&self, group: usize, now: Step) -> Option<f64> {
-        let Asked { first, count } = self.asked[group]?;
-        let steps = now.checked_sub(first).filter(|&steps| steps > 0)? as f64;
-        Some(self.bank.counts()[group] as f64 / (count as f64 / steps))
+    /// The one exit of group `group`'s banked experts, by `reuse`
+    /// ([`Exits::leaving`]): the host tier's move τ, read once, in decode
+    /// steps (τ_1 / ā).
+    fn exits<'a>(&'a self, reuse: &'a Reuse, group: usize) -> Exits<'a> {
+        let stay = (self.placer == crate::planning::Placer::Tier && self.host[group].records() > 0)
+            .then(|| {
+                let times = self.time.lock();
+                let tau = match times.horizon(group, Tier::Host, Reader::Move)? {
+                    Horizon::Tokens(tau) => tau.get(),
+                    Horizon::Unbounded => unreachable!("a move's τ is finite once a decode step has begun"),
+                };
+                Some(tau / times.tokens_per_step(group).expect("ā exists wherever τ does"))
+            })
+            .flatten();
+        Exits { directory: self, reuse, group, stay, displaced: std::cell::OnceCell::new() }
+    }
+
+    /// Carry `leaving` out of bank record `record` of group `group`: where
+    /// its write-back pays, it reserves a tier record in [`Host::WritingBack`]
+    /// until the copy ends ([`Self::written_back`]), leaving the expert lacked
+    /// so no parked decode step ever waits on the transfer queue. Short of a
+    /// ready record, or where another landing already holds it, it writes
+    /// nothing back.
+    fn exit(&mut self, group: usize, record: usize, leaving: Leaving) -> Exit {
+        let Leaving { staged, back } = leaving;
+        let Some(read) = back else {
+            return Exit { staged, back: None };
+        };
+        let back = {
+            let reuse = Reuse::of(&self.ranking);
+            let ranker = reuse.ranker(group, Tier::Host, Reader::Move);
+            let candidate = ranker.rank(staged.0, staged.1, beside(&self.prompt_reads, staged, read));
+            let keep = self.host[group].reserve();
+            match self.host[group].claim_back(staged, keep, outranking(ranker, &self.prompt_reads, candidate)) {
+                Some(grant) => {
+                    let tier = HostRecord(grant.record());
+                    self.backs.insert((group, record), (grant, read));
+                    Some(tier)
+                }
+                None => None,
+            }
+        };
+        Exit { staged, back }
+    }
+
+    /// `staged` leaves bank record `record` of group `group` by its exit,
+    /// decided by the ranking now ([`Exits::leaving`]) and carried out
+    /// ([`Self::exit`]).
+    fn exit_now(&mut self, group: usize, record: usize, staged: Staged) -> Exit {
+        let leaving = self.exits(&self.reuse_now(), group).leaving(staged);
+        self.exit(group, record, leaving)
+    }
+
+    /// The releases' write-backs queued ([`BankRecords::backs_queued`]).
+    pub fn backs_queued(&self) -> Vec<(usize, BankRecord, Staged, HostRecord)> {
+        self.bank.backs_queued()
+    }
+
+    /// The releases' write-backs copying, each (group, record, batch).
+    pub fn backing(&self) -> Vec<(usize, BankRecord, u64)> {
+        self.bank.backing()
+    }
+
+    /// Queued write-back of releasing `record` of group `group` copies by
+    /// batch `batch`.
+    pub fn back_copy(&mut self, group: usize, record: BankRecord, batch: u64) {
+        self.bank.back_copy(group, record, batch);
+    }
+
+    /// The write-back of releasing `record` of group `group` ended,
+    /// `written` or not: written, its tier record is mapped and keeps the
+    /// expert alone ([`Self::landed`], ranked beside its last read, which
+    /// feeds the host tier's tier-1 move); else the landing ends unlanded
+    /// and only the file holds it. The release drains as any from now.
+    pub fn written_back(&mut self, group: usize, record: BankRecord, written: bool) {
+        let Back { staged: (layer, expert), tier: HostRecord(tier), .. } = self.bank.backed(group, record);
+        let (grant, read) = self.backs.remove(&(group, record.index())).expect("a write-back holds its landing's grant");
+        let kept = match self.bank.held(layer, expert) {
+            Some(_) => Kept::Banked,
+            None => Kept::Alone,
+        };
+        if self.tier(layer).written_back(tier, (layer, expert), read, kept, written) {
+            grant.map();
+            let (group, tier) = (self.bank.group(layer), self.host_tier());
+            self.time.lock().moved(group, tier);
+            // A want its tier lacked is promotable from now.
+            self.stirred |= self.wanted[layer].contains(&expert);
+        }
+    }
+
+    /// Layer `layer`'s write-backs are priced at `price` from now, none
+    /// before the passes and the copy line are measured.
+    pub fn price_write_backs(&mut self, layer: usize, price: Option<WriteBack>) {
+        self.write_backs[layer] = price;
     }
 
     /// The promotions every group has asked since the load.
     pub fn asked(&self) -> u64 {
-        self.asked.iter().flatten().map(|asked| asked.count).sum()
+        self.asked
     }
 
     /// Layer `layer`'s promotions earn their copies at `hits` reads from
@@ -1126,8 +1459,8 @@ impl Directory {
     }
 
     /// The promotions queued, which copy now ([`BankRecords::queued`]).
-    pub fn queued(&self, lending: &Lending) -> Vec<(usize, BankRecord, Staged)> {
-        self.bank.queued(lending)
+    pub fn queued(&self) -> Vec<(usize, BankRecord, Staged)> {
+        self.bank.queued()
     }
 
     /// The promotions copying, each (group, record, batch).
@@ -1147,28 +1480,39 @@ impl Directory {
 
     /// Queued promotion `record` of group `group` copies from tier record
     /// `tier`, held, by batch `batch` ([`BankRecords::copy`]).
-    pub fn copy(&mut self, group: usize, record: BankRecord, tier: HostRecord, batch: u64, lending: &mut Lending) {
-        self.bank.copy(group, record, tier, batch, lending);
+    pub fn copy(&mut self, group: usize, record: BankRecord, tier: HostRecord, batch: u64) {
+        self.bank.copy(group, record, tier, batch);
     }
 
-    /// The copy of promotion `record` of group `group` has completed: it
-    /// holds its expert from the first step not yet begun, banking the copy
-    /// its host tier keeps, whose tier record the copy no longer holds.
-    pub fn promoted(&mut self, completed: Vec<(usize, BankRecord)>, steps: &Steps, lent: &LentRecords) {
+    /// The copies of promotions `completed`, each (group, record), have
+    /// completed: each holds its expert from the map rule's step for its
+    /// layer with the device known at `progress` (`Unresolved::from`, read
+    /// under the steps' lock, [`BankRecords::promoted`]), banking the copy
+    /// its host tier keeps, whose tier record the copy no longer holds. Each
+    /// one's expert and the record it holds it in.
+    pub fn promoted(&mut self, completed: Vec<(usize, BankRecord)>, progress: Point, steps: &Steps) -> Vec<(Staged, BankRecord)> {
         // Only the records' change and its mapping under the steps' lock;
-        // what the tier and the ranking learn of it after.
-        for ((layer, expert), tier) in self.bank.promoted(completed, steps, lent) {
-            self.tier(layer).banked((layer, expert));
-            self.tier(layer).unhold(tier.0);
-            self.resettle(layer, expert);
-        }
+        // what the tier and the ranking learn of it after, outside it.
+        let bank = &mut self.bank;
+        let promoted = steps.unresolved(progress, |unresolved| bank.promoted(completed, |layer| unresolved.from(layer)));
+        promoted
+            .into_iter()
+            .map(|((layer, expert), record, tier)| {
+                let group = self.bank.group(layer);
+                self.time.lock().moved(group, Tier::Compute);
+                self.tier(layer).banked((layer, expert));
+                self.tier(layer).unhold(tier.0);
+                self.resettle(layer, expert);
+                ((layer, expert), record)
+            })
+            .collect()
     }
 
     /// Promotion `record` of group `group` ended without its expert (its
     /// tier record was taken before its copy began, or its copy failed):
     /// the record is free, as nothing maps it.
-    pub fn unpromoted(&mut self, group: usize, record: BankRecord, lent: &LentRecords) {
-        let ((layer, expert), tier) = self.bank.unpromoted(group, record, lent);
+    pub fn unpromoted(&mut self, group: usize, record: BankRecord) {
+        let ((layer, expert), tier) = self.bank.unpromoted(group, record);
         if let Some(tier) = tier {
             self.tier(layer).unhold(tier.0);
         }
@@ -1189,26 +1533,27 @@ impl Directory {
     }
 
     /// Back group `group`'s host `records`, holes or past every record:
-    /// ready from now, the ranking's shares too where the tier is the one
+    /// ready from now, the ranking's pool too where the tier is the one
     /// store.
     pub fn grow_host(&mut self, group: usize, records: Vec<u32>) {
+        let before = self.host[group].records();
         self.host[group].grow(records);
-        if self.placer == crate::planning::Placer::Bank {
-            let count = self.host[group].records() as usize;
-            self.resized(group, count);
+        self.resize_pool(group);
+        if self.host[group].records() != before {
+            self.resized(group, self.host_tier());
         }
     }
 
     /// The host records group `group` evicts to hold `target` records
     /// ([`HostRecords::evictable`]), changing nothing yet: the most valuable
-    /// kept where their bytes are, by the one store's rank. None where it
-    /// holds no more than `target`, and fewer than it lacks where too few
-    /// are evictable.
+    /// kept where their bytes are, by the store's observer rank (design
+    /// §3.2, §4: `Reader::Observe`). None where it holds no more than
+    /// `target`, and fewer than it lacks where too few are evictable.
     pub fn host_evictions(&self, group: usize, target: u32) -> Vec<u32> {
         let excess = self.host[group].records().saturating_sub(target) as usize;
         let reuse = Reuse::of(&self.ranking);
-        let rank = store_rank(&reuse, &self.prompt_reads);
-        let mut evicted = self.host[group].evictable(rank, self.store_shares(&reuse));
+        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Observe), &self.prompt_reads);
+        let mut evicted = self.host[group].evictable(rank);
         evicted.truncate(excess);
         evicted
     }
@@ -1216,20 +1561,23 @@ impl Directory {
     /// Evict group `group`'s host `records` ([`Self::host_evictions`],
     /// nothing changed since), beside running steps or not: holes from now,
     /// nothing moved, each kept expert unmapped from `until(expert)` on
-    /// ([`HostRecords::evict`]). The ranking's shares shrink too where the
+    /// where given, else from the first step not yet begun
+    /// ([`HostRecords::evict`]). The ranking's pool shrinks too where the
     /// tier is the one store.
-    pub fn evict_host(&mut self, group: usize, records: &[u32], until: impl Fn(Staged) -> Step) {
+    pub fn evict_host(&mut self, group: usize, records: &[u32], until: impl Fn(Staged) -> Option<UnmapStep>) {
+        let before = self.host[group].records();
         self.host[group].evict(records, until);
-        if self.placer == crate::planning::Placer::Bank {
-            let count = self.host[group].records() as usize;
-            self.resized(group, count);
+        self.resize_pool(group);
+        if self.host[group].records() != before {
+            self.resized(group, self.host_tier());
         }
     }
 
-    /// The bank no longer holds `layer`'s `expert`, last read at `read`: its
-    /// host tier holds it alone where a record keeps its copy, ranked beside
-    /// that read, and otherwise only the file holds it. Nothing is written
-    /// back.
+    /// The bank no longer holds `layer`'s `expert`, last read at `read`,
+    /// gone by its exit ([`Self::exit`]): its host tier holds it alone where
+    /// a record keeps its copy, ranked beside that read; where its exit
+    /// writes it back, the tier holds it once the copy ends
+    /// ([`Self::written_back`]); otherwise only the file holds it.
     fn left_bank(&mut self, layer: usize, expert: usize, read: Option<Step>) {
         self.tier(layer).evicted((layer, expert), read);
         self.resettle(layer, expert);
@@ -1291,140 +1639,206 @@ impl Directory {
         (0..self.bank.experts(layer)).filter(|&expert| self.bank.held(layer, expert).is_some()).count()
     }
 
-    /// Claim lent record `record` of group `group`'s host records, its
-    /// lender's, for the prompt group whose first step is `from`
-    /// ([`HostRecords::claim_record`]): what it kept unmapped from `from`
-    /// on, before any read lands in it. Whether the group holds it; it
-    /// waits while a copy reads it or a landing or grace holds it.
-    pub fn claim_lent(&mut self, group: usize, record: HostRecord, from: Step) -> bool {
-        self.host[group].claim_record(record.0, from)
+    /// Grant scratch group `scratch_group` its lease of group `lender`'s
+    /// lent records: its host records' (the conveyor's, and on the one
+    /// store the scratch's, [`HostRecords::lease`]), record by record, each
+    /// kept one's expert unmapped from the group's first step on before
+    /// any read lands in it, a record waiting while a copy reads it or a
+    /// landing or grace holds it, so each call claims what it can and the
+    /// transitions that free them grant the rest; and beside a host tier
+    /// the bank's, the scratch's, at once ([`BankRecords::lease`]), each
+    /// held one's expert leaving the bank. The pool shrinks by the host
+    /// records claimed now ([`Self::resize_pool`]). Whether the group holds
+    /// the records its scratch lies in ([`Self::leased`]).
+    pub fn lease(&mut self, lender: usize, scratch_group: ScratchGroup) -> bool {
+        let before = self.host[lender].claimed();
+        self.host[lender].lease(scratch_group);
+        if self.host[lender].claimed() != before {
+            self.resize_pool(lender);
+        }
+        // Each decided after the exits before it took their tier records.
+        let exits = self.bank.lent_held().into_iter().map(|(group, record, staged)| self.exit_now(group, record, staged)).collect();
+        for (layer, expert) in self.bank.lease(scratch_group, exits) {
+            self.left_bank(layer, expert, None);
+        }
+        self.leased(lender)
     }
 
-    /// Whether a prompt group holds conveyor record `record` of group
-    /// `group`'s host records claimed.
+    /// Whether the prompt group holds the lent records of group `lender`
+    /// its scratch lies in: on the one store its host records'
+    /// ([`HostRecords::leased`]), beside a host tier the bank's
+    /// ([`BankRecords::leased`]).
+    pub fn leased(&self, lender: usize) -> bool {
+        match self.placer {
+            crate::planning::Placer::Bank => self.host[lender].leased(),
+            crate::planning::Placer::Tier => self.bank.leased(),
+        }
+    }
+
+    /// Whether the prompt group's lease holds conveyor record `record` of
+    /// group `group`'s host records claimed.
     pub fn lent_claimed(&self, group: usize, HostRecord(record): HostRecord) -> bool {
         self.host(group).is_claimed(record)
     }
 
-    /// Lend the bank's lent records to the prompt group whose first step
-    /// is `from` (beside a host tier, its scratch's), as the conveyor starts
-    /// serving it ([`BankRecords::lend`]): each expert one held leaves the
-    /// bank, and each promotion queued into one ends without its expert.
-    pub fn lend(&mut self, from: Step, lending: &Lending) {
-        let Lent { evicted, dropped } = self.bank.lend(from, lending);
-        for (layer, expert) in evicted {
-            self.left_bank(layer, expert, None);
-        }
-        for (layer, expert) in dropped {
-            self.resettle(layer, expert);
-        }
-    }
-
-    /// The prompt group past (the device past it, and its conveyor quiet):
-    /// every host record of group `lender` it claimed returns empty, and
-    /// every bank record lent to it free. Its pending reads
+    /// The prompt group past (the device past it, and its conveyor quiet)
+    /// returns its lease empty: every host record of group `lender` it
+    /// claimed ([`HostRecords::return_lease`]), its pool back to the whole
+    /// decode capacity, and every bank record lent to it free
+    /// ([`BankRecords::unlend`]). Its pending reads
     /// ([`Self::read_pending`]) are forgotten: the ranking logs the group's
     /// reads once its steps end, which may come after this, so until then
     /// they rank as the ranking last logged them.
     pub fn end_prompt_group(&mut self, lender: usize) {
-        self.host[lender].restore_lent();
+        self.host[lender].return_lease();
+        self.resize_pool(lender);
         self.bank.unlend();
         self.prompt_reads.clear();
     }
 
-    /// Seed `layer` at `point` with what a prompt group routed there:
-    /// `routed`, each expert with the step that last routed it. Every
+    /// Member layers of `group` from `layer` onwards (including `layer`), at
+    /// least 1: free records during a prompt pass are divided across these so
+    /// an earlier layer's unretired seeds do not starve later layers of the
+    /// same group before they run.
+    fn remaining_layers(&self, group: usize, layer: usize) -> usize {
+        self.homes[group].iter().filter(|&&(_, member)| member >= layer).count().max(1)
+    }
+
+    /// Seed `layer` at `point`, a point of scratch group `scratch_group`,
+    /// with what the group routed there: `routed`, each expert with its
+    /// count in the group's union and the step that last routed it. Every
     /// placer seeds so, by the device's seed copy out of the expert's
     /// scratch slot, which its rounds converted into whether it was read
     /// into a conveyor record or a slot, and by the one seed policy
-    /// ([`seeding`]): each routed expert the layer lacks whose scratch slot
-    /// the group filled (`filled`), the most ranked first (beside the step
-    /// that last routed it), takes the least ranked record its store may
-    /// give it while that ranks below it, a free record below every one; a
-    /// record of the layer's own replaces one of its experts, a free one or
-    /// another layer's grows the layer only while it holds fewer experts
-    /// than its share. No layer's share is taken, and none grows past it: a
-    /// prompt group leaves every layer the experts the ranking holds for
-    /// it, and decode begins at each layer's share wherever the layers fall
-    /// in the pass, not with the first layers holding the group's records.
-    /// The layer's `pinned` experts (those its merge set's pass reads in
-    /// place after the seeding) are never taken. Where the host places (the
-    /// one store), into its host records past those it keeps ready for its
-    /// `reserve` ([`Self::seed_store`]); else into the bank's records, by
-    /// [`Ranked`] (reuse beside the later of its ranking's last read and
-    /// the routing step), taking no record whose expert lies inside its own
-    /// layer's share (`Reuse::in_top`, as a release's), placed as fills its
-    /// seed copy and commit commit. The seeds with their records, and the
-    /// experts evicted, (layer, expert).
-    pub fn seed(&mut self, point: Point, layer: usize, routed: &[(usize, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool, reserve: usize) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
+    /// ([`seeding`], design §3.7): each routed expert the layer lacks whose
+    /// scratch slot the group filled (`filled`), ranked by the prompt table
+    /// with prior = its count share (`Reuse::rank_union`), takes free
+    /// records first (divided across the group's remaining layers so an
+    /// earlier layer's unretired seeds do not starve later layers), then the
+    /// group's kept records of any layer, least ranked first, while it
+    /// outranks them. Capacity is pooled across the group's layers. The
+    /// layer's `pinned` experts (those its merge set's pass reads in place
+    /// after the seeding) are never taken. Where the host places (the one
+    /// store), into its host records past those it keeps ready for its
+    /// `reserve` ([`Self::seed_store`]); else into the bank's records,
+    /// taking no record whose expert lies inside the ranking's pool
+    /// (`Reuse::in_top`, as a release's), placed as fills its seed copy and
+    /// commit commit. The seeds with their records, and the experts evicted,
+    /// (layer, expert).
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed(&mut self, point: Point, scratch_group: ScratchGroup, layer: usize, routed: &[(usize, u32, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
         if self.placer == crate::planning::Placer::Bank {
-            return self.seed_store(point, layer, routed, pinned, filled, reserve);
+            return self.seed_store(point, scratch_group, layer, routed, pinned, filled);
         }
         let group = self.bank.group(layer);
+        let remaining = self.remaining_layers(group, layer);
         let taken = {
             let reuse = self.reuse_now();
+            let ranks = reuse.rank_union(layer, routed);
             let mut reads = self.record_reads(&reuse, group);
-            for &(expert, recency) in routed {
+            for &(expert, _, recency) in routed {
                 if let Some(record) = self.bank.held(layer, expert) {
                     reads[record] = reads[record].max(recency);
                 }
             }
             let absent = routed
                 .iter()
-                .filter(|&&(expert, _)| self.bank.held(layer, expert).is_none() && !self.bank.placing((layer, expert)) && filled(expert))
-                .map(|&(expert, recency)| self.ranked(&reuse, layer, expert, Some(recency)))
+                .zip(ranks)
+                .filter(|(&(expert, _, _), _)| self.bank.held(layer, expert).is_none() && !self.bank.placing((layer, expert)) && filled(expert))
+                .map(|(&(expert, _, _), rank)| Ranked { rank, layer, expert })
                 .collect::<Vec<_>>();
             let pinned = pinned.iter().filter_map(|&expert| self.bank.held(layer, expert)).collect::<Vec<_>>();
             let contents = self.bank.records(group);
-            let shared = contents.iter().map(|content| matches!(*content, Record::Held((layer, expert)) if reuse.in_top(layer, expert))).collect::<Vec<_>>();
-            let own = |record: usize| matches!(contents[record], Record::Held((owner, _)) if owner == layer);
-            let kept = |record: usize| pinned.contains(&record) || shared[record];
-            let read = |record: usize| reads[record];
-            let room = self.shares()[layer].saturating_sub(self.held_count(layer));
-            let wanted = absent.len();
-            let mut order = self.least_of(&reuse, group, wanted, read, |record| kept(record) || !own(record));
-            order.extend(self.least_of(&reuse, group, wanted.min(room), read, |record| kept(record) || own(record)));
-            order.sort_unstable();
-            seeding(layer, room, absent, order, |held| held.layer)
+            let pooled = contents.iter().map(|content| matches!(*content, Record::Held((layer, expert)) if reuse.in_top(layer, expert))).collect::<Vec<_>>();
+            let backs = self.kept_by_exit(&reuse, group);
+            let kept = |record: usize| pinned.contains(&record) || pooled[record] || backs[record];
+            let free_limit = self.bank.free(group).filter(|&record| !kept(record)).count().div_ceil(remaining);
+            let mut order = self
+                .bank
+                .free(group)
+                .filter(|&record| !kept(record))
+                .take(absent.len().min(free_limit))
+                .map(|record| (None, bank_record(record)))
+                .collect::<Vec<_>>();
+            if order.len() < absent.len() {
+                let rank = seed_rank(&reuse, reuse.ranker(group, Tier::Compute, Reader::Move), &self.prompt_reads);
+                let mut held = self
+                    .bank
+                    .records(group)
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(record, content)| match *content {
+                        Record::Held((owner, expert)) if !kept(record) => {
+                            let step = (reads[record] != 0).then_some(reads[record]);
+                            Some((Some(Ranked { rank: rank((owner, expert), step), layer: owner, expert }), bank_record(record)))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let short = absent.len() - order.len();
+                if short < held.len() {
+                    held.select_nth_unstable(short);
+                    held.truncate(short);
+                }
+                held.sort_unstable();
+                order.extend(held);
+            }
+            let (seeded, records): (Vec<_>, Vec<_>) = seeding(absent, order, |held, seed| {
+                (held.rank.expected(), held.rank.last().is_some()) < (seed.rank.expected(), seed.rank.last().is_some())
+            })
+            .into_iter()
+            .map(|(seed, record)| (seed.expert, record))
+            .unzip();
+            (seeded, self.leaving_of(&reuse, layer, records))
         };
-        let (seeded, records): (Vec<_>, Vec<_>) = taken.into_iter().map(|(seed, record)| (seed.expert, record)).unzip();
-        let placed = self.place_into(point, layer, &seeded, records);
+        let (seeded, records) = taken;
+        let placed = self.place_into(point, scratch_group, layer, &seeded, records);
         let evicted = placed.evicted.iter().map(|&(layer, expert, _)| (layer, expert)).collect();
         (seeded.into_iter().zip(placed.records).collect(), evicted)
     }
 
-    /// [`Self::seed`] where the host places, into the one store: the
-    /// store's rank (beside each seed's routing step) places seeds and
-    /// records, its taking order ([`HostRecords::seed_order`]) the records
-    /// a seed may take, which leaves every other layer its share. However
-    /// full the store, a seed that outranks a kept expert evicts it:
-    /// seeding never waits for a ready record. The ready records the host
-    /// keeps for its `reserve` are never taken. Each seed's record is the
-    /// device's seed copy's to write ([`HostRecords::seed`]) until it
-    /// retires with its step ([`Self::retire`]); its expert stays lacked
-    /// meanwhile, so no step waits on it. The seeds with their records, and
-    /// the experts evicted, (layer, expert).
-    fn seed_store(&mut self, point: Point, layer: usize, routed: &[(usize, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool, reserve: usize) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
+    /// [`Self::seed`] where the host places, into the one store: seeds rank
+    /// by the prompt table (`Reuse::rank_union`), and the store's taking
+    /// order ([`HostRecords::seed_order`]) offers free records first (divided
+    /// across the group's remaining layers), then kept records of any layer
+    /// in the group. However full the store, a seed that outranks a kept
+    /// expert evicts it: seeding never waits for a ready record. The ready
+    /// records the host keeps for its `reserve` are never taken. Each seed's
+    /// record is the device's seed copy's to write ([`HostRecords::seed`])
+    /// until it retires with its step ([`Self::retire`]); its expert stays
+    /// lacked meanwhile, so no step waits on it. The seeds with their
+    /// records, and the experts evicted, (layer, expert).
+    #[allow(clippy::too_many_arguments)]
+    fn seed_store(&mut self, point: Point, scratch_group: ScratchGroup, layer: usize, routed: &[(usize, u32, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
+        assert_eq!(point.group, scratch_group.first(), "a seed at {point:?} of the scratch group from step {}", scratch_group.first());
         let group = self.bank.group(layer);
+        let remaining = self.remaining_layers(group, layer);
         let taken = {
             let reuse = self.reuse_now();
-            let rank = store_rank(&reuse, &self.prompt_reads);
+            let ranks = reuse.rank_union(layer, routed);
+            let rank = seed_rank(&reuse, reuse.ranker(group, Tier::Compute, Reader::Move), &self.prompt_reads);
             let host = &self.host[group];
             let absent = routed
                 .iter()
-                .filter(|&&(expert, _)| host.located((layer, expert)) == Located::Lacked && filled(expert))
-                .map(|&(expert, step)| (Kept::Alone, rank((layer, expert), Some(step)), (layer, expert)))
+                .zip(ranks)
+                .filter(|(&(expert, _, _), _)| host.located((layer, expert)) == Located::Lacked && filled(expert))
+                .map(|(&(expert, _, _), rank)| (Kept::Alone, rank, (layer, expert)))
                 .collect::<Vec<_>>();
-            let shares = reuse.shares();
-            let room = shares[layer].saturating_sub(host.holding(layer));
             let pinned = |(of, expert): Staged| of == layer && pinned.contains(&expert);
-            let order = host.seed_order(layer, reserve, rank, shares, pinned);
-            seeding(layer, room, absent, order, |(.., (of, _))| of)
+            let mut order = host.seed_order(rank, pinned);
+            let free = order.iter().take_while(|(held, _)| held.is_none()).count();
+            let free_limit = free.div_ceil(remaining);
+            if free_limit < free {
+                order.drain(free_limit..free);
+            }
+            seeding(absent, order, |(held_kept, held_rank, _), (seed_kept, seed_rank, _)| {
+                (held_kept, held_rank.expected(), held_rank.last().is_some()) < (seed_kept, seed_rank.expected(), seed_rank.last().is_some())
+            })
         };
         let mut seeds = Vec::with_capacity(taken.len());
         let mut evicted = Vec::new();
         for ((.., staged), (_, record)) in taken {
-            evicted.extend(self.host[group].seed(staged, record, point.group));
+            evicted.extend(self.host[group].seed(staged, record, scratch_group));
             self.seeding.push((group, record, staged, point));
             seeds.push((staged.1, BankRecord(record)));
         }
@@ -1432,12 +1846,11 @@ impl Directory {
     }
 
     /// A prompt group in flight routes `layer`'s `expert` at step `read`,
-    /// `routed` choices of its steps to it so far, which the ranking logs
-    /// when the group ends: until then every taking, on either placer,
-    /// ranks it beside that read and its use.
-    pub fn read_pending(&mut self, layer: usize, expert: usize, read: Step, routed: u32) {
-        let pending = self.prompt_reads.entry((layer, expert)).or_insert(Unlogged { step: read, routed });
-        *pending = (*pending).max(Unlogged { step: read, routed });
+    /// which the ranking logs when the group ends: until then every taking,
+    /// on either placer, ranks it beside that read, a use at its step.
+    pub fn read_pending(&mut self, layer: usize, expert: usize, read: Step) {
+        let pending = self.prompt_reads.entry((layer, expert)).or_insert(Unlogged::at(read));
+        *pending = (*pending).max(Unlogged::at(read));
     }
 
     /// The device is at `progress`: every seed placed before it whose step
@@ -1509,48 +1922,127 @@ impl Directory {
     /// The device is at `progress`: every host tier record graced for
     /// steps each past the record's layer there, or ended, is ready
     /// ([`HostRecords::retire`]).
-    pub fn retire_graces(&mut self, progress: Point, steps: &Steps) {
-        for records in self.host.iter_mut() {
-            records.retire(progress, steps);
-        }
+    pub fn retire_graces(&mut self, progress: Point, steps: &Steps) -> bool {
+        self.host
+            .iter_mut()
+            .fold(false, |freed, records| freed | records.retire(progress, steps))
     }
 
-    /// Place `absent` experts of `layer` at `point`, keeping the records of
-    /// its `held` experts, in the eviction order of [`Self::least`], each
-    /// held record ranked beside `read(record)`: a prompt group's seeds,
-    /// which its seed commit commits (and the miss replay's model of a bank
-    /// whose every miss is placed). The tier learns each evicted expert
-    /// ([`Self::left_bank`]). `None` when the group has fewer such records
-    /// than `absent` (beside those promotions take).
+    /// Place `absent` experts of `layer` at `point`, a point of scratch group
+    /// `scratch_group`, keeping the records of its `held` experts, in the eviction
+    /// order of [`Self::least`], each held record ranked beside
+    /// `read(record)`: a prompt group's seeds, which its seed commit
+    /// commits (and the miss replay's model of a bank whose every miss is
+    /// placed). The tier learns each evicted expert ([`Self::left_bank`]).
+    /// `None` when the group has fewer such records than `absent` (beside
+    /// those promotions take).
     pub fn place(
         &mut self,
         point: Point,
+        scratch_group: ScratchGroup,
         layer: usize,
         held: &[usize],
         absent: &[usize],
         read: impl Fn(usize) -> Step,
     ) -> Option<Placed> {
-        let candidates = self.least(&self.reuse_now(), layer, held, absent.len(), &read);
-        (candidates.len() == absent.len()).then(|| self.place_into(point, layer, absent, candidates))
+        let candidates = {
+            let reuse = self.reuse_now();
+            let candidates = self.least(&reuse, layer, held, absent.len(), &read);
+            self.leaving_of(&reuse, layer, candidates)
+        };
+        (candidates.len() == absent.len()).then(|| self.place_into(point, scratch_group, layer, absent, candidates))
     }
 
-    /// Place `absent` experts of `layer` at `point` into `candidates`, one
-    /// each, as [`Self::least`] ranks them: each held one's expert evicted.
-    fn place_into(&mut self, point: Point, layer: usize, absent: &[usize], candidates: Vec<(Option<Ranked>, BankRecord)>) -> Placed {
+    /// Place `absent` experts of `layer` at `point`, keeping the records of
+    /// its `held` experts, evicting free records first and then held records
+    /// ordered by `key(record)` alone (least first, never reading `Reuse` or
+    /// the clock): used by offline replay's `Recency::NextRead` bound.
+    #[cfg(any(test, feature = "expert-routing"))]
+    pub(super) fn place_by<K: Ord + Copy>(
+        &mut self,
+        point: Point,
+        scratch_group: ScratchGroup,
+        layer: usize,
+        held: &[usize],
+        absent: &[usize],
+        key: impl Fn(usize) -> K,
+    ) -> Option<Placed> {
+        let group = self.bank.group(layer);
+        let kept: Vec<usize> = held.iter().filter_map(|&expert| self.bank.held(layer, expert)).collect();
+        let count = absent.len();
+        let mut chosen: Vec<(Option<(usize, usize)>, usize)> = self
+            .bank
+            .free(group)
+            .filter(|record| !kept.contains(record))
+            .take(count)
+            .map(|record| (None, record))
+            .collect();
+        let short = count - chosen.len();
+        if short > 0 {
+            let mut order: Vec<((K, usize, usize), usize)> = self
+                .bank
+                .records(group)
+                .iter()
+                .enumerate()
+                .filter_map(|(record, content)| match *content {
+                    Record::Held((owner, expert)) if !kept.contains(&record) => Some(((key(record), owner, expert), record)),
+                    _ => None,
+                })
+                .collect();
+            if short < order.len() {
+                order.select_nth_unstable(short);
+                order.truncate(short);
+            }
+            order.sort_unstable();
+            chosen.extend(order.into_iter().map(|((_, owner, expert), record)| (Some((owner, expert)), record)));
+        }
+        if chosen.len() < count {
+            return None;
+        }
+        let mut evicted = Vec::new();
+        let mut records = Vec::with_capacity(count);
+        for (&expert, (victim, record)) in absent.iter().zip(chosen) {
+            let record = bank_record(record);
+            let exit = victim.map(|staged| Exit { staged, back: None });
+            let got = self.bank.fill(point, scratch_group, (layer, expert), record, exit);
+            assert_eq!(got, victim, "a placement evicts what its record holds");
+            self.record_eviction(&mut evicted, victim.map(|staged| (staged, None)));
+            self.resettle(layer, expert);
+            records.push(record);
+        }
+        Some(Placed { records, evicted })
+    }
+
+    /// Place `absent` experts of `layer` at `point`, a point of scratch group
+    /// `scratch_group`, into `candidates`, one each, as [`Self::least`] ranks them:
+    /// each held one's expert evicted.
+    fn place_into(&mut self, point: Point, scratch_group: ScratchGroup, layer: usize, absent: &[usize], candidates: Vec<(Option<(Ranked, Leaving)>, BankRecord)>) -> Placed {
         let mut evicted = Vec::new();
         let mut records = Vec::with_capacity(absent.len());
+        let group = self.bank.group(layer);
         for (&expert, (held, record)) in absent.iter().zip(candidates) {
-            let victim = self.bank.fill(point, (layer, expert), record);
+            // A seed overwrites its victim's bytes: no record whose victim's
+            // write-back pays is a candidate ([`Self::kept_by_exit`]), so
+            // its exit writes nothing back.
+            let exit = held.map(|(_, leaving)| self.exit(group, record.index(), leaving));
+            let held = held.map(|(held, _)| held);
+            let victim = self.bank.fill(point, scratch_group, (layer, expert), record, exit);
             assert_eq!(victim, held.map(|held| (held.layer, held.expert)), "a seed evicts what its record holds");
-            if let Some(Ranked { rank, layer: owner, expert }) = held {
-                let read = rank.last().expect("a placement ranks what it evicts beside a read");
-                evicted.push((owner, expert, read));
-                self.left_bank(owner, expert, Some(read));
-            }
+            self.record_eviction(&mut evicted, held.map(|Ranked { rank, layer, expert }| ((layer, expert), rank.last())));
             self.resettle(layer, expert);
             records.push(record);
         }
         Placed { records, evicted }
+    }
+
+    /// Record an expert a placement evicted from the bank (if any), with its
+    /// last logged read step (`0` in `evicted` where unlogged), and notify the
+    /// host tier ([`Self::left_bank`]).
+    fn record_eviction(&mut self, evicted: &mut Vec<(usize, usize, Step)>, victim: Option<(Staged, Option<Step>)>) {
+        if let Some(((owner, expert), read)) = victim {
+            evicted.push((owner, expert, read.unwrap_or(0)));
+            self.left_bank(owner, expert, read);
+        }
     }
 
     /// The `count` records of `layer`'s group a placement takes first (fewer
@@ -1576,7 +2068,25 @@ impl Directory {
             .iter()
             .filter_map(|&expert| self.bank.held(layer, expert))
             .collect::<Vec<_>>();
-        self.least_of(reuse, self.bank.group(layer), count, read, |record| kept.contains(&record))
+        let group = self.bank.group(layer);
+        let backs = self.kept_by_exit(reuse, group);
+        self.least_of(reuse, group, count, read, |record| kept.contains(&record) || backs[record])
+    }
+
+    /// Which of group `group`'s records hold an expert whose exit writes it
+    /// back ([`Exits::leaving`]): what a seed never takes, as it overwrites
+    /// the record's bytes at once. Such an expert leaves by a release
+    /// instead, which keeps them until its write-back ends.
+    fn kept_by_exit(&self, reuse: &Reuse, group: usize) -> Vec<bool> {
+        let exits = self.exits(reuse, group);
+        self.bank.records(group).iter().map(|content| matches!(*content, Record::Held(staged) if exits.leaving(staged).backs())).collect()
+    }
+
+    /// Each of `layer`'s group's `candidates` with its held expert's exit,
+    /// decided by `reuse`, the ranking that chose them.
+    fn leaving_of(&self, reuse: &Reuse, layer: usize, candidates: Vec<(Option<Ranked>, BankRecord)>) -> Vec<(Option<(Ranked, Leaving)>, BankRecord)> {
+        let exits = self.exits(reuse, self.bank.group(layer));
+        candidates.into_iter().map(|(held, record)| (held.map(|held| (held, exits.leaving((held.layer, held.expert)))), record)).collect()
     }
 
     /// The one ranking of group `group`'s records, least first, that every
@@ -1601,13 +2111,20 @@ impl Directory {
         if short == 0 {
             return typed(least);
         }
+        let ranker = reuse.ranker(group, Tier::Compute, Reader::Move);
         let mut held = self
             .bank
             .records(group)
             .iter()
             .enumerate()
             .filter_map(|(record, content)| match *content {
-                Record::Held((layer, expert)) if !excluded(record) => Some((Some(self.ranked(reuse, layer, expert, Some(read(record)))), record)),
+                Record::Held((layer, expert)) if !excluded(record) => {
+                    let step = match read(record) {
+                        0 => None,
+                        step => Some(step),
+                    };
+                    Some((Some(self.ranked(ranker, layer, expert, step)), record))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1651,7 +2168,8 @@ impl Directory {
             // may hold it) has answered.
             let mut held = {
                 let reuse = self.reuse_now();
-                held.into_iter().map(|(layer, expert, read, record)| (self.ranked(&reuse, layer, expert, read), record)).collect::<Vec<_>>()
+                let ranker = reuse.ranker(group, Tier::Compute, Reader::Observe);
+                held.into_iter().map(|(layer, expert, read, record)| (self.ranked(ranker, layer, expert, read), record)).collect::<Vec<_>>()
             };
             held.sort_unstable();
             evicted.extend(held.into_iter().map(|(_, record)| record).take(excess - evicted.len()));
@@ -1659,18 +2177,60 @@ impl Directory {
         evicted
     }
 
-    /// Evict group `group`'s `records` ([`Self::evictions`], nothing changed
-    /// since): holes from now, nothing moved, each held expert unmapped from
-    /// `until(expert)` on ([`BankRecords::evict`]). The host tier learns
-    /// each expert, ranked by `last_read`: one whose copy it keeps is held
-    /// alone there, and the rest are dropped, the file holding them. Nothing
-    /// is written back.
-    pub fn evict(&mut self, group: usize, records: &[usize], last_read: impl Fn(usize, usize) -> Option<Step>, until: impl Fn(Staged) -> Step) {
-        for (layer, expert) in self.bank.evict(group, records, until) {
-            self.left_bank(layer, expert, last_read(layer, expert));
+    /// Evict each group's `records` (`records[group]`, [`Self::evictions`],
+    /// nothing changed since), under the steps' lock (`at`): holes from
+    /// now, nothing moved, each held expert leaving by its exit
+    /// ([`Exits::leaving`] at the first step not yet begun), unmapped from
+    /// `until(expert)` on ([`BankRecords::evict`]), and the host tier
+    /// learning each, ranked by `last_read`. A shrink takes the storage of
+    /// what it evicts, so no exit of one may write back: where any held
+    /// expert's would, the shrink evicts nothing and waits a boundary,
+    /// each such expert released into its write-back now
+    /// ([`BankRecords::release`]), whose record it then evicts first,
+    /// idle. While any write-back of a group it evicts is in flight, it
+    /// waits on it, releasing nothing more. Whether it evicted.
+    pub fn evict(&mut self, records: &[Vec<usize>], last_read: impl Fn(usize, usize) -> Option<Step>, until: impl Fn(Staged) -> UnmapStep, at: &Unbegun) -> bool {
+        let backing = self.bank.backs_queued().into_iter().map(|(group, ..)| group).chain(self.bank.backing().into_iter().map(|(group, ..)| group)).collect::<BTreeSet<_>>();
+        if records.iter().enumerate().any(|(group, records)| !records.is_empty() && backing.contains(&group)) {
+            return false;
         }
-        let count = self.bank.counts()[group];
-        self.resized(group, count);
+        // Each decided after the exits before it took their tier records.
+        let mut exits = records
+            .iter()
+            .enumerate()
+            .map(|(group, records)| {
+                records
+                    .iter()
+                    .map(|&record| match self.bank.records(group)[record] {
+                        Record::Held(staged) => Some(self.exit_now(group, record, staged)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let backs = exits.iter().flatten().flatten().any(|exit| exit.back().is_some());
+        if backs {
+            for (group, (exits, records)) in exits.iter_mut().zip(records).enumerate() {
+                for (exit, &record) in exits.iter_mut().zip(records) {
+                    if exit.as_ref().is_some_and(|exit| exit.back().is_some()) {
+                        let (layer, expert) = self.bank.release(group, bank_record(record), at.into(), exit.take().expect("an exit that writes back"));
+                        self.left_bank(layer, expert, None);
+                    }
+                }
+            }
+            return false;
+        }
+        for (group, (exits, records)) in exits.into_iter().zip(records).enumerate() {
+            let before = self.bank.counts()[group];
+            for (layer, expert) in self.bank.evict(group, records, &until, exits) {
+                self.left_bank(layer, expert, last_read(layer, expert));
+            }
+            self.resize_pool(group);
+            if self.bank.counts()[group] != before {
+                self.resized(group, Tier::Compute);
+            }
+        }
+        true
     }
 
     /// The first record of group `group` a seed may take: what a seed list
@@ -1687,9 +2247,12 @@ impl Directory {
     /// Back group `group`'s `records`, holes or past every record: free
     /// from now.
     pub fn grow(&mut self, group: usize, records: Vec<usize>) {
+        let before = self.bank.counts()[group];
         self.bank.grow(group, records);
-        let count = self.bank.counts()[group];
-        self.resized(group, count);
+        self.resize_pool(group);
+        if self.bank.counts()[group] != before {
+            self.resized(group, Tier::Compute);
+        }
     }
 }
 

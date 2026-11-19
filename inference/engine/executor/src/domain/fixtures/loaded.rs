@@ -214,17 +214,17 @@ impl Pricing {
     /// input pending, as the job has not stored it.
     pub(crate) fn measures(
         &self,
-        lines: crate::assessment::Priced<std::sync::Arc<[crate::assessment::ExpertLines]>>,
-        convert: crate::assessment::Priced<Option<std::sync::Arc<[crate::assessment::RecordLine]>>>,
+        lines: crate::assessment::Priced<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>,
+        convert: crate::assessment::Priced<Option<std::sync::Arc<[magnitude_cost_model::RecordLine]>>>,
     ) -> crate::LoadMeasures {
-        use crate::assessment::{ExpertPass, Priced};
+        use crate::assessment::Priced;
         fn pending<T>() -> Priced<T> {
             Priced::Pending("not measured by the test".to_owned())
         }
         let experts = self.planned.load().expert_bank().map(|bank| crate::ExpertMeasures {
             lines,
             read: pending(),
-            pass: Priced::Measured(ExpertPass::of_bank(bank, self.costs.clone()).expect("the synthetic costs price the bank's pass")),
+            pass: Priced::Measured(crate::assessment::expert_pass(bank, &self.costs).expect("the synthetic costs price the bank's pass")),
             tier_copy: pending(),
             convert,
         });

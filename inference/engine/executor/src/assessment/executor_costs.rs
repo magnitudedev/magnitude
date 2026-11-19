@@ -90,7 +90,9 @@
 //! figure priced from those read; a required one that does means the
 //! executor has no costs.
 
-use super::demand::{Bytes, Flops, HistoryRead, Work};
+use super::demand::{element_of, format_of, layout_of};
+use magnitude_cost_model::Census;
+use seismic::measure::pricing::{self, Bytes, DecodeLine, Figures, Flops, Format, HistoryFigure, HistoryLadder, HistoryRead, Layout, PriceError, Rates, Storage, Work};
 use super::requests::JobDeadlines;
 use super::AssessmentError;
 use crate::{resident_element, resident_elements, resident_layout, ExecutionPath};
@@ -360,15 +362,6 @@ pub struct HistoryCosts {
     rungs: Vec<MeasuredCost>,
 }
 
-/// The cost of a history call at one depth: the segment of a layout's
-/// ladder the depth lies in (the nearest where it lies outside), as a fixed
-/// cost per call and the seconds each history byte read beyond it takes.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HistoryLine {
-    pub fixed_seconds: f64,
-    pub seconds_per_byte: f64,
-}
-
 impl HistoryCosts {
     /// `layout`'s costs from the `rungs` its ladder read, at most one at
     /// each of [`HISTORY_DEPTHS`].
@@ -394,48 +387,12 @@ impl HistoryCosts {
         HISTORY_DEPTHS.into_iter().zip(&self.rungs)
     }
 
-    /// The line of the segment `tokens` lies in, on each rung's time at
+    /// The ladder its rungs make ([`HistoryLadder`]), each rung's time at
     /// least that of every rung below it, as a call over more history takes
     /// no less time (a GB10's 20-core CPU read 16K tokens of affine history
-    /// no slower than 8K, 2026-10-22). Its seconds per byte are the far
-    /// rung's time beyond the near one's, none on a flat segment; its fixed
-    /// cost the near time less its bytes' time, none where the line meets
-    /// zero tokens below zero seconds (a call takes at least its bytes'
-    /// time). Where one rung was read the line runs through it from no
-    /// fixed cost, and where none was, at `stream` bytes per second, the
-    /// rate memory streams them at, which a call reads its history no
-    /// faster than.
-    pub fn line(&self, tokens: f64, stream: f64) -> HistoryLine {
-        let per_token = self.per_token as f64;
-        let rungs = self
-            .rungs()
-            .scan(0f64, |slowest, (depth, cost)| {
-                *slowest = slowest.max(cost.value);
-                Some((depth as f64, *slowest))
-            })
-            .collect::<Vec<_>>();
-        match rungs[..] {
-            [] => HistoryLine {
-                fixed_seconds: 0.,
-                seconds_per_byte: 1. / stream,
-            },
-            [(depth, seconds)] => HistoryLine {
-                fixed_seconds: 0.,
-                seconds_per_byte: seconds / (depth * per_token),
-            },
-            _ => {
-                let segment = rungs
-                    .windows(2)
-                    .position(|pair| tokens <= pair[1].0)
-                    .unwrap_or(rungs.len() - 2);
-                let [(near_depth, near), (far_depth, far)] = [rungs[segment], rungs[segment + 1]];
-                let seconds_per_byte = (far - near) / ((far_depth - near_depth) * per_token);
-                HistoryLine {
-                    fixed_seconds: (near - near_depth * per_token * seconds_per_byte).max(0.),
-                    seconds_per_byte,
-                }
-            }
-        }
+    /// no slower than 8K, 2026-10-22).
+    pub fn ladder(&self) -> HistoryLadder {
+        HistoryLadder::new(self.per_token, self.rungs().map(|(depth, cost)| (depth, cost.value)))
     }
 }
 
@@ -457,29 +414,16 @@ impl Placement {
     }
 }
 
-/// The storage kinds operands are allocated in, whose routes the costs
-/// measure: a graph run's inputs lie in upload storage (`Tensor::upload`);
-/// host storage (`Tensor::shared`) holds shared words and an expert bank's
-/// host tier, which a streamed layer's GPU reads in place (the cost
-/// function's link line, `ExpertPass::lines`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OperandStorage {
-    Device,
-    Upload,
-    Host,
-}
-
-impl OperandStorage {
-    /// Every kind, in declaration order.
-    pub const ALL: [Self; 3] = [Self::Device, Self::Upload, Self::Host];
-
-    /// The storage kind.
-    pub const fn kind(self) -> seismic::Contract {
-        match self {
-            Self::Device => seismic::Contract::DeviceOnly,
-            Self::Upload => seismic::Contract::Upload,
-            Self::Host => seismic::Contract::Shared,
-        }
+/// The storage kind operands of `storage` are allocated in, whose routes
+/// the costs measure: a graph run's inputs lie in upload storage
+/// (`Tensor::upload`); host storage (`Tensor::shared`) holds shared words
+/// and an expert bank's host tier, which a streamed layer's GPU reads in
+/// place (the cost function's link line, `ExpertPass::lines`).
+pub const fn contract(storage: Storage) -> seismic::Contract {
+    match storage {
+        Storage::Device => seismic::Contract::DeviceOnly,
+        Storage::Upload => seismic::Contract::Upload,
+        Storage::Host => seismic::Contract::Shared,
     }
 }
 
@@ -493,11 +437,11 @@ pub struct Placements {
 
 impl Placements {
     /// The placement of `storage`.
-    pub fn of(&self, storage: OperandStorage) -> &Placement {
+    pub fn of(&self, storage: Storage) -> &Placement {
         match storage {
-            OperandStorage::Device => &self.device,
-            OperandStorage::Upload => &self.upload,
-            OperandStorage::Host => &self.host,
+            Storage::Device => &self.device,
+            Storage::Upload => &self.upload,
+            Storage::Host => &self.host,
         }
     }
 }
@@ -608,14 +552,6 @@ pub struct ExecutorCosts {
 }
 
 impl ExecutorCosts {
-    /// The step cost a decode under `lookahead` pays.
-    pub fn step_seconds(&self, lookahead: bool) -> f64 {
-        match lookahead {
-            true => self.step_pipelined_seconds.value,
-            false => self.step_round_trip_seconds.value,
-        }
-    }
-
     /// The device seconds of one call inside a sealed graph.
     pub fn launch(&self) -> f64 {
         self.launch_seconds.value
@@ -626,7 +562,9 @@ impl ExecutorCosts {
     pub fn composition(&self) -> Result<MeasuredCost, AssessmentError> {
         let depth = u32::try_from(HISTORY_DEPTHS[0])
             .map_err(|_| AssessmentError::Demand("the chain's depth exceeds u32".into()))?;
-        let priced = self.chain.layers as f64 * super::estimate::calls_seconds(&self.chain.calls, self, depth)?;
+        let formats = self.chain.calls.iter().flat_map(Work::formats).collect::<Vec<_>>();
+        let layouts = self.chain.calls.iter().filter_map(Work::layout).collect::<Vec<_>>();
+        let priced = self.chain.layers as f64 * pricing::calls_seconds(&self.chain.calls, &self.rates(&formats, &layouts), depth)?;
         let timing = self.chain.timing;
         Ok(MeasuredCost {
             value: timing.median / priced,
@@ -677,7 +615,7 @@ impl ExecutorCosts {
     /// Whether every route of `storage`'s placement has its activation
     /// dtype's rate read, so its weight rates are measured along it, not
     /// priced from device storage's probe.
-    pub fn reads_along(&self, storage: OperandStorage) -> bool {
+    pub fn reads_along(&self, storage: Storage) -> bool {
         let placement = self.placements.of(storage);
         std::iter::once(&placement.first).chain(&placement.rest).all(|&route| {
             route == self.first.route
@@ -688,7 +626,7 @@ impl ExecutorCosts {
     /// Why a route of `storage`'s placement has no activation rate read
     /// ([`Self::reads_along`]) though the walk reached it: none while its
     /// point is merely unrecorded, which a job measures.
-    pub fn unobtainable_along(&self, storage: OperandStorage) -> Option<&Unobtainable> {
+    pub fn unobtainable_along(&self, storage: Storage) -> Option<&Unobtainable> {
         let placement = self.placements.of(storage);
         std::iter::once(&placement.first).chain(&placement.rest).find_map(|&route| {
             self.unobtainable.iter().find(|unread| unread.figure == Derived::ActivationRate(route))
@@ -698,7 +636,7 @@ impl ExecutorCosts {
     /// The bytes per second of `format` in `storage`: the slowest rate of
     /// its placement's paths, since a load's bytes may lie along any of
     /// them.
-    pub fn weight_rate(&self, storage: OperandStorage, format: Element) -> f64 {
+    pub fn weight_rate(&self, storage: Storage, format: Element) -> f64 {
         let placement = self.placements.of(storage);
         placement.rest.iter().fold(
             self.route_rate(placement.first, format),
@@ -793,28 +731,93 @@ impl ExecutorCosts {
         }
     }
 
-    /// A call's cost over `tokens` of `layout`'s history in device storage:
-    /// its ladder's line there ([`HistoryCosts::line`]), measured along
-    /// device storage's first route, its seconds per byte scaled up by the
-    /// slowest route of the placement against that one (in the activation
-    /// dtype the history holds), since the kernel reads no faster than the
-    /// path its history lies along (spec §2.14).
-    pub fn history_line(
-        &self,
-        layout: KvCodec,
-        tokens: f64,
-    ) -> Result<HistoryLine, AssessmentError> {
-        let measured_along = self.placements.device.first;
-        let activation = Element::bf16();
-        let along = self.route_rate(measured_along, activation);
-        let slowdown = self.weight_rate(OperandStorage::Device, activation) / along;
-        let line = self.history(layout)?.line(tokens, along);
-        Ok(HistoryLine {
-            seconds_per_byte: line.seconds_per_byte / slowdown,
-            ..line
-        })
+    /// `layout`'s history figure ([`HistoryFigure`]): its ladder's line
+    /// ([`HistoryCosts::ladder`]), measured along device storage's first
+    /// route, its seconds per byte scaled up by the slowest route of the
+    /// placement against that one (in the activation dtype the history
+    /// holds), since the kernel reads no faster than the path its history
+    /// lies along (spec §2.14); or why no native attention entry reads it.
+    fn history_figure(&self, layout: Layout) -> Result<HistoryFigure, PriceError> {
+        let codec = HISTORY_CODECS
+            .into_iter()
+            .find(|codec| codec.identity() == layout.0)
+            .unwrap_or_else(|| panic!("invariant violated: no history codec is {layout:?}"));
+        let history = self.history(codec).map_err(|error| match error {
+            AssessmentError::Demand(reason) => PriceError::History(reason),
+            other => PriceError::History(other.to_string()),
+        })?;
+        let along = self.route_rate(self.placements.device.first, Element::bf16());
+        Ok(HistoryFigure { ladder: history.ladder(), along, slowdown: self.weight_rate(Storage::Device, Element::bf16()) / along })
+    }
+
+    /// The rates of `formats` and `layouts` beside the activation dtype's
+    /// (bf16), each format's in every storage ([`Self::weight_rate`],
+    /// [`Self::matrix_flops`]) and each layout's history figure: the plain
+    /// figures a census of them is priced at.
+    pub fn rates(&self, formats: &[Format], layouts: &[Layout]) -> Rates {
+        let activation = format_of(Element::bf16());
+        let mut read = vec![activation];
+        for &format in formats {
+            if !read.contains(&format) {
+                read.push(format);
+            }
+        }
+        let mut history = Vec::<(Layout, Result<HistoryFigure, PriceError>)>::new();
+        for &layout in layouts {
+            if history.iter().all(|(priced, _)| *priced != layout) {
+                history.push((layout, self.history_figure(layout)));
+            }
+        }
+        Rates {
+            activation,
+            weights: Storage::ALL.iter().flat_map(|&storage| read.iter().map(move |&format| (storage, format, self.weight_rate(storage, element_of(format))))).collect(),
+            flops: read.iter().map(|&format| (format, self.matrix_flops(element_of(format)))).collect(),
+            history,
+            launch: self.launch(),
+            decode: Some(DECODE_LINE),
+        }
+    }
+
+    /// The figures the launches of `censuses` are priced at: the rates of
+    /// their formats and layouts ([`Self::rates`]), the composition ratio
+    /// ([`Self::composition`]) and the step costs.
+    pub fn figures(&self, censuses: &[&Census]) -> Figures {
+        let formats = censuses.iter().flat_map(|census| census.formats()).collect::<Vec<_>>();
+        let layouts = censuses.iter().flat_map(|census| census.layouts()).collect::<Vec<_>>();
+        Figures {
+            rates: self.rates(&formats, &layouts),
+            composition: self.composition().map(|composition| composition.value).map_err(|error| match error {
+                AssessmentError::Demand(reason) => PriceError::Composition(reason),
+                other => PriceError::Composition(other.to_string()),
+            }),
+            step_pipelined: self.step_pipelined_seconds.value,
+            step_round_trip: self.step_round_trip_seconds.value,
+        }
+    }
+
+    /// Whether the costs read host storage's routes, the link line's
+    /// ([`Self::reads_along`], [`Self::unobtainable_along`]).
+    pub fn host_reads(&self) -> magnitude_cost_model::HostReads {
+        match (self.reads_along(Storage::Host), self.unobtainable_along(Storage::Host)) {
+            (true, _) => magnitude_cost_model::HostReads::Read,
+            (false, Some(unread)) => magnitude_cost_model::HostReads::Unobtainable(unread.to_string()),
+            (false, None) => magnitude_cost_model::HostReads::Unread,
+        }
     }
 }
+
+/// A decode form's row line ([`DecodeLine`]): the dense GEMV's arithmetic
+/// a FLOP of one row, 0.25 ps at no rows and 0.31 ps more per row (0.5 and
+/// 0.62 µs per million weights). Measured on an M4 Pro's Metal from the
+/// slope of `dense_output` 17408 × 5120 over 4 and 8 rows (q4k 0.667,
+/// iq2s 0.578 µs per million weights a row, run fcb870) and of an 8192 ×
+/// 4096 q4g32s projection (0.69), which reproduces q4k's 2 and 4 rows
+/// within 2%. No job measures it yet; a backend whose matrix throughput is
+/// slower prices its rows at that ([`seismic::measure::pricing::Rates::decode_compute`]).
+pub(super) const DECODE_LINE: DecodeLine = DecodeLine { fixed: 0.25e-12, row: 0.31e-12 };
+
+/// Every history codec a load can store.
+const HISTORY_CODECS: [KvCodec; 3] = [KvCodec::Dense, KvCodec::AffineK8V4, KvCodec::RotatedK4V4];
 
 /// Why executor costs could not be measured or derived.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2086,7 +2089,7 @@ pub(super) fn rotation_sets(cache: u64, bytes: u64) -> u64 {
 /// it is charged along allocates, so one rate is measured per route.
 struct Route {
     route: NativeKind,
-    storage: OperandStorage,
+    storage: Storage,
     /// The placement's paths along the route: what a history rotation may
     /// take and which store holds it are read from them.
     along: Vec<AccessPathId>,
@@ -2096,10 +2099,10 @@ struct Route {
 /// in order: a kind every path of which an earlier one of the placement is
 /// charged along is no route of its own, as its memory is measured along
 /// those paths already.
-fn routes_of<'a>(topology: &'a DeviceTopology, executor: &Executor, storage: OperandStorage) -> Vec<&'a seismic::Kind> {
+fn routes_of<'a>(topology: &'a DeviceTopology, executor: &Executor, storage: Storage) -> Vec<&'a seismic::Kind> {
     let mut reached: Vec<AccessPathId> = Vec::new();
     let mut routes = Vec::new();
-    for id in executor.placement(storage.kind()) {
+    for id in executor.placement(contract(storage)) {
         let kind = topology.kind(*id).expect("a placement's kinds belong to its topology");
         if kind.paths().iter().any(|path| !reached.contains(path)) {
             reached.extend(kind.paths());
@@ -2127,7 +2130,7 @@ impl Routes {
 impl Route {
     /// The route of `kind`, one of `storage`'s placement: in `storage`,
     /// confined to `kind`.
-    fn of(storage: OperandStorage, kind: &seismic::Kind) -> Self {
+    fn of(storage: Storage, kind: &seismic::Kind) -> Self {
         Self {
             route: kind.native(),
             storage,
@@ -2141,7 +2144,7 @@ impl Route {
         topology: &DeviceTopology,
         executor: &Executor,
     ) -> Result<(Routes, Placements), ExecutorCostsError> {
-        let placement = |storage: OperandStorage| {
+        let placement = |storage: Storage| {
             let routes = routes_of(topology, executor, storage);
             let (first, rest) = routes.split_first().ok_or_else(|| {
                 ExecutorCostsError(format!(
@@ -2155,18 +2158,18 @@ impl Route {
             })
         };
         let placements = Placements {
-            device: placement(OperandStorage::Device)?,
-            upload: placement(OperandStorage::Upload)?,
-            host: placement(OperandStorage::Host)?,
+            device: placement(Storage::Device)?,
+            upload: placement(Storage::Upload)?,
+            host: placement(Storage::Host)?,
         };
         let mut routes = Routes {
             device: Self::of(
-                OperandStorage::Device,
-                routes_of(topology, executor, OperandStorage::Device)[0],
+                Storage::Device,
+                routes_of(topology, executor, Storage::Device)[0],
             ),
             others: Vec::new(),
         };
-        for storage in OperandStorage::ALL {
+        for storage in Storage::ALL {
             for kind in routes_of(topology, executor, storage) {
                 if !routes.iter().any(|known| known.route == kind.native()) {
                     routes.others.push(Self::of(storage, kind));
@@ -2204,9 +2207,9 @@ impl Route {
         extents: &[u64],
     ) -> Result<Tensor, seismic::TensorError> {
         match self.storage {
-            OperandStorage::Device => Tensor::zeros(charges, element, extents),
-            OperandStorage::Upload => Tensor::upload(charges, element, extents),
-            OperandStorage::Host => Tensor::shared(charges, element, extents),
+            Storage::Device => Tensor::zeros(charges, element, extents),
+            Storage::Upload => Tensor::upload(charges, element, extents),
+            Storage::Host => Tensor::shared(charges, element, extents),
         }
     }
 }
@@ -2832,6 +2835,7 @@ impl AttendCase {
             previous_tape: 0,
             following_bank: 2,
             stop: 1,
+            front: 0,
         };
         let tables = PackedRowTables::pack(
             &[slot],
@@ -3604,7 +3608,7 @@ fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
         .filter(|format| *format != activation)
         .collect::<Vec<_>>();
     let (device, host): (Vec<usize>, Vec<usize>) =
-        (0..routes.len()).partition(|&index| routes[index].storage == OperandStorage::Device);
+        (0..routes.len()).partition(|&index| routes[index].storage == Storage::Device);
     let first_rungs = |layout| {
         [Rung::Pilot, Rung::Depth(0), Rung::Depth(1)].map(move |rung| Step::Rung(layout, rung))
     };
@@ -4267,7 +4271,7 @@ impl Walk<'_> {
                 .canonical_byte_len(&[HIDDEN, features])
                 .map_err(|error| failed("dense_output weights")(&error))?;
         let history_bytes = AttendCase::operand(KvCodec::Dense, depth, 1)?.bytes()?;
-        let line = dense.line(depth as f64, stream);
+        let line = dense.ladder().line(depth as f64, stream);
         let layer = weight_bytes as f64 / stream
             + line.fixed_seconds
             + (depth * token_bytes(KvCodec::Dense)?) as f64 * line.seconds_per_byte
@@ -4333,18 +4337,18 @@ impl ChainRead {
         Ok([
             Work {
                 weights: vec![Bytes {
-                    format,
+                    format: format_of(format),
                     bytes: expand_weight_bytes(format, features)?,
                 }],
                 row_flops: vec![Flops {
-                    format,
+                    format: format_of(format),
                     flops: 2 * 2 * features * HIDDEN,
                 }],
                 ..Work::default()
             },
             Work {
                 history: Some(HistoryRead {
-                    layout: Some(KvCodec::Dense),
+                    layout: Some(layout_of(KvCodec::Dense)),
                     bytes_per_token: token_bytes(KvCodec::Dense)?,
                     flops_per_token: 2 * KV_HEADS * GROUP * (2 * HEAD_WIDTH),
                     window: None,
@@ -4353,11 +4357,11 @@ impl ChainRead {
             },
             Work {
                 weights: vec![Bytes {
-                    format,
+                    format: format_of(format),
                     bytes: output,
                 }],
                 row_flops: vec![Flops {
-                    format,
+                    format: format_of(format),
                     flops: 2 * features * HIDDEN,
                 }],
                 ..Work::default()
@@ -4367,7 +4371,7 @@ impl ChainRead {
     }
 
     /// The composition ratio: the chain's time over its calls' as `costs`
-    /// price them alone, the chain of `programs` ([`super::estimate::calls_seconds`]), so a step
+    /// price them alone, the chain of `programs` (`seismic::measure::pricing::calls_seconds`), so a step
     /// priced from the same costs is scaled to what composing its calls
     /// takes.
     /// The chain's cost: its timing and one layer's calls of `programs`.
@@ -4407,7 +4411,7 @@ fn weight_rate<T: Times>(
         ),
         // Host memory is timed with no compile sharing the host.
         match route.storage {
-            OperandStorage::Device => share,
+            Storage::Device => share,
             _ => share.on_host(),
         },
     )?;
@@ -4868,11 +4872,17 @@ pub(super) fn retraced(
             pending,
         }),
         Ok(Walked { costs: Err(_), missing: Some(key), .. }) => Ok(StoredCosts::Missing(key)),
-        // A required figure whose point is recorded unobtainable: no
-        // estimate is had on this executor.
-        Ok(Walked { costs: Err(unread), missing: None, .. }) => Err(ExecutorCostsError(format!(
-            "the executor's costs require {unread:?}, which cannot be measured on it"
-        ))),
+        // A required figure unread where every point is recorded: one whose
+        // point is recorded unobtainable, so no estimate is had on this
+        // executor, or one past a failure outside a point's timing, which
+        // the error names, as it is the cause.
+        Ok(Walked { costs: Err(unread), missing: None, failures, .. }) => Err(ExecutorCostsError(match failures.as_slice() {
+            [] => format!("the executor's costs require {unread:?}, which cannot be measured on it"),
+            failures => format!(
+                "the executor's costs require {unread:?}, unread past its walk's failures: {}",
+                failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+            ),
+        })),
         Err(Stop::Missing(key)) => Ok(StoredCosts::Missing(key)),
         Err(Stop::Point(error) | Stop::Failed(error)) => Err(error),
         Err(Stop::Expired) => unreachable!("timings from records alone have no deadline"),
@@ -4974,15 +4984,15 @@ mod tests {
         let mut costs = super::super::synthetic::costs();
         costs.placements.host = Placement { first: device, rest: vec![link] };
         costs.routes = vec![RouteCosts { route: link, activation: None, formats: Vec::new() }];
-        assert!(!costs.reads_along(OperandStorage::Host));
-        assert!(costs.unobtainable_along(OperandStorage::Host).is_none(), "unrecorded is pending, not unobtainable");
+        assert!(!costs.reads_along(Storage::Host));
+        assert!(costs.unobtainable_along(Storage::Host).is_none(), "unrecorded is pending, not unobtainable");
         costs.unobtainable = vec![Unobtainable {
             figure: Derived::ActivationRate(link),
             step: "probe".into(),
             cannot: Cannot::Point,
             reason: "recorded unobtainable".into(),
         }];
-        let unread = costs.unobtainable_along(OperandStorage::Host).expect("the host route is named");
+        let unread = costs.unobtainable_along(Storage::Host).expect("the host route is named");
         assert_eq!(unread.figure, Derived::ActivationRate(link));
         assert!(unread.to_string().contains("recorded unobtainable"));
     }
@@ -5075,13 +5085,13 @@ mod tests {
         )
         .unwrap();
         let price = |depth: f64| {
-            let line = history.line(depth, 1e9);
+            let line = history.ladder().line(depth, 1e9);
             line.fixed_seconds + depth * per_token * line.seconds_per_byte
         };
         for depth in [4096., 12000., 16384., 24576., 65536.] {
             assert!((price(depth) / at(depth) - 1.).abs() < 1e-9, "{depth}");
         }
-        assert!((history.line(65536., 1e9).seconds_per_byte * 200e9 - 1.).abs() < 1e-9);
+        assert!((history.ladder().line(65536., 1e9).seconds_per_byte * 200e9 - 1.).abs() < 1e-9);
     }
 
     /// A rung that reads faster than one below it is priced at the slower
@@ -5101,10 +5111,10 @@ mod tests {
             vec![cost(2e-3), cost(1.5e-3), cost(4e-3)],
         )
         .unwrap();
-        let flat = history.line(12000., 1e9);
+        let flat = history.ladder().line(12000., 1e9);
         assert_eq!(flat.seconds_per_byte, 0.);
         assert_eq!(flat.fixed_seconds, 2e-3);
-        let rising = history.line(24576., 1e9);
+        let rising = history.ladder().line(24576., 1e9);
         let between = (HISTORY_DEPTHS[2] - HISTORY_DEPTHS[1]) as f64 * per_token;
         assert!((rising.seconds_per_byte * between / 2e-3 - 1.).abs() < 1e-12);
     }
@@ -5124,13 +5134,13 @@ mod tests {
             }],
         )
         .unwrap();
-        let line = one.line(65536., 1e9);
+        let line = one.ladder().line(65536., 1e9);
         assert_eq!(line.fixed_seconds, 0.);
         assert!((line.seconds_per_byte * HISTORY_DEPTHS[0] as f64 * per_token / 2e-3 - 1.).abs() < 1e-12);
         let none = HistoryCosts::new(KvCodec::Dense, Vec::new()).unwrap();
         assert_eq!(
-            none.line(65536., 1e9),
-            HistoryLine {
+            none.ladder().line(65536., 1e9),
+            pricing::HistoryLine {
                 fixed_seconds: 0.,
                 seconds_per_byte: 1e-9,
             }
@@ -5147,7 +5157,7 @@ mod tests {
             storage,
             along: Vec::new(),
         };
-        let (device, upload) = (route(OperandStorage::Device), route(OperandStorage::Upload));
+        let (device, upload) = (route(Storage::Device), route(Storage::Upload));
         let (bf16, f32) = (Element::bf16(), Element::f32());
         let steps = plan(&[&device, &upload], &[bf16, f32]);
         let first = |layout| {

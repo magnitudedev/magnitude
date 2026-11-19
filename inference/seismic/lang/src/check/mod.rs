@@ -965,15 +965,17 @@ pub(crate) fn check_closed<E>(
     crate::checked::CheckFailure<E>,
 > {
     use crate::checked::{CheckFailure, Diagnostics, SourceDiagnostic, SourceError};
-    // Two passes: the first finds every file's module constants, which the
-    // second reads as the integers they name.
+    // Two passes: the first finds every file's module constants and constant
+    // functions, which the second reads as the integers they name and the
+    // bodies they call.
     let mut constants = std::collections::BTreeMap::new();
     let mut declared = Vec::new();
     let mut parse_diagnostics = Vec::new();
-    let empty = std::collections::BTreeMap::new();
+    let mut function_decls = Vec::new();
     for source in sources.files() {
-        match crate::syntax::parse(&source.text, &empty) {
+        match crate::syntax::parse(&source.text, &Default::default(), &Default::default()) {
             Ok(ast) => {
+                function_decls.extend(ast.constant_functions.into_iter().map(|function| (source, function)));
                 for constant in &ast.constants {
                     if constants.contains_key(&constant.name.name) {
                         parse_diagnostics.push(SourceDiagnostic::located(
@@ -994,21 +996,53 @@ pub(crate) fn check_closed<E>(
             }
         }
     }
+    // Each constant function's body, once every module constant is known; a
+    // name is a module's once.
+    let mut constant_functions: Vec<crate::checked::ConstantFunction> = Vec::new();
+    for (source, function) in &function_decls {
+        let located = |span, message| {
+            SourceDiagnostic::located(
+                source,
+                crate::span::Diagnostic::with_rule(crate::checked::DiagnosticRule::Resolution, span, message),
+            )
+        };
+        if constants.contains_key(&function.name.name)
+            || constant_functions.iter().any(|checked| checked.name() == function.name.name)
+        {
+            parse_diagnostics.push(located(function.name.span, format!("`{}` is declared twice", function.name.name)));
+            continue;
+        }
+        match constant_function(function, &constants) {
+            Ok(checked) => constant_functions.push(checked),
+            Err((span, message)) => parse_diagnostics.push(located(span, message)),
+        }
+    }
     if let Some(diagnostics) = Diagnostics::new(std::mem::take(&mut parse_diagnostics)) {
         return Err(CheckFailure::Source(SourceError::new(diagnostics)));
     }
+    let functions = constant_functions
+        .iter()
+        .map(|function| (function.name().to_owned(), function.clone()))
+        .collect();
     let mut parsed = Vec::new();
     for (file, source) in sources.files().iter().enumerate() {
-        match crate::syntax::parse(&source.text, &constants) {
+        match crate::syntax::parse(&source.text, &constants, &functions) {
             Ok(ast) => {
                 for decl in &ast.decls {
-                    if constants.contains_key(&decl.name().name) {
+                    let module_name = if constants.contains_key(&decl.name().name) {
+                        Some("module constant")
+                    } else if functions.contains_key(&decl.name().name) {
+                        Some("module constant function")
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = module_name {
                         parse_diagnostics.push(SourceDiagnostic::located(
                             source,
                             crate::span::Diagnostic::with_rule(
                                 crate::checked::DiagnosticRule::Resolution,
                                 decl.name().span,
-                                format!("`{}` is a module constant's name", decl.name().name),
+                                format!("`{}` is a {kind}'s name", decl.name().name),
                             ),
                         ));
                     }
@@ -1212,6 +1246,7 @@ pub(crate) fn check_closed<E>(
             definitions,
             families,
             constants: declared,
+            constant_functions,
         },
         native_sources,
     ))
@@ -1457,7 +1492,7 @@ fn check_native(
             crate::checked::ElementTarget::Concrete(_) => None,
         })
         .collect();
-    let element_reads = NativeElements {
+    let native_reads = NativeReads {
         parameters: &entry.element_parameters,
         destinations: &destinations,
         backend,
@@ -1544,7 +1579,7 @@ fn check_native(
             continue;
         }
         let value = native_term_expansion(&term.value, &terms);
-        match native_nat_expr(&value, &entry.dimensions, &parameter_names, element_reads) {
+        match native_nat_expr(&value, &entry.dimensions, &parameter_names, native_reads) {
             Ok(_) => terms.push((name.clone(), value)),
             Err(message) => errors.push((term.value.span, message)),
         }
@@ -1629,7 +1664,7 @@ fn check_native(
         let (expr, lowered) = match &param.default {
             ast::NativeDefaultDecl::Value(expr) => (
                 expr,
-                native_nat_expr(expr, &entry.dimensions, &[], element_reads)
+                native_nat_expr(expr, &entry.dimensions, &[], native_reads)
                     .map(crate::checked::NativeDefault::Value)
                     .map_err(|message| (expr.span, message)),
             ),
@@ -1642,7 +1677,7 @@ fn check_native(
                         expr,
                         &entry.dimensions,
                         std::slice::from_ref(name),
-                        element_reads,
+                        native_reads,
                     )
                     .map(|condition| match least {
                         true => crate::checked::NativeDefault::Least(condition),
@@ -1774,7 +1809,7 @@ fn check_native(
     }
 
     let expression = |expr: &crate::syntax::ast::Expr, errors: &mut Vec<(Span, String)>| {
-        native_nat_expr(expr, &entry.dimensions, &parameter_names, element_reads)
+        native_nat_expr(expr, &entry.dimensions, &parameter_names, native_reads)
             .map_err(|message| errors.push((expr.span, message)))
             .ok()
     };
@@ -1786,7 +1821,7 @@ fn check_native(
                      errors: &mut Vec<(Span, String)>| match expr {
         None => Some(None),
         Some(expr) => {
-            native_condition(clause, expr, &entry.dimensions, &parameter_names, element_reads)
+            native_condition(clause, expr, &entry.dimensions, &parameter_names, native_reads)
                 .map_err(|error| errors.push(error))
                 .ok()
                 .map(Some)
@@ -1806,7 +1841,7 @@ fn check_native(
     // `where` may read the elements: admissible configurations are those of
     // the implementation at its bindings (`NativeImplementation::at_elements`).
     let constraint = native.constraint.as_ref().and_then(|expr| {
-        native_condition("where", expr, &entry.dimensions, &where_names, element_reads)
+        native_condition("where", expr, &entry.dimensions, &where_names, native_reads)
             .map_err(|error| errors.push(error))
             .ok()
     });
@@ -2143,14 +2178,14 @@ fn check_native(
             .collect::<Vec<_>>();
         let launch_expression = |expr: &crate::syntax::ast::Expr,
                                  errors: &mut Vec<(Span, String)>| {
-            native_nat_expr(expr, &entry.dimensions, &launch_names, element_reads)
+            native_nat_expr(expr, &entry.dimensions, &launch_names, native_reads)
                 .map_err(|message| errors.push((expr.span, message)))
                 .ok()
         };
         let when = match &launch.when {
             None => Some(None),
             Some(expr) => {
-                native_condition("when", expr, &entry.dimensions, &launch_names, element_reads)
+                native_condition("when", expr, &entry.dimensions, &launch_names, native_reads)
                     .map_err(|error| errors.push(error))
                     .ok()
                     .map(Some)
@@ -2480,7 +2515,7 @@ fn native_condition(
     expression: &crate::syntax::ast::Expr,
     dimensions: &[String],
     parameters: &[String],
-    elements: NativeElements<'_>,
+    reads: NativeReads<'_>,
 ) -> Result<crate::checked::NativeCondition, (Span, String)> {
     use crate::checked::{NativeComparison, NativeCondition};
     use crate::syntax::ast::{BinaryOp, ExprKind};
@@ -2495,7 +2530,7 @@ fn native_condition(
     // A capability the backend provides stands as a condition: it holds.
     if let ExprKind::Attr { base, name } = &expression.kind {
         if matches!(&base.kind, ExprKind::Name(device) if device.name == "device")
-            && crate::device::provided(elements.backend, &name.name)
+            && crate::device::provided(reads.backend, &name.name)
                 == Some(crate::device::PropertyKind::Support)
         {
             return Ok(NativeCondition::Compare {
@@ -2518,8 +2553,8 @@ fn native_condition(
     };
     let comparison = match op {
         BinaryOp::And | BinaryOp::Or => {
-            let left = Box::new(native_condition(clause, lhs, dimensions, parameters, elements)?);
-            let right = Box::new(native_condition(clause, rhs, dimensions, parameters, elements)?);
+            let left = Box::new(native_condition(clause, lhs, dimensions, parameters, reads)?);
+            let right = Box::new(native_condition(clause, rhs, dimensions, parameters, reads)?);
             return Ok(match op {
                 BinaryOp::And => NativeCondition::And(left, right),
                 _ => NativeCondition::Or(left, right),
@@ -2534,7 +2569,7 @@ fn native_condition(
         _ => return Err(not_a_condition()),
     };
     let operand = |expr: &crate::syntax::ast::Expr| {
-        native_nat_expr(expr, dimensions, parameters, elements)
+        native_nat_expr(expr, dimensions, parameters, reads)
             .map_err(|message| (expr.span, message))
     };
     Ok(NativeCondition::Compare {
@@ -2544,17 +2579,19 @@ fn native_condition(
     })
 }
 
-/// The element parameters a native expression may read, those the entry
-/// converts into (`repack[U = W]`: bound only to a registered conversion's
-/// packed destination), and the backend whose forms `form(W, NAME)` names.
+/// What a native expression may read beyond its dimensions and parameters:
+/// the entry's element parameters, those it converts into (`repack[U = W]`:
+/// bound only to a registered conversion's packed destination), the backend
+/// whose forms `form(W, NAME)` names and whose properties `device.NAME`
+/// reads.
 #[derive(Clone, Copy)]
-struct NativeElements<'a> {
+struct NativeReads<'a> {
     parameters: &'a [String],
     destinations: &'a [String],
     backend: crate::registry::BackendName,
 }
 
-impl NativeElements<'_> {
+impl NativeReads<'_> {
     /// Element parameter `argument` of a read, as `call` names it.
     fn parameter(self, call: &str, argument: &crate::syntax::ast::Arg) -> Result<String, String> {
         match &argument.value.kind {
@@ -2575,37 +2612,28 @@ fn native_nat_expr(
     expression: &crate::syntax::ast::Expr,
     dimensions: &[String],
     parameters: &[String],
-    elements: NativeElements<'_>,
+    reads: NativeReads<'_>,
 ) -> Result<crate::checked::NativeNatExpr, String> {
-    use crate::checked::{ElementQuery, NativeNatExpr as N};
+    nat_expr(expression, &|read| native_read(read, dimensions, parameters, reads))
+}
+
+/// The closed integer language ([`crate::checked::NativeNatExpr`]) of
+/// `expression`: integer literals, `+`, `-`, `*`, `/`, `%`, `ceil_div`,
+/// `min` and `max` over `read` of every other expression (a name, any other
+/// call, a device property), which reads it or refuses it.
+fn nat_expr(
+    expression: &crate::syntax::ast::Expr,
+    read: &dyn Fn(&crate::syntax::ast::Expr) -> Result<crate::checked::NativeNatExpr, String>,
+) -> Result<crate::checked::NativeNatExpr, String> {
+    use crate::checked::NativeNatExpr as N;
     use crate::syntax::ast::{BinaryOp, ExprKind};
     let binary = |left: &crate::syntax::ast::Expr,
                   right: &crate::syntax::ast::Expr,
                   make: fn(Box<N>, Box<N>) -> N| {
-        Ok(make(
-            Box::new(native_nat_expr(left, dimensions, parameters, elements)?),
-            Box::new(native_nat_expr(right, dimensions, parameters, elements)?),
-        ))
+        Ok(make(Box::new(nat_expr(left, read)?), Box::new(nat_expr(right, read)?)))
     };
     match &expression.kind {
         ExprKind::Int(value) => Ok(N::Constant(*value)),
-        ExprKind::Name(name) if dimensions.contains(&name.name) => {
-            Ok(N::Dimension(name.name.clone()))
-        }
-        ExprKind::Name(name) if parameters.contains(&name.name) => {
-            Ok(N::Parameter(name.name.clone()))
-        }
-        ExprKind::Name(name) => crate::forms::constants(elements.backend)
-            .iter()
-            .find(|(constant, _)| *constant == name.name)
-            .map(|(_, value)| N::Constant(*value))
-            .ok_or_else(|| {
-                format!(
-                    "native expression references `{}`, which is neither a dimension, a native parameter nor a constant of `{}`",
-                    name.name,
-                    elements.backend.as_str()
-                )
-            }),
         ExprKind::Binary { op, lhs, rhs } => match op {
             BinaryOp::Add => binary(lhs, rhs, N::Add),
             BinaryOp::Sub => binary(lhs, rhs, N::Sub),
@@ -2618,10 +2646,60 @@ fn native_nat_expr(
             callee,
             bindings,
             args,
+        } if bindings.is_empty()
+            && args.len() == 2
+            && args.iter().all(|arg| arg.name.is_none())
+            && matches!(&callee.kind, ExprKind::Name(name) if matches!(name.name.as_str(), "ceil_div" | "min" | "max")) =>
+        {
+            let make: fn(Box<N>, Box<N>) -> N = match &callee.kind {
+                ExprKind::Name(name) if name.name == "ceil_div" => N::CeilDiv,
+                ExprKind::Name(name) if name.name == "min" => N::Min,
+                ExprKind::Name(name) if name.name == "max" => N::Max,
+                _ => unreachable!("the guard admits only `ceil_div`, `min` and `max`"),
+            };
+            binary(&args[0].value, &args[1].value, make)
+        }
+        _ => read(expression),
+    }
+}
+
+/// A native expression's read of what the integer language ([`nat_expr`])
+/// leaves to it: a dimension, a native parameter, a backend constant, an
+/// element read or a device property.
+fn native_read(
+    expression: &crate::syntax::ast::Expr,
+    dimensions: &[String],
+    parameters: &[String],
+    reads: NativeReads<'_>,
+) -> Result<crate::checked::NativeNatExpr, String> {
+    use crate::checked::{ElementQuery, NativeNatExpr as N};
+    use crate::syntax::ast::ExprKind;
+    match &expression.kind {
+        ExprKind::Name(name) if dimensions.contains(&name.name) => {
+            Ok(N::Dimension(name.name.clone()))
+        }
+        ExprKind::Name(name) if parameters.contains(&name.name) => {
+            Ok(N::Parameter(name.name.clone()))
+        }
+        ExprKind::Name(name) => crate::forms::constants(reads.backend)
+            .iter()
+            .find(|(constant, _)| *constant == name.name)
+            .map(|(_, value)| N::Constant(*value))
+            .ok_or_else(|| {
+                format!(
+                    "native expression references `{}`, which is neither a dimension, a native parameter nor a constant of `{}`",
+                    name.name,
+                    reads.backend.as_str()
+                )
+            }),
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
         } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "operands") => {
             match (bindings.is_empty(), args.as_slice()) {
                 (true, [arg]) => Ok(N::Element(
-                    elements.parameter("operands", arg)?,
+                    reads.parameter("operands", arg)?,
                     ElementQuery::Operands,
                 )),
                 _ => Err("`operands` takes one element parameter".to_owned()),
@@ -2633,7 +2711,7 @@ fn native_nat_expr(
             args,
         } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "packed") => {
             match (bindings.is_empty(), args.as_slice()) {
-                (true, [arg]) => Ok(N::Element(elements.parameter("packed", arg)?, ElementQuery::Packed)),
+                (true, [arg]) => Ok(N::Element(reads.parameter("packed", arg)?, ElementQuery::Packed)),
                 _ => Err("`packed` takes one element parameter".to_owned()),
             }
         }
@@ -2644,7 +2722,7 @@ fn native_nat_expr(
         } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "dense_bytes") => {
             match (bindings.is_empty(), args.as_slice()) {
                 (true, [arg]) => {
-                    Ok(N::Element(elements.parameter("dense_bytes", arg)?, ElementQuery::DenseBytes))
+                    Ok(N::Element(reads.parameter("dense_bytes", arg)?, ElementQuery::DenseBytes))
                 }
                 _ => Err("`dense_bytes` takes one element parameter".to_owned()),
             }
@@ -2656,8 +2734,8 @@ fn native_nat_expr(
         } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "unit_columns") => {
             match (bindings.is_empty(), args.as_slice()) {
                 (true, [arg]) => {
-                    let element = elements.parameter("unit_columns", arg)?;
-                    if !elements.destinations.contains(&element) {
+                    let element = reads.parameter("unit_columns", arg)?;
+                    if !reads.destinations.contains(&element) {
                         return Err(format!(
                             "`unit_columns` reads a conversion's destination; `{element}` is not one (`repack[U = {element}]`)"
                         ));
@@ -2672,14 +2750,14 @@ fn native_nat_expr(
             bindings,
             args,
         } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "form") => {
-            let names = crate::forms::names(elements.backend);
+            let names = crate::forms::names(reads.backend);
             let form = |arg: &crate::syntax::ast::Arg| match &arg.value.kind {
                 ExprKind::Name(name) if arg.name.is_none() => {
-                    crate::forms::Form::named(elements.backend, &name.name).ok_or_else(|| {
+                    crate::forms::Form::named(reads.backend, &name.name).ok_or_else(|| {
                         format!(
                             "`{}` is not a form of `{}`; its forms are {}",
                             name.name,
-                            elements.backend.as_str(),
+                            reads.backend.as_str(),
                             if names.is_empty() { "none".to_owned() } else { names.join(", ") }
                         )
                     })
@@ -2688,7 +2766,7 @@ fn native_nat_expr(
             };
             match (bindings.is_empty(), args.as_slice()) {
                 (true, [element, name]) => Ok(N::Element(
-                    elements.parameter("form", element)?,
+                    reads.parameter("form", element)?,
                     ElementQuery::Form(form(name)?),
                 )),
                 _ => Err("`form` takes an element parameter and a form name".to_owned()),
@@ -2709,7 +2787,7 @@ fn native_nat_expr(
                         let names: Vec<&str> = crate::producers::Axis::ALL.iter().map(|axis| axis.name()).collect();
                         format!("`axis` names a decode axis: one of {}", names.join(", "))
                     })?;
-                    Ok(N::Element(elements.parameter("axis", element)?, ElementQuery::Axis(axis)))
+                    Ok(N::Element(reads.parameter("axis", element)?, ElementQuery::Axis(axis)))
                 }
                 _ => Err("`axis` takes an element parameter and a decode axis name".to_owned()),
             }
@@ -2732,36 +2810,15 @@ fn native_nat_expr(
                     let ExprKind::Int(values) = &values.kind else {
                         return Err("`row_bytes` reads the bytes of an integer count of values".to_owned());
                     };
-                    Ok(N::Element(elements.parameter("row_bytes", element)?, ElementQuery::RowBytes(part, *values)))
+                    Ok(N::Element(reads.parameter("row_bytes", element)?, ElementQuery::RowBytes(part, *values)))
                 }
                 _ => Err("`row_bytes` takes an element parameter, `codes` or `coefficients`, and a count of values".to_owned()),
             }
         }
-        ExprKind::Call {
-            callee,
-            bindings,
-            args,
-        } if bindings.is_empty()
-            && args.len() == 2
-            && args.iter().all(|arg| arg.name.is_none()) =>
-        {
-            let make: fn(Box<N>, Box<N>) -> N = match &callee.kind {
-                ExprKind::Name(name) if name.name == "ceil_div" => N::CeilDiv,
-                ExprKind::Name(name) if name.name == "min" => N::Min,
-                ExprKind::Name(name) if name.name == "max" => N::Max,
-                _ => {
-                    return Err(
-                        "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form`, `axis`, `row_bytes`, `packed`, `dense_bytes` and `unit_columns`"
-                            .to_owned()
-                    );
-                }
-            };
-            binary(&args[0].value, &args[1].value, make)
-        }
         ExprKind::Attr { base, name }
             if matches!(&base.kind, ExprKind::Name(device) if device.name == "device") =>
         {
-            match crate::device::provided(elements.backend, &name.name) {
+            match crate::device::provided(reads.backend, &name.name) {
                 Some(crate::device::PropertyKind::Support | crate::device::PropertyKind::Count) => {
                     Ok(N::Device(name.name.clone()))
                 }
@@ -2774,12 +2831,55 @@ fn native_nat_expr(
                 None => Err(format!(
                     "`device.{}` is not a property `{}` provides",
                     name.name,
-                    elements.backend.as_str()
+                    reads.backend.as_str()
                 )),
             }
         }
+        ExprKind::Call { .. } => Err(
+            "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form`, `axis`, `row_bytes`, `packed`, `dense_bytes` and `unit_columns`"
+                .to_owned(),
+        ),
         _ => Err("unsupported native expression".to_owned()),
     }
+}
+
+/// A module constant function (`const NAME(P, ..) = EXPR`), checked: its
+/// body ([`ConstantBody`](crate::checked::ConstantBody)) over its
+/// parameters, the module's `constants` (each the integer it names) and
+/// integers, admitted by [`ConstantFunction::new`](crate::checked::ConstantFunction::new).
+fn constant_function(
+    function: &crate::syntax::ast::ConstFnDecl,
+    constants: &std::collections::BTreeMap<String, u64>,
+) -> Result<crate::checked::ConstantFunction, (Span, String)> {
+    use crate::checked::ConstantBody as B;
+    use crate::syntax::ast::{BinaryOp, Expr, ExprKind};
+    let parameters: Vec<String> = function.parameters.iter().map(|parameter| parameter.name.clone()).collect();
+    fn body(
+        expression: &Expr,
+        parameters: &[String],
+        constants: &std::collections::BTreeMap<String, u64>,
+    ) -> Result<B, String> {
+        let binary = |left: &Expr, right: &Expr, make: fn(Box<B>, Box<B>) -> B| {
+            Ok(make(Box::new(body(left, parameters, constants)?), Box::new(body(right, parameters, constants)?)))
+        };
+        match &expression.kind {
+            ExprKind::Int(value) => Ok(B::Constant(*value)),
+            ExprKind::Name(name) if parameters.contains(&name.name) => Ok(B::Parameter(name.name.clone())),
+            ExprKind::Name(name) if constants.contains_key(&name.name) => Ok(B::Constant(constants[&name.name])),
+            ExprKind::Binary { op: BinaryOp::Add, lhs, rhs } => binary(lhs, rhs, B::Add),
+            ExprKind::Binary { op: BinaryOp::Sub, lhs, rhs } => binary(lhs, rhs, B::Sub),
+            ExprKind::Binary { op: BinaryOp::Mul, lhs, rhs } => binary(lhs, rhs, B::Mul),
+            ExprKind::Binary { op: BinaryOp::Div, lhs, rhs } => binary(lhs, rhs, B::Div),
+            ExprKind::Binary { op: BinaryOp::Rem, lhs, rhs } => binary(lhs, rhs, B::Rem),
+            _ => Err(format!(
+                "a module constant function reads only its parameters ({}), module constants and integers, by `+`, `-`, `*`, `/` and `%`",
+                parameters.join(", ")
+            )),
+        }
+    }
+    let checked = body(&function.body, &parameters, constants).map_err(|message| (function.body.span, message))?;
+    crate::checked::ConstantFunction::new(function.name.name.clone(), parameters, checked)
+        .map_err(|message| (function.name.span, message))
 }
 
 fn element_summary(element: &Elem) -> crate::checked::ElementSummary {
