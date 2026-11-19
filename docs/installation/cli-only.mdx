@@ -48,41 +48,11 @@ This allows connections on networks Windows treats as private. If the server's n
 
 ## Keep it running in the background
 
-To serve after you disconnect and after a restart, register `magnitude serve` with the system's service manager. Every definition below runs the `magnitude` command, never a versioned path inside `~/.magnitude/cli`, so it keeps working after updates. Set up only one per machine.
+To keep serving after you disconnect and after a restart, register `magnitude serve` with the system's service manager. Each definition below starts it at boot, with nobody logged in, and runs it as you, with your `~/.magnitude`. It runs the `magnitude` command, never a versioned path inside `~/.magnitude/cli`, so it keeps working after updates. Set up only one per machine.
 
 <Tabs>
 <Tab title="macOS">
-**At login.** A LaunchAgent runs `serve` while you're logged in at the Mac:
-
-```sh
-mkdir -p ~/Library/LaunchAgents ~/.magnitude/logs
-cat > ~/Library/LaunchAgents/dev.magnitude.serve.plist <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>dev.magnitude.serve</string>
-  <key>ProgramArguments</key>
-  <array><string>$HOME/.magnitude/bin/magnitude</string><string>serve</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Interactive</string>
-  <key>StandardOutPath</key><string>$HOME/.magnitude/logs/serve.log</string>
-  <key>StandardErrorPath</key><string>$HOME/.magnitude/logs/serve.log</string>
-</dict>
-</plist>
-EOF
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.magnitude.serve.plist
-```
-
-To stop and remove it:
-
-```sh
-launchctl bootout gui/$(id -u)/dev.magnitude.serve
-rm ~/Library/LaunchAgents/dev.magnitude.serve.plist
-```
-
-**At boot, before anyone logs in.** On a headless Mac, use a LaunchDaemon instead. It still runs as you, with your `~/.magnitude`. Run these as yourself, not in a root shell:
+A LaunchDaemon runs `serve` as you. Run these as yourself, not in a root shell:
 
 ```sh
 mkdir -p ~/.magnitude/logs
@@ -114,17 +84,19 @@ sudo chmod 644 /Library/LaunchDaemons/dev.magnitude.serve.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/dev.magnitude.serve.plist
 ```
 
-With FileVault on, nothing starts after a restart until someone unlocks the disk. To stop and remove it:
+With FileVault on, nothing starts after a restart until someone unlocks the disk.
+
+Logs: `~/.magnitude/logs/serve.log` and `~/.magnitude/logs/service.log`
+
+To stop and remove it:
 
 ```sh
 sudo launchctl bootout system/dev.magnitude.serve
 sudo rm /Library/LaunchDaemons/dev.magnitude.serve.plist
 ```
-
-Logs: `~/.magnitude/logs/serve.log` and `~/.magnitude/logs/service.log`
 </Tab>
 <Tab title="Linux">
-A systemd user unit runs `serve` as you:
+A systemd user unit runs `serve` as you, and lingering starts it at boot and keeps it running when you're not logged in:
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -140,13 +112,8 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 EOF
-systemctl --user daemon-reload && systemctl --user enable --now magnitude
-```
-
-This starts it now and whenever you log in. To start it at boot and keep it running when you're not logged in:
-
-```sh
 sudo loginctl enable-linger $USER
+systemctl --user daemon-reload && systemctl --user enable --now magnitude
 ```
 
 Logs: `journalctl --user -u magnitude`
@@ -160,20 +127,7 @@ systemctl --user daemon-reload
 ```
 </Tab>
 <Tab title="Windows">
-**At sign-in.** In your own PowerShell, register a scheduled task:
-
-```powershell
-$action = New-ScheduledTaskAction -Execute "$env:LOCALAPPDATA\Programs\Magnitude CLI\magnitude.exe" -Argument "serve"
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
-Start-ScheduledTask -TaskName "Magnitude"
-```
-
-It runs in your session with a console window; closing the window stops serving until you sign in again.
-
-**At startup, before anyone signs in.** On a machine such as Windows Server, register it at startup from an administrator PowerShell, for the account that installed Magnitude:
+A scheduled task runs `serve` as the account that installed Magnitude. From an administrator PowerShell, set `$account` and `$userProfile` to that account and its profile folder:
 
 ```powershell
 $account = "$env:COMPUTERNAME\alice"
@@ -182,17 +136,19 @@ $userProfile = "C:\Users\alice"
 Add-LocalGroupMember -Group "Performance Log Users" -Member $account -ErrorAction SilentlyContinue
 $action = New-ScheduledTaskAction -Execute "$userProfile\AppData\Local\Programs\Magnitude CLI\magnitude.exe" -Argument "serve"
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+# Checks every minute and starts serve again if it has exited; a running serve is left alone.
+$restart = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 $password = (Get-Credential $account).GetNetworkCredential().Password
-Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -User $account -Password $password -RunLevel Limited
+Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger, $restart -Settings $settings -User $account -Password $password -RunLevel Limited
 Start-ScheduledTask -TaskName "Magnitude"
 ```
 
-Windows runs a task as another account before anyone signs in only with that account's password, so the task keeps it (entered in a prompt, never on the command line). A standard account also needs the right to log on as a batch job, which the group above grants; you can instead grant "Log on as a batch job" in Local Security Policy. Register the task again after the account's password changes.
+Windows runs a task with nobody signed in only with the account's password, so the task keeps it (entered in a prompt, never on the command line). Register the task again after the password changes.
 
 Logs: `%USERPROFILE%\.magnitude\logs\service.log`
 
-To stop and remove it (from an administrator PowerShell for the startup task):
+To stop and remove it, from an administrator PowerShell:
 
 ```powershell
 Stop-ScheduledTask -TaskName "Magnitude"

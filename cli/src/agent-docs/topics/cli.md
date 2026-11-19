@@ -28,7 +28,7 @@ irm https://magnitude.dev/install.ps1 | iex
 
 No npm package is needed. Open a new terminal or SSH session after installation to use `magnitude`;
 the Windows script also updates PATH in its current PowerShell session. See `magnitude docs headless`
-for the CLI-only install, running `magnitude serve` in the background at login, updates, and removal.
+for the CLI-only install, running `magnitude serve` in the background, updates, and removal.
 
 ## Commands
 

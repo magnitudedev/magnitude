@@ -70,13 +70,13 @@ open, it serves, and any `magnitude serve`, in a terminal or a background servic
 account, prints that another Magnitude app is serving and waits. When the app quits, `serve` takes
 over again by itself.
 
-## Running it in the background at login
+## Running it in the background
 
 Ask your user before setting this up. A background service keeps the inference API running, and
-using memory and the GPU while a model is loaded, until it is removed. Confirm which they want: at
-login, or at boot before anyone logs in (a headless machine).
+using memory and the GPU while a model is loaded, until it is removed.
 
-Every definition below calls the `magnitude` command (`~/.magnitude/bin/magnitude`, or
+Each definition below starts `serve` at boot, with nobody logged in, and runs it as the user with
+their `~/.magnitude`. Every one calls the `magnitude` command (`~/.magnitude/bin/magnitude`, or
 `%LOCALAPPDATA%\Programs\Magnitude CLI\magnitude.exe` on Windows), never a path inside
 `~/.magnitude/cli/<version>/`. That keeps it working across updates, and on macOS and Windows a
 later desktop install runs the app's CLI through the same definition (on Linux, see Switching to the
@@ -85,50 +85,11 @@ serves and resumes when it quits.
 
 Set up only one of these per computer. Check that it serves with `magnitude status`.
 
-### macOS: at login
+### macOS
 
-A LaunchAgent runs `serve` as the user while they are logged in at the Mac. launchd does not expand
-`~` or `$HOME` inside a plist, so the heredoc below writes the absolute home path:
-
-```sh
-mkdir -p ~/Library/LaunchAgents ~/.magnitude/logs
-cat > ~/Library/LaunchAgents/dev.magnitude.serve.plist <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>dev.magnitude.serve</string>
-  <key>ProgramArguments</key>
-  <array><string>$HOME/.magnitude/bin/magnitude</string><string>serve</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Interactive</string>
-  <key>StandardOutPath</key><string>$HOME/.magnitude/logs/serve.log</string>
-  <key>StandardErrorPath</key><string>$HOME/.magnitude/logs/serve.log</string>
-</dict>
-</plist>
-EOF
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.magnitude.serve.plist
-```
-
-`launchctl bootstrap gui/...` needs the user logged in at the Mac; over SSH without that login, use
-the LaunchDaemon below. After editing the plist, run the `bootout` command below and then
-`bootstrap` again.
-
-- Restart: `launchctl kickstart -k gui/$(id -u)/dev.magnitude.serve`
-- Logs: `~/.magnitude/logs/serve.log`, and the service's own log at `~/.magnitude/logs/service.log`
-- Stop and remove:
-
-  ```sh
-  launchctl bootout gui/$(id -u)/dev.magnitude.serve
-  rm ~/Library/LaunchAgents/dev.magnitude.serve.plist
-  ```
-
-### macOS: at boot, before login
-
-For a headless Mac, a LaunchDaemon starts at boot and keeps running after logout. It still runs as
-the user, with their `~/.magnitude`, through `UserName`. It needs `sudo`; run the commands as the
-user, not in a root shell, so `$HOME` and `id -un` name them:
+A LaunchDaemon runs `serve` as the user through `UserName`. launchd does not expand `~` or `$HOME`
+inside a plist, so the heredoc below writes the absolute home path. It needs `sudo`; run the
+commands as the user, not in a root shell, so `$HOME` and `id -un` name them:
 
 ```sh
 mkdir -p ~/.magnitude/logs
@@ -160,9 +121,11 @@ sudo chmod 644 /Library/LaunchDaemons/dev.magnitude.serve.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/dev.magnitude.serve.plist
 ```
 
-With FileVault on, nothing starts after a restart until someone unlocks the disk.
+With FileVault on, nothing starts after a restart until someone unlocks the disk. After editing the
+plist, run the `bootout` command below and then `bootstrap` again.
 
 - Restart: `sudo launchctl kickstart -k system/dev.magnitude.serve`
+- Logs: `~/.magnitude/logs/serve.log`, and the service's own log at `~/.magnitude/logs/service.log`
 - Stop and remove:
 
   ```sh
@@ -176,7 +139,8 @@ LaunchDaemon. It keeps working. To remove it:
 
 ### Linux
 
-A systemd user unit runs `serve` as the user:
+A systemd user unit runs `serve` as the user, and lingering starts it at boot and keeps it running
+without anyone logged in:
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -192,14 +156,8 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 EOF
-systemctl --user daemon-reload && systemctl --user enable --now magnitude
-```
-
-This starts it now and whenever the user logs in, and stops it at their last logout. To start it at
-boot and keep it running without anyone logged in, also run:
-
-```sh
 sudo loginctl enable-linger $USER
+systemctl --user daemon-reload && systemctl --user enable --now magnitude
 ```
 
 - Status: `systemctl --user status magnitude`
@@ -218,33 +176,11 @@ sudo loginctl enable-linger $USER
 Over SSH, `systemctl --user` needs the user's session bus. If it reports that it can't connect, log in
 over SSH directly as the user (not through `su` or `sudo -u`).
 
-### Windows: at logon
+### Windows
 
-A scheduled task runs `serve` as the user when they sign in. In the user's own PowerShell:
-
-```powershell
-$action = New-ScheduledTaskAction -Execute "$env:LOCALAPPDATA\Programs\Magnitude CLI\magnitude.exe" -Argument "serve"
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-# Checks every minute and starts serve again if it has exited; a running serve is left alone.
-$restart = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger, $restart -Settings $settings -Principal $principal
-Start-ScheduledTask -TaskName "Magnitude"
-```
-
-It runs in the user's session, so a console window for `magnitude.exe` stays open while it serves;
-closing that window stops serving only until the task's next check, within a minute. To stop serving
-for a while, `Disable-ScheduledTask -TaskName "Magnitude"`, then `Stop-ScheduledTask -TaskName "Magnitude"`;
-`Enable-ScheduledTask -TaskName "Magnitude"` turns it back on.
-If Windows refuses to register the task with "Access is denied", run the same commands in an
-administrator PowerShell; the task still runs as the user.
-
-### Windows: at startup, before sign-in
-
-For a Windows machine that serves without anyone signed in, such as Windows Server, register the task
-at startup from an administrator PowerShell. Set `$account` to the account that installed Magnitude
-(`COMPUTERNAME\user`, or `DOMAIN\user`) and `$userProfile` to its profile folder:
+A scheduled task runs `serve` as the account that installed Magnitude. From an administrator
+PowerShell, set `$account` to that account (`COMPUTERNAME\user`, or `DOMAIN\user`) and `$userProfile`
+to its profile folder:
 
 ```powershell
 $account = "$env:COMPUTERNAME\alice"
@@ -262,9 +198,9 @@ Start-ScheduledTask -TaskName "Magnitude"
 ```
 
 The task keeps the account's password, entered in a prompt rather than typed on the command line,
-because Windows runs a task as another account before anyone signs in only with its password. A standard
-account also needs the right to log on as a batch job; the group above grants it (or grant "Log on as a
-batch job" in Local Security Policy). After the account's password changes, register the task again.
+because Windows runs a task with nobody signed in only with its password. A standard account also
+needs the right to log on as a batch job; the group above grants it (or grant "Log on as a batch job"
+in Local Security Policy). After the account's password changes, register the task again.
 
 If other computers need to reach it, allow inbound TCP port 10100 in Windows Defender Firewall from an
 administrator PowerShell. Cloud servers usually have a Public network profile, so the rule covers every
@@ -274,11 +210,11 @@ profile; set `-RemoteAddress` to the addresses of your clients to admit only the
 New-NetFirewallRule -DisplayName "Magnitude" -Direction Inbound -Protocol TCP -LocalPort 10100 -Action Allow -Profile Any -RemoteAddress Any
 ```
 
-### Windows: status, logs and removal
-
 - Status: `Get-ScheduledTask -TaskName "Magnitude" | Get-ScheduledTaskInfo`, and `magnitude status`
 - Logs: `%USERPROFILE%\.magnitude\logs\service.log`
-- Stop and remove (administrator PowerShell for the startup task):
+- Stop for a while: `Disable-ScheduledTask -TaskName "Magnitude"`, then `Stop-ScheduledTask -TaskName "Magnitude"`;
+  `Enable-ScheduledTask -TaskName "Magnitude"` turns it back on.
+- Stop and remove, from an administrator PowerShell:
 
   ```powershell
   Stop-ScheduledTask -TaskName "Magnitude"

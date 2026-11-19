@@ -41,7 +41,7 @@ curl -H "Authorization: Bearer KEY" http://ADDRESS:10100/inference/v1/models
 
 On the remote computer, install the CLI only (see `magnitude docs headless`), turn on Network access
 in its `~/.magnitude/config.json` as above, and run `magnitude serve`. To keep it serving after logout
-and across restarts, set it up as a background service at login or at boot, as described in
+and across restarts, set it up as a background service that starts at boot, as described in
 `magnitude docs headless`; ask your user before doing that. `magnitude status` on the remote computer
 shows the addresses other devices can use, never the key.
 
