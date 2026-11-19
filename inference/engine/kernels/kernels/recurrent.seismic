@@ -417,9 +417,9 @@ native gated_delta_step for cuda from "cuda/gated_delta_step.cu":
 # Vulkan: the CUDA step. Workgroup (value head, state-row block, slot); each
 # subgroup holds ROWS state rows in registers for the whole slot. ROWS and
 # WARPS never change result bits. Shared: a span's prepared q | k | v
-# channels and gates. `gate` forms each (head, row): to 8 rows W / 8 lanes
-# each sum eight columns' squares in order, then a butterfly; beyond, lanes
-# stride the columns, then a subgroup sum.
+# channels and gates. `gate` forms each (head, row), a workgroup two rows'
+# subgroups: to 8 rows W / 8 lanes each sum eight columns' squares in order,
+# then a butterfly; beyond, lanes stride the columns, then a subgroup sum.
 native gated_delta_step for vulkan from "vulkan/gated_delta_step.comp":
     static (NK, NV, W, C)
     params (ROWS in [2, 4] default 2, WARPS in [4, 8] default 4)
@@ -430,9 +430,8 @@ native gated_delta_step for vulkan from "vulkan/gated_delta_step.comp":
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes ((8 * (2 * W + ROWS * WARPS) + 16) * 4)
     launch gated_delta_step_gate:
-        threadgroups (NV, M, 1)
-        threads_per_threadgroup (32, 1, 1)
-        shared_bytes (128)
+        threadgroups (NV, ceil_div(M, 2), 1)
+        threads_per_threadgroup (64, 1, 1)
 
 # CPU: a work item per (value head, ROWS state rows, slot) holds its state
 # rows privately for the whole slot and computes each row's prologue itself.
@@ -637,9 +636,8 @@ native gated_delta_chunk for vulkan from "vulkan/gated_delta_chunk.comp":
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes ((8 * (2 * W + ROWS * WARPS) + 16) * 4)
     launch gated_delta_chunk_gate:
-        threadgroups (NV, M, 1)
-        threads_per_threadgroup (32, 1, 1)
-        shared_bytes (128)
+        threadgroups (NV, ceil_div(M, 2), 1)
+        threads_per_threadgroup (64, 1, 1)
 
 # CPU: `inputs` convolves and normalizes each slot row once into scratch (one
 # work item per row), with the step's arithmetic; the scan advances every
@@ -780,9 +778,8 @@ native kimi_delta_step for vulkan from "vulkan/kimi_delta_step.comp":
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes (8 * (3 * W + ROWS * WARPS + 1) * 4)
     launch kimi_delta_step_gate:
-        threadgroups (NV, M, 1)
-        threads_per_threadgroup (32, 1, 1)
-        shared_bytes (128)
+        threadgroups (NV, ceil_div(M, 2), 1)
+        threads_per_threadgroup (64, 1, 1)
 
 # CPU: `gated_delta_step`'s work items; private bytes: the state rows, the
 # key head's q and k, the rows' v and the head's W decay factors.
@@ -888,9 +885,8 @@ native kimi_delta_chunk for vulkan from "vulkan/kimi_delta_chunk.comp":
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes (8 * (3 * W + ROWS * WARPS + 1) * 4)
     launch kimi_delta_chunk_gate:
-        threadgroups (NV, M, 1)
-        threads_per_threadgroup (32, 1, 1)
-        shared_bytes (128)
+        threadgroups (NV, ceil_div(M, 2), 1)
+        threads_per_threadgroup (64, 1, 1)
 
 # CPU: `gated_delta_chunk`'s launches, staging W decay factors per value head
 # and row.

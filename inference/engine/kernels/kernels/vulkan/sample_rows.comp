@@ -80,17 +80,21 @@ void sample_rows_partition() {
     float score = -SAMPLE_INF;
     uint token = SAMPLE_NO_TOKEN;
     uint bad = 0u;
-    for (uint t = begin + gl_LocalInvocationIndex; t < end; t += gl_WorkGroupSize.x) {
+    // The slice's tokens the subgroup reduction combines, spread by
+    // `SEISMIC_THREAD` (no subgroup operation lies inside). The draw stays
+    // behind the admission test, so a subgroup whose tokens are all rejected
+    // skips it.
+    seismic_strided_from(uint, t, begin, SEISMIC_THREAD, end, gl_WorkGroupSize.x) {
         const float value = element_f32_at(line + uint64_t(t) * SEISMIC_LOGITS_STRIDE_1 * 4ul);
         bad |= (isnan(value) || value == SAMPLE_INF) ? 1u : 0u;
-        if (!(value > -SAMPLE_INF && value < SAMPLE_INF))
-            continue;
-        if (masked && ((element_u32_at(bits + uint64_t(t / 32u) * SEISMIC_MASK_STRIDE_1 * 4ul) >> (t % 32u)) & 1u) == 0u)
-            continue;
-        const float candidate = sample_gumbel_score(value, t, draw, SEISMIC_DRAWS_STRIDE_1);
-        if (sample_better(candidate, t, score, token)) {
-            score = candidate;
-            token = t;
+        const bool admitted = value > -SAMPLE_INF && value < SAMPLE_INF
+            && (!masked || ((element_u32_at(bits + uint64_t(t / 32u) * SEISMIC_MASK_STRIDE_1 * 4ul) >> (t % 32u)) & 1u) != 0u);
+        if (admitted) {
+            const float candidate = sample_gumbel_score(value, t, draw, SEISMIC_DRAWS_STRIDE_1);
+            if (sample_better(candidate, t, score, token)) {
+                score = candidate;
+                token = t;
+            }
         }
     }
     sample_subgroup_best(score, token, bad);
@@ -100,14 +104,17 @@ void sample_rows_partition() {
         seismic_shared_u32[3u * SEISMIC_SUBGROUP + 2u] = bad;
     }
     barrier();
-    if (SEISMIC_SUBGROUP == 0u) {
+    // Subgroup 0 merges the subgroup winners; its lane 0 publishes. On 64
+    // lanes its hardware subgroup's other logical subgroup merges alongside.
+    bool merging;
+    if (seismic_steer(merging, SEISMIC_SUBGROUP == 0u)) {
         const uint lane = SEISMIC_LANE;
         const bool present = lane < SEISMIC_SUBGROUPS;
         score = present ? uintBitsToFloat(seismic_shared_u32[3u * lane]) : -SAMPLE_INF;
         token = present ? seismic_shared_u32[3u * lane + 1u] : SAMPLE_NO_TOKEN;
         bad = present ? seismic_shared_u32[3u * lane + 2u] : 0u;
         sample_subgroup_best(score, token, bad);
-        if (lane == 0u) {
+        if (merging && lane == 0u) {
             const uint64_t slot = partials + (row * SEISMIC_TUNE_PARTS + part) * 12ul;
             element_u32_put(slot, floatBitsToUint(score));
             element_u32_put(slot + 4ul, token);

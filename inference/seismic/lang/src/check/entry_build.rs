@@ -1847,27 +1847,23 @@ fn build_schema_parameters(
             binding: semantic.binding,
         });
     }
-    // Tensor pairs are disjoint whenever either side is mutable/owned.
-    // Shared/shared pairs may overlap.
+    // Tensor pairs are disjoint whenever either side is written
+    // (`TensorAccess::writer`); pairs neither writes may overlap.
     let mut aliases = Vec::new();
     for left in 0..parameters.len() {
         for right in left + 1..parameters.len() {
-            let tensor =
-                |parameter: &Parameter| matches!(parameter.kind, ParameterKind::Tensor { .. });
-            let shared = |parameter: &Parameter| {
-                matches!(
-                    parameter.kind,
-                    ParameterKind::Tensor {
-                        access: TensorAccess::Shared,
-                        ..
-                    }
-                )
+            // Each tensor parameter's: whether it is written.
+            let written = |parameter: &Parameter| match &parameter.kind {
+                ParameterKind::Tensor { access, .. } => Some(access.writer().is_some()),
+                _ => None,
             };
-            if tensor(&parameters[left]) && tensor(&parameters[right]) {
-                aliases.push(if shared(&parameters[left]) && shared(&parameters[right]) {
-                    AliasRule::MayOverlap(parameters[left].id, parameters[right].id)
-                } else {
+            if let (Some(left_written), Some(right_written)) =
+                (written(&parameters[left]), written(&parameters[right]))
+            {
+                aliases.push(if left_written || right_written {
                     AliasRule::Disjoint(parameters[left].id, parameters[right].id)
+                } else {
+                    AliasRule::MayOverlap(parameters[left].id, parameters[right].id)
                 });
             }
         }

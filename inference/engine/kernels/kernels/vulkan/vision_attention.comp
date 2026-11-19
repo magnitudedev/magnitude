@@ -24,14 +24,19 @@
 // row: query heads, key heads, value heads. Rows past M publish zeros.
 void vision_attention_prepare() {
     const uint row = gl_WorkGroupID.x;
-    const uint part = gl_WorkGroupID.y * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
-    if (part >= VISION_SLOTS)
+    // A hardware subgroup without a part leaves; a logical subgroup past the
+    // parts on a 64-lane one prepares the last part again and stores nothing.
+    const uint placed = gl_WorkGroupID.y * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
+    bool live;
+    if (!seismic_steer(live, placed < VISION_SLOTS))
         return;
+    const uint part = live ? placed : VISION_SLOTS - 1u;
     const uint64_t target = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS)
         + ((uint64_t(part) * VISION_PADDED + row) * VISION_WP) * 2ul;
     if (row >= VISION_M) {
-        for (uint i = SEISMIC_LANE; i < VISION_WP; i += 32u)
-            element_put(ELEMENT_F16, target, i, 0.0);
+        if (live)
+            for (uint i = SEISMIC_LANE; i < VISION_WP; i += 32u)
+                element_put(ELEMENT_F16, target, i, 0.0);
         return;
     }
     const uint plane = part < VISION_H ? 0u : part < VISION_H + uint(SEISMIC_DIM_KV) ? 1u : 2u;
@@ -42,7 +47,7 @@ void vision_attention_prepare() {
         : plane == 1u ? SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM) : 0ul;
     const uint heads = plane == 0u ? VISION_H : uint(SEISMIC_DIM_KV);
     const uint head = plane == 0u ? part : part - VISION_H - (plane - 1u) * uint(SEISMIC_DIM_KV);
-    vision_prepare_head(ACTIVATION_A, source + (uint64_t(row) * heads + head) * VISION_W * 2ul, target, normed,
+    vision_prepare_head(ACTIVATION_A, source + (uint64_t(row) * heads + head) * VISION_W * 2ul, target, live, normed,
         norm, element_word_f32(SEISMIC_PARAM_EPSILON), plane < 2u && element_word_f32(SEISMIC_PARAM_LOG_BASE) != 0.0,
         SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + uint64_t(row) * 8ul, element_word_f32(SEISMIC_PARAM_LOG_BASE),
         VISION_W, VISION_WP);

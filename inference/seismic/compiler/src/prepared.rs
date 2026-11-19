@@ -261,7 +261,10 @@ pub struct TensorDescriptor {
     pub representation: RepresentationId,
     pub extents: Vec<u64>,
     pub strides: Vec<u64>,
-    /// Allocation identity and byte range, for alias checks.
+    /// The identity of the storage the view lies in, and its byte range
+    /// there: what identifies the tensor's storage to its holders (a host
+    /// binding's validity gate keys on it). Binding is checked by the
+    /// bytes the runtime binds, not by this.
     pub allocation: u64,
     pub byte_offset: u64,
     pub byte_len: u64,
@@ -588,21 +591,6 @@ mod internals {
             }
         }
 
-        for alias in schema.aliases() {
-            let (first, second) = match *alias {
-                seismic_lang::entry::AliasRule::Disjoint(first, second) => (first, second),
-                seismic_lang::entry::AliasRule::MayOverlap(_, _) => continue,
-            };
-            let first_tensor = tensor_argument(schema, arguments, first);
-            let second_tensor = tensor_argument(schema, arguments, second);
-            if byte_ranges_overlap(first_tensor, second_tensor) {
-                return Err(InvocationError::IllegalAliasing {
-                    first: parameter_label(schema.parameter(first)),
-                    second: parameter_label(schema.parameter(second)),
-                });
-            }
-        }
-
         match contract.target_domain.evaluate(&values) {
             Ok(true) => Ok(values),
             Ok(false) | Err(_) => Err(InvocationError::OutsideTargetDomain),
@@ -675,37 +663,6 @@ mod internals {
             }
             _ => None,
         }
-    }
-
-    fn tensor_argument<'a>(
-        schema: &CallSchema,
-        arguments: &'a [ArgumentValue],
-        parameter: seismic_lang::ids::ParameterId,
-    ) -> &'a TensorDescriptor {
-        let position = schema
-            .parameters()
-            .iter()
-            .position(|candidate| candidate.id == parameter)
-            .unwrap_or_else(|| panic!("alias rule names a parameter outside its schema"));
-        let ArgumentValue::Tensor(tensor) = &arguments[position] else {
-            panic!("alias rule names a non-tensor parameter");
-        };
-        tensor
-    }
-
-    fn byte_ranges_overlap(first: &TensorDescriptor, second: &TensorDescriptor) -> bool {
-        if first.allocation != second.allocation || first.byte_len == 0 || second.byte_len == 0 {
-            return false;
-        }
-        let first_end = first
-            .byte_offset
-            .checked_add(first.byte_len)
-            .unwrap_or(u64::MAX);
-        let second_end = second
-            .byte_offset
-            .checked_add(second.byte_len)
-            .unwrap_or(u64::MAX);
-        first.byte_offset < second_end && second.byte_offset < first_end
     }
 }
 

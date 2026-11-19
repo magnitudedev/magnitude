@@ -282,27 +282,21 @@ enum Former {
     },
 }
 
-/// The preparation baseline of the Vulkan floor: a 32-lane fp16 device
-/// without cooperative matrix, declaring every seal mode.
-const VULKAN_BASE: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTarget {
-    subgroup_lanes: seismic_vulkan::SUBGROUP_WIDTH,
-    float16: true,
-    matrix: false,
-    matrix_hardware: false,
-    wide_accumulators: true,
-    mixed_dot: true,
-    f32_atomic_add: false,
-    shared_int64_atomics: false,
-    rounding_rte_32: true,
-    denorm_preserve_32: true,
-};
-
 /// The Vulkan floor's cooperative-matrix target: the baseline with the
 /// matrix path formed, whose sources no baseline formation compiles.
 const VULKAN_MATRIX: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTarget {
     matrix: true,
     matrix_hardware: true,
-    ..VULKAN_BASE
+    ..seismic_vulkan::FormationTarget::FLOOR
+};
+
+/// The Vulkan floor's 64-lane target (AMD GCN): the baseline with two
+/// logical subgroups in each hardware subgroup, where a logical subgroup's
+/// identity derives from the hardware lane, so the execution model is
+/// checked on its sources too.
+const VULKAN_WIDE: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTarget {
+    subgroup_lanes: 2 * seismic_vulkan::SUBGROUP_WIDTH,
+    ..seismic_vulkan::FormationTarget::FLOOR
 };
 
 impl Former {
@@ -364,11 +358,21 @@ impl Former {
 
     /// The configurations every entry's base forms in ([`form_bases`]):
     /// each source path a configuration selects, so a check that forms only
-    /// the bases still compiles every path. On Vulkan the floor baseline and
-    /// its cooperative-matrix target.
+    /// the bases still compiles every path. On Vulkan the floor baseline,
+    /// its cooperative-matrix target and its 64-lane target, each without
+    /// maximal reconvergence and with it: the strided loops form as rounds
+    /// in the one and as plain loops in the other, and the uniformity check
+    /// holds each form to its own rule.
     fn bases(&self) -> Vec<Configuration> {
         match self {
-            Self::Vulkan => vec![Configuration::Vulkan(VULKAN_BASE), Configuration::Vulkan(VULKAN_MATRIX)],
+            Self::Vulkan => [seismic_vulkan::FormationTarget::FLOOR, VULKAN_MATRIX, VULKAN_WIDE]
+                .into_iter()
+                .flat_map(|target| {
+                    [false, true].map(|maximal_reconvergence| {
+                        Configuration::Vulkan(seismic_vulkan::FormationTarget { maximal_reconvergence, ..target })
+                    })
+                })
+                .collect(),
             Self::Cuda { architectures, .. } => vec![Configuration::Cuda {
                 architecture: architectures[0],
             }],
@@ -1112,30 +1116,33 @@ impl<'m> Subject<'m> {
 
     /// The programs preparation forms for `row`, every code variant of a
     /// launch-scoped implementation among their entries: none of a launch no
-    /// admissible configuration reaches.
-    fn programs(&self, row: &Row) -> Vec<ProgramSource> {
+    /// admissible configuration reaches. A Vulkan program's entries are its
+    /// formed launches, each with the workgroup size and constants its
+    /// pipeline takes on any device (`vulkan_entries`), or preparation's
+    /// refusal of the row's geometry.
+    fn programs(&self, row: &Row) -> Result<Vec<ProgramSource>, String> {
         let logical = self
             .module
             .entry(self.info.id, &row.bindings)
             .expect("a row's bindings are admitted");
         let dialect = row.configuration.dialect();
         let implementation = self.implementation(&row.bindings);
-        match dialect {
-            Dialect::Vulkan(_) => vec![ProgramSource {
-                text: render_source(
-                    dialect,
-                    &logical,
-                    &row.bindings,
-                    implementation,
-                    &row.specialization,
-                    self.asset,
-                ),
-                entries: implementation
-                    .launches
-                    .iter()
-                    .map(|launch| ProgramEntry::named(launch.kernel.as_str()))
-                    .collect(),
-            }],
+        Ok(match dialect {
+            Dialect::Vulkan(_) => {
+                let formed = super::formed_launches(implementation, &row.specialization);
+                let entries = super::vulkan_entries(&self.info.name, implementation, &row.specialization, &formed)?;
+                vec![ProgramSource {
+                    text: render_source(
+                        dialect,
+                        &logical,
+                        &row.bindings,
+                        implementation,
+                        &row.specialization,
+                        self.asset,
+                    ),
+                    entries: entries.into_iter().flatten().map(|(entry, _)| entry).collect(),
+                }]
+            }
             Dialect::Cuda(_) | Dialect::Metal(_) => super::implementation_programs(
                 dialect,
                 &logical,
@@ -1148,7 +1155,7 @@ impl<'m> Subject<'m> {
             .into_iter()
             .filter(|program| !program.entries.is_empty())
             .collect(),
-        }
+        })
     }
 
     /// How many programs [`Self::programs`] renders for a row: one per
@@ -1172,7 +1179,10 @@ impl<'m> Subject<'m> {
             Configuration::Vulkan(_) | Configuration::Metal { .. } => String::new(),
         };
         let dialect = row.configuration.dialect();
+        // A row whose geometry preparation refuses forms nothing, so reaches
+        // nothing: its refusal is its formation's (`form_row`).
         self.programs(row)
+            .unwrap_or_default()
             .iter()
             .map(|program| skeleton(&program.text, self.asset.text, &self.label, dialect, &preamble))
             .collect()
@@ -1836,7 +1846,10 @@ fn form_row(subject: &Subject<'_>, forms: Forms<'_>, row: &Row) -> RowOutcome {
     if !forms.former.formable(row.configuration) {
         return RowOutcome::Unformable;
     }
-    let programs = subject.programs(row);
+    let programs = match subject.programs(row) {
+        Ok(programs) => programs,
+        Err(refusal) => return RowOutcome::Failed(refusal),
+    };
     gated(|| {
         for program in &programs {
             match forms.form(row.configuration, program) {
@@ -2599,7 +2612,7 @@ mod tests {
             &text,
             asset,
             "k.comp",
-            Dialect::Vulkan(abi::vulkan::VulkanFeatures::of(&VULKAN_BASE)),
+            Dialect::Vulkan(abi::vulkan::VulkanFeatures::of(&seismic_vulkan::FormationTarget::FLOOR)),
             "",
         );
         assert_eq!(

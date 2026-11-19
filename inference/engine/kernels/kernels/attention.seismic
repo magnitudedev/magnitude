@@ -785,7 +785,8 @@ native attention_decode for cuda from "cuda/attention_decode.cu":
 #
 # MATRIX selects the grouped-query matrix form: the prefill's cooperative-matrix
 # L2 (`vulkan/lib/attention/prefill.glsl` with PREFILL_DECODE) over row tiles of
-# 16 * SIMDS / G rows, whose query heads are the matrix rows; its rows'
+# 16 * SIMDS / G rows (two subgroups at least: one would leave a 64-lane
+# hardware subgroup partial), whose query heads are the matrix rows; its rows'
 # 32-key tiles sit at fixed positions of each row's key sequence, each
 # partition taking a contiguous run of them. Shared bytes: the prefill's, then the
 # query tile [16 * SIMDS][W + 8] f16 and its rows' factors [16 * SIMDS] F32.
@@ -814,7 +815,7 @@ native attention_decode for vulkan from "vulkan/attention_decode.comp":
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
         arithmetic SIMDS in [4, 8, 1, 2] default 4, arithmetic SLICES in [1, 2, 4, 8] default 1,
         arithmetic form MATRIX in [0, 1] default 0, arithmetic GROUPS in [1, 2, 4, 8, 16, 32, 64] default 1)
-    where KR <= 1 and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and VK <= 1 and G % GROUPS == 0 and (GROUPS == 1 or (MATRIX == 0 and G * (2 * P + S) * 2 > 32768)) and (RA == 0 or (2 * P + S) % 64 == 0 or (2 * P + S) == 32) and (RO == 0 or (P > 0 and I == 0 and U == 0)) and SK <= 1 and (I == 0 or I == (2 * P + S)) and (U == 0 or U == 1 or U == (2 * P + S)) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (G / GROUPS) % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or SIMDS >= 4) and (MATRIX == 1 or SIMDS * (G / GROUPS / SLICES) * 8 + max(SIMDS, ceil_div(G / GROUPS, 2)) * (2 * P + S) * 4 <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 <= 32768 and (G * (2 * P + S) * 2 > 32768 or 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 + SIMDS * 16 * 4 <= 32768))) and (AB == 0 or MATRIX == 0)
+    where KR <= 1 and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and VK <= 1 and G % GROUPS == 0 and (GROUPS == 1 or (MATRIX == 0 and G * (2 * P + S) * 2 > 32768)) and (RA == 0 or (2 * P + S) % 64 == 0 or (2 * P + S) == 32) and (RO == 0 or (P > 0 and I == 0 and U == 0)) and SK <= 1 and (I == 0 or I == (2 * P + S)) and (U == 0 or U == 1 or U == (2 * P + S)) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (G / GROUPS) % SLICES == 0 and SIMDS % SLICES == 0 and (SIMDS >= 4 or (MATRIX == 1 and SIMDS >= 2)) and (MATRIX == 1 or SIMDS * (G / GROUPS / SLICES) * 8 + max(SIMDS, ceil_div(G / GROUPS, 2)) * (2 * P + S) * 4 <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 <= 32768 and (G * (2 * P + S) * 2 > 32768 or 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 + SIMDS * 16 * 4 <= 32768))) and (AB == 0 or MATRIX == 0)
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
     scratch queries bytes ((ceil_div(M, max(1, SIMDS * 16 / G)) * max(1, SIMDS * 16 / G) * KV * G + SIMDS * 16) * (2 * P + S) * 2) when MATRIX == 1 and G * (2 * P + S) * 2 > 32768
@@ -829,8 +830,8 @@ native attention_decode for vulkan from "vulkan/attention_decode.comp":
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes ((1 - MATRIX) * (SIMDS * (G / GROUPS / SLICES) * 8 + max(SIMDS, ceil_div(G / GROUPS, 2)) * (2 * P + S) * 4) + MATRIX * (64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + (1 - min(1, G * (2 * P + S) * 2 / 32769)) * SIMDS * 16 * (((2 * P + S) + 8) * 2 + 4)))
     launch attention_decode_merge:
-        threadgroups (KV * G, M, 1)
-        threads_per_threadgroup (2 * P + S, 1, 1)
+        threadgroups (ceil_div(KV * G, (1 + (2 * P + S) / 32 % 2)), M, 1)
+        threads_per_threadgroup ((2 * P + S) * (1 + (2 * P + S) / 32 % 2), 1, 1)
     launch attention_decode_rotate when RO == 1:
         threadgroups (M, KV * G, 1)
         threads_per_threadgroup (ceil_div(P, 32) * 32, 1, 1)
@@ -1110,8 +1111,8 @@ native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes (SIMDS * (G / SLICES) * 8 + max(SIMDS, ceil_div(G / SLICES, 2)) * (2 * P + S) * 4)
     launch attention_prefill_gate when MATRIX == 0:
-        threadgroups (KV * G, M, 1)
-        threads_per_threadgroup ((2 * P + S), 1, 1)
+        threadgroups (ceil_div(KV * G, (1 + (2 * P + S) / 32 % 2)), M, 1)
+        threads_per_threadgroup ((2 * P + S) * (1 + (2 * P + S) / 32 % 2), 1, 1)
     launch attention_prefill_prepare when MATRIX == 1:
         threadgroups (ceil_div(ceil_div(M, ROWS / G) * (ROWS / G) * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -1124,8 +1125,8 @@ native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
         threads_per_threadgroup (ROWS * 2, 1, 1)
         shared_bytes (64 * (min((2 * P + S), 256) + 8) + ROWS / 16 * 2048)
     launch attention_prefill_picks when KS > 0:
-        threadgroups (M, KV * G, 1)
-        threads_per_threadgroup (32, 1, 1)
+        threadgroups (M, ceil_div(KV * G, 2), 1)
+        threads_per_threadgroup (64, 1, 1)
     launch attention_prefill_merge when MATRIX == 1 and (SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV or KS > 0):
         threadgroups (ceil_div(M, ROWS / G), KV * G, 1)
         threads_per_threadgroup ((2 * P + S), 1, 1)
@@ -1616,8 +1617,9 @@ native attention_decode_k8v4 for cuda from "cuda/attention_decode_k8v4.cu":
 # from shared memory, the codes corrected per group, no per-key subgroup
 # reduction), one subgroup maximum and sum per head and batch, and each lane
 # decodes its value columns as it accumulates them. History rows are read
-# coalesced through a per-subgroup staging tile, so the form admits one and
-# two subgroups. Its shared bytes, after the states: the queries [G][W]
+# coalesced through a per-subgroup staging tile, so the form admits two
+# subgroups, as the matrix form does (one would leave a 64-lane hardware
+# subgroup partial; the searches never chose it). Its shared bytes, after the states: the queries [G][W]
 # (F32), each subgroup's weights [32][G / SLICES] (F32), the query group sums
 # [G][W / 32] (F32) and each subgroup's staging tile [32][max(min(W, 128) /
 # 16, W / 32 + ceil(W / 128)) + 1] (uvec4), with 32 bytes of 16-byte
@@ -1641,7 +1643,7 @@ native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp"
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
         arithmetic SIMDS in [4, 8, 1, 2] default 2, arithmetic SLICES in [1, 2, 4, 8] default 1,
         arithmetic form MATRIX in [0, 1] default 0, arithmetic form KEYWISE in [0, 1] default 1)
-    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or KEYWISE == 1 or SIMDS >= 4) and (MATRIX == 0 or KEYWISE == 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + (1 - KEYWISE) * max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4 + KEYWISE * max(SIMDS * (2 * P + S) * 4, 32 + G * (2 * P + S) * 4 + SIMDS * (G / SLICES) * 128 + G * (2 * P + S) / 8 + SIMDS * 512 * (max(min((2 * P + S), 128) / 16, (2 * P + S) / 32 + ceil_div((2 * P + S), 128)) + 1)) <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 + SIMDS * 16 * 4 <= 32768))
+    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (SIMDS >= 4 or ((MATRIX == 1 or KEYWISE == 1) and SIMDS >= 2)) and (MATRIX == 0 or KEYWISE == 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + (1 - KEYWISE) * max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4 + KEYWISE * max(SIMDS * (2 * P + S) * 4, 32 + G * (2 * P + S) * 4 + SIMDS * (G / SLICES) * 128 + G * (2 * P + S) / 8 + SIMDS * 512 * (max(min((2 * P + S), 128) / 16, (2 * P + S) / 32 + ceil_div((2 * P + S), 128)) + 1)) <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 + SIMDS * 16 * 4 <= 32768))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
     launch attention_decode_k8v4_partial:
@@ -1649,8 +1651,8 @@ native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp"
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + (1 - KEYWISE) * max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4 + KEYWISE * max(SIMDS * (2 * P + S) * 4, 32 + G * (2 * P + S) * 4 + SIMDS * (G / SLICES) * 128 + G * (2 * P + S) / 8 + SIMDS * 512 * (max(min((2 * P + S), 128) / 16, (2 * P + S) / 32 + ceil_div((2 * P + S), 128)) + 1))) + MATRIX * (64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * (((2 * P + S) + 8) * 2 + 4)))
     launch attention_decode_k8v4_merge:
-        threadgroups (KV * G, M, 1)
-        threads_per_threadgroup (2 * P + S, 1, 1)
+        threadgroups (ceil_div(KV * G, (1 + (2 * P + S) / 32 % 2)), M, 1)
+        threads_per_threadgroup ((2 * P + S) * (1 + (2 * P + S) / 32 % 2), 1, 1)
 
 # CPU: the dense CPU decode's launch and partitions (units a kv head and
 # row): `attend` prepares its own queries, keys and values, part 0

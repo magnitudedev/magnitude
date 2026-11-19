@@ -1334,6 +1334,12 @@ impl Inner {
         if properties.fma_32.holds() {
             extensions.push(facts::SHADER_FMA_EXTENSION);
         }
+        if target.subgroup_uniform_control_flow {
+            extensions.push(ash::khr::shader_subgroup_uniform_control_flow::NAME);
+        }
+        if target.maximal_reconvergence {
+            extensions.push(ash::khr::shader_maximal_reconvergence::NAME);
+        }
         if facts.pipeline_statistics {
             extensions.push(ash::khr::pipeline_executable_properties::NAME);
         }
@@ -1355,6 +1361,10 @@ impl Inner {
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
             .shader_buffer_float32_atomic_add(true);
+        let mut uniform_control_flow = vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR::default()
+            .shader_subgroup_uniform_control_flow(true);
+        let mut maximal_reconvergence =
+            vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR::default().shader_maximal_reconvergence(true);
         let mut f11 =
             vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -1394,6 +1404,12 @@ impl Inner {
         }
         if properties.fma_32.holds() {
             features = features.push_next(&mut shader_fma);
+        }
+        if target.subgroup_uniform_control_flow {
+            features = features.push_next(&mut uniform_control_flow);
+        }
+        if target.maximal_reconvergence {
+            features = features.push_next(&mut maximal_reconvergence);
         }
         let mut executables =
             vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);

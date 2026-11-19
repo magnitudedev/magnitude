@@ -27,7 +27,8 @@ void ngram_gate() {
         float queries = 0.0;
         float dot = 0.0;
         float values = 0.0;
-        for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
+        // Numbered by `SEISMIC_THREAD`: the partials reach the reductions.
+        seismic_strided(uint64_t, i, uint64_t(SEISMIC_THREAD), width, gl_WorkGroupSize.x) {
             const float kv = element_f32_at(k + i * SEISMIC_KEY_STRIDE_2 * 4ul);
             const float xv = element_f32_at(x + i * SEISMIC_HIDDEN_STRIDE_2 * 4ul);
             const float vv = element_f32_at(v + i * SEISMIC_VALUE_STRIDE_1 * 4ul);

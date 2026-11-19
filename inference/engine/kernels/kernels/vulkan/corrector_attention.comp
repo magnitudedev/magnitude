@@ -28,11 +28,15 @@ void corrector_attention() {
     const uint64_t key_bias = SEISMIC_INPUT_BIAS_STRIDE_0 + head * SEISMIC_INPUT_BIAS_STRIDE_1;
     const uint64_t value_bias = 2ul * SEISMIC_INPUT_BIAS_STRIDE_0 + head * SEISMIC_INPUT_BIAS_STRIDE_1;
 
-    for (uint64_t key = SEISMIC_SUBGROUP; key < nodes; key += SEISMIC_SUBGROUPS) {
-        const uint64_t key_row = block * SEISMIC_QKV_STRIDE_0 + key * SEISMIC_QKV_STRIDE_1 + SEISMIC_QKV_STRIDE_2
-            + head * SEISMIC_QKV_STRIDE_3;
+    // One key a logical subgroup, steered while a logical subgroup holds a
+    // key: a logical subgroup past the keys on a 64-lane hardware subgroup
+    // scores the last key again and stores nothing.
+    bool held;
+    for (uint64_t key = SEISMIC_SUBGROUP; seismic_steer(held, key < nodes); key += SEISMIC_SUBGROUPS) {
+        const uint64_t key_row = block * SEISMIC_QKV_STRIDE_0 + (held ? key : nodes - 1ul) * SEISMIC_QKV_STRIDE_1
+            + SEISMIC_QKV_STRIDE_2 + head * SEISMIC_QKV_STRIDE_3;
         float partial = 0.0;
-        for (uint64_t c = SEISMIC_LANE; c < width; c += 32ul) {
+        seismic_strided(uint64_t, c, uint64_t(SEISMIC_LANE), width, 32ul) {
             const float q = element_f32_at(qkv + (query_row + c * SEISMIC_QKV_STRIDE_4) * 4ul)
                 + element_f32_at(input_bias + (query_bias + c * SEISMIC_INPUT_BIAS_STRIDE_2) * 4ul);
             const float k = element_f32_at(qkv + (key_row + c * SEISMIC_QKV_STRIDE_4) * 4ul)
@@ -40,7 +44,7 @@ void corrector_attention() {
             partial = seismic_fma_rn(q, k, partial);
         }
         const float dot = seismic_subgroup_sum_f32(partial);
-        if (SEISMIC_LANE == 0u)
+        if (held && SEISMIC_LANE == 0u)
             seismic_shared_f32[ATTENTION_SCORES + uint(key)] = dot * scale
                 + element_f32_at(bias + (head * SEISMIC_BIAS_STRIDE_0 + query * SEISMIC_BIAS_STRIDE_1
                     + key * SEISMIC_BIAS_STRIDE_2) * 4ul);

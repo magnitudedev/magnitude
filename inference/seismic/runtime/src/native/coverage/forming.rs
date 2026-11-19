@@ -96,11 +96,7 @@ fn formed(target: Target, program: &ProgramSource) -> Result<(), NativeCompilati
     match target {
         Target::Vulkan(facts) => {
             for entry in &program.entries {
-                seismic_vulkan::formation::compile(
-                    &program.text,
-                    &entry.symbol,
-                    facts.environment(),
-                )?;
+                seismic_vulkan::formation::form(&program.text, entry, facts.environment())?;
             }
             Ok(())
         }

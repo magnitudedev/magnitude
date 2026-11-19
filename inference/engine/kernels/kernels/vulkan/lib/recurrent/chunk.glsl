@@ -103,15 +103,22 @@ bool chunk_row_slot(uint64_t row, out recurrent_slot slot) {
 }
 
 // The inputs launch: one subgroup per (row, channel head) convolves the row
-// once with the step's arithmetic, W / 32 channels per lane.
+// once with the step's arithmetic, W / 32 channels per lane. A hardware
+// subgroup without a channel head leaves; a logical subgroup past them on a
+// 64-lane one convolves the last head again and stores nothing.
 void chunk_inputs() {
     const recurrent_inputs in_ = recurrent_inputs_of();
     const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INPUTS);
     const uint W = RECURRENT_W, C = RECURRENT_C, CPL = RECURRENT_CPL;
-    const uint channel_head = gl_WorkGroupID.y * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
+    const uint heads = 2u * RECURRENT_NK + RECURRENT_NV;
+    const uint placed = gl_WorkGroupID.y * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
     const uint64_t row = gl_WorkGroupID.x;
+    bool live;
+    if (!seismic_steer(live, placed < heads))
+        return;
+    const uint channel_head = live ? placed : heads - 1u;
     recurrent_slot slot;
-    if (channel_head >= 2u * RECURRENT_NK + RECURRENT_NV || !chunk_row_slot(row, slot))
+    if (!chunk_row_slot(row, slot))
         return;
     const uint lane = SEISMIC_LANE;
     const int position = int(row) - slot.lo;
@@ -131,10 +138,19 @@ void chunk_inputs() {
         values[c] = seismic_div_rn(sum, 1.0 + exp(-sum));
         squares = seismic_fma_rn(values[c], values[c], squares);
     }
+    // The q and k heads' square sum, taken wherever a hardware subgroup
+    // holds one (the logical subgroups of a 64-lane one may hold a value head
+    // beside it).
+    float total = 0.0;
+    bool normed;
+    if (seismic_steer(normed, channel_head < 2u * RECURRENT_NK))
+        total = seismic_subgroup_sum_f32(squares);
+    if (!live)
+        return;
     if (channel_head < 2u * RECURRENT_NK) {
         const bool key = channel_head >= RECURRENT_NK;
-        const float inverse = key ? inversesqrt(seismic_subgroup_sum_f32(squares) + in_.epsilon)
-                                  : inversesqrt(seismic_subgroup_sum_f32(squares) + in_.epsilon) * inversesqrt(float(W));
+        const float inverse = key ? inversesqrt(total + in_.epsilon)
+                                  : inversesqrt(total + in_.epsilon) * inversesqrt(float(W));
         const uint64_t destination = chunk_rows_at(inputs, channel_head % RECURRENT_NK, row) + (key ? W : 0u) * 4ul;
         [[unroll]] for (uint c = 0u; c < CPL; ++c)
             element_f32_put(destination + uint64_t(lane * CPL + c) * 4ul, values[c] * inverse);
@@ -205,7 +221,8 @@ void chunk_store(recurrent_inputs in_, int bank, uint head, uint state_row, floa
 #define CHUNK_BETA (CHUNK_DECAY + RECURRENT_SPAN * RECURRENT_DECAYS)
 
 // The piece of rows [first, first + count): each invocation's float4 items and
-// gates.
+// gates, spread by `SEISMIC_THREAD`, as the group butterflies reading them
+// need.
 struct chunk_stage {
     vec4 items[CHUNK_ITEMS_PER_THREAD];
     float gates[CHUNK_GATES_PER_THREAD];
@@ -214,7 +231,7 @@ struct chunk_stage {
 chunk_stage chunk_load_piece(uint64_t inputs, uint head, uint key_head, uint block_row, int first, int count) {
     chunk_stage stage;
     [[unroll]] for (uint i = 0u; i < CHUNK_ITEMS_PER_THREAD; ++i) {
-        const uint item = gl_LocalInvocationIndex + i * CHUNK_THREADS;
+        const uint item = SEISMIC_THREAD + i * CHUNK_THREADS;
         stage.items[i] = vec4(0.0);
         const uint r = item / (CHUNK_PREPARED / 4u), at = 4u * (item % (CHUNK_PREPARED / 4u));
         if (item < CHUNK_ITEMS && int(r) < count) {
@@ -225,7 +242,7 @@ chunk_stage chunk_load_piece(uint64_t inputs, uint head, uint key_head, uint blo
         }
     }
     [[unroll]] for (uint i = 0u; i < CHUNK_GATES_PER_THREAD; ++i) {
-        const uint item = gl_LocalInvocationIndex + i * CHUNK_THREADS;
+        const uint item = SEISMIC_THREAD + i * CHUNK_THREADS;
         const bool decay = item < RECURRENT_SPAN * RECURRENT_DECAYS;
         const uint r = decay ? item / RECURRENT_DECAYS : item - RECURRENT_SPAN * RECURRENT_DECAYS;
         stage.gates[i] = 0.0;
@@ -239,7 +256,7 @@ chunk_stage chunk_load_piece(uint64_t inputs, uint head, uint key_head, uint blo
 
 void chunk_store_piece(chunk_stage stage) {
     [[unroll]] for (uint i = 0u; i < CHUNK_ITEMS_PER_THREAD; ++i) {
-        const uint item = gl_LocalInvocationIndex + i * CHUNK_THREADS;
+        const uint item = SEISMIC_THREAD + i * CHUNK_THREADS;
         if (item < CHUNK_ITEMS) {
             const uint r = item / (CHUNK_PREPARED / 4u), at = 4u * (item % (CHUNK_PREPARED / 4u));
             [[unroll]] for (uint e = 0u; e < 4u; ++e)
@@ -247,7 +264,7 @@ void chunk_store_piece(chunk_stage stage) {
         }
     }
     [[unroll]] for (uint i = 0u; i < CHUNK_GATES_PER_THREAD; ++i) {
-        const uint item = gl_LocalInvocationIndex + i * CHUNK_THREADS;
+        const uint item = SEISMIC_THREAD + i * CHUNK_THREADS;
         if (item < CHUNK_GATES)
             seismic_shared_f32[CHUNK_DECAY + item] = stage.gates[i];
     }

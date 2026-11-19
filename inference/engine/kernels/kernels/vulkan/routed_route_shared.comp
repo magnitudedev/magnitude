@@ -68,7 +68,10 @@ void routed_route_shared_ordered_gemv4() { projection_segmented_ordered_gemv_mix
 void routed_route_shared_ordered_gemv8() { projection_segmented_ordered_gemv_mixed(8u, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES); }
 
 void routed_route_select() {
+    // A logical subgroup past the rows on a 64-lane hardware subgroup with a
+    // row ranks the last row again and stores nothing.
     const uint64_t row = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
-    if (row < SEISMIC_DIM_M)
-        route_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), row);
+    bool live;
+    if (seismic_steer(live, row < SEISMIC_DIM_M))
+        route_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), live ? row : SEISMIC_DIM_M - 1ul, live);
 }

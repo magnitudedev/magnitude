@@ -44,7 +44,7 @@ projection_epilogue projected_output(uint g) {
 void select_publish_decode_rows() {
     const projection_prologue norm_in = select_norm_input();
     const uint m = uint(SEISMIC_DIM_M);
-    for (uint idx = gl_LocalInvocationIndex; idx < m * SELECT_H; idx += gl_WorkGroupSize.x) {
+    for (uint idx = SEISMIC_THREAD; idx < m * SELECT_H; idx += PROJECTION_THREADS) {
         const uint r = idx / SELECT_H, c = idx % SELECT_H;
         out_put(SEISMIC_RESULT_0_OUT,
             uint64_t(r) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(c) * SEISMIC_RESULT_0_STRIDE_1,
@@ -65,7 +65,7 @@ void routed_select_ordered_stage() {
     const float inv = projection_ordered_stage_row(projected_input(0u), row,
         out_over_scratch(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)), SELECT_H, 1ul);
     const projection_prologue norm_in = select_norm_input();
-    for (uint c = gl_LocalInvocationIndex; c < SELECT_H; c += gl_WorkGroupSize.x) {
+    for (uint c = SEISMIC_THREAD; c < SELECT_H; c += PROJECTION_THREADS) {
         out_put(SEISMIC_RESULT_0_OUT,
             uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(c) * SEISMIC_RESULT_0_STRIDE_1,
             projection_ordered_at(norm_in, row, c, inv));
@@ -76,7 +76,11 @@ void routed_select_ordered_gemv() { projection_single_ordered_gemv(); }
 void routed_select_ordered_gemm() { projection_single_ordered_gemm(); }
 
 void routed_select_select() {
-    const uint64_t row = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
-    if (row < SEISMIC_DIM_M)
-        select_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), row);
+    // A hardware subgroup without a row leaves; a logical subgroup past the
+    // rows on a 64-lane one ranks the last row again and stores nothing.
+    const uint64_t placed = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + uint64_t(SEISMIC_SUBGROUP);
+    bool live;
+    if (!seismic_steer(live, placed < SEISMIC_DIM_M))
+        return;
+    select_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), live ? placed : SEISMIC_DIM_M - 1ul, live);
 }

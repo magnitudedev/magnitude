@@ -21,20 +21,15 @@
 #include "lib/attention/history.glsl"
 
 void attention_append_k8v4() {
-    // Item (row, kv_head) of each of a group's 8 subgroups.
+    // Item (row, kv_head) of each of a group's 8 subgroups; one past the rows
+    // has no destination and appends nothing (`history_append_fresh`, row 0
+    // existing).
     uint64_t row, head;
     seismic_split_group(gl_WorkGroupID.x, 8u, SEISMIC_SUBGROUP, ATTENTION_KV, row, head);
-    const uint kv_head = uint(head);
-    const uint lane = SEISMIC_LANE;
-    if (!ATTENTION_FRESH || row >= SEISMIC_DIM_M) return;
-    const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul);
-    if (destination < 0) return;
-    const attention_history h = attention_affine_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES),
-        SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS, SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
-        SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS);
-    float x[ATTENTION_E];
-    history_fresh_row(true, row, kv_head, lane, x);
-    history_hold(h, true, destination, kv_head, lane, false, x);
-    history_fresh_row(false, row, kv_head, lane, x);
-    history_hold(h, false, destination, kv_head, lane, false, x);
+    const int destination = ATTENTION_FRESH && row < SEISMIC_DIM_M
+        ? element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul)
+        : -1;
+    history_append_fresh(attention_affine_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES),
+            SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS, SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
+            SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS), row, 0ul, uint(head), destination);
 }

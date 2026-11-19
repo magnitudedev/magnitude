@@ -30,7 +30,7 @@ use crate::api::kernel::{
     EncodedScalar, EncodedWorkflowArgs, EncodedWorkflowArgument, NativePreparedAny, PendingWorkflowResults,
     ViewOperation, WorkflowResultRef, WorkflowTensorArgument,
 };
-use crate::api::tensor::{Records, TensorInner};
+use crate::api::tensor::{exclusive_pairs, meet, Reaching, Records, TensorInner};
 use crate::api::{CallError, GraphBuffer, LayoutMismatch, TensorError, WorkflowError};
 use crate::driver::Allocation;
 use crate::layout;
@@ -39,7 +39,7 @@ use seismic_compiler::errors::{ExecutionError, InvocationError};
 use seismic_compiler::graph_cost::{argument_bytes, GraphCensus, LaunchGraphs, LaunchedGraph};
 use seismic_compiler::prepared::{ArgumentValue, DeviceIdentity, TensorDescriptor};
 use seismic_lang::checked::NativeImplementation;
-use seismic_lang::entry::{AliasRule, CallSchema, ParameterKind, TensorAccess};
+use seismic_lang::entry::{CallSchema, ParameterKind, ResultKind};
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry::BackendName;
 use std::marker::PhantomData;
@@ -166,8 +166,6 @@ pub struct SealedNodeShape {
     words: usize,
     /// Declared launches, active or not.
     launches: usize,
-    /// Per pair of parameters the entry requires disjoint: their ordinals.
-    disjoint: Vec<[usize; 2]>,
     /// Whether a call parks (`CallSchema::parks`), so a park node precedes
     /// it.
     parks: bool,
@@ -178,13 +176,6 @@ pub struct SealedNodeShape {
 
 impl SealedNodeShape {
     pub fn of(schema: &CallSchema, implementation: &NativeImplementation) -> Self {
-        let parameter = |id| {
-            schema
-                .parameters()
-                .iter()
-                .position(|parameter| parameter.id == id)
-                .expect("alias rule names a schema parameter")
-        };
         let arguments = super::abi::buffer_slots(schema, implementation) - 2;
         let words = super::abi::native_word_count(schema, implementation);
         let launch_arguments = argument_bytes(implementation.backend, arguments as u64, 8 * words as u64);
@@ -200,16 +191,6 @@ impl SealedNodeShape {
             words,
             launches: implementation.launches.len(),
             census,
-            disjoint: schema
-                .aliases()
-                .iter()
-                .filter_map(|rule| match *rule {
-                    AliasRule::Disjoint(first, second) => {
-                        Some([parameter(first), parameter(second)])
-                    }
-                    _ => None,
-                })
-                .collect(),
             parks: schema.parks(),
         }
     }
@@ -1010,7 +991,7 @@ impl NativeGraphDraft {
             external_writes: vec![false; self.ports.len()],
             port_uses: vec![PortUse::default(); self.ports.len()],
             upload_written: false,
-            disjoint: Vec::new(),
+            exclusive: None,
             timelines: exact(self.timelines),
             marks: exact(self.marks),
             workspace_records: 0,
@@ -1021,8 +1002,9 @@ impl NativeGraphDraft {
             executable
                 .seal_node(kernel, &arguments, shape, planned, &storage, &self.ports, node)
                 .map_err(CallError::Workflow)?;
+            executable.exclude(node, planned)?;
         }
-        executable.disjoint = exact(executable.disjoint);
+        executable.refuse_plain_overlaps()?;
         let shape = PlanShape::of(identity, self.layout.as_deref(), &executable);
         Ok(NativeGraphPlan {
             identity,
@@ -1394,8 +1376,7 @@ impl NativeGraphMetadataDraft {
     /// The host heap of the plan this topology seals to
     /// (`NativeGraphPlan::host_heap`), from the lengths of its vectors: the
     /// plan in its shared allocation, its ports, each node's buffers, words
-    /// and launches, the external pairs a run checks disjoint, the result
-    /// specs, the exports and the placements.
+    /// and launches, the result specs, the exports and the placements.
     pub fn plan_heap(&self) -> HostHeap {
         use std::mem::size_of;
         let mut heap = HostHeap::default();
@@ -1411,30 +1392,12 @@ impl NativeGraphMetadataDraft {
         heap.hold(self.ports.len(), size_of::<PortUse>());
         heap.hold(self.timelines.len(), size_of::<(usize, TimelineNode)>());
         heap.hold(self.marks.len(), size_of::<usize>());
-        let mut disjoint = 0usize;
-        for (node, shape) in self.nodes.iter().zip(&self.shapes) {
+        for shape in &self.shapes {
             heap.hold(shape.buffers, size_of::<Site>());
             heap.hold(shape.arguments, size_of::<&'static str>());
             heap.hold(shape.words, size_of::<u64>());
             heap.hold(shape.launches, size_of::<Option<LaunchGeometry>>());
-            // A pair is checked per run when both arguments are external
-            // ports, and different ones (`Executable::seal_node`).
-            let external = |ordinal: usize| {
-                argument_reference(&node.args.arguments()[ordinal])
-                    .filter(|reference| {
-                        reference.node == INPUT_NODE && !self.ports[reference.result as usize].local
-                    })
-                    .map(|reference| reference.result)
-            };
-            for [first, second] in &shape.disjoint {
-                if let (Some(first), Some(second)) = (external(*first), external(*second)) {
-                    if first != second {
-                        disjoint += 1;
-                    }
-                }
-            }
         }
-        heap.hold(disjoint, size_of::<(PortRange, PortRange)>());
         heap.hold(
             self.results.len(),
             size_of::<Vec<Option<NativeTensorSpec>>>(),
@@ -2599,7 +2562,8 @@ fn exclusive(a: Option<Condition>, b: Option<Condition>) -> bool {
 /// Validate each node's shared result (`NativeGraphDraft::share`): it is a
 /// result of the node, of exactly the description of the result it shares,
 /// a result of another node whose condition is exclusive of its own; nothing
-/// reads, exports or stores it (its readers read the result it shares), and
+/// reads, exports or stores it (its readers read the result it shares), the
+/// node does not read the result it shares (the two take the same bytes), and
 /// the result it shares is neither stored nor itself shared.
 fn validate_shares(
     nodes: &[PlannedNode],
@@ -2625,7 +2589,7 @@ fn validate_shares(
         let primary_node = &nodes[primary.node as usize];
         let read = nodes.iter().any(|node| {
             node.args.arguments().iter().any(|argument| argument_reference(argument) == Some(other))
-        });
+        }) || planned.args.arguments().iter().any(|argument| argument_reference(argument) == Some(primary));
         let held = exports.contains(&other)
             || stores.iter().any(|store| store.result == other || store.result == primary)
             || primary_node.share.is_some_and(|(shared, _)| shared == primary.result);
@@ -2638,7 +2602,7 @@ fn validate_shares(
 
 /// Where a node's buffer lives. Only an external port's tensor is bound
 /// per run; every other buffer is placed at seal.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Region {
     /// The tensor bound to this external port (a port ordinal is a `u32`
     /// result reference); the site offset is added to the tensor's own byte
@@ -2663,6 +2627,16 @@ struct Site {
     bytes: u64,
     /// How it binds records, if it is a record port's.
     records: SiteRecords,
+    /// The site after it in its node's external chain
+    /// ([`ExternalPairs::first`]), where it is in one.
+    next_external: Option<u32>,
+}
+
+impl Site {
+    /// The bytes of its region it reaches.
+    fn range(&self) -> std::ops::Range<u64> {
+        self.offset..self.offset + self.bytes
+    }
 }
 
 /// The records a site binds (whole records, checked at seal), through a
@@ -2737,26 +2711,72 @@ struct SealedNode {
     /// Per launch ordinal, the launch conditions it is encoded under, a
     /// conjunction.
     conditions: Vec<Vec<LaunchCondition>>,
+    /// Where it is in [`Executable::exclusive`]'s chain: its external
+    /// pairs that bindings are checked for.
+    exclusive: Option<ExternalPairs>,
 }
 
-/// Byte range of an external port's view in one node argument.
-#[derive(Clone, Debug)]
-struct PortRange {
-    port: usize,
-    offset: u64,
-    bytes: u64,
-    /// The node and the ordinal of its entry parameter, which name the
-    /// parameter in the aliasing error from the node's own schema.
-    node: usize,
-    parameter: usize,
+/// A node's exclusive pairs ([`exclusive_pairs`]) of buffers both in external
+/// ports' tensors, whose bytes only bindings fix, as
+/// [`NativeGraphPlan::check_disjoint`] walks them: its external sites in a
+/// chain through [`Site::next_external`], those it writes first, so each
+/// one it writes pairs with every site after it, and nothing else does.
+/// Held inline in the node and its sites, so a plan's host heap is what its
+/// topology fixes ([`NativeGraphMetadataDraft::plan_heap`]).
+#[derive(Clone, Copy, Debug)]
+struct ExternalPairs {
+    /// The next node of the chain.
+    next: Option<u32>,
+    /// Its first external site.
+    first: u32,
 }
 
-impl PortRange {
-    fn parameter_name(&self, nodes: &[SealedNode]) -> String {
-        nodes[self.node].kernel.schema().parameters()[self.parameter]
-            .name
-            .clone()
+impl SealedNode {
+    /// The refusal of its buffers `first` and `second` (ABI order), an
+    /// exclusive pair ([`exclusive_pairs`]), bound to bytes in common.
+    fn aliasing(&self, first: usize, second: usize) -> CallError {
+        CallError::Invocation(InvocationError::IllegalAliasing {
+            first: self.buffer_name(first),
+            second: self.buffer_name(second),
+        })
     }
+
+    /// The name of its buffer `buffer` (ABI order): a tensor parameter's
+    /// own ([`super::abi::tensor_buffer_name`]), a tensor result's ordinal
+    /// among the entry's results, a scratch buffer's own.
+    fn buffer_name(&self, buffer: usize) -> String {
+        let (schema, implementation) = (self.kernel.schema(), self.kernel.implementation());
+        let parameters = schema
+            .parameters()
+            .iter()
+            .filter(|parameter| matches!(parameter.kind, ParameterKind::Tensor { .. }))
+            .count();
+        let scratch = self.sites.len() - implementation.scratch.len();
+        if buffer < parameters {
+            return super::abi::tensor_buffer_name(schema, buffer).to_owned();
+        }
+        if buffer >= scratch {
+            return format!("scratch {}", implementation.scratch[buffer - scratch].name);
+        }
+        let (ordinal, _) = schema
+            .results()
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| matches!(result.kind, ResultKind::Tensor { .. }))
+            .nth(buffer - parameters)
+            .expect("a result buffer is a tensor result's");
+        format!("result {ordinal}")
+    }
+}
+
+/// The external port of `node`'s site `buffer`, a link of its exclusive
+/// chain ([`ExternalPairs`]), and the site.
+fn external_site(node: &SealedNode, buffer: u32) -> (usize, &Site) {
+    let site = &node.sites[buffer as usize];
+    let Region::External(port) = site.region else {
+        unreachable!("an external chain links external sites");
+    };
+    (port as usize, site)
 }
 
 /// The sealed nodes and what a run must check of its external bindings.
@@ -2768,10 +2788,12 @@ struct Executable {
     port_uses: Vec<PortUse>,
     /// Whether any node writes a host-written input.
     upload_written: bool,
-    /// Argument pairs on two different external ports that their entry
-    /// requires to be disjoint. Pairs on graph storage, or on one port,
-    /// were decided at seal.
-    disjoint: Vec<(PortRange, PortRange)>,
+    /// The last node two of whose exclusive buffers lie in external ports'
+    /// tensors, the first of the chain through [`ExternalPairs::next`] that
+    /// bindings are checked along
+    /// ([`NativeGraphPlan::check_disjoint`]): the nodes a run's bindings can
+    /// alias, and only those.
+    exclusive: Option<u32>,
     /// Timeline nodes in order, each with the kernel node it precedes
     /// (`nodes.len()` after the last).
     timelines: Vec<(usize, TimelineNode)>,
@@ -2804,7 +2826,6 @@ impl Executable {
         let record_ports = kernel.records(&shape.launches);
         let mut sites = Vec::with_capacity(buffers);
         let mut representations = Vec::with_capacity(buffers);
-        let mut external = vec![None; arguments.len()];
         for (ordinal, ((parameter, argument), value)) in schema
             .parameters()
             .iter()
@@ -2824,26 +2845,30 @@ impl Executable {
                 let port = reference.result as usize;
                 match storage.port_placements[port] {
                     Some(placement) => placement.site(),
-                    None => {
-                        external[ordinal] = Some(PortRange {
-                            port,
-                            offset: descriptor.byte_offset,
-                            bytes: descriptor.byte_len,
-                            node,
-                            parameter: ordinal,
-                        });
-                        (Region::External(reference.result), 0)
-                    }
+                    None => (Region::External(reference.result), 0),
                 }
             } else {
                 storage.placements[reference.node as usize][reference.result as usize].site()
             };
-            let write = matches!(access, TensorAccess::Owned | TensorAccess::Mutable);
+            let write = access.writer().is_some();
             match region {
                 Region::External(port) => {
                     self.external_writes[port as usize] |= write;
                     self.port_uses[port as usize].grid |= kernel.reads_grid(ordinal);
                     self.port_uses[port as usize].slab |= kernel.addresses_slab(ordinal);
+                    // A slab port binds its port's address table from its
+                    // first entry (`QueuedRun::dispatch`), so it takes the
+                    // port's view from its first byte: a view of it from
+                    // another byte has no table the binding could address.
+                    // So a slab view with elements is bound only where a
+                    // site's offset is both its table's and its view's (the
+                    // hazards' and `NativeGraphPlan::check_disjoint`'s); an
+                    // empty one reaches nothing from any byte.
+                    if kernel.addresses_slab(ordinal) && descriptor.byte_offset != 0 && descriptor.byte_len > 0 {
+                        return Err(WorkflowError::PlainSlabBinding {
+                            parameter: parameter.name.clone(),
+                        });
+                    }
                 }
                 // Graph storage is never a slab view: a slab port takes it
                 // only where it holds no elements.
@@ -2862,6 +2887,7 @@ impl Executable {
                 offset: base + descriptor.byte_offset,
                 bytes: descriptor.byte_len,
                 records: SiteRecords::None,
+                next_external: None,
             };
             let (extents, strides) = (&descriptor.extents, &descriptor.strides);
             let (record, bound) = (record_ports[sites.len()], kernel.bound[sites.len()]);
@@ -2875,25 +2901,6 @@ impl Executable {
             representations
                 .push(seismic_lang::registry::representation_info(descriptor.representation).name);
         }
-        for rule in schema.aliases() {
-            let AliasRule::Disjoint(first, second) = *rule else {
-                continue;
-            };
-            let position = |id| {
-                schema
-                    .parameters()
-                    .iter()
-                    .position(|parameter| parameter.id == id)
-                    .expect("alias rule names a schema parameter")
-            };
-            if let (Some(first), Some(second)) =
-                (&external[position(first)], &external[position(second)])
-            {
-                if first.port != second.port {
-                    self.disjoint.push((first.clone(), second.clone()));
-                }
-            }
-        }
         for (ordinal, result) in shape.results.iter().enumerate() {
             let Some(spec) = result else { continue };
             let (region, offset) = storage.placements[node][ordinal].site();
@@ -2905,6 +2912,7 @@ impl Executable {
                 offset,
                 bytes: spec.byte_len,
                 records: SiteRecords::None,
+                next_external: None,
             };
             let record = record_ports[sites.len()];
             if !self.use_site(&mut site, record, false, true, spec.representation, &spec.extents, &spec.strides, ports) {
@@ -2925,7 +2933,10 @@ impl Executable {
                 if need.bytes > ports[port as usize].byte_len {
                     return Err(WorkflowError::NativePortMismatch { port: port as usize });
                 }
+                // Its bytes are elements, so the port binds no slab view
+                // with elements (whose binding is its address table).
                 self.port_uses[port as usize].direct = true;
+                self.port_uses[port as usize].plain = true;
                 if let Some(ScratchOperand::Emitted { .. }) = need.operand {
                     self.external_writes[port as usize] = true;
                 }
@@ -2935,6 +2946,7 @@ impl Executable {
                 offset,
                 bytes: need.bytes,
                 records: SiteRecords::None,
+                next_external: None,
             });
             representations.push("bytes");
         }
@@ -2988,7 +3000,113 @@ impl Executable {
             words: shape.words,
             launches: shape.launches,
             conditions,
+            exclusive: None,
         });
+        Ok(())
+    }
+
+    /// Hold node `node`'s buffers to the no-alias rule
+    /// ([`exclusive_pairs`]). Two of an exclusive pair in graph storage
+    /// meet only where they bind one value (its `planned` arguments name
+    /// it twice), which is refused; the planner places distinct values a
+    /// node binds apart. Pairs both in external ports' tensors, whose bytes
+    /// only bindings fix, are chained ([`ExternalPairs`]) for
+    /// [`NativeGraphPlan::check_disjoint`], unless each is two ranges of
+    /// one port that cannot meet: a port's view reaches its bytes one to
+    /// one, a slab view's slots distinct slabs. (Two of one port's that do
+    /// meet are refused once every node is sealed where the port binds a
+    /// plain view, [`Self::refuse_plain_overlaps`].) A buffer in graph
+    /// storage never meets an external tensor: a run's attach refuses a
+    /// port bound to its own storage.
+    fn exclude(&mut self, node: usize, planned: &PlannedNode) -> Result<(), CallError> {
+        let sealed = &self.nodes[node];
+        // The value each tensor parameter's buffer binds; a result's or a
+        // scratch buffer's is its own.
+        let values: Vec<Option<WorkflowResultRef>> = sealed
+            .kernel
+            .schema()
+            .parameters()
+            .iter()
+            .zip(planned.args.arguments())
+            .filter(|(parameter, _)| matches!(parameter.kind, ParameterKind::Tensor { .. }))
+            .map(|(_, argument)| argument_reference(argument))
+            .collect();
+        let value = |buffer: usize| values.get(buffer).copied().flatten();
+        let writes = |buffer: usize| sealed.kernel.writes(buffer);
+        let mut chained = false;
+        for (first, second) in exclusive_pairs(sealed.sites.len(), writes) {
+            let (first_site, second_site) = (&sealed.sites[first], &sealed.sites[second]);
+            let meets = meet(&first_site.range(), &second_site.range());
+            match (first_site.region, second_site.region) {
+                (Region::External(port), Region::External(other)) => chained |= port != other || meets,
+                (Region::External(_), _) | (_, Region::External(_)) => {}
+                (region, other) if region == other && meets => {
+                    if value(first).is_some() && value(first) == value(second) {
+                        return Err(sealed.aliasing(first, second));
+                    }
+                    panic!(
+                        "graph storage planned buffers {first} and {second} of node {node}, distinct values, in common bytes"
+                    );
+                }
+                _ => {}
+            }
+        }
+        if !chained {
+            return Ok(());
+        }
+        let external = |buffer: &usize| matches!(sealed.sites[*buffer].region, Region::External(_));
+        let (written, read): (Vec<usize>, Vec<usize>) =
+            (0..sealed.sites.len()).filter(external).partition(|&buffer| writes(buffer));
+        let chain: Vec<u32> = written
+            .into_iter()
+            .chain(read)
+            .map(|buffer| u32::try_from(buffer).expect("native node buffer ordinal exhausted"))
+            .collect();
+        let sealed = &mut self.nodes[node];
+        for link in chain.windows(2) {
+            sealed.sites[link[0] as usize].next_external = Some(link[1]);
+        }
+        let ordinal = u32::try_from(node).expect("native graph node ordinal exhausted");
+        sealed.exclusive = Some(ExternalPairs { next: self.exclusive.replace(ordinal), first: chain[0] });
+        Ok(())
+    }
+
+    /// The pairs of the exclusive chain ([`ExternalPairs`]): each node of
+    /// it with each external site it writes, which lead its chain, and
+    /// every site after that one, as buffers (ABI order), the written first.
+    fn external_pairs(&self) -> impl Iterator<Item = (&SealedNode, u32, u32)> + '_ {
+        let pairs = |node: &SealedNode| node.exclusive.expect("a node of the exclusive chain holds its external pairs");
+        std::iter::successors(self.exclusive, move |&ordinal| pairs(&self.nodes[ordinal as usize]).next).flat_map(
+            move |ordinal| {
+                let node = &self.nodes[ordinal as usize];
+                let after = move |buffer: u32| {
+                    std::iter::successors(node.sites[buffer as usize].next_external, move |&next| {
+                        node.sites[next as usize].next_external
+                    })
+                };
+                let first = pairs(node).first;
+                std::iter::once(first)
+                    .chain(after(first))
+                    .take_while(move |&buffer| node.kernel.writes(buffer as usize))
+                    .flat_map(move |written| after(written).map(move |second| (node, written, second)))
+            },
+        )
+    }
+
+    /// Refuse, once every node is sealed, two ranges of one port in a
+    /// node's exclusive pair ([`Self::external_pairs`]) that meet where the
+    /// port binds a plain view (`PortUse::plain`), which reaches its bytes
+    /// one to one: they meet under every binding. Only two of a port that
+    /// may bind a slab view, whose free slots reach nothing, stay a
+    /// question for each run's bindings
+    /// ([`NativeGraphPlan::check_disjoint`]).
+    fn refuse_plain_overlaps(&self) -> Result<(), CallError> {
+        for (node, first, second) in self.external_pairs() {
+            let ((port, first_site), (other, second_site)) = (external_site(node, first), external_site(node, second));
+            if port == other && self.port_uses[port].plain && meet(&first_site.range(), &second_site.range()) {
+                return Err(node.aliasing(first.min(second) as usize, first.max(second) as usize));
+            }
+        }
         Ok(())
     }
 
@@ -3719,7 +3837,6 @@ impl NativeGraphPlan {
         heap.hold_vec(&self.executable.port_uses);
         heap.hold_vec(&self.executable.timelines);
         heap.hold_vec(&self.executable.marks);
-        heap.hold_vec(&self.executable.disjoint);
         heap.hold_vec(&self.results);
         for row in &self.results {
             heap.hold_vec(row);
@@ -3803,36 +3920,36 @@ impl NativeGraphPlan {
             timelines: vec![None; self.executable.timelines.len()],
         }
     }
-    /// Refuse the disjoint pairs of `bindings` that overlap: those whose
-    /// both ports are statically bound (`fixed`, checked once in
-    /// [`Self::bind_static`]), or else those a run binds a port of (checked
-    /// at attach, when every external port is bound).
+    /// Refuse bindings under which two buffers of one node, an exclusive
+    /// pair ([`exclusive_pairs`]) in external ports' tensors, reach a byte
+    /// in common ([`Reaching::meets`]): those of ports both statically bound
+    /// (`fixed`, checked once in [`Self::bind_static`]), or else those of a
+    /// port a run binds (checked at attach, when every external port is
+    /// bound). Only the pairs chained at seal can
+    /// ([`Executable::exclude`], which holds the rest of each node's buffers
+    /// to the rule), and only those are walked
+    /// ([`Executable::external_pairs`]), each in O(1), a bound slab view's
+    /// reach read at most once.
     fn check_disjoint(&self, bindings: &NativeGraphBindings, fixed: bool) -> Result<(), CallError> {
-        for (first, second) in &self.executable.disjoint {
-            if (bindings.fixed[first.port] && bindings.fixed[second.port]) != fixed {
+        if self.executable.exclusive.is_none() {
+            return Ok(());
+        }
+        let reaching: Vec<Option<Reaching<'_>>> = bindings
+            .inputs
+            .iter()
+            .map(|bound| bound.as_ref().map(|bound| Reaching::new(&bound.tensor)))
+            .collect();
+        let tensor = |port: usize| reaching[port].as_ref().expect("every external port of a checked pair is bound");
+        for (node, first, second) in self.executable.external_pairs() {
+            let ((first_port, first_site), (second_port, second_site)) =
+                (external_site(node, first), external_site(node, second));
+            if (first_port == second_port && !meet(&first_site.range(), &second_site.range()))
+                || (bindings.fixed[first_port] && bindings.fixed[second_port]) != fixed
+            {
                 continue;
             }
-            let range = |range: &PortRange| {
-                let tensor = &bindings.inputs[range.port]
-                    .as_ref()
-                    .expect("every port of a checked pair is bound")
-                    .tensor;
-                let start = tensor.descriptor().byte_offset + range.offset;
-                (tensor.alias_identity(), start, start + range.bytes)
-            };
-            let (first_allocation, first_start, first_end) = range(first);
-            let (second_allocation, second_start, second_end) = range(second);
-            if first_allocation == second_allocation
-                && first.bytes != 0
-                && second.bytes != 0
-                && first_start < second_end
-                && second_start < first_end
-            {
-                let nodes = &self.executable.nodes;
-                return Err(CallError::Invocation(InvocationError::IllegalAliasing {
-                    first: first.parameter_name(nodes),
-                    second: second.parameter_name(nodes),
-                }));
+            if tensor(first_port).meets(first_site.range(), tensor(second_port), second_site.range()) {
+                return Err(node.aliasing(first.min(second) as usize, first.max(second) as usize));
             }
         }
         Ok(())
@@ -3876,8 +3993,9 @@ impl NativeGraphPlan {
 
     /// Bind the ports that stay fixed across runs, each checked and its
     /// records formed through `charges` as it is bound
-    /// ([`NativeGraphBindings::set`]). A disjoint pair of fixed ports that
-    /// overlaps is refused here, so no run of the bound plan can alias it.
+    /// ([`NativeGraphBindings::set`]). An exclusive pair of buffers on
+    /// fixed ports whose bytes meet is refused here
+    /// (`Self::check_disjoint`), so no run of the bound plan can alias it.
     pub fn bind_static(
         self: &Arc<Self>,
         charges: &Charges,
@@ -5885,9 +6003,16 @@ impl DispatchList for SequenceList<'_> {
                 (Region::External(port), SiteRecords::Port(count)) => {
                     let records = run.records(port);
                     match run.slab(port) {
-                        // A slab view's records, one a slab: wherever its
-                        // slabs lie now.
-                        Some(slab) => slab.extend(buffer, &records.table, records.table_offset, reaches),
+                        // A slab view's records, one a slab: the site's,
+                        // wherever their slabs lie now.
+                        Some(slab) => slab.extend(
+                            buffer,
+                            &records.table,
+                            records.table_offset,
+                            site.offset,
+                            count * records.record,
+                            reaches,
+                        ),
                         None => records.extend(buffer, site.offset / records.record, count, reaches),
                     }
                     continue;
@@ -5907,7 +6032,7 @@ impl DispatchList for SequenceList<'_> {
                 (Region::External(port), SiteRecords::None) => {
                     let External { allocation, offset: start, .. } = run.external(port);
                     if let Some(slab) = run.slab(port) {
-                        slab.extend(buffer, allocation, start + site.offset, reaches);
+                        slab.extend(buffer, allocation, *start, site.offset, site.bytes, reaches);
                         continue;
                     }
                     (allocation.identity(), start + site.offset, site.bytes)

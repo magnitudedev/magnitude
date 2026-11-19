@@ -122,7 +122,9 @@ void ss_step_of(int row, uint head, out float delta, out float log_decay) {
 // Publishes head `head`'s share of the slot's successor window (the C - 1 raw
 // rows before the publication row, then the raw rows of its tape): its x
 // channels, and its group's B and C channels when it leads the group. `part`
-// of `parts` cooperating workgroups copies an even share.
+// of `parts` cooperating workgroups copies an even share, spread by
+// `SEISMIC_THREAD`: the state the subgroups reduce is read from the arenas
+// these stores write.
 void ss_publish_window(versions_slot slot, uint head, uint part, uint parts) {
     const int taps = SS_TAPS - 1;
     const uint rows = uint(taps + versions_tape_rows(slot, int(SEISMIC_DIM_T)));
@@ -131,7 +133,7 @@ void ss_publish_window(versions_slot slot, uint head, uint part, uint parts) {
     const uint total = rows * per_tap;
     const uint per = (total + parts - 1u) / parts;
     const uint last = min(total, (part + 1u) * per);
-    for (uint item = part * per + gl_LocalInvocationIndex; item < last; item += gl_WorkGroupSize.x) {
+    for (uint item = part * per + SEISMIC_THREAD; item < last; item += gl_WorkGroupSize.x) {
         const int tap = int(item / per_tap);
         const uint offset = item % per_tap;
         const uint channel = offset < SS_P ? head * SS_P + offset
@@ -192,7 +194,9 @@ void ss_load_version(versions_slot slot, uint head, uint row0, out float rows[SS
 // (delta x) B^T, output S C + D x.
 void ss_advance_rows(versions_slot slot, int begin, uint head, uint block_row0, uint row0,
     inout float rows[SS_LANE_ROWS][SS_COLUMNS]) {
-    const uint lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    // The staging is spread by `SEISMIC_THREAD`, as the subgroup sums that
+    // read it need.
+    const uint lane = SEISMIC_LANE, thread = SEISMIC_THREAD, threads = gl_WorkGroupSize.x;
     const uint group = ss_group_of(head);
     const int publish = slot.lo + slot.stop;
     const int recorded = versions_tape_rows(slot, int(SEISMIC_DIM_T));

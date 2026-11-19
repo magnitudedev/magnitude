@@ -14,7 +14,7 @@ use seismic_lang::checked::{
     LaunchGrid, NativeAsset, NativeImplementation, NativeSpecialization, PROJECTION_SEGMENTS, RecordPort,
 };
 use seismic_lang::entry::{
-    CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
+    CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess, Writer,
 };
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::expr::compiled::InvocationValues;
@@ -325,9 +325,7 @@ pub(crate) fn scratch_buffer(schema: &CallSchema, implementation: &NativeImpleme
 /// scratch buffer.
 pub(crate) fn buffer_writes(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
     let parameters = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
-        ParameterKind::Tensor { access, .. } => {
-            Some(matches!(access, TensorAccess::Owned | TensorAccess::Mutable))
-        }
+        ParameterKind::Tensor { access, .. } => Some(access.writer() == Some(Writer::Device)),
         _ => None,
     });
     let results = schema
@@ -345,9 +343,7 @@ pub(crate) fn buffer_writes(schema: &CallSchema, implementation: &NativeImplemen
 /// port the host only reads is ordered as the read every bound buffer is.)
 pub(crate) fn host_writes(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
     let parameters = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
-        ParameterKind::Tensor { access, .. } => {
-            Some(matches!(access, TensorAccess::Host { write: true }))
-        }
+        ParameterKind::Tensor { access, .. } => Some(access.writer() == Some(Writer::Host)),
         _ => None,
     });
     let rest = buffer_writes(schema, implementation).len() - parameters.clone().count();
@@ -474,11 +470,11 @@ fn render_owner_handle(
     element_prefix: &str,
     representation: RepresentationId,
     buffer: usize,
-    slab: bool,
+    address_table: bool,
 ) {
-    // A slab port's buffer is the slab address table: its handle is `SlabOut`, whose regions and
-    // rows are handles.
-    match (dialect, slab) {
+    // A slab or record port's buffer is its address table: its handle is `SlabOut`, whose regions
+    // and rows are handles.
+    match (dialect, address_table) {
         (Dialect::Cuda(_), false) => out.push_str(&format!(
             "#define {expression} element::abi_out<ELEMENT_OF({element_prefix})>(seismic_buffer_{buffer})\n"
         )),
@@ -491,7 +487,7 @@ fn render_owner_handle(
         (Dialect::Metal(_), true) => out.push_str(&format!(
             "#define {declaration}(name) device const slab::Table<ELEMENT_OF({element_prefix})> *name [[buffer({buffer})]]\n"
         )),
-        // A Vulkan handle wraps the buffer's device address; a slab port's is its address table.
+        // A Vulkan handle wraps the buffer's device address; an address table's is the table's.
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         (Dialect::Vulkan(_), false) => {
             let kind = vulkan_element_kind(representation);
@@ -677,9 +673,8 @@ fn render_source_with(
         }
     }
     let mut buffer = 0usize;
-    // Per bound buffer, whether it is absent (`StaticTensor::absent`): its
-    // address reads as 0 (`SEISMIC_PTR`), so no source guards it.
-    let mut absent = Vec::new();
+    // Per bound buffer, in order: how the source reaches it.
+    let mut bound = Vec::new();
     let mut word = 0usize;
     for dimension in schema.dimensions() {
         let name = native_macro(&dimension.name);
@@ -721,12 +716,16 @@ fn render_source_with(
                 representation,
                 access,
             } => {
+                let record_port = implementation
+                    .launch_records(formed)
+                    .contains(&RecordPort::Parameter(parameter.name.clone()));
+                // A slab port's buffer is its slabs' address table, a record
+                // port's its records'.
+                let address_table = parameter.binding == seismic_lang::entry::PortBinding::Slab || record_port;
                 let reach = parameter_reach(
                     representation_reach(*representation),
                     matches!(access, TensorAccess::Mutable),
-                    implementation
-                        .launch_records(formed)
-                        .contains(&RecordPort::Parameter(parameter.name.clone())),
+                    record_port,
                 );
                 if reach == OwnerReach::Owner {
                     // A floating tensor the kernel mutates is reached only through its owner's
@@ -747,7 +746,7 @@ fn render_source_with(
                             &element,
                             *representation,
                             buffer,
-                            parameter.binding == seismic_lang::entry::PortBinding::Slab,
+                            address_table,
                         );
                     }
                 } else {
@@ -758,7 +757,16 @@ fn render_source_with(
                 let fixed = geometry.parameters[ordinal]
                     .as_ref()
                     .expect("a tensor parameter has static geometry");
-                absent.push(fixed.absent());
+                bound.push(BoundBuffer {
+                    absent: fixed.absent(),
+                    access: if access.writer().is_none() {
+                        BufferAccess::ReadOnly
+                    } else if address_table {
+                        BufferAccess::AddressTable
+                    } else {
+                        BufferAccess::Written
+                    },
+                });
                 let tensor = TensorAbi {
                     representation: *representation,
                     rank: axes.len(),
@@ -772,10 +780,7 @@ fn render_source_with(
                 // (`BackendName::plain_loads_read_host_writes`). The source's
                 // record ports are its launch's; an entry not launch-scoped
                 // lists the same at every launch.
-                let host_written = !dialect.backend().plain_loads_read_host_writes()
-                    && implementation
-                        .launch_records(formed)
-                        .contains(&RecordPort::Parameter(parameter.name.clone()));
+                let host_written = !dialect.backend().plain_loads_read_host_writes() && record_port;
                 for symbol in names.tensor_prefixes() {
                     tensor.render(&mut prefix, &symbol);
                     if host_written {
@@ -840,7 +845,10 @@ fn render_source_with(
             let fixed = geometry.results[ordinal]
                 .as_ref()
                 .expect("a tensor result has static geometry");
-            absent.push(fixed.absent());
+            bound.push(BoundBuffer {
+                absent: fixed.absent(),
+                access: if record_port { BufferAccess::AddressTable } else { BufferAccess::Written },
+            });
             TensorAbi {
                 representation: *representation,
                 rank: axes.len(),
@@ -887,30 +895,13 @@ fn render_source_with(
             "#define SEISMIC_BUFFER_SCRATCH_{} {buffer}\n",
             native_macro(&scratch.name)
         ));
-        absent.push(false);
+        bound.push(BoundBuffer { absent: false, access: BufferAccess::Written });
         buffer += 1;
     }
-    debug_assert_eq!(absent.len(), buffer);
-    // Bound tensor parameters lead the buffer order; a shared (`&`) one is
-    // read-only. Results and scratch follow.
-    let read_only = schema
-        .parameters()
-        .iter()
-        .filter_map(|parameter| match &parameter.kind {
-            ParameterKind::Tensor {
-                access: TensorAccess::Host { .. },
-                ..
-            } => None,
-            ParameterKind::Tensor { access, .. } => Some(matches!(access, TensorAccess::Shared)),
-            ParameterKind::Scalar { .. }
-            | ParameterKind::Index { .. }
-            | ParameterKind::Range { .. } => None,
-        })
-        .chain(std::iter::repeat(false))
-        .take(buffer);
+    debug_assert_eq!(bound.len(), buffer);
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     if let Dialect::Vulkan(_) = dialect {
-        prefix.push_str(&vulkan::tail(read_only, &absent));
+        prefix.push_str(&vulkan::tail(&bound));
         debug_assert_eq!(word, word_count(schema) + emitted_words(implementation) + runtime_parameters.len());
         constant_macros(&mut prefix, asset);
         prefix.push_str(asset.text);
@@ -929,8 +920,9 @@ fn render_source_with(
         ));
         // A read-only buffer is `const`, so its loads are eligible for the
         // non-coherent path.
-        let qualifiers = read_only
-            .map(|read_only| if read_only { "const " } else { "" })
+        let qualifiers = bound
+            .iter()
+            .map(|buffer| if buffer.access == BufferAccess::ReadOnly { "const " } else { "" })
             .collect::<Vec<_>>();
         let buffers = qualifiers
             .iter()
@@ -941,7 +933,7 @@ fn render_source_with(
             "#define SEISMIC_KERNEL_PARAMS {buffers}seismic_words_t seismic_words_value, unsigned long long* seismic_scalar_results\n"
         ));
         prefix.push_str(&addresses(
-            &absent,
+            &bound,
             |index| format!("seismic_buffer_{index}"),
             |index| format!("(({}unsigned char *)0)", qualifiers[index]),
         ));
@@ -972,14 +964,35 @@ fn render_source_with(
     prefix
 }
 
+/// A buffer bound to a launch, as its source reaches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundBuffer {
+    /// A static extent is zero (`StaticTensor::absent`): its address reads
+    /// as 0 (`SEISMIC_PTR`), so no source guards it.
+    absent: bool,
+    access: BufferAccess,
+}
+
+/// What a launch does with a bound buffer's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferAccess {
+    /// Nothing in the launch writes them (a `&` port's).
+    ReadOnly,
+    /// They are the address table of a slab or record port the launch may
+    /// write through, which it only reads.
+    AddressTable,
+    /// The launch may write them.
+    Written,
+}
+
 /// `SEISMIC_PTR(index)`: buffer `index`'s address, `bound(index)` (its
 /// argument), or `null(index)`, address 0 of the same type, where the buffer
-/// is absent (`StaticTensor::absent`). An absent operand has nothing to
+/// is absent (`BoundBuffer::absent`). An absent operand has nothing to
 /// dereference, so its address is 0 by construction and no source guards it.
-fn addresses(absent: &[bool], bound: impl Fn(usize) -> String, null: impl Fn(usize) -> String) -> String {
+fn addresses(buffers: &[BoundBuffer], bound: impl Fn(usize) -> String, null: impl Fn(usize) -> String) -> String {
     let mut out = String::from("#define SEISMIC_PTR_(index) SEISMIC_ADDRESS_##index\n#define SEISMIC_PTR(index) SEISMIC_PTR_(index)\n");
-    for (index, absent) in absent.iter().enumerate() {
-        let address = if *absent { null(index) } else { bound(index) };
+    for (index, buffer) in buffers.iter().enumerate() {
+        let address = if buffer.absent { null(index) } else { bound(index) };
         out.push_str(&format!("#define SEISMIC_ADDRESS_{index} {address}\n"));
     }
     out
@@ -2564,6 +2577,19 @@ mod tests {
             assert!(source.contains(handle), "{name}: {source}");
             assert!(!source.contains("SEISMIC_BUFFER_ROWS"), "{name}");
             assert!(!source.contains("SEISMIC_PARAM_0_BUFFER"), "{name}");
+            // Vulkan reads the table's address through the address-table
+            // block, which formation's check reads as a table the launch
+            // only reads, whose addresses point into the slabs.
+            if name == "vulkan" {
+                assert!(
+                    source.contains("#define SEISMIC_ADDRESS_0 (seismic_address_table_block_t(seismic_arguments).w[0])\n"),
+                    "{source}"
+                );
+                assert!(
+                    source.contains("#define SEISMIC_ADDRESS_1 (seismic_input_block_t(seismic_arguments).w[1])\n"),
+                    "{source}"
+                );
+            }
         }
     }
 
@@ -2624,6 +2650,7 @@ mod tests {
         mixed_dot: true,
         f32_atomic_add: false,
         shared_int64_atomics: false,
+        maximal_reconvergence: false,
     };
 
     #[test]
@@ -2644,7 +2671,11 @@ mod tests {
             "#define SEISMIC_BUFFER_SCRATCH_PARTIALS 2\n",
             "#define SEISMIC_BUFFER_SCALAR_RESULTS 3\n",
             "#define SEISMIC_SCALAR_RESULTS (seismic_argument_block_t(seismic_arguments).w[3])\n",
-            "#define seismic_words (seismic_argument_block_t(seismic_arguments + 32ul).w)\n",
+            "#define seismic_words (seismic_input_block_t(seismic_arguments + 32ul).w)\n",
+            // The read-only `x` is read through the input block, the result
+            // through the argument block.
+            "#define SEISMIC_ADDRESS_0 (seismic_input_block_t(seismic_arguments).w[0])\n",
+            "#define SEISMIC_ADDRESS_1 (seismic_argument_block_t(seismic_arguments).w[1])\n",
             "#define SEISMIC_READONLY_0 true\n",
             "#define SEISMIC_READONLY_1 false\n",
             "#define SEISMIC_READONLY_2 false\n",
@@ -2708,13 +2739,16 @@ mod tests {
     fn vulkan_prefix_compiles_for_every_representation_kind() {
         const ASSET: &str = "
 void probe() {
-    const uint lane = gl_LocalInvocationID.x;
+    const uint lane = SEISMIC_SUBGROUP * 32u + SEISMIC_LANE;
     seismic_shared_f32[lane] = float(SEISMIC_X_STRIDE_0 + SEISMIC_DIM_N) * float(SEISMIC_TUNE_TILE);
     barrier();
     float value = seismic_subgroup_sum_f32(seismic_shared_f32[lane]);
+    // Subgroup operations come before the correctly rounded helpers, whose
+    // loops may run a different count in each lane.
+    const int total = seismic_redux_add_s32(1);
     value = seismic_fma_rn(value, seismic_div_rn(value, 3.0), seismic_sqrt_rn(value));
     value += seismic_bf16_to_f32(seismic_f32_to_bf16(value)) + seismic_unpack_f16x2(seismic_pack_f16x2(value, 1.0)).x;
-    value += float(seismic_dp4a_s8(int(lane), 3, 1) + seismic_dp4a_u8s8(lane, -3, 0) + seismic_redux_add_s32(1));
+    value += float(seismic_dp4a_s8(int(lane), 3, 1) + seismic_dp4a_u8s8(lane, -3, 0) + total);
     if (SEISMIC_READONLY(SEISMIC_BUFFER_X) && lane == 0u)
         seismic_shared_f32[0] = value + seismic_tanh_approx(value);
     seismic_u64(SEISMIC_SCALAR_RESULTS)[0].v = seismic_words[0];
@@ -2738,6 +2772,8 @@ void probe() {
                 float16: true,
                 rounding_rte_32: true,
                 denorm_preserve_32: true,
+                subgroup_uniform_control_flow: true,
+                maximal_reconvergence: true,
             };
             let module = seismic_vulkan::formation::compile(&source, "probe", environment)
                 .unwrap_or_else(|error| panic!("{representation}: {error:?}"));
@@ -2790,6 +2826,8 @@ void probe() {{
                 float16: true,
                 rounding_rte_32: true,
                 denorm_preserve_32: true,
+                subgroup_uniform_control_flow: true,
+                maximal_reconvergence: true,
             };
             seismic_vulkan::formation::compile(&source, "probe", environment).unwrap_or_else(
                 |error| {
@@ -2830,6 +2868,6 @@ void probe() {{
         assert!(vulkan.contains("#define SEISMIC_ADDRESS_0 0ul\n"));
         assert!(vulkan.contains("#define SEISMIC_ADDRESS_1 (seismic_argument_block_t(seismic_arguments).w[1])\n"));
         let present = render(Dialect::Vulkan(VULKAN_FEATURES), "f32");
-        assert!(present.contains("#define SEISMIC_ADDRESS_0 (seismic_argument_block_t(seismic_arguments).w[0])\n"));
+        assert!(present.contains("#define SEISMIC_ADDRESS_0 (seismic_input_block_t(seismic_arguments).w[0])\n"));
     }
 }

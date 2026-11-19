@@ -158,20 +158,25 @@ uint attention_span_length(uint64_t visible, uint64_t fresh, uint64_t row, uint6
 }
 
 // The total number of keys a row sees: its visible spans, then its fresh span.
-// Lane l sums spans l, l + 32, ...; the whole subgroup calls it.
+// Lane l sums spans l, l + 32, ... (`seismic_strided`). The whole hardware
+// subgroup calls it for one row, so every logical subgroup forms the same
+// total and the result is uniform across the hardware subgroup.
 uint attention_visible_total(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spans) {
     uint total = 0u;
-    for (uint64_t index = SEISMIC_LANE; index <= spans; index += 32ul)
+    seismic_strided(uint64_t, index, uint64_t(SEISMIC_LANE), spans + 1ul, 32ul)
         total += attention_span_length(visible, fresh, row, spans, index);
-    return seismic_subgroup_add(total);
+    return seismic_hardware_first(seismic_subgroup_add(total));
 }
 
 // The span of `row` holding its key `key` and the span's first key: the first
 // span s in 0..=spans whose keys end past `key`, or (spans + 1, total) when
 // the row has no such key. Spans before it hold no key at or after `key`. The
-// whole subgroup calls it, 32 spans at a time.
+// whole hardware subgroup calls it, 32 spans at a time. On 64 lanes `key` may
+// differ between its logical subgroups, so the walk cannot leave at the first
+// one's span: it runs until every one has found its own.
 uvec2 attention_locate(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spans, uint key) {
     uint carried = 0u;
+#if SEISMIC_SUBGROUP_LANES == 32
     for (uint64_t base = 0ul; base <= spans; base += 32ul) {
         uint found;
         if (reduce_lanes_locate(attention_span_length(visible, fresh, row, spans, base + SEISMIC_LANE), key, carried,
@@ -179,6 +184,23 @@ uvec2 attention_locate(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t 
             return uvec2(uint(base) + found, carried);
     }
     return uvec2(uint(spans) + 1u, carried);
+#else
+    bool located = false;
+    uvec2 result = uvec2(0u);
+    bool searching;
+    for (uint64_t base = 0ul; seismic_steer(searching, base <= spans && !located); base += 32ul) {
+        uint found;
+        uint at = carried;
+        const bool hit =
+            reduce_lanes_locate(attention_span_length(visible, fresh, row, spans, base + SEISMIC_LANE), key, at, found);
+        if (searching) {
+            carried = at;
+            result = uvec2(uint(base) + found, at);
+        }
+        located = located || hit;
+    }
+    return located ? result : uvec2(uint(spans) + 1u, carried);
+#endif
 }
 
 // A key group's cursor over its row's key sequence: its `spans` visible
@@ -226,23 +248,29 @@ attention_cursor attention_cursor_at(uint64_t visible, uint64_t fresh, uint64_t 
 
 // Moves the cursor to the span holding key `position` (at or past its own)
 // and returns the key's index in that span: a history or fresh row, or the
-// ordinal of a pick.
+// ordinal of a pick. The whole hardware subgroup calls it; a cursor that is
+// not `live` stays where it is (its index means nothing), and the walk runs
+// until every live cursor of the hardware subgroup is on its span.
 uint64_t attention_cursor_to(inout attention_cursor c, uint64_t visible, uint64_t fresh, uint64_t row,
-    uint64_t spans, uint picks, uint position) {
-    while (position >= c.offset + c.count) {
-        c.offset += c.count;
-        ++c.span;
-        attention_cursor_span(c, visible, fresh, row, spans, picks);
+    uint64_t spans, uint picks, uint position, const bool live) {
+    bool moving;
+    while (seismic_steer(moving, live && position >= c.offset + c.count)) {
+        if (moving) {
+            c.offset += c.count;
+            ++c.span;
+            attention_cursor_span(c, visible, fresh, row, spans, picks);
+        }
     }
     return uint64_t(c.lo) + uint64_t(position - c.offset);
 }
 
 // [`attention_cursor_to`], holding on a history row (span < spans) the
-// row's slab of `slab_rows` rows; `moved` is whether that changed it.
+// row's slab of `slab_rows` rows; `moved` is whether that changed it (never
+// for a cursor that is not `live`).
 uint64_t attention_cursor_seek(inout attention_cursor c, uint64_t visible, uint64_t fresh, uint64_t row,
-    uint64_t spans, uint picks, uint64_t slab_rows, uint position, out bool moved) {
-    const uint64_t index = attention_cursor_to(c, visible, fresh, row, spans, picks, position);
-    moved = c.span < spans && (index < c.slab_lo || index >= c.slab_hi);
+    uint64_t spans, uint picks, uint64_t slab_rows, uint position, const bool live, out bool moved) {
+    const uint64_t index = attention_cursor_to(c, visible, fresh, row, spans, picks, position, live);
+    moved = live && c.span < spans && (index < c.slab_lo || index >= c.slab_hi);
     if (moved) {
         // A key's index in its row is 32-bit (positions are), so the quotient is.
         uint64_t rest = index;
@@ -263,6 +291,8 @@ uint attention_partition_span(uint total, uint span, uint parts) {
 // its keys, in the exp2 domain, absorbing `n` (1 to 4) keys at a time. Key j
 // is attended where bit j of `live` is set; another (a pick of none) scores
 // -inf, so it adds nothing and a batch of none leaves the state as it is.
+// `live` may differ across the hardware subgroup: a key's score is reduced
+// where any of its logical subgroups attends it.
 void attention_absorb(const uint n, uint live, float q[ATTENTION_HEADS][ATTENTION_E], float k[4][ATTENTION_E],
     float v[4][ATTENTION_E], inout float maximum[ATTENTION_HEADS], inout float denominator[ATTENTION_HEADS],
     inout float result[ATTENTION_HEADS][ATTENTION_E]) {
@@ -273,7 +303,13 @@ void attention_absorb(const uint n, uint live, float q[ATTENTION_HEADS][ATTENTIO
                 float partial = 0.0;
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                     partial = seismic_fma_rn(q[g][i], k[j][i], partial);
-                score[j] = ((live >> j) & 1u) != 0u ? seismic_subgroup_sum_f32(partial) : -ATTENTION_INF;
+                bool attended;
+                if (seismic_steer(attended, ((live >> j) & 1u) != 0u)) {
+                    const float sum = seismic_subgroup_sum_f32(partial);
+                    score[j] = attended ? sum : -ATTENTION_INF;
+                } else {
+                    score[j] = -ATTENTION_INF;
+                }
             }
         }
         float next = maximum[g];
@@ -458,7 +494,7 @@ void attention_publish(float maximum[ATTENTION_HEADS], float denominator[ATTENTI
     float result[ATTENTION_HEADS][ATTENTION_E], uint states, uint columns, uint64_t partials, uint64_t statistics,
     uint64_t first, uint parts) {
     const uint sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE;
-    const uint thread = gl_LocalInvocationIndex;
+    const uint thread = SEISMIC_THREAD;
     const uint slices = attention_slices();
     if (lane == 0u) {
         [[unroll]] for (uint h = 0u; h < ATTENTION_HEADS; ++h) {
@@ -517,15 +553,31 @@ void attention_store_gated(uint64_t query, uint64_t gate, Out result, uint64_t r
     out_put(result, (row * heads + head) * ATTENTION_W + column, value);
 }
 
+// The merge launches' workgroup (query heads, row): ATTENTION_MERGE_HEADS
+// query heads of W invocations each, one per column. Two where W is an odd
+// number of 32-lane subgroups, so the workgroup is whole 64-lane hardware
+// subgroups and every merge holds one subgroup per 32 columns on both widths.
+#define ATTENTION_MERGE_HEADS (1u + (ATTENTION_W / 32u) % 2u)
+
+// The invocation's (query head, column) in a merge workgroup; the column is
+// W, no column, for the pair's second head past the last.
+uvec2 attention_merge_place() {
+    const uint head = gl_WorkGroupID.x * ATTENTION_MERGE_HEADS + gl_LocalInvocationIndex / ATTENTION_W;
+    const bool live = ATTENTION_MERGE_HEADS == 1u || head < ATTENTION_KV * ATTENTION_G;
+    return uvec2(head, live ? gl_LocalInvocationIndex % ATTENTION_W : ATTENTION_W);
+}
+
 // The decode merge of one (query head, row) column over the row's key
 // sequence, its `spans` visible spans then its `picks` picks: the row's
 // non-empty partitions in partition order, then the output gate. A row that
-// sees no key attends to zero. Whole subgroups call it (each finds the row's
-// total keys).
+// sees no key attends to zero. Whole hardware subgroups call it (each finds
+// the row's total keys); a column at or past W stores nothing.
 void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint64_t fresh, Out result,
     uint64_t partials, uint64_t statistics, uint64_t spans, uint picks, uint64_t head, uint64_t row, uint column,
     uint span, uint parts) {
     const uint total = attention_visible_total(visible, fresh, row, spans) + picks;
+    if (column >= ATTENTION_W)
+        return;
     const uint span_keys = attention_partition_span(total, span, parts);
     const uint used = (total + span_keys - 1u) / span_keys;
     const float attended = attention_merge(partials, statistics,

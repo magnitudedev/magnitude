@@ -11,7 +11,10 @@
 // Workgroup reductions keep their partials in the shared region: `partials`
 // is an offset in floats into `seismic_shared_f32` with room for one float
 // per subgroup; the leading barrier lets consecutive calls share it. Every
-// invocation of the workgroup must call them.
+// invocation of the workgroup must call them. Their results are read from
+// the shared region after their last barrier, so they are uniform (and may
+// steer control) only where the caller stores no shared memory before its
+// next barrier: a store there could race the reads.
 
 // Sum of `value` over the aligned groups of `width` lanes (a power of two,
 // at most 32), in the butterfly order xor width/2, ..., 1.
@@ -77,16 +80,6 @@ int reduce_argmax(float score, int index, const int ties, out float best) {
 // Integer scans over the logical subgroup, exact in any order. Every lane of
 // the logical subgroup calls them and receives its own result.
 
-// The logical subgroup's lanes for which `predicate` holds: bit l for lane l.
-uint reduce_lanes_ballot(bool predicate) {
-    const uvec4 lanes = subgroupBallot(predicate);
-#if SEISMIC_SUBGROUP_LANES == 32
-    return lanes.x;
-#else
-    return SEISMIC_LANE_BASE == 0u ? lanes.x : lanes.y;
-#endif
-}
-
 // The sum of `value` over the lanes below this one.
 uint reduce_lanes_exclusive_add(uint value) {
     uint inclusive = value;
@@ -107,7 +100,9 @@ uint reduce_lanes_exclusive_add(uint value) {
 // lane receives the same results.
 bool reduce_lanes_locate(uint length, uint key, inout uint carried, out uint found) {
     const uint before = reduce_lanes_exclusive_add(length);
-    const uint hits = reduce_lanes_ballot(carried + before + length > key);
+    const uint hits = seismic_ballot(carried + before + length > key);
+#if SEISMIC_SUBGROUP_LANES == 32
+    // `hits` is the hardware subgroup's ballot, the same on all its lanes.
     if (hits == 0u) {
         carried += seismic_subgroup_add(length);
         found = 0u;
@@ -116,6 +111,16 @@ bool reduce_lanes_locate(uint length, uint key, inout uint carried, out uint fou
     found = uint(findLSB(hits));
     carried += seismic_shuffle(before, found);
     return true;
+#else
+    // The two logical subgroups of a 64-lane hardware one may differ, so
+    // neither reduction may sit under a branch on `hits`: both outcomes are
+    // formed and selected.
+    const uint chunk = seismic_subgroup_add(length);
+    found = hits == 0u ? 0u : uint(findLSB(hits));
+    const uint first = seismic_shuffle(before, found);
+    carried += hits == 0u ? chunk : first;
+    return hits != 0u;
+#endif
 }
 
 // The sum of `value` over the workgroup's invocations before this one, in

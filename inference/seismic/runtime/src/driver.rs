@@ -33,7 +33,7 @@ use seismic_compiler::{
     prepare_analytically, OptimizationCompletion, PlanningBudget, PreparationBudget,
 };
 use seismic_lang::checked::CheckedModule;
-use seismic_lang::entry::{CallSchema, ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
+use seismic_lang::entry::{CallSchema, ElementBindings, LogicalEntry, ParameterKind};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
@@ -1571,7 +1571,7 @@ pub(crate) fn collect_native_access(
         let (ParameterKind::Tensor { access, .. }, Some(tensor)) = (&parameter.kind, tensor) else {
             continue;
         };
-        let write = matches!(access, TensorAccess::Owned | TensorAccess::Mutable);
+        let write = access.writer().is_some();
         for allocation in tensor.bound_allocations() {
             merged
                 .entry(allocation.access_identity())

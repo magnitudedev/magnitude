@@ -187,7 +187,8 @@ void projection_load8(projection_prologue in_, uint m, uint k, float inverse, ou
 
 // The Rms row norm's square sum is split into PROJECTION_RMS_PARTS fixed
 // parts; one lane's share of `part`: columns 4c .. 4c + 3 for
-// c = 32 * part + lane + 32 * parts * j, in order.
+// c = 32 * part + lane + 32 * parts * j, in order (`seismic_strided`: the
+// caller reduces the shares over the subgroup).
 #define PROJECTION_RMS_PARTS 8u
 
 float projection_rms_squares(projection_prologue in_, uint m, uint part, uint lane) {
@@ -196,7 +197,7 @@ float projection_rms_squares(projection_prologue in_, uint m, uint part, uint la
     const uint64_t row = uint64_t(projection_row(in_.rows, m)) * in_.x0;
     const bool vector = in_.x1 == 1ul && (in_.x0 & 3ul) == 0ul && (in_.columns & 3u) == 0u;
     float sum = 0.0;
-    for (uint c = 4u * (32u * part + lane); c < in_.columns; c += 128u * PROJECTION_RMS_PARTS) {
+    seismic_strided(uint, c, 4u * (32u * part + lane), in_.columns, 128u * PROJECTION_RMS_PARTS) {
         vec4 v;
         if (vector) {
             v = stored_vec4_at(in_.x, row + uint64_t(c));
@@ -267,7 +268,7 @@ float projection_ordered_combine8(float value) {
 
 void projection_ordered_inverses(projection_prologue in_, uint m_rows, uint inv_off, uint inv_stride,
     uint first_row, bool has_scratch, uint scratch_off) {
-    const uint tid = SEISMIC_SUBGROUP * 32u + SEISMIC_LANE, threads = SEISMIC_SUBGROUPS * 32u;
+    const uint tid = SEISMIC_THREAD, threads = SEISMIC_SUBGROUPS * 32u;
     if (in_.kind == PROJECTION_ORDERED_SUMMED) {
         for (uint r = tid; r < m_rows; r += threads)
             seismic_shared_f32[inv_off + r * inv_stride] = 1.0;
@@ -343,12 +344,12 @@ void projection_ordered_inverses(projection_prologue in_, uint m_rows, uint inv_
                     sum = seismic_fma_rn(v6, v6, sum);
                     sum = seismic_fma_rn(v7, v7, sum);
                 }
-                for (uint c = k0 + u; c < in_.columns; c += 8u) {
+                seismic_strided_from(uint, c, k0, u, in_.columns, 8u) {
                     const float v = stored_at(in_.x, row + uint64_t(c));
                     sum = seismic_fma_rn(v, v, sum);
                 }
             } else {
-                for (uint c = u; c < in_.columns; c += 8u) {
+                seismic_strided(uint, c, u, in_.columns, 8u) {
                     const float v = stored_at(in_.x, row + uint64_t(c) * in_.x1);
                     sum = seismic_fma_rn(v, v, sum);
                 }

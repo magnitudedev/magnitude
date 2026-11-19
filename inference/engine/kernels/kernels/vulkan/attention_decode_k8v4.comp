@@ -108,19 +108,25 @@ struct decode_planes {
 // sequence, updating `p` when its slab changes, sets `first` to that key's
 // four plane sources for `kv_head`, and returns how many consecutive keys
 // from `position` up to `end` lie in the same span and slab (`decode_step`).
+// The whole hardware subgroup calls it; where not `live` the cursor and
+// planes stay as they are, and it returns 0.
 uint decode_historical_run(inout attention_cursor c, inout decode_planes p, attention_history h, uint64_t row,
-    uint kv_head, uint position, uint end, out history_source first) {
+    uint kv_head, uint position, uint end, const bool live, out history_source first) {
     const uint64_t key_bytes = uint64_t(history_row_words(HISTORY_KEY_BITS)) * 4ul;
     const uint64_t value_bytes = uint64_t(history_row_words(HISTORY_VALUE_BITS)) * 4ul;
     const uint64_t pair_elements = 2ul * uint64_t(HISTORY_PAIRS);
     bool moved;
     const uint64_t index = attention_cursor_seek(c, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
-        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), row, SEISMIC_DIM_R, 0u, h.slab_rows, position, moved);
+        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), row, SEISMIC_DIM_R, 0u, h.slab_rows, position, live, moved);
     if (moved)
         p = decode_planes(slab_region(h.key_codes, c.slab) + uint64_t(kv_head) * key_bytes,
             slab_region(h.value_codes, c.slab) + uint64_t(kv_head) * value_bytes,
             out_stored(slab_out_region(h.key_coefficients, c.slab), uint64_t(kv_head) * pair_elements),
             out_stored(slab_out_region(h.value_coefficients, c.slab), uint64_t(kv_head) * pair_elements));
+    if (!live) {
+        first = history_source(p.key_rows, p.key_pairs, p.value_rows, p.value_pairs);
+        return 0u;
+    }
     const uint64_t step = (index - c.slab_lo) * uint64_t(ATTENTION_KV);
     first = history_source(p.key_rows + step * key_bytes, stored_offset(p.key_pairs, step * pair_elements),
         p.value_rows + step * value_bytes, stored_offset(p.value_pairs, step * pair_elements));
@@ -140,46 +146,63 @@ history_source decode_step(history_source s, uint i) {
 // Resolves `hist_n` historical keys [position, position + hist_n) for a
 // keywise subgroup (`fallback` when `hist_n` is 0): true when all lie in one
 // span and slab from `first`, else lane t's key (repeating the last) in
-// `own_source`.
+// `own_source`. The whole hardware subgroup calls it; `hist_n` may differ
+// between its logical subgroups, so each run is resolved where any still
+// has keys left, and only there.
 bool decode_keywise_history(inout attention_cursor c, inout decode_planes p, inout history_source fallback,
     attention_history h, uint64_t row, uint kv_head, uint position, uint hist_n, out history_source first,
     out history_source own_source) {
-    if (hist_n == 0u) {
-        first = fallback;
-        own_source = fallback;
+    first = fallback;
+    own_source = fallback;
+    bool live;
+    if (!seismic_steer(live, hist_n != 0u))
         return true;
+    history_source resolved;
+    const uint run = decode_historical_run(c, p, h, row, kv_head, position, position + hist_n, live, resolved);
+    if (live) {
+        fallback = resolved;
+        first = resolved;
+        own_source = resolved;
     }
-    const uint run = decode_historical_run(c, p, h, row, kv_head, position, position + hist_n, first);
-    fallback = first;
-    own_source = first;
-    if (run == hist_n)
-        return true;
-    const uint own = position + min(SEISMIC_LANE, hist_n - 1u);
-    if (own < position + run)
+    const bool contiguous = run == hist_n;
+    const uint own = position + min(SEISMIC_LANE, max(hist_n, 1u) - 1u);
+    if (!contiguous && own < position + run)
         own_source = decode_step(first, own - position);
-    for (uint at = position + run; at < position + hist_n;) {
+    bool more;
+    for (uint at = position + run; seismic_steer(more, !contiguous && at < position + hist_n);) {
         history_source next_part;
-        const uint next_run = decode_historical_run(c, p, h, row, kv_head, at, position + hist_n, next_part);
-        if (own >= at && own < at + next_run)
+        const uint next_run = decode_historical_run(c, p, h, row, kv_head, at, position + hist_n, more, next_part);
+        if (more && own >= at && own < at + next_run)
             own_source = decode_step(next_part, own - at);
         at += next_run;
     }
-    return false;
+    return contiguous;
 }
 
 // Key `position` of `row`'s sequence (at or past the cursor's,
 // `attention_cursor`) for `kv_head`, as this lane's codes and its group's
 // (scale, zero) pair: a history row as stored, from the cursor's slab's
 // planes `p` (resolved again only when the cursor's slab moves), or a fresh
-// row as its append encodes it (`decode_fresh_codes`). The whole subgroup
-// calls it.
+// row as its append encodes it (`decode_fresh_codes`). The whole hardware
+// subgroup calls it; where not `live` the cursor stays where it is and the
+// codes are no key's, and a fresh row is encoded where any lane reads one.
 void decode_read_codes(inout attention_cursor c, inout decode_planes p, attention_history h, uint64_t row,
-    uint kv_head, uint position, out uint k[HISTORY_LANE_WORDS], out vec2 kc, out uint v[HISTORY_LANE_WORDS],
-    out vec2 vc) {
+    uint kv_head, uint position, const bool live, out uint k[HISTORY_LANE_WORDS], out vec2 kc,
+    out uint v[HISTORY_LANE_WORDS], out vec2 vc) {
     bool moved;
     const uint64_t index = attention_cursor_seek(c, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
-        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), row, SEISMIC_DIM_R, 0u, h.slab_rows, position, moved);
-    if (c.span < SEISMIC_DIM_R) {
+        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), row, SEISMIC_DIM_R, 0u, h.slab_rows, position, live, moved);
+    bool fresh_key;
+    if (seismic_steer(fresh_key, live && c.span >= SEISMIC_DIM_R)) {
+        // A logical subgroup reading no fresh key encodes its own batch row,
+        // which exists, then reads its history row, if any.
+        const uint64_t token = fresh_key ? index : row;
+        decode_fresh_codes(true, token, kv_head, k, kc);
+        decode_fresh_codes(false, token, kv_head, v, vc);
+        if (fresh_key)
+            return;
+    }
+    if (live) {
         const uint64_t key_bytes = uint64_t(history_row_words(HISTORY_KEY_BITS)) * 4ul;
         const uint64_t value_bytes = uint64_t(history_row_words(HISTORY_VALUE_BITS)) * 4ul;
         const uint64_t pair_elements = 2ul * uint64_t(HISTORY_PAIRS);
@@ -194,10 +217,7 @@ void decode_read_codes(inout attention_cursor c, inout decode_planes p, attentio
         history_lane_load(HISTORY_VALUE_BITS, p.value_rows + step * value_bytes, SEISMIC_LANE, v);
         kc = stored_at2(p.key_pairs, pair);
         vc = stored_at2(p.value_pairs, pair);
-        return;
     }
-    decode_fresh_codes(true, index, kv_head, k, kc);
-    decode_fresh_codes(false, index, kv_head, v, vc);
 }
 
 void attention_decode_k8v4_partial() {
@@ -225,14 +245,14 @@ void attention_decode_k8v4_partial() {
     const uint64_t value_bytes = uint64_t(history_row_words(HISTORY_VALUE_BITS)) * 4ul;
     const uint64_t pair_elements = 2ul * uint64_t(HISTORY_PAIRS);
 
-    // Plane 0 (the key) and plane 1 (the value) append from subgroups 0 and 1,
-    // or both from a workgroup's one subgroup.
+    // Plane 0 (the key) and plane 1 (the value) append from subgroups 0 and 1
+    // (SIMDS >= 2), which no hardware subgroup splits.
     if (ATTENTION_FRESH && part == 0u) {
         const int destination = element_i32_at(destinations + row * 4ul);
-        for (uint plane = sg; destination >= 0 && plane < 2u; plane += simds) {
+        if (destination >= 0 && SEISMIC_HARDWARE_SUBGROUP < 2u) {
             float x[ATTENTION_E];
-            history_fresh_row(plane == 0u, row, kv_head, lane, x);
-            history_hold(h, plane == 0u, destination, kv_head, lane, false, x);
+            history_fresh_row(sg == 0u, row, kv_head, lane, x);
+            history_hold(h, sg == 0u, destination, kv_head, lane, false, x);
         }
     }
 
@@ -254,8 +274,11 @@ void attention_decode_k8v4_partial() {
     const float query_scale = scale * ATTENTION_LOG2E;
     const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
     if (DECODE_KEYWISE) {
-        // Each head's prepared queries as F32, and their group sums.
-        for (uint head = sg; head < G; head += simds) {
+        // Each head's prepared queries as F32, and their group sums. A logical
+        // subgroup past the last head prepares it again and stores nothing.
+        bool held;
+        for (uint slot = sg; seismic_steer(held, slot < G); slot += simds) {
+            const uint head = held ? slot : G - 1u;
             float x[ATTENTION_E];
             attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + head)
                 * ATTENTION_QUERY_STRIDE) * act_bytes, ATTENTION_QUERY_NORM, query_norm,
@@ -263,35 +286,45 @@ void attention_decode_k8v4_partial() {
             float sum = 0.0;
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
                 const float q = element_round(ACTIVATION_A, x[i]) * query_scale;
-                seismic_shared_f32[prepared + head * W + lane * E + i] = q;
+                if (held)
+                    seismic_shared_f32[prepared + head * W + lane * E + i] = q;
                 sum += q;
             }
             // The group's HISTORY_PAIR_LANES neighbouring lanes.
             [[unroll]] for (uint offset = 1u; offset < 32u; offset *= 2u)
                 if (offset < HISTORY_PAIR_LANES)
                     sum += subgroupShuffleXor(sum, offset);
-            if (lane % HISTORY_PAIR_LANES == 0u)
+            if (held && lane % HISTORY_PAIR_LANES == 0u)
                 seismic_shared_f32[sums + head * HISTORY_PAIRS + lane / HISTORY_PAIR_LANES] = sum;
         }
     } else {
         // Head pair p's prepared queries share words: head 2p in the low
-        // half, head 2p + 1 in the high half.
-        for (uint pair = sg; pair < (G + 1u) / 2u; pair += simds) {
+        // half, head 2p + 1 in the high half. A logical subgroup past the
+        // last pair prepares it again and stores nothing.
+        const uint pairs = (G + 1u) / 2u;
+        bool held;
+        for (uint slot = sg; seismic_steer(held, slot < pairs); slot += simds) {
+            const uint pair = held ? slot : pairs - 1u;
             float low[ATTENTION_E];
             float high[ATTENTION_E];
             attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair)
                 * ATTENTION_QUERY_STRIDE) * act_bytes, ATTENTION_QUERY_NORM, query_norm,
                 row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), low);
-            if (2u * pair + 1u < G)
-                attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair + 1u)
-                    * ATTENTION_QUERY_STRIDE) * act_bytes, ATTENTION_QUERY_NORM, query_norm,
-                    row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), high);
-            else
-                [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-                    high[i] = 0.0;
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-                seismic_shared_u32[prepared + pair * W + lane * E + i] =
-                    element_store(ACTIVATION_A, low[i]) | (element_store(ACTIVATION_A, high[i]) << 16u);
+                high[i] = 0.0;
+            bool paired;
+            if (seismic_steer(paired, 2u * pair + 1u < G)) {
+                float other[ATTENTION_E];
+                attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair + (paired ? 1u : 0u))
+                    * ATTENTION_QUERY_STRIDE) * act_bytes, ATTENTION_QUERY_NORM, query_norm,
+                    row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), other);
+                if (paired)
+                    high = other;
+            }
+            if (held)
+                [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+                    seismic_shared_u32[prepared + pair * W + lane * E + i] =
+                        element_store(ACTIVATION_A, low[i]) | (element_store(ACTIVATION_A, high[i]) << 16u);
         }
     }
     barrier();
@@ -344,8 +377,15 @@ void attention_decode_k8v4_partial() {
         const Stored empty_pairs = stored_at_buffer(ELEMENT_F16, 0ul);
         decode_planes planes = decode_planes(0ul, 0ul, empty_pairs, empty_pairs);
         history_source fallback = history_source(0ul, empty_pairs, 0ul, empty_pairs);
-        if (has_history && !sg_has_history)
-            decode_historical_run(c, planes, h, row, kv_head, partition_lo, partition_lo + 1u, fallback);
+        // A group with no history key of its own still holds the
+        // partition's first history planes, for its fresh batches.
+        bool seeded;
+        if (seismic_steer(seeded, has_history && !sg_has_history)) {
+            history_source seed;
+            decode_historical_run(c, planes, h, row, kv_head, partition_lo, partition_lo + 1u, seeded, seed);
+            if (seeded)
+                fallback = seed;
+        }
         const uint64_t key_stride = uint64_t(KV) * key_bytes;
         const uint64_t value_stride = uint64_t(KV) * value_bytes;
         const uint64_t pair_stride = uint64_t(KV) * pair_elements;
@@ -393,11 +433,15 @@ void attention_decode_k8v4_partial() {
                     const uint step_base = step * HISTORY_FRESH_KEYS;
                     const uint step_n = fresh_n > step_base ? min(HISTORY_FRESH_KEYS, fresh_n - step_base) : 0u;
                     subgroupBarrier();
-                    for (uint j = 0u; j < step_n; ++j) {
+                    // The hardware subgroup encodes the most keys any of
+                    // its logical subgroups has; one past its own encodes
+                    // its batch row, which exists, and stores nothing.
+                    bool live;
+                    for (uint j = 0u; seismic_steer(live, j < step_n); ++j) {
                         uint w[HISTORY_LANE_WORDS];
                         vec2 sz;
-                        decode_fresh_codes(true, fresh_row0 + step_base + j, kv_head, w, sz);
-                        history_keywise_fresh_key(j, w, sz, staging);
+                        decode_fresh_codes(true, live ? fresh_row0 + step_base + j : row, kv_head, w, sz);
+                        history_keywise_fresh_key(j, w, sz, staging, live);
                     }
                     subgroupMemoryBarrierShared();
                     subgroupBarrier();
@@ -417,11 +461,12 @@ void attention_decode_k8v4_partial() {
                             first.value_pairs, pair_stride, staging);
                     }
                 }
-                for (uint j = 0u; j < fresh_n; ++j) {
+                bool live;
+                for (uint j = 0u; seismic_steer(live, j < fresh_n); ++j) {
                     uint w[HISTORY_LANE_WORDS];
                     vec2 sz;
-                    decode_fresh_codes(false, fresh_row0 + j, kv_head, w, sz);
-                    history_keywise_fresh_value(hist_n + j, w, sz, staging);
+                    decode_fresh_codes(false, live ? fresh_row0 + j : row, kv_head, w, sz);
+                    history_keywise_fresh_value(hist_n + j, w, sz, staging, live);
                 }
                 subgroupMemoryBarrierShared();
                 subgroupBarrier();
@@ -437,16 +482,21 @@ void attention_decode_k8v4_partial() {
         attention_cursor c = attention_cursor_at(visible, fresh, row, spans, 0u, range.x);
         const Stored empty_pairs = stored_at_buffer(ELEMENT_F16, 0ul);
         decode_planes planes = decode_planes(0ul, 0ul, empty_pairs, empty_pairs);
-        for (uint position = range.x; position < range.y;) {
-            const uint n = min(HISTORY_BATCH, range.y - position);
+        // The hardware subgroup walks while any of its logical subgroups has
+        // keys left; one that has none reads and absorbs nothing.
+        bool live;
+        for (uint position = range.x; seismic_steer(live, position < range.y);) {
+            const uint n = live ? min(HISTORY_BATCH, range.y - position) : 0u;
             uint k[HISTORY_BATCH][HISTORY_LANE_WORDS];
             uint v[HISTORY_BATCH][HISTORY_LANE_WORDS];
             vec2 kc[HISTORY_BATCH];
             vec2 vc[HISTORY_BATCH];
-            [[unroll]] for (uint j = 0u; j < HISTORY_BATCH; ++j)
-                if (j < n)
-                    decode_read_codes(c, planes, h, row, kv_head, position + j, k[j], kc[j], v[j], vc[j]);
-            history_absorb_affine(n, q, qsum, k, kc, v, vc, maximum, denominator, result, bias);
+            [[unroll]] for (uint j = 0u; j < HISTORY_BATCH; ++j) {
+                bool reading;
+                if (seismic_steer(reading, j < n))
+                    decode_read_codes(c, planes, h, row, kv_head, position + j, reading, k[j], kc[j], v[j], vc[j]);
+            }
+            history_absorb_affine(n, live, q, qsum, k, kc, v, vc, maximum, denominator, result, bias);
             position += n;
         }
     }
@@ -459,13 +509,15 @@ void attention_decode_k8v4_partial() {
         SEISMIC_TUNE_PARTS);
 }
 
-// L2: workgroup (query head, row), one invocation per column: the
-// fixed-order merge of the row's partitions and the output gate.
+// L2: workgroup (query heads, row), one invocation per column
+// (`attention_merge_place`): the fixed-order merge of the row's partitions
+// and the output gate.
 void attention_decode_k8v4_merge() {
+    const uvec2 place = attention_merge_place();
     attention_decode_gate(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
         SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_RESULT_0_OUT,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), SEISMIC_DIM_R,
-        0u, gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
+        0u, place.x, gl_WorkGroupID.y, place.y, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
 }
 
 #endif

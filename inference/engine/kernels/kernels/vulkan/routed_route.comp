@@ -51,7 +51,11 @@ void routed_route_ordered_gemv() { projection_segmented_ordered_gemv_all(); }
 void routed_route_ordered_gemm() { projection_segmented_ordered_gemm(); }
 
 void routed_route_select() {
-    const uint64_t row = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
-    if (row < SEISMIC_DIM_M)
-        route_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), row);
+    // A hardware subgroup without a row leaves; a logical subgroup past the
+    // rows on a 64-lane one ranks the last row again and stores nothing.
+    const uint64_t placed = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + uint64_t(SEISMIC_SUBGROUP);
+    bool live;
+    if (!seismic_steer(live, placed < SEISMIC_DIM_M))
+        return;
+    route_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), live ? placed : SEISMIC_DIM_M - 1ul, live);
 }

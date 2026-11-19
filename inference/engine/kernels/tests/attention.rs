@@ -275,8 +275,10 @@ fn metal_matrix_specializations(
 }
 
 /// Vulkan's grouped-query matrix decode form at `geometry` over `parts`
-/// partitions: the fewest subgroups whose 16-row blocks hold the query
-/// group.
+/// partitions: the fewest subgroups, two at least, whose 16-row blocks hold
+/// the query group within the declaration's shared bytes (the K/V tile and
+/// the subgroup scratch, and the query tile and its rows' factors unless
+/// the queries stage in scratch); none where no count fits.
 fn vulkan_matrix_specialization(
     device: &Device,
     geometry: Geometry,
@@ -285,9 +287,13 @@ fn vulkan_matrix_specialization(
     if device.backend() != BackendName::Vulkan {
         return None;
     }
-    let simds = [1u64, 2, 4, 8]
-        .into_iter()
-        .find(|simds| geometry.g as u64 <= simds * 16)?;
+    let (g, w) = (geometry.g as u64, geometry.w() as u64);
+    let simds = [2u64, 4, 8].into_iter().find(|simds| {
+        let tiles = 64 * (w.min(256) + 8) + simds * 2048;
+        g <= simds * 16
+            && tiles <= 32768
+            && (g * w * 2 > 32768 || tiles + simds * 16 * ((w + 8) * 2 + 4) <= 32768)
+    })?;
     Some((
         format!("Vulkan matrix (PARTS, SIMDS) {:?}", (parts, simds)),
         qwen_form(statics(geometry), geometry)

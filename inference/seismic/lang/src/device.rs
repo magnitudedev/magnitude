@@ -553,6 +553,8 @@ properties! {
         shader_denorm_preserve_float32: Support,
         shader_fma_float32: Support,
         shader_rounding_mode_rte_float32: Support,
+        shader_subgroup_uniform_control_flow: Support,
+        shader_maximal_reconvergence: Support,
     }
     probes {
         // `seismic_vulkan::probe`: each probe's kernel and its expected result.
@@ -590,6 +592,13 @@ properties! {
         shared_int64_atomics: Support = query(shader_shared_int64_atomics);
         denorm_preserve_32: Support = query(shader_denorm_preserve_float32);
         fma_32: Support = query(shader_fma_float32);
+        // `VK_KHR_shader_subgroup_uniform_control_flow`: a selection entered
+        // with subgroup-uniform control flow is guaranteed to rejoin at its
+        // merge (`SubgroupUniformControlFlowKHR`).
+        subgroup_uniform_control_flow: Support = query(shader_subgroup_uniform_control_flow);
+        // `VK_KHR_shader_maximal_reconvergence`: invocations that leave a
+        // loop apart rejoin after it (`MaximallyReconvergesKHR`).
+        maximal_reconvergence: Support = query(shader_maximal_reconvergence);
     }
 }
 
@@ -678,6 +687,12 @@ mod tests {
             Some(false)
         }
         fn shader_rounding_mode_rte_float32(&self) -> Option<bool> {
+            Some(true)
+        }
+        fn shader_subgroup_uniform_control_flow(&self) -> Option<bool> {
+            Some(true)
+        }
+        fn shader_maximal_reconvergence(&self) -> Option<bool> {
             Some(true)
         }
     }

@@ -55,7 +55,7 @@ uint flash_pitch(const uint w) { return w + 8u; }
 void flash_stage(const int kind, uint64_t plane, uint64_t row_stride, uint64_t column, int first, int end, const uint w,
     uint base) {
     const uint pieces = w / 8u;
-    for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
+    for (uint item = SEISMIC_THREAD; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
         const uint k = item / pieces;
         const uint c = (item % pieces) * 8u;
         const int t = first + int(k);

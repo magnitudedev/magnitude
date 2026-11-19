@@ -58,10 +58,15 @@ void indexer_score() {
         SEISMIC_ROTARY_FREQUENCIES_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES),
         SEISMIC_ROTARY_AMPLITUDES_STRIDE_0, SCORE_ROTARY, lane);
     const uint64_t query = SEISMIC_PTR(SEISMIC_BUFFER_QUERY);
-    for (uint head = simd; head < SCORE_H; head += SEISMIC_SUBGROUPS) {
+    // The hardware subgroup runs while either of its logical subgroups holds
+    // a head (64-lane: one past the heads prepares head H - 1 and stores
+    // nothing; 32-lane: the subgroup's own heads).
+    bool holding;
+    for (uint head = simd; seismic_steer(holding, head < SCORE_H); head += SEISMIC_SUBGROUPS) {
         float x[LANE_E];
         [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-            x[i] = element_at(ACTIVATION_A, query, row * SEISMIC_QUERY_STRIDE_0 + uint64_t(head) * SEISMIC_QUERY_STRIDE_1
+            x[i] = element_at(ACTIVATION_A, query, row * SEISMIC_QUERY_STRIDE_0
+                + uint64_t(holding ? head : SCORE_H - 1u) * SEISMIC_QUERY_STRIDE_1
                 + uint64_t(lane * LANE_E + i) * SEISMIC_QUERY_STRIDE_2);
         // A rounded query is rounded from its norm and rotation held in A.
         if (SEISMIC_DIM_NQ != 0) {
@@ -71,8 +76,9 @@ void indexer_score() {
         rotary_lane_rotate(x, turns, SCORE_ROTARY, lane);
         rounding_hold_lanes(x, trained);
         rounding_lanes(x, trained);
-        [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-            seismic_shared_f32[head * SCORE_W + lane * LANE_E + i] = x[i];
+        if (holding)
+            [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
+                seismic_shared_f32[head * SCORE_W + lane * LANE_E + i] = x[i];
     }
     barrier();
     if (ordinal >= n)

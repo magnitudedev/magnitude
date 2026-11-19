@@ -23,8 +23,9 @@ void corrector_rows() {
     const int form = int(SEISMIC_PARAM_FORM);
     float length = 1.0;
     if (form == 2) {
+        // Numbered by `SEISMIC_THREAD`: the partials reach the reduction.
         float partial = 0.0;
-        for (uint64_t column = lane; column < SEISMIC_DIM_N; column += threads) {
+        seismic_strided(uint64_t, column, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_N, threads) {
             const float value = rows_biased(values, bias, row, column);
             partial += value * value;
         }

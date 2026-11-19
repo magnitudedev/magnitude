@@ -4017,11 +4017,15 @@ fn grouped_projection<E: seismic::Entry>(
     })
 }
 
-/// The grouped expert pass of the packed block's experts on `device` at
-/// `mapping`, in its default form (CUDA's operand path 0).
-fn grouped_experts(device: &seismic::Device, block: &PackedBlock, mapping: &[(&'static str, u64)]) -> seismic::NativeKernel<routed_experts::Entry> {
+/// The grouped expert pass of the packed block's experts in its default form
+/// (CUDA's operand path 0), at each of `device`'s grouped mappings its
+/// declaration admits.
+fn grouped_experts(
+    device: &seismic::Device,
+    block: &PackedBlock,
+) -> Vec<(Vec<(&'static str, u64)>, seismic::NativeKernel<routed_experts::Entry>)> {
     let (h, f) = (PackedBlock::HIDDEN as u64, block.routed.features as u64);
-    grouped_projection(
+    let pass = grouped_projection(
         routed_experts::native_entry_with(routed_experts::Elements {
             A: seismic::Element::bf16(),
             EGW: block.expert_gate.element(),
@@ -4030,8 +4034,15 @@ fn grouped_experts(device: &seismic::Device, block: &PackedBlock, mapping: &[(&'
         }),
         [[("H", h), ("F", f), ("T", 32)].as_slice(), &block.routed.expansion_statics(), &[("LB", 0)]].concat(),
         0,
-    )
-    .kernel(device, Grouped { mapping, form: &GroupedForm::default() })
+    );
+    let form = GroupedForm::default();
+    mapped::admitted("routed_experts", grouped_mappings(device), |mapping| pass.admits(device, Grouped { mapping, form: &form }))
+        .into_iter()
+        .map(|mapping| {
+            let kernel = pass.kernel(device, Grouped { mapping: &mapping, form: &form });
+            (mapping, kernel)
+        })
+        .collect()
 }
 
 /// A graph sealed at 16,384 rows passes only the blocks its rows fill, and a
@@ -4045,8 +4056,7 @@ fn native_merged_expert_pass_keeps_each_chunks_bits_at_any_capacity() {
         let block = PackedBlock::new(&device, Experts::Packed);
         let routing = PackedBlock::routing(2048, 77);
         let (scales, map) = (block.routed.expansion_scales(&device), [absent_map(&device), absent_step(&device)]);
-        for mapping in grouped_mappings(&device) {
-            let experts = grouped_experts(&device, &block, &mapping);
+        for (mapping, experts) in grouped_experts(&device, &block) {
             let run = |pass: &GroupedPass| pass.rows(&experts.call(&charges, pass.args(&block, &map, &scales)).unwrap().value);
             let chunks = (0..4)
                 .map(|chunk| run(&GroupedPass::new(&device, &routing, chunk * 512..(chunk + 1) * 512, 0, 512)))
@@ -4086,8 +4096,7 @@ fn native_expert_row_keeps_its_bits_at_any_tile_occupancy() {
         let mut routing = PackedBlock::routing(32, 79);
         routing.routes = routing.routes[..k].repeat(32);
         let (scales, map) = (block.routed.expansion_scales(&device), [absent_map(&device), absent_step(&device)]);
-        for mapping in grouped_mappings(&device) {
-            let experts = grouped_experts(&device, &block, &mapping);
+        for (mapping, experts) in grouped_experts(&device, &block) {
             let last = |rows: std::ops::Range<usize>| {
                 let pass = GroupedPass::new(&device, &routing, rows, 0, 32);
                 let bits = pass.rows(&experts.call(&charges, pass.args(&block, &map, &scales)).unwrap().value);
@@ -5208,25 +5217,24 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
         }
         let residual_tensor = f32_tensor(&device, &[m, h], &residual);
         let [gate_scale, up_scale] = block.routed.expansion_scales(device);
-        for mapping in grouped_mappings(&device) {
+        let pass = grouped_projection(
+            routed_experts::native_entry_with(routed_experts::Elements {
+                A: bf16,
+                EGW: element(&device, "q4k"),
+                EUW: element(&device, "q4k"),
+                EDW: element(&device, "q5k"),
+            }),
+            [[("H", h), ("F", f), ("T", t)].as_slice(), &block.routed.expansion_statics(), &[("LB", 0)]].concat(),
+            0,
+        );
+        let form = GroupedForm::default();
+        for mapping in mapped::admitted("routed_experts", grouped_mappings(&device), |mapping| pass.admits(device, Grouped { mapping, form: &form })) {
             let label = format!("35B grouped rows {rows} mapping {mapping:?}");
             // The default forms, CUDA's operand path at its first value: the
             // staged one is the grouped test's (`OPERAND` 1).
-            let configuration = Grouped {
-                mapping: &mapping,
-                form: &GroupedForm::default(),
-            };
-            let experts = grouped_projection(
-                routed_experts::native_entry_with(routed_experts::Elements {
-                    A: bf16,
-                    EGW: element(&device, "q4k"),
-                    EUW: element(&device, "q4k"),
-                    EDW: element(&device, "q5k"),
-                }),
-                [[("H", h), ("F", f), ("T", t)].as_slice(), &block.routed.expansion_statics(), &[("LB", 0)]].concat(),
-                0,
-            )
-            .kernel(device, configuration)
+            let configuration = Grouped { mapping: &mapping, form: &form };
+            let experts = pass
+                .kernel(device, configuration)
             .call(&charges, routed_experts::Args {
                 first: &first_row(&device),
                 rows: &grouped,
@@ -5544,13 +5552,21 @@ fn native_35b_grouped_capacity_keeps_every_bit_on(device: &seismic::Device) {
         let residual_tensor = f32_tensor(device, &[m, h], &residual);
         let padded = group_blocks(m * k, e, t);
         let bounded = group_blocks(m * k, e.min(m * k), t);
-        for mapping in grouped_mappings(device) {
+        let pass = grouped_projection(
+            routed_experts::native_entry_with(routed_experts::Elements {
+                A: bf16,
+                EGW: element(device, "q4k"),
+                EUW: element(device, "q4k"),
+                EDW: element(device, "q5k"),
+            }),
+            vec![("H", h), ("F", f), ("T", t), ("GS", 0), ("US", 0), ("LB", 0)],
+            0,
+        );
+        let form = GroupedForm::default();
+        for mapping in mapped::admitted("routed_experts", grouped_mappings(device), |mapping| pass.admits(device, Grouped { mapping, form: &form })) {
             // The default forms, CUDA's operand path at its first value, as
             // the 35B chain's.
-            let configuration = Grouped {
-                mapping: &mapping,
-                form: &GroupedForm::default(),
-            };
+            let configuration = Grouped { mapping: &mapping, form: &form };
             let combined = |blocks: u64| {
                 let fill = |shape: &[u64]| {
                     i32_tensor(
@@ -5582,17 +5598,8 @@ fn native_35b_grouped_capacity_keeps_every_bit_on(device: &seismic::Device) {
                     used: &mut used,
                 })
                 .unwrap();
-                let experts = grouped_projection(
-                    routed_experts::native_entry_with(routed_experts::Elements {
-                        A: bf16,
-                        EGW: element(device, "q4k"),
-                        EUW: element(device, "q4k"),
-                        EDW: element(device, "q5k"),
-                    }),
-                    vec![("H", h), ("F", f), ("T", t), ("GS", 0), ("US", 0), ("LB", 0)],
-                    0,
-                )
-                .kernel(device, configuration)
+                let experts = pass
+                    .kernel(device, configuration)
                 .call(&charges, routed_experts::Args {
                     first: &first_row(&device),
                     rows: &grouped,

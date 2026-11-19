@@ -88,11 +88,11 @@ void readout_project_rows_finalize() { projection_single_finalize(); }
 
 // The routed projection's `choice` over row m's selected rows (choice y % I):
 // workgroup x a tile of SUBGROUPS x ROWS selected rows, the K1 GEMV of the
-// feature row against them. Once the tile's logits are stored (the GEMV
-// stages through shared memory, so every invocation reaches its end), a
-// selection past the vocabulary's logit is -inf.
+// feature row against them. Each row's logit is published by the lane that
+// holds its sum (`projection_gemv`'s epilogue lane), -inf for a selection
+// past the vocabulary, so one invocation stores each logit.
 void readout_project_rows_gather_choice() {
-    const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_GATHER_ROWS;
+    const uint r_rows = SEISMIC_TUNE_GATHER_ROWS;
     const uint tile = gl_WorkGroupID.x, s = uint(SEISMIC_DIM_S);
     uint64_t m, choice;
     seismic_split(gl_WorkGroupID.y, SEISMIC_DIM_I, m, choice);
@@ -101,14 +101,18 @@ void readout_project_rows_gather_choice() {
     const Out row = out_offset(SEISMIC_RESULT_0_OUT, m * SEISMIC_RESULT_0_STRIDE_0);
     const projection_weights w = projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS, HEAD_K,
         selected, SEISMIC_TOKEN_ROWS_STRIDE_2, 0u);
-    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_GATHER_ROWS, 32u, 1u, false, false,
-        PROJECTION_NORM_NONE, feature_rows(m), logits_at(row), w, w, 1u, s, HEAD_K, tile);
-    memoryBarrierBuffer();
-    barrier();
-    for (uint n = tile * rows_per_tile + gl_LocalInvocationIndex; n < min(s, (tile + 1u) * rows_per_tile);
-         n += gl_WorkGroupSize.x) {
-        const int token = element_i32_at(selected + uint64_t(n) * SEISMIC_TOKEN_ROWS_STRIDE_2 * 4ul);
-        if (token < 0 || uint64_t(token) >= SEISMIC_DIM_V)
-            out_put(row, uint64_t(n) * SEISMIC_RESULT_0_STRIDE_1, uintBitsToFloat(0xff800000u));
+    float totals[PROJECTION_GEMV_SUMS], totals2[PROJECTION_GEMV_SUMS];
+    projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, r_rows, 32u, 1u, false, false, PROJECTION_NORM_NONE,
+        feature_rows(m), w, w, 1u, s, HEAD_K, tile, totals, totals2);
+    const uint first_row = projection_gemv_first_row(r_rows, 32u, tile);
+    [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
+        const uint n = first_row + r;
+        if (SEISMIC_LANE == r && n < s) {
+            const int token = element_i32_at(selected + uint64_t(n) * SEISMIC_TOKEN_ROWS_STRIDE_2 * 4ul);
+            if (token < 0 || uint64_t(token) >= SEISMIC_DIM_V)
+                out_put(row, uint64_t(n) * SEISMIC_RESULT_0_STRIDE_1, uintBitsToFloat(0xff800000u));
+            else
+                projection_put(logits_at(row), 0u, n, totals[r * PROJECTION_GEMV_MAX_M]);
+        }
     }
 }

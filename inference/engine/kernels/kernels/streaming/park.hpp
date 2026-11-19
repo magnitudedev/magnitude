@@ -107,3 +107,19 @@ STREAMING_FN int streaming_held(STREAMING_SYSTEM_READ row, u64 stride, u64 q) {
         return -1;
     return streaming_load_acquire(STREAMING_AT(row, SEISMIC_CONST_MAP_RECORD * stride));
 }
+
+// `streaming_held` of a map in device words nothing writes while the
+// reading launch runs (a merge set's pass's `resolved`, written by
+// `routed_pass_map` before the pass, with the step it is read for): plain
+// loads, each u64 its low and high words, so every invocation reading a row
+// reads it alike, and a block whose expert is skipped leaves its group
+// whole, ahead of the group's barriers and matrix work.
+STREAMING_FN int streaming_held_input(STREAMING_DEVICE_READ row, u64 stride, u64 q) {
+    const u64 from = (u64(u32(streaming_device_load(STREAMING_AT(row, (SEISMIC_CONST_MAP_FROM + 1) * stride)))) << 32) |
+                     u64(u32(streaming_device_load(STREAMING_AT(row, SEISMIC_CONST_MAP_FROM * stride))));
+    const u64 until = (u64(u32(streaming_device_load(STREAMING_AT(row, (SEISMIC_CONST_MAP_UNTIL + 1) * stride)))) << 32) |
+                      u64(u32(streaming_device_load(STREAMING_AT(row, SEISMIC_CONST_MAP_UNTIL * stride))));
+    if (q < from || q >= until)
+        return -1;
+    return streaming_device_load(STREAMING_AT(row, SEISMIC_CONST_MAP_RECORD * stride));
+}

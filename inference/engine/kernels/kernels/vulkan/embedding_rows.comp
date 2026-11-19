@@ -33,12 +33,19 @@ void embedding_rows_inverse() {
         return;
     const uint64_t table_row = packets_row(SEISMIC_PTR(SEISMIC_BUFFER_TABLE), geometry, uint64_t(held));
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    // Every invocation's packet rounds, spread by `SEISMIC_THREAD`; one past
+    // the row, or a value past it, adds nothing.
     float squares = 0.0;
-    for (uint p = gl_LocalInvocationID.x; p * 32u < width; p += gl_WorkGroupSize.x) {
-        const packets_packet packet = packets_load(PACKETS_W0, table_row, geometry, p, width);
-        for (uint i = 0u; i < 32u && 32u * p + i < width; ++i) {
-            const float value = packets_value_at(PACKETS_W0, packet, i) * scale;
-            squares = seismic_fma_rn(value, value, squares);
+    for (uint base = 0u; base * 32u < width; base += gl_WorkGroupSize.x) {
+        const uint p = base + SEISMIC_THREAD;
+        if (p * 32u < width) {
+            const packets_packet packet = packets_load(PACKETS_W0, table_row, geometry, p, width);
+            for (uint i = 0u; i < 32u; ++i) {
+                if (32u * p + i < width) {
+                    const float value = packets_value_at(PACKETS_W0, packet, i) * scale;
+                    squares = seismic_fma_rn(value, value, squares);
+                }
+            }
         }
     }
     squares = reduce_group_sum(squares, 0u);

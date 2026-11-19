@@ -2,7 +2,7 @@
 
 **Each backend declares one explicit floor of hardware, drivers, and operating system.**
 Anything above the floor is an optional tier that is detected at runtime and never required.
-The CPU backend is always available as the fallback.
+The CPU backend serves hosts with no GPU above any backend's floor.
 
 ## Principles
 
@@ -14,8 +14,10 @@ The CPU backend is always available as the fallback.
 - **Checked at discovery:** floors are checked when devices are discovered, and a failing
   device reports a typed reason. A device that passes the floor must not later fail for a
   compatibility reason.
-- **Fallback between backends:** hardware below one GPU backend's floor may be served by
-  another backend (for example, Turing through Vulkan). Otherwise it falls back to CPU.
+- **Backends by floor:** hardware below one GPU backend's floor may be served by another
+  backend (for example, Turing through Vulkan). Hardware below every GPU floor is served by the
+  CPU. A GPU above a floor is never sent to the CPU: a kernel that computes wrong on it is an
+  engine bug that fails loudly and is fixed.
 - **Documented exclusions:** the exclusions listed here are deliberate. A new exclusion
   requires updating this document.
 
@@ -129,16 +131,187 @@ The CPU backend is always available as the fallback.
     subgroups.
 - **Kernel authoring rules:**
   - Use the prelude's lane and subgroup identity helpers and its 32-lane-clustered
-    reductions. Never use `gl_Subgroup*` builtins or whole-subgroup reductions directly.
+    reductions. `seismic-build` refuses `gl_Subgroup*` built-ins and every subgroup operation
+    that spans the hardware subgroup in kernel sources.
   - Keep lane exchanges inside the logical subgroup.
-- **Results are identical across subgroup widths:** fixed-order reductions give identical
-  results on 32- and 64-wide hardware.
+- A kernel computes the same function at either width. Its rounding may differ where a form's
+  reduction order does; the precision system judges that, not this document.
+
+### Execution model
+
+A kernel may assume only what Vulkan guarantees, plus two assumptions. Vulkan does not run a
+subgroup in lockstep, does not say which invocations of a workgroup share a subgroup or in which
+lane order, and does not promise that invocations rejoin after a loop they leave at different
+iterations, or after some of them exit. CUDA's warp gives all of these, and NVIDIA's Vulkan
+driver happens to; AMD's Windows driver does not (#151).
+
+- **The assumptions:**
+  - A selection (if/else, switch) entered with subgroup-uniform control flow rejoins at its
+    merge: a subgroup operation after it has every invocation. A function call rejoins at its
+    return in the same way, whatever returns its body takes. Where the device has
+    `VK_KHR_shader_subgroup_uniform_control_flow`, every module that relies on the assumption
+    declares `SubgroupUniformControlFlowKHR`, and the driver guarantees it. A module relies on
+    it where it runs a subgroup operation or subgroup barrier after invocations that divergent
+    control parted have rejoined: at or after a divergent selection's merge, or where an exit
+    taken under divergent control leads, with no workgroup barrier between. Elsewhere it is
+    relied on because every driver merges structured selections; loops whose invocations leave
+    at different iterations are what compilers break, and they are refused, with one exception.
+    Where the device has `VK_KHR_shader_maximal_reconvergence`, a subgroup operation may follow
+    such a loop, and so may a subgroup barrier: the module declares `MaximallyReconvergesKHR` and
+    the driver rejoins the invocations after the loop. Formation accepts the form only in a
+    module formed that way. The device library owns the mode (`SEISMIC_HAS_MAXIMAL_RECONVERGENCE`, which `seismic-build`
+    refuses in kernel sources). Its `seismic_strided`, `seismic_strided_from` and
+    `seismic_strided_bounded` loops are written once for both: the plain loop where the device
+    has the mode, otherwise rounds with a uniform trip count and a guard on the bound. Its
+    `seismic_rejoin()` is nothing where the device has the mode, otherwise a workgroup barrier.
+    A subgroup operation inside a loop whose invocations leave apart is refused either way.
+  - A workgroup barrier at a legal point is executed by every invocation of the workgroup
+    together, so control is uniform after it, even after a loop its invocations left at
+    different iterations. Every implementation counts a workgroup barrier per hardware subgroup.
+    A point is legal where control, and every exit before it, is the same for every invocation
+    of the workgroup: neither divergent nor steered by which subgroup an invocation is in. A
+    subgroup barrier carries no such assumption.
+- **Uniform and divergent:** a value is uniform when every invocation of the hardware subgroup
+  holds it: constants, loads through uniform pointers from push constants, the argument block,
+  the tables buffer and the buffers the launch only reads, the workgroup, grid and subgroup
+  counts and ids, whole-subgroup reductions, votes and ballots, a broadcast or shuffle from a
+  uniform lane, and what is computed from uniform values alone. Lane ids, invocation ids,
+  relative shuffles, scans, clustered reductions and atomics' results are divergent, and so is
+  anything computed from them. An undefined value (a variable before it is written) adds
+  nothing to what it joins: a kernel whose result depends on one is wrong whatever it holds.
+  A whole-subgroup result shows which subgroup combined it (it derives from the lane order,
+  below) where its operands derive from the subgroup's id or differ between invocations
+  otherwise than by lane. Where they differ by lane alone, such as a lane id or a load at a
+  lane's address of memory no store races, every full subgroup combines the same values, and
+  the result is the same in every subgroup.
+- **Memory:**
+  - A load through a uniform pointer from workgroup memory is uniform only where no store that
+    may touch its bytes shares its barrier interval: the stretch reachable from the same
+    workgroup barrier (one whose semantics order workgroup memory), or from the entry, without
+    crossing another. Within an interval a store races a load where one reaches the other in
+    it, in either order, or where a branch whose condition may differ between invocations parts
+    the ways to them, as different invocations take different branches at once. It races no
+    load where a branch the whole workgroup takes alike (its condition, the control it runs
+    under and the exits before it uniform), which the interval passes once at most, parts every
+    way to the store from every way to the load: every invocation took the same way there, so
+    none is at both. Otherwise the invocations of a subgroup see the store or not, and only
+    lockstep would make them agree. Workgroup memory is followed by byte: an access at
+    a constant offset into its variable (every index the same constant in every invocation)
+    touches those bytes alone, all group-memory views being one memory; an access at any other
+    offset may touch any byte, so a store at a variable offset races every load.
+  - A load from a buffer the launch writes is never uniform: a barrier orders only its own
+    workgroup, and other workgroups may store to it at any time. A kernel steered by such a word
+    stages it through workgroup memory. What another workgroup stores derives from none of the
+    reader's ids or lane order: through a uniform pointer, a load carries what a store derives
+    from only where one of its own workgroup shares its barrier interval or may run anywhere
+    before it, since no barrier here orders device memory.
+  - A buffer the launch only reads is one nothing in the launch writes. Access belongs to the
+    launch, and its module is the one source of what it writes: a buffer whose address the
+    module never stores through is one it only reads, such as a result or scratch an earlier
+    launch of the dispatch wrote. A `&` parameter is one by declaration: the ABI reads its
+    address, and the argument words, through the input block (`seismic_input_block_t`), and a
+    write through it, or through the tables buffer, is refused. So is the address table of a
+    slab or record port the launch writes through: the ABI reads its address through the
+    address-table block (`seismic_address_table_block_t`), and a write through it is refused.
+  - Which buffer an access reaches is followed through the invocation's registers and
+    variables: a value computed from buffers' addresses, as the argument block gives them,
+    names every one of them, whatever the computation, so an address rebuilt from another
+    buffer's address and a delta names both. No such value is stored to workgroup or device
+    memory, so a value read from memory holds no address the launch was given: it is an
+    offset where it is added to a named address, and otherwise may point anywhere, except
+    where it is read from memory the launch only reads: one read from a `&` buffer points into
+    the memory a `&` buffer's tables reach, and one read from an address table into that
+    port's own bytes, which the runtime keeps apart from every other binding of the launch
+    (so a store through it writes only them). That holds for backed slots: a free slot names a
+    zero slab its store shares, which kernels only read by a masked load whose value they
+    discard and never store through (formation does not check this), and the host repoints no
+    slot a launch in flight reads as backed. A condition (a boolean) holds no address: one
+    on an address carries the condition's divergence but not its address. One assumption
+    remains: a delta rebuilt from conditions, bit by bit or branch by branch, is taken as an
+    offset. No kernel builds one.
+  - No two tensors bound to one launch share a byte when either is written. The language makes
+    every such pair disjoint, and the runtime refuses a binding that breaks it on every platform,
+    in its one binding check, comparing the bytes each binding reaches (a slab view's, the slots
+    its site binds).
+- **Steering by votes and joins:** hardware-wide votes (the prelude's `seismic_uniform_all` and
+  `seismic_uniform_any`) are uniform and may steer control flow; the logical-subgroup helpers on
+  64-lane hardware are clustered, so their results are divergent. A value each logical subgroup
+  holds alike steers the hardware subgroup through the prelude's `seismic_steer(live, p)`, the
+  whole condition of an `if`, `while` or `for`: a vote over its logical subgroups on 64-lane
+  hardware, binding `live` to the caller's own predicate for the region it guards. On 32-lane
+  hardware the vote is the predicate itself and `live` the literal true: formation requires the
+  predicate uniform, then removes the vote from the module it ships, so neither the vote nor
+  `live` is left there, and a steered loop exits at its header (seismic-build refuses any other
+  placement). `seismic_hardware_first` broadcasts such a value from the first logical subgroup,
+  and is the value itself on 32-lane hardware.
+- **Lane order:** because the lane order is unspecified, a value derived from the local or
+  global invocation id and a value derived from the lane order (a lane or subgroup id, a
+  per-lane subgroup result, or a whole-subgroup result that shows which subgroup combined it)
+  never meet in one value or one store, nor through the control a store to shared memory runs
+  under, nor where invocations that took different paths meet. Shared memory is judged per
+  class (workgroup memory; memory the launch writes), not per array, but for the bytes a load
+  at a constant offset of workgroup memory reads (Memory, above).
+- **Constructs:** a selection is divergent when its condition is. A loop is lane-varying when it
+  is left or continued under a divergent condition. A return, `break` or `continue` under a
+  divergent condition is a lane-dependent exit. A value a loop carries out derives from the
+  lane order when the loop is left under a condition that differs between subgroups. A
+  branch whose condition is computed from constants (through values, struct members, calls'
+  parameters and variables) takes one way, and the way no invocation takes is not checked; a
+  specialization constant is no constant here, since pipeline creation sets it after the
+  check, and an undefined condition takes either way.
+- **Variables:** a function's variable (a local left in memory, a call's parameter) is each
+  invocation's own. A store to it keeps the value stored, whatever control it runs under; the
+  control enters where invocations that took different paths meet (a selection's merge, a
+  lane-varying loop's exits, the rejoin after a lane-dependent exit), as it does for a value
+  chosen there, and what a lane-varying loop stores differs where the loop is left.
+- **Enforced at formation:** after cleanup, a copy of each module with its functions inlined
+  (except the 32-lane joins) and its locals in SSA form is checked, and formation refuses:
+  - a subgroup operation inside a divergent selection or a lane-varying loop, or after a
+    lane-varying loop with no workgroup barrier between, or after a lane-dependent exit (until
+    the merge the exit rejoins at);
+  - a control barrier inside a divergent selection or a lane-varying loop, after a
+    lane-dependent exit, or, for a subgroup barrier, after a lane-varying loop with no workgroup
+    barrier between (but in a module declaring `MaximallyReconvergesKHR`);
+  - a workgroup barrier under control, or after an exit, steered by which subgroup an
+    invocation is in;
+  - a subgroup operation on a value derived from the local or global invocation id: computed
+    from one, chosen by control that depends on one, read from memory such a value is stored to,
+    or through an address derived from one;
+  - a value or store where local-id and lane-order derivations meet;
+  - a subgroup operation whose operand SPIR-V requires to be uniform is divergent: a broadcast's
+    or read invocation's lane, a quad broadcast's index, a cooperative-matrix load's or store's
+    pointer, layout and stride;
+  - a 32-lane join whose argument is divergent;
+  - a store of a buffer's address, or of a value computed from one, to workgroup or device
+    memory;
+  - a function named as a 32-lane join (`seismic_hardware_`) that does not return its one
+    argument;
+  - a write to a buffer the launch only reads, a module with more than one entry point, and an
+    instruction the check does not read.
+- **Precision of the check:** a struct's members are followed apart, in values and in variables,
+  inside arrays too (each member joined across the array's elements, so one member written
+  at a divergent index leaves the others as they were), and a variable holds at each point
+  what the stores reaching it put there. A value a lane-varying loop computes alike in every
+  iteration (from values outside it, push constants, the argument block, or memory the launch
+  only reads at an address the same in every iteration) is uniform after it. A refusal names,
+  per kind, how many instructions break the model so, the first, and where what it refuses
+  comes from (the built-in load, racing read, subgroup operation, phi where divergent control
+  rejoins or load of a variable written there that raised the offending fact, or the loop
+  or selection and the condition that steer it).
+- **Full subgroups:** a pipeline whose module reads its subgroups (a subgroup operation or a
+  subgroup built-in) requires full subgroups, and a launch of it whose workgroup X extent is not
+  a multiple of 64 is refused when it is formed, for every device and offline alike, so no
+  subgroup it reads is ever partial at either width. A kernel that reads no subgroup takes any X.
 
 ### Driver defects
 
 Drivers that meet the floor and still fail on a valid module. Each defect has a shape the kernels
 avoid, and formation refuses that shape where it can be recognised.
 
+- **NVIDIA 580, a 64-bit conditional subtraction written as a branch** (`if (x >= m) x -= m;`):
+  the compiler crashed forming `attention_prefill`, `attention_append_k8v4` and `import_dense`.
+  Kernels write the select, `x -= x >= m ? m : 0ul`. Formation refuses the branch form (an
+  `OpPhi` of `x` and `x - m` at the merge of a compare of the two; `seal.rs`).
 - **NVIDIA 580 (GB10 on 580.159.03, Ada on 580.95.05), `seismic_sqrt_rn`'s digit steps as a
   loop.** On Ada the numerics oracle's kernel with this loop hung the GPU (utilization 100%, no
   completion in 38 minutes). On GB10 the restoring square root's 28 steps of 64-bit selects,
@@ -162,6 +335,8 @@ avoid, and formation refuses that shape where it can be recognised.
 - **Shader float atomics and 64-bit shared atomics.**
 - **`VK_KHR_shader_fma`.** With it, `fma` compiles to `OpFmaKHR` and is fused. Without it,
   `fma` is GLSL `fma`, which the driver may fuse or round twice.
+- **`VK_KHR_shader_subgroup_uniform_control_flow`.** With it, modules declare
+  `SubgroupUniformControlFlowKHR`, which guarantees the execution model's one assumption.
 
 ### Coverage
 

@@ -11,7 +11,9 @@
 #include "select.glsl"
 SELECT_RANKING
 
-void select_select_row(uint64_t logits_base, uint64_t row) {
+// Row `row`'s selection; a subgroup not `live` ranks it without storing
+// (its 64-lane partner's row is live).
+void select_select_row(uint64_t logits_base, uint64_t row, bool live) {
     const uint lane = SEISMIC_LANE;
     float chosen[SELECT_K];
     int winners[SELECT_K];
@@ -20,7 +22,7 @@ void select_select_row(uint64_t logits_base, uint64_t row) {
     float denominator = 0.0;
     for (uint slot = 0u; slot < SELECT_K; ++slot)
         denominator += chosen[slot];
-    if (lane == 0u) {
+    if (live && lane == 0u) {
         const int normalization = int(SEISMIC_PARAM_NORMALIZATION);
         const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
         const float epsilon = element_word_f32(SEISMIC_PARAM_NORMALIZATION_EPSILON);
@@ -31,6 +33,9 @@ void select_select_row(uint64_t logits_base, uint64_t row) {
                     + uint64_t(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0 * 4ul);
             element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
                 + (row * SEISMIC_ROUTES_STRIDE_0 + uint64_t(slot) * SEISMIC_ROUTES_STRIDE_1) * 4ul, winners[slot]);
+#ifdef STREAMING_ROUTES_GROUPED
+            routed_group_route(row, slot, winners[slot]);
+#endif
             out_put(SEISMIC_OUT_WEIGHTS,
                 row * SEISMIC_WEIGHTS_STRIDE_0 + uint64_t(slot) * SEISMIC_WEIGHTS_STRIDE_1, weight);
         }

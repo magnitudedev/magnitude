@@ -81,14 +81,16 @@ void attention_decode_partial() {
         gl_WorkGroupID.z, DECODE_PICKS, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
 }
 
-// L2: workgroup (query head, row), one invocation per column: the
-// fixed-order merge of the row's partitions (of its visible keys and picks;
-// with the head's sink when SK = 1) and the output gate.
+// L2: workgroup (query heads, row), one invocation per column
+// (`attention_merge_place`): the fixed-order merge of the row's partitions
+// (of its visible keys and picks; with the head's sink when SK = 1) and the
+// output gate.
 void attention_decode_merge() {
+    const uvec2 place = attention_merge_place();
     attention_decode_gate(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
         SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_RESULT_0_OUT,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), SEISMIC_DIM_R,
-        DECODE_PICKS, gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN,
+        DECODE_PICKS, place.x, gl_WorkGroupID.y, place.y, SEISMIC_TUNE_SPAN,
         SEISMIC_TUNE_PARTS);
 }
 

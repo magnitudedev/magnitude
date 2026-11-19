@@ -271,16 +271,19 @@ bool packets_detail_staged = false;
 #endif
 
 // Copies slot axes `AXES`' table to its place PLACE among the staged ones,
-// the workgroup's invocations a word each in turn.
+// the workgroup's invocations a word each in turn, numbered by
+// `SEISMIC_THREAD`: the staged words feed subgroup operations, so no store
+// of them may derive from the local invocation index (every includer reads
+// its subgroups and declares X a multiple of 64).
 #define PACKETS_DETAIL_STAGE_GRID8(AXES, PLACE) \
-    for (uint i = gl_LocalInvocationIndex; i < PACKETS_DETAIL_TABLE_WORDS_OF(AXES); i += threads) \
+    for (uint i = SEISMIC_THREAD; i < PACKETS_DETAIL_TABLE_WORDS_OF(AXES); i += threads) \
         seismic_shared_u32[PACKETS_DETAIL_TABLES_AT + (PLACE) + i] = \
             PACKETS_DETAIL_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i >> 1u][i & 1u];
 #define PACKETS_DETAIL_STAGE_GRID4(AXES, PLACE) \
-    for (uint i = gl_LocalInvocationIndex; i < PACKETS_DETAIL_TABLE_WORDS_OF(AXES); i += threads) \
+    for (uint i = SEISMIC_THREAD; i < PACKETS_DETAIL_TABLE_WORDS_OF(AXES); i += threads) \
         seismic_shared_u32[PACKETS_DETAIL_TABLES_AT + (PLACE) + i] = PACKETS_DETAIL_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i];
 #define PACKETS_DETAIL_STAGE_CODEBOOK(AXES, PLACE) \
-    for (uint i = gl_LocalInvocationIndex; i < PACKETS_DETAIL_TABLE_WORDS_OF(AXES); i += threads) \
+    for (uint i = SEISMIC_THREAD; i < PACKETS_DETAIL_TABLE_WORDS_OF(AXES); i += threads) \
         seismic_shared_f32[PACKETS_DETAIL_TABLES_AT + (PLACE) + i] = \
             PACKETS_DETAIL_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i];
 

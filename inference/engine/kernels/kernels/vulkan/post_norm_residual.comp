@@ -15,8 +15,9 @@ void post_norm_residual() {
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     const uint64_t projected = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTED) + row * SEISMIC_PROJECTED_STRIDE_0 * 4ul;
+    // The squares the reduction combines are spread by `SEISMIC_THREAD`.
     float squares = 0.0;
-    for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
+    seismic_strided(uint64_t, i, SEISMIC_THREAD, width, gl_WorkGroupSize.x) {
         const float v = element_f32_at(projected + i * SEISMIC_PROJECTED_STRIDE_1 * 4ul);
         squares = seismic_fma_rn(v, v, squares);
     }

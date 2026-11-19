@@ -427,12 +427,12 @@ inline void gate_head(arrive::coherent_device<const Storage> mixed, long covered
     device const uchar *norm, element::Out<activation::Act> gated, ulong head, uint thread_index, uint threads,
     constant ulong *seismic_words) {
     constexpr uint LANES = SEISMIC_DIM_W / 8;
-    static_assert(SEISMIC_DIM_W % 32 == 0 && LANES <= 32, "a head is gated over W / 8 lanes, 4 to 32");
+    static_assert(SEISMIC_DIM_W % 8 == 0 && LANES <= 32, "a head is gated over W / 8 lanes, up to 32");
     // A row's butterfly group: the power of two at or above LANES (LANES
     // itself when it is one). Lanes of the group past LANES read an owner's
     // columns, so every address lies in the row, but add zero and store
     // nothing.
-    constexpr uint GROUP = LANES <= 4 ? 4 : LANES <= 8 ? 8 : LANES <= 16 ? 16 : 32;
+    constexpr uint GROUP = LANES <= 1 ? 1 : LANES <= 2 ? 2 : LANES <= 4 ? 4 : LANES <= 8 ? 8 : LANES <= 16 ? 16 : 32;
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     const uint items = uint(SEISMIC_DIM_M) * GROUP;
     for (uint first = 0; first < items; first += threads) {

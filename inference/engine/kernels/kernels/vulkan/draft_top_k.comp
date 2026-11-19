@@ -18,7 +18,8 @@ void draft_top_k() {
     for (uint64_t rank = 0ul; rank < SEISMIC_DIM_K; ++rank) {
         float best = -TOP_K_INF;
         int best_token = 0x7fffffff;
-        for (uint64_t token = gl_LocalInvocationIndex; token < SEISMIC_DIM_V; token += gl_WorkGroupSize.x) {
+        // Numbered by `SEISMIC_THREAD`: the candidates reach the reductions.
+        seismic_strided(uint64_t, token, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_V, gl_WorkGroupSize.x) {
             const float value = element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1) * 4ul);
             const bool after = value < previous || (value == previous && int(token) > previous_token);
             if (after && (value > best || (value == best && int(token) < best_token))) {

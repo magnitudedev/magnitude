@@ -180,7 +180,9 @@ pub enum WorkflowError {
         port: usize,
     },
     /// A tensor with elements other than a slab view bound to a slab port
-    /// (`&slab`): its natives read its binding as a slab address table.
+    /// (`&slab`): its natives read its binding as a slab address table. In
+    /// a graph, also a view with elements of a port from other than its
+    /// first byte: no table of the port's addresses starts there.
     PlainSlabBinding {
         parameter: String,
     },
@@ -992,7 +994,7 @@ pub mod tensor {
     };
     use crate::driver::Allocation;
     use crate::memory::Charges;
-    use crate::pool::{GranuleHold, Slots};
+    use crate::pool::{SlabHold, Slots};
     use crate::layout;
     use seismic_compiler::errors::ExecutionError;
     use seismic_compiler::prepared::TensorDescriptor;
@@ -1120,9 +1122,10 @@ pub mod tensor {
         strides: Vec<u64>,
         slabs: Option<SlabView>,
         alias_identity: Option<u64>,
-        /// The granule of the pooled slab this view lies in, held while any
-        /// view of it lives (`crate::pool::GranuleHold`).
-        hold: Option<Arc<GranuleHold>>,
+        /// The slab this view lies in, held while any view of it lives: its
+        /// store's slot, and its granule where it is a pool's
+        /// (`crate::pool::SlabHold`).
+        hold: Option<Arc<SlabHold>>,
         /// This view's records as a native record port binds them, formed
         /// at its first such binding ([`TensorInner::forming_records`]).
         records: OnceLock<Arc<Records>>,
@@ -1173,11 +1176,210 @@ pub mod tensor {
     }
 
     /// What a slab view's binding reaches ([`TensorInner::slab_reach`]): its
-    /// address-table entries and, by address, each backed slab region
-    /// (allocation, byte offset, bytes).
+    /// address-table entries and, by address, each slot's slab region
+    /// (allocation, byte offset, bytes), `None` a free slot's.
     pub(crate) struct SlabReach {
         pub(crate) table_bytes: u64,
-        pub(crate) regions: Vec<(u64, u64, u64)>,
+        /// The bytes of one slab's rows of the view, as its elements lie
+        /// in the view: slot `s` holds the view's bytes from `s` of them.
+        pub(crate) slab_bytes: u64,
+        pub(crate) regions: Vec<Option<(u64, u64, u64)>>,
+        /// Per slot, the backed slots before it, and last all of them: how
+        /// many of a run of slots are backed is one difference.
+        backed: Vec<usize>,
+    }
+
+    /// The slots of `slab_bytes` each that hold bytes `[offset, offset +
+    /// bytes)` of a slab view, slot `s` its bytes from `s` slabs' on.
+    fn slots_holding(slab_bytes: u64, offset: u64, bytes: u64) -> std::ops::Range<usize> {
+        if bytes == 0 {
+            return 0..0;
+        }
+        (offset / slab_bytes) as usize..(offset + bytes).div_ceil(slab_bytes) as usize
+    }
+
+    impl SlabReach {
+        fn new(table_bytes: u64, slab_bytes: u64, regions: Vec<Option<(u64, u64, u64)>>) -> Self {
+            let backed = std::iter::once(0)
+                .chain(regions.iter().scan(0, |backed, region| {
+                    *backed += usize::from(region.is_some());
+                    Some(*backed)
+                }))
+                .collect();
+            Self { table_bytes, slab_bytes, regions, backed }
+        }
+
+        /// The slots that hold the view's bytes `[offset, offset + bytes)`.
+        #[cfg(any(test, target_os = "macos"))]
+        pub(crate) fn slots(&self, offset: u64, bytes: u64) -> std::ops::Range<usize> {
+            slots_holding(self.slab_bytes, offset, bytes)
+        }
+
+        /// Whether any of `slots` is backed.
+        fn any_backed(&self, slots: std::ops::Range<usize>) -> bool {
+            self.backed[slots.end] > self.backed[slots.start]
+        }
+
+        /// The bytes device work reaches in slot `slot` for the view's bytes
+        /// `[offset, offset + bytes)`, which it holds some of: the slab's
+        /// bytes that hold them (`Allocation::identity`, range); none for a
+        /// free slot.
+        fn slot_bytes(&self, slot: usize, offset: u64, bytes: u64) -> Option<(u64, std::ops::Range<u64>)> {
+            let (allocation, start, _) = self.regions[slot]?;
+            let first = slot as u64 * self.slab_bytes;
+            let from = offset.max(first) - first;
+            let to = (offset + bytes).min(first + self.slab_bytes) - first;
+            Some((allocation, start + from..start + to))
+        }
+
+        /// The bytes device work reaches for the view's bytes `[offset,
+        /// offset + bytes)`: in each slot holding some, the slab's bytes
+        /// that hold them ([`Self::slot_bytes`]); a free slot's none.
+        #[cfg(any(test, target_os = "macos"))]
+        pub(crate) fn bytes(
+            &self,
+            offset: u64,
+            bytes: u64,
+        ) -> impl Iterator<Item = (u64, std::ops::Range<u64>)> + '_ {
+            self.slots(offset, bytes).filter_map(move |slot| self.slot_bytes(slot, offset, bytes))
+        }
+    }
+
+    /// Whether two byte ranges share a byte (an empty range shares none).
+    pub(crate) fn meet(first: &std::ops::Range<u64>, second: &std::ops::Range<u64>) -> bool {
+        first.start.max(second.start) < first.end.min(second.end)
+    }
+
+    /// The pairs `(first, second)`, `first < second`, of a launch's `count`
+    /// buffers that may share no bound byte: those it writes either of
+    /// (`written`, as the buffers' declared access says,
+    /// [`seismic_lang::entry::TensorAccess::writer`]). A launch reads a
+    /// buffer it writes nothing through as memory nothing in the launch
+    /// writes (Vulkan formation's execution model,
+    /// `seismic_vulkan::uniformity`), and orders its launches by what each
+    /// reaches, so binding refuses every such pair whose bytes meet: the one
+    /// rule each binder holds its bindings to, by the bytes it binds
+    /// ([`Reaching::meets`] for a tensor's).
+    pub(crate) fn exclusive_pairs(
+        count: usize,
+        written: impl Fn(usize) -> bool,
+    ) -> impl Iterator<Item = (usize, usize)> {
+        (0..count)
+            .flat_map(move |first| (first + 1..count).map(move |second| (first, second)))
+            .filter(move |&(first, second)| written(first) || written(second))
+    }
+
+    /// A tensor as binding's no-alias check reaches it ([`Self::meets`]): a
+    /// slab view's reach is read at most once, by the first of its pairs
+    /// that needs it, however many pairs it is in.
+    pub(crate) struct Reaching<'a> {
+        tensor: &'a TensorInner,
+        reach: std::cell::OnceCell<Arc<SlabReach>>,
+    }
+
+    impl<'a> Reaching<'a> {
+        pub(crate) fn new(tensor: &'a TensorInner) -> Self {
+            Self { tensor, reach: std::cell::OnceCell::new() }
+        }
+
+        /// What `slabs`, the tensor's slab view, reaches now.
+        fn reach(&self, slabs: &SlabView) -> &SlabReach {
+            self.reach.get_or_init(|| slabs.reach())
+        }
+
+        /// Whether the bytes device work reaches for the tensor's bytes
+        /// `span` and `other`'s bytes `other_span` share one: what binding
+        /// refuses of an exclusive pair ([`exclusive_pairs`]). A plain view
+        /// reaches its own bytes; a slab view its lent slabs' in their
+        /// lender, one range ([`SlabView::lent_bytes`]), and its other
+        /// slabs', which only its store holds, each region's apart
+        /// (`crate::pool::SlabStore::in_pool`). So each pair costs O(1),
+        /// whatever the slots, and reads a slab view's reach only where two
+        /// views of one store's region meet in it or a view of one of its
+        /// slabs is the other side.
+        pub(crate) fn meets(
+            &self,
+            span: std::ops::Range<u64>,
+            other: &Reaching<'_>,
+            other_span: std::ops::Range<u64>,
+        ) -> bool {
+            match (&self.tensor.slabs, &other.tensor.slabs) {
+                (None, None) => {
+                    let (identity, range) = self.tensor.plain_bytes(span);
+                    let (other_identity, other_range) = other.tensor.plain_bytes(other_span);
+                    identity == other_identity && meet(&range, &other_range)
+                }
+                (Some(slabs), None) => self.meets_plain(slabs, span, other.tensor, other_span),
+                (None, Some(slabs)) => other.meets_plain(slabs, other_span, self.tensor, span),
+                (Some(slabs), Some(other_slabs)) => self.meets_slabs(slabs, span, other_slabs, other_span),
+            }
+        }
+
+        /// [`Self::meets`] of this slab view, `slabs`, and `plain`, a plain
+        /// view: in a lent slab, or in the one slab whose region `plain`
+        /// views, where it is one of this view's store's
+        /// ([`TensorInner::slab_hold`]).
+        fn meets_plain(
+            &self,
+            slabs: &SlabView,
+            span: std::ops::Range<u64>,
+            plain: &TensorInner,
+            plain_span: std::ops::Range<u64>,
+        ) -> bool {
+            let (identity, range) = plain.plain_bytes(plain_span);
+            if slabs.lent_bytes(&span).is_some_and(|(lender, lent)| lender == identity && meet(&lent, &range)) {
+                return true;
+            }
+            let Some(hold) = plain.hold.as_ref().filter(|hold| hold.store() == slabs.slots.id()) else {
+                return false;
+            };
+            let bytes = span.end - span.start;
+            hold.slot()
+                .checked_sub(slabs.first)
+                .filter(|slot| slots_holding(slabs.slab_bytes, span.start, bytes).contains(slot))
+                .and_then(|slot| self.reach(slabs).slot_bytes(slot, span.start, bytes))
+                .is_some_and(|(allocation, bound)| allocation == identity && meet(&bound, &range))
+        }
+
+        /// [`Self::meets`] of two slab views, this one's `slabs` and the
+        /// other's `other_slabs`: in their lent slabs, by lender, or in
+        /// slabs of one store's one region, where each view's bytes lie as
+        /// the region's from its first slot's, which meet in a backed slot
+        /// of the store's own (read from this view's reach: those slots lie
+        /// in both).
+        fn meets_slabs(
+            &self,
+            slabs: &SlabView,
+            span: std::ops::Range<u64>,
+            other_slabs: &SlabView,
+            other_span: std::ops::Range<u64>,
+        ) -> bool {
+            if let (Some((lender, lent)), Some((other_lender, other_lent))) =
+                (slabs.lent_bytes(&span), other_slabs.lent_bytes(&other_span))
+            {
+                if lender == other_lender && meet(&lent, &other_lent) {
+                    return true;
+                }
+            }
+            if !Arc::ptr_eq(&slabs.slots, &other_slabs.slots) || slabs.region != other_slabs.region {
+                return false;
+            }
+            assert_eq!(slabs.slab_bytes, other_slabs.slab_bytes, "invariant violated: views of one slab region differ in its slab bytes");
+            let in_region = |view: &SlabView, span: &std::ops::Range<u64>| {
+                let first = view.first as u64 * view.slab_bytes;
+                first + span.start..first + span.end
+            };
+            let (mine, theirs) = (in_region(slabs, &span), in_region(other_slabs, &other_span));
+            let common = mine.start.max(theirs.start)..mine.end.min(theirs.end);
+            if common.is_empty() {
+                return false;
+            }
+            // The store's own slots of those holding the common bytes; the
+            // lent ones were compared above.
+            let slots = slots_holding(slabs.slab_bytes, common.start, common.end - common.start);
+            let own = slots.start.max(slabs.slots.lent())..slots.end;
+            !own.is_empty() && self.reach(slabs).any_backed(own.start - slabs.first..own.end - slabs.first)
+        }
     }
 
     /// A slab view's region of its store: its slots as they are when it is
@@ -1235,16 +1437,27 @@ pub mod tensor {
             match &*cached {
                 Some((read, reach)) if *read == generation => reach.clone(),
                 _ => {
-                    let reach = Arc::new(SlabReach {
-                        table_bytes: seismic_lang::registry::record_table_entry(self.count as u64),
-                        regions: self
-                            .slots
-                            .reach(self.region, self.first, self.count, self.slab_bytes),
-                    });
+                    let reach = Arc::new(SlabReach::new(
+                        seismic_lang::registry::record_table_entry(self.count as u64),
+                        self.slab_bytes,
+                        self.slots.reach(self.region, self.first, self.count, self.slab_bytes),
+                    ));
                     *cached = Some((generation, reach.clone()));
                     reach
                 }
             }
+        }
+
+        /// The bytes of the view's `span` that lie in its store's lent slabs,
+        /// which never move nor free: one range of the allocation they are
+        /// lent from (`Allocation::identity`, range), as each slot's lies a
+        /// slab after the one before; none where none do.
+        fn lent_bytes(&self, span: &std::ops::Range<u64>) -> Option<(u64, std::ops::Range<u64>)> {
+            let (lender, start) = self.slots.lent_region(self.region)?;
+            let lent = self.slots.lent().saturating_sub(self.first).min(self.count) as u64 * self.slab_bytes;
+            let first = start + self.first as u64 * self.slab_bytes;
+            let end = span.end.min(lent);
+            (span.start < end).then(|| (lender.identity(), first + span.start..first + end))
         }
 
         /// The region's rows of each slot's slab in `first..first + count`
@@ -1352,7 +1565,7 @@ pub mod tensor {
             offset: u64,
             representation: RepresentationId,
             extents: &[u64],
-            hold: Option<Arc<GranuleHold>>,
+            hold: Option<Arc<SlabHold>>,
         ) -> Result<Self, TensorError> {
             let layout = layout::canonical(representation, extents)?;
             let mut view = Self::new_view(
@@ -1374,7 +1587,7 @@ pub mod tensor {
         /// view's lent slabs' storage.
         pub(crate) fn bound_allocations(&self) -> impl Iterator<Item = Arc<Allocation>> + '_ {
             std::iter::once(self.allocation.clone())
-                .chain(self.slabs.iter().flat_map(|slabs| slabs.slots.lenders().iter().cloned()))
+                .chain(self.slabs.iter().flat_map(|slabs| slabs.slots.lenders().cloned()))
         }
 
         /// Whether the tensor is a slab view: its binding is an address table,
@@ -1405,11 +1618,23 @@ pub mod tensor {
             self.slabs.as_ref().map(SlabView::reach)
         }
 
+        /// The slab a view of a slab's region lies in ([`SlabHold`]): its
+        /// store's slot; none for any other view.
+        pub(crate) fn slab_hold(&self) -> Option<&Arc<SlabHold>> {
+            self.hold.as_ref()
+        }
+
+        /// The bytes device work bound to this plain view's bytes `span`
+        /// reaches: its own (`Self::alias_identity`, range).
+        fn plain_bytes(&self, span: std::ops::Range<u64>) -> (u64, std::ops::Range<u64>) {
+            (self.alias_identity(), self.byte_offset + span.start..self.byte_offset + span.end)
+        }
+
         /// The device bytes the tensor's elements occupy: a slab view's
         /// backed slabs, otherwise its byte length.
         pub(crate) fn occupied_bytes(&self) -> u64 {
             match &self.slabs {
-                Some(slabs) => slabs.reach().regions.len() as u64 * slabs.slab_bytes,
+                Some(slabs) => slabs.reach().regions.iter().flatten().count() as u64 * slabs.slab_bytes,
                 None => self.byte_len,
             }
         }
@@ -3688,7 +3913,8 @@ pub mod kernel {
                 reach.table_bytes,
                 seismic_lang::registry::record_table_entry(3)
             );
-            assert_eq!(reach.regions.len(), 2);
+            assert_eq!(reach.regions.len(), 3);
+            assert_eq!(reach.regions.iter().flatten().count(), 2);
             assert_eq!(sub.occupied_bytes(), 2 * (4 * 2 * 4));
 
             let img = sub.image().unwrap();
@@ -3706,6 +3932,61 @@ pub mod kernel {
             let empty_copy = empty.copy_of(&crate::memory::Charges::tally(&device), &empty.image().unwrap()).unwrap();
             assert_eq!(empty_copy.extents(), &[0, 2]);
             assert!(empty_copy.read_to_host().unwrap().is_empty());
+        }
+
+        /// Binding compares the bytes device work reaches
+        /// (`Reaching::meets`): a slab view's slot meets that slot's own
+        /// region view and no other slot's bytes, and a free slot's rows
+        /// meet nothing.
+        #[test]
+        fn reaching_compares_the_slab_bytes_bound() {
+            let catalog = crate::devices::Devices::discover(&[]).unwrap();
+            let id = catalog
+                .resolve(seismic_topology::ExecutorSelector::HostCpu)
+                .unwrap();
+            let device = catalog.open(id).unwrap();
+            let topology = catalog.topology();
+            let info = topology.executor(id).unwrap();
+            let store = topology
+                .first_store(info, seismic_topology::Contract::DeviceOnly)
+                .unwrap();
+            let identity = topology.store_identity(store).unwrap();
+            let entry: Arc<dyn crate::memory::Entry> =
+                Arc::new(crate::memory::Tally::unbounded(identity));
+            let pool = crate::pool::Pool::open(
+                &crate::pool::PoolCharges::one(&crate::memory::Charges::in_store(&device, seismic_topology::Contract::DeviceOnly, entry)),
+                seismic_topology::Contract::DeviceOnly,
+                1 << 16,
+                1 << 18,
+            )
+            .unwrap();
+            let f32_rep = seismic_lang::registry::dense(seismic_lang::types::DType::F32);
+            let geometry = crate::pool::SlabGeometry {
+                rows_per_slab: 4,
+                logical_rows: 16,
+                capacity: 4,
+                slab_bytes: crate::pool::BLOCK_ALIGNMENT,
+                slab_alignment: crate::pool::BLOCK_ALIGNMENT,
+                regions: vec![(f32_rep, vec![2], 0)],
+            };
+            let slabs = crate::pool::SlabStore::in_pool(&crate::memory::Charges::tally(&device), &pool, geometry, &[]).unwrap();
+            for _ in 0..4 {
+                slabs.add_slab(crate::pool::SlabFill::Zeroed).unwrap();
+            }
+            assert!(slabs.free_slab(2).unwrap());
+            let logical = slabs.logical_region(0).unwrap();
+            let region = slabs.slab_region(1, 0).unwrap().unwrap();
+            let (whole, one) = (crate::api::tensor::Reaching::new(&logical), crate::api::tensor::Reaching::new(&region));
+            // One slot's rows of the view: 4 rows of 2 f32.
+            let slot = 4 * 2 * 4;
+            let rows = |index: u64| index * slot..(index + 1) * slot;
+            assert!(whole.meets(rows(1), &whole, rows(1)));
+            assert!(!whole.meets(rows(0), &whole, rows(1)), "distinct slots lie apart");
+            assert!(whole.meets(rows(1), &one, 0..region.byte_len()), "a slot meets its region view");
+            assert!(!whole.meets(rows(0), &one, 0..region.byte_len()));
+            assert!(!whole.meets(rows(3), &one, 0..region.byte_len()));
+            // Slot 2 is free: its rows reach nothing, not even the whole view.
+            assert!(!whole.meets(rows(2), &whole, 0..4 * slot), "a free slot reaches nothing");
         }
 
         /// A pool's absent granule, which every free slot names and no slab

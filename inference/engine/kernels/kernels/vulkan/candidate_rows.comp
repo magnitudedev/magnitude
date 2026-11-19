@@ -126,7 +126,7 @@ void candidate_ranges(uint thread, uint lo, uint hi, uint valid, uint x, bool x_
 
 void candidate_rows() {
     const uint64_t row = gl_WorkGroupID.x;
-    const uint thread = SEISMIC_SUBGROUP * 32u + SEISMIC_LANE;
+    const uint thread = SEISMIC_THREAD;
     const uint r = uint(SEISMIC_DIM_R);
     const uint b = uint(SEISMIC_DIM_B);
     const uint k = uint(SEISMIC_DIM_K);
@@ -160,7 +160,7 @@ void candidate_rows() {
     uint pooled;
     {
         uint count = 0u, sum = 0u;
-        for (uint s = thread; s < b; s += CANDIDATE_THREADS)
+        seismic_strided(uint, s, thread, b, CANDIDATE_THREADS)
             if (candidate_pick(s) >= 0) {
                 ++count;
                 sum += candidate_end_unit(s) - candidate_first_unit(s);
@@ -168,6 +168,11 @@ void candidate_rows() {
         reduce_group_exclusive_add(count, CANDIDATE_SCAN, valid);
         reduce_group_exclusive_add(sum, CANDIDATE_SCAN, pooled);
     }
+    // The offsets' scan reads its total where the offsets' stores follow
+    // before a barrier; read back past the scans' barriers, the row's units
+    // are every invocation's alike.
+    units = seismic_shared_u32[CANDIDATE_FIRST + r];
+    candidate_units = units;
     const uint wanted = min(k, units);
     const uint fill = wanted > pooled ? wanted - pooled : 0u;
 
@@ -182,6 +187,7 @@ void candidate_rows() {
         uint gaps = 0u;
         for (uint s = lo; s < hi; ++s)
             gaps += (s == valid ? units : candidate_first_unit(s)) - (s == 0u ? 0u : candidate_end_unit(s - 1u));
+        seismic_rejoin();
         uint before = reduce_group_exclusive_add(gaps, CANDIDATE_SCAN, total);
         for (uint s = lo; s < hi; ++s) {
             const uint first = s == 0u ? 0u : candidate_end_unit(s - 1u);
@@ -204,6 +210,7 @@ void candidate_rows() {
     const uint hi = min(lo + share, valid);
     uint opened = 0u;
     candidate_ranges(thread, lo, hi, valid, x, x_followed, false, opened);
+    seismic_rejoin();
     uint count;
     uint entry = reduce_group_exclusive_add(opened, CANDIDATE_SCAN, count);
     candidate_ranges(thread, lo, hi, valid, x, x_followed, true, entry);

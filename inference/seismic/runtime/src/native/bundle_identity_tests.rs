@@ -34,6 +34,7 @@ const VULKAN: VulkanFeatures = VulkanFeatures {
     mixed_dot: true,
     f32_atomic_add: true,
     shared_int64_atomics: false,
+    maximal_reconvergence: false,
 };
 
 /// At most this many element bindings per entry.

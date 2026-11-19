@@ -29,7 +29,7 @@
 
 use super::Dispatch;
 use super::DispatchList;
-use crate::api::tensor::{Records, SlabReach};
+use crate::api::tensor::{meet, Records, SlabReach};
 use crate::driver::Allocation;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -172,29 +172,41 @@ pub(crate) enum Through {
 }
 
 impl SlabReach {
-    /// The reaches of buffer `buffer`, bound to this slab view's table at
-    /// `offset` of `table`, into `reaches`.
+    /// The reaches of buffer `buffer`, bound to this slab view's bytes
+    /// `[offset, offset + bytes)` through its table, whose entry 0 is at
+    /// `table_offset` of `table`, into `reaches`: the entries of the slots
+    /// holding them, and the slab bytes that hold them
+    /// ([`SlabReach::bytes`]).
     pub(crate) fn extend(
         &self,
         buffer: usize,
         table: &Allocation,
+        table_offset: u64,
         offset: u64,
+        bytes: u64,
         reaches: &mut Vec<Reach>,
     ) {
+        use seismic_lang::registry::record_table_entry;
+        let slots = self.slots(offset, bytes);
         reaches.push(Reach {
             buffer,
             allocation: table.identity(),
-            offset,
-            bytes: self.table_bytes,
+            offset: table_offset + record_table_entry(slots.start as u64),
+            bytes: record_table_entry(slots.len() as u64),
             through: Through::Table,
         });
-        reaches.extend(self.regions.iter().map(|&(allocation, offset, bytes)| Reach {
+        reaches.extend(self.bytes(offset, bytes).map(|(allocation, range)| Reach {
             buffer,
             allocation,
-            offset,
-            bytes,
+            offset: range.start,
+            bytes: range.end - range.start,
             through: Through::Slab,
         }));
+    }
+
+    /// The reaches of the whole view, as [`Self::extend`].
+    pub(crate) fn extend_whole(&self, buffer: usize, table: &Allocation, table_offset: u64, reaches: &mut Vec<Reach>) {
+        self.extend(buffer, table, table_offset, 0, self.regions.len() as u64 * self.slab_bytes, reaches);
     }
 }
 
@@ -259,6 +271,12 @@ impl Access {
 /// What every launch of `dispatch` reaches, into `accesses`: its `reaches`,
 /// written as the kernel's ABI writes their buffers or its host rewrites
 /// them, and its scalar-result slots when the kernel publishes scalars.
+///
+/// Its reaches are the bytes it binds (a slab view's, those its site
+/// binds), never the whole view; binding refuses any two of them with a
+/// written side that share a byte ([`exclusive_pairs`]).
+///
+/// [`exclusive_pairs`]: crate::api::tensor::exclusive_pairs
 pub(crate) fn dispatch_accesses(
     dispatch: &Dispatch<'_>,
     reaches: &[Reach],
@@ -266,8 +284,7 @@ pub(crate) fn dispatch_accesses(
 ) {
     let kernel = dispatch.kernel;
     accesses.extend(reaches.iter().map(|reach| {
-        let written = kernel.buffer_writes[reach.buffer] || kernel.host_writes[reach.buffer];
-        let write = written && reach.through != Through::Table;
+        let write = kernel.writes(reach.buffer) && reach.through != Through::Table;
         Access::of(reach.allocation, reach.offset, reach.bytes, write)
     }));
     if let Some(scalars) = &kernel.scalars {
@@ -291,7 +308,7 @@ impl Reached {
 
     /// Whether these bytes meet `bytes`.
     fn meets(&self, bytes: &Range<u64>) -> bool {
-        self.bytes.start < bytes.end && bytes.start < self.bytes.end
+        meet(&self.bytes, bytes)
     }
 }
 
