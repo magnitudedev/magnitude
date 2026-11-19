@@ -13,7 +13,7 @@
 use super::ExpertBank;
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, RunningBegun, RunningPressure, Trip};
 use crate::experts::source::Records;
-use crate::experts::watcher::{BankRecordViews, Candidates, Evicted, Evicting, Join, ScratchGroup};
+use crate::experts::watcher::{Candidates, Evicted, Evicting, Join, ScratchGroup};
 use crate::memory::ledger::Changes;
 use crate::planning::{BankTier, Placer};
 use crate::storage_thread::{Done, StorageThread};
@@ -26,10 +26,11 @@ use std::time::{Duration, Instant};
 /// One store's records: each group's slab store in the store's pool, a
 /// record a slab, its leading `lent` records over the lender's lent
 /// allocation for the load's life, each region one routed tensor's record
-/// of `record_bytes`.
+/// of `record_bytes`. `SlabTensor` provides interior mutability so no outer
+/// per-group mutex is ever held across `add_slab` / `allocate_block`.
 pub(super) struct Stores {
     pool: Pool,
-    groups: Vec<Mutex<SlabTensor>>,
+    groups: Vec<SlabTensor>,
     lent: Vec<u64>,
     record_bytes: Vec<Vec<u64>>,
 }
@@ -40,15 +41,15 @@ impl Stores {
     pub(super) fn new(pool: Pool, groups: Vec<(SlabTensor, u64, Vec<u64>)>) -> Self {
         let (mut stores, mut lent, mut record_bytes) = (Vec::new(), Vec::new(), Vec::new());
         for (store, leading, bytes) in groups {
-            stores.push(Mutex::new(store));
+            stores.push(store);
             lent.push(leading);
             record_bytes.push(bytes);
         }
         Self { pool, groups: stores, lent, record_bytes }
     }
 
-    fn group(&self, group: usize) -> MutexGuard<'_, SlabTensor> {
-        self.groups[group].lock().expect("a bank group's store")
+    fn group(&self, group: usize) -> &SlabTensor {
+        &self.groups[group]
     }
 
     /// The records group `group` holds: its slabs, lent ones included.
@@ -72,17 +73,20 @@ impl Stores {
     /// Claim records of group `group` until it holds `records`, each a
     /// granule of the pool (`SlabTensor::add_slab`: a free one in process,
     /// else the pool grows by a block its ledger entry admits), unwritten:
-    /// the watcher writes a record before any step reads it. The records
-    /// claimed, the lowest free first; on a refusal, none (those claimed
-    /// before it are freed, never having been read).
+    /// claimed records join the watcher free (`Directory::grow` /
+    /// `Directory::grow_host`) and are never published to the device until a
+    /// promotion copy or file read writes every byte and completes. The
+    /// records claimed, the lowest free first; on a refusal, none (those
+    /// claimed before it are freed, never having been read).
     pub(super) fn claim_to(&self, group: usize, records: u64) -> Result<Vec<usize>, TensorError> {
-        let mut store = self.group(group);
+        seismic::memory::assert_blocking_allocation_allowed("Stores::claim_to");
+        let store = self.group(group);
         let mut claimed = Vec::new();
         while (store.backed().len() as u64) < records {
             match store.add_slab(seismic::SlabFill::Unwritten) {
                 Ok(record) => claimed.push(record),
                 Err(refusal) => {
-                    Self::unclaim_in(&mut store, group, &claimed);
+                    Self::unclaim_in(store, group, &claimed);
                     return Err(refusal);
                 }
             }
@@ -93,10 +97,10 @@ impl Stores {
     /// Free `claimed` of group `group`, which nothing read: a refusal
     /// breaks the pool's invariant.
     fn unclaim(&self, group: usize, claimed: &[usize]) {
-        Self::unclaim_in(&mut self.group(group), group, claimed);
+        Self::unclaim_in(self.group(group), group, claimed);
     }
 
-    fn unclaim_in(store: &mut SlabTensor, group: usize, claimed: &[usize]) {
+    fn unclaim_in(store: &SlabTensor, group: usize, claimed: &[usize]) {
         for &record in claimed {
             if let Err(error) = store.free_slab(record) {
                 panic!("invariant violated: the bank's pool refused to free record {record} of group {group}, claimed and never read: {error}");
@@ -107,6 +111,7 @@ impl Stores {
     /// Return `records` of group `group` to the pool: each granule free
     /// once the last flight that read it completes. Never waits.
     pub(super) fn free(&self, group: usize, records: &[u32]) -> Result<(), TensorError> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::free");
         let store = self.group(group);
         records.iter().try_for_each(|&record| store.free_slab(record as usize).map(drop))
     }
@@ -115,18 +120,46 @@ impl Stores {
     /// every empty block, then the emptiest emptied while those fall short
     /// (`seismic::Pool::return_freed`). The bytes returned.
     fn return_freed(&self, freed: u64) -> Result<u64, TensorError> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::return_freed");
         self.pool.return_freed(freed)
+    }
+
+    /// The backed record indices currently held in group `group`.
+    pub(super) fn backed(&self, group: usize) -> Vec<usize> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::backed");
+        self.group(group).backed()
     }
 
     /// Record `record` of group `group`'s region `region`, while it is
     /// held.
     pub(super) fn view(&self, group: usize, region: usize, record: usize) -> Option<Tensor> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::view");
         self.group(group).slab_region(record, region).expect("a record and region lie in their group's store")
+    }
+
+    /// All routed tensor views for each slot in `records` of group `group`,
+    /// delivered into residency's `Group::bank` at open and on `Join::Bank`.
+    pub(super) fn record_views(&self, group: usize, records: &[usize]) -> Vec<Vec<Tensor>> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::record_views");
+        let regions = self.group(group).region_count();
+        records
+            .iter()
+            .map(|&record| {
+                (0..regions)
+                    .map(|region| {
+                        self.view(group, region, record).unwrap_or_else(|| {
+                            panic!("invariant violated: record {record} of group {group} holds no storage")
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Each group's routed tensors' records the host addresses, as held
     /// now, through the last held: holes where none is.
     pub(super) fn records(&self) -> Result<Vec<Vec<Records>>, String> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::records");
         (0..self.groups.len())
             .map(|group| {
                 let store = self.group(group);
@@ -141,13 +174,6 @@ impl Stores {
                     .collect()
             })
             .collect()
-    }
-}
-
-impl BankRecordViews for Stores {
-    fn view(&self, group: usize, tensor: usize, record: usize) -> Tensor {
-        Stores::view(self, group, tensor, record)
-            .unwrap_or_else(|| panic!("invariant violated: a promotion copies into record {record} of group {group}, which the bank holds no storage for"))
     }
 }
 
@@ -327,24 +353,29 @@ pub(super) fn grow_by_slots<S>(
         };
         spent.slots += 1;
         let claiming = Instant::now();
-        let claimed = changes.back(|_| {
+        // Acquire `rises` before `changes.back` (matching `domain::observe`
+        // order). `SlabTensor::add_slab` grows the pool outside slab/pool locks
+        // via single-flight `GrowGate` when no granule is free.
+        let claimed = {
             let _rises = rises.lock().expect("the bank's charge rises");
-            let mut claimed: Vec<Vec<usize>> = Vec::with_capacity(groups);
-            for group in 0..groups {
-                match stores.claim_to(group, records(group, at)) {
-                    Ok(records) => claimed.push(records),
-                    Err(refusal) => {
-                        // The slot joins nothing: what its groups claimed
-                        // before returns at once, never read.
-                        for (group, records) in claimed.iter().enumerate() {
-                            stores.unclaim(group, records);
+            changes.back(|_| {
+                let mut claimed: Vec<Vec<usize>> = Vec::with_capacity(groups);
+                for group in 0..groups {
+                    match stores.claim_to(group, records(group, at)) {
+                        Ok(records) => claimed.push(records),
+                        Err(refusal) => {
+                            // The slot joins nothing: what its groups claimed
+                            // before returns at once, never read.
+                            for (group, records) in claimed.iter().enumerate() {
+                                stores.unclaim(group, records);
+                            }
+                            return Err(refusal);
                         }
-                        return Err(refusal);
                     }
                 }
-            }
-            Ok(claimed)
-        });
+                Ok(claimed)
+            })
+        };
         let claimed = match claimed {
             Ok(claimed) => claimed,
             Err(refusal) => return Grown { at: reached, joined, cut: Cut::Refused(refusal), spent },
@@ -352,7 +383,14 @@ pub(super) fn grow_by_slots<S>(
         let joining_at = Instant::now();
         spent.claim += joining_at - claiming;
         let join = match &mut views {
-            None => Join::Bank { records: claimed },
+            None => {
+                let bank_views = claimed
+                    .iter()
+                    .enumerate()
+                    .map(|(group, records)| stores.record_views(group, records))
+                    .collect();
+                Join::Bank { records: claimed, views: bank_views }
+            }
             Some(views) => {
                 let formed = claimed.iter().enumerate().try_for_each(|(group, records)| {
                     for &record in records {

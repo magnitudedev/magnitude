@@ -217,9 +217,9 @@ impl Device {
     /// of host pages (large pages where the host has them) backed whole and
     /// registered for the device (`cuMemHostRegister`), which reads it in
     /// place.
-    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>, fill: seismic_memory::SlabFill) -> Result<Buffer, ExecutionError> {
         match kind {
-            crate::topology::DEVICE_KIND => self.blocks.allocate_block(bytes, entry).map(Buffer::block),
+            crate::topology::DEVICE_KIND => self.blocks.allocate_block(bytes, entry, fill).map(Buffer::block),
             crate::topology::PINNED_KIND => {
                 if self.allocations_in_process_footprint()
                     && crate::driver::can_create_host_node(&self.context).map_err(submission_error)?

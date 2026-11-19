@@ -56,7 +56,10 @@ fn a_resize_between_flights_keeps_the_most_recent_experts() {
     // A regrowth backs the holes, which the next seeds take; it joins
     // beside a running step, at the watcher's next pass.
     let running = harness.step();
-    shared.join(super::Join::Bank { records: vec![vec![0, 1]] });
+    shared.join(super::Join::Bank {
+        records: vec![vec![0, 1]],
+        views: vec![harness.host.bank_record_views(&[0, 1])],
+    });
     shared.joins.wait_taken();
     drop(running);
     assert_eq!(shared.costs().records, [4]);
@@ -508,7 +511,6 @@ fn a_cut_of_a_whole_banks_reserve_alone_ends_its_resident_form() {
     eventually("a layer stayed resident beside evicted records", || (0..2).all(|layer| whole(layer) == 0));
     assert_eq!(shared.life.ended(), None, "the watcher serves on");
 }
-
 /// Admission is decided once at the claim (design §3.7, §6): a landing
 /// whose step has ended before its read arrives still lands into the
 /// record it claimed and stays kept there without being tested again,
@@ -541,4 +543,70 @@ fn a_landing_keeps_its_claimed_record() {
     eventually("the landing past its request was left in flight", || unevictable(&harness).is_empty());
     assert!((0..3).all(|expert| harness.in_tier(0, expert).is_some()), "incumbents stay kept");
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
+}
+
+/// Attempting to acquire a `Pool` or `SlabTensor` allocation lock (or call
+/// `Pool::grow`) while holding `residency` panics immediately, preventing
+/// lock-order deadlocks against a device parked on the host answer path.
+#[test]
+fn entering_pool_or_slab_lock_while_holding_residency_panics() {
+    let harness = prompted("no-blocking-alloc-guard", EXPERTS, 4);
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+    let charges = seismic::Charges::tally(&device);
+    let regions = [seismic::SlabRegion { element: seismic::Element::i32(), row_shape: vec![16] }];
+    let slabs = crate::experts::bank::pooled_slabs(&charges, seismic::Contract::Shared, 1, 4, &regions, 2).unwrap();
+    let pool = slabs.pool().clone();
+
+    fn assert_no_blocking_alloc_panic(label: &str, f: impl FnOnce() + std::panic::UnwindSafe) {
+        let err = std::panic::catch_unwind(f).expect_err(&format!("{label} must panic under residency"));
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("no-blocking-allocation scope"), "{label} panicked with unexpected message: {msg}");
+    }
+
+    {
+        let _held = residency::lock(&harness.watcher.state);
+        assert_no_blocking_alloc_panic("Pool::free_granules", std::panic::AssertUnwindSafe(|| {
+            let _ = pool.free_granules();
+        }));
+        assert_no_blocking_alloc_panic("Pool::grow", std::panic::AssertUnwindSafe(|| {
+            let _ = pool.grow();
+        }));
+        assert_no_blocking_alloc_panic("SlabTensor::backed", std::panic::AssertUnwindSafe(|| {
+            let _ = slabs.backed();
+        }));
+    }
+
+    // Outside residency, pool and slab operations succeed normally.
+    assert!(pool.grow().is_ok());
+    assert_eq!(slabs.add_slab(seismic::SlabFill::Unwritten).unwrap(), 0);
+}
+
+/// `Promotions` (including into bank records rejoined via `Join::Bank`) and
+/// `Requests` (decode and scratch) never enter driver or pool allocation locks
+/// while holding `residency` or on the host answer path.
+#[test]
+fn promotions_and_requests_never_enter_blocking_allocation() {
+    let harness = promoting("no-blocking-alloc-ok", 4, TIER);
+    harness.promoted(0, &[0, 1, 2, 3]);
+    let shared = harness.watcher.shared();
+    let evicted = shared
+        .shrink(Evicting::Bank, Candidates::one(2, vec![2]), None)
+        .unwrap()
+        .expect("shrink evicts two records");
+    let rejoined: Vec<usize> = evicted.records[0].iter().map(|&r| r as usize).collect();
+    shared.join(super::Join::Bank {
+        views: vec![harness.host.bank_record_views(&rejoined)],
+        records: vec![rejoined],
+    });
+    shared.joins.wait_taken();
+    // Promote new experts into the rejoined records using views delivered by
+    // `Join::Bank` (never touching `Stores` or `Pool`), and serve a decode
+    // request.
+    harness.promoted(0, &[4, 5]);
+    harness.request(&[4, 5]).complete().unwrap();
+    assert_eq!(shared.life.ended(), None, "serving never tripped the no-blocking-allocation guard");
 }

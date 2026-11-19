@@ -785,16 +785,18 @@ impl Device {
     /// is mappable, else on the second queue, beside work the first runs
     /// or holds parked; on a device without one, on the first queue behind
     /// its submissions.
-    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>, fill: seismic_memory::SlabFill) -> Result<Buffer, ExecutionError> {
         let range = self.inner.memory.block(&self.inner.device, kind, bytes, entry)?;
         // Freed by its drop where zeroing fails.
         let buffer = Buffer::new(self.inner.clone(), range, None);
-        let range = buffer.range();
-        match range.mapped() {
-            // SAFETY: the block's own mapping, which nothing else reaches yet.
-            Some(base) => unsafe { std::ptr::write_bytes(base, 0, range.bytes() as usize) },
-            None if self.inner.side.is_some() => self.inner.zero(&[(range, 0, range.bytes())])?,
-            None => drop(self.transfer(range, |_| Staged::Zero)?),
+        if fill == seismic_memory::SlabFill::Zeroed {
+            let range = buffer.range();
+            match range.mapped() {
+                // SAFETY: the block's own mapping, which nothing else reaches yet.
+                Some(base) => unsafe { std::ptr::write_bytes(base, 0, range.bytes() as usize) },
+                None if self.inner.side.is_some() => self.inner.zero(&[(range, 0, range.bytes())])?,
+                None => drop(self.transfer(range, |_| Staged::Zero)?),
+            }
         }
         Ok(buffer)
     }
@@ -1801,7 +1803,7 @@ mod reconcile_tests {
             let kind = device.opened.pools.device().kinds()[0];
             for _ in 0..20 {
                 drop(device.allocate(BLOCK, 256, &driver).expect("a pooled block allocates"));
-                drop(device.allocate_block(kind, BLOCK, &driver).expect("a block of its own allocates"));
+                drop(device.allocate_block(kind, BLOCK, &driver, seismic_memory::SlabFill::Zeroed).expect("a block of its own allocates"));
             }
             stop.store(true, Ordering::Relaxed);
             reconciler.join().unwrap();

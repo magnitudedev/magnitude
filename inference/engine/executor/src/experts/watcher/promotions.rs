@@ -55,20 +55,11 @@ use crate::experts::directory::{BankRecord, MissCurve, Point};
 use crate::experts::horizon::{Hold, Tokens};
 use crate::experts::staging::Staged;
 
-/// What promotions copy with: the device's copy engine, and each group's
-/// bank records (`BankRecordViews`), which a promotion copies its tier
-/// record into, routed tensor by routed tensor, each record whole: from the
-/// group's host tier records (`Group::tier`), which the copy engine reads.
+/// What promotions copy with: the device's copy engine. Destination bank
+/// record views are held in `Core::groups[group].bank` (delivered at open and
+/// via `Join::Bank`), so promotions never touch `Stores` or `Pool`.
 pub(in crate::experts) struct Copier {
     pub copies: crate::experts::copies::Copies,
-    pub bank: std::sync::Arc<dyn BankRecordViews>,
-}
-
-/// The bank's records as a promotion's copy writes them: record `record` of
-/// group `group`'s routed tensor `tensor` (in its record's order), a view of
-/// its storage while the bank holds it.
-pub(in crate::experts) trait BankRecordViews: Send + Sync {
-    fn view(&self, group: usize, tensor: usize, record: usize) -> seismic::Tensor;
 }
 
 /// What a reserve is sized within ([`reserve`]): each layer's group and
@@ -375,7 +366,7 @@ fn post(core: &mut Core, copier: &Copier, depth: usize, (group, record, (layer, 
             .map(|(index, tensor)| crate::experts::copies::Run {
                 source: tensor.records.tensor(u64::from(tier.0)).clone(),
                 source_offset: 0,
-                destination: copier.bank.view(group, index, record.index()),
+                destination: groups[group].bank_view(index, record.index()),
                 destination_offset: 0,
                 bytes: tensor.records.bytes(),
             })
@@ -403,7 +394,7 @@ fn post_back(core: &mut Core, copier: &Copier, depth: usize, (group, record, _, 
             .iter()
             .enumerate()
             .map(|(index, tensor)| crate::experts::copies::Run {
-                source: copier.bank.view(group, index, record.index()),
+                source: groups[group].bank_view(index, record.index()),
                 source_offset: 0,
                 destination: tensor.records.tensor(u64::from(tier.0)).clone(),
                 destination_offset: 0,

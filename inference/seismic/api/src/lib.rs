@@ -175,8 +175,9 @@ pub use seismic_runtime::artifacts::{
 pub mod memory {
     pub use crate::Charges;
     pub use seismic_runtime::memory::{
-        AllocationFailure, Backed, Carved, Change, Charge, Charging, DropScope, Entry, Grant, HostBlock, PageSize, Refused,
-        Store, Tally, Wiring,
+        AllocationFailure, Backed, Carved, Change, Charge, Charging, DropScope, Entry, Grant,
+        HostBlock, NoBlockingAllocationGuard, PageSize, Refused, Store, Tally, Wiring,
+        assert_blocking_allocation_allowed, enter_no_blocking_allocation,
     };
 }
 pub use seismic_runtime::probes::{carry as carry_probe_results, probe_misses, probe_runs, serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE, PROBE_LIMIT};

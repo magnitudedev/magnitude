@@ -197,7 +197,7 @@ fn a_block_is_charged_and_counted_once_and_backed_as_it_returns() {
     let entry: std::sync::Arc<dyn Entry> = std::sync::Arc::new(tally.clone());
     let allocated = || device.handle().current_allocated_bytes();
     let before = (allocated(), ProcessMemory::read());
-    let block = device.allocate_block(seismic_metal::topology::SHARED_KIND, BLOCK, &entry).unwrap();
+    let block = device.allocate_block(seismic_metal::topology::SHARED_KIND, BLOCK, &entry, seismic_memory::SlabFill::Zeroed).unwrap();
     assert_eq!(tally.held(), BLOCK, "a block of whole pages is charged its bytes");
     assert_eq!(allocated() - before.0, BLOCK, "Metal counts the block once");
     let footprint = grew(|reading| reading.footprint_bytes, &before.1, &ProcessMemory::read());

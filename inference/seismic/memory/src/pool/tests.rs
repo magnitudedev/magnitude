@@ -49,7 +49,7 @@ impl Blocks for Counted {
     type Fence = Flight;
     type Error = Refused;
 
-    fn allocate(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Plain, Refused> {
+    fn allocate(&self, bytes: u64, entry: &Arc<dyn Entry>, _fill: SlabFill) -> Result<Plain, Refused> {
         let charge = Charge::take(&entry.change(), entry, bytes + self.slack, Wiring::Pageable)?;
         let made = self.allocations.fetch_add(1, Ordering::Relaxed);
         Ok(Plain { address: (made + 1) * bytes * 2, charge })
@@ -73,16 +73,24 @@ enum Holder {
 
 const GRANULE: u64 = 1 << 20;
 
-fn pool_of(granules_a_block: u64, slack: u64, tally: &Tally) -> (GranulePool<Counted, Holder>, Arc<AtomicU64>) {
+fn pool_of(granules_a_block: u64, slack: u64) -> (GranulePool<Counted, Holder>, Arc<AtomicU64>) {
     let allocations = Arc::new(AtomicU64::new(0));
     let blocks = Counted { allocations: allocations.clone(), slack };
-    (GranulePool::new(blocks, GRANULE, granules_a_block * GRANULE, Arc::new(tally.clone())), allocations)
+    (GranulePool::new(blocks, GRANULE, granules_a_block * GRANULE), allocations)
 }
 
 fn pool(granules_a_block: u64) -> (GranulePool<Counted, Holder>, Arc<AtomicU64>, Tally) {
     let tally = Tally::unbounded(StoreIdentity::HostRam);
-    let (pool, allocations) = pool_of(granules_a_block, 0, &tally);
+    let (pool, allocations) = pool_of(granules_a_block, 0);
     (pool, allocations, tally)
+}
+
+/// Allocate one zeroed block outside the pool and install it (mirrors
+/// `PoolShared::grow_once`).
+fn grow(pool: &mut GranulePool<Counted, Holder>, tally: &Tally) -> Result<BlockId, Refused> {
+    let entry: Arc<dyn Entry> = Arc::new(tally.clone());
+    let block = pool.backend().allocate(pool.block_bytes(), &entry, SlabFill::Zeroed)?;
+    Ok(pool.install(block, SlabFill::Zeroed))
 }
 
 /// The bytes `pool` returns now, its returned blocks dropped.
@@ -99,7 +107,7 @@ fn flight() -> Arc<Flight> {
 #[test]
 fn a_kv_claim_takes_a_released_bank_granule_in_process() {
     let (mut pool, allocations, tally) = pool(4);
-    pool.grow().unwrap();
+    grow(&mut pool, &tally).unwrap();
     let bank = (0..4).map(|slot| pool.take(Holder::Bank(slot)).unwrap()).collect::<Vec<_>>();
     assert!(pool.take(Holder::Kv(0)).is_none(), "every granule is the bank's");
     let read = flight();
@@ -117,8 +125,8 @@ fn a_kv_claim_takes_a_released_bank_granule_in_process() {
 /// addresses, and the holes take the next claims.
 #[test]
 fn release_with_holes_needs_no_moves() {
-    let (mut pool, allocations, _tally) = pool(8);
-    pool.grow().unwrap();
+    let (mut pool, allocations, tally) = pool(8);
+    grow(&mut pool, &tally).unwrap();
     let bank = (0..8).map(|slot| pool.take(Holder::Bank(slot)).unwrap()).collect::<Vec<_>>();
     for hole in [1, 4, 6] {
         pool.release(bank[hole].granule, None);
@@ -138,7 +146,7 @@ fn release_with_holes_needs_no_moves() {
 #[test]
 fn a_granule_frees_only_after_its_flight() {
     let (mut pool, _, tally) = pool(2);
-    pool.grow().unwrap();
+    grow(&mut pool, &tally).unwrap();
     let first = pool.take(Holder::Bank(0)).unwrap();
     let second = pool.take(Holder::Bank(1)).unwrap();
     let read = flight();
@@ -190,8 +198,8 @@ fn block_sizing_rounds_the_least_allocation_to_granules() {
 #[test]
 fn a_block_returns_only_once_its_live_granules_are_copied_out() {
     let (mut pool, _, tally) = pool(2);
-    let older = pool.grow().unwrap();
-    let newer = pool.grow().unwrap();
+    let older = grow(&mut pool, &tally).unwrap();
+    let newer = grow(&mut pool, &tally).unwrap();
     let kept = pool.take(Holder::Kv(0)).unwrap();
     let moved = (0..2).map(|slot| pool.take(Holder::Bank(slot)).unwrap()).last().unwrap();
     assert_eq!(moved.granule.block, newer);
@@ -221,8 +229,8 @@ fn a_block_returns_only_once_its_live_granules_are_copied_out() {
 #[test]
 fn a_vacated_block_pays_what_is_owed_and_returns_behind_its_copy() {
     let (mut pool, _, tally) = pool(2);
-    pool.grow().unwrap();
-    let newer = pool.grow().unwrap();
+    grow(&mut pool, &tally).unwrap();
+    let newer = grow(&mut pool, &tally).unwrap();
     let freed_older = pool.take(Holder::Kv(0)).unwrap();
     pool.take(Holder::Kv(1)).unwrap();
     let freed_newer = pool.take(Holder::Bank(0)).unwrap();
@@ -253,9 +261,9 @@ fn a_vacated_block_pays_what_is_owed_and_returns_behind_its_copy() {
 /// granules take claims again, and what its holders still hold stays.
 #[test]
 fn an_unvacated_block_takes_claims_again() {
-    let (mut pool, _, _tally) = pool(2);
-    let older = pool.grow().unwrap();
-    let newer = pool.grow().unwrap();
+    let (mut pool, _, tally) = pool(2);
+    let older = grow(&mut pool, &tally).unwrap();
+    let newer = grow(&mut pool, &tally).unwrap();
     let kept = pool.take(Holder::Kv(0)).unwrap();
     let stays = pool.take(Holder::Kv(1)).unwrap();
     let live = pool.take(Holder::Bank(0)).unwrap();
@@ -279,9 +287,9 @@ fn an_unvacated_block_takes_claims_again() {
 #[test]
 fn the_entry_is_charged_exact_block_bytes() {
     let tally = Tally::unbounded(StoreIdentity::HostRam);
-    let (mut pool, _) = pool_of(4, 4096, &tally);
-    pool.grow().unwrap();
-    pool.grow().unwrap();
+    let (mut pool, _) = pool_of(4, 4096);
+    grow(&mut pool, &tally).unwrap();
+    grow(&mut pool, &tally).unwrap();
     let held = (0..5).map(|slot| pool.take(Holder::Bank(slot)).unwrap()).collect::<Vec<_>>();
     pool.release(held[1].granule, None);
     assert_eq!(tally.held(), 2 * (4 * GRANULE + 4096));
@@ -294,9 +302,9 @@ fn the_entry_is_charged_exact_block_bytes() {
 #[test]
 fn a_refused_block_is_never_allocated() {
     let tally = Tally::limited(StoreIdentity::HostRam, 6 * GRANULE);
-    let (mut pool, allocations) = pool_of(4, 0, &tally);
-    pool.grow().unwrap();
-    match pool.grow() {
+    let (mut pool, allocations) = pool_of(4, 0);
+    grow(&mut pool, &tally).unwrap();
+    match grow(&mut pool, &tally) {
         Err(refused) => assert_eq!(refused, Refused { required: 4 * GRANULE, available: 2 * GRANULE }),
         other => panic!("expected a refusal, got {:?}", other.map(drop)),
     }
@@ -310,8 +318,8 @@ fn a_refused_block_is_never_allocated() {
 #[test]
 fn one_block_counts_once_in_the_entry() {
     let tally = Tally::unbounded(StoreIdentity::HostRam);
-    let (mut pool, _) = pool_of(4, 512, &tally);
-    pool.grow().unwrap();
+    let (mut pool, _) = pool_of(4, 512);
+    grow(&mut pool, &tally).unwrap();
     assert_eq!(tally.held(), 4 * GRANULE + 512);
     assert_eq!(pool.held_bytes(), tally.held());
     assert_eq!(returned(&mut pool), 4 * GRANULE + 512);
@@ -328,7 +336,7 @@ fn owed_granules_return_as_their_flight_ends() {
     let pool = Arc::new(Mutex::new(pool));
     let granules = {
         let mut pool = pool.lock().unwrap();
-        pool.grow().unwrap();
+        grow(&mut pool, &tally).unwrap();
         (0..2).map(|slot| pool.take(Holder::Bank(slot)).unwrap().granule).collect::<Vec<_>>()
     };
     let read = flight();
@@ -358,9 +366,9 @@ fn owed_granules_return_as_their_flight_ends() {
 /// block for a debt the reuse already paid.
 #[test]
 fn a_claim_reusing_freed_granules_pays_what_is_owed() {
-    let (mut pool, _, _tally) = pool(4);
-    let first = pool.grow().unwrap();
-    let second = pool.grow().unwrap();
+    let (mut pool, _, tally) = pool(4);
+    let first = grow(&mut pool, &tally).unwrap();
+    let second = grow(&mut pool, &tally).unwrap();
     let held = (0..8).map(|slot| pool.take(Holder::Bank(slot)).unwrap()).collect::<Vec<_>>();
     // A shrink frees two granules of each block, one behind a flight.
     let read = flight();
@@ -391,9 +399,9 @@ fn a_claim_reusing_freed_granules_pays_what_is_owed() {
 /// nothing.
 #[test]
 fn a_debt_is_never_more_than_the_unheld_granules() {
-    let (mut pool, _, _tally) = pool(2);
-    pool.grow().unwrap();
-    let newer = pool.grow().unwrap();
+    let (mut pool, _, tally) = pool(2);
+    grow(&mut pool, &tally).unwrap();
+    let newer = grow(&mut pool, &tally).unwrap();
     let held = (0..4).map(|slot| pool.take(Holder::Bank(slot)).unwrap()).collect::<Vec<_>>();
     pool.release(held[0].granule, None);
     pool.release(held[1].granule, None);
@@ -409,4 +417,134 @@ fn a_debt_is_never_more_than_the_unheld_granules() {
     assert_eq!(pool.vacated(newer), 2 * GRANULE);
     assert_eq!(pool.owed(), 0, "the vacated block pays the debt");
     assert_eq!(returned(&mut pool), 0, "and returns, its bytes reported by its vacate");
+}
+
+/// Concurrent threads claiming from an empty pool via [`GrowGate`] allocate
+/// only one block when that block has enough granules for both callers, and
+/// the second caller deterministically parks on `GrowTurn::Waited`.
+#[test]
+fn single_flight_concurrent_growth_allocates_one_block() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Barrier, Mutex};
+    let (pool, allocations, tally) = pool(2);
+    let pool = Arc::new(Mutex::new(pool));
+    let gate = Arc::new(GrowGate::new());
+    let blocks = Arc::new(Counted { allocations: allocations.clone(), slack: 0 });
+    let entry: Arc<dyn Entry> = Arc::new(tally);
+    let t1_growing = Arc::new(Barrier::new(2));
+    let t2_parked = Arc::new(Barrier::new(2));
+    let t2_waited = Arc::new(AtomicBool::new(false));
+
+    let t1 = {
+        let pool = pool.clone();
+        let gate = gate.clone();
+        let blocks = blocks.clone();
+        let entry = entry.clone();
+        let t1_growing = t1_growing.clone();
+        let t2_parked = t2_parked.clone();
+        seismic_threads::spawn("pool-grow-t1", move || loop {
+            if let Some(claimed) = pool.lock().unwrap().take(Holder::Bank(0)) {
+                return claimed;
+            }
+            match gate.enter_or_wait() {
+                GrowTurn::Waited => panic!("t1 must be the grower"),
+                GrowTurn::Grow(_guard) => {
+                    t1_growing.wait();
+                    // Wait until t2 is deterministically parked inside GrowGate.
+                    t2_parked.wait();
+                    let block = blocks.allocate(2 * GRANULE, &entry, SlabFill::Unwritten).unwrap();
+                    pool.lock().unwrap().install(block, SlabFill::Unwritten);
+                }
+            }
+        })
+        .unwrap()
+    };
+
+    t1_growing.wait();
+    let t2 = {
+        let pool = pool.clone();
+        let gate = gate.clone();
+        let t2_parked = t2_parked.clone();
+        let t2_waited = t2_waited.clone();
+        seismic_threads::spawn("pool-grow-t2", move || loop {
+            if let Some(claimed) = pool.lock().unwrap().take(Holder::Bank(1)) {
+                return claimed;
+            }
+            match gate.enter_or_wait_with(|| {
+                t2_parked.wait();
+            }) {
+                GrowTurn::Waited => {
+                    t2_waited.store(true, Ordering::Relaxed);
+                    continue;
+                }
+                GrowTurn::Grow(_guard) => panic!("t2 must wait on t1's growth, not allocate a second block"),
+            }
+        })
+        .unwrap()
+    };
+
+    let c1 = t1.join().unwrap();
+    let c2 = t2.join().unwrap();
+    assert!(t2_waited.load(Ordering::Relaxed), "t2 deterministically observed GrowTurn::Waited");
+    assert_ne!(c1.granule, c2.granule, "each caller claims a distinct granule");
+    assert_eq!(allocations.load(Ordering::Relaxed), 1, "single-flight growth allocates one block, not two");
+}
+
+/// A grower that returns an error or panics while holding [`GrowGuard`] clears
+/// `growing` and wakes waiting threads cleanly without hanging.
+#[test]
+fn single_flight_growth_wakes_waiters_on_error_and_panic() {
+    use std::sync::Barrier;
+    let gate = Arc::new(GrowGate::new());
+
+    // Error path: grower drops guard on Err after waiter is deterministically parked.
+    let guard = match gate.enter_or_wait() {
+        GrowTurn::Grow(g) => g,
+        GrowTurn::Waited => panic!("first caller must grow"),
+    };
+    let parked = Arc::new(Barrier::new(2));
+    let waiter = {
+        let gate = gate.clone();
+        let parked = parked.clone();
+        seismic_threads::spawn("pool-grow-wait-err", move || {
+            matches!(
+                gate.enter_or_wait_with(|| {
+                    parked.wait();
+                }),
+                GrowTurn::Waited
+            )
+        })
+        .unwrap()
+    };
+    parked.wait();
+    drop(guard);
+    assert!(waiter.join().unwrap(), "waiter wakes after grower drops guard on error");
+
+    // Panic path: grower panics while holding guard after waiter is deterministically parked.
+    let mut waiter2 = None;
+    let parked2 = Arc::new(Barrier::new(2));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = match gate.enter_or_wait() {
+            GrowTurn::Grow(g) => g,
+            GrowTurn::Waited => panic!("expected grow turn"),
+        };
+        let gate_for_waiter = gate.clone();
+        let parked_for_waiter = parked2.clone();
+        waiter2 = Some(
+            seismic_threads::spawn("pool-grow-wait-panic", move || {
+                matches!(
+                    gate_for_waiter.enter_or_wait_with(|| {
+                        parked_for_waiter.wait();
+                    }),
+                    GrowTurn::Waited
+                )
+            })
+            .unwrap(),
+        );
+        parked2.wait();
+        panic!("simulated allocator panic");
+    }));
+    assert!(panicked.is_err());
+    assert!(waiter2.unwrap().join().unwrap(), "waiter wakes after grower panics");
+    assert!(matches!(gate.enter_or_wait(), GrowTurn::Grow(_)), "gate is usable after panic");
 }

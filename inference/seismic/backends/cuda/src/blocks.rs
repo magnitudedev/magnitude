@@ -128,9 +128,11 @@ impl Blocks {
     }
 
     /// One block of its own ([`crate::Device::allocate_block`]): at least
-    /// `bytes`, whole allocation granules, zero, charged exactly to `entry`
-    /// and freed as it drops, never shared with a range.
-    pub(crate) fn allocate_block(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<DeviceBlock, ExecutionError> {
+    /// `bytes`, whole allocation granules, its bytes as `fill` says
+    /// (`SlabFill::Unwritten` skips synchronous zeroing so allocation never
+    /// synchronizes the transfer stream), charged exactly to `entry` and freed
+    /// as it drops, never shared with a range.
+    pub(crate) fn allocate_block(&self, bytes: u64, entry: &Arc<dyn Entry>, fill: seismic_memory::SlabFill) -> Result<DeviceBlock, ExecutionError> {
         let size = bytes
             .max(1)
             .checked_next_multiple_of(self.granularity)
@@ -140,7 +142,9 @@ impl Blocks {
         let refused = || crate::executor::allocation_error(size, || crate::executor::device_free(&self.context));
         let backed = Backed::take(entry, size, Wiring::Pageable, |_| {
             let allocation = Allocation::new(&self.context, host).map_err(refused())?;
-            driver::zero(&self.context, allocation.pointer, host).map_err(refused())?;
+            if fill == seismic_memory::SlabFill::Zeroed {
+                driver::zero(&self.context, allocation.pointer, host).map_err(refused())?;
+            }
             Ok::<_, ExecutionError>(allocation)
         })?;
         Ok(DeviceBlock { backed })

@@ -26,6 +26,7 @@ use super::liveness;
 use super::residency::{Residency, lock, lock_counted};
 use super::scratch::Pending;
 use super::Shared;
+use crate::experts::ExchangeTable;
 use crate::experts::yielding::Yielding;
 use magnitude_kernels::constants;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -192,10 +193,14 @@ pub(super) struct Requests {
 }
 
 /// The request service's own state: its look at the decode requests, the
-/// misses waiting, and per layer the scratch request being served.
+/// misses waiting, immutable per-layer scratch tables (so scratch arrival
+/// observation runs outside `residency`'s lock), and per layer the scratch
+/// request being served.
 pub(super) struct Service {
     look: Look,
     decode: Decode,
+    scratch_tables: Vec<ExchangeTable>,
+    window_rounds: u64,
     /// Per layer, the scratch request taken and not yet served whole: a
     /// layer's requests are served in step order, one at a time, as the
     /// device runs their rounds.
@@ -232,6 +237,8 @@ impl Requests {
             Service {
                 look: Look::new(&held.core, held.prefetch.staging.clone()),
                 decode: Decode::new(),
+                scratch_tables: held.core.layers.iter().map(|layer| layer.scratch.clone()).collect(),
+                window_rounds: held.core.extents.window_rounds,
                 pending: (0..layers).map(|_| None).collect(),
                 rested: Rested::fixed(IDLE),
             }
@@ -268,8 +275,13 @@ impl Requests {
             // residency, so the keeper starts no job before its pass.
             let began = Began { ended, looked: Instant::now() };
             let mut posted = Vec::new();
+            let mut scratch_arrived = Vec::new();
             let (progressed, polls) = {
-                let mut held = lock_counted(&residency, || posted = self.look(began));
+                let mut held = lock_counted(&residency, || {
+                    let (p, s) = self.look(began);
+                    posted = p;
+                    scratch_arrived = s;
+                });
                 // When the pass holds residency, for the read timeline: the
                 // look's requests wait for it, their reads already running.
                 for request in &posted {
@@ -284,7 +296,7 @@ impl Requests {
                         let gave_up = posted.into_iter().fold(false, |gave_up, request| request.give_up(&mut held.core, &held.prefetch, &self.shared) | gave_up);
                         liveness::refuse(&held.core, &self.shared) | gave_up
                     }
-                    None => self.pass(&mut service, &mut held, posted),
+                    None => self.pass(&mut service, &mut held, posted, &mut scratch_arrived),
                 };
                 (progressed, self.polls(&held))
             };
@@ -301,14 +313,29 @@ impl Requests {
     }
 
     /// The decode requests the device posted since the last look, each
-    /// absent expert's read submitted (`Look::look`): none once serving
-    /// ended.
-    fn look(&self, began: Began) -> Vec<Posted> {
+    /// absent expert's read submitted (`Look::look`), and any pending scratch
+    /// arrivals observed on `Service::scratch_tables` outside `residency`'s
+    /// lock: none once serving ended.
+    fn look(&self, began: Began) -> (Vec<Posted>, Vec<Option<Instant>>) {
+        let _no_alloc = seismic::memory::enter_no_blocking_allocation();
         if self.shared.life.ended().is_some() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let mut service = self.service.lock().expect("the request service is never left by a panic");
-        service.look.look(&self.shared, began)
+        let posted = service.look.look(&self.shared, began);
+        let arrived = service
+            .pending
+            .iter()
+            .enumerate()
+            .map(|(layer, pending)| match pending {
+                Some(Pending::Arriving { at, window, .. }) => {
+                    let lane = constants::ROUND_LANE(*window * service.window_rounds);
+                    service.scratch_tables[layer].requested(at.point.sequence, lane).then(Instant::now)
+                }
+                _ => None,
+            })
+            .collect();
+        (posted, arrived)
     }
 
     /// Whether the device's words are polled while a step runs: where kernels
@@ -328,7 +355,7 @@ impl Requests {
     /// hints, and a ring whose hinted layer's request is noticed is
     /// decided, not read (`Prefetch::rings`). True when it changed anything;
     /// each scratch round that arrived is counted `noticed`.
-    fn pass(&self, service: &mut Service, residency: &mut Residency, posted: Vec<Posted>) -> bool {
+    fn pass(&self, service: &mut Service, residency: &mut Residency, posted: Vec<Posted>, scratch_arrived: &mut [Option<Instant>]) -> bool {
         // A panic of the executor's work, or the device lost under the
         // parks, ends serving, as the service's own panic does.
         if let Some(reason) = self.shared.fault() {
@@ -342,7 +369,7 @@ impl Requests {
         let resumed = service.decode.resume(residency.serving());
         // A served group's reads that landed move on, ahead of its rounds.
         let conveyed = residency.scratch.convey(&mut residency.core, &self.shared);
-        let served = self.serve_requests(service, residency, posted, joined | resumed | conveyed);
+        let served = self.serve_requests(service, residency, posted, scratch_arrived, joined | resumed | conveyed);
         resumed | conveyed | served
     }
 
@@ -354,7 +381,14 @@ impl Requests {
     /// host alone holds (a scratch request taken, its rounds, the decode
     /// requests the look took, `posted`) is carried every pass. Whether it
     /// served any.
-    fn serve_requests(&self, service: &mut Service, residency: &mut Residency, posted: Vec<Posted>, freed: bool) -> bool {
+    fn serve_requests(
+        &self,
+        service: &mut Service,
+        residency: &mut Residency,
+        posted: Vec<Posted>,
+        scratch_arrived: &mut [Option<Instant>],
+        freed: bool,
+    ) -> bool {
         let parked = self.shared.parks.parked();
         let layers = residency.core.layers.len();
         let mut progressed = false;
@@ -376,7 +410,8 @@ impl Requests {
             if parked {
                 progressed |= residency.publish(layer);
             }
-            progressed |= self.scratch(service, residency, layer);
+            let arrived = scratch_arrived.get_mut(layer).and_then(Option::take);
+            progressed |= self.scratch(service, residency, layer, arrived);
         }
         assert!(posted.next().is_none(), "the look takes requests of the load's layers, in order");
         if self.shared.parks.settled() {
@@ -397,7 +432,7 @@ impl Requests {
     /// next, whose requests wait on its backs. A step that ended before its
     /// round 0 arrived (a device error) fails its request. Whether any
     /// moved.
-    fn scratch(&self, service: &mut Service, residency: &mut Residency, layer: usize) -> bool {
+    fn scratch(&self, service: &mut Service, residency: &mut Residency, layer: usize, mut pre_arrived: Option<Instant>) -> bool {
         let layers = residency.core.layers.len();
         let mut moved = false;
         loop {
@@ -416,17 +451,22 @@ impl Requests {
                 Pending::Served(serve) => serve,
                 Pending::Arriving { at, place, window } => {
                     let sequence = at.point.sequence;
-                    let lane = constants::ROUND_LANE(window * residency.core.extents.window_rounds);
-                    if !residency.core.layers[layer].scratch.requested(sequence, lane) {
-                        if !self.shared.steps.ended(sequence) {
-                            service.pending[layer] = Some(Pending::Arriving { at, place, window });
-                            return moved;
+                    let lane = constants::ROUND_LANE(window * service.window_rounds);
+                    let arrived = match pre_arrived.take() {
+                        Some(arrived) => arrived,
+                        None => {
+                            if !service.scratch_tables[layer].requested(sequence, lane) {
+                                if !self.shared.steps.ended(sequence) {
+                                    service.pending[layer] = Some(Pending::Arriving { at, place, window });
+                                    return moved;
+                                }
+                                residency.scratch.unarrived(at, place, window, &mut residency.core, &self.shared);
+                                moved = true;
+                                continue;
+                            }
+                            Instant::now()
                         }
-                        residency.scratch.unarrived(at, place, window, &mut residency.core, &self.shared);
-                        moved = true;
-                        continue;
-                    }
-                    let arrived = Instant::now();
+                    };
                     residency.publish(layer);
                     if window == 0 {
                         residency.advance(at.point);

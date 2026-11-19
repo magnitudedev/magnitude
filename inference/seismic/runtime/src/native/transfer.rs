@@ -187,6 +187,7 @@ impl TransferInner {
     /// (written) and every signal's word (written): host access to them,
     /// and their storage's release, wait for it.
     pub fn copy(&self, items: &[TransferItem<'_>]) -> Result<u64, TransferError> {
+        seismic_memory::assert_blocking_allocation_allowed("TransferInner::copy");
         for item in items {
             match item {
                 TransferItem::Run(run) => self.check(run)?,
@@ -345,6 +346,7 @@ impl TransferInner {
     /// completed, or why none can. The thread sleeps until the batch
     /// completes, whatever other queues of the device still run.
     pub fn wait(&self, value: u64, timeout: Duration) -> Result<bool, TransferError> {
+        seismic_memory::assert_blocking_allocation_allowed("TransferInner::wait");
         self.queue.wait(value, timeout).map_err(TransferError::Execution)
     }
 }

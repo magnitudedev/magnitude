@@ -980,17 +980,22 @@ impl MetalDevice {
         Ok(self.held(charged, mapping, bytes, Storage::Shared))
     }
 
-    /// A private buffer of `bytes` in the device's own memory, zero (Metal
-    /// leaves a private buffer's contents undefined, so a blit zeroes it),
-    /// its bytes charged exactly to `entry` as device memory the driver
-    /// holds ([`Wiring::Pageable`]), kept resident for the device's work as
-    /// every buffer is ([`Residency`]).
-    fn allocate_private(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<WritableMetalBuffer, ExecutionError> {
+    /// A private buffer of `bytes` in the device's own memory, its bytes as
+    /// `fill` says (Metal leaves a private buffer's contents undefined, so a
+    /// blit zeroes it for [`seismic_memory::SlabFill::Zeroed`]; skipped for
+    /// [`seismic_memory::SlabFill::Unwritten`] so allocation never
+    /// synchronously waits on the device command queue), its bytes charged
+    /// exactly to `entry` as device memory the driver holds
+    /// ([`Wiring::Pageable`]), kept resident for the device's work as every
+    /// buffer is ([`Residency`]).
+    fn allocate_private(&self, bytes: u64, entry: &Arc<dyn Entry>, fill: seismic_memory::SlabFill) -> Result<WritableMetalBuffer, ExecutionError> {
         let length = usize::try_from(bytes.max(1)).map_err(|_| {
             ExecutionError::AllocationFailed(format!("{bytes} bytes exceed the host address space"))
         })?;
         let charged = charged_buffer(&self.handle, length, storage(crate::topology::PRIVATE_KIND), entry, Wiring::Pageable)?;
-        self.staging.zero(&charged, length)?;
+        if fill == seismic_memory::SlabFill::Zeroed {
+            self.staging.zero(&charged, length)?;
+        }
         Ok(self.held(charged, None, bytes, Storage::Private(self.staging.clone())))
     }
 
@@ -1012,14 +1017,14 @@ impl MetalDevice {
     /// ([`crate::topology::kinds`]): private storage, or shared storage, a
     /// pool block's over a mapping of its own where `block`
     /// ([`Self::allocate_shared`]).
-    fn allocate_kind(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>, block: bool) -> Result<WritableMetalBuffer, ExecutionError> {
+    fn allocate_kind(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>, block: bool, fill: seismic_memory::SlabFill) -> Result<WritableMetalBuffer, ExecutionError> {
         let unified = self.handle.has_unified_memory();
         assert!(
             crate::topology::kinds(unified).iter().any(|own| own.id == kind),
             "invariant violated: a Metal allocation of kind {kind}, which the device (unified memory: {unified}) does not have"
         );
         match kind {
-            crate::topology::PRIVATE_KIND => self.allocate_private(bytes, entry),
+            crate::topology::PRIVATE_KIND => self.allocate_private(bytes, entry, fill),
             _ => self.allocate_shared(bytes, entry, block),
         }
     }
@@ -1028,21 +1033,23 @@ impl MetalDevice {
     /// ledgers ([`crate::topology::own_kind`]), zero, charged exactly to
     /// `entry`.
     pub(crate) fn allocate_own(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<WritableMetalBuffer, ExecutionError> {
-        self.allocate_kind(crate::topology::own_kind(self.handle.has_unified_memory()), bytes, entry, false)
+        self.allocate_kind(crate::topology::own_kind(self.handle.has_unified_memory()), bytes, entry, false, seismic_memory::SlabFill::Zeroed)
     }
 
     /// One block of a granule pool (`seismic_memory::pool::Blocks`) of
-    /// `kind`, zero, charged exactly to `entry`: shared storage over a
-    /// mapping of its own ([`Self::allocate_shared`]), its pages returned
-    /// to the OS within the drop of its last handle ([`WiredAllocation`]'s
-    /// drop), or private storage ([`Self::allocate_private`]).
+    /// `kind`, its bytes as `fill` says, charged exactly to `entry`: shared
+    /// storage over a mapping of its own ([`Self::allocate_shared`]), its pages
+    /// returned to the OS within the drop of its last handle
+    /// ([`WiredAllocation`]'s drop), or private storage
+    /// ([`Self::allocate_private`]).
     pub fn allocate_block(
         &self,
         kind: u32,
         bytes: u64,
         entry: &Arc<dyn Entry>,
+        fill: seismic_memory::SlabFill,
     ) -> Result<WritableMetalBuffer, ExecutionError> {
-        self.allocate_kind(kind, bytes, entry, true)
+        self.allocate_kind(kind, bytes, entry, true, fill)
     }
 
 
@@ -1113,7 +1120,7 @@ impl DeviceService<Metal> for MetalDevice {
         // The profile advertises the alignment returned by
         // `heapBufferSizeAndAlignWithLength:options:` for this same shared
         // buffer class; direct device buffers satisfy that requirement.
-        self.allocate_kind(kind, bytes, entry, false)
+        self.allocate_kind(kind, bytes, entry, false, seismic_memory::SlabFill::Zeroed)
     }
 
     fn write(
@@ -1248,7 +1255,7 @@ mod mapped_tests {
             return;
         };
         let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
-        let buffer = device.allocate_private(3 << 12, &crate::test_support::entry()).unwrap();
+        let buffer = device.allocate_private(3 << 12, &crate::test_support::entry(), seismic_memory::SlabFill::Zeroed).unwrap();
         assert!(<MetalDevice as DeviceService<Metal>>::host_address(&device, &buffer).is_none());
         assert_eq!(device.residency.lock().count(), 1);
         let mut read = vec![1u8; 3 << 12];
@@ -1263,7 +1270,7 @@ mod mapped_tests {
         assert_eq!(device.residency.lock().count(), 0);
         // An access longer than one staging copy is staged a chunk at a
         // time, each landing at its own offset.
-        let long = device.allocate_private((STAGING_CHUNK + (3 << 12)) as u64, &crate::test_support::entry()).unwrap();
+        let long = device.allocate_private((STAGING_CHUNK + (3 << 12)) as u64, &crate::test_support::entry(), seismic_memory::SlabFill::Zeroed).unwrap();
         let written = (0..STAGING_CHUNK + 4096).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         long.write_bytes(4097, &written).unwrap();
         let mut back = vec![0u8; written.len()];
@@ -1296,7 +1303,7 @@ mod mapped_tests {
         tally.bound(0);
         let before = device.handle().current_allocated_bytes();
         assert!(matches!(
-            device.allocate_block(crate::topology::SHARED_KIND, 1 << 20, &entry),
+            device.allocate_block(crate::topology::SHARED_KIND, 1 << 20, &entry, seismic_memory::SlabFill::Zeroed),
             Err(ExecutionError::AllocationCapacity { .. })
         ));
         assert_eq!(device.handle().current_allocated_bytes(), before);
@@ -1513,7 +1520,7 @@ mod mapped_tests {
         let before = count();
         let started = std::time::Instant::now();
         let blocks = (0..512)
-            .map(|_| device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry()).unwrap())
+            .map(|_| device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry(), seismic_memory::SlabFill::Zeroed).unwrap())
             .collect::<Vec<_>>();
         let added = started.elapsed();
         assert_eq!(count() - before, blocks.len() as u64, "one buffer per block");
@@ -1540,7 +1547,7 @@ mod mapped_tests {
         };
         let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
         let block = 1u64 << 30;
-        let buffer = device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry()).unwrap();
+        let buffer = device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry(), seismic_memory::SlabFill::Zeroed).unwrap();
         // Touched: every page the process's.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         let ones = vec![1u8; page as usize];

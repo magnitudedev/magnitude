@@ -145,6 +145,7 @@ impl PoolBlock {
 
 /// A pool's blocks: allocations of its store from the backend's plain
 /// allocator, in the pool's hazard domain.
+#[derive(Clone)]
 struct PoolBlocks {
     device: Arc<DeviceInner>,
     /// The kinds of the pool's contract that lie in its store, in placement
@@ -158,10 +159,10 @@ impl Blocks for PoolBlocks {
     type Fence = DeviceUses;
     type Error = ExecutionError;
 
-    fn allocate(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<PoolBlock, ExecutionError> {
+    fn allocate(&self, bytes: u64, entry: &Arc<dyn Entry>, fill: SlabFill) -> Result<PoolBlock, ExecutionError> {
         let charged = Arc::new(BlockEntry { entry: entry.clone(), charged: AtomicU64::new(0) });
         let through: Arc<dyn Entry> = charged.clone();
-        let allocation = self.device.allocate_block(&self.kinds, bytes, &through, self.access.clone())?;
+        let allocation = self.device.allocate_block(&self.kinds, bytes, &through, self.access.clone(), fill)?;
         let address = self.device.allocation_address(&allocation, 0);
         assert!(
             address % BLOCK_ALIGNMENT == 0,
@@ -223,6 +224,8 @@ pub struct Pool(Arc<PoolShared>);
 
 struct PoolShared {
     device: Arc<DeviceInner>,
+    blocks: PoolBlocks,
+    entry: Arc<dyn Entry>,
     granule: u64,
     block_bytes: u64,
     /// One zero granule no slab holds, which every free slot of the pool's
@@ -230,6 +233,7 @@ struct PoolShared {
     /// of the pool is).
     absent: PoolBlock,
     state: Mutex<PoolState>,
+    grow_gate: seismic_memory::pool::GrowGate,
 }
 
 struct PoolState {
@@ -247,7 +251,28 @@ struct PoolState {
 
 impl PoolShared {
     fn state(&self) -> MutexGuard<'_, PoolState> {
+        seismic_memory::assert_blocking_allocation_allowed("PoolShared::state");
         self.state.lock().expect("granule pool lock poisoned")
+    }
+
+    /// Allocate one pool block outside all pool and slab locks.
+    fn allocate_block(&self, fill: SlabFill) -> Result<PoolBlock, ExecutionError> {
+        seismic_memory::assert_blocking_allocation_allowed("PoolShared::allocate_block");
+        self.blocks.allocate(self.block_bytes, &self.entry, fill)
+    }
+
+    /// Perform one single-flight growth step outside all pool and slab locks.
+    /// Returns `Ok(true)` if this thread allocated and installed a block, or
+    /// `Ok(false)` if it waited for another thread's growth to finish.
+    fn grow_once(&self, fill: SlabFill) -> Result<bool, ExecutionError> {
+        match self.grow_gate.enter_or_wait() {
+            seismic_memory::pool::GrowTurn::Waited => Ok(false),
+            seismic_memory::pool::GrowTurn::Grow(_guard) => {
+                let block = self.allocate_block(fill)?;
+                self.state().granules.install(block, fill);
+                Ok(true)
+            }
+        }
     }
 
     /// The newest uses of the pool's hazard domain: what a granule released
@@ -315,18 +340,21 @@ impl Pool {
         }
         let access = Arc::new(AccessGroup::default());
         let blocks = PoolBlocks { device: device.clone(), kinds, access: access.clone() };
-        let absent = blocks.allocate(granule, &absent)?;
+        let absent = blocks.allocate(granule, &absent, SlabFill::Zeroed)?;
         let shared = Arc::new(PoolShared {
             device: device.clone(),
+            blocks: blocks.clone(),
+            entry: entry.clone(),
             granule,
             block_bytes,
             absent,
             state: Mutex::new(PoolState {
-                granules: GranulePool::new(blocks, granule, block_bytes, entry),
+                granules: GranulePool::new(blocks, granule, block_bytes),
                 stores: HashMap::new(),
                 releasing: Vec::new(),
                 waiting: false,
             }),
+            grow_gate: seismic_memory::pool::GrowGate::new(),
         });
         Ok(Self(shared))
     }
@@ -360,10 +388,12 @@ impl Pool {
     }
 
     /// Allocate one block, admitted by the pool's entry first: the pool's
-    /// grow step. Refused (`ExecutionError::AllocationCapacity` where the
-    /// entry refuses), nothing changes.
+    /// grow step, allocated outside the pool's lock. Refused
+    /// (`ExecutionError::AllocationCapacity` where the entry refuses), nothing
+    /// changes.
     pub fn grow(&self) -> Result<(), TensorError> {
-        self.0.state().granules.grow().map(drop).map_err(TensorError::Execution)
+        while !self.0.grow_once(SlabFill::Zeroed).map_err(TensorError::Execution)? {}
+        Ok(())
     }
 
     /// Take every block whose granules are all free out of the pool: the
@@ -588,15 +618,7 @@ impl Drop for GranuleHold {
     }
 }
 
-/// What a new slab's bytes hold ([`SlabStore::add_slab`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SlabFill {
-    /// Zero, as kernels that read a slab before writing it require.
-    Zeroed,
-    /// Whatever its granule held: for a holder that writes every byte
-    /// before device work reads them.
-    Unwritten,
-}
+pub use seismic_memory::SlabFill;
 
 /// How a store's slabs are laid out.
 #[derive(Clone, Debug)]
@@ -678,6 +700,7 @@ pub(crate) struct Slots {
 
 impl Slots {
     fn slabs(&self) -> MutexGuard<'_, Vec<Option<Slab>>> {
+        seismic_memory::assert_blocking_allocation_allowed("Slots::slabs");
         self.slabs.lock().expect("slab store lock poisoned")
     }
 
@@ -1228,23 +1251,29 @@ impl SlabStore {
     pub fn add_slab(&self, fill: SlabFill) -> Result<usize, TensorError> {
         let slots = &self.slots;
         let pool = slots.pool.as_ref().expect("a store that adds slabs is a pool's");
-        let mut slabs = slots.slabs();
-        let slot = slabs
-            .iter()
-            .position(Option::is_none)
-            .ok_or_else(|| TensorError::SlabLayout("all slab slots are backed".into()))?;
-        let holder = Holder { store: slots.id, slot };
-        let (Claimed { granule, address, zero: fresh }, block) = {
-            let mut state = pool.state();
-            let claimed = match state.granules.take(holder) {
-                Some(claimed) => claimed,
-                None => {
-                    state.granules.grow().map_err(TensorError::Execution)?;
-                    state.granules.take(holder).expect("a grown block has free granules")
-                }
+        let (mut slabs, slot, Claimed { granule, address, zero: fresh }, block) = loop {
+            let slabs = slots.slabs();
+            let Some(slot) = slabs.iter().position(Option::is_none) else {
+                return Err(TensorError::SlabLayout("all slab slots are backed".into()));
             };
-            let block = state.granules.block(claimed.granule.block).allocation.clone();
-            (claimed, block)
+            let holder = Holder { store: slots.id, slot };
+            let taken = {
+                let mut state = pool.state();
+                state.granules.take(holder).map(|claimed| {
+                    let block = state.granules.block(claimed.granule.block).allocation.clone();
+                    (claimed, block)
+                })
+            };
+            if let Some((claimed, block)) = taken {
+                break (slabs, slot, claimed, block);
+            }
+            // Release both `slots.slabs()` and `pool.state()` before growing so
+            // no driver call runs under a lock. Growth is single-flight through
+            // `PoolShared::grow_once`: concurrent callers wait for the active
+            // growth to install and then re-check for a free granule rather
+            // than over-admitting a second block.
+            drop(slabs);
+            pool.grow_once(fill).map_err(TensorError::Execution)?;
         };
         // Its granule goes back free should the slab not form.
         let hold = Arc::new(SlabHold { store: slots.id, slot, granule: Some(GranuleHold { pool: pool.clone(), granule }) });

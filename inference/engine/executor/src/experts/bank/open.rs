@@ -1,7 +1,7 @@
 use super::{ExpertBank, PoolConveyor, allocate_placed, homes, placed_words, slot_maps, write_blocks};
 use crate::experts::conveyor::{Carrier, LentPool, Lending};
 use crate::experts::source::{ExpertSource, Records};
-use crate::experts::watcher::{BankRecordViews, Copier, Extents, Group, Layer, ListRecords, LoadWords, PlacedWords, Pool, Steps, StoredPart, StoredTensor, Watcher, WatcherParts};
+use crate::experts::watcher::{Copier, Extents, Group, Layer, ListRecords, LoadWords, PlacedWords, Pool, Steps, StoredPart, StoredTensor, Watcher, WatcherParts};
 use crate::experts::directory::{HostTier as TierStart, Placement};
 use crate::experts::landing::{LandingList, TierTensor};
 use crate::experts::map::{LandingMap, StampedMap};
@@ -524,8 +524,7 @@ fn watch(
             let copies = seismic::Transfer::new(&device)
                 .map(|transfer| super::copies::Copies::new(transfer, steps.events().clone()))
                 .map_err(|error| format!("the device's transfers: {error}"))?;
-            let bank: Arc<dyn BankRecordViews> = bank.clone();
-            Some(Copier { copies, bank })
+            Some(Copier { copies })
         }
         Placer::Bank => None,
     };
@@ -573,15 +572,17 @@ fn watch(
         TierStart { records, lent, reserve, placement }
     };
     // A group's commits span its ceiling, as its entries bind them, so a
-    // resize keeps them.
+    // resize keeps them. Initial bank record views are delivered into
+    // `Group::bank` for `Placer::Tier` so promotions never touch `Stores`.
     let groups = layout
         .groups
         .iter()
         .enumerate()
         .map(|(index, group)| {
-            Ok(Group {
+            let mut watched = Group {
                 commits: Words::new(group.commits.clone(), plan.records(index), 0)?,
                 tier: Some(tiers[index].clone()),
+                bank: Vec::new(),
                 // The bank records the directory places into: none where
                 // landings land into the bank itself (their records are the
                 // landings').
@@ -590,7 +591,12 @@ fn watch(
                         .map_err(|_| "committed records exceed the host")?,
                     Placer::Bank => 0,
                 },
-            })
+            };
+            if plan.placer() == Placer::Tier {
+                let backed = bank.backed(index);
+                watched.join_bank(&backed, bank.record_views(index, &backed));
+            }
+            Ok(watched)
         })
         .collect::<Result<Vec<_>, String>>()?;
     let compute = super::HostCompute::serving(site_layers, &threads)?;

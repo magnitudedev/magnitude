@@ -37,7 +37,10 @@
 
 pub use seismic_memory::entry::{Backed, Carved, Change, Charge, Charging, DropScope, Entry, Refused, Store, Tally, Wiring};
 use crate::api::device::DeviceInner;
-pub use seismic_memory::{AllocationFailure, HostBlock, PageSize};
+pub use seismic_memory::{
+    AllocationFailure, HostBlock, NoBlockingAllocationGuard, PageSize, assert_blocking_allocation_allowed,
+    enter_no_blocking_allocation,
+};
 use seismic_compiler::errors::ExecutionError;
 use seismic_native_target::process::{ProcessFootprint, ProcessId};
 use seismic_topology::{AccessPathId, Contract, DeviceTopology, Executor, PhysicalIdentity, StoreId, StoreIdentity};

@@ -128,14 +128,21 @@ pub(super) fn lock_counted(residency: &Yielding<Residency>, counted: impl FnOnce
 /// Why residency's lock is never poisoned ([`lock`]).
 const POISONED: &str = "residency is never left by a panic";
 
-/// Residency held ([`lock`]): as it is released, what each layer holds published and then
-/// what waits on that publication answered (`Owed`), the one publisher of
-/// what any holder moved.
-pub(super) struct Held<'a>(MutexGuard<'a, Residency>);
+/// Residency held ([`lock`]): as it is released, what each layer holds is
+/// published under the lock, then the lock and `NoBlockingAllocationGuard` are
+/// released, any evicted/replaced `Tensor`/`Records` views are dropped outside
+/// the lock, and finally what waits on that publication (`Owed`) is answered.
+pub(super) struct Held<'a> {
+    guard: Option<MutexGuard<'a, Residency>>,
+    no_alloc: Option<seismic::memory::NoBlockingAllocationGuard>,
+}
 
 impl<'a> Held<'a> {
     fn new(held: MutexGuard<'a, Residency>) -> Self {
-        Self(held)
+        Self {
+            guard: Some(held),
+            no_alloc: Some(seismic::memory::enter_no_blocking_allocation()),
+        }
     }
 
     /// Given first to every holder waiting for it (the keeper's, between
@@ -148,25 +155,40 @@ impl<'a> Held<'a> {
 impl std::ops::Deref for Held<'_> {
     type Target = Residency;
     fn deref(&self) -> &Residency {
-        &self.0
+        self.guard.as_deref().expect("Held guard is present while live")
     }
 }
 
 impl std::ops::DerefMut for Held<'_> {
     fn deref_mut(&mut self) -> &mut Residency {
-        &mut self.0
+        self.guard.as_deref_mut().expect("Held guard is present while live")
     }
 }
 
 impl Drop for Held<'_> {
     fn drop(&mut self) {
+        let mut guard = self.guard.take().expect("Held guard dropped once");
+        let shared = guard.shared.clone();
         // A panic is caught inside the lock, never unwinding through it,
         // and ends serving before the lock is released ([`lock`]): nothing
         // is published or answered from the state it left.
-        if !std::thread::panicking() && self.0.shared.life.ended().is_none() {
-            let residency = &mut *self.0;
-            residency.publish_held();
-            residency.owed.settle(&residency.shared);
+        let settle = !std::thread::panicking() && guard.shared.life.ended().is_none();
+        if settle {
+            guard.publish_held();
+        }
+        let mut owed = std::mem::take(&mut guard.owed);
+        let deferred_tensors = std::mem::take(&mut owed.deferred_tensors);
+        let deferred_records = std::mem::take(&mut owed.deferred_records);
+        // Release residency and `NoBlockingAllocationGuard` before dropping
+        // evicted or replaced views (whose final `SlabHold`/`Allocation` drop
+        // may touch pool or driver locks), and before `Owed::settle` wakes the
+        // resize thread so `Stores::free` sees no lingering view references.
+        drop(guard);
+        drop(self.no_alloc.take());
+        drop(deferred_tensors);
+        drop(deferred_records);
+        if settle {
+            owed.settle(&shared);
         }
     }
 }
@@ -713,7 +735,7 @@ impl Residency {
     /// tensors and the CPU site's, which read the same records.
     pub(super) fn address_tier(&mut self, views: Vec<Vec<crate::experts::source::Records>>) {
         self.shared.compute.address(&views);
-        self.core.address_tier(views);
+        self.core.address_tier(views, &mut self.owed.deferred_records);
     }
 
     /// What decode serving reads and writes of it (`decode::Serving`).

@@ -9,13 +9,54 @@
 pub mod entry;
 pub mod placement;
 pub mod pool;
+pub use pool::SlabFill;
 
 /// Alignment of the base of every workspace buffer placed in a graph arena.
 pub const BUFFER_ALIGNMENT: u64 = 256;
 
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+
+thread_local! {
+    /// Nesting depth of no-blocking-allocation scopes on this thread.
+    static NO_BLOCKING_ALLOC_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII guard marking a scope on the current thread where blocking memory
+/// allocations, frees, driver locks, and pool locks are forbidden.
+pub struct NoBlockingAllocationGuard {
+    _not_send: PhantomData<*const ()>,
+}
+
+/// Enter a no-blocking-allocation scope on this thread.
+pub fn enter_no_blocking_allocation() -> NoBlockingAllocationGuard {
+    NO_BLOCKING_ALLOC_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    NoBlockingAllocationGuard { _not_send: PhantomData }
+}
+
+impl Drop for NoBlockingAllocationGuard {
+    fn drop(&mut self) {
+        NO_BLOCKING_ALLOC_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "NoBlockingAllocationGuard depth underflow");
+            depth.set(current - 1);
+        });
+    }
+}
+
+/// Assert that the current thread is not inside a no-blocking-allocation
+/// scope.
+#[track_caller]
+pub fn assert_blocking_allocation_allowed(operation: &str) {
+    let depth = NO_BLOCKING_ALLOC_DEPTH.with(Cell::get);
+    assert!(
+        depth == 0,
+        "invariant violated: {operation} called inside a no-blocking-allocation scope"
+    );
+}
 
 /// Why a host allocation could not be made: the only real failure of a
 /// host buffer.

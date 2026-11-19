@@ -637,6 +637,7 @@ impl DeviceInner {
         alignment: u64,
         access: Option<Arc<driver::AccessGroup>>,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        seismic_memory::assert_blocking_allocation_allowed("DeviceInner::allocate_contract");
         self.ran_work();
         self.kind.allocate_contract(charge, bytes, alignment, access)
     }
@@ -648,9 +649,11 @@ impl DeviceInner {
         bytes: u64,
         entry: &Arc<dyn crate::memory::Entry>,
         access: Arc<driver::AccessGroup>,
+        fill: seismic_memory::SlabFill,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        seismic_memory::assert_blocking_allocation_allowed("DeviceInner::allocate_block");
         self.ran_work();
-        self.kind.allocate_block(kinds, bytes, entry, access)
+        self.kind.allocate_block(kinds, bytes, entry, access, fill)
     }
 
     /// [`OpenedKind::map_read_only_host_region`] on this device.
@@ -659,6 +662,7 @@ impl DeviceInner {
         region: crate::api::HostRegion,
         alignment: u64,
     ) -> Result<Arc<driver::Allocation>, crate::api::TensorError> {
+        seismic_memory::assert_blocking_allocation_allowed("DeviceInner::map_read_only_host_region");
         self.ran_work();
         self.kind.map_read_only_host_region(region, alignment).map_err(crate::api::TensorError::Execution)
     }
@@ -856,20 +860,21 @@ impl OpenedKind {
         bytes: u64,
         entry: &Arc<dyn crate::memory::Entry>,
         access: Arc<driver::AccessGroup>,
+        fill: seismic_memory::SlabFill,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
         let allocate = |kind: u32| match self {
             Self::Cpu(device) => {
-                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry))
+                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry, fill))
             }
             #[cfg(target_os = "macos")]
             Self::Metal(device) => {
-                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry))
+                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry, fill))
             }
             Self::Cuda(device) => {
-                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry))
+                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry, fill))
             }
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.allocate_block(kind, bytes, entry, access.clone()),
+            Self::Vulkan(device) => device.allocate_block(kind, bytes, entry, access.clone(), fill),
         };
         // A kind short of room passes the block to the next; any other
         // failure is the block's, and returns.
@@ -894,6 +899,7 @@ impl OpenedKind {
         allocation: Arc<driver::Allocation>,
         bytes: u64,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        seismic_memory::assert_blocking_allocation_allowed("OpenedKind::zeroed");
         match self {
             Self::Cpu(_) => {}
             #[cfg(target_os = "macos")]
