@@ -697,17 +697,43 @@ pub struct HostWord {
 }
 
 /// What a [`HostWord`]'s waiters sleep on, which every write of the word
-/// notifies, under its lock, so no wake is lost between a waiter's look at
-/// the word and its sleep.
+/// notifies. Its mutex is a leaf lock — never held across a waiter's
+/// predicate — because [`wake_after_write`] runs on CUDA's `cuLaunchHostFunc`
+/// thread, which driver teardown (`cuMemHostUnregister`, `cuMemFree`) waits
+/// for while holding internal driver locks.
 pub(crate) struct Wake {
-    lock: Mutex<()>,
+    generation: Mutex<u64>,
     changed: Condvar,
 }
 
 impl Wake {
+    fn new() -> Self {
+        Self { generation: Mutex::new(0), changed: Condvar::new() }
+    }
+
     fn notify(&self) {
-        drop(self.lock.lock().expect("host word wake lock"));
+        let mut generation = self.generation.lock().expect("host word wake lock");
+        *generation = generation.wrapping_add(1);
+        drop(generation);
         self.changed.notify_all();
+    }
+
+    fn wait(&self, reached: impl Fn() -> bool, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let seen = *self.generation.lock().expect("host word wake lock");
+            if reached() {
+                return true;
+            }
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let guard = self.generation.lock().expect("host word wake lock");
+            if *guard != seen {
+                continue;
+            }
+            let _ = self.changed.wait_timeout(guard, left).expect("host word wake lock");
+        }
     }
 
     /// Wake the waiters once `written`'s last record, on `writer`,
@@ -757,7 +783,7 @@ impl HostWord {
     ) -> Result<Self, ExecutionError> {
         let mapped = driver::HostMapped::new(context, entry, 4)?;
         mapped.write_at(0, &0u32.to_le_bytes());
-        Ok(Self { mapped, wake: Arc::new(Wake { lock: Mutex::new(()), changed: Condvar::new() }) })
+        Ok(Self { mapped, wake: Arc::new(Wake::new()) })
     }
 
     /// Wake the word's waiters now: what they wait on besides the word
@@ -781,17 +807,7 @@ impl HostWord {
     /// Wait at most `timeout` until `reached` holds of the word, sleeping
     /// between its writes; whether it did.
     pub fn wait(&self, reached: impl Fn(u32) -> bool, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut lock = self.wake.lock.lock().expect("host word wake lock");
-        loop {
-            if reached(self.load()) {
-                return true;
-            }
-            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return false;
-            };
-            lock = self.wake.changed.wait_timeout(lock, left).expect("host word wake lock").0;
-        }
+        self.wake.wait(|| reached(self.load()), timeout)
     }
 
     fn atomic(&self) -> &std::sync::atomic::AtomicU32 {
@@ -1256,5 +1272,65 @@ extern "C" __global__ void mark(unsigned int* out, Words words, unsigned int* sc
         // SAFETY: the launches writing `out` have completed.
         let written = unsafe { [host.as_ptr().read_volatile(), host.as_ptr().add(1).read_volatile()] };
         assert_eq!(written, [1, 2]);
+    }
+
+    /// `Wake::wait` never holds its lock across `reached`: a predicate that
+    /// blocks on another lock held by a thread waiting for `Wake::notify`
+    /// (the lock-order cycle between `HostWord::wait`, a driver call, and
+    /// CUDA's `cuLaunchHostFunc` callback) must not deadlock.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test starts threads of its own"
+    )]
+    fn wake_notify_does_not_deadlock_with_a_locking_wait_predicate() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let wake = Arc::new(Wake::new());
+        let other = Arc::new(Mutex::new(()));
+        let in_reached = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let holder = other.lock().unwrap();
+        let waiter = {
+            let wake = Arc::clone(&wake);
+            let other = Arc::clone(&other);
+            let in_reached = Arc::clone(&in_reached);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                wake.wait(
+                    || {
+                        in_reached.store(true, Ordering::Release);
+                        let _guard = other.lock().unwrap();
+                        done.load(Ordering::Acquire)
+                    },
+                    Duration::from_secs(2),
+                )
+            })
+        };
+
+        while !in_reached.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        // Simulate CUDA's `cuLaunchHostFunc` callback running `Wake::notify`
+        // while `holder` still holds `other` (waiting for the callback to
+        // complete before releasing `other`).
+        let (tx, rx) = mpsc::sync_channel(1);
+        let notifier = {
+            let wake = Arc::clone(&wake);
+            std::thread::spawn(move || {
+                wake.notify();
+                let _ = tx.send(());
+            })
+        };
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("Wake::notify deadlocked behind Wake::wait's predicate");
+        notifier.join().unwrap();
+
+        done.store(true, Ordering::Release);
+        drop(holder);
+        assert!(waiter.join().unwrap(), "waiter should observe done == true");
     }
 }
