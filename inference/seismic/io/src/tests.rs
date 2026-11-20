@@ -580,9 +580,9 @@ fn a_cancel_gives_up_the_pieces_no_worker_took() {
     let (untouched, _) = queued(2);
     let (untouched, _) = queue.push(untouched, Want::now());
     queue.take().unwrap();
-    assert_eq!(queue.cancel(started).unwrap().pieces.len(), 2);
+    assert_eq!(queue.cancel(started).unwrap().0.pieces.len(), 2);
     assert!(queue.cancel(started).is_none());
-    assert_eq!(queue.cancel(untouched).unwrap().pieces.len(), 2);
+    assert_eq!(queue.cancel(untouched).unwrap().0.pieces.len(), 2);
     assert!(queue.cancel(untouched).is_none());
     assert!(queue.take().is_none());
     let (empty, state) = queued(0);

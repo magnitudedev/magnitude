@@ -567,14 +567,119 @@ fn lock_record_under_store_lock(root: &Path, privacy: Privacy, record: &Path, ho
     Ok(Some(Locked { record: root.join(record), _file: file }))
 }
 
-/// Acquire `record`'s Level-2 lock by taking the store's Level-1 `.lock`
-/// shared for the duration of acquisition, then releasing Level 1.
+/// Whether `file` still refers to the file currently linked at `path`.
+#[cfg(unix)]
+fn same_lock_file(file: &File, path: &Path) -> Result<bool, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata().map_err(|source| StoreError::io("metadata", path, source))?;
+    match fs::metadata(path).map_err(PathError::classify) {
+        Ok(on_disk) => Ok((held.dev(), held.ino()) == (on_disk.dev(), on_disk.ino())),
+        Err(PathError::Absent(_)) => Ok(false),
+        Err(error) => Err(StoreError::io("metadata", path, error.into_io())),
+    }
+}
+
+#[cfg(windows)]
+fn file_identity(file: &File, path: &Path) -> Result<(u32, [u32; 2]), StoreError> {
+    use std::os::windows::io::{AsRawHandle, RawHandle};
+    #[repr(C)]
+    #[derive(Default)]
+    struct Information {
+        attributes: u32,
+        times: [u32; 6],
+        volume_serial_number: u32,
+        size: [u32; 2],
+        links: u32,
+        index: [u32; 2],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(file: RawHandle, information: *mut Information) -> i32;
+    }
+    let mut information = Information::default();
+    // SAFETY: a handle `file` owns, and a structure of the layout the call writes.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(StoreError::io("file_identity", path, std::io::Error::last_os_error()));
+    }
+    Ok((information.volume_serial_number, information.index))
+}
+
+/// Whether `file` still refers to the file currently linked at `path`.
+#[cfg(windows)]
+fn same_lock_file(file: &File, path: &Path) -> Result<bool, StoreError> {
+    let held = file_identity(file, path)?;
+    match File::open(path).map_err(PathError::classify) {
+        Ok(on_disk) => Ok(held == file_identity(&on_disk, path)?),
+        Err(PathError::Absent(_)) => Ok(false),
+        Err(error) => Err(StoreError::io("open_lock", path, error.into_io())),
+    }
+}
+
+/// Whether `file` still refers to the file currently linked at `path`.
+#[cfg(not(any(unix, windows)))]
+fn same_lock_file(_file: &File, path: &Path) -> Result<bool, StoreError> {
+    match fs::metadata(path).map_err(PathError::classify) {
+        Ok(_) => Ok(true),
+        Err(PathError::Absent(_)) => Ok(false),
+        Err(error) => Err(StoreError::io("metadata", path, error.into_io())),
+    }
+}
+
+/// Acquire `record`'s Level-2 lock without holding Level-1 `.lock` across
+/// blocking waits, preventing AB-BA deadlocks with [`Store::exclusive`] and
+/// starvation of [`Store::evict`].
 fn lock_record(root: &Path, privacy: Privacy, record: &Path, holding: Holding) -> Result<Option<Locked>, StoreError> {
-    let store_lock = open_lock_file(privacy, &root.join(LOCK))?;
-    store_lock
-        .lock_shared()
-        .map_err(|source| StoreError::io("lock_shared", &root.join(LOCK), source))?;
-    lock_record_under_store_lock(root, privacy, record, holding)
+    let store_lock_path = root.join(LOCK);
+    match holding {
+        Holding::Try | Holding::TryShared => {
+            let store_lock = open_lock_file(privacy, &store_lock_path)?;
+            store_lock
+                .lock_shared()
+                .map_err(|source| StoreError::io("lock_shared", &store_lock_path, source))?;
+            lock_record_under_store_lock(root, privacy, record, holding)
+        }
+        Holding::Exclusive | Holding::Shared => {
+            let path = record_lock_path(&root.join(LOCKS), record);
+            loop {
+                let store_lock = open_lock_file(privacy, &store_lock_path)?;
+                store_lock
+                    .lock_shared()
+                    .map_err(|source| StoreError::io("lock_shared", &store_lock_path, source))?;
+                let file = open_lock_file(privacy, &path)?;
+                let acquired = match holding {
+                    Holding::Exclusive => taken(file.try_lock(), &path)?,
+                    Holding::Shared => taken(file.try_lock_shared(), &path)?,
+                    Holding::Try | Holding::TryShared => unreachable!(),
+                };
+                if acquired {
+                    drop(store_lock);
+                    return Ok(Some(Locked { record: root.join(record), _file: file }));
+                }
+                // Release Level-1 `.lock` before blocking on Level-2 so
+                // `Store::exclusive` and `Store::evict` are neither deadlocked
+                // nor starved while waiting.
+                drop(store_lock);
+                match holding {
+                    Holding::Exclusive => file.lock().map_err(|source| StoreError::io("lock", &path, source))?,
+                    Holding::Shared => file.lock_shared().map_err(|source| StoreError::io("lock_shared", &path, source))?,
+                    Holding::Try | Holding::TryShared => unreachable!(),
+                }
+                // Re-verify under Level-1 `.lock` shared that `path` was not
+                // unlinked or replaced while waiting. Use non-blocking try so
+                // holding Level-2 never blocks on an exclusive Level-1 holder;
+                // if contended, release Level-2 and retry from Level-1 first.
+                let store_lock = open_lock_file(privacy, &store_lock_path)?;
+                if taken(store_lock.try_lock_shared(), &store_lock_path)? {
+                    let same = same_lock_file(&file, &path)?;
+                    drop(store_lock);
+                    if same {
+                        return Ok(Some(Locked { record: root.join(record), _file: file }));
+                    }
+                }
+                drop(file);
+            }
+        }
+    }
 }
 
 /// A temporary file: under a name no other live temporary holds, which
@@ -927,8 +1032,8 @@ impl Store {
             }
             result
         };
-        let mut directories = vec![(self.root.clone(), false)];
-        while let Some((directory, kept)) = directories.pop() {
+        let mut directories = vec![(self.root.clone(), false, false)];
+        while let Some((directory, kept, dir_in_use)) = directories.pop() {
             let Ok(listing) = fs::read_dir(&directory) else {
                 continue;
             };
@@ -939,7 +1044,7 @@ impl Store {
                 let (name, path) = (item.file_name(), item.path());
                 let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 if unpublished(&name) {
-                    if now.duration_since(modified).unwrap_or_default() > ABANDONED {
+                    if !dir_in_use && now.duration_since(modified).unwrap_or_default() > ABANDONED {
                         let _ = remove(&path, metadata.is_dir());
                     }
                     continue;
@@ -949,22 +1054,24 @@ impl Store {
                 }
                 let place = |path: &Path| layout.place(&relative(path), &examining);
                 if metadata.is_dir() {
+                    let locked_dir = dir_in_use || in_use(&path);
                     match place(&path) {
                         Eviction::Apart => {}
-                        placed => directories.push((path, kept || placed == Eviction::Kept)),
+                        placed => directories.push((path, kept || placed == Eviction::Kept, locked_dir)),
                     }
                     continue;
                 }
                 if kept {
                     continue;
                 }
+                let used_now = dir_in_use || in_use(&path);
                 let (entry, order, pinned) = match place(&path) {
                     Eviction::Kept | Eviction::Apart => {
                         referenced.extend(layout.references(&relative(&path), &examining));
                         continue;
                     }
                     Eviction::Unreachable => {
-                        if !recent(modified) && !in_use(&path) {
+                        if !recent(modified) && !used_now {
                             if let Err(error) = remove(&path, false) {
                                 tracing::warn!("store {}: cannot remove {}, which nothing reaches: {error}", self.root.display(), path.display());
                             }
@@ -972,7 +1079,7 @@ impl Store {
                         continue;
                     }
                     Eviction::Shared => {
-                        shared.insert(relative(&path), (metadata.len(), modified, in_use(&path)));
+                        shared.insert(relative(&path), (metadata.len(), modified, used_now));
                         continue;
                     }
                     Eviction::Alone => (Entry::Alone(path.clone()), 0, false),
@@ -981,7 +1088,7 @@ impl Store {
                 };
                 let references = layout.references(&relative(&path), &examining);
                 let entry = entries.entry(entry).or_insert(Listed { pinned, used: SystemTime::UNIX_EPOCH, bytes: 0, paths: Vec::new(), references: Vec::new() });
-                entry.pinned |= in_use(&path);
+                entry.pinned |= used_now;
                 entry.used = entry.used.max(modified);
                 entry.bytes += metadata.len();
                 entry.paths.push((order, path));
@@ -2028,6 +2135,85 @@ mod tests {
             })
             .unwrap();
         });
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Holding a record lock on a directory protects every file in its
+    /// subtree during `Store::evict`, regardless of eviction class, while
+    /// unlocked siblings are still evicted.
+    #[test]
+    fn directory_lock_protects_subtree_during_evict() {
+        let root = scratch("dir-lock-evict");
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
+        let nested_alone = Path::new("repo/snap/weights.bin");
+        let nested_unreachable = Path::new("repo/snap/sub/orphan.bin");
+        let sibling = Path::new("other/old.bin");
+        {
+            let shared = store.shared().unwrap();
+            shared.publish(nested_alone, Durability::Volatile, |f| f.write_all(b"weights")).unwrap();
+            shared.publish(nested_unreachable, Durability::Volatile, |f| f.write_all(b"orphan")).unwrap();
+            shared.publish(sibling, Durability::Volatile, |f| f.write_all(b"evict-me")).unwrap();
+        }
+        aged(&root.join(nested_alone), 60);
+        aged(&root.join(nested_unreachable), 60);
+        aged(&root.join(sibling), 60);
+
+        let dir_lock = store.lock(Path::new("repo")).unwrap();
+        let layout = |path: &Path, _: &Examining<'_>| {
+            if path.ends_with("orphan.bin") {
+                Eviction::Unreachable
+            } else {
+                Eviction::Alone
+            }
+        };
+        assert!(store.evict(0, Duration::ZERO, &layout).unwrap());
+        assert_eq!(store.read(nested_alone, 64).unwrap().as_deref(), Some(&b"weights"[..]));
+        assert_eq!(store.read(nested_unreachable, 64).unwrap().as_deref(), Some(&b"orphan"[..]));
+        assert!(store.read(sibling, 64).unwrap().is_none(), "unlocked sibling should be evicted");
+
+        drop(dir_lock);
+        assert!(store.evict(0, Duration::ZERO, &layout).unwrap());
+        assert!(store.read(nested_alone, 64).unwrap().is_none());
+        assert!(store.read(nested_unreachable, 64).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A thread blocked waiting on a contended Level-2 record lock releases
+    /// Level-1 `.lock` before blocking, so `Store::exclusive` and `Store::evict`
+    /// proceed without deadlock or starvation.
+    #[test]
+    fn contended_record_lock_does_not_hold_store_lock() {
+        let root = scratch("contended-record-lock");
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
+        let record = Path::new("records/contended");
+        let held = store.lock(record).unwrap();
+        let started = std::sync::Barrier::new(2);
+        let acquired = std::sync::atomic::AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let store_ref = &store;
+            let started_ref = &started;
+            let acquired_ref = &acquired;
+            seismic_threads::spawn_scoped(scope, "contended-waiter", move || {
+                started_ref.wait();
+                let _waiter = store_ref.lock(record).unwrap();
+                acquired_ref.store(true, Ordering::Release);
+            })
+            .unwrap();
+
+            started.wait();
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!acquired.load(Ordering::Acquire), "waiter must still be blocked on record lock");
+
+            // Neither `evict` nor `exclusive` may block or deadlock while the
+            // waiter is parked on the record lock.
+            assert!(store.evict(0, Duration::ZERO, &alone).unwrap());
+            let excl = store.exclusive().unwrap();
+            drop(excl);
+
+            drop(held);
+        });
+        assert!(acquired.load(Ordering::Acquire));
         fs::remove_dir_all(root).unwrap();
     }
 }
