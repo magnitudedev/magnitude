@@ -282,7 +282,10 @@ def _cargo(arguments, results: dict[str, JobResult]) -> tuple[list[str], bool]:
     if executables is not None:
         configuration = cargo.configuration(cargo.split(_given(arguments))[0])
         runs = executables.directory.parent
-        ledger.record(runs, ledger.rows(runs, executables.directory, backend, configuration, doc))
+        try:
+            ledger.record(runs, ledger.rows(runs, executables.directory, backend, configuration, doc))
+        except ledger.LedgerError as error:
+            shown.append(f"ledger failed: {error}")
     return shown, verdict == "PASS"
 
 
