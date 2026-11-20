@@ -8,9 +8,10 @@ use crate::Metal;
 use objc2::rc::Retained;
 use objc2::Message;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSRange;
+use objc2_foundation::{NSError, NSRange};
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferError,
+    MTLCommandBufferErrorDomain, MTLCommandEncoder, MTLCommandQueue,
     MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLCopyAllDevices, MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice,
     MTLDevice, MTLDispatchType, MTLResidencySet, MTLResidencySetDescriptor, MTLResource,
@@ -113,6 +114,17 @@ impl DeviceHandle {
                 allocated: self.current_allocated_bytes(),
             },
         }
+    }
+
+    /// Map a failed command buffer's `NSError`: Metal reports working-set
+    /// exhaustion as `MTLCommandBufferErrorOutOfMemory`, which is a capacity
+    /// refusal; any other command-buffer error goes through `fallback`.
+    pub(crate) fn command_buffer_error(
+        &self,
+        error: &NSError,
+        fallback: fn(String) -> ExecutionError,
+    ) -> ExecutionError {
+        classify_command_buffer_error(error, || self.refused(0), fallback)
     }
 
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
@@ -367,13 +379,38 @@ struct Mapping {
 unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
+fn classify_command_buffer_error(
+    error: &NSError,
+    refused: impl FnOnce() -> ExecutionError,
+    fallback: fn(String) -> ExecutionError,
+) -> ExecutionError {
+    let domain = unsafe { MTLCommandBufferErrorDomain };
+    if *error.domain() == *domain && error.code() == MTLCommandBufferError::OutOfMemory.0 as isize {
+        refused()
+    } else {
+        fallback(error.localizedDescription().to_string())
+    }
+}
+
+fn classify_mmap_error(
+    len: usize,
+    error: std::io::Error,
+    refused: impl FnOnce(u64) -> ExecutionError,
+) -> ExecutionError {
+    if error.raw_os_error() == Some(libc::ENOMEM) {
+        refused(len as u64)
+    } else {
+        ExecutionError::AllocationFailed(format!("{len} bytes were not mapped: {error}"))
+    }
+}
+
 impl Mapping {
     /// A zero mapping of `len` bytes, whole host pages.
-    fn anonymous(len: usize) -> Result<Self, ExecutionError> {
+    fn anonymous(handle: &DeviceHandle, len: usize) -> Result<Self, ExecutionError> {
         let pointer = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
         match (pointer != libc::MAP_FAILED).then(|| NonNull::new(pointer.cast::<u8>())).flatten() {
             Some(pointer) => Ok(Self { pointer, len }),
-            None => Err(ExecutionError::AllocationFailed(format!("{len} bytes were not mapped: {}", std::io::Error::last_os_error()))),
+            None => Err(classify_mmap_error(len, std::io::Error::last_os_error(), |bytes| handle.refused(bytes))),
         }
     }
 
@@ -417,7 +454,7 @@ fn mapped_buffer(
     let length = length.checked_next_multiple_of(page).ok_or_else(|| ExecutionError::AllocationFailed(format!("{length} bytes exceed the host address space")))?;
     let mut mapping = None;
     let buffer = Backed::take(entry, length as u64, wiring, |_| {
-        let made = Mapping::anonymous(length)?;
+        let made = Mapping::anonymous(handle, length)?;
         made.back(page);
         let buffer = crate::pooled(|| unsafe {
             handle.raw().newBufferWithBytesNoCopy_length_options_deallocator(made.pointer.cast(), length, MTLResourceOptions::StorageModeShared, None)
@@ -594,7 +631,7 @@ impl Staging {
             command.commit();
             command.waitUntilCompleted();
             match command.error() {
-                Some(error) => Err(ExecutionError::SynchronizationFailed(error.localizedDescription().to_string())),
+                Some(error) => Err(self.handle.command_buffer_error(&error, ExecutionError::SynchronizationFailed)),
                 None => Ok(()),
             }
         })
@@ -1775,5 +1812,66 @@ mod mapped_tests {
         assert_eq!(status, libc::KERN_SUCCESS, "task_info TASK_VM_INFO returned {status}");
         assert_eq!(count, words, "task_vm_info reaches phys_footprint");
         vm.phys_footprint
+    }
+
+    #[test]
+    fn mmap_enomem_maps_to_device_refused_and_other_errno_to_allocation_failed() {
+        use seismic_compiler::errors::RefusalReading;
+
+        let oom = super::classify_mmap_error(
+            4096,
+            std::io::Error::from_raw_os_error(libc::ENOMEM),
+            |required| ExecutionError::DeviceRefused { required, reading: RefusalReading::Host },
+        );
+        assert!(oom.capacity_refusal().is_some(), "{oom:?}");
+        assert!(matches!(oom, ExecutionError::DeviceRefused { required: 4096, .. }));
+
+        let other = super::classify_mmap_error(
+            4096,
+            std::io::Error::from_raw_os_error(libc::EINVAL),
+            |required| ExecutionError::DeviceRefused { required, reading: RefusalReading::Host },
+        );
+        assert!(other.capacity_refusal().is_none(), "{other:?}");
+        assert!(matches!(other, ExecutionError::AllocationFailed(_)));
+    }
+
+    #[test]
+    fn command_buffer_oom_maps_to_device_refused_and_other_error_to_fallback() {
+        use objc2_foundation::NSError;
+        use objc2_metal::{MTLCommandBufferError, MTLCommandBufferErrorDomain};
+        use seismic_compiler::errors::RefusalReading;
+
+        crate::pooled(|| {
+            let domain = unsafe { MTLCommandBufferErrorDomain };
+            let oom_ns = unsafe {
+                NSError::errorWithDomain_code_userInfo(
+                    domain,
+                    MTLCommandBufferError::OutOfMemory.0 as isize,
+                    None,
+                )
+            };
+            let oom = super::classify_command_buffer_error(
+                &oom_ns,
+                || ExecutionError::DeviceRefused { required: 0, reading: RefusalReading::Host },
+                ExecutionError::SubmissionFailed,
+            );
+            assert!(oom.capacity_refusal().is_some(), "{oom:?}");
+            assert!(matches!(oom, ExecutionError::DeviceRefused { required: 0, .. }));
+
+            let timeout_ns = unsafe {
+                NSError::errorWithDomain_code_userInfo(
+                    domain,
+                    MTLCommandBufferError::Timeout.0 as isize,
+                    None,
+                )
+            };
+            let timeout = super::classify_command_buffer_error(
+                &timeout_ns,
+                || ExecutionError::DeviceRefused { required: 0, reading: RefusalReading::Host },
+                ExecutionError::SubmissionFailed,
+            );
+            assert!(timeout.capacity_refusal().is_none(), "{timeout:?}");
+            assert!(matches!(timeout, ExecutionError::SubmissionFailed(_)));
+        });
     }
 }

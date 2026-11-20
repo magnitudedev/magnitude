@@ -9,7 +9,8 @@
 //! tables buffer's.
 
 use crate::device::{
-    barrier, call, Device, Handed, Recording, Retired, RetiredCommand, ARGUMENT_CHUNK_BYTES,
+    barrier, call, memory_call, Device, Handed, Recording, Retired, RetiredCommand,
+    ARGUMENT_CHUNK_BYTES,
 };
 use crate::formation::DirectModule;
 use crate::memory::{Buffer, Range};
@@ -229,9 +230,12 @@ fn begin(
     if let Some(inheritance) = inheritance {
         info = info.inheritance_info(inheritance);
     }
-    call(
+    memory_call(
         unsafe { device.inner.device.begin_command_buffer(command, &info) },
         "vkBeginCommandBuffer",
+        0,
+        &device.inner.memory,
+        ExecutionError::SubmissionFailed,
     )
 }
 
@@ -307,9 +311,12 @@ impl DirectGraphBuilder {
 
     fn end_segment(&self) -> Result<(), ExecutionError> {
         let recording = self.device.locked();
-        let ended = call(
+        let ended = memory_call(
             unsafe { self.device.inner.device.end_command_buffer(self.command()) },
             "vkEndCommandBuffer",
+            0,
+            &self.device.inner.memory,
+            ExecutionError::SubmissionFailed,
         );
         drop(recording);
         ended
@@ -862,7 +869,7 @@ impl<T: Timing> DirectBatch<T> {
         let timing = match T::open(device, &mut recording, launches) {
             Ok(timing) => timing,
             Err(error) => {
-                recording.free_command(command);
+                recording.free_command(&device.inner.device, command);
                 return Err(error);
             }
         };

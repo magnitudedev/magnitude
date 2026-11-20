@@ -25,6 +25,84 @@ pub(crate) fn call<T>(result: Result<T, vk::Result>, what: &str) -> Result<T, Ex
     })
 }
 
+/// Map a Vulkan call that allocates, maps, or backs device/host memory or
+/// command objects: device loss stays `DeviceLost`, memory/object exhaustion
+/// maps to `DeviceRefused`, and any other error goes through `fallback`.
+pub(crate) fn memory_call<T>(
+    result: Result<T, vk::Result>,
+    what: &str,
+    required: u64,
+    memory: &Memory,
+    fallback: fn(String) -> ExecutionError,
+) -> Result<T, ExecutionError> {
+    result.map_err(|error| {
+        classify_vk_error(
+            error,
+            what,
+            required,
+            || memory.memory_budget(),
+            || (memory.object_limit(), memory.objects()),
+            fallback,
+        )
+    })
+}
+
+fn classify_vk_error(
+    error: vk::Result,
+    what: &str,
+    required: u64,
+    budget: impl FnOnce() -> crate::MemoryBudget,
+    objects: impl FnOnce() -> (u64, u64),
+    fallback: fn(String) -> ExecutionError,
+) -> ExecutionError {
+    match error {
+        vk::Result::ERROR_DEVICE_LOST => ExecutionError::DeviceLost(format!("{what}: {error}")),
+        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
+            let budget = budget();
+            ExecutionError::DeviceRefused {
+                required,
+                reading: seismic_compiler::errors::RefusalReading::HeapBudget {
+                    budget: budget.heap_budget_bytes,
+                    usage: budget.heap_usage_bytes,
+                },
+            }
+        }
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_MEMORY_MAP_FAILED => {
+            ExecutionError::DeviceRefused {
+                required,
+                reading: seismic_compiler::errors::RefusalReading::Host,
+            }
+        }
+        vk::Result::ERROR_TOO_MANY_OBJECTS => {
+            let (limit, held) = objects();
+            ExecutionError::DeviceRefused {
+                required,
+                reading: seismic_compiler::errors::RefusalReading::MemoryObjects { limit, held },
+            }
+        }
+        other => fallback(format!("{what} failed: {other}")),
+    }
+}
+
+/// Structural retention cap for submission free lists (`free_commands`,
+/// `free_queries`, `free_chunks`): one ready resource for the next submission
+/// plus one per active in-flight submission (`recording.retired.len()`).
+/// Steady-state pipelines stay warm without allocator churn, while burst
+/// overflow is released back to Vulkan as flights drain.
+fn free_cap(in_flight: usize) -> usize {
+    in_flight.saturating_add(1)
+}
+
+/// Drain excess entries beyond `cap` from the tail so steady-state low-index
+/// entries remain pooled and overflow entries are released first.
+fn trim_to_cap<T>(pool: &mut Vec<T>, cap: usize) -> Vec<T> {
+    if pool.len() > cap {
+        pool.drain(cap..).collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Why a device could not be opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenError {
@@ -122,9 +200,14 @@ pub(crate) struct Recording {
 }
 
 impl Recording {
-    /// Return an unused primary command buffer.
-    pub(crate) fn free_command(&mut self, command: vk::CommandBuffer) {
+    /// Return an unused primary command buffer, freeing excess beyond the
+    /// active in-flight retention cap (`free_cap`).
+    pub(crate) fn free_command(&mut self, device: &ash::Device, command: vk::CommandBuffer) {
         self.free_commands.push(command);
+        let excess = trim_to_cap(&mut self.free_commands, free_cap(self.retired.len()));
+        if !excess.is_empty() {
+            unsafe { device.free_command_buffers(self.pool, &excess) };
+        }
     }
 }
 
@@ -1090,13 +1173,16 @@ impl Device {
     ) -> Result<vk::CommandBuffer, ExecutionError> {
         if level == vk::CommandBufferLevel::PRIMARY {
             if let Some(command) = recording.free_commands.pop() {
-                call(
+                memory_call(
                     unsafe {
                         self.inner
                             .device
                             .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
                     },
                     "vkResetCommandBuffer",
+                    0,
+                    &self.inner.memory,
+                    ExecutionError::SubmissionFailed,
                 )?;
                 return Ok(command);
             }
@@ -1105,9 +1191,12 @@ impl Device {
             .command_pool(recording.pool)
             .level(level)
             .command_buffer_count(1);
-        call(
+        memory_call(
             unsafe { self.inner.device.allocate_command_buffers(&info) },
             "vkAllocateCommandBuffers",
+            0,
+            &self.inner.memory,
+            ExecutionError::SubmissionFailed,
         )
         .map(|commands| commands[0])
     }
@@ -1128,9 +1217,12 @@ impl Device {
         let info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(queries);
-        call(
+        memory_call(
             unsafe { self.inner.device.create_query_pool(&info, None) },
             "vkCreateQueryPool",
+            0,
+            &self.inner.memory,
+            ExecutionError::SubmissionFailed,
         )
         .map(|pool| (pool, queries))
     }
@@ -1540,6 +1632,7 @@ impl Inner {
     }
 
     fn retire_up_to(&self, recording: &mut Recording, completed: u64) {
+        let mut touched_opens: Vec<Arc<Opened>> = Vec::new();
         let mut index = 0;
         while index < recording.retired.len() {
             if recording.retired[index].0.value <= completed {
@@ -1553,11 +1646,18 @@ impl Inner {
                 }
                 recording.free_queries.extend(retired.queries);
                 match owner.upgrade() {
-                    Some(opened) => opened
-                        .free_chunks
-                        .lock()
-                        .expect("free chunks lock is never poisoned")
-                        .extend(retired.arguments),
+                    Some(opened) => {
+                        if !retired.arguments.is_empty() {
+                            opened
+                                .free_chunks
+                                .lock()
+                                .expect("free chunks lock is never poisoned")
+                                .extend(retired.arguments);
+                            if !touched_opens.iter().any(|existing| Arc::ptr_eq(existing, &opened)) {
+                                touched_opens.push(opened);
+                            }
+                        }
+                    }
                     None => {
                         for chunk in retired.arguments {
                             self.memory.release(&self.device, &chunk);
@@ -1566,6 +1666,29 @@ impl Inner {
                 }
             } else {
                 index += 1;
+            }
+        }
+        let cap = free_cap(recording.retired.len());
+        let excess_commands = trim_to_cap(&mut recording.free_commands, cap);
+        if !excess_commands.is_empty() {
+            unsafe {
+                self.device
+                    .free_command_buffers(recording.pool, &excess_commands)
+            };
+        }
+        for (pool, _) in trim_to_cap(&mut recording.free_queries, cap) {
+            unsafe { self.device.destroy_query_pool(pool, None) };
+        }
+        for opened in touched_opens {
+            let excess_chunks = {
+                let mut free = opened
+                    .free_chunks
+                    .lock()
+                    .expect("free chunks lock is never poisoned");
+                trim_to_cap(&mut free, cap)
+            };
+            for chunk in excess_chunks {
+                self.memory.release(&self.device, &chunk);
             }
         }
     }
@@ -1712,9 +1835,8 @@ impl Inner {
                 ),
                 "vkQueueSubmit2",
             )?;
-            let waited = call(device.wait_for_fences(&[side.fence], true, u64::MAX), "vkWaitForFences");
-            call(device.reset_fences(&[side.fence]), "vkResetFences")?;
-            waited
+            call(device.wait_for_fences(&[side.fence], true, u64::MAX), "vkWaitForFences")?;
+            call(device.reset_fences(&[side.fence]), "vkResetFences")
         }
     }
 
@@ -1813,5 +1935,102 @@ mod reconcile_tests {
             assert_eq!(charged, unheld, "the charge is what the driver holds");
             assert!(charged.abs_diff(before) < BLOCK / 2, "a block charged as the driver's: moved {}", charged.abs_diff(before));
         }
+    }
+
+    #[test]
+    fn classify_vk_error_maps_all_oom_and_device_loss_codes() {
+        use seismic_compiler::errors::RefusalReading;
+
+        let budget = || crate::MemoryBudget {
+            heap_budget_bytes: 1000,
+            heap_usage_bytes: 900,
+        };
+        let objects = || (4096, 4096);
+
+        let lost = classify_vk_error(
+            vk::Result::ERROR_DEVICE_LOST,
+            "vkCreateBuffer",
+            64,
+            budget,
+            objects,
+            ExecutionError::AllocationFailed,
+        );
+        assert!(matches!(lost, ExecutionError::DeviceLost(_)));
+
+        let dev_oom = classify_vk_error(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            "vkAllocateMemory",
+            64,
+            budget,
+            objects,
+            ExecutionError::AllocationFailed,
+        );
+        assert!(dev_oom.capacity_refusal().is_some(), "{dev_oom:?}");
+        assert!(matches!(
+            dev_oom,
+            ExecutionError::DeviceRefused {
+                required: 64,
+                reading: RefusalReading::HeapBudget { budget: 1000, usage: 900 },
+            }
+        ));
+
+        for host_code in [vk::Result::ERROR_OUT_OF_HOST_MEMORY, vk::Result::ERROR_MEMORY_MAP_FAILED] {
+            let host_oom = classify_vk_error(
+                host_code,
+                "vkMapMemory",
+                64,
+                budget,
+                objects,
+                ExecutionError::AllocationFailed,
+            );
+            assert!(host_oom.capacity_refusal().is_some(), "{host_oom:?}");
+            assert!(matches!(
+                host_oom,
+                ExecutionError::DeviceRefused { required: 64, reading: RefusalReading::Host }
+            ));
+        }
+
+        let too_many = classify_vk_error(
+            vk::Result::ERROR_TOO_MANY_OBJECTS,
+            "vkAllocateMemory",
+            64,
+            budget,
+            objects,
+            ExecutionError::AllocationFailed,
+        );
+        assert!(too_many.capacity_refusal().is_some(), "{too_many:?}");
+        assert!(matches!(
+            too_many,
+            ExecutionError::DeviceRefused {
+                required: 64,
+                reading: RefusalReading::MemoryObjects { limit: 4096, held: 4096 },
+            }
+        ));
+
+        let other = classify_vk_error(
+            vk::Result::ERROR_INITIALIZATION_FAILED,
+            "vkCreateQueryPool",
+            0,
+            budget,
+            objects,
+            ExecutionError::SubmissionFailed,
+        );
+        assert!(other.capacity_refusal().is_none(), "{other:?}");
+        assert!(matches!(other, ExecutionError::SubmissionFailed(_)));
+    }
+
+    #[test]
+    fn free_cap_and_trim_to_cap_retain_steady_state_prefix_and_evict_overflow_tail() {
+        assert_eq!(free_cap(0), 1);
+        assert_eq!(free_cap(3), 4);
+
+        let mut pool = vec![10, 20, 30, 40, 50];
+        let evicted = trim_to_cap(&mut pool, free_cap(1));
+        assert_eq!(pool, vec![10, 20]);
+        assert_eq!(evicted, vec![30, 40, 50]);
+
+        let none = trim_to_cap(&mut pool, free_cap(2));
+        assert!(none.is_empty());
+        assert_eq!(pool, vec![10, 20]);
     }
 }

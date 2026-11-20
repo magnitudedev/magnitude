@@ -33,11 +33,13 @@ const HOST_REGISTER: c_uint = 1 | 2;
 /// `CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM`.
 const HOST_POINTER: c_int = 91;
 
-fn host_pages(failure: seismic_memory::AllocationFailure) -> DriverError {
-    DriverError {
-        operation: "host block pages",
-        code: 0,
-        description: failure.to_string(),
+fn host_allocation_error(bytes: u64, failure: seismic_memory::AllocationFailure) -> ExecutionError {
+    match failure {
+        seismic_memory::AllocationFailure::OutOfMemory => ExecutionError::DeviceRefused {
+            required: bytes,
+            reading: RefusalReading::Host,
+        },
+        other => ExecutionError::AllocationFailed(format!("host block pages: {other}")),
     }
 }
 
@@ -67,14 +69,14 @@ impl RegisteredBlock {
     /// (`seismic_memory::registration_granule`, a large page where the
     /// host has them), charged to `entry` before it is backed.
     pub fn new(context: &Arc<Context>, entry: &Arc<dyn Entry>, bytes: u64) -> Result<Self, ExecutionError> {
-        let failed = |error: DriverError| crate::executor::allocation_error(bytes, || RefusalReading::Host)(error);
-        let granule = seismic_memory::registration_granule().map_err(|error| failed(host_pages(error)))?;
+        let granule = seismic_memory::registration_granule().map_err(|error| host_allocation_error(bytes, error))?;
         let whole = bytes
             .max(1)
             .checked_next_multiple_of(granule)
-            .ok_or_else(|| failed(host_pages(seismic_memory::AllocationFailure::Unrepresentable)))?;
+            .ok_or_else(|| host_allocation_error(bytes, seismic_memory::AllocationFailure::Unrepresentable))?;
+        let failed = |error: DriverError| crate::executor::allocation_error(whole, || RefusalReading::Host)(error);
         Backed::take(entry, whole, Wiring::Pageable, |_| {
-            let block = HostBlock::allocate(whole, PageSize::Large).map_err(|error| failed(host_pages(error)))?;
+            let block = HostBlock::allocate(whole, PageSize::Large).map_err(|error| host_allocation_error(whole, error))?;
             assert_eq!(block.bytes() as u64, whole, "invariant violated: a block of whole registration granules is that many bytes");
             let driver = &context.driver;
             let _current = context.enter().map_err(failed)?;
@@ -132,5 +134,32 @@ impl Drop for Registered {
     /// Unregistered before its block unmaps (the fields drop after this).
     fn drop(&mut self) {
         unregister(&self.context, self.block.base().as_ptr().cast());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_allocation_error;
+    use seismic_compiler::errors::{ExecutionError, RefusalReading};
+    use seismic_memory::AllocationFailure;
+
+    #[test]
+    fn host_oom_maps_to_device_refused_with_capacity_refusal() {
+        let error = host_allocation_error(4 << 20, AllocationFailure::OutOfMemory);
+        assert!(error.capacity_refusal().is_some(), "{error:?}");
+        assert!(matches!(
+            error,
+            ExecutionError::DeviceRefused {
+                required,
+                reading: RefusalReading::Host,
+            } if required == (4 << 20)
+        ));
+    }
+
+    #[test]
+    fn non_oom_host_failure_maps_to_allocation_failed() {
+        let error = host_allocation_error(4 << 20, AllocationFailure::Unrepresentable);
+        assert!(error.capacity_refusal().is_none(), "{error:?}");
+        assert!(matches!(error, ExecutionError::AllocationFailed(_)));
     }
 }

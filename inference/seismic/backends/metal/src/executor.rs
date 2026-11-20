@@ -49,6 +49,7 @@ pub struct MetalSubmission {
 }
 
 pub struct MetalExecution {
+    device: MetalDevice,
     pending: Vec<PendingCommand>,
 }
 
@@ -159,6 +160,7 @@ impl NativeSubmission<Metal> for MetalSubmission {
 
     fn submit(mut self) -> Self::Execution {
         MetalExecution {
+            device: self.device.clone(),
             pending: std::mem::take(&mut self.pending),
         }
     }
@@ -169,13 +171,13 @@ impl Drop for MetalSubmission {
     /// without being submitted (e.g. error return or unwind), so caller storage
     /// is never freed while the GPU still reads it.
     fn drop(&mut self) {
-        let _ = complete_pending(&mut self.pending);
+        let _ = complete_pending(&self.device, &mut self.pending);
     }
 }
 
 impl NativeExecution for MetalExecution {
     fn complete(&mut self) -> Result<(), ExecutionError> {
-        complete_pending(&mut self.pending)
+        complete_pending(&self.device, &mut self.pending)
     }
 }
 
@@ -184,13 +186,13 @@ impl Drop for MetalExecution {
     /// before `complete()` runs, so caller storage is never freed while the
     /// GPU still reads it.
     fn drop(&mut self) {
-        let _ = complete_pending(&mut self.pending);
+        let _ = complete_pending(&self.device, &mut self.pending);
     }
 }
 
 impl MetalSubmission {
     fn synchronize(&mut self) -> Result<(), ExecutionError> {
-        complete_pending(&mut self.pending)
+        complete_pending(&self.device, &mut self.pending)
     }
 
     fn write_words(
@@ -222,7 +224,7 @@ impl MetalSubmission {
             self.pending
                 .iter()
                 .filter(|pending| pending.words.overlaps(&words)),
-            |pending| complete_command(&pending.command),
+            |pending| complete_command(&self.device, &pending.command),
         );
         // Preserve every owner if a native wait panics, and preserve unrelated
         // issued work on an ordinary completion error.
@@ -437,21 +439,29 @@ impl MetalSubmission {
     }
 }
 
-fn complete_command(command: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), ExecutionError> {
+fn complete_command(
+    device: &MetalDevice,
+    command: &ProtocolObject<dyn MTLCommandBuffer>,
+) -> Result<(), ExecutionError> {
     crate::pooled(|| {
         command.waitUntilCompleted();
         if let Some(error) = command.error() {
-            Err(ExecutionError::SynchronizationFailed(
-                error.localizedDescription().to_string(),
-            ))
+            Err(device
+                .handle()
+                .command_buffer_error(&error, ExecutionError::SynchronizationFailed))
         } else {
             Ok(())
         }
     })
 }
 
-fn complete_pending(pending: &mut Vec<PendingCommand>) -> Result<(), ExecutionError> {
-    let completed = complete_all(pending.iter(), |pending| complete_command(&pending.command));
+fn complete_pending(
+    device: &MetalDevice,
+    pending: &mut Vec<PendingCommand>,
+) -> Result<(), ExecutionError> {
+    let completed = complete_all(pending.iter(), |pending| {
+        complete_command(device, &pending.command)
+    });
     // Keep every command-buffer owner in `pending` until every wait returns.
     // If a foreign call panics, the runtime leaks the still-populated
     // execution owner and therefore cannot release in-flight ownership.

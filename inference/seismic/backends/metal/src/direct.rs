@@ -1327,9 +1327,10 @@ impl DirectSubmission {
                 .iter()
                 .find_map(|command| command.error())
                 .map_or(Ok(true), |error| {
-                    Err(ExecutionError::SubmissionFailed(
-                        error.localizedDescription().to_string(),
-                    ))
+                    Err(self
+                        .device
+                        .handle()
+                        .command_buffer_error(&error, ExecutionError::SubmissionFailed))
                 })
         })
     }

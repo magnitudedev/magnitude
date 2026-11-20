@@ -21,7 +21,7 @@
 //! `maxMemoryAllocationCount`, so the device's memory objects stay within
 //! the count by construction, whatever allocates them.
 
-use crate::device::{call, Inner};
+use crate::device::Inner;
 use crate::instance::Instance;
 use ash::vk;
 use seismic_compiler::blocks::{
@@ -573,6 +573,11 @@ impl Memory {
         self.objects.load(Ordering::SeqCst)
     }
 
+    /// The device's limit on simultaneous memory allocations.
+    pub(crate) fn object_limit(&self) -> u64 {
+        self.object_limit
+    }
+
     /// Reconcile the driver's memory ([`DriverMemory`]): read the blocks and
     /// the heaps' usage with no block in transition ([`Self::unheld`]), and
     /// settle its charge on `driver` to the driver's part of the usage
@@ -829,10 +834,6 @@ fn create_block(
     dedicated: bool,
     mut holding: Holding<'_>,
 ) -> Result<Arc<Block>, ExecutionError> {
-    let allocation = |error: ExecutionError| match error {
-        ExecutionError::SubmissionFailed(message) => ExecutionError::AllocationFailed(message),
-        other => other,
-    };
     // Every memory object holds at least the device's least
     // (`Memory::least_object`), its free space a pool block's to use and
     // a block of its own's to strand.
@@ -853,7 +854,13 @@ fn create_block(
         )
         .sharing_mode(if families.len() > 1 { vk::SharingMode::CONCURRENT } else { vk::SharingMode::EXCLUSIVE })
         .queue_family_indices(if families.len() > 1 { families } else { &[] });
-    let buffer = call(unsafe { device.create_buffer(&info, None) }, "vkCreateBuffer").map_err(allocation)?;
+    let buffer = crate::device::memory_call(
+        unsafe { device.create_buffer(&info, None) },
+        "vkCreateBuffer",
+        bytes,
+        memory_owner,
+        ExecutionError::AllocationFailed,
+    )?;
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
     let refuse = |error: ExecutionError| -> Result<Arc<Block>, ExecutionError> {
         unsafe { device.destroy_buffer(buffer, None) };
@@ -878,49 +885,33 @@ fn create_block(
         .allocation_size(allocated_bytes)
         .memory_type_index(pool.memory_type)
         .push_next(&mut flags);
-    let memory = match unsafe { device.allocate_memory(&allocate, None) } {
+    let memory = match crate::device::memory_call(
+        unsafe { device.allocate_memory(&allocate, None) },
+        "vkAllocateMemory",
+        bytes,
+        memory_owner,
+        ExecutionError::AllocationFailed,
+    ) {
         Ok(memory) => memory,
-        Err(result) => {
+        Err(error) => {
             unsafe { device.destroy_buffer(buffer, None) };
-            return Err(match result {
-                // The driver's own refusal, with its budget read now.
-                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
-                    let budget = memory_owner.memory_budget();
-                    ExecutionError::DeviceRefused {
-                        required: bytes,
-                        reading: seismic_compiler::errors::RefusalReading::HeapBudget {
-                            budget: budget.heap_budget_bytes,
-                            usage: budget.heap_usage_bytes,
-                        },
-                    }
-                }
-                vk::Result::ERROR_OUT_OF_HOST_MEMORY => ExecutionError::DeviceRefused {
-                    required: bytes,
-                    reading: seismic_compiler::errors::RefusalReading::Host,
-                },
-                // The count reached: only where the blocks hold more than
-                // the heaps (`Memory::least_object`).
-                vk::Result::ERROR_TOO_MANY_OBJECTS => ExecutionError::DeviceRefused {
-                    required: bytes,
-                    reading: seismic_compiler::errors::RefusalReading::MemoryObjects {
-                        limit: memory_owner.object_limit,
-                        held: memory_owner.objects(),
-                    },
-                },
-                other => {
-                    ExecutionError::AllocationFailed(format!("vkAllocateMemory failed: {other}"))
-                }
-            });
+            return Err(error);
         }
     };
-    let bound = call(
+    let bound = crate::device::memory_call(
         unsafe { device.bind_buffer_memory(buffer, memory, 0) },
         "vkBindBufferMemory",
+        bytes,
+        memory_owner,
+        ExecutionError::AllocationFailed,
     );
     let mapped = bound.and_then(|()| match pool.mapped {
-        true => call(
+        true => crate::device::memory_call(
             unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) },
             "vkMapMemory",
+            bytes,
+            memory_owner,
+            ExecutionError::AllocationFailed,
         )
         .map(|pointer| pointer.cast::<u8>()),
         false => Ok(std::ptr::null_mut()),
@@ -932,7 +923,7 @@ fn create_block(
                 device.destroy_buffer(buffer, None);
                 device.free_memory(memory, None);
             }
-            return Err(allocation(error));
+            return Err(error);
         }
     };
     let address = unsafe {
