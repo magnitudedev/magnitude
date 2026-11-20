@@ -168,7 +168,7 @@ impl ConvertForm {
     /// [`CONVERTED_RECORDS`] staging records into as many records, of one
     /// row's one choice (`K` 1), an up-only record's gate views empty in its
     /// up's elements.
-    fn land(&self) -> Formation<routed_land::Entry> {
+    pub(super) fn land(&self) -> Formation<routed_land::Entry> {
         let RecordTensors { gate, up, down } = self.record;
         let gate = gate.unwrap_or(up);
         Formation::new(
@@ -409,22 +409,14 @@ impl ConvertCosts {
 
 impl ConvertForm {
     /// Measure the form's points in the measurement job (`walks`): landing
-    /// launches of one record and of [`CONVERTED_RECORDS`], the kernel
-    /// formed with the first attempted.
+    /// launches of one record and of [`CONVERTED_RECORDS`], consuming the
+    /// kernel formed on the job's worker pool.
     pub(super) fn measure(&self, walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
-        let (device, charges) = (walks.device(), walks.charges().clone());
-        let charges = &charges;
-        type Formed = Result<NativeKernel<routed_land::Entry>, ExecutorCostsError>;
-        let formed = OnceCell::<Formed>::new();
+        let (device, charges) = (walks.device(), walks.charges());
         for converted in [1, CONVERTED_RECORDS] {
             let key = self.key(&walks.identity(), device.backend(), converted)?;
-            let formed = &formed;
-            walks.time(key, false, move || {
-                let kernel = formed
-                    .get_or_init(|| self.land().form(device, None))
-                    .as_ref()
-                    .map_err(|error| Unformed::Never(error.clone()))?;
-                convert_point(charges, kernel, self, converted).map_err(Unformed::Now)
+            walks.time_convert(key, self, move |kernel| {
+                convert_point(charges, kernel, self, converted)
             });
         }
         Ok(())

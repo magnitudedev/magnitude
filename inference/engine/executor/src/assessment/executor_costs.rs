@@ -91,6 +91,7 @@
 //! executor has no costs.
 
 use super::demand::{element_of, format_of, layout_of};
+use super::streaming_costs::ConvertForm;
 use magnitude_cost_model::Census;
 use seismic::measure::pricing::{self, Bytes, DecodeLine, Figures, Flops, Format, HistoryFigure, HistoryLadder, HistoryRead, Layout, PriceError, Rates, Storage, Work};
 use super::requests::JobDeadlines;
@@ -101,6 +102,7 @@ use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, 
 use magnitude_family_contracts::{GluLimit, Rotary, ScaledActivations};
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, conditioning_overlay, dense_expand, dense_output,
+    routed_land,
 };
 use magnitude_state::{HistoryEncoding, KvCodec};
 use seismic::measure::{Attempt, Measure, Outcome, Reason, Record, RecordStore, Timing, Unformed};
@@ -1161,11 +1163,12 @@ impl<E: Entry> Formation<E> {
     }
 }
 
-/// Every kernel the walk times, as forms of them: one `dense_expand`
-/// program per measured format, the chain's `dense_output`, the decode
-/// attention over each layout and `conditioning_overlay`.
+/// The cost walk's own programs: one `dense_expand` per measured format, the
+/// chain's `dense_output`, the decode attention over each layout and
+/// `conditioning_overlay`. Held in [`ProgramSet::walk`] only when the job
+/// includes a cost walk.
 #[derive(Clone)]
-struct ProgramSet {
+struct WalkPrograms {
     sizes: Sizes,
     /// Each measured format with its F and program.
     expands: Vec<(Element, u64, Program<dense_expand::Entry>)>,
@@ -1178,19 +1181,13 @@ struct ProgramSet {
     copy: Program<conditioning_overlay::Entry>,
 }
 
-impl ProgramSet {
-    /// The native programs the set prepares: one per measured format's
-    /// expand, and one per formation beside them, each named here so a
-    /// formation added to the set is counted.
+impl WalkPrograms {
     fn kernels(&self) -> u64 {
         let Self { sizes: _, expands, chain: _, output, dense, affine, copy } = self;
         let beside = [output as &dyn std::any::Any, dense, affine, copy].len() as u64;
         expands.len() as u64 + beside
     }
 
-    /// The programs of `formats` ([`measured_formats`]) at `sizes` on an
-    /// executor of `backend` whose largest allocation is `largest`, the
-    /// chain in `chain`.
     fn new(
         backend: seismic::BackendName,
         sizes: Sizes,
@@ -1216,7 +1213,6 @@ impl ProgramSet {
         })
     }
 
-    /// `format`'s F and program.
     fn expand(&self, format: Element) -> (u64, &Program<dense_expand::Entry>) {
         let (_, features, formation) = self
             .expands
@@ -1224,6 +1220,87 @@ impl ProgramSet {
             .find(|(measured, _, _)| *measured == format)
             .expect("every measured format has a program");
         (*features, formation)
+    }
+}
+
+/// Every kernel a measurement job forms: the cost walk's programs (present
+/// only when the job includes a cost walk) and every convert launch the job's
+/// requests will measure.
+#[derive(Clone)]
+pub(super) struct ProgramSet {
+    walk: Option<WalkPrograms>,
+    /// Every convert launch the job's requests will measure, in request order.
+    converts: Vec<(ConvertForm, Program<routed_land::Entry>)>,
+}
+
+impl ProgramSet {
+    /// The native programs the set prepares: the walk's (when present) plus
+    /// every queued convert launch.
+    fn kernels(&self) -> u64 {
+        self.walk.as_ref().map_or(0, WalkPrograms::kernels) + self.converts.len() as u64
+    }
+
+    /// A set holding only `converts` (for a job with no cost walk).
+    pub(super) fn converts(backend: seismic::BackendName, converts: &[ConvertForm]) -> Self {
+        let converts = converts
+            .iter()
+            .map(|&form| (form, Program::of(form.land(), backend)))
+            .collect();
+        Self { walk: None, converts }
+    }
+
+    /// A set holding the cost walk's programs for `executor` plus `converts`.
+    pub(super) fn with_walk(
+        executor: &Executor,
+        converts: &[ConvertForm],
+    ) -> Result<Self, ExecutorCostsError> {
+        let backend = executor.backend();
+        let largest = executor.limits().max_allocation.bytes();
+        let chain = chain_element(backend).ok_or_else(|| {
+            ExecutorCostsError(format!(
+                "{CHAIN_FORMAT:?} has no resident form on {}",
+                backend.as_str()
+            ))
+        })?;
+        Self::new(
+            backend,
+            Sizes::of(backend),
+            &measured_formats(backend),
+            chain,
+            largest,
+            converts,
+        )
+    }
+
+    /// The programs of `formats` ([`measured_formats`]) at `sizes` on an
+    /// executor of `backend` whose largest allocation is `largest`, the
+    /// chain in `chain`, plus every convert form `converts` the job measures.
+    fn new(
+        backend: seismic::BackendName,
+        sizes: Sizes,
+        formats: &[Element],
+        chain: Element,
+        largest: u64,
+        converts: &[ConvertForm],
+    ) -> Result<Self, ExecutorCostsError> {
+        let walk = WalkPrograms::new(backend, sizes, formats, chain, largest)?;
+        let converts = converts
+            .iter()
+            .map(|&form| (form, Program::of(form.land(), backend)))
+            .collect();
+        Ok(Self { walk: Some(walk), converts })
+    }
+
+    /// The walk's programs, for callers inside a cost walk.
+    fn walk(&self) -> &WalkPrograms {
+        self.walk
+            .as_ref()
+            .expect("a cost walk's ProgramSet holds its walk programs")
+    }
+
+    /// `format`'s F and program.
+    fn expand(&self, format: Element) -> (u64, &Program<dense_expand::Entry>) {
+        self.walk().expand(format)
     }
 
     /// Every program formed on `device` on the host's threads
@@ -1248,15 +1325,22 @@ impl ProgramSet {
         );
         let programs = Programs {
             host,
-            expands: self
-                .expands
+            walk: self.walk.as_ref().map(|walk| FormedWalkPrograms {
+                expands: walk
+                    .expands
+                    .iter()
+                    .map(|(format, _, _)| (*format, Pending::new(), Pending::new()))
+                    .collect(),
+                output: Pending::new(),
+                dense: Pending::new(),
+                affine: Pending::new(),
+                copy: Pending::new(),
+            }),
+            converts: self
+                .converts
                 .iter()
-                .map(|(format, _, _)| (*format, Pending::new(), Pending::new()))
+                .map(|(form, _)| (*form, Pending::new()))
                 .collect(),
-            output: Pending::new(),
-            dense: Pending::new(),
-            affine: Pending::new(),
-            copy: Pending::new(),
             formation: Arc::default(),
         };
         let (set, device, forming) = (self.clone(), device.clone(), programs.clone());
@@ -1265,40 +1349,48 @@ impl ProgramSet {
         // would, and reaches every wait for a program with its cause.
         let measuring = seismic::threads::Submitter::here();
         let thread = seismic::threads::spawn("measurement-formation", move || {
-            let index = |format: Element| {
-                set.expands
-                    .iter()
-                    .position(|(measured, _, _)| *measured == format)
-                    .expect("every measured format has a program")
+            let jobs = if let Some(walk) = &set.walk {
+                let index = |format: Element| {
+                    walk.expands
+                        .iter()
+                        .position(|(measured, _, _)| *measured == format)
+                        .expect("every measured format has a program")
+                };
+                let (activation, chain) = (index(Element::bf16()), index(walk.chain));
+                let others = (0..walk.expands.len()).filter(|&other| other != activation);
+                let decodes = others
+                    .clone()
+                    .filter(|&other| other != chain)
+                    .map(|other| Job::Expand(other, Rows::Decode));
+                let matrices = others.map(|other| Job::Expand(other, Rows::Matrix));
+                // The probe's program comes first, so the probe waits on no
+                // other compile however few the host's threads; then every
+                // convert form the job will measure (compiling off the
+                // measuring thread while the required walk and storage probe
+                // run) and the programs of the plan's early points ([`plan`]),
+                // so those wait on no other format's. The attention programs
+                // are one long compile each (the affine one's 1.2 s alone on
+                // an RTX 3090's Vulkan, against 0.7 s for a decode projection):
+                // they start next, beside the short ones the weight rates
+                // read, so each has formed by its history's points.
+                let mut jobs = vec![Job::Expand(activation, Rows::Decode)];
+                jobs.extend((0..set.converts.len()).map(Job::Convert));
+                jobs.extend([
+                    Job::Affine,
+                    Job::Dense,
+                    Job::Expand(chain, Rows::Decode),
+                    Job::Copy,
+                    Job::Output,
+                    Job::Expand(activation, Rows::Matrix),
+                ]);
+                // The chain's format is a backend's resident form of Q4_K,
+                // which may be the activation dtype's.
+                jobs.dedup();
+                jobs.extend(decodes.chain(matrices));
+                jobs
+            } else {
+                (0..set.converts.len()).map(Job::Convert).collect()
             };
-            let (activation, chain) = (index(Element::bf16()), index(set.chain));
-            let others = (0..set.expands.len()).filter(|&other| other != activation);
-            let decodes = others
-                .clone()
-                .filter(|&other| other != chain)
-                .map(|other| Job::Expand(other, Rows::Decode));
-            let matrices = others.map(|other| Job::Expand(other, Rows::Matrix));
-            // The probe's program comes first, so the probe waits on no
-            // other compile however few the host's threads; then the
-            // programs of the plan's early points ([`plan`]), so those
-            // wait on no other format's. The attention programs are one
-            // long compile each (the affine one's 1.2 s alone on an RTX
-            // 3090's Vulkan, against 0.7 s for a decode projection):
-            // they start next, beside the short ones the weight rates
-            // read, so each has formed by its history's points.
-            let mut jobs = vec![
-                Job::Expand(activation, Rows::Decode),
-                Job::Affine,
-                Job::Dense,
-                Job::Expand(chain, Rows::Decode),
-                Job::Copy,
-                Job::Output,
-                Job::Expand(activation, Rows::Matrix),
-            ];
-            // The chain's format is a backend's resident form of Q4_K,
-            // which may be the activation dtype's.
-            jobs.dedup();
-            jobs.extend(decodes.chain(matrices));
             let formed = measuring.run(|| {
                 seismic::Workers::of_the_host().each(&jobs, |job| match *job {
                     _ if !forming.formation.begin() => {}
@@ -1322,19 +1414,25 @@ impl Programs {
     fn form(&self, set: &ProgramSet, device: &Device, job: Job) {
         match job {
             Job::Expand(index, rows) => {
-                let (_, decode, matrix) = &self.expands[index];
-                let formed = set.expands[index]
+                let (walk, formed_walk) = (set.walk(), self.walk());
+                let (_, decode, matrix) = &formed_walk.expands[index];
+                let formed = walk.expands[index]
                     .2
-                    .form(device, Some(rows.count(set.sizes)));
+                    .form(device, Some(rows.count(walk.sizes)));
                 match rows {
                     Rows::Decode => decode.set(formed),
                     Rows::Matrix => matrix.set(formed),
                 }
             }
-            Job::Copy => self.copy.set(set.copy.form(device, None)),
-            Job::Dense => self.dense.set(set.dense.form(device, None)),
-            Job::Affine => self.affine.set(set.affine.form(device, None)),
-            Job::Output => self.output.set(set.output.form(device, Some(1))),
+            Job::Copy => self.walk().copy.set(set.walk().copy.form(device, None)),
+            Job::Dense => self.walk().dense.set(set.walk().dense.form(device, None)),
+            Job::Affine => self.walk().affine.set(set.walk().affine.form(device, None)),
+            Job::Output => self.walk().output.set(set.walk().output.form(device, Some(1))),
+            Job::Convert(index) => {
+                self.converts[index]
+                    .1
+                    .set(set.converts[index].1.form(device, None));
+            }
         }
     }
 }
@@ -1347,6 +1445,7 @@ enum Job {
     Dense,
     Affine,
     Output,
+    Convert(usize),
 }
 
 /// The F of `format`'s program: the executor's ([`Sizes`]), halved while a
@@ -1365,11 +1464,10 @@ fn features(sizes: Sizes, format: Element, largest: u64) -> Result<u64, Executor
     Ok(features)
 }
 
-/// The walk's kernels as formed on the job's device, each with why it could
-/// not be where it failed: the points of a kernel that failed record its
-/// failure as their own.
+/// The cost walk's kernels as formed on the job's device. Present in
+/// [`Programs::walk`] only when the job includes a cost walk.
 #[derive(Clone)]
-struct Programs {
+struct FormedWalkPrograms {
     /// Each measured format's program for decode, then for the matrix
     /// throughput.
     expands: Vec<(
@@ -1382,6 +1480,15 @@ struct Programs {
     dense: Forming<attention_decode::Entry>,
     affine: Forming<attention_decode_k8v4::Entry>,
     copy: Forming<conditioning_overlay::Entry>,
+}
+
+/// The job's kernels as formed on the job's device, each with why it could
+/// not be where it failed: the points of a kernel that failed record its
+/// failure as their own.
+#[derive(Clone)]
+struct Programs {
+    walk: Option<FormedWalkPrograms>,
+    converts: Vec<(ConvertForm, Forming<routed_land::Entry>)>,
     /// The compiles running and the points that touch the host holding the
     /// formation between its programs ([`Self::quiet`]).
     formation: Arc<Compiles>,
@@ -1531,6 +1638,13 @@ impl Drop for Quiet {
 }
 
 impl Programs {
+    /// The walk's formed kernels, for callers inside a cost walk.
+    fn walk(&self) -> &FormedWalkPrograms {
+        self.walk
+            .as_ref()
+            .expect("a cost walk's Programs holds its walk kernels")
+    }
+
     /// `format`'s program formed for `rows`.
     fn expand(
         &self,
@@ -1538,6 +1652,7 @@ impl Programs {
         rows: Rows,
     ) -> Result<&NativeKernel<dense_expand::Entry>, Unformed<ExecutorCostsError>> {
         let (_, decode, matrix) = self
+            .walk()
             .expands
             .iter()
             .find(|(measured, _, _)| *measured == format)
@@ -1578,14 +1693,19 @@ impl Programs {
     /// Every program not formed yet is never formed: the formation thread
     /// panicked, with `panic`, which every wait for one resumes.
     fn abandon(&self, panic: &seismic::threads::Panic) {
-        for (_, decode, matrix) in &self.expands {
-            decode.abandon(panic);
-            matrix.abandon(panic);
+        if let Some(walk) = &self.walk {
+            for (_, decode, matrix) in &walk.expands {
+                decode.abandon(panic);
+                matrix.abandon(panic);
+            }
+            walk.output.abandon(panic);
+            walk.dense.abandon(panic);
+            walk.affine.abandon(panic);
+            walk.copy.abandon(panic);
         }
-        self.output.abandon(panic);
-        self.dense.abandon(panic);
-        self.affine.abandon(panic);
-        self.copy.abandon(panic);
+        for (_, convert) in &self.converts {
+            convert.abandon(panic);
+        }
         self.formation.abandon(panic);
     }
 }
@@ -1818,7 +1938,10 @@ struct Measured<'a, 'd> {
     /// job alone.
     charges: &'d seismic::Charges,
     attempting: &'a mut dyn FnMut(&PointKey) -> Attempt,
-    /// The walk's kernels, formed before the first point no record holds: a
+    /// The job's programs (walk programs when the job walks costs, plus every
+    /// convert launch it measures), formed on the first point no record holds.
+    program_set: ProgramSet,
+    /// The job's kernels, formed before the first point no record holds: a
     /// job whose points are all stored forms nothing.
     programs: std::cell::OnceCell<Formed>,
     /// The storage every point's rotated operands view, allocated as the
@@ -1974,7 +2097,7 @@ impl Times for Measured<'_, '_> {
     fn time(
         &mut self,
         spec: PointSpec,
-        programs: &ProgramSet,
+        _programs: &ProgramSet,
         build: &mut Build<'_>,
         share: Share,
     ) -> Result<Timing, Stop<Self::Missing>> {
@@ -1989,6 +2112,7 @@ impl Times for Measured<'_, '_> {
         // holds is reached, before the host records its attempt: a compile
         // that fails or ends the job is no point's.
         let (device, charges) = (self.device, self.charges);
+        let program_set = &self.program_set;
         let formed = &self.programs;
         let backings = &mut self.backings;
         let host = &mut *self.attempting;
@@ -2000,7 +2124,7 @@ impl Times for Measured<'_, '_> {
         let (mut quiet, mut made) = (None, None);
         let mut outcomes = self.measurer.measure_all(
             vec![(key, || {
-                let formed = &formed.get_or_init(|| programs.form(device)).programs;
+                let formed = &formed.get_or_init(|| program_set.form(device)).programs;
                 let point = build(charges, formed, backings)?;
                 if formed.touches_host(share.host) {
                     backings.settle();
@@ -2013,7 +2137,7 @@ impl Times for Measured<'_, '_> {
             seismic::measure::Deadline::new(Some(ends)),
             self.records.store,
             &mut |key| {
-                formed.get_or_init(|| programs.form(device));
+                formed.get_or_init(|| program_set.form(device));
                 host(key)
             },
         );
@@ -3070,10 +3194,10 @@ impl Attention for attention_decode::Entry {
         case.dense()
     }
     fn program(programs: &ProgramSet) -> &Program<Self> {
-        &programs.dense
+        &programs.walk().dense
     }
     fn formed(programs: &Programs) -> &Forming<Self> {
-        &programs.dense
+        &programs.walk().dense
     }
 }
 
@@ -3087,10 +3211,10 @@ impl Attention for attention_decode_k8v4::Entry {
         case.affine()
     }
     fn program(programs: &ProgramSet) -> &Program<Self> {
-        &programs.affine
+        &programs.walk().affine
     }
     fn formed(programs: &Programs) -> &Forming<Self> {
-        &programs.affine
+        &programs.walk().affine
     }
 }
 
@@ -3208,9 +3332,9 @@ impl<'p> ChainKernels<'p> {
     fn of(programs: &'p Programs, weight: Element) -> Result<Self, Unformed<ExecutorCostsError>> {
         Ok(Self {
             expand: programs.expand(weight, Rows::Decode)?,
-            attend: programs.kernel(&programs.dense)?,
-            output: programs.kernel(&programs.output)?,
-            copy: programs.kernel(&programs.copy)?,
+            attend: programs.kernel(&programs.walk().dense)?,
+            output: programs.kernel(&programs.walk().output)?,
+            copy: programs.kernel(&programs.walk().copy)?,
         })
     }
 }
@@ -3472,7 +3596,7 @@ fn launch_graph_point<T: Times>(
         &[("timing", timing_ordinal(timing))],
     );
     let mut build = |charges: &seismic::Charges, formed: &Programs, _: &mut Backings| {
-        let copy = formed.kernel(&formed.copy)?;
+        let copy = formed.kernel(&formed.walk().copy)?;
         launch_graph(charges, copy)
             .and_then(|graph| graph.point(charges, timing))
             .map_err(Unformed::Now)
@@ -3683,7 +3807,14 @@ fn walk<T: Times>(
             backend.as_str()
         )))
     })?;
-    let programs = ProgramSet::new(backend, Sizes::of(backend), formats, chain, largest)?;
+    let programs = ProgramSet::new(
+        backend,
+        Sizes::of(backend),
+        formats,
+        chain,
+        largest,
+        &[],
+    )?;
     let (routes, placements) = Route::all(topology, executor)?;
     let routes = routes.iter().collect::<Vec<_>>();
     let mut steps = plan(&routes, formats);
@@ -3691,7 +3822,7 @@ fn walk<T: Times>(
     let points = 1 + steps.len();
     let through = part.through(&steps);
     let walk = Walk {
-        copy: programs.copy.identity()?,
+        copy: programs.walk().copy.identity()?,
         programs,
         cache: largest_cache(topology, executor),
         largest,
@@ -4070,7 +4201,7 @@ impl Walk<'_> {
         let Some((_, rates)) = read.formats[0].iter().find(|(read, _)| *read == format) else {
             return Ok(None);
         };
-        let rows = Rows::Matrix.count(self.programs.sizes) as f64;
+        let rows = Rows::Matrix.count(self.programs.walk().sizes) as f64;
         let pass = rows * call_seconds(format, &rates.pilot);
         Ok(Some(Forecast { pass }))
     }
@@ -4215,14 +4346,14 @@ impl Walk<'_> {
         share: Share,
     ) -> Result<ChainRead, Stop<T::Missing>> {
         let programs = &self.programs;
-        let chain_format = programs.chain;
+        let chain_format = programs.walk().chain;
         let device_route = self.routes[0];
         let depth = HISTORY_DEPTHS[0];
         let (features, expand_chain) = programs.expand(chain_format);
         let kernels = vec![
             expand_chain.identity()?,
-            programs.dense.identity()?,
-            programs.output.identity()?,
+            programs.walk().dense.identity()?,
+            programs.walk().output.identity()?,
             self.copy.clone(),
         ];
         let ChainShape { sets, layers, forecast } = self.chain_shape(read)?;
@@ -4257,7 +4388,7 @@ impl Walk<'_> {
     /// The composition chain's shape as `read` sizes it ([`Self::chain`]):
     /// its sets, its layers and its forecast.
     fn chain_shape(&self, read: &Read) -> Result<ChainShape, ExecutorCostsError> {
-        let chain_format = self.programs.chain;
+        let chain_format = self.programs.walk().chain;
         let depth = HISTORY_DEPTHS[0];
         let (features, _) = self.programs.expand(chain_format);
         // A layer's time as the walk's records price it: its projections'
@@ -4333,7 +4464,7 @@ impl ChainRead {
     /// Their rows' bytes, a few kilobytes against the weights' megabytes,
     /// are none.
     fn layer(programs: &ProgramSet) -> Result<[Work; CHAIN_LAYER_CALLS], ExecutorCostsError> {
-        let format = programs.chain;
+        let format = programs.walk().chain;
         let (features, _) = programs.expand(format);
         let output = format
             .canonical_byte_len(&[HIDDEN, features])
@@ -4453,7 +4584,7 @@ fn matrix<T: Times>(
     share: Share,
 ) -> Result<MatrixCosts, Stop<T::Missing>> {
     let (features, formation) = programs.expand(format);
-    let rows = Rows::Matrix.count(programs.sizes);
+    let rows = Rows::Matrix.count(programs.walk().sizes);
     let timing = times.time(
         PointSpec::new(
             vec![formation.identity()?],
@@ -4649,6 +4780,7 @@ impl<'a, 'd> Walks<'a, 'd> {
         charges: &'d seismic::Charges,
         store: &'a dyn RecordStore<PointKey>,
         deadlines: JobDeadlines,
+        program_set: ProgramSet,
         attempting: &'a mut dyn FnMut(&PointKey) -> Attempt,
         visit: &'a mut Visit<'a>,
     ) -> Result<Self, ExecutorCostsError> {
@@ -4663,6 +4795,7 @@ impl<'a, 'd> Walks<'a, 'd> {
             device,
             charges,
             attempting,
+            program_set,
             programs: std::cell::OnceCell::new(),
             backings: Backings::default(),
             visit,
@@ -4756,6 +4889,51 @@ impl<'a, 'd> Walks<'a, 'd> {
     /// The job's executor's identity, every point's key's.
     pub(super) fn identity(&self) -> Identity {
         self.measured.records.executor.clone()
+    }
+
+    /// Time a convert point under `key`, consuming `form`'s kernel from the
+    /// job's single `ProgramSet` worker-pool formation.
+    pub(super) fn time_convert<F>(&mut self, key: PointKey, form: &ConvertForm, build: F)
+    where
+        F: FnOnce(&NativeKernel<routed_land::Entry>) -> Result<Point, ExecutorCostsError>,
+    {
+        let began = std::time::Instant::now();
+        let (how, ends) = self.measured.next(0.);
+        let measured = &mut self.measured;
+        let device = measured.device;
+        let program_set = &measured.program_set;
+        let programs = &measured.programs;
+        let store = measured.records.store;
+        let host = &mut *measured.attempting;
+        let (mut quiet, mut made) = (None, None);
+        let mut outcomes = measured.measurer.measure_all(
+            vec![(key, || {
+                let formed = &programs.get_or_init(|| program_set.form(device)).programs;
+                let kernel = formed
+                    .converts
+                    .iter()
+                    .find(|(queued, _)| queued == form)
+                    .expect("every ConvertForm measured in a job was queued in ProgramSet")
+                    .1
+                    .wait()
+                    .as_ref()
+                    .map_err(|error| Unformed::Never(error.clone()))?;
+                let point = build(kernel).map_err(Unformed::Now)?;
+                quiet = formed.quiet(false);
+                made = Some(std::time::Instant::now());
+                Ok(point)
+            })],
+            &how,
+            seismic::measure::Deadline::new(Some(ends)),
+            store,
+            &mut |key| {
+                programs.get_or_init(|| program_set.form(device));
+                host(key)
+            },
+        );
+        drop(quiet);
+        let (key, outcome) = outcomes.pop().expect("one point is measured");
+        self.measured.tell(key, outcome, began, made);
     }
 
     /// Time the device point `build` makes under `key`, as the job times a
@@ -4946,9 +5124,18 @@ impl ExecutorCosts {
         let chain = chain_element(backend).ok_or_else(|| {
             ExecutorCostsError(format!("{CHAIN_FORMAT:?} has no resident form on {}", backend.as_str()))
         })?;
-        let programs = ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, largest)?;
+        let converts = ConvertForm::reference(backend)?.into_iter().collect::<Vec<_>>();
+        let programs = ProgramSet::new(
+            backend,
+            Sizes::of(backend),
+            &measured_formats(backend),
+            chain,
+            largest,
+            &converts,
+        )?;
         let (routes, _) = Route::all(topology, executor)?;
         let weights = programs
+            .walk()
             .expands
             .iter()
             .map(|&(format, features, _)| expand_weight_bytes(format, features))
@@ -5009,11 +5196,14 @@ mod tests {
     #[test]
     fn a_hold_keeps_the_formation_between_programs() {
         let programs = Programs {
-            expands: vec![(Element::bf16(), Pending::new(), Pending::new())],
-            output: Pending::new(),
-            dense: Pending::new(),
-            affine: Pending::new(),
-            copy: Pending::new(),
+            walk: Some(FormedWalkPrograms {
+                expands: vec![(Element::bf16(), Pending::new(), Pending::new())],
+                output: Pending::new(),
+                dense: Pending::new(),
+                affine: Pending::new(),
+                copy: Pending::new(),
+            }),
+            converts: Vec::new(),
             formation: Arc::default(),
             host: false,
         };
@@ -5036,10 +5226,10 @@ mod tests {
             assert!(begun.join().unwrap(), "the hold released, the program begins");
         });
         std::thread::scope(|scope| {
-            let point = scope.spawn(|| programs.kernel(&programs.copy).is_err());
+            let point = scope.spawn(|| programs.kernel(&programs.walk().copy).is_err());
             std::thread::sleep(pause);
             assert!(!point.is_finished(), "a point waits for its kernel forming");
-            programs.copy.set(Err(ExecutorCostsError("no kernel".into())));
+            programs.walk().copy.set(Err(ExecutorCostsError("no kernel".into())));
             programs.formation.end();
             assert!(point.join().unwrap(), "a kernel that failed to form never makes its point");
         });
@@ -5194,7 +5384,7 @@ mod tests {
         let backend = seismic::BackendName::Cpu;
         let chain = chain_element(backend).unwrap();
         let programs =
-            ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34)
+            ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[])
                 .unwrap();
         let (features, _) = programs.expand(chain);
         let depth = HISTORY_DEPTHS[0] as f64;
@@ -5344,15 +5534,17 @@ mod tests {
                 &measured_formats(backend),
                 chain_element(backend).unwrap(),
                 1 << 34,
+                &[],
             )
             .unwrap();
+            let walk = programs.walk();
             let mut statics = vec![
-                programs.output.formation.statics(backend),
-                programs.dense.formation.statics(backend),
-                programs.affine.formation.statics(backend),
-                programs.copy.formation.statics(backend),
+                walk.output.formation.statics(backend),
+                walk.dense.formation.statics(backend),
+                walk.affine.formation.statics(backend),
+                walk.copy.formation.statics(backend),
             ];
-            statics.extend(programs.expands.iter().map(|(_, _, expand)| expand.formation.statics(backend)));
+            statics.extend(walk.expands.iter().map(|(_, _, expand)| expand.formation.statics(backend)));
             for given in statics {
                 given.unwrap_or_else(|error| panic!("{backend:?}: {}", error.0));
             }
@@ -5369,12 +5561,13 @@ mod tests {
         }
         for backend in seismic::BackendName::ALL {
             let chain = chain_element(backend).unwrap();
-            let programs = ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34).unwrap();
-            same(&programs.output, backend);
-            same(&programs.dense, backend);
-            same(&programs.affine, backend);
-            same(&programs.copy, backend);
-            for (_, _, expand) in &programs.expands {
+            let programs = ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[]).unwrap();
+            let walk = programs.walk();
+            same(&walk.output, backend);
+            same(&walk.dense, backend);
+            same(&walk.affine, backend);
+            same(&walk.copy, backend);
+            for (_, _, expand) in &walk.expands {
                 same(expand, backend);
             }
         }

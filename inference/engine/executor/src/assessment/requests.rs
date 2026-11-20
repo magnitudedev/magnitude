@@ -43,7 +43,7 @@
 //!   the rest from the records stored. No load measures, and no load waits
 //!   on the job.
 
-use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, Visit, Walks, Whose};
+use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, ProgramSet, Visit, Walks, Whose};
 use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, StorageCosts, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
 use super::Priced;
 use crate::native::SiteForm;
@@ -553,7 +553,32 @@ pub fn measure(
             0
         }))
         .collect::<Vec<_>>();
-    let mut walks = Walks::new(measurer, device, charges, store, deadlines, attempting, visit)?;
+    let mut converts = Vec::new();
+    for (_, request) in &requests {
+        if let PointRequest::Convert(form) = request {
+            if !converts.contains(form) {
+                converts.push(*form);
+            }
+        }
+    }
+    let programs = if requests
+        .iter()
+        .any(|(_, request)| matches!(request, PointRequest::Costs(_)))
+    {
+        ProgramSet::with_walk(executor, &converts)?
+    } else {
+        ProgramSet::converts(executor.backend(), &converts)
+    };
+    let mut walks = Walks::new(
+        measurer,
+        device,
+        charges,
+        store,
+        deadlines,
+        programs,
+        attempting,
+        visit,
+    )?;
     let mut failures = Vec::new();
     for (index, (whose, request)) in requests.iter().enumerate() {
         // Its points and those after it of the same whose.
