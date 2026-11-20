@@ -760,6 +760,62 @@ fn gpu_elapsed_batch(
     gpu_elapsed_pipeline_batch(device, buffer, &requests)
 }
 
+/// Committed GPU commands that borrow caller-owned resources (such as a probe
+/// buffer) until `waitUntilCompleted()` has returned for every entry.
+///
+/// Any unwaited entries are drained inside `crate::pooled` on drop so no early
+/// `?`, `return Err`, or unwind can return while GPU work is still in flight.
+struct InFlightBatch<T, F: FnMut(&T)> {
+    entries: Vec<T>,
+    awaited: usize,
+    wait: F,
+}
+
+impl<T, F: FnMut(&T)> InFlightBatch<T, F> {
+    fn with_capacity(capacity: usize, wait: F) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            awaited: 0,
+            wait,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn push(&mut self, entry: T) {
+        self.entries.push(entry);
+    }
+
+    fn wait_all<R, E>(
+        &mut self,
+        mut on_completed: impl FnMut(&T) -> Result<R, E>,
+    ) -> Result<Vec<R>, E> {
+        let mut results = Vec::with_capacity(self.entries.len().saturating_sub(self.awaited));
+        while self.awaited < self.entries.len() {
+            let entry = &self.entries[self.awaited];
+            (self.wait)(entry);
+            self.awaited += 1;
+            results.push(on_completed(entry)?);
+        }
+        Ok(results)
+    }
+}
+
+impl<T, F: FnMut(&T)> Drop for InFlightBatch<T, F> {
+    fn drop(&mut self) {
+        if self.awaited < self.entries.len() {
+            crate::pooled(|| {
+                for entry in &self.entries[self.awaited..] {
+                    (self.wait)(entry);
+                }
+            });
+            self.awaited = self.entries.len();
+        }
+    }
+}
+
 fn gpu_elapsed_pipeline_batch(
     device: &crate::device::MetalDevice,
     buffer: &crate::device::MetalBuffer,
@@ -769,7 +825,12 @@ fn gpu_elapsed_pipeline_batch(
     let timestamps = crate::direct::LaunchTimestamps::shared(device)
         .map_err(|error| unavailable(error.to_string()))?;
     let calibration = crate::direct::sample_timestamps(device);
-    let mut commands = Vec::with_capacity(requests.len());
+    let mut commands = InFlightBatch::with_capacity(
+        requests.len(),
+        |(command, _, _): &(Retained<ProtocolObject<dyn MTLCommandBuffer>>, f64, _)| {
+            command.waitUntilCompleted();
+        },
+    );
     for &(pipeline, iterations, threads) in requests {
         let command = device.command_buffer().ok_or_else(|| {
             unavailable("Metal could not create a service-probe command buffer".into())
@@ -814,14 +875,15 @@ fn gpu_elapsed_pipeline_batch(
         command.commit();
         commands.push((command, committed, pair));
     }
-    let mut ticks = Vec::with_capacity(commands.len());
-    for (command, committed, pair) in &commands {
-        command.waitUntilCompleted();
+    let ticks = commands.wait_all(|(command, committed, pair)| {
         if let Some(error) = command.error() {
             return Err(unavailable(error.localizedDescription().to_string()));
         }
-        ticks.push((*committed, pair.resolve().map_err(|error| unavailable(error.to_string()))?));
-    }
+        Ok((
+            *committed,
+            pair.resolve().map_err(|error| unavailable(error.to_string()))?,
+        ))
+    })?;
     let host = crate::direct::host_clock(device, calibration).map_err(|error| unavailable(error.to_string()))?;
     let after = crate::timing::host_seconds();
     ticks
@@ -2020,7 +2082,8 @@ mod tests {
     use super::{
         confidence_interval, is_qualified, paired_batch_mean_confidence_interval,
         paired_difference_confidence_interval, paired_matched_confidence_interval,
-        paired_measurement_batch, probe_source, DurationInterval, MetalService, PROBE_METHOD,
+        paired_measurement_batch, probe_source, DurationInterval, InFlightBatch, MetalService,
+        PROBE_METHOD,
     };
 
     #[test]
@@ -2229,5 +2292,68 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(interval, DurationInterval::new(6_400, 6_400, 640));
+    }
+
+    #[test]
+    fn in_flight_batch_drains_remaining_entries_on_early_drop() {
+        let mut waited = Vec::new();
+        {
+            let mut batch = InFlightBatch::with_capacity(3, |id: &usize| waited.push(*id));
+            batch.push(0);
+            batch.push(1);
+            batch.push(2);
+            assert_eq!(batch.len(), 3);
+        }
+        assert_eq!(waited, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn in_flight_batch_drains_remaining_entries_after_wait_error() {
+        let mut waited = Vec::new();
+        {
+            let mut batch = InFlightBatch::with_capacity(4, |id: &usize| waited.push(*id));
+            for id in 0..4 {
+                batch.push(id);
+            }
+            let result = batch.wait_all(|id| {
+                if *id == 1 {
+                    Err("command failed")
+                } else {
+                    Ok(*id * 10)
+                }
+            });
+            assert_eq!(result, Err("command failed"));
+        }
+        assert_eq!(waited, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn in_flight_batch_drains_remaining_entries_on_unwind() {
+        let mut waited = Vec::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut batch = InFlightBatch::with_capacity(3, |id: &usize| waited.push(*id));
+            batch.push(0);
+            batch.push(1);
+            batch.push(2);
+            let _ = batch.wait_all::<(), ()>(|id| {
+                assert_ne!(*id, 0, "simulated unwind mid-batch");
+                Ok(())
+            });
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(waited, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn in_flight_batch_does_not_double_wait_after_success() {
+        let mut waited = Vec::new();
+        let values = {
+            let mut batch = InFlightBatch::with_capacity(2, |id: &usize| waited.push(*id));
+            batch.push(0);
+            batch.push(1);
+            batch.wait_all::<usize, ()>(|id| Ok(*id * 10)).unwrap()
+        };
+        assert_eq!(values, vec![0, 10]);
+        assert_eq!(waited, vec![0, 1]);
     }
 }
