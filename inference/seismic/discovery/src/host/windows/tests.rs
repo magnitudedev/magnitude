@@ -18,7 +18,7 @@ struct Machine {
     nodes: Vec<Option<u64>>,
     job: Option<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>,
     process: PROCESS_MEMORY_COUNTERS,
-    records: Option<Vec<u64>>,
+    records: Option<topology::ProcessorRecords>,
     brand: Option<String>,
     smbios: Option<Vec<u8>>,
     parallelism: NonZeroUsize,
@@ -82,7 +82,7 @@ impl Sys for Machine {
     fn cpu_brand(&self) -> Option<String> {
         self.brand.clone()
     }
-    fn processor_records(&self, _relationship: LOGICAL_PROCESSOR_RELATIONSHIP) -> Option<Vec<u64>> {
+    fn processor_records(&self, _relationship: LOGICAL_PROCESSOR_RELATIONSHIP) -> Option<topology::ProcessorRecords> {
         self.records.clone()
     }
     fn highest_node(&self) -> u16 {

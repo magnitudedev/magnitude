@@ -29,7 +29,7 @@ use seismic_compiler::blocks::{
     BLOCK_CAP_BYTES,
 };
 use seismic_compiler::errors::ExecutionError;
-use seismic_memory::entry::{Carved, Change, Charge, Entry, Store, Wiring};
+use seismic_memory::entry::{CarvableCharge, Carved, Change, Charge, Entry, Store, Wiring};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 /// Every allocation starts at least this aligned.
@@ -96,7 +96,7 @@ enum Held {
     /// entry for a pool's block, whose ranges are carved from it; to its
     /// allocation's entry for a block of its own ([`Memory::block`]). Freed
     /// as the block is ([`Memory::free`]), in the change that destroys it.
-    Charged(Mutex<Charge>),
+    Charged(CarvableCharge),
     /// The logical device's own ([`Memory::driver_block`]): uncounted among
     /// the blocks, so each reconciliation charges it as the driver's memory
     /// ([`DriverMemory`]) to every live open's own entry, like the logical
@@ -133,7 +133,7 @@ impl Holding<'_> {
 
     fn held(self) -> Held {
         match self {
-            Self::Charged(_, charge) => Held::Charged(Mutex::new(charge)),
+            Self::Charged(_, charge) => Held::Charged(charge.into_carvable()),
             Self::Driver(_) => Held::Driver,
         }
     }
@@ -550,21 +550,15 @@ impl Memory {
     pub(crate) fn free(&self, device: &ash::Device, block: &Block) {
         // The memory's destruction and the free of its bytes are one change.
         let charged = match &block.held {
-            Held::Charged(charge) => {
-                let charge = charge.lock().expect("block charge lock poisoned");
-                Some((charge.entry().change(), charge))
-            }
+            Held::Charged(charge) => Some((charge.entry().change(), charge)),
             Held::Driver => None,
         };
         let _transition = self.transition();
         self.device_blocks.fetch_sub(block.counted_bytes(&self.device_heaps), Ordering::SeqCst);
         destroy_block(device, block);
         self.objects.fetch_sub(1, Ordering::SeqCst);
-        if let Some((change, mut charge)) = charged {
-            let bytes = charge.bytes();
-            if bytes > 0 {
-                charge.shrink(&change, bytes);
-            }
+        if let Some((change, charge)) = charged {
+            charge.release(&change);
         }
     }
 
@@ -976,7 +970,7 @@ impl Range {
         let Held::Charged(charge) = &self.block.held else {
             panic!("a range carved from a block the driver holds: only a pool's ranges are carved");
         };
-        Charge::carve(&charge.lock().expect("block charge lock poisoned"), entry, self.bytes)
+        charge.carve(entry, self.bytes)
     }
 
     /// Offset of the range in its block's `VkBuffer`.
@@ -1135,10 +1129,10 @@ mod tests {
             mapped: std::ptr::null_mut(),
             dedicated: false,
             free: Mutex::new(FreeRanges::new(bytes)),
-            held: Held::Charged(Mutex::new({
+            held: Held::Charged({
                 let entry = tally();
-                Charge::took(&entry.change(), &entry, bytes, Wiring::Pageable)
-            })),
+                Charge::took(&entry.change(), &entry, bytes, Wiring::Pageable).into_carvable()
+            }),
         })
     }
 

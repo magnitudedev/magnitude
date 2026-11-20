@@ -12,7 +12,7 @@ use seismic_compiler::blocks::{
     BLOCK_CAP_BYTES,
 };
 use seismic_compiler::errors::ExecutionError;
-use seismic_memory::entry::{Backed, Carved, Charge, Entry, Wiring};
+use seismic_memory::entry::{Backed, CarvableCharge, Carved, Entry, Wiring};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Every range starts at least this aligned.
@@ -21,7 +21,7 @@ const MINIMUM_ALIGNMENT: u64 = 256;
 struct Block {
     /// The driver's allocation with its bytes, on the device store's own
     /// entry, which its ranges are carved from.
-    backed: Backed<Allocation>,
+    backed: Backed<Allocation, CarvableCharge>,
     dedicated: bool,
     free: Mutex<FreeRanges>,
 }
@@ -103,7 +103,8 @@ impl Blocks {
                         })?,
                     )
                     .map_err(crate::executor::allocation_error(size, || crate::executor::device_free(&self.context)))
-                })?;
+                })?
+                .into_carvable();
                 let size = backed.charge().bytes();
                 let block = Arc::new(Block {
                     backed,
@@ -119,7 +120,7 @@ impl Blocks {
             }
         };
         Ok(Range {
-            _carved: Charge::carve(block.backed.charge(), entry, bytes),
+            _carved: block.backed.charge().carve(entry, bytes),
             blocks: self.clone(),
             block,
             offset,

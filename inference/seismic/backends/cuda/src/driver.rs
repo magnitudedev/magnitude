@@ -19,7 +19,7 @@ use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
-use seismic_memory::entry::{Backed, Change, Charge, DropScope, Entry, Wiring};
+use seismic_memory::entry::{Backed, Change, Charge, DropInChange, Entry, ScopedDrop, Wiring};
 
 pub type Handle = *mut c_void;
 type ResultCode = c_int;
@@ -278,8 +278,7 @@ impl fmt::Display for DriverError {
 
 impl std::error::Error for DriverError {}
 
-/// The retained primary context of one device ordinal.
-pub(crate) struct Context {
+pub(crate) struct ContextInner {
     pub driver: Arc<Driver>,
     raw: Handle,
     ordinal: c_int,
@@ -314,12 +313,25 @@ pub(crate) struct Context {
     /// Context-lifetime high-water mark and retained ledger charge for
     /// instantiated CUDA graphs (`graph_cost::GraphPool`): CUDA retains
     /// destroyed graph memory until the context is released, so this charge
-    /// only grows while the context lives and drops inside `scope`.
+    /// only grows while the context lives and drops inside `ScopedDrop`.
     graph_charge: std::sync::Mutex<(u64, Option<Charge>)>,
-    /// The change its drop runs in, ended after the stack's and graphs'
-    /// charges are freed ([`DropScope`]): last. A context's release and the
-    /// free of its charges are many effects, which no one [`Backed`] owns.
-    scope: DropScope,
+}
+
+/// The retained primary context of one device ordinal.
+pub(crate) struct Context(ScopedDrop<ContextInner>);
+
+impl std::ops::Deref for Context {
+    type Target = ContextInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Context {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 // The raw handle is an opaque driver object usable from any thread once made
@@ -337,7 +349,7 @@ impl Context {
                 "primary context retain",
             )?;
         }
-        let mut context = Self {
+        let mut context = Self(ScopedDrop::new(ContextInner {
             driver,
             raw,
             ordinal,
@@ -350,8 +362,7 @@ impl Context {
             limit_calls: std::sync::atomic::AtomicUsize::new(0),
             stack_charges: std::sync::Mutex::new(Vec::new()),
             graph_charge: std::sync::Mutex::new((0, None)),
-            scope: DropScope::default(),
-        };
+        }));
         context.transfer = {
             let _current = context.enter()?;
             let mut stream = std::ptr::null_mut();
@@ -586,16 +597,29 @@ impl Context {
     }
 }
 
-impl Drop for Context {
+impl DropInChange for ContextInner {
+    fn drop_entry(&self) -> Option<&Arc<dyn Entry>> {
+        self.own_entry.get()
+    }
+
     /// The context's release, which returns the stack and retained graph pool
-    /// memory it holds, and the free of the bytes charged for them are one
-    /// change.
-    fn drop(&mut self) {
-        if let Some(entry) = self.own_entry.get() {
-            self.scope.begin(entry);
-        }
+    /// memory it holds, runs before the fields' charges drop inside one change.
+    fn before_drop(&mut self) {
         if !self.transfer.is_null() {
-            if let Ok(_current) = self.enter() {
+            let mut previous = std::ptr::null_mut();
+            let entered = unsafe {
+                self.driver
+                    .check((self.driver.context_get)(&mut previous), "current context query")
+                    .and_then(|()| {
+                        self.driver
+                            .check((self.driver.context_set)(self.raw), "set current context")
+                    })
+                    .map(|()| Current {
+                        driver: &self.driver,
+                        previous,
+                    })
+            };
+            if let Ok(_current) = entered {
                 unsafe {
                     (self.driver.stream_destroy)(self.transfer);
                 }
@@ -612,7 +636,9 @@ impl Drop for Context {
             std::mem::replace(&mut guard.0, 0)
         };
         if graph_peak > 0 {
-            self.driver_freed(graph_peak);
+            if let Some(memory) = self.driver_memory.get() {
+                memory.freed(graph_peak);
+            }
         }
     }
 }
@@ -1983,26 +2009,22 @@ impl Drop for Allocation {
 /// One loaded module; unloaded with its context. The device memory its
 /// load took is charged to the device's own entry while it is loaded, where
 /// the device was opened with one (`Context::charge_own_to`).
-pub(crate) struct Module {
+pub(crate) struct ModuleInner {
     pub raw: Handle,
     pub context: Arc<Context>,
     /// What its load took, as the device's free memory read it.
     taken: u64,
     /// Those bytes on the device's own entry; freed after the unload.
     _charge: Option<Charge>,
-    /// The change its drop runs in ([`DropScope`]): last.
-    scope: DropScope,
 }
 
-unsafe impl Send for Module {}
-unsafe impl Sync for Module {}
+impl DropInChange for ModuleInner {
+    fn drop_entry(&self) -> Option<&Arc<dyn Entry>> {
+        self._charge.as_ref().map(Charge::entry)
+    }
 
-impl Drop for Module {
     /// The unload and the free of its bytes are one change.
-    fn drop(&mut self) {
-        if let Some(charge) = &self._charge {
-            self.scope.begin(charge.entry());
-        }
+    fn before_drop(&mut self) {
         if let Ok(_current) = self.context.enter() {
             unsafe {
                 let _changing = self.context.changing_memory();
@@ -2012,6 +2034,19 @@ impl Drop for Module {
         }
     }
 }
+
+pub(crate) struct Module(ScopedDrop<ModuleInner>);
+
+impl std::ops::Deref for Module {
+    type Target = ModuleInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Send for Module {}
+unsafe impl Sync for Module {}
 
 /// A JIT link state; retains its log buffers until destroyed.
 struct Linker {
@@ -2204,15 +2239,14 @@ pub(crate) fn load_module(
     let (loaded, taken) = loaded.map_err(JitError::Driver)?;
     let (raw, functions) = loaded?;
     context.driver_allocated(taken);
-    let module = Module {
+    let module = Module(ScopedDrop::new(ModuleInner {
         raw,
         context: context.clone(),
         taken,
         _charge: change
             .as_ref()
             .map(|(entry, change)| Charge::took(change, entry, taken, Wiring::Pageable)),
-        scope: DropScope::default(),
-    };
+    }));
     drop(change);
     for &function in &functions {
         context

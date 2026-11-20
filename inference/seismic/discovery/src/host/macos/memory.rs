@@ -138,52 +138,9 @@ pub(super) fn paired(
     }
 }
 
-/// `task_vm_info` (`TASK_VM_INFO`) through revision 7, laid out as the
-/// kernel writes it and read in part.
-#[allow(dead_code)]
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(crate) struct TaskVm {
-    virtual_size: u64,
-    region_count: i32,
-    page_size: i32,
-    resident_size: u64,
-    resident_size_peak: u64,
-    device: u64,
-    device_peak: u64,
-    internal: u64,
-    internal_peak: u64,
-    external: u64,
-    external_peak: u64,
-    reusable: u64,
-    reusable_peak: u64,
-    purgeable_volatile_pmap: u64,
-    purgeable_volatile_resident: u64,
-    purgeable_volatile_virtual: u64,
-    compressed: u64,
-    compressed_peak: u64,
-    compressed_lifetime: u64,
-    phys_footprint: u64,
-    min_address: u64,
-    max_address: u64,
-    /// `ledger_phys_footprint_peak` and the twenty purgeable and tag
-    /// ledgers after it.
-    ledgers: [i64; 21],
-    limit_bytes_remaining: u64,
-    decompressions: i32,
-    ledger_swapins: i64,
-    ledger_tag_neural_nofootprint_total: i64,
-    ledger_tag_neural_nofootprint_peak: i64,
-}
-
-pub(super) const TASK_VM_INFO: libc::task_flavor_t = 22;
-/// `TASK_VM_INFO_REV7_COUNT`: the structure in natural-sized words.
-pub(super) const TASK_VM_INFO_REV7_COUNT: libc::mach_msg_type_number_t =
-    (std::mem::size_of::<TaskVm>() / std::mem::size_of::<libc::natural_t>())
-        as libc::mach_msg_type_number_t;
-/// `TASK_VM_INFO_REV6_COUNT`: through `ledger_swapins`.
-pub(super) const TASK_VM_INFO_REV6_COUNT: libc::mach_msg_type_number_t =
-    TASK_VM_INFO_REV7_COUNT - 4;
+/// `task_vm_info` (`TASK_VM_INFO`) through revision 7, owned by
+/// `seismic_native_target::process::macos::TaskVmInfo`.
+pub(crate) use seismic_native_target::process::macos::TaskVmInfo as TaskVm;
 
 /// The process's task's decompressions, widened across their wraps.
 static OWN_DECOMPRESSIONS: Widened = Widened::new();
@@ -195,11 +152,9 @@ static OWN_DECOMPRESSIONS: Widened = Widened::new();
 /// # Panics
 /// Where the swap-ins read negative.
 fn own_paging(vm: &TaskVm, page: u64) -> u64 {
-    let swapins = u64::try_from(vm.ledger_swapins).unwrap_or_else(|_| {
-        panic!(
-            "invariant violated: task_vm_info.ledger_swapins is {}",
-            vm.ledger_swapins
-        )
+    let ledger_swapins = vm.ledger_swapins;
+    let swapins = u64::try_from(ledger_swapins).unwrap_or_else(|_| {
+        panic!("invariant violated: task_vm_info.ledger_swapins is {ledger_swapins}")
     });
     OWN_DECOMPRESSIONS.of(vm.decompressions as u32) + swapins / page
 }

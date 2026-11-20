@@ -193,13 +193,14 @@ thread_local! {
 /// `sched_setaffinity` of every thread of the process (`/proc/self/task`)
 /// but those [`pin`] placed to `cpus`, pass after pass until one finds no
 /// thread it had not placed: a thread started during a pass by one not yet
-/// placed is placed by the next.
+/// placed is placed by the next. Serialized with [`pin`] under [`PINNED`]
+/// so a concurrent `pin` is never overwritten.
 pub(crate) fn place_process(cpus: &[usize]) -> Result<(), String> {
     let set = cpu_set(cpus)?;
-    let mut placed = PINNED
+    let pinned = PINNED
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut placed = pinned.clone();
     loop {
         let tasks = std::fs::read_dir("/proc/self/task")
             .map_err(|error| format!("/proc/self/task: {error}"))?;
@@ -224,9 +225,12 @@ pub(crate) fn place_process(cpus: &[usize]) -> Result<(), String> {
 }
 
 /// `sched_setaffinity` of the calling thread to `cpus`, which [`place_process`]
-/// then leaves where it is.
+/// then leaves where it is. Serialized with [`place_process`] under [`PINNED`].
 pub(crate) fn pin(cpus: &[usize]) -> Result<(), String> {
     let set = cpu_set(cpus)?;
+    let mut pinned = PINNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // SAFETY: a CPU set, applied to the calling thread.
     let placed =
         unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
@@ -234,14 +238,10 @@ pub(crate) fn pin(cpus: &[usize]) -> Result<(), String> {
         0 => {
             // SAFETY: the calling thread's id.
             let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+            pinned.insert(tid);
+            drop(pinned);
             PIN.with(|pin| {
-                pin.get_or_init(|| {
-                    PINNED
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(tid);
-                    Pinned(tid)
-                });
+                pin.get_or_init(|| Pinned(tid));
             });
             Ok(())
         }

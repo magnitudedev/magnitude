@@ -37,8 +37,32 @@ pub struct ProcessPlacement {
 
 impl Drop for ProcessPlacement {
     fn drop(&mut self) {
-        crate::host::place_process(&self.every)
-            .expect("the process's threads back on every CPU it could run on");
+        // Restore best-effort onto the intersection of originally allowed CPUs
+        // and currently online/allowed CPUs (in case a CPU was offlined or
+        // cpuset narrowed), never panicking inside `Drop`, and always clearing
+        // `PLACED`.
+        let online = discover_processors();
+        let restore: Vec<usize> = self
+            .every
+            .iter()
+            .copied()
+            .filter(|cpu| online.allowed().contains(cpu))
+            .collect();
+        let target = if restore.is_empty() {
+            &self.every[..]
+        } else {
+            &restore[..]
+        };
+        let _ = crate::host::place_process(target);
+        PLACED.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Clears `PLACED` if setup in [`place_process`] returns early or panics.
+struct PlacementClaim;
+
+impl Drop for PlacementClaim {
+    fn drop(&mut self) {
         PLACED.store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -66,12 +90,11 @@ pub fn place_process(cpus: &[usize]) -> Result<ProcessPlacement, String> {
         !PLACED.swap(true, std::sync::atomic::Ordering::AcqRel),
         "the process is placed already: one placement owns every thread's CPUs at a time (a second serving executor in one process)"
     );
+    let claim = PlacementClaim;
     let every = discover_processors().allowed().iter().copied().collect::<Vec<_>>();
-    let placed = crate::host::place_process(cpus).map(|()| ProcessPlacement { every });
-    if placed.is_err() {
-        PLACED.store(false, std::sync::atomic::Ordering::Release);
-    }
-    placed
+    crate::host::place_process(cpus)?;
+    std::mem::forget(claim);
+    Ok(ProcessPlacement { every })
 }
 
 /// The memory node of the device at `location` ([`HostNode`]): Linux's

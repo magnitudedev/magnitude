@@ -371,55 +371,85 @@ mod windows {
 }
 
 #[cfg(target_os = "macos")]
-mod macos {
+pub mod macos {
     use std::ffi::{c_int, c_uint, c_void};
 
-    /// `TASK_VM_INFO` through its graphics ledger tags (within revision 3
-    /// of the structure), as `<mach/task_info.h>` lays it out, packed to
-    /// four bytes.
+    /// `TASK_VM_INFO` through revision 7, as `<mach/task_info.h>` lays it out
+    /// under `#pragma pack(push, 4)`.
+    ///
+    /// Single owner of the macOS `task_vm_info` ABI across Seismic.
     #[repr(C, packed(4))]
     #[derive(Clone, Copy, Default)]
-    pub(super) struct TaskVmInfo {
-        virtual_size: u64,
-        region_count: i32,
-        page_size: i32,
-        resident_size: u64,
-        resident_size_peak: u64,
-        device: u64,
-        device_peak: u64,
-        internal: u64,
-        internal_peak: u64,
-        pub(super) external: u64,
-        external_peak: u64,
-        reusable: u64,
-        reusable_peak: u64,
-        purgeable_volatile_pmap: u64,
-        purgeable_volatile_resident: u64,
-        purgeable_volatile_virtual: u64,
-        compressed: u64,
-        compressed_peak: u64,
-        compressed_lifetime: u64,
-        pub(super) phys_footprint: u64,
-        min_address: u64,
-        max_address: u64,
-        ledger_phys_footprint_peak: i64,
-        ledger_purgeable_nonvolatile: i64,
-        ledger_purgeable_novolatile_compressed: i64,
-        ledger_purgeable_volatile: i64,
-        ledger_purgeable_volatile_compressed: i64,
-        ledger_tag_network_nonvolatile: i64,
-        ledger_tag_network_nonvolatile_compressed: i64,
-        ledger_tag_network_volatile: i64,
-        ledger_tag_network_volatile_compressed: i64,
-        ledger_tag_media_footprint: i64,
-        ledger_tag_media_footprint_compressed: i64,
-        ledger_tag_media_nofootprint: i64,
-        ledger_tag_media_nofootprint_compressed: i64,
-        pub(super) ledger_tag_graphics_footprint: i64,
-        ledger_tag_graphics_footprint_compressed: i64,
-        ledger_tag_graphics_nofootprint: i64,
-        ledger_tag_graphics_nofootprint_compressed: i64,
+    #[allow(dead_code)]
+    pub struct TaskVmInfo {
+        pub virtual_size: u64,
+        pub region_count: i32,
+        pub page_size: i32,
+        pub resident_size: u64,
+        pub resident_size_peak: u64,
+        pub device: u64,
+        pub device_peak: u64,
+        pub internal: u64,
+        pub internal_peak: u64,
+        pub external: u64,
+        pub external_peak: u64,
+        pub reusable: u64,
+        pub reusable_peak: u64,
+        pub purgeable_volatile_pmap: u64,
+        pub purgeable_volatile_resident: u64,
+        pub purgeable_volatile_virtual: u64,
+        pub compressed: u64,
+        pub compressed_peak: u64,
+        pub compressed_lifetime: u64,
+        pub phys_footprint: u64,
+        pub min_address: u64,
+        pub max_address: u64,
+        pub ledger_phys_footprint_peak: i64,
+        pub ledger_purgeable_nonvolatile: i64,
+        pub ledger_purgeable_novolatile_compressed: i64,
+        pub ledger_purgeable_volatile: i64,
+        pub ledger_purgeable_volatile_compressed: i64,
+        pub ledger_tag_network_nonvolatile: i64,
+        pub ledger_tag_network_nonvolatile_compressed: i64,
+        pub ledger_tag_network_volatile: i64,
+        pub ledger_tag_network_volatile_compressed: i64,
+        pub ledger_tag_media_footprint: i64,
+        pub ledger_tag_media_footprint_compressed: i64,
+        pub ledger_tag_media_nofootprint: i64,
+        pub ledger_tag_media_nofootprint_compressed: i64,
+        pub ledger_tag_graphics_footprint: i64,
+        pub ledger_tag_graphics_footprint_compressed: i64,
+        pub ledger_tag_graphics_nofootprint: i64,
+        pub ledger_tag_graphics_nofootprint_compressed: i64,
+        pub ledger_tag_neural_footprint: i64,
+        pub ledger_tag_neural_footprint_compressed: i64,
+        pub ledger_tag_neural_nofootprint: i64,
+        pub ledger_tag_neural_nofootprint_compressed: i64,
+        pub limit_bytes_remaining: u64,
+        pub decompressions: i32,
+        pub ledger_swapins: i64,
+        pub ledger_tag_neural_nofootprint_total: i64,
+        pub ledger_tag_neural_nofootprint_peak: i64,
     }
+
+    /// `TASK_VM_INFO_REV7_COUNT`: the full revision 7 structure in 32-bit words (93).
+    pub const TASK_VM_INFO_REV7_COUNT: u32 =
+        (std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<c_uint>()) as u32;
+    /// `TASK_VM_INFO_REV6_COUNT`: through `ledger_swapins` in 32-bit words (89).
+    pub const TASK_VM_INFO_REV6_COUNT: u32 = TASK_VM_INFO_REV7_COUNT - 4;
+
+    const _: () = {
+        assert!(std::mem::size_of::<TaskVmInfo>() == 372);
+        assert!(TASK_VM_INFO_REV7_COUNT == 93);
+        assert!(TASK_VM_INFO_REV6_COUNT == 89);
+        assert!(std::mem::offset_of!(TaskVmInfo, external) == 64);
+        assert!(std::mem::offset_of!(TaskVmInfo, compressed) == 120);
+        assert!(std::mem::offset_of!(TaskVmInfo, phys_footprint) == 144);
+        assert!(std::mem::offset_of!(TaskVmInfo, ledger_tag_graphics_footprint) == 272);
+        assert!(std::mem::offset_of!(TaskVmInfo, decompressions) == 344);
+        assert!(std::mem::offset_of!(TaskVmInfo, ledger_swapins) == 348);
+        assert!(std::mem::offset_of!(TaskVmInfo, ledger_tag_neural_nofootprint_total) == 356);
+    };
 
     /// `malloc_statistics_t` of `<malloc/malloc.h>`.
     #[repr(C)]
@@ -443,13 +473,14 @@ mod macos {
         fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
     }
 
-    pub(super) fn task_vm_info() -> Option<TaskVmInfo> {
+    /// Read `TASK_VM_INFO` for this process, returning the populated struct and
+    /// the 32-bit word count written by the kernel, or the Mach status code on failure.
+    pub fn task_vm_info_with_count() -> Result<(TaskVmInfo, u32), i32> {
         const TASK_VM_INFO: c_uint = 22;
         let mut info = TaskVmInfo::default();
-        let mut count =
-            (std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<c_uint>()) as c_uint;
-        // SAFETY: `task_info` writes at most `count` 32-bit words of the
-        // flavor's structure, which `TaskVmInfo` is a prefix of.
+        let mut count = TASK_VM_INFO_REV7_COUNT as c_uint;
+        // SAFETY: `task_info` writes at most `count` 32-bit words into `info`,
+        // which matches `struct task_vm_info` packed to 4 bytes through rev7.
         let result = unsafe {
             task_info(
                 mach_task_self_,
@@ -458,7 +489,16 @@ mod macos {
                 &mut count,
             )
         };
-        (result == 0).then_some(info)
+        if result == 0 {
+            Ok((info, count))
+        } else {
+            Err(result)
+        }
+    }
+
+    /// Read `TASK_VM_INFO` for this process, returning `None` if Mach refuses.
+    pub fn task_vm_info() -> Option<TaskVmInfo> {
+        task_vm_info_with_count().ok().map(|(info, _)| info)
     }
 
     /// `ri_lifetime_max_phys_footprint` of `rusage_info_v4`

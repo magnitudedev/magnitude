@@ -31,7 +31,7 @@ struct Space {
     available: u64,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn statvfs(path: &Path) -> std::io::Result<Space> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -40,10 +40,14 @@ fn statvfs(path: &Path) -> std::io::Result<Space> {
     if unsafe { libc::statvfs(path.as_ptr(), &mut status) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let fragment = status.f_frsize as u64;
+    let fragment = if status.f_frsize != 0 {
+        status.f_frsize as u64
+    } else {
+        status.f_bsize as u64
+    };
     Ok(Space {
-        size: status.f_blocks as u64 * fragment,
-        available: status.f_bavail as u64 * fragment,
+        size: (status.f_blocks as u64).saturating_mul(fragment),
+        available: (status.f_bavail as u64).saturating_mul(fragment),
     })
 }
 
@@ -56,14 +60,19 @@ mod platform {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
-    pub(super) fn identify(path: &Path) -> std::io::Result<VolumeId> {
-        let device = std::fs::metadata(path)?.dev();
+    fn statfs(path: &Path) -> std::io::Result<libc::statfs> {
         let c_path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         let mut status = unsafe { std::mem::zeroed::<libc::statfs>() };
         if unsafe { libc::statfs(c_path.as_ptr(), &mut status) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
+        Ok(status)
+    }
+
+    pub(super) fn identify(path: &Path) -> std::io::Result<VolumeId> {
+        let device = std::fs::metadata(path)?.dev();
+        let status = statfs(path)?;
         // The mount point's volume UUID; a volume without one (some network
         // and FAT volumes) is known by its device alone.
         let mount = unsafe { CStr::from_ptr(status.f_mntonname.as_ptr()) };
@@ -74,7 +83,14 @@ mod platform {
     }
 
     pub(super) fn space(path: &Path) -> std::io::Result<Space> {
-        super::statvfs(path)
+        // Use 64-bit `statfs` rather than `statvfs` (whose 32-bit `f_blocks`
+        // truncates volumes above 16 TiB at 4 KiB block size).
+        let status = statfs(path)?;
+        let block = u64::from(status.f_bsize);
+        Ok(Space {
+            size: status.f_blocks.saturating_mul(block),
+            available: status.f_bavail.saturating_mul(block),
+        })
     }
 
     /// `ATTR_VOL_UUID` of the volume mounted at `mount`: none where the
@@ -214,7 +230,7 @@ mod platform {
     /// The volume's serial number, and its `\\?\Volume{GUID}\` name's GUID.
     pub(super) fn identify(path: &Path) -> std::io::Result<VolumeId> {
         let path = wide(path);
-        let mut root = [0u16; 261];
+        let mut root = vec![0u16; path.len().max(261)];
         if unsafe { GetVolumePathNameW(path.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
             return Err(std::io::Error::last_os_error());
         }

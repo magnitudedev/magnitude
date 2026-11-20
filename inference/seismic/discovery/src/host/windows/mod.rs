@@ -45,8 +45,8 @@ pub(crate) trait Sys {
     /// unavailable.
     fn cpu_brand(&self) -> Option<String>;
     /// The records `GetLogicalProcessorInformationEx(relationship)` writes,
-    /// each `Size` bytes, in a buffer aligned for them.
-    fn processor_records(&self, relationship: LOGICAL_PROCESSOR_RELATIONSHIP) -> Option<Vec<u64>>;
+    /// each `Size` bytes, in a buffer aligned for them with exact byte length.
+    fn processor_records(&self, relationship: LOGICAL_PROCESSOR_RELATIONSHIP) -> Option<topology::ProcessorRecords>;
     /// `GetNumaHighestNodeNumber`.
     fn highest_node(&self) -> u16;
     /// `GetNumaAvailableMemoryNodeEx(node)`: bytes available on it; none
@@ -198,25 +198,42 @@ impl Sys for LiveSys {
         cpuid_brand_string()
     }
 
-    fn processor_records(&self, relationship: LOGICAL_PROCESSOR_RELATIONSHIP) -> Option<Vec<u64>> {
+    fn processor_records(
+        &self,
+        relationship: LOGICAL_PROCESSOR_RELATIONSHIP,
+    ) -> Option<topology::ProcessorRecords> {
+        use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
         use windows_sys::Win32::System::SystemInformation::GetLogicalProcessorInformationEx;
         let mut length = 0u32;
-        unsafe {
-            GetLogicalProcessorInformationEx(relationship, std::ptr::null_mut(), &mut length)
-        };
-        let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
         if unsafe {
-            GetLogicalProcessorInformationEx(
-                relationship,
-                buffer.as_mut_ptr().cast(),
-                &mut length,
-            )
-        } == 0
+            GetLogicalProcessorInformationEx(relationship, std::ptr::null_mut(), &mut length)
+        } != 0
         {
-            return last_error(&format!("GetLogicalProcessorInformationEx({relationship})"));
+            return Some(topology::ProcessorRecords::new(Vec::new(), 0));
         }
-        buffer.truncate((length as usize).div_ceil(8));
-        Some(buffer)
+        let first_err = std::io::Error::last_os_error();
+        if first_err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return read(format!("GetLogicalProcessorInformationEx({relationship})"), Err(first_err));
+        }
+        loop {
+            let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
+            if unsafe {
+                GetLogicalProcessorInformationEx(
+                    relationship,
+                    buffer.as_mut_ptr().cast(),
+                    &mut length,
+                )
+            } != 0
+            {
+                let byte_len = length as usize;
+                buffer.truncate(byte_len.div_ceil(8));
+                return Some(topology::ProcessorRecords::new(buffer, byte_len));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+                return read(format!("GetLogicalProcessorInformationEx({relationship})"), Err(error));
+            }
+        }
     }
 
     fn highest_node(&self) -> u16 {
@@ -489,18 +506,14 @@ fn relation_cache_bytes(sys: &impl Sys) -> Option<u64> {
     let records = sys.processor_records(RelationCache)?;
     // The highest level seen, and its instances' bytes together.
     let mut last: Option<(u8, u64)> = None;
-    topology::each_record(&records, |record| {
-        if record.Relationship == RelationCache {
-            // SAFETY: a `RelationCache` record's union is its cache.
-            let cache = unsafe { &record.Anonymous.Cache };
-            if cache.Type == CacheData || cache.Type == CacheUnified {
-                let size = u64::from(cache.CacheSize);
-                last = match last {
-                    Some((level, total)) if level == cache.Level => Some((level, total + size)),
-                    Some((level, _)) if level > cache.Level => last,
-                    _ => Some((cache.Level, size)),
-                };
-            }
+    records.caches(|cache| {
+        if cache.Type == CacheData || cache.Type == CacheUnified {
+            let size = u64::from(cache.CacheSize);
+            last = match last {
+                Some((level, total)) if level == cache.Level => Some((level, total + size)),
+                Some((level, _)) if level > cache.Level => last,
+                _ => Some((cache.Level, size)),
+            };
         }
     });
     last.map(|(_, total)| total)

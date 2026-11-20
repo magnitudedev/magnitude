@@ -35,7 +35,7 @@
 //! names, and lies along that kind's access path. Charges may confine the
 //! allocations made through them to one kind ([`Charges::confined`]).
 
-pub use seismic_memory::entry::{Backed, Carved, Change, Charge, Charging, DropScope, Entry, Refused, Store, Tally, Wiring};
+pub use seismic_memory::entry::{Backed, BackedCharge, CarvableCharge, Carved, Change, Charge, Charging, DropInChange, Entry, Refused, ScopedDrop, Store, Tally, Wiring};
 use crate::api::device::DeviceInner;
 pub use seismic_memory::{
     AllocationFailure, HostBlock, NoBlockingAllocationGuard, PageSize, assert_blocking_allocation_allowed,

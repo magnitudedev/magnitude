@@ -20,7 +20,7 @@ use objc2_metal::{
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::DeviceService;
 use std::fmt;
-use seismic_memory::entry::{Backed, DropScope, Entry, Store, Wiring};
+use seismic_memory::entry::{Backed, DropInChange, Entry, ScopedDrop, Store, Wiring};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::{any::Any, ptr::NonNull};
 
@@ -488,21 +488,29 @@ fn shared_buffer(
     }
 }
 
+struct WiredAllocationInner {
+    residency: Arc<Residency>,
+    buffer: ChargedBuffer,
+    /// A pool block's mapping, unmapped as it is released:
+    /// after the buffer over it. Held only for its drop.
+    _mapping: Option<Mapping>,
+}
+
+impl DropInChange for WiredAllocationInner {
+    fn drop_entry(&self) -> Option<&Arc<dyn Entry>> {
+        Some(self.buffer.entry())
+    }
+
+    fn before_drop(&mut self) {
+        self.residency.remove(&self.buffer);
+    }
+}
+
 /// A buffer's membership of its device's residency set, and the charge of
 /// its bytes. It is requested resident from the commit that adds it until
 /// this is dropped ([`Residency`]); its bytes are charged to the entry its
 /// allocation named until then ([`MetalDevice::allocate_bytes`]).
-pub struct WiredAllocation {
-    residency: Arc<Residency>,
-    buffer: ChargedBuffer,
-    /// A pool block's mapping, unmapped as it is released ([`Self::drop`]):
-    /// after the buffer over it. Held only for its drop.
-    _mapping: Option<Mapping>,
-    /// The change its drop runs in ([`DropScope`]): last, so the charge's
-    /// free and the unmapping, an OS effect of the drop beside the
-    /// buffer's release, are one change.
-    scope: DropScope,
-}
+pub struct WiredAllocation(ScopedDrop<WiredAllocationInner>);
 
 unsafe impl Send for WiredAllocation {}
 unsafe impl Sync for WiredAllocation {}
@@ -514,25 +522,16 @@ impl WiredAllocation {
         mapping: Option<Mapping>,
     ) -> Self {
         residency.add(&buffer);
-        Self {
+        Self(ScopedDrop::new(WiredAllocationInner {
             residency: residency.clone(),
             buffer,
             _mapping: mapping,
-            scope: DropScope::default(),
-        }
+        }))
     }
-}
 
-impl Drop for WiredAllocation {
-    /// The buffer leaves the residency set first, then its fields drop in
-    /// order: the buffer is released, and a block's mapping, which no work
-    /// reads any more (the granule pool returns a block only after its
-    /// granules' fences), is unmapped, its pages free within the drop. So
-    /// our own release of a block shows in the next host reading with a
-    /// release λ of 0, as anonymous memory's does.
-    fn drop(&mut self) {
-        self.scope.begin(self.buffer.entry());
-        self.residency.remove(&self.buffer);
+    #[cfg(test)]
+    fn buffer(&self) -> &ChargedBuffer {
+        &self.0.buffer
     }
 }
 
@@ -571,17 +570,26 @@ enum Storage {
 /// beside the bytes its caller holds.
 const STAGING_CHUNK: usize = 16 << 20;
 
-/// One transient staging buffer held for the duration of a single blit chunk.
-/// Its charge release and optional mapping unmap run together inside `scope`.
-struct StagedBuffer {
+struct StagedBufferInner {
     buffer: ChargedBuffer,
     _mapping: Option<Mapping>,
-    scope: DropScope,
 }
 
-impl Drop for StagedBuffer {
-    fn drop(&mut self) {
-        self.scope.begin(self.buffer.entry());
+impl DropInChange for StagedBufferInner {
+    fn drop_entry(&self) -> Option<&Arc<dyn Entry>> {
+        Some(self.buffer.entry())
+    }
+}
+
+/// One transient staging buffer held for the duration of a single blit chunk.
+/// Its charge release and optional mapping unmap run together inside one change.
+struct StagedBuffer(ScopedDrop<StagedBufferInner>);
+
+impl std::ops::Deref for StagedBuffer {
+    type Target = StagedBufferInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -646,11 +654,10 @@ impl Staging {
             // SAFETY: `buffer` is a writable shared buffer of at least `length` bytes.
             unsafe { host_write(buffer.contents().as_ptr().cast::<u8>(), length as u64, 0, bytes) };
         }
-        Ok(StagedBuffer {
+        Ok(StagedBuffer(ScopedDrop::new(StagedBufferInner {
             buffer,
             _mapping: mapping,
-            scope: DropScope::default(),
-        })
+        })))
     }
 
     /// Write `bytes` at `offset` of `buffer`, of `length` bytes, staged
@@ -1645,7 +1652,7 @@ mod mapped_tests {
         let entry = crate::test_support::entry();
         let buffer = device.allocate_bytes(1 << 16, &entry).unwrap();
         let wired = buffer._wired.as_ref().expect("an allocated buffer is in the set");
-        assert_eq!(wired.buffer.charge().wiring(), Wiring::Wired);
+        assert_eq!(wired.buffer().charge().wiring(), Wiring::Wired);
         assert_eq!(device.order.charge().wiring(), Wiring::Pageable);
     }
 
@@ -1772,46 +1779,11 @@ mod mapped_tests {
         assert_eq!(store.held(), baseline);
     }
 
-    /// `task_vm_info` (`TASK_VM_INFO`) through `phys_footprint`, laid out as
-    /// the kernel writes it.
-    #[allow(dead_code)]
-    #[repr(C)]
-    #[derive(Default)]
-    struct TaskVm {
-        virtual_size: u64,
-        region_count: i32,
-        page_size: i32,
-        resident_size: u64,
-        resident_size_peak: u64,
-        device: u64,
-        device_peak: u64,
-        internal: u64,
-        internal_peak: u64,
-        external: u64,
-        external_peak: u64,
-        reusable: u64,
-        reusable_peak: u64,
-        purgeable_volatile_pmap: u64,
-        purgeable_volatile_resident: u64,
-        purgeable_volatile_virtual: u64,
-        compressed: u64,
-        compressed_peak: u64,
-        compressed_lifetime: u64,
-        phys_footprint: u64,
-    }
-
     /// This process's physical footprint now, read live.
     fn footprint() -> u64 {
-        const TASK_VM_INFO: libc::task_flavor_t = 22;
-        let mut vm = TaskVm::default();
-        let words = (std::mem::size_of::<TaskVm>() / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
-        let mut count = words;
-        #[allow(deprecated)]
-        let task = unsafe { libc::mach_task_self() };
-        let status = unsafe { libc::task_info(task, TASK_VM_INFO, (&mut vm as *mut TaskVm).cast(), &mut count) };
-        assert_eq!(status, libc::KERN_SUCCESS, "task_info TASK_VM_INFO returned {status}");
-        assert_eq!(count, words, "task_vm_info reaches phys_footprint");
-        vm.phys_footprint
+        seismic_native_target::process::macos::task_vm_info()
+            .expect("task_info TASK_VM_INFO")
+            .phys_footprint
     }
 
     #[test]

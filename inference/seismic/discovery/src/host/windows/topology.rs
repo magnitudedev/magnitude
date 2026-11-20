@@ -8,26 +8,115 @@ use seismic_topology::{
 };
 use std::collections::BTreeSet;
 use windows_sys::Win32::System::SystemInformation::{
-    GROUP_AFFINITY, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    CACHE_RELATIONSHIP, GROUP_AFFINITY, LOGICAL_PROCESSOR_RELATIONSHIP, NUMA_NODE_RELATIONSHIP,
+    PROCESSOR_RELATIONSHIP, RelationCache, RelationNumaNode, RelationProcessorCore,
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 
-/// Each record of `buffer` ([`Sys::processor_records`]), in order.
-pub(super) fn each_record(
-    buffer: &[u64],
-    mut each: impl FnMut(&SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX),
-) {
-    let (bytes, length) = (buffer.as_ptr().cast::<u8>(), buffer.len() * 8);
-    let mut offset = 0usize;
-    while offset < length {
-        // SAFETY: the OS wrote consecutive records, each `Size` bytes long.
-        let record = unsafe {
-            &*(bytes.add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
-        };
-        if record.Size == 0 {
-            break;
+/// Aligned, exact-length buffer of `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX`
+/// records returned by `GetLogicalProcessorInformationEx`.
+#[derive(Clone)]
+pub(crate) struct ProcessorRecords {
+    words: Vec<u64>,
+    byte_len: usize,
+}
+
+impl ProcessorRecords {
+    pub(crate) fn new(words: Vec<u64>, byte_len: usize) -> Self {
+        assert!(
+            byte_len <= words.len().saturating_mul(std::mem::size_of::<u64>()),
+            "invariant violated: ProcessorRecords byte_len {byte_len} exceeds backing buffer"
+        );
+        Self { words, byte_len }
+    }
+
+    /// Walk each valid `(Relationship, ptr, size)` header in the buffer using
+    /// raw pointers so we never construct an over-wide `&SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX`
+    /// reference over a shorter variant or trailing tail.
+    fn each_raw(
+        &self,
+        mut each: impl FnMut(
+            LOGICAL_PROCESSOR_RELATIONSHIP,
+            *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+            usize,
+        ),
+    ) {
+        const HEADER_BYTES: usize = 8;
+        let align = std::mem::align_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>();
+        let base = self.words.as_ptr().cast::<u8>();
+        let mut offset = 0usize;
+        while offset.saturating_add(HEADER_BYTES) <= self.byte_len && offset % align == 0 {
+            // SAFETY: `words` is 8-byte aligned and each OS record is aligned to
+            // at least 4 bytes; `offset + HEADER_BYTES <= self.byte_len`.
+            let record = unsafe { base.add(offset).cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() };
+            let relationship = unsafe { std::ptr::addr_of!((*record).Relationship).read_unaligned() };
+            let size = unsafe { std::ptr::addr_of!((*record).Size).read_unaligned() } as usize;
+            if size < HEADER_BYTES || offset.saturating_add(size) > self.byte_len {
+                break;
+            }
+            each(relationship, record, size);
+            offset += size;
         }
-        each(record);
-        offset += record.Size as usize;
+    }
+
+    /// Visit every `RelationCache` record whose byte size covers `CACHE_RELATIONSHIP`.
+    pub(super) fn caches(&self, mut each: impl FnMut(&CACHE_RELATIONSHIP)) {
+        let union_offset = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+        let needed = union_offset + std::mem::size_of::<CACHE_RELATIONSHIP>();
+        self.each_raw(|relationship, record, size| {
+            if relationship == RelationCache && size >= needed {
+                // SAFETY: `relationship == RelationCache` and `size` covers the full
+                // `CACHE_RELATIONSHIP` payload inside the allocation.
+                let cache = unsafe { &*std::ptr::addr_of!((*record).Anonymous.Cache) };
+                each(cache);
+            }
+        });
+    }
+
+    /// Visit every `RelationProcessorCore` record, yielding `(efficiency_class, group_masks)`.
+    fn processor_cores(&self, mut each: impl FnMut(u8, &[GROUP_AFFINITY])) {
+        let union_offset = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+        let masks_offset = union_offset + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupMask);
+        let min_size = union_offset + std::mem::size_of::<PROCESSOR_RELATIONSHIP>();
+        self.each_raw(|relationship, record, size| {
+            if relationship != RelationProcessorCore || size < min_size {
+                return;
+            }
+            // SAFETY: `relationship == RelationProcessorCore` and `size` covers the
+            // fixed header of `PROCESSOR_RELATIONSHIP`.
+            let core = unsafe { &*std::ptr::addr_of!((*record).Anonymous.Processor) };
+            let count = usize::from(core.GroupCount);
+            let masks_end = masks_offset.saturating_add(count.saturating_mul(std::mem::size_of::<GROUP_AFFINITY>()));
+            if masks_end <= size {
+                // SAFETY: `count` `GROUP_AFFINITY` entries lie strictly within `size`.
+                let masks = unsafe { std::slice::from_raw_parts(core.GroupMask.as_ptr(), count) };
+                each(core.EfficiencyClass, masks);
+            }
+        });
+    }
+
+    /// Visit every `RelationNumaNode` record, yielding `(node_number, group_masks)`.
+    fn numa_nodes(&self, mut each: impl FnMut(u32, &[GROUP_AFFINITY])) {
+        let union_offset = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+        let masks_offset = union_offset + std::mem::offset_of!(NUMA_NODE_RELATIONSHIP, Anonymous);
+        let min_size = union_offset + std::mem::size_of::<NUMA_NODE_RELATIONSHIP>();
+        self.each_raw(|relationship, record, size| {
+            if relationship != RelationNumaNode || size < min_size {
+                return;
+            }
+            // SAFETY: `relationship == RelationNumaNode` and `size` covers the
+            // fixed header of `NUMA_NODE_RELATIONSHIP`.
+            let node = unsafe { &*std::ptr::addr_of!((*record).Anonymous.NumaNode) };
+            let count = usize::from(node.GroupCount).max(1);
+            let masks_end = masks_offset.saturating_add(count.saturating_mul(std::mem::size_of::<GROUP_AFFINITY>()));
+            if masks_end <= size {
+                // SAFETY: `count` `GROUP_AFFINITY` entries lie strictly within `size`.
+                let masks = unsafe {
+                    std::slice::from_raw_parts(node.Anonymous.GroupMasks.as_ptr(), count)
+                };
+                each(node.NodeNumber, masks);
+            }
+        });
     }
 }
 
@@ -46,7 +135,8 @@ fn group_cpus(masks: &[GROUP_AFFINITY]) -> Vec<usize> {
 }
 
 /// Each NUMA node (`RelationNumaNode`), with memory where
-/// `GetNumaAvailableMemoryNodeEx` reports any available on it, its cores
+/// `GetNumaAvailableMemoryNodeEx` answers for it (static node memory presence,
+/// independent of momentary free bytes under pressure), its cores
 /// (`RelationProcessorCore`) those whose threads lie in it, each a
 /// performance core of the highest `EfficiencyClass`; the process may run
 /// on the CPUs of its groups (`GetProcessGroupAffinity`), within its
@@ -70,51 +160,37 @@ pub(crate) fn processors(sys: &impl Sys) -> Processors {
 /// The nodes and allowed CPUs the OS reports ([`processors`]), none where
 /// any of them is unanswered.
 fn reported_processors(sys: &impl Sys) -> Option<(Vec<MemoryNode>, BTreeSet<usize>)> {
-    use windows_sys::Win32::System::SystemInformation::{RelationNumaNode, RelationProcessorCore};
     let mut cores = Vec::new();
-    each_record(&sys.processor_records(RelationProcessorCore)?, |record| {
-        // SAFETY: a `RelationProcessorCore` record's union is its processor.
-        let core = unsafe { &record.Anonymous.Processor };
-        // SAFETY: the record holds `GroupCount` masks.
-        let masks = unsafe {
-            std::slice::from_raw_parts(core.GroupMask.as_ptr(), usize::from(core.GroupCount))
-        };
-        cores.push((group_cpus(masks), core.EfficiencyClass));
-    });
+    sys.processor_records(RelationProcessorCore)?
+        .processor_cores(|efficiency_class, masks| {
+            cores.push((group_cpus(masks), efficiency_class));
+        });
     let fastest = cores.iter().map(|(_, class)| *class).max()?;
     let mut nodes = Vec::new();
     let mut unanswered = false;
-    each_record(&sys.processor_records(RelationNumaNode)?, |record| {
-        // SAFETY: a `RelationNumaNode` record's union is its node, holding
-        // `GroupCount` masks (one where it reports none).
-        let node = unsafe { &record.Anonymous.NumaNode };
-        let masks = unsafe {
-            std::slice::from_raw_parts(
-                node.Anonymous.GroupMasks.as_ptr(),
-                usize::from(node.GroupCount).max(1),
-            )
-        };
-        let cpus = group_cpus(masks);
-        let number = u16::try_from(node.NodeNumber)
-            .unwrap_or_else(|_| panic!("invariant violated: NUMA node {}", node.NodeNumber));
-        let Some(available) = sys.numa_available(number) else {
-            unanswered = true;
-            return;
-        };
-        let cores = cores
-            .iter()
-            .filter(|(threads, _)| threads.first().is_some_and(|first| cpus.contains(first)))
-            .map(|(threads, class)| Core {
-                threads: threads.clone(),
-                performance: *class == fastest,
-            })
-            .collect();
-        nodes.push(MemoryNode {
-            id: usize::from(number),
-            memory: available > 0,
-            cores,
+    sys.processor_records(RelationNumaNode)?
+        .numa_nodes(|node_number, masks| {
+            let cpus = group_cpus(masks);
+            let number = u16::try_from(node_number)
+                .unwrap_or_else(|_| panic!("invariant violated: NUMA node {node_number}"));
+            if sys.numa_available(number).is_none() {
+                unanswered = true;
+                return;
+            }
+            let cores = cores
+                .iter()
+                .filter(|(threads, _)| threads.first().is_some_and(|first| cpus.contains(first)))
+                .map(|(threads, class)| Core {
+                    threads: threads.clone(),
+                    performance: *class == fastest,
+                })
+                .collect();
+            nodes.push(MemoryNode {
+                id: usize::from(number),
+                memory: true,
+                cores,
+            });
         });
-    });
     if unanswered {
         return None;
     }

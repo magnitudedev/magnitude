@@ -240,9 +240,10 @@ impl Supply {
 }
 
 /// `free` less `floor`, signed: what [`Supply::free_beyond_target`] holds.
+/// Clamped to `i64::MIN..=i64::MAX` so OS limits above `i64::MAX` (such as
+/// Linux `RLIMIT_AS` or Windows working-set/job caps) never panic.
 pub(crate) fn beyond(free: u64, floor: u64) -> i64 {
-    let signed = |bytes: u64| i64::try_from(bytes).expect("a store's bytes fit i64");
-    signed(free) - signed(floor)
+    (i128::from(free) - i128::from(floor)).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 /// When a sample's counters show the machine, by the OS's mechanism that
