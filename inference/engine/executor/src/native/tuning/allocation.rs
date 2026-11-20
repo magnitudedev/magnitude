@@ -290,6 +290,11 @@ pub(crate) trait Unit {
     /// The unit's share of expected step time at its defaults: measured
     /// once baseline discovery is complete; unknown before then.
     fn share(&self) -> f64;
+    /// Prior weight for ordering baseline discovery (`Stage::Discovery`)
+    /// before measured shares are available. Higher weight discovers earlier.
+    fn discovery_weight(&self) -> f64 {
+        1.0
+    }
     /// The kind of unit: units of one kind check the same untimed points
     /// in their conversions ([`Unpriced`]).
     fn kind(&self) -> &'static str {
@@ -897,6 +902,46 @@ fn device_ends(now: Duration, mut jobs: Vec<(Duration, Duration)>) -> Duration {
     })
 }
 
+/// What is owed when the allocator stops, once each unit `working` has run
+/// one more piece: its own ending, and what every unit owes, where units
+/// with work in flight will have worked too.
+fn compute_owed<U: Unit>(
+    units: &[U],
+    ending: &[Duration],
+    flying: impl Fn(usize) -> bool,
+    longest: Duration,
+) -> Vec<Duration> {
+    let base_unit_owed = (0..units.len())
+        .map(|unit| forecast(&units[unit].owed(flying(unit)), longest))
+        .collect::<Vec<_>>();
+    let base_owed = base_unit_owed
+        .iter()
+        .copied()
+        .fold(Duration::ZERO, Duration::saturating_add);
+    (0..units.len())
+        .map(|working| {
+            let sum = if flying(working) {
+                base_owed
+            } else {
+                let worked = forecast(&units[working].owed(true), longest);
+                let base = base_unit_owed[working];
+                if base_owed < Duration::MAX {
+                    base_owed.saturating_sub(base).saturating_add(worked)
+                } else if worked >= base {
+                    Duration::MAX
+                } else {
+                    base_unit_owed
+                        .iter()
+                        .enumerate()
+                        .filter(|(unit, _)| *unit != working)
+                        .fold(worked, |acc, (_, &value)| acc.saturating_add(value))
+                }
+            };
+            ending[working].saturating_add(sum)
+        })
+        .collect()
+}
+
 /// Spend `total` on the units' work, starting only work whose price fits
 /// what remains. `longest` is the longest single non-compile operation the
 /// load completed before the allocator began; `compiled` is the longest
@@ -947,7 +992,14 @@ pub(crate) fn allocate<U: Unit>(
     // allocator's other classes.
     let mut opened = None::<Duration>;
     let mut apart = Duration::ZERO;
-    report.ending.began = clock.now();
+    let began = clock.now();
+    report.ending.began = began;
+    // Cap baseline discovery to 1/3 of the optional search budget so large
+    // models do not spend 100% of the budget on Stage::Discovery; once this
+    // cutoff is reached and at least one non-departed unit is discovered
+    // with post-discovery work, remaining undiscovered units depart so the
+    // objective freezes and discovered high-demand units proceed to tuning.
+    let discovery_cutoff = began.saturating_add(total.saturating_sub(began) / 3);
     let outcome = loop {
         let opening = clock.now();
         if let Some(opened) = opened {
@@ -970,17 +1022,46 @@ pub(crate) fn allocate<U: Unit>(
         if let Err(failure) = landed {
             break Err(failure);
         }
+        let flying = |unit: usize| flights.iter().any(|flight| flight.unit == unit);
+        // Once the discovery phase reaches its cutoff and at least one
+        // non-departed unit is discovered with post-discovery work, depart
+        // remaining undiscovered units so the objective freezes and the
+        // remaining budget tunes the discovered high-demand units.
+        let mut objective_ready =
+            (0..units.len()).all(|unit| departed[unit] || units[unit].discovered());
+        if !objective_ready
+            && opening >= discovery_cutoff
+            && (0..units.len()).any(|unit| {
+                !departed[unit] && units[unit].discovered() && units[unit].next().is_some()
+            })
+        {
+            let leaving = (0..units.len())
+                .filter(|unit| !departed[*unit] && !units[*unit].discovered() && !flying(*unit))
+                .collect::<Vec<_>>();
+            if !leaving.is_empty() {
+                let standing = leaving
+                    .iter()
+                    .filter_map(|unit| units[*unit].next().map(|work| (*unit, work)))
+                    .collect();
+                let no_barred = vec![false; units.len()];
+                report
+                    .refused
+                    .extend(refuse(units, context, standing, &starved, &no_barred));
+                for unit in leaving {
+                    departed[unit] = true;
+                }
+                objective_ready =
+                    (0..units.len()).all(|unit| departed[unit] || units[unit].discovered());
+            }
+        }
         // The objective is every unit still of the work and every unit that
         // left it discovered; it is measured once each of them is.
         let objective = (0..units.len())
             .map(|unit| !departed[unit] || units[unit].discovered())
             .collect::<Vec<_>>();
-        let objective_ready =
-            (0..units.len()).all(|unit| departed[unit] || units[unit].discovered());
         if objective_ready {
             U::refresh(units, &objective, context);
         }
-        let flying = |unit: usize| flights.iter().any(|flight| flight.unit == unit);
         let offers = units
             .iter()
             .enumerate()
@@ -1042,19 +1123,7 @@ pub(crate) fn allocate<U: Unit>(
         // What is owed when the allocator stops, once `working` has run
         // one more piece: its own ending, and what the units owe, where
         // the units with work in flight will have worked too.
-        let owed = (0..units.len())
-            .map(|working| {
-                units
-                    .iter()
-                    .enumerate()
-                    .fold(ending[working], |sum, (unit, offered)| {
-                        sum.saturating_add(forecast(
-                            &offered.owed(unit == working || flying(unit)),
-                            longest,
-                        ))
-                    })
-            })
-            .collect::<Vec<_>>();
+        let owed = compute_owed(units, &ending, &flying, longest);
         // The ending begins at the earliest cutoff of the pieces in flight
         // ([`Unit::perform`]): from then what they would measure and what
         // is owed after it no longer fit, whatever their compiles do.
@@ -1242,7 +1311,16 @@ pub(crate) fn allocate<U: Unit>(
                 compiled,
             );
             if work.stage == Stage::Discovery {
-                return discovery_effort[*unit].as_secs_f64();
+                let weight = units[*unit].discovery_weight();
+                return if weight > 0. {
+                    discovery_effort[*unit]
+                        .saturating_add(price)
+                        .max(Duration::from_nanos(1))
+                        .as_secs_f64()
+                        / weight
+                } else {
+                    f64::INFINITY
+                };
             }
             let opportunity = units[*unit].share() * work.opportunity;
             if opportunity > 0. {
@@ -1958,6 +2036,8 @@ mod tests {
         name: usize,
         clock: Fake,
         share: f64,
+        discovery_weight: f64,
+        refreshed: usize,
         points: usize,
         discovery: Duration,
         measurement: Duration,
@@ -2108,6 +2188,8 @@ mod tests {
                 name,
                 clock: clock.clone(),
                 share,
+                discovery_weight: 1.,
+                refreshed: 0,
                 points: 1,
                 discovery: SECOND,
                 measurement: SECOND,
@@ -2248,6 +2330,14 @@ mod tests {
         type Forming = Duration;
         type Formed = ();
 
+        fn refresh(units: &mut [Self], members: &[bool], _: &mut Log) {
+            for (unit, member) in units.iter_mut().zip(members) {
+                if *member {
+                    unit.refreshed += 1;
+                }
+            }
+        }
+
         fn prerequisites(&self) -> Vec<usize> {
             self.prerequisites.clone()
         }
@@ -2258,6 +2348,10 @@ mod tests {
 
         fn share(&self) -> f64 {
             self.share
+        }
+
+        fn discovery_weight(&self) -> f64 {
+            self.discovery_weight
         }
 
         fn refused_for_bytes(&mut self, _: &mut Log) {
@@ -3375,12 +3469,12 @@ mod tests {
             discovery: if name == 1 { SECOND } else { SECOND * 3 },
             ..Synthetic::new(name, clock, 0.5, challengers)
         };
-        // Unknown discovery receives no invented importance or free price.
-        // Equal elapsed effort starts in preparation order.
+        // With equal discovery weight, virtual finish ranks the lower-priced
+        // unpriced discovery ahead of the 3 s priced discovery.
         let clock = Fake::default();
         let mut units = [unit(&clock, 0, &[]), unit(&clock, 1, &[])];
         let (log, _) = run(&mut units, &clock, 10);
-        assert_eq!(stages(&log), [(0, Stage::Discovery), (1, Stage::Discovery)]);
+        assert_eq!(stages(&log), [(1, Stage::Discovery), (0, Stage::Discovery)]);
         // The load has completed a 1 s operation: the unpriced discovery is
         // ranked at 1 s, behind the 3 s discovery of a unit worth nine
         // times as much. That makes 3 s the longest operation completed:
@@ -3389,10 +3483,12 @@ mod tests {
         let mut units = [
             Synthetic {
                 share: 0.9,
+                discovery_weight: 0.9,
                 ..unit(&clock, 0, &[])
             },
             Synthetic {
                 share: 0.1,
+                discovery_weight: 0.1,
                 ..unit(&clock, 1, &[])
             },
         ];
@@ -4659,5 +4755,160 @@ mod tests {
             [true, false],
             "the unit the room stopped was told, the one tuned was not"
         );
+    }
+
+    /// Units with higher `discovery_weight` complete baseline discovery ahead
+    /// of lower-weight units, matching virtual finish time.
+    #[test]
+    fn higher_discovery_weight_units_discover_first() {
+        let clock = Fake::default();
+        let mut units = [
+            Synthetic {
+                discovery_weight: 1.,
+                points: 2,
+                ..Synthetic::new(0, &clock, 0.05, &[0.8])
+            },
+            Synthetic {
+                discovery_weight: 48.,
+                points: 2,
+                ..Synthetic::new(1, &clock, 0.70, &[0.8])
+            },
+            Synthetic {
+                discovery_weight: 12.,
+                points: 2,
+                ..Synthetic::new(2, &clock, 0.25, &[0.8])
+            },
+        ];
+        let (log, _) = run(&mut units, &clock, 60);
+        let discoveries = stages(&log)
+            .into_iter()
+            .filter(|(_, stage)| *stage == Stage::Discovery)
+            .map(|(unit, _)| unit)
+            .collect::<Vec<_>>();
+        // Unit 1 (weight 48) finishes both points first: virtual finish
+        // 1/48 < 2/48 < 1/12 < 2/12 < 1/1 < 2/1.
+        assert_eq!(discoveries, [1, 1, 2, 2, 0, 0]);
+    }
+
+    /// When discovery reaches the 1/3 budget cutoff with high-weight units
+    /// already discovered, remaining undiscovered units depart cleanly,
+    /// `U::refresh` runs over the discovered set, and discovered units advance
+    /// to `Stage::Form` / `Stage::Measure` instead of spending 100% of the
+    /// budget on `Stage::Discovery`.
+    #[test]
+    fn discovery_cutoff_departs_undiscovered_units_and_advances_to_tuning() {
+        let clock = Fake::default();
+        // 15 units each taking 2 s to discover (30 s total > 10 s cutoff of a
+        // 30 s budget). Units 0..3 have high discovery_weight and discover
+        // first within the 10 s discovery window; units 5..15 depart at the
+        // cutoff so units 0..5 refresh and spend the remaining ~20 s on Form
+        // and Measure.
+        let mut units = (0..15)
+            .map(|name| Synthetic {
+                discovery: SECOND * 2,
+                discovery_weight: if name < 5 { 48. } else { 1. },
+                forms: 1,
+                ..Synthetic::new(name, &clock, if name < 5 { 0.2 } else { 0.01 }, &[0.5, 0.4])
+            })
+            .collect::<Vec<_>>();
+        let (log, report) = run(&mut units, &clock, 30);
+        let log = stages(&log);
+        // The 5 high-weight units completed discovery within the 10 s cutoff.
+        for unit in 0..5 {
+            assert_eq!(units[unit].discovered, 1, "high-weight unit {unit} discovered");
+            assert!(
+                units[unit].refreshed > 0,
+                "high-weight unit {unit} received U::refresh"
+            );
+        }
+        // Low-weight units departed at the cutoff without running discovery.
+        for unit in 5..15 {
+            assert_eq!(units[unit].discovered, 0, "low-weight unit {unit} departed");
+            assert_eq!(units[unit].refreshed, 0, "departed unit {unit} excluded from refresh");
+        }
+        assert!(
+            log.iter().any(|(_, stage)| *stage == Stage::Form),
+            "discovered units advanced to Stage::Form: {log:?}"
+        );
+        assert!(
+            log.iter().any(|(_, stage)| *stage == Stage::Measure),
+            "discovered units advanced to Stage::Measure: {log:?}"
+        );
+        assert!(
+            log.iter().any(|(_, stage)| *stage == Stage::Promote),
+            "discovered units advanced to Stage::Promote: {log:?}"
+        );
+        assert!(
+            report
+                .refused
+                .iter()
+                .filter(|r| r.stage == Stage::Discovery && r.refusal == Refusal::Seconds)
+                .count()
+                == 10,
+            "the 10 departing undiscovered units were recorded as refused: {:?}",
+            report.refused
+        );
+    }
+
+    /// O(N) `compute_owed` matches the original O(N^2) sum across flying,
+    /// non-flying, and saturating cases.
+    #[test]
+    fn owed_linear_matches_quadratic_formula() {
+        let clock = Fake::default();
+        let units = [
+            Synthetic {
+                publication: Duration::from_millis(100),
+                changed: true,
+                ..Synthetic::new(0, &clock, 0.4, &[])
+            },
+            Synthetic {
+                publication: Duration::from_millis(250),
+                changed: false,
+                ..Synthetic::new(1, &clock, 0.3, &[])
+            },
+            Synthetic {
+                publication: Duration::from_millis(400),
+                changed: false,
+                ..Synthetic::new(2, &clock, 0.2, &[])
+            },
+            Synthetic {
+                publication: Duration::MAX,
+                changed: true,
+                ..Synthetic::new(3, &clock, 0.1, &[])
+            },
+        ];
+        let ending = [
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+        ];
+        let longest = SECOND;
+        for flying_mask in 0..(1usize << units.len()) {
+            let flying = |u: usize| (flying_mask & (1 << u)) != 0;
+            // Test both non-saturating (units[0..3]) and saturating (units[0..4]).
+            for len in [3usize, 4usize] {
+                let slice = &units[..len];
+                let end = &ending[..len];
+                let expected: Vec<Duration> = (0..len)
+                    .map(|working| {
+                        slice
+                            .iter()
+                            .enumerate()
+                            .fold(end[working], |sum, (unit, offered)| {
+                                sum.saturating_add(forecast(
+                                    &offered.owed(unit == working || flying(unit)),
+                                    longest,
+                                ))
+                            })
+                    })
+                    .collect();
+                let actual = compute_owed(slice, end, flying, longest);
+                assert_eq!(
+                    actual, expected,
+                    "mismatch for len={len}, flying_mask={flying_mask:#b}"
+                );
+            }
+        }
     }
 }

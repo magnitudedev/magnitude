@@ -1749,6 +1749,31 @@ struct Incumbent<'s> {
     points: &'s [PointMeasurement],
 }
 
+/// Shared sustained clock slot for a device across all tuning units in a load.
+type ClockSlot = Rc<std::cell::RefCell<Option<Arc<Clock<CallError>>>>>;
+
+/// Return the shared clock slot for `device`, creating one if no unit on
+/// `device` currently holds one. Stored via `Weak` so the clock (and its
+/// device gauge) is freed as soon as all tuning units on `device` are dropped.
+fn shared_clock(device: &Arc<DeviceInner>) -> ClockSlot {
+    thread_local! {
+        static DEVICE_CLOCKS: std::cell::RefCell<
+            HashMap<usize, std::rc::Weak<std::cell::RefCell<Option<Arc<Clock<CallError>>>>>>,
+        > = std::cell::RefCell::new(HashMap::new());
+    }
+    DEVICE_CLOCKS.with(|map| {
+        let mut guard = map.borrow_mut();
+        guard.retain(|_, weak| weak.strong_count() > 0);
+        let key = Arc::as_ptr(device) as usize;
+        if let Some(slot) = guard.get(&key).and_then(std::rc::Weak::upgrade) {
+            return slot;
+        }
+        let slot = Rc::new(std::cell::RefCell::new(None));
+        guard.insert(key, Rc::downgrade(&slot));
+        slot
+    })
+}
+
 /// What a session of matched rounds is run with.
 struct Matching<'s> {
     deadline: Deadline,
@@ -1758,31 +1783,39 @@ struct Matching<'s> {
     /// by.
     rates: &'s mut Rates,
     shuffle: &'s mut Shuffle,
-    /// The device's sustained clock, held by the unit from its first
-    /// session ([`Clock`]).
-    clock: &'s mut Option<Arc<Clock<CallError>>>,
+    /// The device's sustained clock, shared by the load's units on the same
+    /// device from the first session ([`Clock`]).
+    clock: &'s ClockSlot,
     /// What the unit's witnesses and rounds have cost and how often each
     /// ended a challenger: the order its challengers' tests are taken in.
     sequence: &'s mut Sequence,
 }
 
 /// Bring the device of `placed`'s slots to its sustained clock for the
-/// session that follows at once, with the clock its unit holds in `held`:
-/// the unit's own work, which is `placed`'s first slot's when the unit
-/// holds none yet ([`Clock::hold`]).
+/// session that follows at once, with the clock held in `held`:
+/// `placed`'s first slot's when the device holds none yet ([`Clock::hold`]).
 fn raise(
-    held: &mut Option<Arc<Clock<CallError>>>,
+    held: &ClockSlot,
     placed: &[PointTiming],
     settings: &SearchSettings,
     min_sample_seconds: f64,
     deadline: Deadline,
-) -> Result<(), WorkError<CallError>> {
+) -> Result<Option<Arc<Clock<CallError>>>, WorkError<CallError>> {
     let Some(first) = placed.first() else {
-        return Ok(());
+        return Ok(held.borrow().clone());
     };
     // The device's state is asked the evidence a lead is.
-    let clock = Clock::hold(held, first.slot(), min_sample_seconds, settings.error_rate)?;
-    warm(&clock, placed, deadline)
+    let clock = {
+        let mut guard = held.borrow_mut();
+        Clock::hold(
+            &mut *guard,
+            first.slot(),
+            min_sample_seconds,
+            settings.error_rate,
+        )?
+    };
+    warm(&clock, placed, deadline)?;
+    Ok(Some(clock))
 }
 
 /// What a challenger new to the unit takes at the timed points besides its
@@ -2274,27 +2307,31 @@ fn measure_matched(
     // device is given nothing but the session's work. A device that cannot
     // be raised samples nothing.
     let sampling = Instant::now();
-    if let Err(error) = raise(
+    let clock = match raise(
         matching.clock,
         &placed,
         matching.settings,
         minimum,
         matching.deadline,
     ) {
-        if let WorkError::Failed(error) = error {
-            let exclusion = Exclusion::measuring("device clock".into(), error);
-            for (failure, pairing) in failures.iter_mut().zip(&mut rounds.pairings) {
-                failure.get_or_insert(exclusion.clone());
-                pairing.admitted = 0;
+        Ok(clock) => clock,
+        Err(error) => {
+            if let WorkError::Failed(error) = error {
+                let exclusion = Exclusion::measuring("device clock".into(), error);
+                for (failure, pairing) in failures.iter_mut().zip(&mut rounds.pairings) {
+                    failure.get_or_insert(exclusion.clone());
+                    pairing.admitted = 0;
+                }
             }
+            matching.clock.borrow().clone()
         }
-    }
+    };
     while let Err(failure) = sample(
         &mut placed,
         minimum,
         &mut rounds,
         matching.shuffle,
-        matching.clock.as_deref(),
+        clock.as_deref(),
         matching.deadline,
     ) {
         let error = match failure.error {
@@ -2647,18 +2684,32 @@ struct PointSurveyor {
     shuffle: Shuffle,
     /// The device's sustained clock, held from the first session
     /// ([`Clock`]).
-    clock: Option<Arc<Clock<CallError>>>,
+    clock: ClockSlot,
 }
 
 impl PointSurveyor {
     fn new(implementation: &NativeImplementation, gated: bool, charges: &Charges) -> Self {
+        Self::with_clock(
+            implementation,
+            gated,
+            charges,
+            Rc::new(std::cell::RefCell::new(None)),
+        )
+    }
+
+    fn with_clock(
+        implementation: &NativeImplementation,
+        gated: bool,
+        charges: &Charges,
+        clock: ClockSlot,
+    ) -> Self {
         Self {
             keying: Keying::of(implementation),
             measured: HashMap::new(),
             outputs: OutputPool::new(charges.clone()),
             gated,
             shuffle: Shuffle::default(),
-            clock: None,
+            clock,
         }
     }
 
@@ -2696,21 +2747,21 @@ impl PointSurveyor {
             .unzip();
         // Each point's own time, the count its caller named, at the
         // device's sustained clock.
-        let clock = |error: CallError| Exclusion::measuring("device clock".into(), error);
-        raise(
-            &mut self.clock,
+        let clock_error = |error: CallError| Exclusion::measuring("device clock".into(), error);
+        let clock = raise(
+            &self.clock,
             &timings,
             settings,
             options.min_sample_seconds,
             deadline,
         )
-        .map_err(|error| error.map(clock))?;
+        .map_err(|error| error.map(clock_error))?;
         sample(
             &mut timings,
             options.min_sample_seconds,
             &mut Counted::new(fresh.len(), options.samples),
             &mut self.shuffle,
-            self.clock.as_deref(),
+            clock.as_deref(),
             deadline,
         )
         .map_err(|failure| {
@@ -3417,9 +3468,9 @@ struct Run {
     samples: BTreeMap<(usize, LaunchKey), PointMeasurement>,
     /// The order of every round's samples, from session to session.
     shuffle: Shuffle,
-    /// The device's sustained clock, held as the unit's census held it
-    /// ([`Clock`]).
-    clock: Option<Arc<Clock<CallError>>>,
+    /// The device's sustained clock, shared across the load's units on the
+    /// same device ([`Clock`]).
+    clock: ClockSlot,
     /// The order the unit's challengers take their two tests in.
     sequence: Sequence,
 }
@@ -3474,6 +3525,9 @@ pub struct UnitSearch<'m, 'a> {
     /// Measures the defaults as points are discovered; none once the
     /// search is open, which places into its own result storage.
     surveyor: Option<PointSurveyor>,
+    /// The device's sustained clock, shared by all tuning units on the same
+    /// device so it is established once per load instead of once per unit.
+    clock: ClockSlot,
     plan: Option<UnitPlan>,
     progress: Progress<'a>,
     /// Building each point's inputs, by point: its class.
@@ -3570,6 +3624,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .default_specialization(&statics)
             .map_err(|error| TuneError::Declaration(error.to_string()))?;
         let launch_scoped = implementation.launch_scoped();
+        let clock = shared_clock(device);
         Ok(Self {
             expired: false,
             unit: Unit {
@@ -3587,7 +3642,13 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             statics,
             cpu,
             backend,
-            surveyor: Some(PointSurveyor::new(&implementation, true, charges)),
+            surveyor: Some(PointSurveyor::with_clock(
+                &implementation,
+                true,
+                charges,
+                clock.clone(),
+            )),
+            clock,
             implementation: implementation.into_implementation(),
             logical,
             mutable,
@@ -3778,20 +3839,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
     }
 
-    /// What the unit's clock did since this was last asked: its raises and
-    /// its establishment ([`Clock::raises`]). The clock is the
-    /// census's until a search takes it.
+    /// What the device's clock did since this was last asked: its raises and
+    /// its establishment ([`Clock::raises`]).
     fn raises(&self) -> Vec<Raise> {
-        let searching = match &self.progress {
-            Progress::Searching(searching) => searching.run.clock.as_ref(),
-            Progress::Discovering(_) => None,
-        };
-        searching
-            .or_else(|| {
-                self.surveyor
-                    .as_ref()
-                    .and_then(|surveyor| surveyor.clock.as_ref())
-            })
+        self.clock
+            .borrow()
+            .as_ref()
             .map_or_else(Vec::new, |clock| clock.raises())
     }
 
@@ -5056,7 +5109,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     min_sample_seconds: plan.min_sample_seconds,
                     rates,
                     shuffle: &mut run.shuffle,
-                    clock: &mut run.clock,
+                    clock: &run.clock,
                     sequence: &mut run.sequence,
                 },
                 None,
@@ -5316,9 +5369,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .enumerate()
             .map(|(point, measurement)| ((point, measurement.key.clone()), measurement.clone()))
             .collect();
-        // The run places into its own result storage, and holds the clock
-        // the census held.
-        let clock = self.surveyor.take().and_then(|surveyor| surveyor.clock);
+        // The run places into its own result storage, and shares the device
+        // clock slot held by the unit.
+        self.surveyor.take();
+        let clock = self.clock.clone();
         Ok((
             Run {
                 search: GroupSearch::new(
@@ -6596,7 +6650,7 @@ impl Run {
                 min_sample_seconds,
                 rates,
                 shuffle: &mut self.shuffle,
-                clock: &mut self.clock,
+                clock: &self.clock,
                 sequence: &mut self.sequence,
             },
             affected,

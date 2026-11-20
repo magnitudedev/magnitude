@@ -2857,6 +2857,11 @@ trait SearchedUnit<'a> {
     /// The unit's time in each of the objective's `terms` at its defaults,
     /// as its census measured it ([`term_times`]).
     fn times(&self, terms: usize) -> Vec<f64>;
+    /// The unit's launch counts in each of the objective's `terms`.
+    fn launches(&self, terms: usize) -> Vec<f64>;
+    /// Prior weight for ordering baseline discovery before measured shares exist.
+    fn discovery_weight(&self) -> f64;
+    fn set_discovery_weight(&mut self, weight: f64);
     /// Weigh the unit's points again under `objective`, whose terms' times
     /// now stand on measurements, once its discovery is complete and
     /// before anything of its search is measured against those weights.
@@ -2989,6 +2994,10 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
 
     fn share(&self) -> f64 {
         (**self).share()
+    }
+
+    fn discovery_weight(&self) -> f64 {
+        (**self).discovery_weight()
     }
 
     fn next(&self) -> Option<seismic::Work> {
@@ -3234,6 +3243,7 @@ struct CaseUnit<'a, T: EntryTuning> {
     cases: UnitCases<T::Case>,
     search: Box<dyn EntrySearch<T::Entry>>,
     share: f64,
+    discovery_weight: f64,
     /// The wall time of the unit's work so far, its mandatory work
     /// included.
     spent: Duration,
@@ -3284,6 +3294,18 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
                 .find(|point| point.point == shape.label)
                 .map(|point| point.median_seconds)
         })
+    }
+
+    fn launches(&self, terms: usize) -> Vec<f64> {
+        term_times(&self.shapes, terms, |_| Some(1.))
+    }
+
+    fn discovery_weight(&self) -> f64 {
+        self.discovery_weight
+    }
+
+    fn set_discovery_weight(&mut self, weight: f64) {
+        self.discovery_weight = weight;
     }
 
     /// Freeze this unit's objective after the load's complete baseline
@@ -4405,6 +4427,29 @@ impl<'a> Tuner<'a> {
                 "cyclic canonical prerequisites",
             ));
         }
+        // Rank baseline discovery by each unit's scale-invariant launch
+        // fraction across objective terms so decode-hot multi-layer units
+        // discover ahead of rare single-layer variants.
+        let terms = self.invocations.objective.terms.len();
+        if terms > 0 {
+            let launch_counts = units
+                .iter()
+                .map(|unit| unit.launches(terms))
+                .collect::<Vec<_>>();
+            let term_weights = self
+                .invocations
+                .objective
+                .terms
+                .iter()
+                .map(|term| term.weight)
+                .collect::<Vec<_>>();
+            let priors = shares(&launch_counts, &term_weights);
+            if priors.iter().any(|&weight| weight > 0.) {
+                for (unit, weight) in units.iter_mut().zip(priors) {
+                    unit.set_discovery_weight(weight);
+                }
+            }
+        }
         let longest = self.longest;
         let longest_compile = self.longest_compile;
         // The pieces' compiles run on the load's worker threads while the
@@ -4803,6 +4848,7 @@ impl<'a> Tuner<'a> {
             cases,
             search,
             share: 0.,
+            discovery_weight: 1.,
             spent: mandatory,
             stages: 0,
             resident_footprint: None,
