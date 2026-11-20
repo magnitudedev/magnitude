@@ -300,7 +300,7 @@ pub enum TableFill {
 /// rows, or the bytes do not divide evenly into them. The one rule of every
 /// prefix of an expert stack, planned ([`WeightPlan::leading`]) and stored.
 pub(crate) fn leading_bytes(bytes: u64, rows: u64, leading: u64) -> Option<u64> {
-    (leading <= rows && bytes % rows == 0).then(|| bytes / rows * leading)
+    (rows > 0 && leading <= rows && bytes % rows == 0).then(|| bytes / rows * leading)
 }
 
 impl WeightPlan {
@@ -318,7 +318,9 @@ impl WeightPlan {
             None => None,
             Some(scale) if scale.stored == 1 => Some(WeightScalePlan {
                 extent: experts,
-                resident_bytes: scale.resident_bytes / scale.extent * experts,
+                resident_bytes: (scale.extent > 0)
+                    .then(|| scale.resident_bytes / scale.extent)
+                    .and_then(|per| per.checked_mul(experts))?,
                 ..scale.clone()
             }),
             Some(scale) if scale.extent == rows => Some(WeightScalePlan {
@@ -1948,8 +1950,16 @@ impl ModelLoadPlan {
     /// its rows in.
     pub fn host_table_bytes(&self) -> Result<u64, String> {
         self.host_tables.iter().try_fold(0u64, |total, table| {
-            (table.bytes / table.shape[0])
-                .checked_mul(crate::streamed_table::cached_rows(table.shape[0]) + table.step_rows)
+            let rows = table.shape[0];
+            if rows == 0 {
+                return Err(format!("host table {:?} has zero rows", table.descriptor.name));
+            }
+            (table.bytes / rows)
+                .checked_mul(
+                    crate::streamed_table::cached_rows(rows)
+                        .checked_add(table.step_rows)
+                        .ok_or_else(|| "host table bytes overflow".to_owned())?,
+                )
                 .and_then(|bytes| total.checked_add(bytes))
                 .ok_or_else(|| "host table bytes overflow".to_owned())
         })
@@ -3400,9 +3410,15 @@ fn host_table(
             descriptor.name
         ));
     }
-    let [_, width] = stored.shape[..] else {
+    let [rows, width] = stored.shape[..] else {
         return Err(format!("host table {:?} is not a matrix", descriptor.name));
     };
+    if rows == 0 || width == 0 {
+        return Err(format!(
+            "host table {:?} has a zero dimension: {:?}",
+            descriptor.name, stored.shape
+        ));
+    }
     let source = source_element(stored.encoding, width)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
     let resident = resident_element(
@@ -3634,6 +3650,9 @@ fn push_stored_table(
     let [table_rows, width] = stored.shape[..] else {
         return Err(refused("it is not a matrix"));
     };
+    if table_rows == 0 || width == 0 {
+        return Err(refused("it has a zero dimension"));
+    }
     // Its own rows, each with its own row of block scales at most: each row
     // as stored is then its tensors' ranges of that row alone.
     let within_rows = match &descriptor.transforms[..] {
@@ -3704,6 +3723,9 @@ fn push_stored_table(
 /// stored, `row_bytes` (the importer's assembly moves every byte, adding
 /// none). The planner and the importer each take a table's ranges from this.
 pub(crate) fn stored_row_ranges(tensors: &[(&str, u64)], rows: u64, row_bytes: u64) -> Result<Vec<u64>, String> {
+    if rows == 0 || row_bytes == 0 {
+        return Err(format!("stored table has zero dimension (rows={rows}, row_bytes={row_bytes})"));
+    }
     let ranges = tensors
         .iter()
         .map(|&(name, bytes)| match bytes % rows {
@@ -3711,7 +3733,7 @@ pub(crate) fn stored_row_ranges(tensors: &[(&str, u64)], rows: u64, row_bytes: u
             _ => Err(format!("{name:?}'s {bytes} bytes are not {rows} rows")),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if ranges.iter().sum::<u64>() != row_bytes {
+    if ranges.iter().try_fold(0u64, |acc, &r| acc.checked_add(r)) != Some(row_bytes) {
         return Err(format!("ranges of {ranges:?} bytes are not a row of {row_bytes} as stored"));
     }
     Ok(ranges)
@@ -4808,6 +4830,44 @@ mod stored_table_tests {
                     Element::stored("q5g32s", Layout::Rows16).unwrap()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn zero_dimension_tables_and_leading_bytes_are_rejected() {
+        assert_eq!(leading_bytes(0, 0, 0), None);
+        assert_eq!(leading_bytes(16, 0, 0), None);
+        assert_eq!(leading_bytes(16, 4, 2), Some(8));
+
+        assert!(stored_row_ranges(&[("w", 0)], 0, 0).is_err());
+        assert!(stored_row_ranges(&[("w", 0)], 4, 0).is_err());
+
+        let component = ArtifactComponent {
+            kind: ArtifactComponentKind::Target,
+            identity: ArtifactIdentity([0; 32]),
+        };
+        let form = ResidentForm {
+            activation: DType::BF16,
+            layout: Layout::Rows16,
+        };
+        for shape in [vec![0, 256], vec![4, 0]] {
+            let inventory = [TensorDescriptor {
+                name: "tbl".into(),
+                shape: shape.clone(),
+                encoding: Encoding::F16,
+                offset: 0,
+                nbytes: 0,
+            }];
+            let index = TensorIndex::new(&inventory);
+            let descriptor = WeightDescriptor::stored("tbl", [shape[0], shape[1]]);
+            assert!(
+                host_table(&index, component, ngram_role(), &descriptor, form, 1).is_err(),
+                "host_table must reject zero-dimension shape {shape:?}"
+            );
+            assert!(
+                push_stored_table(&mut Vec::new(), &index, component, ngram_role(), &descriptor, form).is_err(),
+                "push_stored_table must reject zero-dimension shape {shape:?}"
+            );
         }
     }
 }

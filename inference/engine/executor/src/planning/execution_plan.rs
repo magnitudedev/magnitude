@@ -667,10 +667,11 @@ impl ExecutionPlanDraft {
     /// the slots fix each other, so they are a fixed point: from the path of
     /// a bank holding every slot its ceiling allows, each settle prices the
     /// path at the slots it settled at, until a settle keeps the path it was
-    /// planned at. Each path is one of a slot count's in the ceiling's
-    /// range, so the settles end within that range's size: a path seen
-    /// before and not kept is a cycle, which the model's records and slots
-    /// never make (an invariant violation).
+    /// planned at. Because `paths -> bank_paths(settled_slots(paths))` is
+    /// anti-monotone on discrete integers, it can enter a cycle instead of
+    /// reaching a fixed point; on cycle detection it converges to the
+    /// covering envelope (componentwise `max` of `ahead` and `reserve`) over
+    /// the cycle and settles once at that envelope.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn with_paths<C: HeldCharge, T, E: From<PlanError>>(
         &self,
@@ -694,36 +695,37 @@ impl ExecutionPlanDraft {
                 Err(no) => return Ok(Err(no)),
             };
         }
-        let mut paths = bank_paths(&bank_prices, ceiling.whole.bank(), ceiling.ceiling)?;
-        let mut seen = Vec::new();
-        loop {
+        let initial = bank_paths(&bank_prices, ceiling.whole.bank(), ceiling.ceiling)?;
+        let (settled_paths, outcome, settles) = settle_bank_paths::<_, E>(initial, |paths| {
             if ceiling.whole.bank().paths != paths {
                 let whole = ceiling.whole.clone();
-                ceiling = match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Fixed, |load| load.with_bank_paths(paths))? {
-                    Ok(ceiling) => ceiling,
-                    Err(no) => return Ok(Err(no)),
-                };
+                match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Fixed, |load| load.with_bank_paths(paths))? {
+                    Ok(rebuilt) => ceiling = rebuilt,
+                    Err(no) => return Ok((Err(no), None)),
+                }
             }
             let settled = self.settled_in(&ceiling, bound, definition, prices, held, room, confirm)?;
-            let Ok((draft, ..)) = &settled else {
-                return Ok(Ok((ceiling, settled)));
+            let next = match &settled {
+                Ok((draft, ..)) => Some(bank_paths(&bank_prices, draft.bank(), draft.bank().slots)?),
+                Err(_) => None,
             };
-            let slots = draft.bank().slots;
-            let next = bank_paths(&bank_prices, draft.bank(), slots)?;
-            if next == paths {
-                let records = paths.records();
-                tracing::info!(
-                    slots,
-                    ahead = records.ahead,
-                    reserve = records.reserve,
-                    settles = seen.len() + 1,
-                    "the bank's path records are settled"
-                );
-                return Ok(Ok((ceiling, settled)));
+            Ok((Ok(settled), next))
+        })?;
+        match outcome {
+            Err(no) => Ok(Err(no)),
+            Ok(settled) => {
+                if let Ok((draft, ..)) = &settled {
+                    let records = settled_paths.records();
+                    tracing::info!(
+                        slots = draft.bank().slots,
+                        ahead = records.ahead,
+                        reserve = records.reserve,
+                        settles,
+                        "the bank's path records are settled"
+                    );
+                }
+                Ok(Ok((ceiling, settled)))
             }
-            assert!(!seen.contains(&next), "invariant violated: a bank's path records and slots cycle through {seen:?} without a fixed point");
-            seen.push(paths);
-            paths = next;
         }
     }
 
@@ -974,7 +976,6 @@ impl ExecutionPlanDraft {
         // grows to it as memory frees, whatever the room at the load
         // (`settle_bank`).
         let device = bound.device();
-        let hi_bound = top.min(most);
         let (ceiling, ceiling_bytes, ceiling_paths) = match mode {
             CeilingPaths::Fixed => {
                 // Paths are fixed at `self.bank().paths`, so borrow `self.load`
@@ -993,14 +994,14 @@ impl ExecutionPlanDraft {
                 if let Some(limit) = bound.limit.filter(|limit| needed > limit.bytes()) {
                     return Ok(Err((self, NoBank::Bound { bound: limit, needed })));
                 }
-                let (ceiling, ceiling_bytes) = if floor >= hi_bound || needed > device {
+                let (ceiling, ceiling_bytes) = if floor >= top || needed > device {
                     (floor, needed)
                 } else {
-                    let hi_bytes = bytes_at(hi_bound)?;
+                    let hi_bytes = bytes_at(top)?;
                     if hi_bytes <= device {
-                        (hi_bound, hi_bytes)
+                        (top, hi_bytes)
                     } else {
-                        let (mut lo, mut lo_bytes, mut hi) = (floor, needed, hi_bound);
+                        let (mut lo, mut lo_bytes, mut hi) = (floor, needed, top);
                         while lo + 1 < hi {
                             let mid = lo + (hi - lo) / 2;
                             let mid_bytes = bytes_at(mid)?;
@@ -1060,7 +1061,7 @@ impl ExecutionPlanDraft {
                 let mut ceiling = floor;
                 let mut ceiling_bytes = needed;
                 let mut ceiling_paths = floor_paths;
-                while ceiling < hi_bound {
+                while ceiling < top {
                     let (bytes, paths) = weights_at(ceiling + 1)?;
                     if bytes > device {
                         break;
@@ -2341,7 +2342,7 @@ fn refusal(no: NoBank, capacity: u64) -> PlanError {
         NoBank::Bound { bound, needed } => PlanError::WeightBound { bound, needed },
         NoBank::Short { deficit_bytes } => PlanError::Resource(crate::CapacityError {
             resource: crate::ResourceKind::DeviceMemory,
-            required: capacity + deficit_bytes.get(),
+            required: capacity.saturating_add(deficit_bytes.get()),
             available: capacity,
         }),
     }
@@ -2738,6 +2739,55 @@ fn bank_paths(prices: &magnitude_cost_model::BankPrices, bank: &super::ExpertBan
         .paths(bytes, magnitude_cost_model::HeldSlots::bank(slots), super::HINT_LEADS)
         .unwrap_or(magnitude_cost_model::PathRecords::NONE);
     Ok(super::BankPaths::Priced { line: prices.read(), records })
+}
+
+/// Componentwise covering envelope (`max` of `ahead` and `reserve`) over all
+/// states in a detected `BankPaths` cycle (`cycle` plus `current`).
+fn cycle_envelope(cycle: &[super::BankPaths], current: super::BankPaths) -> super::BankPaths {
+    let mut ahead = current.records().ahead;
+    let mut reserve = current.records().reserve;
+    for path in cycle {
+        let records = path.records();
+        ahead = ahead.max(records.ahead);
+        reserve = reserve.max(records.reserve);
+    }
+    match current {
+        super::BankPaths::Priced { line, .. } => super::BankPaths::Priced {
+            line,
+            records: magnitude_cost_model::PathRecords { ahead, reserve },
+        },
+        super::BankPaths::Unpriced => super::BankPaths::Unpriced,
+    }
+}
+
+/// Settle `paths` to a fixed point of `step`, or—when the discrete
+/// anti-monotone mapping enters a cycle—to the covering envelope over the
+/// cycle's states, settling once at that envelope.
+fn settle_bank_paths<T, E>(
+    initial: super::BankPaths,
+    mut step: impl FnMut(super::BankPaths) -> Result<(T, Option<super::BankPaths>), E>,
+) -> Result<(super::BankPaths, T, usize), E> {
+    let mut paths = initial;
+    let mut seen = Vec::new();
+    loop {
+        let (value, next) = step(paths)?;
+        let Some(next) = next else {
+            return Ok((paths, value, seen.len() + 1));
+        };
+        if next == paths {
+            return Ok((paths, value, seen.len() + 1));
+        }
+        if let Some(cycle_start) = seen.iter().position(|&p| p == next) {
+            let envelope = cycle_envelope(&seen[cycle_start..], paths);
+            if envelope == paths {
+                return Ok((paths, value, seen.len() + 1));
+            }
+            let (value, _) = step(envelope)?;
+            return Ok((envelope, value, seen.len() + 2));
+        }
+        seen.push(paths);
+        paths = next;
+    }
 }
 
 /// How [`ExecutionPlanDraft::ceiling_of`] prices a bank's path records at
@@ -4293,6 +4343,78 @@ mod tests {
                 derived >= decode_minimum,
                 "layers={layers}, groups={groups}: derived {derived} < decode minimum {decode_minimum}"
             );
+        }
+    }
+
+    #[test]
+    fn settle_bank_paths_converges_to_covering_envelope_on_cycle() {
+        let line = magnitude_cost_model::ReadLine::new(1e-6, 1e-10).unwrap();
+        let priced = |ahead, reserve| {
+            crate::planning::BankPaths::Priced {
+                line,
+                records: magnitude_cost_model::PathRecords { ahead, reserve },
+            }
+        };
+
+        // 2-cycle p_high -> p_low -> p_high: closes while settled at p_low,
+        // so settles once more at envelope p_high.
+        let p_low = priced(2, 3);
+        let p_high = priced(4, 6);
+        let mut visited = Vec::new();
+        let (settled, value, count) = settle_bank_paths::<_, PlanError>(p_high, |p| {
+            visited.push(p);
+            let next = if p == p_high { p_low } else { p_high };
+            Ok((p.records(), Some(next)))
+        })
+        .unwrap();
+        assert_eq!(settled, p_high);
+        assert_eq!(value, p_high.records());
+        assert_eq!(count, 3);
+        assert_eq!(visited, vec![p_high, p_low, p_high]);
+
+        // 2-cycle p_low -> p_high -> p_low: closes while already settled at
+        // envelope p_high, so returns without an extra settle.
+        let mut visited = Vec::new();
+        let (settled, value, count) = settle_bank_paths::<_, PlanError>(p_low, |p| {
+            visited.push(p);
+            let next = if p == p_low { p_high } else { p_low };
+            Ok((p.records(), Some(next)))
+        })
+        .unwrap();
+        assert_eq!(settled, p_high);
+        assert_eq!(value, p_high.records());
+        assert_eq!(count, 2);
+        assert_eq!(visited, vec![p_low, p_high]);
+
+        // Incomparable 2-cycle {(2, 5), (4, 3)} -> covering envelope (4, 5).
+        let p_a = priced(2, 5);
+        let p_b = priced(4, 3);
+        let envelope = priced(4, 5);
+        let mut visited = Vec::new();
+        let (settled, value, count) = settle_bank_paths::<_, PlanError>(p_a, |p| {
+            visited.push(p);
+            let next = if p == p_a { p_b } else { p_a };
+            Ok((p.records(), Some(next)))
+        })
+        .unwrap();
+        assert_eq!(settled, envelope);
+        assert_eq!(value, envelope.records());
+        assert_eq!(count, 3);
+        assert_eq!(visited, vec![p_a, p_b, envelope]);
+    }
+
+    #[test]
+    fn refusal_saturates_required_bytes_on_overflow() {
+        let err = refusal(
+            NoBank::Short { deficit_bytes: NonZeroU64::new(100).unwrap() },
+            u64::MAX - 10,
+        );
+        match err {
+            PlanError::Resource(capacity) => {
+                assert_eq!(capacity.required, u64::MAX);
+                assert_eq!(capacity.available, u64::MAX - 10);
+            }
+            other => panic!("expected Resource capacity error, got {other:?}"),
         }
     }
 }
