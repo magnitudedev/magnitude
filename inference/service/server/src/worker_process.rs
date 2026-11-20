@@ -328,8 +328,8 @@ pub fn install_parent_watchdog() -> anyhow::Result<()> {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
-        INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        WaitForSingleObject,
+        GetCurrentProcess, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, TerminateProcess, WaitForSingleObject,
     };
     let parent: u32 = std::env::var("MAGNITUDE_ICN_PARENT_PID")
         .context("native worker has no owning ICN identity")?
@@ -369,8 +369,14 @@ pub fn install_parent_watchdog() -> anyhow::Result<()> {
         if result != WAIT_OBJECT_0 {
             eprintln!("ICN parent observation failed");
         }
-        // Both parent loss and observation failure terminate before further worker work.
-        std::process::exit(91);
+        // Both parent loss and observation failure terminate immediately without running
+        // CRT/DLL teardown (matching Unix `libc::_exit(91)`), so GPU/driver destructors
+        // cannot hang an orphaned worker.
+        // SAFETY: GetCurrentProcess returns a pseudo-handle valid for self-termination.
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 91);
+        }
+        std::process::abort();
     })
     .context("cannot start native worker parent watchdog")?;
     Ok(())

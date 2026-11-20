@@ -266,7 +266,13 @@ impl Drop for PreparationGuard {
             .remove(&self.key)
             .and_then(|job| job.worker);
         if let Some(worker) = worker {
-            worker.end("preparation_ended", "the installation's optimization ended");
+            if tokio::runtime::Handle::try_current().is_ok() {
+                drop(magnitude_service_utils::blocking::run(move || {
+                    worker.end("preparation_ended", "the installation's optimization ended");
+                }));
+            } else {
+                worker.end("preparation_ended", "the installation's optimization ended");
+            }
         }
     }
 }
@@ -335,16 +341,18 @@ async fn prepare(
                     };
                     job.report(CatalogOptimizationProgress::preparing(Some(device.clone())));
                     let mut preemption = hold.preemption();
-                    let spawned =
-                        EngineWorker::spawn(&environment.launcher, DeviceHold::Job(hold)).map_err(
-                            |error| {
-                                PricedFailure::Host(ModelOperationFailure::new(
-                                    "worker_spawn_failed",
-                                    format!("{error:#}"),
-                                    true,
-                                ))
-                            },
-                        )?;
+                    let launcher = environment.launcher.clone();
+                    let spawned = magnitude_service_utils::blocking::run(move || {
+                        EngineWorker::spawn(&launcher, DeviceHold::Job(hold))
+                    })
+                    .await
+                    .map_err(|error| {
+                        PricedFailure::Host(ModelOperationFailure::new(
+                            "worker_spawn_failed",
+                            format!("{error:#}"),
+                            true,
+                        ))
+                    })?;
                     let worker = Arc::clone(&spawned.worker);
                     job.attach(Arc::clone(&worker));
                     let preparing = magnitude_service_utils::blocking::run({
@@ -369,7 +377,11 @@ async fn prepare(
                     let (prepared, preempted) = tokio::select! {
                         prepared = &mut preparing => (prepared, false),
                         () = preemption.preempted() => {
-                            worker.end("preparation_preempted", "a load takes the device");
+                            let worker = Arc::clone(&worker);
+                            magnitude_service_utils::blocking::run(move || {
+                                worker.end("preparation_preempted", "a load takes the device");
+                            })
+                            .await;
                             (preparing.as_mut().await, true)
                         }
                     };
