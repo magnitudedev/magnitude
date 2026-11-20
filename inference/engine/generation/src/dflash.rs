@@ -9,7 +9,10 @@
 //! layout, and selects its proposals in one pass (`DraftForm::Block`).
 
 use crate::mtp::{Drafter, DrafterState};
-use crate::{DraftBudget, DraftLoad, Method, MethodCheckpoint, MethodRequirements, MethodState};
+use crate::{
+    DraftBudget, DraftLoad, Method, MethodCheckpoint, MethodChoice, MethodRequirements,
+    MethodState,
+};
 use magnitude_executor::Demand;
 use std::sync::Arc;
 
@@ -57,6 +60,11 @@ impl DFlash {
 impl Method for DFlash {
     fn identity(&self) -> &str {
         &self.identity
+    }
+    fn capability(&self) -> MethodChoice {
+        MethodChoice::DFlash {
+            proposals: self.proposals as u8,
+        }
     }
     fn requires(&self) -> MethodRequirements {
         MethodRequirements {

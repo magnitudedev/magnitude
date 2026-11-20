@@ -1520,3 +1520,87 @@ fn a_fused_drafter_declining_decodes_at_the_plain_pace() {
     let enter = costs[&((CONTEXT + 1).next_power_of_two(), 1)].enter.cost() * 1000.0;
     assert!((enter - 0.19).abs() < 0.01, "entering costs the taps alone: {enter} ms");
 }
+
+#[test]
+fn concurrent_controllers_share_look_seconds_without_lost_updates_or_stale_overwrites() {
+    let stream = Stream::of(&[(3_000, UNPREDICTABLE)]);
+    let load = warmed(&stream, LONG);
+    *load.look_seconds.lock().unwrap() = 0.0;
+
+    let mut first = DraftController::new(WIDEST, load.clone());
+    let mut second = DraftController::new(WIDEST, load.clone());
+
+    assert_eq!(first.generate(WIDEST, CONTEXT, true), 0);
+    let after_first = *load.look_seconds.lock().unwrap();
+    assert!(after_first > 0.0, "first controller accrues look time");
+
+    assert_eq!(second.generate(WIDEST, CONTEXT, true), 0);
+    let after_second = *load.look_seconds.lock().unwrap();
+    assert!(
+        (after_second - 2.0 * after_first).abs() < 1e-12,
+        "second controller accrues on top of first ({after_second} vs 2 * {after_first})"
+    );
+
+    // A round with no wider look candidate (`limit == 0`) must not touch `look_seconds`.
+    assert_eq!(first.generate(0, CONTEXT, true), 0);
+    assert_eq!(
+        *load.look_seconds.lock().unwrap(),
+        after_second,
+        "a round without a look candidate leaves look_seconds untouched"
+    );
+
+    // Alternating both controllers accrues until one triggers the look and resets to 0.0.
+    let mut triggered_by_first = None;
+    for step in 0..500 {
+        let is_first = step % 2 == 0;
+        let controller = if is_first { &mut first } else { &mut second };
+        let generated = controller.generate(WIDEST, CONTEXT, true);
+        if generated > 0 {
+            assert!(controller.choice().look);
+            assert_eq!(*load.look_seconds.lock().unwrap(), 0.0);
+            triggered_by_first = Some(is_first);
+            break;
+        }
+    }
+    let triggered_by_first = triggered_by_first.expect("shared accrual triggers a look");
+
+    // The peer controller must not overwrite the reset with any stale value.
+    let peer = if triggered_by_first { &mut second } else { &mut first };
+    assert_eq!(peer.generate(0, CONTEXT, true), 0);
+    assert_eq!(*load.look_seconds.lock().unwrap(), 0.0);
+    assert_eq!(peer.generate(WIDEST, CONTEXT, true), 0);
+    let after_reset = *load.look_seconds.lock().unwrap();
+    assert!(
+        (after_reset - after_first).abs() < 1e-12,
+        "peer accrues from 0.0 after reset ({after_reset} vs {after_first})"
+    );
+}
+
+#[test]
+fn draft_load_costs_stays_bounded_across_many_context_and_sequence_buckets() {
+    let load = Arc::new(DraftLoad::default());
+    let mut controller = DraftController::new(8, load.clone());
+    // Sweep 200 distinct (context_class, sequences) pairs across simulated sessions.
+    for context_pow in 0..10u32 {
+        let position = 1usize << context_pow;
+        for sequences in 1..=20usize {
+            let _ = controller.generate(0, position, true);
+            controller.timed(
+                TimedLaunch::Target,
+                Some(LaunchDuration { duration: std::time::Duration::from_millis(10), covering: false }),
+                sequences,
+                sequences,
+            );
+            controller.committed(&[TokenId(0)]);
+        }
+    }
+    let buckets = load.costs.lock().unwrap().len();
+    assert_eq!(
+        buckets,
+        super::MAX_COST_BUCKETS,
+        "DraftLoad::costs should populate and cap at MAX_COST_BUCKETS ({})",
+        super::MAX_COST_BUCKETS
+    );
+    // Most recently measured bucket is still retained.
+    assert!(load.costs.lock().unwrap().contains_key(&(1 << 9, 20)));
+}

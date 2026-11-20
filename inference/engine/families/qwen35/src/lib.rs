@@ -22,7 +22,7 @@ use magnitude_family_contracts::{
     VocabularyProjection, WeightDescriptor,
 };
 use magnitude_family_qwen::{
-    Geometry, MixerKind, Weight, mixer_kinds, prediction_blocks, product, stores_prediction_blocks,
+    Geometry, MixerKind, mixer_kinds, prediction_blocks, product, stores_prediction_blocks,
 };
 
 pub use magnitude_family_qwen::Error;
@@ -87,17 +87,26 @@ pub fn inspect_package(package: &Package) -> Result<ModelDefinition, Error> {
 /// every target layer and every MTP block has them.
 fn block(
     geometry: &Geometry,
-    weight: &mut Weight,
+    tensors: &mut Tensors,
+    prefix: &str,
     kind: MixerKind,
     intermediate: u64,
 ) -> Result<Block, Error> {
     let mixer = match kind {
-        MixerKind::Attention => Operator::Attention(Box::new(geometry.attention(weight)?)),
-        MixerKind::Recurrent => {
-            Operator::GatedDelta(Box::new(geometry.gated_delta(weight, GateFunction::Silu)?))
+        MixerKind::Attention => {
+            let mut weight = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
+                Ok(tensors.bind(&format!("{prefix}{name}"), shape)?)
+            };
+            Operator::Attention(Box::new(geometry.attention(&mut weight)?))
         }
+        MixerKind::Recurrent => Operator::GatedDelta(Box::new(
+            geometry.gated_delta(tensors, prefix, GateFunction::Silu)?,
+        )),
     };
-    let feed_forward = geometry.feed_forward(weight, intermediate)?;
+    let mut weight = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
+        Ok(tensors.bind(&format!("{prefix}{name}"), shape)?)
+    };
+    let feed_forward = geometry.feed_forward(&mut weight, intermediate)?;
     let hidden = geometry.hidden;
     Ok(Block {
         sublayers: vec![
@@ -133,33 +142,19 @@ pub fn inspect_components(
         let key = m.key("rope.section_order");
         return Err(Error::metadata(&key, format!("{key} must be \"zyxt\"")));
     }
-    let block_count = m.integer("block_count")?;
+    let block_count = m.bounded_block_count("block_count")?;
     let speculative = prediction_blocks(&m, block_count)?;
     let layer_count = block_count - speculative;
-    // Each real layer requires distinct stored weights. Reject impossible counts
-    // before allocating architecture vectors from untrusted metadata.
-    if layer_count > directory.tensors.len() as u64 {
-        return Err(invalid("Qwen layer count exceeds available weight roles"));
-    }
     let layers = mixer_kinds(&m, layer_count, speculative)?;
-    let embedding = directory
-        .tensor("token_embd.weight")
-        .ok_or_else(|| invalid("missing Qwen embedding"))?;
-    if embedding.shape.len() != 2 {
-        return Err(invalid("Qwen embedding must be a matrix"));
-    }
     let geometry = Geometry::read(&m, architecture.is_routed())?;
     let hidden = geometry.hidden;
-    let vocabulary = embedding.shape[0];
     let context_limit = m.integer("context_length")?;
     let mut tensors = Tensors::new(directory);
-    let mut tensor = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
-        Ok(tensors.bind(name, shape)?)
-    };
-    let embedding = tensor(&embedding.name, &[vocabulary, hidden])?;
-    let output_norm = tensor("output_norm.weight", &[hidden])?;
-    let output = tensor(
-        if directory.tensor("output.weight").is_some() {
+    let vocabulary = m.vocab_size(tensors.rows("token_embd.weight")?)?;
+    let embedding = tensors.bind("token_embd.weight", &[vocabulary, hidden])?;
+    let output_norm = tensors.bind("output_norm.weight", &[hidden])?;
+    let output = tensors.bind(
+        if tensors.contains("output.weight") {
             "output.weight"
         } else {
             &embedding.name
@@ -171,12 +166,7 @@ pub fn inspect_components(
         .enumerate()
         .map(|(i, kind)| {
             let p = format!("blk.{i}.");
-            block(
-                &geometry,
-                &mut |name, shape| tensor(&format!("{p}{name}"), shape),
-                *kind,
-                geometry.intermediate,
-            )
+            block(&geometry, &mut tensors, &p, *kind, geometry.intermediate)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let head = if !stores_prediction_blocks(directory, layer_count, speculative) {
@@ -185,13 +175,16 @@ pub fn inspect_components(
         let mut head_blocks = Vec::with_capacity(speculative as usize);
         for offset in 0..speculative {
             let p = format!("blk.{}.", layer_count + offset);
-            let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
             let block = block(
                 &geometry,
-                &mut weight,
+                &mut tensors,
+                &p,
                 MixerKind::Attention,
                 geometry.intermediate,
             )?;
+            let mut weight = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
+                Ok(tensors.bind(&format!("{p}{name}"), shape)?)
+            };
             head_blocks.push(HeadBlock {
                 residual: magnitude_family_contracts::ResidualForm::Single,
                 input: HeadInput::Combine {

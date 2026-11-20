@@ -275,8 +275,12 @@ impl<'a> Checker<'a> {
                 let mut ownership = self.ownership(value);
                 let mut failure = None;
                 ownership.visit(&mut Vec::new(), &mut |_, leaf| {
-                    if let super::ownership::TensorOwnership::Borrowed { owner, .. } = leaf {
-                        let exclusive = state && self.writable_place(owner);
+                    if let super::ownership::TensorOwnership::Borrowed {
+                        owner,
+                        exclusive: prior,
+                    } = leaf
+                    {
+                        let exclusive = (*prior || state) && self.writable_place(owner);
                         if self
                             .live_borrows()
                             .iter()
@@ -323,7 +327,7 @@ impl<'a> Checker<'a> {
                         }
                         ValueOwnership::Tensor(TensorOwnership::Owned { moved }) => *moved = false,
                         ValueOwnership::Tensor(TensorOwnership::Borrowed { owner, exclusive }) => {
-                            *exclusive = state && writable(owner)
+                            *exclusive = (*exclusive || state) && writable(owner)
                         }
                         ValueOwnership::Tuple(parts) => {
                             for part in parts {
@@ -645,7 +649,8 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 };
-                if !self.writable_root(self.root_var_local(binding)) {
+                let storage_place = self.local_storage_place(binding);
+                if !self.writable_root(binding) || !self.writable_place(&storage_place) {
                     let name = self.locals[binding.index()].name.clone();
                     self.error(
                         DiagnosticRule::Ownership,
@@ -757,12 +762,17 @@ impl<'a> Checker<'a> {
                         "this selection has type",
                     )?,
                 };
-                self.write(root, binding, record, target.span)?;
+                let storage_root = self.write(binding, record, target.span)?;
+                if matches!(selected, ValueType::Scalar(_)) {
+                    if let Some(shaped) = &shaped {
+                        self.elements.float_stored(&shaped.elem);
+                    }
+                }
                 let checked_place = CheckedPlace::Element {
                     root: super::ownership::LocalPlace::root(root),
                     indices,
                 };
-                let authorities = self.exclusive_write_authority(root, &checked_place);
+                let authorities = self.exclusive_write_authority(storage_root, &checked_place);
                 Some(CheckedStmt::Assign {
                     place: checked_place,
                     value,
@@ -797,9 +807,13 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, root.local, false, span)
+                let record = self.locals[root.local.index()]
+                    .ty
+                    .shaped()
+                    .is_some_and(|shaped| super::ir::whole_records(&[], shaped.rank()));
+                self.write(root.local, record, span)
             }
-            CheckedPlace::Element { root, .. } => {
+            CheckedPlace::Element { root, indices } => {
                 if !self.writable_place(root) {
                     self.error(
                         DiagnosticRule::Ownership,
@@ -808,7 +822,11 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, root.local, false, span)
+                let record = self.locals[root.local.index()]
+                    .ty
+                    .shaped()
+                    .is_some_and(|shaped| super::ir::whole_records(indices, shaped.rank()));
+                self.write(root.local, record, span)
             }
             CheckedPlace::Tuple(places) => {
                 let mut last = None;

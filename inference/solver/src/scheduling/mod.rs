@@ -375,10 +375,54 @@ impl SchedulingConstraint {
         scope
     }
 
+    fn has_empty_domain(&self, domains: &[Domain]) -> bool {
+        let interval_empty = |interval: &Interval| {
+            domains[interval.start.0].is_empty()
+                || domains[interval.end.0].is_empty()
+                || interval.presence.iter().any(|v| domains[v.0].is_empty())
+        };
+        let activity_empty = |a: &Activity| {
+            domains[a.start.0].is_empty()
+                || domains[a.duration.0].is_empty()
+                || domains[a.end.0].is_empty()
+                || a.presence.is_some_and(|v| domains[v.0].is_empty())
+        };
+        match self {
+            Self::Activity(a) => activity_empty(a),
+            Self::Precedence { before, after, .. } => {
+                domains[before.time.0].is_empty()
+                    || domains[after.time.0].is_empty()
+                    || before.presence.is_some_and(|v| domains[v.0].is_empty())
+                    || after.presence.is_some_and(|v| domains[v.0].is_empty())
+            }
+            Self::NoOverlap { intervals } => intervals.iter().any(interval_empty),
+            Self::Cumulative { reservations, .. } => reservations.iter().any(|r| {
+                interval_empty(&r.interval)
+                    || matches!(r.demand, Demand::Variable(v) if domains[v.0].is_empty())
+            }),
+            Self::ActivityCumulative {
+                completion,
+                activities,
+                ..
+            } => {
+                domains[completion.0].is_empty()
+                    || activities.iter().any(|r| {
+                        activity_empty(&r.activity)
+                            || matches!(r.demand, Demand::Variable(v) if domains[v.0].is_empty())
+                    })
+            }
+            Self::ArenaPacking(packing) => packing.has_empty_domain(domains),
+        }
+    }
+
     pub fn propagate(&self, domains: &mut [Domain]) -> Result<Propagation> {
         // Validation is also necessary when this entry point is called directly.
         self.validate(domains)?;
-        if self.scope().iter().any(|v| domains[v.0].is_empty()) {
+        self.propagate_validated(domains)
+    }
+
+    pub(crate) fn propagate_validated(&self, domains: &mut [Domain]) -> Result<Propagation> {
+        if self.has_empty_domain(domains) {
             return Ok(Propagation {
                 changed: false,
                 infeasible: true,
@@ -450,7 +494,7 @@ impl SchedulingConstraint {
                 }
             }
             Self::ArenaPacking(packing) => {
-                if packing.assess(state.domains)?.infeasible {
+                if packing.assess_validated(state.domains)?.infeasible {
                     state.infeasible = true;
                 }
             }

@@ -94,6 +94,30 @@ impl MoveStep<'_> {
     }
 }
 
+/// Host write permit acquired before taking a store's slab lock on Metal,
+/// where moves drain device work on the domain before copying on the host.
+/// Non-Metal backends enqueue asynchronously and need no pre-acquired permit.
+pub(crate) struct MovePermit {
+    #[cfg(target_os = "macos")]
+    host: Option<crate::driver::AllocationPermit>,
+}
+
+/// Acquire any host write permit needed before locking `Slots::slabs` for
+/// [`submit_prepared`]: on Metal, drains device work on `domain` via
+/// `domain.acquire(true)` outside `Slots::slabs` so a parked GPU kernel
+/// waiting on `region_view` cannot deadlock. No-op on other backends.
+pub(crate) fn prepare(device: &Arc<DeviceInner>, domain: &Arc<Allocation>) -> Result<MovePermit, ExecutionError> {
+    #[cfg(target_os = "macos")]
+    if matches!(device.kind, OpenedKind::Metal(_)) {
+        return Ok(MovePermit { host: Some(domain.acquire(true)?) });
+    }
+    let _ = (device, domain);
+    Ok(MovePermit {
+        #[cfg(target_os = "macos")]
+        host: None,
+    })
+}
+
 /// Run `steps`, in order (every copy before every word), after the device
 /// work submitted before that uses
 /// `domain`'s hazard domain and before any submitted after (the module
@@ -112,6 +136,17 @@ pub(crate) fn submit(
     domain: &Arc<Allocation>,
     steps: &[MoveStep<'_>],
 ) -> Result<Option<Arc<dyn DeviceCompletion>>, ExecutionError> {
+    let permit = prepare(device, domain)?;
+    submit_prepared(device, domain, steps, permit)
+}
+
+/// Like [`submit`], using a [`MovePermit`] already obtained from [`prepare`].
+pub(crate) fn submit_prepared(
+    device: &Arc<DeviceInner>,
+    domain: &Arc<Allocation>,
+    steps: &[MoveStep<'_>],
+    permit: MovePermit,
+) -> Result<Option<Arc<dyn DeviceCompletion>>, ExecutionError> {
     device.ran_work();
     for step in steps {
         step.check(domain);
@@ -122,15 +157,15 @@ pub(crate) fn submit(
     );
     #[cfg(target_os = "macos")]
     if matches!(device.kind, OpenedKind::Metal(_)) {
-        // Host write access: every device use of the domain has ended, and
-        // nothing else accesses it until the permit drops.
-        let _permit = domain.acquire(true)?;
+        assert!(permit.host.is_some(), "invariant violated: Metal moves require a host write permit");
         for step in steps {
-            // SAFETY: the permit excludes every other access.
+            // SAFETY: `permit.host` excludes every other access to the domain.
             unsafe { step.run_on_host() };
         }
+        drop(permit);
         return Ok(None);
     }
+    drop(permit);
     // Owns retirement until the moves are recorded, as a native
     // submission's: unwinding waits for issued work before releasing.
     let mut issued = IssuedWork(None);

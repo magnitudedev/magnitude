@@ -95,19 +95,41 @@ impl ValueOwnership {
         found
     }
 }
-impl Checker<'_> {
-    pub fn value_place(&self, value: &ir::Expr) -> Option<LocalPlace> {
-        match &value.kind {
-            ir::ExprKind::Local(local) => Some(LocalPlace::root(*local)),
+fn resolve_tuple_projection<'a>(mut expr: &'a ir::Expr) -> (&'a ir::Expr, Vec<usize>) {
+    let mut path = Vec::new();
+    loop {
+        match &expr.kind {
             ir::ExprKind::Primitive {
                 id: PrimitiveId::TupleGet(index),
                 operands,
                 ..
             } => {
-                let mut place = self.value_place(&operands[0])?;
-                place.path.push(*index as usize);
-                Some(place)
+                path.push(*index as usize);
+                expr = &operands[0];
             }
+            ir::ExprKind::Primitive {
+                id: PrimitiveId::TuplePack,
+                operands,
+                ..
+            } if !path.is_empty() => {
+                let index = path.pop().expect("non-empty projection path");
+                expr = &operands[index];
+            }
+            _ => break,
+        }
+    }
+    path.reverse();
+    (expr, path)
+}
+
+impl Checker<'_> {
+    pub fn value_place(&self, value: &ir::Expr) -> Option<LocalPlace> {
+        let (base, path) = resolve_tuple_projection(value);
+        match &base.kind {
+            ir::ExprKind::Local(local) => Some(LocalPlace {
+                local: *local,
+                path,
+            }),
             _ => None,
         }
     }
@@ -179,10 +201,10 @@ impl Checker<'_> {
     pub fn is_borrowed_local(&self, local: ir::LocalId) -> bool {
         self.locals[local.index()].ownership.has_borrowed()
     }
-    pub fn local_storage_root(&self, local: ir::LocalId) -> ir::LocalId {
+    pub fn local_storage_place(&self, local: ir::LocalId) -> LocalPlace {
         match &self.locals[local.index()].ownership {
-            ValueOwnership::Tensor(TensorOwnership::Borrowed { owner, .. }) => owner.local,
-            _ => local,
+            ValueOwnership::Tensor(TensorOwnership::Borrowed { owner, .. }) => owner.clone(),
+            _ => LocalPlace::root(local),
         }
     }
     pub fn moved_snapshot(&self) -> BTreeSet<LocalPlace> {
@@ -403,23 +425,26 @@ impl Checker<'_> {
             Ok(())
         }
         // Tuple construction preserves each operand's own source place.
-        if let ir::ExprKind::Primitive {
-            id: PrimitiveId::TuplePack,
-            operands,
-            ..
-        } = &value.kind
-        {
-            let mut parts = Vec::new();
-            for operand in operands {
-                let (part, taken) = self.owned_consumption(operand)?;
-                parts.push(part);
-                for place in taken {
-                    if !moves.insert(place) {
-                        return Err("owned tensor leaf is consumed more than once".into());
+        let (resolved, remaining) = resolve_tuple_projection(value);
+        if remaining.is_empty() {
+            if let ir::ExprKind::Primitive {
+                id: PrimitiveId::TuplePack,
+                operands,
+                ..
+            } = &resolved.kind
+            {
+                let mut parts = Vec::new();
+                for operand in operands {
+                    let (part, taken) = self.owned_consumption(operand)?;
+                    parts.push(part);
+                    for place in taken {
+                        if !moves.insert(place) {
+                            return Err("owned tensor leaf is consumed more than once".into());
+                        }
                     }
                 }
+                return Ok((ValueOwnership::Tuple(parts), moves));
             }
-            return Ok((ValueOwnership::Tuple(parts), moves));
         }
         consume(
             self,
@@ -479,11 +504,7 @@ impl Checker<'_> {
         fn writable(checker: &Checker<'_>, value: &ValueOwnership, place: &LocalPlace) -> bool {
             match value {
                 ValueOwnership::Tensor(TensorOwnership::Borrowed { owner, exclusive }) => {
-                    if owner == place {
-                        *exclusive
-                    } else {
-                        checker.writable_place(owner)
-                    }
+                    *exclusive && (owner == place || checker.writable_place(owner))
                 }
                 ValueOwnership::Tuple(parts) => parts.iter().enumerate().any(|(i, part)| {
                     let mut child = place.clone();
@@ -553,6 +574,7 @@ impl Checker<'_> {
             value: &ir::Expr,
             result: &mut BTreeSet<LocalPlace>,
         ) -> Result<(), String> {
+            let (resolved, remaining) = resolve_tuple_projection(value);
             if let Some(source) = checker.value_place(value) {
                 let mut duplicate = false;
                 let mut borrowed = false;
@@ -575,19 +597,106 @@ impl Checker<'_> {
                 if duplicate {
                     return Err("owned tensor leaf is moved more than once".into());
                 }
-            } else if let ir::ExprKind::Primitive {
-                id: PrimitiveId::TuplePack,
-                operands,
-                ..
-            } = &value.kind
-            {
-                for operand in operands {
-                    collect(checker, operand, result)?;
+            } else if remaining.is_empty() {
+                if let ir::ExprKind::Primitive {
+                    id: PrimitiveId::TuplePack,
+                    operands,
+                    ..
+                } = &resolved.kind
+                {
+                    for operand in operands {
+                        collect(checker, operand, result)?;
+                    }
                 }
             }
             Ok(())
         }
         collect(self, value, &mut result)?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::span::Span;
+    use crate::types::{DType, NonEmpty};
+
+    fn local_expr(id: u32) -> ir::Expr {
+        ir::Expr::new(
+            ir::ExprKind::Local(ir::LocalId::new(id)),
+            ValueType::Scalar(DType::F32),
+            None,
+            Span::new(0, 0),
+        )
+    }
+
+    fn tuple_pack(operands: Vec<ir::Expr>) -> ir::Expr {
+        let ty = ValueType::Tuple(
+            NonEmpty::new(operands.iter().map(|e| e.ty.clone()).collect()).expect("non-empty"),
+        );
+        ir::Expr::new(
+            ir::ExprKind::Primitive {
+                id: PrimitiveId::TuplePack,
+                operands,
+                failure: PrimitiveFailure::ProvedAbsent,
+            },
+            ty,
+            None,
+            Span::new(0, 0),
+        )
+    }
+
+    fn tuple_get(tuple: ir::Expr, index: u32) -> ir::Expr {
+        let ValueType::Tuple(parts) = &tuple.ty else {
+            panic!("expected tuple");
+        };
+        let ty = parts.as_slice()[index as usize].clone();
+        ir::Expr::new(
+            ir::ExprKind::Primitive {
+                id: PrimitiveId::TupleGet(index),
+                operands: vec![tuple],
+                failure: PrimitiveFailure::ProvedAbsent,
+            },
+            ty,
+            None,
+            Span::new(0, 0),
+        )
+    }
+
+    #[test]
+    fn resolve_tuple_projection_unwraps_direct_and_nested_tuple_packs() {
+        let x = local_expr(0);
+        let y = local_expr(1);
+        let pair = tuple_pack(vec![x.clone(), y.clone()]);
+        let first = tuple_get(pair, 0);
+        let (base, path) = resolve_tuple_projection(&first);
+        assert!(matches!(base.kind, ir::ExprKind::Local(id) if id == ir::LocalId::new(0)));
+        assert!(path.is_empty());
+
+        let nested = tuple_pack(vec![tuple_pack(vec![x, y]), local_expr(2)]);
+        let inner_second = tuple_get(tuple_get(nested, 0), 1);
+        let (base, path) = resolve_tuple_projection(&inner_second);
+        assert!(matches!(base.kind, ir::ExprKind::Local(id) if id == ir::LocalId::new(1)));
+        assert!(path.is_empty());
+
+        // Projecting a tuple local through a TuplePack preserves the remaining path on that local.
+        let pair_local = ir::Expr::new(
+            ir::ExprKind::Local(ir::LocalId::new(3)),
+            ValueType::Tuple(
+                NonEmpty::new(vec![
+                    ValueType::Scalar(DType::F32),
+                    ValueType::Scalar(DType::F32),
+                ])
+                .expect("non-empty"),
+            ),
+            None,
+            Span::new(0, 0),
+        );
+        let wrapped = tuple_pack(vec![local_expr(4), pair_local]);
+        let leaf = tuple_get(tuple_get(wrapped, 1), 0);
+        let (base, path) = resolve_tuple_projection(&leaf);
+        assert!(matches!(base.kind, ir::ExprKind::Local(id) if id == ir::LocalId::new(3)));
+        assert_eq!(path, vec![0]);
     }
 }

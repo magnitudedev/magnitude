@@ -1219,9 +1219,10 @@ impl ExecutionPlanDraft {
             }
             let free = room.room(&mandatory, &charge)?;
             let slots = count(slots_within(free.free.min(free.ceiling), (points[0], *ceiling), &reserved)?)?;
+            let held = magnitude_cost_model::HeldSlots { slots, host };
             // The smallest pass leaves the most slots.
-            let most = *most.get_or_insert(magnitude_cost_model::HeldSlots { slots, host });
-            let seconds = rates.decode_steps_per_s * prices.step_seconds(magnitude_cost_model::HeldSlots::bank(slots))
+            let most = *most.get_or_insert(held);
+            let seconds = rates.decode_steps_per_s * prices.step_seconds(held)
                 + rates.requests_per_s * prices.prompt_seconds(pass.get() as u64, most);
             if chosen.as_ref().is_none_or(|(_, _, least)| seconds <= *least) {
                 chosen = Some((pass, mandatory_bytes, seconds));
@@ -3540,8 +3541,8 @@ mod tests {
         assert_eq!(
             (charge.state_bytes, charge.startup_state_bytes),
             (
-                target_state.slab_charge(54 * target_state.granule).unwrap() + target_state.table_bytes().unwrap(),
-                target_state.slab_charge(4 * target_state.granule).unwrap() + target_state.table_bytes().unwrap(),
+                target_state.slab_charge(54 * target_state.granule).unwrap() + target_state.table_bytes().unwrap() + target_state.block.absent,
+                target_state.slab_charge(4 * target_state.granule).unwrap() + target_state.table_bytes().unwrap() + target_state.block.absent,
             ),
             "the KL load's state at the harness's limits"
         );

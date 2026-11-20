@@ -23,20 +23,24 @@ impl CompileCache {
     }
 
     pub fn compile(&self, gbnf: &str) -> Result<Arc<Compiled>, GrammarError> {
-        {
-            let mut entries = self.entries.lock().expect("compile cache lock");
-            if let Some(index) = entries.iter().position(|(source, _)| source == gbnf) {
-                let entry = entries.remove(index).unwrap();
-                let compiled = entry.1.clone();
-                entries.push_back(entry);
-                return Ok(compiled);
-            }
+        let promote = |entries: &mut VecDeque<(String, Arc<Compiled>)>| -> Option<Arc<Compiled>> {
+            let index = entries.iter().position(|(source, _)| source == gbnf)?;
+            let entry = entries.remove(index).unwrap();
+            let compiled = entry.1.clone();
+            entries.push_back(entry);
+            Some(compiled)
+        };
+        if let Some(compiled) = promote(&mut self.entries.lock().expect("compile cache lock")) {
+            return Ok(compiled);
         }
         let compiled = Arc::new(compile(gbnf)?);
         let bytes = |entry: &(String, Arc<Compiled>)| entry.0.len() + entry.1.grammar.lark().len();
         let entry = (gbnf.to_owned(), compiled.clone());
         if self.max_entries > 0 && bytes(&entry) <= self.max_bytes {
             let mut entries = self.entries.lock().expect("compile cache lock");
+            if let Some(existing) = promote(&mut entries) {
+                return Ok(existing);
+            }
             entries.push_back(entry);
             while entries.len() > self.max_entries
                 || entries.iter().map(bytes).sum::<usize>() > self.max_bytes

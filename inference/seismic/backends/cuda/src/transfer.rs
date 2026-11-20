@@ -57,9 +57,10 @@ pub struct TransferQueue {
     /// Lock-free mirror of `fault.is_some()`, set under `fault` before waking
     /// waiters so `wait` and `completed` never block on `fault`.
     faulted: AtomicBool,
-    /// Why the queue can complete no batch from now: a driver call failed
-    /// after a batch began to be queued (the stream then holds part of it).
-    /// Never held across a CUDA driver call.
+    /// Serializes `copy` enqueueing (`fault` check, `queue`, `wake_after`, and
+    /// fault transition) and records why the queue can complete no batch from
+    /// now after a driver call fails mid-enqueue. Never acquired on the
+    /// lock-free `wait`/`completed` happy paths.
     fault: std::sync::Mutex<Option<String>>,
 }
 
@@ -108,19 +109,19 @@ impl TransferQueue {
     /// until the batch is complete.
     pub fn copy(&self, items: &[TransferItem<'_>], value: u32) -> Result<(), ExecutionError> {
         let checked = items.iter().map(Self::check).collect::<Result<Vec<_>, _>>()?;
-        if self.faulted() {
-            let fault = self.fault.lock().expect("transfer fault lock is never poisoned");
-            let reason = fault.as_deref().unwrap_or("unknown");
-            return Err(ExecutionError::SubmissionFailed(format!("the transfer queue faulted: {reason}")));
-        }
-        if let Err(error) = self.queue(&checked, value).map_err(submission).and_then(|()| self.done.wake_after(&self.stream)) {
-            {
-                let mut fault = self.fault.lock().expect("transfer fault lock is never poisoned");
-                if fault.is_none() {
-                    *fault = Some(error.to_string());
-                }
-                self.faulted.store(true, Ordering::Release);
+        let mut faulted_now = false;
+        {
+            let mut fault = self.fault.lock().expect("transfer queue lock is never poisoned");
+            if let Some(reason) = fault.as_deref() {
+                return Err(ExecutionError::SubmissionFailed(format!("the transfer queue faulted: {reason}")));
             }
+            if let Err(error) = self.queue(&checked, value).map_err(submission).and_then(|()| self.done.wake_after(&self.stream)) {
+                *fault = Some(error.to_string());
+                self.faulted.store(true, Ordering::Release);
+                faulted_now = true;
+            }
+        }
+        if faulted_now {
             // Its waiters learn the fault now ([`Self::completed`]), with
             // `fault` already released and `faulted` published.
             self.done.wake();
@@ -218,13 +219,13 @@ impl TransferQueue {
         if !self.faulted() && reached() {
             return Ok(true);
         }
-        let fault = self.fault.lock().expect("transfer fault lock is never poisoned").clone();
-        if fault.is_none() && reached() {
-            return Ok(true);
-        }
         if !self.stream.query().map_err(submission)? {
             return Ok(false);
         }
+        if !self.faulted() && reached() {
+            return Ok(true);
+        }
+        let fault = self.fault.lock().expect("transfer queue lock is never poisoned").clone();
         match fault {
             Some(fault) => Err(ExecutionError::SubmissionFailed(format!("the transfer queue faulted: {fault}"))),
             // The stream drained: the word holds the last value it wrote.

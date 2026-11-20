@@ -404,16 +404,21 @@ impl PlaneEncoding {
             _ => None,
         }
     }
+    /// The scalar dtype of a plane entry: the dense dtype for a dense plane,
+    /// `DType::U32` for packed/grid/local/float-code planes.
+    pub const fn dtype(&self) -> DType {
+        match self {
+            PlaneEncoding::Dense(dtype) => *dtype,
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. }
+            | PlaneEncoding::FloatCode { .. } => DType::U32,
+        }
+    }
 }
 impl Plane {
     pub(crate) fn dtype(&self) -> DType {
-        match self.encoding {
-            PlaneEncoding::Dense(dtype) => dtype,
-            PlaneEncoding::Packed { .. }
-            | PlaneEncoding::Grid(_)
-            | PlaneEncoding::SignedLocal { .. } => DType::U32,
-            PlaneEncoding::FloatCode { .. } => DType::U32,
-        }
+        self.encoding.dtype()
     }
     pub(crate) fn entry_bits(&self) -> u32 {
         self.encoding.entry_bits()
@@ -796,6 +801,11 @@ impl PlaneSchema {
     /// `storage_dtype` words.
     pub fn bit_offset(&self, entry: u64) -> u64 {
         entry * u64::from(self.entry_bits)
+    }
+
+    /// The scalar dtype of a plane entry (`self.encoding.dtype()`).
+    pub const fn dtype(&self) -> DType {
+        self.encoding.dtype()
     }
 }
 

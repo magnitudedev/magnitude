@@ -443,3 +443,76 @@ fn muse_glimmer_disabled_reasoning_opens_the_answer() {
     assert!(prepared.description().prompt.contains("Reasoning strength: none."));
     assert!(prepared.description().prompt.ends_with("<|start|>assistant"));
 }
+
+/// A generic autoparser template whose generation prompt unconditionally opens
+/// a tag-based reasoning block (without reading `enable_thinking`) closes the
+/// empty block when `enable_thinking` is explicitly false, and parses replies
+/// with zero reasoning for plain content, tool calls, and JSON schema output.
+#[test]
+fn autoparser_closes_unconditionally_opened_reasoning_when_disabled() {
+    const OPEN_THINK_TEMPLATE: &str = r#"{%- for m in messages -%}
+{%- if m.role == 'user' -%}<|user|>{{ m.content }}
+{%- elif m.role == 'assistant' -%}<|assistant|>{%- if m.reasoning_content is defined -%}<think>{{ m.reasoning_content }}</think>{%- else -%}<think></think>{%- endif -%}{{ m.content or '' }}
+{%- if m.tool_calls -%}{%- for tc in m.tool_calls -%}<tool_call>{{ tc.function.name }}<arg_key>city</arg_key><arg_value>{{ tc.function.arguments.city }}</arg_value></tool_call>{%- endfor -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}"#;
+
+    let template = Template::new(OPEN_THINK_TEMPLATE, &Default::default()).unwrap();
+    let base = || {
+        Request::new(
+            vec![json!({"role":"user","content":"Say hello."})],
+            946684800,
+        )
+    };
+
+    // Default (thinking enabled): prompt opens <think>.
+    let enabled = template.prepare(&base()).unwrap();
+    assert!(enabled.description().prompt.ends_with("<|assistant|><think>"));
+    assert_eq!(enabled.description().generation_prefix, "<|assistant|><think>");
+    assert_eq!(
+        parse(&enabled, "Plan.</think>Hello.").unwrap(),
+        Transcript {
+            reasoning: "Plan.".into(),
+            content: "Hello.".into(),
+            ..Default::default()
+        }
+    );
+
+    // Explicitly disabled: autoparser closes <think></think> and disables reasoning extraction.
+    let mut disabled_req = base();
+    disabled_req
+        .template_arguments
+        .insert("enable_thinking".into(), json!(false));
+    let disabled = template.prepare(&disabled_req).unwrap();
+    let desc = disabled.description();
+    assert!(desc.prompt.ends_with("<|assistant|><think></think>"));
+    assert_eq!(desc.generation_prefix, "<|assistant|><think></think>");
+    assert_eq!(
+        parse(&disabled, "  Hello.").unwrap(),
+        Transcript {
+            content: "  Hello.".into(),
+            ..Default::default()
+        }
+    );
+
+    // JSON schema with thinking disabled: grammar starts at the closed prefix.
+    let mut schema_req = disabled_req.clone();
+    schema_req.json_schema = Some(json!({
+        "type": "object",
+        "properties": {"answer": {"type": "integer"}},
+        "required": ["answer"]
+    }));
+    let schema_prepared = template.prepare(&schema_req).unwrap();
+    assert_eq!(
+        schema_prepared.description().grammar_initial_prefix,
+        "<|assistant|><think></think>"
+    );
+    assert_eq!(
+        parse(&schema_prepared, "{\"answer\": 42}").unwrap(),
+        Transcript {
+            content: "{\"answer\": 42}".into(),
+            ..Default::default()
+        }
+    );
+}

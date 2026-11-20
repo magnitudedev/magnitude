@@ -73,8 +73,8 @@
 //! joins the reference, and no level costs an allowance twice.
 
 use crate::deadline::{Deadline, WorkError};
-use crate::session::{passes_covering, Slot, Slotted};
-use crate::statistics::{median_of, Tally};
+use crate::session::{passes_covering, valid_seconds, Slot, Slotted};
+use crate::statistics::{median_of, median_sorted, Tally};
 use crate::work::{Gauge, Pending, Work};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -110,7 +110,7 @@ impl<E> Saturation<'_, E> {
         match queued {
             Ok(queued) => {
                 self.ahead = Some((passes, queued));
-                Ok(reading.seconds()?)
+                Ok(valid_seconds(reading.seconds()?))
             }
             Err(error) => {
                 // Expiry between readings still drains the admitted one.
@@ -129,7 +129,7 @@ impl<E> Saturation<'_, E> {
     /// at, with no pause since: its passes and its seconds.
     fn finish(self) -> Result<Option<(usize, f64)>, E> {
         match self.ahead {
-            Some((passes, queued)) => Ok(Some((passes, queued.seconds()?))),
+            Some((passes, queued)) => Ok(Some((passes, valid_seconds(queued.seconds()?)))),
             None => Ok(None),
         }
     }
@@ -215,7 +215,7 @@ impl Reference {
     }
 
     fn median(&self) -> f64 {
-        median_of(self.readings.clone())
+        median_sorted(&self.readings)
     }
 
     /// The slowest a reading of the device at a sustained clock is taken
@@ -476,6 +476,7 @@ impl SustainedClock {
         &mut self,
         mut read: impl FnMut(usize) -> Result<f64, E>,
     ) -> Result<Raise, E> {
+        let mut read = |passes| read(passes).map(valid_seconds);
         let began = Instant::now();
         let Some(gauged) = &mut self.gauged else {
             let (passes, settled, readings) = establish(&mut read, self.seconds, self.stages)?;
@@ -614,12 +615,13 @@ impl<E> Clock<E> {
             deadline,
         };
         let raised = sustained.raise(|passes| saturation.read(passes));
+        let finished = saturation.finish();
+        let raise = raised?;
         // The reading queued behind the last one read is of the device at
         // a sustained clock, whatever the readings before it were.
-        if let Some((passes, seconds)) = saturation.finish()? {
+        if let Some((passes, seconds)) = finished? {
             sustained.observe(passes, seconds);
         }
-        let raise = raised?;
         self.raises
             .lock()
             .expect("raise record lock is never poisoned")
@@ -1092,5 +1094,94 @@ mod tests {
         );
         assert!(device.elapsed < 0.1, "{}", device.elapsed);
         assert_eq!(reference.levels.len(), 1);
+    }
+
+    /// A failed raise drains its queued ahead reading without observing it
+    /// into the reference, and preserves the raise's own error.
+    #[test]
+    fn a_failed_raise_drains_without_poisoning_the_reference() {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ScriptedPending {
+            outcome: Result<f64, &'static str>,
+            drained: Arc<AtomicUsize>,
+        }
+
+        impl Pending<&'static str> for ScriptedPending {
+            fn seconds(&self) -> Result<f64, &'static str> {
+                self.drained.fetch_add(1, Ordering::Relaxed);
+                self.outcome
+            }
+            fn wait(&self) -> Result<(), &'static str> {
+                self.drained.fetch_add(1, Ordering::Relaxed);
+                self.outcome.map(|_| ())
+            }
+        }
+
+        struct ScriptedGauge {
+            outcomes: Mutex<VecDeque<Result<f64, &'static str>>>,
+            drained: Arc<AtomicUsize>,
+        }
+
+        impl Gauge<&'static str> for ScriptedGauge {
+            fn submit(&self, _passes: usize) -> Result<Box<dyn Pending<&'static str>>, &'static str> {
+                let outcome = self
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Ok(1.0));
+                Ok(Box::new(ScriptedPending {
+                    outcome,
+                    drained: self.drained.clone(),
+                }))
+            }
+        }
+
+        let drained = Arc::new(AtomicUsize::new(0));
+        let outcomes = Mutex::new(VecDeque::from([
+            // First raise: primary read fails while queued ahead holds a slow
+            // cold reading that must be drained but never observed.
+            Err("read failed"),
+            Ok(10.0),
+            // Second raise: primary read fails and ahead finish also fails;
+            // the primary error must be preserved.
+            Err("primary failed"),
+            Err("finish failed"),
+        ]));
+        let gauge = ScriptedGauge {
+            outcomes,
+            drained: drained.clone(),
+        };
+        let clock = Clock {
+            gauge: Box::new(gauge),
+            sustained: Mutex::new(SustainedClock {
+                seconds: 1.0,
+                stages: 1,
+                gauged: Some(Gauged {
+                    passes: 1,
+                    reference: Reference::established(vec![1.0, 1.0]),
+                    allowance: 1.0,
+                }),
+            }),
+            raises: Mutex::new(Vec::new()),
+        };
+
+        let first = clock.raise(Deadline::default());
+        assert!(matches!(first, Err(WorkError::Failed("read failed"))));
+        assert_eq!(drained.load(Ordering::Relaxed), 2);
+        {
+            let sustained = clock.sustained.lock().unwrap();
+            let reference = &sustained.gauged.as_ref().unwrap().reference;
+            assert_eq!(reference.readings, [1.0, 1.0]);
+            assert_eq!(reference.bound(), 1.0);
+        }
+        assert!(clock.raises().is_empty());
+
+        let second = clock.raise(Deadline::default());
+        assert!(matches!(second, Err(WorkError::Failed("primary failed"))));
+        assert_eq!(drained.load(Ordering::Relaxed), 4);
+        assert!(clock.raises().is_empty());
     }
 }

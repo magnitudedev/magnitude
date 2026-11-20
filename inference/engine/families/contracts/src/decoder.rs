@@ -1772,6 +1772,22 @@ fn attention_at(blocks: &[Block], index: SublayerIndex) -> Option<&Attention> {
     })
 }
 
+fn attention_source_owner<'a>(
+    blocks: &'a [Block],
+    index: SublayerIndex,
+    attention: &'a Attention,
+    part: u64,
+) -> Option<(SublayerIndex, u64, &'a Attention)> {
+    match &attention.history.get(part as usize)?.rows {
+        HistoryRows::Own(_) => Some((index, part, attention)),
+        HistoryRows::Shared { source, part } => {
+            let owner = attention_at(blocks, *source)?;
+            matches!(owner.history.get(*part as usize)?.rows, HistoryRows::Own(_))
+                .then_some((*source, *part, owner))
+        }
+    }
+}
+
 /// The owner of source `part` of the attention sublayer `index` in
 /// `blocks`, with the owner's attention: `(index, part)` itself when it owns
 /// the rows, or the owned source a Shared one names.
@@ -1781,14 +1797,7 @@ pub(crate) fn source_owner(
     part: u64,
 ) -> Option<(SublayerIndex, u64, &Attention)> {
     let attention = attention_at(blocks, index)?;
-    match &attention.history.get(part as usize)?.rows {
-        HistoryRows::Own(_) => Some((index, part, attention)),
-        HistoryRows::Shared { source, part } => {
-            let owner = attention_at(blocks, *source)?;
-            matches!(owner.history.get(*part as usize)?.rows, HistoryRows::Own(_))
-                .then_some((*source, *part, owner))
-        }
-    }
+    attention_source_owner(blocks, index, attention, part)
 }
 
 /// The producer of source `part` of the attention sublayer `index`.
@@ -1822,9 +1831,20 @@ pub(crate) fn validate_blocks(blocks: &[Block], context: &Context) -> Result<(),
                 expect_shape(layer_scale, &[1], "sublayer layer scale")?;
             }
         }
-        if let Operator::Attention(attention) = &sublayer.op {
-            validate_shared_sources(blocks, index, attention, context)?;
-            validate_output_rotary(blocks, attention, context)?;
+        match &sublayer.op {
+            Operator::Attention(attention) => {
+                validate_shared_sources(blocks, index, attention, context)?;
+                validate_output_rotary(blocks, attention, context)?;
+            }
+            Operator::Parallel(branches) => {
+                for branch in branches {
+                    if let Operator::Attention(attention) = &branch.op {
+                        validate_shared_sources(blocks, index, attention, context)?;
+                        validate_output_rotary(blocks, attention, context)?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -1930,7 +1950,8 @@ fn validate_shared_sources(
             // Every layer reading these rows binds one launch-scoped picks
             // table and an own indexer overwrites it, so the reused picks
             // are the latest own indexer's over the rows this source reads.
-            let rows = source_owner(blocks, index, part as u64).map(|(a, ap, _)| (a, ap));
+            let rows = attention_source_owner(blocks, index, attention, part as u64)
+                .map(|(a, ap, _)| (a, ap));
             let indexers: Vec<(SublayerIndex, u64)> = indexed_sublayers(blocks)
                 .take_while(|(at, _)| *at < index)
                 .filter_map(|(at, sublayer)| match &sublayer.op {
@@ -1981,7 +2002,7 @@ fn validate_shared_indexer(
     // The earlier own indexer at (`source`, `source_part`) over the rows this
     // source reads.
     let earlier = |source: SublayerIndex, source_part: u64| {
-        let same_rows = source_owner(blocks, index, part)
+        let same_rows = attention_source_owner(blocks, index, attention, part)
             .zip(source_owner(blocks, source, source_part))
             .is_some_and(|((a, ap, _), (b, bp, _))| a == b && ap == bp);
         (context.shared_sources.is_none() && source < index && same_rows)

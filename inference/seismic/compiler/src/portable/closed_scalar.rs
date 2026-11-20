@@ -196,71 +196,139 @@ impl Terms {
     /// Restrict a term to the successful continuation of preceding source
     /// failures. Undefined results on a failed path are never observations.
     pub(super) fn under(&mut self, term: Term, assumptions: &[(Term, bool)]) -> Term {
-        let mut projected: Vec<Term> = Vec::with_capacity(term.0 + 1);
-        for ordinal in 0..=term.0 {
-            let current = Term(ordinal);
-            let get = |term: Term| projected[term.0];
-            let known = assumptions.iter().find_map(|(term, value)| {
-                if *term == current {
-                    Some(*value)
-                } else if matches!(self.nodes[term.0], Node::Not(inner) if inner == current) {
-                    Some(!value)
-                } else {
-                    None
+        if assumptions.is_empty() {
+            return term;
+        }
+        let mut known = HashMap::with_capacity(assumptions.len() * 2);
+        for &(assumption, value) in assumptions {
+            known.entry(assumption).or_insert(value);
+            if let Node::Not(inner) = self.nodes[assumption.0] {
+                known.entry(inner).or_insert(!value);
+            }
+        }
+        let mut memo = HashMap::new();
+        self.under_term(term, &known, &mut memo)
+    }
+
+    fn under_term(
+        &mut self,
+        current: Term,
+        known: &HashMap<Term, bool>,
+        memo: &mut HashMap<Term, Term>,
+    ) -> Term {
+        if let Some(&projected) = memo.get(&current) {
+            return projected;
+        }
+        let value = if let Some(&value) = known.get(&current) {
+            self.boolean(value)
+        } else {
+            match self.nodes[current.0].clone() {
+                Node::Word(op, a, b) => {
+                    let a = self.under_term(a, known, memo);
+                    let b = self.under_term(b, known, memo);
+                    self.node(Node::Word(op, a, b))
                 }
-            });
-            let value = if let Some(value) = known {
-                self.boolean(value)
-            } else {
-                match self.nodes[ordinal].clone() {
-                    Node::Word(op, a, b) => self.node(Node::Word(op, get(a), get(b))),
-                    Node::Compare(op, a, b) => self.compare(op, get(a), get(b)),
-                    Node::And(a, b) => self.and(get(a), get(b)),
-                    Node::Not(a) => self.not(get(a)),
-                    Node::Select(c, a, b) => self.select(get(c), get(a), get(b)),
-                    Node::Bits(a) => self.node(Node::Bits(get(a))),
-                    Node::FromBits(a, dtype) => self.node(Node::FromBits(get(a), dtype)),
-                    Node::Resize(a, dtype) => self.node(Node::Resize(get(a), dtype)),
-                    Node::NaturalFromWord(a, dtype) => {
-                        self.node(Node::NaturalFromWord(get(a), dtype))
-                    }
-                    Node::WordFromNatural(a, dtype) => self.word_from_natural(get(a), dtype),
-                    Node::NaturalAdd(a, b) => self.natural_binary(false, get(a), get(b)),
-                    Node::NaturalMul(a, b) => self.natural_binary(true, get(a), get(b)),
-                    Node::NaturalDiv(value, divisor) => {
-                        self.natural_div_rem(false, get(value), divisor)
-                    }
-                    Node::NaturalRem(value, divisor) => {
-                        self.natural_div_rem(true, get(value), divisor)
-                    }
-                    Node::PackedBits { root, bit, width } => self.node(Node::PackedBits {
-                        root,
-                        bit: get(bit),
-                        width,
-                    }),
-                    Node::Fold {
+                Node::Compare(op, a, b) => {
+                    let a = self.under_term(a, known, memo);
+                    let b = self.under_term(b, known, memo);
+                    self.compare(op, a, b)
+                }
+                Node::And(a, b) => {
+                    let a = self.under_term(a, known, memo);
+                    let b = self.under_term(b, known, memo);
+                    self.and(a, b)
+                }
+                Node::Not(a) => {
+                    let a = self.under_term(a, known, memo);
+                    self.not(a)
+                }
+                Node::Select(c, a, b) => {
+                    let c = self.under_term(c, known, memo);
+                    let a = self.under_term(a, known, memo);
+                    let b = self.under_term(b, known, memo);
+                    self.select(c, a, b)
+                }
+                Node::Bits(a) => {
+                    let a = self.under_term(a, known, memo);
+                    self.node(Node::Bits(a))
+                }
+                Node::FromBits(a, dtype) => {
+                    let a = self.under_term(a, known, memo);
+                    self.node(Node::FromBits(a, dtype))
+                }
+                Node::Resize(a, dtype) => {
+                    let a = self.under_term(a, known, memo);
+                    self.node(Node::Resize(a, dtype))
+                }
+                Node::NaturalFromWord(a, dtype) => {
+                    let a = self.under_term(a, known, memo);
+                    self.node(Node::NaturalFromWord(a, dtype))
+                }
+                Node::WordFromNatural(a, dtype) => {
+                    let a = self.under_term(a, known, memo);
+                    self.word_from_natural(a, dtype)
+                }
+                Node::NaturalAdd(a, b) => {
+                    let a = self.under_term(a, known, memo);
+                    let b = self.under_term(b, known, memo);
+                    self.natural_binary(false, a, b)
+                }
+                Node::NaturalMul(a, b) => {
+                    let a = self.under_term(a, known, memo);
+                    let b = self.under_term(b, known, memo);
+                    self.natural_binary(true, a, b)
+                }
+                Node::NaturalDiv(value, divisor) => {
+                    let value = self.under_term(value, known, memo);
+                    self.natural_div_rem(false, value, divisor)
+                }
+                Node::NaturalRem(value, divisor) => {
+                    let value = self.under_term(value, known, memo);
+                    self.natural_div_rem(true, value, divisor)
+                }
+                Node::PackedBits { root, bit, width } => {
+                    let bit = self.under_term(bit, known, memo);
+                    self.node(Node::PackedBits { root, bit, width })
+                }
+                Node::Fold {
+                    start,
+                    end,
+                    initial,
+                    next,
+                    output,
+                } => {
+                    let start = self.under_term(start, known, memo);
+                    let end = self.under_term(end, known, memo);
+                    let initial = initial
+                        .into_iter()
+                        .map(|t| self.under_term(t, known, memo))
+                        .collect();
+                    let next = next
+                        .into_iter()
+                        .map(|t| self.under_term(t, known, memo))
+                        .collect();
+                    self.node(Node::Fold {
                         start,
                         end,
                         initial,
                         next,
                         output,
-                    } => self.node(Node::Fold {
-                        start: get(start),
-                        end: get(end),
-                        initial: initial.into_iter().map(get).collect(),
-                        next: next.into_iter().map(get).collect(),
-                        output,
-                    }),
-                    Node::Read(mut place) => {
-                        place.byte = get(place.byte);
-                        self.node(Node::Read(place))
-                    }
-                    _ => current,
+                    })
                 }
-            };
-            projected.push(value);
-        }
-        projected[term.0]
+                Node::Read(mut place) => {
+                    place.byte = self.under_term(place.byte, known, memo);
+                    self.node(Node::Read(place))
+                }
+                Node::Opaque(_)
+                | Node::Iteration(_)
+                | Node::Header { .. }
+                | Node::Input(..)
+                | Node::Constant(_)
+                | Node::Natural(_) => current,
+            }
+        };
+        memo.insert(current, value);
+        value
     }
     pub(super) fn node(&mut self, node: Node) -> Term {
         if let Some(term) = self.interned.get(&node) {
@@ -1619,5 +1687,51 @@ mod tests {
             terms.nodes[known.0],
             Node::Constant(ReferenceScalar::Bool(true))
         ));
+    }
+
+    #[test]
+    fn under_rewrites_only_reachable_subdag_and_preserves_assumption_semantics() {
+        let mut arena = ExprArena::default();
+        let sym_x = arena.schedule_slot(0, seismic_lang::expr::SymbolSort::Nat);
+        let sym_y = arena.schedule_slot(1, seismic_lang::expr::SymbolSort::Nat);
+        let mut terms = Terms::default();
+
+        // Populate unrelated arena nodes before the target sub-DAG.
+        let y = terms.node(Node::Input(sym_y, ScalarKind::Nat64));
+        let mut unrelated = y;
+        for step in 1..=32u64 {
+            let k = terms.node(Node::Natural(step));
+            unrelated = terms.natural_binary(false, unrelated, k);
+        }
+        let hundred = terms.node(Node::Natural(100));
+        let unrelated_bound = terms.compare(reference::CmpOp::Lt, unrelated, hundred);
+
+        // Target sub-DAG: select(cond, x, 0) where cond = (x < 8).
+        let x = terms.node(Node::Input(sym_x, ScalarKind::Nat64));
+        let eight = terms.node(Node::Natural(8));
+        let zero = terms.node(Node::Natural(0));
+        let cond = terms.compare(reference::CmpOp::Lt, x, eight);
+        let not_cond = terms.not(cond);
+        let selected = terms.select(cond, x, zero);
+
+        // Empty assumptions early-return without touching the arena.
+        let nodes_before = terms.nodes.len();
+        assert_eq!(terms.under(selected, &[]), selected);
+        assert_eq!(terms.nodes.len(), nodes_before);
+
+        // Assuming `!cond == false` implies `cond == true`, collapsing `select(cond, x, 0)` to `x`.
+        let nodes_before = terms.nodes.len();
+        assert_eq!(terms.under(selected, &[(not_cond, false)]), x);
+        // Only boolean constants (at most 1-2 nodes) may be interned; unrelated nodes are untouched.
+        assert!(terms.nodes.len() <= nodes_before + 2);
+
+        // First matching assumption wins when contradictory assumptions are passed.
+        assert_eq!(
+            terms.under(selected, &[(cond, false), (not_cond, false)]),
+            zero
+        );
+
+        // Unrelated assumption does not rewrite `unrelated_bound` or corrupt `selected`.
+        assert_eq!(terms.under(selected, &[(unrelated_bound, true)]), selected);
     }
 }

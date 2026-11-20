@@ -54,12 +54,9 @@ use seismic::{NativeCondition, NativeImplementation, NativeNatExpr};
 /// Every row count: the rows of an entry whose launches take any.
 pub(crate) const EVERY_ROW: Range<u64> = 1..u64::MAX;
 
-/// The dimension of an entry's rows, which a range bounds (`M=2..9`).
-const ROWS: &str = "M";
-
-/// Where `implementation`'s choice can differ by its rows over `served` at
-/// the unit's `statics`, between the rows `points` it is measured at, as its
-/// declaration states it:
+/// Where `implementation`'s choice can differ by its rows (`row_dim`, e.g.
+/// `"M"` or `"O"`) over `served` at the unit's `statics`, between the rows
+/// `points` it is measured at, as its declaration states it:
 ///
 /// - between two neighbouring points that can run different launches or
 ///   size different scratch buffers ([`Declared::reach`]), the first row
@@ -87,10 +84,11 @@ const ROWS: &str = "M";
 pub(crate) fn row_cuts(
     implementation: &NativeImplementation,
     statics: &NativeSpecialization,
+    row_dim: &str,
     served: &Range<u64>,
     points: &[u64],
 ) -> Vec<u64> {
-    let declared = Declared::of(implementation, statics);
+    let declared = Declared::of(implementation, statics, row_dim);
     let mut held = points
         .iter()
         .copied()
@@ -108,7 +106,7 @@ pub(crate) fn row_cuts(
             cuts.extend(tile_cuts(
                 tiled.clone(),
                 |row| declared.can_hold(launch.when.as_ref(), Some(ordinal), row),
-                |row| tiling(axis, &names, &assignments, row, statics),
+                |row| tiling(axis, &names, &assignments, row_dim, row, statics),
             ));
         }
     }
@@ -173,12 +171,17 @@ fn tile_cuts(rows: Range<u64>, runs: impl Fn(u64) -> bool, tiling: impl Fn(u64) 
 struct Declared<'a> {
     implementation: &'a NativeImplementation,
     statics: &'a NativeSpecialization,
+    row_dim: &'a str,
     /// Each entry parameter's admitted values ([`admitted`]), by its name.
     admitted: BTreeMap<&'a str, Vec<u64>>,
 }
 
 impl<'a> Declared<'a> {
-    fn of(implementation: &'a NativeImplementation, statics: &'a NativeSpecialization) -> Self {
+    fn of(
+        implementation: &'a NativeImplementation,
+        statics: &'a NativeSpecialization,
+        row_dim: &'a str,
+    ) -> Self {
         let mut conjuncts = Vec::new();
         if let Some(constraint) = &implementation.constraint {
             constraint.conjuncts(&mut conjuncts);
@@ -196,6 +199,7 @@ impl<'a> Declared<'a> {
         Self {
             implementation,
             statics,
+            row_dim,
             admitted,
         }
     }
@@ -219,7 +223,7 @@ impl<'a> Declared<'a> {
     /// hold at `row` rows ([`can_hold`] over [`Self::values`]).
     fn can_hold(&self, condition: Option<&NativeCondition>, launch: Option<usize>, row: u64) -> bool {
         condition.is_none_or(|condition| {
-            can_hold(condition, row, self.statics, &|name: &str| {
+            can_hold(condition, self.row_dim, row, self.statics, &|name: &str| {
                 let values = self.values(launch, name)?;
                 values.iter().copied().min().zip(values.iter().copied().max())
             })
@@ -257,7 +261,7 @@ impl<'a> Declared<'a> {
         let (mut dimensions, mut names) = (Vec::new(), Vec::new());
         axis.dimensions(&mut dimensions);
         axis.parameters(&mut names);
-        if names.is_empty() || !dimensions.iter().any(|name| name == ROWS) {
+        if names.is_empty() || !dimensions.iter().any(|name| name == self.row_dim) {
             return None;
         }
         let domains = names
@@ -309,13 +313,14 @@ fn admitted(name: &str, values: &[u64], conjuncts: &[&NativeCondition], statics:
 /// hold at every row count.
 fn can_hold(
     condition: &NativeCondition,
+    row_dim: &str,
     row: u64,
     statics: &NativeSpecialization,
     bounds: &impl Fn(&str) -> Option<(u64, u64)>,
 ) -> bool {
     condition.may_hold(
         &|name: &str| {
-            if name == ROWS {
+            if name == row_dim {
                 Some((row, row))
             } else {
                 statics.static_value(name).map(|value| (value, value))
@@ -350,6 +355,7 @@ fn tiling(
     axis: &NativeNatExpr,
     names: &[String],
     assignments: &[Vec<u64>],
+    row_dim: &str,
     row: u64,
     statics: &NativeSpecialization,
 ) -> Vec<usize> {
@@ -358,7 +364,7 @@ fn tiling(
         .map(|assignment| {
             axis.evaluate(
                 &|name: &str| {
-                    if name == ROWS {
+                    if name == row_dim {
                         Some(row)
                     } else {
                         statics.static_value(name)
@@ -440,9 +446,9 @@ impl<T> Ranged<T> {
 /// is written open (`M=9..`).
 fn identify(bindings: String, rows: &Range<u64>) -> String {
     if rows.end == u64::MAX {
-        format!("{bindings},{ROWS}={}..", rows.start)
+        format!("{bindings},M={}..", rows.start)
     } else {
-        format!("{bindings},{ROWS}={}..{}", rows.start, rows.end)
+        format!("{bindings},M={}..{}", rows.start, rows.end)
     }
 }
 
@@ -476,6 +482,9 @@ impl<T: EntryTuning> EntryTuning for Ranged<T> {
     }
     fn launch_rows(&self, launch: &Launch) -> u64 {
         self.case.launch_rows(launch)
+    }
+    fn row_dimension(&self) -> &'static str {
+        self.case.row_dimension()
     }
     fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
         if !self.rows.contains(&self.case.launch_rows(launch)) {
@@ -582,7 +591,7 @@ mod tests {
     }
 
     fn rows() -> Box<NativeNatExpr> {
-        Box::new(NativeNatExpr::Dimension(ROWS.into()))
+        Box::new(NativeNatExpr::Dimension("M".into()))
     }
 
     fn constant(value: u64) -> NativeNatExpr {
@@ -624,7 +633,7 @@ mod tests {
         let reach = |row: u64| {
             launches
                 .iter()
-                .map(|launch| can_hold(launch, row, &statics, &batch_from))
+                .map(|launch| can_hold(launch, "M", row, &statics, &batch_from))
                 .collect::<Vec<_>>()
         };
         assert_eq!(reach(1), [true, false, false, false, false]);
@@ -652,20 +661,20 @@ mod tests {
             constant(16),
         );
         assert_eq!(
-            reach_cuts(&points(512), |row| can_hold(&slots, row, &statics, &batch_from)),
+            reach_cuts(&points(512), |row| can_hold(&slots, "M", row, &statics, &batch_from)),
             vec![5]
         );
         // A band no point lies in cuts nothing: the points on its two
         // sides run the same.
         let band = and(compare(Ge, *rows(), constant(20)), compare(Le, *rows(), constant(30)));
-        assert!(can_hold(&band, 24, &statics, &batch_from));
-        assert!(reach_cuts(&points(512), |row| can_hold(&band, row, &statics, &batch_from)).is_empty());
+        assert!(can_hold(&band, "M", 24, &statics, &batch_from));
+        assert!(reach_cuts(&points(512), |row| can_hold(&band, "M", row, &statics, &batch_from)).is_empty());
         // A condition a dimension of the call decides can hold at every
         // row count, and one over an unknown parameter likewise.
         let call = compare(Lt, *rows(), NativeNatExpr::Dimension("H".into()));
         let unknown = compare(Lt, *rows(), parameter("OTHER"));
         for condition in [&call, &unknown] {
-            assert!(reach_cuts(&points(512), |row| can_hold(condition, row, &statics, &batch_from)).is_empty());
+            assert!(reach_cuts(&points(512), |row| can_hold(condition, "M", row, &statics, &batch_from)).is_empty());
         }
     }
 
@@ -695,7 +704,7 @@ mod tests {
         assert!(cpu.has_tuning_parameters());
         let statics = NativeSpecialization::new().with_static("WS", 1);
         let ranges = |served: Range<u64>, points: &[u64]| {
-            row_ranges(served.clone(), &row_cuts(&cpu, &statics, &served, points), points)
+            row_ranges(served.clone(), &row_cuts(&cpu, &statics, "M", &served, points), points)
         };
         assert_eq!(
             ranges(EVERY_ROW, &points(512)),
@@ -749,7 +758,7 @@ mod tests {
             Box::new(NativeNatExpr::CeilDiv(rows(), Box::new(parameter("TOKENS")))),
         );
         let (names, values) = (read(&tokens), assignments(&[&[1, 2, 4, 8]]));
-        let tiles = |row: u64| tiling(&tokens, &names, &values, row, &statics);
+        let tiles = |row: u64| tiling(&tokens, &names, &values, "M", row, &statics);
         // One row is one tile under every value; two part the one-row tile
         // from the others.
         assert_eq!(tiles(1), [0, 0, 0, 0]);
@@ -805,7 +814,7 @@ mod tests {
         // The matrix form parts from the row form at two rows, and its
         // four-row and eight-row tiles from the wider ones past their rows.
         assert_eq!(
-            tile_cuts(decode.clone(), |_| true, |row| tiling(&formed, &names, &values, row, &statics)),
+            tile_cuts(decode.clone(), |_| true, |row| tiling(&formed, &names, &values, "M", row, &statics)),
             vec![2, 5, 9]
         );
 
@@ -813,7 +822,7 @@ mod tests {
         // an axis the rows do not decide.
         let wide = assignments(&[&[32, 64, 128]]);
         let names = read(&tokens);
-        assert!(tile_cuts(decode.clone(), |_| true, |row| tiling(&tokens, &names, &wide, row, &statics)).is_empty());
+        assert!(tile_cuts(decode.clone(), |_| true, |row| tiling(&tokens, &names, &wide, "M", row, &statics)).is_empty());
         let columns = NativeNatExpr::Mul(
             rows(),
             Box::new(NativeNatExpr::CeilDiv(
@@ -821,7 +830,56 @@ mod tests {
                 Box::new(parameter("TOKENS")),
             )),
         );
-        assert!(tile_cuts(decode, |_| true, |row| tiling(&columns, &names, &wide, row, &statics)).is_empty());
+        assert!(tile_cuts(decode, |_| true, |row| tiling(&columns, &names, &wide, "M", row, &statics)).is_empty());
+    }
+
+    #[test]
+    fn o_indexed_entries_cut_by_their_row_dimension() {
+        let bf16 = Element::bf16();
+        let expand = magnitude_kernels::dense_expand::native_entry_with(
+            magnitude_kernels::dense_expand::Elements {
+                NW: bf16,
+                GW: bf16,
+                UW: bf16,
+                A: bf16,
+            },
+        );
+        let cuda_expand = seismic::generated::native_implementation_at::<magnitude_kernels::dense_expand::Entry>(
+            seismic::BackendName::Cuda,
+            expand.elements(),
+        )
+        .unwrap()
+        .unwrap();
+        let cuda_statics = NativeSpecialization::new()
+            .with_static("H", 2048)
+            .with_static("F", 8192)
+            .with_static("GS", 0)
+            .with_static("US", 0)
+            .with_static("LB", 0);
+        // Binding `"M"` misses `"O"`-indexed launch conditions and leaves the
+        // entry monolithic; binding `"O"` partitions its row regimes.
+        assert!(row_cuts(&cuda_expand, &cuda_statics, "M", &EVERY_ROW, &points(512)).is_empty());
+        let cuda_cuts = row_cuts(&cuda_expand, &cuda_statics, "O", &EVERY_ROW, &points(512));
+        assert_eq!(cuda_cuts, vec![2, VERIFY_ROWS + 1, 17, 65]);
+        assert_eq!(
+            row_ranges(EVERY_ROW, &cuda_cuts, &points(512)),
+            vec![1..2, 2..VERIFY_ROWS + 1, VERIFY_ROWS + 1..17, 17..65, 65..u64::MAX]
+        );
+
+        let metal_expand = seismic::generated::native_implementation_at::<magnitude_kernels::dense_expand::Entry>(
+            seismic::BackendName::Metal,
+            expand.elements(),
+        )
+        .unwrap()
+        .unwrap();
+        let metal_statics = cuda_statics.with_static("GB", 0).with_static("UB", 0);
+        let metal_cuts = row_cuts(&metal_expand, &metal_statics, "O", &EVERY_ROW, &points(512));
+        assert!(metal_cuts.contains(&2), "Metal dense_expand cuts O=1: {metal_cuts:?}");
+        assert!(
+            metal_cuts.contains(&(VERIFY_ROWS + 1)),
+            "Metal dense_expand cuts verify from prefill: {metal_cuts:?}"
+        );
+        assert!(metal_cuts.contains(&65), "Metal dense_expand cuts tall/large GEMM: {metal_cuts:?}");
     }
 
     #[test]

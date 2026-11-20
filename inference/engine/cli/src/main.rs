@@ -437,10 +437,12 @@ fn run() -> Result<(), String> {
         .merge(magnitude_serving::router(serving));
     let runtime = seismic_threads::runtime().map_err(|error| error.to_string())?;
     runtime.block_on(async move {
-        let address = format!("{}:{}", options.host, options.port);
-        let listener = tokio::net::TcpListener::bind(&address)
+        let listener = tokio::net::TcpListener::bind((options.host.as_str(), options.port))
             .await
-            .map_err(|error| format!("binding {address}: {error}"))?;
+            .map_err(|error| format!("binding {}:{}: {error}", options.host, options.port))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("reading bound listener address: {error}"))?;
         eprintln!(
             "magnitude-engine: model={} path=native backend={} context={} vocabulary={}",
             options.served_model,

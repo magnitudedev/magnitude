@@ -211,6 +211,7 @@ impl From<HeaderError> for Error {
             },
             HeaderError::UnboundWeights(names) => Self::UnboundWeights(names),
             HeaderError::Definition(error) => Self::Definition(error),
+            HeaderError::RopeScaling(kind) => Self::Unadmitted(vec![Feature::RopeScaling(kind)]),
             error @ (HeaderError::NotMatrix { .. }
             | HeaderError::CompanionScale { .. }
             | HeaderError::Rotary { .. }
@@ -242,16 +243,13 @@ pub fn inspect_components(
         return Err(Error::Projector);
     }
     let m = Metadata::new(directory, FAMILY_ID);
-    if let Some(scaling) = m.value("rope.scaling.type") {
-        let kind = scaling.string().unwrap_or("unspecified").to_owned();
-        return Err(Error::Unadmitted(vec![Feature::RopeScaling(kind)]));
-    }
-    let block_count = m.integer("block_count")?;
+    m.reject_rope_scaling()?;
+    let block_count = m.bounded_block_count("block_count")?;
     let context_limit = m.integer("context_length")?;
     let hidden = m.integer("embedding_length")?;
     let intermediate = m.integer("feed_forward_length")?;
     let heads = m.integer("attention.head_count")?;
-    let kv_heads = m.integer("attention.head_count_kv")?;
+    let kv_heads = m.optional_integer("attention.head_count_kv")?.unwrap_or(heads);
     // As llama.cpp reads them, absent head widths are the embedding width per head and an absent
     // rotary dimension is the whole head.
     if !hidden.is_multiple_of(heads) {
@@ -264,7 +262,6 @@ pub fn inspect_components(
         .unwrap_or(hidden / heads);
     let epsilon = m.positive_number("attention.layer_norm_rms_epsilon")?;
     let base = m.positive_number("rope.freq_base")?;
-    let vocabulary = m.integer("vocab_size")?;
     if m.optional_integer("attention.value_length")?.unwrap_or(width) != width {
         return Err(Error::Geometry(
             "value head width differs from key head width".into(),
@@ -277,13 +274,6 @@ pub fn inspect_components(
             "rotary must cover the whole even head width".into(),
         ));
     }
-    // Each block binds distinct stored weights; reject impossible counts
-    // before allocating from untrusted metadata.
-    if block_count > directory.tensors.len() as u64 {
-        return Err(Error::Geometry(
-            "block count exceeds the stored weight roles".into(),
-        ));
-    }
     let query_rows = product(&[heads, width])?;
     let key_rows = product(&[kv_heads, width])?;
     let rms = |weight: WeightDescriptor| RmsNorm { weight, epsilon };
@@ -293,6 +283,7 @@ pub fn inspect_components(
     let half_split = rotary::half_split_rows(width, width);
 
     let mut tensors = Tensors::new(directory);
+    let vocabulary = m.vocab_size(tensors.rows("token_embd.weight")?)?;
     if !tensors.contains("output.weight") {
         return Err(Error::Unadmitted(vec![Feature::TiedOutput]));
     }

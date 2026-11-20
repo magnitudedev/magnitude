@@ -49,6 +49,9 @@ struct DirectFunction {
     /// Largest dynamic shared size currently admitted by the function
     /// attribute; raised on demand.
     dynamic_shared_limit: AtomicU64,
+    /// Serializes slow-path raises of `dynamic_shared_limit` so concurrent
+    /// callers never downgrade the driver attribute.
+    dynamic_shared_raise: Mutex<()>,
 }
 
 // Loaded functions are immutable driver objects owned by `module`.
@@ -157,6 +160,7 @@ impl DirectModule {
                 static_shared,
                 statistics,
                 dynamic_shared_limit: AtomicU64::new(attribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)?),
+                dynamic_shared_raise: Mutex::new(()),
             });
         }
         let edge = if context.driver.graph_add_dependencies.is_some()
@@ -226,14 +230,22 @@ impl DirectFunction {
     /// Raises the function's dynamic shared-memory limit to `bytes` when it
     /// is lower.
     fn admit_shared(&self, device: &Device, bytes: u64) -> Result<(), ExecutionError> {
-        if bytes > self.dynamic_shared_limit.load(Ordering::Acquire) {
-            let value = i32::try_from(bytes).map_err(|_| {
-                ExecutionError::SubmissionFailed("dynamic shared size exceeds driver ABI".into())
-            })?;
-            driver::set_function_attribute(device.context(), self.raw, MAX_DYNAMIC_SHARED_SIZE_BYTES, value)
-                .map_err(submission)?;
-            self.dynamic_shared_limit.fetch_max(bytes, Ordering::AcqRel);
+        if bytes <= self.dynamic_shared_limit.load(Ordering::Acquire) {
+            return Ok(());
         }
+        let _guard = self
+            .dynamic_shared_raise
+            .lock()
+            .expect("dynamic shared limit lock is never poisoned");
+        if bytes <= self.dynamic_shared_limit.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let value = i32::try_from(bytes).map_err(|_| {
+            ExecutionError::SubmissionFailed("dynamic shared size exceeds driver ABI".into())
+        })?;
+        driver::set_function_attribute(device.context(), self.raw, MAX_DYNAMIC_SHARED_SIZE_BYTES, value)
+            .map_err(submission)?;
+        self.dynamic_shared_limit.fetch_max(bytes, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -634,19 +646,24 @@ impl DirectGraph {
         if marks.is_empty() && self.sampled.is_empty() {
             return Ok(());
         }
-        if marks.is_empty() {
-            let rest = self.rest.as_ref().expect("a graph that was sampled has marks");
-            for mark in 0..self.sampled.len() {
-                self.exec.set_event(self.graph.mark(mark), rest).map_err(submission)?;
-            }
-            self.sampled.clear();
-            return Ok(());
-        }
-        self.sampled.clear();
         for (node, (stamps, mark)) in marks.iter().enumerate() {
             let event = stamps.events[*mark].clone();
             self.exec.set_event(self.graph.mark(node), &event).map_err(submission)?;
-            self.sampled.push(event);
+            if node < self.sampled.len() {
+                self.sampled[node] = event;
+            } else {
+                self.sampled.push(event);
+            }
+        }
+        if marks.len() < self.sampled.len() {
+            let rest = self.rest.as_ref().expect("a graph that was sampled has marks");
+            // Reset trailing nodes from the end so any partial failure keeps
+            // every still-referenced event alive in `self.sampled`.
+            while self.sampled.len() > marks.len() {
+                let node = self.sampled.len() - 1;
+                self.exec.set_event(self.graph.mark(node), rest).map_err(submission)?;
+                self.sampled.pop();
+            }
         }
         Ok(())
     }
@@ -890,10 +907,13 @@ impl Stamps {
 pub struct DirectBatch {
     device: Device,
     stream: std::sync::Arc<driver::Stream>,
-    start: Event,
+    start: Option<Event>,
     /// For a timed batch, per `launch` call, the event recorded just before
     /// the launch (absent for an empty launch).
     marks: Option<Vec<Option<Event>>>,
+    /// Whether device work was enqueued on `stream` and has not yet been
+    /// handed to a [`DirectSubmission`] (or synchronized on `end` failure).
+    enqueued: bool,
 }
 
 impl DirectBatch {
@@ -905,8 +925,9 @@ impl DirectBatch {
         Ok(Self {
             device: device.clone(),
             stream,
-            start,
+            start: Some(start),
             marks: None,
+            enqueued: false,
         })
     }
 
@@ -928,7 +949,9 @@ impl DirectBatch {
         // SAFETY: the stream and the event are this context's, and the end
         // event was recorded when its submission committed.
         let status = unsafe { context.enqueue().stream_wait_event(self.stream.raw(), other.end.raw()) };
-        context.driver.check(status, "cross-stream wait").map_err(submission)
+        context.driver.check(status, "cross-stream wait").map_err(submission)?;
+        self.enqueued = true;
+        Ok(())
     }
 
     /// Record a launch that does no device work (inactive, or an empty
@@ -970,7 +993,9 @@ impl DirectBatch {
         };
         driver
             .check(status, "native kernel launch")
-            .map_err(submission)
+            .map_err(submission)?;
+        self.enqueued = true;
+        Ok(())
     }
 
     /// Copy `bytes` bytes of the device's memory at `source` to
@@ -985,7 +1010,9 @@ impl DirectBatch {
         // SAFETY: both ranges lie in live device allocations of this
         // context, which the caller keeps until the batch completes.
         let status = unsafe { context.enqueue().memcpy_device_async(destination, source, count, self.stream.raw()) };
-        context.driver.check(status, "device copy").map_err(submission)
+        context.driver.check(status, "device copy").map_err(submission)?;
+        self.enqueued = true;
+        Ok(())
     }
 
     /// Set the 8-byte-aligned word of the device's memory at `destination`
@@ -1003,6 +1030,7 @@ impl DirectBatch {
             // SAFETY: a word of a live device allocation of this context.
             let status = unsafe { context.enqueue().memset_d32_async(destination + offset, half, 1, self.stream.raw()) };
             context.driver.check(status, "device word write").map_err(submission)?;
+            self.enqueued = true;
         }
         Ok(())
     }
@@ -1010,7 +1038,9 @@ impl DirectBatch {
     /// Stamp mark `mark` of `stamps` once the stream's preceding work
     /// completes ([`Stamps`]).
     pub fn stamp(&mut self, stamps: &Stamps, mark: usize) -> Result<(), ExecutionError> {
-        stamps.events[mark].record(&self.stream).map_err(submission)
+        stamps.events[mark].record(&self.stream).map_err(submission)?;
+        self.enqueued = true;
+        Ok(())
     }
 
     /// The stream's following work waits until `word` reaches `value`
@@ -1050,7 +1080,9 @@ impl DirectBatch {
         context
             .driver
             .check(status, "stream memory operation")
-            .map_err(submission)
+            .map_err(submission)?;
+        self.enqueued = true;
+        Ok(())
     }
 
     /// Queue every launch of `graph`, in its order, and behind each of its
@@ -1063,6 +1095,7 @@ impl DirectBatch {
             "DirectBatch::replay precondition: a timed batch times each launch"
         );
         graph.exec.launch(&self.stream).map_err(submission)?;
+        self.enqueued = true;
         graph.launched.record(&self.stream).map_err(submission)?;
         for (written, wake) in graph.words.iter().filter_map(|node| node.written.as_ref()) {
             wake.behind(&self.stream, written)?;
@@ -1089,16 +1122,19 @@ impl DirectBatch {
     /// finished, or (the wait failing too, both errors returned) the
     /// context's sticky error lets nothing more run, so no storage they
     /// reach is reused while they run.
-    fn end(self) -> Result<DirectSubmission, ExecutionError> {
+    fn end(mut self) -> Result<DirectSubmission, ExecutionError> {
+        self.enqueued = false;
+        let start = self.start.take().expect("DirectBatch::end called once");
+        let marks = self.marks.take();
         let end = Event::new(self.device.context()).and_then(|end| {
             end.record(&self.stream)?;
             Ok(end)
         });
         match end {
             Ok(end) => Ok(DirectSubmission {
-                start: self.start,
+                start,
                 end,
-                marks: self.marks,
+                marks,
                 complete: std::sync::atomic::AtomicBool::new(false),
             }),
             Err(error) => Err(match self.stream.synchronize() {
@@ -1108,6 +1144,14 @@ impl DirectBatch {
                     completion: Box::new(submission(waited)),
                 },
             }),
+        }
+    }
+}
+
+impl Drop for DirectBatch {
+    fn drop(&mut self) {
+        if self.enqueued {
+            let _ = self.stream.synchronize();
         }
     }
 }
@@ -1220,6 +1264,14 @@ impl DirectSubmission {
             intervals.push(Some((anchor.place(mark)?, anchor.place(end)?)));
         }
         Ok(Some(intervals))
+    }
+}
+
+impl Drop for DirectSubmission {
+    fn drop(&mut self) {
+        if !self.complete.load(Ordering::Relaxed) {
+            let _ = self.end.synchronize();
+        }
     }
 }
 

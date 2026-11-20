@@ -1103,6 +1103,10 @@ pub struct PlaneInfo {
 }
 
 impl PlaneInfo {
+    /// The scalar dtype of a plane entry (`self.encoding.dtype()`).
+    pub const fn dtype(&self) -> DType {
+        self.encoding.dtype()
+    }
     /// Storage coordinates differ from logical decoded-value coordinates:
     /// integer codes expose words, float codes bytes, coefficients typed elements.
     pub fn storage_element_bytes(&self) -> u32 {
@@ -3166,6 +3170,16 @@ fn element_name(representation: &str, operands: OperandRecipe, layout: Layout) -
     let storage = format!("{representation}{}", operands.suffix());
     Box::leak(stored_name(&storage, layout).into_boxed_str())
 }
+/// Minimum alignment in bytes of one storage unit of `representation`.
+pub fn representation_alignment(representation: RepresentationId) -> u64 {
+    match &representation_info(representation).kind {
+        RepresentationKind::Dense(dtype) => u64::from(dtype.bytes()),
+        RepresentationKind::Packed(layout) => u64::from(layout.packet_alignment),
+        RepresentationKind::PackedRows(_) => ROW_ALIGNMENT,
+        RepresentationKind::External(layout) => u64::from(layout.packet_alignment),
+    }
+}
+
 /// The storage units of a contiguous tensor with `extents` in
 /// representation `id`, per axis, and the bytes of one unit: dense units
 /// are elements; a packed or external tensor's packing axis counts packets

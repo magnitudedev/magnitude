@@ -1754,7 +1754,9 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
     let history_slabs = terms.fit_depth.div_ceil(u64::from(history.slab_rows));
     assert_eq!(
         state_bytes,
-        history_layout.address_table_bytes + history_slabs * state.target_state().granule
+        history_layout.address_table_bytes
+            + history_slabs * state.target_state().granule
+            + state.target_state().block.absent
     );
     assert!(state_bytes > terms.history_at_fit_depth().unwrap());
     let startup_state = state.startup_state_bytes().unwrap();

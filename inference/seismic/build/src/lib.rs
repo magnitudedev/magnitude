@@ -669,6 +669,7 @@ mod internals {
     /// loop's body) keeps the predicate and the exit in the module the 32-lane
     /// driver compiles, which it does not fold away.
     fn vulkan_steering_rule(source: &str, identifier: &str, offset: usize) -> Option<String> {
+        use seismic_lang::native_source::{tokens, TokenKind};
         if identifier == "seismic_hardware_any" {
             return Some("`seismic_hardware_any` is `seismic_steer`'s; steer by `seismic_steer`".to_owned());
         }
@@ -676,62 +677,115 @@ mod internals {
             return None;
         }
         let whole = "`seismic_steer` is the whole condition of an `if`, `while` or `for`";
-        // The condition's opening parenthesis: the innermost one open at `offset`.
-        let before = &source[..offset];
+        let toks: Vec<_> = tokens(source).collect();
+        let Some(pos) = toks.iter().position(|t| t.offset == offset) else {
+            return Some(whole.to_owned());
+        };
+        // The condition's opening parenthesis: the innermost one open at `pos`.
         let mut depth = 0usize;
-        let open = before.char_indices().rev().find_map(|(at, c)| match c {
-            ')' => {
-                depth += 1;
+        let open = toks[..pos].iter().enumerate().rev().find_map(|(i, t)| {
+            if t.kind == TokenKind::Punctuator {
+                match t.text {
+                    ")" => {
+                        depth += 1;
+                        None
+                    }
+                    "(" if depth == 0 => Some(i),
+                    "(" => {
+                        depth -= 1;
+                        None
+                    }
+                    _ => None,
+                }
+            } else {
                 None
             }
-            '(' if depth == 0 => Some(at),
-            '(' => {
-                depth -= 1;
-                None
-            }
-            _ => None,
         });
         let Some(open) = open else {
             return Some(whole.to_owned());
         };
-        let keyword = source[..open].trim_end();
-        let keyword = &keyword[keyword
-            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .map_or(0, |at| at + 1)..];
-        let inside = source[open + 1..offset].trim();
+        let keyword = open
+            .checked_sub(1)
+            .map(|i| toks[i])
+            .filter(|t| t.kind == TokenKind::Identifier)
+            .map(|t| t.text)
+            .unwrap_or("");
+        let inside = &toks[open + 1..pos];
         let leading = match keyword {
-            "if" | "while" => inside.is_empty() || inside == "!",
+            "if" | "while" => {
+                inside.is_empty()
+                    || (inside.len() == 1
+                        && inside[0].kind == TokenKind::Punctuator
+                        && inside[0].text == "!")
+            }
             // The condition: after the header's one `;` at its own depth.
             "for" => {
-                inside.ends_with(';') && source[open + 1..offset].matches(';').count() == 1
+                let mut semi_count = 0usize;
+                let mut d = 0usize;
+                for t in inside {
+                    if t.kind == TokenKind::Punctuator {
+                        match t.text {
+                            "(" => d += 1,
+                            ")" => d = d.saturating_sub(1),
+                            ";" if d == 0 => semi_count += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                semi_count == 1
+                    && inside
+                        .last()
+                        .is_some_and(|t| t.kind == TokenKind::Punctuator && t.text == ";")
             }
             _ => false,
         };
         // The call's closing parenthesis, and what follows it.
+        if !toks
+            .get(pos + 1)
+            .is_some_and(|t| t.kind == TokenKind::Punctuator && t.text == "(")
+        {
+            return Some(whole.to_owned());
+        }
         let mut depth = 0usize;
-        let close = source[offset..].char_indices().find_map(|(at, c)| match c {
-            '(' => {
-                depth += 1;
+        let close = toks[pos + 1..].iter().enumerate().find_map(|(rel, t)| {
+            if t.kind == TokenKind::Punctuator {
+                match t.text {
+                    "(" => {
+                        depth += 1;
+                        None
+                    }
+                    ")" if depth == 1 => Some(pos + 1 + rel),
+                    ")" => {
+                        depth -= 1;
+                        None
+                    }
+                    _ => None,
+                }
+            } else {
                 None
             }
-            ')' if depth == 1 => Some(offset + at),
-            ')' => {
-                depth -= 1;
-                None
-            }
-            _ => None,
-        })?;
-        let after = source[close + 1..].trim_start();
+        });
+        let Some(close) = close else {
+            return Some(whole.to_owned());
+        };
         let trailing = match keyword {
-            "for" => after.starts_with(';'),
-            _ => after.starts_with(')'),
+            "for" => toks
+                .get(close + 1)
+                .is_some_and(|t| t.kind == TokenKind::Punctuator && t.text == ";"),
+            _ => toks
+                .get(close + 1)
+                .is_some_and(|t| t.kind == TokenKind::Punctuator && t.text == ")"),
         };
         if !leading || !trailing {
             return Some(whole.to_owned());
         }
         if keyword == "if" {
-            let body = after[1..].trim_start().trim_start_matches('{').trim_start();
-            if body.starts_with("break") || body.starts_with("continue") {
+            let body = toks[close + 2..]
+                .iter()
+                .find(|t| !(t.kind == TokenKind::Punctuator && t.text == "{"));
+            if body.is_some_and(|t| {
+                t.kind == TokenKind::Identifier && matches!(t.text, "break" | "continue")
+            }) {
                 return Some(
                     "a loop steered by `seismic_steer` exits at its header, `for (...; seismic_steer(live, p); ...)` \
                      or `while (seismic_steer(live, p))`, not by a `break` or `continue` in its body"
@@ -776,23 +830,23 @@ mod internals {
             }
         };
         if dialect == SourceDialect::Vulkan {
-            let mut offset = 0;
-            for line in source.split_inclusive('\n') {
-                let trimmed = line.trim_start();
-                if let Some(directive) = trimmed.strip_prefix('#') {
-                    let name = directive
-                        .trim_start()
-                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                        .next()
-                        .unwrap_or("");
-                    if VULKAN_RESERVED_DIRECTIVES.contains(&name) {
-                        violations.push(reserved(
-                            offset + (line.len() - trimmed.len()),
-                            format!("prefix-owned directive: `#{name}` is generated by the Vulkan prefix"),
-                        ));
+            use seismic_lang::native_source::{tokens, TokenKind};
+            let mut iter = tokens(source).peekable();
+            while let Some(tok) = iter.next() {
+                if tok.first && tok.kind == TokenKind::Punctuator && tok.text == "#" {
+                    if let Some(next) = iter.peek() {
+                        if !next.first
+                            && next.kind == TokenKind::Identifier
+                            && VULKAN_RESERVED_DIRECTIVES.contains(&next.text)
+                        {
+                            let name = next.text;
+                            violations.push(reserved(
+                                tok.offset,
+                                format!("prefix-owned directive: `#{name}` is generated by the Vulkan prefix"),
+                            ));
+                        }
                     }
                 }
-                offset += line.len();
             }
         }
         for (identifier, offset) in identifiers(source) {
@@ -1614,7 +1668,7 @@ mod internals {
         native: Option<&EntryNative<'_>>,
         cpu_library: Option<&CpuLibrary>,
     ) -> Result<(), BuildError> {
-        let module_name = ident(&entry.name);
+        let module_name = rust_ident(&entry.name);
         out.push_str(&format!("pub mod {module_name} {{\n"));
         let borrowed = entry.parameters.iter().any(|parameter| {
             matches!(
@@ -1639,7 +1693,7 @@ mod internals {
             let parameter = parameters[0];
             out.push_str(&format!(
                 "    pub {}: {},\n",
-                ident(&parameter.name),
+                rust_ident(&parameter.name),
                 source_parameter_type(parameters, 0)
             ));
         }
@@ -1654,7 +1708,7 @@ mod internals {
             let parameter = parameters[0];
             out.push_str(&format!(
                 "    pub {}: {},\n",
-                ident(&parameter.name),
+                rust_ident(&parameter.name),
                 source_workflow_parameter_type(parameters, 0)
             ));
         }
@@ -1703,7 +1757,7 @@ mod internals {
             for parameter in &entry.element_parameters {
                 out.push_str(&format!(
                     "    pub {}: seismic::Element,\n",
-                    ident(parameter)
+                    rust_ident(parameter)
                 ));
             }
             out.push_str("  }\n");
@@ -1752,7 +1806,7 @@ mod internals {
         out.push_str("      let mut encoder = seismic::generated::ArgsEncoder::new();\n");
         for parameters in &sources {
             let source = parameters[0];
-            let field = ident(&source.name);
+            let field = rust_ident(&source.name);
             for parameter in parameters {
                 let expression = parameter_access(&field, &parameter.path);
                 match &parameter.kind {
@@ -1824,7 +1878,7 @@ mod internals {
         out.push_str("      let mut encoder = seismic::generated::WorkflowArgsEncoder::new();\n");
         for parameters in &sources {
             let source = parameters[0];
-            let field = ident(&source.name);
+            let field = rust_ident(&source.name);
             for parameter in parameters {
                 let expression = parameter_access(&field, &parameter.path);
                 match &parameter.kind {
@@ -1899,7 +1953,7 @@ mod internals {
                 out.push_str(&format!(
                     "      ({:?}, elements.{}),\n",
                     parameter,
-                    ident(parameter)
+                    rust_ident(parameter)
                 ));
             }
             out.push_str("    ])\n  }\n");
@@ -1915,7 +1969,7 @@ mod internals {
                 out.push_str(&format!(
                     "      ({:?}, elements.{}),\n",
                     parameter,
-                    ident(parameter)
+                    rust_ident(parameter)
                 ));
             }
             out.push_str("    ])\n  }\n");
@@ -1942,7 +1996,7 @@ mod internals {
                 out.push_str(&format!(
                     "      ({:?}, elements.{}),\n",
                     parameter,
-                    ident(parameter)
+                    rust_ident(parameter)
                 ));
             }
         };
@@ -2065,7 +2119,7 @@ mod internals {
                         .map(|component| component.as_os_str().to_string_lossy().into_owned())
                         .collect::<Vec<_>>();
                     for module in &modules {
-                        if ident(module) != *module {
+                        if rust_ident(module) != *module {
                             return Err(BuildError::CpuNative {
                                 path,
                                 reason: format!(
@@ -2205,11 +2259,17 @@ mod internals {
 
     /// The accessor of entry parameter `ordinal` on a CPU `Context`:
     /// `arg_<name>`, or `arg_<ordinal>` where another parameter shares the
-    /// name.
+    /// lowered sanitized name.
     fn cpu_argument(entry: &EntryInfo, ordinal: usize) -> String {
-        let name = &entry.parameters[ordinal].name;
-        if entry.parameters.iter().filter(|candidate| candidate.name == *name).count() == 1 {
-            format!("arg_{}", ident(name).to_lowercase())
+        let key = ident_fragment(&entry.parameters[ordinal].name).to_lowercase();
+        let unique = entry
+            .parameters
+            .iter()
+            .filter(|candidate| ident_fragment(&candidate.name).to_lowercase() == key)
+            .count()
+            == 1;
+        if unique {
+            format!("arg_{key}")
         } else {
             format!("arg_{ordinal}")
         }
@@ -2255,8 +2315,8 @@ mod internals {
     fn cpu_nat(expression: &seismic_lang::checked::NativeNatExpr) -> Option<String> {
         use seismic_lang::checked::NativeNatExpr as E;
         rust_nat(expression, &|read| match read {
-            E::Dimension(name) => Some(format!("cx.dim_{}()", ident(name).to_lowercase())),
-            E::Parameter(name) => Some(format!("cx.param_{}()", ident(name).to_lowercase())),
+            E::Dimension(name) => Some(format!("cx.dim_{}()", ident_fragment(name).to_lowercase())),
+            E::Parameter(name) => Some(format!("cx.param_{}()", ident_fragment(name).to_lowercase())),
             _ => None,
         })
     }
@@ -2269,17 +2329,17 @@ mod internals {
         let parameters = function
             .parameters()
             .iter()
-            .map(|parameter| format!("{}: u64", ident(parameter)))
+            .map(|parameter| format!("{}: u64", rust_ident(parameter)))
             .collect::<Vec<_>>()
             .join(", ");
         let body = rust_nat(&function.body().nat(), &|read| match read {
-            E::Dimension(name) => Some(ident(name)),
+            E::Dimension(name) => Some(rust_ident(name)),
             _ => None,
         })
         .unwrap_or_else(|| panic!("constant function `{}` reads only its parameters", function.name()));
         out.push_str(&format!(
             "  #[allow(non_snake_case)]\n  pub const fn {}({parameters}) -> u64 {{\n    {body}\n  }}\n",
-            ident(function.name())
+            rust_ident(function.name())
         ));
     }
 
@@ -2347,7 +2407,7 @@ mod internals {
                 .map(|index| format!("&weight_{index} as &dyn operator::Recipe"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let scratch = |ordinal: u32| ident(&definition.scratch[ordinal as usize].name).to_lowercase();
+            let scratch = |ordinal: u32| ident_fragment(&definition.scratch[ordinal as usize].name).to_lowercase();
             out.push_str(&format!(
                 "      {{\n        let (sources, width, groups) = ({sources}, {} as usize, {groups});\n        let rows = sources * groups;\n        {weight_binds}\n        let weights: [&dyn operator::Recipe; {}] = [{weight_refs}];\n",
                 nat(&operand.width)?,
@@ -2453,7 +2513,7 @@ mod internals {
         match element {
             ElementSummary::Parameter(name) => {
                 if elements.dense.iter().any(|(dense, _)| dense == name) {
-                    CpuView::Dense(format!("E::{}", ident(name)))
+                    CpuView::Dense(format!("E::{}", rust_ident(name)))
                 } else if elements.weights.contains(name) {
                     CpuView::Weights
                 } else if elements.external.contains(name) {
@@ -2479,6 +2539,246 @@ mod internals {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RustTokenKind {
+        Ident,
+        Literal,
+        Punct,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct RustToken<'a> {
+        kind: RustTokenKind,
+        text: &'a str,
+    }
+
+    /// Minimal Rust token stream for [`out_of_line`]: skips whitespace and
+    /// comments (including nested block comments) and keeps string/char
+    /// literals opaque while distinguishing lifetimes from char literals.
+    fn rust_tokens(text: &str) -> Vec<RustToken<'_>> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let start = i;
+            match bytes[i] {
+                b if b.is_ascii_whitespace() => {
+                    i += 1;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    let mut depth = 1usize;
+                    while i + 1 < bytes.len() && depth > 0 {
+                        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                        } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if depth > 0 {
+                        i = bytes.len();
+                    }
+                }
+                // Raw strings (`r"..."`, `r#"..."#`, `br#"..."#`, `cr#"..."#`) and raw idents (`r#ident`).
+                b'r' | b'b' | b'c' => {
+                    let raw_pos = if bytes[i] == b'r' {
+                        Some(i + 1)
+                    } else if bytes.get(i + 1) == Some(&b'r') {
+                        Some(i + 2)
+                    } else {
+                        None
+                    };
+                    if let Some(p) = raw_pos {
+                        let mut hashes = 0usize;
+                        while bytes.get(p + hashes) == Some(&b'#') {
+                            hashes += 1;
+                        }
+                        if bytes.get(p + hashes) == Some(&b'"') {
+                            i = p + hashes + 1;
+                            while i < bytes.len() {
+                                if bytes[i] == b'"'
+                                    && i + 1 + hashes <= bytes.len()
+                                    && bytes[i + 1..i + 1 + hashes].iter().all(|&b| b == b'#')
+                                {
+                                    i += 1 + hashes;
+                                    break;
+                                }
+                                i += 1;
+                            }
+                            out.push(RustToken {
+                                kind: RustTokenKind::Literal,
+                                text: &text[start..i],
+                            });
+                            continue;
+                        } else if bytes[i] == b'r'
+                            && hashes == 1
+                            && bytes
+                                .get(p + 1)
+                                .is_some_and(|&b| b == b'_' || b.is_ascii_alphabetic())
+                        {
+                            i = p + 2;
+                            while i < bytes.len()
+                                && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                            {
+                                i += 1;
+                            }
+                            out.push(RustToken {
+                                kind: RustTokenKind::Ident,
+                                text: &text[start..i],
+                            });
+                            continue;
+                        }
+                    }
+                    // Byte/C string literals (`b"..."`, `c"..."`) and byte char literals (`b'...'`).
+                    if (bytes[i] == b'b' || bytes[i] == b'c') && bytes.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        while i < bytes.len() {
+                            if bytes[i] == b'\\' {
+                                i = (i + 2).min(bytes.len());
+                            } else if bytes[i] == b'"' {
+                                i += 1;
+                                break;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        out.push(RustToken {
+                            kind: RustTokenKind::Literal,
+                            text: &text[start..i],
+                        });
+                    } else if bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        while i < bytes.len() {
+                            if bytes[i] == b'\\' {
+                                i = (i + 2).min(bytes.len());
+                            } else if bytes[i] == b'\'' {
+                                i += 1;
+                                break;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        out.push(RustToken {
+                            kind: RustTokenKind::Literal,
+                            text: &text[start..i],
+                        });
+                    } else {
+                        i += 1;
+                        while i < bytes.len()
+                            && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                        {
+                            i += 1;
+                        }
+                        out.push(RustToken {
+                            kind: RustTokenKind::Ident,
+                            text: &text[start..i],
+                        });
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i = (i + 2).min(bytes.len());
+                        } else if bytes[i] == b'"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    out.push(RustToken {
+                        kind: RustTokenKind::Literal,
+                        text: &text[start..i],
+                    });
+                }
+                b'\'' => {
+                    if bytes.get(i + 1) == Some(&b'\\') {
+                        i += 1;
+                        while i < bytes.len() {
+                            if bytes[i] == b'\\' {
+                                i = (i + 2).min(bytes.len());
+                            } else if bytes[i] == b'\'' {
+                                i += 1;
+                                break;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        out.push(RustToken {
+                            kind: RustTokenKind::Literal,
+                            text: &text[start..i],
+                        });
+                    } else if let Some(ch) = text[i + 1..].chars().next() {
+                        let end = i + 1 + ch.len_utf8();
+                        if bytes.get(end) == Some(&b'\'') {
+                            i = end + 1;
+                            out.push(RustToken {
+                                kind: RustTokenKind::Literal,
+                                text: &text[start..i],
+                            });
+                        } else {
+                            // Lifetime tick `'a`, `'static`, `'_`.
+                            i += 1;
+                            out.push(RustToken {
+                                kind: RustTokenKind::Punct,
+                                text: &text[start..i],
+                            });
+                        }
+                    } else {
+                        i += 1;
+                        out.push(RustToken {
+                            kind: RustTokenKind::Punct,
+                            text: &text[start..i],
+                        });
+                    }
+                }
+                b if b == b'_' || b.is_ascii_alphabetic() => {
+                    i += 1;
+                    while i < bytes.len()
+                        && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                    {
+                        i += 1;
+                    }
+                    out.push(RustToken {
+                        kind: RustTokenKind::Ident,
+                        text: &text[start..i],
+                    });
+                }
+                b if b.is_ascii_digit() => {
+                    i += 1;
+                    while i < bytes.len()
+                        && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                    {
+                        i += 1;
+                    }
+                    out.push(RustToken {
+                        kind: RustTokenKind::Literal,
+                        text: &text[start..i],
+                    });
+                }
+                _ => {
+                    i += text[i..].chars().next().map_or(1, char::len_utf8);
+                    out.push(RustToken {
+                        kind: RustTokenKind::Punct,
+                        text: &text[start..i],
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// The first function with a body in the CPU source `text` that is not
     /// `#[inline(always)]`. Each form of a CPU entry is a `#[target_feature]`
     /// function of its tier, into which the authored kernel and everything it
@@ -2486,39 +2786,177 @@ mod internals {
     /// without the tier's features, and so are the vector intrinsics it
     /// reaches. Tests and functions with their own target features are exempt.
     fn out_of_line(text: &str) -> Option<&str> {
-        let lines = text.lines().collect::<Vec<_>>();
-        lines.iter().enumerate().find_map(|(index, line)| {
-            let mut rest = line.trim_start();
-            for qualifier in ["pub(crate) ", "pub(super) ", "pub ", "const ", "unsafe "] {
-                rest = rest.strip_prefix(qualifier).unwrap_or(rest);
+        let toks = rust_tokens(text);
+        for (i, tok) in toks.iter().enumerate() {
+            if tok.kind != RustTokenKind::Ident || tok.text != "fn" {
+                continue;
             }
-            let rest = rest.strip_prefix("fn ")?;
-            let name = &rest[..rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?];
-            // A trait's required method ends at `;` (outside an array type)
-            // before any body.
+            let Some(name_tok) = toks.get(i + 1) else {
+                continue;
+            };
+            if name_tok.kind != RustTokenKind::Ident {
+                continue;
+            }
+            let name = name_tok.text;
+
+            // A trait's required method or extern declaration ends at `;`
+            // (outside `(...)` and `[...]`) before any body `{`.
+            let mut parens = 0i32;
             let mut brackets = 0i32;
-            let body = lines[index..].iter().flat_map(|line| line.chars()).find_map(|c| {
-                match c {
-                    '[' => brackets += 1,
-                    ']' => brackets -= 1,
-                    '{' => return Some(true),
-                    ';' if brackets == 0 => return Some(false),
-                    _ => {}
+            let has_body = toks[i + 2..].iter().find_map(|t| {
+                if t.kind == RustTokenKind::Punct {
+                    match t.text {
+                        "(" => parens += 1,
+                        ")" => parens -= 1,
+                        "[" => brackets += 1,
+                        "]" => brackets -= 1,
+                        "{" if parens == 0 && brackets == 0 => return Some(true),
+                        ";" if parens == 0 && brackets == 0 => return Some(false),
+                        _ => {}
+                    }
                 }
                 None
-            })?;
-            let mut attributes = lines[..index]
-                .iter()
-                .rev()
-                .map(|line| line.trim())
-                .take_while(|line| line.starts_with("#[") || line.starts_with("//"));
-            let exempt = |line: &str| {
-                line == "#[inline(always)]"
-                    || line.starts_with("#[test]")
-                    || line.starts_with("#[target_feature")
-            };
-            (body && !attributes.any(exempt)).then_some(name)
-        })
+            });
+            if has_body != Some(true) {
+                continue;
+            }
+
+            // Walk backward past arbitrary `fn` qualifiers:
+            // `pub`, `pub(...)`, `const`, `async`, `unsafe`, `default`, `extern`, `extern "ABI"`.
+            let mut pos = i;
+            loop {
+                if pos == 0 {
+                    break;
+                }
+                let prev = toks[pos - 1];
+                if prev.kind == RustTokenKind::Ident
+                    && matches!(
+                        prev.text,
+                        "pub" | "const" | "async" | "unsafe" | "default" | "extern"
+                    )
+                {
+                    pos -= 1;
+                } else if prev.kind == RustTokenKind::Literal
+                    && pos >= 2
+                    && toks[pos - 2].kind == RustTokenKind::Ident
+                    && toks[pos - 2].text == "extern"
+                {
+                    pos -= 2;
+                } else if prev.kind == RustTokenKind::Punct && prev.text == ")" {
+                    let mut depth = 0usize;
+                    let open = toks[..pos].iter().enumerate().rev().find_map(|(k, t)| {
+                        if t.kind == RustTokenKind::Punct {
+                            match t.text {
+                                ")" => {
+                                    depth += 1;
+                                    None
+                                }
+                                "(" if depth == 1 => Some(k),
+                                "(" => {
+                                    depth -= 1;
+                                    None
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(open) = open {
+                        if open > 0
+                            && toks[open - 1].kind == RustTokenKind::Ident
+                            && toks[open - 1].text == "pub"
+                        {
+                            pos = open - 1;
+                            continue;
+                        }
+                    }
+                    break;
+                } else {
+                    break;
+                }
+            }
+
+            // Walk backward across consecutive outer attributes `#[...]`.
+            let mut exempt = false;
+            while pos > 0
+                && toks[pos - 1].kind == RustTokenKind::Punct
+                && toks[pos - 1].text == "]"
+            {
+                let mut depth = 0usize;
+                let open = toks[..pos].iter().enumerate().rev().find_map(|(k, t)| {
+                    if t.kind == RustTokenKind::Punct {
+                        match t.text {
+                            "]" => {
+                                depth += 1;
+                                None
+                            }
+                            "[" if depth == 1 => Some(k),
+                            "[" => {
+                                depth -= 1;
+                                None
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                });
+                let Some(open) = open else {
+                    break;
+                };
+                if open == 0
+                    || toks[open - 1].kind != RustTokenKind::Punct
+                    || toks[open - 1].text != "#"
+                {
+                    break;
+                }
+                let attr = &toks[open + 1..pos - 1];
+                let is_inline_always = attr.len() == 4
+                    && attr[0]
+                        == RustToken {
+                            kind: RustTokenKind::Ident,
+                            text: "inline",
+                        }
+                    && attr[1]
+                        == RustToken {
+                            kind: RustTokenKind::Punct,
+                            text: "(",
+                        }
+                    && attr[2]
+                        == RustToken {
+                            kind: RustTokenKind::Ident,
+                            text: "always",
+                        }
+                    && attr[3]
+                        == RustToken {
+                            kind: RustTokenKind::Punct,
+                            text: ")",
+                        };
+                let is_test = attr.len() == 1
+                    && attr[0]
+                        == RustToken {
+                            kind: RustTokenKind::Ident,
+                            text: "test",
+                        };
+                let is_target_feature = attr.first().is_some_and(|t| {
+                    *t == RustToken {
+                        kind: RustTokenKind::Ident,
+                        text: "target_feature",
+                    }
+                });
+                if is_inline_always || is_test || is_target_feature {
+                    exempt = true;
+                    break;
+                }
+                pos = open - 1;
+            }
+
+            if !exempt {
+                return Some(name);
+            }
+        }
+        None
     }
 
     fn out_of_line_reason(function: &str) -> String {
@@ -2595,7 +3033,7 @@ mod internals {
             } else {
                 "Element"
             };
-            out.push_str(&format!("      type {}: {bound};\n", ident(element)));
+            out.push_str(&format!("      type {}: {bound};\n", rust_ident(element)));
         }
         out.push_str("    }\n");
         out.push_str(&format!(
@@ -2613,7 +3051,7 @@ mod internals {
         for dimension in &entry.dimensions {
             out.push_str(&format!(
                 "      pub fn dim_{}(&self) -> u64 {{ self.invocation.word({word}) }}\n",
-                ident(dimension).to_lowercase()
+                ident_fragment(dimension).to_lowercase()
             ));
             word += 1;
         }
@@ -2687,17 +3125,7 @@ mod internals {
             Ok(())
         };
         for (ordinal, parameter) in entry.parameters.iter().enumerate() {
-            let unique = entry
-                .parameters
-                .iter()
-                .filter(|candidate| candidate.name == parameter.name)
-                .count()
-                == 1;
-            let name = if unique {
-                format!("arg_{}", ident(&parameter.name).to_lowercase())
-            } else {
-                format!("arg_{ordinal}")
-            };
+            let name = cpu_argument(entry, ordinal);
             match &parameter.kind {
                 // A host port is in the words but bound to no buffer
                 // (`abi::bound`): the kernel never accesses it.
@@ -2785,7 +3213,7 @@ mod internals {
         // the call emits it; on the rows, bit 1, as NVFP4 operand rows.
         for scratch in &definition.scratch {
             if let Some(seismic_lang::checked::NativeOperand::Emitted { result, rows, .. }) = &scratch.operand {
-                let name = ident(&scratch.name).to_lowercase();
+                let name = ident_fragment(&scratch.name).to_lowercase();
                 out.push_str(&format!(
                     "      /// Whether the call emits result {result}'s operand into `scratch_{name}`: a sealed graph pairs it.\n      pub fn emits_{name}(&self) -> bool {{ self.invocation.word({word}) & 1 != 0 }}\n"
                 ));
@@ -2800,7 +3228,7 @@ mod internals {
         for scratch in &definition.scratch {
             out.push_str(&format!(
                 "      pub fn scratch_{}(&self) -> seismic::cpu::Scratch<'a> {{ // SAFETY: the runtime places every scratch buffer for the call, 256-byte aligned.\n        unsafe {{ seismic::cpu::Scratch::from_raw(self.invocation.buffer({buffer})) }} }}\n",
-                ident(&scratch.name).to_lowercase()
+                ident_fragment(&scratch.name).to_lowercase()
             ));
             buffer += 1;
         }
@@ -2808,7 +3236,7 @@ mod internals {
             out.push_str(&format!(
                 "      /// Tuning parameter `{}`.\n      pub fn param_{}(&self) -> u64 {{ self.invocation.param({index}) }}\n",
                 parameter.name,
-                ident(&parameter.name).to_lowercase()
+                ident_fragment(&parameter.name).to_lowercase()
             ));
         }
         out.push_str("    }\n");
@@ -2851,7 +3279,7 @@ mod internals {
                 "    pub struct {name};\n    impl Elements for {name} {{"
             ));
             for ((element, _), (_, ty)) in elements.dense.iter().zip(binding) {
-                out.push_str(&format!(" type {} = seismic::cpu::{ty};", ident(element)));
+                out.push_str(&format!(" type {} = seismic::cpu::{ty};", rust_ident(element)));
             }
             out.push_str(" }\n");
         }
@@ -3089,7 +3517,7 @@ mod internals {
         for (ordinal, name) in entry.dimensions.iter().enumerate() {
             render_range(
                 out,
-                &format!("dimension_{}", ident(name)),
+                &format!("dimension_{}", ident_fragment(name)),
                 "seismic::BigUint",
                 "Nat",
                 false,
@@ -3111,7 +3539,7 @@ mod internals {
                         .join("_")
                 )
             };
-            let name = format!("{}_{}{}", "parameter", ident(&parameter.name), suffix);
+            let name = format!("{}_{}{}", "parameter", ident_fragment(&parameter.name), suffix);
             match parameter.kind {
                 ParameterSummaryKind::Tensor { .. } => {}
                 ParameterSummaryKind::Scalar(dtype) => {
@@ -3208,7 +3636,7 @@ mod internals {
     }
 
     fn validate_identifier(value: &str) -> Result<(), BuildError> {
-        if ident(value) != value || value.is_empty() {
+        if rust_ident(value) != value || value.is_empty() {
             return Err(BuildError::Environment(format!(
                 "`{value}` is not a Rust module identifier"
             )));
@@ -3216,8 +3644,29 @@ mod internals {
         Ok(())
     }
 
-    fn ident(value: &str) -> String {
-        let mut result = String::new();
+    /// Sanitized ASCII alphanumeric/underscore fragment suitable for prefixed
+    /// Rust identifiers (`arg_<fragment>`, `dim_<fragment>`, `param_<fragment>`,
+    /// etc.). Never emits `r#`.
+    fn ident_fragment(value: &str) -> String {
+        let mut result = String::with_capacity(value.len());
+        for character in value.chars() {
+            if character == '_' || character.is_ascii_alphanumeric() {
+                result.push(character);
+            } else {
+                result.push('_');
+            }
+        }
+        if result.is_empty() {
+            result.push('_');
+        }
+        result
+    }
+
+    /// Standalone Rust identifier: escapes keywords that Rust allows as raw
+    /// identifiers with `r#`, and suffixes `_` for `self`/`Self`/`super`/`crate`
+    /// (which Rust forbids as raw identifiers).
+    fn rust_ident(value: &str) -> String {
+        let mut result = String::with_capacity(value.len());
         for (index, character) in value.chars().enumerate() {
             if character == '_'
                 || character.is_ascii_alphabetic()
@@ -3231,47 +3680,19 @@ mod internals {
         if result.is_empty() || result.as_bytes()[0].is_ascii_digit() {
             result.insert(0, '_');
         }
-        if matches!(
-            result.as_str(),
-            "as" | "break"
-                | "const"
-                | "continue"
-                | "crate"
-                | "else"
-                | "enum"
-                | "extern"
-                | "false"
-                | "fn"
-                | "for"
-                | "if"
-                | "impl"
-                | "in"
-                | "let"
-                | "loop"
-                | "match"
-                | "mod"
-                | "move"
-                | "mut"
-                | "pub"
-                | "ref"
-                | "return"
-                | "self"
-                | "Self"
-                | "static"
-                | "struct"
-                | "super"
-                | "trait"
-                | "true"
-                | "type"
-                | "unsafe"
-                | "use"
-                | "where"
-                | "while"
-                | "async"
-                | "await"
-                | "dyn"
-        ) {
-            result.insert_str(0, "r#");
+        match result.as_str() {
+            "self" | "Self" | "super" | "crate" => {
+                result.push('_');
+            }
+            "as" | "break" | "const" | "continue" | "else" | "enum" | "extern" | "false"
+            | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move"
+            | "mut" | "pub" | "ref" | "return" | "static" | "struct" | "trait" | "true"
+            | "type" | "unsafe" | "use" | "where" | "while" | "async" | "await" | "dyn"
+            | "abstract" | "become" | "box" | "do" | "final" | "macro" | "override" | "priv"
+            | "try" | "typeof" | "unsized" | "virtual" | "yield" | "gen" => {
+                result.insert_str(0, "r#");
+            }
+            _ => {}
         }
         result
     }
@@ -3356,6 +3777,98 @@ mod internals {
             assert_eq!(symbols.0["SEISMIC_CONVERSION_S_D"], Visibility::Surface);
             assert_eq!(symbols.0["SEISMIC_CONVERSION_S_D_WORDS"], Visibility::Library);
             assert_eq!(symbols.0["SEISMIC_CONVERSION_S_D_CODES_FIRST"], Visibility::Library);
+        }
+
+        #[test]
+        fn rust_ident_and_ident_fragment_handle_keywords_and_prefixes() {
+            assert_eq!(ident_fragment("type"), "type");
+            assert_eq!(ident_fragment("self"), "self");
+            assert_eq!(ident_fragment("a-b.0"), "a_b_0");
+            assert_eq!(ident_fragment(""), "_");
+
+            assert_eq!(rust_ident("type"), "r#type");
+            assert_eq!(rust_ident("match"), "r#match");
+            assert_eq!(rust_ident("async"), "r#async");
+            assert_eq!(rust_ident("self"), "self_");
+            assert_eq!(rust_ident("Self"), "Self_");
+            assert_eq!(rust_ident("super"), "super_");
+            assert_eq!(rust_ident("crate"), "crate_");
+            assert_eq!(rust_ident("0abc"), "_abc");
+            assert_eq!(rust_ident("valid_1"), "valid_1");
+            assert!(validate_identifier("valid_1").is_ok());
+            assert!(validate_identifier("self").is_err());
+            assert!(validate_identifier("type").is_err());
+            assert!(validate_identifier("").is_err());
+        }
+
+        #[test]
+        fn vulkan_steering_rule_is_token_driven() {
+            let check = |src: &str| {
+                let offset = src.find("seismic_steer").expect("contains seismic_steer");
+                vulkan_steering_rule(src, "seismic_steer", offset)
+            };
+
+            assert!(check("if (seismic_steer(live, p)) { x = 1; }").is_none());
+            assert!(check("if (!seismic_steer(live, p)) { x = 1; }").is_none());
+            assert!(check("while (seismic_steer(live, p)) { x = 1; }").is_none());
+            assert!(check("for (uint i = 0; seismic_steer(live, i < n); ++i) { x = 1; }").is_none());
+
+            // Exact token match: `breaker()` and `continued` are not `break`/`continue`.
+            assert!(check("if (seismic_steer(live, p)) { breaker(); }").is_none());
+            assert!(check("if (seismic_steer(live, p)) { continued = true; }").is_none());
+            assert!(check("if (seismic_steer(live, p)) { /* comment */ break; }").is_some());
+            assert!(check("if (seismic_steer(live, p)) continue;").is_some());
+
+            // Comments containing parens or semicolons do not fool the rule.
+            assert!(check("/* ( */ if (seismic_steer(live, p /* ) */)) { x = 1; }").is_none());
+            assert!(check("for (uint i = 0; /* ; */ seismic_steer(live, i < n); ++i) {}").is_none());
+
+            // Unbalanced call or non-whole condition must be rejected (never silently `None`).
+            assert!(check("if (seismic_steer(live, p").is_some());
+            assert!(check("if (a && seismic_steer(live, p)) {}").is_some());
+            assert!(check("if (seismic_steer(live, p) && a) {}").is_some());
+        }
+
+        #[test]
+        fn out_of_line_handles_comments_strings_multiline_attrs_and_qualifiers() {
+            let ok = r##"
+                // fn commented_out() {}
+                /* nested /* fn also_commented() {} */ */
+                const S: &str = "fn in_string() {}";
+                const R: &str = r#"fn in_raw_string() {}"#;
+                type Callback = unsafe extern "C" fn(u32) -> u32;
+
+                trait Helper {
+                    fn required(&self) -> [u8; 4];
+                }
+
+                #[inline(
+                    always
+                )]
+                #[allow(dead_code)]
+                pub(crate) unsafe const fn ok_qualifiers<'a>(x: &'a u8) -> u8 {
+                    let _ = '{';
+                    *x
+                }
+
+                #[target_feature(
+                    enable = "avx2"
+                )]
+                pub unsafe extern "C" fn ok_target() {}
+
+                #[test]
+                async fn ok_test() {}
+            "##;
+            assert_eq!(out_of_line(ok), None);
+
+            let bad_unsafe_const = "pub(crate) unsafe const fn missing_inline() {}";
+            assert_eq!(out_of_line(bad_unsafe_const), Some("missing_inline"));
+
+            let bad_extern = "pub extern \"C\" fn missing_inline_extern() {}";
+            assert_eq!(out_of_line(bad_extern), Some("missing_inline_extern"));
+
+            let bad_async = "pub async fn missing_inline_async() {}";
+            assert_eq!(out_of_line(bad_async), Some("missing_inline_async"));
         }
     }
 }

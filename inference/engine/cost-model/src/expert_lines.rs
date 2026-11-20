@@ -494,6 +494,15 @@ impl ServedMisses {
     }
 }
 
+/// Result of scheduling decode misses onto the CPU or the GPU link
+/// ([`ExpertLines::serve_decode`]).
+pub(crate) struct DecodeSchedule {
+    pub gpu_ns: f64,
+    pub cpu_ns: f64,
+    pub served_cpu: bool,
+    pub link_count: u64,
+}
+
 impl ExpertLines {
     /// The lines with `observed`, the landing line the load observes of
     /// its landings' site beside the lines it was priced on, where it has
@@ -572,6 +581,45 @@ impl ExpertLines {
         line.seconds(count * self.host.record_bytes) + self.landed(count, record_read)
     }
 
+    /// Assign each decode miss in `misses` (already ordered most-rows-first) to
+    /// the CPU or the GPU in place, starting the GPU queue at `hit_ns` and
+    /// notifying `on_site(tag, site)` for each assigned miss.
+    ///
+    /// Single owner of the decode-miss tie-breaking, handshake and link-busy
+    /// rules shared by [`Self::serve`] and [`crate::step::StepInputs`].
+    pub(crate) fn serve_decode<T>(
+        &self,
+        hit_ns: f64,
+        misses: impl IntoIterator<Item = (T, Miss)>,
+        mut on_site: impl FnMut(T, Site),
+    ) -> DecodeSchedule {
+        let link_busy = self.gpu.moves.link.get();
+        let (mut gpu_ns, mut cpu_ns) = (hit_ns, 0f64);
+        let mut served_cpu = false;
+        let mut link_count = 0u64;
+        for (tag, miss) in misses {
+            let ready_ns = miss.ready_seconds * 1e9;
+            let on_cpu = self.host.cpu.map(|lines| {
+                let handshake = if served_cpu { 0. } else { lines.handshake.get() };
+                cpu_ns.max(ready_ns) + lines.expert.nanoseconds(miss.rows) + handshake
+            });
+            let in_place = gpu_ns.max(ready_ns).max(link_busy) + self.gpu.link.nanoseconds(miss.rows);
+            match on_cpu {
+                Some(end) if end <= in_place => {
+                    cpu_ns = end;
+                    served_cpu = true;
+                    on_site(tag, Site::Cpu);
+                }
+                _ => {
+                    gpu_ns = in_place;
+                    link_count += 1;
+                    on_site(tag, Site::Link);
+                }
+            }
+        }
+        DecodeSchedule { gpu_ns, cpu_ns, served_cpu, link_count }
+    }
+
     /// The layer's distinct missed experts served in `pass` beside its GPU
     /// `hits` (each expert at its resident line): each, the most rows first
     /// (ties in their order), at the site of the pass it ends soonest on,
@@ -600,25 +648,9 @@ impl ExpertLines {
             let end_seconds = (moves + hit + moved) * 1e-9;
             return ServedMisses { sites: vec![Site::Copy; misses.len()], end_seconds, exposed, moved_compute_seconds: moved * 1e-9 };
         }
-        let (mut gpu, mut cpu) = (hit, 0f64);
         let mut sites = vec![Site::Link; misses.len()];
-        let mut served = false;
-        for index in order {
-            let miss = misses[index];
-            let ready = miss.ready_seconds * 1e9;
-            let on_cpu = self.host.cpu.map(|lines| {
-                let handshake = if served { 0. } else { lines.handshake.get() };
-                cpu.max(ready) + lines.expert.nanoseconds(miss.rows) + handshake
-            });
-            let in_place = gpu.max(ready).max(self.gpu.moves.link.get()) + self.gpu.link.nanoseconds(miss.rows);
-            match on_cpu {
-                Some(end) if end <= in_place => {
-                    (cpu, served) = (end, true);
-                    sites[index] = Site::Cpu;
-                }
-                _ => gpu = in_place,
-            }
-        }
+        let DecodeSchedule { gpu_ns: gpu, cpu_ns: cpu, served_cpu: served, .. } =
+            self.serve_decode(hit, order.into_iter().map(|index| (index, misses[index])), |index, site| sites[index] = site);
         // The CPU's queue carries the handshake once it served any: of what
         // it ran past the GPU's, its experts' part shown first, the
         // handshake's the rest.
@@ -639,6 +671,26 @@ impl ExpertLines {
     pub fn staged(&self, misses: &[Miss]) -> f64 {
         let served = self.serve(Pass::Group, &[], misses);
         served.end_seconds - served.moved_compute_seconds
+    }
+
+    /// When a prompt group's pass has `tiered` host-tier misses (ready at 0)
+    /// and `filed` file misses (ready after [`Self::filed`]) in the GPU's
+    /// memory, from their requests: [`Self::staged`] (`Pass::Group`) without
+    /// resident compute. Single owner shared by runtime `Stages` and plan-time
+    /// [`crate::BankPrices::prompt_seconds`].
+    pub fn group_stage(&self, line: &ReadLine, tiered: u64, filed: u64) -> f64 {
+        if tiered == 0 && filed == 0 {
+            return 0.;
+        }
+        let filed_seconds = match filed {
+            0 => 0.,
+            count => self.filed(line, count),
+        };
+        let misses: Vec<Miss> = std::iter::repeat_n(0., tiered as usize)
+            .chain(std::iter::repeat_n(filed_seconds, filed as usize))
+            .map(|ready_seconds| Miss { rows: 1., ready_seconds })
+            .collect();
+        self.staged(&misses)
     }
 
     /// The policy words of the layer's lines (`streaming_words.seismic`'s

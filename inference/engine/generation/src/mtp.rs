@@ -34,8 +34,8 @@
 use crate::{
     method::{DraftTail, OpenFeature, PendingRows},
     DraftBudget, DraftCheckpoint, DraftController, DraftLoad, DraftOutlook, Method, MethodCheckpoint,
-    MethodCheckpointError, MethodEffects, MethodRequirements, MethodState, Propose, TimedLaunch,
-    Verification,
+    MethodCheckpointError, MethodChoice, MethodEffects, MethodRequirements, MethodState, Propose,
+    TimedLaunch, Verification,
 };
 use crate::{front::FrontState, DraftHistory, DraftRoundState};
 use magnitude_executor::{
@@ -124,6 +124,11 @@ impl Method for Mtp {
     }
     fn identity(&self) -> &str {
         &self.identity
+    }
+    fn capability(&self) -> MethodChoice {
+        MethodChoice::Mtp {
+            proposals: self.proposals as u8,
+        }
     }
     fn requires(&self) -> MethodRequirements {
         // An embedded head enters every prompt row with its feature; a head
@@ -246,26 +251,33 @@ pub(crate) struct Drafted {
     pub(crate) confidence: Option<Vec<f32>>,
 }
 
-/// A head transaction's proposal: its selections up to the first it
-/// selected nothing at, since each drafted proposal conditions on the one
-/// before it.
-pub(crate) fn proposal(selected: &[Selected]) -> Vec<TokenId> {
-    selected
+/// A head transaction's proposal: its leading selected tokens up to the
+/// first empty or declined slot, since each drafted proposal conditions on
+/// the one before it. Any nonfinite selection anywhere in the batch fails
+/// explicitly rather than silently truncating speculation.
+pub(crate) fn proposal(selected: &[Selected]) -> Result<Vec<TokenId>, String> {
+    if selected.contains(&Selected::NonFinite) {
+        return Err("draft sampling distribution is nonfinite".into());
+    }
+    Ok(selected
         .iter()
-        .take_while(|selected| selected.status == 0)
-        .map(|selected| selected.token)
-        .collect()
+        .map_while(|selected| match *selected {
+            Selected::Token(token) => Some(token),
+            Selected::Empty | Selected::Declined => None,
+            Selected::NonFinite => unreachable!("checked above"),
+        })
+        .collect())
 }
 
 /// The chain a head transaction drafted for a head decoding in front
 /// passes, from its selections (`Outcome::Head`'s): its proposal, each the
 /// head's guess. The one reading of a drafted chain, generation's and the
 /// evaluation harness's alike.
-pub fn drafted_chain(selected: &[Selected]) -> Vec<Guess> {
-    proposal(selected)
+pub fn drafted_chain(selected: &[Selected]) -> Result<Vec<Guess>, String> {
+    Ok(proposal(selected)?
         .into_iter()
         .map(|token| Guess { token, kind: GuessKind::Head })
-        .collect()
+        .collect())
 }
 
 impl HeadTransaction {
@@ -317,7 +329,7 @@ impl HeadTransaction {
         {
             return Err("head transaction outcome differs from its transaction".into());
         }
-        let proposal = proposal(&selected);
+        let proposal = proposal(&selected)?;
         Ok(Drafted {
             entered: tokens.len(),
             requested: proposals.len(),
@@ -694,28 +706,36 @@ impl MethodState for DrafterState {
         if !anchored && !prepares {
             return Propose::Tokens(Vec::new());
         }
-        let position = self
-            .round_state()
-            .target_position()
-            .expect("drafter state preserves its method boundary")
-            + self.skipped;
-        let generated = match (&mut self.control, self.generated) {
-            (_, Some(generated)) => generated,
-            (Some(control), None) => control.generate(selects.len(), position, anchored),
-            (None, None) => self.budget.generated_within(selects.len()),
-        };
-        self.generated = Some(generated);
-        if generated == 0 || generated > selects.len() {
-            return Propose::Tokens(Vec::new());
-        }
         // Rounds that drafted nothing left their pairs pending: the drafter
-        // enters them now, then this round drafts from its anchor.
-        if self.round_state().catching_up().0.is_some() {
+        // enters them before choosing a draft width, so a smaller allowance
+        // after catch-up cannot leave a cached choice wider than `selects`.
+        if anchored && self.round_state().catching_up().0.is_some() {
             let effects = self
                 .flush(request, 1, HeadPhase::Generation)
                 .expect("pending pairs slice by their own rows");
             return Propose::Pending(effects.operations);
         }
+        let position = self
+            .round_state()
+            .target_position()
+            .expect("drafter state preserves its method boundary")
+            + self.skipped;
+        if self
+            .generated
+            .is_some_and(|generated| generated > selects.len())
+        {
+            self.generated = None;
+        }
+        let generated = match (&mut self.control, self.generated) {
+            (_, Some(generated)) => generated,
+            (Some(control), None) => control.generate(selects.len(), position, anchored),
+            (None, None) => self.budget.generated_within(selects.len()),
+        };
+        if generated == 0 || generated > selects.len() {
+            self.generated = Some(0);
+            return Propose::Tokens(Vec::new());
+        }
+        self.generated = Some(generated);
         let Some(pending) = &self.pending else {
             unreachable!("a drafting round holds its anchor");
         };
@@ -734,6 +754,7 @@ impl MethodState for DrafterState {
             selects[..generated].to_vec(),
             self.drafter.form(),
         ) else {
+            self.generated = Some(0);
             return Propose::Tokens(Vec::new());
         };
         let operation = transaction.operation().clone();

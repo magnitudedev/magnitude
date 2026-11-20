@@ -81,10 +81,17 @@ impl Workflow {
         if args.len() != kernel.function.parameters().len() {
             return Err(Error::new("TypeError", "wrong argument count"));
         }
-        let mut external = self.moved_external.clone();
-        let mut pending = self.moved_pending.clone();
+        let mut new_external = Vec::new();
+        let mut new_pending = Vec::new();
         for ((_, ty), v) in kernel.function.parameters().iter().zip(&args) {
-            validate(self, ty, v, &kernel.elements, &mut external, &mut pending)?;
+            validate(
+                self,
+                ty,
+                v,
+                &kernel.elements,
+                &mut new_external,
+                &mut new_pending,
+            )?;
         }
         let node = self.nodes.len();
         let mut leaf = 0;
@@ -96,8 +103,8 @@ impl Workflow {
             &mut leaf,
         );
         self.nodes.push(Node { kernel, args });
-        self.moved_external = external;
-        self.moved_pending = pending;
+        self.moved_external.extend(new_external);
+        self.moved_pending.extend(new_pending);
         Ok(result)
     }
     /// Single use even when admission fails. No external moves happen until
@@ -192,8 +199,8 @@ fn validate(
     ty: &SignatureType,
     v: &WorkflowValue,
     elements: &BTreeMap<String, Element>,
-    external: &mut BTreeSet<usize>,
-    pending: &mut BTreeSet<(usize, usize)>,
+    new_external: &mut Vec<usize>,
+    new_pending: &mut Vec<(usize, usize)>,
 ) -> Result<(), Error> {
     match (ty, v) {
         (SignatureType::Unit, WorkflowValue::Unit) => Ok(()),
@@ -201,7 +208,7 @@ fn validate(
             if types.len() == values.len() =>
         {
             for (t, v) in types.iter().zip(values) {
-                validate(w, t, v, elements, external, pending)?;
+                validate(w, t, v, elements, new_external, new_pending)?;
             }
             Ok(())
         }
@@ -209,7 +216,8 @@ fn validate(
             let mut tensors = Vec::new();
             collect_tensors(v, &mut tensors);
             for t in &tensors {
-                if external.contains(&(Arc::as_ptr(&t.0) as usize)) {
+                let id = Arc::as_ptr(&t.0) as usize;
+                if w.moved_external.contains(&id) || new_external.contains(&id) {
                     return Err(Error::new(
                         "WorkflowError",
                         "external tensor used after move",
@@ -225,7 +233,10 @@ fn validate(
                 &mut moves,
             )?;
             for t in moves {
-                external.insert(Arc::as_ptr(&t.0) as usize);
+                let id = Arc::as_ptr(&t.0) as usize;
+                if !new_external.contains(&id) {
+                    new_external.push(id);
+                }
             }
             Ok(())
         }
@@ -236,7 +247,8 @@ fn validate(
                     "pending value belongs to another workflow",
                 ));
             }
-            if pending.contains(&(p.node, p.leaf)) {
+            let key = (p.node, p.leaf);
+            if w.moved_pending.contains(&key) || new_pending.contains(&key) {
                 return Err(Error::new("WorkflowError", "pending value used after move"));
             }
             match (ty, &p.ty) {
@@ -270,7 +282,7 @@ fn validate(
                         ));
                     }
                     if owned {
-                        pending.insert((p.node, p.leaf));
+                        new_pending.push(key);
                     }
                     Ok(())
                 }

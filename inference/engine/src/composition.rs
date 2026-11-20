@@ -349,11 +349,14 @@ pub fn start_in_process(
             outcome
         };
         match connect_worker(host_end, None, |update| (progress.borrow_mut())(update)) {
-            Ok(LoadAttempt::Loaded(connection)) => ReadyEngine::new(Arc::clone(&host), *connection)
-                .map(|ready| LoadAttempt::Loaded(Box::new(ready)))
-                .map_err(|mismatch| LoadError::Internal {
-                    reason: mismatch.to_string(),
-                }),
+            Ok(LoadAttempt::Loaded(connection)) => {
+                match ReadyEngine::new(Arc::clone(&host), *connection) {
+                    Ok(ready) => Ok(LoadAttempt::Loaded(Box::new(ready))),
+                    Err(mismatch) => unloaded(Err(LoadError::Internal {
+                        reason: mismatch.to_string(),
+                    })),
+                }
+            }
             Ok(LoadAttempt::Unprepared) => unloaded(Ok(LoadAttempt::Unprepared)),
             Err(error) => unloaded(Err(error)),
         }

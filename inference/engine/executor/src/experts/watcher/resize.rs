@@ -182,13 +182,17 @@ enum Resize {
 
 /// The resize the owner and the watcher exchange.
 pub(super) struct ResizeHandoff {
+    /// Serializes callers of [`Shared::ask`] so concurrent `shrink`/`place`
+    /// requests never overwrite each other's `Resize::Asked` or steal each
+    /// other's `Answer`. Never acquired by the watcher thread.
+    ask_lock: Mutex<()>,
     resize: Mutex<Resize>,
     resized: Condvar,
 }
 
 impl ResizeHandoff {
     pub(super) fn new() -> Self {
-        Self { resize: Mutex::new(Resize::None), resized: Condvar::new() }
+        Self { ask_lock: Mutex::new(()), resize: Mutex::new(Resize::None), resized: Condvar::new() }
     }
 
     /// What the owner asks of a resize, and when it asked, taken.
@@ -260,7 +264,12 @@ impl Shared {
 
     fn ask(&self, ask: Ask) -> Result<Answer, String> {
         let resizing = &self.resizing;
-        let post = |ask| *resizing.resize.lock().expect("watcher resize") = Resize::Asked(ask, Instant::now());
+        let _ask = resizing.ask_lock.lock().expect("watcher resize caller");
+        let post = |ask| {
+            let mut resize = resizing.resize.lock().expect("watcher resize");
+            assert!(matches!(*resize, Resize::None), "invariant violated: a resize is already pending in ResizeHandoff");
+            *resize = Resize::Asked(ask, Instant::now());
+        };
         match ask.waits() {
             true => self.steps.between_flights(|| post(ask))?,
             false => {
@@ -356,7 +365,8 @@ impl Residency {
                     for (dst, src) in acc.iter_mut().zip(records) {
                         dst.extend(src);
                     }
-                    *acc_views = views;
+                    let displaced = std::mem::replace(acc_views, views);
+                    self.owed.deferred_records.extend(displaced.into_iter().flatten());
                 }
                 (_, join) => coalesced.push(join),
             }
@@ -488,9 +498,8 @@ impl Residency {
         if chain.is_some_and(|chain| !self.shared.steps.latest(chain.last())) {
             return Ok(None);
         }
-        // Ranked by every step that ended before it, whichever turn of this
-        // thread their ends fell in.
-        self.shared.telemetry.feed();
+        // Ranked by every step that ended before it, fed by `Residency::keep`
+        // outside the residency lock immediately before this turn.
         let ranking = self.core.directory.ranking();
         let last_read = |layer: usize, expert: usize| Reuse::of(&ranking).last(layer, expert);
         let groups = self.core.groups.len();

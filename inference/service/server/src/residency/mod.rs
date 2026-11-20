@@ -210,7 +210,7 @@ enum ReleaseOperation<R> {
         worker: Option<Arc<dyn ResidencyWorker>>,
     },
     Draining {
-        resources: Option<ResidentResources<R>>,
+        resources: ResidentResources<R>,
     },
     Stopping {
         control: ReleaseControl,
@@ -1218,16 +1218,15 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         match &mut releasing.operation {
             ReleaseOperation::StoppingLoad { .. } => {}
             ReleaseOperation::Draining { resources } => {
-                let Some(resources) = resources.take() else {
-                    return;
-                };
-                let instance = releasing.instance.clone();
                 let control = self.controller.start_worker_release(
-                    instance.id.clone(),
-                    resources.worker,
+                    releasing.instance.id.clone(),
+                    Arc::clone(&resources.worker),
                     true,
                 );
-                releasing.operation = ReleaseOperation::Stopping { control };
+                let _ = std::mem::replace(
+                    &mut releasing.operation,
+                    ReleaseOperation::Stopping { control },
+                );
             }
             ReleaseOperation::Stopping { control } => control.interrupt(),
             ReleaseOperation::RetirementFailed { worker, .. } => {
@@ -1383,7 +1382,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 reason,
                 terminal_failure: None,
                 operation: ReleaseOperation::Draining {
-                    resources: Some(ready.resources),
+                    resources: ready.resources,
                 },
                 stop_replies,
             });
@@ -1401,10 +1400,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             }
             ResidencyState::Releasing(ReleasingResidency {
                 instance,
-                operation:
-                    ReleaseOperation::Draining {
-                        resources: Some(resources),
-                    },
+                operation: ReleaseOperation::Draining { resources },
                 ..
             }) if instance.id == instance_id => {
                 resources.leases.remove(&token);
@@ -1424,22 +1420,21 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let ResidencyState::Releasing(releasing) = &mut self.state else {
             return;
         };
-        let ReleaseOperation::Draining { resources } = &mut releasing.operation else {
+        let ReleaseOperation::Draining { resources } = &releasing.operation else {
             return;
         };
-        let Some(current) = resources.as_ref() else {
-            return;
-        };
-        if !current.leases.is_empty() {
+        if !resources.leases.is_empty() {
             return;
         }
-        let resources = resources.take().expect("drained residency remains owned");
         let control = self.controller.start_worker_release(
             releasing.instance.id.clone(),
-            resources.worker,
+            Arc::clone(&resources.worker),
             false,
         );
-        releasing.operation = ReleaseOperation::Stopping { control };
+        let _ = std::mem::replace(
+            &mut releasing.operation,
+            ReleaseOperation::Stopping { control },
+        );
     }
 
     fn release_finished(
@@ -1761,18 +1756,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 .worker
                 .end("service_shutdown", "the inference service stopped"),
             ResidencyState::Releasing(ReleasingResidency {
-                operation:
-                    ReleaseOperation::Draining {
-                        resources: Some(resources),
-                    },
+                operation: ReleaseOperation::Draining { resources },
                 ..
             }) => resources
                 .worker
                 .end("service_shutdown", "the inference service stopped"),
-            ResidencyState::Releasing(ReleasingResidency {
-                operation: ReleaseOperation::Draining { resources: None },
-                ..
-            }) => {}
             ResidencyState::Releasing(ReleasingResidency {
                 operation: ReleaseOperation::Stopping { control },
                 ..

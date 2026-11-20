@@ -267,7 +267,7 @@ pub(super) fn last_level_cache(sys: &impl Sys) -> CacheSize {
             .max()
     };
     let (bytes, is_last_level) = resolve(
-        &[(true, &last_level), (true, &largest_l2)],
+        &[(true, &last_level), (false, &largest_l2)],
         false,
         || 0,
     );

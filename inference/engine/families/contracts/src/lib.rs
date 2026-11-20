@@ -983,15 +983,23 @@ impl Head {
             .is_some_and(|block| matches!(block.chain, HeadChain::Residual))
     }
 
-    pub fn conditioning_width(&self, decoder: &Decoder) -> u64 {
+    fn checked_conditioning_width(&self, decoder: &Decoder) -> Result<u64, DefinitionError> {
         if self.residual_conditioning() {
             match &decoder.residual {
-                ResidualForm::Single => decoder.hidden,
-                ResidualForm::HyperConnections(form) => decoder.hidden * form.streams,
+                ResidualForm::Single => Ok(decoder.hidden),
+                ResidualForm::HyperConnections(form) => decoder
+                    .hidden
+                    .checked_mul(form.streams)
+                    .ok_or_else(|| DefinitionError::new("draft head conditioning width overflows")),
             }
         } else {
-            decoder.hidden
+            Ok(decoder.hidden)
         }
+    }
+
+    pub fn conditioning_width(&self, decoder: &Decoder) -> u64 {
+        self.checked_conditioning_width(decoder)
+            .expect("validated decoder hyper-connection width fits u64")
     }
     pub fn depth(&self) -> usize {
         self.blocks.len()
@@ -1002,6 +1010,11 @@ impl Head {
             return Err(DefinitionError::new("draft head has no blocks"));
         }
         let combined_hidden = checked_product(&[2, decoder.hidden])?;
+        let conditioning_width = self.checked_conditioning_width(decoder)?;
+        let projected_input = decoder
+            .hidden
+            .checked_add(conditioning_width)
+            .ok_or_else(|| DefinitionError::new("draft head input width overflows"))?;
         for block in &self.blocks {
             if matches!(block.chain, HeadChain::Residual) != self.residual_conditioning() {
                 return Err(DefinitionError::new(
@@ -1016,11 +1029,10 @@ impl Head {
                     combine,
                 } => {
                     decoder::validate_rms(embedding_norm, decoder.hidden, "draft head norm")?;
-                    decoder::validate_rms(
-                        hidden_norm,
-                        self.conditioning_width(decoder),
-                        "draft head norm",
-                    )?;
+                    decoder::validate_rms(hidden_norm, conditioning_width, "draft head norm")?;
+                    // `Combine` projects `[norm(e) ‖ norm(h_s)]` per stream, so
+                    // `combine` is always `[hidden, 2·hidden]` even when
+                    // `hidden_norm` spans multiple hyper-connection streams.
                     expect_shape(
                         combine,
                         &[decoder.hidden, combined_hidden],
@@ -1033,7 +1045,7 @@ impl Head {
                     }
                     expect_shape(
                         pre,
-                        &[width, combined_hidden],
+                        &[width, projected_input],
                         "draft head input projection",
                     )?;
                 }
@@ -2593,5 +2605,118 @@ mod tests {
             };
             assert_eq!(ScaleCodes::of_stored(encoding), codes, "{encoding:?}");
         }
+    }
+
+    #[test]
+    fn head_validate_checks_conditioning_width_overflow_and_projected_input_width() {
+        let model = hyper_connected(vec![mixed(
+            attention("a", owned("a", TokenDomain::Token)),
+            "a",
+        )]);
+        let residual_head = |pre_columns| Head {
+            blocks: vec![HeadBlock {
+                residual: model.decoder.residual.clone(),
+                input: HeadInput::Projected {
+                    pre: weight("pre", &[4, pre_columns]),
+                    embedding_scale: EmbeddingScale::Unit,
+                },
+                blocks: vec![Block {
+                    sublayers: vec![mixed(
+                        attention("h", owned("h", TokenDomain::Token)),
+                        "h",
+                    )],
+                }],
+                output_norm: exit(low_rank("head_out", false)),
+                readout: HeadReadout::full(VocabularyProjection::Target),
+                chain: HeadChain::Residual,
+            }],
+            history: HeadHistory::Own,
+            component: HeadComponent::Target,
+        };
+        // Under 2-stream hyper-connections (hidden = 4, conditioning_width = 8),
+        // `Projected::pre` must accept `hidden + conditioning_width = 12`, not `2 * hidden = 8`.
+        assert!(residual_head(8).validate(&model.decoder, 1).is_err());
+        assert!(residual_head(12).validate(&model.decoder, 1).is_ok());
+
+        // Overflow in `decoder.hidden * form.streams` is rejected cleanly instead of panicking.
+        let mut overflowing = model.decoder.clone();
+        overflowing.hidden = u64::MAX / 2;
+        overflowing.residual = ResidualForm::HyperConnections(HyperConnections {
+            streams: 4,
+            mixing: HyperConnectionMixing::LowRankGated { rank: 3 },
+        });
+        assert_eq!(
+            residual_head(12)
+                .validate(&overflowing, 1)
+                .unwrap_err()
+                .to_string(),
+            "draft head conditioning width overflows"
+        );
+    }
+
+    #[test]
+    fn parallel_attention_branches_validate_shared_sources_and_output_rotary() {
+        let parallel_branch = |sublayer: Sublayer| Branch {
+            input: sublayer.input,
+            op: sublayer.op,
+            output: BranchOutput::Plain,
+        };
+        let parallel = |branches: Vec<Branch>| Sublayer {
+            input: InputNorm::None,
+            op: Operator::Parallel(branches),
+            output: OutputForm::Residual,
+        };
+
+        // Valid: a parallel branch sharing an earlier top-level attention layer.
+        let earlier = SublayerIndex {
+            block: 0,
+            sublayer: 0,
+        };
+        let valid = definition(vec![
+            attention("a", owned("a", TokenDomain::Token)),
+            parallel(vec![
+                parallel_branch(attention("b0", shared(earlier))),
+                parallel_branch(attention("b1", owned("b1", TokenDomain::Token))),
+            ]),
+        ]);
+        assert!(valid.validate().is_ok());
+
+        // Invalid: a parallel branch with a backwards/non-existent shared source.
+        let bad_shared = definition(vec![parallel(vec![
+            parallel_branch(attention(
+                "b0",
+                shared(SublayerIndex {
+                    block: 1,
+                    sublayer: 0,
+                }),
+            )),
+            parallel_branch(attention("b1", owned("b1", TokenDomain::Token))),
+        ])]);
+        assert_eq!(
+            bad_shared.validate().unwrap_err().to_string(),
+            "shared attention history names no earlier attention sublayer"
+        );
+
+        // Invalid: a parallel branch using `OutputRotary::Inverse` over non-StoredKey values.
+        let mut inverse_branch = attention("b0", owned("b0", TokenDomain::Token));
+        if let Operator::Attention(layer) = &mut inverse_branch.op {
+            layer.rotary = Rotary::Table {
+                pairs: vec![RotaryPair {
+                    frequency: 1.0,
+                    amplitude: 1.0,
+                }],
+                layout: RotaryLayout::HALF_SPLIT_LEADING,
+                divisors: None,
+                output: OutputRotary::Inverse,
+            };
+        }
+        let bad_rotary = definition(vec![parallel(vec![
+            parallel_branch(inverse_branch),
+            parallel_branch(attention("b1", owned("b1", TokenDomain::Token))),
+        ])]);
+        assert_eq!(
+            bad_rotary.validate().unwrap_err().to_string(),
+            "an inverse output rotary over values other than the stored keys"
+        );
     }
 }

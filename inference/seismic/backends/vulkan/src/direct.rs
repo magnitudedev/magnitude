@@ -9,8 +9,8 @@
 //! tables buffer's.
 
 use crate::device::{
-    barrier, call, memory_call, Device, Handed, Recording, Retired, RetiredCommand,
-    ARGUMENT_CHUNK_BYTES,
+    barrier, call, cmd_update_buffer, memory_call, Device, Handed, Recording, Retired,
+    RetiredCommand, ARGUMENT_CHUNK_BYTES,
 };
 use crate::formation::DirectModule;
 use crate::memory::{Buffer, Range};
@@ -66,26 +66,46 @@ impl DirectLaunch<'_> {
     }
 
     /// The launch's argument block: each buffer's address, the
-    /// scalar-result address, then the words.
+    /// scalar-result address, then the words, zero-padded to its 16-byte
+    /// aligned slot size ([`argument_block_bytes`]) so `vkCmdUpdateBuffer`
+    /// always receives a 4-byte-multiple size
+    /// (`VUID-vkCmdUpdateBuffer-dataSize-00034`).
     pub fn argument_block(&self) -> Vec<u8> {
-        let mut block = Vec::with_capacity((self.buffers.len() + 1) * 8 + self.words.len());
-        for (buffer, offset) in self.buffers {
-            block.extend_from_slice(&(buffer.address() + offset).to_le_bytes());
-        }
-        let scalar_results = self
-            .scalar_results
-            .map_or(0, |(buffer, offset)| buffer.address() + offset);
-        block.extend_from_slice(&scalar_results.to_le_bytes());
-        block.extend_from_slice(self.words);
-        block
+        pack_argument_block(
+            self.buffers
+                .iter()
+                .map(|(buffer, offset)| buffer.address() + offset),
+            self.scalar_results
+                .map_or(0, |(buffer, offset)| buffer.address() + offset),
+            self.words,
+        )
     }
 }
 
-/// Where a recorded launch's argument block lies in its graph's chunks, and
-/// the bytes it holds now.
+/// Pack a launch's buffer addresses, scalar-result address, and argument words
+/// into a zero-padded 16-byte-aligned argument block.
+fn pack_argument_block(
+    buffers: impl ExactSizeIterator<Item = u64>,
+    scalar_results: u64,
+    words: &[u8],
+) -> Vec<u8> {
+    let slot_bytes = argument_block_bytes(buffers.len() as u64, words.len() as u64) as usize;
+    let mut block = Vec::with_capacity(slot_bytes);
+    for address in buffers {
+        block.extend_from_slice(&address.to_le_bytes());
+    }
+    block.extend_from_slice(&scalar_results.to_le_bytes());
+    block.extend_from_slice(words);
+    block.resize(slot_bytes, 0);
+    block
+}
+
+/// Where a recorded launch's argument block lies in its graph's chunks, its
+/// reserved slot size, and the bytes it holds now.
 struct Block {
     chunk: usize,
     offset: u64,
+    slot_bytes: u64,
     bytes: Vec<u8>,
 }
 
@@ -123,7 +143,7 @@ impl Arguments {
         launch: &DirectLaunch<'_>,
     ) -> Result<(u64, Block), ExecutionError> {
         let block = launch.argument_block();
-        let bytes = argument_block_bytes(launch.buffers.len() as u64, launch.words.len() as u64);
+        let bytes = block.len() as u64;
         if bytes > ARGUMENT_CHUNK_BYTES {
             return Err(ExecutionError::SubmissionFailed(format!(
                 "a launch's argument block needs {bytes} bytes; a chunk holds {ARGUMENT_CHUNK_BYTES}"
@@ -138,7 +158,15 @@ impl Arguments {
         chunk.write_mapped(start, &block);
         self.used = start + bytes;
         let address = chunk.address() + start;
-        Ok((address, Block { chunk: self.chunks.len() - 1, offset: start, bytes: block }))
+        Ok((
+            address,
+            Block {
+                chunk: self.chunks.len() - 1,
+                offset: start,
+                slot_bytes: bytes,
+                bytes: block,
+            },
+        ))
     }
 }
 
@@ -992,6 +1020,20 @@ impl<T: Timing> DirectBatch<T> {
             "DirectBatch::rebind precondition: a timed batch times each launch"
         );
         assert_eq!(blocks.len(), graph.blocks.len(), "a shape's launches are its graph's");
+        for (held, block) in graph.blocks.iter().zip(&blocks) {
+            assert!(
+                block.len() as u64 <= held.slot_bytes,
+                "DirectBatch::rebind precondition: argument block ({} bytes) exceeds its recorded slot ({} bytes)",
+                block.len(),
+                held.slot_bytes,
+            );
+            assert_eq!(
+                block.len() % 4,
+                0,
+                "DirectBatch::rebind precondition: argument block ({} bytes) must be a multiple of 4 bytes",
+                block.len(),
+            );
+        }
         if graph.blocks.iter().zip(&blocks).all(|(held, block)| held.bytes == *block) {
             return Ok(());
         }
@@ -1011,7 +1053,7 @@ impl<T: Timing> DirectBatch<T> {
             for (held, block) in graph.blocks.iter_mut().zip(blocks) {
                 if held.bytes != block {
                     let chunk = &graph.inner.arguments[held.chunk];
-                    raw.cmd_update_buffer(self.command, chunk.raw(), chunk.offset() + held.offset, &block);
+                    cmd_update_buffer(raw, self.command, chunk.raw(), chunk.offset() + held.offset, &block);
                     held.bytes = block;
                 }
             }
@@ -1084,18 +1126,24 @@ impl<T: Timing> DirectBatch<T> {
                 raw.cmd_copy_buffer(self.command, *source, *destination, std::slice::from_ref(region));
             }
             for (buffer, offset, bytes) in &words {
-                raw.cmd_update_buffer(self.command, *buffer, *offset, bytes);
+                cmd_update_buffer(raw, self.command, *buffer, *offset, bytes);
             }
             // The copies' and words' writes to what follows: this batch's
-            // launches, and the host once the submission completes (a later
-            // submission's own leading barrier orders its reads).
+            // launches (indirect dispatch grids included), and the host once
+            // the submission completes (a later submission's own leading
+            // barrier orders its reads).
             barrier(
                 raw,
                 self.command,
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER | vk::PipelineStageFlags2::HOST,
-                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::HOST_READ,
+                vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::TRANSFER
+                    | vk::PipelineStageFlags2::DRAW_INDIRECT
+                    | vk::PipelineStageFlags2::HOST,
+                vk::AccessFlags2::MEMORY_READ
+                    | vk::AccessFlags2::MEMORY_WRITE
+                    | vk::AccessFlags2::HOST_READ,
             );
         }
         self.launched = true;
@@ -1738,5 +1786,41 @@ mod park_tests {
             unsafe { device.inner.device.signal_semaphore(&info) }
                 .expect("unblock simulated-loss test semaphore before teardown");
         }
+    }
+}
+
+#[cfg(test)]
+mod argument_block_tests {
+    use super::*;
+
+    #[test]
+    fn argument_block_pads_with_zeros_to_16_byte_slot_size() {
+        // 0 buffers, 0 words: 8-byte scalar_results padded to 16 bytes.
+        let empty = pack_argument_block(std::iter::empty(), 0x1122_3344_5566_7788, &[]);
+        assert_eq!(empty.len() as u64, argument_block_bytes(0, 0));
+        assert_eq!(empty.len(), 16);
+        assert_eq!(&empty[..8], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&empty[8..], &[0u8; 8]);
+
+        // 1 buffer + 3 word bytes (not a multiple of 4): 19 bytes padded to 32 bytes.
+        let unaligned = pack_argument_block([0x1000u64].into_iter(), 0x2000, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(unaligned.len() as u64, argument_block_bytes(1, 3));
+        assert_eq!(unaligned.len(), 32);
+        assert_eq!(unaligned.len() % 16, 0);
+        assert_eq!(unaligned.len() % 4, 0);
+        assert_eq!(&unaligned[0..8], &0x1000u64.to_le_bytes());
+        assert_eq!(&unaligned[8..16], &0x2000u64.to_le_bytes());
+        assert_eq!(&unaligned[16..19], &[0xAA, 0xBB, 0xCC]);
+        assert!(unaligned[19..].iter().all(|&b| b == 0));
+
+        // 2 buffers + 8 word bytes: already 32 bytes (exact multiple of 16).
+        let words = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let aligned = pack_argument_block([0x10u64, 0x20u64].into_iter(), 0, &words);
+        assert_eq!(aligned.len() as u64, argument_block_bytes(2, 8));
+        assert_eq!(aligned.len(), 32);
+        assert_eq!(&aligned[0..8], &0x10u64.to_le_bytes());
+        assert_eq!(&aligned[8..16], &0x20u64.to_le_bytes());
+        assert_eq!(&aligned[16..24], &0u64.to_le_bytes());
+        assert_eq!(&aligned[24..32], &words);
     }
 }

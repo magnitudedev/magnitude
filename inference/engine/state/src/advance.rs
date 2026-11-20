@@ -2,9 +2,8 @@
 
 use super::{
     append_ranges, install_commit, ranges_from, BankHandle, Claims, Codec, ComponentDescriptor,
-    ComponentRole,
-    Error, HistoryDomainId, HistoryValue, KvCodec, LayerRef, PlaneBuffer, SequenceState, StateStore, StoreCopy,
-    Tail, VectorKind,
+    ComponentRole, Error, HistoryDomainId, HistoryValue, KvCodec, LayerRef, LayoutError,
+    PlaneBuffer, SequenceState, StateStore, StoreCopy, Tail, VectorKind,
 };
 use seismic::Tensor;
 use std::{cell::Cell, rc::Rc};
@@ -141,7 +140,19 @@ impl OwnedCodecAdvance {
                     Err(error) => return Err((source, destination, error)),
                 };
                 let to = destinations(&claims);
-                let rows = counts.iter().sum::<usize>();
+                let rows = match counts
+                    .iter()
+                    .try_fold(0usize, |total, &count| total.checked_add(count))
+                {
+                    Some(rows) => rows,
+                    None => {
+                        return Err((
+                            source,
+                            destination,
+                            LayoutError::ArithmeticOverflow("codec conversion row count").into(),
+                        ));
+                    }
+                };
                 let source_history = match source.store.history_planes() {
                     Ok(planes) => planes,
                     Err(error) => return Err((source, destination, error)),
@@ -436,14 +447,15 @@ impl OwnedTailRelocation {
         let first = last.max((end - 1) / page_rows * page_rows);
         let moved = end - first;
         let Some(destination) = state.store.reserve_page(domain, moved) else {
-            let required = page_rows as u64 * state.store.history_row_bytes(domain);
-            return Err((
-                state,
-                Error::Capacity {
+            let error = match (page_rows as u64).checked_mul(state.store.history_row_bytes(domain))
+            {
+                Some(required) => Error::Capacity {
                     required,
                     available_bytes: 0,
                 },
-            ));
+                None => LayoutError::ArithmeticOverflow("relocation page bytes").into(),
+            };
+            return Err((state, error));
         };
         let to = destination
             .ranges()
@@ -515,7 +527,18 @@ impl OwnedStateAdvance {
         acceptable: usize,
         front: usize,
     ) -> Result<Self, (SequenceState, Error)> {
-        let count = committed + acceptable + front;
+        let Some(acceptable_end) = committed.checked_add(acceptable) else {
+            return Err((
+                state,
+                LayoutError::ArithmeticOverflow("advance row count").into(),
+            ));
+        };
+        let Some(count) = acceptable_end.checked_add(front) else {
+            return Err((
+                state,
+                LayoutError::ArithmeticOverflow("advance row count").into(),
+            ));
+        };
         // Every pass commits a row: acceptable rows extend a commit of the
         // rows before them, and a front row runs beside the row it guesses
         // the successor of.
@@ -543,7 +566,7 @@ impl OwnedStateAdvance {
             state,
             count,
             committed,
-            acceptable: committed + acceptable,
+            acceptable: acceptable_end,
             claims,
             following,
             history,
@@ -855,8 +878,18 @@ impl<'a> Predecessor<'a> {
 fn follow(
     mut slots: Vec<(Predecessor<'_>, usize, usize, Option<BankHandle>)>,
 ) -> Result<Vec<OwnedSuccessorAdvance>, Error> {
+    let mut counts = Vec::with_capacity(slots.len());
     for (predecessor, committed, front, _) in &mut slots {
-        predecessor.fit(*committed + *front);
+        let count = committed
+            .checked_add(*front)
+            .ok_or(LayoutError::ArithmeticOverflow("successor row count"))?;
+        if *committed == 0
+            || count > predecessor.store.context_capacity.saturating_sub(predecessor.end)
+        {
+            return Err(Error::from("successor advance exceeds context capacity"));
+        }
+        predecessor.fit(count);
+        counts.push(count);
     }
     let Some((first, ..)) = slots.first() else {
         return Ok(Vec::new());
@@ -870,8 +903,9 @@ fn follow(
     }
     let demands = slots
         .iter()
-        .flat_map(|(predecessor, committed, front, _)| {
-            store.demands(&predecessor.tails(), &predecessor.counts(committed + front))
+        .zip(&counts)
+        .flat_map(|((predecessor, ..), &count)| {
+            store.demands(&predecessor.tails(), &predecessor.counts(count))
         })
         .collect::<Vec<_>>();
     let admission = Rc::new(Admission {
@@ -881,8 +915,9 @@ fn follow(
     });
     slots
         .into_iter()
-        .map(|(predecessor, committed, front, writes)| {
-            OwnedSuccessorAdvance::reserve(predecessor, committed, front, writes, &admission)
+        .zip(counts)
+        .map(|((predecessor, committed, _, writes), count)| {
+            OwnedSuccessorAdvance::reserve(predecessor, committed, count, writes, &admission)
         })
         .collect()
 }
@@ -955,15 +990,11 @@ impl OwnedSuccessorAdvance {
     fn reserve(
         predecessor: Predecessor<'_>,
         committed: usize,
-        front: usize,
+        count: usize,
         writes: Option<BankHandle>,
         admission: &Rc<Admission>,
     ) -> Result<Self, Error> {
         let store = predecessor.store;
-        let count = committed + front;
-        if committed == 0 || count > store.context_capacity.saturating_sub(predecessor.end) {
-            return Err(Error::from("successor advance exceeds context capacity"));
-        }
         let reserved = store.reserve_rows(&predecessor.tails(), &predecessor.counts(count))?;
         let following = match writes {
             Some(bank) => bank,
@@ -1898,5 +1929,29 @@ mod tests {
             panic!("an accepted prefix commits");
         };
         assert_eq!((state.position(), state.tape_rows()), (6, 1));
+    }
+
+    #[test]
+    fn follow_rejects_out_of_context_capacity_successor_before_admitting() {
+        let store = recurrent_store(8, 3);
+        let first = OwnedStateAdvance::begin(store.create().unwrap(), 2)
+            .ok()
+            .unwrap();
+        let occupied = store.occupied_rows(TOKEN);
+        let free_banks = store.available_banks();
+        assert!(matches!(
+            first.successor(0),
+            Err(Error::Request(ref msg)) if msg.contains("context capacity")
+        ));
+        assert!(matches!(
+            first.successor(7),
+            Err(Error::Request(ref msg)) if msg.contains("context capacity")
+        ));
+        assert!(matches!(
+            first.successor(usize::MAX),
+            Err(Error::Request(ref msg)) if msg.contains("context capacity")
+        ));
+        assert_eq!(store.occupied_rows(TOKEN), occupied);
+        assert_eq!(store.available_banks(), free_banks);
     }
 }

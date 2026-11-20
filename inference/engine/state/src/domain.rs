@@ -61,7 +61,9 @@ impl HistoryDomainKind {
     /// one per row, or for Block one per block it completes.
     pub fn advance_rows(self, position: usize, count: usize) -> usize {
         match self {
-            Self::Block { rate } => (position + count) / rate - position / rate,
+            Self::Block { rate } => {
+                count / rate + usize::from(position % rate >= rate - count % rate)
+            }
             Self::Token | Self::Window { .. } | Self::Shared { .. } => count,
         }
     }
@@ -237,10 +239,14 @@ pub fn state_bytes(
         .try_fold(0u64, |total, domain| {
             let page_rows = domain.pages(domains, context, max_advance)?.page_rows;
             let kind = domain.kind();
-            let taken = crate::layout::page_demand_rows(page_rows, 0, kind.most_advance_rows(rows));
+            let taken = crate::layout::page_demand_rows(page_rows, 0, kind.most_advance_rows(rows))
+                .ok_or_else(overflow)?;
             let taken = match kind {
                 HistoryDomainKind::Window { .. } => {
-                    taken.min(crate::layout::window_pages(page_rows, kind.row_limit(context, max_advance)?) * page_rows)
+                    let cap = crate::layout::window_pages(page_rows, kind.row_limit(context, max_advance)?)
+                        .checked_mul(page_rows)
+                        .ok_or_else(overflow)?;
+                    taken.min(cap)
                 }
                 HistoryDomainKind::Token | HistoryDomainKind::Shared { .. } | HistoryDomainKind::Block { .. } => taken,
             };
@@ -527,4 +533,32 @@ pub(crate) fn validate_domains(
         }
     }
     Ok((stored, bindings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HistoryDomainKind;
+
+    #[test]
+    fn block_advance_rows_does_not_overflow_near_usize_max() {
+        assert_eq!(HistoryDomainKind::Block { rate: 4 }.advance_rows(3, 1), 1);
+        assert_eq!(HistoryDomainKind::Block { rate: 4 }.advance_rows(2, 1), 0);
+        assert_eq!(HistoryDomainKind::Block { rate: 4 }.advance_rows(3, 5), 2);
+        assert_eq!(
+            HistoryDomainKind::Block { rate: 4 }.advance_rows(usize::MAX - 1, usize::MAX),
+            usize::MAX / 4 + 1
+        );
+        assert_eq!(
+            HistoryDomainKind::Block { rate: 1 }.advance_rows(usize::MAX, usize::MAX),
+            usize::MAX
+        );
+        assert_eq!(
+            HistoryDomainKind::Block { rate: usize::MAX }.advance_rows(usize::MAX - 1, 1),
+            1
+        );
+        assert_eq!(
+            HistoryDomainKind::Block { rate: usize::MAX }.advance_rows(usize::MAX - 1, usize::MAX),
+            1
+        );
+    }
 }

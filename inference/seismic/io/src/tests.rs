@@ -1219,3 +1219,52 @@ fn a_link_holds_at_most_its_due_depth_in_flight() {
     queue.push(queued_on(&VolumeReads { id: Volume(2), ..narrow }, &[(0, 5)]), Want::now());
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(2), 0)));
 }
+
+/// A burst of pieces much smaller than the link's measured read size never
+/// admits more pieces in flight (or wakes more workers) than the link's
+/// `Shape::queue_depth()`, matching the per-device worker cap in
+/// `Device::workers`.
+#[test]
+fn a_burst_of_small_pieces_never_admits_past_the_links_queue_depth() {
+    let link = volume(21, (1024, 512), 256);
+    let depth = link.shape.queue_depth() as usize;
+    assert_eq!(depth, 7);
+    let mut queue = Queue::default();
+    let spans: Vec<(u64, u64)> = (0..20).map(|i| (i * 4, i * 4 + 4)).collect();
+    let (_, woken) = queue.push(queued_on(&link, &spans), Want::now());
+    assert_eq!(woken, depth, "Link::room caps woken workers at shape.queue_depth()");
+    let mut in_flight = Vec::new();
+    while let Some(taken) = queue.take() {
+        in_flight.push(taken);
+    }
+    assert_eq!(in_flight.len(), depth);
+    assert_eq!(queue.taken(), depth);
+    assert_eq!(queue.push(queued_on(&link, &[(200, 204)]), ahead()).1, 0);
+    assert!(queue.take().is_none(), "no further piece is admitted at queue_depth");
+    queue.ended(in_flight.pop().unwrap().returned(Instant::now()));
+    assert_eq!(queue.taken(), depth - 1);
+    assert!(queue.take().is_some(), "ending one piece frees one queue_depth slot");
+    assert_eq!(queue.taken(), depth);
+}
+
+/// `Reader::stream` rejects an overflowing `offset + length` with
+/// `InvalidInput` instead of panicking in debug or wrapping in release.
+#[test]
+fn stream_rejects_offset_overflow_with_invalid_input() {
+    let path = temporary("stream-overflow", &[0u8; 4096]);
+    let reader = Reader::open(&path, CachePolicy::Cached).unwrap();
+    for (offset, length) in [(u64::MAX - 8, 16), (u64::MAX - LEAST_READ + 1, 2 * LEAST_READ)] {
+        let err = reader
+            .stream::<std::io::Error>(offset, length, Want::now(), |_, _| {
+                panic!("sink must not be called on overflow")
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    reader
+        .stream::<std::io::Error>(u64::MAX, 0, Want::now(), |_, _| {
+            panic!("sink must not be called for zero-length stream")
+        })
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+}

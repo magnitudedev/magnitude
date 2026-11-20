@@ -95,3 +95,43 @@ fn a_groups_acknowledgement_goes_with_its_group() {
     let group = harness.watcher.shared().costs().group.expect("group B is counted");
     assert_eq!((group.first, group.layers[0].computed), (3, 1));
 }
+
+/// `Telemetry::costs.ahead` prunes entries for steps `<= sequence` on
+/// `complete_step` and ignores late `read_ahead` records for already-completed
+/// steps so dead entries never accumulate over engine lifetime.
+#[test]
+fn telemetry_ahead_prunes_past_completed_steps_and_ignores_late_reads() {
+    use super::steps::{CompletedRoute, CompletedStep};
+    use crate::experts::interest::Source;
+    let harness = prompted("ahead-prune", EXPERTS, 4);
+    let telemetry = &harness.watcher.shared().telemetry;
+    let lead = Source::Lead { distance: 1, row: None };
+    for step in [1u64, 2, 3, 5] {
+        telemetry.read_ahead(lead, step, (0, 0), 0, 1024);
+    }
+    assert_eq!(telemetry.ahead_len(), 4);
+    // Completing step 4 prunes skipped/uncompleted earlier steps 1..=3.
+    telemetry
+        .complete_step(
+            &harness.watcher.shared().steps,
+            4,
+            CompletedStep { work: LaunchWork::Prompt, begun: Instant::now(), route: CompletedRoute::Grouped },
+            &|_| (0, 0, Duration::ZERO),
+            None,
+        )
+        .expect("complete step 4");
+    assert_eq!(telemetry.ahead_len(), 1, "steps <= 4 pruned, future step 5 kept");
+    // Late read_ahead for already-completed step 2 must not leak back in.
+    telemetry.read_ahead(lead, 2, (0, 0), 0, 1024);
+    assert_eq!(telemetry.ahead_len(), 1, "late read_ahead for completed step ignored");
+    telemetry
+        .complete_step(
+            &harness.watcher.shared().steps,
+            5,
+            CompletedStep { work: LaunchWork::Prompt, begun: Instant::now(), route: CompletedRoute::Grouped },
+            &|_| (0, 0, Duration::ZERO),
+            None,
+        )
+        .expect("complete step 5");
+    assert_eq!(telemetry.ahead_len(), 0, "all completed steps pruned");
+}

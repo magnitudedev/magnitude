@@ -70,11 +70,11 @@ impl RoundForward {
 
 /// A row's selected token, or why its sampling selected none.
 fn selected_token(selected: Selected) -> Result<TokenId, String> {
-    match selected.status {
-        0 => Ok(selected.token),
-        1 => Err("sampling distribution is empty".into()),
-        2 => Err("sampling distribution is nonfinite".into()),
-        _ => Err("sampling returned an unknown status".into()),
+    match selected {
+        Selected::Token(token) => Ok(token),
+        Selected::Empty => Err("sampling distribution is empty".into()),
+        Selected::NonFinite => Err("sampling distribution is nonfinite".into()),
+        Selected::Declined => Err("target sampling cannot decline".into()),
     }
 }
 
@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(paired.forward().front.iter().map(|front| front.kind).collect::<Vec<_>>(), [FrontKind::Host(GuessKind::Head)]);
         assert_eq!(paired.publication_bound(), 1);
         // Its samples are its exact row's selection alone.
-        let selected = |token| Selected { token: TokenId(token), status: 0 };
+        let selected = |token| Selected::Token(TokenId(token));
         let exact = [RowResult { selected: Some(selected(8)), ..Default::default() }];
         assert_eq!(paired.forward().samples(&exact).unwrap(), tokens(&[8]));
         assert!(paired.forward().samples(&[]).is_err(), "its exact row's outcome");

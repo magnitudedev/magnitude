@@ -116,7 +116,7 @@ impl LiveDecode {
     fn shares(&self, layer: usize, slots: usize, model: Shares) -> Shares {
         let reads = &self.layers[layer];
         let all = reads.misses[0];
-        if all == 0 {
+        if all == 0 || self.steps == 0 || !self.rows.is_finite() || self.rows <= 0. {
             return model;
         }
         let at = slots.min(reads.misses.len() - 1);
@@ -128,6 +128,9 @@ impl LiveDecode {
     /// counted steps (each read counted once, at its depth); none where it
     /// read nothing, where the generic model's `D(r)` stands.
     fn routed(&self, layer: usize) -> Option<f64> {
+        if self.steps == 0 {
+            return None;
+        }
         match self.layers[layer].misses[0] {
             0 => None,
             all => Some(all as f64 / self.steps as f64),
@@ -297,12 +300,30 @@ impl StreamedLayers {
         patterns
     }
 
-    /// The seconds a prompt pass of `rows` rows waits on its misses' reads
-    /// holding `held`: the step model's ([`Self::step_seconds`]) at those
-    /// rows, the generic model's misses, with no compute beside them to
-    /// cover them; none where `held` makes the bank whole.
+    /// The seconds a prompt pass of `rows` rows waits on its misses' staging
+    /// holding `held`: each layer's cold experts staged via `Pass::Group`
+    /// ([`ExpertLines::group_stage`], matching runtime `Stages`), averaged over
+    /// the generic model's period; none where `held` makes the bank whole.
     pub(crate) fn pass_reads(&self, read: ReadLine, held: HeldSlots, rows: f64) -> f64 {
-        self.step_seconds(None, read, held, rows, FormSeconds { resident: 0., streamed: 0. }).total_seconds
+        if self.whole(held) {
+            return 0.;
+        }
+        let patterns = self.period(None, held, rows);
+        let total_steps: usize = patterns.iter().map(|(_, count)| *count).sum();
+        let weighted: f64 = patterns
+            .iter()
+            .map(|(runs, count)| {
+                let mut layer = 0;
+                let mut step_seconds = 0.;
+                for run in runs {
+                    let lines = &self.lines[layer];
+                    step_seconds += run.layers as f64 * lines.group_stage(&read, run.load.tier, run.load.file);
+                    layer += run.layers;
+                }
+                *count as f64 * step_seconds
+            })
+            .sum();
+        weighted / total_steps as f64
     }
 
     /// The free path records needed for moves of `bytes` stored bytes along
@@ -320,7 +341,7 @@ impl StreamedLayers {
         num_layers: u64,
     ) -> Option<crate::PathRecords> {
         let step = self.step_seconds(None, read, held, 1.0, compute).total_seconds;
-        let reads = self.pass_reads(read, held, 1.0);
+        let reads = self.step_seconds(None, read, held, 1.0, FormSeconds { resident: 0., streamed: 0. }).total_seconds;
         let queue = if num_layers == 0 {
             0.0
         } else {
@@ -606,5 +627,46 @@ mod tests {
         assert!(whole.patterns.is_empty());
         let compute = FormSeconds { resident: 0.010, streamed: 0.012 };
         assert_eq!(whole.step_seconds(READ, compute), StreamedStep { compute_seconds: 0.010, exposed_seconds: 0., total_seconds: 0.010 });
+    }
+
+    /// Prompt miss reads (`pass_reads`) price cold experts via `Pass::Group`
+    /// (`ExpertLines::group_stage`), matching runtime `Stages` without
+    /// double-counting compute rows the way `Pass::Decode` did on a host-tiered
+    /// GPU.
+    #[test]
+    fn prompt_pass_reads_uses_group_stage_without_compute_double_count() {
+        let lines = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
+        let layers = StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines]));
+        // 8 slots in VRAM, all 32 in host tier: every miss is served from host tier.
+        let held = HeldSlots { slots: 8, host: 32 };
+        let rows = 512.;
+        let group_reads = layers.pass_reads(READ, held, rows);
+        let more_rows = layers.pass_reads(READ, held, 2048.);
+        // At 512 rows all 32 experts are routed, 24 miss VRAM and are staged over the link.
+        let expected = 2. * lines.group_stage(&READ, 24, 0);
+        assert!((group_reads - expected).abs() < 1e-12, "group_reads={group_reads}, expected={expected}");
+        // `Pass::Group` stages each cold expert's weights once (independent of
+        // rows once all experts are routed), without charging per-row compute.
+        assert!((group_reads - more_rows).abs() < 1e-12, "group_reads ({group_reads}) must stay independent of row count ({more_rows})");
+        // Whole bank has zero prompt miss reads.
+        assert_eq!(layers.pass_reads(READ, HeldSlots::bank(32), rows), 0.);
+    }
+
+    /// A `LiveDecode` with zero counted steps or non-positive/non-finite rows
+    /// falls back cleanly to the generic model without dividing by zero or
+    /// producing NaN/infinite shares.
+    #[test]
+    fn live_decode_guards_zero_steps_and_non_positive_rows() {
+        let reads = LayerReads::of_depths(&[2, 1, 0, 0, 1], &[1, 1, 0, 0, 1]);
+        let model = Shares { misses: 0.5, requests: 0.75 };
+
+        let zero_steps = LiveDecode { layers: vec![reads.clone()], steps: 0, rows: 1., depth: 100 };
+        assert_eq!(zero_steps.shares(0, 1, model), model);
+        assert_eq!(zero_steps.routed(0), None);
+
+        for bad_rows in [0., -1., f64::NAN, f64::INFINITY] {
+            let bad = LiveDecode { layers: vec![reads.clone()], steps: 1, rows: bad_rows, depth: 100 };
+            assert_eq!(bad.shares(0, 1, model), model);
+        }
     }
 }

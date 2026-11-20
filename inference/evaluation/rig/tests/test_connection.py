@@ -107,6 +107,30 @@ class RemoteCommandTests(unittest.TestCase):
             )
             self.assertEqual(result.stdout.strip(), "prompts")
 
+    def test_host_package_does_not_shadow_installed_siblings(self):
+        """With `HOST_PACKAGE` first on `PYTHONPATH`, `magnitude_rig.host` resolves from the zip
+        while sibling modules installed on `sys.path` (such as `magnitude_rig.store`, imported by
+        `magnitude-references` under `mrig kl`) remain importable."""
+        src_dir = Path(__file__).resolve().parent.parent / "src"
+        with tempfile.TemporaryDirectory() as directory:
+            zip_path = Path(directory) / "agent.zip"
+            zip_path.write_bytes(HOST_PACKAGE)
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            env["PYTHONPATH"] = os.pathsep.join([str(zip_path), str(src_dir)])
+            result = subprocess.run(
+                [sys.executable, "-S", "-c",
+                 "import magnitude_rig.host, magnitude_rig.store; "
+                 "print(magnitude_rig.host.__file__); print(magnitude_rig.store.__file__)"],
+                cwd=directory,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            host_file, store_file = result.stdout.strip().splitlines()
+            self.assertIn("agent.zip", host_file)
+            self.assertIn(str(src_dir), store_file)
+
 
 if __name__ == "__main__":
     unittest.main()

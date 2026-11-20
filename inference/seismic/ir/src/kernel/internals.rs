@@ -494,7 +494,7 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
             kind,
             representation,
             extents,
-            alignment: representation_alignment(representation),
+            alignment: registry::representation_alignment(representation),
         });
         let rank = self.inner.state.locals[local as usize].extents.len() as u32;
         let index = self
@@ -1056,13 +1056,7 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
         };
         let schema = &layout.planes[plane as usize];
         assert!(field < schema.fields, "field is outside its plane group");
-        let dtype = match schema.encoding {
-            registry::PlaneEncoding::Dense(dtype) => dtype,
-            registry::PlaneEncoding::Packed { .. }
-            | registry::PlaneEncoding::Grid(_)
-            | registry::PlaneEncoding::SignedLocal { .. }
-            | registry::PlaneEncoding::FloatCode { .. } => DType::U32,
-        };
+        let dtype = schema.dtype();
         let indices = self.read_indices(entry, index);
         let ty = dtype_value_type(dtype);
         let uniformity = self
@@ -2486,15 +2480,6 @@ fn definitely_written<B: PhysicalDialect>(blocks: &[BlockData<B>], block: BlockI
         }
     }
     written
-}
-
-fn representation_alignment(id: RepresentationId) -> u64 {
-    match &registry::representation_info(id).kind {
-        RepresentationKind::Dense(dtype) => dtype.bytes() as u64,
-        RepresentationKind::Packed(layout) => u64::from(layout.packet_alignment),
-        RepresentationKind::PackedRows(_) => registry::ROW_ALIGNMENT,
-        RepresentationKind::External(layout) => u64::from(layout.packet_alignment),
-    }
 }
 
 // Registry-validated dispatch used only by the core semantic walker for an

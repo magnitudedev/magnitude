@@ -153,3 +153,101 @@ impl StateLaunchCore {
         (self.batch, self.work)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_batching::StateBatchError;
+    use magnitude_state::{Codec, CodecConversionStep, HistoryDomainId, KvCodec, LayerRef, VectorKind};
+    use seismic::DType;
+
+    fn step(
+        domain: usize,
+        layer: u32,
+        vector: VectorKind,
+        source_planes: Vec<usize>,
+        destination_planes: Vec<usize>,
+        from: Vec<usize>,
+        to: Vec<usize>,
+    ) -> CodecConversionStep {
+        CodecConversionStep {
+            domain: HistoryDomainId(domain),
+            layer: LayerRef::Target(layer),
+            vector,
+            source_codec: Codec::Dense { dtype: DType::F16 },
+            destination_codec: Codec::Dense { dtype: DType::F16 },
+            source_planes,
+            destination_planes,
+            from,
+            to,
+        }
+    }
+
+    #[test]
+    fn multi_domain_codec_conversion_sums_per_domain_rows_and_checks_per_domain_capacities() {
+        let steps = vec![
+            step(0, 0, VectorKind::Key, vec![0], vec![0], vec![0, 1, 2], vec![4, 5, 6]),
+            step(0, 0, VectorKind::Value, vec![1], vec![1], vec![0, 1, 2], vec![4, 5, 6]),
+            step(1, 1, VectorKind::Key, vec![2], vec![2], vec![10, 11], vec![0, 1]),
+            step(1, 1, VectorKind::Value, vec![3], vec![3], vec![10, 11], vec![0, 1]),
+        ];
+        // Domain 0 has 3 rows, domain 1 has 2 rows -> actual_rows == 5.
+        let batch = ValidatedStateBatch::convert(
+            KvCodec::Dense,
+            KvCodec::AffineK8V4,
+            steps.clone(),
+            &[8, 16],
+            &[8, 4],
+            8,
+        )
+        .unwrap();
+        assert_eq!(batch.actual_rows(), 5);
+
+        // Exceeding domain 1's destination capacity (1) rejects even though domain 0 has capacity 8.
+        assert_eq!(
+            ValidatedStateBatch::convert(
+                KvCodec::Dense,
+                KvCodec::AffineK8V4,
+                steps.clone(),
+                &[8, 16],
+                &[8, 1],
+                8,
+            )
+            .unwrap_err(),
+            StateBatchError::InvalidMapping
+        );
+
+        // Class capacity is checked against the sum across domains (5 > 4).
+        assert_eq!(
+            ValidatedStateBatch::convert(
+                KvCodec::Dense,
+                KvCodec::AffineK8V4,
+                steps.clone(),
+                &[8, 16],
+                &[8, 4],
+                4,
+            )
+            .unwrap_err(),
+            StateBatchError::Capacity {
+                required: 5,
+                available: 4,
+            }
+        );
+
+        // Mismatched row mapping within the same domain is rejected.
+        let mut mismatched = steps;
+        mismatched[1].to[0] = 7;
+        assert_eq!(
+            ValidatedStateBatch::convert(
+                KvCodec::Dense,
+                KvCodec::AffineK8V4,
+                mismatched,
+                &[8, 16],
+                &[8, 4],
+                8,
+            )
+            .unwrap_err(),
+            StateBatchError::InvalidMapping
+        );
+    }
+}

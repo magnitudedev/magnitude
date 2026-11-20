@@ -43,11 +43,13 @@
 //!     (invariant under our own shrinks, since `-Δheld + Δfree == 0`).
 //!   - Each OS pressure event (`seismic::PressureEvents`) while pressure is
 //!     above `Normal` lowers B by one block (`unit`) per event; if pressure
-//!     persists silently past a dwell window (`1 s` for `Warn`, `250 ms` for
-//!     `Critical`) without new edge events (level-triggered OSes such as
-//!     Windows `LowMemoryResourceNotification`), B steps down one block per
-//!     dwell so the model never freezes in starvation. B never falls below
-//!     committed memory.
+//!     persists silently under immediate scarcity (`free <= scarcity_cushion`)
+//!     without new edge events, `Critical` steps B down every `250 ms` on every
+//!     OS, while standing `Warn` steps down every `1 s` only when the OS reports
+//!     no harm counters (level-triggered OSes such as Windows
+//!     `LowMemoryResourceNotification`). On macOS and judged Linux, standing
+//!     `Warn` with `events == 0` never drains cache on its own. B never falls
+//!     below committed memory.
 
 use std::time::{Duration, Instant};
 
@@ -397,22 +399,34 @@ impl Boundary {
         let seismic::Counted { at, lag } = paging.counted;
         let cold = paging.cold;
         self.harmed = None;
+        let scarce_free = free <= scarcity_cushion(total, unit);
+        // When over half of total RAM is immediately free + clean cache
+        // (e.g. Linux PSI firing on hugepage/DMA compaction with 77 GB free),
+        // the host is not under memory scarcity.
+        let abundant_free = total > 0 && free > total / 2;
         let prev_level = self.level;
         self.level = paging.pressure.filter(|level| *level != seismic::PressureLevel::Normal);
-        let mut pressure_trigger = self.level.filter(|_| events > 0);
+        let mut pressure_trigger = self.level.filter(|_| events > 0 && !abundant_free);
         match self.level {
             None => self.pressure_at = None,
             Some(level) => {
-                if events > 0 || prev_level.is_none() {
-                    self.pressure_at = Some(at);
-                } else if unit > 0 && held > self.committed {
-                    let dwell = match level {
-                        seismic::PressureLevel::Critical => STANDING_CRITICAL_DWELL,
-                        seismic::PressureLevel::Warn | seismic::PressureLevel::Normal => STANDING_WARN_DWELL,
-                    };
-                    if self.pressure_at.is_some_and(|since| at.saturating_duration_since(since) >= dwell) {
-                        pressure_trigger = Some(level);
-                        self.pressure_at = Some(at);
+                let standing_dwell = match level {
+                    seismic::PressureLevel::Critical if scarce_free => Some(STANDING_CRITICAL_DWELL),
+                    seismic::PressureLevel::Warn if scarce_free && paging.harm.is_none() => Some(STANDING_WARN_DWELL),
+                    _ => None,
+                };
+                match standing_dwell {
+                    None => self.pressure_at = None,
+                    Some(dwell) => {
+                        if events > 0 || prev_level.is_none() || self.pressure_at.is_none() {
+                            self.pressure_at = Some(at);
+                        } else if unit > 0
+                            && held > self.committed
+                            && self.pressure_at.is_some_and(|since| at.saturating_duration_since(since) >= dwell)
+                        {
+                            pressure_trigger = Some(level);
+                            self.pressure_at = Some(at);
+                        }
                     }
                 }
             }
@@ -436,12 +450,27 @@ impl Boundary {
             };
             self.cap = Some(cap);
         }
-        let level = self.level;
+        // Track the trough of exogenous room/cold/anchor while `cap` stands:
+        // our own shrinks preserve `room` (`-Δin_use + Δsupply == 0`) and
+        // `held + free` (`-Δheld + Δfree == 0`), so only others' growth lowers
+        // these troughs. Recording the trough ensures that once a competing app
+        // exits after pushing `room` down, recovery from the trough lifts `cap`.
+        if let Some(cap) = self.cap.as_mut() {
+            cap.room = cap.room.min(room);
+            cap.cold = cap.cold.min(cold);
+            cap.anchor = cap.anchor.min(held.saturating_add(free));
+        }
+        let pressure_calm = self.level.is_none()
+            || (self.level == Some(seismic::PressureLevel::Warn)
+                && self.pressed.is_none()
+                && paging.harm.is_some()
+                && !scarce_free);
+        let max_lift_gain = scarcity_cushion(total, unit).max(unit);
         let lifted = |cap: &Cap| {
-            let min_gain = cap.step.max(unit);
+            let min_gain = cap.step.min(max_lift_gain).max(unit);
             room >= cap.room.saturating_add(min_gain)
                 || cold >= cap.cold.saturating_add(min_gain)
-                || (level.is_none()
+                || (pressure_calm
                     && free >= cap.free.saturating_add(min_gain)
                     && held.saturating_add(free) >= cap.anchor.saturating_add(min_gain))
         };
@@ -449,7 +478,7 @@ impl Boundary {
             // No share of the process's is counted: nothing judges harm,
             // growth or a step; B, where pressure set it, lifts on others' release.
             self.unjudged = true;
-            if self.level.is_none() && self.cap.as_ref().is_some_and(lifted) {
+            if pressure_calm && self.cap.as_ref().is_some_and(lifted) {
                 self.cap = None;
             }
             return;
@@ -471,7 +500,7 @@ impl Boundary {
         let harmed = harm.machine.saturating_sub(last.machine).saturating_sub(harm.own.saturating_sub(last.own));
         let harmed_bytes = harmed.saturating_mul(paging.page_bytes);
         let rate_bps = harmed_bytes as f64 / span;
-        let scarce = self.level.is_some() || free <= scarcity_cushion(total, unit);
+        let scarce = self.level == Some(seismic::PressureLevel::Critical) || scarce_free;
         let no_exogenous_relief = free <= last.free.saturating_add(EXOGENOUS_RELIEF_TOLERANCE)
             && room <= last.room.saturating_add(EXOGENOUS_RELIEF_TOLERANCE);
         let excess_span = ((rate_bps - THRASH_RATE_BPS).max(0.0) * span).round() as u64;
@@ -548,7 +577,7 @@ impl Boundary {
                 }
             }
         }
-        let calm = !thrashing && self.thrash.is_none() && self.step.is_none() && self.level.is_none();
+        let calm = !thrashing && self.thrash.is_none() && self.step.is_none() && pressure_calm;
         if calm && self.cap.as_ref().is_some_and(lifted) {
             self.cap = None;
         }
@@ -758,31 +787,104 @@ mod tests {
         assert_eq!(boundary.cap(), None, "exogenous free lifts B cleanly");
     }
 
-    /// Standing OS pressure (`Warn` past 1 s or `Critical` past 250 ms) yields
-    /// one block per dwell interval even when the OS stops delivering edge
-    /// events (e.g. Windows level-triggered `LowMemoryResourceNotification`),
-    /// while ignoring transient sub-dwell standing readings.
+    /// Standing OS pressure under scarcity yields one block per dwell interval
+    /// without edge events:
+    /// - `Warn` past 1 s only on level-triggered / unjudged OSes (`harm: None`,
+    ///   e.g. Windows `LowMemoryResourceNotification`), never on judged OSes
+    ///   (macOS/Linux) where standing `Warn` is normal desktop compressor state;
+    /// - `Critical` past 250 ms on every OS while `free <= scarcity_cushion`;
+    /// - neither fires when immediate `free` exceeds `scarcity_cushion`.
     #[test]
     fn standing_pressure_yields_past_dwell_even_without_edge_events() {
+        let start = Instant::now();
+        let total = 64 * GB;
+        let unit = 256 * MB;
+        let unjudged = |at, held, free, pressure| {
+            let mut o = obs(at, total, 0, held, free, unit, 0, pressure);
+            o.paging.harm = None;
+            o
+        };
+
+        // Level-triggered / unjudged OS (Windows): Warn past 1s under scarcity yields.
+        let mut boundary = Boundary::default();
+        boundary.observe(unjudged(start, 30 * GB, 0, seismic::PressureLevel::Normal));
+        boundary.observe(unjudged(start + Duration::from_millis(100), 30 * GB, 0, seismic::PressureLevel::Warn));
+        boundary.observe(unjudged(start + Duration::from_millis(400), 30 * GB, 0, seismic::PressureLevel::Warn));
+        assert_eq!(boundary.pressed(), None);
+        assert_eq!(boundary.cap(), None);
+
+        boundary.observe(unjudged(start + Duration::from_millis(1100), 30 * GB, 0, seismic::PressureLevel::Warn));
+        assert_eq!(boundary.pressed(), Some(seismic::PressureLevel::Warn));
+        assert_eq!(boundary.cap(), Some(30 * GB - unit));
+
+        // Standing Critical steps faster (250ms dwell) under scarcity.
+        boundary.observe(unjudged(start + Duration::from_millis(1350), 30 * GB, 0, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), Some(seismic::PressureLevel::Critical));
+        assert_eq!(boundary.cap(), Some(30 * GB - 2 * unit));
+
+        // Abundant free supply suppresses standing dwell even under Critical.
+        boundary.observe(unjudged(start + Duration::from_millis(2500), 30 * GB, 4 * GB, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), None);
+        assert_eq!(boundary.cap(), Some(30 * GB - 2 * unit));
+
+        // Judged OS (macOS / Linux): standing Warn with events == 0 NEVER drains,
+        // even for 60s, while Critical under scarcity still yields at 250ms.
+        let mut macos = Boundary::default();
+        macos.observe(obs(start, total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        for sec in 1..=60 {
+            macos.observe(obs(start + Duration::from_secs(sec), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Warn));
+            assert_eq!(macos.pressed(), None, "standing Warn on macOS/Linux must never drain (sec {sec})");
+            assert_eq!(macos.cap(), None);
+        }
+        // Escalation to Critical under scarcity starts dwell cleanly and yields after 250ms.
+        macos.observe(obs(start + Duration::from_secs(61), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Critical));
+        assert_eq!(macos.pressed(), None);
+        macos.observe(obs(start + Duration::from_millis(61_250), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Critical));
+        assert_eq!(macos.pressed(), Some(seismic::PressureLevel::Critical));
+        assert_eq!(macos.cap(), Some(30 * GB - unit));
+    }
+
+    /// Standing macOS `Warn` with abundant free supply never triggers false
+    /// `Harm` on lazy decompressions, and after a competing app grows (pushing
+    /// `room` down and setting `cap`) then exits, `cap` lifts cleanly from the
+    /// trough even if `Warn` remains standing.
+    #[test]
+    fn standing_warn_never_false_harms_and_lifts_cap_from_trough_on_recovery() {
         let mut boundary = Boundary::default();
         let start = Instant::now();
         let total = 64 * GB;
         let unit = 256 * MB;
-        boundary.observe(obs(start, total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
-        // Warn stands for 300ms with 0 events: no trigger before 1s dwell.
-        boundary.observe(obs(start + Duration::from_millis(100), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Warn));
-        boundary.observe(obs(start + Duration::from_millis(400), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Warn));
-        assert_eq!(boundary.pressed(), None);
+        let page = 16 * 1024;
+        boundary.observe(obs(start, total, 0, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
+        boundary.observe(obs(start + Duration::from_secs(1), total, 0, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
+        assert!(boundary.judges());
+
+        // High-rate lazy decompressions (128 MiB/s) under standing Warn with 4 GB free (> 2 GB cushion):
+        // must NOT fire Harm because immediate free supply is abundant.
+        let rate_pages = (128 * MB) / page;
+        boundary.observe(obs(start + Duration::from_secs(2), total, rate_pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
+        boundary.observe(obs(start + Duration::from_secs(3), total, 2 * rate_pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
+        assert_eq!(boundary.harmed(), None, "standing Warn with abundant free must not fire Harm");
         assert_eq!(boundary.cap(), None);
 
-        // Standing Warn past 1s dwell fires one block step even with events == 0.
-        boundary.observe(obs(start + Duration::from_millis(1100), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Warn));
-        assert_eq!(boundary.pressed(), Some(seismic::PressureLevel::Warn));
+        // Competing app grows +10 GB: triggers pressure events, pushes room down from 30 GB to 20 GB.
+        boundary.observe(obs(start + Duration::from_secs(4), total, 2 * rate_pages, 30 * GB, 0, unit, 1, seismic::PressureLevel::Warn));
         assert_eq!(boundary.cap(), Some(30 * GB - unit));
+        for tick in 5..=14 {
+            let held = 30 * GB - (tick - 4) * GB;
+            boundary.observe(obs(start + Duration::from_secs(tick), total, 2 * rate_pages, held, 0, unit, 1, seismic::PressureLevel::Warn));
+        }
+        assert!(boundary.cap().is_some());
 
-        // Standing Critical steps faster (250ms dwell) even while held hasn't dropped yet.
-        boundary.observe(obs(start + Duration::from_millis(1350), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Critical));
-        assert_eq!(boundary.pressed(), Some(seismic::PressureLevel::Critical));
-        assert_eq!(boundary.cap(), Some(30 * GB - 2 * unit));
+        // Competing app exits, freeing 10 GB: room recovers from trough (20 GB) to 30 GB,
+        // free jumps to 10 GB (> cushion), even while macOS stays at standing Warn.
+        boundary.observe(obs(start + Duration::from_secs(15), total, 2 * rate_pages, 20 * GB, 10 * GB, unit, 0, seismic::PressureLevel::Warn));
+        assert_eq!(boundary.cap(), None, "exogenous recovery from trough must lift cap even under standing Warn");
+
+        // Abundant free supply (> total/2) suppresses even edge pressure events
+        // (e.g. Linux PSI compaction stalls when >50% of host RAM is free).
+        boundary.observe(obs(start + Duration::from_secs(16), total, 2 * rate_pages, 20 * GB, 36 * GB, unit, 1, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), None, "pressure event with >50% of total RAM free must not fire");
+        assert_eq!(boundary.cap(), None);
     }
 }

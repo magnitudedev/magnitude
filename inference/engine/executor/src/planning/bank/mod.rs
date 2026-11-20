@@ -1093,18 +1093,38 @@ impl ExpertBankPlan {
         })
     }
 
+    /// The absent granules the bank's records pools allocate when they open
+    /// (`LoadPools::open_at`), held for the load's life outside any slot count:
+    /// one in the bank's store and, for a linked host tier, one in host RAM.
+    pub fn absent_demand(&self) -> ClaimDemand {
+        let mut demand = ClaimDemand::pooled(BankTier::Bank, self.block.absent);
+        if self.host_granule().is_some() {
+            demand = demand
+                .checked_plus(ClaimDemand::pooled(BankTier::Host, self.block.absent))
+                .expect("bank absent granule demand fits u64");
+        }
+        demand
+    }
+
     /// The pools' granules of the records the bank commits at its load, by
     /// what commits them: the bank's for its slots
-    /// ([`Self::resident_charge`]) and for its stored tables, every record
-    /// held ([`Self::tables_charge`]), and a host tier's at no host slots
-    /// ([`Self::host_charge`]), where the bank has a tier.
+    /// ([`Self::resident_charge`]), for its stored tables, every record
+    /// held ([`Self::tables_charge`]), its records pool's absent granule,
+    /// and a host tier's at no host slots ([`Self::host_charge`]) and its
+    /// pool's absent granule, where the bank has a tier.
     pub(super) fn pooled_charges(&self) -> Result<Vec<(&'static str, ClaimDemand)>, String> {
-        let mut pooled = vec![("group: records", ClaimDemand::pooled(BankTier::Bank, self.resident_charge(self.slots)?))];
+        let mut pooled = vec![
+            ("group: records", ClaimDemand::pooled(BankTier::Bank, self.resident_charge(self.slots)?)),
+            ("pool: absent", ClaimDemand::pooled(BankTier::Bank, self.block.absent)),
+        ];
         if !self.tables.is_empty() {
             pooled.push(("stored tables", ClaimDemand::pooled(BankTier::Bank, self.tables_charge()?)));
         }
         if self.tiered() {
             pooled.push(("host tier", ClaimDemand::pooled(BankTier::Host, self.host_charge(0)?)));
+            if self.host_granule().is_some() {
+                pooled.push(("host pool: absent", ClaimDemand::pooled(BankTier::Host, self.block.absent)));
+            }
         }
         Ok(pooled)
     }

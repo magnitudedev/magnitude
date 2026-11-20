@@ -1102,9 +1102,11 @@ impl fmt::Display for OperationError {
 impl std::error::Error for OperationError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Selected {
-    pub token: TokenId,
-    pub status: u8,
+pub enum Selected {
+    Token(TokenId),
+    Empty,
+    NonFinite,
+    Declined,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]

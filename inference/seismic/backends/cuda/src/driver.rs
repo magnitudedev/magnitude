@@ -95,6 +95,7 @@ driver! {
     stream_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuStreamCreate",
     stream_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamDestroy_v2",
     stream_query: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamQuery",
+    stream_synchronize: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamSynchronize",
     event_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuEventCreate",
     event_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventDestroy_v2",
     event_synchronize: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventSynchronize",
@@ -309,7 +310,10 @@ pub(crate) struct ContextInner {
     /// The driver's stack limit calls (queries and raises) this context made.
     #[cfg(test)]
     limit_calls: std::sync::atomic::AtomicUsize,
-    stack_charges: std::sync::Mutex<Vec<Charge>>,
+    /// Context-lifetime stack growth recorded in `driver_memory` and its ledger
+    /// charges; freed from `driver_memory` in `before_drop` alongside
+    /// `graph_charge`.
+    stack_charges: std::sync::Mutex<(u64, Vec<Charge>)>,
     /// Context-lifetime high-water mark and retained ledger charge for
     /// instantiated CUDA graphs (`graph_cost::GraphPool`): CUDA retains
     /// destroyed graph memory until the context is released, so this charge
@@ -360,7 +364,7 @@ impl Context {
             stack_limit: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             limit_calls: std::sync::atomic::AtomicUsize::new(0),
-            stack_charges: std::sync::Mutex::new(Vec::new()),
+            stack_charges: std::sync::Mutex::new((0, Vec::new())),
             graph_charge: std::sync::Mutex::new((0, None)),
         }));
         context.transfer = {
@@ -429,18 +433,22 @@ impl Context {
         if limit >= bytes {
             return Ok(0);
         }
-        let ((), taken) = self.taken_by(|| {
+        let (raised, taken) = self.taken_by(|| {
+            if self.stack_limit.load(std::sync::atomic::Ordering::Acquire) >= bytes {
+                return Ok(false);
+            }
             #[cfg(test)]
             self.limit_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             unsafe {
                 driver.check(
                     (driver.context_set_limit)(CU_LIMIT_STACK_SIZE, bytes),
                     "stack limit raise",
-                )
+                )?;
             }
+            self.stack_limit.fetch_max(bytes, std::sync::atomic::Ordering::AcqRel);
+            Ok(true)
         })?;
-        self.stack_limit.fetch_max(bytes, std::sync::atomic::Ordering::AcqRel);
-        Ok(taken)
+        Ok(if raised { taken } else { 0 })
     }
 
     /// Run `work`, driver calls that take device memory no allocation of
@@ -495,14 +503,14 @@ impl Context {
         // of its own, with no effect of this call beside it.
         let change = entry.change();
         let mut charges = self.stack_charges();
-        charges.push(Charge::took(&change, &entry, self.stack.bytes(), Wiring::Pageable));
+        charges.1.push(Charge::took(&change, &entry, self.stack.bytes(), Wiring::Pageable));
         assert!(
             self.own_entry.set(entry).is_ok(),
             "a context's driver memory is charged to one entry, at its device's opening"
         );
     }
 
-    fn stack_charges(&self) -> std::sync::MutexGuard<'_, Vec<Charge>> {
+    fn stack_charges(&self) -> std::sync::MutexGuard<'_, (u64, Vec<Charge>)> {
         self.stack_charges
             .lock()
             .expect("the stack charge lock is never poisoned")
@@ -530,9 +538,13 @@ impl Context {
         let taken = self.raise_stack(usize::try_from(local).unwrap_or(0))?;
         if taken > 0 {
             self.stack.grew(taken);
-            self.driver_allocated(taken);
+            let mut stack = self.stack_charges();
+            if let Some(memory) = self.driver_memory.get() {
+                memory.allocated(taken);
+                stack.0 = stack.0.saturating_add(taken);
+            }
             if let Some((entry, change)) = &change {
-                self.stack_charges().push(Charge::took(change, entry, taken, Wiring::Pageable));
+                stack.1.push(Charge::took(change, entry, taken, Wiring::Pageable));
             }
         }
         Ok(())
@@ -628,6 +640,13 @@ impl DropInChange for ContextInner {
         unsafe {
             (self.driver.primary_context_release)(self.ordinal);
         }
+        let stack_bytes = {
+            let mut guard = self
+                .stack_charges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut guard.0, 0)
+        };
         let graph_peak = {
             let mut guard = self
                 .graph_charge
@@ -635,9 +654,10 @@ impl DropInChange for ContextInner {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::replace(&mut guard.0, 0)
         };
-        if graph_peak > 0 {
+        let retained = stack_bytes.saturating_add(graph_peak);
+        if retained > 0 {
             if let Some(memory) = self.driver_memory.get() {
-                memory.freed(graph_peak);
+                memory.freed(retained);
             }
         }
     }
@@ -1270,6 +1290,69 @@ fn granularity(driver: &Driver, location: MemoryLocation) -> Result<u64, DriverE
     Ok(granularity as u64)
 }
 
+/// Sequence for a synchronous transfer on `context.transfer`: create the
+/// synchronization event *before* enqueueing the async DMA, record and wait on
+/// it after enqueueing, and fall back to synchronous stream drain if recording
+/// fails after the DMA is already in flight so a borrowed host slice is never
+/// returned while DMA still references it.
+fn run_transfer_and_sync<E, Ev>(
+    create_event: impl FnOnce() -> Result<Ev, E>,
+    enqueue: impl FnOnce() -> Result<(), E>,
+    record_event: impl FnOnce(&Ev) -> Result<(), E>,
+    sync_event: impl FnOnce(&Ev) -> Result<(), E>,
+    sync_stream: impl FnOnce(),
+    destroy_event: impl FnOnce(Ev),
+) -> Result<(), E> {
+    let event = create_event()?;
+    let result = match enqueue() {
+        Err(error) => Err(error),
+        Ok(()) => match record_event(&event) {
+            Ok(()) => sync_event(&event),
+            Err(error) => {
+                sync_stream();
+                Err(error)
+            }
+        },
+    };
+    destroy_event(event);
+    result
+}
+
+/// Enqueues a single transfer on `context.transfer` and waits for it to
+/// complete before returning, even on synchronization-setup errors.
+fn transfer_and_sync(
+    context: &Context,
+    operation: &'static str,
+    sync_operation: &'static str,
+    enqueue: impl FnOnce() -> ResultCode,
+) -> Result<(), DriverError> {
+    let _current = context.enter()?;
+    let driver = &context.driver;
+    run_transfer_and_sync(
+        || {
+            let mut event = std::ptr::null_mut();
+            unsafe {
+                driver.check((driver.event_create)(&mut event, EVENT_BLOCKING_SYNC), sync_operation)?;
+            }
+            Ok(event)
+        },
+        || driver.check(enqueue(), operation),
+        |&event| {
+            driver.check(
+                unsafe { context.enqueue().event_record(event, context.transfer) },
+                sync_operation,
+            )
+        },
+        |&event| driver.check(unsafe { (driver.event_synchronize)(event) }, sync_operation),
+        || unsafe {
+            (driver.stream_synchronize)(context.transfer);
+        },
+        |event| unsafe {
+            (driver.event_destroy)(event);
+        },
+    )
+}
+
 /// Synchronous host copy into device memory at `pointer`, on the context's
 /// non-blocking transfer stream: it waits for nothing but itself (callers
 /// hold the destination's access fence, so no queued launch still reads or
@@ -1278,14 +1361,11 @@ pub(crate) fn upload(context: &Context, pointer: u64, bytes: &[u8]) -> Result<()
     if bytes.is_empty() {
         return Ok(());
     }
-    let _current = context.enter()?;
-    unsafe {
-        context.driver.check(
-            context.enqueue().upload_async(pointer, bytes.as_ptr().cast(), bytes.len(), context.transfer),
-            "upload",
-        )?;
-    }
-    context.synchronize(context.transfer, "upload synchronization")
+    transfer_and_sync(context, "upload", "upload synchronization", || unsafe {
+        context
+            .enqueue()
+            .upload_async(pointer, bytes.as_ptr().cast(), bytes.len(), context.transfer)
+    })
 }
 
 /// Synchronous zero fill of `bytes` of device memory at `pointer`, on the
@@ -1295,13 +1375,11 @@ pub(crate) fn zero(context: &Context, pointer: u64, bytes: usize) -> Result<(), 
     if bytes == 0 {
         return Ok(());
     }
-    let _current = context.enter()?;
-    unsafe {
+    transfer_and_sync(context, "zero fill", "zero fill synchronization", || unsafe {
         context
-            .driver
-            .check(context.enqueue().memset_d8_async(pointer, 0, bytes, context.transfer), "zero fill")?;
-    }
-    context.synchronize(context.transfer, "zero fill synchronization")
+            .enqueue()
+            .memset_d8_async(pointer, 0, bytes, context.transfer)
+    })
 }
 
 /// Synchronous device-to-host copy from `pointer`, on the context's
@@ -1315,14 +1393,11 @@ pub(crate) fn download(
     if bytes.is_empty() {
         return Ok(());
     }
-    let _current = context.enter()?;
-    unsafe {
-        context.driver.check(
-            context.enqueue().download_async(bytes.as_mut_ptr().cast(), pointer, bytes.len(), context.transfer),
-            "download",
-        )?;
-    }
-    context.synchronize(context.transfer, "download synchronization")
+    transfer_and_sync(context, "download", "download synchronization", || unsafe {
+        context
+            .enqueue()
+            .download_async(bytes.as_mut_ptr().cast(), pointer, bytes.len(), context.transfer)
+    })
 }
 
 /// `CUDA_KERNEL_NODE_PARAMS_v2`.
@@ -1424,9 +1499,66 @@ impl WordOperation {
     }
 }
 
+/// DAG frontier state for [`Graph`]: tracks every current sink node (no
+/// outgoing edges yet), the last non-kernel barrier added since the last
+/// kernel node, and whether that barrier included a wait.
+struct GraphFrontier {
+    frontier: Vec<Handle>,
+    since: Option<Handle>,
+    gated: bool,
+}
+
+impl GraphFrontier {
+    fn new() -> Self {
+        Self {
+            frontier: Vec::new(),
+            since: None,
+            gated: false,
+        }
+    }
+
+    fn barrier_dependencies(&self) -> &[Handle] {
+        &self.frontier
+    }
+
+    fn commit_barrier(&mut self, raw: Handle, is_wait: bool) {
+        self.frontier.clear();
+        self.frontier.push(raw);
+        self.since = Some(raw);
+        self.gated |= is_wait;
+    }
+
+    /// Compute `(programmatic, predecessors)` for a kernel node without
+    /// mutating state so driver failures leave the DAG unchanged.
+    fn kernel_plan(&self, edge: Edge, after: &[Handle]) -> (bool, Vec<Handle>) {
+        let mut predecessors = Vec::with_capacity(after.len() + usize::from(self.since.is_some()));
+        for &handle in after {
+            if !predecessors.contains(&handle) {
+                predecessors.push(handle);
+            }
+        }
+        let programmatic = edge == Edge::Programmatic && !predecessors.is_empty() && !self.gated;
+        if !programmatic {
+            if let Some(since) = self.since {
+                if !predecessors.contains(&since) {
+                    predecessors.push(since);
+                }
+            }
+        }
+        (programmatic, predecessors)
+    }
+
+    fn commit_kernel(&mut self, raw: Handle, predecessors: &[Handle]) {
+        self.gated = false;
+        self.since = None;
+        self.frontier.retain(|handle| !predecessors.contains(handle));
+        self.frontier.push(raw);
+    }
+}
+
 /// A kernel graph under construction: kernel nodes, each depending on the
 /// earlier nodes it names, and event-record and word-operation nodes among
-/// them, each after the node added before it.
+/// them, each after every current sink of the DAG.
 pub(crate) struct Graph {
     raw: Handle,
     /// Every kernel node, in order of addition.
@@ -1436,14 +1568,7 @@ pub(crate) struct Graph {
     marks: Vec<Handle>,
     /// Every word-operation node, in order of addition.
     operations: Vec<Handle>,
-    /// The node added last.
-    last: Option<Handle>,
-    /// The node added last since the last kernel node, where one was: the
-    /// next kernel node follows it.
-    since: Option<Handle>,
-    /// Whether a wait was added since the last kernel node: the next kernel
-    /// node follows it to completion, whatever its edge.
-    gated: bool,
+    dag: GraphFrontier,
     context: Arc<Context>,
 }
 
@@ -1462,15 +1587,13 @@ impl Graph {
             nodes: Vec::new(),
             marks: Vec::new(),
             operations: Vec::new(),
-            last: None,
-            since: None,
-            gated: false,
+            dag: GraphFrontier::new(),
             context: context.clone(),
         })
     }
 
-    /// Add an event-record node of a mark, recording `event` once the node
-    /// added last completes, or as the graph starts where none was
+    /// Add an event-record node of a mark, recording `event` once every
+    /// current sink completes, or as the graph starts where none was
     /// ([`Self::push_event`]).
     pub fn push_mark(&mut self, event: &Event) -> Result<(), DriverError> {
         let raw = self.push_event(event)?;
@@ -1478,52 +1601,47 @@ impl Graph {
         Ok(())
     }
 
-    /// Add an event-record node recording `event` once the node added last
+    /// Add an event-record node recording `event` once every current sink
     /// completes, or as the graph starts where none was. A launch's chain
     /// runs through it, so the graph stays one chain, but for a programmatic
     /// edge, which only a kernel can source: there the node hangs off the
-    /// chain (`push_kernel`).
+    /// chain (`push_kernel`) and remains in the frontier until the next
+    /// barrier consumes it.
     pub fn push_event(&mut self, event: &Event) -> Result<Handle, DriverError> {
         let add = graph_symbol(self.context.driver.graph_add_event_record_node)?;
         let _current = self.context.enter()?;
         let mut raw = std::ptr::null_mut();
-        let dependencies = self.last;
+        let dependencies = self.dag.barrier_dependencies();
         unsafe {
             self.context.driver.check(
-                add(&mut raw, self.raw, dependencies.as_slice().as_ptr(), dependencies.as_slice().len(), event.raw()),
+                add(&mut raw, self.raw, dependencies.as_ptr(), dependencies.len(), event.raw()),
                 "kernel graph event record node",
             )?;
         }
-        self.last = Some(raw);
-        self.since = Some(raw);
+        self.dag.commit_barrier(raw, false);
         Ok(raw)
     }
 
     /// Add a node of one word operation on the word at device address
-    /// `address`, once the node added last completes, or as the graph starts
+    /// `address`, once every current sink completes, or as the graph starts
     /// where none was. A wait holds every later node of the chain, a
     /// programmatic launch's too (`push_kernel`); a write hangs off a
-    /// programmatic edge as an event-record node does. Following the node
-    /// added last follows the whole chain before it: a kernel on a
-    /// programmatic edge waits for its predecessor's completion itself
-    /// ([`Edge::Programmatic`]), so it completes only after it.
+    /// programmatic edge as an event-record node does.
     pub fn push_word(&mut self, operation: WordOperation, address: u64, value: u32) -> Result<(), DriverError> {
         let add = graph_symbol(self.context.driver.graph_add_batch_mem_op_node)?;
         let _current = self.context.enter()?;
         let mut raw = std::ptr::null_mut();
-        let dependencies = self.last;
+        let dependencies = self.dag.barrier_dependencies();
         let mut word = operation.of(address, value);
         let params = BatchMemOpNodeParams { context: self.context.raw, count: 1, operations: &mut word, flags: 0 };
         unsafe {
             self.context.driver.check(
-                add(&mut raw, self.raw, dependencies.as_slice().as_ptr(), dependencies.as_slice().len(), &params),
+                add(&mut raw, self.raw, dependencies.as_ptr(), dependencies.len(), &params),
                 "kernel graph word operation node",
             )?;
         }
         self.operations.push(raw);
-        self.last = Some(raw);
-        self.since = Some(raw);
-        self.gated |= operation == WordOperation::Wait;
+        self.dag.commit_barrier(raw, operation == WordOperation::Wait);
         Ok(())
     }
 
@@ -1535,17 +1653,20 @@ impl Graph {
     /// parameter values the node's `parameters` point to.
     pub fn push_kernel(&mut self, node: &KernelNodeParams, edge: Edge, after: &[usize]) -> Result<(), DriverError> {
         let add = graph_symbol(self.context.driver.graph_add_kernel_node)?;
+        let after = after.iter().map(|&node| self.nodes[node]).collect::<Vec<_>>();
+        let (programmatic, predecessors) = self.dag.kernel_plan(edge, &after);
+        let connect = if programmatic {
+            Some(self.context.driver.graph_add_dependencies.ok_or(DriverError {
+                operation: "kernel graph edge",
+                code: 0,
+                description: "the CUDA driver predates driver API 12.3 typed graph edges".into(),
+            })?)
+        } else {
+            None
+        };
         let _current = self.context.enter()?;
         let mut raw = std::ptr::null_mut();
-        let after = after.iter().map(|&node| self.nodes[node]).collect::<Vec<_>>();
-        let gated = std::mem::take(&mut self.gated);
-        let programmatic = edge == Edge::Programmatic && !after.is_empty() && !gated;
-        let since = self.since.take();
-        let dependencies = match since {
-            _ if programmatic => &[][..],
-            Some(ref since) => std::slice::from_ref(since),
-            None => after.as_slice(),
-        };
+        let dependencies = if programmatic { &[][..] } else { predecessors.as_slice() };
         unsafe {
             self.context.driver.check(
                 add(
@@ -1558,12 +1679,7 @@ impl Graph {
                 "kernel graph node",
             )?;
         }
-        if programmatic {
-            let connect = self.context.driver.graph_add_dependencies.ok_or(DriverError {
-                operation: "kernel graph edge",
-                code: 0,
-                description: "the CUDA driver predates driver API 12.3 typed graph edges".into(),
-            })?;
+        if let Some(connect) = connect {
             // CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC out of the predecessor,
             // CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC.
             let data = EdgeData {
@@ -1572,7 +1688,7 @@ impl Graph {
                 kind: 1,
                 reserved: [0; 5],
             };
-            for from in &after {
+            for from in &predecessors {
                 unsafe {
                     self.context
                         .driver
@@ -1581,7 +1697,7 @@ impl Graph {
             }
         }
         self.nodes.push(raw);
-        self.last = Some(raw);
+        self.dag.commit_kernel(raw, &predecessors);
         Ok(())
     }
 
@@ -2462,6 +2578,176 @@ mod tests {
         assert!(
             grown + (8 << 20) >= expected_min && grown <= expected_max + (64 << 20),
             "the raise took {grown} bytes; the reservation grew by {expected_min}..={expected_max}"
+        );
+    }
+
+    #[test]
+    fn graph_frontier_tracks_parallel_sinks_and_barrier_unions() {
+        let handle = |id: usize| id as Handle;
+        let (k1, k2, k3, e1, w1, k4, e2) = (
+            handle(1),
+            handle(2),
+            handle(3),
+            handle(4),
+            handle(5),
+            handle(6),
+            handle(7),
+        );
+
+        let mut dag = GraphFrontier::new();
+        // Two independent parallel kernel branches.
+        let (prog, preds) = dag.kernel_plan(Edge::Complete, &[]);
+        assert!(!prog && preds.is_empty());
+        dag.commit_kernel(k1, &preds);
+        let (prog, preds) = dag.kernel_plan(Edge::Complete, &[]);
+        assert!(!prog && preds.is_empty());
+        dag.commit_kernel(k2, &preds);
+        assert_eq!(dag.barrier_dependencies(), &[k1, k2]);
+
+        // An event barrier waits on ALL current sinks, then becomes the sole sink.
+        dag.commit_barrier(e1, false);
+        assert_eq!(dag.barrier_dependencies(), &[e1]);
+
+        // A non-programmatic kernel after k1 (with duplicate) while `since = Some(e1)`
+        // depends on `after` union `since`, deduplicated.
+        let (prog, preds) = dag.kernel_plan(Edge::Complete, &[k1, k1]);
+        assert!(!prog);
+        assert_eq!(preds, vec![k1, e1]);
+        // Failing before commit leaves the frontier and `since` untouched.
+        assert_eq!(dag.barrier_dependencies(), &[e1]);
+        assert_eq!(dag.since, Some(e1));
+
+        // Programmatic kernel after k2 with non-wait `since = Some(e1)` does NOT
+        // wait on `e1`, so `e1` stays in the frontier beside `k3`.
+        let (prog, preds) = dag.kernel_plan(Edge::Programmatic, &[k2]);
+        assert!(prog);
+        assert_eq!(preds, vec![k2]);
+        dag.commit_kernel(k3, &preds);
+        assert_eq!(dag.barrier_dependencies(), &[e1, k3]);
+
+        // A wait barrier consumes both sinks and sets `gated`, forcing even a
+        // programmatic kernel to wait on `after` union `w1`.
+        dag.commit_barrier(w1, true);
+        assert_eq!(dag.barrier_dependencies(), &[w1]);
+        let (prog, preds) = dag.kernel_plan(Edge::Programmatic, &[k3]);
+        assert!(!prog);
+        assert_eq!(preds, vec![k3, w1]);
+        dag.commit_kernel(k4, &preds);
+        assert_eq!(dag.barrier_dependencies(), &[k4]);
+
+        dag.commit_barrier(e2, false);
+        assert_eq!(dag.barrier_dependencies(), &[e2]);
+    }
+
+    #[test]
+    fn transfer_and_sync_creates_event_first_and_drains_stream_on_record_failure() {
+        let log = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let push = |step: &'static str| log.borrow_mut().push(step);
+
+        // Event creation failure aborts before enqueueing any async DMA.
+        let err = run_transfer_and_sync::<&'static str, ()>(
+            || {
+                push("create");
+                Err("oom")
+            },
+            || {
+                push("enqueue");
+                Ok(())
+            },
+            |_| {
+                push("record");
+                Ok(())
+            },
+            |_| {
+                push("sync_event");
+                Ok(())
+            },
+            || push("sync_stream"),
+            |_| push("destroy"),
+        );
+        assert_eq!(err, Err("oom"));
+        assert_eq!(*log.borrow(), vec!["create"]);
+
+        // Enqueue failure destroys the pre-created event without synchronizing.
+        log.borrow_mut().clear();
+        let err = run_transfer_and_sync::<&'static str, ()>(
+            || {
+                push("create");
+                Ok(())
+            },
+            || {
+                push("enqueue");
+                Err("invalid")
+            },
+            |_| {
+                push("record");
+                Ok(())
+            },
+            |_| {
+                push("sync_event");
+                Ok(())
+            },
+            || push("sync_stream"),
+            |_| push("destroy"),
+        );
+        assert_eq!(err, Err("invalid"));
+        assert_eq!(*log.borrow(), vec!["create", "enqueue", "destroy"]);
+
+        // Record failure after enqueue falls back to synchronous stream drain
+        // before returning to the caller.
+        log.borrow_mut().clear();
+        let err = run_transfer_and_sync::<&'static str, ()>(
+            || {
+                push("create");
+                Ok(())
+            },
+            || {
+                push("enqueue");
+                Ok(())
+            },
+            |_| {
+                push("record");
+                Err("record_failed")
+            },
+            |_| {
+                push("sync_event");
+                Ok(())
+            },
+            || push("sync_stream"),
+            |_| push("destroy"),
+        );
+        assert_eq!(err, Err("record_failed"));
+        assert_eq!(
+            *log.borrow(),
+            vec!["create", "enqueue", "record", "sync_stream", "destroy"]
+        );
+
+        // Happy path uses the blocking event without calling sync_stream.
+        log.borrow_mut().clear();
+        let ok = run_transfer_and_sync::<&'static str, ()>(
+            || {
+                push("create");
+                Ok(())
+            },
+            || {
+                push("enqueue");
+                Ok(())
+            },
+            |_| {
+                push("record");
+                Ok(())
+            },
+            |_| {
+                push("sync_event");
+                Ok(())
+            },
+            || push("sync_stream"),
+            |_| push("destroy"),
+        );
+        assert_eq!(ok, Ok(()));
+        assert_eq!(
+            *log.borrow(),
+            vec!["create", "enqueue", "record", "sync_event", "destroy"]
         );
     }
 }

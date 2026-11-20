@@ -11,14 +11,14 @@
 //! every backend's report of it ([`device_memory`]); every executor of the
 //! device then places by that one decision.
 
-use crate::kind::{KindMemory, KindReport, Reach};
+use crate::kind::{KindMemory, KindReport};
 use crate::model::{
     AllocationLimit, Availability, Builder, CacheSize, DeviceMemory, DeviceTopology, Diagnostic,
     ExecutorBuilder, ExecutorKind, ExecutorReport, Grant, GrantKind, GrantSource, Host, Limits,
     NativeAllocations, OwnKind, OwnPath, PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy,
     Revision, StoreId, StoreKind, VolumeId,
 };
-use crate::placement::{place, Contract, WINDOW_BYTES};
+use crate::placement::{is_window, place, Contract};
 use crate::processors::{HostNode, Processors};
 use crate::selector::ExecutorSelector;
 use crate::system::SystemIdentity;
@@ -629,7 +629,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 let along = match (&alike, kind.memory) {
                     (Some(paths), _) => paths.clone(),
                     (None, KindMemory::Heap { index, device_local: true, bytes })
-                        if !is_window_heap(kind) =>
+                        if !is_window(kind) =>
                     {
                         vec![*local.entry(index).or_insert_with(|| {
                             executor.granted(
@@ -818,20 +818,6 @@ fn host_class_paths(
     paths
 }
 
-/// Whether `kind` lies in a small host-visible device-local BAR window
-/// (`placement::Lies::Window`), which counts as host RAM rather than the
-/// device's own memory.
-fn is_window_heap(kind: &KindReport) -> bool {
-    matches!(
-        kind.memory,
-        KindMemory::Heap {
-            device_local: true,
-            bytes,
-            ..
-        } if kind.reach != Reach::Device && bytes <= WINDOW_BYTES
-    )
-}
-
 /// The dedicated memory the OS reports for the adapter of `luid`, when it
 /// reports some.
 fn dedicated(adapters: &[AdapterReport], luid: Option<[u8; 8]>) -> Option<u64> {
@@ -846,7 +832,8 @@ fn dedicated(adapters: &[AdapterReport], luid: Option<[u8; 8]>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kind::HostReads;
+    use crate::kind::{HostReads, Reach};
+    use crate::placement::WINDOW_BYTES;
 
     #[test]
     fn vulkan_window_only_device_routes_window_heap_to_host_ram_without_panicking() {

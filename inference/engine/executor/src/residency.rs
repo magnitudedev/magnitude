@@ -1065,7 +1065,11 @@ impl ResidencyStore {
             kept,
         )
         .map_err(invalid)?;
-        table.seed(charges).map_err(invalid)?;
+        match self.upload.borrow_mut().as_mut() {
+            Some(upload) => upload.allocate(&self.device, |upload| table.seed(upload)),
+            None => table.seed(charges),
+        }
+        .map_err(invalid)?;
         let table = Rc::new(table);
         crate::settle::owe(Rc::downgrade(&table));
         Ok(table)

@@ -154,7 +154,7 @@ async def execute(
         if obs.outcome != "valid":
             raise RuntimeError(f"engine qualification request failed: {obs.outcome}: {obs.error}")
 
-        async def run_request(request):
+        async def run_request(request, section_started: float):
             for dependency in request.depends_on:
                 await tasks[dependency]
                 if settled[dependency] not in ("valid", "invalid"):
@@ -166,7 +166,7 @@ async def execute(
                     save(request, obs)
                     settled[request.id] = obs.outcome
                     return
-            delay = request.release_ms / 1000 - (time.perf_counter() - started)
+            delay = request.release_ms / 1000 - (time.perf_counter() - section_started)
             if delay > 0:
                 await asyncio.sleep(delay)
             store.event(
@@ -195,14 +195,16 @@ async def execute(
             save(request, obs)
             settled[request.id] = obs.outcome
 
-        started = time.perf_counter()
         try:
             # Sections are independent schedules and cannot overlap accidentally.
             for section in dict.fromkeys(request.section for request in plan.requests):
+                section_started = time.perf_counter()
                 async with asyncio.TaskGroup() as group:
                     for request in plan.requests:
                         if request.section == section:
-                            tasks[request.id] = group.create_task(run_request(request))
+                            tasks[request.id] = group.create_task(
+                                run_request(request, section_started)
+                            )
         finally:
             # Include requests that never reached submission when the target/run was interrupted.
             for request in plan.requests:

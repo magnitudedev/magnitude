@@ -1434,7 +1434,7 @@ impl NativeSharedHeadProgram {
         &self,
         core: &HeadLaunchCore,
         workspace: &mut NativeGraphWorkspaceLease,
-        output: NativeGraphOutputLease,
+        output: &mut NativeGraphOutputLease,
     ) -> Result<(seismic::NativeGraphCompletion, HeadOutput), SubmitError> {
         let reads = core
             .target_reads()
@@ -1545,16 +1545,14 @@ impl NativeSharedHeadProgram {
             }
             readout::write_selection(pass, &mut active, &ports.selection, slots, words)?;
         }
-        let mut output = output;
-        let outputs = output
+        let active_output = output
             .activate(&graph.plan)
             .map_err(SubmitError::Invariant)?;
-        let (outputs, completion) = active
-            .attach(bindings, outputs)
-            .and_then(|ready| ready.submit())
+        let (active_output, completion) = active_output
+            .run(|outputs| active.attach(bindings, outputs).and_then(|ready| ready.submit()))
             .map_err(device)?;
         let landed_reads = landed.into_iter().map(SelectedRead::submitted).collect();
-        let owner = output.publish(outputs);
+        let owner = active_output.publish();
         let selections = HeadSelections {
             tokens: owner
                 .tensor(&graph.output)
@@ -1585,7 +1583,7 @@ impl HeadProgram for NativeSharedHeadProgram {
     ) -> Result<Self::Submission, (SubmitError, ValidatedHeadLaunch)> {
         let queued = {
             let (core, workspace, output) = launch.execution_parts_mut();
-            match output.take() {
+            match output.as_mut() {
                 Some(output) => self.queue(core, workspace, output),
                 None => Err(invalid("head graph output lease is absent")),
             }

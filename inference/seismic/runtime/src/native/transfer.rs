@@ -217,7 +217,14 @@ impl TransferInner {
                     Copy(*const u8, *mut u8, usize),
                     Signal(*mut u8, i32),
                 }
-                let at = |tensor: &TensorInner, offset: u64| {
+                let read_at = |tensor: &TensorInner, offset: u64| {
+                    let base = typed_buffer::<seismic_cpu::Cpu, seismic_cpu::Executor>(tensor.allocation())
+                        .data_pointer()
+                        .cast_const();
+                    // SAFETY: within the tensor's view, checked above.
+                    unsafe { base.add((tensor.byte_offset() + offset) as usize) }
+                };
+                let write_at = |tensor: &TensorInner, offset: u64| {
                     let base = tensor
                         .allocation()
                         .storage()
@@ -230,11 +237,11 @@ impl TransferInner {
                     .iter()
                     .map(|item| match item {
                         TransferItem::Run(run) => Ok(Step::Copy(
-                            at(run.source, run.source_offset)?,
-                            at(run.destination, run.destination_offset)?,
+                            read_at(run.source, run.source_offset),
+                            write_at(run.destination, run.destination_offset)?,
                             run.bytes as usize,
                         )),
-                        TransferItem::Signal { word, offset, value } => Ok(Step::Signal(at(word, *offset)?, *value)),
+                        TransferItem::Signal { word, offset, value } => Ok(Step::Signal(write_at(word, *offset)?, *value)),
                     })
                     .collect::<Result<Vec<_>, TransferError>>()?;
                 for step in steps {
@@ -308,8 +315,15 @@ impl TransferInner {
     }
 
     /// A run copies between live views of this device's tensors, each
-    /// within its view's bytes.
+    /// within its view's bytes, never a slab view directly and never into
+    /// read-only storage.
     fn check(&self, run: &TransferRun<'_>) -> Result<(), TransferError> {
+        if run.source.is_slab_view() || run.destination.is_slab_view() {
+            return Err(TransferError::Run("a run cannot transfer a slab view directly".into()));
+        }
+        if run.destination.allocation().storage().read_only() {
+            return Err(TransferError::Run("a run cannot write to a read-only tensor".into()));
+        }
         let within =
             |tensor: &TensorInner, offset: u64| offset.checked_add(run.bytes).is_some_and(|end| end <= tensor.byte_len());
         if !within(run.source, run.source_offset) || !within(run.destination, run.destination_offset) {
@@ -321,8 +335,15 @@ impl TransferInner {
         Ok(())
     }
 
-    /// A signal's word is an aligned i32 of a live view of this device's.
+    /// A signal's word is an aligned i32 of a live writable view of this
+    /// device's, never a slab view.
     fn check_signal(&self, word: &TensorInner, offset: u64) -> Result<(), TransferError> {
+        if word.is_slab_view() {
+            return Err(TransferError::Run("a signal's word cannot lie in a slab view".into()));
+        }
+        if word.allocation().storage().read_only() {
+            return Err(TransferError::Run("a signal's word cannot lie in a read-only tensor".into()));
+        }
         if offset.checked_add(4).is_none_or(|end| end > word.byte_len()) {
             return Err(TransferError::Run("a signal's word lies outside its tensor".into()));
         }
@@ -398,5 +419,97 @@ mod tests {
         }
         assert_eq!(destination.read_to_host().unwrap(), [7, 8, 0, 0, 1, 2, 0, 0], "a refused batch wrote nothing");
         assert!(!transfer.completed(value + 1).unwrap(), "a refused batch takes no value");
+    }
+
+    #[test]
+    fn transfer_rejects_slab_views_and_read_only_destinations() {
+        let device = cpu();
+        let transfer = TransferInner::new(&device).unwrap();
+        let charges = crate::memory::Charges::tally(&device);
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let writable = TensorInner::from_host(&charges, i32s, &[4], &[1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+
+        // Build a read-only mapped host region tensor.
+        let backing = Arc::new([9u8, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // SAFETY: `backing` is an immutable Arc<[u8; 16]> owned by the region for its full lifetime.
+        let region = unsafe {
+            crate::api::HostRegion::new(
+                std::ptr::NonNull::new(backing.as_ptr() as *mut u8).unwrap(),
+                backing.len(),
+                backing.clone(),
+            )
+        };
+        let mapped = crate::api::tensor::MappedRegionInner::new(&device, region).unwrap();
+        let read_only = mapped.tensor(i32s, &[4], 0).unwrap();
+
+        // Copying FROM a read-only tensor into a writable tensor succeeds.
+        let value = transfer
+            .copy(&[TransferItem::Run(TransferRun {
+                source: &read_only,
+                source_offset: 0,
+                destination: &writable,
+                destination_offset: 0,
+                bytes: 4,
+            })])
+            .unwrap();
+        assert!(transfer.completed(value).unwrap());
+        assert_eq!(&writable.read_to_host().unwrap()[..4], &[9, 10, 11, 12]);
+
+        // Writing TO a read-only tensor (copy destination or signal word) is refused.
+        assert!(matches!(
+            transfer.copy(&[TransferItem::Run(TransferRun {
+                source: &writable,
+                source_offset: 0,
+                destination: &read_only,
+                destination_offset: 0,
+                bytes: 4,
+            })]),
+            Err(TransferError::Run(_))
+        ));
+        assert!(matches!(
+            transfer.copy(&[TransferItem::Signal { word: &read_only, offset: 0, value: 1 }]),
+            Err(TransferError::Run(_))
+        ));
+
+        // Build a logical slab view and verify source, destination, and signal are all refused.
+        let pool_charges = crate::pool::PoolCharges::one(&charges);
+        let pool = crate::pool::Pool::open(&pool_charges, seismic_topology::Contract::DeviceOnly, 1 << 16, 1 << 18).unwrap();
+        let geometry = crate::pool::SlabGeometry {
+            rows_per_slab: 4,
+            logical_rows: 16,
+            capacity: 4,
+            slab_bytes: crate::pool::BLOCK_ALIGNMENT,
+            slab_alignment: crate::pool::BLOCK_ALIGNMENT,
+            regions: vec![(i32s, vec![2], 0)],
+        };
+        let store = crate::pool::SlabStore::in_pool(&charges, &pool, geometry, &[]).unwrap();
+        store.add_slab(crate::pool::SlabFill::Zeroed).unwrap();
+        let slab_view = store.logical_region(0).unwrap();
+        assert!(slab_view.is_slab_view());
+
+        assert!(matches!(
+            transfer.copy(&[TransferItem::Run(TransferRun {
+                source: &slab_view,
+                source_offset: 0,
+                destination: &writable,
+                destination_offset: 0,
+                bytes: 4,
+            })]),
+            Err(TransferError::Run(_))
+        ));
+        assert!(matches!(
+            transfer.copy(&[TransferItem::Run(TransferRun {
+                source: &writable,
+                source_offset: 0,
+                destination: &slab_view,
+                destination_offset: 0,
+                bytes: 4,
+            })]),
+            Err(TransferError::Run(_))
+        ));
+        assert!(matches!(
+            transfer.copy(&[TransferItem::Signal { word: &slab_view, offset: 0, value: 1 }]),
+            Err(TransferError::Run(_))
+        ));
     }
 }

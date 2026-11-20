@@ -154,6 +154,10 @@ impl EntryTuning for DenseExpandTuning {
     type Entry = dense_expand::Entry;
     type Case = DenseExpandCase;
 
+    fn row_dimension(&self) -> &'static str {
+        "O"
+    }
+
     fn launches(&self) -> usize {
         self.scopes.len()
     }
@@ -275,6 +279,10 @@ impl EntryTuning for DenseUpTuning {
     type Entry = dense_up::Entry;
     type Case = DenseUpCase;
 
+    fn row_dimension(&self) -> &'static str {
+        "O"
+    }
+
     fn launches(&self) -> usize {
         self.scopes.len()
     }
@@ -380,6 +388,10 @@ impl DenseOutputTuning {
 impl EntryTuning for DenseOutputTuning {
     type Entry = dense_output::Entry;
     type Case = DenseOutputCase;
+
+    fn row_dimension(&self) -> &'static str {
+        "O"
+    }
 
     fn launches(&self) -> usize {
         self.scopes.len()

@@ -339,7 +339,7 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             file_floor,
         },
         task,
-    ) = snapshot(sys, at, page, free_target);
+    ) = snapshot(sys, at, page, free_target_raw);
     // Free and volatile purgeable pages (purged at no one's cost) less the
     // free-page target, which the pageout daemon refills by compressing,
     // swapping and evicting other pages: pages taken below it are never free

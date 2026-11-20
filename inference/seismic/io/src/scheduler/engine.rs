@@ -77,6 +77,37 @@ pub(crate) fn totals(volume: Volume, now: Instant) -> Totals {
 /// it, never across a read.
 type InFlight = Arc<Mutex<Option<Flight>>>;
 
+/// A worker's registered slot in [`Engine::flights`]: inserted before the
+/// worker starts and removed when it exits (whether retiring or unwinding),
+/// so a retiring worker can never race ahead of registration and leak its
+/// slot, and an active worker's piece is always visible to [`engine_work`].
+struct FlightSlot {
+    engine: &'static Engine,
+    flight: InFlight,
+}
+
+impl FlightSlot {
+    fn register(engine: &'static Engine) -> Self {
+        let flight = InFlight::default();
+        engine.flights.lock().expect("read workers' flights").push(flight.clone());
+        Self { engine, flight }
+    }
+
+    fn set(&self, value: Option<Flight>) {
+        *self.flight.lock().expect("a read worker's flight") = value;
+    }
+}
+
+impl Drop for FlightSlot {
+    fn drop(&mut self) {
+        self.engine
+            .flights
+            .lock()
+            .expect("read workers' flights")
+            .retain(|other| !Arc::ptr_eq(other, &self.flight));
+    }
+}
+
 /// The process's pool: its queue, the pieces whose reads returned while
 /// another held it, the condition its workers wait on, its workers and
 /// what its readers and probes need of them ([`Pool`]), each worker's piece
@@ -216,19 +247,15 @@ impl Engine {
         let names = pool.starting();
         drop(pool);
         for (index, name) in names.clone().enumerate() {
-            let flight = InFlight::default();
-            let started = seismic_threads::spawn(format!("seismic-read-{name}"), {
-                let flight = flight.clone();
-                move || {
-                    crate::waited_on();
-                    work(self, &flight)
-                }
+            let slot = FlightSlot::register(self);
+            let started = seismic_threads::spawn(format!("seismic-read-{name}"), move || {
+                crate::waited_on();
+                work(self, slot)
             });
             if let Err(error) = started {
                 self.pool.lock().expect("read pool").started -= names.len() - index;
                 return Err(Error::ThreadStart(error));
             }
-            self.flights.lock().expect("read workers' flights").push(flight);
         }
         Ok(())
     }
@@ -466,7 +493,7 @@ impl Drop for Need {
 /// start more, so what a change frees fills one worker after another.
 /// One that finds nothing to take while the pool holds more workers than
 /// its claims need leaves it.
-fn work(engine: &'static Engine, flight: &InFlight) {
+fn work(engine: &'static Engine, slot: FlightSlot) {
     loop {
         let taken = {
             let mut queue = engine.queue();
@@ -482,7 +509,6 @@ fn work(engine: &'static Engine, flight: &InFlight) {
                     break taken;
                 }
                 if engine.retire() {
-                    engine.flights.lock().expect("read workers' flights").retain(|other| !Arc::ptr_eq(other, flight));
                     return;
                 }
                 if engine.left.load(Ordering::Acquire) != 0 {
@@ -494,14 +520,14 @@ fn work(engine: &'static Engine, flight: &InFlight) {
             }
         };
         let piece = &taken.piece;
-        *flight.lock().expect("a read worker's flight") = Some(Flight {
+        slot.set(Some(Flight {
             path: taken.file.path.clone(),
             volume: taken.volume.id,
             offset: piece.start,
             bytes: piece.end - piece.start,
             window: if taken.standing.due() { taken.volume.shape.due } else { taken.volume.shape.knee },
             since: Instant::now(),
-        });
+        }));
         // A panic is the request's, ending as one on its submitter would:
         // where that unwinds, its observer resumes it and the worker serves
         // on. A piece serving several parts that fails may have failed in bytes
@@ -531,7 +557,7 @@ fn work(engine: &'static Engine, flight: &InFlight) {
         let now = Instant::now();
         crate::timeline::note_at(now, crate::timeline::Kind::Read, 0, (piece.start as i64, (piece.end - piece.start) as i64, 0));
         engine.read_returned(taken.returned(now));
-        *flight.lock().expect("a read worker's flight") = None;
+        slot.set(None);
         let read = read.and_then(|read| {
             taken.state.submitter.run(|| match read {
                 Ok(fetched) => {
@@ -620,7 +646,7 @@ impl Buffers {
 
 #[cfg(test)]
 mod tests {
-    use super::{Buffers, Pool};
+    use super::{work, Buffers, Engine, FlightSlot, Pool};
     use crate::disk::{VolumeReads, LEAST_READ};
     use crate::{Shape, Volume};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -733,5 +759,26 @@ mod tests {
         assert_eq!(pool.target(), 6, "remaining claim needs 4 due + 1 knee + 1 = 6 workers");
         assert!(pool.release(small));
         assert_eq!(pool.target(), 0);
+    }
+
+    /// A worker's flight slot is registered before the worker begins and
+    /// removed when it retires (or if dropped before running, as on a failed
+    /// spawn), so a retiring worker can never leak its slot into `flights`.
+    #[test]
+    fn flight_slot_registers_before_work_and_deregisters_on_retire_or_drop() {
+        let engine: &'static Engine = Box::leak(Box::new(Engine::new()));
+        // Direct drop (e.g. failed spawn) removes the slot.
+        let aborted = FlightSlot::register(engine);
+        assert_eq!(engine.flights.lock().unwrap().len(), 1);
+        drop(aborted);
+        assert!(engine.flights.lock().unwrap().is_empty());
+
+        // A worker that retires immediately deregisters its slot cleanly.
+        engine.pool.lock().unwrap().started = 1;
+        let slot = FlightSlot::register(engine);
+        assert_eq!(engine.flights.lock().unwrap().len(), 1);
+        std::thread::spawn(move || work(engine, slot)).join().unwrap();
+        assert_eq!(engine.pool.lock().unwrap().started, 0);
+        assert!(engine.flights.lock().unwrap().is_empty());
     }
 }

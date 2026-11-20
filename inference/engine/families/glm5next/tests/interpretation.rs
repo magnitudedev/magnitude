@@ -354,14 +354,26 @@ fn a_header_with_unread_missing_or_uninterpreted_metadata_is_refused_naming_it()
     types[7] = false;
     headers::set(&mut shared, &key("attention.indexer.types"), array(types, Scalar::Bool));
     assert!(refusal(&shared).contains(&key("attention.indexer.types")));
-    let mut share_mtp = published.clone();
-    headers::set(&mut share_mtp, &key("attention.indexer.index_share_mtp"), Value::Scalar(Scalar::Bool(true)));
-    assert!(refusal(&share_mtp).contains(&key("attention.indexer.index_share_mtp")));
+    let mut no_tail = published.clone();
+    headers::set(
+        &mut no_tail,
+        &key("attention.indexer.kpool_select_tail"),
+        Value::Scalar(Scalar::Bool(false)),
+    );
+    assert!(refusal(&no_tail).contains(&key("attention.indexer.kpool_select_tail")));
+    let mut bad_share_mtp = published.clone();
+    headers::set(
+        &mut bad_share_mtp,
+        &key("attention.indexer.index_share_mtp"),
+        Value::Scalar(Scalar::Unsigned(1)),
+    );
+    assert!(refusal(&bad_share_mtp).contains(&key("attention.indexer.index_share_mtp")));
 }
 
 #[test]
-fn admits_shared_ffn_length_and_unshared_mtp_indexer_switch() {
+fn admits_unsloth_header_metadata_variants() {
     let published = published();
+    let expected = inspect(&published).unwrap();
     let key = |name: &str| format!("{FAMILY_ID}.{name}");
     let shared_width = published
         .value(&key("expert_shared_count"))
@@ -371,21 +383,38 @@ fn admits_shared_ffn_length_and_unshared_mtp_indexer_switch() {
             .value(&key("expert_feed_forward_length"))
             .and_then(Value::unsigned)
             .unwrap();
-    let mut quant = published.clone();
-    headers::set(
-        &mut quant,
-        &key("expert_shared_feed_forward_length"),
-        Value::Scalar(Scalar::Unsigned(shared_width)),
-    );
-    headers::set(
-        &mut quant,
-        &key("attention.indexer.index_share_mtp"),
-        Value::Scalar(Scalar::Bool(false)),
-    );
-    quant
-        .metadata
-        .retain(|entry| entry.name != key("attention.indexer.types"));
-    assert_eq!(inspect(&quant).unwrap(), inspect(&published).unwrap());
+    for share_mtp in [false, true] {
+        let mut quant = published.clone();
+        headers::set(
+            &mut quant,
+            &key("expert_shared_feed_forward_length"),
+            Value::Scalar(Scalar::Unsigned(shared_width)),
+        );
+        headers::set(
+            &mut quant,
+            &key("attention.indexer.index_share_mtp"),
+            Value::Scalar(Scalar::Bool(share_mtp)),
+        );
+        quant.metadata.retain(|entry| {
+            entry.name != key("attention.indexer.types")
+                && entry.name != key("attention.indexer.kpool_select_tail")
+        });
+        assert_eq!(inspect(&quant).unwrap(), expected);
+    }
+    // Unsloth also stores KDA conv planes as 3D [inner, 1, taps] rather than
+    // 4D [1, inner, 1, taps]; after MergeLeadingAxes the logical shape matches.
+    let mut conv3d = published.clone();
+    for tensor in &mut conv3d.tensors {
+        if tensor.name.contains("ssm_conv1d_") {
+            assert_eq!(tensor.shape.first(), Some(&1));
+            tensor.shape.remove(0);
+        }
+    }
+    let defined = inspect(&conv3d).unwrap();
+    let Operator::GatedDelta(kda) = &defined.decoder.blocks[0].sublayers[0].op else {
+        panic!("block 0 is KDA");
+    };
+    assert_eq!(kda.convolution.shape, vec![3 * 8192, 4]);
 }
 
 /// How a synthetic weight is stored: the NVFP4 file's forms

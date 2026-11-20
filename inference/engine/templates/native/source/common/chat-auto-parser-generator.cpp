@@ -54,6 +54,27 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
     data.additional_stops.insert(data.additional_stops.end(),
         autoparser.additional_stops.begin(), autoparser.additional_stops.end());
 
+    // If the caller explicitly disabled thinking, yet the template's generation
+    // prompt still leaves a tag-based reasoning block open (e.g. ends with
+    // "<think>" without a closing "</think>"), close the empty reasoning block
+    // so the model begins directly at the answer.
+    const bool reasoning_disabled = inputs.enable_thinking.has_value() && !*inputs.enable_thinking;
+    if (reasoning_disabled && !inputs.has_continuation() &&
+        autoparser.reasoning.mode != reasoning_mode::NONE &&
+        !autoparser.reasoning.start.empty() && !autoparser.reasoning.end.empty()) {
+        const std::string start = trim_whitespace(autoparser.reasoning.start);
+        const std::string end   = trim_whitespace(autoparser.reasoning.end);
+        if (!start.empty() && !end.empty()) {
+            const auto pos = data.generation_prompt.rfind(start);
+            if (pos != std::string::npos &&
+                data.generation_prompt.find(end, pos + start.size()) == std::string::npos &&
+                trim_whitespace(data.generation_prompt.substr(pos + start.size())).empty()) {
+                data.generation_prompt += end;
+                data.prompt            += end;
+            }
+        }
+    }
+
     std::string parser_generation_prompt = data.generation_prompt;
 
     if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
@@ -120,7 +141,19 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
         parser_build_context ctx(p, inputs);
         bool                 extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
-        ctx.extracting_reasoning = extract_reasoning && reasoning.mode != reasoning_mode::NONE;
+        const std::string reasoning_start = trim_whitespace(reasoning.start);
+        const std::string reasoning_end   = trim_whitespace(reasoning.end);
+        const bool reasoning_closed_in_prefix =
+            inputs.enable_thinking.has_value() && !*inputs.enable_thinking &&
+            reasoning.mode != reasoning_mode::NONE &&
+            !reasoning_start.empty() && !reasoning_end.empty() &&
+            [&]() {
+                const auto pos = generation_prompt.rfind(reasoning_start);
+                return pos != std::string::npos &&
+                       generation_prompt.find(reasoning_end, pos + reasoning_start.size()) != std::string::npos;
+            }();
+
+        ctx.extracting_reasoning = extract_reasoning && reasoning.mode != reasoning_mode::NONE && !reasoning_closed_in_prefix;
         ctx.content              = &content;
         ctx.reasoning            = &reasoning;
 
@@ -132,7 +165,7 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
         // Tools render into the prompt either way; without a tool format the reply reads as content.
         bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty() && tools.format.mode != tool_format::NONE;
         bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
-        bool pure_content        = reasoning.mode == reasoning_mode::NONE;
+        bool pure_content        = reasoning.mode == reasoning_mode::NONE || reasoning_closed_in_prefix;
 
         if (has_response_format) {
             auto response_format = p.rule("response-format", p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)));
@@ -147,8 +180,8 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
         } else {
             parser = content.build_parser(ctx);
         }
-        const std::string reasoning_start = trim_whitespace(reasoning.start);
-        return pure_content ? p.prefix(generation_prompt, reasoning_start) + parser : p.prefix(generation_prompt, reasoning_start) << parser;
+        const std::string prefix_delimiter = reasoning_closed_in_prefix ? std::string() : reasoning_start;
+        return pure_content ? p.prefix(generation_prompt, prefix_delimiter) + parser : p.prefix(generation_prompt, prefix_delimiter) << parser;
     });
 }
 

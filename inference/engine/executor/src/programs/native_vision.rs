@@ -2219,7 +2219,7 @@ impl NativeVisionProgram {
             .chain(std::iter::repeat_n(0, padding * pixel_row))
             .collect::<Vec<_>>();
         let output = output
-            .take()
+            .as_mut()
             .ok_or_else(|| invalid("vision graph output lease is absent"))?;
         Ok(prepared
             .run(
@@ -2469,7 +2469,7 @@ impl PreparedVisionGraphs {
         patch_rows: u64,
         bound: &BoundNativeGraphPlan,
         slot: &mut NativeGraphFamilySlot,
-        mut output: NativeGraphOutputLease,
+        output: &mut NativeGraphOutputLease,
         uploads: VisionGraphUploads<'_>,
     ) -> Result<VisionGraphResult, SubmitError> {
         let variant = self
@@ -2500,14 +2500,13 @@ impl PreparedVisionGraphs {
                 active.write_input(port, bytes).map_err(device)?;
             }
         }
-        let outputs = output
+        let active_output = output
             .activate(&variant.plan)
             .map_err(SubmitError::Invariant)?;
-        let outputs = active
-            .attach(bindings, outputs)
-            .and_then(super::run_graph)
+        let active_output = active_output
+            .run_outputs(|outputs| active.attach(bindings, outputs).and_then(super::run_graph))
             .map_err(device)?;
-        let owner = output.publish(outputs);
+        let owner = active_output.publish();
         let features = owner
             .tensor(&ports.features)
             .ok_or_else(|| invalid("vision graph omitted retained features"))?;

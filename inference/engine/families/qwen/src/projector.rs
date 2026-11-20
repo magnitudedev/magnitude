@@ -4,7 +4,7 @@ use crate::{Error, product};
 use magnitude_artifacts::gguf::Directory;
 use magnitude_family_common::{ProjectorMetadata, projector_type, Tensors};
 use magnitude_family_contracts::{
-    ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
+    ActivationDType, CellReduction, MergerStage, PositionSampling,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
     VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionOperator,
     VisionPositions, VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp,
@@ -22,17 +22,14 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("qwen3vl_merger", ())], target_width)?;
-    let meta = ProjectorMetadata::new(directory);
-    meta.ignore("clip.has_vision_encoder");
-    meta.ignore("clip.projector_type");
-    meta.ignore("clip.vision.projector_type");
+    let meta = ProjectorMetadata::open(directory);
     let depth = meta.bounded_block_count("clip.vision.block_count")?;
     let hidden = meta.integer("clip.vision.embedding_length")?;
     let intermediate = meta.integer("clip.vision.feed_forward_length")?;
     let heads = meta.integer("clip.vision.attention.head_count")?;
     let patch = meta.integer("clip.vision.patch_size")?;
     let merge = meta.integer("clip.vision.spatial_merge_size")?;
-    let image_size = meta.integer("clip.vision.image_size")?;
+    let image_size = meta.optional_integer("clip.vision.image_size")?;
     let output_hidden = meta.integer("clip.vision.projection_dim")?;
     let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
     let mean = meta.f64_array("clip.vision.image_mean")?;
@@ -43,9 +40,7 @@ pub fn describe_projector(
     let max_pixels = meta
         .optional_integer("clip.vision.image_max_pixels")?
         .unwrap_or(16_777_216);
-    if meta.optional_bool("clip.use_gelu")? == Some(false) {
-        return Err(invalid("Qwen3-VL projector requires GELU (clip.use_gelu)"));
-    }
+    meta.invariant_flag("clip.use_gelu", true, "true (GELU feed-forward)")?;
     if meta
         .optional_bool_array("clip.vision.is_deepstack_layers", depth)?
         .is_some_and(|layers| layers.into_iter().any(|enabled| enabled))
@@ -55,29 +50,28 @@ pub fn describe_projector(
     meta.finish()?;
 
     let mut tensors = Tensors::new(directory);
+    let (table_rows, table_cols) = tensors.matrix_or_batched_shape("v.position_embd.weight")?;
+    if table_cols != hidden {
+        return Err(invalid("invalid projector position embedding shape"));
+    }
+    let table_side = (table_rows as f64).sqrt() as u64;
+    if table_side.checked_mul(table_side) != Some(table_rows) {
+        return Err(invalid("projector position table is not square"));
+    }
+    if let Some(image_size) = image_size {
+        if image_size.checked_rem(patch) != Some(0) || image_size / patch != table_side {
+            return Err(invalid(
+                "projector position table does not cover the nominal image",
+            ));
+        }
+    }
+    let table = tensors.bind_matrix_or_batched("v.position_embd.weight", table_rows, hidden)?;
     let mut tensor = |name: &str, shape: &[u64]| tensors.bind(name, shape);
     let patch_frames = ["v.patch_embd.weight", "v.patch_embd.weight.1"]
         .into_iter()
         .map(|name| tensor(name, &[hidden, 3, patch, patch]))
         .collect::<Result<Vec<_>, _>>()?;
     let patch_bias = tensor("v.patch_embd.bias", &[hidden])?;
-    let position = directory
-        .tensor("v.position_embd.weight")
-        .ok_or_else(|| invalid("missing projector position embedding"))?;
-    if position.shape.len() != 2 || position.shape[1] != hidden {
-        return Err(invalid("invalid projector position embedding shape"));
-    }
-    let table_rows = position.shape[0];
-    let table_side = (table_rows as f64).sqrt() as u64;
-    if table_side.checked_mul(table_side) != Some(table_rows) {
-        return Err(invalid("projector position table is not square"));
-    }
-    if image_size.checked_rem(patch) != Some(0) || image_size / patch != table_side {
-        return Err(invalid(
-            "projector position table does not cover the nominal image",
-        ));
-    }
-    let table = tensor("v.position_embd.weight", &[table_rows, hidden])?;
     if heads == 0 || hidden % heads != 0 || (hidden / heads) % 4 != 0 {
         return Err(invalid(
             "projector heads do not split into 2-D rotary heads",

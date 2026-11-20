@@ -160,6 +160,21 @@ impl Cgroups {
     }
 }
 
+/// OOM-safety reserve below a Linux cgroup memory limit (`memory.max` /
+/// `memory.high` / `hierarchical_memory_limit`): unlike host RAM (which has
+/// zone `low` watermarks and kswapd), a cgroup limit has no kernel watermark
+/// and OOM-kills immediately on overrun (especially when `memory.swap.max = 0`
+/// or pinned CUDA host blocks cannot swap). Reserves `min(limit / 12, 2 GiB)`
+/// on real containers (`>= 64 MiB`), and `0` on tiny synthetic limits.
+pub(super) fn cgroup_floor(limit_bytes: u64) -> u64 {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if limit_bytes < 64 * MIB {
+        return 0;
+    }
+    (limit_bytes / 12).min(2 * GIB)
+}
+
 /// The v1 limit of this process's cgroup: its `memory.stat`'s
 /// `hierarchical_memory_limit`, the least `memory.limit_in_bytes` of it and
 /// every ancestor, which the kernel computes past any cgroup namespace or
@@ -167,9 +182,9 @@ impl Cgroups {
 /// which its siblings share: the visible level whose own
 /// `memory.limit_in_bytes` is that limit, else (the level is above the
 /// mount) the mount's root, the outermost visible; its clean file cache
-/// from that level's hierarchical (`total_`) counts. None where the limit
-/// is the page counter's maximum ([`v1_unlimited_bytes`]) or a file is
-/// missing.
+/// from that level's hierarchical (`total_`) counts, excluding `total_shmem`
+/// and `total_mapped_file`. None where the limit is the page counter's
+/// maximum ([`v1_unlimited_bytes`]) or a file is missing.
 fn v1_limit(sys: &impl Sys, mount: &CgroupMount) -> Option<Limit> {
     let own = mount.cgroup.join("memory.stat");
     let limit_bytes = stat_field(&own, &sys.text(&own)?, "hierarchical_memory_limit")?;
@@ -184,7 +199,7 @@ fn v1_limit(sys: &impl Sys, mount: &CgroupMount) -> Option<Limit> {
         .iter()
         .find(|directory| read_bytes(sys, &directory.join("memory.limit_in_bytes")) == Some(limit_bytes))
         .or(levels.last())?;
-    let used_bytes = read_bytes(sys, &setter.join("memory.usage_in_bytes"))?;
+    let raw_used = read_bytes(sys, &setter.join("memory.usage_in_bytes"))?;
     let path = setter.join("memory.stat");
     let stat = sys.text(&path)?;
     let cache = [
@@ -193,24 +208,30 @@ fn v1_limit(sys: &impl Sys, mount: &CgroupMount) -> Option<Limit> {
         "total_dirty",
         "total_writeback",
     ];
+    let non_droppable = stat_field(&path, &stat, "total_shmem")
+        .unwrap_or(0)
+        .saturating_add(stat_field(&path, &stat, "total_mapped_file").unwrap_or(0));
+    let reclaimable_bytes = clean_cache(
+        cache.map(|key| stat_field(&path, &stat, key)),
+        non_droppable,
+    )
+    .min(raw_used);
     Some(Limit {
         kind: ProcessLimitKind::CgroupV1 {
             cgroup: mount.name(setter),
         },
         limit_bytes,
-        used_bytes,
-        reclaimable_bytes: clean_cache(
-            cache.map(|key| stat_field(&path, &stat, key)),
-            stat_field(&path, &stat, "total_shmem").unwrap_or(0),
-        ),
+        used_bytes: raw_used.saturating_add(cgroup_floor(limit_bytes)),
+        reclaimable_bytes,
     })
 }
 
 /// A cgroup v2 level's limit: the lower of `memory.max` and `memory.high`
 /// (past which the kernel reclaims the cgroup and throttles it), enforced
-/// against its `memory.current`; its clean file cache from its
-/// `memory.stat`. None where both are `max` or missing (the root, or no
-/// memory controller), or where `memory.current` is missing.
+/// against its `memory.current` plus [`cgroup_floor`]; its clean file cache
+/// from its `memory.stat`, excluding `shmem` and `file_mapped` (executables
+/// and shared libraries). None where both are `max` or missing (the root, or
+/// no memory controller), or where `memory.current` is missing.
 fn v2_limit(sys: &impl Sys, directory: &Path, cgroup: String) -> Option<Limit> {
     let limit_bytes = ["memory.max", "memory.high"]
         .into_iter()
@@ -221,20 +242,28 @@ fn v2_limit(sys: &impl Sys, directory: &Path, cgroup: String) -> Option<Limit> {
             (value != "max").then(|| parse_bytes(&file, value))
         })
         .min()?;
-    let used_bytes = read_bytes(sys, &directory.join("memory.current"))?;
+    let raw_used = read_bytes(sys, &directory.join("memory.current"))?;
     let path = directory.join("memory.stat");
     let cache = ["active_file", "inactive_file", "file_dirty", "file_writeback"];
     let stat = sys.text(&path);
+    let non_droppable = stat
+        .as_deref()
+        .and_then(|stat| stat_field(&path, stat, "shmem"))
+        .unwrap_or(0)
+        .saturating_add(
+            stat.as_deref()
+                .and_then(|stat| stat_field(&path, stat, "file_mapped"))
+                .unwrap_or(0),
+        );
     let reclaimable_bytes = clean_cache(
         cache.map(|key| stat.as_deref().and_then(|stat| stat_field(&path, stat, key))),
-        stat.as_deref()
-            .and_then(|stat| stat_field(&path, stat, "shmem"))
-            .unwrap_or(0),
-    );
+        non_droppable,
+    )
+    .min(raw_used);
     Some(Limit {
         kind: ProcessLimitKind::CgroupV2 { cgroup },
         limit_bytes,
-        used_bytes,
+        used_bytes: raw_used.saturating_add(cgroup_floor(limit_bytes)),
         reclaimable_bytes,
     })
 }

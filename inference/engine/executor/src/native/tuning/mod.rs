@@ -1109,6 +1109,12 @@ pub(crate) trait EntryTuning: Clone + 'static {
     fn launch_rows(&self, launch: &Launch) -> u64 {
         launch.rows
     }
+    /// The dimension name of the rows this entry's launch conditions and grid
+    /// axes index by: `"M"` for entries operating on every step row, `"O"` for
+    /// entries operating on an `out_rows` subset.
+    fn row_dimension(&self) -> &'static str {
+        "M"
+    }
     /// Project a logical graph launch onto this entry's performance
     /// representative: the rows of the point that times it, none where the
     /// unit's kernel does not serve it (another kernel for the same layers
@@ -2079,6 +2085,15 @@ pub struct SearchProgress {
 
 pub trait TuningObserver {
     fn event(&self, event: &TuningEvent);
+
+    /// Whether this observer reads [`TunedEntry::receipt`] from
+    /// [`TuningEvent::Finished`]. Defaults to `true` so observers that
+    /// forward finished entries to a trace always receive receipts; observers
+    /// that ignore receipts return `false` to skip reading stored evidence
+    /// files from disk on matching cache hits.
+    fn needs_receipts(&self) -> bool {
+        true
+    }
 }
 
 /// An observer for hosts that do not report tuning progress.
@@ -2086,6 +2101,10 @@ pub struct UnreportedTuning;
 
 impl TuningObserver for UnreportedTuning {
     fn event(&self, _event: &TuningEvent) {}
+
+    fn needs_receipts(&self) -> bool {
+        false
+    }
 }
 
 /// What tuning needs from the host: the model, its weights, and where
@@ -3087,18 +3106,28 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         tuner.memory.return_freed_pages();
     }
 
-    /// The pool of activation noise, twice the largest activation built,
-    /// where the host's growth counts against the device's room (the one
-    /// rule, [`allocation::Unit::shared_host`]). It is generated again when
-    /// a point is next built; its values are pseudo-random either way, and
-    /// a point built again is observed again.
+    /// The pool of activation noise, twice the largest activation built.
+    /// It lives in host RAM, relieving the shared device ceiling on unified
+    /// memory or the separate host domain on discrete GPUs. It is generated
+    /// again when a point is next built; its values are pseudo-random either
+    /// way, and a point built again is observed again.
     fn spare(tuner: &Tuner<'a>) -> u64 {
-        Self::shared_host(tuner, tuner.noise.bytes())
+        tuner.noise.bytes()
     }
 
     fn drop_spare(tuner: &mut Tuner<'a>) {
         tuner.noise = Noise::default();
         tuner.memory.return_freed_pages();
+    }
+
+    fn host_holding(&self, tuner: &Tuner<'a>) -> u64 {
+        if <Self as allocation::Unit>::holding(self) == 0 {
+            return 0;
+        }
+        tuner
+            .memory
+            .host_added(&unit_name((**self).key()), false)
+            .unwrap_or(0)
     }
 
     fn programs(&self) -> u64 {
@@ -4283,7 +4312,7 @@ impl<'a> Tuner<'a> {
             })
             .collect::<HashMap<_, _>>();
         self.memory.mandatory_bytes = allocated(&self.charges.device());
-        self.memory.peak_bytes = self.memory.mandatory_bytes;
+        self.memory.peak_bytes = self.memory.peak_bytes.max(self.memory.mandatory_bytes);
         let searches = !launches.is_empty();
         self.first_load_search = searches;
         self.phase = Phase::Census {
@@ -4635,22 +4664,11 @@ impl<'a> Tuner<'a> {
         // A valid cached final choice is never searched again. The first
         // preparation alone owns the fixed tuning allowance.
         let began = Instant::now();
-        let cached = self.stored(case, statics, shapes).map_err(failure)?;
+        let cached = self.stored(case, statics, shapes, defaults).map_err(failure)?;
         let slot = cached.as_ref().map(|(_, slot, _)| slot.clone());
         let settled = if let Some((_, _, Some((choice, receipt)))) = cached {
             // A later load is metadata only: the walk that prepares the
-            // choice forms what it serves, once. A stored fallback is the
-            // declared default or a violated contract.
-            if matches!(
-                choice.disposition,
-                seismic::TuningDisposition::CanonicalFallback { .. }
-            ) && choice.overall.specialization() != *defaults
-            {
-                return Err(failure(
-                    "terminal fallback: choice is not the declared canonical default; search cannot reopen"
-                        .into(),
-                ));
-            }
+            // choice forms what it serves, once.
             let tuned = tuned_entry(
                 key.0,
                 key.1.clone(),
@@ -4904,7 +4922,7 @@ impl<'a> Tuner<'a> {
             return Ok(chosen);
         }
         let began = Instant::now();
-        let stored = self.stored(case, statics, &shapes).map_err(failure)?;
+        let stored = self.stored(case, statics, &shapes, defaults).map_err(failure)?;
         let Some((_, _, Some((choice, receipt)))) = stored else {
             self.unprepared_unit(entry, bindings, key.2.statics.clone())?;
             self.chosen.insert(key, defaults.clone());
@@ -4956,6 +4974,7 @@ impl<'a> Tuner<'a> {
         case: &T,
         statics: &NativeSpecialization,
         shapes: &[PointShape],
+        defaults: &NativeSpecialization,
     ) -> Result<Option<StoredSlot<'a>>, String> {
         let entry = <T::Entry as seismic::Entry>::NAME;
         let Some(cache) = self.context.cache.filter(|_| survey_plan(entry).is_none()) else {
@@ -4972,32 +4991,43 @@ impl<'a> Tuner<'a> {
             requirement.activation(),
             shapes,
         ));
-        // A fresh preparation searches again and replaces the stored record.
-        // Any other serves the stored record under this load's requirement.
-        // Under the requirement it was searched under, that is its stored
-        // choice, and its evidence stays unread in the store. Its
-        // measurements are the same facts under every α, so under another
-        // the evidence is read and chosen from again, with nothing formed
-        // or measured. The store keeps a choice and its evidence together,
-        // so evidence that cannot be read is a broken store, not a miss.
-        let stored = match self.context.settings.fresh {
-            true => None,
-            false => cache.tuning::<StoredChoice>(&key)?,
-        };
         // A provisional record is what a search abandoned before its optional
         // work stopped left: the unit has no choice yet, and is searched
         // again as if nothing were stored. A record made without demand is
         // the unit's choice only for a load without demand for it: one that
         // serves the unit searches it. The store's key holds no demand.
         let demanded = shapes.iter().any(|shape| shape.weight > 0.);
-        let hit = match stored.filter(|(choice, _)| {
-            choice.settled && (choice.demanded || !demanded) && choice.searched_within(self.budget())
-        }) {
+        let budget = self.budget();
+        let needs_receipts = self.context.observer.needs_receipts();
+        let usable = |choice: &StoredChoice| {
+            choice.settled && (choice.demanded || !demanded) && choice.searched_within(budget)
+        };
+        // A fresh preparation searches again and replaces the stored record.
+        // Any other serves the stored record under this load's requirement.
+        // Under the requirement it was searched under, that is its stored
+        // choice, and its evidence stays unread on disk unless the observer
+        // needs receipts. Its measurements are the same facts under every α,
+        // so under another the evidence is read and chosen from again, with
+        // nothing formed or measured. The store keeps a choice and its
+        // evidence together, so requested evidence that cannot be read is a
+        // broken store, not a miss.
+        let stored = match self.context.settings.fresh {
+            true => None,
+            false => cache.tuning::<StoredChoice>(&key, |choice| {
+                usable(choice) && (choice.requirement != requirement || needs_receipts)
+            })?,
+        };
+        let hit = match stored.filter(|(choice, _)| usable(choice)) {
             None => None,
             Some((choice, evidence)) if choice.requirement == requirement => {
-                Some((choice, Receipt::Stored(evidence)))
+                let receipt = match evidence {
+                    Some(evidence) => Receipt::Stored(evidence),
+                    None => Receipt::Unread,
+                };
+                Some((choice, receipt))
             }
             Some((stored, evidence)) => {
+                let evidence = evidence.expect("evidence read whenever requirement differs");
                 let mut result = evidence.read()?;
                 seismic::reselect(&mut result, &requirement);
                 // What stopped the record's search is the stored choice's
@@ -5023,10 +5053,16 @@ impl<'a> Tuner<'a> {
             }
             match &choice.disposition {
                 seismic::TuningDisposition::CanonicalFallback { .. } => {
+                    if chosen != *defaults {
+                        return Err(
+                            "terminal fallback: choice is not the declared canonical default; search cannot reopen"
+                                .into(),
+                        );
+                    }
                     choice.chosen.usable_fallback()?;
                 }
                 seismic::TuningDisposition::QualifiedCandidate => {
-                    if shapes.iter().any(|shape| shape.weight > 0.) {
+                    if demanded {
                         choice.chosen.qualified_at(shapes).map_err(|detail| {
                             format!("terminal tuning choice for {entry} lacks matching numerical evidence: {detail}; search cannot reopen")
                         })?;

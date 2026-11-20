@@ -92,6 +92,7 @@ _PUBLIC_DTYPES = {
     "bf16": "bfloat16",
     "i32": "int32",
     "u32": "uint32",
+    "u64": "uint64",
     "bool": "bool_",
 }
 _NUMPY_DTYPES = {
@@ -100,6 +101,7 @@ _NUMPY_DTYPES = {
     "bf16": np.dtype(ml_dtypes.bfloat16),
     "i32": np.dtype("int32"),
     "u32": np.dtype("uint32"),
+    "u64": np.dtype("uint64"),
     "bool": np.dtype("bool"),
 }
 
@@ -108,7 +110,9 @@ def element(name: str) -> Element:
     return Element(*_invoke(_native.element_info, name))
 
 
-float32, float16, bfloat16, int32, uint32, bool_ = (element(n) for n in _PUBLIC_DTYPES)
+float32, float16, bfloat16, int32, uint32, uint64, bool_ = (
+    element(n) for n in _PUBLIC_DTYPES
+)
 
 
 def _dtype(value) -> Element:
@@ -215,15 +219,26 @@ def _host_array(data, dtype=None):
         raise TypeError(
             "object, complex, string, and structured inputs are unsupported"
         )
-    if target.name in ("i32", "u32"):
+    if target.name in ("i32", "u32", "u64"):
         bounds = np.iinfo(target_dtype)
-        if (
-            np.any(~np.isfinite(array))
-            or np.any(array < bounds.min)
-            or np.any(array > bounds.max)
-            or np.any(array != np.trunc(array))
-        ):
-            raise OverflowError(f"values are not representable as {target_dtype}")
+        if array.dtype.kind == "f" or array.dtype == _NUMPY_DTYPES["bf16"]:
+            too_high = (
+                np.any(array >= float(1 << 64))
+                if target.name == "u64"
+                else np.any(array > bounds.max)
+            )
+            if (
+                np.any(~np.isfinite(array))
+                or np.any(array < bounds.min)
+                or too_high
+                or np.any(array != np.trunc(array))
+            ):
+                raise OverflowError(f"values are not representable as {target_dtype}")
+        else:
+            too_low = array.dtype.kind == "i" and np.any(array < bounds.min)
+            too_high = target.name != "u64" and np.any(array > bounds.max)
+            if too_low or too_high:
+                raise OverflowError(f"values are not representable as {target_dtype}")
     with np.errstate(over="ignore", invalid="ignore"):
         converted = array.astype(target_dtype)
     if target.name in ("f32", "f16", "bf16") and np.any(
@@ -536,7 +551,7 @@ def _argument(ty, value):
     name = ty["dtype"]
     if name == "bool" and not isinstance(value, (bool, np.bool_)):
         raise TypeError("boolean parameter requires bool")
-    if name in ("i32", "u32"):
+    if name in ("i32", "u32", "u64"):
         if isinstance(value, (bool, np.bool_)):
             raise TypeError("integer parameter cannot accept bool")
         value = operator.index(value)

@@ -89,6 +89,16 @@ impl VulkanReplays {
         self.graphs.plan_counts(plan)
     }
 
+    /// Track a live plan key in `by_plan` so it is pruned when dropped.
+    pub(crate) fn register_plan(&self, plan: u64) {
+        self.graphs.register_plan(plan);
+    }
+
+    /// Release a live plan key from `by_plan` when dropped.
+    pub(crate) fn unregister_plan(&self, plan: u64) {
+        self.graphs.unregister_plan(plan);
+    }
+
     /// Drop every graph if none is held (`Replays::clear_unheld`).
     pub(crate) fn clear_unheld(&self, unheld: impl FnOnce() -> bool) {
         self.graphs.clear_unheld(unheld)

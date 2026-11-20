@@ -7,7 +7,7 @@ use std::fmt;
 /// The cell class an image of `cells` merged cells encodes in: the launch row
 /// ladder (the next power of two up to [`SMALL_CLASS_ROWS`], otherwise the
 /// next multiple of [`PREFILL_ROW_QUANTUM`]) without the launch row bound.
-/// `None` for zero cells.
+/// `None` for zero cells or if the rounded class would overflow `usize`.
 pub const fn image_cell_class(cells: usize) -> Option<usize> {
     if cells == 0 {
         return None;
@@ -15,7 +15,9 @@ pub const fn image_cell_class(cells: usize) -> Option<usize> {
     if cells <= SMALL_CLASS_ROWS {
         return Some(cells.next_power_of_two());
     }
-    Some(cells.div_ceil(PREFILL_ROW_QUANTUM) * PREFILL_ROW_QUANTUM)
+    cells
+        .div_ceil(PREFILL_ROW_QUANTUM)
+        .checked_mul(PREFILL_ROW_QUANTUM)
 }
 
 /// Every cell class of images of at most `limit` cells, in ascending order:
@@ -24,13 +26,13 @@ pub fn image_cell_classes(limit: usize) -> Vec<usize> {
     let Some(last) = image_cell_class(limit) else {
         return Vec::new();
     };
-    let mut classes = Vec::new();
-    let mut cells = 1;
-    while cells <= last {
-        classes.push(cells);
-        cells = image_cell_class(cells + 1).unwrap_or(cells + 1);
-    }
-    classes
+    std::iter::successors(Some(1usize), |&cells| {
+        cells
+            .checked_add(1)
+            .and_then(image_cell_class)
+            .filter(|&next| next <= last)
+    })
+    .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -111,5 +113,15 @@ mod tests {
             let class = image_cell_class(cells).unwrap();
             assert!(classes.contains(&class) && class >= cells && class - cells < 64);
         }
+    }
+
+    #[test]
+    fn image_cell_class_and_classes_reject_overflow() {
+        let max_multiple = usize::MAX - (usize::MAX % crate::PREFILL_ROW_QUANTUM);
+        assert_eq!(image_cell_class(max_multiple), Some(max_multiple));
+        assert_eq!(image_cell_class(max_multiple + 1), None);
+        assert_eq!(image_cell_class(usize::MAX), None);
+        assert!(image_cell_classes(max_multiple + 1).is_empty());
+        assert!(image_cell_classes(usize::MAX).is_empty());
     }
 }

@@ -184,7 +184,7 @@ impl ConvertForm {
         )
     }
 
-    fn key(&self, executor: &seismic::Identity, backend: seismic::BackendName, converted: u64) -> Result<PointKey, ExecutorCostsError> {
+    fn key(&self, executor: &seismic::Identity, backend: seismic::BackendName, tensor_ops: bool, converted: u64) -> Result<PointKey, ExecutorCostsError> {
         // Measured with any load beside it holding its own traffic
         // (`SCHEMA`).
         let mut configuration = named(&[("convert", CONVERTED_RECORDS), SCHEMA]);
@@ -192,8 +192,8 @@ impl ConvertForm {
             configuration.extend(named(&[(&format!("{index}.n"), tensor.matrix[0]), (&format!("{index}.k"), tensor.matrix[1])]));
         }
         Ok(PointKey {
-            executor: executor.clone(),
-            kernels: vec![self.land().identity(backend)?],
+            subject: seismic::PointSubject::executor(executor),
+            kernels: vec![self.land().identity(backend, tensor_ops)?],
             configuration,
             point: named(&[("converted", converted)]),
         })
@@ -363,7 +363,7 @@ impl ConvertCosts {
     ) -> Result<Self, CeilingError> {
         let identity = executor_identity(topology, executor)?;
         let [one, most] = [1, CONVERTED_RECORDS].map(|converted| {
-            let key = form.key(&identity, executor.backend(), converted)?;
+            let key = form.key(&identity, executor.backend(), executor.forms_tensor_operations(), converted)?;
             let timing = match store.load(&key)? {
                 Some(Record::Measured(timing)) => timing,
                 Some(Record::Unobtainable { reason }) => return Err(CeilingError::Unobtainable { count: converted, reason }),
@@ -454,7 +454,7 @@ impl ConvertForm {
     pub(super) fn measure(&self, walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
         let (device, charges) = (walks.device(), walks.charges());
         for converted in [1, CONVERTED_RECORDS] {
-            let key = self.key(&walks.identity(), device.backend(), converted)?;
+            let key = self.key(&walks.identity(), device.backend(), device.info().forms_tensor_operations(), converted)?;
             walks.time_convert(key, self, move |kernel| {
                 convert_point(charges, kernel, self, converted)
             });
@@ -641,11 +641,11 @@ impl TierCopyCosts {
         )
     }
 
-    fn key(identity: &seismic::Identity, backend: seismic::BackendName, blocks: u32) -> Result<PointKey, ExecutorCostsError> {
+    fn key(identity: &seismic::Identity, backend: seismic::BackendName, tensor_ops: bool, blocks: u32) -> Result<PointKey, ExecutorCostsError> {
         let (records, bytes) = TIER_COPY_PROBE;
         Ok(PointKey {
-            executor: identity.clone(),
-            kernels: vec![Self::formation().identity(backend)?],
+            subject: seismic::PointSubject::executor(identity),
+            kernels: vec![Self::formation().identity(backend, tensor_ops)?],
             configuration: named(&[("tier_copy", 1), ("records", records), ("bytes", bytes), SCHEMA]),
             point: named(&[("blocks", u64::from(blocks))]),
         })
@@ -653,11 +653,11 @@ impl TierCopyCosts {
 
     /// The stall probe's key: the probe's records copied within device
     /// memory on a list's whole grid, each run its own submission, `beside`.
-    fn stall_key(identity: &seismic::Identity, backend: seismic::BackendName, beside: Beside) -> Result<PointKey, ExecutorCostsError> {
+    fn stall_key(identity: &seismic::Identity, backend: seismic::BackendName, tensor_ops: bool, beside: Beside) -> Result<PointKey, ExecutorCostsError> {
         let (records, bytes) = TIER_COPY_PROBE;
         Ok(PointKey {
-            executor: identity.clone(),
-            kernels: vec![Self::formation().identity(backend)?],
+            subject: seismic::PointSubject::executor(identity),
+            kernels: vec![Self::formation().identity(backend, tensor_ops)?],
             configuration: named(&[("copy_stall", 1), ("records", records), ("bytes", bytes), SCHEMA]),
             point: named(&[("beside_copy", beside.point())]),
         })
@@ -668,7 +668,7 @@ impl TierCopyCosts {
     fn transfer_key(identity: &seismic::Identity, records: u64, direction: Direction) -> PointKey {
         let (probe, bytes) = TIER_COPY_PROBE;
         PointKey {
-            executor: identity.clone(),
+            subject: seismic::PointSubject::executor(identity),
             kernels: Vec::new(),
             configuration: named(&[(direction.name(), 1), ("records", probe), ("bytes", bytes), SCHEMA]),
             point: named(&[("batch", records)]),
@@ -679,7 +679,7 @@ impl TierCopyCosts {
     /// forming nothing; why there are none: a load copies on a list's whole
     /// grid until the job has measured them.
     pub fn stored(topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> Result<Self, TierCopyError> {
-        let (backend, identity) = (executor.backend(), executor_identity(topology, executor)?);
+        let (backend, tensor_ops, identity) = (executor.backend(), executor.forms_tensor_operations(), executor_identity(topology, executor)?);
         let grid = magnitude_kernels::LIST_BLOCKS;
         let timing = |key: PointKey, point: TierCopyPoint| match store.load(&key)? {
             Some(Record::Measured(timing)) => Ok(timing),
@@ -687,12 +687,12 @@ impl TierCopyCosts {
             None => Err(TierCopyError::Unrecorded { point }),
         };
         let median = |key: PointKey, point: TierCopyPoint| timing(key, point).map(|timing| timing.median);
-        let [one, whole] = [1, grid].map(|blocks| median(Self::key(&identity, backend, blocks)?, TierCopyPoint::Copy { blocks }));
+        let [one, whole] = [1, grid].map(|blocks| median(Self::key(&identity, backend, tensor_ops, blocks)?, TierCopyPoint::Copy { blocks }));
         let [one, whole] = [one?, whole?];
         // A block's rate against the link's, `R_link / r_block`, is the one
         // block's time over the whole grid's.
         let blocks = (one / whole).ceil().clamp(1., f64::from(grid)) as u32;
-        let [alone, beside] = [Beside::Alone, Beside::Copy].map(|beside| timing(Self::stall_key(&identity, backend, beside)?, beside.named()));
+        let [alone, beside] = [Beside::Alone, Beside::Copy].map(|beside| timing(Self::stall_key(&identity, backend, tensor_ops, beside)?, beside.named()));
         let (alone, beside) = (alone?, beside?);
         // The work beside a copy takes at least its time alone. Faster beside
         // it within the timings' intervals, a copy stalls nothing the probe
@@ -755,7 +755,7 @@ impl TierCopyCosts {
         let charges = &charges;
         let formed = OnceCell::<Result<NativeKernel<routed_copy::Entry>, ExecutorCostsError>>::new();
         for blocks in [1, magnitude_kernels::LIST_BLOCKS] {
-            let key = Self::key(&walks.identity(), device.backend(), blocks)?;
+            let key = Self::key(&walks.identity(), device.backend(), device.info().forms_tensor_operations(), blocks)?;
             let formed = &formed;
             walks.time(key, true, move || {
                 let kernel = formed
@@ -786,7 +786,7 @@ impl TierCopyCosts {
         // The device's work queued alone, then beside a copy the transfer
         // queue runs throughout its timing.
         for beside in [Beside::Alone, Beside::Copy] {
-            let key = Self::stall_key(&walks.identity(), device.backend(), beside)?;
+            let key = Self::stall_key(&walks.identity(), device.backend(), device.info().forms_tensor_operations(), beside)?;
             let formed = &formed;
             let point = move || {
                 let kernel = formed
@@ -1043,7 +1043,7 @@ impl GraphMemory {
 
     fn key(identity: &seismic::Identity, term: &str) -> PointKey {
         PointKey {
-            executor: identity.clone(),
+            subject: seismic::PointSubject::executor(identity),
             kernels: Vec::new(),
             configuration: named(&[("graph_memory", 1)]),
             point: named(&[(term, 1)]),
@@ -1122,31 +1122,29 @@ impl VolumeCosts {
     /// A term's key under `schema`, at `at` (its read size and window, as
     /// the term has them): the rule's ([`Curve::SCHEMA`](seismic_io::Curve::SCHEMA)
     /// or [`EarlierChoice::SCHEMA`](seismic_io::EarlierChoice::SCHEMA)).
-    fn key(identity: &seismic::Identity, file: &Path, urgent: Option<&seismic_io::Urgent>, schema: u64, term: &str, at: &[(&str, u64)]) -> Result<PointKey, ExecutorCostsError> {
+    /// Keyed by the volume and normalized OS, independent of any GPU executor.
+    fn key(topology: &DeviceTopology, file: &Path, urgent: Option<&seismic_io::Urgent>, schema: u64, term: &str, at: &[(&str, u64)]) -> Result<PointKey, ExecutorCostsError> {
         let volume = seismic::volume_identity(file).map_err(|cause| failed("volume identity")(&cause))?;
-        let mut configuration = named(&[("volume_device", volume.device)]);
-        configuration.insert(format!("volume_{}", volume.uuid.as_deref().unwrap_or("unnamed")), 1);
-        configuration.insert("schema".into(), schema);
+        let mut configuration = named(&[("schema", schema)]);
         if let Some(urgent) = urgent {
             configuration.insert("records".into(), urgent.records);
             configuration.extend(urgent.parts.iter().enumerate().map(|(part, &bytes)| (format!("part_{part}"), bytes)));
         }
         let mut point = named(&[(term, 1)]);
         point.extend(at.iter().map(|&(name, value)| (name.to_owned(), value)));
-        Ok(PointKey { executor: identity.clone(), kernels: Vec::new(), configuration, point })
+        Ok(PointKey { subject: seismic::PointSubject::volume(topology, volume), kernels: Vec::new(), configuration, point })
     }
 
     /// The curve `store` records of `file`'s volume, whole; else the rule
     /// before it's choice ([`StoredVolume`]); none until the job probed it.
     pub fn stored(
         topology: &DeviceTopology,
-        executor: &Executor,
+        _executor: &Executor,
         file: &Path,
         urgent: Option<&seismic_io::Urgent>,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<Option<StoredVolume>, ExecutorCostsError> {
-        let identity = executor_identity(topology, executor)?;
-        let term = |schema: u64, term: &str, at: &[(&str, u64)]| measured(store, &Self::key(&identity, file, urgent, schema, term, at)?, "volume record");
+        let term = |schema: u64, term: &str, at: &[(&str, u64)]| measured(store, &Self::key(topology, file, urgent, schema, term, at)?, "volume record");
         let (grid, lone, depths) = seismic_io::Curve::grid(urgent);
         let schema = seismic_io::Curve::SCHEMA;
         let mut points = Vec::with_capacity(grid.len());
@@ -1199,7 +1197,7 @@ impl VolumeCosts {
         store: &dyn RecordStore<PointKey>,
     ) -> Result<(), ExecutorCostsError> {
         let error = failed("volume probe");
-        let identity = executor_identity(device.topology(), device.info())?;
+        let topology = device.topology();
         let source = magnitude_artifacts::FileSource::open(file).map_err(|cause| error(&cause))?;
         let curve = seismic_io::probe_volume(&source, urgent).map_err(|cause| error(&cause))?;
         let schema = seismic_io::Curve::SCHEMA;
@@ -1214,7 +1212,7 @@ impl VolumeCosts {
         });
         for (term, at, value) in points.chain(lone).chain(ranges) {
             let timing = Timing { median: value, interval: None, samples: 1 };
-            store.store(&Self::key(&identity, file, urgent, schema, term, &at)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
+            store.store(&Self::key(topology, file, urgent, schema, term, &at)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
         }
         Ok(())
     }
@@ -1277,23 +1275,25 @@ impl From<StoreError> for StorageError {
 const STORAGE_POINTS: [&str; 2] = ["full", "lone"];
 
 impl StorageCosts {
-    fn key(identity: &seismic::Identity, directory: &Path, point: &str) -> Result<PointKey, StorageError> {
+    fn key(topology: &DeviceTopology, directory: &Path, point: &str) -> Result<PointKey, StorageError> {
         let volume = seismic::volume_identity(directory).map_err(|cause| StorageError::Volume(cause.to_string()))?;
-        let mut configuration = named(&[("storage", 1), ("volume_device", volume.device)]);
-        configuration.insert(format!("volume_{}", volume.uuid.as_deref().unwrap_or("unnamed")), 1);
-        Ok(PointKey { executor: identity.clone(), kernels: Vec::new(), configuration, point: named(&[(point, 1)]) })
+        Ok(PointKey {
+            subject: seismic::PointSubject::volume(topology, volume),
+            kernels: Vec::new(),
+            configuration: named(&[("storage", 1)]),
+            point: named(&[(point, 1)]),
+        })
     }
 
     /// The read line of `directory`'s volume that `store`'s records give,
     /// measuring nothing; why there is none.
     pub fn stored(
         topology: &DeviceTopology,
-        executor: &Executor,
+        _executor: &Executor,
         directory: &Path,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<ReadLine, StorageError> {
-        let identity = executor_identity(topology, executor)?;
-        let [full, lone] = STORAGE_POINTS.map(|point| match store.load(&Self::key(&identity, directory, point)?)? {
+        let [full, lone] = STORAGE_POINTS.map(|point| match store.load(&Self::key(topology, directory, point)?)? {
             Some(Record::Measured(timing)) => Ok(timing.median),
             Some(Record::Unobtainable { reason }) => Err(StorageError::Unobtainable { point, reason }),
             None => Err(StorageError::Unrecorded { point }),
@@ -1325,11 +1325,11 @@ impl StorageCosts {
     /// Measure the line's points in the job (`walks`), the probe file opened
     /// (written first where it is not whole) by the first point taken.
     pub(super) fn measure(directory: &Path, walks: &mut Walks<'_, '_>) -> Result<(), StorageError> {
-        let identity = walks.identity();
+        let topology = walks.device().topology().clone();
         let probe = OnceCell::new();
         for point in STORAGE_POINTS {
             let probe = &probe;
-            walks.time_host(Self::key(&identity, directory, point)?, move || {
+            walks.time_host(Self::key(&topology, directory, point)?, move || {
                 let probe = match probe.get() {
                     Some(probe) => probe,
                     None => {
@@ -1473,7 +1473,7 @@ impl CpuForm {
         }
     }
 
-    fn key(&self, identity: &seismic::Identity, term: &str) -> PointKey {
+    fn key(&self, topology: &DeviceTopology, term: &str) -> PointKey {
         let mut configuration = named(&[
             ("cpu_site", 1),
             ("rows", magnitude_kernels::constants::VERIFY_ROWS),
@@ -1484,7 +1484,9 @@ impl CpuForm {
             ("function", u64::from(self.function as u32)),
             ("flight", self.flight),
             ("widest", self.widest),
+            ("threads", seismic::threads::quota().get() as u64),
         ]);
+        configuration.insert(format!("tier_{:?}", seismic::cpu::Tier::detected()), 1);
         // A clamped site's limit as its word; an unclamped site's key is
         // the one it had before sites clamped.
         if self.limit.is_some() {
@@ -1494,23 +1496,27 @@ impl CpuForm {
             configuration.insert(format!("{name:?}_{}_n", tensor.resident.name()), tensor.matrix[0]);
             configuration.insert(format!("{name:?}_{}_k", tensor.resident.name()), tensor.matrix[1]);
         }
-        PointKey { executor: identity.clone(), kernels: Vec::new(), configuration, point: named(&[(term, 1)]) }
+        PointKey {
+            subject: seismic::PointSubject::host(topology),
+            kernels: Vec::new(),
+            configuration,
+            point: named(&[(term, 1)]),
+        }
     }
 }
 
 impl CpuCosts {
-    /// What `store` records of `form`'s site on `executor`; none until the
-    /// job measured it.
+    /// What `store` records of `form`'s site on `topology`'s host; none until
+    /// the job measured it.
     pub(super) fn stored(
         topology: &DeviceTopology,
-        executor: &Executor,
+        _executor: &Executor,
         form: &CpuForm,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<Option<Self>, ExecutorCostsError> {
         use magnitude_cost_model::{CpuLines, Nanoseconds, RowCost, RowLine};
-        let identity = executor_identity(topology, executor)?;
         let error = failed("CPU site record");
-        let term = |term: &str| measured(store, &form.key(&identity, term), "CPU site record");
+        let term = |term: &str| measured(store, &form.key(topology, term), "CPU site record");
         let (workers, one, handshake) = (term("workers")?, term("one")?, term("handshake")?);
         let (exact, at_most) = (term("row")?, term("row_at_most")?);
         let (Some(workers), Some(one), Some(handshake)) = (workers, one, handshake) else {
@@ -1545,7 +1551,7 @@ impl CpuCosts {
     pub(super) fn measure(charges: &seismic::Charges, form: &CpuForm, store: &dyn RecordStore<PointKey>) -> Result<(), ExecutorCostsError> {
         use magnitude_cost_model::RowCost;
         let error = failed("CPU site");
-        let identity = executor_identity(charges.device().topology(), charges.device().info())?;
+        let topology = charges.device().topology().clone();
         let (workers, lines) = crate::experts::measure_cpu_site(charges, form).map_err(|cause| error(&cause))?;
         let seconds = |nanoseconds: f64| nanoseconds * 1e-9;
         let (row, row_term) = match lines.expert.row {
@@ -1560,7 +1566,7 @@ impl CpuCosts {
         ];
         for (term, value) in terms {
             let timing = Timing { median: value, interval: None, samples: 1 };
-            store.store(&form.key(&identity, term), &Record::Measured(timing)).map_err(|cause| error(&cause))?;
+            store.store(&form.key(&topology, term), &Record::Measured(timing)).map_err(|cause| error(&cause))?;
         }
         Ok(())
     }
@@ -1711,31 +1717,28 @@ impl MemoryCosts {
     }
 
     /// The key of a sweep of `bytes` by `readers` threads on `topology`'s
-    /// host, beside `executor` (whose identity names the hardware and
-    /// driver), of a span `span`.
-    fn key(identity: &seismic::Identity, readers: u64, span: u64, bytes: u64) -> PointKey {
+    /// host, of a span `span`, independent of any GPU executor.
+    fn key(topology: &DeviceTopology, readers: u64, span: u64, bytes: u64) -> PointKey {
         PointKey {
-            executor: identity.clone(),
+            subject: seismic::PointSubject::host(topology),
             kernels: Vec::new(),
             configuration: named(&[("host_memory", 1), ("readers", readers), ("span", span)]),
             point: named(&[("bytes", bytes)]),
         }
     }
 
-    /// The host memory's read line beside `executor` with `readers` reading
-    /// at once (a load's CPUs, `std::thread::available_parallelism` in its
-    /// process) that `store`'s records give, measuring nothing; why there is
-    /// none.
+    /// The host memory's read line with `readers` reading at once (a load's
+    /// CPUs, `std::thread::available_parallelism` in its process) that
+    /// `store`'s records give, measuring nothing; why there is none.
     pub fn stored(
         topology: &DeviceTopology,
-        executor: &Executor,
+        _executor: &Executor,
         readers: u64,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<Self, MemoryError> {
-        let identity = executor_identity(topology, executor)?;
         let span = Self::span(topology);
         let [none, all] = [0, span].map(|bytes| {
-            let key = Self::key(&identity, readers, span, bytes);
+            let key = Self::key(topology, readers, span, bytes);
             let timing = match store.load(&key)? {
                 Some(Record::Measured(timing)) => timing,
                 Some(Record::Unobtainable { reason }) => return Err(MemoryError::Unobtainable { bytes, reason }),
@@ -1770,12 +1773,12 @@ impl MemoryCosts {
     /// in `readers` shares ([`Sweeps::written`]; an untouched page reads as
     /// the one zero page).
     pub(super) fn measure(readers: u64, walks: &mut Walks<'_, '_>) {
-        let span = Self::span(walks.device().topology());
-        let identity = walks.identity();
+        let topology = walks.device().topology().clone();
+        let span = Self::span(&topology);
         let words = OnceCell::new();
         for bytes in [0, span] {
             let words = &words;
-            walks.time_host(Self::key(&identity, readers, span, bytes), move || {
+            walks.time_host(Self::key(&topology, readers, span, bytes), move || {
                 let readers = usize::try_from(readers).map_err(|_| Unformed::Never(ExecutorCostsError(format!("{readers} readers exceed the host"))))?;
                 let words = words.get_or_init(|| Sweeps::written((span / 8) as usize, readers));
                 Ok(Sweeps { words: &words[..(bytes / 8) as usize], readers })
@@ -2035,11 +2038,12 @@ mod tests {
                     }
                     plan.point(&charges, bindings, GraphTiming::Device).map(Point::Graph).map_err(|cause| Unformed::Now(cause.to_string()))
                 };
+                let tensor_ops = device.info().forms_tensor_operations();
                 let key = PointKey {
-                    executor: identity.clone(),
+                    subject: seismic::PointSubject::executor(&identity),
                     kernels: vec![
-                        grid_formation.identity(device.backend()).unwrap(),
-                        formation.identity(device.backend()).unwrap(),
+                        grid_formation.identity(device.backend(), tensor_ops).unwrap(),
+                        formation.identity(device.backend(), tensor_ops).unwrap(),
                     ],
                     configuration: named(&[("S", sources), ("D", destinations)]),
                     point: named(&[("copied", copied)]),
@@ -2099,6 +2103,22 @@ mod tests {
             assert!(costs.line.terms().slope() > 0. && costs.record_seconds > 0., "{backend:?}: {:?}", costs.line);
             std::fs::remove_dir_all(records).unwrap();
         }
+    }
+
+    #[test]
+    fn host_and_volume_keys_are_independent_of_gpu_executor() {
+        let topology = seismic::Devices::discover(&[]).unwrap().topology();
+        let dir = std::env::temp_dir();
+        let storage_key = StorageCosts::key(&topology, &dir, "full").unwrap();
+        assert!(matches!(storage_key.subject, seismic::PointSubject::Volume { .. }));
+        let volume_key = VolumeCosts::key(&topology, &dir, None, seismic_io::Curve::SCHEMA, "rate", &[("read", 4096)]).unwrap();
+        assert!(matches!(volume_key.subject, seismic::PointSubject::Volume { .. }));
+        let mem_key = MemoryCosts::key(&topology, 8, 64 << 20, 64 << 20);
+        assert!(matches!(mem_key.subject, seismic::PointSubject::Host(_)));
+        let form = CpuForm::reference(seismic::BackendName::Cuda).unwrap().unwrap();
+        let cpu_key = form.key(&topology, "one");
+        assert!(matches!(cpu_key.subject, seismic::PointSubject::Host(_)));
+        assert!(cpu_key.configuration.contains_key("threads"));
     }
 
     }

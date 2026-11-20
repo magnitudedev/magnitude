@@ -486,6 +486,40 @@ fn replay_from_a_prompt_prefix_stops_at_the_prompt_end() {
     assert_eq!(decode.round_forward().tokens, [TokenId(11)]);
 }
 
+#[test]
+fn eviction_mid_replay_preserves_reconciliation_target_and_clamps_cached_tokens() {
+    let mut generation = prefill(generation(None), 10);
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let (mut generation, _) = resolve(start(generation, 1), &[11], None);
+    let (mut generation, _) = resolve(start(generation, 1), &[12], None);
+    assert_eq!(generation.resident_position(), 4);
+
+    // Evict, start replaying from zero, and evict again mid-replay.
+    generation.evicted().unwrap();
+    generation.resume_at(None).unwrap();
+    let replay = start(generation, 1);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(1)]);
+    let (mut generation, _) = resolve(replay, &[], None);
+    assert_eq!(generation.resident_position(), 1);
+    generation.evicted().unwrap();
+
+    // Resuming at a generated position past the 2-token prompt must keep the
+    // original reconciliation target (4) and never report cached_tokens > prompt.len().
+    generation.resume_at(Some((3, &checkpoint))).unwrap();
+    assert_eq!(generation.resident_position(), 3);
+    assert!(generation.detailed_usage().cached_tokens <= 2);
+
+    let replay = start(generation, 4);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(11)]);
+    let (generation, _) = resolve(replay, &[], None);
+    assert_eq!(generation.resident_position(), 4);
+    let decode = start(generation, 1);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+    assert_eq!(decode.round_forward().tokens, [TokenId(12)]);
+}
+
 /// An admitted MTP generation that is not yet resident.
 fn mtp_fresh(prompt: &[u32], proposals: u8) -> Generation {
     let mut configured = options();
@@ -538,9 +572,12 @@ fn reconcile_confident_head(
     let outcome = Outcome::Head {
         proposals: proposals
             .iter()
-            .map(|&(token, status)| Selected {
-                token: TokenId(token),
-                status,
+            .map(|&(token, status)| match status {
+                0 => Selected::Token(TokenId(token)),
+                1 => Selected::Empty,
+                2 => Selected::NonFinite,
+                3 => Selected::Declined,
+                other => panic!("invalid test selection status {other}"),
             })
             .collect(),
         confidence,
@@ -742,6 +779,63 @@ fn proposals_stop_at_a_failed_selection_or_a_stop_token() {
 }
 
 #[test]
+fn nonfinite_draft_selection_fails_while_empty_and_declined_truncate() {
+    // Empty and Declined truncate proposals normally.
+    for terminator in [Selected::Empty, Selected::Declined] {
+        let (mut generation, first) = mtp_drafting(3);
+        let outcome = Outcome::Head {
+            proposals: vec![
+                Selected::Token(TokenId(11)),
+                terminator,
+                Selected::Token(TokenId(13)),
+            ],
+            confidence: None,
+        };
+        let transition = generation
+            .prepare_method_transition(&first, &outcome)
+            .expect("empty and declined terminate speculation cleanly");
+        generation.commit_method_transition(transition);
+        assert_eq!(
+            start(generation, 4).round_forward().tokens,
+            [TokenId(10), TokenId(11)]
+        );
+    }
+
+    // NonFinite at position 0 or after an earlier Empty/Declined slot returns Err.
+    for proposals in [
+        vec![
+            Selected::NonFinite,
+            Selected::Token(TokenId(12)),
+            Selected::Token(TokenId(13)),
+        ],
+        vec![
+            Selected::Token(TokenId(11)),
+            Selected::Declined,
+            Selected::NonFinite,
+        ],
+        vec![
+            Selected::Token(TokenId(11)),
+            Selected::Empty,
+            Selected::NonFinite,
+        ],
+    ] {
+        let (generation, first) = mtp_drafting(3);
+        let outcome = Outcome::Head {
+            proposals: proposals.clone(),
+            confidence: None,
+        };
+        assert!(
+            generation.prepare_method_transition(&first, &outcome).is_err(),
+            "nonfinite draft selection must fail: {proposals:?}"
+        );
+        assert!(
+            magnitude_generation::drafted_chain(&proposals).is_err(),
+            "drafted_chain must reject nonfinite selection: {proposals:?}"
+        );
+    }
+}
+
+#[test]
 fn checkpoints_carry_host_rows_and_restore_at_their_target_boundary() {
     let source = mtp_generation(&[1, 2], 2);
     let (mut source, effects) = resolve(start(source, 2), &[10], Some(feature(3)));
@@ -823,6 +917,9 @@ struct PrimeMethod {
 impl Method for PrimeMethod {
     fn identity(&self) -> &str {
         "mtp:prime-fixture:1"
+    }
+    fn capability(&self) -> MethodChoice {
+        MethodChoice::Mtp { proposals: 1 }
     }
     fn requires(&self) -> MethodRequirements {
         MethodRequirements {
@@ -1065,6 +1162,46 @@ fn a_reply_that_reaches_the_context_end_owes_no_row_past_it() {
     assert_eq!(generation.accepted_position(), 5);
     assert_eq!(generation.pending_reconciliation(), None);
     assert!(generation.start_reconciliation(4).is_err());
+}
+
+#[test]
+fn unbounded_max_tokens_reports_context_while_explicit_limit_reports_length() {
+    // With max_tokens set to the unbounded sentinel (i32::MAX), exhausting the
+    // served context finishes with FinishReason::Context.
+    let mut unbounded = options();
+    unbounded.context_limit = 4;
+    unbounded.max_tokens = i32::MAX as usize;
+    let generation = resident(
+        Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            unbounded,
+            None,
+        )
+        .unwrap(),
+    );
+    let generation = prefill(generation, 10);
+    let (generation, _) = resolve(start(generation, 4), &[11], None);
+    let (generation, _) = resolve(start(generation, 4), &[12], None);
+    assert_eq!(generation.finish_reason(), Some(FinishReason::Context));
+
+    // With an explicit max_tokens reached before the context ends, it finishes
+    // with FinishReason::Length.
+    let mut bounded = options();
+    bounded.context_limit = 4;
+    bounded.max_tokens = 2;
+    let generation = resident(
+        Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            bounded,
+            None,
+        )
+        .unwrap(),
+    );
+    let generation = prefill(generation, 10);
+    let (generation, _) = resolve(start(generation, 4), &[11], None);
+    assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
 }
 
 #[test]
@@ -1945,6 +2082,65 @@ fn rounds_that_draft_nothing_defer_the_drafter_until_it_drafts_again() {
     }
 }
 
+#[test]
+fn shrinking_allowance_after_catch_up_drafts_within_the_new_allowance() {
+    let methods: [Arc<dyn Method>; 2] = [
+        Arc::new(Mtp::new("fixture", 3).unwrap()),
+        Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()),
+    ];
+    for method in methods {
+        let mut configured = options();
+        configured.max_tokens = 16;
+        configured.context_limit = 32;
+        configured.method = match method.identity().starts_with("mtp") {
+            true => MethodChoice::Mtp { proposals: 3 },
+            false => MethodChoice::DFlash { proposals: 3 },
+        };
+        let generation = resident(
+            Generation::new_with_method(
+                vec![TokenId(1), TokenId(2)],
+                InputLayout::new(2, vec![]).unwrap(),
+                configured,
+                None,
+                method.clone(),
+            )
+            .unwrap(),
+        );
+        let (mut generation, effects) = resolve(start(generation, 2), &[10], Some(feature(1)));
+        assert!(effects.is_empty());
+        generation.take(4).unwrap();
+
+        // Accumulate enough pending pairs (> entry_bound = proposals + 1 = 4)
+        // that the next drafting attempt must first run a catch-up flush.
+        let mut anchor = TokenId(10);
+        for round in 0..4u32 {
+            let decode = start(generation, 1);
+            let sample = 11 + round;
+            let (next, effects) = resolve(decode, &[sample], Some(feature(2 + u64::from(round))));
+            assert!(effects.is_empty());
+            generation = next;
+            generation.take(4).unwrap();
+            anchor = TokenId(sample);
+        }
+
+        // First attempt with allowance 4 (selects.len() == 3) triggers catch-up.
+        let (mut generation, catch_up) = draft(generation, 4);
+        let [catch_up] = <[Operation; 1]>::try_from(catch_up).unwrap();
+        assert!(head_parts(&catch_up).3.is_empty());
+        reconcile_head(&mut generation, &catch_up, &[]);
+
+        // Allowance shrinks to 2 (selects.len() == 1) before the actual draft:
+        // must draft 1 proposal rather than getting stuck on a cached width of 3.
+        let (mut generation, drafted) = draft(generation, 2);
+        let [drafted] = <[Operation; 1]>::try_from(drafted).unwrap();
+        assert_eq!(head_parts(&drafted).3.len(), 1, "{}", method.identity());
+        reconcile_head(&mut generation, &drafted, &[(20, 0)]);
+
+        let verify = start(generation, 2);
+        assert_eq!(verify.round_forward().tokens, [anchor, TokenId(20)]);
+    }
+}
+
 /// A separate draft under the adaptive policy, with `max_tokens` to
 /// generate.
 fn adaptive_generation(max_tokens: usize) -> Generation {
@@ -2294,7 +2490,7 @@ fn mtp_on_a_fronting_load_verifies_its_chain_and_drafts_the_next_on_the_host() {
         panic!("one head transaction from the head's position: {operations:?}");
     };
     assert_eq!((entered.clone(), row_ids(conditioning), proposals.len()), (tokens(&[12, 13, 14]), vec![(1, 0), (1, 1), (1, 2)], 2));
-    let selected = |token| Selected { token: TokenId(token), status: 0 };
+    let selected = |token| Selected::Token(TokenId(token));
     let outcome = Outcome::Head { proposals: vec![selected(15), selected(16)], confidence: None };
     let transition = generation.prepare_method_transition(operation, &outcome).unwrap();
     assert_eq!(transition.decision().accepted_rows, 3, "it commits the pairs it entered");

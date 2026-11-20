@@ -154,7 +154,7 @@ impl<const N: usize> Sums<N> {
         if !(self.weight > 0.) || independent(&self.joined(*settling).xx, &[true; N]).len() < N {
             return None;
         }
-        Some(Terms::new(non_negative(self, settling)))
+        Some(non_negative(self, settling).and_then(Terms::new))
     }
 }
 
@@ -197,7 +197,7 @@ fn independent<const N: usize>(matrix: &[[f64; N]; N], of: &[bool; N]) -> Vec<us
 /// ([`independent`]; the rest follow from them), `S` and `s` the settling
 /// sums'. Regular where both sums together tell the free terms apart: `B`
 /// has full row rank, and `S` is definite on its null space.
-fn solve<const N: usize>(primary: &Sums<N>, settling: &Sums<N>, free: &[bool; N]) -> [f64; N] {
+fn solve<const N: usize>(primary: &Sums<N>, settling: &Sums<N>, free: &[bool; N]) -> Option<[f64; N]> {
     let terms = (0..N).filter(|&term| free[term]).collect::<Vec<_>>();
     let rows = independent(&primary.xx, free);
     let mut system = Vec::with_capacity(terms.len() + rows.len());
@@ -210,24 +210,29 @@ fn solve<const N: usize>(primary: &Sums<N>, settling: &Sums<N>, free: &[bool; N]
         let placed = terms.iter().map(|&column| primary.xx[constraint][column]);
         system.push(placed.chain(rows.iter().map(|_| 0.)).chain([primary.xt[constraint]]).collect());
     }
-    let solved = eliminate(system);
+    let solved = eliminate(system)?;
     let mut costs = [0.; N];
     for (index, &term) in terms.iter().enumerate() {
         costs[term] = solved[index];
     }
-    costs
+    Some(costs)
 }
 
 /// The solution of the regular system of `system`'s rows, each its
 /// coefficients then its right side: Gaussian elimination with partial
-/// pivoting.
-fn eliminate(mut system: Vec<Vec<f64>>) -> Vec<f64> {
+/// pivoting. Returns `None` if a pivot is zero or non-finite, or if
+/// back-substitution produces a non-finite entry.
+fn eliminate(mut system: Vec<Vec<f64>>) -> Option<Vec<f64>> {
     let size = system.len();
     for pivot in 0..size {
         let best = (pivot..size).max_by(|&a, &b| system[a][pivot].abs().total_cmp(&system[b][pivot].abs())).expect("a pivot row");
         system.swap(pivot, best);
+        let pivot_value = system[pivot][pivot];
+        if !pivot_value.is_finite() || pivot_value == 0. {
+            return None;
+        }
         for row in pivot + 1..size {
-            let factor = system[row][pivot] / system[pivot][pivot];
+            let factor = system[row][pivot] / pivot_value;
             for column in pivot..=size {
                 system[row][column] -= factor * system[pivot][column];
             }
@@ -236,9 +241,13 @@ fn eliminate(mut system: Vec<Vec<f64>>) -> Vec<f64> {
     let mut solved = vec![0.; size];
     for row in (0..size).rev() {
         let known = (row + 1..size).map(|column| system[row][column] * solved[column]).sum::<f64>();
-        solved[row] = (system[row][size] - known) / system[row][row];
+        let value = (system[row][size] - known) / system[row][row];
+        if !value.is_finite() {
+            return None;
+        }
+        solved[row] = value;
     }
-    solved
+    Some(solved)
 }
 
 /// Whether freeing `term` beside the terms `free`, whose costs are the
@@ -248,7 +257,7 @@ fn eliminate(mut system: Vec<Vec<f64>>) -> Vec<f64> {
 fn settles<const N: usize>(primary: &Sums<N>, settling: &Sums<N>, free: &[bool; N], term: usize) -> bool {
     let mut with = *free;
     with[term] = true;
-    !adds_column(primary, free, term) && solve(primary, settling, &with)[term] > 0.
+    !adds_column(primary, free, term) && solve(primary, settling, &with).is_some_and(|trial| trial[term] > 0.)
 }
 
 /// Whether freeing `term` beside the terms `free` adds a column of the
@@ -269,7 +278,7 @@ fn adds_column<const N: usize>(primary: &Sums<N>, free: &[bool; N], term: usize)
 /// terms': a dependent one's gradient is rounding (the primary is already
 /// best over its direction), and admitting it by that rounding could enter
 /// and leave it every pass; it is `settles`'s to decide.
-fn non_negative<const N: usize>(primary: &Sums<N>, settling: &Sums<N>) -> [f64; N] {
+fn non_negative<const N: usize>(primary: &Sums<N>, settling: &Sums<N>) -> Result<[f64; N], InvalidLine> {
     let mut costs = [0.; N];
     let mut free = [false; N];
     let scale = primary.xt.iter().fold(0f64, |most, value| most.max(value.abs())).max(f64::MIN_POSITIVE);
@@ -287,7 +296,13 @@ fn non_negative<const N: usize>(primary: &Sums<N>, settling: &Sums<N>) -> [f64; 
         };
         free[entering] = true;
         loop {
-            let trial = solve(primary, settling, &free);
+            let Some(trial) = solve(primary, settling, &free) else {
+                let term = (0..N).find(|&term| free[term]).unwrap_or(0);
+                return Err(InvalidLine { term, cost: f64::NAN });
+            };
+            if let Some(term) = (0..N).find(|&term| free[term] && !trial[term].is_finite()) {
+                return Err(InvalidLine { term, cost: trial[term] });
+            }
             if (0..N).all(|term| !free[term] || trial[term] > 0.) {
                 costs = trial;
                 break;
@@ -315,7 +330,7 @@ fn non_negative<const N: usize>(primary: &Sums<N>, settling: &Sums<N>) -> [f64; 
             }
         }
     }
-    costs
+    Ok(costs)
 }
 
 /// A line's state, what a decision taking it handles: no line yet, a line
@@ -502,5 +517,27 @@ mod tests {
         let direct = sums(&[(1., 2.), (3., 6.), (1., 4.)]).fit().unwrap().unwrap();
         close(fit.fixed(), direct.fixed());
         close(fit.slope(), direct.slope());
+    }
+
+    /// Singular systems and non-finite solves return `Err(InvalidLine)` rather
+    /// than panicking.
+    #[test]
+    fn singular_or_non_finite_systems_return_invalid_line() {
+        assert_eq!(eliminate(vec![vec![0., 0., 1.], vec![0., 1., 2.]]), None);
+        assert_eq!(eliminate(vec![vec![1., 2., 3.], vec![2., 4., 5.]]), None);
+
+        // Finite normal sums whose solve overflows to infinity.
+        let overflow = Sums {
+            weight: 1.,
+            xx: [[1., 0.], [0., 1e-300]],
+            xt: [1., 1e200],
+        };
+        assert!(matches!(overflow.settled_by(&Sums::default()), Some(Err(InvalidLine { .. }))));
+
+        // Non-finite sums in either primary or settling.
+        let mut with_nan = sums(&[(1., 2.), (2., 4.)]);
+        with_nan.xx[0][1] = f64::NAN;
+        assert!(matches!(with_nan.settled_by(&Sums::default()), Some(Err(InvalidLine { .. }))));
+        assert!(matches!(sums(&[(1., 2.), (2., 4.)]).settled_by(&with_nan), Some(Err(InvalidLine { .. }))));
     }
 }

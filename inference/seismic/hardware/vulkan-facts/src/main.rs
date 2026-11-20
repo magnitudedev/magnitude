@@ -587,6 +587,83 @@ void main() {
     Ok(json!({ "fma": fma, "shared_spec": shared }))
 }
 
+/// Destroys all Vulkan resources created during [`dispatch`] in reverse order
+/// on both normal return and `?` error paths.
+struct DispatchGuard<'a> {
+    device: &'a ash::Device,
+    shader_module: vk::ShaderModule,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: bool,
+    descriptor_pool: vk::DescriptorPool,
+    command_pool: vk::CommandPool,
+    fence: vk::Fence,
+    in_flight: bool,
+}
+
+impl<'a> DispatchGuard<'a> {
+    fn new(device: &'a ash::Device) -> Self {
+        Self {
+            device,
+            shader_module: vk::ShaderModule::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            mapped: false,
+            descriptor_pool: vk::DescriptorPool::null(),
+            command_pool: vk::CommandPool::null(),
+            fence: vk::Fence::null(),
+            in_flight: false,
+        }
+    }
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        let d = self.device;
+        unsafe {
+            if self.in_flight {
+                let _ = d.device_wait_idle();
+            }
+            if self.fence != vk::Fence::null() {
+                d.destroy_fence(self.fence, None);
+            }
+            if self.command_pool != vk::CommandPool::null() {
+                d.destroy_command_pool(self.command_pool, None);
+            }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                d.destroy_descriptor_pool(self.descriptor_pool, None);
+            }
+            if self.mapped {
+                d.unmap_memory(self.memory);
+            }
+            if self.buffer != vk::Buffer::null() {
+                d.destroy_buffer(self.buffer, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                d.free_memory(self.memory, None);
+            }
+            if self.pipeline != vk::Pipeline::null() {
+                d.destroy_pipeline(self.pipeline, None);
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                d.destroy_pipeline_layout(self.pipeline_layout, None);
+            }
+            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                d.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            }
+            if self.shader_module != vk::ShaderModule::null() {
+                d.destroy_shader_module(self.shader_module, None);
+            }
+        }
+    }
+}
+
 /// Builds a one-binding compute pipeline, runs one workgroup over `input` (u32 words) and returns
 /// the first `read` words, the ISA text (if captured) and the driver statistics.
 fn dispatch(
@@ -597,16 +674,20 @@ fn dispatch(
     read: usize,
 ) -> Result<(Vec<u32>, String, Vec<(String, String)>), Error> {
     let d = &c.device;
+    let mut guard = DispatchGuard::new(d);
     unsafe {
         let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)?;
+        guard.shader_module = module;
         let binding = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE)];
         let set_layout = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding), None)?;
+        guard.descriptor_set_layout = set_layout;
         let set_layouts = [set_layout];
         let layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts), None)?;
+        guard.pipeline_layout = layout;
         let map = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
         let spec = vk::SpecializationInfo::default().map_entries(&map).data(spec_bytes);
         let mut stage = vk::PipelineShaderStageCreateInfo::default()
@@ -628,6 +709,7 @@ fn dispatch(
                 None,
             )
             .map_err(|(_, e)| e)?[0];
+        guard.pipeline = pipeline;
 
         let (isa, stats) = match &c.executable {
             Some(x) => capture(x, pipeline)?,
@@ -638,6 +720,7 @@ fn dispatch(
             &vk::BufferCreateInfo::default().size(BUFFER_BYTES).usage(vk::BufferUsageFlags::STORAGE_BUFFER),
             None,
         )?;
+        guard.buffer = buffer;
         let req = d.get_buffer_memory_requirements(buffer);
         let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let type_index = (0..c.memory_types.memory_type_count)
@@ -650,12 +733,15 @@ fn dispatch(
             &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(type_index),
             None,
         )?;
+        guard.memory = memory;
         d.bind_buffer_memory(buffer, memory, 0)?;
         let mapped = d.map_memory(memory, 0, BUFFER_BYTES, vk::MemoryMapFlags::empty())? as *mut u32;
+        guard.mapped = true;
         std::ptr::copy_nonoverlapping(input.as_ptr(), mapped, input.len());
 
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 }];
         let pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)?;
+        guard.descriptor_pool = pool;
         let set = d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&set_layouts))?[0];
         let buffer_info = [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
         d.update_descriptor_sets(
@@ -667,6 +753,7 @@ fn dispatch(
             &[],
         );
         let command_pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.family), None)?;
+        guard.command_pool = command_pool;
         let command = d.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default().command_pool(command_pool).command_buffer_count(1),
         )?[0];
@@ -688,21 +775,13 @@ fn dispatch(
         );
         d.end_command_buffer(command)?;
         let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
+        guard.fence = fence;
         let commands = [command];
         d.queue_submit(c.queue, &[vk::SubmitInfo::default().command_buffers(&commands)], fence)?;
+        guard.in_flight = true;
         d.wait_for_fences(&[fence], true, u64::MAX)?;
+        guard.in_flight = false;
         let out = std::slice::from_raw_parts(mapped, read).to_vec();
-
-        d.destroy_fence(fence, None);
-        d.destroy_command_pool(command_pool, None);
-        d.destroy_descriptor_pool(pool, None);
-        d.unmap_memory(memory);
-        d.destroy_buffer(buffer, None);
-        d.free_memory(memory, None);
-        d.destroy_pipeline(pipeline, None);
-        d.destroy_pipeline_layout(layout, None);
-        d.destroy_descriptor_set_layout(set_layout, None);
-        d.destroy_shader_module(module, None);
         Ok((out, isa, stats))
     }
 }

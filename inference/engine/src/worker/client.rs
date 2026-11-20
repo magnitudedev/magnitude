@@ -395,6 +395,10 @@ impl State {
 
 /// The reader thread holds only `state`: dropping the last client closes
 /// the sender, which ends the worker and then the reader.
+///
+/// Lock order is strictly `sender -> state` (and `state` is never held across
+/// `sender.send`), so every state transition that emits a host message
+/// reaches the wire in the same order it mutated `State`.
 struct Connection {
     sender: Mutex<Box<dyn MessageSender<HostMessage>>>,
     state: Arc<Mutex<State>>,
@@ -402,14 +406,42 @@ struct Connection {
 }
 
 impl Connection {
+    fn send_locked(
+        sender: &mut dyn MessageSender<HostMessage>,
+        message: HostMessage,
+    ) -> Result<(), RequestError> {
+        sender.send(message).map_err(|error| RequestError::WorkerLost {
+            reason: error.to_string(),
+        })
+    }
+
     fn send(&self, message: HostMessage) -> Result<(), RequestError> {
-        self.sender
-            .lock()
-            .unwrap()
-            .send(message)
-            .map_err(|error| RequestError::WorkerLost {
-                reason: error.to_string(),
-            })
+        let mut sender = self.sender.lock().unwrap();
+        Self::send_locked(&mut **sender, message)
+    }
+
+    /// Run a state transition and its wire send under one `sender` lock,
+    /// releasing `state` before performing I/O. `prepare` returns the value
+    /// for the caller and an optional message to send; if sending fails,
+    /// `on_error` rolls back `State` before returning the error.
+    fn send_with_state<T>(
+        &self,
+        prepare: impl FnOnce(&mut State) -> Result<(T, Option<HostMessage>), RequestError>,
+        on_error: impl FnOnce(&mut State, &T, &RequestError),
+    ) -> Result<T, RequestError> {
+        let mut sender = self.sender.lock().unwrap();
+        let (value, message) = {
+            let mut state = self.state.lock().unwrap();
+            prepare(&mut state)?
+        };
+        if let Some(message) = message {
+            if let Err(error) = Self::send_locked(&mut **sender, message) {
+                let mut state = self.state.lock().unwrap();
+                on_error(&mut state, &value, &error);
+                return Err(error);
+            }
+        }
+        Ok(value)
     }
 }
 
@@ -654,25 +686,34 @@ impl EngineClient {
                 reason: "request output capacity must be positive".into(),
             });
         }
-        let id = self.connection.state.lock().unwrap().open_request(lease)?;
+        let output_capacity = request.output_capacity;
+        let id = self.connection.send_with_state(
+            |state| {
+                let id = state.open_request(lease)?;
+                Ok((
+                    id,
+                    Some(HostMessage::Admit(Admission {
+                        request_id: id,
+                        input: request.input,
+                        options: request.options,
+                        constraint: request.constraint,
+                        retention: request.retention,
+                        output_capacity,
+                    })),
+                ))
+            },
+            |state, &id, _| {
+                state.requests.remove(&id);
+                state.leases.remove(&id);
+            },
+        )?;
         // From here, dropping the handle cancels the request.
         let mut handle = EngineRequest {
             connection: self.connection.clone(),
             id,
-            output_capacity: request.output_capacity,
+            output_capacity,
             finished: false,
         };
-        if let Err(error) = self.connection.send(HostMessage::Admit(Admission {
-            request_id: id,
-            input: request.input,
-            options: request.options,
-            constraint: request.constraint,
-            retention: request.retention,
-            output_capacity: request.output_capacity,
-        })) {
-            self.connection.state.lock().unwrap().leases.remove(&id);
-            return Err(error);
-        }
         let admission = poll_fn(|cx| {
             let mut state = self.connection.state.lock().unwrap();
             let slot = state.requests.get_mut(&id).expect("live request slot");
@@ -712,42 +753,49 @@ impl EngineClient {
     /// until that release. One job claims at a time; a claim while one is
     /// pending joins it.
     pub async fn claim_measurement_room(&self, bytes: u64) -> Result<RoomAnswer, RequestError> {
-        let (reply, send_claim) = {
-            let mut state = self.connection.state.lock().unwrap();
-            if let Some(error) = &state.closed {
-                return Err(error.clone());
-            }
-            state.begin_room_claim()
-        };
-        if let Some(claim) = send_claim {
-            if let Err(error) = self
-                .connection
-                .send(HostMessage::ClaimMeasurementRoom { claim, bytes })
-            {
-                self.connection
-                    .state
-                    .lock()
-                    .unwrap()
-                    .abort_room_claim(claim, &reply, error.clone());
-                return Err(error);
-            }
-        }
+        let (reply, _) = self.connection.send_with_state(
+            |state| {
+                if let Some(error) = &state.closed {
+                    return Err(error.clone());
+                }
+                let (reply, send_claim) = state.begin_room_claim();
+                let message =
+                    send_claim.map(|claim| HostMessage::ClaimMeasurementRoom { claim, bytes });
+                Ok(((reply, send_claim), message))
+            },
+            |state, (reply, send_claim), error| {
+                if let Some(claim) = *send_claim {
+                    state.abort_room_claim(claim, reply, error.clone());
+                }
+            },
+        )?;
         Self::wait(reply).await
     }
 
     /// The measurement job holding the room was started as `process`: the
     /// worker credits its footprint against the room from now.
     pub fn attach_measurement_process(&self, process: magnitude_executor::ProcessId) -> Result<(), RequestError> {
-        self.check()?;
-        self.connection
-            .send(HostMessage::AttachMeasurementProcess { process })
+        self.connection.send_with_state(
+            |state| {
+                if let Some(error) = &state.closed {
+                    return Err(error.clone());
+                }
+                Ok(((), Some(HostMessage::AttachMeasurementProcess { process })))
+            },
+            |_, _, _| {},
+        )
     }
 
     /// The measurement job ended: the bank may grow into its room again. A
     /// claim still pending is withdrawn.
     pub fn release_measurement_room(&self) -> Result<(), RequestError> {
-        self.connection.state.lock().unwrap().release_room();
-        self.connection.send(HostMessage::ReleaseMeasurementRoom)
+        self.connection.send_with_state(
+            |state| {
+                state.release_room();
+                Ok(((), Some(HostMessage::ReleaseMeasurementRoom)))
+            },
+            |_, _, _| {},
+        )
     }
 
     /// The measurement job stored new records: the worker prices its
@@ -759,8 +807,13 @@ impl EngineClient {
     /// Ask the worker to unload and exit. Open requests fail with
     /// `ModelUnloaded { cause: Shutdown }`.
     pub fn shutdown(&self) -> Result<(), RequestError> {
-        self.connection.state.lock().unwrap().shutting_down = true;
-        self.connection.send(HostMessage::Shutdown)
+        self.connection.send_with_state(
+            |state| {
+                state.shutting_down = true;
+                Ok(((), Some(HostMessage::Shutdown)))
+            },
+            |_, _, _| {},
+        )
     }
 
     /// Join the pending query of this kind, or send one.
@@ -769,35 +822,31 @@ impl EngineClient {
         field: impl Fn(&mut State) -> &mut Option<Shared<T>>,
         query: HostMessage,
     ) -> Result<Shared<T>, RequestError> {
-        let (reply, should_send) = {
-            let mut state = self.connection.state.lock().unwrap();
-            if let Some(error) = &state.closed {
-                return Err(error.clone());
-            }
-            let slot = field(&mut state);
-            if let Some(reply) = slot {
-                (reply.clone(), false)
-            } else {
-                let reply = Arc::new(Mutex::new(SharedReply::default()));
-                *slot = Some(reply.clone());
-                (reply, true)
-            }
-        };
-        if should_send {
-            if let Err(error) = self.connection.send(query) {
-                let mut state = self.connection.state.lock().unwrap();
-                let slot = field(&mut state);
+        self.connection.send_with_state(
+            |state| {
+                if let Some(error) = &state.closed {
+                    return Err(error.clone());
+                }
+                let slot = field(state);
+                if let Some(reply) = slot {
+                    Ok((reply.clone(), None))
+                } else {
+                    let reply = Arc::new(Mutex::new(SharedReply::default()));
+                    *slot = Some(reply.clone());
+                    Ok((reply, Some(query)))
+                }
+            },
+            |state, reply, error| {
+                let slot = field(state);
                 if slot
                     .as_ref()
-                    .is_some_and(|pending| Arc::ptr_eq(pending, &reply))
+                    .is_some_and(|pending| Arc::ptr_eq(pending, reply))
                 {
                     *slot = None;
                 }
                 reply.lock().unwrap().fulfill_if_pending(Err(error.clone()));
-                return Err(error);
-            }
-        }
-        Ok(reply)
+            },
+        )
     }
 
     async fn wait<T: Clone>(reply: Shared<T>) -> Result<T, RequestError> {
@@ -858,12 +907,18 @@ impl EngineRequest {
         if event.is_terminal() {
             self.finished = true;
             self.connection.state.lock().unwrap().requests.remove(&id);
-        } else if self.connection.check_open() {
+        } else {
             // A lost worker already terminated the stream above.
-            let _ = self.connection.send(HostMessage::Credit {
-                request_id: id,
-                batches: 1,
-            });
+            let _ = self.connection.send_with_state(
+                |state| {
+                    let message = state.closed.is_none().then_some(HostMessage::Credit {
+                        request_id: id,
+                        batches: 1,
+                    });
+                    Ok(((), message))
+                },
+                |_, _, _| {},
+            );
         }
         Some(event)
     }
@@ -892,20 +947,23 @@ impl EngineRequest {
             return None;
         }
         let id = self.id;
-        {
-            let mut state = self.connection.state.lock().unwrap();
-            if state.closed.is_some() {
-                return None;
-            }
-            state
-                .requests
-                .get_mut(&id)
-                .expect("live request slot")
-                .status = None;
+        let sent = self.connection.send_with_state(
+            |state| {
+                if state.closed.is_some() {
+                    return Ok((false, None));
+                }
+                state
+                    .requests
+                    .get_mut(&id)
+                    .expect("live request slot")
+                    .status = None;
+                Ok((true, Some(HostMessage::Status { request_id: id })))
+            },
+            |_, _, _| {},
+        );
+        if !matches!(sent, Ok(true)) {
+            return None;
         }
-        self.connection
-            .send(HostMessage::Status { request_id: id })
-            .ok()?;
         poll_fn(|cx| {
             let mut state = self.connection.state.lock().unwrap();
             let slot = state.requests.get_mut(&id).expect("live request slot");
@@ -921,27 +979,21 @@ impl EngineRequest {
     }
 }
 
-impl Connection {
-    fn check_open(&self) -> bool {
-        self.state.lock().unwrap().closed.is_none()
-    }
-}
-
 impl Drop for EngineRequest {
     fn drop(&mut self) {
         if self.finished {
             return;
         }
-        let open = {
-            let mut state = self.connection.state.lock().unwrap();
-            state.requests.remove(&self.id);
-            state.closed.is_none()
-        };
-        if open {
-            let _ = self.connection.send(HostMessage::Cancel {
-                request_id: self.id,
-            });
-        }
+        let _ = self.connection.send_with_state(
+            |state| {
+                state.requests.remove(&self.id);
+                let message = state.closed.is_none().then_some(HostMessage::Cancel {
+                    request_id: self.id,
+                });
+                Ok(((), message))
+            },
+            |_, _, _| {},
+        );
     }
 }
 

@@ -56,8 +56,11 @@ pub(crate) fn allocation_error(error: AllocationFailure) -> ExecutionError {
 }
 
 enum Allocation {
-    /// A range of host pages of this crate's ([`WritableBuffer::new`]).
-    Pages(PageRange),
+    /// Whole host pages of their own ([`WritableBuffer::pages`]), never
+    /// tracked by [`Carver`].
+    Whole { block: Arc<PageBlock>, bytes: u64 },
+    /// A range carved from an entry's filling block ([`Carver`]).
+    Carved(PageRange),
     /// Host memory another owner holds ([`Buffer::borrowed`]).
     Borrowed(BorrowedRegion),
 }
@@ -179,12 +182,30 @@ impl Carver {
     /// closing returns it otherwise ([`Self::closed`]).
     fn returned(&self, block: Arc<PageBlock>) {
         let key = Self::key(block.entry());
-        let mut filling = self.filling.lock().expect("the carver's lock is never held across a panic");
-        if block.entry().closed() && filling.get(&key).is_some_and(|held| Arc::ptr_eq(&held.block, &block) && Arc::strong_count(&block) == 2) {
-            filling.remove(&key);
+        let mut to_drop = None;
+        {
+            let mut filling = self
+                .filling
+                .lock()
+                .expect("the carver's lock is never held across a panic");
+            if filling
+                .get(&key)
+                .is_some_and(|held| Arc::ptr_eq(&held.block, &block))
+            {
+                if block.entry().closed() && Arc::strong_count(&block) == 2 {
+                    to_drop = Some((filling.remove(&key), block));
+                } else {
+                    // `filling` holds another handle to `block` while the lock
+                    // is held, so dropping `block` here only decrements the
+                    // refcount (never running `PageBlock::drop`) and makes
+                    // `Filling::idle()` visible before releasing the lock.
+                    drop(block);
+                }
+            } else {
+                to_drop = Some((None, block));
+            }
         }
-        drop(block);
-        drop(filling);
+        drop(to_drop);
     }
 
     /// `bytes` (at most [`CARVED_LIMIT`], at least one byte's room) at
@@ -199,33 +220,38 @@ impl Carver {
     /// dropped with nothing beside it reuses its block.
     fn carve(&self, bytes: u64, alignment: u64, page: u64, entry: &Arc<dyn Entry>) -> Result<PageRange, ExecutionError> {
         let key = Self::key(entry);
-        let mut filling = self.filling.lock().expect("the carver's lock is never held across a panic");
-        if let Some(current) = filling.get_mut(&key) {
-            if current.idle() && current.used != 0 {
-                // Every byte of a buffer reads zero.
-                // In the block, which nothing else holds.
-                unsafe { std::ptr::write_bytes(current.block.base().as_ptr(), 0, current.used as usize) };
-                current.used = 0;
-            }
-            let offset = current.used.next_multiple_of(alignment);
-            if offset + bytes.max(1) <= current.block.bytes() {
-                current.used = offset + bytes;
-                return Ok(PageRange { block: Some(current.block.clone()), offset, bytes });
+        {
+            let mut filling = self.filling.lock().expect("the carver's lock is never held across a panic");
+            if let Some(current) = filling.get_mut(&key) {
+                if current.idle() && current.used != 0 {
+                    // Every byte of a buffer reads zero.
+                    // In the block, which nothing else holds.
+                    unsafe { std::ptr::write_bytes(current.block.base().as_ptr(), 0, current.used as usize) };
+                    current.used = 0;
+                }
+                let offset = current.used.next_multiple_of(alignment);
+                if offset + bytes.max(1) <= current.block.bytes() {
+                    current.used = offset + bytes;
+                    return Ok(PageRange { block: Some(current.block.clone()), offset, bytes });
+                }
             }
         }
         let pages = bytes.max(1).div_ceil(page).max(CARVED_BLOCK_PAGES);
         let block = PageBlock::allocate(pages * page, entry)?;
         let room = |held: &Filling| held.block.bytes() - held.used;
         let fresh = Filling { block: block.clone(), used: bytes };
-        let first = match filling.get(&key) {
-            Some(current) if !current.idle() && room(current) >= room(&fresh) => false,
-            current => {
-                let first = current.is_none();
-                filling.insert(key, fresh);
-                first
+        let (first, discarded) = {
+            let mut filling = self.filling.lock().expect("the carver's lock is never held across a panic");
+            match filling.get(&key) {
+                Some(current) if !current.idle() && room(current) >= room(&fresh) => (false, Some(fresh)),
+                current => {
+                    let first = current.is_none();
+                    let replaced = filling.insert(key, fresh);
+                    (first, replaced)
+                }
             }
         };
-        drop(filling);
+        drop(discarded);
         // Run at once where the holder is gone already: the range below
         // keeps the block, which returns as it drops ([`Self::returned`]).
         if first {
@@ -285,7 +311,7 @@ impl WritableBuffer {
             return Self::pages(bytes, entry);
         }
         let range = Carver::process().carve(bytes, alignment.max(LEAST_ALIGNMENT), page, entry)?;
-        Ok(Self(Buffer { inner: Arc::new(Allocation::Pages(range)) }))
+        Ok(Self(Buffer { inner: Arc::new(Allocation::Carved(range)) }))
     }
 
     /// `bytes` in whole host pages of its own, at least one, never carved:
@@ -299,8 +325,8 @@ impl WritableBuffer {
             .max(1)
             .checked_next_multiple_of(page)
             .ok_or_else(|| allocation_error(AllocationFailure::Unrepresentable))?;
-        let range = PageRange { block: Some(PageBlock::allocate(whole, entry)?), offset: 0, bytes };
-        Ok(Self(Buffer { inner: Arc::new(Allocation::Pages(range)) }))
+        let block = PageBlock::allocate(whole, entry)?;
+        Ok(Self(Buffer { inner: Arc::new(Allocation::Whole { block, bytes }) }))
     }
 
     /// Copies `bytes` into the buffer at `offset`. The range lies inside the
@@ -346,7 +372,8 @@ impl Buffer {
     /// Logical bytes.
     pub fn len(&self) -> u64 {
         match &*self.inner {
-            Allocation::Pages(range) => range.bytes,
+            Allocation::Whole { bytes, .. } => *bytes,
+            Allocation::Carved(range) => range.bytes,
             Allocation::Borrowed(region) => region.len,
         }
     }
@@ -358,8 +385,9 @@ impl Buffer {
     /// The host address of byte 0. Valid while any handle is alive.
     pub fn data_pointer(&self) -> *mut u8 {
         match &*self.inner {
+            Allocation::Whole { block, .. } => block.base().as_ptr(),
             // In the block by construction.
-            Allocation::Pages(range) => unsafe { range.block().base().as_ptr().add(range.offset as usize) },
+            Allocation::Carved(range) => unsafe { range.block().base().as_ptr().add(range.offset as usize) },
             Allocation::Borrowed(region) => region.pointer.as_ptr(),
         }
     }
@@ -658,6 +686,50 @@ mod tests {
         assert_eq!(tally.held(), whole, "a live handle keeps the block");
         drop(handle);
         assert_eq!(tally.held(), 0);
+    }
+
+    /// Re-entering the carver from `Entry::freed` when a carved block drops
+    /// must not deadlock: `PageBlock::drop` runs outside the carver's lock.
+    #[test]
+    fn carved_block_drop_runs_outside_carver_lock() {
+        struct Reentrant {
+            tally: Tally,
+            other: Arc<dyn Entry>,
+        }
+
+        impl Entry for Reentrant {
+            fn store(&self) -> &StoreIdentity {
+                self.tally.store()
+            }
+            fn change(&self) -> Change {
+                self.tally.change()
+            }
+            fn on_close(&self, closed: Box<dyn FnOnce() + Send>) {
+                self.tally.on_close(closed);
+            }
+            fn closed(&self) -> bool {
+                self.tally.closed()
+            }
+            fn take(&self, change: &Change, bytes: u64, wiring: Wiring) -> Result<(), Refused> {
+                self.tally.take(change, bytes, wiring)
+            }
+            fn took(&self, change: &Change, bytes: u64, wiring: Wiring) {
+                self.tally.took(change, bytes, wiring);
+            }
+            fn freed(&self, change: &Change, bytes: u64, wiring: Wiring) {
+                self.tally.freed(change, bytes, wiring);
+                let probe = WritableBuffer::new(64, 64, &self.other).expect("reentrant carve");
+                drop(probe);
+            }
+        }
+
+        let other: Arc<dyn Entry> = Arc::new(Tally::unbounded(StoreIdentity::HostRam));
+        let reentrant: Arc<dyn Entry> = Arc::new(Reentrant {
+            tally: Tally::unbounded(StoreIdentity::HostRam),
+            other,
+        });
+        let buffer = WritableBuffer::new(64, 64, &reentrant).expect("buffer");
+        drop(buffer);
     }
 }
 

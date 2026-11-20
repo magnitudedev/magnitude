@@ -4,7 +4,7 @@ use pyo3::types::{PyBytes, PyTuple};
 use seismic::dynamic as d;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 fn error(e: d::Error) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err((e.kind.to_owned(), e.message))
@@ -14,14 +14,15 @@ fn element(name: &str) -> PyResult<seismic::Element> {
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("unknown element {name}")))
 }
 /// The process's devices, over the inventory discovered on first use.
-fn discovered() -> PyResult<&'static Mutex<seismic::Devices>> {
-    static DISCOVERED: OnceLock<Mutex<seismic::Devices>> = OnceLock::new();
-    if let Some(c) = DISCOVERED.get() {
-        return Ok(c);
+fn with_discovered<R>(f: impl FnOnce(&seismic::Devices) -> PyResult<R>) -> PyResult<R> {
+    static DISCOVERED: Mutex<Option<seismic::Devices>> = Mutex::new(None);
+    let mut guard = DISCOVERED.lock().expect("discovered devices lock poisoned");
+    if guard.is_none() {
+        let discovered = seismic::Devices::discover(&[])
+            .map_err(|e| error(d::Error::new("TargetError", e)))?;
+        *guard = Some(discovered);
     }
-    let c = seismic::Devices::discover(&[]).map_err(|e| error(d::Error::new("TargetError", e)))?;
-    let _ = DISCOVERED.set(Mutex::new(c));
-    Ok(DISCOVERED.get().expect("devices discovered"))
+    f(guard.as_ref().expect("devices discovered"))
 }
 
 /// Each executor opened in the process, with the tallies of its stores
@@ -108,18 +109,19 @@ impl Device {
 }
 #[pyfunction]
 fn devices() -> PyResult<Vec<(String, String, String)>> {
-    let c = discovered()?.lock().unwrap();
-    Ok(c.topology()
-        .executors()
-        .iter()
-        .map(|i| {
-            (
-                i.selector().to_string(),
-                i.name().to_owned(),
-                i.backend().as_str().to_owned(),
-            )
-        })
-        .collect())
+    with_discovered(|c| {
+        Ok(c.topology()
+            .executors()
+            .iter()
+            .map(|i| {
+                (
+                    i.selector().to_string(),
+                    i.name().to_owned(),
+                    i.backend().as_str().to_owned(),
+                )
+            })
+            .collect())
+    })
 }
 /// Opens an exact device selector (`host-cpu`, `metal:…`, `cuda:…`), or,
 /// for low-level use, the first device of a backend name (`cpu`, `metal`).
@@ -127,26 +129,28 @@ fn devices() -> PyResult<Vec<(String, String, String)>> {
 fn device(py: Python<'_>, selector: &str) -> PyResult<Device> {
     let selector = selector.to_owned();
     py.detach(move || {
-        let c = discovered()?.lock().unwrap();
-        let id = match selector.parse::<seismic::ExecutorSelector>() {
-            Ok(exact) => c
-                .resolve(exact)
-                .map_err(|e| error(d::Error::new("TargetError", e)))?,
-            Err(_) => c
-                .topology()
-                .executors()
-                .iter()
-                .find(|i| i.backend().as_str() == selector)
-                .map(|i| i.id())
-                .ok_or_else(|| {
-                    error(d::Error::new(
-                        "TargetError",
-                        format!("no device matches `{selector}`"),
-                    ))
-                })?,
-        };
-        let inner = open_tallied(&c, id).map_err(|e| error(d::Error::new("TargetError", e)))?;
-        Ok(Device::opened(inner))
+        with_discovered(|c| {
+            let id = match selector.parse::<seismic::ExecutorSelector>() {
+                Ok(exact) => c
+                    .resolve(exact)
+                    .map_err(|e| error(d::Error::new("TargetError", e)))?,
+                Err(_) => c
+                    .topology()
+                    .executors()
+                    .iter()
+                    .find(|i| i.backend().as_str() == selector)
+                    .map(|i| i.id())
+                    .ok_or_else(|| {
+                        error(d::Error::new(
+                            "TargetError",
+                            format!("no device matches `{selector}`"),
+                        ))
+                    })?,
+            };
+            let inner =
+                open_tallied(c, id).map_err(|e| error(d::Error::new("TargetError", e)))?;
+            Ok(Device::opened(inner))
+        })
     })
 }
 

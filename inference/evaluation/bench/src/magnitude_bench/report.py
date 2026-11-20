@@ -251,6 +251,10 @@ def markdown(summary: dict) -> str:
             "score. All recorded requests enter accuracy denominators; unscored failures earn "
             "zero. Partial field accuracy does not penalize extra keys; exact accuracy does. "
             "Latency includes correct and incorrect protocol-complete responses.",
+            "vision": "Vision image-value check; strict JSON answers checked as retrieved fields. "
+            "All recorded requests enter accuracy denominators; unscored failures earn zero. "
+            "Partial field accuracy does not penalize extra keys; exact accuracy does. "
+            "Latency includes correct and incorrect protocol-complete responses.",
             "repeat": "Moby Dick repeat: each request repeats a Moby Dick passage back; no "
             "answer-quality scoring. EOS or reaching the output budget ends a valid "
             "measurement; actual lengths are in summary.json.",

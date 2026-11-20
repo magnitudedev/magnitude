@@ -719,7 +719,7 @@ mod tests {
             zero_seed_bytes: 16,
             recurrent_pool_bytes: 48,
             granule: BANK_GRANULE,
-            block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE },
+            block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE, absent: BANK_GRANULE },
             cached_bank_slab: Default::default(),
         };
         let classes = state_copy_classes(&plan, None, &[1, 2, 4, 8]).unwrap();
@@ -760,7 +760,7 @@ mod tests {
             zero_seed_bytes: 16,
             recurrent_pool_bytes: 160,
             granule: BANK_GRANULE,
-            block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE },
+            block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE, absent: BANK_GRANULE },
             cached_bank_slab: Default::default(),
         };
         let banks = plan.bank_capacity.storage_total().unwrap();

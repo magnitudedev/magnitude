@@ -99,11 +99,20 @@ pub fn history_pages(row_limit: usize, appended_rows: usize) -> HistoryPages {
     };
     // No page below this many tiles meets the limit (each span holds at most
     // a page), so the search starts there and settles within a few tiles.
-    let mut tiles = ((row_limit + appended_rows) / (MAX_HISTORY_SPANS * SLAB_ROW_TILE)).max(1);
-    while span_limit(tiles * SLAB_ROW_TILE) > MAX_HISTORY_SPANS {
-        tiles += 1;
+    let max_tiles = usize::MAX / SLAB_ROW_TILE;
+    let total = row_limit as u128 + appended_rows as u128;
+    let mut lo = ((total / (MAX_HISTORY_SPANS as u128 * SLAB_ROW_TILE as u128)) as usize)
+        .clamp(1, max_tiles);
+    let mut hi = max_tiles;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if span_limit(mid * SLAB_ROW_TILE) > MAX_HISTORY_SPANS {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
-    let page_rows = tiles * SLAB_ROW_TILE;
+    let page_rows = lo * SLAB_ROW_TILE;
     HistoryPages { page_rows, span_limit: span_limit(page_rows) }
 }
 
@@ -123,8 +132,11 @@ pub fn history_geometry(
 /// page holds `in_place` more in place: whatever the last page cannot hold,
 /// rounded up to whole pages of `page_rows`. The one rule of a history's
 /// page demand (`StateStore::page_demand`, [`crate::state_bytes`]).
-pub(crate) fn page_demand_rows(page_rows: usize, in_place: usize, count: usize) -> usize {
-    count.saturating_sub(in_place).div_ceil(page_rows) * page_rows
+pub(crate) fn page_demand_rows(page_rows: usize, in_place: usize, count: usize) -> Option<usize> {
+    count
+        .saturating_sub(in_place)
+        .div_ceil(page_rows)
+        .checked_mul(page_rows)
 }
 
 /// The most pages a Window history occupies, its histories holding at most

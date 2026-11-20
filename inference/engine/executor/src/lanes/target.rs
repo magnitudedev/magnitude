@@ -212,19 +212,35 @@ impl TargetLaunchInputs {
         if self
             .batch
             .slots()
+            .any(|slot| front[slot.span()].first() == Some(&true))
+        {
+            return Err(invalid(
+                "a slot's first row cannot be a front row".into(),
+            ));
+        }
+        if self
+            .batch
+            .slots()
             .zip(&self.guesses)
             .any(|(slot, guess)| guess.front.len() != if host { fronts(&slot) } else { 0 })
         {
             return Err(invalid("front rows' guesses are the host's exactly where it builds the tokens".into()));
         }
-        if let TargetTokens::Selected { selected, .. } = &self.tokens {
+        if let TargetTokens::Selected { selected, guesses } = &self.tokens {
             let rows = self.batch.class().rows() as u64;
-            let front = self.batch.upload().front;
-            if selected.tensor().extents() != [rows, 2]
+            let valid_pairs = |tensor: &GraphOutputTensor| {
+                tensor.tensor().element() == seismic::Element::i32()
+                    && tensor.tensor().extents() == [rows, 2]
+            };
+            let has_front = self.batch.slots().any(|slot| fronts(&slot) > 0);
+            if !valid_pairs(selected)
+                || guesses
+                    .as_ref()
+                    .map_or(has_front, |guesses| !valid_pairs(guesses))
                 || self
                     .batch
                     .slots()
-                    .any(|slot| slot.rows() - front[slot.span()].iter().filter(|&&front| front).count() != 1)
+                    .any(|slot| slot.rows() - fronts(&slot) != 1)
                 || self.conditioning.iter().any(Option::is_some)
             {
                 return Err(invalid(
@@ -244,6 +260,8 @@ impl TargetLaunchInputs {
                 "workspace or output lease differs from batch domain/class".into(),
             ));
         }
+        let mut expected: Vec<[i32; 2]> = Vec::new();
+        let mut occupied: Vec<bool> = Vec::new();
         for (index, (((slot, advance), conditioning), slices)) in self
             .batch
             .slots()
@@ -339,11 +357,11 @@ impl TargetLaunchInputs {
                 for (row, (destination, visible)) in
                     packed.destinations.iter().zip(packed.visible).enumerate()
                 {
-                    let expected = destinations
+                    let expected_destination = destinations
                         .get(row)
                         .map(|destination| i32::try_from(*destination).ok())
                         .unwrap_or(Some(-1));
-                    if expected != Some(*destination) {
+                    if expected_destination != Some(*destination) {
                         return Err(invalid(format!(
                             "slot {index} row {row} destination differs"
                         )));
@@ -351,41 +369,45 @@ impl TargetLaunchInputs {
                     // Each row reads its domain's accepted rows from its
                     // query's window start.
                     let from = kind.visible_from(advance.position() + row);
-                    let expected = advance
-                        .visible_ranges(domain, from)
-                        .into_iter()
-                        .map(|(start, count)| {
-                            let end = start.checked_add(count)?;
-                            Some([i32::try_from(start).ok()?, i32::try_from(end).ok()?])
-                        })
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or_else(|| {
-                            invalid(format!(
-                                "slot {index} history range exceeds packed coordinates"
-                            ))
-                        })?;
-                    let supplied = visible
-                        .iter()
-                        .copied()
-                        .filter(|range| *range != [0, 0])
-                        .collect::<Vec<_>>();
-                    let mut prepared = expected.clone();
-                    if let Some(appended) = &appended {
-                        // The row's first fresh row in the slot, as
-                        // `accepted_history` reports it.
-                        let fresh_start = from.saturating_sub(advance.position());
-                        prepared.extend(appended.causal_prior(fresh_start, row).map_err(invalid)?);
+                    expected.clear();
+                    for (start, count) in advance.visible_ranges(domain, from) {
+                        let range = start
+                            .checked_add(count)
+                            .and_then(|end| {
+                                Some([i32::try_from(start).ok()?, i32::try_from(end).ok()?])
+                            })
+                            .ok_or_else(|| {
+                                invalid(format!(
+                                    "slot {index} history range exceeds packed coordinates"
+                                ))
+                            })?;
+                        expected.push(range);
                     }
+                    let supplied = visible.iter().copied().filter(|range| *range != [0, 0]);
                     // Media rows retain their declared dense fresh block;
                     // causal compressed rows may additionally see exactly
                     // their own earlier destinations, never a future row.
-                    if supplied != expected
-                        && (supplied != prepared
-                            || packed.fresh[row][1] - packed.fresh[row][0] != 1)
-                    {
-                        return Err(invalid(format!(
-                            "slot {index} visibility differs from accepted state"
-                        )));
+                    if supplied.clone().ne(expected.iter().copied()) {
+                        let causal_match = if packed.fresh[row][1] - packed.fresh[row][0] == 1 {
+                            if let Some(appended) = &appended {
+                                // The row's first fresh row in the slot, as
+                                // `accepted_history` reports it.
+                                let fresh_start = from.saturating_sub(advance.position());
+                                expected.extend(
+                                    appended.causal_prior(fresh_start, row).map_err(invalid)?,
+                                );
+                                supplied.eq(expected.iter().copied())
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !causal_match {
+                            return Err(invalid(format!(
+                                "slot {index} visibility differs from accepted state"
+                            )));
+                        }
                     }
                 }
             }
@@ -401,35 +423,38 @@ impl TargetLaunchInputs {
                     )));
                 }
             }
-            let mut occupied = vec![false; slot.rows()];
-            for slice in slices {
-                let source = slice.source.features.allocation();
-                let end = slice
-                    .destination
-                    .checked_add(slice.source.count)
-                    .ok_or_else(|| {
-                        invalid(format!("slot {index} conditioning destination overflows"))
-                    })?;
-                let source_end = slice
-                    .source
-                    .start
-                    .checked_add(slice.source.count)
-                    .ok_or_else(|| {
-                        invalid(format!("slot {index} conditioning source overflows"))
-                    })?;
-                if slice.source.features.domain() != domain
-                    || source.width() != hidden_width
-                    || source_end > source.rows()
-                    || end > slot.rows()
-                    || slice.source.count == 0
-                    || source.tensor().is_err()
-                    || occupied[slice.destination..end].iter().any(|set| *set)
-                {
-                    return Err(invalid(format!(
-                        "slot {index} conditioning slice is invalid"
-                    )));
+            if !slices.is_empty() {
+                occupied.clear();
+                occupied.resize(slot.rows(), false);
+                for slice in slices {
+                    let source = slice.source.features.allocation();
+                    let end = slice
+                        .destination
+                        .checked_add(slice.source.count)
+                        .ok_or_else(|| {
+                            invalid(format!("slot {index} conditioning destination overflows"))
+                        })?;
+                    let source_end = slice
+                        .source
+                        .start
+                        .checked_add(slice.source.count)
+                        .ok_or_else(|| {
+                            invalid(format!("slot {index} conditioning source overflows"))
+                        })?;
+                    if slice.source.features.domain() != domain
+                        || source.width() != hidden_width
+                        || source_end > source.rows()
+                        || end > slot.rows()
+                        || slice.source.count == 0
+                        || source.tensor().is_err()
+                        || occupied[slice.destination..end].iter().any(|set| *set)
+                    {
+                        return Err(invalid(format!(
+                            "slot {index} conditioning slice is invalid"
+                        )));
+                    }
+                    occupied[slice.destination..end].fill(true);
                 }
-                occupied[slice.destination..end].fill(true);
             }
         }
         Ok(())
@@ -637,14 +662,19 @@ impl TargetLaunchCore {
         let upload = self.batch.upload();
         let mut rows = vec![[0; 2]; upload.class.rows()];
         for (slot, guess) in self.batch.slots().zip(&self.guesses) {
-            let front = slot.span().filter(|&row| upload.front[row]).collect::<Vec<_>>();
-            assert_eq!(guess.front.len(), front.len(), "each front row of host tokens runs the host's guess");
+            let mut front = slot.span().filter(|&row| upload.front[row]);
+            let mut matched = 0;
             // An idle row's stays zero: it guessed nothing.
-            for (row, guess) in front.into_iter().zip(&guess.front) {
+            for (row, guess) in (&mut front).zip(&guess.front) {
+                matched += 1;
                 if let Some(guess) = guess {
                     rows[row - 1] = [i32::try_from(guess.token.0).expect("a token fits i32"), guess.kind.word()];
                 }
             }
+            assert!(
+                matched == guess.front.len() && front.next().is_none(),
+                "each front row of host tokens runs the host's guess"
+            );
         }
         rows
     }
@@ -663,5 +693,387 @@ impl TargetLaunchCore {
             self.conditioning,
             self.conditioning_slices,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operation::{FrontRow, GuessKind, Sampling, SelectSpec, Shaping, TokenId, WorkKind};
+    use crate::{NativeGraphCharge, NativeGraphPool};
+    use magnitude_batching::{ClassLimits, Demand, Row, RowHistory, Slot};
+    use magnitude_kernels::{selection_notice, shape_rows};
+    use magnitude_state::{
+        BankCapacity, ComponentDescriptor, HistoryDomainLayout, HistoryDomainPlan, KvCodec,
+        LayerRef, OwnedStateAdvance, RowDemand, StoreBindings,
+    };
+    use seismic::{
+        BackendName, Charges, Device, Element, NativeExecutionArena, NativeGraphFamily,
+        NativeSpecialization,
+    };
+
+    fn test_pool(
+        charges: &Charges,
+        domain: &ResourceDomainId,
+        family: &NativeGraphFamily,
+        activations: usize,
+        output_slots: usize,
+    ) -> NativeGraphPool {
+        let arena = NativeExecutionArena::new(charges, family.workspace_bytes().max(64)).unwrap();
+        let charge = NativeGraphCharge {
+            workspace_bytes: family.workspace_bytes(),
+            sync_bytes: family.sync_bytes(),
+            output_bytes: family.output_bytes(),
+            upload_regions: crate::planning::serial_upload_regions(family.upload_bytes()),
+            activations,
+            output_slots,
+            committed_bytes: 0,
+            graphs: family.graphs(),
+        };
+        NativeGraphPool::new(
+            domain.clone(),
+            family,
+            &charge,
+            &arena,
+            charges,
+            crate::resources::Outputs::Host,
+        )
+        .unwrap()
+    }
+
+    fn pair_output(charges: &Charges, element: Element, rows: u64) -> GraphOutputTensor {
+        let tensor = seismic::Tensor::zeros(charges, element, &[rows, 2]).unwrap();
+        GraphOutputTensor::from_test_tensor(tensor)
+    }
+
+    fn i32_pair_output(
+        _device: &Device,
+        charges: &Charges,
+        _domain: &ResourceDomainId,
+        rows: u64,
+    ) -> GraphOutputTensor {
+        pair_output(charges, Element::i32(), rows)
+    }
+
+    fn f32_pair_output(
+        _device: &Device,
+        charges: &Charges,
+        _domain: &ResourceDomainId,
+        rows: u64,
+    ) -> GraphOutputTensor {
+        pair_output(charges, Element::f32(), rows)
+    }
+
+    fn test_store(device: &Device, charges: &Charges) -> (Rc<StateStore>, StoreBindings) {
+        let granule = 256 << 10;
+        let entry: std::sync::Arc<dyn seismic::memory::Entry> = std::sync::Arc::new(
+            seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam),
+        );
+        let pool = seismic::Pool::open(
+            &seismic::PoolCharges::one(&device.charges_in(seismic::Contract::Shared, entry)),
+            seismic::Contract::Shared,
+            granule,
+            granule,
+        )
+        .unwrap();
+        StateStore::new(
+            charges,
+            pool,
+            2048,
+            32,
+            vec![HistoryDomainPlan {
+                layout: HistoryDomainLayout::Token {
+                    components: vec![ComponentDescriptor::new(
+                        LayerRef::Target(0),
+                        KvCodec::Dense.spec(seismic::DType::F32, 64, 64),
+                        1,
+                    )
+                    .unwrap()],
+                },
+                logical_rows: 2048,
+            }],
+            vec![],
+            BankCapacity {
+                active: 4,
+                in_flight: 4,
+                retained: 0,
+            },
+        )
+        .unwrap()
+    }
+
+    fn dummy_select() -> SelectSpec {
+        SelectSpec {
+            sampling: Sampling::Greedy,
+            seed: 0,
+            position: 0,
+            domain: 0,
+            mask: None,
+            shaping: Shaping::default(),
+            history: None,
+        }
+    }
+
+    fn build_slot_and_advance(
+        store: &Rc<StateStore>,
+        bindings: &mut StoreBindings,
+        rows: usize,
+        front: usize,
+    ) -> (Slot, TentativeAdvance) {
+        let history_domain = store.sole_history_domain().unwrap();
+        bindings
+            .provision(&[RowDemand { domain: history_domain, rows }], 0)
+            .unwrap();
+        let advance = TentativeAdvance::Accepted(
+            OwnedStateAdvance::begin(store.create().unwrap(), rows)
+                .ok()
+                .unwrap(),
+        );
+        let binding = advance.bindings();
+        let slot_rows = (0..rows)
+            .map(|row| Row {
+                token: (row + 1) as i32,
+                coordinates: [0, 0, 0, 0],
+                histories: vec![RowHistory {
+                    visible: Vec::new(),
+                    fresh_start: 0,
+                    bidirectional_end: None,
+                    destination: binding.destinations[history_domain.0][row] as i32,
+                }],
+                demand: Demand::NONE,
+                select: None,
+            })
+            .collect();
+        let slot = Slot {
+            rows: slot_rows,
+            bank: i32::try_from(binding.previous_bank).unwrap(),
+            previous_tape: 0,
+            following_bank: i32::try_from(binding.following_bank).unwrap(),
+            stop: 1,
+            front,
+        };
+        (slot, advance)
+    }
+
+    fn make_launch_inputs(
+        store: &Rc<StateStore>,
+        bindings: &mut StoreBindings,
+        leases: &NativeGraphPool,
+        rows: usize,
+        front: usize,
+        tokens: TargetTokens,
+    ) -> TargetLaunchInputs {
+        let (slot, advance) = build_slot_and_advance(store, bindings, rows, front);
+        let batch = ValidatedTargetBatch::from_slots(
+            &[slot],
+            32,
+            ClassLimits {
+                rows: 4,
+                segments: 4,
+                slots: 2,
+            },
+        )
+        .unwrap();
+        let front_kind = match &tokens {
+            TargetTokens::Host => FrontKind::Host(GuessKind::Chained),
+            TargetTokens::Selected { .. } => FrontKind::Device,
+        };
+        let operation = Operation::Forward {
+            request: RequestId(1),
+            kind: WorkKind::Decode,
+            tokens: (0..rows).map(|r| TokenId((r + 1) as u32)).collect(),
+            position: 0,
+            conditioning: None,
+            demand: Demand::NONE,
+            select: Vec::new(),
+            committed: 1,
+            prime: None,
+            front: (0..front)
+                .map(|_| FrontRow {
+                    select: dummy_select(),
+                    kind: front_kind,
+                })
+                .collect(),
+            chain: None,
+        };
+        TargetLaunchInputs::new(
+            batch,
+            LaunchWork::Generation,
+            vec![RequestId(1)],
+            tokens,
+            vec![advance],
+            vec![None],
+            vec![Vec::new()],
+            &[operation],
+            leases.acquire_workspace().unwrap(),
+            leases.acquire_output().unwrap(),
+            leases.acquire_workspace().unwrap(),
+            leases.acquire_output().unwrap(),
+        )
+    }
+
+    #[test]
+    fn selected_tokens_validate_element_and_guesses() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
+        let charges = Charges::tally(&device);
+        let domain = ResourceDomainId::new("target-selected-test").unwrap();
+        let (store, mut bindings) = test_store(&device, &charges);
+
+        // Lease pool backed by a minimal graph family.
+        let implementation = selection_notice::native_implementation(&device)
+            .unwrap()
+            .unwrap();
+        let copy = selection_notice::native_for_device(
+            &device,
+            &implementation
+                .default_specialization(&NativeSpecialization::new())
+                .unwrap(),
+        )
+        .unwrap();
+        let mut graph = device.native_graph();
+        let selection = graph.port(Element::i32(), &[2, 2]).unwrap();
+        let mut notice = graph.local_for(&copy, "notice", &[("M", 2)]).unwrap();
+        graph
+            .enqueue(
+                &copy,
+                selection_notice::WorkflowArgs {
+                    selection: selection.tensor().into(),
+                    notice: notice.tensor_mut().into(),
+                },
+            )
+            .unwrap();
+        graph.export(notice.tensor()).unwrap();
+        let plan = graph.seal().unwrap();
+        let family = NativeGraphFamily::new(&[plan], 0).unwrap();
+        let leases = test_pool(&charges, &domain, &family, 2, 2);
+
+        // Determine the class row count for a 2-row (1 exact + 1 front) decode batch.
+        let (probe_slot, _) = build_slot_and_advance(&store, &mut bindings, 2, 1);
+        let class_rows = ValidatedTargetBatch::from_slots(
+            &[probe_slot],
+            32,
+            ClassLimits {
+                rows: 4,
+                segments: 4,
+                slots: 2,
+            },
+        )
+        .unwrap()
+        .class()
+        .rows() as u64;
+
+        let valid_i32 = i32_pair_output(&device, &charges, &domain, class_rows);
+        let wrong_extent_i32 = i32_pair_output(&device, &charges, &domain, class_rows + 1);
+        let wrong_element_f32 = f32_pair_output(&device, &charges, &domain, class_rows);
+
+        // Wrong element on `selected` (f32 instead of i32, matching [rows, 2] extents) is rejected.
+        let inputs = make_launch_inputs(
+            &store,
+            &mut bindings,
+            &leases,
+            2,
+            1,
+            TargetTokens::Selected {
+                selected: wrong_element_f32.clone(),
+                guesses: Some(valid_i32.clone()),
+            },
+        );
+        assert!(ValidatedTargetLaunch::new(inputs, &store, &domain, 64, 64).is_err());
+
+        // Wrong extents on `selected` is rejected.
+        let inputs = make_launch_inputs(
+            &store,
+            &mut bindings,
+            &leases,
+            2,
+            1,
+            TargetTokens::Selected {
+                selected: wrong_extent_i32.clone(),
+                guesses: Some(valid_i32.clone()),
+            },
+        );
+        assert!(ValidatedTargetLaunch::new(inputs, &store, &domain, 64, 64).is_err());
+
+        // Wrong element on `guesses` (f32 instead of i32) is rejected.
+        let inputs = make_launch_inputs(
+            &store,
+            &mut bindings,
+            &leases,
+            2,
+            1,
+            TargetTokens::Selected {
+                selected: valid_i32.clone(),
+                guesses: Some(wrong_element_f32),
+            },
+        );
+        assert!(ValidatedTargetLaunch::new(inputs, &store, &domain, 64, 64).is_err());
+
+        // Wrong extents on `guesses` is rejected.
+        let inputs = make_launch_inputs(
+            &store,
+            &mut bindings,
+            &leases,
+            2,
+            1,
+            TargetTokens::Selected {
+                selected: valid_i32.clone(),
+                guesses: Some(wrong_extent_i32),
+            },
+        );
+        assert!(ValidatedTargetLaunch::new(inputs, &store, &domain, 64, 64).is_err());
+
+        // Missing `guesses` when a slot has front rows is rejected.
+        let inputs = make_launch_inputs(
+            &store,
+            &mut bindings,
+            &leases,
+            2,
+            1,
+            TargetTokens::Selected {
+                selected: valid_i32.clone(),
+                guesses: None,
+            },
+        );
+        assert!(ValidatedTargetLaunch::new(inputs, &store, &domain, 64, 64).is_err());
+
+        // Valid `selected` and `guesses` (both i32 [class_rows, 2]) with front rows are accepted.
+        let inputs = make_launch_inputs(
+            &store,
+            &mut bindings,
+            &leases,
+            2,
+            1,
+            TargetTokens::Selected {
+                selected: valid_i32.clone(),
+                guesses: Some(valid_i32),
+            },
+        );
+        assert!(ValidatedTargetLaunch::new(inputs, &store, &domain, 64, 64).is_ok());
+
+        // Host tokens with a front row validate and `host_guesses()` writes at `row - 1`.
+        let inputs = make_launch_inputs(&store, &mut bindings, &leases, 2, 1, TargetTokens::Host);
+        let validated = ValidatedTargetLaunch::new(inputs, &store, &domain, 64, 64)
+            .ok()
+            .expect("valid host front launch");
+        let (core, _) = validated.into_submission_parts();
+        let host_guesses = core.host_guesses();
+        assert_eq!(host_guesses[0], [2, GuessKind::Chained.word()]);
+        assert_eq!(host_guesses[1], [0, 0]);
+
+        // A slot whose first row would be a front row (`front == rows.len()`) is rejected.
+        let (bad_slot, _) = build_slot_and_advance(&store, &mut bindings, 1, 1);
+        assert!(
+            ValidatedTargetBatch::from_slots(
+                &[bad_slot],
+                32,
+                ClassLimits {
+                    rows: 4,
+                    segments: 4,
+                    slots: 2,
+                },
+            )
+            .is_err()
+        );
     }
 }

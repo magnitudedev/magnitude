@@ -204,7 +204,14 @@ impl Factor {
         self.assess_validated(domains)
     }
     pub(crate) fn assess_validated(&self, domains: &[Domain]) -> Result<Assessment> {
-        for var in self.scope() {
+        self.assess_with_scope(&self.scope(), domains)
+    }
+    pub(crate) fn assess_with_scope(
+        &self,
+        scope: &[VarId],
+        domains: &[Domain],
+    ) -> Result<Assessment> {
+        for &var in scope {
             if get_domain(domains, var)?.is_empty() {
                 return Ok(Assessment::infeasible());
             }
@@ -256,13 +263,22 @@ impl Factor {
         })
     }
     pub fn guard_state(&self, domains: &[Domain]) -> Result<Option<bool>> {
+        let sorted = self
+            .guards
+            .windows(2)
+            .all(|pair| pair[0].variable <= pair[1].variable);
         let mut active = true;
-        let mut guard_assignments = BTreeMap::new();
-        for guard in &self.guards {
-            if guard_assignments
-                .insert(guard.variable, guard.value)
-                .is_some_and(|value| value != guard.value)
-            {
+        for (index, guard) in self.guards.iter().enumerate() {
+            let conflict = if sorted {
+                index > 0
+                    && self.guards[index - 1].variable == guard.variable
+                    && self.guards[index - 1].value != guard.value
+            } else {
+                self.guards[..index]
+                    .iter()
+                    .any(|prev| prev.variable == guard.variable && prev.value != guard.value)
+            };
+            if conflict {
                 return Ok(Some(false));
             }
             match guard.state(domains)? {

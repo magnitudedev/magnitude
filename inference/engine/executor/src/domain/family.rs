@@ -529,7 +529,7 @@ pub trait ProgramFamily: 'static {
 
     /// Hold the bound head's storage for a class of `places` places, under a
     /// heap claim for `bound_head_demand`.
-    fn hold_bound_head(&self, _charges: &seismic::Charges, _places: usize) -> Result<(), String> {
+    fn hold_bound_head(&self, _charges: &seismic::Charges, _places: usize) -> Result<(), crate::resources::AllocationError> {
         Ok(())
     }
 
@@ -812,8 +812,17 @@ impl ProgramFamily for NativeFamily {
         Ok(crate::memory::ClaimDemand { device, ..Default::default() })
     }
 
-    fn hold_bound_head(&self, charges: &seismic::Charges, places: usize) -> Result<(), String> {
-        self.head_tables.iter().try_for_each(|table| table.hold_places(charges, places))
+    fn hold_bound_head(&self, charges: &seismic::Charges, places: usize) -> Result<(), crate::resources::AllocationError> {
+        let staged = self
+            .head_tables
+            .iter()
+            .map(|table| table.prepare_places(charges, places))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(crate::resources::AllocationError::Tensor)?;
+        for (table, prepared) in self.head_tables.iter().zip(staged) {
+            table.install_places(prepared);
+        }
+        Ok(())
     }
 
     fn unbind_optional(&mut self, component: OptionalComponent) {
@@ -882,12 +891,21 @@ impl ProgramFamily for NativeFamily {
             Some(bank) => Some((bank, bank.place(charges, places_of(places.get()).map_err(invariant)?)?)),
             None => None,
         };
+        let tables = self.device_tables();
+        let staged = tables
+            .iter()
+            .map(|table| table.prepare_places(charges, places.get()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(crate::resources::AllocationError::Tensor)?;
         self.target.hold_group(charges, places)?;
-        for table in self.device_tables() {
-            table.hold_places(charges, places.get()).map_err(invariant)?;
-        }
         if let Some((bank, placed)) = placed {
-            bank.hold_places(placed).map_err(invariant)?;
+            if let Err(detail) = bank.hold_places(placed) {
+                self.target.release_group();
+                return Err(invariant(detail));
+            }
+        }
+        for (table, prepared) in tables.iter().zip(staged) {
+            table.install_places(prepared);
         }
         Ok(())
     }

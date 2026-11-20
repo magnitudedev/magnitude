@@ -218,8 +218,10 @@ fn apply_tool_selection_instruction(
         .filter(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
     {
         match system.get_mut("content") {
-            Some(serde_json::Value::String(content)) if !content.is_empty() => {
-                content.push_str("\n\n");
+            Some(serde_json::Value::String(content)) => {
+                if !content.is_empty() {
+                    content.push_str("\n\n");
+                }
                 content.push_str(&instruction);
             }
             Some(serde_json::Value::Null) | None => {
@@ -796,6 +798,20 @@ mod tests {
         assert_eq!(
             single.messages[0]["content"],
             "Call one of the supplied tools to answer this request."
+        );
+
+        let mut empty_system = native(
+            vec![
+                json!({"role":"system", "content":""}),
+                json!({"role":"user", "content":"weather"}),
+            ],
+            false,
+        );
+        apply_tool_selection_instruction(&mut empty_system, &ToolChoice::Named("lookup".into()))
+            .unwrap();
+        assert_eq!(
+            empty_system.messages[0]["content"],
+            "Call the supplied tool 'lookup' to answer this request."
         );
     }
 

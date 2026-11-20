@@ -15,7 +15,7 @@ use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
 use magnitude_executor::{
     ChainEntry, Demand, DomainError, DraftForm, ExecutionPath, ExecutorDomain, FeatureReader, FeatureRows, FeatureSpan, FrontGrant,
     FrontPass, HeadPhase, NumericalProfile, Operation, Outcome, PhysicalDecision, Priming, ProgramFamily, RequestId,
-    ReservedResources, ResumeState, Sampling, SelectSpec, Shaping, StateBindings, TokenId, TuningSettings, WorkKind,
+    ReservedResources, ResumeState, Sampling, SelectSpec, Selected, Shaping, StateBindings, TokenId, TuningSettings, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{RoundState, drafted_chain};
@@ -827,7 +827,10 @@ impl Engine {
                         sequence.selected = rows
                             .last()
                             .and_then(|row| row.selected)
-                            .map(|row| row.token);
+                            .and_then(|selected| match selected {
+                                Selected::Token(token) => Some(token),
+                                _ => None,
+                            });
                         sequence.two_row.guessed(guesses.clone());
                     }
                     PhysicalDecision::rows(pending.rows())
@@ -896,7 +899,7 @@ impl Engine {
             let Outcome::Head { proposals, .. } = self.head(operation, entered)? else {
                 return Err("a head transaction returns proposals".into());
             };
-            sequence.two_row.guessed(drafted_chain(&proposals));
+            sequence.two_row.guessed(drafted_chain(&proposals)?);
         }
         let round = sequence.two_row_round()?;
         let operation = round.forward().clone().into_operation(sequence.request, sequence.position, None)?;

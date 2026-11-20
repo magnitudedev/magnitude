@@ -391,9 +391,9 @@ impl Slots {
             }
             StoredSlots::Banked { pool, .. } => {
                 let store = seismic::SlabTensor::in_pool(charges, pool, 1, records, &regions)?;
-                for _ in 0..records {
-                    store.add_slab(seismic::SlabFill::Zeroed)?;
-                }
+                let count = usize::try_from(records)
+                    .map_err(|_| seismic::TensorError::SlabLayout("records exceed host domain".into()))?;
+                store.add_slabs(count, seismic::SlabFill::Zeroed)?;
                 Ok(Self { store, record_rows: rows, backing: Backing::Banked(pool.clone()) })
             }
         }
@@ -410,7 +410,7 @@ impl Slots {
 
     /// The slots of the records held.
     fn held(&self) -> usize {
-        self.records().count() * self.record_rows()
+        self.store.backed_count() * self.record_rows()
     }
 
     /// Whether the record of slot `slot` is held.

@@ -33,12 +33,12 @@ use std::rc::Rc;
 /// The inclusive range of an integer word of `dtype`; none for any other
 /// scalar.
 fn word_bounds(arena: &mut ExprArena, dtype: DType) -> Option<(IntExpr, IntExpr)> {
-    Some(match dtype {
-        DType::I32 => (arena.int(i64::from(i32::MIN)), arena.int(i64::from(i32::MAX))),
-        DType::U32 => (arena.int(0), arena.int(i64::from(u32::MAX))),
-        DType::U64 => (arena.int(0), arena.int_exact(crate::expr::BigInt::from(u64::MAX))),
-        DType::F32 | DType::F16 | DType::BF16 | DType::Bool => return None,
-    })
+    let (lo, hi) = dtype.integer_bounds()?;
+    let int = |arena: &mut ExprArena, value: i128| match i64::try_from(value) {
+        Ok(value) => arena.int(value),
+        Err(_) => arena.int_exact(crate::expr::BigInt::from(value)),
+    };
+    Some((int(arena, lo), int(arena, hi)))
 }
 
 pub(crate) fn constant(arena: &ExprArena, e: IntExpr) -> Option<i64> {
@@ -2935,11 +2935,25 @@ impl<'a> Engine<'a> {
                 hi = hi.add(&exact);
                 continue;
             }
+            let bounds: Vec<_> = m
+                .iter()
+                .map(|(a, k)| (a, *k, self.atom_bounds_over(a, bound)))
+                .collect();
+            if !affine
+                && bounds
+                    .iter()
+                    .any(|(_, _, (l, _))| !self.nonnegative_polynomial(l, &mut HashSet::new()))
+            {
+                let mut exact = Poly::default();
+                exact.insert(m.clone(), *c);
+                lo = lo.add(&exact);
+                hi = hi.add(&exact);
+                continue;
+            }
             let mut lo_term = Poly::constant(*c);
             let mut hi_term = Poly::constant(*c);
-            for (a, k) in m {
-                let (l, u) = self.atom_bounds_over(a, bound);
-                for _ in 0..*k {
+            for (a, k, (l, u)) in bounds {
+                for _ in 0..k {
                     if *c >= 0 {
                         lo_term = lo_term.mul(&l);
                         match &u {
@@ -2968,9 +2982,6 @@ impl<'a> Engine<'a> {
                 if !self.facts.scalar_defined(self.arena, value) { return None; }
                 let types = operands.iter().map(|operand| operand.dtype(self.arena)).collect::<Vec<_>>();
                 Some(crate::reference_math::scalar_recipe(operation, &types).output().ty())
-            }
-            NodeView::Unary { op: crate::expr::UnaryOp::IntFromScalar, operand: AnyExpr::Scalar(value) } => {
-                Some(ScalarOperand::Scalar(value).dtype(self.arena))
             }
             _ => None,
         }
@@ -3017,12 +3028,16 @@ impl<'a> Engine<'a> {
             }
             Atom::Foreign(f) => {
                 if let Some(dtype) = self.word_dtype(f.node) {
-                    return match dtype {
-                        DType::I32 => (Poly::constant(i64::from(i32::MIN)), Some(Poly::constant(i64::from(i32::MAX)))),
-                        DType::U32 => (Poly::constant(0), Some(Poly::constant(i64::from(u32::MAX)))),
-                        // Its upper end 2^64 - 1 is no i64 polynomial constant.
-                        DType::U64 => (Poly::constant(0), None),
-                        _ => (Poly::atom(a.clone()), Some(Poly::atom(a.clone()))),
+                    return match dtype.integer_bounds() {
+                        Some((lo, hi)) => {
+                            let lower = i64::try_from(lo)
+                                .map(Poly::constant)
+                                .unwrap_or_else(|_| Poly::atom(a.clone()));
+                            // Bounds outside i64 (such as u64::MAX) have no i64 polynomial constant.
+                            let upper = i64::try_from(hi).ok().map(Poly::constant);
+                            (lower, upper)
+                        }
+                        None => (Poly::atom(a.clone()), Some(Poly::atom(a.clone()))),
                     };
                 }
                 if let NodeView::Binary {
@@ -3071,6 +3086,13 @@ impl<'a> Engine<'a> {
                             right_lower
                         } else {
                             left_lower
+                        };
+                        let lower = if self.nonnegative_atom(a, &mut HashSet::new())
+                            && !self.nonnegative_polynomial(&lower, &mut HashSet::new())
+                        {
+                            Poly::constant(0)
+                        } else {
+                            lower
                         };
                         return (lower, Some(Poly::atom(a.clone())));
                     }
@@ -3187,7 +3209,13 @@ impl<'a> Engine<'a> {
             }
             Atom::Rem(..) => true,
             Atom::Foreign(f) => {
-                if matches!(self.word_dtype(f.node), Some(DType::U32 | DType::U64)) { return true; }
+                if self
+                    .word_dtype(f.node)
+                    .and_then(DType::integer_bounds)
+                    .is_some_and(|(lo, _)| lo >= 0)
+                {
+                    return true;
+                }
                 if let NodeView::Binary {
                     op,
                     lhs: AnyExpr::Int(lhs),
@@ -5132,4 +5160,23 @@ fn established_sign_rejects_cyclic_quotient_bounds_and_uses_other_premises() {
     let zero = arena.int(0);
     let negative_x = arena.int_sub(zero, xv);
     assert!(!established_nonnegative(&arena, &mutual, negative_x));
+}
+
+#[cfg(test)]
+#[test]
+fn nonnegative_max_does_not_unsoundly_square_negative_branch() {
+    let mut arena = ExprArena::new();
+    let x = arena.checker_variable(crate::expr::SymbolSort::Nat);
+    let x_nat = arena.nat_symbol(x);
+    let xv = arena.int_from_nat(x_nat);
+    let neg_five = arena.int(-5);
+    let clamped = arena.int_max(xv, neg_five);
+    let squared = arena.int_mul(clamped, clamped);
+    let twenty_five = arena.int(25);
+    let facts = Facts::new();
+    // For x = 0, max(0, -5)^2 = 0 < 25, so max(x, -5)^2 >= 25 is false.
+    assert_eq!(
+        derive_le(&mut arena, &facts, twenty_five, squared),
+        Derivation::Unresolved
+    );
 }

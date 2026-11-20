@@ -22,6 +22,11 @@ use std::mem::size_of;
 /// The half-lives, in decode steps, the history selector measures reads by.
 pub(super) const HALF_LIVES: [f64; 10] = [0., 1., 2., 4., 8., 16., 32., 64., 128., 256.];
 
+/// Half-life, in decode steps, of the exponentially decayed miss counts used
+/// to select the live candidate. Decaying miss counts prevents earlier
+/// sessions from locking in a stale half-life across workload shifts.
+const MISS_HALF_LIFE_STEPS: f64 = 128.0;
+
 /// An expert's reuse as its equivalent step: greater is more reused. An expert
 /// never read scores below every other.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,15 +105,16 @@ struct Pool {
 /// across all decode steps, per-layer Mattson stacks, and per-group pools.
 struct Measure {
     half_life: f64,
+    miss_decay: f64,
     layers: Vec<Vec<Logged>>,
     steps_score: Vec<Score>,
     logged: u64,
     stacks: Vec<Vec<usize>>,
-    misses: u64,
+    misses: f64,
     groups: Vec<usize>,
     pools: Vec<Pool>,
     pooled: Vec<Vec<bool>>,
-    pooled_misses: u64,
+    pooled_misses: f64,
     /// Pre-allocated scratch buffers (fixed capacity `max_experts`, zero per-call allocs).
     scratch_held: Vec<usize>,
     scratch_lacked: Vec<usize>,
@@ -118,17 +124,20 @@ struct Measure {
 impl Measure {
     fn new(half_life: f64, experts: &[usize], groups: &[usize], records: &[usize]) -> Self {
         let max_experts = experts.iter().copied().max().unwrap_or(0);
+        let num_layers = experts.len().max(1) as f64;
+        let miss_decay = 0.5_f64.powf(1.0 / (MISS_HALF_LIFE_STEPS * num_layers));
         Self {
             half_life,
+            miss_decay,
             layers: experts.iter().map(|&n| vec![Logged::NONE; n]).collect(),
             steps_score: vec![Score::NEVER; experts.len()],
             logged: 0,
             stacks: experts.iter().map(|&n| Vec::with_capacity(n)).collect(),
-            misses: 0,
+            misses: 0.0,
             groups: groups.to_vec(),
             pools: records.iter().map(|&cap| Pool { records: cap, held: BTreeSet::new() }).collect(),
             pooled: experts.iter().map(|&n| vec![false; n]).collect(),
-            pooled_misses: 0,
+            pooled_misses: 0.0,
             scratch_held: Vec::with_capacity(max_experts),
             scratch_lacked: Vec::with_capacity(max_experts),
             scratch_entering: Vec::with_capacity(max_experts),
@@ -185,8 +194,8 @@ impl Measure {
                 self.scratch_lacked.push(expert);
             }
         }
-        self.misses += misses;
-        self.pooled_misses += self.scratch_lacked.len() as u64;
+        self.misses = self.misses * self.miss_decay + misses as f64;
+        self.pooled_misses = self.pooled_misses * self.miss_decay + self.scratch_lacked.len() as f64;
 
         for i in 0..self.scratch_held.len() {
             let expert = self.scratch_held[i];
@@ -345,7 +354,7 @@ impl History {
     }
 
     #[inline]
-    fn missed(&self, candidate: usize) -> u64 {
+    fn missed(&self, candidate: usize) -> f64 {
         let measure = &self.measures[candidate % HALF_LIVES.len()];
         if candidate >= HALF_LIVES.len() {
             measure.pooled_misses
@@ -355,7 +364,8 @@ impl History {
     }
 
     /// Log a decode step's routed `experts` at `layer` and `step`: updates all
-    /// half-life stacks and pools and selects the candidate with fewest misses.
+    /// half-life stacks and pools and selects the candidate with fewest decayed
+    /// misses.
     pub(super) fn read_decode(&mut self, layer: usize, step: Step, experts: &[usize]) {
         self.decode_steps[layer] += 1;
         self.harmonic[layer] += 1.0 / self.decode_steps[layer] as f64;
@@ -364,7 +374,7 @@ impl History {
             measure.read_decode(layer, step, experts, slots);
         }
         self.live = (0..2 * HALF_LIVES.len())
-            .min_by_key(|&candidate| self.missed(candidate))
+            .min_by(|&a, &b| self.missed(a).total_cmp(&self.missed(b)))
             .expect("HALF_LIVES is non-empty");
     }
 
@@ -500,5 +510,43 @@ mod tests {
             history.read_decode(0, step, &chosen);
         }
         assert_eq!(history.bytes(), initial, "history memory footprint must be constant");
+    }
+
+    /// Decayed miss selection adapts cleanly across sessions: a long session
+    /// favoring long half-lives cannot lock in a stale half-life when a later
+    /// session shifts to a pure-recency burst workload.
+    #[test]
+    fn decayed_misses_adapt_across_session_regime_shifts() {
+        let mut history = History::new(&[128], &[0], &[2]);
+        // Session 1 (5,000 steps): expert 0 is hot every 3rd step beside one-off
+        // cold experts — long half-life wins by a wide margin.
+        let mut step = 1u64;
+        for _ in 0..5_000 {
+            let cold = 1 + ((step as usize) % 127);
+            if step % 3 == 0 {
+                history.read_decode(0, step, &[0, cold]);
+            } else {
+                history.read_decode(0, step, &[cold]);
+            }
+            step += 1;
+        }
+        assert!(history.half_life() > 0., "session 1 selects a positive half-life");
+
+        // Session 2 (600 steps): shifting bursts of 2 experts for 6 steps each.
+        // Pure recency (h = 0) adapts immediately on each burst change, whereas
+        // long half-lives cling to stale high-frequency experts from previous bursts.
+        for burst in 0..100usize {
+            let a = (burst * 2) % 126 + 1;
+            let b = a + 1;
+            for _ in 0..6 {
+                history.read_decode(0, step, &[a, b]);
+                step += 1;
+            }
+        }
+        assert!(
+            history.half_life() <= 4.0,
+            "session 2 should adapt to a short half-life, got {}",
+            history.half_life()
+        );
     }
 }

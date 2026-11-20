@@ -197,12 +197,27 @@ impl SlabTensor {
         self.store.backed()
     }
 
+    /// The number of backed slots, without allocating.
+    pub fn backed_count(&self) -> usize {
+        self.store.backed_count()
+    }
+
     /// Back the lowest free slot with a granule of the pool, growing the
     /// pool by a block, admitted by its entry, where none is free: the slot.
     /// Refused where every slot is backed, or with the entry's capacity
     /// error where it refuses the block. Never waits on device work.
     pub fn add_slab(&self, fill: SlabFill) -> Result<usize, TensorError> {
         self.store.add_slab(fill)
+    }
+
+    /// Back the `count` lowest free slots with granules of the pool in one
+    /// batch, growing the pool by blocks, admitted by its entry, where none
+    /// are free: the slots in ascending order. Refused where fewer than
+    /// `count` slots are free, or with the entry's capacity error where it
+    /// refuses a block (on refusal, no slot is backed). Never waits on device
+    /// work.
+    pub fn add_slabs(&self, count: usize, fill: SlabFill) -> Result<Vec<usize>, TensorError> {
+        self.store.add_slabs(count, fill)
     }
 
     /// Free slot `index`: its table entries name the pool's zero slab from

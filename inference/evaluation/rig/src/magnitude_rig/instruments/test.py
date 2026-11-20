@@ -35,7 +35,9 @@ import dataclasses
 import functools
 import hashlib
 import json
+import os
 import re
+import threading
 
 from .. import ledger, selectors
 from ..engine import Headers, Refused, Step, Weights
@@ -124,7 +126,7 @@ def _stale(arguments, source, host: str, runner: tuple) -> tuple[tuple[Step, ...
     path = SELECTIONS / f"selection-{hashlib.sha256(content.encode()).hexdigest()[:16]}.json"
     if not path.is_file():
         SELECTIONS.mkdir(parents=True, exist_ok=True)
-        staged = path.with_suffix(".tmp")
+        staged = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         staged.write_text(content)
         staged.replace(path)
     jobs = (("test", Step("test", (*runner, "--selection", "{inputs}/" + path.name, "--", *binary))),)

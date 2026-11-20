@@ -674,4 +674,88 @@ mod tests {
         assert_eq!(reading.room_after(&ledgers).device.room(), plan.device.room() - 24 * MIB, "the load's reading stands");
         assert!(ledgers.changes().change(|keeping| ledgers.claim_at(&keeping.claims(), &reading, &device, CommittedKind::Load, ClaimDemand { device: 60 * MIB, ..Default::default() })).is_ok(), "claims at the held reading");
     }
+
+    /// Opening a store's granule pool claims and allocates its absent granule
+    /// at the load's reading: when opened before `admit_most_pair` sizes an
+    /// expert bank into the remaining room, the bank's admission sees the
+    /// absent granules already held and never leaves the pool short; when the
+    /// store genuinely lacks room for the absent granule, `open_pool_at`
+    /// returns `OpenPoolError::Short` rather than an internal allocation error.
+    #[test]
+    fn open_pool_at_claims_absent_granule_before_bank_admission() {
+        let (catalog, device) = cpu();
+        let granule = 16 * MIB;
+        let slot = 10 * MIB;
+        // Room holds two pools' absent granules (2 × 16 MiB = 32 MiB) plus
+        // 3 bank slots (30 MiB) and 2 MiB spare (< 1 slot).
+        let room = 2 * granule + 3 * slot + 2 * MIB;
+        let reader = DeviceReader::open(Rc::new(Room::new(&catalog, &device, room, 0)), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (ledgers, reading) = reader.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, stateless()));
+
+        let state_pool = ledgers
+            .open_pool_at(Some(&reading), &device, seismic::Contract::DeviceOnly, crate::memory::ledger::PoolClass::State, granule)
+            .expect("state pool opens and claims its absent granule");
+        let records_pool = ledgers
+            .open_pool_at(Some(&reading), &device, seismic::Contract::DeviceOnly, crate::memory::ledger::PoolClass::Records, granule)
+            .expect("records pool opens and claims its absent granule");
+        assert_eq!(reading.room_after(&ledgers).device.room(), 3 * slot + 2 * MIB, "both absent granules are held before bank admission");
+
+        let admitted = ledgers
+            .changes()
+            .change(|keeping| {
+                ledgers.admit_most_pair(
+                    &keeping.claims(),
+                    &reading,
+                    &device,
+                    CommittedKind::Load,
+                    (1, 10),
+                    (0, 0),
+                    |slots, _| Ok::<_, std::convert::Infallible>(ClaimDemand { device: slots * slot, ..Default::default() }),
+                )
+            })
+            .unwrap()
+            .expect("bank fits into what the pools leave");
+        assert_eq!(admitted.0, 3, "bank takes the 3 slots left after both pools' absent granules");
+        drop((admitted, records_pool, state_pool));
+
+        // Genuine shortage returns OpenPoolError::Short (not Internal).
+        let tight = DeviceReader::open(Rc::new(Room::new(&catalog, &device, granule / 2, 0)), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (tight_ledgers, tight_reading) = tight.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, stateless()));
+        let Err(err) = tight_ledgers
+            .open_pool_at(Some(&tight_reading), &device, seismic::Contract::DeviceOnly, crate::memory::ledger::PoolClass::State, granule)
+        else {
+            panic!("tight store must refuse the absent granule");
+        };
+        assert!(matches!(err, crate::memory::ledger::OpenPoolError::Short { .. }), "shortage reports typed Short, got: {err}");
+    }
+
+    /// An import's upload window (`CommittedKind::Upload`) is a reusable peak
+    /// reservation across batches: freeing one batch's workspace must keep
+    /// the window's committed bytes intact so a later batch allocates inside
+    /// it even when free room has vanished, and dropping the window releases
+    /// it whole.
+    #[test]
+    fn upload_window_preserves_reservation_across_batches() {
+        let (catalog, device) = cpu();
+        let window = 32 * MIB;
+        let reader = DeviceReader::open(Rc::new(Room::new(&catalog, &device, window, 0)), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (ledgers, reading) = reader.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, stateless()));
+        let mut upload = ledgers
+            .changes()
+            .change(|keeping| ledgers.claim_at(&keeping.claims(), &reading, &device, CommittedKind::Upload, ClaimDemand { device: window, ..Default::default() }))
+            .expect("upload window fits");
+        // Batch 1 allocates and drops a full-window workspace.
+        let batch1 = upload
+            .allocate(&device, |charges| seismic::Tensor::zeros(charges, seismic::Element::bool(), &[window]))
+            .expect("batch 1 allocates inside upload window");
+        drop(batch1);
+        assert_eq!(ledgers.device().estimate().committed(), window, "upload window keeps its committed reservation after batch 1 drops");
+        // Batch 2 allocates another full-window workspace inside the same window.
+        let batch2 = upload
+            .allocate(&device, |charges| seismic::Tensor::zeros(charges, seismic::Element::bool(), &[window]))
+            .expect("batch 2 reuses upload window reservation");
+        drop(batch2);
+        drop(upload);
+        assert_eq!(ledgers.device().estimate().committed(), 0, "dropping upload window releases its reservation");
+    }
 }

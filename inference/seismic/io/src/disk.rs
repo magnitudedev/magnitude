@@ -252,6 +252,9 @@ impl Reader {
         want: Want,
         mut sink: impl FnMut(u64, &[u8]) -> Result<(), E>,
     ) -> Result<(), E> {
+        offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
         let chunk = (self.knee() / 2).max(LEAST_READ) as usize;
         let depth = 3;
         let mut flight = std::collections::VecDeque::<(Handle, Arc<Buffer>, u64, usize)>::new();
@@ -260,8 +263,11 @@ impl Reader {
         loop {
             while flight.len() < depth && next < length {
                 let bytes = (length - next).min(chunk as u64) as usize;
+                let range_offset = offset
+                    .checked_add(next)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
                 let buffer = spare.pop().unwrap_or_else(|| Arc::new(Buffer::new(chunk)));
-                let range = Range { offset: offset + next, length: bytes, into: buffer.clone(), at: 0 };
+                let range = Range { offset: range_offset, length: bytes, into: buffer.clone(), at: 0 };
                 // SAFETY: the buffer is the stream's alone, read by it only
                 // once its request has ended (`wait`).
                 let request = unsafe { self.request(vec![range], want) }.map_err(io_error)?;

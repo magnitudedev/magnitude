@@ -653,19 +653,24 @@ impl ExecutorCosts {
 
     /// The matrix throughput of weights resident as `format`: its measured
     /// throughput; until a job measures it, its pilot's arithmetic rate at
-    /// one row along device storage's first route, as a CPU's rows take
-    /// about one row's time each (a 12-core M6's CPU ran 8 rows in 7 to 9.4
-    /// times one row's time, 2026-10-22), and a GPU, whose rows share its
-    /// weights' bytes, reads every throughput in its first job. Where its
-    /// pilot could not be read, the activation dtype's, which its arithmetic
-    /// runs in once its weights are decoded (an M4 Max's Metal, 2026-10-21:
-    /// every format within 2.5% of bf16); the activation dtype's own, until
-    /// read, at the probe's one-row rate, by the same bound.
+    /// one row along device storage's first route scaled by the activation
+    /// dtype's measured matrix-to-one-row ratio (`activation / bf16_one_row`),
+    /// capped at `activation`. On a CPU, `activation / bf16_one_row ≈ 1` (8
+    /// rows take about 8 one-row times), preserving one-row CPU scaling; on a
+    /// GPU, where one-row calls are memory-bandwidth-bound and multi-row
+    /// matrix calls reach 30×–100× higher tensor-core throughput, scaling by
+    /// the activation ratio prevents a 30×–100× underestimate when a format's
+    /// 1-row pilot is measured before its matrix throughput, while capping at
+    /// `activation` prevents narrower decoded formats from exceeding bf16
+    /// arithmetic. Where its pilot could not be read, `activation` itself
+    /// (falling back to the probe's one-row rate before `activation_matrix` is
+    /// read).
     pub fn matrix_flops(&self, format: Element) -> f64 {
-        let activation = self.activation_matrix.as_ref().map_or_else(
-            || one_row_flops(Element::bf16(), &self.first.activation),
-            |matrix| matrix.flops.value,
-        );
+        let bf16_one_row = one_row_flops(Element::bf16(), &self.first.activation);
+        let activation = self
+            .activation_matrix
+            .as_ref()
+            .map_or(bf16_one_row, |matrix| matrix.flops.value);
         if format == Element::bf16() {
             return activation;
         }
@@ -673,7 +678,10 @@ impl ExecutorCosts {
             return matrix.flops.value;
         }
         match self.first.formats.iter().find(|(read, _)| *read == format) {
-            Some((_, rates)) => one_row_flops(format, &rates.pilot),
+            Some((_, rates)) => {
+                let scale = activation / bf16_one_row;
+                (one_row_flops(format, &rates.pilot) * scale).min(activation)
+            }
             None => activation,
         }
     }
@@ -1026,6 +1034,7 @@ impl<E: Entry> Clone for Formation<E> {
 pub(super) struct Program<E: Entry> {
     formation: Formation<E>,
     backend: seismic::BackendName,
+    tensor_ops: bool,
     identity: std::sync::OnceLock<Result<KernelIdentity, ExecutorCostsError>>,
 }
 
@@ -1034,19 +1043,22 @@ impl<E: Entry> Clone for Program<E> {
         Self {
             formation: self.formation.clone(),
             backend: self.backend,
+            tensor_ops: self.tensor_ops,
             identity: self.identity.clone(),
         }
     }
 }
 
 impl<E: Entry> Program<E> {
-    fn of(formation: Formation<E>, backend: seismic::BackendName) -> Self {
-        Self { formation, backend, identity: std::sync::OnceLock::new() }
+    fn of(formation: Formation<E>, backend: seismic::BackendName, tensor_ops: bool) -> Self {
+        Self { formation, backend, tensor_ops, identity: std::sync::OnceLock::new() }
     }
 
     /// Its source identity on the set's backend ([`Formation::identity`]).
     fn identity(&self) -> Result<KernelIdentity, ExecutorCostsError> {
-        self.identity.get_or_init(|| self.formation.identity(self.backend)).clone()
+        self.identity
+            .get_or_init(|| self.formation.identity(self.backend, self.tensor_ops))
+            .clone()
     }
 
     /// Formed on `device` ([`Formation::form`]).
@@ -1114,12 +1126,13 @@ impl<E: Entry> Formation<E> {
         Ok(statics)
     }
 
-    /// Its source identity on `backend`, formable without a device.
+    /// Its source identity on `backend`, formable without opening a device.
     pub(super) fn identity(
         &self,
         backend: seismic::BackendName,
+        tensor_ops: bool,
     ) -> Result<KernelIdentity, ExecutorCostsError> {
-        KernelIdentity::of(backend, &self.entry, &self.statics(backend)?)
+        KernelIdentity::of(backend, tensor_ops, &self.entry, &self.statics(backend)?)
             .map_err(|error| failed(E::NAME)(&error))
     }
 
@@ -1199,6 +1212,7 @@ impl WalkPrograms {
 
     fn new(
         backend: seismic::BackendName,
+        tensor_ops: bool,
         sizes: Sizes,
         formats: &[Element],
         chain: Element,
@@ -1208,17 +1222,17 @@ impl WalkPrograms {
             .iter()
             .map(|&format| {
                 let features = features(sizes, format, largest)?;
-                Ok((format, features, Program::of(expand(format, features), backend)))
+                Ok((format, features, Program::of(expand(format, features), backend, tensor_ops)))
             })
             .collect::<Result<Vec<_>, ExecutorCostsError>>()?;
         Ok(Self {
             sizes,
-            output: Program::of(output(chain, features(sizes, chain, largest)?), backend),
+            output: Program::of(output(chain, features(sizes, chain, largest)?), backend, tensor_ops),
             expands,
             chain,
-            dense: Program::of(attend::<attention_decode::Entry>(KvCodec::Dense)?, backend),
-            affine: Program::of(attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?, backend),
-            copy: Program::of(copy(), backend),
+            dense: Program::of(attend::<attention_decode::Entry>(KvCodec::Dense)?, backend, tensor_ops),
+            affine: Program::of(attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?, backend, tensor_ops),
+            copy: Program::of(copy(), backend, tensor_ops),
         })
     }
 
@@ -1250,10 +1264,12 @@ impl ProgramSet {
     }
 
     /// A set holding only `converts` (for a job with no cost walk).
-    pub(super) fn converts(backend: seismic::BackendName, converts: &[ConvertForm]) -> Self {
+    pub(super) fn converts(executor: &Executor, converts: &[ConvertForm]) -> Self {
+        let backend = executor.backend();
+        let tensor_ops = executor.forms_tensor_operations();
         let converts = converts
             .iter()
-            .map(|&form| (form, Program::of(form.land(), backend)))
+            .map(|&form| (form, Program::of(form.land(), backend, tensor_ops)))
             .collect();
         Self { walk: None, converts }
     }
@@ -1264,6 +1280,7 @@ impl ProgramSet {
         converts: &[ConvertForm],
     ) -> Result<Self, ExecutorCostsError> {
         let backend = executor.backend();
+        let tensor_ops = executor.forms_tensor_operations();
         let largest = executor.limits().max_allocation.bytes();
         let chain = chain_element(backend).ok_or_else(|| {
             ExecutorCostsError(format!(
@@ -1273,6 +1290,7 @@ impl ProgramSet {
         })?;
         Self::new(
             backend,
+            tensor_ops,
             Sizes::of(backend),
             &measured_formats(backend),
             chain,
@@ -1286,16 +1304,17 @@ impl ProgramSet {
     /// chain in `chain`, plus every convert form `converts` the job measures.
     fn new(
         backend: seismic::BackendName,
+        tensor_ops: bool,
         sizes: Sizes,
         formats: &[Element],
         chain: Element,
         largest: u64,
         converts: &[ConvertForm],
     ) -> Result<Self, ExecutorCostsError> {
-        let walk = WalkPrograms::new(backend, sizes, formats, chain, largest)?;
+        let walk = WalkPrograms::new(backend, tensor_ops, sizes, formats, chain, largest)?;
         let converts = converts
             .iter()
-            .map(|&form| (form, Program::of(form.land(), backend)))
+            .map(|&form| (form, Program::of(form.land(), backend, tensor_ops)))
             .collect();
         Ok(Self { walk: Some(walk), converts })
     }
@@ -1882,7 +1901,7 @@ struct Records<'a> {
 impl Records<'_> {
     fn key(&self, spec: PointSpec) -> PointKey {
         PointKey {
-            executor: self.executor.clone(),
+            subject: seismic::PointSubject::executor(&self.executor),
             kernels: spec.kernels,
             configuration: spec.configuration,
             point: spec.point,
@@ -3869,10 +3888,10 @@ fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
             );
         }
     }
+    steps.extend(others.iter().map(|&format| Step::Matrix(format)));
     steps.extend(HISTORY_LAYOUTS.into_iter().flat_map(|layout| {
         (FIRST_RUNGS..HISTORY_DEPTHS.len()).map(move |index| Step::Rung(layout, Rung::Depth(index)))
     }));
-    steps.extend(others.iter().map(|&format| Step::Matrix(format)));
     steps
 }
 
@@ -3912,6 +3931,7 @@ fn walk<T: Times>(
     })?;
     let programs = ProgramSet::new(
         backend,
+        executor.forms_tensor_operations(),
         Sizes::of(backend),
         formats,
         chain,
@@ -5344,6 +5364,7 @@ impl ExecutorCosts {
         let converts = ConvertForm::reference(backend)?.into_iter().collect::<Vec<_>>();
         let programs = ProgramSet::new(
             backend,
+            executor.forms_tensor_operations(),
             Sizes::of(backend),
             &measured_formats(backend),
             chain,
@@ -5587,8 +5608,8 @@ mod tests {
             Step::WeightRate(0, f32, Pass::Pilot),
             Step::WeightRate(0, f32, Pass::Rate),
         ]);
-        expected.extend(deeper(KvCodec::Dense).chain(deeper(KvCodec::AffineK8V4)));
         expected.push(Step::Matrix(f32));
+        expected.extend(deeper(KvCodec::Dense).chain(deeper(KvCodec::AffineK8V4)));
         assert_eq!(steps, expected);
     }
 
@@ -5602,7 +5623,7 @@ mod tests {
         let backend = seismic::BackendName::Cpu;
         let chain = chain_element(backend).unwrap();
         let programs =
-            ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[])
+            ProgramSet::new(backend, false, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[])
                 .unwrap();
         let (features, _) = programs.expand(chain);
         let depth = HISTORY_DEPTHS[0] as f64;
@@ -5749,6 +5770,7 @@ mod tests {
         for backend in seismic::BackendName::ALL {
             let programs = ProgramSet::new(
                 backend,
+                false,
                 Sizes::of(backend),
                 &measured_formats(backend),
                 chain_element(backend).unwrap(),
@@ -5775,19 +5797,19 @@ mod tests {
     /// derives it once, and no key or record changes.
     #[test]
     fn a_walk_program_keys_by_the_identity_its_formation_derives() {
-        fn same<E: Entry>(program: &Program<E>, backend: seismic::BackendName) {
-            assert_eq!(program.identity(), program.formation.identity(backend), "{backend:?}: {}", E::NAME);
+        fn same<E: Entry>(program: &Program<E>, backend: seismic::BackendName, tensor_ops: bool) {
+            assert_eq!(program.identity(), program.formation.identity(backend, tensor_ops), "{backend:?}: {}", E::NAME);
         }
         for backend in seismic::BackendName::ALL {
             let chain = chain_element(backend).unwrap();
-            let programs = ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[]).unwrap();
+            let programs = ProgramSet::new(backend, false, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[]).unwrap();
             let walk = programs.walk();
-            same(&walk.output, backend);
-            same(&walk.dense, backend);
-            same(&walk.affine, backend);
-            same(&walk.copy, backend);
+            same(&walk.output, backend, false);
+            same(&walk.dense, backend, false);
+            same(&walk.affine, backend, false);
+            same(&walk.copy, backend, false);
             for (_, _, expand) in &walk.expands {
-                same(expand, backend);
+                same(expand, backend, false);
             }
         }
     }
@@ -5903,5 +5925,47 @@ mod tests {
         assert!(fit_decode_line(&timing(1.0e-3, Some((f64::NAN, 1.1e-3))), &timing(2.0e-3, None), flops).is_err());
         assert!(fit_decode_line(&timing(1.0e-3, Some((1.2e-3, 0.9e-3))), &timing(2.0e-3, None), flops).is_err());
         assert!(fit_decode_line(&timing(1.0e-3, None), &timing(2.0e-3, None), 0.0).is_err());
+    }
+
+    /// On a GPU whose multi-row `activation_matrix` throughput is 30×–100×
+    /// higher than its memory-bound 1-row bf16 probe, measuring a format's
+    /// 1-row pilot before its matrix throughput scales by
+    /// `activation_matrix / one_row_flops(bf16)` (capped at `activation_matrix`)
+    /// rather than degrading to 1-row FLOPs; on a CPU (`ratio ≈ 1`) one-row
+    /// scaling is preserved.
+    #[test]
+    fn matrix_flops_scales_unmeasured_formats_by_activation_matrix_ratio() {
+        let measured = |value| MeasuredCost { value, interval: None, samples: 8 };
+        let rate = |bytes_per_second| WeightRate {
+            bytes_per_second: measured(bytes_per_second),
+            features: 16384,
+        };
+        let mut gpu = crate::assessment::fixtures::costs();
+        // GPU: 300 GB/s 1-row bf16 (300 GFLOP/s), 30 TFLOP/s bf16 matrix (100× ratio).
+        gpu.first.activation = rate(300e9);
+        gpu.activation_matrix = Some(MatrixCosts { flops: measured(30e12), features: 16384 });
+        gpu.matrices.clear();
+        let f32_el = Element::f32();
+        let q4k_el = chain_element(seismic::BackendName::Cuda).unwrap();
+        gpu.first.formats = vec![
+            // F32 at 300 GB/s has half bf16's 1-row FLOPs (150 GFLOP/s) -> scales 100× to 15 TFLOP/s.
+            (f32_el, FormatRates { pilot: rate(300e9), streamed: None }),
+            // Q4_K at 300 GB/s has >3× bf16's 1-row FLOPs -> caps at 30 TFLOP/s (never exceeds bf16).
+            (q4k_el, FormatRates { pilot: rate(300e9), streamed: None }),
+        ];
+        assert!((gpu.matrix_flops(f32_el) - 15e12).abs() < 1e6, "got {}", gpu.matrix_flops(f32_el));
+        assert!((gpu.matrix_flops(q4k_el) - 30e12).abs() < 1e6, "got {}", gpu.matrix_flops(q4k_el));
+        // Once Q4_K's own matrix throughput is measured, that value is returned directly.
+        gpu.matrices.push((q4k_el, MatrixCosts { flops: measured(28e12), features: 16384 }));
+        assert_eq!(gpu.matrix_flops(q4k_el), 28e12);
+
+        // CPU: 1-row bf16 is compute-bound at 100 GFLOP/s and matrix is also 100 GFLOP/s (ratio = 1).
+        let mut cpu = gpu.clone();
+        cpu.matrices.clear();
+        cpu.first.activation = rate(100e9);
+        cpu.activation_matrix = Some(MatrixCosts { flops: measured(100e9), features: 16384 });
+        // F32 pilot at 100 GB/s = 50 GFLOP/s; with ratio = 1 it stays 50 GFLOP/s.
+        cpu.first.formats = vec![(f32_el, FormatRates { pilot: rate(100e9), streamed: None })];
+        assert!((cpu.matrix_flops(f32_el) - 50e9).abs() < 1e3, "got {}", cpu.matrix_flops(f32_el));
     }
 }

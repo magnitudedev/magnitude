@@ -86,36 +86,118 @@ impl ArenaExpression {
         }
     }
 
-    fn minimum(&self, domains: &[Domain]) -> Result<i64> {
+    fn check_domains(&self, domains: &[Domain], all_singleton: &mut bool) -> bool {
         match self {
-            Self::Constant(value) => Ok(*value),
+            Self::Constant(_) => true,
             Self::Variable(variable) => {
-                domains
-                    .get(variable.0)
-                    .and_then(Domain::min)
-                    .ok_or_else(|| {
-                        Error::InvalidModel("arena expression has an empty variable domain".into())
-                    })
+                let domain = &domains[variable.0];
+                if domain.is_empty() {
+                    return false;
+                }
+                *all_singleton &= domain.is_singleton();
+                true
             }
             Self::Sum(terms) => terms
                 .iter()
-                .try_fold(0i64, |sum, (coefficient, expression)| {
-                    if *coefficient < 0 {
-                        return Ok(0);
+                .all(|(_, expression)| expression.check_domains(domains, all_singleton)),
+            Self::Product(factors) => factors
+                .iter()
+                .all(|factor| factor.check_domains(domains, all_singleton)),
+            Self::Quotient(left, right) | Self::Remainder(left, right) => {
+                left.check_domains(domains, all_singleton)
+                    && right.check_domains(domains, all_singleton)
+            }
+        }
+    }
+
+    pub(crate) fn bounds(&self, domains: &[Domain]) -> Result<(i128, i128)> {
+        match self {
+            Self::Constant(value) => {
+                let value = *value as i128;
+                Ok((value, value))
+            }
+            Self::Variable(variable) => {
+                let domain = domains.get(variable.0).ok_or_else(|| {
+                    Error::InvalidModel(format!(
+                        "arena expression names variable {} absent from the model",
+                        variable.0
+                    ))
+                })?;
+                let (Some(min), Some(max)) = (domain.min(), domain.max()) else {
+                    return Err(Error::InvalidModel(
+                        "arena expression has an empty variable domain".into(),
+                    ));
+                };
+                Ok((min as i128, max as i128))
+            }
+            Self::Sum(terms) => {
+                let mut lower = 0i128;
+                let mut upper = 0i128;
+                for (coefficient, expression) in terms {
+                    let (min, max) = expression.bounds(domains)?;
+                    let c = *coefficient as i128;
+                    let a = min
+                        .checked_mul(c)
+                        .ok_or_else(|| Error::Overflow("arena bound product".into()))?;
+                    let b = max
+                        .checked_mul(c)
+                        .ok_or_else(|| Error::Overflow("arena bound product".into()))?;
+                    lower = lower
+                        .checked_add(a.min(b))
+                        .ok_or_else(|| Error::Overflow("arena bound sum".into()))?;
+                    upper = upper
+                        .checked_add(a.max(b))
+                        .ok_or_else(|| Error::Overflow("arena bound sum".into()))?;
+                }
+                Ok((lower, upper))
+            }
+            Self::Product(factors) => {
+                let mut lower = 1i128;
+                let mut upper = 1i128;
+                for factor in factors {
+                    let (fmin, fmax) = factor.bounds(domains)?;
+                    let corners = [
+                        lower.checked_mul(fmin),
+                        lower.checked_mul(fmax),
+                        upper.checked_mul(fmin),
+                        upper.checked_mul(fmax),
+                    ];
+                    let mut next_min = i128::MAX;
+                    let mut next_max = i128::MIN;
+                    for corner in corners {
+                        let value =
+                            corner.ok_or_else(|| Error::Overflow("arena bound product".into()))?;
+                        next_min = next_min.min(value);
+                        next_max = next_max.max(value);
                     }
-                    let term = expression
-                        .minimum(domains)?
-                        .checked_mul(*coefficient)
-                        .ok_or_else(|| Error::Overflow("arena lower-bound product".into()))?;
-                    sum.checked_add(term)
-                        .ok_or_else(|| Error::Overflow("arena lower-bound sum".into()))
-                }),
-            Self::Product(factors) => factors.iter().try_fold(1i64, |product, factor| {
-                product
-                    .checked_mul(factor.minimum(domains)?)
-                    .ok_or_else(|| Error::Overflow("arena lower-bound product".into()))
-            }),
-            Self::Quotient(_, _) | Self::Remainder(_, _) => Ok(0),
+                    lower = next_min;
+                    upper = next_max;
+                }
+                Ok((lower, upper))
+            }
+            Self::Quotient(numerator, denominator) => {
+                let (n_min, n_max) = numerator.bounds(domains)?;
+                let (d_min, d_max) = denominator.bounds(domains)?;
+                if d_max <= 0 {
+                    return Err(Error::InvalidModel(
+                        "arena expression has a nonpositive divisor".into(),
+                    ));
+                }
+                let d_lo = d_min.max(1);
+                let q_min = n_min.div_euclid(d_lo).min(n_min.div_euclid(d_max));
+                let q_max = n_max.div_euclid(d_lo).max(n_max.div_euclid(d_max));
+                Ok((q_min, q_max))
+            }
+            Self::Remainder(numerator, denominator) => {
+                let _ = numerator.bounds(domains)?;
+                let (_, d_max) = denominator.bounds(domains)?;
+                if d_max <= 0 {
+                    return Err(Error::InvalidModel(
+                        "arena expression has a nonpositive divisor".into(),
+                    ));
+                }
+                Ok((0, d_max - 1))
+            }
         }
     }
 
@@ -242,6 +324,14 @@ impl ArenaPacking {
                 }
             }
         }
+        for variable in self.scope() {
+            if domains.get(variable.0).is_none() {
+                return Err(Error::InvalidModel(format!(
+                    "arena packing names unknown variable {}",
+                    variable.0
+                )));
+            }
+        }
         let mut edges = BTreeSet::new();
         for &(left, right) in &self.interference {
             if left == right || !ordinals.contains(&left) || !ordinals.contains(&right) {
@@ -258,13 +348,45 @@ impl ArenaPacking {
         Ok(())
     }
 
+    pub(crate) fn has_empty_domain(&self, domains: &[Domain]) -> bool {
+        let mut all_singleton = true;
+        for item in &self.items {
+            for clause in &item.activation {
+                for literal in clause {
+                    if domains[literal.variable.0].is_empty() {
+                        return true;
+                    }
+                }
+            }
+            if !item.bytes.check_domains(domains, &mut all_singleton) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn assess(&self, domains: &[Domain]) -> Result<Assessment> {
         self.validate(domains)?;
-        if self
-            .scope()
-            .iter()
-            .all(|variable| domains[variable.0].is_singleton())
-        {
+        self.assess_validated(domains)
+    }
+
+    pub(crate) fn assess_validated(&self, domains: &[Domain]) -> Result<Assessment> {
+        let mut all_singleton = true;
+        for item in &self.items {
+            for clause in &item.activation {
+                for literal in clause {
+                    let domain = &domains[literal.variable.0];
+                    if domain.is_empty() {
+                        return Ok(Assessment::infeasible());
+                    }
+                    all_singleton &= domain.is_singleton();
+                }
+            }
+            if !item.bytes.check_domains(domains, &mut all_singleton) {
+                return Ok(Assessment::infeasible());
+            }
+        }
+        if all_singleton {
             let values = domains
                 .iter()
                 .map(|domain| domain.singleton_value().unwrap_or(0))
@@ -310,15 +432,16 @@ impl ArenaPacking {
                     clique.push(*candidate);
                 }
             }
-            let bytes = clique.iter().try_fold(0u64, |sum, member| {
-                let minimum = member.bytes.minimum(domains)?;
-                let minimum = u64::try_from(minimum).map_err(|_| {
-                    Error::InvalidModel("arena item has a negative minimum size".into())
-                })?;
-                sum.checked_add(minimum)
-                    .ok_or_else(|| Error::Overflow("arena clique lower bound".into()))
-            })?;
-            if bytes > self.capacity {
+            let mut bytes = 0u128;
+            for member in &clique {
+                let (minimum, _) = member.bytes.bounds(domains)?;
+                if minimum > 0 {
+                    bytes = bytes
+                        .checked_add(minimum as u128)
+                        .ok_or_else(|| Error::Overflow("arena clique lower bound".into()))?;
+                }
+            }
+            if bytes > self.capacity as u128 {
                 return Ok(true);
             }
         }
@@ -461,4 +584,123 @@ pub fn arena_offsets(packing: &ArenaPacking, values: &[i64]) -> Result<Option<BT
         offsets.insert(ordinal, offset);
     }
     Ok(Some(offsets))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounds_handles_negative_coefficients_in_sum() {
+        // 10 * x - 3 * y with x in [4, 6], y in [1, 5]
+        // min = 10*4 - 3*5 = 25, max = 10*6 - 3*1 = 57
+        let expr = ArenaExpression::Sum(vec![
+            (10, ArenaExpression::Variable(VarId(0))),
+            (-3, ArenaExpression::Variable(VarId(1))),
+        ]);
+        let domains = [
+            Domain::interval(4, 6).unwrap(),
+            Domain::interval(1, 5).unwrap(),
+        ];
+        assert_eq!(expr.bounds(&domains).unwrap(), (25, 57));
+
+        // Ensure negative term can lower the bound below zero instead of clamping to 0.
+        let neg_expr = ArenaExpression::Sum(vec![
+            (1, ArenaExpression::Variable(VarId(0))),
+            (-10, ArenaExpression::Variable(VarId(1))),
+        ]);
+        assert_eq!(neg_expr.bounds(&domains).unwrap(), (-46, -4));
+    }
+
+    #[test]
+    fn bounds_handles_negative_factors_in_product() {
+        // [-4, -2] * [-5, -1] => min = (-2)*(-1) = 2, max = (-4)*(-5) = 20
+        let expr = ArenaExpression::Product(vec![
+            ArenaExpression::Variable(VarId(0)),
+            ArenaExpression::Variable(VarId(1)),
+        ]);
+        let domains = [
+            Domain::interval(-4, -2).unwrap(),
+            Domain::interval(-5, -1).unwrap(),
+        ];
+        assert_eq!(expr.bounds(&domains).unwrap(), (2, 20));
+
+        // Mixed signs: [-3, 2] * [-4, 5] => corners {12, -15, -8, 10} => (-15, 12)
+        let mixed = [
+            Domain::interval(-3, 2).unwrap(),
+            Domain::interval(-4, 5).unwrap(),
+        ];
+        assert_eq!(expr.bounds(&mixed).unwrap(), (-15, 12));
+    }
+
+    #[test]
+    fn bounds_handles_quotient_and_remainder() {
+        let quot = ArenaExpression::Quotient(
+            Box::new(ArenaExpression::Variable(VarId(0))),
+            Box::new(ArenaExpression::Variable(VarId(1))),
+        );
+        let domains = [
+            Domain::interval(-5, 7).unwrap(),
+            Domain::interval(2, 4).unwrap(),
+        ];
+        // (-5).div_euclid(2) = -3, 7.div_euclid(2) = 3
+        assert_eq!(quot.bounds(&domains).unwrap(), (-3, 3));
+
+        let rem = ArenaExpression::Remainder(
+            Box::new(ArenaExpression::Variable(VarId(0))),
+            Box::new(ArenaExpression::Variable(VarId(1))),
+        );
+        assert_eq!(rem.bounds(&domains).unwrap(), (0, 3));
+    }
+
+    #[test]
+    fn assess_short_circuits_empty_domain_to_infeasible() {
+        let packing = ArenaPacking {
+            capacity: 16,
+            items: vec![ArenaItem {
+                ordinal: 0,
+                activation: vec![vec![ArenaLiteral {
+                    variable: VarId(0),
+                    value: 1,
+                }]],
+                bytes: ArenaExpression::Variable(VarId(1)),
+                alignment: 1,
+            }],
+            interference: vec![],
+        };
+        let domains = [Domain::singleton(1), Domain::empty()];
+        assert_eq!(packing.assess(&domains).unwrap(), Assessment::infeasible());
+    }
+
+    #[test]
+    fn assess_uses_sound_lower_bound_with_negative_sum_coefficient() {
+        // bytes = 100 - 10 * x with x in [1, 9] => actual bytes in [10, 90].
+        // With capacity 50, x = 8 gives bytes = 20 <= 50 (feasible),
+        // while capacity 5 is infeasible because min bytes = 10 > 5.
+        let make_packing = |capacity| ArenaPacking {
+            capacity,
+            items: vec![ArenaItem {
+                ordinal: 0,
+                activation: vec![vec![ArenaLiteral {
+                    variable: VarId(0),
+                    value: 1,
+                }]],
+                bytes: ArenaExpression::Sum(vec![
+                    (1, ArenaExpression::Constant(100)),
+                    (-10, ArenaExpression::Variable(VarId(1))),
+                ]),
+                alignment: 1,
+            }],
+            interference: vec![],
+        };
+        let domains = [Domain::singleton(1), Domain::interval(1, 9).unwrap()];
+        assert_eq!(
+            make_packing(50).assess(&domains).unwrap(),
+            Assessment::bounded(0)
+        );
+        assert_eq!(
+            make_packing(5).assess(&domains).unwrap(),
+            Assessment::infeasible()
+        );
+    }
 }

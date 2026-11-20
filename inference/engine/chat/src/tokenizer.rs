@@ -487,12 +487,16 @@ impl magnitude_grammar::TokenTable for ByteBpeTokenizer {
     fn len(&self) -> usize {
         self.vocabulary()
     }
-    /// Unused pieces, and byte-fallback pieces outside UTF-8, never spell
-    /// grammar text.
+    /// Unused pieces, and pieces containing bytes that can never appear in
+    /// valid UTF-8, never spell grammar text.
     fn bytes(&self, token: TokenId) -> Option<&[u8]> {
         let id = token.0 as usize;
         let piece = self.pieces.get(id)?;
-        (self.kinds[id] != PieceKind::Unused && !piece.starts_with(&[0xff])).then_some(piece)
+        (self.kinds[id] != PieceKind::Unused
+            && !piece
+                .iter()
+                .any(|&byte| matches!(byte, 0xc0 | 0xc1 | 0xf5..=0xff)))
+        .then_some(piece)
     }
     fn stop_tokens(&self) -> &BTreeSet<TokenId> {
         &self.stop_tokens
@@ -599,5 +603,20 @@ mod tests {
         assert_eq!(decoder.pending.len(), 1);
         assert_eq!(decoder.finish().unwrap(), "\u{FFFD}");
         assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn token_table_excludes_all_invalid_utf8_bytes() {
+        use magnitude_grammar::TokenTable;
+
+        let tokenizer = byte_fallback_tokenizer();
+        for byte in 0u8..=255 {
+            let expected = (!matches!(byte, 0xc0 | 0xc1 | 0xf5..=0xff)).then_some([byte]);
+            assert_eq!(
+                tokenizer.bytes(TokenId(u32::from(byte))),
+                expected.as_ref().map(|slice| slice.as_slice()),
+                "unexpected TokenTable::bytes result for 0x{byte:02X}",
+            );
+        }
     }
 }

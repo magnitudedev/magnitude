@@ -2,8 +2,11 @@
 use super::{ImageProcessor, resize};
 use image::{GenericImageView, Rgb32FImage};
 
-fn divisible(value: f64, factor: usize) -> usize {
-    ((value / factor as f64).round_ties_even() as usize).max(1) * factor
+fn divisible(value: f64, factor: usize) -> Result<usize, String> {
+    ((value / factor as f64).round_ties_even() as usize)
+        .max(1)
+        .checked_mul(factor)
+        .ok_or_else(|| String::from("resized image extent overflows"))
 }
 
 pub(super) fn best_size(
@@ -12,15 +15,19 @@ pub(super) fn best_size(
     resolution: usize,
     patch: usize,
     upscale: bool,
-) -> (usize, usize) {
-    let (height, width) = if height * width > (resolution * resolution) as f64 || upscale {
+) -> Result<(usize, usize), String> {
+    let resolution_area = resolution
+        .checked_mul(resolution)
+        .ok_or("slice resolution overflows")?;
+    let align = patch.checked_mul(4).ok_or("slice alignment overflows")?;
+    let (height, width) = if height * width > resolution_area as f64 || upscale {
         let ratio = width / height;
         let height = (resolution as f64 / ratio.sqrt()).floor();
         (height, (height * ratio).floor())
     } else {
         (height, width)
     };
-    (divisible(height, patch * 4), divisible(width, patch * 4))
+    Ok((divisible(height, align)?, divisible(width, align)?))
 }
 
 pub(super) fn grid(height: usize, width: usize, resolution: usize, maximum: usize) -> [usize; 2] {
@@ -32,7 +39,7 @@ pub(super) fn grid(height: usize, width: usize, resolution: usize, maximum: usiz
     }
     let target = (width as f64 / height as f64).ln();
     let (mut best, mut error) = ([1, 1], f64::INFINITY);
-    for count in multiple - 1..=multiple + 1 {
+    for count in multiple - 1..=multiple.saturating_add(1) {
         if count == 1 || count > maximum {
             continue;
         }
@@ -69,13 +76,13 @@ impl ImageProcessor {
             resolution,
             self.config.patch,
             grid == [0, 0],
-        );
+        )?;
         let overview_rows = self.prepared_rows(prior_rows, h, w)?;
         let detail = if grid != [0, 0] {
             let [rows, columns] = grid;
-            let h = divisible(height as f64, rows) as f64 / rows as f64;
-            let w = divisible(width as f64, columns) as f64 / columns as f64;
-            let (h, w) = best_size(h, w, resolution, self.config.patch, true);
+            let h = divisible(height as f64, rows)? as f64 / rows as f64;
+            let w = divisible(width as f64, columns)? as f64 / columns as f64;
+            let (h, w) = best_size(h, w, resolution, self.config.patch, true)?;
             let full_h = h
                 .checked_mul(rows)
                 .ok_or("refined image height overflows")?;
@@ -112,9 +119,17 @@ mod tests {
     fn overview_and_detail_grids_follow_the_reference_rounding() {
         assert_eq!(grid(448, 448, 448, 9), [0, 0]);
         assert_eq!(grid(1000, 2000, 448, 9), [2, 4]);
-        assert_eq!(best_size(1000., 2000., 448, 14, false), (336, 616));
-        assert_eq!(best_size(100., 200., 448, 14, true), (336, 616));
-        assert_eq!(best_size(448., 448., 448, 14, true), (448, 448));
+        assert_eq!(best_size(1000., 2000., 448, 14, false).unwrap(), (336, 616));
+        assert_eq!(best_size(100., 200., 448, 14, true).unwrap(), (336, 616));
+        assert_eq!(best_size(448., 448., 448, 14, true).unwrap(), (448, 448));
         assert_eq!(grid(896, 896, 448, 9), [2, 2]);
+    }
+
+    #[test]
+    fn best_size_and_divisible_reject_overflowing_arithmetic() {
+        let half_bits = 1usize << (usize::BITS / 2);
+        assert!(best_size(448., 448., half_bits, 14, true).is_err());
+        assert!(best_size(448., 448., 448, usize::MAX / 2, true).is_err());
+        assert!(divisible(usize::MAX as f64, 16).is_err());
     }
 }

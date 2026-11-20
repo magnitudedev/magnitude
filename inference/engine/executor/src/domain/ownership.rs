@@ -85,21 +85,34 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         );
         let reserved = crate::memory::ledger::RequestRows::of(&self.execution).opening(rows);
         let changes = self.resources.ledgers().changes().clone();
-        let mut reservation = changes
+        let (mut reservation, kept) = changes
             .change(|keeping| {
                 let kept = self.keep_components(&keeping);
-                let reservation = self.resources.ledgers().device().reserve(&keeping.claims(), &self.request_slot, request, reserved);
-                match reservation {
-                    Ok(_) => self.activate_components(kept),
-                    Err(_) => self.idle_kept(kept),
+                match self.resources.ledgers().device().reserve(&keeping.claims(), &self.request_slot, request, reserved) {
+                    Ok(reservation) => Ok((reservation, kept)),
+                    Err(short) => {
+                        self.idle_kept(kept);
+                        Err(short)
+                    }
                 }
-                reservation
             })
             .map_err(DomainError::request_short)?;
-        self.conclude_chain()?;
-        let (target, head) = match from {
-            Some(from) => self.fork_resume_state(from),
-            None => self.fresh_state(&mut unchained)?,
+        let opened = (|| -> Result<_, DomainError> {
+            self.conclude_chain()?;
+            match from {
+                Some(from) => Ok(self.fork_resume_state(from)),
+                None => self.fresh_state(&mut unchained),
+            }
+        })();
+        let (target, head) = match opened {
+            Ok(state) => state,
+            Err(error) => {
+                changes.change(|_| {
+                    drop(reservation);
+                    self.idle_kept(kept);
+                });
+                return Err(error);
+            }
         };
         let position = target.position();
         reservation.grow(position as u64);
@@ -111,9 +124,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if let Err(error) = self.back_reservation(unchained.bindings(), request) {
             self.target.remove(&request);
             self.head.remove(&request);
-            self.change_state(|this, _| this.drop_state_claim(request));
+            self.change_state(|this, _| {
+                this.drop_state_claim(request);
+                this.idle_kept(kept);
+            });
             return Err(error);
         }
+        self.activate_components(kept);
         let installed = self.input.get_mut(&request).expect("input checked above");
         installed.resident = true;
         installed.boundary = from.and_then(|from| from.boundary.clone());
@@ -282,6 +299,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.chain_holder().is_some_and(|holder| requests.contains(&holder)) {
             self.conclude_chain().map_err(|error| error.to_string())?;
         }
+        if !requests.iter().all(|request| self.input.contains_key(request)) {
+            return Err("evicted request has no installed input".into());
+        }
         if !requests.iter().all(|request| self.target.contains_key(request)) {
             return Err("an evicted request has unresolved or absent target state".into());
         }
@@ -295,12 +315,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let installed = self
                 .input
                 .get_mut(request)
-                .ok_or("evicted request has no installed input")?;
+                .expect("input checked above");
             installed.resident = false;
             installed.boundary = None;
+            installed.tokens = Default::default();
             for slot in installed.images.values_mut() {
                 slot.features = None;
             }
+            self.verifying.remove(request);
+            self.publishing.remove(request);
             self.target.remove(request);
             self.head.remove(request);
         }
@@ -311,5 +334,67 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_state_clears_verifying_publishing_and_tokens() {
+        let (mut domain, mut bindings) = super::fixtures::fixture(None);
+        let request = RequestId(1);
+        domain
+            .install_input(request, PreparedModelInput::continuation_only())
+            .unwrap();
+        domain.open_served(&mut bindings, request, None).unwrap();
+        domain.verifying.insert(request);
+        domain.publishing.insert(request);
+        domain
+            .input
+            .get_mut(&request)
+            .unwrap()
+            .tokens
+            .feed(0, &[TokenId(7), TokenId(8)])
+            .unwrap();
+
+        domain.release_state(&[request]).unwrap();
+
+        assert!(!domain.verifying.contains(&request));
+        assert!(!domain.publishing.contains(&request));
+        assert!(!domain.target.contains_key(&request));
+        assert!(!domain.state_claims.contains_key(&request));
+        let installed = &domain.input[&request];
+        assert!(!installed.resident);
+        assert!(installed.boundary.is_none());
+        assert!(installed.tokens.before(1).is_err());
+    }
+
+    #[test]
+    fn release_state_rejects_missing_input_atomically() {
+        let (mut domain, mut bindings) = super::fixtures::fixture(None);
+        let first = RequestId(1);
+        let second = RequestId(2);
+        for request in [first, second] {
+            domain
+                .install_input(request, PreparedModelInput::continuation_only())
+                .unwrap();
+            domain.open_served(&mut bindings, request, None).unwrap();
+        }
+        domain.verifying.insert(first);
+        domain.publishing.insert(first);
+        // Drop `second`'s input while leaving its target state intact so only
+        // the input check rejects the batch.
+        domain.input.remove(&second);
+
+        let err = domain.release_state(&[first, second]).unwrap_err();
+        assert!(err.contains("no installed input"), "unexpected error: {err}");
+
+        assert!(domain.input[&first].resident);
+        assert!(domain.target.contains_key(&first));
+        assert!(domain.state_claims.contains_key(&first));
+        assert!(domain.verifying.contains(&first));
+        assert!(domain.publishing.contains(&first));
     }
 }

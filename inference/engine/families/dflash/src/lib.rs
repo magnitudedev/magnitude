@@ -33,7 +33,7 @@ use magnitude_family_contracts::{
     BlockConvolutions, BlockLayout, CandidateCorrector, CandidateSelector, CenteredNorm,
     ConfidenceHead, CorrectorLayer, DefinitionError, DenseFfn, DraftDefinition, DraftEmbedding,
     DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, HeadNorm, HistoryRows,
-    HistorySource, ImportTransform, InputNorm, LayerConvolutions, MarkovHead, ProjectedRows,
+    HistorySource, InputNorm, LayerConvolutions, MarkovHead, ProjectedRows,
     RowProducer, RowRounding, TokenDomain,
     MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection, OutputRotary,
     QueryKeys, QueryProjection, RmsNorm, Rotary, RotaryLayout, Sublayer, TapPoint,
@@ -204,6 +204,7 @@ impl From<HeaderError> for Error {
                 tensors,
             },
             HeaderError::Definition(error) => Self::Definition(error),
+            HeaderError::RopeScaling(kind) => Self::RopeScaling(kind),
             error @ (HeaderError::NotMatrix { .. }
             | HeaderError::CompanionScale { .. }
             | HeaderError::Rotary { .. }
@@ -231,20 +232,6 @@ pub fn recognizes(directory: &Directory) -> bool {
     recognize(directory).is_ok()
 }
 
-/// A parameter vector stored as `[n]` or as a `[1, n]` matrix.
-fn bind_vector(
-    tensors: &mut Tensors,
-    name: &str,
-    width: u64,
-) -> Result<WeightDescriptor, HeaderError> {
-    match tensors.shape(name)? {
-        [1, columns] if *columns == width => {
-            tensors.bind_transformed(name, &[1, width], vec![ImportTransform::Flatten])
-        }
-        _ => tensors.bind(name, &[width]),
-    }
-}
-
 /// The draft's rotary table. Pairs are `(p, p + W/2)` over the whole head
 /// (the stored rows are already in that order); YaRN, when declared, folds
 /// into each pair's frequency and amplitude exactly.
@@ -261,14 +248,16 @@ fn rotary_table(m: &Metadata, width: u64) -> Result<Rotary, Error> {
                 "rotary sections {sections:?} other than one text axis over the head"
             )));
         }
-        if m.optional_string("rope.scaling.type")?.is_some() {
+        if m.optional_string("rope.scaling.type")?
+            .is_some_and(|scaling| scaling != "none")
+        {
             return Err(Error::Geometry(
                 "a draft's rotary is either sectioned or scaled".into(),
             ));
         }
     }
     match m.optional_string("rope.scaling.type")? {
-        None => Ok(rotary::table(width, width, base)?),
+        None | Some("none") => Ok(rotary::table(width, width, base)?),
         Some("yarn") => {
             // The drafts' YaRN scales its amplitude by YaRN's mscale, under
             // the header's multiplier; only the neutral multiplier is
@@ -307,7 +296,7 @@ pub fn inspect(
     recognize(directory)?;
     let m = Metadata::new(directory, ARCHITECTURE);
     let decoder = &target.decoder;
-    let block_count = m.integer("block_count")?;
+    let block_count = m.bounded_block_count("block_count")?;
     // The longest sequence the draft was trained on: no layer reads further
     // back than it (a full layer's history is a window of that length).
     let context_length = m.integer("context_length")?;
@@ -332,21 +321,15 @@ pub fn inspect(
             "draft models require a single-stream target residual".into(),
         ));
     }
-    if m.integer("attention.value_length")? != width {
-        return Err(Error::Geometry(
-            "value head width differs from key head width".into(),
-        ));
-    }
+    m.invariant_count(
+        "attention.value_length",
+        width,
+        "equal to attention.key_length",
+    )?;
+    let _ = m.vocab_size(decoder.vocabulary)?;
     if !width.is_multiple_of(2) || block_size < 2 {
         return Err(Error::Geometry(
             "draft heads need an even width and blocks two slots".into(),
-        ));
-    }
-    // Each layer binds distinct stored weights; reject impossible counts
-    // before allocating from untrusted metadata.
-    if block_count > directory.tensors.len() as u64 {
-        return Err(Error::Geometry(
-            "block count exceeds the stored weight roles".into(),
         ));
     }
     let mask_token = directory
@@ -402,7 +385,7 @@ pub fn inspect(
             let role = |role: &str| format!("blk.{index}.{role}.weight");
             let sinks = role("attn_sinks");
             let sinks = if binder.contains(&sinks) {
-                Some(bind_vector(&mut binder, &sinks, heads)?)
+                Some(binder.bind(&sinks, &[heads])?)
             } else {
                 None
             };
@@ -530,8 +513,8 @@ pub fn inspect(
             ));
         }
         let confidence = ConfidenceHead {
-            weight: bind_vector(&mut binder, "conf_proj.weight", hidden + rank)?,
-            bias: bind_vector(&mut binder, "conf_proj.bias", 1)?,
+            weight: binder.bind("conf_proj.weight", &[hidden + rank])?,
+            bias: binder.bind("conf_proj.bias", &[1])?,
         };
         DraftMethod::DSpark { markov, confidence }
     } else {
@@ -667,7 +650,7 @@ fn candidate_corrector(
     let width = m.integer("hidden_size")?;
     let top_k = m.integer("candidate_topk")?;
     let heads = m.integer("num_heads")?;
-    let layers = m.integer("num_layers")?;
+    let layers = m.bounded_block_count("num_layers")?;
     let factor = m.integer("factor_dim")?;
     let mlp = m.integer("mlp_hidden_size")?;
     let vector_epsilon = m.positive_number("vector_eps")?;
@@ -677,11 +660,9 @@ fn candidate_corrector(
         || top_k == 0
         || heads == 0
         || !width.is_multiple_of(heads)
-        || layers == 0
         || factor == 0
         || mlp == 0
         || block_size < 2
-        || layers > directory.tensors.len() as u64
     {
         return Err(Error::Geometry("corrector geometry".into()));
     }
@@ -694,7 +675,7 @@ fn candidate_corrector(
      -> Result<Affine, Error> {
         Ok(Affine {
             weight: binder.bind(&format!("{stem}.weight"), &[outputs, inputs])?,
-            bias: bind_vector(binder, &format!("{stem}.bias"), outputs)?,
+            bias: binder.bind(&format!("{stem}.bias"), &[outputs])?,
         })
     };
     let rms = |weight| RmsNorm { weight, epsilon };
@@ -707,15 +688,13 @@ fn candidate_corrector(
     let context = affine(binder, "lilicorr.context_proj", width, hidden)?;
     let features = block_count + layers;
     let feature_norm = CenteredNorm {
-        weight: bind_vector(
-            binder,
+        weight: binder.bind(
             &format!("blk.{features}.ffn_norm.weight"),
-            CORRECTOR_FEATURES,
+            &[CORRECTOR_FEATURES],
         )?,
-        bias: bind_vector(
-            binder,
+        bias: binder.bind(
             &format!("blk.{features}.ffn_norm.bias"),
-            CORRECTOR_FEATURES,
+            &[CORRECTOR_FEATURES],
         )?,
         epsilon: CORRECTOR_FEATURE_EPSILON,
     };
@@ -733,11 +712,7 @@ fn candidate_corrector(
         .map(|index| {
             let block = block_count + index;
             Ok(CorrectorLayer {
-                attention_norm: rms(bind_vector(
-                    binder,
-                    &format!("blk.{block}.attn_norm.weight"),
-                    width,
-                )?),
+                attention_norm: rms(binder.bind(&format!("blk.{block}.attn_norm.weight"), &[width])?),
                 attention_input: affine(
                     binder,
                     &format!("lilicorr.layers.{index}.attn.in_proj"),
@@ -750,11 +725,7 @@ fn candidate_corrector(
                     width,
                     width,
                 )?,
-                mlp_norm: rms(bind_vector(
-                    binder,
-                    &format!("blk.{block}.ffn_norm.weight"),
-                    width,
-                )?),
+                mlp_norm: rms(binder.bind(&format!("blk.{block}.ffn_norm.weight"), &[width])?),
                 up: affine(binder, &format!("blk.{block}.ffn_up"), mlp, width)?,
                 down: affine(binder, &format!("blk.{block}.ffn_down"), width, mlp)?,
             })
@@ -775,8 +746,8 @@ fn candidate_corrector(
         rank_embedding,
         attention_bias,
         layers: corrector_layers,
-        output_norm: rms(bind_vector(binder, "lilicorr.output_norm.weight", width)?),
-        anchor_norm: rms(bind_vector(binder, "lilicorr.anchor_norm.weight", width)?),
+        output_norm: rms(binder.bind("lilicorr.output_norm.weight", &[width])?),
+        anchor_norm: rms(binder.bind("lilicorr.anchor_norm.weight", &[width])?),
         factor_input: affine(
             binder,
             "lilicorr.factor_input_proj",

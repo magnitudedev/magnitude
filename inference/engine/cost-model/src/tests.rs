@@ -363,3 +363,46 @@ fn a_victims_release_is_half_the_step_its_reads_leave() {
     assert_eq!(PathRecords::release(0.1, 0.12), 0.);
     assert_eq!(PathRecords::release(0.1, 0.), 0.05);
 }
+
+/// `BankPrices::step_seconds` credits the host tier when `HeldSlots { slots, host }`
+/// is passed (unlike `HeldSlots::bank(slots)` which drops the host tier), and
+/// `BankPrices::prompt_seconds` prices cold misses via `Pass::Group`
+/// (`ExpertLines::group_stage`) without double-counting compute.
+#[test]
+fn bank_prices_step_accounts_for_host_tier_and_prompt_uses_group_stage() {
+    let read = ReadLine::new(4e-4, 1. / 2e9).unwrap();
+    let lines = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
+    let experts = vec![32u64, 32];
+    let layers = StreamedLayers::new(experts.clone(), 4, std::sync::Arc::from([lines, lines]));
+    let pass = ExpertPass::new(
+        figures().rates,
+        vec![
+            (RoutedKind(0), vec![Bytes { format: Q4K, bytes: ExpertLines::REFERENCE_RECORD }], vec![Flops { format: Q4K, flops: 2 * ExpertLines::REFERENCE_RECORD }]),
+            (RoutedKind(0), vec![Bytes { format: Q4K, bytes: ExpertLines::REFERENCE_RECORD }], vec![Flops { format: Q4K, flops: 2 * ExpertLines::REFERENCE_RECORD }]),
+        ],
+        HostReads::Read,
+    );
+    let routed = PassLayers::of(&pass, experts, 4);
+    let compute = FormSeconds { resident: 0.010, streamed: 0.012 };
+    let rates = WorkloadRates::prior(0.012, 100., 512., 0.1);
+    let prices = BankPrices::new(layers, pass, routed, 1, read, compute, rates, 256, 512);
+
+    // Host tier holds all 32 experts while VRAM holds 8: decode step is strictly
+    // faster with host tier credited than with `HeldSlots::bank(8)` (file misses).
+    let with_host = HeldSlots { slots: 8, host: 32 };
+    let without_host = HeldSlots::bank(8);
+    assert!(
+        prices.step_seconds(with_host) < prices.step_seconds(without_host),
+        "host tier must reduce decode step time: {} vs {}",
+        prices.step_seconds(with_host),
+        prices.step_seconds(without_host)
+    );
+
+    // Prompt seconds at 2 launches (512 rows, 1 pass) equals routed compute
+    // (the whole-bank prompt seconds) plus `Pass::Group` staging of the 24
+    // host-tier misses per layer.
+    let whole_prompt = prices.prompt_seconds(2, HeldSlots::bank(32));
+    let tiered_prompt = prices.prompt_seconds(2, with_host);
+    let expected_stage = 2. * lines.group_stage(&read, 24, 0);
+    close(tiered_prompt - whole_prompt, expected_stage);
+}

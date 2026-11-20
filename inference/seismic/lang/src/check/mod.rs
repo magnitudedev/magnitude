@@ -191,7 +191,7 @@ impl<'a> Checker<'a> {
             }
         }
         for element in tensor_elements(&c.sig.result.clone()) {
-            c.elements.stored(element);
+            c.elements.record_stored(element);
         }
         let contract = env.resolved.families[declared.family.index()]
             .contract
@@ -504,11 +504,12 @@ impl<'a> Checker<'a> {
     /// storage takes (`registry::store_rule`).
     pub fn write(
         &mut self,
-        root: LocalId,
         binding: LocalId,
         record: bool,
         span: Span,
     ) -> Option<LocalId> {
+        let storage_place = self.local_storage_place(binding);
+        let root = storage_place.local;
         let binding_name = self.locals[binding.index()].name.clone();
         match &self.kinds[binding.index()] {
             LocalKind::Param(i) if self.sig.params[*i].ownership == ParamOwnership::Owned => {
@@ -520,7 +521,7 @@ impl<'a> Checker<'a> {
                 return None;
             }
             LocalKind::Param(_) | LocalKind::State => {}
-            LocalKind::Value if self.is_borrowed_local(binding) => {}
+            LocalKind::Value if self.is_borrowed_local(binding) && self.writable_root(binding) => {}
             _ => {
                 self.error(
                     DiagnosticRule::Ownership,
@@ -530,7 +531,7 @@ impl<'a> Checker<'a> {
                 return None;
             }
         }
-        if !self.writable_root(binding) || !self.writable_root(root) {
+        if !self.writable_root(binding) || !self.writable_place(&storage_place) {
             self.error(
                 DiagnosticRule::Ownership,
                 span,
@@ -541,7 +542,7 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        if let ValueType::Tensor(tensor) = &self.locals[root.index()].ty {
+        if let ValueType::Tensor(tensor) = &self.locals[binding.index()].ty {
             if let Elem::Repr(representation) = &tensor.elem {
                 if let Err(refusal) = crate::registry::store_rule(*representation).admits(record) {
                     self.error(DiagnosticRule::Type, span, refusal);
@@ -558,7 +559,7 @@ impl<'a> Checker<'a> {
         if self
             .live_borrows()
             .iter()
-            .any(|(borrow, borrowed, _)| borrowed.local == root && borrow.local != binding)
+            .any(|(borrow, borrowed, _)| borrowed.overlaps(&storage_place) && borrow.local != binding)
         {
             self.error(
                 DiagnosticRule::Ownership,
@@ -571,7 +572,7 @@ impl<'a> Checker<'a> {
             return None;
         }
         self.source_values.remove(&root);
-        let tensor_effect = matches!(self.locals[root.index()].ty, ValueType::Tensor(_));
+        let tensor_effect = matches!(self.locals[binding.index()].ty, ValueType::Tensor(_));
         self.dyn_views.retain(|(start, end, _, _)| {
             let mentions =
                 |e: &Option<CheckedExpr>| e.as_ref().is_some_and(|b| expr::mentions_local(b, root));
@@ -1763,7 +1764,10 @@ fn check_native(
                 continue;
             }
             Some(parameter)
-                if !(parameter.uses.stored || parameter.uses.partial_copy) || converted =>
+                if !(parameter.uses.stored
+                    || parameter.uses.float_stored
+                    || parameter.uses.partial_copy)
+                    || converted =>
             {
                 errors.push((
                     coverage.name.span,

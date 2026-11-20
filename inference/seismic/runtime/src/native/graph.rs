@@ -1098,6 +1098,8 @@ impl NativeGraphDraft {
         } else {
             Arc::new(candidate)
         };
+        let backend = super::backend_name(&self.device.kind);
+        self.device.native.register_plan_key(backend, shape.keyed(backend));
         Ok(NativeGraphPlan {
             identity,
             shape,
@@ -4783,6 +4785,13 @@ pub struct NativeGraphPlan {
 /// allocation's two reference counts.
 const SHARED_PLAN_BYTES: usize =
     std::mem::size_of::<NativeGraphPlan>() + 2 * std::mem::size_of::<usize>();
+
+impl Drop for NativeGraphPlan {
+    fn drop(&mut self) {
+        let backend = super::backend_name(&self.device.kind);
+        self.device.native.unregister_plan_key(backend, self.shape.keyed(backend));
+    }
+}
 
 impl NativeGraphPlan {
     /// The host heap this plan holds: itself in its shared allocation and

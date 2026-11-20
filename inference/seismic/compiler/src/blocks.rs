@@ -261,6 +261,51 @@ pub fn charge_block(
         .map_err(ExecutionError::from)
 }
 
+/// Like [`charge_block`], but charges the first allocation's `bytes` directly
+/// to `entry` (drawing on its already-committed claim) and only the uncarved
+/// block remainder `size - bytes` to `own`. Returns `(remainder, first)`.
+pub fn charge_block_for(
+    change: &Change,
+    own: &Arc<dyn Entry>,
+    entry: &Arc<dyn Entry>,
+    largest: Option<u64>,
+    cap: u64,
+    bytes: u64,
+    granularity: u64,
+) -> Result<(Charge, Charge), ExecutionError> {
+    let first = Charge::take(change, entry, bytes, Wiring::Pageable).map_err(ExecutionError::from)?;
+    let size = block_bytes(largest, cap, bytes, granularity);
+    let needed = bytes.next_multiple_of(granularity);
+    let take_slack = |total: u64| {
+        let slack = total - bytes;
+        if slack == 0 {
+            Ok(Charge::took(change, own, 0, Wiring::Pageable))
+        } else {
+            Charge::take(change, own, slack, Wiring::Pageable)
+        }
+    };
+    let mut candidate = size;
+    let remainder = loop {
+        match take_slack(candidate) {
+            Ok(charge) => break charge,
+            Err(_) if candidate > needed => {
+                // Step down by half (whole granules) so a tight store still
+                // opens a shared block that fits its room instead of falling
+                // straight to per-tensor dedicated granules.
+                let halved = (candidate / 2).next_multiple_of(granularity).max(needed);
+                candidate = if halved < candidate { halved } else { needed };
+            }
+            Err(_) => {
+                // Mandatory driver granularity rounding (`needed - bytes < granularity`)
+                // for an already-admitted `first` allocation is block slack: record it
+                // on `own` rather than refusing the admitted allocation.
+                break Charge::took(change, own, needed - bytes, Wiring::Pageable);
+            }
+        }
+    };
+    Ok((remainder, first))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +407,36 @@ mod tests {
         assert!(takes_own_block(32 * MIB + 1, cap));
         assert!(!takes_own_block(32 * MIB, cap));
         assert!(takes_own_block(9 * MIB, 16 * MIB));
+    }
+
+    /// Under a tight store, `charge_block_for` charges `bytes` directly to
+    /// `entry`, steps the shared block down by half to the largest power-of-two
+    /// multiple of `granularity` whose slack `own` admits, and never refuses an
+    /// admitted `first` allocation for mandatory granularity rounding.
+    #[test]
+    fn charge_block_for_steps_down_shared_block_and_tolerates_granularity_rounding() {
+        let cap = 1024 * MIB;
+        let g = 2 * MIB;
+        let identity = seismic_topology::StoreIdentity::HostRam;
+        let own_tally = seismic_memory::entry::Tally::limited(identity.clone(), 70 * MIB);
+        let entry_tally = seismic_memory::entry::Tally::limited(identity, u64::MAX);
+        let own: Arc<dyn Entry> = Arc::new(own_tally.clone());
+        let entry: Arc<dyn Entry> = Arc::new(entry_tally.clone());
+
+        // 70 MiB free on `own`: doubled 128 MiB is refused, halved 64 MiB fits.
+        let (remainder, first) =
+            charge_block_for(&own.change(), &own, &entry, Some(64 * MIB), cap, MIB / 4, g).unwrap();
+        assert_eq!(first.bytes(), MIB / 4);
+        assert_eq!(remainder.bytes(), 64 * MIB - MIB / 4);
+        assert_eq!(entry_tally.held(), MIB / 4);
+        assert_eq!(own_tally.held(), 64 * MIB - MIB / 4);
+        drop((remainder, first));
+
+        // 0 free on `own`: mandatory granularity rounding still succeeds via `took`.
+        own_tally.bound(0);
+        let (remainder, first) =
+            charge_block_for(&own.change(), &own, &entry, Some(64 * MIB), cap, MIB / 4, g).unwrap();
+        assert_eq!(first.bytes(), MIB / 4);
+        assert_eq!(remainder.bytes(), g - MIB / 4);
     }
 }

@@ -40,9 +40,7 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("minicpmv4_7", ())], target_width)?;
-    let meta = ProjectorMetadata::new(directory);
-    meta.ignore("clip.has_vision_encoder");
-    meta.ignore("clip.projector_type");
+    let meta = ProjectorMetadata::open(directory);
     meta.ignore("clip.vision.wa_layer_indexes");
     let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
     let mut r = Reader {
@@ -54,9 +52,7 @@ pub fn describe_projector(
             "MiniCPM-V 16x intra-tower compression is not supported by this projector",
         ));
     }
-    if !meta.bool("clip.use_gelu")? {
-        return Err(invalid("MiniCPM-V requires the published GELU tower"));
-    }
+    meta.invariant_flag("clip.use_gelu", true, "true (GELU tower)")?;
     let hidden = meta.integer("clip.vision.embedding_length")?;
     let output_hidden = meta.integer("clip.vision.projection_dim")?;
     let intermediate = meta.integer("clip.vision.feed_forward_length")?;
@@ -66,20 +62,20 @@ pub fn describe_projector(
     if hidden % heads != 0 || (hidden / heads) % 4 != 0 {
         return Err(invalid("invalid MiniCPM-V tower geometry"));
     }
-    let [positions, position_hidden] = r.tensors.shape("v.position_embd.weight")? else {
-        return Err(invalid("position embedding must be a matrix"));
-    };
-    if *position_hidden != hidden {
+    let (positions, position_hidden) = r
+        .tensors
+        .matrix_or_batched_shape("v.position_embd.weight")?;
+    if position_hidden != hidden {
         return Err(invalid("position embedding width differs from tower"));
     }
-    let side = (*positions as f64).sqrt() as u64;
-    if side.checked_mul(side) != Some(*positions) {
+    let side = (positions as f64).sqrt() as u64;
+    if side.checked_mul(side) != Some(positions) {
         return Err(invalid("position embedding must have a square bucket grid"));
     }
     let positions = VisionPositions {
         table: r
             .tensors
-            .bind("v.position_embd.weight", &[side * side, hidden])?,
+            .bind_matrix_or_batched("v.position_embd.weight", side * side, hidden)?,
         sampling: PositionSampling::Buckets { side },
     };
     let stem = VisionStem::Patch {

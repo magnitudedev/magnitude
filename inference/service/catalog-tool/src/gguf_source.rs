@@ -99,14 +99,14 @@ pub struct Shard {
 /// metadata and every shard's tensors.
 pub struct Gguf {
     location: Location,
-    pub shards: Vec<Shard>,
+    shards: Vec<Shard>,
     tensors: HashMap<String, usize>,
 }
 
 impl Gguf {
     pub async fn open(source: &GgufSource) -> anyhow::Result<Self> {
-        let (location, first, resolved_hub_shards) = match source {
-            GgufSource::Local { path } => (Location::Local, path.clone(), None),
+        let (location, first, candidate_paths) = match source {
+            GgufSource::Local { path } => (Location::Local, path.clone(), vec![path.clone()]),
             GgufSource::Hub {
                 repository,
                 revision,
@@ -118,7 +118,7 @@ impl Gguf {
                 let shards = store
                     .resolve_snapshot_shards(&snapshot, path)
                     .await
-                    .ok();
+                    .with_context(|| format!("failed to resolve shards for {}", path.display()))?;
                 (Location::Hub { store, snapshot }, path.clone(), shards)
             }
         };
@@ -127,8 +127,7 @@ impl Gguf {
             shards: Vec::new(),
             tensors: HashMap::new(),
         };
-        let shard = gguf.read_shard(first.clone()).await?;
-        let candidate_paths = resolved_hub_shards.unwrap_or_else(|| vec![first]);
+        let shard = gguf.read_shard(first).await?;
         let paths = resolve_shard_paths(&candidate_paths, &shard.directory)?;
         gguf.add(shard)?;
         for path in paths.into_iter().skip(1) {
@@ -202,6 +201,11 @@ impl Gguf {
         }
         self.shards.push(shard);
         Ok(())
+    }
+
+    /// Every shard in order, starting with the primary shard.
+    pub fn shards(&self) -> &[Shard] {
+        &self.shards
     }
 
     /// The first shard's directory, whose metadata is the GGUF's.

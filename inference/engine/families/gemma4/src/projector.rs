@@ -117,13 +117,12 @@ pub fn describe_projector(
         &[("gemma4v", Form::Encoder), ("gemma4uv", Form::Unified)],
         output_hidden,
     )?;
-    let meta = ProjectorMetadata::new(directory);
-    meta.ignore("clip.has_vision_encoder");
-    meta.ignore("clip.vision.projector_type");
+    let meta = ProjectorMetadata::open(directory);
     meta.ignore("clip.vision.image_size");
     // The audio encoder's keys describe a component that is not interpreted.
     meta.ignore("clip.has_audio_encoder");
     meta.ignore_prefix("clip.audio.");
+    meta.invariant_flag("clip.use_gelu", true, "true (GELU feed-forward)")?;
     // Declared, and the target's (`projector_type`).
     meta.integer("clip.vision.projection_dim")?;
     let mut reader = Reader {

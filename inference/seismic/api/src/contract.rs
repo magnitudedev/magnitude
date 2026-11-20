@@ -313,7 +313,30 @@ pub trait EntryContract: crate::Entry {
 pub mod rt {
     use super::ContractError;
     use crate::{BackendName, Element};
+    pub use seismic_lang::checked::ElementUses;
     pub use seismic_lang::registry::RowPart;
+
+    #[inline]
+    pub fn admits_uses(uses: ElementUses, element: Element) -> Result<(), ContractError> {
+        if uses.admits(element.id()) {
+            Ok(())
+        } else {
+            Err(ContractError::UnsupportedElements)
+        }
+    }
+
+    #[inline]
+    pub fn admits_conversion(source: Element, target: Element) -> Result<(), ContractError> {
+        let s = source.id();
+        let t = target.id();
+        if seismic_lang::registry::representation_conversion(s, t).is_some()
+            || seismic_lang::registry::dense_conversion(s, t).is_some()
+        {
+            Ok(())
+        } else {
+            Err(ContractError::UnsupportedElements)
+        }
+    }
 
     #[inline]
     pub fn element_named(name: &'static str) -> Element {

@@ -277,9 +277,27 @@ impl Function {
     }
 }
 
+static STORAGES: OnceLock<Mutex<BTreeMap<u64, Weak<Storage>>>> = OnceLock::new();
+
+fn storages() -> &'static Mutex<BTreeMap<u64, Weak<Storage>>> {
+    STORAGES.get_or_init(Default::default)
+}
+
 struct Storage {
+    allocation_id: u64,
     gate: Mutex<()>,
     handles: AtomicUsize,
+}
+impl Drop for Storage {
+    fn drop(&mut self) {
+        let mut map = lock(storages());
+        if map
+            .get(&self.allocation_id)
+            .is_some_and(|entry| entry.strong_count() == 0)
+        {
+            map.remove(&self.allocation_id);
+        }
+    }
 }
 struct TensorHandle {
     value: Mutex<Option<super::Tensor>>,
@@ -305,19 +323,21 @@ impl Drop for TensorHandle {
 pub struct Tensor(Arc<TensorHandle>);
 impl Tensor {
     fn new(value: super::Tensor, view: bool) -> Self {
-        static STORAGES: OnceLock<Mutex<BTreeMap<u64, Weak<Storage>>>> = OnceLock::new();
         let id = value.descriptor().allocation;
-        let mut map = lock(STORAGES.get_or_init(Default::default));
-        map.retain(|_, v| v.strong_count() > 0);
-        let storage = map.get(&id).and_then(Weak::upgrade).unwrap_or_else(|| {
-            let s = Arc::new(Storage {
-                gate: Mutex::new(()),
-                handles: AtomicUsize::new(0),
+        let storage = {
+            let mut map = lock(storages());
+            let storage = map.get(&id).and_then(Weak::upgrade).unwrap_or_else(|| {
+                let s = Arc::new(Storage {
+                    allocation_id: id,
+                    gate: Mutex::new(()),
+                    handles: AtomicUsize::new(0),
+                });
+                map.insert(id, Arc::downgrade(&s));
+                s
             });
-            map.insert(id, Arc::downgrade(&s));
-            s
-        });
-        storage.handles.fetch_add(1, Ordering::SeqCst);
+            storage.handles.fetch_add(1, Ordering::SeqCst);
+            storage
+        };
         Self(Arc::new(TensorHandle {
             value: Mutex::new(Some(value)),
             storage,
@@ -483,6 +503,21 @@ pub struct Kernel {
     inner: KernelKind,
     pub preparation_seconds: f64,
 }
+enum CallOutcome {
+    Terminated(
+        seismic_lang::failure::SourceTermination<Value, seismic_compiler::errors::CheckFailure>,
+    ),
+    ResourceLimit(Error),
+}
+
+fn is_allocation_capacity(e: &CallError) -> bool {
+    matches!(
+        e,
+        CallError::Invocation(InvocationError::AllocationCapacity { .. })
+            | CallError::Execution(ExecutionError::AllocationCapacity { .. })
+    )
+}
+
 impl Kernel {
     pub fn function(&self) -> &Function {
         &self.function
@@ -495,20 +530,20 @@ impl Kernel {
     }
     pub fn call(&self, args: &[Value]) -> Result<Value, Error> {
         match self.call_outcome_limited(args, None)? {
-            seismic_lang::failure::SourceTermination::Returned(value) => Ok(value),
-            seismic_lang::failure::SourceTermination::Failed(failure) => {
+            CallOutcome::Terminated(seismic_lang::failure::SourceTermination::Returned(value)) => {
+                Ok(value)
+            }
+            CallOutcome::Terminated(seismic_lang::failure::SourceTermination::Failed(failure)) => {
                 Err(Error::from(ExecutionError::DataCheckFailed(failure)))
             }
+            CallOutcome::ResourceLimit(err) => Err(err),
         }
     }
     fn call_outcome_limited(
         &self,
         args: &[Value],
         allocation_limit: Option<u64>,
-    ) -> Result<
-        seismic_lang::failure::SourceTermination<Value, seismic_compiler::errors::CheckFailure>,
-        Error,
-    > {
+    ) -> Result<CallOutcome, Error> {
         if args.len() != self.function.parameters().len() {
             return Err(Error::new("TypeError", "wrong argument count"));
         }
@@ -540,12 +575,25 @@ impl Kernel {
                     .map_err(|e| Error::from(CallError::Workflow(e)))?;
                 let bound = runtime::bind_workflow(draft)?
                     .with_allocation_limit(allocation_limit.unwrap_or(u64::MAX));
-                let admitted = runtime::admit_workflow(bound)?;
+                let admitted = match runtime::admit_workflow(bound) {
+                    Ok(admitted) => admitted,
+                    Err(e) if is_allocation_capacity(&e) => {
+                        return Ok(CallOutcome::ResourceLimit(Error::from(e)));
+                    }
+                    Err(e) => return Err(Error::from(e)),
+                };
                 for t in &moves {
                     t.commit();
                 }
-                match runtime::submit_workflow(admitted)?.outcome()? {
-                    seismic_lang::failure::SourceTermination::Returned(mut groups) => {
+                let completion = match runtime::submit_workflow(admitted) {
+                    Ok(completion) => completion,
+                    Err(e) if is_allocation_capacity(&e) => {
+                        return Ok(CallOutcome::ResourceLimit(Error::from(e)));
+                    }
+                    Err(e) => return Err(Error::from(e)),
+                };
+                match completion.outcome() {
+                    Ok(seismic_lang::failure::SourceTermination::Returned(mut groups)) => {
                         assert_eq!(
                             groups.len(),
                             1,
@@ -553,28 +601,46 @@ impl Kernel {
                         );
                         seismic_lang::failure::SourceTermination::Returned(groups.pop().unwrap())
                     }
-                    seismic_lang::failure::SourceTermination::Failed(failure) => {
+                    Ok(seismic_lang::failure::SourceTermination::Failed(failure)) => {
                         seismic_lang::failure::SourceTermination::Failed(failure)
                     }
+                    Err(e) if is_allocation_capacity(&e) => {
+                        return Ok(CallOutcome::ResourceLimit(Error::from(e)));
+                    }
+                    Err(e) => return Err(Error::from(e)),
                 }
             }
-            KernelKind::Native(kernel) => seismic_lang::failure::SourceTermination::Returned(
-                runtime::call_native_with_commit(kernel, self.charges.inner(), encoded, || {
-                    for t in &moves {
-                        t.commit();
+            KernelKind::Native(kernel) => {
+                let output = match runtime::call_native_with_commit(
+                    kernel,
+                    self.charges.inner(),
+                    encoded,
+                    || {
+                        for t in &moves {
+                            t.commit();
+                        }
+                    },
+                ) {
+                    Ok(output) => output,
+                    Err(e) if is_allocation_capacity(&e) => {
+                        return Ok(CallOutcome::ResourceLimit(Error::from(e)));
                     }
-                })?
-                .into_values(),
-            ),
+                    Err(e) => return Err(Error::from(e)),
+                };
+                seismic_lang::failure::SourceTermination::Returned(output.into_values())
+            }
         };
         match result {
             seismic_lang::failure::SourceTermination::Returned(values) => {
-                decode(self.function.result_type(), &mut values.into_iter())
-                    .map(seismic_lang::failure::SourceTermination::Returned)
+                decode(self.function.result_type(), &mut values.into_iter()).map(|value| {
+                    CallOutcome::Terminated(seismic_lang::failure::SourceTermination::Returned(
+                        value,
+                    ))
+                })
             }
-            seismic_lang::failure::SourceTermination::Failed(failure) => {
-                Ok(seismic_lang::failure::SourceTermination::Failed(failure))
-            }
+            seismic_lang::failure::SourceTermination::Failed(failure) => Ok(
+                CallOutcome::Terminated(seismic_lang::failure::SourceTermination::Failed(failure)),
+            ),
         }
     }
 }
@@ -882,15 +948,7 @@ impl Function {
             if !lower.matches(&ty) || !upper.matches(&ty) {
                 return Err(Error::new("TypeError", "scope endpoint type mismatch"));
             }
-            let ordered = match (&lower, &upper) {
-                (Scalar::Index(a), Scalar::Index(b)) => a <= b,
-                _ => {
-                    lower.word_number().is_finite()
-                        && upper.word_number().is_finite()
-                        && lower.word_number() <= upper.word_number()
-                }
-            };
-            if !ordered {
+            if !lower.ordered_interval(&upper) {
                 return Err(Error::new(
                     "ValueError",
                     "scope interval is inverted or nonfinite",
@@ -932,16 +990,32 @@ fn parameter_path(p: &seismic_lang::checked::ParameterSummary) -> String {
     name
 }
 impl Scalar {
-    fn word_number(&self) -> f64 {
-        match self.clone() {
-            Self::F32(v) => f32::from_bits(v) as f64,
-            Self::F16(v) => seismic_lang::registry::f16_to_f32(v) as f64,
-            Self::BF16(v) => f32::from_bits((v as u32) << 16) as f64,
-            Self::I32(v) => v as f64,
-            Self::U32(v) => v as f64,
-            Self::U64(v) => v as f64,
-            Self::Bool(v) => u8::from(v) as f64,
-            Self::Index(_) | Self::Range(..) => f64::NAN,
+    fn ordered_interval(&self, upper: &Self) -> bool {
+        match (self, upper) {
+            (Self::Index(a), Self::Index(b)) => a <= b,
+            (Self::I32(a), Self::I32(b)) => a <= b,
+            (Self::U32(a), Self::U32(b)) => a <= b,
+            (Self::U64(a), Self::U64(b)) => a <= b,
+            (Self::Bool(a), Self::Bool(b)) => a <= b,
+            (Self::F32(a), Self::F32(b)) => {
+                let (a, b) = (f32::from_bits(*a), f32::from_bits(*b));
+                a.is_finite() && b.is_finite() && a <= b
+            }
+            (Self::F16(a), Self::F16(b)) => {
+                let (a, b) = (
+                    seismic_lang::registry::f16_to_f32(*a),
+                    seismic_lang::registry::f16_to_f32(*b),
+                );
+                a.is_finite() && b.is_finite() && a <= b
+            }
+            (Self::BF16(a), Self::BF16(b)) => {
+                let (a, b) = (
+                    f32::from_bits((*a as u32) << 16),
+                    f32::from_bits((*b as u32) << 16),
+                );
+                a.is_finite() && b.is_finite() && a <= b
+            }
+            _ => false,
         }
     }
     fn symbol(&self) -> seismic_lang::expr::SymbolValue {
@@ -962,3 +1036,90 @@ impl Scalar {
 
 mod observation;
 pub use observation::CheckReport;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_rejects_inverted_u64_interval_above_f64_precision() {
+        let module = Module::source(
+            "fn id(x: u64) -> u64:\n    return x\n",
+            "scope_u64.seismic",
+            false,
+            None,
+        )
+        .unwrap();
+        let function = module.function("id").unwrap();
+        let lo = (1u64 << 53) + 2;
+        let hi = (1u64 << 53) + 1;
+        let Err(err) = function.scope(vec![(
+            ScopeKind::Scalar,
+            "x".to_owned(),
+            Scalar::U64(lo),
+            Scalar::U64(hi),
+        )]) else {
+            panic!("inverted u64 interval above 2^53 must be rejected");
+        };
+        assert_eq!(err.kind, "ValueError");
+        assert!(
+            function
+                .scope(vec![(
+                    ScopeKind::Scalar,
+                    "x".to_owned(),
+                    Scalar::U64(hi),
+                    Scalar::U64(lo),
+                )])
+                .is_ok(),
+            "ordered u64 interval above 2^53 must be accepted"
+        );
+    }
+
+    #[test]
+    fn storage_drop_removes_entry_without_clobbering_reused_id() {
+        let id = u64::MAX - 17;
+        let first = {
+            let mut map = lock(storages());
+            let s = Arc::new(Storage {
+                allocation_id: id,
+                gate: Mutex::new(()),
+                handles: AtomicUsize::new(1),
+            });
+            map.insert(id, Arc::downgrade(&s));
+            s
+        };
+        assert!(lock(storages()).contains_key(&id));
+        drop(first);
+        assert!(
+            !lock(storages()).contains_key(&id),
+            "dropping the last Storage handle must remove its STORAGES entry"
+        );
+
+        // Simulate allocation_id reuse while an older Storage is about to drop.
+        let older = Arc::new(Storage {
+            allocation_id: id,
+            gate: Mutex::new(()),
+            handles: AtomicUsize::new(0),
+        });
+        let newer = {
+            let mut map = lock(storages());
+            let s = Arc::new(Storage {
+                allocation_id: id,
+                gate: Mutex::new(()),
+                handles: AtomicUsize::new(1),
+            });
+            map.insert(id, Arc::downgrade(&s));
+            s
+        };
+        drop(older);
+        assert!(
+            lock(storages())
+                .get(&id)
+                .and_then(Weak::upgrade)
+                .is_some_and(|s| Arc::ptr_eq(&s, &newer)),
+            "dropping an older Storage must not remove a live reused allocation_id entry"
+        );
+        drop(newer);
+        assert!(!lock(storages()).contains_key(&id));
+    }
+}

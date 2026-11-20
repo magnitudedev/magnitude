@@ -1280,8 +1280,9 @@ impl<'a> Checker<'a> {
         let binding = self
             .lookup(&name.name)
             .expect("a checked place names a local");
-        let storage_root = self.root_var_local(binding);
-        if !self.writable_root(storage_root) || !self.writable_root(binding) {
+        let storage_place = self.local_storage_place(binding);
+        let storage_root = storage_place.local;
+        if !self.writable_place(&storage_place) || !self.writable_root(binding) {
             self.error(
                 DiagnosticRule::Atomic,
                 span,
@@ -1292,9 +1293,9 @@ impl<'a> Checker<'a> {
         if self
             .live_borrows()
             .iter()
-            .any(|(borrow, borrowed, _)| borrowed.local == root && borrow.local != binding)
+            .any(|(borrow, borrowed, _)| borrowed.overlaps(&storage_place) && borrow.local != binding)
         {
-            let name = self.locals[root.index()].name.clone();
+            let name = self.locals[storage_root.index()].name.clone();
             self.error(
                 DiagnosticRule::Ownership,
                 span,
@@ -1336,11 +1337,6 @@ impl<'a> Checker<'a> {
             None,
             span,
         ))
-    }
-
-    /// The storage root of a binding local, before following view aliases.
-    pub(crate) fn root_var_local(&self, id: LocalId) -> LocalId {
-        self.local_storage_root(id)
     }
 
     // ---- capability intrinsics ----
@@ -2126,6 +2122,20 @@ impl<'a> Checker<'a> {
         }
         let mut accesses: Vec<(super::ownership::LocalPlace, ParamOwnership)> = Vec::new();
         let mut moves = std::collections::BTreeSet::new();
+        fn strip_views(mut expr: &CheckedExpr) -> &CheckedExpr {
+            while let CheckedExprKind::Primitive {
+                id: PrimitiveId::SliceView { .. } | PrimitiveId::Reshape | PrimitiveId::Transpose,
+                operands,
+                ..
+            } = &expr.kind
+            {
+                let Some(base) = operands.first() else {
+                    break;
+                };
+                expr = base;
+            }
+            expr
+        }
         for (ownership, argument) in &arguments {
             if *ownership == ParamOwnership::Value {
                 continue;
@@ -2175,13 +2185,20 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             };
-            if *ownership == ParamOwnership::Exclusive && !self.writable_place(&root) {
-                self.error(
-                    DiagnosticRule::Ownership,
-                    argument.span,
-                    "tensor place does not permit exclusive access",
-                );
-                return None;
+            if *ownership == ParamOwnership::Exclusive {
+                let direct_place = self.value_place(strip_views(argument));
+                if !self.writable_place(&root)
+                    || !direct_place
+                        .as_ref()
+                        .is_some_and(|place| self.writable_place(place))
+                {
+                    self.error(
+                        DiagnosticRule::Ownership,
+                        argument.span,
+                        "tensor place does not permit exclusive access",
+                    );
+                    return None;
+                }
             }
             if accesses.iter().any(|(previous, mode)| {
                 previous.overlaps(&root)
@@ -2204,19 +2221,20 @@ impl<'a> Checker<'a> {
             if mode != ParamOwnership::Exclusive {
                 continue;
             }
-            let base_local = |operands: &[CheckedExpr]| match operands.first().map(|o| &o.kind) {
-                Some(CheckedExprKind::Local(v)) => Some(*v),
-                _ => None,
-            };
-            let binding_local = match &arg.kind {
-                CheckedExprKind::Local(v) => Some(*v),
+            let binding_local = self
+                .value_place(strip_views(&arg))
+                .map(|place| place.local);
+            let record = match &arg.kind {
+                CheckedExprKind::Local(_) => true,
                 CheckedExprKind::Primitive {
-                    id:
-                        PrimitiveId::SliceView { .. } | PrimitiveId::Reshape | PrimitiveId::Transpose,
+                    id: PrimitiveId::SliceView { indices },
                     operands,
                     ..
-                } => base_local(operands),
-                _ => self.value_place(&arg).map(|place| place.local),
+                } => operands
+                    .first()
+                    .and_then(|o| o.ty.shaped())
+                    .is_some_and(|shaped| super::ir::whole_record_slots(indices, shaped.rank())),
+                _ => false,
             };
             let Some(binding_local) = binding_local else {
                 self.error(
@@ -2226,8 +2244,7 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             };
-            let storage_root = self.root_var_local(binding_local);
-            self.write(storage_root, binding_local, false, arg.span)?;
+            self.write(binding_local, record, arg.span)?;
         }
 
         // The members that apply at this call: the contract, then every
@@ -2239,11 +2256,21 @@ impl<'a> Checker<'a> {
             participant_uniform: self.participant_uniform(),
         };
         let callee_domain = outcome.element_domain.clone();
-        let contract_arguments = elements
+        let mut contract_arguments = elements
             .arguments
             .iter()
             .map(|(name, element)| (name.clone(), element.clone()))
             .collect::<Vec<_>>();
+        // Match `substitute_type`: any result-only element parameter not
+        // unified from input arguments binds by identity to the caller's
+        // element parameter of the same name.
+        for element in super::tensor_elements(&outcome.signature.result) {
+            if let Elem::Param(name) = element {
+                if !contract_arguments.iter().any(|(bound, _)| bound == name) {
+                    contract_arguments.push((name.clone(), Elem::Param(name.clone())));
+                }
+            }
+        }
         self.elements.call(&callee_domain, &contract_arguments);
         let members = &resolved.families[family];
         let mut candidates = Vec::new();

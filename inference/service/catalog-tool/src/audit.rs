@@ -139,10 +139,8 @@ pub fn run(exported: &Path, output: &Path) -> anyhow::Result<()> {
         "resolutions": resolutions,
         "artifacts": artifacts,
     });
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(output, serde_json::to_string_pretty(&report)? + "\n")?;
+    let output = crate::prepare_output_file(output)?;
+    std::fs::write(&output, serde_json::to_string_pretty(&report)? + "\n")?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     anyhow::ensure!(
         unknown.is_empty(),

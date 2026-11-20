@@ -152,6 +152,17 @@ distinct `select`/`reject` vs `selectattr`/`rejectattr`, the `le` test, `is iter
 `count`, tuple `startswith`/`endswith`, whitespace `split`/`rsplit`, negative string indexing,
 `extend`, `insert`, `remove`, `index`), `{% do ... %}` (`jinja2.ext.do`), and `{% for ch in str %}`.
 
+Patch 0039 closes an open tag-based reasoning block in the differential autoparser when
+`enable_thinking` is explicitly false. Templates that unconditionally open a reasoning tag in
+`add_generation_prompt` without inspecting `enable_thinking` (such as GLM-5.3-Flash, which always
+ends with `<|assistant|><think>` while rendering non-thinking history turns as `<think></think>`)
+now append the closing reasoning tag (`</think>`) to `prompt` and `generation_prompt` when
+`enable_thinking` is false. When `enable_thinking` is false and the reasoning block is already
+closed in `generation_prompt`, the parser matches the entire closed prefix literally with reasoning
+extraction disabled so no whitespace inside the empty block leaks into `reasoning_content` and
+constrained grammars begin directly after the closed block. The generic autoparser declares
+`enable_thinking` in `handler_context_variables` so pruned and unpruned reasoning discovery agree.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

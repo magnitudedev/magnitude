@@ -2428,8 +2428,19 @@ impl Arena {
         )
     }
     pub(super) fn duration_add(&mut self, a: DurationExpr, b: DurationExpr) -> DurationExpr {
-        let mut operands: Vec<AnyExpr> = Vec::new();
-        for duration in [a, b] {
+        self.duration_sum_all(&[a, b])
+    }
+    pub(super) fn duration_sum_all(&mut self, durations: &[DurationExpr]) -> DurationExpr {
+        match durations {
+            [] => return self.duration(&[]),
+            [only] => {
+                self.expr_index(*only);
+                return *only;
+            }
+            _ => {}
+        }
+        let mut operands: Vec<AnyExpr> = Vec::with_capacity(durations.len());
+        for &duration in durations {
             match self.node(self.expr_index(duration)) {
                 Node::Nary {
                     op: NaryOp::DurationAdd,
@@ -3789,15 +3800,10 @@ impl Arena {
                             .into_iter()
                             .map(|i| handle::<super::sort::Duration>(self.id, i))
                             .collect::<Vec<_>>();
-                        match terms.split_first() {
-                            None => i,
-                            Some((first, rest)) => {
-                                let mut sum = *first;
-                                for term in rest {
-                                    sum = self.duration_add(sum, *term);
-                                }
-                                sum.index
-                            }
+                        if terms.is_empty() {
+                            i
+                        } else {
+                            self.duration_sum_all(&terms).index
                         }
                     }
                 }

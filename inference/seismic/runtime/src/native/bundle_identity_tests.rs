@@ -89,13 +89,32 @@ fn bindings(
     }
 }
 
+/// The declaration's default specialization at `statics`, or its first
+/// admissible configuration when a parameter's default reads the device.
+fn base_specialization(
+    native: &NativeImplementation,
+    statics: &NativeSpecialization,
+) -> Result<NativeSpecialization, seismic_lang::checked::NativeSpecializationError> {
+    if let Some(result) = native.default_specialization_without_device(statics) {
+        return result;
+    }
+    let mut first = None;
+    native.walk_admissible(statics, |configuration| {
+        first = Some(configuration.clone());
+        false
+    })?;
+    first.ok_or(seismic_lang::checked::NativeSpecializationError::Inadmissible)
+}
+
 /// A deterministic admissible specialization of `native`.
 fn specialization(native: &NativeImplementation) -> NativeSpecialization {
-    native
-        .default_specialization_without_device(&statics(native).unwrap_or_else(|| {
+    base_specialization(
+        native,
+        &statics(native).unwrap_or_else(|| {
             panic!("no admissible specialization of `{}` found", native.source_path)
-        })).unwrap()
-        .expect("the statics admit the default")
+        }),
+    )
+    .expect("the statics admit the specialization")
 }
 
 /// Deterministic static values at which `native` has an admissible default,
@@ -131,7 +150,7 @@ fn statics(native: &NativeImplementation) -> Option<NativeSpecialization> {
                 .wrapping_add(1442695040888963407);
             statics = statics.with_static(name.as_str(), admitted[(state >> 33) as usize % admitted.len()]);
         }
-        if native.default_specialization_without_device(&statics).unwrap().is_ok() {
+        if base_specialization(native, &statics).is_ok() {
             return Some(statics);
         }
     }

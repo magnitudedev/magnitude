@@ -38,6 +38,100 @@ const MODEL_ASSESSMENT_SOURCE_RETRY_DELAY: std::time::Duration = std::time::Dura
 /// Concurrent targets, each holding at most one blocking-pool task of header arithmetic.
 const MAX_ASSESSMENT_CONCURRENCY: usize = 8;
 
+/// Serializes concurrent async work per key, dropping idle gates as soon as their last holder
+/// finishes.
+pub(crate) struct KeyedGate<K> {
+    gates: tokio::sync::Mutex<std::collections::BTreeMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl<K> Default for KeyedGate<K> {
+    fn default() -> Self {
+        Self {
+            gates: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+}
+
+impl<K: Ord> KeyedGate<K> {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) async fn lock(&self, key: K) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self.gates.lock().await;
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(key, Arc::downgrade(&gate));
+                gate
+            }
+        };
+        gate.lock_owned().await
+    }
+}
+
+/// A bounded key-value cache that evicts the oldest inserted entry when full.
+pub(crate) struct BoundedMap<K, V> {
+    capacity: usize,
+    next_seq: u64,
+    entries: std::collections::BTreeMap<K, (u64, V)>,
+}
+
+impl<K: Ord + Clone, V> BoundedMap<K, V> {
+    pub(crate) fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "bounded cache capacity must be non-zero");
+        Self {
+            capacity,
+            next_seq: 0,
+            entries: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|(_, value)| value)
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
+        if !self.entries.contains_key(&key) {
+            self.evict_if_full();
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.entries.insert(key, (seq, value)).map(|(_, old)| old)
+    }
+
+    pub(crate) fn get_or_insert_with(&mut self, key: K, make: impl FnOnce() -> V) -> &V {
+        if !self.entries.contains_key(&key) {
+            self.evict_if_full();
+            let seq = self.next_seq;
+            self.next_seq = self.next_seq.saturating_add(1);
+            self.entries.insert(key.clone(), (seq, make()));
+        }
+        &self.entries.get(&key).expect("entry just inserted").1
+    }
+
+    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+        self.entries.remove(key).map(|(_, value)| value)
+    }
+
+    fn evict_if_full(&mut self) {
+        if self.entries.len() < self.capacity {
+            return;
+        }
+        if let Some(oldest) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, (seq, _))| *seq)
+            .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
 struct AssessmentTarget {
     entry: ModelAssessmentEntry,
     key: AssessmentWorkKey,
@@ -301,41 +395,36 @@ impl AssessmentPoolCurrent {
         rekeyed: &std::collections::BTreeMap<AssessmentWorkKey, AssessmentWorkKey>,
         outcomes: &[AssessmentOutcome],
     ) -> AppliedAssessmentOutcome {
-        for (domain_kind, subject) in self
-            .domains()
-            .into_iter()
-            .zip([AssessmentDomain::Catalog, AssessmentDomain::Custom])
-            .flat_map(|(domain, kind)| {
-                assessment_domain_entries(domain)
-                    .iter()
-                    .map(move |entry| (kind, entry.subject.clone()))
-            })
-            .collect::<Vec<_>>()
-        {
-            let Some(key) = self
-                .entry_keys
-                .get(&subject)
-                .and_then(|key| rekeyed.get(key))
-            else {
+        let mut outcomes_by_key = std::collections::HashMap::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            outcomes_by_key.entry(&outcome.key).or_insert(outcome);
+        }
+        let mut applied = AppliedAssessmentOutcome::default();
+        for (domain_kind, domain) in [
+            (AssessmentDomain::Catalog, &mut self.snapshot.catalog),
+            (AssessmentDomain::Custom, &mut self.snapshot.custom),
+        ] {
+            let ModelAssessmentDomainSnapshot::Available { entries, .. } = domain else {
                 continue;
             };
-            self.entry_keys.insert(subject.clone(), key.clone());
-            if let ModelAssessmentDomainSnapshot::Available { entries, .. } =
-                self.domain_mut(domain_kind)
-            {
-                for entry in entries.iter_mut().filter(|entry| entry.subject == subject) {
+            let catalog = matches!(domain_kind, AssessmentDomain::Catalog);
+            for entry in entries.iter_mut() {
+                let Some(entry_key) = self.entry_keys.get_mut(&entry.subject) else {
+                    continue;
+                };
+                if let Some(next_key) = rekeyed.get(&*entry_key) {
+                    *entry_key = next_key.clone();
                     entry.state = ModelAssessmentEntryState::Assessing;
+                }
+                if let Some(outcome) = outcomes_by_key.get(&*entry_key)
+                    && (matches!(entry.state, ModelAssessmentEntryState::Assessing)
+                        || self.revalidating.remove(&entry.subject))
+                {
+                    apply_entry_outcome(catalog, entry, outcome, &mut applied);
                 }
             }
         }
         self.retain_referenced_works();
-        let mut applied = AppliedAssessmentOutcome::default();
-        for outcome in outcomes {
-            let mut one = self.apply_outcome(outcome);
-            applied
-                .dropped_catalog_models
-                .append(&mut one.dropped_catalog_models);
-        }
         applied.changed = true;
         self.snapshot.environment_id = environment.clone();
         self.snapshot.measurement = measurement;
@@ -378,6 +467,29 @@ impl AssessmentPoolCurrent {
             || self.revalidating.contains(&entry.subject)
     }
 
+    fn assessing_keys(&self) -> std::collections::HashSet<AssessmentWorkKey> {
+        self.domains()
+            .into_iter()
+            .flat_map(assessment_domain_entries)
+            .filter(|entry| self.awaits_outcome(entry))
+            .filter_map(|entry| self.entry_keys.get(&entry.subject).cloned())
+            .collect()
+    }
+
+    fn dropped_keys(&self) -> std::collections::BTreeMap<ModelAssessmentSubject, AssessmentWorkKey> {
+        self.domains()
+            .into_iter()
+            .flat_map(assessment_domain_entries)
+            .filter(|entry| matches!(entry.state, ModelAssessmentEntryState::Dropped))
+            .filter_map(|entry| {
+                self.entry_keys
+                    .get(&entry.subject)
+                    .map(|key| (entry.subject.clone(), key.clone()))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     fn references_assessing(&self, key: &AssessmentWorkKey) -> bool {
         self.domains().into_iter().any(|domain| {
             assessment_domain_entries(domain).iter().any(|entry| {
@@ -386,6 +498,7 @@ impl AssessmentPoolCurrent {
         })
     }
 
+    #[cfg(test)]
     fn references_dropped(
         &self,
         subject: &ModelAssessmentSubject,
@@ -409,40 +522,49 @@ impl AssessmentPoolCurrent {
             let ModelAssessmentDomainSnapshot::Available { entries, .. } = domain else {
                 continue;
             };
+            let catalog = matches!(domain_kind, AssessmentDomain::Catalog);
             for entry in entries.iter_mut() {
                 if self.entry_keys.get(&entry.subject) == Some(&outcome.key)
                     && (matches!(entry.state, ModelAssessmentEntryState::Assessing)
                         || self.revalidating.remove(&entry.subject))
                 {
-                    let catalog = matches!(domain_kind, AssessmentDomain::Catalog);
-                    let dropped = match &outcome.result {
-                        // A catalog model the engine cannot execute is a release defect,
-                        // never a verdict.
-                        Ok(CachedModelAssessment {
-                            profile: ModelAssessment::Unsupported { detail, .. },
-                            ..
-                        }) if catalog => Some(DomainModelFailure {
-                            code: "unsupported".to_owned(),
-                            message: detail.clone(),
-                            retryable: false,
-                        }),
-                        Ok(_) => None,
-                        Err(failure) => Some(failure.clone()),
-                    };
-                    entry.state = match (&outcome.result, &dropped) {
-                        (Ok(assessment), None) => assessed_state(assessment),
-                        _ => ModelAssessmentEntryState::Dropped,
-                    };
-                    applied.changed = true;
-                    if let (true, Some(failure)) = (catalog, dropped) {
-                        applied
-                            .dropped_catalog_models
-                            .push((entry.subject.model_id().clone(), failure));
-                    }
+                    apply_entry_outcome(catalog, entry, outcome, &mut applied);
                 }
             }
         }
         applied
+    }
+}
+
+fn apply_entry_outcome(
+    catalog: bool,
+    entry: &mut ModelAssessmentEntry,
+    outcome: &AssessmentOutcome,
+    applied: &mut AppliedAssessmentOutcome,
+) {
+    let dropped = match &outcome.result {
+        // A catalog model the engine cannot execute is a release defect,
+        // never a verdict.
+        Ok(CachedModelAssessment {
+            profile: ModelAssessment::Unsupported { detail, .. },
+            ..
+        }) if catalog => Some(DomainModelFailure {
+            code: "unsupported".to_owned(),
+            message: detail.clone(),
+            retryable: false,
+        }),
+        Ok(_) => None,
+        Err(failure) => Some(failure.clone()),
+    };
+    entry.state = match (&outcome.result, &dropped) {
+        (Ok(assessment), None) => assessed_state(assessment),
+        _ => ModelAssessmentEntryState::Dropped,
+    };
+    applied.changed = true;
+    if let (true, Some(failure)) = (catalog, dropped) {
+        applied
+            .dropped_catalog_models
+            .push((entry.subject.model_id().clone(), failure));
     }
 }
 
@@ -521,6 +643,7 @@ struct ActiveAssessment {
 struct ActiveAssessments {
     next_id: u64,
     entries: std::collections::BTreeMap<AssessmentWorkKey, ActiveAssessment>,
+    refinish_task: Option<magnitude_service_utils::owner::Owner>,
 }
 
 impl ActiveAssessments {
@@ -528,6 +651,13 @@ impl ActiveAssessments {
         Self {
             next_id: 1,
             entries: std::collections::BTreeMap::new(),
+            refinish_task: None,
+        }
+    }
+
+    fn replace_refinish(&mut self, task: magnitude_service_utils::owner::Owner) {
+        if let Some(previous) = self.refinish_task.replace(task) {
+            previous.abort();
         }
     }
 
@@ -635,18 +765,14 @@ impl ManagedModelAssessments {
         domain: AssessmentDomain,
         subject: ModelAssessmentSubject,
         profile: ServingProfile,
+        dropped: &std::collections::BTreeMap<ModelAssessmentSubject, AssessmentWorkKey>,
     ) -> AssessmentTarget {
         // A target that cannot be resolved has no environment to be assessed in.
         let unresolved_key = AssessmentWorkKey(
             serde_json::to_string(&(&subject, &profile, "unresolved"))
                 .expect("assessment target identity is serializable"),
         );
-        if self
-            .current
-            .read()
-            .expect("assessment state lock poisoned")
-            .references_dropped(&subject, &unresolved_key)
-        {
+        if dropped.get(&subject) == Some(&unresolved_key) {
             return AssessmentTarget {
                 entry: ModelAssessmentEntry {
                     subject,
@@ -726,10 +852,15 @@ impl ManagedModelAssessments {
 
     async fn reconcile_catalog(self: &Arc<Self>) -> Result<(), InventoryError> {
         let source = self.catalog.list_catalog().await?;
+        let dropped = self
+            .current
+            .read()
+            .expect("assessment state lock poisoned")
+            .dropped_keys();
         let targets = catalog_candidates(source.models)
             .into_iter()
             .map(|(subject, profile)| {
-                self.target_entry(AssessmentDomain::Catalog, subject, profile)
+                self.target_entry(AssessmentDomain::Catalog, subject, profile, &dropped)
             })
             .collect::<Vec<_>>();
         self.replace_domain(AssessmentDomain::Catalog, source.revision, targets);
@@ -745,10 +876,15 @@ impl ManagedModelAssessments {
             self.cancel_unreferenced();
             return Ok(());
         }
+        let dropped = self
+            .current
+            .read()
+            .expect("assessment state lock poisoned")
+            .dropped_keys();
         let targets = custom_candidates(source.models)
             .into_iter()
             .map(|(subject, profile)| {
-                self.target_entry(AssessmentDomain::Custom, subject, profile)
+                self.target_entry(AssessmentDomain::Custom, subject, profile, &dropped)
             })
             .collect::<Vec<_>>();
         self.replace_domain(AssessmentDomain::Custom, source.revision, targets);
@@ -793,9 +929,16 @@ impl ManagedModelAssessments {
     }
 
     fn schedule(self: &Arc<Self>, work: Vec<AssessmentWork>) {
+        if work.is_empty() {
+            return;
+        }
+        let assessing = self
+            .current
+            .read()
+            .expect("assessment state lock poisoned")
+            .assessing_keys();
         for item in work {
-            let current = self.current.read().expect("assessment state lock poisoned");
-            if !current.references_assessing(&item.key) {
+            if !assessing.contains(&item.key) {
                 continue;
             }
             let mut active = self.active.lock().expect("assessment owner lock poisoned");
@@ -803,7 +946,6 @@ impl ManagedModelAssessments {
                 continue;
             };
             drop(active);
-            drop(current);
             let service = Arc::clone(self);
             let task_key = item.key.clone();
             let runner_key = task_key.clone();
@@ -875,7 +1017,10 @@ impl ManagedModelAssessments {
         measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
     ) {
         let (rekeyed, assessed) = {
-            let current = self.current.read().expect("assessment state lock poisoned");
+            let mut current = self
+                .current
+                .write()
+                .expect("assessment state lock poisoned");
             let rekeyed = current
                 .works
                 .iter()
@@ -888,12 +1033,10 @@ impl ManagedModelAssessments {
                     (key.clone(), next)
                 })
                 .collect::<std::collections::BTreeMap<_, _>>();
-            (rekeyed, current.assessed_keys())
+            let assessed = current.assessed_keys();
+            current.rekey_unassessed(&rekeyed, &assessed);
+            (rekeyed, assessed)
         };
-        self.current
-            .write()
-            .expect("assessment state lock poisoned")
-            .rekey_unassessed(&rekeyed, &assessed);
         self.cancel_unreferenced();
         self.schedule(
             rekeyed
@@ -920,7 +1063,7 @@ impl ManagedModelAssessments {
         measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
     ) {
         let service = Arc::clone(self);
-        magnitude_service_utils::owner::spawn("an assessment refinish", async move {
+        let handle = magnitude_service_utils::owner::spawn("an assessment refinish", async move {
             let outcomes = futures_util::future::join_all(
                 refinished
                     .values()
@@ -959,6 +1102,10 @@ impl ManagedModelAssessments {
                 .changes
                 .send(ModelAssessmentsInvalidation { revision });
         });
+        self.active
+            .lock()
+            .expect("assessment owner lock poisoned")
+            .replace_refinish(handle);
     }
 
     fn publish_outcome(&self, outcome: AssessmentOutcome) {
@@ -1774,5 +1921,158 @@ mod tests {
                 work: None,
             }],
         ));
+    }
+
+    #[tokio::test]
+    async fn replacing_refinish_task_aborts_the_prior_in_flight_refinish() {
+        let mut active = ActiveAssessments::new();
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (first_dropped_tx, first_dropped_rx) = tokio::sync::oneshot::channel();
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let first = magnitude_service_utils::owner::spawn("first refinish", async move {
+            let _guard = DropSignal(Some(first_dropped_tx));
+            let _ = first_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        active.replace_refinish(first);
+        first_started_rx.await.expect("first refinish started");
+
+        let (second_done_tx, second_done_rx) = tokio::sync::oneshot::channel();
+        let second = magnitude_service_utils::owner::spawn("second refinish", async move {
+            let _ = second_done_tx.send(());
+        });
+        active.replace_refinish(second);
+
+        first_dropped_rx
+            .await
+            .expect("prior refinish task was aborted and dropped");
+        second_done_rx
+            .await
+            .expect("replacement refinish task completed");
+    }
+
+    /// Cold multi-bundle assessment with both plain and drafted catalog models:
+    /// - A drafted model whose drafter fit arrives before measurement transitions
+    ///   `Assessing -> Pending -> refinish -> Estimated` alongside plain models.
+    /// - A drafted model still awaiting its drafter fit when measurement finishes is assessed
+    ///   directly in the measured environment once its drafter fit arrives, reaching `Estimated`
+    ///   with zero stuck `Assessing` or `Pending` entries.
+    #[test]
+    fn drafted_models_transition_pending_and_late_drafter_fit_to_estimated() {
+        use magnitude_service_contracts::models::{
+            ModelPerformance, ModelResidency, PerformanceEvidence,
+        };
+        let plain = assessment_subject("plain", CatalogModelSelection::Desired);
+        let drafted_early = assessment_subject("drafted-early", CatalogModelSelection::Desired);
+        let drafted_late = assessment_subject("drafted-late", CatalogModelSelection::Desired);
+        let mut current = assessment_pool_current();
+
+        // Initial catalog read: plain starts assessing immediately; both drafted models await
+        // their catalog drafter fit (`work: None`).
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            1,
+            &[
+                assessment_target(plain.clone(), "plain-pending"),
+                assessment_target(drafted_early.clone(), "awaiting-early"),
+                assessment_target(drafted_late.clone(), "awaiting-late"),
+            ],
+        );
+        current.replace_domain(AssessmentDomain::Custom, 1, &[]);
+        current.apply_outcome(&AssessmentOutcome {
+            key: AssessmentWorkKey("plain-pending".to_owned()),
+            result: Ok(fits(&plain, ModelPerformance::Pending)),
+        });
+
+        // Early drafted model's drafter fit resolves before measurement completes -> assessed to
+        // `Pending`.
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            2,
+            &[
+                assessment_target(plain.clone(), "plain-pending"),
+                assessment_target(drafted_early.clone(), "drafted-early-pending"),
+                assessment_target(drafted_late.clone(), "awaiting-late"),
+            ],
+        );
+        current.apply_outcome(&AssessmentOutcome {
+            key: AssessmentWorkKey("drafted-early-pending".to_owned()),
+            result: Ok(fits(&drafted_early, ModelPerformance::Pending)),
+        });
+        assert_eq!(current.assessed_keys().len(), 2);
+
+        // Measurement completes: both already-assessed models (plain + early drafted) refinish
+        // atomically to `Estimated`, while late drafted remains awaiting its fit.
+        let estimated = ModelPerformance::Estimated {
+            samples: vec![PerformanceEvidence {
+                context_tokens: 8_192,
+                estimated_tokens_per_second: 42.0,
+            }],
+        };
+        let key = |s: &str| AssessmentWorkKey(s.to_owned());
+        let rekeyed = [
+            (key("plain-pending"), key("plain-measured")),
+            (key("drafted-early-pending"), key("drafted-early-measured")),
+        ]
+        .into_iter()
+        .collect();
+        let outcomes = vec![
+            AssessmentOutcome {
+                key: key("plain-measured"),
+                result: Ok(fits(&plain, estimated.clone())),
+            },
+            AssessmentOutcome {
+                key: key("drafted-early-measured"),
+                result: Ok(fits(&drafted_early, estimated.clone())),
+            },
+        ];
+        let measured_env = AssessmentEnvironmentId("measured-environment".to_owned());
+        current.republish(&measured_env, MeasurementState::Measured, &rekeyed, &outcomes);
+
+        // Late drafted model's drafter fit now resolves under the measured environment.
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            3,
+            &[
+                assessment_target(plain.clone(), "plain-measured"),
+                assessment_target(drafted_early.clone(), "drafted-early-measured"),
+                assessment_target(drafted_late.clone(), "drafted-late-measured"),
+            ],
+        );
+        assert!(current.references_assessing(&key("drafted-late-measured")));
+        current.apply_outcome(&AssessmentOutcome {
+            key: key("drafted-late-measured"),
+            result: Ok(fits(&drafted_late, estimated.clone())),
+        });
+
+        assert!(current.settled(), "all plain and drafted models settled");
+        let ModelAssessmentDomainSnapshot::Available { entries, .. } =
+            current.domain(AssessmentDomain::Catalog)
+        else {
+            panic!("catalog slice must be available");
+        };
+        assert_eq!(entries.len(), 3);
+        for entry in entries {
+            assert!(
+                matches!(
+                    &entry.state,
+                    ModelAssessmentEntryState::Assessed { profiles, .. }
+                        if matches!(profiles.as_slice(), [ModelAssessment::Fits {
+                            residency: ModelResidency::Resident { performance },
+                            ..
+                        }] if *performance == estimated)
+                ),
+                "expected Estimated for {:?}, got {:?}",
+                entry.subject,
+                entry.state
+            );
+        }
     }
 }

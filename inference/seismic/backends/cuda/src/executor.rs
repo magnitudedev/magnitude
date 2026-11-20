@@ -11,10 +11,9 @@ use seismic_compiler::executable::{
     ExecutableAllocationId, ExecutableCommand, ExecutableKernelId, ExecutionEnvironment,
     KernelAbiBindings, NativeExecution, NativeExecutor, NativeSubmission, RuntimeBuffer,
 };
-use seismic_ir::physical_target::KernelAbiAllocationRole;
+use seismic_ir::physical_target::{KernelAbiAllocationRole, KernelWordValues, LocalWordValues};
 use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_lang::expr::compiled::InvocationValues;
-use seismic_lang::expr::SymbolValue;
 use seismic_memory::entry::{Entry, Store};
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -303,19 +302,79 @@ impl NativeExecutor<Cuda> for Executor {
     fn begin_submission(&self) -> Result<Self::Submission, ExecutionError> {
         Ok(Submission {
             device: self.device.clone(),
-            in_flight_uploads: Vec::new(),
+            in_flight_uploads: InFlightUploads::new(self.device.stream.clone()),
         })
+    }
+}
+
+trait PendingStream {
+    fn synchronize(&self) -> Result<(), DriverError>;
+}
+
+impl PendingStream for Arc<Stream> {
+    fn synchronize(&self) -> Result<(), DriverError> {
+        Stream::synchronize(self)
+    }
+}
+
+struct InFlightUploads<S: PendingStream = Arc<Stream>, U = PinnedUpload> {
+    stream: S,
+    uploads: Vec<U>,
+    enqueued: bool,
+}
+
+impl<S: PendingStream, U> InFlightUploads<S, U> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            uploads: Vec::new(),
+            enqueued: false,
+        }
+    }
+
+    fn mark_enqueued(&mut self) {
+        self.enqueued = true;
+    }
+
+    fn push(&mut self, upload: U) {
+        self.enqueued = true;
+        self.uploads.push(upload);
+    }
+
+    fn complete(&mut self) -> Result<(), ExecutionError> {
+        self.stream
+            .synchronize()
+            .map_err(synchronization_error)?;
+        self.uploads.clear();
+        self.enqueued = false;
+        Ok(())
+    }
+}
+
+impl<S: PendingStream, U> Drop for InFlightUploads<S, U> {
+    fn drop(&mut self) {
+        if !self.enqueued && self.uploads.is_empty() {
+            return;
+        }
+        if self.stream.synchronize().is_ok() {
+            self.uploads.clear();
+            self.enqueued = false;
+        } else if !self.uploads.is_empty() {
+            // Never free pinned memory that a live DMA may still read. On a
+            // lost device/context this is a bounded process-lifetime leak;
+            // it is safer than violating the CUDA async-copy contract.
+            std::mem::forget(std::mem::take(&mut self.uploads));
+        }
     }
 }
 
 pub struct Submission {
     device: Device,
-    in_flight_uploads: Vec<PinnedUpload>,
+    in_flight_uploads: InFlightUploads,
 }
 
 pub struct Execution {
-    device: Device,
-    in_flight_uploads: Vec<PinnedUpload>,
+    in_flight_uploads: InFlightUploads,
 }
 
 impl NativeSubmission<Cuda> for Submission {
@@ -390,17 +449,16 @@ impl NativeSubmission<Cuda> for Submission {
         self.synchronize_pending()
     }
 
-    fn submit(mut self) -> Self::Execution {
+    fn submit(self) -> Self::Execution {
         Execution {
-            device: self.device.clone(),
-            in_flight_uploads: std::mem::take(&mut self.in_flight_uploads),
+            in_flight_uploads: self.in_flight_uploads,
         }
     }
 }
 
 impl NativeExecution for Execution {
     fn complete(&mut self) -> Result<(), ExecutionError> {
-        synchronize(&self.device, &mut self.in_flight_uploads)
+        self.in_flight_uploads.complete()
     }
 }
 
@@ -408,7 +466,8 @@ impl Submission {
     /// One fill of `bytes` bytes at device address `pointer`
     /// ([`Submission::fill`]).
     fn fill_piece(
-        &self,
+        device: &Device,
+        in_flight: &mut InFlightUploads,
         issue: &crate::enqueue::Enqueue,
         pointer: u64,
         value: FillValue,
@@ -416,64 +475,89 @@ impl Submission {
     ) -> Result<(), ExecutionError> {
         let count = usize::try_from(bytes / value.width())
             .unwrap_or_else(|_| panic!("prepared CUDA fill exceeds usize"));
-        let driver = &self.device.context.driver;
+        let driver = &device.context.driver;
         unsafe {
             match value {
-                FillValue::U8(pattern) => driver.check(
-                    issue.memset_d8_async(pointer, pattern[0], count, self.device.stream.raw()),
-                    "device fill",
-                ),
-                FillValue::U16(pattern) => driver.check(
-                    issue.memset_d16_async(
-                        pointer,
-                        u16::from_le_bytes(pattern),
-                        count,
-                        self.device.stream.raw(),
-                    ),
-                    "device fill",
-                ),
-                FillValue::U32(pattern) => driver.check(
-                    issue.memset_d32_async(
-                        pointer,
-                        u32::from_le_bytes(pattern),
-                        count,
-                        self.device.stream.raw(),
-                    ),
-                    "device fill",
-                ),
+                FillValue::U8(pattern) => {
+                    driver
+                        .check(
+                            issue.memset_d8_async(pointer, pattern[0], count, device.stream.raw()),
+                            "device fill",
+                        )
+                        .map_err(submission_error)?;
+                    in_flight.mark_enqueued();
+                    Ok(())
+                }
+                FillValue::U16(pattern) => {
+                    driver
+                        .check(
+                            issue.memset_d16_async(
+                                pointer,
+                                u16::from_le_bytes(pattern),
+                                count,
+                                device.stream.raw(),
+                            ),
+                            "device fill",
+                        )
+                        .map_err(submission_error)?;
+                    in_flight.mark_enqueued();
+                    Ok(())
+                }
+                FillValue::U32(pattern) => {
+                    driver
+                        .check(
+                            issue.memset_d32_async(
+                                pointer,
+                                u32::from_le_bytes(pattern),
+                                count,
+                                device.stream.raw(),
+                            ),
+                            "device fill",
+                        )
+                        .map_err(submission_error)?;
+                    in_flight.mark_enqueued();
+                    Ok(())
+                }
                 // Each 32-bit half of every element: one strided pass per half,
                 // or a single pass when the halves agree.
                 FillValue::U64(pattern) => {
                     let low = u32::from_le_bytes([pattern[0], pattern[1], pattern[2], pattern[3]]);
                     let high = u32::from_le_bytes([pattern[4], pattern[5], pattern[6], pattern[7]]);
                     if low == high {
-                        driver.check(
-                            issue.memset_d32_async(
-                                pointer,
-                                low,
-                                count * 2,
-                                self.device.stream.raw(),
-                            ),
-                            "device fill",
-                        )
-                    } else {
-                        [(0, low), (4, high)].into_iter().try_for_each(|(offset, half)| {
-                            driver.check(
-                                issue.memset_d2d32_async(
-                                    pointer + offset,
-                                    8,
-                                    half,
-                                    1,
-                                    count,
-                                    self.device.stream.raw(),
+                        driver
+                            .check(
+                                issue.memset_d32_async(
+                                    pointer,
+                                    low,
+                                    count * 2,
+                                    device.stream.raw(),
                                 ),
                                 "device fill",
                             )
-                        })
+                            .map_err(submission_error)?;
+                        in_flight.mark_enqueued();
+                        Ok(())
+                    } else {
+                        for (offset, half) in [(0, low), (4, high)] {
+                            driver
+                                .check(
+                                    issue.memset_d2d32_async(
+                                        pointer + offset,
+                                        8,
+                                        half,
+                                        1,
+                                        count,
+                                        device.stream.raw(),
+                                    ),
+                                    "device fill",
+                                )
+                                .map_err(submission_error)?;
+                            in_flight.mark_enqueued();
+                        }
+                        Ok(())
                     }
                 }
             }
-            .map_err(submission_error)
         }
     }
 
@@ -509,62 +593,63 @@ impl Submission {
         if grid.contains(&0) || workgroup.contains(&0) {
             return Ok(());
         }
-        let mut buffer_words = Vec::with_capacity(bindings.len());
-        let mut words = vec![0u64; kernel.layout.words.total as usize];
-        for (position, binding) in bindings.iter().enumerate() {
-            let resolved = env.resolve_view(binding)?;
-            buffer_words.push(
+        let mut resolved_views = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            resolved_views.push(env.resolve_view(binding)?);
+        }
+        let buffer_words = resolved_views
+            .iter()
+            .map(|resolved| {
                 resolved
                     .buffer
                     .pointer()
                     .checked_add(resolved.byte_offset)
-                    .unwrap_or_else(|| panic!("prepared CUDA buffer address overflows")),
-            );
-            let layout = kernel.layout.words.bindings[position];
-            words[layout.first as usize..layout.first as usize + layout.rank as usize]
-                .copy_from_slice(&resolved.extents);
-            words[layout.first as usize + layout.rank as usize
-                ..layout.first as usize + 2 * layout.rank as usize]
-                .copy_from_slice(&resolved.strides);
-        }
-        for (index, value) in nat_args.iter().enumerate() {
-            words[kernel.layout.words.nat_first as usize + index] = evaluate(value, env.values());
-        }
-        for (index, symbol) in scalar_args.iter().copied().enumerate() {
-            words[kernel.layout.words.scalar_first as usize + index] = encode_symbol(
-                env.values()
-                    .get(symbol)
-                    .unwrap_or_else(|| panic!("prepared CUDA scalar argument is unbound")),
-            )?;
-        }
-        let workgroup_bytes = evaluate(&totals.workgroup_bytes, env.values());
-        let participant_bytes = evaluate(&totals.participant_bytes, env.values());
-        let register_bytes = evaluate(&totals.register_bytes, env.values());
-        for (position, local) in locals.iter().enumerate() {
-            let layout = kernel.layout.words.locals[position];
-            let offset = evaluate(&local.byte_offset, env.values());
-            words[layout.first as usize] = offset;
-            for (axis, value) in local.extents.iter().enumerate() {
-                words[layout.first as usize + 1 + axis] = evaluate(value, env.values());
-            }
-            for (axis, value) in local.strides.iter().enumerate() {
-                words[layout.first as usize + 1 + layout.rank as usize + axis] =
-                    evaluate(value, env.values());
-            }
-        }
-        for (position, resource) in addressable_resources.iter().enumerate() {
-            let layout = kernel.layout.words.addressable_resources[position];
-            words[layout.offset_units as usize] = evaluate(&resource.offset_units, env.values());
-            words[layout.units as usize] = evaluate(&resource.units, env.values());
-        }
-        words[kernel.layout.words.grid_first as usize..kernel.layout.words.grid_first as usize + 3]
-            .copy_from_slice(&grid);
-        words[kernel.layout.words.workgroup_first as usize
-            ..kernel.layout.words.workgroup_first as usize + 3]
-            .copy_from_slice(&workgroup);
-        words[kernel.layout.words.local_total_first as usize
-            ..kernel.layout.words.local_total_first as usize + 3]
-            .copy_from_slice(&[workgroup_bytes, participant_bytes, register_bytes]);
+                    .unwrap_or_else(|| panic!("prepared CUDA buffer address overflows"))
+            })
+            .collect::<Vec<_>>();
+        let values = env.values();
+        let workgroup_bytes = evaluate(&totals.workgroup_bytes, values);
+        let participant_bytes = evaluate(&totals.participant_bytes, values);
+        let register_bytes = evaluate(&totals.register_bytes, values);
+        let words = kernel
+            .layout
+            .words
+            .populate(KernelWordValues {
+                nat_args: nat_args.iter().map(|value| evaluate(value, values)),
+                scalar_args: scalar_args.iter().copied().map(|symbol| {
+                    values
+                        .get(symbol)
+                        .unwrap_or_else(|| panic!("prepared CUDA scalar argument is unbound"))
+                }),
+                bindings: resolved_views
+                    .iter()
+                    .map(|view| (view.extents.as_slice(), view.strides.as_slice())),
+                locals: locals.iter().map(|local| LocalWordValues {
+                    byte_offset: evaluate(&local.byte_offset, values),
+                    extents: local
+                        .extents
+                        .iter()
+                        .map(move |value| evaluate(value, values)),
+                    strides: local
+                        .strides
+                        .iter()
+                        .map(move |value| evaluate(value, values)),
+                }),
+                addressable_resources: addressable_resources.iter().map(|resource| {
+                    (
+                        evaluate(&resource.offset_units, values),
+                        evaluate(&resource.units, values),
+                    )
+                }),
+                grid,
+                workgroup,
+                local_totals: [workgroup_bytes, participant_bytes, register_bytes],
+            })
+            .map_err(|error| {
+                ExecutionError::ConstructionContradiction(format!(
+                    "native scalar ABI quantity does not fit its planned word: {error:?}"
+                ))
+            })?;
 
         let buffers = abi_buffer(abi, KernelAbiAllocationRole::BufferTable, env);
         let word_table = abi_buffer(abi, KernelAbiAllocationRole::WordTable, env);
@@ -613,6 +698,7 @@ impl Submission {
             workgroup,
             workgroup_bytes,
         )?;
+        self.in_flight_uploads.mark_enqueued();
         // Ordinary launches remain asynchronous in the opened device's
         // production stream. A
         // schedule scalar is a host-side dependency for subsequent command
@@ -676,11 +762,11 @@ impl Submission {
     }
 
     fn synchronize_pending(&mut self) -> Result<(), ExecutionError> {
-        synchronize(&self.device, &mut self.in_flight_uploads)
+        self.in_flight_uploads.complete()
     }
 
     fn copy(
-        &self,
+        &mut self,
         source: &CompiledBufferView,
         destination: &CompiledBufferView,
         bytes: u64,
@@ -705,11 +791,13 @@ impl Submission {
                     ),
                     "device copy",
                 )
-                .map_err(submission_error)
+                .map_err(submission_error)?;
         }
+        self.in_flight_uploads.mark_enqueued();
+        Ok(())
     }
     fn fill(
-        &self,
+        &mut self,
         destination: &CompiledBufferView,
         value: FillValue,
         bytes: u64,
@@ -721,7 +809,14 @@ impl Submission {
         }
         let _current = self.device.context.enter().map_err(submission_error)?;
         let issue = self.device.context.enqueue();
-        self.fill_piece(issue, destination.buffer.pointer() + destination.byte_offset, value, bytes)
+        Self::fill_piece(
+            &self.device,
+            &mut self.in_flight_uploads,
+            issue,
+            destination.buffer.pointer() + destination.byte_offset,
+            value,
+            bytes,
+        )
     }
     fn scalar_read(
         &mut self,
@@ -816,15 +911,6 @@ fn abi_buffer<'a>(
     env.buffer(bindings.allocation(role))
 }
 
-fn synchronize(
-    device: &Device,
-    in_flight_uploads: &mut Vec<PinnedUpload>,
-) -> Result<(), ExecutionError> {
-    device.stream.synchronize().map_err(synchronization_error)?;
-    in_flight_uploads.clear();
-    Ok(())
-}
-
 fn abi_offset(buffer: &RuntimeBuffer<Buffer>) -> usize {
     usize::try_from(buffer.base_offset)
         .unwrap_or_else(|_| panic!("prepared CUDA ABI offset exceeds usize"))
@@ -845,13 +931,6 @@ fn evaluate(value: &seismic_lang::expr::compiled::CompiledNat, values: &Invocati
     value
         .evaluate_u64(values)
         .unwrap_or_else(|error| panic!("prepared CUDA expression failed evaluation: {error:?}"))
-}
-fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
-    value.try_word64().map_err(|error| {
-        ExecutionError::ConstructionContradiction(format!(
-            "native scalar ABI quantity does not fit its planned word: {error:?}"
-        ))
-    })
 }
 /// The error of an allocation of `bytes` the driver failed: a device loss,
 /// a capacity refusal where the driver is out of memory
@@ -930,18 +1009,108 @@ fn synchronization_error(error: DriverError) -> ExecutionError {
     }
 }
 
-impl Drop for Submission {
-    fn drop(&mut self) {
-        if self.in_flight_uploads.is_empty() {
-            return;
+#[cfg(test)]
+mod tests {
+    use super::{InFlightUploads, PendingStream};
+    use crate::driver::DriverError;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct MockStream {
+        syncs: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl MockStream {
+        fn new(fail: bool) -> Self {
+            Self {
+                syncs: Arc::new(AtomicUsize::new(0)),
+                fail: Arc::new(AtomicBool::new(fail)),
+            }
         }
-        if self.device.stream.synchronize().is_ok() {
-            self.in_flight_uploads.clear();
-        } else {
-            // Never free pinned memory that a live DMA may still read. On a
-            // lost device/context this is a bounded process-lifetime leak;
-            // it is safer than violating the CUDA async-copy contract.
-            std::mem::forget(std::mem::take(&mut self.in_flight_uploads));
+    }
+
+    impl PendingStream for MockStream {
+        fn synchronize(&self) -> Result<(), DriverError> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err(DriverError {
+                    operation: "stream synchronization",
+                    code: 700,
+                    description: "illegal address".into(),
+                })
+            } else {
+                Ok(())
+            }
         }
+    }
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn empty_in_flight_does_not_synchronize_on_drop() {
+        let stream = MockStream::new(false);
+        let in_flight = InFlightUploads::<MockStream, DropCounter>::new(stream.clone());
+        drop(in_flight);
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn enqueued_work_without_uploads_synchronizes_on_early_drop() {
+        let stream = MockStream::new(false);
+        let mut in_flight = InFlightUploads::<MockStream, DropCounter>::new(stream.clone());
+        in_flight.mark_enqueued();
+        drop(in_flight);
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn completed_work_does_not_synchronize_again_on_drop() {
+        let stream = MockStream::new(false);
+        let mut in_flight = InFlightUploads::<MockStream, DropCounter>::new(stream.clone());
+        in_flight.mark_enqueued();
+        in_flight.complete().unwrap();
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 1);
+        drop(in_flight);
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_frees_uploads_when_sync_succeeds_and_leaks_when_sync_fails() {
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let ok_stream = MockStream::new(false);
+        let mut ok_in_flight = InFlightUploads::new(ok_stream.clone());
+        ok_in_flight.push(DropCounter(drops.clone()));
+        drop(ok_in_flight);
+        assert_eq!(ok_stream.syncs.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let err_stream = MockStream::new(true);
+        let mut err_in_flight = InFlightUploads::new(err_stream.clone());
+        err_in_flight.push(DropCounter(drops.clone()));
+        drop(err_in_flight);
+        assert_eq!(err_stream.syncs.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_complete_retains_enqueued_flag_so_drop_retries_sync_and_leaks_uploads() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let stream = MockStream::new(true);
+        let mut in_flight = InFlightUploads::new(stream.clone());
+        in_flight.push(DropCounter(drops.clone()));
+        assert!(in_flight.complete().is_err());
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 1);
+        drop(in_flight);
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
 }

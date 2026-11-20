@@ -61,7 +61,8 @@ fn symbolic_cost_matches_independent_oracle_across_regime_and_capacity_boundarie
                 demand,
                 mode,
                 InvocationProvenance::KernelLaunch { ordinal: 2 },
-            );
+            )
+            .unwrap();
             let estimate = arena
                 .eval_duration(contribution.duration(), &Assignment::new())
                 .unwrap();
@@ -88,4 +89,92 @@ fn symbolic_cost_matches_independent_oracle_across_regime_and_capacity_boundarie
             assert_eq!(contribution.evidence(), &model.0.provenance);
         }
     }
+}
+
+#[test]
+fn service_contribution_reports_invalid_envelope_overflow_and_zero_capacity() {
+    struct CustomModel {
+        service: ServiceDefinition,
+        envelope_bps: u16,
+    }
+    impl ServiceModel for CustomModel {
+        fn service(&self, class: ServiceClassId) -> &ServiceDefinition {
+            assert_eq!(class, self.service.class);
+            &self.service
+        }
+        fn maximum_relative_error_basis_points(&self) -> u16 {
+            self.envelope_bps
+        }
+    }
+
+    let service_id = ServiceClassId::new("fixture.compute");
+    let mut arena = ExprArena::default();
+    let demand = arena.nat(4);
+
+    // 1. Envelope > 10_000 bps must return Err instead of underflowing.
+    let bad_envelope = CustomModel {
+        service: model().0,
+        envelope_bps: 10_001,
+    };
+    assert_eq!(
+        service_contribution(
+            &bad_envelope,
+            &mut arena,
+            service_id,
+            demand,
+            DemandMode::DependencyLatency,
+            InvocationProvenance::HostSchedule,
+        )
+        .unwrap_err(),
+        ModelLimitation::InvalidErrorEnvelope {
+            basis_points: 10_001,
+        }
+    );
+
+    // 2. Denominator overflow in checked_mul(10_000) must return Err instead of panicking.
+    let mut overflow_def = model().0;
+    overflow_def.dependency_latency = DurationInterval::new(1, 1, u64::MAX);
+    let overflow_model = CustomModel {
+        service: overflow_def,
+        envelope_bps: 100,
+    };
+    assert_eq!(
+        service_contribution(
+            &overflow_model,
+            &mut arena,
+            service_id,
+            demand,
+            DemandMode::DependencyLatency,
+            InvocationProvenance::HostSchedule,
+        )
+        .unwrap_err(),
+        ModelLimitation::DurationArithmeticOverflow {
+            service: service_id,
+        }
+    );
+
+    // 3. Zero capacity (resources == 0 or max_concurrency == 0) must return Err.
+    let mut zero_cap_def = model().0;
+    zero_cap_def.topology = ResourceTopology {
+        resources: 0,
+        max_concurrency: 2,
+    };
+    let zero_cap_model = CustomModel {
+        service: zero_cap_def,
+        envelope_bps: 100,
+    };
+    assert_eq!(
+        service_contribution(
+            &zero_cap_model,
+            &mut arena,
+            service_id,
+            demand,
+            DemandMode::SaturatedCapacity,
+            InvocationProvenance::HostSchedule,
+        )
+        .unwrap_err(),
+        ModelLimitation::ZeroServiceCapacity {
+            service: service_id,
+        }
+    );
 }

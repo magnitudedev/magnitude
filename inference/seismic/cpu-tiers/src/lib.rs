@@ -244,13 +244,25 @@ impl Tier {
             .find(|tier| tier.is_detected())
     }
 
-    /// Every tier at or below `self` that the host supports: the tier axis a
-    /// device offers the tuner.
+    /// Whether `self` is `ancestor` or extends it through [`Tier::parent`].
+    pub const fn extends(self, ancestor: Tier) -> bool {
+        let mut current = Some(self);
+        while let Some(tier) = current {
+            if tier.id() == ancestor.id() {
+                return true;
+            }
+            current = tier.parent();
+        }
+        false
+    }
+
+    /// Every tier at or below `self` in its [`Tier::parent`] chain that the
+    /// host supports, lowest first: the tier axis a device offers the tuner.
     pub fn at_or_below(self) -> impl Iterator<Item = Tier> {
         Tier::all()
             .iter()
             .copied()
-            .filter(move |tier| *tier <= self && tier.is_detected())
+            .filter(move |&tier| self.extends(tier) && tier.is_detected())
     }
 }
 
@@ -288,5 +300,17 @@ mod tests {
         }
         assert_eq!(Tier::with_id(0), None);
         assert!(!Tier::X86V4.has("avx512") && Tier::X86V4Vnni.has("avx512vnni") && !Tier::X86V3Vnni.has("avx512vnni"));
+    }
+
+    #[test]
+    fn x86v4_at_or_below_excludes_incomparable_sibling_x86v3vnni() {
+        assert!(Tier::X86V4.extends(Tier::X86V4));
+        assert!(Tier::X86V4.extends(Tier::X86V3));
+        assert!(Tier::X86V4.extends(Tier::X86V2));
+        assert!(!Tier::X86V4.extends(Tier::X86V3Vnni));
+        assert!(!Tier::X86V4Vnni.extends(Tier::X86V3Vnni));
+        assert!(!Tier::X86V3Vnni.extends(Tier::X86V4));
+        assert!(Tier::X86V4.at_or_below().all(|tier| tier != Tier::X86V3Vnni));
+        assert!(Tier::X86V4Vnni.at_or_below().all(|tier| tier != Tier::X86V3Vnni));
     }
 }

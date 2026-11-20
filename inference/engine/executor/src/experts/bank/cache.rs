@@ -135,17 +135,73 @@ impl BankCache {
         &self.changes
     }
 
+    /// Remove 0-byte entries from `held`, harvesting any uncollected `claimed`
+    /// bytes into `self.owed` before returning them to be dropped outside the
+    /// lock.
+    fn prune_empty(&self, held: &mut Vec<(BankHolding, Cached)>) -> Vec<Cached> {
+        let mut pruned = Vec::new();
+        let mut i = 0;
+        while i < held.len() {
+            if held[i].1.bytes() == 0 {
+                let (holding, cached) = held.remove(i);
+                let claimed = cached.take_claimed();
+                if claimed > 0 {
+                    let mut owed = self.owed.lock().expect("bank owed");
+                    match owed.iter_mut().find(|(of, _)| *of == holding) {
+                        Some((_, owes)) => *owes += claimed,
+                        None => owed.push((holding, claimed)),
+                    }
+                }
+                pruned.push(cached);
+            } else {
+                i += 1;
+            }
+        }
+        pruned
+    }
+
+    fn drop_pruned(&self, pruned: Vec<Cached>) {
+        if !pruned.is_empty() {
+            self.changes.back(|_| drop(pruned));
+        }
+    }
+
     /// `cache` held for `holding` from now: what it holds above its floor.
     pub(crate) fn hold(&self, holding: BankHolding, cache: Cached) {
-        cache.value(*self.value.lock().expect("bank cache value"));
-        self.held.lock().expect("bank cache").push((holding, cache));
+        let value = *self.value.lock().expect("bank cache value");
+        let pruned = {
+            let mut held = self.held.lock().expect("bank cache");
+            let mut pruned = self.prune_empty(&mut held);
+            if cache.bytes() == 0 {
+                let claimed = cache.take_claimed();
+                if claimed > 0 {
+                    let mut owed = self.owed.lock().expect("bank owed");
+                    match owed.iter_mut().find(|(of, _)| *of == holding) {
+                        Some((_, owes)) => *owes += claimed,
+                        None => owed.push((holding, claimed)),
+                    }
+                }
+                pruned.push(cache);
+            } else {
+                cache.value(value);
+                held.push((holding, cache));
+            }
+            pruned
+        };
+        self.drop_pruned(pruned);
     }
 
     /// Value its slots at `value` per byte (`memory::ledger::Cached::value`):
     /// the order the ledger takes cache in.
     pub(crate) fn value(&self, value: Value) {
         *self.value.lock().expect("bank cache value") = value;
-        self.held.lock().expect("bank cache").iter().for_each(|(_, cached)| cached.value(value));
+        let pruned = {
+            let mut held = self.held.lock().expect("bank cache");
+            let pruned = self.prune_empty(&mut held);
+            held.iter().for_each(|(_, cached)| cached.value(value));
+            pruned
+        };
+        self.drop_pruned(pruned);
     }
 
     /// `claim` (`Ledger::backing`) taken for a growth of `holding`: it
@@ -184,8 +240,14 @@ impl BankCache {
     /// (`experts::derived::held_target`); what a shortage took of it is no
     /// part of it.
     pub(crate) fn owed(&self, holding: BankHolding, above: u64) -> u64 {
-        let held = self.held.lock().expect("bank cache");
-        self.settle_owed(&held, holding, above)
+        let (owes, pruned) = {
+            let mut held = self.held.lock().expect("bank cache");
+            let owes = self.settle_owed(&held, holding, above);
+            let pruned = self.prune_empty(&mut held);
+            (owes, pruned)
+        };
+        self.drop_pruned(pruned);
+        owes
     }
 
     /// [`Self::owed`], with `held` the pieces: what claims took of them
@@ -236,8 +298,9 @@ impl BankCache {
             holds -= less;
         }
         self.settle_owed(&held, holding, above);
+        cut.extend(self.prune_empty(&mut held));
         drop(held);
-        self.changes.back(|_| drop(cut));
+        self.drop_pruned(cut);
     }
 
     /// The cache of the resize an advance reports finished: a growth's
@@ -449,5 +512,35 @@ mod tests {
         let estimate = ledger.estimate();
         assert_eq!(estimate.cache_of(CacheKind::Bank), 2 * GB, "no phantom bank cache past backed slots");
         assert_eq!(estimate.allocated(), 2 * GB);
+    }
+
+    /// 0-byte `Cached` entries (whether pushed empty or drained to 0 by the
+    /// ledger) are pruned so `BankCache::held` never grows over engine lifetime.
+    #[test]
+    fn zero_byte_entries_are_pruned_from_held() {
+        let (scope, ledger, _pool) = ledger();
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        let holding = BankHolding::Experts;
+        for _ in 0..50 {
+            let piece = ledger.cached(CacheKind::Bank, GB).expect("room");
+            cache.hold(holding, piece);
+            // Reclaim all bytes of the piece via a higher-priority claim or fit.
+            cache.fit(holding, 0);
+        }
+        assert_eq!(cache.held.lock().unwrap().len(), 0, "fit prunes drained entries");
+
+        // Explicitly holding a 0-byte piece never adds a dead entry to `held`.
+        let empty = ledger.cached(CacheKind::Bank, 0).expect("zero bytes");
+        cache.hold(holding, empty);
+        assert_eq!(cache.held.lock().unwrap().len(), 0, "0-byte hold is not retained");
+
+        // A piece drained in place to 0 bytes by split/reclaim is pruned on owed/value.
+        let mut piece = ledger.cached(CacheKind::Bank, GB).expect("room");
+        let split_all = piece.split(GB, CacheKind::Bank);
+        assert_eq!(piece.bytes(), 0);
+        cache.held.lock().unwrap().push((holding, piece));
+        assert_eq!(cache.owed(holding, 0), 0);
+        assert_eq!(cache.held.lock().unwrap().len(), 0, "owed prunes 0-byte entries");
+        scope.changes().back(|_| drop(split_all));
     }
 }

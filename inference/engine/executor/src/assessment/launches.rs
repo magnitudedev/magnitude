@@ -185,17 +185,54 @@ impl Declarations {
                     .fold(NativeSpecialization::new(), |statics, (name, value)| {
                         statics.with_static(name.clone(), *value)
                     });
-                // An assessment names a backend, not a device: a declaration
-                // whose defaults read the device has no default here.
-                let specialization = implementation
+                // An assessment names a backend, not a device: when a
+                // parameter's default reads the device, fall back to the first
+                // admissible specialization if neither the admission constraint
+                // nor any launch-activation expression (`repeat`, `when`) reads
+                // a device property or tuning parameter.
+                let specialization = match implementation
                     .default_specialization_without_device(&statics)
-                    .ok_or_else(|| {
-                        launch_error(format!(
-                            "`{}`'s defaults read the device's properties, and an assessment has no device",
-                            kernel.name
-                        ))
-                    })?
-                    .map_err(|error| launch_error(format!("{request}: {error}")))?;
+                {
+                    Some(result) => {
+                        result.map_err(|error| launch_error(format!("{request}: {error}")))?
+                    }
+                    None => {
+                        let constraint_reads_device =
+                            implementation.constraint.as_ref().is_some_and(|constraint| {
+                                let mut reads = Vec::new();
+                                constraint.device_reads(&mut reads);
+                                !reads.is_empty()
+                            });
+                        let mut launch_params = Vec::new();
+                        if let Some(repeat) = &implementation.repeat {
+                            repeat.count.parameters(&mut launch_params);
+                        }
+                        for launch in &implementation.launches {
+                            if let Some(when) = &launch.when {
+                                when.parameters(&mut launch_params);
+                            }
+                        }
+                        if constraint_reads_device || !launch_params.is_empty() {
+                            return Err(launch_error(format!(
+                                "`{}`'s defaults read the device's properties, and an assessment has no device",
+                                kernel.name
+                            )));
+                        }
+                        let mut first = None;
+                        implementation
+                            .walk_admissible(&statics, |configuration| {
+                                first = Some(configuration.clone());
+                                false
+                            })
+                            .map_err(|error| launch_error(format!("{request}: {error}")))?;
+                        first.ok_or_else(|| {
+                            launch_error(format!(
+                                "{request}: {}",
+                                seismic::NativeSpecializationError::Inadmissible
+                            ))
+                        })?
+                    }
+                };
                 Ok(Prepared {
                     implementation,
                     specialization,

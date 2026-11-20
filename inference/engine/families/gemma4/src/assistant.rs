@@ -64,15 +64,10 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
     }
     let decoder = &target.decoder;
     let m = Metadata::new(draft, ASSISTANT_ARCHITECTURE);
-    let layers = m.integer("block_count")?;
-    if layers > draft.tensors.len() as u64 {
-        return Err(invalid(
-            "Gemma assistant layer count exceeds its stored weights",
-        ));
-    }
+    let layers = m.bounded_block_count("block_count")?;
     if m.integer("nextn_predict_layers")? != layers
-        || m.count("attention.shared_kv_layers")? != layers
-        || m.count("embedding_length_per_layer_input")? != 0
+        || m.default_count("attention.shared_kv_layers", layers)? != layers
+        || m.default_count("embedding_length_per_layer_input", 0)? != 0
     {
         return Err(mismatch(
             "every Gemma assistant layer is a prediction layer reading its target's history",
@@ -102,6 +97,7 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
     let window = window_geometry(&m, MediaRowAttention::Causal)?;
 
     let mut b = Tensors::new(draft);
+    let _ = m.vocab_size(decoder.vocabulary)?;
     let table = b.bind("token_embd.weight", &[decoder.vocabulary, width])?;
     let policy = match m.optional_integer("output.cluster_count")? {
         None => {

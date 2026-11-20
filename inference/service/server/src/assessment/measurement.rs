@@ -1319,11 +1319,11 @@ mod tests {
     /// A point key of the scripted jobs.
     fn key(name: &str) -> PointKey {
         PointKey {
-            executor: seismic::Identity {
+            subject: seismic::PointSubject::executor(&seismic::Identity {
                 physical: seismic::PhysicalIdentity::Uuid([3; 16]),
                 backend: seismic::BackendName::Vulkan,
                 driver: "580".into(),
-            },
+            }),
             kernels: Vec::new(),
             configuration: Default::default(),
             point: [(name.to_owned(), 1)].into(),

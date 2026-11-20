@@ -1,16 +1,6 @@
 //! Concrete (u64) geometry of one representation's storage.
 use super::*;
 
-/// Minimum alignment of one element of `representation`.
-pub fn representation_alignment(representation: RepresentationId) -> u64 {
-    match &registry::representation_info(representation).kind {
-        RepresentationKind::Dense(dtype) => dtype.bytes() as u64,
-        RepresentationKind::Packed(layout) => u64::from(layout.packet_alignment),
-        RepresentationKind::PackedRows(_) => registry::ROW_ALIGNMENT,
-        RepresentationKind::External(layout) => u64::from(layout.packet_alignment),
-    }
-}
-
 /// Concrete per-axis storage units and the byte width of one unit
 /// (`registry::storage_units`), `None` for a unit of no bytes.
 pub fn concrete_storage_units(

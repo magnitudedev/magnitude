@@ -245,7 +245,9 @@ fn rejects_unknown_and_malformed_metadata() {
         "lfm2moe.expert_weights_scale",
         Value::Scalar(Scalar::Float(2.5)),
     );
-    assert!(inspect(&scaled).unwrap_err().contains("unknown metadata"));
+    assert!(inspect(&scaled)
+        .unwrap_err()
+        .contains("expert_weights_scale"));
 
     // Expert keys belong to the routed architecture only.
     let routed_key = with_metadata(

@@ -8,7 +8,7 @@ use crate::Error;
 use magnitude_artifacts::gguf::Directory;
 use magnitude_family_common::{ProjectorMetadata, projector_type, Tensors};
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage, RmsNorm,
+    checked_product, ActivationDType, CellReduction, MergerStage, RmsNorm,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan,
     VisionBlock, VisionDescription, VisionFeedForward, VisionGatedConvolution, VisionLinear,
     VisionMerger, VisionNorm, VisionOperator, VisionPreprocessing, VisionResampling, VisionResize,
@@ -38,16 +38,16 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("lfm3vl", ())], target_width)?;
-    let meta = ProjectorMetadata::new(directory);
-    meta.ignore("clip.has_vision_encoder");
-    meta.ignore("clip.vision.projector_type");
+    let meta = ProjectorMetadata::open(directory);
     meta.ignore("clip.vision.image_size");
     // The tower's feed-forward is SwiGLU and its pixels are resampled
     // bicubically; anything else is another projector.
-    if !meta.bool("clip.use_silu")?
-        || meta.string("clip.vision.image_resize_algo")? != "bicubic"
+    meta.invariant_flag("clip.use_silu", true, "true (SwiGLU feed-forward)")?;
+    if meta
+        .optional_string("clip.vision.image_resize_algo")?
+        .is_some_and(|algo| algo != "bicubic")
     {
-        return Err(invalid("LFM3-VL projector activation or resampling"));
+        return Err(invalid("LFM3-VL projector resampling must be bicubic"));
     }
     let depth = meta.bounded_block_count("clip.vision.block_count")?;
     let hidden = meta.integer("clip.vision.embedding_length")?;

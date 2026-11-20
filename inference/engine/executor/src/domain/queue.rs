@@ -549,15 +549,17 @@ fn continuing(predicted: &[Operation]) -> Vec<Option<FrontContinuation>> {
 fn claimed(predicted: &Operation, first: usize, selected: &[(Selected, Option<Guess>)]) -> Option<Operation> {
     let mut expected = predicted.clone();
     if let Operation::Forward { tokens, front, .. } = &mut expected {
-        let (exact, _) = selected.get(first).filter(|(choice, _)| choice.status == 0)?;
+        let (Selected::Token(exact), _) = selected.get(first).copied()? else {
+            return None;
+        };
         let chain = selected[first..].iter().map_while(|(_, guess)| *guess).take(front.len()).collect::<Vec<_>>();
         for (depth, (token, front)) in tokens[1..].iter_mut().zip(front.iter_mut()).enumerate() {
             (*token, front.kind) = match chain.get(depth) {
                 Some(guess) => (guess.token, crate::FrontKind::Host(guess.kind)),
-                None => (exact.token, crate::FrontKind::Idle),
+                None => (exact, crate::FrontKind::Idle),
             };
         }
-        tokens[0] = exact.token;
+        tokens[0] = exact;
     }
     Some(expected)
 }
@@ -1716,7 +1718,7 @@ mod tests {
             .map(|row| {
                 let token = TokenId(first + row as u32);
                 let guess = chain.get(row).copied().flatten().map(|token| crate::Guess { token: TokenId(token), kind: crate::GuessKind::Chained });
-                (crate::Selected { token, status: 0 }, guess)
+                (crate::Selected::Token(token), guess)
             })
             .collect()
     }

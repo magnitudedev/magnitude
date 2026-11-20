@@ -17,7 +17,7 @@ pub(crate) fn resolved_installation(
         .files
         .iter()
         .map(|file| file.size_bytes)
-        .sum();
+        .fold(0_u64, u64::saturating_add);
     ResolvedModelInstallation::Resolved {
         installed_bytes,
         primary_path: primary_model_path(installed),
@@ -122,7 +122,7 @@ pub(crate) fn ready_model(bundle: &ServableModelBundle, profile: ServingProfile)
             storage_bytes: bundle_packages(bundle)
                 .flat_map(|package| &package.files)
                 .map(|file| file.size_bytes)
-                .sum(),
+                .fold(0_u64, u64::saturating_add),
             maximum_context_length: package.properties.maximum_context_length,
         },
         profile,

@@ -24,6 +24,7 @@ use seismic_compiler::errors::{ExecutionError, RefusalReading};
 use seismic_memory::entry::{Backed, Entry, Wiring};
 use seismic_memory::{HostBlock, PageSize};
 use std::ffi::{c_int, c_uint, c_void};
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 /// `CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP`: pinned for
@@ -58,8 +59,9 @@ impl std::ops::Deref for RegisteredBlock {
 }
 
 pub(crate) struct Registered {
-    // Unregistered in `drop` before the block unmaps.
-    block: HostBlock,
+    // Unregistered in `drop` before the block unmaps; intentionally leaked
+    // if unregistration fails so CUDA-pinned pages are never unmapped.
+    block: ManuallyDrop<HostBlock>,
     device: u64,
     context: Arc<Context>,
 }
@@ -74,6 +76,8 @@ impl RegisteredBlock {
             .max(1)
             .checked_next_multiple_of(granule)
             .ok_or_else(|| host_allocation_error(bytes, seismic_memory::AllocationFailure::Unrepresentable))?;
+        let whole_usize = usize::try_from(whole)
+            .map_err(|_| host_allocation_error(bytes, seismic_memory::AllocationFailure::Unrepresentable))?;
         let failed = |error: DriverError| crate::executor::allocation_error(whole, || RefusalReading::Host)(error);
         Backed::take(entry, whole, Wiring::Pageable, |_| {
             let block = HostBlock::allocate(whole, PageSize::Large).map_err(|error| host_allocation_error(whole, error))?;
@@ -83,21 +87,29 @@ impl RegisteredBlock {
             let base: *mut c_void = block.base().as_ptr().cast();
             {
                 let _changing = context.changing_memory();
-                unsafe { driver.check((driver.host_register)(base, whole as usize, HOST_REGISTER), "host register") }.map_err(failed)?;
+                unsafe { driver.check((driver.host_register)(base, whole_usize, HOST_REGISTER), "host register") }.map_err(failed)?;
             }
-            let device = (|| {
-                if driver.attribute(HOST_POINTER, context.ordinal())? != 0 {
-                    return Ok(base as u64);
-                }
+            // Owned from here: if the device-pointer query fails, `Registered::drop`
+            // unregisters before dropping `block`, or leaks `block` on unregistration failure.
+            let mut registered = Registered {
+                block: ManuallyDrop::new(block),
+                device: 0,
+                context: context.clone(),
+            };
+            registered.device = if driver.attribute(HOST_POINTER, context.ordinal()).map_err(failed)? != 0 {
+                base as u64
+            } else {
                 let mut device = 0u64;
-                unsafe { driver.check((driver.host_device_pointer)(&mut device, base, 0), "host device pointer")? };
-                Ok(device)
-            })();
-            let device = device.map_err(|error| {
-                unregister(context, base);
-                failed(error)
-            })?;
-            Ok::<_, ExecutionError>(Registered { block, device, context: context.clone() })
+                unsafe {
+                    driver.check(
+                        (driver.host_device_pointer)(&mut device, base, 0),
+                        "host device pointer",
+                    )
+                }
+                .map_err(failed)?;
+                device
+            };
+            Ok::<_, ExecutionError>(registered)
         })
         .map(Self)
     }
@@ -119,29 +131,63 @@ impl Registered {
     }
 }
 
-/// Unregister the block at `base`. A block no work uses that will not
-/// unregister is a driver fault it cannot outlive: unmapping it would free
-/// pages the driver still pins.
-fn unregister(context: &Context, base: *mut c_void) {
-    let driver = &context.driver;
-    let _current = context.enter().unwrap_or_else(|error| panic!("a registered host block's context enters: {error}"));
+/// Try to unregister the host block at `base`. Returns `true` only when
+/// `cuMemHostUnregister` succeeds; on failure (for example on context loss),
+/// logs a warning and returns `false` so the caller does not unmap pages
+/// the driver may still pin.
+fn try_unregister(context: &Context, base: *mut c_void) -> bool {
+    let Ok(_current) = context.enter() else {
+        tracing::warn!(
+            "CUDA registered host block drop: failed to enter context; skipping unregistration and leaking host pages"
+        );
+        return false;
+    };
     let _changing = context.changing_memory();
-    unsafe { driver.check((driver.host_unregister)(base), "host unregister") }
-        .unwrap_or_else(|error| panic!("a registered host block no work uses unregisters: {error}"));
+    let driver = &context.driver;
+    if let Err(error) = unsafe { driver.check((driver.host_unregister)(base), "host unregister") } {
+        tracing::warn!("CUDA registered host block drop: {error}; leaking host pages");
+        return false;
+    }
+    true
+}
+
+/// Drops `block` if and only if `unregistered` is `true`; otherwise
+/// intentionally leaves it un-dropped to avoid unmapping CUDA-pinned pages.
+unsafe fn drop_block_if_unregistered<T>(block: &mut ManuallyDrop<T>, unregistered: bool) {
+    if unregistered {
+        unsafe {
+            ManuallyDrop::drop(block);
+        }
+    }
 }
 
 impl Drop for Registered {
-    /// Unregistered before its block unmaps (the fields drop after this).
+    /// Unregistered before its block unmaps; on unregistration failure,
+    /// `self.block` is intentionally leaked without panicking.
     fn drop(&mut self) {
-        unregister(&self.context, self.block.base().as_ptr().cast());
+        let unregistered = try_unregister(&self.context, self.block.base().as_ptr().cast());
+        unsafe {
+            drop_block_if_unregistered(&mut self.block, unregistered);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::host_allocation_error;
+    use super::{drop_block_if_unregistered, host_allocation_error};
     use seismic_compiler::errors::{ExecutionError, RefusalReading};
     use seismic_memory::AllocationFailure;
+    use std::mem::ManuallyDrop;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn host_oom_maps_to_device_refused_with_capacity_refusal() {
@@ -161,5 +207,17 @@ mod tests {
         let error = host_allocation_error(4 << 20, AllocationFailure::Unrepresentable);
         assert!(error.capacity_refusal().is_none(), "{error:?}");
         assert!(matches!(error, ExecutionError::AllocationFailed(_)));
+    }
+
+    #[test]
+    fn drop_block_only_drops_when_unregistered() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut failed = ManuallyDrop::new(DropCounter(drops.clone()));
+        unsafe { drop_block_if_unregistered(&mut failed, false) };
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        let mut succeeded = ManuallyDrop::new(DropCounter(drops.clone()));
+        unsafe { drop_block_if_unregistered(&mut succeeded, true) };
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

@@ -169,7 +169,10 @@ impl EngineWorker {
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
         });
-        drain_diagnostics(stderr, Arc::clone(&worker.diagnostics), pid)?;
+        if let Err(error) = drain_diagnostics(stderr, Arc::clone(&worker.diagnostics), pid) {
+            worker.retire()?;
+            return Err(error.into());
+        }
         Ok(SpawnedWorker {
             worker,
             transport: FramedTransport::new(std::io::BufReader::new(stdout), stdin),
@@ -457,30 +460,72 @@ impl Drop for EngineWorker {
     /// A worker dropped before its retirement was shown has no owner left to poll it: it is
     /// stopped on a thread of its own, which holds its device until the kernel has reaped it, so
     /// no drop waits on the reap and no device is released before it. A stop the system refuses
-    /// is tried again ([`RETIREMENT_RETRY`]).
+    /// is tried again ([`RETIREMENT_RETRY`]). If spawning the reaper thread fails, the process is
+    /// stopped synchronously on the dropping thread instead of panicking in `Drop`.
     fn drop(&mut self) {
         // The dropped worker's state is read no more: what it held moves to its reaper.
         let state = self.process.get_mut().expect("worker process lock").take().expect(STANDS);
-        let (mut process, device) = match state {
+        let (process, device) = match state {
             ProcessState::Owned { process, device } => (process, device),
             ProcessState::Retired(_) => return,
             ProcessState::Retiring { .. } => unreachable!("{ONE_RETIRER}"),
         };
-        let pid = process_id(&process);
-        seismic::threads::spawn(format!("inference-worker-reap-{pid}"), move || {
-            let status = loop {
-                match stop(&mut process) {
-                    Ok(status) => break status,
-                    Err(error) => {
-                        tracing::error!(worker.pid = pid, %error, "an ownerless inference worker could not be shown to have ended; trying again");
-                        std::thread::sleep(RETIREMENT_RETRY);
-                    }
+        reap_ownerless(process, device, |name, task| {
+            seismic::threads::spawn(name, task).map(drop)
+        });
+    }
+}
+
+/// Reap an ownerless worker process, spawning a dedicated reaper thread when possible and falling
+/// back to stopping it synchronously on the calling thread if thread creation fails.
+fn reap_ownerless(
+    process: BlockingProcess,
+    device: DeviceHold,
+    spawn: impl FnOnce(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) {
+    let pid = process_id(&process);
+    let held = Arc::new(Mutex::new(Some((process, device))));
+    let thread_held = Arc::clone(&held);
+    let task: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let Some((mut process, device)) = thread_held.lock().expect("reaper handoff lock").take()
+        else {
+            return;
+        };
+        let status = loop {
+            match stop(&mut process) {
+                Ok(status) => break status,
+                Err(error) => {
+                    tracing::error!(
+                        worker.pid = pid,
+                        %error,
+                        "an ownerless inference worker could not be shown to have ended; trying again"
+                    );
+                    std::thread::sleep(RETIREMENT_RETRY);
                 }
-            };
-            log_exit(pid, status);
+            }
+        };
+        log_exit(pid, status);
+        drop(device);
+    });
+    if let Err(error) = spawn(format!("inference-worker-reap-{pid}"), task) {
+        tracing::error!(
+            worker.pid = pid,
+            %error,
+            "failed to spawn reaper thread for ownerless inference worker; stopping synchronously"
+        );
+        if let Some((mut process, device)) = held.lock().expect("reaper handoff lock").take() {
+            match stop(&mut process) {
+                Ok(status) => log_exit(pid, status),
+                Err(stop_error) => {
+                    tracing::error!(
+                        worker.pid = pid,
+                        error = %stop_error,
+                        "an ownerless inference worker could not be shown to have ended"
+                    );
+                }
+            }
             drop(device);
-        })
-        .expect("a thread to reap an ownerless inference worker");
+        }
     }
 }
 
@@ -686,5 +731,21 @@ mod tests {
         assert_eq!(worker.pid(), None);
         assert!(device.try_job().is_some());
         assert_eq!(worker.retire().unwrap(), status);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_ownerless_falls_back_to_synchronous_stop_when_reaper_spawn_fails() {
+        let process = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let device = crate::device_lock::DeviceLock::default();
+        let hold = DeviceHold::Share(Arc::new(device.try_share().unwrap()));
+        assert!(device.try_job().is_none());
+        reap_ownerless(process, hold, |_, _| {
+            Err(std::io::Error::other("simulated thread exhaustion"))
+        });
+        assert!(device.try_job().is_some());
     }
 }

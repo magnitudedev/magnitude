@@ -1098,8 +1098,8 @@ static std::vector<std::string> specialized_handler_context_variables(specialize
             return { "enable_thinking", "reasoning_effort", "reasoning_strength" };
         case specialized_handler::deepseek_v3_2:
         case specialized_handler::minimax_m3:
-            return { "enable_thinking" };
         case specialized_handler::none:
+            return { "enable_thinking" };
         case specialized_handler::ministral_3:
         case specialized_handler::gpt_oss:
         case specialized_handler::functionary_v3_2:

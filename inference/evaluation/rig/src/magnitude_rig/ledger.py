@@ -189,6 +189,7 @@ def read() -> list[dict]:
     if not path().exists():
         return []
     with open(path()) as stream:
+        fcntl.flock(stream, fcntl.LOCK_SH)
         return [row for line in stream if line.strip() and "configuration" in (row := json.loads(line))]
 
 

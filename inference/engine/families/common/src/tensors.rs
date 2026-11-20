@@ -70,14 +70,70 @@ impl<'a> Tensors<'a> {
     /// scale when its encoding carries one (`F8E4M3` block scale grid or
     /// `Nvfp4` per-tensor/per-matrix scale); its stored shape must be `shape`.
     pub fn bind(&mut self, name: &str, shape: &[u64]) -> Result<WeightDescriptor, HeaderError> {
-        // A vector stored with a leading unit axis (`[1, n]`, as some converters write a parameter
-        // vector) holds the same elements in the same order as `[n]`.
+        // A vector stored with a unit axis (`[1, n]` or `[n, 1]`, as some converters write a
+        // parameter vector) holds the same elements in the same order as `[n]`.
         if let [length] = *shape {
-            if self.stored(name)?.shape == [1, length] {
-                return self.bind_transformed(name, &[1, length], vec![ImportTransform::Flatten]);
+            let stored = self.stored(name)?.shape.as_slice();
+            if stored == [1, length] || stored == [length, 1] {
+                return self.bind_transformed(name, stored, vec![ImportTransform::Flatten]);
             }
         }
         self.bind_transformed(name, shape, Vec::new())
+    }
+
+    /// Binds a depthwise 1-D convolution kernel of `channels` × `taps`,
+    /// accepting 2-D `[channels, taps]`, 3-D `[channels, 1, taps]`, and 4-D
+    /// `[1, channels, 1, taps]` layouts and normalizing higher ranks to
+    /// `[channels, taps]` via [`ImportTransform::MergeLeadingAxes`].
+    pub fn bind_conv1d(
+        &mut self,
+        name: &str,
+        channels: u64,
+        taps: u64,
+    ) -> Result<WeightDescriptor, HeaderError> {
+        match self.stored(name)?.shape.as_slice() {
+            [c, 1, k] if *c == channels && *k == taps => self.bind_transformed(
+                name,
+                &[channels, 1, taps],
+                vec![ImportTransform::MergeLeadingAxes],
+            ),
+            [1, c, 1, k] if *c == channels && *k == taps => self.bind_transformed(
+                name,
+                &[1, channels, 1, taps],
+                vec![ImportTransform::MergeLeadingAxes],
+            ),
+            _ => self.bind_transformed(name, &[channels, taps], Vec::new()),
+        }
+    }
+
+    /// The `(rows, cols)` of a matrix stored as `[rows, cols]` or batched with
+    /// a leading singleton axis as `[1, rows, cols]`.
+    pub fn matrix_or_batched_shape(&self, name: &str) -> Result<(u64, u64), HeaderError> {
+        match self.shape(name)? {
+            [rows, cols] | [1, rows, cols] => Ok((*rows, *cols)),
+            shape => Err(HeaderError::NotMatrix {
+                name: name.to_owned(),
+                shape: shape.to_vec(),
+            }),
+        }
+    }
+
+    /// Binds a `[rows, cols]` matrix, also accepting a leading singleton axis
+    /// `[1, rows, cols]` normalized via [`ImportTransform::MergeLeadingAxes`].
+    pub fn bind_matrix_or_batched(
+        &mut self,
+        name: &str,
+        rows: u64,
+        cols: u64,
+    ) -> Result<WeightDescriptor, HeaderError> {
+        match self.stored(name)?.shape.as_slice() {
+            [1, r, c] if *r == rows && *c == cols => self.bind_transformed(
+                name,
+                &[1, rows, cols],
+                vec![ImportTransform::MergeLeadingAxes],
+            ),
+            _ => self.bind_transformed(name, &[rows, cols], Vec::new()),
+        }
     }
 
     /// Accepts `name`, when stored, as a weight the model never reads: its
@@ -346,21 +402,63 @@ mod tests {
         }
     }
 
-    /// A vector stored with a leading unit axis binds as the vector, read
-    /// flattened; any other stored shape is still refused.
+    /// A vector stored with a leading or trailing unit axis binds as the
+    /// vector, read flattened; any other stored shape is still refused.
     #[test]
     fn a_vector_stored_with_a_leading_unit_axis_binds_flattened() {
         let directory = stored(vec![
             ("row", vec![1, 8], Encoding::F32),
+            ("col", vec![8, 1], Encoding::F32),
             ("plain", vec![8], Encoding::F32),
             ("wide", vec![2, 8], Encoding::F32),
         ]);
         let mut tensors = Tensors::new(&directory);
         let row = tensors.bind("row", &[8]).unwrap();
         assert_eq!((row.shape, row.transforms), (vec![8], vec![ImportTransform::Flatten]));
+        let col = tensors.bind("col", &[8]).unwrap();
+        assert_eq!((col.shape, col.transforms), (vec![8], vec![ImportTransform::Flatten]));
         let plain = tensors.bind("plain", &[8]).unwrap();
         assert_eq!((plain.shape, plain.transforms), (vec![8], Vec::new()));
         assert!(matches!(tensors.bind("wide", &[8]), Err(HeaderError::WeightShape { .. })));
+    }
+
+    #[test]
+    fn conv1d_and_batched_matrix_bind_canonical_shapes() {
+        let directory = stored(vec![
+            ("conv2d", vec![16, 4], Encoding::F32),
+            ("conv3d", vec![16, 1, 4], Encoding::F32),
+            ("conv4d", vec![1, 16, 1, 4], Encoding::F32),
+            ("conv_bad", vec![2, 16, 1, 4], Encoding::F32),
+            ("mat2d", vec![64, 128], Encoding::F32),
+            ("mat3d", vec![1, 64, 128], Encoding::F32),
+            ("mat_bad", vec![2, 64, 128], Encoding::F32),
+        ]);
+        let mut tensors = Tensors::new(&directory);
+        let c2 = tensors.bind_conv1d("conv2d", 16, 4).unwrap();
+        assert_eq!((c2.shape, c2.transforms), (vec![16, 4], Vec::new()));
+        let c3 = tensors.bind_conv1d("conv3d", 16, 4).unwrap();
+        assert_eq!((c3.shape, c3.transforms), (vec![16, 4], vec![ImportTransform::MergeLeadingAxes]));
+        let c4 = tensors.bind_conv1d("conv4d", 16, 4).unwrap();
+        assert_eq!((c4.shape, c4.transforms), (vec![16, 4], vec![ImportTransform::MergeLeadingAxes]));
+        assert!(matches!(
+            tensors.bind_conv1d("conv_bad", 16, 4),
+            Err(HeaderError::WeightShape { .. })
+        ));
+
+        assert_eq!(tensors.matrix_or_batched_shape("mat2d"), Ok((64, 128)));
+        assert_eq!(tensors.matrix_or_batched_shape("mat3d"), Ok((64, 128)));
+        assert!(matches!(
+            tensors.matrix_or_batched_shape("mat_bad"),
+            Err(HeaderError::NotMatrix { .. })
+        ));
+        let m2 = tensors.bind_matrix_or_batched("mat2d", 64, 128).unwrap();
+        assert_eq!((m2.shape, m2.transforms), (vec![64, 128], Vec::new()));
+        let m3 = tensors.bind_matrix_or_batched("mat3d", 64, 128).unwrap();
+        assert_eq!((m3.shape, m3.transforms), (vec![64, 128], vec![ImportTransform::MergeLeadingAxes]));
+        assert!(matches!(
+            tensors.bind_matrix_or_batched("mat_bad", 64, 128),
+            Err(HeaderError::WeightShape { .. })
+        ));
     }
 
     /// GLM's KDA q, k and v projections, stored apart as F8_E4M3 under F32

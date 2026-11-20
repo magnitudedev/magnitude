@@ -3230,13 +3230,17 @@ impl<L: Interpretation, const BITS: u32, B: PlaneBias> Locals for Scales<L, BITS
     #[inline(always)]
     unsafe fn x86_groups<const GROUP: usize>(scales: *const u8) -> Option<[[std::arch::x86_64::__m256i; 2]; 2]> {
         use std::arch::x86_64::*;
-        if !Self::X86_GROUPS {
+        let groups = Q8_BLOCK / GROUP;
+        let bytes = const {
+            let bytes = (Q8_BLOCK / GROUP * Self::WIDTH).div_ceil(8);
+            assert!(bytes <= 16, "a storage group's fields fit 16 bytes");
+            bytes
+        };
+        if !Self::X86_GROUPS || bytes > 16 {
             return None;
         }
-        let groups = Q8_BLOCK / GROUP;
-        let bytes = (groups * Self::WIDTH).div_ceil(8);
         let mut fields = [0u8; 16];
-        unsafe { std::ptr::copy_nonoverlapping(scales, fields.as_mut_ptr(), bytes.min(16)) };
+        unsafe { std::ptr::copy_nonoverlapping(scales, fields.as_mut_ptr(), bytes) };
         // Lane `i` of vector `v` takes group `8v + i`'s field: its first
         // byte and the next two as the lane's low bytes, shifted down by its
         // first bit's place in its first byte.
@@ -3296,11 +3300,16 @@ impl<L: Interpretation, const BITS: u32, B: PlaneBias> Locals for Scales<L, BITS
             return Some(out);
         }
         #[cfg(target_arch = "aarch64")]
-        if V::QUANTIZED_DOTS >= 1 && Self::X86_GROUPS {
+        if V::QUANTIZED_DOTS >= 1 && Self::X86_GROUPS && (Q8_BLOCK / GROUP * Self::WIDTH).div_ceil(8) <= 16 {
             use std::arch::aarch64::*;
             let lanes = Q8_BLOCK / GROUP;
+            let bytes_len = const {
+                let bytes = (Q8_BLOCK / GROUP * Self::WIDTH).div_ceil(8);
+                assert!(bytes <= 16, "a storage group's fields fit 16 bytes");
+                bytes
+            };
             let mut bytes = [0u8; 16];
-            unsafe { std::ptr::copy_nonoverlapping(fields, bytes.as_mut_ptr(), (lanes * Self::WIDTH).div_ceil(8)) };
+            unsafe { std::ptr::copy_nonoverlapping(fields, bytes.as_mut_ptr(), bytes_len) };
             // Lane `i` (field `i`) takes its first byte and the next two,
             // shifted down by its first bit's place: `x86_groups`'s order.
             let (select, shifts) = const {

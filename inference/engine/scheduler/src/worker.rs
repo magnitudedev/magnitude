@@ -104,21 +104,20 @@ struct Rereading {
 
 impl Rereading {
     /// The timed reading after a run that returned `reread`, at `now`.
-    ///
-    /// # Panics
-    /// Where a reading took no time: no clock reads one so, and a zero
-    /// interval would read without end.
+    /// A coarse monotonic clock may report a zero reading duration; it is
+    /// floored to 1 ns so the interval stays positive and doubling makes
+    /// progress.
     fn after(self, reread: Reread, now: Instant) -> Self {
         match reread {
             Reread::Settled => Self::default(),
             Reread::Unread => self,
             Reread::Stands { cost, changed, ceiling } => {
-                assert!(!cost.is_zero(), "invariant violated: a reading of memory took no time");
+                let cost = cost.max(Duration::from_nanos(1));
                 let interval = match (changed, self.interval) {
                     (false, Some(interval)) => interval.saturating_mul(2),
                     _ => cost,
                 };
-                let interval = ceiling.map_or(interval, |ceiling| interval.min(ceiling));
+                let interval = ceiling.map_or(interval, |ceiling| interval.min(ceiling.max(Duration::from_nanos(1))));
                 Self { interval: Some(interval), due: now.checked_add(interval) }
             }
         }
@@ -784,6 +783,27 @@ mod tests {
         let capped = bounded(bounded(reset));
         assert_eq!(capped, Rereading { interval: Some(ms(10)), due: Some(now + ms(10)) });
         assert_eq!(bounded(capped).interval, Some(ms(10)));
+    }
+
+    #[test]
+    fn rereading_floors_zero_cost_from_coarse_clocks_instead_of_panicking() {
+        let now = Instant::now();
+        let ns = Duration::from_nanos;
+        let first = Rereading::default().after(
+            Reread::Stands { cost: Duration::ZERO, changed: false, ceiling: None },
+            now,
+        );
+        assert_eq!(first, Rereading { interval: Some(ns(1)), due: Some(now + ns(1)) });
+        let doubled = first.after(
+            Reread::Stands { cost: Duration::ZERO, changed: false, ceiling: None },
+            now,
+        );
+        assert_eq!(doubled, Rereading { interval: Some(ns(2)), due: Some(now + ns(2)) });
+        let reset = doubled.after(
+            Reread::Stands { cost: Duration::ZERO, changed: true, ceiling: Some(Duration::ZERO) },
+            now,
+        );
+        assert_eq!(reset, Rereading { interval: Some(ns(1)), due: Some(now + ns(1)) });
     }
 
     /// The incident's worker half: commands never wait on the owner's state.

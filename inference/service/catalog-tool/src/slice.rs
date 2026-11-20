@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -50,7 +51,7 @@ pub struct Options {
     pub minimum: usize,
     pub no_mtp: bool,
     pub list: bool,
-    pub parallel: usize,
+    pub parallel: NonZeroUsize,
 }
 
 /// `slice-record`'s inputs: the slice, its sources as provenance names them, and the source main
@@ -59,6 +60,23 @@ pub struct RecordOptions {
     pub output: PathBuf,
     pub source: Vec<String>,
     pub layers: Vec<usize>,
+}
+
+/// Recounts a trailing-layer metadata value (e.g. `attention.shared_kv_layers`) over `kept`
+/// layers, failing when the declared count exceeds `main`.
+fn recount_trailing_layers(
+    main: usize,
+    trailing_count: u64,
+    kept: &[usize],
+) -> anyhow::Result<usize> {
+    let trailing_count = usize::try_from(trailing_count)?;
+    let first = main
+        .checked_sub(trailing_count)
+        .context("trailing-layer count exceeds main layers")?;
+    Ok(kept
+        .iter()
+        .filter(|layer| (first..main).contains(*layer))
+        .count())
 }
 
 /// A layer tensor's layer and the name after `blk.<layer>.`.
@@ -291,13 +309,8 @@ impl<'a> Slicer<'a> {
             } else if trailing.iter().any(|key| key == name) {
                 // Counts of trailing layers keep meaning "the last n layers": recount over the
                 // kept layers.
-                let first = self.main
-                    - usize::try_from(value.unsigned().context("a trailing-layer count")?)?;
-                *value = count(
-                    kept.iter()
-                        .filter(|layer| (first..self.main).contains(*layer))
-                        .count(),
-                );
+                let trailing_count = value.unsigned().context("a trailing-layer count")?;
+                *value = count(recount_trailing_layers(self.main, trailing_count, kept)?);
             } else if no_mtp
                 && self.mtp > 0
                 && name == format!("{architecture}.nextn_predict_layers")
@@ -392,7 +405,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         (slicer.main..slicer.total).collect()
     };
     let kept = [main_layers.as_slice(), &mtp].concat();
-    let stored = StoredHeader::read(&mut Cursor::new(&gguf.shards[0].header))?;
+    let stored = StoredHeader::read(&mut Cursor::new(&gguf.shards()[0].header))?;
     let metadata = slicer.metadata(stored, &kept, options.no_mtp)?;
     let pairs = slicer.tensors(&kept)?;
     let header = StoredHeader::new(
@@ -404,9 +417,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         }),
     )?;
     let alignment = usize::try_from(header.alignment()?)?;
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let output = crate::prepare_output_file(&output)?;
     let mut file = std::io::BufWriter::new(std::fs::File::create(&output)?);
     let mut digest = Sha256::new();
     let mut write = |bytes: &[u8]| -> std::io::Result<()> {
@@ -421,7 +432,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         .map(|(old, new)| async move {
             Ok::<_, anyhow::Error>((old, new, gguf.tensor_bytes(old).await?))
         })
-        .buffered(options.parallel);
+        .buffered(options.parallel.get());
     while let Some(read) = reads.next().await {
         let (old, new, data) = read?;
         write(&data)?;
@@ -516,7 +527,7 @@ pub async fn record_existing(options: RecordOptions) -> anyhow::Result<()> {
     })
     .await?;
     anyhow::ensure!(
-        gguf.shards.len() == 1,
+        gguf.shards().len() == 1,
         "{} is split; a slice is one file",
         output.display()
     );
@@ -592,5 +603,19 @@ mod tests {
             })
         );
         assert!(summary(record).get("renaming").is_none());
+    }
+
+    #[test]
+    fn recount_trailing_layers_checks_bounds() {
+        assert_eq!(recount_trailing_layers(8, 3, &[0, 1, 5, 7]).unwrap(), 2);
+        assert_eq!(recount_trailing_layers(4, 4, &[0, 2]).unwrap(), 2);
+        assert_eq!(recount_trailing_layers(4, 0, &[0, 1, 2, 3]).unwrap(), 0);
+        let error = recount_trailing_layers(4, 5, &[0, 1]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("trailing-layer count exceeds main layers"),
+            "unexpected error: {error}"
+        );
     }
 }

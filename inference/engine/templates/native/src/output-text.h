@@ -68,6 +68,11 @@ class common_peg_text {
         auto p = stack.back(); stack.pop_back();
         stack.push_back(p->right); stack.push_back(p->left);
     }
+    static ptr materialize(const ptr & p, size_t skip, std::string_view input) {
+        auto m = std::make_shared<node>();
+        m->literal = escape(std::string(input.substr(p->start + skip, p->end - p->start - skip)), p->escaping);
+        return m;
+    }
   public:
     common_peg_text() = default;
     common_peg_text(const char * value) : common_peg_text(std::string(value)) {}
@@ -106,24 +111,26 @@ class common_peg_text {
             if (!old.empty() && old.back()->left) { expand(old); continue; }
             const size_t length = p->source ? p->end - p->start : p->literal.size();
             if (old.empty()) {
-                auto text = p->source ? std::string(input.substr(p->start + new_skip, length - new_skip))
-                                      : p->literal.substr(new_skip);
-                result += escape(std::move(text), p->source ? p->escaping : 0);
+                if (p->source) {
+                    result += escape(std::string(input.substr(p->start + new_skip, length - new_skip)), p->escaping);
+                } else {
+                    result.append(p->literal, new_skip, std::string::npos);
+                }
                 current.pop_back(); new_skip = 0; continue;
             }
             auto q = old.back();
+            if (p->source != q->source || (p->source && (p->escaping != q->escaping || p->start + new_skip != q->start + old_skip))) {
+                // Literal and source representations (or differing escaping depths /
+                // offsets) can meet at a provisional delimiter. Materialize each
+                // mismatched source leaf once and compare in rendered-byte space.
+                if (p->source) { current.back() = materialize(p, new_skip, input); new_skip = 0; }
+                if (q->source) { old.back() = materialize(q, old_skip, input); old_skip = 0; }
+                continue;
+            }
             const size_t old_length = q->source ? q->end - q->start : q->literal.size();
             const auto count = std::min(old_length - old_skip, length - new_skip);
-            if (p->source != q->source || p->escaping != q->escaping ||
-                (p->source ? p->start + new_skip != q->start + old_skip
-                           : p->literal.compare(new_skip, count, q->literal, old_skip, count) != 0)) {
-                // Literal and source representations can meet at a provisional
-                // delimiter. Compare their actual bytes in that uncommon case.
-                auto a = p->source ? escape(std::string(input.substr(p->start + new_skip, count)), p->escaping)
-                                   : p->literal.substr(new_skip, count);
-                auto b = q->source ? escape(std::string(input.substr(q->start + old_skip, count)), q->escaping)
-                                   : q->literal.substr(old_skip, count);
-                if (a != b) { return std::nullopt; }
+            if (!p->source && p->literal.compare(new_skip, count, q->literal, old_skip, count) != 0) {
+                return std::nullopt;
             }
             new_skip += count; old_skip += count;
             if (new_skip == length) { current.pop_back(); new_skip = 0; }

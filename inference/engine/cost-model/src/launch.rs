@@ -107,7 +107,7 @@ impl FrontRoutes {
     /// can compute.
     fn read(&self, experts: &Experts, requests: u64, fronted: u64, ahead: u64, streamed: bool) -> ExpertRead {
         let total = experts.experts as f64;
-        let missed = |read: f64, sequences: u64| (1. - read / total).powf(sequences as f64);
+        let missed = |read: f64, sequences: u64| (1. - read / total).clamp(0., 1.).powf(sequences as f64);
         let unread = missed(experts.selected as f64, requests - fronted) * missed(self.sequence(experts, ahead, streamed), fronted);
         ExpertRead { experts: total * (1. - unread), picks: ((requests + fronted * ahead) * experts.selected) as f64 }
     }
@@ -241,5 +241,31 @@ impl LaunchPrices {
         let seconds = target.each(|census| launch_terms(census, &pricing, sequences.into(), rows.into(), depth))?;
         priced.insert((sequences, rows, depth), seconds);
         Ok(seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Measured `fresh` sums exceeding `total` experts saturate at `total`
+    /// rather than raising a negative base to `sequences` and yielding
+    /// negative or out-of-range `experts`.
+    #[test]
+    fn front_routes_read_saturates_when_fresh_exceeds_total() {
+        let experts = Experts { experts: 16, selected: 4, slab_bytes: Vec::new(), slab_flops: Vec::new() };
+        // selected + fresh = 4 + 40 = 44 > 2 * 16: unclamped `1 - 44/16 = -1.75`
+        // would give `(-1.75)^2 > 1` and negative `experts` for `fronted = 2`.
+        let oversaturated = FrontRoutes { fresh: vec![20., 20.], held: Some(1.) };
+        for (requests, fronted) in [(1, 1), (2, 2), (4, 2), (3, 3)] {
+            let read = oversaturated.read(&experts, requests, fronted, 2, true);
+            assert!(read.experts.is_finite());
+            assert_eq!(read.experts, 16.);
+            assert_eq!(read.picks, ((requests + fronted * 2) * 4) as f64);
+        }
+        // Zero fronted sequences ignore the oversaturated front factor.
+        let unfronted = oversaturated.read(&experts, 2, 0, 2, true);
+        let expected = 16. * (1. - (1. - 4. / 16f64).powf(2.));
+        assert!((unfronted.experts - expected).abs() < 1e-12);
     }
 }

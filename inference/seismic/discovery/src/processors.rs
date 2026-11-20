@@ -35,25 +35,43 @@ pub struct ProcessPlacement {
     every: Vec<usize>,
 }
 
-impl Drop for ProcessPlacement {
-    fn drop(&mut self) {
-        // Restore best-effort onto the intersection of originally allowed CPUs
-        // and currently online/allowed CPUs (in case a CPU was offlined or
-        // cpuset narrowed), never panicking inside `Drop`, and always clearing
-        // `PLACED`.
-        let online = discover_processors();
-        let restore: Vec<usize> = self
-            .every
+/// Restore the process's original CPU affinity `every`, falling back to its
+/// intersection with currently online topology CPUs if direct restoration fails
+/// (for instance, if a CPU was offlined while the placement was held).
+fn restore_affinity(
+    every: &[usize],
+    mut apply: impl FnMut(&[usize]) -> Result<(), String>,
+    online_nodes: impl FnOnce() -> Vec<MemoryNode>,
+) {
+    if apply(every).is_err() {
+        let online: std::collections::BTreeSet<usize> = online_nodes()
+            .iter()
+            .flat_map(|node| &node.cores)
+            .flat_map(|core| &core.threads)
+            .copied()
+            .collect();
+        let restore: Vec<usize> = every
             .iter()
             .copied()
-            .filter(|cpu| online.allowed().contains(cpu))
+            .filter(|cpu| online.contains(cpu))
             .collect();
-        let target = if restore.is_empty() {
-            &self.every[..]
-        } else {
-            &restore[..]
-        };
-        let _ = crate::host::place_process(target);
+        if !restore.is_empty() {
+            let _ = apply(&restore);
+        }
+    }
+}
+
+impl Drop for ProcessPlacement {
+    fn drop(&mut self) {
+        // Restore best-effort onto the originally allowed CPUs, falling back to
+        // their intersection with currently online topology CPUs (never
+        // `allowed()`, which reflects the narrowed affinity we are undoing).
+        // Never panic inside `Drop`, and always clear `PLACED`.
+        restore_affinity(
+            &self.every,
+            crate::host::place_process,
+            || discover_processors().nodes().to_vec(),
+        );
         PLACED.store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -147,5 +165,38 @@ mod tests {
         pin(&cpus[..1]).unwrap();
         pin(&cpus).unwrap();
         assert!(pin(&[]).is_err());
+    }
+
+    #[test]
+    fn restore_affinity_restores_full_set_and_falls_back_to_online_topology() {
+        // Direct restore succeeds with the original CPU set even when the
+        // process's current affinity was narrowed; topology is not queried.
+        let mut applied: Vec<Vec<usize>> = Vec::new();
+        restore_affinity(
+            &[0, 1, 2, 3],
+            |cpus| {
+                applied.push(cpus.to_vec());
+                Ok(())
+            },
+            || panic!("online_nodes should not be queried when direct restore succeeds"),
+        );
+        assert_eq!(applied, vec![vec![0, 1, 2, 3]]);
+
+        // If a CPU was offlined (direct restore fails), intersect with
+        // currently online topology CPUs rather than narrowed process affinity.
+        let mut applied: Vec<Vec<usize>> = Vec::new();
+        restore_affinity(
+            &[0, 1, 2, 3],
+            |cpus| {
+                applied.push(cpus.to_vec());
+                if cpus.contains(&3) {
+                    Err("CPU 3 offline".into())
+                } else {
+                    Ok(())
+                }
+            },
+            || seismic_topology::flat_nodes(&[0, 1, 2].into_iter().collect()),
+        );
+        assert_eq!(applied, vec![vec![0, 1, 2, 3], vec![0, 1, 2]]);
     }
 }

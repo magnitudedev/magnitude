@@ -67,7 +67,7 @@ use magnitude_artifacts::{
 use magnitude_family_common::{
     binders,
     rotary::{self, Yarn, YarnAmplitude},
-    HeaderError, Metadata, Tensors,
+    Metadata, Tensors,
 };
 use magnitude_family_contracts::{
     checked_product, grouped_output_columns, ActivationDType, Attention, AttentionGate, Block,
@@ -154,20 +154,23 @@ pub fn rotary(m: &Metadata, ratio: u64, width: u64) -> Result<Rotary, FamilyErro
         ),
     };
     match scaling {
-        None => Ok(rotary::laid_out(
+        None | Some("none") => Ok(rotary::laid_out(
             rotated,
             width,
             base,
             ROTARY_LAYOUT,
             output,
         )?),
-        Some("yarn") => Ok(Yarn::read(m, YarnAmplitude::Unit)?.table(
-            rotated,
-            width,
-            base,
-            ROTARY_LAYOUT,
-            output,
-        )?),
+        Some("yarn") => {
+            m.optional_positive_number("rope.scaling.yarn_attn_factor")?;
+            Ok(Yarn::read(m, YarnAmplitude::Unit)?.table(
+                rotated,
+                width,
+                base,
+                ROTARY_LAYOUT,
+                output,
+            )?)
+        }
         Some(kind) => Err(FamilyError::unsupported(
             vec![UnsupportedReason::RopeScaling { kind: kind.into() }],
             format!("{FAMILY_ID} rope scaling {kind:?}"),
@@ -441,28 +444,13 @@ impl Geometry {
     fn read(m: &Metadata, layers: u64) -> Result<Self, FamilyError> {
         let heads = m.integer("attention.head_count")?;
         let width = m.integer("attention.key_length")?;
-        let equal = |key: &str, expected: u64| -> Result<(), FamilyError> {
-            match m.integer(key)? {
-                value if value == expected => Ok(()),
-                value => Err(FamilyError::metadata(
-                    m.key(key),
-                    format!("{} is {value}, V4.1 states {expected}", m.key(key)),
-                )),
-            }
-        };
         // One key head, which is also the value head.
-        equal("attention.head_count_kv", 1)?;
-        equal("attention.value_length", width)?;
-        equal("expert_gating_func", SQRT_SOFTPLUS)?;
-        if m.count("hash_layer_count")? != 0 {
-            let key = m.key("hash_layer_count");
-            return Err(FamilyError::metadata(
-                &key,
-                format!("{key}: V4.1 hashes no layer"),
-            ));
-        }
+        m.invariant_count("attention.head_count_kv", 1, "1 (one key/value head)")?;
+        m.invariant_count("attention.value_length", width, "equal to attention.key_length")?;
+        m.invariant_count("expert_gating_func", SQRT_SOFTPLUS, "4 (sqrt-softplus)")?;
+        m.invariant_count("hash_layer_count", 0, "0 (V4.1 hashes no layer)")?;
         let clamp = |key: &str| -> Result<Vec<Option<GluLimit>>, FamilyError> {
-            m.layer_numbers(key, layers)?
+            m.uniform_or_layer_numbers(key, layers)?
                 .into_iter()
                 // A limit of 0 is no clamp, as the released definition reads it.
                 .map(|limit| match limit == 0.0 {
@@ -471,7 +459,7 @@ impl Geometry {
                 })
                 .collect()
         };
-        let shared = match m.count("expert_shared_count")? {
+        let shared = match m.default_count("expert_shared_count", 0)? {
             0 => None,
             count => Some(product(&[count, m.integer("expert_feed_forward_length")?])?),
         };
@@ -798,26 +786,25 @@ pub fn inspect_components(
     // Uninterpreted sibling DSpark drafter metadata carried on target GGUFs;
     // any stray drafter tensors are still rejected by `Tensors::finish`.
     m.ignore_prefix("dspark.");
-    let layers = m.integer("block_count")?;
-    // Each layer requires distinct stored weights. Reject impossible counts
-    // before allocating per-layer vectors from untrusted metadata.
-    if layers > directory.tensors.len() as u64 {
-        return Err(FamilyError::invalid(format!(
-            "{FAMILY_ID} layer count exceeds available weight roles"
-        )));
-    }
+    let layers = m.bounded_block_count("block_count")?;
     let compressions = compressions(&m, layers)?;
     let engram = Engram::read(&m, layers)?;
     if compressions.iter().all(|layer| *layer == Compression::None) {
-        // The converter writes compressed-layer rotary keys even when no kept
-        // layer compresses its history.
+        // The converter writes compressed-layer rotary and indexer keys even
+        // when no kept layer compresses its history.
         for key in [
             "attention.compress_rope_freq_base",
+            "attention.kv_source_layers",
+            "attention.indexer.source_layers",
+            "attention.indexer.candidate_source_layer",
+            "attention.indexer.candidate_top_k_blocks",
+            "attention.indexer.candidate_block_size",
             "rope.scaling.type",
             "rope.scaling.factor",
             "rope.scaling.original_context_length",
             "rope.scaling.yarn_beta_fast",
             "rope.scaling.yarn_beta_slow",
+            "rope.scaling.yarn_attn_factor",
         ] {
             m.ignore(key);
         }
@@ -827,16 +814,7 @@ pub fn inspect_components(
     let streams = geometry.streams;
     let window_rotary = rotary(&m, 0, geometry.width)?;
     let mut tensors = Tensors::new(directory);
-    let vocabulary = match tensors.shape("token_embd.weight")? {
-        [vocabulary, _] => *vocabulary,
-        shape => {
-            return Err(HeaderError::NotMatrix {
-                name: "token_embd.weight".into(),
-                shape: shape.to_vec(),
-            }
-            .into());
-        }
-    };
+    let vocabulary = m.vocab_size(tensors.rows("token_embd.weight")?)?;
     // An FP8 projection binds with its UE8M0 grid.
     let mut tensor = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, FamilyError> {
         Ok(tensors.bind(name, shape)?)

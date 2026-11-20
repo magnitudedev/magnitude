@@ -1102,12 +1102,20 @@ impl Generation {
             return Err("only a head transaction reconciles into method state".into());
         };
         if let magnitude_executor::Outcome::Head { proposals, .. } = outcome {
-            if proposals.iter().any(|selected| {
-                selected.status > 2
-                    || (selected.status == 0
-                        && selected.token.0 as usize >= self.options.vocabulary)
-            }) {
-                return Err("head returned an invalid proposal".into());
+            for &selected in proposals {
+                match selected {
+                    magnitude_executor::Selected::Token(token)
+                        if (token.0 as usize) >= self.options.vocabulary =>
+                    {
+                        return Err("head returned an out-of-vocabulary proposal".into());
+                    }
+                    magnitude_executor::Selected::NonFinite => {
+                        return Err("draft sampling distribution is nonfinite".into());
+                    }
+                    magnitude_executor::Selected::Token(_)
+                    | magnitude_executor::Selected::Empty
+                    | magnitude_executor::Selected::Declined => {}
+                }
             }
         }
         let mut method = self.method.fork_transition();
@@ -1119,7 +1127,7 @@ impl Generation {
             (two_row.as_mut(), operation, outcome)
         {
             if !proposals.is_empty() {
-                decode.guessed(drafted_chain(selected));
+                decode.guessed(drafted_chain(selected)?);
             }
         }
         Ok(PreparedMethodTransition {
@@ -1385,11 +1393,12 @@ impl Generation {
     /// Called after the execution owner releases numerical state. Logical history,
     /// grammar, queued output, and terminal decisions remain available.
     pub fn evicted(&mut self) -> Result<(), String> {
-        // Restore exactly the numerical prefix that existed before eviction.
+        // Restore at least the numerical prefix that existed before eviction,
+        // preserving an earlier target if eviction occurs again mid-replay.
         // A live decode normally has one accepted successor that has not yet
         // been fed through the model; replaying that token here would advance
         // past the point from which the next decode must start.
-        self.reconciliation_target = self.resident_position;
+        self.reconciliation_target = self.reconciliation_target.max(self.resident_position);
         self.method.evict();
         self.resident = false;
         Ok(())
@@ -1428,7 +1437,7 @@ impl Generation {
         if position > self.reconciliation_target {
             self.reconciliation_target = position;
             self.accepted_position = self.accepted_position.max(position);
-            self.cached_tokens = self.cached_tokens.max(position);
+            self.cached_tokens = self.cached_tokens.max(position.min(self.prompt.len()));
         }
         self.resident_position = position;
         self.resident = true;
@@ -1607,32 +1616,39 @@ mod thread_boundary {
 
 fn method_matches_choice(choice: MethodChoice, method: &dyn Method) -> bool {
     let requirements = method.requires();
-    match choice {
-        MethodChoice::Plain => {
-            method.identity() == "plain"
-                && requirements
-                    == (MethodRequirements {
-                        prefill_demand: Demand::NONE,
-                        closing_demand: Demand::NONE,
-                        verify_demand: Demand::NONE,
-                        head: false,
-                    })
+    match (choice, method.capability()) {
+        (MethodChoice::Plain, MethodChoice::Plain) => {
+            requirements
+                == (MethodRequirements {
+                    prefill_demand: Demand::NONE,
+                    closing_demand: Demand::NONE,
+                    verify_demand: Demand::NONE,
+                    head: false,
+                })
         }
-        MethodChoice::Mtp { proposals } | MethodChoice::DFlash { proposals } => {
-            let prefix = match choice {
-                MethodChoice::Mtp { .. } => "mtp:",
-                _ => "dflash:",
-            };
+        (
+            MethodChoice::Mtp { proposals },
+            MethodChoice::Mtp {
+                proposals: capacity,
+            },
+        )
+        | (
+            MethodChoice::DFlash { proposals },
+            MethodChoice::DFlash {
+                proposals: capacity,
+            },
+        ) => {
             proposals > 0
-                && method.identity().starts_with(prefix)
+                && proposals <= capacity
+                && usize::from(proposals) <= method.proposals()
                 && requirements.head
                 // The first draft's anchor is selected by the closing
                 // chunk's final feature, whichever demand returns it.
                 && (requirements.prefill_demand | requirements.closing_demand)
                     .contains(Demand::FEATURES)
                 && requirements.verify_demand.contains(Demand::FEATURES)
-                && usize::from(proposals) <= method.proposals()
         }
+        _ => false,
     }
 }
 
@@ -1642,6 +1658,7 @@ mod method_choice_tests {
 
     struct Descriptor {
         identity: &'static str,
+        capability: MethodChoice,
         requirements: MethodRequirements,
         proposals: usize,
     }
@@ -1649,6 +1666,9 @@ mod method_choice_tests {
     impl Method for Descriptor {
         fn identity(&self) -> &str {
             self.identity
+        }
+        fn capability(&self) -> MethodChoice {
+            self.capability
         }
         fn requires(&self) -> MethodRequirements {
             self.requirements
@@ -1671,6 +1691,7 @@ mod method_choice_tests {
     fn choice_requires_matching_identity_requirements_and_mtp_width() {
         let plain = Descriptor {
             identity: "plain",
+            capability: MethodChoice::Plain,
             requirements: MethodRequirements {
                 prefill_demand: Demand::NONE,
                 closing_demand: Demand::NONE,
@@ -1687,6 +1708,7 @@ mod method_choice_tests {
 
         let mtp = Descriptor {
             identity: "mtp:fixture:3",
+            capability: MethodChoice::Mtp { proposals: 3 },
             requirements: MethodRequirements {
                 prefill_demand: Demand::FEATURES,
                 closing_demand: Demand::NONE,
@@ -1712,6 +1734,7 @@ mod method_choice_tests {
         // chunk's features; a head demanding no prompt features cannot draft.
         let reading = Descriptor {
             identity: "mtp:fixture:3",
+            capability: MethodChoice::Mtp { proposals: 3 },
             requirements: MethodRequirements {
                 prefill_demand: Demand::NONE,
                 closing_demand: Demand::FEATURES,

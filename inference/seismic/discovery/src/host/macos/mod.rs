@@ -77,10 +77,15 @@ impl Sys for LiveSys {
     }
 
     fn vm_statistics(&self) -> libc::vm_statistics64 {
+        static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+        let host = *HOST.get_or_init(|| {
+            #[allow(deprecated)]
+            unsafe {
+                libc::mach_host_self()
+            }
+        });
         let mut statistics: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
         let mut count = libc::HOST_VM_INFO64_COUNT;
-        #[allow(deprecated)]
-        let host = unsafe { libc::mach_host_self() };
         let status = unsafe {
             libc::host_statistics64(
                 host,

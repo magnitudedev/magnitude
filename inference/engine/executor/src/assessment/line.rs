@@ -409,11 +409,12 @@ impl<E: Probe> Plan<E> {
         &self,
         identity: &seismic::Identity,
         backend: BackendName,
+        tensor_ops: bool,
         unroll: u64,
     ) -> Result<PointKey, ExecutorCostsError> {
         Ok(PointKey {
-            executor: identity.clone(),
-            kernels: vec![self.formation.identity(backend)?],
+            subject: seismic::PointSubject::executor(identity),
+            kernels: vec![self.formation.identity(backend, tensor_ops)?],
             configuration: named(&[("unroll", unroll)]),
             point: named(&self.point),
         })
@@ -424,10 +425,11 @@ impl<E: Probe> Plan<E> {
         &self,
         identity: &seismic::Identity,
         backend: BackendName,
+        tensor_ops: bool,
         store: &dyn RecordStore<PointKey>,
         unroll: u64,
     ) -> Result<Result<Timing, Reason>, MachineLineError> {
-        match store.load(&self.key(identity, backend, unroll)?)? {
+        match store.load(&self.key(identity, backend, tensor_ops, unroll)?)? {
             Some(Record::Measured(timing)) => Ok(Ok(timing)),
             Some(Record::Unobtainable { reason }) => Ok(Err(reason)),
             None => Err(MachineLineError::Unrecorded { probe: E::NAME, unroll }),
@@ -440,12 +442,13 @@ impl<E: Probe> Plan<E> {
         &self,
         identity: &seismic::Identity,
         backend: BackendName,
+        tensor_ops: bool,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<Result<Rate<Line>, Reason>, MachineLineError> {
         let mut rates = Vec::new();
         let mut unobtainable = None;
         for &unroll in &self.unrolls {
-            match self.load(identity, backend, store, unroll)? {
+            match self.load(identity, backend, tensor_ops, store, unroll)? {
                 Ok(timing) => rates.push((unroll, MeasuredCost::rate(self.units, &timing))),
                 Err(reason) => {
                     unobtainable.get_or_insert(reason);
@@ -472,10 +475,11 @@ impl<E: Probe> Plan<E> {
         let (device, charges) = (walks.device(), walks.charges().clone());
         let charges = &charges;
         let identity = walks.identity();
+        let tensor_ops = device.info().forms_tensor_operations();
         let kernels = OnceCell::<Vec<Result<NativeKernel<E>, ExecutorCostsError>>>::new();
         for (index, &unroll) in self.unrolls.iter().enumerate() {
             let (kernels, make) = (&kernels, &make);
-            walks.time(self.key(&identity, device.backend(), unroll)?, false, move || {
+            walks.time(self.key(&identity, device.backend(), tensor_ops, unroll)?, false, move || {
                 if let Some(lacking) = E::lacking(device) {
                     return Err(Unformed::Never(ExecutorCostsError(lacking)));
                 }
@@ -576,6 +580,7 @@ impl<E: Probe> Ladder<E> {
         &self,
         identity: &seismic::Identity,
         backend: BackendName,
+        tensor_ops: bool,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<Peak, MachineLineError> {
         let mut points = Vec::new();
@@ -583,7 +588,7 @@ impl<E: Probe> Ladder<E> {
         for &unroll in &self.plans[0].unrolls {
             let mut timings = Vec::with_capacity(MULTIPLES.len());
             for plan in &self.plans {
-                match plan.load(identity, backend, store, unroll)? {
+                match plan.load(identity, backend, tensor_ops, store, unroll)? {
                     Ok(timing) => timings.push(timing),
                     Err(reason) => {
                         unobtainable.get_or_insert(reason);
@@ -774,19 +779,20 @@ impl MachineLine {
     ) -> Result<Self, MachineLineError> {
         let identity = executor_identity(topology, executor)?;
         let backend = executor.backend();
+        let tensor_ops = executor.forms_tensor_operations();
         let Probes { stream, host, peaks: (f32, matrix, matrix_f32, int8), .. } = Probes::of(topology, executor)?;
         let mut peaks = Vec::new();
         if let Some(ladder) = f32 {
-            peaks.push((Operand::F32, ladder.stored(&identity, backend, store)?));
+            peaks.push((Operand::F32, ladder.stored(&identity, backend, tensor_ops, store)?));
         }
         if let Some(ladder) = matrix {
-            peaks.push((Operand::Matrix, ladder.stored(&identity, backend, store)?));
+            peaks.push((Operand::Matrix, ladder.stored(&identity, backend, tensor_ops, store)?));
         }
         if let Some(ladder) = matrix_f32 {
-            peaks.push((Operand::MatrixF32, ladder.stored(&identity, backend, store)?));
+            peaks.push((Operand::MatrixF32, ladder.stored(&identity, backend, tensor_ops, store)?));
         }
         if let Some(ladder) = int8 {
-            peaks.push((Operand::Int8, ladder.stored(&identity, backend, store)?));
+            peaks.push((Operand::Int8, ladder.stored(&identity, backend, tensor_ops, store)?));
         }
         // The stream last; an unobtainable one leaves the peaks.
         let stream = match (stream, host) {
@@ -794,7 +800,7 @@ impl MachineLine {
                 let mut fastest: Option<Rate<Rows>> = None;
                 let mut unobtainable = None;
                 for (plan, columns) in plans.iter().zip(ROW_VALUES) {
-                    match plan.stored(&identity, backend, store)? {
+                    match plan.stored(&identity, backend, tensor_ops, store)? {
                         Ok(rate) => {
                             let rate = rate.map(|line| Rows { line, row_bytes: columns * 4 });
                             if fastest.is_none_or(|best| {
@@ -813,7 +819,7 @@ impl MachineLine {
                     None => Stream::Unobtainable(unobtainable.expect("a stream has row lengths")),
                 }
             }
-            (None, Some(readers)) => host_stream(readers, topology, &identity, store)?,
+            (None, Some(readers)) => host_stream(readers, topology, store)?,
             (None, None) => unreachable!("a device without a stream probe is the CPU"),
         };
         Ok(Self { stream, peaks })
@@ -882,11 +888,12 @@ fn readers_among(threads: usize, performance: usize) -> Result<[u64; 2], Executo
 const HOST_POINTS: usize = 4;
 
 /// The key of the sweep of `bytes` of a span `span` by `readers` threads on
-/// the CPU executor `identity` names: the line's own, apart from the host
-/// memory's line (`MemoryCosts`) the runtime prices a host tier by.
-fn sweep_key(identity: &seismic::Identity, readers: u64, span: u64, bytes: u64) -> PointKey {
+/// `topology`'s host: the line's own, apart from the host memory's line
+/// (`MemoryCosts`) the runtime prices a host tier by, keyed by the host
+/// itself rather than any GPU executor.
+fn sweep_key(topology: &DeviceTopology, readers: u64, span: u64, bytes: u64) -> PointKey {
     PointKey {
-        executor: identity.clone(),
+        subject: seismic::PointSubject::host(topology),
         kernels: Vec::new(),
         configuration: named(&[("line_host_stream", 1), ("readers", readers), ("span", span)]),
         point: named(&[("bytes", bytes)]),
@@ -899,15 +906,15 @@ fn sweep_key(identity: &seismic::Identity, readers: u64, span: u64, bytes: u64) 
 /// host memory), every page of it written once before it is timed, in the
 /// readers' shares ([`Sweeps::written`]).
 fn measure_host(readers: [u64; 2], walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
-    let span = MemoryCosts::span(walks.device().topology());
-    let identity = walks.identity();
+    let topology = walks.device().topology().clone();
+    let span = MemoryCosts::span(&topology);
     for readers in readers {
         let threads = usize::try_from(readers)
             .map_err(|_| ExecutorCostsError(format!("{readers} readers exceed the host")))?;
         let words = OnceCell::new();
         for bytes in [0, span] {
             let words = &words;
-            walks.time_host(sweep_key(&identity, readers, span, bytes), move || {
+            walks.time_host(sweep_key(&topology, readers, span, bytes), move || {
                 let words = words.get_or_init(|| Sweeps::written((span / 8) as usize, threads));
                 Ok(Sweeps { words: &words[..(bytes / 8) as usize], readers: threads })
             });
@@ -923,7 +930,6 @@ fn measure_host(readers: [u64; 2], walks: &mut Walks<'_, '_>) -> Result<(), Exec
 fn host_stream(
     readers: Result<[u64; 2], ExecutorCostsError>,
     topology: &DeviceTopology,
-    identity: &seismic::Identity,
     store: &dyn RecordStore<PointKey>,
 ) -> Result<Stream, MachineLineError> {
     let readers = match readers {
@@ -934,7 +940,7 @@ fn host_stream(
     let mut rates = Vec::new();
     let mut unmeasured = None;
     for readers in readers {
-        match sweep_rate(identity, span, readers, store)? {
+        match sweep_rate(topology, span, readers, store)? {
             Ok(per_second) => rates.push((readers, per_second)),
             Err(fault) => {
                 unmeasured.get_or_insert(fault);
@@ -952,14 +958,14 @@ fn host_stream(
 /// fixed cost, apart), its interval from the sweeps'; the stream it is a
 /// fault of where a sweep is unobtainable, or rose with no bytes.
 fn sweep_rate(
-    identity: &seismic::Identity,
+    topology: &DeviceTopology,
     span: u64,
     readers: u64,
     store: &dyn RecordStore<PointKey>,
 ) -> Result<Result<MeasuredCost, Stream>, MachineLineError> {
     let mut sweeps = [None, None];
     for (sweep, bytes) in sweeps.iter_mut().zip([0, span]) {
-        match store.load(&sweep_key(identity, readers, span, bytes))? {
+        match store.load(&sweep_key(topology, readers, span, bytes))? {
             Some(Record::Measured(timing)) => *sweep = Some(timing),
             Some(Record::Unobtainable { reason }) => return Ok(Err(Stream::Unobtainable(reason))),
             None => return Err(MachineLineError::UnrecordedSweep { readers, bytes }),
@@ -1114,13 +1120,14 @@ mod tests {
         let [pool, wider] = host_readers().unwrap();
         let span = MemoryCosts::span(topology);
         let sweeps = [(pool, 0), (pool, span), (wider, 0), (wider, span)]
-            .map(|(readers, bytes)| sweep_key(&identity, readers, span, bytes));
+            .map(|(readers, bytes)| sweep_key(topology, readers, span, bytes));
         for (key, seconds) in sweeps.iter().zip([1., 3., 1., 4.]) {
             time(key.clone(), super::timing(seconds, None));
         }
         let (f32, matrix, matrix_f32, int8) = &probes.peaks;
         assert!(matrix.is_none() && matrix_f32.is_none(), "the CPU's forms multiply no matrix operand");
         let (f32, int8) = (f32.as_ref().unwrap(), int8.as_ref().unwrap());
+        let tensor_ops = executor.forms_tensor_operations();
         // Every UNROLL a second faster than the one before at its multiples
         // (a call's fixed 1 s beside a work of `work` seconds a multiple),
         // or with the work not growing past 2S.
@@ -1129,7 +1136,7 @@ mod tests {
                 let work = 8. - index as f64 * 0.5;
                 for (plan, multiple) in f32.plans.iter().zip(MULTIPLES) {
                     let grown = if scales { multiple as f64 } else { multiple.min(2) as f64 };
-                    time(plan.key(&identity, backend, unroll).unwrap(), super::timing(1. + work * grown, Some(0.05)));
+                    time(plan.key(&identity, backend, tensor_ops, unroll).unwrap(), super::timing(1. + work * grown, Some(0.05)));
                 }
             }
         };
@@ -1138,7 +1145,7 @@ mod tests {
             for &unroll in &plan.unrolls {
                 store
                     .store(
-                        &plan.key(&identity, backend, unroll).unwrap(),
+                        &plan.key(&identity, backend, tensor_ops, unroll).unwrap(),
                         &Record::Unobtainable { reason: reason.clone() },
                     )
                     .unwrap();
@@ -1178,7 +1185,7 @@ mod tests {
         assert!(matches!(line.stream, Stream::Unobtainable(_)));
         assert!(matches!(line.peaks[0].1, Peak::Unscaled { .. }));
         // A sweep the job has not measured is no record of the line's.
-        let unrecorded = sweep_rate(&identity, span, pool, &HeldStore::default());
+        let unrecorded = sweep_rate(topology, span, pool, &HeldStore::default());
         assert!(matches!(unrecorded, Err(MachineLineError::UnrecordedSweep { bytes: 0, .. })), "{unrecorded:?}");
     }
 
@@ -1194,9 +1201,7 @@ mod tests {
         assert!(readers_among(8, 0).is_err());
         let topology = seismic::Devices::discover(&[]).unwrap().topology();
         let cause = ExecutorCostsError("the host's processors: no".to_owned());
-        let host = topology.executors().iter().find(|executor| executor.backend() == BackendName::Cpu).unwrap();
-        let identity = executor_identity(&topology, host).unwrap();
-        let stream = host_stream(Err(cause.clone()), &topology, &identity, &HeldStore::default()).unwrap();
+        let stream = host_stream(Err(cause.clone()), &topology, &HeldStore::default()).unwrap();
         assert_eq!(stream, Stream::Unobtainable(Reason::new(cause.to_string())));
     }
 }

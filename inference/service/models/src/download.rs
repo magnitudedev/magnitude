@@ -888,6 +888,10 @@ impl ManagedModelStore {
 
     /// Runs one package download under its repository lock, and discards a cancelled download's
     /// partial files while still holding it, so no other download can be resuming from them.
+    ///
+    /// Acquires a concurrency slot before locking the repository so queued downloads never hold
+    /// `repository_lock` while waiting for a slot, and cancellation while queued settles
+    /// immediately without blocking on active transfers.
     async fn run_download_locked(
         &self,
         operation_id: &str,
@@ -896,6 +900,7 @@ impl ManagedModelStore {
         admitted_space: SpaceAdmission,
     ) -> Result<(), DownloadError> {
         operation.ensure_active()?;
+        let _slot = acquire_download_slot(&self.download_slots, &operation.control).await?;
         let (repository, _) = package.repository_revision();
         let repo_root = self.config.root.join("hub").join(hf_repo_dir(repository));
         let repository_lock = lock_repository(&self.config.root, repository)
@@ -966,7 +971,7 @@ impl ManagedModelStore {
         let total_bytes: u64 = components
             .iter()
             .map(|component| component.size_bytes)
-            .sum();
+            .fold(0_u64, u64::saturating_add);
         let existing = self.models.read().ok().and_then(|models| {
             models
                 .get(&model_id)
@@ -1067,16 +1072,6 @@ impl ManagedModelStore {
             });
         }
 
-        let _slot = self
-            .download_slots
-            .acquire()
-            .await
-            .map_err(|error| DownloadError {
-                kind: DownloadErrorKind::Internal,
-                message: error.to_string(),
-                retryable: false,
-                resumable: true,
-            })?;
         ensure_owned_directory(&repo_root).await?;
         ensure_owned_directory(&repo_root.join("blobs")).await?;
         let started = Instant::now();
@@ -1107,8 +1102,11 @@ impl ManagedModelStore {
                     let previous_files = components[..index]
                         .iter()
                         .map(|item| item.size_bytes)
-                        .sum::<u64>();
-                    let future_resumed = resumed_by_component[index + 1..].iter().sum::<u64>();
+                        .fold(0_u64, u64::saturating_add);
+                    let future_resumed = resumed_by_component[index + 1..]
+                        .iter()
+                        .copied()
+                        .fold(0_u64, u64::saturating_add);
                     let completed = previous_files
                         .saturating_add(file_completed)
                         .saturating_add(future_resumed);
@@ -1117,7 +1115,7 @@ impl ManagedModelStore {
                         .iter()
                         .zip(&resumed_by_component[..index])
                         .map(|(item, resumed)| item.size_bytes.saturating_sub(*resumed))
-                        .sum::<u64>();
+                        .fold(0_u64, u64::saturating_add);
                     let transferred = previous_transferred
                         .saturating_add(file_completed.saturating_sub(resumed_from));
                     let rate =
@@ -1395,7 +1393,14 @@ async fn download_component_once(
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(error) => {
-                persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
+                persist_integrity_checkpoint_best_effort(
+                    paths,
+                    component,
+                    integrity,
+                    Some(&mut file),
+                    &error,
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -1420,7 +1425,14 @@ async fn download_component_once(
             });
         }
         if let Err(error) = writes.admit() {
-            persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
+            persist_integrity_checkpoint_best_effort(
+                paths,
+                component,
+                integrity,
+                Some(&mut file),
+                &error,
+            )
+            .await;
             return Err(error);
         }
         file.write_all(&chunk).await.map_err(download_io)?;
@@ -1433,8 +1445,7 @@ async fn download_component_once(
         }
     }
     if offset != component.size_bytes {
-        persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
-        return Err(DownloadError {
+        let error = DownloadError {
             kind: DownloadErrorKind::Network,
             message: format!(
                 "download ended at {offset} bytes; expected {} for {}",
@@ -1443,7 +1454,16 @@ async fn download_component_once(
             ),
             retryable: true,
             resumable: true,
-        });
+        };
+        persist_integrity_checkpoint_best_effort(
+            paths,
+            component,
+            integrity,
+            Some(&mut file),
+            &error,
+        )
+        .await;
+        return Err(error);
     }
     persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
     drop(file);
@@ -1728,7 +1748,9 @@ async fn recover_partial(
     let partial_len = regular_file_len(&paths.partial).await;
     let record = read_integrity_record(&paths.checkpoint).await;
     let Some((partial_len, record)) = partial_len.zip(record) else {
-        if partial_len.is_some() || paths.checkpoint.exists() {
+        if tokio::fs::symlink_metadata(&paths.partial).await.is_ok()
+            || tokio::fs::symlink_metadata(&paths.checkpoint).await.is_ok()
+        {
             discard_component_files(paths).await?;
         }
         return Ok(DownloadIntegrity::empty(component));
@@ -1784,6 +1806,44 @@ async fn recover_completed_blob(
 
     discard_component_files(paths).await?;
     Ok(false)
+}
+
+async fn acquire_download_slot<'a>(
+    slots: &'a tokio::sync::Semaphore,
+    control: &TransferControl,
+) -> Result<tokio::sync::SemaphorePermit<'a>, DownloadError> {
+    tokio::select! {
+        biased;
+        () = control.cancellation() => Err(cancelled_error()),
+        slot = slots.acquire() => slot.map_err(|error| DownloadError {
+            kind: DownloadErrorKind::Internal,
+            message: error.to_string(),
+            retryable: false,
+            resumable: true,
+        }),
+    }
+}
+
+async fn persist_integrity_checkpoint_best_effort(
+    paths: &DownloadComponentPaths,
+    component: &ModelComponent,
+    integrity: &mut DownloadIntegrity,
+    file: Option<&mut tokio::fs::File>,
+    original_error: &DownloadError,
+) {
+    if matches!(original_error.kind, DownloadErrorKind::Cancelled) {
+        return;
+    }
+    if let Err(checkpoint_error) =
+        persist_integrity_checkpoint(paths, component, integrity, file).await
+    {
+        tracing::warn!(
+            path = %component.path.display(),
+            original_kind = ?original_error.kind,
+            checkpoint_error = %checkpoint_error.message,
+            "failed to persist download integrity checkpoint on error path"
+        );
+    }
 }
 
 async fn persist_integrity_checkpoint(
@@ -2696,20 +2756,15 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
             total_bytes,
             ..
         } => (*completed_bytes, *total_bytes),
-        ModelDownloadEvent::Ready { model, .. } => (
-            model
+        ModelDownloadEvent::Ready { model, .. } => {
+            let total = model
                 .location
                 .components()
                 .iter()
                 .map(|item| item.size_bytes)
-                .sum(),
-            model
-                .location
-                .components()
-                .iter()
-                .map(|item| item.size_bytes)
-                .sum(),
-        ),
+                .fold(0_u64, u64::saturating_add);
+            (total, total)
+        }
         ModelDownloadEvent::Resolving { .. } => (0, 0),
     }
 }
@@ -4421,5 +4476,141 @@ mod tests {
                 access: HuggingFaceAccess::AcceptTerms
             })
         );
+    }
+
+    #[tokio::test]
+    async fn download_slot_wait_returns_cancelled_immediately_when_cancelled() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(0));
+        let control = Arc::new(TransferControl::new(SOURCE_STALL_TIMEOUT));
+        let cancel_control = Arc::clone(&control);
+        let cancel_task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel_control.cancel();
+        });
+        let result = acquire_download_slot(&slots, &control).await;
+        cancel_task.await.expect("cancel task");
+        let error = result.expect_err("slot wait must abort on cancellation");
+        assert!(matches!(error.kind, DownloadErrorKind::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn recover_partial_quarantines_foreign_directory_and_broken_checkpoint_symlink() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let blobs = temp.path().join("blobs");
+        std::fs::create_dir_all(&blobs).expect("blobs dir");
+        let component = model_component(b"hello world");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+
+        // Foreign directory at paths.partial with no checkpoint present.
+        std::fs::create_dir_all(&paths.partial).expect("foreign partial dir");
+        let recovered = recover_partial(&paths, &component)
+            .await
+            .expect("recover_partial must quarantine foreign directory");
+        assert_eq!(recovered.bytes, 0);
+        assert!(
+            std::fs::symlink_metadata(&paths.partial).is_err(),
+            "foreign directory at partial path must be quarantined"
+        );
+
+        // Broken symlink at paths.checkpoint with no partial present.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(temp.path().join("does-not-exist"), &paths.checkpoint)
+                .expect("broken checkpoint symlink");
+            assert!(
+                !paths.checkpoint.exists(),
+                "precondition: Path::exists is false for broken symlink"
+            );
+            assert!(
+                std::fs::symlink_metadata(&paths.checkpoint).is_ok(),
+                "precondition: symlink_metadata sees broken symlink"
+            );
+            let recovered = recover_partial(&paths, &component)
+                .await
+                .expect("recover_partial must quarantine broken checkpoint symlink");
+            assert_eq!(recovered.bytes, 0);
+            assert!(
+                std::fs::symlink_metadata(&paths.checkpoint).is_err(),
+                "broken symlink at checkpoint path must be quarantined"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_integrity_checkpoint_best_effort_skips_on_cancel_and_absorbs_checkpoint_io_error()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing_dir = temp.path().join("nonexistent-dir");
+        let component = model_component(b"checkpoint-payload");
+        let paths = DownloadComponentPaths::new(&missing_dir, &blob_key(&component.content));
+        let mut integrity = DownloadIntegrity::empty(&component);
+        integrity.update(b"check").expect("update integrity");
+
+        // On Cancelled: must skip without touching disk or updating checkpointed_bytes.
+        let cancelled = cancelled_error();
+        persist_integrity_checkpoint_best_effort(&paths, &component, &mut integrity, None, &cancelled)
+            .await;
+        assert_eq!(integrity.checkpointed_bytes, 0);
+
+        // On InsufficientDiskSpace (where checkpoint persistence fails because missing_dir doesn't
+        // exist): must absorb the checkpoint I/O error instead of propagating it.
+        let out_of_space = DownloadError {
+            kind: DownloadErrorKind::InsufficientDiskSpace {
+                required_bytes: 100,
+                available_bytes: 0,
+            },
+            message: "disk full".to_owned(),
+            retryable: false,
+            resumable: true,
+        };
+        persist_integrity_checkpoint_best_effort(
+            &paths,
+            &component,
+            &mut integrity,
+            None,
+            &out_of_space,
+        )
+        .await;
+        assert_eq!(integrity.checkpointed_bytes, 0);
+    }
+
+    #[test]
+    fn progress_totals_saturates_large_component_sizes() {
+        let mut first = model_component(b"a");
+        first.size_bytes = u64::MAX - 5;
+        let mut second = model_component(b"b");
+        second.size_bytes = 100;
+        let components = vec![first, second];
+        let content = content_id(&components);
+        let id = inventory_entry_id("magnitude-cache", Path::new("huge"), &content);
+        let model = InventoryModel {
+            id,
+            content_id: content,
+            created: 0,
+            name: "huge".to_owned(),
+            supported_parameters: Vec::new(),
+            availability: ModelAvailability::Available { ready_at: 0 },
+            source: ModelSource::HuggingFace {
+                repository: "owner/repo".to_owned(),
+                requested_revision: "main".to_owned(),
+                commit: "abc".to_owned(),
+                metadata: None,
+            },
+            location: ModelLocation::MagnitudeCache {
+                components,
+                total_bytes: u64::MAX,
+                integrity: Integrity::Unverified {
+                    reason: "test".to_owned(),
+                },
+            },
+            properties: InventoryProperties::Pending,
+            operations: Vec::new(),
+            updated_at: 0,
+        };
+        let event = ModelDownloadEvent::Ready {
+            operation_id: "op".to_owned(),
+            model: Box::new(model),
+        };
+        assert_eq!(progress_totals(&event), (u64::MAX, u64::MAX));
     }
 }

@@ -33,14 +33,29 @@ pub struct Workers {
 /// ([`Workers::narrowed`]).
 pub struct Narrowed {
     workers: Arc<Workers>,
-    before: usize,
+    token: u64,
 }
 
 impl Drop for Narrowed {
     fn drop(&mut self) {
-        self.workers.state().allowed = self.before;
-        // Jobs that waited for a thread they were not allowed may run.
-        self.workers.shared.wake.notify_all();
+        let raised = {
+            let mut state = self.workers.state();
+            let before = state.allowed;
+            if let Some(pos) = state.narrowings.iter().position(|&(t, _)| t == self.token) {
+                state.narrowings.swap_remove(pos);
+            }
+            state.allowed = state
+                .narrowings
+                .iter()
+                .map(|&(_, n)| n)
+                .min()
+                .unwrap_or(self.workers.width + 1);
+            state.allowed > before
+        };
+        if raised {
+            // Jobs that waited for a thread they were not allowed may run.
+            self.workers.shared.wake.notify_all();
+        }
     }
 }
 
@@ -60,6 +75,10 @@ struct State {
     /// out among them ([`Workers::narrowed`]): the set's width and that
     /// caller unless its owner allows fewer.
     allowed: usize,
+    /// Active [`Narrowed`] guards as `(token, clamped_threads)`.
+    narrowings: Vec<(u64, usize)>,
+    /// Next monotonic token for [`Narrowed`].
+    next_narrowing: u64,
     /// The set's threads running a job now.
     running: usize,
 }
@@ -93,10 +112,20 @@ impl Workers {
     /// process may still take allows as many threads as that affords,
     /// instead of as many as the host has.
     pub fn narrowed(self: &Arc<Self>, threads: usize) -> Narrowed {
-        let allowed = threads.clamp(1, self.width + 1);
+        let limit = threads.clamp(1, self.width + 1);
+        let mut state = self.state();
+        let token = state.next_narrowing;
+        state.next_narrowing += 1;
+        state.narrowings.push((token, limit));
+        state.allowed = state
+            .narrowings
+            .iter()
+            .map(|&(_, n)| n)
+            .min()
+            .unwrap_or(self.width + 1);
         Narrowed {
             workers: self.clone(),
-            before: std::mem::replace(&mut self.state().allowed, allowed),
+            token,
         }
     }
 
@@ -550,6 +579,45 @@ mod tests {
         let together = AtOnce::new(whole, std::time::Duration::from_secs(2));
         workers.each(&work[..whole], |_| together.form());
         assert_eq!(together.most(), whole);
+    }
+
+    /// Overlapping narrowings keep the tightest active limit regardless of
+    /// creation or drop order: a wider nested guard never raises the cap above
+    /// a tighter active guard, and dropping out of order restores the next
+    /// tightest limit until all guards are gone.
+    #[test]
+    fn overlapping_narrowings_keep_the_tightest_active_limit() {
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(10);
+        let workers = Arc::new(Workers::new(6));
+        let whole = workers.width() + 1;
+        let work = (0..32usize).collect::<Vec<_>>();
+
+        let a = workers.narrowed(2);
+        assert_eq!(workers.state().allowed, 2);
+
+        // Nested widening: B asks for 4 while A holds 2; effective cap stays 2.
+        let b = workers.narrowed(4);
+        assert_eq!(workers.state().allowed, 2);
+        let capped = AtOnce::new(3, HOLD);
+        workers.each(&work, |_| capped.form());
+        assert!(capped.most() <= 2);
+
+        // Drop A out of order while B is still held: cap rises to B's 4.
+        drop(a);
+        assert_eq!(workers.state().allowed, 4);
+        let widened = AtOnce::new(4, std::time::Duration::from_secs(2));
+        workers.each(&work[..4], |_| widened.form());
+        assert_eq!(widened.most(), 4);
+        let still_capped = AtOnce::new(5, HOLD);
+        workers.each(&work, |_| still_capped.form());
+        assert!(still_capped.most() <= 4);
+
+        // Drop B: cap restores to full width + caller.
+        drop(b);
+        assert_eq!(workers.state().allowed, whole);
+        let restored = AtOnce::new(whole, std::time::Duration::from_secs(2));
+        workers.each(&work[..whole], |_| restored.form());
+        assert_eq!(restored.most(), whole);
     }
 
     /// What a job allocated and freed on a worker thread is the system's

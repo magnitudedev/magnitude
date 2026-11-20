@@ -837,10 +837,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 eprintln!(
                     "draft proposals request={request:?} {:?}",
                     (0..*proposals)
-                        .map(|step| {
-                            let selected = selected[step * slot_class + slot];
-                            (selected.token.0, selected.status)
-                        })
+                        .map(|step| selected[step * slot_class + slot])
                         .collect::<Vec<_>>()
                 );
             }

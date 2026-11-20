@@ -10,15 +10,16 @@
 //! - others' harm rises with no growth of the process's within λ_h;
 //! - a new pressure event came with the OS's pressure level set.
 //!
-//! The response is one relief plan, carried out whole or not at all
-//! (`memory::ledger::relief`): cache in rank order, then (but under
-//! pressure) requests, the lowest value first and never the earliest
-//! admitted, just enough. With no plan nothing yields and new work waits.
-//! New work also waits while committed memory or others' rise is short.
-//! The model unloads only on a floor shortfall that holds on readings
-//! spanning more than the store's λ, with no change of the process's
-//! pending and no plan: what is committed cannot be held. Under pressure
-//! the boundary never falls below what is committed
+//! The response is one relief plan (`memory::ledger::relief`): cache in rank
+//! order, then (but under pressure) requests, the lowest value first and never
+//! the earliest admitted, just enough. Where cache and evictable requests
+//! together cannot cover the need, any remaining cache still drains down to
+//! floor first before costlier responses take effect. New work waits only once
+//! cache is exhausted (no plan covers the need, requests are preempted, or a
+//! floor/rise shortfall exhausts all cache). The model unloads only on a floor
+//! shortfall that holds on readings spanning more than the store's λ, with no
+//! change of the process's pending and no plan: what is committed cannot be
+//! held. Under pressure the boundary never falls below what is committed
 //! (`memory::supply::Boundary`), so pressure sheds cache alone.
 
 use std::time::Duration;
@@ -59,8 +60,8 @@ pub struct Response {
     /// Relief known to cover the shortage, carried out whole
     /// ([`super::ledger::Ledger::execute`]); none where nothing covers it.
     pub relief: Option<ReliefPlan>,
-    /// New work waits: committed memory or others' rise is short, or no
-    /// relief covers the shortage.
+    /// New work waits once cache is exhausted: no relief covers the shortage,
+    /// requests must be preempted, or a floor/rise shortfall exhausts all cache.
     pub admission_waits: bool,
     /// A floor shortfall persists with nothing to give and nothing of ours
     /// pending: unload.
@@ -124,13 +125,18 @@ pub(crate) fn allows(cause: Cause, evictable: &std::collections::BTreeSet<crate:
 }
 
 /// The response to `cause` on `estimate`, `relief` the plan that covers it
-/// (none where nothing does), the shortage having stood since
-/// `persistence`'s first reading.
+/// (or drains remaining cache when nothing covers it whole; none where no
+/// cache remains either), the shortage having stood since `persistence`'s
+/// first reading.
 pub(crate) fn respond(estimate: &Estimate, cause: Cause, relief: Option<ReliefPlan>, persistence: &Persistence) -> Shortage {
     let at = estimate.at();
     let spans = persistence.since.is_some_and(|since| at.at().duration_since(since.at()) > estimate.lag().max(MIN_UNLOAD_SPAN));
+    let need = lacks(estimate, cause);
     let committed_short = matches!(cause, Cause::FloorShort { .. } | Cause::RiseShort { .. });
+    let covered = relief.as_ref().is_some_and(|plan| plan.covers() >= need);
+    let preempts = relief.as_ref().is_some_and(|plan| !plan.preempt().is_empty());
+    let cache_exhausted = relief.as_ref().is_none_or(|plan| !covered || preempts || plan.covers() >= estimate.cache());
     let unload = matches!(cause, Cause::FloorShort { .. }) && spans && relief.is_none() && estimate.releasing() == 0 && !estimate.pending();
-    let admission_waits = committed_short || relief.is_none();
+    let admission_waits = !covered || preempts || (committed_short && cache_exhausted);
     Shortage { cause, response: Response { relief, admission_waits, unload } }
 }

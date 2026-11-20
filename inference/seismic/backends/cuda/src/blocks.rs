@@ -8,7 +8,7 @@
 
 use crate::driver::{self, Allocation, Context, DriverError};
 use seismic_compiler::blocks::{
-    charge_block, first_fit, largest_shared, takes_own_block, FreeRanges, PackedBlock,
+    charge_block_for, first_fit, largest_shared, takes_own_block, FreeRanges, PackedBlock,
     BLOCK_CAP_BYTES,
 };
 use seismic_compiler::errors::ExecutionError;
@@ -85,15 +85,26 @@ impl Blocks {
         let mut blocks = self.blocks();
         let found = first_fit(&blocks, bytes, alignment)
             .map(|(index, offset)| (blocks[index].clone(), offset));
-        let (block, offset) = match found {
-            Some(found) => found,
+        let (block, offset, carved) = match found {
+            Some((block, offset)) => {
+                let carved = block.backed.charge().carve(entry, bytes);
+                (block, offset, carved)
+            }
             None => {
                 // The charge, the driver's allocation and its record are one
-                // change.
+                // change: `bytes` draws on `entry`'s claim directly, and only
+                // the uncarved block remainder is charged to `self.own`.
                 let change = self.own.change();
-                let charge = charge_block(&change, &self.own, largest_shared(&blocks), BLOCK_CAP_BYTES, bytes, self.granularity)?;
-                let backed = Backed::allocate(&change, charge, |charge| {
-                    let size = charge.bytes();
+                let (remainder, first) = charge_block_for(
+                    &change,
+                    &self.own,
+                    entry,
+                    largest_shared(&blocks),
+                    BLOCK_CAP_BYTES,
+                    bytes,
+                    self.granularity,
+                )?;
+                let (backed, carved) = Backed::allocate_carvable_with_first(remainder, first, |size| {
                     Allocation::new(
                         &self.context,
                         usize::try_from(size).map_err(|_| {
@@ -103,8 +114,7 @@ impl Blocks {
                         })?,
                     )
                     .map_err(crate::executor::allocation_error(size, || crate::executor::device_free(&self.context)))
-                })?
-                .into_carvable();
+                })?;
                 let size = backed.charge().bytes();
                 let block = Arc::new(Block {
                     backed,
@@ -116,11 +126,11 @@ impl Blocks {
                     .take(bytes, alignment)
                     .expect("a new block holds its first allocation");
                 blocks.push(block.clone());
-                (block, offset)
+                (block, offset, carved)
             }
         };
         Ok(Range {
-            _carved: block.backed.charge().carve(entry, bytes),
+            carved: Some(carved),
             blocks: self.clone(),
             block,
             offset,
@@ -167,8 +177,8 @@ impl Blocks {
 /// A range of a block, returned on drop.
 pub(crate) struct Range {
     /// Its bytes, carved for its allocation's entry from the block's;
-    /// returned to the block as the range drops.
-    _carved: Carved,
+    /// returned to the block before the range becomes allocatable again.
+    carved: Option<Carved>,
     blocks: Arc<Blocks>,
     block: Arc<Block>,
     offset: u64,
@@ -202,6 +212,7 @@ impl Range {
 
 impl Drop for Range {
     fn drop(&mut self) {
+        drop(self.carved.take());
         self.blocks.release(self);
     }
 }

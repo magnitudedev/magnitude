@@ -197,7 +197,10 @@ bool output_stream::publish(const reading & next) {
     for (size_t i = 0; i < cursors.size(); ++i) {
         auto & cursor = cursors[i];
         const auto & current = next.calls[i];
-        if (current.name.empty()) { continue; }
+        if (current.name.empty()) {
+            if (cursor.started) { return false; }
+            continue;
+        }
         if (!cursor.started) {
             if (has_explicit_ids && current.id.empty() && !current.closed) { continue; }
             cursor.name = current.name;
@@ -205,16 +208,21 @@ bool output_stream::publish(const reading & next) {
             cursor.id = current.id;
             cursor.started = true;
             emitted.push_back({TEMPLATES_TOOL_START, static_cast<uint32_t>(i), cursor.name, cursor.id});
-        } else if (cursor.name != current.name || (!current.id.empty() && cursor.id != current.id)) {
+        } else if (cursor.name != current.name || cursor.id != current.id) {
             return false;
         }
         auto suffix = current.arguments.suffix(cursor.argument_output, context.input);
         if (!suffix) { return false; }
+        if (cursor.complete) {
+            if (!current.closed || !suffix->empty()) { return false; }
+            cursor.argument_output = current.arguments;
+            continue;
+        }
         if (!suffix->empty()) {
             emitted.push_back({TEMPLATES_TOOL_ARGUMENTS, static_cast<uint32_t>(i), std::move(*suffix), {}});
         }
         cursor.argument_output = current.arguments;
-        if (current.closed && !cursor.complete) {
+        if (current.closed) {
             emitted.push_back({TEMPLATES_TOOL_COMPLETE, static_cast<uint32_t>(i), {}, {}});
             cursor.complete = true;
         }

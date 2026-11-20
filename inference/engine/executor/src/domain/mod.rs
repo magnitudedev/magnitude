@@ -1342,16 +1342,16 @@ impl<'d> MemoryProbe<'d> {
         targets: impl FnOnce() -> Vec<crate::experts::derived::DerivedTarget>,
     ) -> Vec<StoreAnswer<'d>> {
         let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
-        let targets = if traced { targets() } else { Vec::new() };
         let answers = stores(self.ledgers)
             .map(|ledger| {
                 // The reading's generation, before its response moves the
                 // ledger: what a resize that follows its target names.
                 let generation = ledger.generation();
                 let mut shortage = ledger.shortage(evictable);
-                // A plan of cache alone is carried out at once; one naming
-                // requests, each evictable now, is the owner's.
-                let owed = match shortage.as_mut().and_then(|shortage| shortage.response.relief.take_if(|plan| plan.preempt().is_empty())) {
+                // Carry out every relief plan's cache yields synchronously now;
+                // any requests it names are in `evictable` and are preempted by
+                // the owner on return.
+                let owed = match shortage.as_mut().and_then(|shortage| shortage.response.relief.take()) {
                     Some(plan) => ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)),
                     None => crate::memory::ledger::Owed::default(),
                 };
@@ -1368,17 +1368,20 @@ impl<'d> MemoryProbe<'d> {
                 cause = ?shortage.cause,
                 yielded = relieved.yielded,
                 admission_waits = shortage.response.admission_waits,
-                preempt = shortage.response.relief.as_ref().map_or(0, |plan| plan.preempt().len()),
+                preempt = relieved.preempt.len(),
                 unload = shortage.response.unload,
                 "a real memory shortage"
             );
             let owed = answered.owed.get_or_insert_with(MemoryResponse::default);
             owed.admission_waits |= shortage.response.admission_waits;
-            owed.relief.extend(shortage.response.relief.clone());
+            owed.preempt.extend(relieved.preempt.iter().copied());
             owed.unload |= shortage.response.unload;
         }
         drop(answered);
         if traced {
+            // Derive bank targets after synchronous relief has executed so
+            // `bank_slots` and `bank_target` match the post-relief estimate.
+            let targets = targets();
             for StoreAnswer { ledger, generation, shortage, owed } in &answers {
                 let estimate = ledger.estimate();
                 let held = |holding| targets.iter().find(|target| target.holding == holding && target.store == ledger.store());
@@ -1627,14 +1630,13 @@ impl SizingTerms {
 /// the rest, in order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryResponse {
-    /// New work waits: committed memory or others' rise is short, or no
-    /// relief covers the shortage.
+    /// New work waits once cache is exhausted: no relief covers the shortage,
+    /// requests must be preempted, or a floor/rise shortfall exhausts all cache.
     pub admission_waits: bool,
-    /// Relief naming requests to preempt, the lowest value first: the
-    /// owner carries each out whole, its cache shed and its requests
-    /// evicted, only where it can evict every one of them now
-    /// (`ExecutorDomain::execute_relief`); otherwise none of it.
-    pub relief: Vec<crate::memory::ledger::ReliefPlan>,
+    /// Requests named for preemption by relief plans already executed in
+    /// [`ExecutorDomain::read_memory`], lowest value first; each is in
+    /// `evictable` so the owner evicts them now.
+    pub preempt: Vec<RequestId>,
     /// A floor shortfall persists with nothing to give and nothing of ours
     /// pending: the model unloads.
     pub unload: bool,
@@ -1950,11 +1952,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let cost = began.elapsed();
         let generation = self.memory_generation();
-        let targets = match (tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG), self.family.expert_bank()) {
-            (true, Some(bank)) => self.derived_targets(bank)?,
-            _ => Vec::new(),
-        };
-        drop(probe.answer(evictable, || targets));
+        let mut target_error = None;
+        drop(probe.answer(evictable, || match self.family.expert_bank() {
+            Some(bank) => match self.derived_targets(bank) {
+                Ok(targets) => targets,
+                Err(error) => {
+                    target_error = Some(error);
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        }));
+        if let Some(error) = target_error {
+            return Err(error);
+        }
         let response = self.answered.borrow_mut().owed.take();
         Ok(MemoryReading::Read(MemoryRead { cost, generation, response }))
     }
@@ -2616,7 +2627,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// unbound, each allocation under its claim (`Self::claim_growth`), in
     /// one change that keeps nothing: the import's resident weights held by
     /// its loader for the import's life, its upload peak only while it
-    /// runs, and its graph constants for its binding's life.
+    /// runs, and its graph constants for its binding's life. If binding fails
+    /// after a fresh import, the loader is unloaded so weight bytes are never
+    /// leaked on the ledger.
     fn bind_component(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
         let changes = self.resources.ledgers().changes().clone();
         changes.change(|keeping| {
@@ -2630,21 +2643,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .as_ref()
                         .ok_or_else(|| DomainError::Input("head component is disabled".into()))?;
                     let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
-                    let resident = self.import_component(
+                    let (resident, fresh) = self.import_component(
                         claiming,
                         loader,
                         self.execution.resources().bytes().head_weights,
                         self.execution.load().head_upload_peak_bytes(),
                     )?;
-                    let mut binding = self.claim_growth(
-                        claiming,
-                        crate::memory::ledger::CommittedKind::Component,
-                        crate::memory::ClaimDemand { device: constants, ..Default::default() },
-                    )?;
-                    binding.allocate(&device, |charges| self.family.bind_head(charges, resident, &self.definition))?;
-                    self.head_binding = binding.into_claims();
-                    self.hold_bound_head(claiming)?;
-                    Ok(())
+                    let bound = (|| -> Result<(), DomainError> {
+                        let mut binding = self.claim_growth(
+                            claiming,
+                            crate::memory::ledger::CommittedKind::Component,
+                            crate::memory::ClaimDemand { device: constants, ..Default::default() },
+                        )?;
+                        binding.allocate(&device, |charges| self.family.bind_head(charges, resident, &self.definition))?;
+                        self.head_binding = binding.into_claims();
+                        self.hold_bound_head(claiming)
+                    })();
+                    if bound.is_err() && fresh {
+                        self.head_loader.as_ref().expect("head loader checked above").unload();
+                    }
+                    bound
                 }
                 ReservationLane::Vision if !self.family.vision_is_bound() => {
                     let loader = self
@@ -2652,20 +2670,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .as_ref()
                         .ok_or_else(|| DomainError::Input("vision component is disabled".into()))?;
                     let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
-                    let resident = self.import_component(
+                    let (resident, fresh) = self.import_component(
                         claiming,
                         loader,
                         self.execution.resources().bytes().vision_weights,
                         self.execution.load().vision_upload_peak_bytes(),
                     )?;
-                    let mut binding = self.claim_growth(
-                        claiming,
-                        crate::memory::ledger::CommittedKind::Component,
-                        crate::memory::ClaimDemand { device: constants, ..Default::default() },
-                    )?;
-                    binding.allocate(&device, |charges| self.family.bind_vision(charges, resident, &self.definition))?;
-                    self.vision_binding = binding.into_claims();
-                    Ok(())
+                    let bound = (|| -> Result<(), DomainError> {
+                        let mut binding = self.claim_growth(
+                            claiming,
+                            crate::memory::ledger::CommittedKind::Component,
+                            crate::memory::ClaimDemand { device: constants, ..Default::default() },
+                        )?;
+                        binding.allocate(&device, |charges| self.family.bind_vision(charges, resident, &self.definition))?;
+                        self.vision_binding = binding.into_claims();
+                        Ok(())
+                    })();
+                    if bound.is_err() && fresh {
+                        self.vision_loader.as_ref().expect("vision loader checked above").unload();
+                    }
+                    bound
                 }
                 _ => Ok(()),
             }
@@ -2675,18 +2699,79 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// `loader`'s component, imported where it is not yet: its `resident`
     /// bytes claimed for the import's life, kept by the loader, and its
     /// upload `peak` (staged through host RAM where that is a store apart)
-    /// claimed only while the import runs, each in `claiming`.
-    fn import_component<T: Clone>(&self, claiming: &crate::memory::ledger::Claiming, loader: &ComponentLoader<T>, resident: u64, peak: u64) -> Result<T, DomainError> {
-        let imported = match loader.resident() {
-            Some(resident) => Ok(resident),
+    /// claimed only while the import runs, each in `claiming`. Returns
+    /// `(resident, fresh)` where `fresh` is true if this call imported it.
+    fn import_component<T: Clone>(
+        &self,
+        claiming: &crate::memory::ledger::Claiming,
+        loader: &ComponentLoader<T>,
+        resident: u64,
+        peak: u64,
+    ) -> Result<(T, bool), DomainError> {
+        match loader.resident() {
+            Some(resident) => Ok((resident, false)),
             None => {
                 use crate::memory::{ClaimDemand, ledger::CommittedKind};
                 let weights = self.claim_growth(claiming, CommittedKind::Component, ClaimDemand { device: resident, ..Default::default() })?;
                 let _upload = self.claim_growth(claiming, CommittedKind::Upload, ClaimDemand { device: peak, staged: peak, ..Default::default() })?;
-                loader.import(weights)
+                loader
+                    .import(weights)
+                    .map(|imported| (imported, true))
+                    .map_err(|error| self.import_error(&error))
             }
-        };
-        imported.map_err(|error| DomainError::Input(error.to_string()))
+        }
+    }
+
+    /// Map a component import failure to its [`DomainError`] class, preserving
+    /// capacity, device, and invariant failures instead of flattening them to
+    /// [`DomainError::Input`].
+    fn import_error(&self, error: &crate::ResidencyError) -> DomainError {
+        use crate::{AllocationError, DeviceError, ResidencyError, SubmitError, WeightImportError};
+        let ledgers = self.resources.ledgers();
+        let device = self.domain.device();
+        match error {
+            ResidencyError::Import(WeightImportError::Refused { contract, required, available }) => {
+                let store = ledgers.of_contract(device, *contract).store();
+                DomainError::Capacity(CapacityError {
+                    resource: match store == ledgers.device().store() {
+                        true => ResourceKind::DeviceMemory,
+                        false => ResourceKind::HostStaging,
+                    },
+                    required: *required,
+                    available: *available,
+                })
+            }
+            ResidencyError::Import(WeightImportError::Allocation(
+                AllocationError::Tensor(error)
+                | AllocationError::Workflow(seismic::WorkflowError::TensorView(error)),
+            )) => match error {
+                seismic::TensorError::Execution(execution)
+                    if execution.capacity_refusal().is_some()
+                        || matches!(execution, seismic::ExecutionError::AllocationFailed(_)) =>
+                {
+                    let (required, available) = execution.capacity_refusal().unwrap_or((1, 0));
+                    DomainError::Capacity(CapacityError {
+                        resource: ResourceKind::DeviceMemory,
+                        required,
+                        available,
+                    })
+                }
+                other => DomainError::Device(DeviceError::Execution(format!("component import: {other}"))),
+            },
+            ResidencyError::Import(WeightImportError::Submit(SubmitError::Device(error)))
+            | ResidencyError::Import(WeightImportError::Completion(error)) => {
+                DomainError::Device(error.clone())
+            }
+            ResidencyError::Import(WeightImportError::Device(message)) => {
+                DomainError::Device(DeviceError::Execution(message.clone()))
+            }
+            ResidencyError::Import(WeightImportError::Submit(SubmitError::Invariant(error)))
+            | ResidencyError::Import(WeightImportError::Invariant(error))
+            | ResidencyError::Import(WeightImportError::Allocation(AllocationError::Plan(error))) => {
+                DomainError::Invariant(error.clone())
+            }
+            other => DomainError::Input(other.to_string()),
+        }
     }
 
     /// Reserve capacity for one group: the front queued step's slots when
@@ -2951,6 +3036,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             "invariant violated: a domain's request slot is a {:?} claim",
             request_slot.kind()
         );
+        if let Some(head) = &head_state {
+            assert_eq!(
+                (head.pool().granule(), head.pool().block_bytes()),
+                (target_state.pool().granule(), target_state.pool().block_bytes()),
+                "invariant violated: head and target state stores do not share one state pool"
+            );
+        }
         let owner = resources.ledgers().changes().own();
         // The load's last allocation is behind it, and the OS has since
         // refilled the free pages its allocations took from the file cache:

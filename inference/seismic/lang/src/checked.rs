@@ -667,9 +667,15 @@ pub struct ElementUses {
     pub component_read: bool,
     /// The component additionally requires an interpreted integer code.
     pub integer_code_read: bool,
+    /// A same-element sub-record store, `tensor[...]` allocation, or writable
+    /// intrinsic operand requiring `ReadWrite` dense storage (any dense dtype,
+    /// including integer and bool).
     pub stored: bool,
-    /// A `&mut` parameter, or a store of whole trailing matrices
-    /// (`registry::record_writable`).
+    /// A scalar/elementwise float store requiring `ReadWrite` dense float
+    /// storage (`f32`, `f16`, `bf16`).
+    pub float_stored: bool,
+    /// A `&mut` parameter, a result tensor leaf, or a store of whole trailing
+    /// matrices (`registry::record_writable`).
     pub record_stored: bool,
     pub conversion_source: bool,
     /// `to_owned` of a view selecting part of the packing axis.
@@ -803,6 +809,7 @@ impl ElementUses {
             component_read,
             integer_code_read,
             stored,
+            float_stored,
             record_stored,
             conversion_source,
             partial_copy,
@@ -811,6 +818,7 @@ impl ElementUses {
         self.component_read |= component_read;
         self.integer_code_read |= integer_code_read;
         self.stored |= stored;
+        self.float_stored |= float_stored;
         self.record_stored |= record_stored;
         self.conversion_source |= conversion_source;
         self.partial_copy |= partial_copy;
@@ -819,6 +827,7 @@ impl ElementUses {
     /// Whether an element parameter with these uses may be bound to `representation`.
     pub fn admits(self, representation: RepresentationId) -> bool {
         let info = registry::representation_info(representation);
+        let dense = matches!(info.kind, RepresentationKind::Dense(_));
         let dense_float = matches!(
             info.kind,
             RepresentationKind::Dense(DType::F32 | DType::F16 | DType::BF16)
@@ -828,23 +837,28 @@ impl ElementUses {
                 info.kind,
                 RepresentationKind::Packed(_) | RepresentationKind::PackedRows(_)
             ) && registry::decode_recipe(representation, DType::F32).is_some());
-        info.decoded.is_float()
-            && (!self.stored || (info.access == RepresentationAccess::ReadWrite && dense_float))
+        (!self.stored || (info.access == RepresentationAccess::ReadWrite && dense))
+            && (!self.float_stored
+                || (info.access == RepresentationAccess::ReadWrite && dense_float))
             && (!self.record_stored || registry::record_writable(representation))
             && (!self.decoded_read
-                || (matches!(
-                    info.access,
-                    RepresentationAccess::ReadWrite | RepresentationAccess::ReadOnly
-                ) && decodable))
+                || (info.decoded.is_float()
+                    && matches!(
+                        info.access,
+                        RepresentationAccess::ReadWrite | RepresentationAccess::ReadOnly
+                    )
+                    && decodable))
             && (!self.component_read
-                || registry::decode_recipe(representation, DType::F32).is_some())
+                || (info.decoded.is_float()
+                    && registry::decode_recipe(representation, DType::F32).is_some()))
             && (!self.integer_code_read
-                || registry::decode_recipe(representation, DType::F32).is_some_and(|recipe| {
-                    recipe
-                        .component(registry::QuantizedComponent::Code)
-                        .is_some()
-                }))
-            && (!self.partial_copy || matches!(info.kind, RepresentationKind::Dense(_)))
+                || (info.decoded.is_float()
+                    && registry::decode_recipe(representation, DType::F32).is_some_and(|recipe| {
+                        recipe
+                            .component(registry::QuantizedComponent::Code)
+                            .is_some()
+                    })))
+            && (!self.partial_copy || (info.decoded.is_float() && dense))
     }
 }
 
@@ -895,7 +909,7 @@ impl ElementDomain {
             .iter()
             .find(|parameter| parameter.name == name)?
             .uses;
-        if uses.stored || uses.partial_copy {
+        if uses.stored || uses.float_stored || uses.partial_copy {
             Some(CpuBinding::Dense)
         } else if uses.decoded_read || uses.component_read {
             Some(CpuBinding::Weights)
@@ -6851,6 +6865,14 @@ mod diagnostic_tests {
             stored: true,
             ..ElementUses::default()
         };
+        let float_stored = ElementUses {
+            float_stored: true,
+            ..ElementUses::default()
+        };
+        let record_stored = ElementUses {
+            record_stored: true,
+            ..ElementUses::default()
+        };
         let read = ElementUses {
             decoded_read: true,
             ..ElementUses::default()
@@ -6869,13 +6891,29 @@ mod diagnostic_tests {
         assert!(!component.admits(dense(DType::F32)));
         assert!(!component.admits(external));
         assert!(stored.admits(dense(DType::BF16)));
+        assert!(stored.admits(dense(DType::I32)));
+        assert!(stored.admits(dense(DType::U32)));
+        assert!(stored.admits(dense(DType::Bool)));
         assert!(!stored.admits(q4g64));
-        assert!(!stored.admits(dense(DType::I32)));
+        assert!(!stored.admits(external));
+        assert!(float_stored.admits(dense(DType::BF16)));
+        assert!(float_stored.admits(dense(DType::F32)));
+        assert!(!float_stored.admits(dense(DType::I32)));
+        assert!(!float_stored.admits(dense(DType::U32)));
+        assert!(!float_stored.admits(dense(DType::Bool)));
+        assert!(!float_stored.admits(q4g64));
+        assert!(!float_stored.admits(external));
+        assert!(record_stored.admits(dense(DType::BF16)));
+        assert!(record_stored.admits(dense(DType::Bool)));
+        assert!(record_stored.admits(q4g64));
+        assert!(!record_stored.admits(external));
         assert!(read.admits(q4g64));
         assert!(!read.admits(external));
+        assert!(!read.admits(dense(DType::I32)));
         assert!(!copied.admits(q4g64));
+        assert!(!copied.admits(dense(DType::I32)));
         assert!(ElementUses::default().admits(external));
-        assert!(!ElementUses::default().admits(dense(DType::Bool)));
+        assert!(ElementUses::default().admits(dense(DType::Bool)));
     }
 
     #[test]

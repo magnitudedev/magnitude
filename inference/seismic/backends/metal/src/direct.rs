@@ -818,18 +818,18 @@ fn grouped_encoder(
     spans: Option<&mut (&'static LaunchTimestamps, Option<std::sync::Arc<SpanPair>>)>,
     held_spans: usize,
 ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, ExecutionError> {
-    let pass = match spans {
-        Some((timestamps, current)) => {
-            let start = current.is_none();
-            let pair = match current {
-                Some(pair) => pair,
-                None => current.insert(std::sync::Arc::new(timestamps.span(device, || held_spans)?)),
-            };
-            Some(crate::pooled(|| sampled_pass(dispatch, pair, start)))
+    let (pass, leased) = match spans.as_deref() {
+        Some((_, Some(pair))) => {
+            (Some(crate::pooled(|| sampled_pass(dispatch, pair, false))), None)
         }
-        None => None,
+        Some((timestamps, None)) => {
+            let pair = std::sync::Arc::new(timestamps.span(device, || held_spans)?);
+            let pass = crate::pooled(|| sampled_pass(dispatch, &pair, true));
+            (Some(pass), Some(pair))
+        }
+        None => (None, None),
     };
-    crate::pooled(|| {
+    let encoder = crate::pooled(|| {
         let kind = match &pass {
             None => crate::device::EncoderKind::Dispatch(dispatch),
             Some(pass) => crate::device::EncoderKind::Pass(pass),
@@ -840,7 +840,11 @@ fn grouped_encoder(
     })
     .ok_or_else(|| {
         ExecutionError::SubmissionFailed("Metal could not create a native compute encoder".into())
-    })
+    })?;
+    if let (Some((_, current)), Some(pair)) = (spans, leased) {
+        *current = Some(pair);
+    }
+    Ok(encoder)
 }
 
 /// A 64-bit value the host or the device's command buffers advance
@@ -1129,7 +1133,6 @@ impl DirectBatch {
                 self.cut()?;
             }
         }
-        self.used = true;
         let command = self
             .command
             .as_ref()
@@ -1157,12 +1160,13 @@ impl DirectBatch {
             }
             Encoding::Timed { timing, lease, gates, encoded } => {
                 let LaunchTiming { timestamps, parts, launches, .. } = &mut **timing;
-                let lease = match lease {
-                    Some(lease) => lease,
-                    None => lease.insert(timestamps.lease(device, || blocked_parts(gates, parts))?),
+                let leased = match lease {
+                    Some(_) => None,
+                    None => Some(timestamps.lease(device, || blocked_parts(gates, parts))?),
                 };
-                let page = lease.page.as_ref().expect("a lease holds its page until committed");
-                let offset = lease.samples;
+                let active = leased.as_ref().or(lease.as_ref()).expect("a timed launch has a lease");
+                let page = active.page.as_ref().expect("a lease holds its page until committed");
+                let offset = active.samples;
                 crate::pooled(|| {
                     let pass = MTLComputePassDescriptor::computePassDescriptor();
                     pass.setDispatchType(MTLDispatchType::Serial);
@@ -1187,11 +1191,16 @@ impl DirectBatch {
                     encoder.endEncoding();
                     Ok::<_, ExecutionError>(())
                 })?;
+                let lease = match leased {
+                    Some(new_lease) => lease.insert(new_lease),
+                    None => lease.as_mut().expect("a timed launch has a lease"),
+                };
                 lease.samples += 2;
                 launches.push(Some(*encoded));
                 *encoded += 1;
             }
         }
+        self.used = true;
         Ok(())
     }
 
@@ -1334,6 +1343,26 @@ struct Observed {
 // Waiting on and querying a committed command buffer is thread-safe.
 unsafe impl Send for DirectSubmission {}
 unsafe impl Sync for DirectSubmission {}
+
+impl Drop for DirectSubmission {
+    /// Wait for any uncompleted command buffers to finish before dropping so
+    /// backing `MetalBuffer`s, anonymous `Mapping`s, and timestamp pages are
+    /// never freed while GPU work referencing them is still in flight.
+    fn drop(&mut self) {
+        if !self.commands.is_empty() {
+            crate::pooled(|| {
+                for command in self.commands.drain(..) {
+                    if !matches!(
+                        command.status(),
+                        MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+                    ) {
+                        command.waitUntilCompleted();
+                    }
+                }
+            });
+        }
+    }
+}
 
 impl DirectSubmission {
     /// Whether the work completed, without waiting: `Ok(false)` while a

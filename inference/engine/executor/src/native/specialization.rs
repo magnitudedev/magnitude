@@ -520,7 +520,7 @@ impl<'a> Specializer<'a> {
             .into_iter()
             .map(|point| point.rows)
             .collect::<Vec<_>>();
-        let cuts = row_cuts(implementation, &statics, &served, &points);
+        let cuts = row_cuts(implementation, &statics, case.row_dimension(), &served, &points);
         Ok(row_ranges(served, &cuts, &points))
     }
 

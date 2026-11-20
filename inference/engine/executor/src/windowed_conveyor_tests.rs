@@ -36,7 +36,7 @@ enum Mode {
     WindowedFloor,
 }
 
-type StepBits = Vec<(Option<Vec<u32>>, Option<Vec<u32>>, Option<(u32, u8)>)>;
+type StepBits = Vec<(Option<Vec<u32>>, Option<Vec<u32>>, Option<crate::Selected>)>;
 
 fn fixture(test: &str, mut definition: ModelDefinition) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
     let manifest = streamed_experts_manifest(&definition);
@@ -385,7 +385,7 @@ fn step_bits(outcome: &Outcome) -> StepBits {
             (
                 row.features.as_ref().map(|features| bits(features.read_to_host().unwrap())),
                 row.logits.as_ref().map(|logits| bits(logits.read_to_host().unwrap())),
-                row.selected.map(|selected| (selected.token.0, selected.status)),
+                row.selected,
             )
         })
         .collect()
@@ -464,12 +464,14 @@ fn run_workload(
             bindings = returned;
             steps.push(step_bits(&outcome));
         }
-        let token = steps
+        let token = match steps
             .last()
             .and_then(|bits| bits.last())
             .and_then(|(_, _, selected)| *selected)
-            .expect("last prompt chunk selects token")
-            .0;
+        {
+            Some(crate::Selected::Token(token)) => token.0,
+            other => panic!("last prompt chunk selects token, got {other:?}"),
+        };
         selected_tokens.push(token);
     }
     for (request, mut token) in requests.into_iter().zip(selected_tokens) {
@@ -478,7 +480,10 @@ fn run_workload(
                 run_step(&mut domain, bindings, decode_step(request, token, CHUNKS * CHUNK_ROWS + offset), false, backend);
             bindings = returned;
             let bits = step_bits(&outcome);
-            token = bits.last().and_then(|(_, _, selected)| *selected).expect("decode selects token").0;
+            token = match bits.last().and_then(|(_, _, selected)| *selected) {
+                Some(crate::Selected::Token(token)) => token.0,
+                other => panic!("decode selects token, got {other:?}"),
+            };
             steps.push(bits);
         }
     }

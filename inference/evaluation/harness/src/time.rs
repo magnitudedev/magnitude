@@ -616,7 +616,7 @@ fn prefill_cell(
             .flat_map(|step| step.submissions)
             .collect::<Vec<_>>();
         submissions.extend(trace.collect().map_err(|error| error.to_string())?);
-        let attributed = attribution(&submissions, 1, (f64::NEG_INFINITY, f64::INFINITY));
+        let attributed = attribution(&submissions, 1);
         let prefill = match whole(&attributed_groups) {
             true => attributed_prefill(&attributed, &attributed_groups),
             false => Err("the attributed prefill did not run whole as prompt groups".to_owned()),
@@ -1391,23 +1391,20 @@ fn measure(
         Value::Null
     } else {
         let trace = traced(engine, TraceDetail::Launches)?;
+        // A leading step drains whatever was queued before the trace opened
+        // (under lookahead, that step was queued before the trace opened and
+        // its collect drains the first traced step queued behind it; without
+        // lookahead, it drains the leading step itself). Each attributed step
+        // that follows then collects its own single step's launches, even
+        // under lookahead, so `attributed` owns the exact attributed steps'
+        // submissions without host-vs-device timestamp filtering.
+        let _ = decode_step(engine, mode, sequences, make, Some(&trace))?;
         let mut attributed = Vec::new();
-        // The window, from a leading step's end (`from`) to the last
-        // attributed step's (`until`). Under lookahead the leading step was
-        // queued before the trace opened, so its launches are not traced;
-        // each step after it is queued behind the one before and starts
-        // after that one's end, so the window holds exactly the attributed
-        // steps' launches. Attributed steps are untimed, so each collects
-        // its own launches even under lookahead.
-        let mut attributed_step = || {
+        for _ in 0..time.attribution_steps {
             let step = decode_step(engine, mode, sequences, make, Some(&trace))?;
             attributed.extend(step.submissions);
-            Ok::<_, String>(step.end)
-        };
-        let from = attributed_step()?;
-        let until = (0..time.attribution_steps).try_fold(from, |_, _| attributed_step())?;
-        attributed.extend(collect(&trace)?);
-        attribution(&attributed, time.attribution_steps, (from, until))
+        }
+        attribution(&attributed, time.attribution_steps)
     };
     // The window's steps' times, each from the completion before it.
     let mut intervals = summaries[1..]

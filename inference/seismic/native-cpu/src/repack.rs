@@ -739,6 +739,9 @@ pub unsafe fn rows(source: &External<'_>, destination: &Packed<'_>, rows: std::o
         "rows {rows:?} outside the operands"
     );
     assert_eq!(source.matrix_rows, destination.matrix_rows);
+    if rows.is_empty() {
+        return;
+    }
     PLANS.with_borrow_mut(|plans| {
         let key = (source.id, destination.element.id, source.k);
         let index = plans

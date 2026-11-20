@@ -691,6 +691,10 @@ impl ExprArena {
     pub fn duration_add(&mut self, a: DurationExpr, b: DurationExpr) -> DurationExpr {
         self.inner.duration_add(a, b)
     }
+    /// Sums a slice of durations in a single flattening pass.
+    pub fn duration_sum_all(&mut self, operands: &[DurationExpr]) -> DurationExpr {
+        self.inner.duration_sum_all(operands)
+    }
     pub fn duration_select(
         &mut self,
         cond: BoolExpr,

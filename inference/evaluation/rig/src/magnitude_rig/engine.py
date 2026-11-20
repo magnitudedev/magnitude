@@ -1409,5 +1409,5 @@ def _fetch_rest(hosts: Hosts, launched: dict) -> None:
     remote = connect(hosts.host(launched["host"]))
     if run_state(remote, launched["run"]) != "absent":
         sync.fetch(remote, remote.path("runs", launched["run"]), Path(launched["results"]))
-        HostRun(remote, launched["run"], launched["agent"]).fetched()
+        HostRun(remote, launched["run"], launched["agent"]).fetched(wait=True)
     state.Launched.remove(launched["run"])

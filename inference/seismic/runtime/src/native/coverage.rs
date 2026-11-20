@@ -864,10 +864,23 @@ fn representations() -> Vec<RepresentationId> {
     found.into_iter().map(|info| info.id).collect()
 }
 
-/// Why a subject's implementations bind as every device offers them:
-/// [`Subject::new`] admits only declarations that read no device property,
-/// and substituting element reads reads none.
-const INDEPENDENT: &str = "a subject's declaration reads no device property (Subject::new)";
+/// The declaration's default specialization at `statics`, or its first
+/// admissible specialization when a parameter's default reads the device
+/// (coverage forms programs offline, on no device).
+fn base_specialization(
+    implementation: &NativeImplementation,
+    statics: &NativeSpecialization,
+) -> Result<NativeSpecialization, seismic_lang::checked::NativeSpecializationError> {
+    if let Some(result) = implementation.default_specialization_without_device(statics) {
+        return result;
+    }
+    let mut first = None;
+    implementation.walk_admissible(statics, |configuration| {
+        first = Some(configuration.clone());
+        false
+    })?;
+    first.ok_or(seismic_lang::checked::NativeSpecializationError::Inadmissible)
+}
 
 /// The checked inputs of one entry's implementation on one backend.
 ///
@@ -909,10 +922,15 @@ impl<'m> Subject<'m> {
             return Ok(None);
         };
         // Coverage forms whole programs offline, on no device: a
-        // declaration that reads the device anywhere (its defaults, or its
-        // launches' geometry, as only CPU declarations do, which coverage
-        // never forms) cannot be formed here.
-        if declaration.device_independent().is_none() {
+        // declaration whose admission constraint reads the device cannot be
+        // evaluated here. A parameter default that reads the device only
+        // picks which admissible configuration runs by default, so coverage
+        // falls back to the first admissible configuration (`base_specialization`).
+        if declaration.constraint.as_ref().is_some_and(|constraint| {
+            let mut reads = Vec::new();
+            constraint.device_reads(&mut reads);
+            !reads.is_empty()
+        }) {
             return Err(CoverageError::DeviceDependent(info.name.clone()));
         }
         let asset = module
@@ -1001,9 +1019,7 @@ impl<'m> Subject<'m> {
         let implementation = self.implementation(&bindings);
         let statics = self.statics(implementation, &[])?;
         Some(Row {
-            specialization: implementation
-                .default_specialization_without_device(&statics)
-                .expect(INDEPENDENT)
+            specialization: base_specialization(implementation, &statics)
                 .expect("searched statics admit a configuration"),
             bindings,
             configuration,
@@ -1018,10 +1034,7 @@ impl<'m> Subject<'m> {
         let specialization = match implementation.validate(&row.specialization) {
             Ok(()) => row.specialization.clone(),
             Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
-                match implementation
-                    .default_specialization_without_device(&statics_of(&row.specialization))
-                    .expect(INDEPENDENT)
-                {
+                match base_specialization(implementation, &statics_of(&row.specialization)) {
                     Ok(specialization) => specialization,
                     Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
                         return None;
@@ -1301,9 +1314,7 @@ impl<'m> Admissible<'m> {
         variant_programs: bool,
     ) -> Self {
         let mut admissible = Self::new(implementation, statics);
-        admissible.first = implementation
-            .default_specialization_without_device(statics)
-            .expect(INDEPENDENT)
+        admissible.first = base_specialization(implementation, statics)
             .expect("a row's statics admit its specialization");
         if variant_programs {
             admissible.variants = (0..implementation.launches.len())
@@ -2573,11 +2584,11 @@ fn form_request(
     let subject = Subject::new(module, info, forms.former.backend(), Vec::new())
         .map_err(|error| RequestFailure::Formation(error.to_string()))?
         .expect("a request names an entry with a native implementation");
-    let specialization = subject
-        .implementation(&request.bindings)
-        .default_specialization_without_device(&request.statics)
-        .expect(INDEPENDENT)
-        .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
+    let specialization = base_specialization(
+        subject.implementation(&request.bindings),
+        &request.statics,
+    )
+    .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
     let row = Row {
         bindings: request.bindings.clone(),
         specialization,

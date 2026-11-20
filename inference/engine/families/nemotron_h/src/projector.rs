@@ -20,7 +20,7 @@ use crate::Error;
 use magnitude_artifacts::gguf::Directory;
 use magnitude_family_common::{ProjectorMetadata, projector_type, Tensors};
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage,
+    checked_product, ActivationDType, CellReduction, MergerStage,
     PositionSampling, VisionActivation, VisionAttention, VisionAttentionScale,
     VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward, VisionLinear,
     VisionMerger, VisionNorm, VisionOperator, VisionPositions, VisionPreprocessing,
@@ -125,9 +125,7 @@ pub fn describe_projector(
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("nemotron_omni", ())], target_width)
         .map_err(Error::ProjectorIdentity)?;
-    let meta = ProjectorMetadata::new(directory);
-    meta.ignore("clip.has_vision_encoder");
-    meta.ignore("clip.projector_type");
+    let meta = ProjectorMetadata::open(directory);
     let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
     let mut r = Reader {
         meta,
@@ -135,12 +133,10 @@ pub fn describe_projector(
         epsilon,
     };
     // The released tower's feed-forward is the erf GELU.
-    if !r.meta.bool("clip.use_gelu")? {
-        return Err(invalid("the Nemotron tower requires its GELU feed-forward"));
-    }
-    if r.meta.optional_bool("clip.vision.nemotron_omni")? == Some(false) {
-        return Err(invalid("clip.vision.nemotron_omni must be true"));
-    }
+    r.meta
+        .invariant_flag("clip.use_gelu", true, "true (GELU feed-forward)")?;
+    r.meta
+        .invariant_flag("clip.vision.nemotron_omni", true, "true")?;
     let hidden = r.meta.integer("clip.vision.embedding_length")?;
     let output_hidden = r.meta.integer("clip.vision.projection_dim")?;
     let intermediate = r.meta.integer("clip.vision.feed_forward_length")?;
@@ -148,7 +144,7 @@ pub fn describe_projector(
     let heads = r.meta.integer("clip.vision.attention.head_count")?;
     let patch = r.meta.integer("clip.vision.patch_size")?;
     let merge = r.meta.integer("clip.vision.projector.scale_factor")?;
-    r.meta.integer("clip.vision.image_size")?;
+    r.meta.optional_integer("clip.vision.image_size")?;
     if !hidden.is_multiple_of(heads) || !(hidden / heads).is_multiple_of(4) {
         return Err(invalid("invalid Nemotron tower geometry"));
     }
@@ -163,26 +159,19 @@ pub fn describe_projector(
         r.tensors
             .bind("v.patch_embd.weight.1", &[hidden, 6, patch, patch])?;
     }
-    let (table, stored) = match r.tensors.shape("v.position_embd.weight")? {
-        [rows, width] => (*rows, vec![*rows, *width]),
-        [1, rows, width] => (*rows, vec![1, *rows, *width]),
-        _ => return Err(invalid("position embedding must be a matrix")),
-    };
+    let (table, width) = r
+        .tensors
+        .matrix_or_batched_shape("v.position_embd.weight")?;
     let side = (table as f64).sqrt() as u64;
-    if side.checked_mul(side) != Some(table) || stored.last() != Some(&hidden) {
+    if side.checked_mul(side) != Some(table) || width != hidden {
         return Err(invalid(
             "position embedding must be a square grid of tower rows",
         ));
     }
-    let transforms = if stored.len() == 3 {
-        vec![ImportTransform::MergeLeadingAxes]
-    } else {
-        Vec::new()
-    };
     let positions = VisionPositions {
         table: r
             .tensors
-            .bind_transformed("v.position_embd.weight", &stored, transforms)?,
+            .bind_matrix_or_batched("v.position_embd.weight", table, hidden)?,
         sampling: PositionSampling::CroppedSquare { side },
     };
     let registers = match r.tensors.shape("v.class_embd")? {

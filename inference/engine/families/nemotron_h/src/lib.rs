@@ -154,6 +154,7 @@ impl From<HeaderError> for Error {
             }
             error @ (HeaderError::MetadataType { .. }
             | HeaderError::Rotary { .. }
+            | HeaderError::RopeScaling(_)
             | HeaderError::Yarn
             | HeaderError::Payload { .. }) => metadata_error(error.to_string()),
         }
@@ -296,6 +297,17 @@ impl Geometry {
             .and_then(|rows| rows.checked_add(g.heads))
             .ok_or_else(|| metadata_error("Nemotron-H state space dimensions overflow"))?;
         let norm_group = g.inner / g.groups;
+        let norm_name = format!("{prefix}ssm_norm.weight");
+        let norm_weight = match binder.shape(&norm_name)? {
+            [groups, group] if *groups == g.groups && *group == norm_group => {
+                binder.bind_transformed(
+                    &norm_name,
+                    &[g.groups, norm_group],
+                    vec![ImportTransform::Flatten],
+                )?
+            }
+            _ => binder.bind(&norm_name, &[g.inner])?,
+        };
         Ok(Operator::StateSpace(Box::new(StateSpace {
             heads: g.heads,
             head_width: g.head_width,
@@ -304,27 +316,16 @@ impl Geometry {
             convolution_width: g.convolution_width,
             projection: binder
                 .bind(&format!("{prefix}ssm_in.weight"), &[projected, hidden])?,
-            convolution: binder.bind(
+            convolution: binder.bind_conv1d(
                 &format!("{prefix}ssm_conv1d.weight"),
-                &[channels, g.convolution_width],
+                channels,
+                g.convolution_width,
             )?,
             convolution_bias: binder.bind(&format!("{prefix}ssm_conv1d.bias"), &[channels])?,
             time_bias: binder.bind(&format!("{prefix}ssm_dt.bias"), &[g.heads])?,
-            decay: binder.bind_transformed(
-                &format!("{prefix}ssm_a"),
-                &[g.heads, 1],
-                vec![ImportTransform::Flatten],
-            )?,
-            skip: binder.bind_transformed(
-                &format!("{prefix}ssm_d"),
-                &[g.heads, 1],
-                vec![ImportTransform::Flatten],
-            )?,
-            norm: self.rms(binder.bind_transformed(
-                &format!("{prefix}ssm_norm.weight"),
-                &[g.groups, norm_group],
-                vec![ImportTransform::Flatten],
-            )?),
+            decay: binder.bind(&format!("{prefix}ssm_a"), &[g.heads])?,
+            skip: binder.bind(&format!("{prefix}ssm_d"), &[g.heads])?,
+            norm: self.rms(norm_weight),
             norm_group,
             output: binder.bind(&format!("{prefix}ssm_out.weight"), &[hidden, g.inner])?,
         })))
@@ -497,28 +498,23 @@ pub fn inspect_components(
     m.ignore("rope.dimension_count");
     m.ignore("rope.freq_base");
     m.ignore("rope.scaling.finetuned");
-    let block_count = m.integer("block_count")?;
-    let head_layers = m.optional_count("nextn_predict_layers")?.unwrap_or(0);
+    let block_count = m.bounded_block_count("block_count")?;
+    let head_layers = m.default_count("nextn_predict_layers", 0)?;
     if head_layers >= block_count {
         return Err(metadata_error(
             "nextn_predict_layers must be below block count",
         ));
-    }
-    // Every layer binds distinct stored weights; reject impossible counts
-    // before allocating per-layer vectors from untrusted metadata.
-    if block_count > directory.tensors.len() as u64 {
-        return Err(metadata_error("Nemotron-H block count exceeds its weights"));
     }
     let kv_heads = m.layer_counts("attention.head_count_kv", block_count)?;
     let intermediates = m.layer_counts("feed_forward_length", block_count)?;
 
     let hidden = m.integer("embedding_length")?;
     let attention_width = m.integer("attention.key_length")?;
-    if m.integer("attention.value_length")? != attention_width {
-        return Err(metadata_error(
-            "Nemotron-H attention key and value widths differ",
-        ));
-    }
+    m.invariant_count(
+        "attention.value_length",
+        attention_width,
+        "equal to attention.key_length",
+    )?;
     let inner = m.integer("ssm.inner_size")?;
     let heads = m.integer("ssm.time_step_rank")?;
     let groups = m.integer("ssm.group_count")?;
@@ -527,15 +523,20 @@ pub fn inspect_components(
             "Nemotron-H state space heads do not divide its inner width into groups",
         ));
     }
-    let experts = match m.value("expert_count") {
+    let experts = match m.optional_count("expert_count")?.filter(|&count| count > 0) {
         None => None,
-        Some(_) => {
-            if m.integer("expert_group_count")? != 1 || m.integer("expert_group_used_count")? != 1 {
-                return Err(metadata_error(
-                    "group-limited Nemotron-H expert routing is not supported",
-                ));
-            }
-            let shared = match m.count("expert_shared_count")? {
+        Some(count) => {
+            m.invariant_count(
+                "expert_group_count",
+                1,
+                "1 (group-limited expert routing is not supported)",
+            )?;
+            m.invariant_count(
+                "expert_group_used_count",
+                1,
+                "1 (group-limited expert routing is not supported)",
+            )?;
+            let shared = match m.default_count("expert_shared_count", 0)? {
                 0 => None,
                 1 => Some(m.integer("expert_shared_feed_forward_length")?),
                 _ => {
@@ -546,13 +547,9 @@ pub fn inspect_components(
             };
             // llama.cpp's gating enumeration: 1 softmax, 2 sigmoid. Absent,
             // the architecture's sigmoid applies.
-            if m.optional_count("expert_gating_func")?.is_some_and(|gating| gating != 2) {
-                return Err(metadata_error(
-                    "Nemotron-H experts are gated only by a sigmoid",
-                ));
-            }
+            m.invariant_count("expert_gating_func", 2, "2 (sigmoid)")?;
             Some(Experts {
-                count: m.integer("expert_count")?,
+                count,
                 selected: m.uniform_or_layer_counts("expert_used_count", block_count)?,
                 intermediate: m
                     .uniform_or_layer_counts("expert_feed_forward_length", block_count)?,
@@ -589,12 +586,7 @@ pub fn inspect_components(
     };
 
     let mut binder = Tensors::new(directory);
-    let vocabulary = binder.rows("token_embd.weight")?;
-    if m.integer("vocab_size")? != vocabulary {
-        return Err(metadata_error(
-            "Nemotron-H vocabulary size differs from its embedding",
-        ));
-    }
+    let vocabulary = m.vocab_size(binder.rows("token_embd.weight")?)?;
     let embedding = binder.bind("token_embd.weight", &[vocabulary, hidden])?;
     let output_name = if binder.contains("output.weight") {
         "output.weight"

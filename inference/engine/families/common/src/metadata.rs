@@ -141,6 +141,25 @@ impl<'a> Metadata<'a> {
         self.required(key, value)
     }
 
+    /// An optional nonnegative integer that defaults to `default` when absent.
+    pub fn default_count(&self, key: &str, default: u64) -> Result<u64, HeaderError> {
+        Ok(self.optional_count(key)?.unwrap_or(default))
+    }
+
+    /// An optional nonnegative integer that must equal `expected` when present.
+    pub fn invariant_count(
+        &self,
+        key: &str,
+        expected: u64,
+        reason: &'static str,
+    ) -> Result<(), HeaderError> {
+        match self.optional_count(key)? {
+            None => Ok(()),
+            Some(value) if value == expected => Ok(()),
+            Some(_) => Err(self.malformed(key, reason)),
+        }
+    }
+
     /// A positive integer.
     pub fn optional_integer(&self, key: &str) -> Result<Option<u64>, HeaderError> {
         self.typed(key, "a positive integer", |value| {
@@ -186,6 +205,51 @@ impl<'a> Metadata<'a> {
         self.required(key, value)
     }
 
+    /// An optional boolean that defaults to `default` when absent.
+    pub fn default_flag(&self, key: &str, default: bool) -> Result<bool, HeaderError> {
+        Ok(self.optional_flag(key)?.unwrap_or(default))
+    }
+
+    /// An optional boolean that must equal `expected` when present.
+    pub fn invariant_flag(
+        &self,
+        key: &str,
+        expected: bool,
+        reason: &'static str,
+    ) -> Result<(), HeaderError> {
+        match self.optional_flag(key)? {
+            None => Ok(()),
+            Some(value) if value == expected => Ok(()),
+            Some(_) => Err(self.malformed(key, reason)),
+        }
+    }
+
+    /// The model's vocabulary size, inferred from the embedding table's rows
+    /// and verified against `<arch>.vocab_size` when that key is present.
+    pub fn vocab_size(&self, embedding_rows: u64) -> Result<u64, HeaderError> {
+        if let Some(declared) = self.optional_integer("vocab_size")? {
+            if declared != embedding_rows {
+                return Err(self.malformed(
+                    "vocab_size",
+                    "equal to the embedding table's row count",
+                ));
+            }
+        }
+        Ok(embedding_rows)
+    }
+
+    /// Admits an absent `rope.scaling.type` or `"none"`, and rejects any
+    /// other scaling type with [`HeaderError::RopeScaling`].
+    pub fn reject_rope_scaling(&self) -> Result<(), HeaderError> {
+        match self.value("rope.scaling.type") {
+            None => Ok(()),
+            Some(value) if value.string() == Some("none") => Ok(()),
+            Some(value) => Err(HeaderError::RopeScaling(
+                value.string().unwrap_or("unspecified").to_owned(),
+            )),
+        }
+    }
+
     pub fn optional_string(&self, key: &str) -> Result<Option<&'a str>, HeaderError> {
         self.typed(key, "a string", Value::string)
     }
@@ -216,6 +280,12 @@ impl<'a> Metadata<'a> {
         layers: u64,
         read: impl Fn(Element<'a>) -> Option<T>,
     ) -> Result<Option<Vec<T>>, HeaderError> {
+        if layers > self.directory.tensors.len() as u64 {
+            return Err(self.malformed(
+                key,
+                "a layer count not exceeding the stored tensor count",
+            ));
+        }
         match self.value(key) {
             Some(Value::Array(_)) => self.array(key, expected, Some(layers), read),
             _ => self.typed(key, expected, |value| match value {
@@ -297,6 +367,18 @@ impl<'a> Metadata<'a> {
         self.required(key, value)
     }
 
+    /// A finite number per layer, stated once for all layers or as an array
+    /// with one entry per layer.
+    pub fn uniform_or_layer_numbers(&self, key: &str, layers: u64) -> Result<Vec<f64>, HeaderError> {
+        let value = self.uniform_or_array(
+            key,
+            "a finite number or one per layer",
+            layers,
+            element_number,
+        )?;
+        self.required(key, value)
+    }
+
     /// One flag per layer.
     pub fn optional_flags(&self, key: &str, layers: u64) -> Result<Option<Vec<bool>>, HeaderError> {
         self.array(key, "one flag per layer", Some(layers), |element| match element {
@@ -354,9 +436,13 @@ fn element_number(element: Element) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_artifacts::gguf::{ByteOrder, Metadata as Entry};
+    use magnitude_artifacts::gguf::{ByteOrder, Encoding, Metadata as Entry, TensorDescriptor};
 
     fn directory(entries: &[(&str, Value)]) -> Directory {
+        directory_with_tensors(entries, 0)
+    }
+
+    fn directory_with_tensors(entries: &[(&str, Value)], tensor_count: usize) -> Directory {
         Directory {
             version: 3,
             byte_order: ByteOrder::Little,
@@ -369,7 +455,15 @@ mod tests {
                     value: value.clone(),
                 })
                 .collect(),
-            tensors: Vec::new(),
+            tensors: (0..tensor_count)
+                .map(|index| TensorDescriptor {
+                    name: format!("blk.{index}.attn_norm.weight"),
+                    shape: vec![4],
+                    encoding: Encoding::F32,
+                    offset: 0,
+                    nbytes: 16,
+                })
+                .collect(),
         }
     }
 
@@ -401,5 +495,107 @@ mod tests {
         m.ignore_prefix("sibling.");
         assert_eq!(m.optional_flag("unknown_switch"), Ok(Some(true)));
         assert_eq!(m.finish(), Ok(()));
+    }
+
+    #[test]
+    fn bounded_block_count_and_uniform_or_array_reject_inflated_layers_without_allocating() {
+        let valid = directory_with_tensors(
+            &[
+                ("arch.block_count", Value::Scalar(Scalar::Unsigned(2))),
+                ("arch.feed_forward_length", Value::Scalar(Scalar::Unsigned(8))),
+                ("arch.expert_used_count", Value::Scalar(Scalar::Unsigned(0))),
+            ],
+            2,
+        );
+        let m = Metadata::new(&valid, "arch");
+        assert_eq!(m.bounded_block_count("block_count"), Ok(2));
+        assert_eq!(m.per_layer("feed_forward_length", 2), Ok(vec![8, 8]));
+        assert_eq!(
+            m.uniform_or_layer_counts("expert_used_count", 2),
+            Ok(vec![0, 0])
+        );
+        assert_eq!(m.finish(), Ok(()));
+
+        let inflated = directory_with_tensors(
+            &[
+                ("arch.block_count", Value::Scalar(Scalar::Unsigned(u64::MAX))),
+                ("arch.feed_forward_length", Value::Scalar(Scalar::Unsigned(8))),
+                ("arch.expert_used_count", Value::Scalar(Scalar::Unsigned(1))),
+            ],
+            2,
+        );
+        let m = Metadata::new(&inflated, "arch");
+        assert!(matches!(
+            m.bounded_block_count("block_count"),
+            Err(HeaderError::MetadataType { key, .. }) if key == "arch.block_count"
+        ));
+        assert!(matches!(
+            m.per_layer("feed_forward_length", u64::MAX),
+            Err(HeaderError::MetadataType { key, .. }) if key == "arch.feed_forward_length"
+        ));
+        assert!(matches!(
+            m.uniform_or_layer_counts("expert_used_count", 3),
+            Err(HeaderError::MetadataType { key, .. }) if key == "arch.expert_used_count"
+        ));
+    }
+
+    #[test]
+    fn policy_primitives_default_validate_and_reject_invariants() {
+        let absent = directory(&[]);
+        let m = Metadata::new(&absent, "arch");
+        assert_eq!(m.default_count("shared", 0), Ok(0));
+        assert_eq!(m.default_flag("norm", true), Ok(true));
+        assert_eq!(m.invariant_count("gating", 2, "2 (sigmoid)"), Ok(()));
+        assert_eq!(m.invariant_flag("tail", true, "true"), Ok(()));
+        assert_eq!(m.vocab_size(32_000), Ok(32_000));
+        assert_eq!(m.reject_rope_scaling(), Ok(()));
+        assert_eq!(m.finish(), Ok(()));
+
+        let matching = directory(&[
+            ("arch.shared", Value::Scalar(Scalar::Unsigned(2))),
+            ("arch.norm", Value::Scalar(Scalar::Bool(false))),
+            ("arch.gating", Value::Scalar(Scalar::Unsigned(2))),
+            ("arch.tail", Value::Scalar(Scalar::Bool(true))),
+            ("arch.vocab_size", Value::Scalar(Scalar::Unsigned(32_000))),
+            ("arch.rope.scaling.type", Value::Scalar(Scalar::String("none".into()))),
+        ]);
+        let m = Metadata::new(&matching, "arch");
+        assert_eq!(m.default_count("shared", 0), Ok(2));
+        assert_eq!(m.default_flag("norm", true), Ok(false));
+        assert_eq!(m.invariant_count("gating", 2, "2 (sigmoid)"), Ok(()));
+        assert_eq!(m.invariant_flag("tail", true, "true"), Ok(()));
+        assert_eq!(m.vocab_size(32_000), Ok(32_000));
+        assert_eq!(m.reject_rope_scaling(), Ok(()));
+        assert_eq!(m.finish(), Ok(()));
+
+        let mismatched = directory(&[
+            ("arch.gating", Value::Scalar(Scalar::Unsigned(1))),
+            ("arch.tail", Value::Scalar(Scalar::Bool(false))),
+            ("arch.vocab_size", Value::Scalar(Scalar::Unsigned(16_000))),
+            ("arch.rope.scaling.type", Value::Scalar(Scalar::String("yarn".into()))),
+        ]);
+        let m = Metadata::new(&mismatched, "arch");
+        assert_eq!(
+            m.invariant_count("gating", 2, "2 (sigmoid)"),
+            Err(HeaderError::MetadataType {
+                key: "arch.gating".into(),
+                expected: "2 (sigmoid)",
+            })
+        );
+        assert_eq!(
+            m.invariant_flag("tail", true, "true"),
+            Err(HeaderError::MetadataType {
+                key: "arch.tail".into(),
+                expected: "true",
+            })
+        );
+        assert!(matches!(
+            m.vocab_size(32_000),
+            Err(HeaderError::MetadataType { key, .. }) if key == "arch.vocab_size"
+        ));
+        assert_eq!(
+            m.reject_rope_scaling(),
+            Err(HeaderError::RopeScaling("yarn".into()))
+        );
     }
 }

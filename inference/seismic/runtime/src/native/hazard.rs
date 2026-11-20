@@ -31,6 +31,7 @@ use super::Dispatch;
 use super::DispatchList;
 use crate::api::tensor::{meet, Records, SlabReach};
 use crate::driver::Allocation;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -113,33 +114,94 @@ impl super::graph_replays::RecordedGraph for Schedule {
     }
 }
 
+/// Reusable scratch buffers for computing [`relative_placement_with`] and
+/// [`schedule_key`] without per-step heap allocations.
+#[derive(Default)]
+pub(crate) struct PlacementScratch {
+    first: HashMap<u64, (u64, u64)>,
+    reaches: Vec<Reach>,
+}
+
 /// What fixes the order of `calls` of `list` beside their sealed plans:
 /// every range each dispatch reaches, in dispatch order, as its
 /// allocation's place among the allocations reached before (first reached
 /// first) and its offset from that allocation's first reach, with its
-/// bytes. Two placements alike in these words meet alike: each
+/// bytes, streamed into a 256-bit digest so the key is fixed-size regardless
+/// of slab count. Two placements alike in these words meet alike: each
 /// allocation's reaches are the other's moved by one distance, and reaches
 /// of different allocations never meet, so every dependency of one is the
 /// other's ([`Order`]). A slab view's reaches name the slabs its table
 /// backs.
-pub(crate) fn relative_placement(list: &impl DispatchList, calls: Range<usize>) -> Vec<u64> {
-    let mut placement = Vec::new();
-    // Per allocation reached, its place and its first reach's offset.
-    let mut first: HashMap<u64, (u64, u64)> = HashMap::new();
-    let mut reaches = Vec::new();
+pub(crate) fn relative_placement_with(
+    scratch: &mut PlacementScratch,
+    list: &impl DispatchList,
+    calls: Range<usize>,
+) -> [u64; 4] {
+    scratch.first.clear();
+    let mut digest = Sha256::new();
+    let mut buf = [0u8; 32];
     for index in calls {
-        reaches.clear();
-        list.reaches(index, &mut reaches);
-        placement.push(reaches.len() as u64);
-        for reach in &reaches {
-            let places = first.len() as u64;
-            let (place, origin) = *first.entry(reach.allocation).or_insert((places, reach.offset));
+        scratch.reaches.clear();
+        list.reaches(index, &mut scratch.reaches);
+        digest.update((scratch.reaches.len() as u64).to_le_bytes());
+        for reach in &scratch.reaches {
+            let places = scratch.first.len() as u64;
+            let (place, origin) = *scratch.first.entry(reach.allocation).or_insert((places, reach.offset));
             // Two's complement: a reach before the allocation's first lies
             // at a distance below it.
-            placement.extend([place, reach.offset.wrapping_sub(origin), reach.bytes, reach.through as u64]);
+            buf[0..8].copy_from_slice(&place.to_le_bytes());
+            buf[8..16].copy_from_slice(&reach.offset.wrapping_sub(origin).to_le_bytes());
+            buf[16..24].copy_from_slice(&reach.bytes.to_le_bytes());
+            buf[24..32].copy_from_slice(&(reach.through as u64).to_le_bytes());
+            digest.update(buf);
         }
     }
-    placement
+    if scratch.first.capacity() > 4096 {
+        scratch.first.clear();
+        scratch.first.shrink_to(1024);
+    }
+    let hash: [u8; 32] = digest.finalize().into();
+    [
+        u64::from_le_bytes(hash[0..8].try_into().expect("8 bytes")),
+        u64::from_le_bytes(hash[8..16].try_into().expect("8 bytes")),
+        u64::from_le_bytes(hash[16..24].try_into().expect("8 bytes")),
+        u64::from_le_bytes(hash[24..32].try_into().expect("8 bytes")),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn relative_placement(list: &impl DispatchList, calls: Range<usize>) -> [u64; 4] {
+    relative_placement_with(&mut PlacementScratch::default(), list, calls)
+}
+
+/// Fixed-size cache key for a Metal sealed-plan submission's schedule:
+/// its first plan id followed by a 256-bit digest of all plan ids,
+/// repetition count, and relative placement.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn schedule_key(
+    scratch: &mut PlacementScratch,
+    runs: &[super::PlanRun],
+    repetitions: usize,
+    list: &impl DispatchList,
+) -> [u64; 5] {
+    let placement = relative_placement_with(scratch, list, 0..list.count());
+    let mut digest = Sha256::new();
+    digest.update((runs.len() as u64).to_le_bytes());
+    for run in runs {
+        digest.update(run.plan.to_le_bytes());
+    }
+    digest.update((repetitions as u64).to_le_bytes());
+    for word in placement {
+        digest.update(word.to_le_bytes());
+    }
+    let hash: [u8; 32] = digest.finalize().into();
+    [
+        runs.first().map_or(0, |run| run.plan),
+        u64::from_le_bytes(hash[0..8].try_into().expect("8 bytes")),
+        u64::from_le_bytes(hash[8..16].try_into().expect("8 bytes")),
+        u64::from_le_bytes(hash[16..24].try_into().expect("8 bytes")),
+        u64::from_le_bytes(hash[24..32].try_into().expect("8 bytes")),
+    ]
 }
 
 /// Append `segment`'s launches to `schedule` level by level, each level in

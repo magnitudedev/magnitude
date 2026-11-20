@@ -99,7 +99,10 @@ impl Budget {
             self.recent.remove(0);
         }
         self.phase = match self.phase {
-            Phase::Before if self.recent.ends_with(&self.spec.start) => Phase::Reasoning(0),
+            Phase::Before if self.recent.ends_with(&self.spec.start) => {
+                self.recent.clear();
+                Phase::Reasoning(0)
+            }
             Phase::Before => Phase::Before,
             Phase::Reasoning(_) if self.recent.ends_with(&self.spec.end) => Phase::After,
             Phase::Reasoning(count) => {
@@ -240,11 +243,24 @@ impl Constraint for Controlled {
         }
         if let Some(budget) = &self.budget {
             if let Phase::Closing(index) = budget.phase {
-                return Ok(budget.spec.end[index..]
-                    .iter()
-                    .take(limit)
-                    .copied()
-                    .collect());
+                let closing = &budget.spec.end[index..];
+                let count = closing.len().min(limit);
+                let Some(inner) = &self.inner else {
+                    return Ok(closing[..count].to_vec());
+                };
+                let mut admitted = Vec::with_capacity(count);
+                let mut current: Option<Box<dyn Constraint>> = None;
+                for &token in &closing[..count] {
+                    let state = current.as_deref().unwrap_or(inner.as_ref());
+                    match state.stage(&[token]) {
+                        Ok(next) => {
+                            admitted.push(token);
+                            current = Some(next);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                return Ok(admitted);
             }
         }
         let Some(inner) = &self.inner else {
@@ -264,6 +280,14 @@ impl Constraint for Controlled {
 
     fn mask(&self) -> Result<Arc<[u32]>, String> {
         if let Some(token) = self.budget.as_ref().and_then(Budget::forced_token) {
+            if let Some(inner) = &self.inner {
+                let inner_mask = inner.mask()?;
+                let word = token.0 as usize / 32;
+                let bit = 1u32 << (token.0 % 32);
+                if inner_mask.get(word).is_none_or(|bits| *bits & bit == 0) {
+                    return Ok(vec![0u32; self.vocabulary.div_ceil(32)].into());
+                }
+            }
             return Ok(single(self.vocabulary, token));
         }
         let mut mask = match &self.inner {
@@ -403,5 +427,98 @@ mod tests {
         let mut state = controlled(EndOfGeneration::Stop, Some(budget(2, true)));
         state = state.stage(&[TokenId(1), TokenId(11)]).unwrap();
         assert_eq!(allowed(&state.mask().unwrap()), vec![12]);
+    }
+
+    #[test]
+    fn overlapping_start_and_end_tags_do_not_prematurely_close_reasoning() {
+        // Start tag [10, 11] overlaps end tag [11, 12]: emitting 12 right after
+        // the start tag must count as a reasoning token, not close reasoning.
+        let overlapping = ReasoningBudget {
+            tokens: 2,
+            start: vec![TokenId(10), TokenId(11)],
+            end: vec![TokenId(11), TokenId(12)],
+            open: false,
+        };
+        let mut state = controlled(EndOfGeneration::Stop, Some(overlapping));
+        state = state.stage(&[TokenId(10), TokenId(11), TokenId(12)]).unwrap();
+        assert_eq!(allowed(&state.mask().unwrap()).len(), 14);
+        // One more reasoning token spends the budget and forces [11, 12].
+        state = state.stage(&[TokenId(4)]).unwrap();
+        assert_eq!(allowed(&state.mask().unwrap()), vec![11]);
+        assert_eq!(state.forced(4).unwrap(), vec![TokenId(11), TokenId(12)]);
+    }
+
+    #[derive(Clone)]
+    struct AllowSet {
+        allowed: BTreeSet<TokenId>,
+        vocabulary: usize,
+        position: usize,
+    }
+
+    impl Constraint for AllowSet {
+        fn position(&self) -> usize {
+            self.position
+        }
+        fn fork(&self) -> Box<dyn Constraint> {
+            Box::new(self.clone())
+        }
+        fn stage(&self, tokens: &[TokenId]) -> Result<Box<dyn Constraint>, String> {
+            if tokens.iter().any(|token| !self.allowed.contains(token)) {
+                return Err("token rejected by inner constraint".into());
+            }
+            Ok(Box::new(Self {
+                position: self.position + tokens.len(),
+                ..self.clone()
+            }))
+        }
+        fn forced(&self, _limit: usize) -> Result<Vec<TokenId>, String> {
+            Ok(Vec::new())
+        }
+        fn mask(&self) -> Result<Arc<[u32]>, String> {
+            let mut mask = vec![0u32; self.vocabulary.div_ceil(32)];
+            for token in &self.allowed {
+                mask[token.0 as usize / 32] |= 1 << (token.0 % 32);
+            }
+            Ok(mask.into())
+        }
+    }
+
+    #[test]
+    fn closing_budget_intersects_forced_tokens_and_mask_with_inner_constraint() {
+        let compose = |allowed_tokens: &[u32]| {
+            let inner = AllowSet {
+                allowed: allowed_tokens.iter().copied().map(TokenId).collect(),
+                vocabulary: 14,
+                position: 0,
+            };
+            Controlled::compose(
+                Some(Box::new(inner)),
+                EndOfGeneration::Stop,
+                &BTreeSet::from([TokenId(13)]),
+                &BTreeSet::new(),
+                Some(&budget(1, true)),
+                14,
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        // Inner admits the entire end tag [11, 12].
+        let state = compose(&[1, 11, 12]).stage(&[TokenId(1)]).unwrap();
+        assert_eq!(state.forced(8).unwrap(), vec![TokenId(11), TokenId(12)]);
+        assert_eq!(allowed(&state.mask().unwrap()), vec![11]);
+
+        // Inner admits only the first end-tag token 11, rejecting 12.
+        let state = compose(&[1, 11]).stage(&[TokenId(1)]).unwrap();
+        assert_eq!(state.forced(8).unwrap(), vec![TokenId(11)]);
+        assert_eq!(allowed(&state.mask().unwrap()), vec![11]);
+        let state = state.stage(&[TokenId(11)]).unwrap();
+        assert!(state.forced(8).unwrap().is_empty());
+        assert!(allowed(&state.mask().unwrap()).is_empty());
+
+        // Inner rejects the first end-tag token 11 outright.
+        let state = compose(&[1, 2]).stage(&[TokenId(1)]).unwrap();
+        assert!(state.forced(8).unwrap().is_empty());
+        assert!(allowed(&state.mask().unwrap()).is_empty());
     }
 }

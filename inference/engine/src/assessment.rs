@@ -745,6 +745,80 @@ fn resident_performance(
     })
 }
 
+/// Evaluate streamed decode performance for `N` slot holdings (`holdings`),
+/// sharing `streamed_layers`, `costs.figures`, and the `held`-independent
+/// compute step time across all holdings, and evaluating independent depths
+/// concurrently on the assessment pool.
+fn streamed_estimates<const N: usize>(
+    costs: &ExecutorCosts,
+    figures: &StreamedFigures,
+    preparation: &PreparedExecutionAssessment,
+    bank: &ExpertBankPlan,
+    request: &AssessmentRequest,
+    holdings: [magnitude_cost_model::HeldSlots; N],
+) -> Result<[Performance; N], AssessmentError> {
+    let (layers, (target, priced)) = pool::join(
+        || streamed_layers(bank, costs, figures),
+        || {
+            let target = preparation.target_census();
+            let priced = costs.figures(&target.censuses());
+            (target, priced)
+        },
+    );
+    let layers = match layers {
+        Priced::Measured(layers) => layers,
+        Priced::Pending(_) => return Ok(std::array::from_fn(|_| Performance::Pending)),
+        Priced::Unavailable(reason) => {
+            let msg = format!("the streamed layers: {reason}");
+            return Ok(std::array::from_fn(|_| Performance::Unavailable {
+                reason: msg.clone(),
+            }));
+        }
+    };
+    let pricing = seismic::measure::pricing::Pricing {
+        figures: &priced,
+        lookahead: lookahead(preparation.draft()),
+    };
+    let depths = performance_depths(request.context_limit, &request.performance_depths);
+    let seq_u64 = u64::from(request.sequences);
+    let seq_f64 = f64::from(request.sequences);
+    let read = figures.read;
+    let mut periods = Vec::with_capacity(N);
+    let mut holding_index = [0usize; N];
+    for i in 0..N {
+        holding_index[i] = if let Some(prev) = holdings[..i].iter().position(|&h| h == holdings[i]) {
+            holding_index[prev]
+        } else {
+            let idx = periods.len();
+            periods.push(layers.prepare(None, holdings[i], seq_f64));
+            idx
+        };
+    }
+    let rows = pool::par_for_results(&depths, |&depth| {
+        let compute = target.each(|census| {
+            magnitude_cost_model::step_seconds(census, &pricing, seq_u64, depth)
+        })?;
+        let mut tps = [0.0f64; N];
+        for (slot, period) in tps.iter_mut().zip(&periods) {
+            *slot = 1. / period.step_seconds(read, compute).total_seconds;
+        }
+        Ok::<_, seismic::measure::pricing::PriceError>(std::array::from_fn::<_, N, _>(|i| {
+            PerformanceEstimate {
+                context_tokens: depth,
+                tokens_per_second: tps[holding_index[i]],
+            }
+        }))
+    })?;
+    let mut estimates: [Vec<PerformanceEstimate>; N] =
+        std::array::from_fn(|_| Vec::with_capacity(rows.len()));
+    for row in rows {
+        for (dst, est) in estimates.iter_mut().zip(row) {
+            dst.push(est);
+        }
+    }
+    Ok(estimates.map(Performance::Estimated))
+}
+
 /// A streamed fit's decode speeds at two slot holdings (`held_a`, `held_b`),
 /// sharing `streamed_layers`, `costs.figures`, and the `held`-independent
 /// compute step time across both evaluations, and evaluating independent
@@ -770,67 +844,15 @@ fn streamed_performance_pair(
                 Performance::Unavailable { reason: reason.clone() },
             )),
             Priced::Measured(figures) => {
-                let (layers, (target, priced)) = pool::join(
-                    || streamed_layers(bank, costs, figures),
-                    || {
-                        let target = preparation.target_census();
-                        let priced = costs.figures(&target.censuses());
-                        (target, priced)
-                    },
-                );
-                let layers = match layers {
-                    Priced::Measured(layers) => layers,
-                    Priced::Pending(_) => return Ok((Performance::Pending, Performance::Pending)),
-                    Priced::Unavailable(reason) => {
-                        let msg = format!("the streamed layers: {reason}");
-                        return Ok((
-                            Performance::Unavailable { reason: msg.clone() },
-                            Performance::Unavailable { reason: msg },
-                        ));
-                    }
-                };
-                let pricing = seismic::measure::pricing::Pricing {
-                    figures: &priced,
-                    lookahead: lookahead(preparation.draft()),
-                };
-                let depths = performance_depths(request.context_limit, &request.performance_depths);
-                let seq_u64 = u64::from(request.sequences);
-                let seq_f64 = f64::from(request.sequences);
-                let read = figures.read;
-                let period_a = layers.prepare(None, held_a, seq_f64);
-                let period_b = (held_a != held_b).then(|| layers.prepare(None, held_b, seq_f64));
-                let pairs = pool::par_for_results(&depths, |&depth| {
-                    let compute = target.each(|census| {
-                        magnitude_cost_model::step_seconds(census, &pricing, seq_u64, depth)
-                    })?;
-                    let (step_a, step_b) = match &period_b {
-                        None => {
-                            let step = period_a.step_seconds(read, compute);
-                            (step, step)
-                        }
-                        Some(period_b) => (
-                            period_a.step_seconds(read, compute),
-                            period_b.step_seconds(read, compute),
-                        ),
-                    };
-                    Ok::<_, seismic::measure::pricing::PriceError>((
-                        PerformanceEstimate {
-                            context_tokens: depth,
-                            tokens_per_second: 1. / step_a.total_seconds,
-                        },
-                        PerformanceEstimate {
-                            context_tokens: depth,
-                            tokens_per_second: 1. / step_b.total_seconds,
-                        },
-                    ))
-                })?;
-                let mut est_a = Vec::with_capacity(pairs.len());
-                let mut est_b = Vec::with_capacity(pairs.len());
-                for (a, b) in pairs {
-                    est_a.push(a);
-                    est_b.push(b);
-                }
-                Ok((Performance::Estimated(est_a), Performance::Estimated(est_b)))
+                let [a, b] = streamed_estimates(
+                    costs,
+                    figures,
+                    preparation,
+                    bank,
+                    request,
+                    [held_a, held_b],
+                )?;
+                Ok((a, b))
             }
         },
     }
@@ -853,36 +875,9 @@ pub fn streamed_estimate(
     request: &AssessmentRequest,
     held: magnitude_cost_model::HeldSlots,
 ) -> Result<Performance, ModelAssessmentError> {
-    let (layers, (target, priced)) = pool::join(
-        || streamed_layers(bank, costs, figures),
-        || {
-            let target = preparation.target_census();
-            let priced = costs.figures(&target.censuses());
-            (target, priced)
-        },
-    );
-    let layers = match layers {
-        Priced::Measured(layers) => layers,
-        Priced::Pending(_) => return Ok(Performance::Pending),
-        Priced::Unavailable(reason) => return Ok(Performance::Unavailable { reason: format!("the streamed layers: {reason}") }),
-    };
-    let pricing = seismic::measure::pricing::Pricing { figures: &priced, lookahead: lookahead(preparation.draft()) };
-    let depths = performance_depths(request.context_limit, &request.performance_depths);
-    let seq_u64 = u64::from(request.sequences);
-    let seq_f64 = f64::from(request.sequences);
-    let read = figures.read;
-    let period = layers.prepare(None, held, seq_f64);
-    let estimates = pool::par_for_results(&depths, |&depth| {
-        let compute = target
-            .each(|census| magnitude_cost_model::step_seconds(census, &pricing, seq_u64, depth))?;
-        let step = period.step_seconds(read, compute);
-        Ok::<_, seismic::measure::pricing::PriceError>(PerformanceEstimate {
-            context_tokens: depth,
-            tokens_per_second: 1. / step.total_seconds,
-        })
-    })
-    .map_err(|error| ModelAssessmentError::Assessment(error.into()))?;
-    Ok(Performance::Estimated(estimates))
+    let [performance] = streamed_estimates(costs, figures, preparation, bank, request, [held])
+        .map_err(ModelAssessmentError::Assessment)?;
+    Ok(performance)
 }
 
 /// The executor's costs as a walk of the stored records found them

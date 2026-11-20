@@ -496,8 +496,8 @@ impl Compute {
     /// between flights, or a growth's joined slot, beside the requests
     /// serving, which a growth leaves every record they name; in record
     /// order), for every site layer of the group.
-    pub(crate) fn address(&self, views: &[Vec<Records>]) {
-        self.inner.site.address(views);
+    pub(crate) fn address(&self, views: &[Vec<Records>]) -> Vec<Records> {
+        self.inner.site.address(views)
     }
 
     /// What gates the site's requests and observes its every answer from now

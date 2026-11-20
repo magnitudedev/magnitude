@@ -20,7 +20,7 @@ use magnitude_executor::{
     CatalogError, CatalogFailure, PlanError, ResourcePlan, ResourcePlanner, StateResourcePlan, SEARCH_VERSION, StateBindings,
     TokenId, TracedWork, TunedEntry, TuningCacheKey, TuningContext, TuningEvent, TuningObserver,
     TuningOrigin, TuningSettings, TuningTrace, UnpreparedUnits, WorkKind,
-    memory::{ClaimDemand, ledger::{Claim, CommittedKind, DeviceLedgers, DeviceReading, Held, Ledgers, LoadShape, OpenChange, Recorded, Short}},
+    memory::{ClaimDemand, ledger::{Claim, CommittedKind, DeviceLedgers, DeviceReading, Held, Ledgers, LoadShape, OpenChange, OpenPoolError, Recorded, Short}},
     platform::{self, DeviceRequest, OpenedPlatform, PlatformConfig, PlatformError},
 };
 use magnitude_family_contracts::{HeadHistory, InputLayout, PreparedModelInput, TokenPlan};
@@ -819,7 +819,8 @@ struct ImportedTarget {
     pools: LoadPools,
     residency: ResidencyStore,
     target: ResidentTarget,
-    state_tables: Held,
+    target_state: magnitude_state::StoreBindings,
+    head_state: Option<magnitude_state::StoreBindings>,
     constants_claim: Held,
     request_slot: Claim,
     drafter_reserve: Option<Held>,
@@ -990,6 +991,21 @@ fn import_target(
         ClaimDemand { device: upload, staged: upload, ..ClaimDemand::default() },
     )?;
     let drafter_reserve = reserve_drafter(&mut startup, &plan, &programs, manifest, head_enabled, primes_drafter)?;
+    // Each store's one granule pool, opened once at the store's granule
+    // BEFORE `claim_target_import`: each pool allocates its absent granule
+    // (claimed at the load's reading) and the initial state stores allocate
+    // their first slabs (and any first-block rounding in the state pool) so
+    // `claim_target_import` sizes the expert bank to what they actually leave.
+    let pools = LoadPools::open_at(&device, &startup.ledgers, Some(&startup.reading), &execution_plan)
+        .map_err(|error| match error {
+            OpenPoolError::Short { purpose, short } => refused(&purpose, short),
+            OpenPoolError::Internal(reason) => internal(reason),
+        })?;
+    let target_state = state_tables.allocate(&device, |charges| plan.allocate_target_state(charges, pools.state.clone())).map_err(internal)?;
+    let head_state = plan
+        .head_state()
+        .map(|state| state_tables.allocate(&device, |charges| state.allocate(charges, pools.state.clone())).map_err(internal))
+        .transpose()?;
     // The target import holds the bank at its derived target now, beside
     // the allocations claimed and the speed guarantee, at most its planned
     // slots (and host slots, down to 0 = landing reserve floor); the bank
@@ -1003,8 +1019,15 @@ fn import_target(
         ),
         // A plan holding its experts whole that the memory free now does
         // not hold streams them, where they can stream.
-        Imported::Unheld(refused) => return streams_instead(planned, manifest, &startup, refused),
+        Imported::Unheld(refused) => {
+            drop(head_state);
+            drop(target_state);
+            drop(pools);
+            drop(state_tables);
+            return streams_instead(planned, manifest, &startup, refused);
+        }
     };
+    startup.recorded.record(state_tables);
     // The served file's volume as the job probed it; with no record it reads
     // at its bounds until a later load's.
     if let Some(root) = &manifest.kernel_cache {
@@ -1014,10 +1037,6 @@ fn import_target(
     // (`ExpertBank::back_host`): its claim is split from the target import's
     // as the store is made, allocated as each slot backs, never before it
     // exists.
-    // Each store's one granule pool, opened once at the store's granule:
-    // the state's slabs, the bank's records and its stored tables share
-    // the device store's.
-    let pools = LoadPools::open(&device, &startup.ledgers, &execution_plan).map_err(internal)?;
     let mut residency = ResidencyStore::for_target(
         device.clone(),
         programs.clone(),
@@ -1090,7 +1109,8 @@ fn import_target(
         pools,
         residency,
         target,
-        state_tables,
+        target_state,
+        head_state,
         constants_claim,
         request_slot,
         drafter_reserve,
@@ -1144,7 +1164,8 @@ fn assemble_domain(
         pools,
         residency,
         target,
-        mut state_tables,
+        target_state,
+        head_state,
         constants_claim,
         request_slot,
         drafter_reserve,
@@ -1175,12 +1196,6 @@ fn assemble_domain(
         })
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
-    let target_state = state_tables.allocate(&device, |charges| plan.allocate_target_state(charges, pools.state.clone())).map_err(internal)?;
-    let head_state = plan
-        .head_state()
-        .map(|state| state_tables.allocate(&device, |charges| state.allocate(charges, pools.state.clone())).map_err(internal))
-        .transpose()?;
-    startup.recorded.record(state_tables);
     let (mut domain, bindings) = ExecutorDomain::new(
         Rc::new(execution_plan),
         definition,
@@ -2331,6 +2346,10 @@ impl TuningReport {
 }
 
 impl TuningObserver for TuningReport {
+    fn needs_receipts(&self) -> bool {
+        self.trace.is_some()
+    }
+
     fn event(&self, event: &TuningEvent) {
         if let Some(trace) = &self.trace {
             trace.event(event);

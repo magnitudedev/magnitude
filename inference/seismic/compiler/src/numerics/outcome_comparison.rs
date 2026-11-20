@@ -1,12 +1,13 @@
 //! One comparison of the completed reference invocation and native observations.
 //! Geometry is checked before values, independently of numerical association.
-use super::{compare_element, ElementComparison};
+use super::{compare_element_bits, ElementComparison};
 use seismic_lang::entry::TensorAccess;
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::failure::SourceTermination;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::interp::{OracleOutcome, OutcomeValue, TensorReader};
 use seismic_lang::precision::PrecisionPolicy;
+use seismic_lang::reference_math::ReferenceScalar;
 use seismic_lang::{registry, types::DType};
 
 #[derive(Debug)]
@@ -220,7 +221,7 @@ pub fn compare_outcome(
             (OutcomeValue::Scalar(value), ObservedValue::Scalar(actual)) => {
                 allowance(1)?;
                 let actual = scalar(actual.clone()).expect("geometry checked").1;
-                element_difference(policy, &name, value.dtype(), value.to_f64(), actual).map(
+                element_difference(policy, &name, value.dtype(), value.bits(), actual).map(
                     |(message, metrics)| Difference {
                         subject: subject(),
                         coordinate: None,
@@ -371,7 +372,9 @@ fn tensor_difference(
         .enumerate()
     {
         allowance(1)?;
-        let expected = reference.read(index).map_err(ComparisonError::Contract)?;
+        let expected = reference
+            .read_bits(index)
+            .map_err(ComparisonError::Contract)?;
         let value = decode(dtype, bytes);
         if let Some((message, metrics)) = element_difference(policy, name, dtype, expected, value) {
             if first.is_none() {
@@ -385,35 +388,41 @@ fn element_difference(
     policy: &PrecisionPolicy,
     name: &str,
     dtype: DType,
-    expected: f64,
-    actual: f64,
+    expected: u64,
+    actual: u64,
 ) -> Option<(String, ElementComparison)> {
-    let metrics = compare_element(policy, name, dtype, expected, actual);
-    (!metrics.accepted).then(|| (format!("expected {expected:?}, actual {actual:?}"), metrics))
+    let metrics = compare_element_bits(policy, name, dtype, expected, actual);
+    (!metrics.accepted).then(|| {
+        (
+            format!(
+                "expected {:?}, actual {:?}",
+                ReferenceScalar::from_bits(dtype, expected),
+                ReferenceScalar::from_bits(dtype, actual),
+            ),
+            metrics,
+        )
+    })
 }
-fn scalar(value: SymbolValue) -> Option<(DType, f64)> {
+fn scalar(value: SymbolValue) -> Option<(DType, u64)> {
     Some(match value {
-        SymbolValue::F32(v) => (DType::F32, v as f64),
-        SymbolValue::F16(v) => (DType::F16, registry::f16_to_f32(v) as f64),
-        SymbolValue::BF16(v) => (DType::BF16, f32::from_bits((v as u32) << 16) as f64),
-        SymbolValue::I32(v) => (DType::I32, v as f64),
-        SymbolValue::U32(v) => (DType::U32, v as f64),
-        SymbolValue::U64(v) => (DType::U64, v as f64),
-        SymbolValue::Bool(v) => (DType::Bool, f64::from(v)),
+        SymbolValue::F32(v) => (DType::F32, u64::from(v.to_bits())),
+        SymbolValue::F16(v) => (DType::F16, u64::from(v)),
+        SymbolValue::BF16(v) => (DType::BF16, u64::from(v)),
+        SymbolValue::I32(v) => (DType::I32, u64::from(v as u32)),
+        SymbolValue::U32(v) => (DType::U32, u64::from(v)),
+        SymbolValue::U64(v) => (DType::U64, v),
+        SymbolValue::Bool(v) => (DType::Bool, u64::from(v)),
         _ => return None,
     })
 }
-fn decode(dtype: DType, bytes: &[u8]) -> f64 {
+fn decode(dtype: DType, bytes: &[u8]) -> u64 {
     match dtype {
-        DType::F32 => f32::from_le_bytes(bytes.try_into().unwrap()) as f64,
-        DType::F16 => registry::f16_to_f32(u16::from_le_bytes(bytes.try_into().unwrap())) as f64,
-        DType::BF16 => {
-            f32::from_bits((u16::from_le_bytes(bytes.try_into().unwrap()) as u32) << 16) as f64
+        DType::F32 | DType::I32 | DType::U32 => {
+            u64::from(u32::from_le_bytes(bytes.try_into().unwrap()))
         }
-        DType::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as f64,
-        DType::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as f64,
-        DType::U64 => u64::from_le_bytes(bytes.try_into().unwrap()) as f64,
-        DType::Bool => f64::from(bytes[0] != 0),
+        DType::F16 | DType::BF16 => u64::from(u16::from_le_bytes(bytes.try_into().unwrap())),
+        DType::U64 => u64::from_le_bytes(bytes.try_into().unwrap()),
+        DType::Bool => u64::from(bytes[0] != 0),
     }
 }
 fn output_name(path: &[u32]) -> String {
@@ -444,7 +453,6 @@ pub(super) mod tests {
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     use seismic_lang::entry::ElementBindings;
     use seismic_lang::interp::{Arg, Interpreter, TensorData};
-    use seismic_lang::reference_math::ReferenceScalar;
     pub(crate) fn scalar_outcome(dtype: DType, value: f64) -> OracleOutcome {
         let source = format!(
             "fn probe(x: {}) -> {}:\n    return x\n",
@@ -1150,5 +1158,123 @@ pub(super) mod tests {
             compare(&reference, &failed_actual(&second)),
             Comparison::Mismatch(_)
         ));
+    }
+
+    #[test]
+    fn u64_values_above_f64_precision_remain_bit_exact() {
+        let high = 1u64 << 53;
+        let next = high + 1;
+        // Scalar U64 > 2^53: both round to the same f64, but must not match.
+        let scalar_ref = run(
+            "fn probe(x: u64) -> u64:\n    return x\n",
+            &[Arg::Scalar(ReferenceScalar::U64(high))],
+            vec![],
+        );
+        assert_eq!(
+            compare(&scalar_ref, &scalar_actual(SymbolValue::U64(high))),
+            Comparison::Match
+        );
+        assert!(matches!(
+            compare(&scalar_ref, &scalar_actual(SymbolValue::U64(next))),
+            Comparison::Mismatch(_)
+        ));
+        assert!(matches!(
+            compare_outcome(
+                &scalar_ref,
+                &scalar_actual(SymbolValue::U64(next)),
+                &PrecisionPolicy::Unconstrained,
+                &mut |_| Ok(())
+            )
+            .unwrap(),
+            Comparison::Mismatch(_)
+        ));
+
+        // Tensor U64 > 2^53: mutable tensor comparison must also be bit-exact.
+        let ref_bytes = high.to_le_bytes().to_vec();
+        let next_bytes = next.to_le_bytes().to_vec();
+        let tensor_ref = run(
+            "fn probe(x: &mut tensor[1] u64):\n    x[0] = x[0]\n",
+            &[Arg::Tensor(0)],
+            vec![TensorData::dense_from_bytes(DType::U64, vec![1], ref_bytes.clone()).unwrap()],
+        );
+        let observed = |bytes: Vec<u8>| ObservedInvocation {
+            termination: SourceTermination::Returned(vec![]),
+            inputs: vec![ObservedInput {
+                ordinal: 0,
+                tensor: ObservedTensor {
+                    representation: registry::dense(DType::U64),
+                    shape: vec![1],
+                    bytes,
+                },
+            }],
+        };
+        assert_eq!(compare(&tensor_ref, &observed(ref_bytes)), Comparison::Match);
+        assert!(matches!(
+            compare(&tensor_ref, &observed(next_bytes)),
+            Comparison::Mismatch(Difference {
+                subject: ComparisonSubject::Input(0),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn exact_policy_distinguishes_nan_payloads_while_bounded_accepts_them() {
+        let bounded_exact = PrecisionPolicy::bounded(seismic_lang::precision::Tolerance::EXACT);
+        // Scalar F32 NaN payload difference.
+        let scalar_ref = run(
+            "fn probe(x: f32) -> f32:\n    return x\n",
+            &[Arg::Scalar(ReferenceScalar::F32(0x7fc0_0000))],
+            vec![],
+        );
+        let same_nan = scalar_actual(SymbolValue::F32(f32::from_bits(0x7fc0_0000)));
+        let other_nan = scalar_actual(SymbolValue::F32(f32::from_bits(0x7fc0_1234)));
+        assert_eq!(compare(&scalar_ref, &same_nan), Comparison::Match);
+        assert!(matches!(
+            compare(&scalar_ref, &other_nan),
+            Comparison::Mismatch(_)
+        ));
+        assert_eq!(
+            compare_outcome(&scalar_ref, &other_nan, &bounded_exact, &mut |_| Ok(())).unwrap(),
+            Comparison::Match
+        );
+
+        // Tensor F16 NaN payload difference.
+        let ref_bytes = 0x7e00u16.to_le_bytes().to_vec();
+        let other_bytes = 0x7e01u16.to_le_bytes().to_vec();
+        let tensor_ref = run(
+            "fn probe(x: &mut tensor[1] f16):\n    x[0] = x[0]\n",
+            &[Arg::Tensor(0)],
+            vec![TensorData::dense_from_bytes(DType::F16, vec![1], ref_bytes.clone()).unwrap()],
+        );
+        let observed = |bytes: Vec<u8>| ObservedInvocation {
+            termination: SourceTermination::Returned(vec![]),
+            inputs: vec![ObservedInput {
+                ordinal: 0,
+                tensor: ObservedTensor {
+                    representation: registry::dense(DType::F16),
+                    shape: vec![1],
+                    bytes,
+                },
+            }],
+        };
+        assert_eq!(compare(&tensor_ref, &observed(ref_bytes)), Comparison::Match);
+        assert!(matches!(
+            compare(&tensor_ref, &observed(other_bytes.clone())),
+            Comparison::Mismatch(Difference {
+                subject: ComparisonSubject::Input(0),
+                ..
+            })
+        ));
+        assert_eq!(
+            compare_outcome(
+                &tensor_ref,
+                &observed(other_bytes),
+                &bounded_exact,
+                &mut |_| Ok(())
+            )
+            .unwrap(),
+            Comparison::Match
+        );
     }
 }

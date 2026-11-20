@@ -48,8 +48,12 @@ async def command(args: list[str], cwd: Path, log: Path, *, env: dict | None = N
 
 
 async def stop(process: asyncio.subprocess.Process):
+    if process.returncode is not None:
+        return
     # The group can outlive its leader. Always retire descendants as well.
     for sig, deadline in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+        if process.returncode is not None:
+            break
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
@@ -362,11 +366,27 @@ class Adapter:
                 yield running
             finally:
                 ended.set()
-                await sampling
-                await stop(process)
-                self.store.event(
-                    "stopped", target=self.target.id, label=label, peak_rss_bytes=running.peak_bytes
-                )
+                try:
+                    await sampling
+                finally:
+                    if not sampling.done():
+                        sampling.cancel()
+                    stopping = asyncio.ensure_future(stop(process))
+                    cancelled = None
+                    while not stopping.done():
+                        try:
+                            await asyncio.shield(stopping)
+                        except asyncio.CancelledError as exc:
+                            cancelled = exc
+                    stopping.result()
+                    self.store.event(
+                        "stopped",
+                        target=self.target.id,
+                        label=label,
+                        peak_rss_bytes=running.peak_bytes,
+                    )
+                    if cancelled is not None:
+                        raise cancelled
 
     @property
     def host_rendered(self) -> bool:

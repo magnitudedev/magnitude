@@ -277,8 +277,16 @@ fn recognized_packages_are_bound_strictly() {
     unsized_vocabulary
         .metadata
         .retain(|item| item.name != "llama.vocab_size");
+    assert_eq!(inspect(&unsized_vocabulary), inspect(&minicpm5()));
+
+    let mut wrong_vocabulary = minicpm5();
+    set_metadata(
+        &mut wrong_vocabulary,
+        "llama.vocab_size",
+        Value::Scalar(Scalar::Unsigned(1234)),
+    );
     assert!(matches!(
-        inspect(&unsized_vocabulary),
+        inspect(&wrong_vocabulary),
         Err(Error::Metadata { key, .. }) if key == "llama.vocab_size"
     ));
 
