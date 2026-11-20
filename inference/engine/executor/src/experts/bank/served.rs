@@ -67,7 +67,10 @@ impl ServedBank {
             // settles it.
             match target.holding {
                 BankHolding::Host if served.bank.plan.host_slots > 0 => {}
-                holding => served.bank.cache.hold(holding, recorded.carve(&store, CommittedKind::Backing(crate::memory::ledger::PoolClass::Records), above).into_backed_cache(CacheKind::Bank)),
+                holding => {
+                    let reclaim = served.bank.cache.reclaim_for(holding);
+                    served.bank.cache.hold(holding, recorded.carve(&store, CommittedKind::Backing(crate::memory::ledger::PoolClass::Records), above).into_backed_cache(CacheKind::Bank, reclaim));
+                }
             }
         }
 
@@ -458,9 +461,10 @@ impl ElasticBank for ServedBank {
             Some(finished) => Some(finished),
             None => match self.bank.advance_host()? {
                 Some((finished, true)) => Some(finished),
-                // The host tier's backing at open settles its claim alone.
+                // The host tier's backing at open settles its cache entry alone.
                 Some((backed, false)) => {
                     self.bank.cache.settle(&backed);
+                    self.bank.cache.fit(BankHolding::Host, self.above_floor(BankHolding::Host, self.bank.host_slots())?);
                     self.finished.lock().expect("table resize outcome").pop_front()
                 }
                 None => self.finished.lock().expect("table resize outcome").pop_front(),

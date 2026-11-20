@@ -407,7 +407,7 @@ fn an_open_refused_short_keeps_the_prefix_cache() {
     }
     assert!(domain.open_served(&mut bindings, holder, None).unwrap().is_empty());
     let ledger = domain.resources.ledgers().device().clone();
-    let _prefix = ledger.cache(CacheKind::Prefix, 4096).expect("the prefix fits");
+    let _prefix = ledger.cache(CacheKind::Prefix, 4096, crate::memory::ledger::Reclaim::Deferred).expect("the prefix fits");
     let (room, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX));
     assert!(
         matches!(domain.open_served(&mut bindings, refused, None), Err(crate::domain::DomainError::Capacity(_))),

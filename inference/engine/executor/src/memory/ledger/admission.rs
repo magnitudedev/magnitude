@@ -2,13 +2,58 @@
 //! here: a claim short of memory, a request's growth included, is relieved
 //! only by a plan ([`super::relief`]).
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU64;
+use std::sync::{Arc, Weak};
 
 use crate::operation::RequestId;
 
 use super::estimate::Read;
 use super::state::{EntryId, State};
-use super::vocabulary::{CacheKind, CommittedKind, Holding, Value};
+use super::view::Ledger;
+use super::vocabulary::{CacheKind, CommittedKind, Holding, PoolClass, Value};
+
+/// Failure while synchronously reclaiming physical memory from a cache entry
+/// or granule pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimError {
+    /// The holding reached its floor or has no further reclaimable blocks:
+    /// admission treats this as a real shortfall once all eligible reclaimers
+    /// are exhausted.
+    AtFloor,
+    /// An internal or device invariant broke while freeing memory: admission
+    /// panics rather than warning and continuing.
+    Invariant(String),
+}
+
+/// Reclaims physical memory backing a cache entry or granule pool in a store,
+/// synchronously freeing at least `need` bytes back to the OS (down to floor),
+/// waiting on any bounded in-flight fence or growth-stop if needed.
+///
+/// Attached at cache creation via [`Reclaim::Backed`] and invoked OUTSIDE the
+/// ledger mutex on host admission paths only.
+pub trait CacheReclaimer: Send + Sync {
+    fn reclaim(&self, need: u64) -> Result<u64, ReclaimError>;
+}
+
+/// How a cache entry frees its physical memory when admission needs its room.
+///
+/// Every cache entry carries a `Reclaim` at creation — there is no
+/// "unregistered physical cache" state.
+#[derive(Clone)]
+pub enum Reclaim {
+    /// Physical memory freed synchronously by [`CacheReclaimer`] outside the
+    /// ledger mutex before any claim is handed out.
+    Backed(Weak<dyn CacheReclaimer>),
+    /// Holds no physical memory of its own (`allocated == 0`, enforced at
+    /// creation and in `entry_take`): logical cache accounting or granules
+    /// freed by their own pool's reclaimer.
+    Unbacked,
+    /// Physical memory freed asynchronously via a [`ReliefPlan`] rather than
+    /// synchronously on admission. Admission never hands out a [`Claim`]
+    /// against `Deferred` bytes while `allocatable < alloc_needed`.
+    Deferred,
+}
 
 /// A claim refused outright, of any kind: a load's allocation
 /// ([`DeviceLedgers::claim`]) or a need ([`Ledger::claim`]): `store` is
@@ -54,16 +99,6 @@ pub enum Admit {
 }
 
 impl State {
-    /// [`Self::take`] in `store` at `at` ([`Self::reading`]), refused as
-    /// [`Short`].
-    pub(super) fn take_in(&mut self, store: &seismic::StoreIdentity, at: Option<Read>, kind: CommittedKind, bytes: u64) -> Result<EntryId, Short> {
-        let at = self.reading(store, at);
-        self.take(at, kind, bytes).map_err(|over| {
-            self.waiting = true;
-            over.of(store, bytes)
-        })
-    }
-
     /// The requests a relief may preempt, never the earliest admitted (it
     /// always progresses), each with the bytes its preemption frees for
     /// `frees`: all it holds for a request's state, which draws on the slot
@@ -167,27 +202,6 @@ impl State {
         Ok(self.insert(Holding::Committed(kind), bytes - owed))
     }
 
-    /// Hold `bytes` of committed memory of `kind` for new work beside the
-    /// load (a request's reservation, a grant): free room beside the
-    /// guarantee, within the boundary B where it stands, then the cache
-    /// worth nothing (spare granules, idle graph slots) yielding in rank
-    /// order. The bank and the retained prefixes give it room only through
-    /// a relief plan ([`super::relief`]): refused here past what these
-    /// cover, nothing taken.
-    pub(super) fn take_beside(&mut self, at: Read, kind: CommittedKind, bytes: u64) -> Result<EntryId, Over> {
-        let worthless = |kind: CacheKind| !kind.valued();
-        let estimate = self.estimate_at(at);
-        let within = estimate.cap().map_or(u64::MAX, |cap| cap.saturating_sub(estimate.held_now()));
-        let beside = self.free_for(at, Holding::Committed(kind), bytes).min(within);
-        let cache = CacheKind::ALL.into_iter().filter(|kind| worthless(*kind)).map(|kind| self.cache_of[kind.index()]).sum::<u64>();
-        if let Some(over) = bytes.checked_sub(beside.saturating_add(cache)).filter(|over| *over > 0) {
-            return Err(Over { bytes: over });
-        }
-        let owed = self.give(bytes.saturating_sub(beside), worthless, Some(Holding::Committed(kind)));
-        assert_eq!(owed, 0, "invariant violated: the cache worth nothing covers what it was counted to");
-        Ok(self.insert(Holding::Committed(kind), bytes))
-    }
-
     /// Yield up to `bytes` of the cache of the kinds `of` admits, in the one
     /// order cache yields in: worth least per byte first ([`Value`]); of
     /// equal worth, in [`CacheKind`]'s order, then the oldest first. What is
@@ -219,21 +233,328 @@ impl State {
         }
         bytes
     }
+}
 
-    /// Hold up to `most` whole `unit`s of committed memory of `kind`: as
-    /// many as free room, then spare granules, idle graph slots and bank
-    /// slots above the floor cover now, that cache yielding in rank order
-    /// ([`Self::give`]). Never preempts and never refuses. The entry and its
-    /// units.
-    pub(super) fn take_units(&mut self, store: &seismic::StoreIdentity, kind: CommittedKind, unit: NonZeroU64, most: u64) -> (EntryId, u64) {
+/// How an admission-reclaimable candidate can give up its bytes.
+enum CandidateReclaim {
+    /// Physical memory freed synchronously by a live [`CacheReclaimer`].
+    Backed(Arc<dyn CacheReclaimer>),
+    /// Logical cache holding zero physical bytes (`Reclaim::Unbacked`).
+    Unbacked,
+}
+
+/// One eligible cache or pool entry considered during admission reclamation,
+/// ordered by `(value, kind, id)` (worth least per byte first, then `CacheKind`
+/// order, then oldest first).
+struct Candidate {
+    value: Value,
+    kind: CacheKind,
+    id: EntryId,
+    bytes: u64,
+    reclaim: CandidateReclaim,
+}
+
+/// One step of [`Ledger::reclaim_until`].
+enum ReclaimStep<T> {
+    Done(T),
+    Reclaim {
+        id: EntryId,
+        reclaimer: Arc<dyn CacheReclaimer>,
+        need: u64,
+    },
+}
+
+/// How [`Ledger::admit_or_reclaim`] judges and reclaims cache for a claim.
+pub(super) struct AdmitPolicy<F> {
+    pub(super) at: Option<Read>,
+    pub(super) kind: CommittedKind,
+    pub(super) bytes: u64,
+    /// Which cache kinds may yield to this claim.
+    pub(super) of: F,
+    /// Whether admission is bounded by the store's boundary cap B.
+    pub(super) within_boundary: bool,
+    /// Whether this claim may spend the guarantee's room once cache is gone.
+    pub(super) allow_guarantee: bool,
+}
+
+impl State {
+    /// Collect eligible cache and pool candidates in rank order `(value, kind, id)`.
+    fn reclaim_candidates(
+        &self,
+        own_pool: Option<PoolClass>,
+        of: &impl Fn(CacheKind) -> bool,
+        need_own_pool_flush: bool,
+        exhausted: &BTreeSet<EntryId>,
+    ) -> Vec<Candidate> {
+        let mut candidates: Vec<Candidate> = self
+            .held
+            .iter()
+            .filter_map(|(id, entry)| {
+                let (kind, bytes) = match entry.holding {
+                    Holding::Cache(ck) if of(ck) && entry.bytes > 0 => (ck, entry.bytes),
+                    Holding::Pool(class) if Some(class) != own_pool && of(CacheKind::Spare) && (entry.bytes > 0 || entry.releasing > 0) => {
+                        (CacheKind::Spare, entry.bytes)
+                    }
+                    Holding::Pool(class) if Some(class) == own_pool && entry.releasing > 0 && need_own_pool_flush => {
+                        (CacheKind::Spare, 0)
+                    }
+                    _ => return None,
+                };
+                let reclaim = match self.reclaim.get(id) {
+                    Some(Reclaim::Backed(weak)) => {
+                        let live = (!exhausted.contains(id)).then(|| weak.upgrade()).flatten()?;
+                        CandidateReclaim::Backed(live)
+                    }
+                    Some(Reclaim::Unbacked) => CandidateReclaim::Unbacked,
+                    Some(Reclaim::Deferred) | None => return None,
+                };
+                Some(Candidate { value: entry.value, kind, id: *id, bytes, reclaim })
+            })
+            .collect();
+        candidates.sort_by_key(|c| (c.value, c.kind, c.id));
+        candidates
+    }
+
+    /// Yield up to `bytes` of [`Reclaim::Unbacked`] cache entries matching `of`
+    /// (entries that hold no physical memory of their own). Returns any
+    /// remaining bytes not covered by unbacked cache.
+    fn give_unbacked(&mut self, mut bytes: u64, of: &impl Fn(CacheKind) -> bool, to: Holding) -> u64 {
+        let mut order: Vec<(Value, CacheKind, EntryId)> = self
+            .held
+            .iter()
+            .filter_map(|(id, entry)| match (entry.holding, self.reclaim.get(id)) {
+                (Holding::Cache(kind), Some(Reclaim::Unbacked)) if of(kind) && entry.bytes > 0 => Some((entry.value, kind, *id)),
+                _ => None,
+            })
+            .collect();
+        order.sort();
+        for (_, _, id) in order {
+            if bytes == 0 {
+                break;
+            }
+            let yields = self.held[&id].bytes.min(bytes);
+            let within = to.pooled() && to.pool_class().is_some() && to.pool_class() == self.held[&id].holding.pool_class();
+            self.yields(id, yields, within, true);
+            bytes -= yields;
+        }
+        bytes
+    }
+
+    /// One lock-held admission attempt for `policy`: either admits `policy.bytes`
+    /// (when physical `allocatable >= alloc_needed` and free/unbacked room cover
+    /// it), requests a synchronous reclaim outside the lock, or refuses with
+    /// [`Short`].
+    fn try_admit<F: Fn(CacheKind) -> bool>(
+        &mut self,
+        store: &seismic::StoreIdentity,
+        policy: &AdmitPolicy<F>,
+        exhausted: &BTreeSet<EntryId>,
+        reclaimed: u64,
+    ) -> ReclaimStep<Result<EntryId, Short>> {
+        let read = self.reading(store, policy.at);
+        let estimate = self.estimate_at(read);
+        let holding = Holding::Committed(policy.kind);
+        let own_pool = holding.pool_class().filter(|_| holding.pooled());
+        let own_spare = own_pool.map_or(0, |class| self.spare_of(class));
+        let external = policy.bytes.saturating_sub(own_spare);
+        let alloc_needed = match (holding, external) {
+            (_, 0) => 0,
+            (Holding::Committed(CommittedKind::Backing(class)), ext) => match self.pools[class.index()].as_ref() {
+                Some(pool) => ext.div_ceil(pool.block.get()).saturating_mul(pool.block.get()),
+                None => ext,
+            },
+            (_, ext) => ext,
+        };
+        let free = if external == 0 { 0 } else { estimate.free() };
+        let beside = {
+            let raw = self.free_for(read, holding, external).saturating_add(reclaimed).min(free);
+            if policy.within_boundary {
+                let within = estimate.cap().map_or(u64::MAX, |cap| cap.saturating_sub(estimate.held_now()));
+                raw.min(within)
+            } else {
+                raw
+            }
+        };
+        let candidates = self.reclaim_candidates(own_pool, &policy.of, alloc_needed > estimate.allocatable(), exhausted);
+        let reclaimable_room: u64 = candidates.iter().map(|c| c.bytes).sum();
+        let max_room = if policy.allow_guarantee { free } else { beside }.saturating_add(reclaimable_room);
+        if external > max_room {
+            self.waiting = true;
+            return ReclaimStep::Done(Err(Over { bytes: external - max_room }.of(store, policy.bytes)));
+        }
+
+        let need_block_slack = alloc_needed.saturating_sub(free);
+        let need_room = external.saturating_sub(beside).max(need_block_slack);
+        let need_alloc = alloc_needed.saturating_sub(estimate.allocatable());
+        let need_reclaim = need_room.max(need_alloc);
+
+        if need_reclaim == 0 {
+            return ReclaimStep::Done(Ok(self.insert(holding, policy.bytes)));
+        }
+
+        if let Some((id, reclaimer)) = candidates.into_iter().find_map(|c| match c.reclaim {
+            CandidateReclaim::Backed(reclaimer) => Some((c.id, reclaimer)),
+            CandidateReclaim::Unbacked => None,
+        }) {
+            return ReclaimStep::Reclaim { id, reclaimer, need: need_reclaim };
+        }
+
+        // No live reclaimer remains: only `Reclaim::Unbacked` cache (which
+        // holds 0 physical bytes) and guarantee room (when allowed) may be
+        // taken, and ONLY when physical `allocatable >= alloc_needed` already
+        // holds. `Reclaim::Deferred` cache is never taken here without being
+        // physically freed first.
+        if need_alloc > 0 {
+            self.waiting = true;
+            return ReclaimStep::Done(Err(Over { bytes: need_alloc }.of(store, policy.bytes)));
+        }
+        let owed = self.give_unbacked(external.saturating_sub(beside), &policy.of, holding);
+        let short = if policy.allow_guarantee { owed.saturating_sub(free - beside) } else { owed };
+        if short > 0 {
+            self.waiting = true;
+            return ReclaimStep::Done(Err(Over { bytes: short }.of(store, policy.bytes)));
+        }
+        ReclaimStep::Done(Ok(self.insert(holding, policy.bytes)))
+    }
+}
+
+impl Ledger {
+    /// Register `reclaimer` for the store's granule pool of `class`, owned for
+    /// the pool's lifetime and stored as [`Reclaim::Backed`].
+    pub(super) fn register_pool_reclaimer(&self, class: PoolClass, reclaimer: Arc<dyn CacheReclaimer>) {
+        let mut state = self.state();
+        if let Some(pool) = state.pools[class.index()].as_mut() {
+            let entry = pool.entry;
+            let weak = Arc::downgrade(&reclaimer);
+            pool.reclaimer = Some(reclaimer);
+            state.reclaim.insert(entry, Reclaim::Backed(weak));
+        }
+    }
+
+    /// The single reclaim loop shared by [`Self::admit_or_reclaim`],
+    /// [`Self::admit_units`], and [`Self::reclaim_and_draw`].
+    fn reclaim_until<T>(&self, mut step: impl FnMut(&mut State, &BTreeSet<EntryId>, u64) -> ReclaimStep<T>) -> T {
+        let mut exhausted: BTreeSet<EntryId> = BTreeSet::new();
+        let mut reclaimed: u64 = 0;
+        loop {
+            let next = {
+                let mut state = self.state();
+                step(&mut state, &exhausted, reclaimed)
+            };
+            match next {
+                ReclaimStep::Done(done) => return done,
+                ReclaimStep::Reclaim { id, reclaimer, need } => match reclaimer.reclaim(need) {
+                    Ok(0) | Err(ReclaimError::AtFloor) => {
+                        exhausted.insert(id);
+                    }
+                    Ok(freed) => {
+                        reclaimed = reclaimed.saturating_add(freed);
+                    }
+                    Err(ReclaimError::Invariant(reason)) => {
+                        panic!("invariant violated: cache reclaim failed for entry {id} (need {need} bytes): {reason}");
+                    }
+                },
+            }
+        }
+    }
+
+    /// The one allocation-admission owner: synchronously reclaims cache
+    /// entries with [`Reclaim::Backed`] reclaimers OUTSIDE the ledger mutex
+    /// until physical `allocatable` and free room cover `policy.bytes` (or
+    /// returns [`Short`] for a real shortfall below floor), then inserts the
+    /// committed entry under the lock.
+    pub(super) fn admit_or_reclaim<F: Fn(CacheKind) -> bool>(&self, policy: AdmitPolicy<F>) -> Result<EntryId, Short> {
+        self.reclaim_until(|state, exhausted, reclaimed| state.try_admit(&self.store.identity, &policy, exhausted, reclaimed))
+    }
+
+    /// Hold up to `most` whole `unit`s of committed memory of `kind`,
+    /// synchronously reclaiming eligible [`Reclaim::Backed`] cache OUTSIDE the
+    /// ledger mutex via [`Self::reclaim_until`] before inserting the claim.
+    pub(super) fn admit_units(&self, kind: CommittedKind, unit: NonZeroU64, most: u64) -> (EntryId, u64) {
         assert!(!matches!(kind, CommittedKind::Request(_)), "a request's state is reserved by its own path, never in units");
-        let yielding = |kind: CacheKind| matches!(kind, CacheKind::Spare | CacheKind::GraphSlots | CacheKind::Bank);
-        let free = self.free_for(self.reading(store, None), Holding::Committed(kind), most);
-        let cover = CacheKind::ALL.into_iter().filter(|kind| yielding(*kind)).fold(free, |cover, kind| cover.saturating_add(self.cache_of[kind.index()]));
-        let units = most.min(cover / unit.get());
-        let bytes = units * unit.get();
-        let owed = self.give(bytes.saturating_sub(free), yielding, Some(Holding::Committed(kind)));
-        assert_eq!(owed, 0, "free room, spare and bank cache cover the units counted from them");
-        (self.insert(Holding::Committed(kind), bytes), units)
+        let yielding = |ck: CacheKind| matches!(ck, CacheKind::Spare | CacheKind::GraphSlots | CacheKind::Bank);
+        self.reclaim_until(|state, exhausted, reclaimed| {
+            let read = state.reading(&self.store.identity, None);
+            let estimate = state.estimate_at(read);
+            let holding = Holding::Committed(kind);
+            let free = state.free_for(read, holding, most).saturating_add(reclaimed).min(state.free(read, most));
+            let candidates = state.reclaim_candidates(None, &yielding, false, exhausted);
+            let cover = candidates.iter().fold(free, |acc, c| acc.saturating_add(c.bytes));
+            let unbacked_room: u64 = candidates
+                .iter()
+                .filter(|c| matches!(c.reclaim, CandidateReclaim::Unbacked))
+                .map(|c| c.bytes)
+                .sum();
+            let units = most.min(cover / unit.get());
+            let bytes = units * unit.get();
+            let need_alloc = bytes.saturating_sub(estimate.allocatable());
+            let need_reclaim = bytes.saturating_sub(free).max(need_alloc);
+            if need_reclaim == 0 {
+                return ReclaimStep::Done((state.insert(holding, bytes), units));
+            }
+            if let Some((id, reclaimer)) = candidates.into_iter().find_map(|c| match c.reclaim {
+                CandidateReclaim::Backed(reclaimer) => Some((c.id, reclaimer)),
+                CandidateReclaim::Unbacked => None,
+            }) {
+                return ReclaimStep::Reclaim { id, reclaimer, need: need_reclaim };
+            }
+            // No live reclaimer remains: admit only as many units as free +
+            // unbacked room and physical `allocatable` actually cover.
+            let physical_units = most.min(free.saturating_add(unbacked_room).min(estimate.allocatable()) / unit.get());
+            let physical_bytes = physical_units * unit.get();
+            let owed = state.give_unbacked(physical_bytes.saturating_sub(free), &yielding, holding);
+            assert_eq!(owed, 0, "free and unbacked cache cover the units counted from them");
+            ReclaimStep::Done((state.insert(holding, physical_bytes), physical_units))
+        })
+    }
+
+    /// Draw `bytes` for a request's state (`reserve` / `extend`): recomputes
+    /// `drawn` from `slot` and `rem` atomically under the ledger lock on every
+    /// [`Self::reclaim_until`] iteration, so `slot` is never read across a
+    /// lock drop.
+    pub(super) fn reclaim_and_draw(&self, slot: EntryId, into: Option<EntryId>, kind: CommittedKind, bytes: u64) -> Result<EntryId, Short> {
+        self.reclaim_until(|state, exhausted, reclaimed| {
+            let held = state.entry(slot).bytes;
+            let drawn = held.min(bytes);
+            let rem = bytes - drawn;
+            let beside = if rem == 0 {
+                None
+            } else {
+                let policy = AdmitPolicy {
+                    at: None,
+                    kind,
+                    bytes: rem,
+                    of: |ck: CacheKind| !ck.valued(),
+                    within_boundary: true,
+                    allow_guarantee: false,
+                };
+                match state.try_admit(&self.store.identity, &policy, exhausted, reclaimed) {
+                    ReclaimStep::Reclaim { id, reclaimer, need } => {
+                        return ReclaimStep::Reclaim { id, reclaimer, need };
+                    }
+                    ReclaimStep::Done(Err(short)) => {
+                        return ReclaimStep::Done(Err(Short { required: bytes, ..short }));
+                    }
+                    ReclaimStep::Done(Ok(id)) => Some(id),
+                }
+            };
+            state.resize(slot, held - drawn);
+            let id = match into {
+                Some(into) => {
+                    let has = state.entry(into).bytes;
+                    state.resize(into, has + drawn);
+                    into
+                }
+                None => state.insert(Holding::Committed(kind), drawn),
+            };
+            if let Some(beside) = beside {
+                state.merge(beside, id);
+            }
+            if drawn > 0 {
+                let lent = state.lent.entry(id).or_insert((slot, 0));
+                lent.1 += drawn;
+            }
+            ReclaimStep::Done(Ok(id))
+        })
     }
 }

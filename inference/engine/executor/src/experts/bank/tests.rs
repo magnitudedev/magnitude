@@ -260,7 +260,7 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
 fn growing_ended_reads_reached_slots_and_charge_after_done_is_taken() {
     use super::resize::{Cut, Growing, Grown, Spent};
     use crate::{BankHolding, BankResized};
-    let done: crate::storage_thread::Done<Grown> = Arc::new(Mutex::new(None));
+    let done: crate::storage_thread::Done<Grown> = crate::storage_thread::Done::new();
     let growing = Growing {
         from: 39,
         charged: 39 * 1024,

@@ -5,9 +5,8 @@
 use super::admission::Short;
 use super::changes::Claiming;
 use super::claims::Claim;
-use super::state::{EntryId, State};
 use super::view::Ledger;
-use super::vocabulary::{CommittedKind, Holding, Need, Value, size};
+use super::vocabulary::{CommittedKind, Need, Value, size};
 use crate::operation::RequestId;
 
 /// A request's state, `rows` rows of it ([`Need::Request`]): reserved as it
@@ -38,7 +37,7 @@ impl Ledger {
         self.check_slot(slot);
         let kind = CommittedKind::Request(sequence);
         let bytes = size(&self.shape, &Need::Request { sequence, rows });
-        let id = self.state().draw(&self.store.identity, slot.id(), None, kind, bytes)?;
+        let id = self.reclaim_and_draw(slot.id(), None, kind, bytes)?;
         Ok(Reservation { claim: Claim::held(self.clone(), id, kind), rows, through: 0 })
     }
 
@@ -58,7 +57,7 @@ impl Ledger {
         };
         let bytes = size(&self.shape, &Need::Request { sequence, rows });
         let more = bytes.checked_sub(reservation.bytes()).expect("invariant violated: a request's state shrinks as its rows grow");
-        self.state().draw(&self.store.identity, slot.id(), Some(reservation.claim.id()), reservation.claim.kind(), more)?;
+        self.reclaim_and_draw(slot.id(), Some(reservation.claim.id()), reservation.claim.kind(), more)?;
         reservation.rows = rows;
         Ok(())
     }
@@ -69,47 +68,6 @@ impl Ledger {
             "invariant violated: a reservation draws on a {:?} claim of another store",
             slot.kind()
         );
-    }
-}
-
-impl State {
-    /// Hold `bytes` more of `kind`, a request's state, in `into` or a new
-    /// entry: what `slot` holds first, the rest beside it
-    /// (`State::take_beside`). The slot's part is lent: it goes back to the
-    /// slot as the entry is released. Short, nothing moves.
-    fn draw(&mut self, store: &seismic::StoreIdentity, slot: EntryId, into: Option<EntryId>, kind: CommittedKind, bytes: u64) -> Result<EntryId, Short> {
-        let held = self.entry(slot).bytes;
-        let drawn = held.min(bytes);
-        let beside = match bytes - drawn {
-            0 => None,
-            beside => {
-                let at = self.reading(store, None);
-                match self.take_beside(at, kind, beside) {
-                    Ok(id) => Some(id),
-                    Err(over) => {
-                        self.waiting = true;
-                        return Err(over.of(store, bytes));
-                    }
-                }
-            }
-        };
-        self.resize(slot, held - drawn);
-        let id = match into {
-            Some(into) => {
-                let has = self.entry(into).bytes;
-                self.resize(into, has + drawn);
-                into
-            }
-            None => self.insert(Holding::Committed(kind), drawn),
-        };
-        if let Some(beside) = beside {
-            self.merge(beside, id);
-        }
-        if drawn > 0 {
-            let lent = self.lent.entry(id).or_insert((slot, 0));
-            lent.1 += drawn;
-        }
-        Ok(id)
     }
 }
 

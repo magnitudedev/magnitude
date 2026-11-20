@@ -138,6 +138,28 @@ pub fn import_slots(
     import_target(at_load.of(BankTier::Bank), beside, &shape, &charge)
 }
 
+/// The host tier's slots a load imports its bank `plan` at, in `[0, plan.host_slots]`,
+/// bounded by post-sealing host room beside `floor` (the import's weights at
+/// `host_slots = 0`, i.e. the landing reserve floor).
+pub fn import_host_slots(
+    at_load: &crate::memory::ledger::LoadEstimate,
+    ledgers: &DeviceLedgers,
+    device: &seismic::Device,
+    plan: &crate::planning::ExpertBankPlan,
+    floor: crate::memory::ClaimDemand,
+) -> u64 {
+    if plan.host_slots == 0 {
+        return 0;
+    }
+    let Some(granule) = plan.host_granule() else {
+        return 0;
+    };
+    let shape = BankShape::new(granule, 0, plan.host_slots, plan.host_slots);
+    let charge = |slots| plan.host_charge(slots).expect("invariant violated: a bank plan charges every host size within its ceiling");
+    let beside = ledgers.placed_in(device, floor, BankTier::Host);
+    import_target(at_load.of(BankTier::Host), beside, &shape, &charge)
+}
+
 /// The experts' target a load's import holds, `beside` the bytes the
 /// import (its bank at its floor) places in the bank's store: the target as a reading of the store derives it once
 /// they are held (the estimate's bank room, `Estimate::import_room`, held by

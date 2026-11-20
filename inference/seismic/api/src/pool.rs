@@ -15,6 +15,18 @@ pub struct Pool {
     inner: seismic_runtime::pool::Pool,
 }
 
+/// A weak handle to a [`Pool`], holding no strong reference to its storage.
+#[derive(Clone)]
+pub struct WeakPool {
+    inner: seismic_runtime::pool::WeakPool,
+}
+
+impl WeakPool {
+    pub fn upgrade(&self) -> Option<Pool> {
+        self.inner.upgrade().map(|inner| Pool { inner })
+    }
+}
+
 /// The charges a pool's memory is made through, of one device: its blocks
 /// through one, its absent granule through the other.
 #[derive(Clone)]
@@ -101,6 +113,17 @@ impl Pool {
     /// on the pool while it copies. The bytes returned.
     pub fn return_freed(&self, freed: u64) -> Result<u64, TensorError> {
         self.inner.return_freed(freed)
+    }
+
+    /// Synchronously return `freed` bytes to the OS or driver, waiting on any
+    /// in-flight fences so every returned block is physically freed before
+    /// returning.
+    pub fn return_freed_sync(&self, freed: u64) -> Result<u64, TensorError> {
+        self.inner.return_freed_sync(freed)
+    }
+
+    pub fn downgrade(&self) -> WeakPool {
+        WeakPool { inner: self.inner.downgrade() }
     }
 
     pub(crate) fn inner(&self) -> &seismic_runtime::pool::Pool {

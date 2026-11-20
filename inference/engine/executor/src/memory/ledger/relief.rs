@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use crate::operation::RequestId;
 
-use super::admission::Frees;
+use super::admission::{Frees, Reclaim, ReclaimError};
 use super::changes::Claiming;
 use super::state::{EntryId, State};
 use super::view::Ledger;
@@ -116,14 +116,35 @@ impl Ledger {
     pub fn execute(&self, claiming: &Claiming, plan: ReliefPlan) -> Owed {
         claiming.of_scope(&self.store.changes);
         assert_eq!(plan.store, self.store.identity, "invariant violated: a relief plan executes in its own store");
-        let mut state = self.state();
         let mut yielded = 0u64;
         for (id, bytes) in plan.yields {
-            let Some(entry) = state.held.get(&id).copied() else { continue };
-            let bytes = bytes.min(entry.bytes);
-            if bytes > 0 && matches!(entry.holding, Holding::Cache(_) | Holding::Pool(_)) {
-                state.yields(id, bytes, false, false);
-                yielded += bytes;
+            let action = {
+                let mut state = self.state();
+                let Some(entry) = state.held.get(&id).copied() else { continue };
+                let need = bytes.min(entry.bytes);
+                if need == 0 || !matches!(entry.holding, Holding::Cache(_) | Holding::Pool(_)) {
+                    continue;
+                }
+                match state.reclaim.get(&id) {
+                    Some(Reclaim::Backed(weak)) => match weak.upgrade() {
+                        Some(reclaimer) => Some((reclaimer, need)),
+                        None => None,
+                    },
+                    Some(Reclaim::Deferred | Reclaim::Unbacked) | None => {
+                        state.yields(id, need, false, false);
+                        yielded += need;
+                        None
+                    }
+                }
+            };
+            if let Some((reclaimer, need)) = action {
+                match reclaimer.reclaim(need) {
+                    Ok(freed) => yielded += freed.max(need),
+                    Err(ReclaimError::AtFloor) => {}
+                    Err(ReclaimError::Invariant(reason)) => {
+                        panic!("invariant violated: relief cache reclaim failed for entry {id} (need {need} bytes): {reason}");
+                    }
+                }
             }
         }
         Owed { yielded, preempt: plan.preempt }

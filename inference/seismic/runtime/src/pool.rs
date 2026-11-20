@@ -222,6 +222,23 @@ impl PoolCharges {
 #[derive(Clone)]
 pub struct Pool(Arc<PoolShared>);
 
+/// A weak handle to a granule pool ([`Pool::downgrade`]), used by reclaimers
+/// so the store's ledger holds no strong reference to the pool.
+#[derive(Clone)]
+pub struct WeakPool(Weak<PoolShared>);
+
+impl WeakPool {
+    pub fn upgrade(&self) -> Option<Pool> {
+        self.0.upgrade().map(Pool)
+    }
+}
+
+impl Pool {
+    pub fn downgrade(&self) -> WeakPool {
+        WeakPool(Arc::downgrade(&self.0))
+    }
+}
+
 struct PoolShared {
     device: Arc<DeviceInner>,
     blocks: PoolBlocks,
@@ -462,6 +479,37 @@ impl Pool {
         // they were submitted, its bytes counted already, and any other.
         returned += self.return_empty();
         self.await_owed();
+        Ok(returned)
+    }
+
+    /// Synchronously return `freed` bytes to the OS or driver, waiting on any
+    /// in-flight fences that pin freed granules or vacated blocks so every
+    /// returned block is physically dropped and its ledger entry freed before
+    /// this call returns.
+    pub fn return_freed_sync(&self, freed: u64) -> Result<u64, TensorError> {
+        let mut returned = self.return_freed(freed)?;
+        loop {
+            let fences = {
+                let mut state = self.0.state();
+                let mut fences = state.granules.awaited().unwrap_or_default();
+                fences.extend(state.releasing.iter().map(|(_, uses)| uses.clone()));
+                fences
+            };
+            if fences.is_empty() {
+                break;
+            }
+            for fence in &fences {
+                fence.wait();
+            }
+            returned += self.return_empty();
+            let more = {
+                let mut state = self.0.state();
+                state.granules.owed() > state.granules.awaiting()
+            };
+            if more {
+                returned += self.return_freed(0)?;
+            }
+        }
         Ok(returned)
     }
 

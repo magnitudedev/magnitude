@@ -355,7 +355,7 @@ impl Machine {
         let at = self.at();
         if slots > held {
             for _ in held..slots {
-                let granule = self.ledger.cache(CacheKind::Bank, GRANULE).expect("the target is free room");
+                let granule = self.ledger.cache(CacheKind::Bank, GRANULE, super::Reclaim::Unbacked).expect("the target is free room");
                 self.ledger.change(|_| self.pool.take(&self.pool.change(), GRANULE, self.wiring)).expect("the pool's block for the granule is admitted");
                 self.os.grow(at, GRANULE, self.wiring);
                 self.bank.push(granule);
@@ -856,7 +856,7 @@ fn only_wired_memory_is_the_processs_in_the_wire_count() {
     assert_eq!((wired_bytes, machine.ledger.estimate().allocated()), (20 * GB, 24 * GB));
     assert_eq!(wired(&machine), (Some(6 * GB), Some(34 * GB)), "pageable memory is not in the wire count");
     machine.tick(100);
-    let _granule = machine.ledger.cache(CacheKind::Bank, GRANULE).expect("room");
+    let _granule = machine.ledger.cache(CacheKind::Bank, GRANULE, super::Reclaim::Unbacked).expect("room");
     machine.ledger.change(|_| { let entry = &machine.pool; entry.take(&entry.change(), GRANULE, Wiring::Wired) }).expect("the pool's block for the granule is admitted");
     let at = machine.at();
     machine.os.grow(at, GRANULE, Wiring::Wired);

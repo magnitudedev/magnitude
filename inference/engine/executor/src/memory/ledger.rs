@@ -92,7 +92,7 @@ pub use pressure::PressureWatch;
 mod store;
 pub use store::*;
 
-pub use admission::{Admit, Frees, Over, Short};
+pub use admission::{Admit, CacheReclaimer, Frees, Over, Reclaim, ReclaimError, Short};
 pub use changes::{Changes, Changing, Claiming, Keeping, OpenChange, Owner, Sample, Sampled};
 pub use claims::{ArenaClaim, Cached, Claim};
 pub use estimate::Estimate;

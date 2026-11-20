@@ -453,7 +453,7 @@ pub use seismic_topology::fixtures;
 #[cfg(feature = "fixtures")]
 pub use seismic_discovery::fixtures as host_samples;
 mod pool;
-pub use pool::{block_bytes, BlockSize, BlockSizing, NativeAllocations, Pool, PoolCharges, SizingError, BLOCK_ALIGNMENT};
+pub use pool::{block_bytes, BlockSize, BlockSizing, NativeAllocations, Pool, PoolCharges, SizingError, WeakPool, BLOCK_ALIGNMENT};
 pub use slab::{SlabFill, SlabLayout, SlabRegion, SlabTensor};
 
 use seismic_compiler::prepared::ArgumentValue;

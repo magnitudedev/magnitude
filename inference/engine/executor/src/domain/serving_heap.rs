@@ -209,7 +209,7 @@ impl IdleComponent {
             OptionalComponent::Drafter => CacheKind::Drafter,
             OptionalComponent::Vision => CacheKind::Vision,
         };
-        let cache = |claims: Vec<Claim>| claims.into_iter().map(|claim| claim.into_cache(kind)).collect::<Vec<_>>();
+        let cache = |claims: Vec<Claim>| claims.into_iter().map(|claim| claim.into_cache(kind, crate::memory::ledger::Reclaim::Deferred)).collect::<Vec<_>>();
         (!weights.is_empty() || !binding.is_empty()).then(|| Self { component, weights: cache(weights), binding: cache(binding) })
     }
 

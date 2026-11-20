@@ -1,11 +1,43 @@
 //! The threads a load's storage work runs on off the submitting thread.
 
 use crate::CompletionWake;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, LockResult};
 use std::time::Instant;
 
 /// A step's outcome once it ends on a [`StorageThread`], and when.
-pub(crate) type Done<T> = Arc<Mutex<Option<(T, Instant)>>>;
+pub(crate) struct Done<T>(Arc<(Mutex<Option<(T, Instant)>>, Condvar)>);
+
+impl<T> Clone for Done<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> Done<T> {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new((Mutex::new(None), Condvar::new())))
+    }
+
+    pub(crate) fn lock(&self) -> LockResult<MutexGuard<'_, Option<(T, Instant)>>> {
+        self.0.0.lock()
+    }
+
+    /// Block until the storage thread records the outcome and take it.
+    pub(crate) fn wait(&self) -> (T, Instant) {
+        let mut guard = self.0.0.lock().expect("storage work outcome");
+        loop {
+            if let Some(done) = guard.take() {
+                return done;
+            }
+            guard = self.0.1.wait(guard).expect("storage work outcome");
+        }
+    }
+
+    fn complete(&self, outcome: T) {
+        *self.0.0.lock().expect("storage work outcome") = Some((outcome, Instant::now()));
+        self.0.1.notify_all();
+    }
+}
 
 /// A thread storage work runs on, started with its owner and joined when it
 /// drops: the expert bank's records' resizes and its host tier's (each
@@ -63,14 +95,14 @@ impl StorageThread {
     /// its owner drops it, so the work, and everything it owns, always
     /// reaches it.
     pub(crate) fn run<T: Send + 'static>(&self, wake: CompletionWake, work: impl FnOnce() -> T + Send + 'static) -> Done<T> {
-        let done = Arc::new(Mutex::new(None));
+        let done = Done::new();
         let slot = done.clone();
         self.work
             .as_ref()
             .expect("a storage thread takes work until its owner drops it")
             .send(Box::new(move || {
                 let outcome = work();
-                *slot.lock().expect("storage work outcome") = Some((outcome, Instant::now()));
+                slot.complete(outcome);
                 wake.complete();
             }))
             .expect("a storage thread takes work until its owner drops it, since its panic ends the process");

@@ -786,7 +786,7 @@ fn bind_domain(
     // tier of a capped bank backs its load-time slots in.
     let load = execution.load();
     let demand = match load.expert_bank() {
-        Some(bank) => load.clone().with_load_slots(bank.slots).unwrap().target_weight_demand(),
+        Some(bank) => load.clone().with_load_slots(bank.slots, bank.host_slots).unwrap().target_weight_demand(),
         None => load.target_weight_demand(),
     }
     .unwrap();

@@ -1216,7 +1216,9 @@ impl FakeBank {
             .change(|_| (0..committed).try_for_each(|_| self.slots.add_slab(seismic::SlabFill::Unwritten).map(drop)))
             .expect("the fixture's ledger holds its bank");
         let above = committed.saturating_sub(1) * self.row();
-        let cache = ledger.cache(crate::memory::ledger::CacheKind::Bank, above).expect("the fixture's ledger holds its bank");
+        let cache = ledger
+            .cache(crate::memory::ledger::CacheKind::Bank, above, crate::memory::ledger::Reclaim::Deferred)
+            .expect("the fixture's ledger holds its bank");
         self.cache.hold(crate::BankHolding::Experts, cache);
     }
 

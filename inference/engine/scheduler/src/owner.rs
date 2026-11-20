@@ -2054,7 +2054,14 @@ trait MemoryStep: MemoryHost + Sized {
             },
         };
         if let Some(bindings) = bindings {
+            let sizing = [BankTier::Bank, BankTier::Host].map(|tier| self.domain().sizing_terms(tier));
             self.follow_yields(bindings)?;
+            // `follow_cache_targets` runs only here (in `between_flights`) for
+            // external `HostRam` pressure and bank growth targets — never to
+            // make room for claims, which reclaim synchronously inside
+            // `Ledger::admit_or_reclaim`. Both paths reach the same bank shrink
+            // release (`ExpertBank::release_evicted`).
+            self.follow_cache_targets(bindings, sizing)?;
         }
         let Some(read) = read else {
             return Ok(Observed { unload: false, reread: Reread::Unread });
@@ -2114,12 +2121,14 @@ trait MemoryStep: MemoryHost + Sized {
     }
 
     /// Follow the expert bank's derived target
-    /// (`ExecutorDomain::follow_cache_targets`): a resize it begins is held as
-    /// begun, a growth as one and a shrink as the target's. One deferred or
-    /// running is followed again at the next boundary, which derives afresh.
-    /// Whether the bank owes a shrink: one begun, running, or deferred to a
-    /// boundary the flight that defers it brings; its finish advances the
-    /// epoch, so what waits on memory retries then.
+    /// (`ExecutorDomain::follow_cache_targets`): called only from `observe`
+    /// (`between_flights`) for external `HostRam` pressure and bank growth
+    /// targets, never for claims (which reclaim synchronously through
+    /// `Ledger::admit_or_reclaim`); both shrink paths reach the same bank
+    /// shrink release (`ExpertBank::release_evicted`). A resize it begins is
+    /// held as begun, a growth as one and a shrink as the target's. One
+    /// deferred or running is followed again at the next boundary, which
+    /// derives afresh.
     fn follow_cache_targets(
         &mut self,
         bindings: &mut StateBindings,
@@ -2142,18 +2151,15 @@ trait MemoryStep: MemoryHost + Sized {
         Ok(cause == BankBegunFor::Shrink)
     }
 
-    /// Free what the ledger took of the load's cache, as its holders do:
-    /// the domain's own kinds at once (`ExecutorDomain::release_yielded`),
-    /// the retained prefixes worth least while their cache is owed
-    /// ([`MemoryHost::evict_owed_prefixes`]), and the expert bank, which
-    /// follows its target derived afresh ([`Self::follow_cache_targets`]):
-    /// a claim that took the bank's cache allocates it only once the bank's
-    /// shrink frees it, so a shrink owed is pending. The one release order
-    /// every boundary and every claim short of memory follow. Each release
-    /// is recorded with what the process held on each side of it, and what
-    /// waits on memory retries once one freed any.
+    /// Free what the ledger took of the load's non-bank cache, as its holders
+    /// do: the domain's own kinds at once (`ExecutorDomain::release_yielded`)
+    /// and the retained prefixes worth least while their cache is owed
+    /// ([`MemoryHost::evict_owed_prefixes`]). The expert bank reclaims
+    /// synchronously inside `Ledger::admit_or_reclaim` before any claim is
+    /// handed out, never asynchronously on yield; `follow_cache_targets` runs
+    /// only in `observe` (`between_flights`) for external `HostRam` pressure
+    /// and bank growth.
     fn follow_yields(&mut self, bindings: &mut StateBindings) -> Result<Yielded, RequestError> {
-        let sizing = [BankTier::Bank, BankTier::Host].map(|tier| self.domain().sizing_terms(tier));
         let (before, started, wake) = (self.domain().held_bytes(), std::time::Instant::now(), self.completion());
         let yielded = self.domain().release_yielded(bindings, wake).map_err(classify_domain_error)?;
         let yielded = match (self.evict_owed_prefixes(), yielded) {
@@ -2171,11 +2177,7 @@ trait MemoryStep: MemoryHost + Sized {
             );
             self.advance_epoch();
         }
-        let shrinking = self.follow_cache_targets(bindings, sizing)?;
-        Ok(match (yielded, shrinking) {
-            (Yielded::Nothing, true) => Yielded::Pending,
-            (yielded, _) => yielded,
-        })
+        Ok(yielded)
     }
 
     /// At a flight boundary, finish the idle graph slots' release off the

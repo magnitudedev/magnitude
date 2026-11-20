@@ -14,13 +14,13 @@ use super::ExpertBank;
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, RunningBegun, RunningPressure, Trip};
 use crate::experts::source::Records;
 use crate::experts::watcher::{Candidates, Evicted, Evicting, Join, ScratchGroup};
-use crate::memory::ledger::Changes;
+use crate::memory::ledger::{CacheReclaimer, Changes, ReclaimError};
 use crate::planning::{BankTier, Placer};
 use crate::storage_thread::{Done, StorageThread};
 use crate::CompletionWake;
 use seismic::{Pool, SlabTensor, Tensor, TensorError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 /// One store's records: each group's slab store in the store's pool, a
@@ -187,6 +187,9 @@ pub(super) struct Commitment {
     pub(super) resize: Resize,
     pub(super) releasing: Option<Releasing>,
     pub(super) shrunk: Option<BankResized>,
+    /// A growth stopped synchronously by [`ExpertBank::reclaim`], queued for
+    /// the next `advance` to report so the caller consumes its resize cleanly.
+    pub(super) stopped_growth: Option<BankResized>,
     /// A shrink begun beside a running chain the domain has not yet taken
     /// ([`ExpertBank::take_running_begun`]).
     pub(super) running: Option<RunningBegun>,
@@ -194,7 +197,7 @@ pub(super) struct Commitment {
 
 impl Commitment {
     pub(super) fn new(slots: Arc<AtomicU64>) -> Self {
-        Self { slots, resize: Resize::Idle, releasing: None, shrunk: None, running: None }
+        Self { slots, resize: Resize::Idle, releasing: None, shrunk: None, stopped_growth: None, running: None }
     }
 
     /// Whether a resize of the store runs until an advance finishes it: a
@@ -428,26 +431,30 @@ impl Growing {
     /// acquired, and where its time went; or why the store is broken (a
     /// slot claimed could not join).
     pub(super) fn ended(&self, holding: BankHolding, charged: impl FnOnce() -> u64) -> Option<Result<(BankResized, Spent), String>> {
-        let (Grown { at, joined, cut, spent }, released) = self.done.lock().expect("bank growth outcome").take()?;
+        let done = self.done.lock().expect("bank growth outcome").take()?;
+        Some(self.finish(holding, done, charged))
+    }
+
+    pub(super) fn finish(&self, holding: BankHolding, (Grown { at, joined, cut, spent }, released): (Grown, Instant), charged: impl FnOnce() -> u64) -> Result<(BankResized, Spent), String> {
         let refused = match cut {
             Cut::None => None,
             Cut::Refused(refusal) => Some(refusal),
-            Cut::Unjoined(reason) => return Some(Err(reason)),
+            Cut::Unjoined(reason) => return Err(reason),
         };
         // No slot joined: refused at its first, or stopped before it.
         let Some((first, last)) = joined else {
-            return Some(Ok(match refused {
+            return Ok(match refused {
                 Some(refusal) => (BankResized::GrowthRefused { holding, at, refusal }, spent),
                 None => (BankResized::Stopped { holding, at }, spent),
-            }));
+            });
         };
         let Some(grown) = charged().checked_sub(self.charged) else {
-            return Some(Err("a growth lowered its records' charge".to_owned()));
+            return Err("a growth lowered its records' charge".to_owned());
         };
         let zero = Duration::ZERO;
         let begun = Begun { decided: self.decided, queued: zero, planned: zero, trip: Trip::default() };
         let times = begun.times(first, last, released);
-        Some(Ok((BankResized::Grown { holding, from: self.from, to: at, grown, refused, times }, spent)))
+        Ok((BankResized::Grown { holding, from: self.from, to: at, grown, refused, times }, spent))
     }
 }
 
@@ -637,6 +644,9 @@ impl ExpertBank {
             return Ok(None);
         };
         let tier = &mut *tier;
+        if let Some(stopped) = tier.commitment.stopped_growth.take() {
+            return Ok(Some((stopped, true)));
+        }
         if let Some(shrunk) = tier.commitment.shrunk.take() {
             return Ok(Some((shrunk, true)));
         }
@@ -718,33 +728,47 @@ impl ExpertBank {
         }
     }
 
-    /// Return a shrink's `evicted` records of `stores` to their pool, the
-    /// records charged `charged` before it, then what they freed to the OS:
-    /// the pool's empty blocks, and where those return less, its emptiest
-    /// blocks emptied for it, their copies enqueued and never waited for
-    /// (`seismic::Pool::return_freed`), the bank's
-    /// cache of `tier`'s holding cut to what stays above its floor
-    /// ([`Self::above_floor`], `BankCache::fit`): one change. The shrink,
-    /// done.
+    /// Return a shrink's `evicted` records of `stores` to their pool, cut
+    /// `BankCache` to `above_floor(tier, to)`, and return freed blocks to the
+    /// OS (`return_freed_sync` when `sync_need` is `Some` for synchronous
+    /// admission reclaim, `return_freed` otherwise for `between_flights`
+    /// external-pressure shrinks). The one shrink-release path both reach.
+    fn release_evicted(
+        &self,
+        stores: &Stores,
+        tier: BankTier,
+        to: u64,
+        charged: u64,
+        evicted: &[Vec<u32>],
+        sync_need: Option<u64>,
+    ) -> Result<(u64, u64), DomainError> {
+        let holding = match tier {
+            BankTier::Bank => BankHolding::Experts,
+            BankTier::Host => BankHolding::Host,
+        };
+        self.cache.changes().clone().back(|_| {
+            for (group, records) in evicted.iter().enumerate() {
+                stores.free(group, records).map_err(|refusal| DomainError::invariant(format!("the expert bank's pool refused a shrink's release: {refusal}")))?;
+            }
+            let released = charged.checked_sub(stores.charged()).ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
+            self.cache.fit(holding, self.above_floor(tier, to));
+            let returned = match sync_need {
+                Some(need) => stores.pool.return_freed_sync(released.max(need)),
+                None => stores.return_freed(released),
+            }
+            .map_err(|error| DomainError::invariant(format!("the expert bank's pool could not return a shrink's blocks: {error}")))?;
+            tracing::debug!(?holding, released, returned, sync = sync_need.is_some(), "a shrink's granules return to the pool, its empty blocks to the OS");
+            Ok((released, returned))
+        })
+    }
+
     fn release(&self, stores: &Stores, tier: BankTier, (from, to): (u64, u64), charged: u64, evicted: &[Vec<u32>], begun: Begun) -> Result<BankResized, DomainError> {
         let holding = match tier {
             BankTier::Bank => BankHolding::Experts,
             BankTier::Host => BankHolding::Host,
         };
         let releasing = Instant::now();
-        let released = self.cache.changes().clone().change(|_| {
-            for (group, records) in evicted.iter().enumerate() {
-                stores.free(group, records).map_err(|refusal| DomainError::invariant(format!("the expert bank's pool refused a shrink's release: {refusal}")))?;
-            }
-            let released = charged.checked_sub(stores.charged()).ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
-            self.cache.fit(holding, self.above_floor(tier, to));
-            let returned = stores
-                .return_freed(released)
-                .map_err(|error| DomainError::invariant(format!("the expert bank's pool could not return a shrink's blocks: {error}")))?;
-            tracing::debug!(?holding, released, returned, "a shrink's granules return to the pool, its empty blocks to the OS");
-            Ok::<_, DomainError>((released, returned))
-        })?;
-        let (released, returned) = released;
+        let (released, returned) = self.release_evicted(stores, tier, to, charged, evicted, None)?;
         let times = begun.times(releasing, releasing, Instant::now());
         Ok(BankResized::Shrunk { holding, from, to, released, returned, times })
     }
@@ -776,6 +800,9 @@ impl ExpertBank {
     /// thread ended it.
     pub(super) fn advance(&self) -> Result<Option<BankResized>, DomainError> {
         let mut commitment = self.commitment();
+        if let Some(stopped) = commitment.stopped_growth.take() {
+            return Ok(Some(stopped));
+        }
         if let Some(releasing) = commitment.releasing.take() {
             match self.released(releasing) {
                 Ok(shrunk) => commitment.shrunk = Some(shrunk),
@@ -914,5 +941,196 @@ impl ExpertBank {
     /// [`ElasticBank::running_begun`](crate::domain::ElasticBank::running_begun).
     pub(super) fn take_running_begun(&self) -> Option<RunningBegun> {
         self.commitment().running.take()
+    }
+
+    /// Synchronously reclaim at least `need` bytes of `tier`'s bank cache back
+    /// to the OS (down to `tier`'s floor): stop and await any running growth,
+    /// compute exact target slots releasing `>= need` from exact slot & granule
+    /// sizes (no 1-block jitter tolerance), evict from the watcher (waiting on
+    /// in-flight bank traffic if needed), free slabs, trim `BankCache`, and
+    /// synchronously return freed blocks to the OS (`return_freed_sync`).
+    pub(super) fn reclaim(&self, tier: BankTier, need: u64) -> Result<u64, ReclaimError> {
+        if need == 0 {
+            return Ok(0);
+        }
+        let holding = match tier {
+            BankTier::Bank => BankHolding::Experts,
+            BankTier::Host => BankHolding::Host,
+        };
+        let stores: Arc<Stores> = match tier {
+            BankTier::Bank => self.stores.clone(),
+            BankTier::Host => match self.host() {
+                Some(host) => host.stores.clone(),
+                None => return Err(ReclaimError::AtFloor),
+            },
+        };
+
+        // 1. Stop any running growth on `tier` and await its current slot
+        //    outside the commitment lock so no deadlock is possible.
+        let stopped = match tier {
+            BankTier::Bank => {
+                let mut commitment = self.commitment();
+                match std::mem::replace(&mut commitment.resize, Resize::Idle) {
+                    Resize::Growing(growing) => {
+                        growing.stop.store(true, Ordering::Release);
+                        Some((growing, false))
+                    }
+                    other => {
+                        commitment.resize = other;
+                        None
+                    }
+                }
+            }
+            BankTier::Host => {
+                let Some(mut host) = self.host() else {
+                    return Err(ReclaimError::AtFloor);
+                };
+                match std::mem::replace(&mut host.commitment.resize, Resize::Idle) {
+                    Resize::Growing(growing) => {
+                        growing.stop.store(true, Ordering::Release);
+                        let was_backing = std::mem::take(&mut host.backing);
+                        Some((growing, was_backing))
+                    }
+                    other => {
+                        host.commitment.resize = other;
+                        None
+                    }
+                }
+            }
+        };
+        if let Some((growing, was_backing)) = stopped {
+            self.watcher.shared().events().notify();
+            let outcome = growing.done.wait();
+            match growing.finish(holding, outcome, || stores.charged()) {
+                Ok((resized, _spent)) => {
+                    self.cache.settle(&resized);
+                    if was_backing {
+                        let slots = match tier {
+                            BankTier::Bank => self.commitment().slots.load(Ordering::Acquire),
+                            BankTier::Host => self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)),
+                        };
+                        self.cache.fit(holding, self.above_floor(tier, slots));
+                    } else {
+                        match tier {
+                            BankTier::Bank => self.commitment().stopped_growth = Some(resized),
+                            BankTier::Host => {
+                                if let Some(mut host) = self.host() {
+                                    host.commitment.stopped_growth = Some(resized);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(reason) => {
+                    match tier {
+                        BankTier::Bank => self.commitment().resize = Resize::Broken(reason.clone()),
+                        BankTier::Host => {
+                            if let Some(mut host) = self.host() {
+                                host.commitment.resize = Resize::Broken(reason.clone());
+                            }
+                        }
+                    }
+                    return Err(ReclaimError::Invariant(reason));
+                }
+            }
+        }
+
+        // 2. Flush any pending `releasing` from an earlier running shrink on Bank.
+        if tier == BankTier::Bank {
+            let releasing = self.commitment().releasing.take();
+            if let Some(releasing) = releasing {
+                self.released(releasing).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            }
+        }
+
+        // 3. Compute exact target slots releasing `>= need` (accounting for
+        //    pool block size so `return_freed_sync` can vacate whole blocks).
+        let (from, floor) = match tier {
+            BankTier::Bank => (self.commitment().slots.load(Ordering::Acquire), self.floor(tier)),
+            BankTier::Host => (self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)), self.floor(tier)),
+        };
+        let block_bytes = stores.pool.block_bytes();
+        let already_free = stores.pool.free_granules() as u64 * stores.pool.granule();
+        let evict_bytes = need.div_ceil(block_bytes).saturating_mul(block_bytes).saturating_sub(already_free).max(need);
+        let charge_fn = self.tier_charge(tier);
+        let charge = |at| Ok::<_, std::convert::Infallible>(charge_fn(&self.counts, at));
+        let shallowest = crate::planning::releasing(from, floor, 0, charge).unwrap_or_else(|never| match never {});
+        let deepest = crate::planning::releasing(from, floor, evict_bytes, charge).unwrap_or_else(|never| match never {});
+        let flush_pool = || -> Result<u64, ReclaimError> {
+            let returned = self
+                .cache
+                .changes()
+                .clone()
+                .back(|_| stores.pool.return_freed_sync(need))
+                .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            match returned {
+                0 => Err(ReclaimError::AtFloor),
+                n => Ok(n),
+            }
+        };
+        let (Some(shallowest), Some(deepest)) = (shallowest, deepest) else {
+            return flush_pool();
+        };
+
+        // 4. Evict from the watcher; if in-flight bank traffic temporarily
+        //    pins slabs, hold traffic and wait for it to drain, then retry.
+        let evicting = self.evicting(tier);
+        let charged = stores.charged();
+        let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+        let evicted = match self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)? {
+            Some(evicted) => Some(evicted),
+            None => {
+                let _hold = self.watcher.shared().hold_traffic();
+                self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
+                let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+                self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)?
+            }
+        };
+
+        let Some(Evicted { slots, records, .. }) = evicted else {
+            return flush_pool();
+        };
+
+        // 5. Commit new slot count, free slabs, trim BankCache, and
+        //    synchronously return freed blocks to the OS.
+        let to = slots as u64;
+        match tier {
+            BankTier::Bank => self.commitment().slots.store(to, Ordering::Release),
+            BankTier::Host => {
+                if let Some(host) = self.host() {
+                    host.commitment.slots.store(to, Ordering::Release);
+                }
+            }
+        }
+        let (released, returned) = self
+            .release_evicted(&stores, tier, to, charged, &records, Some(need))
+            .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+        tracing::info!(?holding, from, to, need, released, returned, "expert bank reclaimed synchronously for admission");
+        match returned {
+            0 => Err(ReclaimError::AtFloor),
+            n => Ok(n),
+        }
+    }
+}
+
+/// Synchronous [`CacheReclaimer`] for one tier of an [`ExpertBank`], holding
+/// only a weak reference so it never extends the bank's lifetime.
+pub(super) struct BankReclaimer {
+    bank: Weak<ExpertBank>,
+    tier: BankTier,
+}
+
+impl BankReclaimer {
+    pub(super) fn new(bank: &Arc<ExpertBank>, tier: BankTier) -> Arc<Self> {
+        Arc::new(Self { bank: Arc::downgrade(bank), tier })
+    }
+}
+
+impl CacheReclaimer for BankReclaimer {
+    fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+        let Some(bank) = self.bank.upgrade() else {
+            return Err(ReclaimError::AtFloor);
+        };
+        bank.reclaim(self.tier, need)
     }
 }

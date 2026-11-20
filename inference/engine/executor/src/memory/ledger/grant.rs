@@ -2,12 +2,12 @@
 //! footprint credited against it at each reading so that growth is never
 //! read as others' (§3.1).
 
-use super::admission::Short;
+use super::admission::{AdmitPolicy, Short};
 use super::changes::Claiming;
 use super::claims::Claim;
 use super::state::{EntryId, State};
 use super::view::Ledger;
-use super::vocabulary::{CommittedKind, GrantRole, Holding, Need, size};
+use super::vocabulary::{CacheKind, CommittedKind, GrantRole, Holding, Need, size};
 
 /// The footprint of a process in a store at a reading: the one way the
 /// ledger reads a process other than through its own entries. The process's
@@ -64,17 +64,15 @@ impl Ledger {
         claiming.of_scope(&self.store.changes);
         let need = Need::Grant { role, bytes };
         let (kind, bytes) = (need.kind(), size(&self.shape, &need));
-        let mut state = self.state();
-        let at = state.reading(&self.store.identity, None);
-        let id = match state.take_beside(at, kind, bytes) {
-            Ok(id) => id,
-            Err(over) => {
-                state.waiting = true;
-                return Err(over.of(&self.store.identity, bytes));
-            }
-        };
-        state.grants.insert(id, Granted::new(role));
-        drop(state);
+        let id = self.admit_or_reclaim(AdmitPolicy {
+            at: None,
+            kind,
+            bytes,
+            of: |ck: CacheKind| !ck.valued(),
+            within_boundary: true,
+            allow_guarantee: false,
+        })?;
+        self.state().grants.insert(id, Granted::new(role));
         Ok(Grant { claim: Claim::held(self.clone(), id, kind) })
     }
 }

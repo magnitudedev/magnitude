@@ -64,7 +64,7 @@ impl ExpertBank {
         cpu: &crate::assessment::StoredCpuSite,
         pools: LoadPools,
         (changes, host_backing): (std::sync::Arc<crate::memory::ledger::Changes>, Option<crate::memory::ledger::Claim>),
-    ) -> Result<Self, crate::residency::WeightImportError> {
+    ) -> Result<Arc<Self>, crate::residency::WeightImportError> {
         // A layer whose CPU site its qualification refused serves every miss
         // over the link: never silently, and with why.
         for (layer, reason) in plan.refused_sites() {
@@ -295,8 +295,14 @@ impl ExpertBank {
             rises: Arc::new(Mutex::new(())),
             plan: plan.clone(),
             counts,
-            cache: Arc::new(super::cache::BankCache::opened(changes, plan.host_slots, host_backing)),
+            cache: Arc::new(super::cache::BankCache::new(changes)),
         };
+        let bank = Arc::new(bank);
+        bank.cache.set_reclaimer(BankTier::Bank, super::resize::BankReclaimer::new(&bank, BankTier::Bank));
+        if bank.host.is_some() {
+            bank.cache.set_reclaimer(BankTier::Host, super::resize::BankReclaimer::new(&bank, BankTier::Host));
+        }
+        bank.cache.open_host(plan.host_slots, host_backing);
         if plan.host_slots > 0 {
             bank.back_host().map_err(|error| format!("the host tier's backing: {error}"))?;
         }

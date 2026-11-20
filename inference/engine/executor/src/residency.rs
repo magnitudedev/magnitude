@@ -1211,7 +1211,7 @@ impl ResidencyStore {
             .map_err(invalid)?;
         }
         self.imported(plan.bytes().map_err(invalid)?)?;
-        Ok(Some(Arc::new(bank)))
+        Ok(Some(bank))
     }
 
     /// The imported physical view selected for an explicit semantic weight role.

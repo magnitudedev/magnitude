@@ -9,7 +9,8 @@
 //! bank keeps of it, the served bank's and a test's alike.
 
 use crate::domain::{BankHolding, BankResized};
-use crate::memory::ledger::{CacheKind, Cached, Changes, Claim, DeviceLedgers, Value};
+use crate::memory::ledger::{CacheKind, CacheReclaimer, Cached, Changes, Claim, DeviceLedgers, Reclaim, Value};
+use crate::planning::BankTier;
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct BankCache {
@@ -21,6 +22,9 @@ pub(crate) struct BankCache {
     growing: Mutex<Vec<Growing>>,
     /// What each holding owes claims that took its cache ([`Self::owed`]).
     owed: Mutex<Vec<(BankHolding, u64)>>,
+    /// Synchronous reclaimers for each tier's bank cache entries, owned here
+    /// (each holding only a weak reference to `ExpertBank`, so no cycle).
+    reclaimers: Mutex<[Option<Arc<dyn CacheReclaimer>>; 2]>,
     /// The changes of the ledgers' scope it holds its cache in, from the
     /// bank's open: every memory change of the bank, the load's own
     /// backing too, is one change with its record ([`Changes::change`]).
@@ -48,38 +52,81 @@ struct Growing {
 }
 
 impl BankCache {
-    /// A bank's cache on the ledgers of `changes`' scope, holding nothing.
-    pub(crate) fn new(changes: Arc<Changes>) -> Self {
-        Self { held: Mutex::default(), value: Mutex::new(Value::NONE), growing: Mutex::default(), owed: Mutex::default(), changes }
+    fn tier_of(holding: BankHolding) -> Option<BankTier> {
+        match holding {
+            BankHolding::Experts => Some(BankTier::Bank),
+            BankHolding::Host => Some(BankTier::Host),
+            BankHolding::Table { .. } => None,
+        }
     }
 
-    /// A bank's cache as the bank opens on the ledgers of `changes`' scope:
-    /// a host tier of `host_slots` holds its backing's claim (`host`) as a
-    /// growth from the open, each slot charged to it as it backs.
+    /// A bank's cache on the ledgers of `changes`' scope, holding nothing.
+    pub(crate) fn new(changes: Arc<Changes>) -> Self {
+        Self {
+            held: Mutex::default(),
+            value: Mutex::new(Value::NONE),
+            growing: Mutex::default(),
+            owed: Mutex::default(),
+            reclaimers: Mutex::new([None, None]),
+            changes,
+        }
+    }
+
+    /// Install `reclaimer` for `tier` before any cache entry of `tier` is
+    /// created, so every `Bank` cache entry carries its [`Reclaim::Backed`]
+    /// reclaimer from creation.
+    pub(crate) fn set_reclaimer(&self, tier: BankTier, reclaimer: Arc<dyn CacheReclaimer>) {
+        self.reclaimers.lock().expect("bank reclaimers")[tier.index()] = Some(reclaimer);
+    }
+
+    /// The [`Reclaim`] policy for a cache entry of `holding`: `Reclaim::Backed`
+    /// with the tier's installed reclaimer for `Experts`/`Host`, `Reclaim::Deferred`
+    /// for stored tables.
+    pub(crate) fn reclaim_for(&self, holding: BankHolding) -> Reclaim {
+        match Self::tier_of(holding) {
+            Some(tier) => {
+                let guard = self.reclaimers.lock().expect("bank reclaimers");
+                let reclaimer = guard[tier.index()]
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("invariant violated: {tier:?} bank cache created before its reclaimer was installed"));
+                Reclaim::Backed(Arc::downgrade(reclaimer))
+            }
+            None => Reclaim::Deferred,
+        }
+    }
+
+    /// Turn a host tier's open backing claim (`host`) into [`CacheKind::Bank`]
+    /// with its installed host reclaimer immediately so host admissions can
+    /// reclaim it even while `back_host` is still running.
     ///
     /// # Panics
     /// Where a host tier has no backing's claim, or a claim no host tier.
-    pub(crate) fn opened(changes: Arc<Changes>, host_slots: u64, host: Option<Claim>) -> Self {
-        let cache = Self::new(changes);
+    pub(crate) fn open_host(&self, host_slots: u64, host: Option<Claim>) {
         match (host_slots > 0, host) {
-            (true, Some(claim)) => cache.grow(BankHolding::Host, claim),
+            (true, Some(claim)) => {
+                let reclaim = self.reclaim_for(BankHolding::Host);
+                let cached = self.changes.back(|_| claim.into_backed_cache(CacheKind::Bank, reclaim));
+                self.hold(BankHolding::Host, cached);
+            }
             (false, None) => {}
             (true, None) => panic!("invariant violated: a host tier opened without its backing's claim"),
             (false, Some(_)) => panic!("invariant violated: a host tier's backing claimed for a bank without one"),
         }
-        cache
     }
 
     /// The cache as a served bank takes it on `ledgers`: of the scope it
-    /// opened on, a host tier of `host_slots` still holding its backing's
-    /// claim from the open, which only an advance settles.
+    /// opened on, a host tier of `host_slots` holding its cache entry from
+    /// the open.
     ///
     /// # Panics
     /// Where either does not hold.
     pub(crate) fn served_on(&self, ledgers: &DeviceLedgers, host_slots: u64) {
         assert!(Arc::ptr_eq(&self.changes, ledgers.changes()), "invariant violated: a bank served on ledgers of another scope than it opened on");
         if host_slots > 0 {
-            assert!(self.growing(BankHolding::Host), "invariant violated: a host tier served without its backing's claim");
+            assert!(
+                self.held.lock().expect("bank cache").iter().any(|(holding, _)| *holding == BankHolding::Host),
+                "invariant violated: a host tier served without its backing's cache entry"
+            );
         }
     }
 
@@ -190,23 +237,31 @@ impl BankCache {
         }
         self.settle_owed(&held, holding, above);
         drop(held);
-        self.changes.change(|_| drop(cut));
+        self.changes.back(|_| drop(cut));
     }
 
     /// The cache of the resize an advance reports finished: a growth's
     /// claim turns cache of the granules it holds, one stopped or refused
     /// frees it all. A shrink cut the pieces as it freed its slots
-    /// ([`Self::fit`]).
+    /// ([`Self::fit`]). A host tier's open backing (`back_host`) already
+    /// holds its cache entry in `held`, so settling it without a `Growing`
+    /// claim leaves that entry in place.
     pub(crate) fn settle(&self, resized: &BankResized) {
         match *resized {
             BankResized::Shrunk { .. } => {}
             BankResized::Grown { holding, .. } => {
-                let growing = self.take(holding).expect("invariant violated: a growth without its claim");
-                let cache = self.changes.change(|_| growing.claim.into_backed_cache(CacheKind::Bank));
-                self.hold(holding, cache);
+                if let Some(growing) = self.take(holding) {
+                    let reclaim = self.reclaim_for(holding);
+                    let cache = self.changes.back(|_| growing.claim.into_backed_cache(CacheKind::Bank, reclaim));
+                    self.hold(holding, cache);
+                }
             }
             // What its slots backed is freed with them.
-            BankResized::Stopped { holding, .. } | BankResized::GrowthRefused { holding, .. } => self.abandon(holding),
+            BankResized::Stopped { holding, .. } | BankResized::GrowthRefused { holding, .. } => {
+                if self.growing(holding) {
+                    self.abandon(holding);
+                }
+            }
         }
     }
 
@@ -289,40 +344,57 @@ mod tests {
         DeviceLedgers::open_in(scope, &device, std::sync::Arc::new(LoadShape { stores: Vec::new() })).read_scripted(Reading::device(64 * GB, 64 * GB, NO_LAG)).0
     }
 
+    struct NoopReclaimer;
+    impl CacheReclaimer for NoopReclaimer {
+        fn reclaim(&self, _need: u64) -> Result<u64, crate::memory::ledger::ReclaimError> {
+            Err(crate::memory::ledger::ReclaimError::AtFloor)
+        }
+    }
+
+    fn cache_with_reclaimers(changes: Arc<Changes>) -> BankCache {
+        let cache = BankCache::new(changes);
+        cache.set_reclaimer(BankTier::Bank, Arc::new(NoopReclaimer));
+        cache.set_reclaimer(BankTier::Host, Arc::new(NoopReclaimer));
+        cache
+    }
+
     /// A bank opens, then is served: its host tier's backing claim, held
-    /// from the open, is still the growth the served bank finds, on the
-    /// ledgers of the scope it opened on.
+    /// from the open as `CacheKind::Bank`, is found on the ledgers of the
+    /// scope it opened on.
     #[test]
     fn a_bank_served_after_its_open_finds_its_host_backing() {
         let scope = Ledgers::new();
         let ledgers = device_ledgers(&scope);
         let claim = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * GB)).expect("room");
-        let cache = BankCache::opened(scope.changes().clone(), 4, Some(claim));
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        cache.open_host(4, Some(claim));
         cache.served_on(&ledgers, 4);
-        assert!(cache.growing(BankHolding::Host));
+        assert_eq!(ledgers.host().estimate().cache_of(CacheKind::Bank), 8 * GB);
     }
 
-    /// An expert growth begins beside the host tier's backing, still held
-    /// from the open, and each settles apart: the Vulkan gate's resident
-    /// decode panicked where one claim stood for both.
+    /// An expert growth begins beside the host tier's backing, held as
+    /// `CacheKind::Bank` from the open, and settles independently.
     #[test]
     fn an_expert_growth_runs_beside_the_host_backing() {
         let scope = Ledgers::new();
         let ledgers = device_ledgers(&scope);
         let backing = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * GB)).expect("room");
-        let cache = BankCache::opened(scope.changes().clone(), 4, Some(backing));
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        cache.open_host(4, Some(backing));
         let claim = ledgers.of(crate::planning::BankTier::Bank).change(|keeping| ledgers.of(crate::planning::BankTier::Bank).backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, GB)).expect("room");
         cache.grow(BankHolding::Experts, claim);
-        assert!(cache.growing(BankHolding::Host) && cache.growing(BankHolding::Experts));
+        assert!(cache.growing(BankHolding::Experts));
         cache.settle(&BankResized::Stopped { holding: BankHolding::Experts, at: 10 });
-        assert!(cache.growing(BankHolding::Host) && !cache.growing(BankHolding::Experts));
+        assert!(!cache.growing(BankHolding::Experts));
+        assert_eq!(ledgers.host().estimate().cache_of(CacheKind::Bank), 8 * GB);
     }
 
     #[test]
     #[should_panic(expected = "a bank served on ledgers of another scope")]
     fn a_bank_served_on_another_scopes_ledgers_panics() {
         let (opened, served) = (Ledgers::new(), Ledgers::new());
-        let cache = BankCache::opened(opened.changes().clone(), 0, None);
+        let cache = cache_with_reclaimers(opened.changes().clone());
+        cache.open_host(0, None);
         cache.served_on(&device_ledgers(&served), 0);
     }
 
@@ -330,7 +402,8 @@ mod tests {
     #[should_panic(expected = "a host tier opened without its backing's claim")]
     fn host_slots_without_a_claim_panic() {
         let scope = Ledgers::new();
-        drop(BankCache::opened(scope.changes().clone(), 4, None));
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        cache.open_host(4, None);
     }
 
     /// A growth's claim holds its slots' granules as the pool backs them,
@@ -338,7 +411,7 @@ mod tests {
     #[test]
     fn a_growth_holds_what_its_slots_backed() {
         let (scope, ledger, pool) = ledger();
-        let cache = BankCache::new(scope.changes().clone());
+        let cache = cache_with_reclaimers(scope.changes().clone());
         let holding = BankHolding::Experts;
         let claim = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 3 * GB)).expect("room");
         assert_eq!(ledger.estimate().allocated(), 0, "nothing backs it yet");

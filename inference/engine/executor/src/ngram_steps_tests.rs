@@ -3379,7 +3379,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         let mut recorded = crate::memory::ledger::Recorded::default();
         let load = execution.load();
         let demand = match load.expert_bank() {
-            Some(bank) => load.clone().with_load_slots(bank.slots).unwrap().target_weight_demand(),
+            Some(bank) => load.clone().with_load_slots(bank.slots, bank.host_slots).unwrap().target_weight_demand(),
             None => load.target_weight_demand(),
         }
         .unwrap();

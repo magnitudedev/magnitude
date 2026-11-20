@@ -1560,12 +1560,12 @@ impl ExecutionPlanDraft {
         self.load.bank.as_ref().expect("a streamed plan holds its bank")
     }
 
-    /// The draft committing `slots` of its expert bank at the load, its
-    /// ceiling kept ([`ModelLoadPlan::with_load_slots`]): what the target
-    /// import's claim admits of the slots planned.
-    pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {
+    /// The draft committing `slots` of its expert bank and `host_slots` of its
+    /// host tier at the load, its ceiling kept ([`ModelLoadPlan::with_load_slots`]):
+    /// what the target import's claim admits of the slots planned.
+    pub fn with_load_slots(self, slots: u64, host_slots: u64) -> Result<Self, PlanError> {
         Ok(Self {
-            load: Box::new(self.load.with_load_slots(slots)?),
+            load: Box::new(self.load.with_load_slots(slots, host_slots)?),
             ..self
         })
     }
@@ -1601,10 +1601,10 @@ impl ExecutionPlan {
         Self { load: Box::new(self.load.without_expert_bank()), ..self }
     }
 
-    /// The plan committing `slots` of its expert bank at the load, its
-    /// ceiling kept ([`ModelLoadPlan::with_load_slots`]).
-    pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {
-        Ok(Self { load: Box::new(self.load.with_load_slots(slots)?), ..self })
+    /// The plan committing `slots` of its expert bank and `host_slots` of its
+    /// host tier at the load, its ceiling kept ([`ModelLoadPlan::with_load_slots`]).
+    pub fn with_load_slots(self, slots: u64, host_slots: u64) -> Result<Self, PlanError> {
+        Ok(Self { load: Box::new(self.load.with_load_slots(slots, host_slots)?), ..self })
     }
 
     pub fn device(&self) -> &PlannedDevice {
@@ -4054,7 +4054,7 @@ mod tests {
         let bank = streamed.load().expert_bank().expect("the streamed plan banks its experts").clone();
         // Each import's storage, admitted as device bytes.
         let import = |load: &ModelLoadPlan| ClaimDemand { device: load.target_weight_demand().unwrap().bytes(), ..ClaimDemand::default() };
-        let at = |slots: u64| Ok::<_, std::convert::Infallible>(import(&streamed.load().clone().with_load_slots(slots).unwrap()));
+        let at = |slots: u64| Ok::<_, std::convert::Infallible>(import(&streamed.load().clone().with_load_slots(slots, bank.host_slots).unwrap()));
         let (whole_bytes, floor_bytes) = (import(whole.load()).device, at(bank.floor()).unwrap().device);
         assert!(floor_bytes < whole_bytes, "the streamed floor imports {floor_bytes} bytes, the whole plan {whole_bytes}");
         // Another program holds all but midway between the two imports.
@@ -4113,7 +4113,7 @@ mod tests {
         let full_floor_bytes = full
             .load()
             .clone()
-            .with_load_slots(full_bank.floor())
+            .with_load_slots(full_bank.floor(), full_bank.host_slots)
             .unwrap();
         let full_floor_draft = ExecutionPlanDraft {
             load: Box::new(full_floor_bytes),
@@ -4124,7 +4124,7 @@ mod tests {
         let min_load = full.load().clone().banked_as(&definition, full_bank, round).unwrap();
         let min_floor_load = min_load
             .clone()
-            .with_load_slots(min_load.expert_bank().unwrap().floor())
+            .with_load_slots(min_load.expert_bank().unwrap().floor(), min_load.expert_bank().unwrap().host_slots)
             .unwrap();
         let min_floor_programs = min_floor_load
             .program_plan(&definition, full.policy().codec())

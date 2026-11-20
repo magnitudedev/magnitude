@@ -1123,7 +1123,7 @@ fn a_loads_bank_is_charged_once_to_the_pool() {
     let others = TOTAL - FLOOR - ABOVE - AVAILABLE;
     read(&ledger, &mut clock, TOTAL, TOTAL - others, None);
     let floor = ledger.change(|keeping| ledger.claim(&keeping.claims(), Need::BankFloor { bytes: FLOOR })).expect("the floor fits");
-    let bank = ledger.cache(CacheKind::Bank, ABOVE).expect("the slots above it fit");
+    let bank = ledger.cache(CacheKind::Bank, ABOVE, Reclaim::Deferred).expect("the slots above it fit");
     // The import allocates the blocks; the next reading shows them.
     ledger.change(|_| pool.take(&pool.change(), FLOOR + ABOVE, Pageable)).expect("the holdings hold the blocks' granules");
     read(&ledger, &mut clock, TOTAL, AVAILABLE, None);
@@ -1148,7 +1148,7 @@ fn the_banks_room_holds_no_spare_of_the_state_pool() {
     let others = TOTAL - FLOOR - ABOVE - STATE_SPARE - AVAILABLE;
     read(&ledger, &mut clock, TOTAL, TOTAL - others, None);
     let _floor = ledger.change(|keeping| ledger.claim(&keeping.claims(), Need::BankFloor { bytes: FLOOR })).expect("the floor fits");
-    let _bank = ledger.cache(CacheKind::Bank, ABOVE).expect("the slots above it fit");
+    let _bank = ledger.cache(CacheKind::Bank, ABOVE, Reclaim::Deferred).expect("the slots above it fit");
     ledger.change(|_| pools.records.take(&pools.records.change(), FLOOR + ABOVE, Pageable)).expect("the records pool holds the slots");
     ledger.change(|_| pools.state.take(&pools.state.change(), STATE_SPARE, Pageable)).expect("the state pool holds a spare block");
     read(&ledger, &mut clock, TOTAL, AVAILABLE, None);
@@ -1187,7 +1187,7 @@ fn a_claim_turns_cache_in_place_and_yields_before_the_bank() {
     read(&ledger, &mut clock, 64 * GB, 0, None);
     let before = ledger.estimate();
     let entries = ledger.entries().len();
-    let slots = class.into_cache(CacheKind::GraphSlots);
+    let slots = class.into_test_cache(CacheKind::GraphSlots);
     let after = ledger.estimate();
     assert_eq!(ledger.entries().len(), entries, "the same entry");
     assert_eq!((after.allocated(), after.free(), after.others()), (before.allocated(), before.free(), before.others()));
@@ -1196,31 +1196,35 @@ fn a_claim_turns_cache_in_place_and_yields_before_the_bank() {
     assert_eq!((slots.bytes(), bank.bytes()), (0, 59 * GB), "the idle slots yield first, then the bank");
 }
 
-/// A claim that takes cache in process allocates those bytes only as the
-/// pool frees the granules the bank let go of: until then they stay the process's
-/// allocation, releasing, so a reading counts them neither others' nor
-/// free, and what the process may allocate leaves them out.
+/// Deferred cache (no synchronous reclaimer) is never taken directly by
+/// admission: it must be shed through a relief plan and physically freed by
+/// its holder before a claim can admit or allocate those bytes. Until freed,
+/// the yielded bytes stay releasing so readings count them neither others'
+/// nor free.
 #[test]
 fn a_claim_allocates_taken_cache_only_as_its_holder_frees_it() {
     let (_scope, ledger, pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let _weights = commit(&ledger, 20 * GB);
-    let bank = ledger.cached(CacheKind::Bank, 40 * GB).expect("free room");
+    let bank = ledger.cached_with(CacheKind::Bank, 40 * GB, Reclaim::Deferred).expect("free room");
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
-    let taken = held(&ledger, 10 * GB).expect("cache yields to it");
+    assert!(held(&ledger, 10 * GB).is_err(), "deferred cache is not admitted without physical free");
+    let plan = ledger.plan_relief(6 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("bank covers 6 GB");
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 6 * GB);
     assert_eq!((bank.bytes(), bank.releasing()), (34 * GB, 0), "the bank yields 6 GB, the pool's still");
-    assert!(ledger.change(|_| taken.entry().take(&taken.entry().change(), 10 * GB, Pageable)).is_err(), "the taken bytes are allocated only once freed");
-    let held = ledger.estimate();
-    assert_eq!((held.allocated(), held.releasing(), held.allocatable()), (60 * GB, 6 * GB, 4 * GB), "only the free 4 GB are allocatable");
+    let held_est = ledger.estimate();
+    assert_eq!((held_est.allocated(), held_est.releasing(), held_est.allocatable()), (60 * GB, 6 * GB, 4 * GB), "only the free 4 GB are allocatable");
+    assert!(held(&ledger, 10 * GB).is_err(), "still unfreed: admission waits for physical free");
     // The bank has not freed them: the next reading counts them the process's.
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
     assert_eq!(ledger.estimate().others(), 0, "the yielded bytes read as the process's");
     ledger.change(|_| pool.freed(&pool.change(), 6 * GB, Pageable));
     let freed = ledger.estimate();
-    assert_eq!((freed.allocated(), freed.releasing(), freed.allocatable()), (54 * GB, 0, 10 * GB), "the claim allocates them once freed");
+    assert_eq!((freed.allocated(), freed.releasing(), freed.allocatable()), (54 * GB, 0, 10 * GB), "freed, all 10 GB are allocatable");
     read(&ledger, &mut clock, 64 * GB, 10 * GB, None);
     assert_eq!(ledger.estimate().others(), 0);
+    let taken = held(&ledger, 10 * GB).expect("freed, the claim is admitted");
     ledger.change(|_| taken.entry().take(&taken.entry().change(), 10 * GB, Pageable)).expect("freed, the claim allocates its bytes");
 }
 
@@ -1233,7 +1237,7 @@ fn a_shortages_yield_is_free_only_once_freed() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let _weights = commit(&ledger, 40 * GB);
-    let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("free room");
+    let bank = ledger.cached_with(CacheKind::Bank, 20 * GB, Reclaim::Deferred).expect("free room");
     assert_eq!(ledger.estimate().free(), 4 * GB);
     let plan = ledger.plan_relief(8 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the bank covers it");
     assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 8 * GB);
@@ -1273,8 +1277,9 @@ fn a_dropped_bank_leaves_spare_granules_until_the_pool_frees_them() {
     let (_scope, ledger, pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
-    let bank = ledger.cached(CacheKind::Bank, 64 * GB).expect("free room");
-    let _taken = held(&ledger, 8 * GB).expect("cache yields to it");
+    let bank = ledger.cached_with(CacheKind::Bank, 64 * GB, Reclaim::Deferred).expect("free room");
+    let plan = ledger.plan_relief(8 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the bank covers 8 GB");
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 8 * GB);
     drop(bank);
     let dropped = ledger.estimate();
     assert_eq!((dropped.allocated(), dropped.releasing(), dropped.cache_of(CacheKind::Spare)), (64 * GB, 8 * GB, 56 * GB));
@@ -1297,7 +1302,7 @@ fn a_backing_holds_its_bytes_and_the_pool_allocates_them() {
     ledger.change(|_| pool.take(&pool.change(), 3 * GB, Pageable)).expect("the backing holds the block's granules");
     assert_eq!((ledger.estimate().allocated(), ledger.estimate().free(), backing.allocated_bytes()), (3 * GB, 56 * GB, 0));
     ledger.change(|_| pool.take(&pool.change(), 2 * GB, Pageable)).expect("the backing holds the block's granules");
-    let cache = backing.into_backed_cache(CacheKind::Bank);
+    let cache = backing.into_backed_cache(CacheKind::Bank, Reclaim::Deferred);
     let snapshot = ledger.estimate();
     assert_eq!((cache.bytes(), snapshot.allocated(), snapshot.cache_of(CacheKind::Bank), snapshot.free()), (8 * GB, 5 * GB, 8 * GB, 56 * GB));
 }
@@ -1554,16 +1559,17 @@ fn a_change_keeps_cache_whole_or_not_at_all() {
     let (_scope, ledger, _pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
-    let weights = ledger.cached(CacheKind::Drafter, 4 * GB).expect("room");
+    let weights = ledger.cached_with(CacheKind::Drafter, 4 * GB, Reclaim::Deferred).expect("room");
     let active = ledger.change(|keeping| keeping.keep(vec![weights], CommittedKind::Component)).ok().expect("whole");
     assert_eq!((ledger.estimate().committed(), ledger.estimate().cache()), (4 * GB, 0));
-    let weights = active.into_iter().next().expect("one claim").into_cache(CacheKind::Drafter);
+    let weights = active.into_iter().next().expect("one claim").into_cache(CacheKind::Drafter, Reclaim::Deferred);
     weights.value(Value::per_byte(2.0, NonZeroU64::new(4 * GB).unwrap()));
-    let binding = ledger.cached(CacheKind::Drafter, GB).expect("room");
+    let binding = ledger.cached_with(CacheKind::Drafter, GB, Reclaim::Deferred).expect("room");
     let rest = ledger.cached(CacheKind::Bank, 59 * GB).expect("room");
     rest.value(Value::per_byte(1.0, NonZeroU64::new(59 * GB).unwrap()));
-    // The binding, worth least, yields first.
-    let _taken = held(&ledger, GB / 2).expect("cache yields");
+    // The binding, worth least, yields first to relief.
+    let plan = ledger.plan_relief(GB / 2, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("binding covers 0.5 GB");
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, GB / 2);
     let before = ledger.estimate();
     let kept = ledger.change(|keeping| keeping.keep(vec![weights, binding], CommittedKind::Component));
     let cached = kept.err().expect("the binding was taken in part");
@@ -1598,7 +1604,7 @@ fn one_charged_allocation_counts_once() {
     let (_scope, ledger, pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
-    let _bank = ledger.cache(CacheKind::Bank, 4 * GB).expect("room");
+    let _bank = ledger.cache(CacheKind::Bank, 4 * GB, Reclaim::Deferred).expect("room");
     let claim = held(&ledger, 2 * GB).expect("room");
     let recorded = ledger.estimate();
     assert_eq!((recorded.allocated(), recorded.cache() + recorded.committed()), (0, 6 * GB), "recorded, held, none allocated");
@@ -1947,4 +1953,124 @@ fn a_preempted_request_frees_its_whole_reservation_for_state_and_beside_the_slot
     let state = ledger.plan_relief(page, Relief::CacheAndRequests(&every), Frees::RequestState).expect("the third's page covers a growth");
     assert_eq!(state.preempt(), [RequestId(3)], "the slot's page it frees is a growth's");
     assert_eq!(ledger.plan_relief(page, Relief::CacheAndRequests(&every), Frees::Room), None, "it frees nothing beside the slot");
+}
+
+/// `Ledger::admit_or_reclaim` invokes a registered [`CacheReclaimer`] outside
+/// the ledger mutex so physical memory is freed (`allocatable >= bytes`)
+/// before `claim_at` or `backing(PoolClass::State)` hands out a [`Claim`] —
+/// and `entry_take` succeeds immediately against it.
+#[test]
+fn admit_or_reclaim_frees_bank_cache_before_handing_out_claim_and_backing() {
+    struct FakeBankReclaimer {
+        cached: Mutex<Option<Cached>>,
+        pool: Arc<dyn seismic::memory::Entry>,
+        calls: AtomicU64,
+    }
+    impl CacheReclaimer for FakeBankReclaimer {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut guard = self.cached.lock().unwrap();
+            let Some(cached) = guard.as_mut() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let has = cached.bytes();
+            let free = has.min(need);
+            if free == 0 {
+                return Err(ReclaimError::AtFloor);
+            }
+            if free == has {
+                drop(guard.take());
+            } else {
+                drop(cached.split(free, CacheKind::Bank));
+            }
+            self.pool.freed(&self.pool.change(), free, seismic::memory::Wiring::Pageable);
+            Ok(free)
+        }
+    }
+
+    let (_scope, ledger, pools) = host();
+    let records_pool = pools.records.clone();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 8 * GB, Some(64 * GB));
+
+    // Fill all 8 GB with Bank cache backed by the records pool and its reclaimer at creation.
+    let reclaimer = Arc::new(FakeBankReclaimer {
+        cached: Mutex::new(None),
+        pool: records_pool.clone(),
+        calls: AtomicU64::new(0),
+    });
+    let bank_cache = ledger
+        .cached_with(CacheKind::Bank, 8 * GB, Reclaim::Backed(Arc::downgrade(&reclaimer) as Weak<dyn CacheReclaimer>))
+        .expect("bank cache fits");
+    *reclaimer.cached.lock().unwrap() = Some(bank_cache);
+    assert_eq!(ledger.estimate().allocatable(), 0, "all 8 GB allocated in records pool");
+
+    // 1. Non-pooled claim (`claim_at`) synchronously reclaims 2 GB before handing out Claim.
+    let claim = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Component, 2 * GB))
+        .expect("claim_at reclaims bank cache");
+    assert!(reclaimer.calls.load(Ordering::Relaxed) >= 1, "reclaimer was invoked");
+    assert!(ledger.estimate().allocatable() >= 2 * GB, "allocatable >= bytes before entry_take");
+    claim.entry().take(&claim.entry().change(), 2 * GB, seismic::memory::Wiring::Pageable).expect("entry_take succeeds immediately");
+
+    // 2. Pooled state backing (`backing(PoolClass::State)`) synchronously reclaims bank cache.
+    let backing = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::State, 1 * GB))
+        .expect("backing(PoolClass::State) reclaims bank cache");
+    assert!(ledger.estimate().allocatable() >= 1 * GB, "state pool block is physically allocatable");
+    drop((claim, backing));
+}
+
+/// When a registered `CacheReclaimer` cannot free any more bytes (`AtFloor`),
+/// `admit_or_reclaim` terminates and returns `Err(Short)` rather than looping.
+#[test]
+fn admit_or_reclaim_returns_short_when_reclaimer_hits_floor() {
+    struct FloorReclaimer(AtomicU64);
+    impl CacheReclaimer for FloorReclaimer {
+        fn reclaim(&self, _need: u64) -> Result<u64, ReclaimError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(ReclaimError::AtFloor)
+        }
+    }
+
+    let (_scope, ledger, _pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 4 * GB, Some(64 * GB));
+    let reclaimer = Arc::new(FloorReclaimer(AtomicU64::new(0)));
+    let _bank_cache = ledger
+        .cached_with(CacheKind::Bank, 4 * GB, Reclaim::Backed(Arc::downgrade(&reclaimer) as Weak<dyn CacheReclaimer>))
+        .expect("bank cache fits");
+
+    // Asking for 5 GB exceeds total budget (4 GB) -> immediate Short without even calling reclaimer.
+    let short = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Component, 5 * GB));
+    assert!(short.is_err(), "shortfall past total room returns Err(Short)");
+    assert_eq!(reclaimer.0.load(Ordering::Relaxed), 0);
+
+    // Asking for 2 GB invokes the reclaimer once, sees AtFloor, and returns Err(Short).
+    let short_at_floor = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Component, 2 * GB));
+    assert!(short_at_floor.is_err(), "AtFloor returns Err(Short)");
+    assert_eq!(reclaimer.0.load(Ordering::Relaxed), 1);
+}
+
+/// A `CacheReclaimer` invariant violation panics immediately rather than
+/// logging a warning and continuing with an inconsistent ledger.
+#[test]
+#[should_panic(expected = "invariant violated: cache reclaim failed")]
+fn admit_or_reclaim_panics_on_reclaimer_invariant_violation() {
+    struct BrokenReclaimer;
+    impl CacheReclaimer for BrokenReclaimer {
+        fn reclaim(&self, _need: u64) -> Result<u64, ReclaimError> {
+            Err(ReclaimError::Invariant("synthetic device shrink failure".to_string()))
+        }
+    }
+
+    let (_scope, ledger, _pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 4 * GB, Some(64 * GB));
+    let reclaimer = Arc::new(BrokenReclaimer);
+    let _bank_cache = ledger
+        .cached_with(CacheKind::Bank, 4 * GB, Reclaim::Backed(Arc::downgrade(&reclaimer) as Weak<dyn CacheReclaimer>))
+        .expect("bank cache fits");
+
+    let _ = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Component, 2 * GB));
 }

@@ -1300,7 +1300,7 @@ pub(super) struct IdleClass(Vec<crate::memory::ledger::Cached>);
 impl IdleClass {
     /// Idle `claims`, a class's committed in place, as cache.
     pub(super) fn idle(&mut self, claims: impl IntoIterator<Item = crate::memory::ledger::Claim>) {
-        self.0.extend(claims.into_iter().map(|claim| claim.into_cache(crate::memory::ledger::CacheKind::GraphSlots)));
+        self.0.extend(claims.into_iter().map(|claim| claim.into_cache(crate::memory::ledger::CacheKind::GraphSlots, crate::memory::ledger::Reclaim::Deferred)));
     }
 
     /// Whether a claim took any of the slots' cache in process: they then
@@ -1442,7 +1442,11 @@ impl SlabCache {
         }
         // Refused where the room is held already, so not held twice.
         if bytes > held {
-            self.held.extend(ledger.cache(self.kind, bytes - held).ok());
+            let reclaim = match self.kind {
+                crate::memory::ledger::CacheKind::Spare => crate::memory::ledger::Reclaim::Unbacked,
+                _ => crate::memory::ledger::Reclaim::Deferred,
+            };
+            self.held.extend(ledger.cache(self.kind, bytes - held, reclaim).ok());
         }
         self.held.retain(|cached| cached.bytes() > 0);
         self.settled = self.held();
@@ -1511,7 +1515,7 @@ impl StateSlabs {
         let within = spare.min(room);
         self.unbacked = room - within;
         if let Some(pending) = self.pending.take() {
-            let cached = pending.into_backed_cache(crate::memory::ledger::CacheKind::Spare);
+            let cached = pending.into_backed_cache(crate::memory::ledger::CacheKind::Spare, crate::memory::ledger::Reclaim::Unbacked);
             self.spare.held.push(cached);
         }
         self.prefix.settle(ledger, prefix);

@@ -822,8 +822,50 @@ struct ImportedTarget {
     state_tables: Held,
     constants_claim: Held,
     request_slot: Claim,
+    drafter_reserve: Option<Held>,
     site_requests: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
     head_enabled: bool,
+    primes_drafter: bool,
+}
+
+/// Reserve the drafter's resident weights, binding constants, and priming
+/// boundary before `claim_target_import` sizes the expert bank.
+#[inline(never)]
+fn reserve_drafter(
+    startup: &mut Startup,
+    plan: &ResourcePlan,
+    programs: &AttestedPrograms,
+    manifest: &ExecutionManifest,
+    head_enabled: bool,
+    primes_drafter: bool,
+) -> Result<Option<Held>, LoadError> {
+    if !head_enabled {
+        return Ok(None);
+    }
+    let head_binding_constants = programs
+        .drafter_graphs()
+        .map_or(Ok(0), |graphs| graphs.binding_constant_bytes())
+        .map_err(internal)?;
+    let boundary_bytes = if primes_drafter {
+        let decoder = &manifest.definition.decoder;
+        manifest.definition.head.as_ref().map_or(
+            decoder.hidden * decoder.activation_dtype.bytes() as u64,
+            |head| head.conditioning_width(decoder) * if head.residual_conditioning() { 4 } else { decoder.activation_dtype.bytes() as u64 },
+        )
+    } else {
+        0
+    };
+    let drafter_device = plan
+        .bytes()
+        .head_weights
+        .checked_add(head_binding_constants)
+        .and_then(|bytes| bytes.checked_add(boundary_bytes))
+        .ok_or_else(|| internal("drafter reserve bytes overflow"))?;
+    Ok(Some(startup.claim_as(
+        "drafter reserve",
+        CommittedKind::Component,
+        ClaimDemand { device: drafter_device, ..ClaimDemand::default() },
+    )?))
 }
 
 /// The sealed load's resources allocated and every allocation after the
@@ -862,8 +904,10 @@ fn import_target(
         .state_graphs()
         .ok_or_else(|| internal("qualified program set has no state graphs"))?;
     // The device's store ledgers as the planned load sizes its state; every
-    // allocation from here is claimed on them.
+    // allocation from here is claimed on them from one post-sealing reading
+    // taken now (after `seal_graphs` dropped its workers and shapes).
     startup.ledgers = startup.ledgers.shaped(Arc::new(LoadShape::of(&execution_plan)));
+    startup.reading = startup.reader.settled_read(&startup.ledgers);
     let mut scratch = startup.claim_as(
         "graph scratch",
         CommittedKind::Arena,
@@ -924,19 +968,37 @@ fn import_target(
         CommittedKind::Arena,
         ClaimDemand { device: target_binding_constants, ..ClaimDemand::default() },
     )?;
+    // A drafter that keeps its own history is primed by the warm-up; a draft
+    // head reading the target's history keeps none to prime.
+    let primes_drafter = head_enabled
+        && !matches!(
+            manifest.model.method,
+            ResolvedMethod::Mtp {
+                history: HeadHistory::Target,
+                ..
+            }
+        );
+    // Reserve the peak upload window across target and (when enabled) head
+    // import, and the drafter's resident weights, binding constants, and
+    // priming boundary BEFORE `claim_target_import` sizes the expert bank.
+    let target_upload = execution_plan.load().target_upload_peak_bytes();
+    let head_upload = if head_enabled { execution_plan.load().head_upload_peak_bytes() } else { 0 };
+    let upload = target_upload.max(head_upload);
     let upload_window = startup.claim_as(
         "target import",
         CommittedKind::Upload,
-        execution_plan.load().target_upload_demand().map_err(internal)?,
+        ClaimDemand { device: upload, staged: upload, ..ClaimDemand::default() },
     )?;
+    let drafter_reserve = reserve_drafter(&mut startup, &plan, &programs, manifest, head_enabled, primes_drafter)?;
     // The target import holds the bank at its derived target now, beside
     // the allocations claimed and the speed guarantee, at most its planned
-    // slots; the bank grows toward its ceiling as it serves.
+    // slots (and host slots, down to 0 = landing reserve floor); the bank
+    // grows toward its ceiling as it serves.
     let (execution_plan, planned, mut weights) = match startup.claim_target_import(execution_plan.load())? {
         Imported::Planned(weights) => (execution_plan, planned, weights),
-        Imported::Fitted(slots, weights) => (
-            execution_plan.with_load_slots(slots).map_err(|error| internal(error.to_string()))?,
-            planned.with_load_slots(slots).map_err(|error| internal(error.to_string()))?,
+        Imported::Fitted(slots, host_slots, weights) => (
+            execution_plan.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
+            planned.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
             weights,
         ),
         // A plan holding its experts whole that the memory free now does
@@ -1031,8 +1093,10 @@ fn import_target(
         state_tables,
         constants_claim,
         request_slot,
+        drafter_reserve,
         site_requests,
         head_enabled,
+        primes_drafter,
     }))
 }
 
@@ -1083,8 +1147,10 @@ fn assemble_domain(
         mut state_tables,
         constants_claim,
         request_slot,
+        drafter_reserve,
         site_requests,
         head_enabled,
+        primes_drafter,
     } = imported;
     let mut phase_started = Instant::now();
     progress(LoadProgress::Finalizing);
@@ -1133,16 +1199,11 @@ fn assemble_domain(
     .map_err(|error| domain_refused(error, &startup.ledgers))?;
     report_load_phase("state and domain allocation", &mut phase_started);
     report_load_memory("domain allocated", &device);
-    // A drafter that keeps its own history is primed by the warm-up; a draft
-    // head reading the target's history keeps none to prime.
-    let primes_drafter = head_enabled
-        && !matches!(
-            manifest.model.method,
-            ResolvedMethod::Mtp {
-                history: HeadHistory::Target,
-                ..
-            }
-        );
+    // Release the pre-claimed drafter reserve into the ledger right before
+    // `warm_up` so `bind_component(Head)` claims those exact bytes cleanly.
+    if let Some(reserve) = drafter_reserve {
+        startup.ledgers.changes().change(|_| drop(reserve));
+    }
     // What the load is doing from its warm-up until it serves, in the
     // process's report on demand (`magnitude_executor::diagnostics`).
     let phase = magnitude_executor::diagnostics::Phase::new("load", "warm-up forward");
@@ -1932,9 +1993,9 @@ fn load_memory_record(moment: &str, device: &seismic::Device) -> serde_json::Val
 enum Imported {
     /// The import as planned, its weights claimed.
     Planned(Held),
-    /// The import with its expert bank at these slots, fewer than planned,
-    /// its weights claimed.
-    Fitted(u64, Held),
+    /// The import with its expert bank at `(slots, host_slots)`, fewer than
+    /// planned, its weights claimed.
+    Fitted(u64, u64, Held),
     /// Nothing: the plan holds its experts whole, and the memory free now
     /// does not hold them so (the refusal).
     Unheld(LoadError),
@@ -2008,34 +2069,50 @@ impl Startup {
     /// prices is what it claims.
     fn claim_target_import(&mut self, load: &ModelLoadPlan) -> Result<Imported, LoadError> {
         const PURPOSE: &str = "target import";
-        self.reading = self.reader.settled_read(&self.ledgers);
         let bank = load.expert_bank();
-        let demand = |slots: u64| -> Result<ClaimDemand, LoadError> {
+        let demand = |slots: u64, host_slots: u64| -> Result<ClaimDemand, LoadError> {
             match bank {
-                Some(_) => load.clone().with_load_slots(slots).map_err(|error| internal(error.to_string()))?.target_weight_demand(),
+                Some(_) => load
+                    .clone()
+                    .with_load_slots(slots, host_slots)
+                    .map_err(|error| internal(error.to_string()))?
+                    .target_weight_demand(),
                 None => load.target_weight_demand(),
             }
             .map_err(internal)
         };
-        let (floor, planned, most) = match bank {
-            None => (0, 0, 0),
+        let (floor, planned, most, planned_host, most_host) = match bank {
+            None => (0, 0, 0, 0, 0),
             Some(bank) => {
                 let device = self.reader.device();
                 let at_load = self.reading.room_after(&self.ledgers);
-                let most = magnitude_executor::import_slots(&at_load, &self.ledgers, device, bank, demand(bank.floor())?);
-                (bank.floor(), bank.slots, most)
+                let floor_demand = demand(bank.floor(), 0)?;
+                let most = magnitude_executor::import_slots(&at_load, &self.ledgers, device, bank, floor_demand);
+                let most_host = magnitude_executor::import_host_slots(&at_load, &self.ledgers, device, bank, floor_demand);
+                (bank.floor(), bank.slots, most, bank.host_slots, most_host)
             }
         };
         let device = self.reader.device();
-        let admitted = self.ledgers.changes().change(|keeping| self.ledgers.admit_most(&keeping.claims(), &self.reading, device, CommittedKind::Load, floor, most, demand))?;
+        let admitted = self.ledgers.changes().change(|keeping| {
+            self.ledgers.admit_most_pair(
+                &keeping.claims(),
+                &self.reading,
+                device,
+                CommittedKind::Load,
+                (floor, most),
+                (0, most_host),
+                demand,
+            )
+        })?;
         match admitted {
-            Ok((slots, held)) if slots == planned => Ok(Imported::Planned(held)),
-            Ok((slots, held)) => {
+            Ok((slots, host_slots, held)) if slots == planned && host_slots == planned_host => Ok(Imported::Planned(held)),
+            Ok((slots, host_slots, held)) => {
                 tracing::info!(
-                    "the target import holds {slots} of the expert bank's {planned} planned slots: \
+                    "the target import holds {slots} of the expert bank's {planned} planned slots \
+                     and {host_slots} of {planned_host} planned host slots: \
                      its derived target now, beside the allocations claimed before it and the speed guarantee",
                 );
-                Ok(Imported::Fitted(slots, held))
+                Ok(Imported::Fitted(slots, host_slots, held))
             }
             // Short of room for experts held whole: streamed, they may fit.
             Err(short) if bank.is_none() => Ok(Imported::Unheld(refused(PURPOSE, short))),

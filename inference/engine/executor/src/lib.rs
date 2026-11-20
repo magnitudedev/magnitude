@@ -78,7 +78,7 @@ mod resident_weights;
 mod resources;
 
 pub use completion::{Completed, Completion, CompletionWake};
-pub use experts::derived::import_slots;
+pub use experts::derived::{import_host_slots, import_slots};
 /// A process whose footprint a grant is credited by (`memory::ledger::Grant`).
 pub use seismic::ProcessId;
 pub use stored_table::{Prefetched, TableWaits};
