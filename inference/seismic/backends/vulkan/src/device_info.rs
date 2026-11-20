@@ -765,20 +765,10 @@ pub(crate) fn describe(
     unsafe { raw.get_physical_device_features2(physical, &mut features) };
     let core = features.features;
     let families = unsafe { raw.get_physical_device_queue_family_properties(physical) };
-    let compute_only = families.iter().position(|family| {
-        family.queue_flags.contains(vk::QueueFlags::COMPUTE)
-            && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-            && family.timestamp_valid_bits > 0
-    });
-    let universal = families.iter().position(|family| {
-        family.queue_flags.contains(vk::QueueFlags::COMPUTE) && family.timestamp_valid_bits > 0
-    });
-    let queue_family = compute_only.or(universal);
-    let transfer_only = families.iter().position(|family| {
-        family.queue_flags.contains(vk::QueueFlags::TRANSFER)
-            && !family.queue_flags.intersects(vk::QueueFlags::COMPUTE | vk::QueueFlags::GRAPHICS)
-    });
-    let side_family = transfer_only.or(queue_family.filter(|&family| families[family].queue_count > 1)).map(|family| family as u32);
+    let (queue_family, dedicated_compute_queue, side_family) = select_queue_families(
+        &families,
+        v12.driver_id == vk::DriverId::MESA_RADV,
+    );
 
     let memory = memory_layout(&unsafe { raw.get_physical_device_memory_properties(physical) });
     let device_type = match base.device_type {
@@ -845,7 +835,7 @@ pub(crate) fn describe(
                 .map_or(0, |family| families[family].timestamp_valid_bits),
         },
         queue_family: queue_family.map_or(0, |family| family as u32),
-        dedicated_compute_queue: compute_only.is_some(),
+        dedicated_compute_queue,
         queue_count: queue_family.map_or(0, |family| families[family].queue_count),
         side_family,
         pipeline_statistics: executables.pipeline_executable_info == vk::TRUE,
@@ -922,6 +912,47 @@ pub(crate) fn describe(
         info,
         floor,
     })
+}
+
+/// Select the primary compute queue family and optional side transfer/zeroing
+/// queue family.
+///
+/// Most devices prefer a dedicated compute-only family (avoiding contention
+/// with desktop graphics), falling back to a universal family. Under Mesa RADV
+/// (`prefer_universal_compute = true`), AMDGPU's MES async-compute rings
+/// (`comp_*`) suffer timeouts and GPUVM faults across RDNA3 hardware, while
+/// the universal family (`gfx_0.0.0`) runs compute on the same CUs at full
+/// throughput; the compute-only family (when distinct) is used as `side_family`
+/// for transfer/fill commands (`vkCmdCopyBuffer` / `vkCmdFillBuffer`).
+fn select_queue_families(
+    families: &[vk::QueueFamilyProperties],
+    prefer_universal_compute: bool,
+) -> (Option<usize>, bool, Option<u32>) {
+    let compute_only = families.iter().position(|family| {
+        family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+            && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            && family.timestamp_valid_bits > 0
+    });
+    let universal = families.iter().position(|family| {
+        family.queue_flags.contains(vk::QueueFlags::COMPUTE) && family.timestamp_valid_bits > 0
+    });
+    let queue_family = if prefer_universal_compute {
+        universal.or(compute_only)
+    } else {
+        compute_only.or(universal)
+    };
+    let dedicated_compute_queue = queue_family.is_some() && queue_family == compute_only;
+    let transfer_only = families.iter().position(|family| {
+        family.queue_flags.contains(vk::QueueFlags::TRANSFER)
+            && !family
+                .queue_flags
+                .intersects(vk::QueueFlags::COMPUTE | vk::QueueFlags::GRAPHICS)
+    });
+    let side_family = transfer_only
+        .or(compute_only.filter(|&family| Some(family) != queue_family))
+        .or(queue_family.filter(|&family| families[family].queue_count > 1))
+        .map(|family| family as u32);
+    (queue_family, dedicated_compute_queue, side_family)
 }
 
 /// The heaps and types of `properties`, in the driver's order.
@@ -1030,5 +1061,29 @@ mod tests {
         assert_eq!(allocation.host, vec![3, 1]);
         assert_eq!(allocation.staging, Some(3));
         assert_eq!(allocation.device_heaps, vec![0]);
+    }
+
+    #[test]
+    fn radv_uses_universal_compute_queue_and_compute_only_side_queue() {
+        let families = [
+            vk::QueueFamilyProperties::default()
+                .queue_flags(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER)
+                .queue_count(1)
+                .timestamp_valid_bits(64),
+            vk::QueueFamilyProperties::default()
+                .queue_flags(vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER)
+                .queue_count(4)
+                .timestamp_valid_bits(64),
+        ];
+        assert_eq!(
+            select_queue_families(&families, true),
+            (Some(0), false, Some(1)),
+            "Mesa RADV should use universal queue 0 for compute and compute-only family 1 as side queue"
+        );
+        assert_eq!(
+            select_queue_families(&families, false),
+            (Some(1), true, Some(1)),
+            "non-RADV drivers should keep preferring compute-only family 1"
+        );
     }
 }
