@@ -11,6 +11,7 @@
 use crate::domain::{BankHolding, BankResized};
 use crate::memory::ledger::{CacheKind, CacheReclaimer, Cached, Changes, Claim, DeviceLedgers, Reclaim, Value};
 use crate::planning::BankTier;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct BankCache {
@@ -25,6 +26,12 @@ pub(crate) struct BankCache {
     /// Synchronous reclaimers for each tier's bank cache entries, owned here
     /// (each holding only a weak reference to `ExpertBank`, so no cycle).
     reclaimers: Mutex<[Option<Arc<dyn CacheReclaimer>>; 2]>,
+    /// Whether the host tier's open backing was registered via [`Self::open_host`].
+    /// Tracked independently of `held`, because a 0-byte backing (when the first
+    /// host slots fit within the floor's landing reserve) is pruned immediately
+    /// on `hold`, and synchronous admission reclaim can shrink a host tier to
+    /// its floor before [`Self::served_on`] runs.
+    host_opened: AtomicBool,
     /// The changes of the ledgers' scope it holds its cache in, from the
     /// bank's open: every memory change of the bank, the load's own
     /// backing too, is one change with its record ([`Changes::change`]).
@@ -68,6 +75,7 @@ impl BankCache {
             growing: Mutex::default(),
             owed: Mutex::default(),
             reclaimers: Mutex::new([None, None]),
+            host_opened: AtomicBool::new(false),
             changes,
         }
     }
@@ -100,10 +108,15 @@ impl BankCache {
     /// reclaim it even while `back_host` is still running.
     ///
     /// # Panics
-    /// Where a host tier has no backing's claim, or a claim no host tier.
+    /// Where a host tier has no backing's claim, a claim has no host tier, or
+    /// the host tier's backing is opened more than once.
     pub(crate) fn open_host(&self, host_slots: u64, host: Option<Claim>) {
         match (host_slots > 0, host) {
             (true, Some(claim)) => {
+                assert!(
+                    !self.host_opened.swap(true, Ordering::AcqRel),
+                    "invariant violated: a host tier's backing opened twice"
+                );
                 let reclaim = self.reclaim_for(BankHolding::Host);
                 let cached = self.changes.back(|_| claim.into_backed_cache(CacheKind::Bank, reclaim));
                 self.hold(BankHolding::Host, cached);
@@ -115,18 +128,18 @@ impl BankCache {
     }
 
     /// The cache as a served bank takes it on `ledgers`: of the scope it
-    /// opened on, a host tier of `host_slots` holding its cache entry from
-    /// the open.
+    /// opened on, with its host tier's open backing registered if and only if
+    /// `host_slots > 0`.
     ///
     /// # Panics
     /// Where either does not hold.
     pub(crate) fn served_on(&self, ledgers: &DeviceLedgers, host_slots: u64) {
         assert!(Arc::ptr_eq(&self.changes, ledgers.changes()), "invariant violated: a bank served on ledgers of another scope than it opened on");
+        let host_opened = self.host_opened.load(Ordering::Acquire);
         if host_slots > 0 {
-            assert!(
-                self.held.lock().expect("bank cache").iter().any(|(holding, _)| *holding == BankHolding::Host),
-                "invariant violated: a host tier served without its backing's cache entry"
-            );
+            assert!(host_opened, "invariant violated: a host tier served without its backing opened");
+        } else {
+            assert!(!host_opened, "invariant violated: a bank without host slots served with a host backing opened");
         }
     }
 
@@ -542,5 +555,57 @@ mod tests {
         assert_eq!(cache.owed(holding, 0), 0);
         assert_eq!(cache.held.lock().unwrap().len(), 0, "owed prunes 0-byte entries");
         scope.changes().back(|_| drop(split_all));
+    }
+
+    /// A host tier whose first slots cost 0 bytes beyond its floor's landing
+    /// reserve opens with a 0-byte backing claim: `hold` prunes the 0-byte
+    /// cache entry, and `served_on` still succeeds because `open_host` ran.
+    #[test]
+    fn a_host_tier_with_zero_byte_backing_serves_cleanly() {
+        let scope = Ledgers::new();
+        let ledgers = device_ledgers(&scope);
+        let claim = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 0)).expect("zero bytes");
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        cache.open_host(4, Some(claim));
+        assert_eq!(cache.held.lock().unwrap().len(), 0, "0-byte host backing is not retained in held");
+        cache.served_on(&ledgers, 4);
+        assert_eq!(ledgers.host().estimate().cache_of(CacheKind::Bank), 0);
+    }
+
+    /// A host tier whose open backing is synchronously reclaimed down to floor
+    /// (0 bytes above floor) before `ServedBank::new` runs still serves cleanly.
+    #[test]
+    fn a_host_tier_reclaimed_to_floor_before_serving_serves_cleanly() {
+        let scope = Ledgers::new();
+        let ledgers = device_ledgers(&scope);
+        let claim = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * GB)).expect("room");
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        cache.open_host(4, Some(claim));
+        cache.fit(BankHolding::Host, 0);
+        assert_eq!(cache.held.lock().unwrap().len(), 0, "reclaim to floor empties held");
+        cache.served_on(&ledgers, 4);
+        assert_eq!(ledgers.host().estimate().cache_of(CacheKind::Bank), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "a host tier served without its backing opened")]
+    fn a_host_tier_served_without_opening_panics() {
+        let scope = Ledgers::new();
+        let ledgers = device_ledgers(&scope);
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        cache.open_host(0, None);
+        cache.served_on(&ledgers, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "a host tier's backing opened twice")]
+    fn a_host_tier_opened_twice_panics() {
+        let scope = Ledgers::new();
+        let ledgers = device_ledgers(&scope);
+        let first = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 0)).expect("zero bytes");
+        let second = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 0)).expect("zero bytes");
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        cache.open_host(4, Some(first));
+        cache.open_host(4, Some(second));
     }
 }
