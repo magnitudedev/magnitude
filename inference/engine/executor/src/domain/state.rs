@@ -471,12 +471,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// The state the stores' holders reference: the rows and banks some
-    /// sequence or checkpoint holds (`StateStore::referenced_bytes`).
-    fn referenced_state_bytes(&self) -> u64 {
-        self.target_store.referenced_bytes() + self.head_store.as_ref().map_or(0, |store| store.referenced_bytes())
-    }
-
     /// The state the stores commit: every history and bank slab they back,
     /// whether a holder references it or not.
     pub fn committed_state_bytes(&self) -> u64 {
@@ -875,10 +869,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.resources.releasing_slots()
     }
 
-    /// At a flight boundary: the idle graph slots' release, once the load's
-    /// release thread has ended it (`AllocatedResources::released_slots`);
-    /// none while it runs.
+    /// At a flight boundary: drain any settled owed blocks from the state
+    /// pools (so fenced granules from an earlier state shrink or rollback
+    /// vacate on the next boundary once their flight ends) and poll the idle
+    /// graph slots' release (`AllocatedResources::released_slots`).
     pub fn advance_slot_release(&mut self) -> Option<crate::resources::SlotsReleased> {
+        let changes = self.resources.ledgers().changes().clone();
+        for pool in std::iter::once(self.target_store.pool()).chain(self.head_store.as_ref().map(|store| store.pool())) {
+            if pool.owed() > 0 {
+                if let Err(error) = changes.change(|_| pool.return_freed(0)) {
+                    tracing::error!(%error, "state pool could not drain settled owed blocks");
+                }
+            }
+        }
         self.resources.released_slots()
     }
 
@@ -1356,8 +1359,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let changed = change(self, keeping);
             // The slabs alone: the stores' address tables are committed by
             // their own claim, never room the reservations' rows fill.
+            // Both `backed` and `referenced` are counted in pool slab granules
+            // so `written`, `prefix`, and `spare` share one unit.
             let backed = self.target_store.backed_slab_bytes() + self.head_store.as_ref().map_or(0, |store| store.backed_slab_bytes());
-            let referenced = self.referenced_state_bytes();
+            let referenced = self.target_store.referenced_slab_bytes() + self.head_store.as_ref().map_or(0, |store| store.referenced_slab_bytes());
             let ledger = self.resources.ledgers().device();
             let written = self
                 .state_claims

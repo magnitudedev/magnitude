@@ -1452,6 +1452,38 @@ impl StateStore {
             .sum()
     }
 
+    /// Bytes of the backed slabs that still hold at least one referenced
+    /// history row or claimed recurrent bank (including the zero seed slab,
+    /// matching [`Self::shrink`]), in pool granule units. Used by
+    /// `StateSlabs::settle` so `backed`, `referenced`, and `written` share
+    /// the same slab-granule unit.
+    pub fn referenced_slab_bytes(&self) -> u64 {
+        let backing = self.backing.borrow();
+        let history_slabs: u64 = self
+            .domains
+            .iter()
+            .zip(&backing.history)
+            .map(|(domain, history)| {
+                let arena = domain.arena.borrow();
+                history.slabs.backed().into_iter().filter(|&slab| !arena.empty_slab(slab)).count() as u64
+            })
+            .sum();
+        let recurrent_slabs: u64 = backing.recurrent.as_ref().map_or(0, |slabs| {
+            let occupied = self.banks.claimed();
+            let reserved = self.bank_capacity.storage_total().unwrap_or(usize::MAX);
+            slabs
+                .backed()
+                .into_iter()
+                .filter(|&slab| {
+                    let start = slab * self.bank_slab_banks;
+                    let end = (start + self.bank_slab_banks).min(reserved);
+                    (start..end).any(|bank| occupied.contains(&bank))
+                })
+                .count() as u64
+        });
+        (history_slabs + recurrent_slabs) * self.pool.granule()
+    }
+
     /// The state its holders reference: every row some history claims and
     /// every recurrent bank some holder claims (the model's seed bank
     /// apart), at their bytes.

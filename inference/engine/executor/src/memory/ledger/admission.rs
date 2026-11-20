@@ -207,14 +207,21 @@ impl State {
     /// equal worth, in [`CacheKind`]'s order, then the oldest first. What is
     /// left of `bytes` once that cache is gone.
     /// `to` is the holding taking them, none for a shortage: a pooled one
-    /// takes pooled cache's granules in place.
+    /// takes pooled cache's granules in place. Unreturned [`Holding::Pool`]
+    /// bytes never yield to a non-pooled or different-pool consumer here:
+    /// they can only be reclaimed synchronously via their [`CacheReclaimer`]
+    /// (`Pool::return_freed_sync`) so blocks physically drop to the driver
+    /// before any claim is minted.
     pub(super) fn give(&mut self, mut bytes: u64, of: impl Fn(CacheKind) -> bool, to: Option<Holding>) -> u64 {
+        let same_pool = |class: PoolClass| to.is_some_and(|to| to.pooled() && to.pool_class() == Some(class));
         let mut order: Vec<(Value, CacheKind, EntryId)> = self
             .held
             .iter()
             .filter_map(|(id, entry)| match entry.holding {
                 Holding::Cache(kind) if of(kind) && entry.bytes > 0 => Some((entry.value, kind, *id)),
-                Holding::Pool(_) if of(CacheKind::Spare) && entry.bytes > 0 => Some((entry.value, CacheKind::Spare, *id)),
+                Holding::Pool(class) if of(CacheKind::Spare) && entry.bytes > 0 && same_pool(class) => {
+                    Some((entry.value, CacheKind::Spare, *id))
+                }
                 _ => None,
             })
             .collect();
@@ -305,7 +312,13 @@ impl State {
                         let live = (!exhausted.contains(id)).then(|| weak.upgrade()).flatten()?;
                         CandidateReclaim::Backed(live)
                     }
-                    Some(Reclaim::Unbacked) => CandidateReclaim::Unbacked,
+                    Some(Reclaim::Unbacked) => {
+                        assert!(
+                            !matches!(entry.holding, Holding::Pool(_)),
+                            "invariant violated: Holding::Pool entry {id} cannot use Reclaim::Unbacked"
+                        );
+                        CandidateReclaim::Unbacked
+                    }
                     Some(Reclaim::Deferred) | None => return None,
                 };
                 Some(Candidate { value: entry.value, kind, id: *id, bytes, reclaim })

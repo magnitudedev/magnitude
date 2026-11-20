@@ -2074,3 +2074,56 @@ fn admit_or_reclaim_panics_on_reclaimer_invariant_violation() {
 
     let _ = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Component, 2 * GB));
 }
+
+/// Unreturned `Holding::Pool` spare bytes cannot mint a non-pooled `Claim`
+/// (via `claim_at`, `claim_units`, or `entry_take`) unless a registered
+/// `CacheReclaimer` physically returns the pool's blocks first.
+#[test]
+fn unreturned_pool_bytes_cannot_mint_claim_without_physical_return() {
+    use seismic::memory::Store as _;
+
+    struct FakePoolReclaimer {
+        pool: Arc<dyn seismic::memory::Entry>,
+        freed: AtomicU64,
+    }
+    impl CacheReclaimer for FakePoolReclaimer {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            self.pool.freed(&self.pool.change(), need, Pageable);
+            self.freed.fetch_add(need, Ordering::Relaxed);
+            Ok(need)
+        }
+    }
+
+    let (_scope, ledger, pool) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 8 * GB, Some(64 * GB));
+
+    // Allocate 8 GB of spare granules into the records pool (no reclaimer yet).
+    ledger.change(|_| pool.take(&pool.change(), 8 * GB, Pageable)).expect("pool block fits");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Spare), 8 * GB);
+    assert_eq!(ledger.estimate().allocatable(), 0);
+
+    // Without a live pool reclaimer, non-pooled claims and entry_take cannot
+    // take unreturned pool bytes.
+    let short = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::GroupClass, 2 * GB));
+    assert!(short.is_err(), "claim_at must refuse unreturned pool bytes without a reclaimer");
+    let (_, units) = ledger.change(|keeping| {
+        ledger.claim_units(&keeping.claims(), CommittedKind::GroupClass, NonZeroU64::new(2 * GB).unwrap(), 1)
+    });
+    assert_eq!(units, 0, "claim_units must yield 0 units from unreturned pool bytes");
+    let own = ledger.own();
+    assert!(
+        own.take(&own.change(), 2 * GB, Pageable).is_err(),
+        "entry_take must refuse unreturned pool bytes"
+    );
+
+    // Once a live pool reclaimer physically frees blocks, claims succeed.
+    let reclaimer = Arc::new(FakePoolReclaimer { pool: pool.clone(), freed: AtomicU64::new(0) });
+    ledger.register_pool_reclaimer(PoolClass::Records, reclaimer.clone());
+    let claim = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::GroupClass, 2 * GB))
+        .expect("reclaimer physically freed 2 GB");
+    assert_eq!(reclaimer.freed.load(Ordering::Relaxed), 2 * GB);
+    assert_eq!(ledger.estimate().allocatable(), 2 * GB);
+    drop(claim);
+}

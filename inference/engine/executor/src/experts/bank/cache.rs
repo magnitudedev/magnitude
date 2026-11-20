@@ -424,4 +424,30 @@ mod tests {
         assert_eq!((estimate.allocated(), estimate.cache_of(CacheKind::Bank), estimate.committed()), (3 * GB, 3 * GB, 0));
         assert!(!cache.growing(holding));
     }
+
+    /// A partial growth that backed fewer slots than planned holds no phantom
+    /// `CacheKind::Bank` bytes once settled and fitted to the slots actually
+    /// backed.
+    #[test]
+    fn partial_growth_fitted_holds_no_phantom_cache() {
+        let (scope, ledger, pool) = ledger();
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        let holding = BankHolding::Experts;
+        let claim = ledger
+            .change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 4 * GB))
+            .expect("room");
+        // Only 2 GB of the planned 4 GB were actually backed before refusal/stop.
+        ledger
+            .change(|_| {
+                let entry = &pool;
+                entry.take(&entry.change(), 2 * GB, seismic::memory::Wiring::Pageable)
+            })
+            .expect("pool backs 2 GB");
+        cache.grow(holding, claim);
+        cache.settle(&BankResized::Grown { holding, from: 10, to: 12, grown: 2 * GB, refused: None, times: times() });
+        cache.fit(holding, 2 * GB);
+        let estimate = ledger.estimate();
+        assert_eq!(estimate.cache_of(CacheKind::Bank), 2 * GB, "no phantom bank cache past backed slots");
+        assert_eq!(estimate.allocated(), 2 * GB);
+    }
 }

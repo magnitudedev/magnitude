@@ -147,7 +147,7 @@ impl ExpertBank {
                     Ok((store, lent, bytes))
                 })
                 .collect::<Result<Vec<_>, WeightImportError>>()?;
-            Ok(Arc::new(Stores::new(pool, groups)))
+            Ok(Arc::new(Stores::new(pool, plan.block(), groups)))
         };
         let LoadPools { records, host: host_pool, .. } = pools;
         let bank_pool = records.expect("invariant violated: a banked load opens its records pool");

@@ -408,6 +408,11 @@ impl Pool {
         self.0.state().granules.free_granules()
     }
 
+    /// Bytes freed for outside demand not yet returned to the OS or driver.
+    pub fn owed(&self) -> u64 {
+        self.0.state().granules.owed()
+    }
+
     /// Allocate one block, admitted by the pool's entry first: the pool's
     /// grow step, allocated outside the pool's lock. Refused
     /// (`ExecutionError::AllocationCapacity` where the entry refuses), nothing

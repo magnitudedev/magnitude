@@ -97,6 +97,11 @@ impl Pool {
         self.inner.free_granules()
     }
 
+    /// Bytes freed for outside demand not yet returned to the OS or driver.
+    pub fn owed(&self) -> u64 {
+        self.inner.owed()
+    }
+
     /// Allocate one block, admitted by the pool's entry first. Refused with
     /// the entry's capacity error, nothing changes.
     pub fn grow(&self) -> Result<(), TensorError> {

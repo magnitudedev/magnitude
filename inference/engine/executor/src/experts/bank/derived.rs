@@ -132,7 +132,7 @@ pub fn import_slots(
     plan: &crate::planning::ExpertBankPlan,
     floor: crate::memory::ClaimDemand,
 ) -> u64 {
-    let shape = BankShape::new(plan.granule(), plan.floor(), plan.ceiling, plan.slots);
+    let shape = BankShape::new(plan.block().held, plan.floor(), plan.ceiling, plan.slots);
     let charge = |slots| plan.resident_charge(slots).expect("invariant violated: a bank plan charges every size within its ceiling");
     let beside = ledgers.placed_in(device, floor, BankTier::Bank);
     import_target(at_load.of(BankTier::Bank), beside, &shape, &charge)
@@ -151,10 +151,10 @@ pub fn import_host_slots(
     if plan.host_slots == 0 {
         return 0;
     }
-    let Some(granule) = plan.host_granule() else {
+    if plan.host_granule().is_none() {
         return 0;
-    };
-    let shape = BankShape::new(granule, 0, plan.host_slots, plan.host_slots);
+    }
+    let shape = BankShape::new(plan.block().held, 0, plan.host_slots, plan.host_slots);
     let charge = |slots| plan.host_charge(slots).expect("invariant violated: a bank plan charges every host size within its ceiling");
     let beside = ledgers.placed_in(device, floor, BankTier::Host);
     import_target(at_load.of(BankTier::Host), beside, &shape, &charge)
