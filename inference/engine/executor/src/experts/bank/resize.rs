@@ -55,7 +55,7 @@ impl Stores {
 
     /// The records group `group` holds: its slabs, lent ones included.
     pub(super) fn present(&self, group: usize) -> u64 {
-        self.group(group).backed().len() as u64
+        self.group(group).backed_count() as u64
     }
 
     /// What the pool charges the records: whole blocks (`BlockSize::charge`)
@@ -76,27 +76,20 @@ impl Stores {
     }
 
     /// Claim records of group `group` until it holds `records`, each a
-    /// granule of the pool (`SlabTensor::add_slab`: a free one in process,
-    /// else the pool grows by a block its ledger entry admits), unwritten:
+    /// granule of the pool (`SlabTensor::add_slabs`: free ones in process,
+    /// else the pool grows by blocks its ledger entry admits), unwritten:
     /// claimed records join the watcher free (`Directory::grow` /
     /// `Directory::grow_host`) and are never published to the device until a
     /// promotion copy or file read writes every byte and completes. The
     /// records claimed, the lowest free first; on a refusal, none (those
-    /// claimed before it are freed, never having been read).
+    /// claimed before it are returned cleanly, never having been published).
     pub(super) fn claim_to(&self, group: usize, records: u64) -> Result<Vec<usize>, TensorError> {
         seismic::memory::assert_blocking_allocation_allowed("Stores::claim_to");
         let store = self.group(group);
-        let mut claimed = Vec::new();
-        while (store.backed().len() as u64) < records {
-            match store.add_slab(seismic::SlabFill::Unwritten) {
-                Ok(record) => claimed.push(record),
-                Err(refusal) => {
-                    Self::unclaim_in(store, group, &claimed);
-                    return Err(refusal);
-                }
-            }
-        }
-        Ok(claimed)
+        let have = store.backed_count() as u64;
+        let need = usize::try_from(records.saturating_sub(have))
+            .map_err(|_| TensorError::SlabLayout("requested records exceed host domain".into()))?;
+        store.add_slabs(need, seismic::SlabFill::Unwritten)
     }
 
     /// Free `claimed` of group `group`, which nothing read: a refusal

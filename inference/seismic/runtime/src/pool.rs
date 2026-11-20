@@ -241,6 +241,7 @@ impl Pool {
 
 struct PoolShared {
     device: Arc<DeviceInner>,
+    contract: Contract,
     blocks: PoolBlocks,
     entry: Arc<dyn Entry>,
     granule: u64,
@@ -365,6 +366,7 @@ impl Pool {
         let absent = blocks.allocate(granule, &absent, SlabFill::Zeroed)?;
         let shared = Arc::new(PoolShared {
             device: device.clone(),
+            contract,
             blocks: blocks.clone(),
             entry: entry.clone(),
             granule,
@@ -820,13 +822,13 @@ pub(crate) struct Slots {
     /// region in it, slot `s`'s `s` of the region's slab bytes after; empty
     /// for a store that lends none.
     lent_regions: Vec<(Arc<Allocation>, u64)>,
-    /// The table's generation: moves each time a slot is repointed
-    /// ([`Self::point`]), under the slab lock, with the slab it names.
+    /// The table's generation: moves each time slots are repointed
+    /// ([`Self::point_many`]), under the mutate lock, with the slabs they name.
     generation: AtomicU64,
-    /// Serializes mutations (`add_slab`, `free_slab`, `adopt`) so `slabs`
-    /// stays a leaf lock for `region_view` / `backed` / `reach` and is never
-    /// held across `granules.grow()`, `moves::submit()`, or `slots.point()`
-    /// during `add_slab` / `free_slab`.
+    /// Serializes mutations (`add_slabs`, `free_slab`, `adopt`) so `slabs`
+    /// stays a leaf lock for `region_view` / `backed` / `backed_count` / `reach`
+    /// and is never held across `granules.grow()`, `moves::submit()`, or
+    /// `slots.point_many()` during `add_slabs` / `free_slab`.
     mutate: Mutex<()>,
     slabs: Mutex<Vec<Option<Slab>>>,
     /// The device work that last wrote the table ([`Self::adopt`]), while
@@ -875,12 +877,13 @@ impl Slots {
         self.capacity
     }
 
-    /// A table of `regions × capacity` entries in `access`, through
-    /// `charges`: record-table storage, aligned to its entry, as every
-    /// reader of an entry (a native kernel's, [`Self::point`]'s atomic
+    /// A table of `regions × capacity` entries in `access`, of `contract`
+    /// through `charges`: record-table storage, aligned to its entry, as every
+    /// reader of an entry (a native kernel's, [`Self::point_many`]'s atomic
     /// store) reads it whole.
     fn allocate_table(
         charges: &Charges,
+        contract: Contract,
         regions: usize,
         capacity: usize,
         access: Option<Arc<AccessGroup>>,
@@ -889,7 +892,7 @@ impl Slots {
             .checked_mul(capacity as u64)
             .and_then(seismic_lang::registry::record_table_bytes)
             .ok_or_else(|| TensorError::SlabLayout("a slab table's bytes overflow".into()))?;
-        Ok(charges.allocate_in(bytes, seismic_lang::registry::RECORD_TABLE_ENTRY_BYTES, access)?)
+        Ok(charges.allocate_contract(contract, bytes, seismic_lang::registry::RECORD_TABLE_ENTRY_BYTES, access)?)
     }
 
     /// Where entry `(region, slot)` lies in the table, in bytes.
@@ -924,38 +927,50 @@ impl Slots {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// Point `slot`'s entries, region by region, at `addresses`: one 8-byte
-    /// store each, which device work in flight reads whole, old or new, and
-    /// which never waits for device work. A host store where the host
-    /// addresses the table and no device write of it may still run
-    /// ([`Self::adopt`]), which the host store could land before; else
-    /// ordered words (`native::moves`), after the work submitted before and
-    /// before the work submitted after. Never a host write through staging
-    /// (`Storage::write` of storage the host does not address): on a backend
-    /// whose staging copy is a submission to the device's one queue
-    /// (Vulkan), the host would wait behind every flight in flight, and
-    /// behind a flight parked on a gate, for the gate, which the writing
-    /// thread may be the one to answer. The caller holds the slab lock and
-    /// changes the slot's slab under it, so the generation moves with the
-    /// change.
-    fn point(&self, slot: usize, addresses: impl Iterator<Item = u64>) -> Result<(), ExecutionError> {
+    /// Point each `(slot, base_address)` pair's entries, region by region, at
+    /// `base_address + self.offsets[region]`: one 8-byte store each, which
+    /// device work in flight reads whole, old or new, and which never waits for
+    /// device work. A host store where the host addresses the table and no
+    /// device write of it may still run ([`Self::adopt`]), which the host store
+    /// could land before; else one batched submission of ordered words
+    /// (`native::moves`), after the work submitted before and before the work
+    /// submitted after. Never a host write through staging (`Storage::write` of
+    /// storage the host does not address): on a backend whose staging copy is a
+    /// submission to the device's one queue (Vulkan), the host would wait
+    /// behind every flight in flight, and behind a flight parked on a gate, for
+    /// the gate, which the writing thread may be the one to answer.
+    fn point_many(&self, updates: &[(usize, u64)]) -> Result<(), ExecutionError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
         self.generation.fetch_add(1, Ordering::AcqRel);
         let mut repointed = self.repointed();
         let pending = repointed.as_ref().is_some_and(|written| matches!(written.completed(), Ok(false)));
         match self.table.storage().host_address().filter(|_| !pending) {
             Some(base) => {
-                for (region, address) in addresses.enumerate() {
-                    let offset = self.entry(region, slot);
-                    // SAFETY: an 8-byte-aligned entry inside the table,
-                    // which lives as `self` does; device work only reads it.
-                    unsafe { AtomicU64::from_ptr(base.as_ptr().add(offset as usize).cast()).store(address, Ordering::Release) }
+                for &(slot, base_address) in updates {
+                    for (region, &region_offset) in self.offsets.iter().enumerate() {
+                        let offset = self.entry(region, slot);
+                        // SAFETY: an 8-byte-aligned entry inside the table,
+                        // which lives as `self` does; device work only reads it.
+                        unsafe {
+                            AtomicU64::from_ptr(base.as_ptr().add(offset as usize).cast())
+                                .store(base_address + region_offset, Ordering::Release);
+                        }
+                    }
                 }
             }
             None => {
-                let words = addresses
-                    .enumerate()
-                    .map(|(region, value)| MoveStep::Word { destination: &self.table, offset: self.entry(region, slot), value })
-                    .collect::<Vec<_>>();
+                let mut words = Vec::with_capacity(updates.len() * self.offsets.len());
+                for &(slot, base_address) in updates {
+                    for (region, &region_offset) in self.offsets.iter().enumerate() {
+                        words.push(MoveStep::Word {
+                            destination: &self.table,
+                            offset: self.entry(region, slot),
+                            value: base_address + region_offset,
+                        });
+                    }
+                }
                 *repointed = moves::submit(&self.device, &self.table, &words)?;
             }
         }
@@ -1118,7 +1133,7 @@ impl Slots {
         let device = charges.device();
         let id = crate::driver::fresh_allocation_identity();
         let capacity = images.len();
-        let table = Self::allocate_table(charges, 1, capacity, None)?;
+        let table = Self::allocate_table(charges, Contract::DeviceOnly, 1, capacity, None)?;
         let slabs = images
             .iter()
             .enumerate()
@@ -1283,7 +1298,21 @@ impl SlabStore {
                 geometry.slab_bytes, shared.granule
             )));
         }
-        let table = Slots::allocate_table(charges, geometry.regions.len(), capacity, Some(shared.absent.allocation.access_group().clone()))?;
+        let table_contract = if shared.absent.allocation.storage().host_address().is_some()
+            && charges.entry(shared.contract).is_some()
+            && charges.of(shared.contract, 0).is_ok()
+        {
+            shared.contract
+        } else {
+            Contract::DeviceOnly
+        };
+        let table = Slots::allocate_table(
+            charges,
+            table_contract,
+            geometry.regions.len(),
+            capacity,
+            Some(shared.absent.allocation.access_group().clone()),
+        )?;
         let offsets = geometry.regions.iter().map(|(_, _, offset)| *offset).collect::<Vec<_>>();
         let absent = device.allocation_address(&shared.absent.allocation, 0);
         let slots = Arc::new(Slots {
@@ -1333,6 +1362,11 @@ impl SlabStore {
     /// The backed slots, in order.
     pub fn backed(&self) -> Vec<usize> {
         self.slots.slabs().iter().enumerate().filter_map(|(slot, slab)| slab.as_ref().map(|_| slot)).collect()
+    }
+
+    /// The number of backed slots, without allocating.
+    pub fn backed_count(&self) -> usize {
+        self.slots.slabs().iter().filter(|slab| slab.is_some()).count()
     }
 
     /// Region `region`'s table: `[capacity, 2]` u32, one 64-bit address an
@@ -1393,67 +1427,117 @@ impl SlabStore {
     /// entry (refused with its capacity error only where the entry refuses
     /// the block), its bytes as `fill` says. Never waits on device work.
     pub fn add_slab(&self, fill: SlabFill) -> Result<usize, TensorError> {
+        self.add_slabs(1, fill).map(|slots| slots[0])
+    }
+
+    /// Back the `count` lowest free slots with granules of the pool in one
+    /// batch, growing the pool outside locks as needed (admitted by its entry),
+    /// with bytes as `fill` says. Zeroing of non-fresh device granules and
+    /// table repointing are batched into a single submission. On refusal (too
+    /// few free slots, or pool growth/submission failure), no slot is backed
+    /// and any already-claimed granules are returned cleanly. Never waits on
+    /// device work.
+    pub fn add_slabs(&self, count: usize, fill: SlabFill) -> Result<Vec<usize>, TensorError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let slots = &self.slots;
         let pool = slots.pool.as_ref().expect("a store that adds slabs is a pool's");
         // Serialize mutations under `mutate` while keeping `slabs` a leaf lock:
         // `region_view` (called by request service to answer parked GPU kernels)
         // only acquires `slabs`, so it never blocks behind `pool.grow_once()`,
-        // `moves::submit()`, or `slots.point()` (which may wait on
+        // `moves::submit()`, or `slots.point_many()` (which may wait on
         // `device.native.order` or CUDA driver allocation).
         let _mutate = slots.mutate();
-        let slot = slots
-            .slabs()
-            .iter()
-            .position(Option::is_none)
-            .ok_or_else(|| TensorError::SlabLayout("all slab slots are backed".into()))?;
-        let holder = Holder { store: slots.id, slot };
-        let (Claimed { granule, address, zero: fresh }, block) = loop {
-            let taken = {
-                let mut state = pool.state();
-                state.granules.take(holder).map(|claimed| {
-                    let block = state.granules.block(claimed.granule.block).allocation.clone();
-                    (claimed, block)
-                })
-            };
-            if let Some(pair) = taken {
-                break pair;
-            }
-            // Neither `slots.slabs()` nor `pool.state()` is held while growing,
-            // so no driver call runs under a lock. Growth is single-flight
-            // through `PoolShared::grow_once`: concurrent callers wait for the
-            // active growth to install and then re-check for a free granule
-            // rather than over-admitting a second block.
-            pool.grow_once(fill).map_err(TensorError::Execution)?;
+        let free_slots: Vec<usize> = {
+            let slabs = slots.slabs();
+            slabs
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, slab)| slab.is_none().then_some(slot))
+                .take(count)
+                .collect()
         };
-        // Its granule goes back free should the slab not form.
-        let hold = Arc::new(SlabHold { store: slots.id, slot, granule: Some(GranuleHold { pool: pool.clone(), granule }) });
-        let base = u64::from(granule.index) * pool.granule;
-        if fill == SlabFill::Zeroed && !fresh {
-            // No work in flight reads the granule: its last reader ended. The
-            // host zeroes storage it addresses; else the pool's absent
-            // granule, zero, is copied over it in device order, before any
-            // work that reads it, never a waited staging write (`point`).
-            match block.storage().host_address() {
-                Some(_) => crate::driver::write_zeros(block.storage(), base, slots.slab_bytes)?,
-                None => drop(moves::submit(
-                    &slots.device,
-                    &slots.table,
-                    &[MoveStep::Copy {
-                        source: &pool.absent.allocation,
-                        source_offset: 0,
-                        destination: &block,
-                        destination_offset: base,
-                        bytes: slots.slab_bytes,
-                    }],
-                )?),
+        if free_slots.len() < count {
+            return Err(TensorError::SlabLayout("all slab slots are backed".into()));
+        }
+        struct ClaimedSlab {
+            slot: usize,
+            address: u64,
+            base: u64,
+            fresh: bool,
+            block: Arc<Allocation>,
+            hold: Arc<SlabHold>,
+        }
+        // Any already-claimed granules drop their `SlabHold` -> `GranuleHold`
+        // if a subsequent grow, zero, or repoint fails, returning them cleanly.
+        let mut claimed = Vec::with_capacity(count);
+        let mut next = 0;
+        while next < free_slots.len() {
+            {
+                let mut state = pool.state();
+                while next < free_slots.len() {
+                    let slot = free_slots[next];
+                    let holder = Holder { store: slots.id, slot };
+                    let Some(Claimed { granule, address, zero: fresh }) = state.granules.take(holder) else {
+                        break;
+                    };
+                    let block = state.granules.block(granule.block).allocation.clone();
+                    let hold = Arc::new(SlabHold {
+                        store: slots.id,
+                        slot,
+                        granule: Some(GranuleHold { pool: pool.clone(), granule }),
+                    });
+                    let base = u64::from(granule.index) * pool.granule;
+                    claimed.push(ClaimedSlab { slot, address, base, fresh, block, hold });
+                    next += 1;
+                }
+            }
+            if next < free_slots.len() {
+                // Neither `slots.slabs()` nor `pool.state()` is held while growing,
+                // so no driver call runs under a lock. Growth is single-flight
+                // through `PoolShared::grow_once`: concurrent callers wait for the
+                // active growth to install and then re-check for a free granule
+                // rather than over-admitting a second block.
+                pool.grow_once(fill).map_err(TensorError::Execution)?;
             }
         }
-        slots.point(slot, slots.offsets.iter().map(|offset| address + offset))?;
-        slots.slabs()[slot] = Some(Slab {
-            regions: slots.offsets.iter().map(|offset| (block.clone(), base + offset)).collect(),
-            hold,
-        });
-        Ok(slot)
+        if fill == SlabFill::Zeroed {
+            // No work in flight reads a claimed granule: its last reader ended.
+            // The host zeroes storage it addresses; else the pool's absent
+            // granule, zero, is copied over all non-fresh granules in one
+            // batched submission, never a waited staging write.
+            let mut copies = Vec::new();
+            for item in &claimed {
+                if !item.fresh {
+                    match item.block.storage().host_address() {
+                        Some(_) => crate::driver::write_zeros(item.block.storage(), item.base, slots.slab_bytes)?,
+                        None => copies.push(MoveStep::Copy {
+                            source: &pool.absent.allocation,
+                            source_offset: 0,
+                            destination: &item.block,
+                            destination_offset: item.base,
+                            bytes: slots.slab_bytes,
+                        }),
+                    }
+                }
+            }
+            if !copies.is_empty() {
+                drop(moves::submit(&slots.device, &slots.table, &copies)?);
+            }
+        }
+        let updates: Vec<(usize, u64)> = claimed.iter().map(|item| (item.slot, item.address)).collect();
+        slots.point_many(&updates)?;
+        {
+            let mut slabs = slots.slabs();
+            for item in claimed {
+                slabs[item.slot] = Some(Slab {
+                    regions: slots.offsets.iter().map(|offset| (item.block.clone(), item.base + offset)).collect(),
+                    hold: item.hold,
+                });
+            }
+        }
+        Ok(free_slots)
     }
 
     /// Free slot `slot`: its entries name the absent slab from now, and its
@@ -1471,7 +1555,7 @@ impl SlabStore {
         if !present {
             return Ok(false);
         }
-        slots.point(slot, slots.offsets.iter().map(|offset| slots.absent + offset))?;
+        slots.point_many(&[(slot, slots.absent)])?;
         let slab = slots.slabs()[slot].take();
         drop(slab);
         Ok(true)
@@ -1737,5 +1821,104 @@ mod tests {
         assert!(woken.load(Ordering::Acquire), "waker fired once releasing cleared");
         assert!(!pool.releasing(), "pool is no longer releasing once block dropped");
         assert_eq!(tally.held(), absent + block, "block 1 physically dropped to the tally");
+    }
+
+    /// `add_slabs` backs the lowest free slots in a single batch (crossing
+    /// block boundaries and reusing freed gaps), zeroes recycled granules when
+    /// asked, updates the table entries for every region, and keeps
+    /// `backed_count` in lockstep with `backed().len()`.
+    #[test]
+    fn add_slabs_batches_lowest_free_slots_and_tracks_backed_count() {
+        let catalog = crate::devices::Devices::discover(&[]).unwrap();
+        let id = catalog.resolve(seismic_topology::ExecutorSelector::HostCpu).unwrap();
+        let device = catalog.open(id).unwrap();
+        let topology = catalog.topology();
+        let store = topology.first_store(topology.executor(id).unwrap(), Contract::DeviceOnly).unwrap();
+        let tally = crate::memory::Tally::unbounded(topology.store_identity(store).unwrap());
+        let (granule, block) = (1 << 16, 1 << 18); // 4 granules per block
+        let charges = PoolCharges::one(&Charges::in_store(&device, Contract::DeviceOnly, Arc::new(tally.clone())));
+        let pool = Pool::open(&charges, Contract::DeviceOnly, granule, block).unwrap();
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let geometry = SlabGeometry {
+            rows_per_slab: 4,
+            logical_rows: 32,
+            capacity: 8,
+            slab_bytes: 2 * BLOCK_ALIGNMENT,
+            slab_alignment: BLOCK_ALIGNMENT,
+            regions: vec![(i32s, vec![2], 0), (i32s, vec![2], BLOCK_ALIGNMENT)],
+        };
+        let slabs = SlabStore::in_pool(&crate::memory::Charges::tally(&device), &pool, geometry, &[]).unwrap();
+        assert_eq!(slabs.backed_count(), 0);
+        assert!(slabs.add_slabs(0, SlabFill::Unwritten).unwrap().is_empty());
+        assert_eq!(slabs.backed_count(), 0);
+
+        // Claim 6 slabs across 2 blocks in one batch.
+        let added = slabs.add_slabs(6, SlabFill::Zeroed).unwrap();
+        assert_eq!(added, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(slabs.backed_count(), 6);
+        assert_eq!(slabs.backed(), vec![0, 1, 2, 3, 4, 5]);
+
+        // Dirty slots 1 and 4, then free them and reclaim with SlabFill::Zeroed.
+        let dirty = vec![0x5au8; 32];
+        for slot in [1, 4] {
+            slabs.slab_region(slot, 0).unwrap().unwrap().write_from_host(&dirty).unwrap();
+            assert!(slabs.free_slab(slot).unwrap());
+        }
+        assert_eq!(slabs.backed_count(), 4);
+
+        let refilled = slabs.add_slabs(3, SlabFill::Zeroed).unwrap();
+        assert_eq!(refilled, vec![1, 4, 6]);
+        assert_eq!(slabs.backed_count(), 7);
+        for &slot in &refilled {
+            let bytes = slabs.slab_region(slot, 0).unwrap().unwrap().read_to_host().unwrap();
+            assert!(bytes.iter().all(|&b| b == 0), "recycled slot {slot} is zeroed");
+        }
+        // Requesting more than remaining capacity fails without modifying state.
+        assert!(slabs.add_slabs(2, SlabFill::Unwritten).is_err());
+        assert_eq!(slabs.backed_count(), 7);
+    }
+
+    /// When a pool growth is refused partway through `add_slabs`, no slot is
+    /// backed and every granule already claimed for the batch is returned to
+    /// the pool without leaking.
+    #[test]
+    fn add_slabs_rolls_back_claimed_granules_on_refusal() {
+        let catalog = crate::devices::Devices::discover(&[]).unwrap();
+        let id = catalog.resolve(seismic_topology::ExecutorSelector::HostCpu).unwrap();
+        let device = catalog.open(id).unwrap();
+        let topology = catalog.topology();
+        let store = topology.first_store(topology.executor(id).unwrap(), Contract::DeviceOnly).unwrap();
+        let (granule, block) = (1 << 16, 1 << 18); // 4 granules per block
+        let tally = crate::memory::Tally::unbounded(topology.store_identity(store).unwrap());
+        let charges = PoolCharges::one(&Charges::in_store(&device, Contract::DeviceOnly, Arc::new(tally.clone())));
+        let pool = Pool::open(&charges, Contract::DeviceOnly, granule, block).unwrap();
+        let absent = tally.held();
+        // Allow exactly one block beyond the absent granule (4 granules total).
+        tally.bound(absent + block);
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let geometry = SlabGeometry {
+            rows_per_slab: 4,
+            logical_rows: 32,
+            capacity: 8,
+            slab_bytes: BLOCK_ALIGNMENT,
+            slab_alignment: BLOCK_ALIGNMENT,
+            regions: vec![(i32s, vec![2], 0)],
+        };
+        let slabs = SlabStore::in_pool(&crate::memory::Charges::tally(&device), &pool, geometry, &[]).unwrap();
+        // Claim 2 slabs (2 granules remain free in block 0).
+        assert_eq!(slabs.add_slabs(2, SlabFill::Unwritten).unwrap(), vec![0, 1]);
+        assert_eq!(slabs.backed_count(), 2);
+        assert_eq!(pool.free_granules(), 2);
+
+        // Requesting 4 more needs a second block, which the tally refuses.
+        assert!(slabs.add_slabs(4, SlabFill::Unwritten).is_err());
+        assert_eq!(slabs.backed_count(), 2, "no slot backed on refusal");
+        assert_eq!(slabs.backed(), vec![0, 1]);
+        assert_eq!(pool.free_granules(), 2, "already-claimed granules returned cleanly");
+
+        // The 2 remaining granules are still claimable.
+        assert_eq!(slabs.add_slabs(2, SlabFill::Unwritten).unwrap(), vec![2, 3]);
+        assert_eq!(slabs.backed_count(), 4);
+        assert_eq!(pool.free_granules(), 0);
     }
 }

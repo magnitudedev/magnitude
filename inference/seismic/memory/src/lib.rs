@@ -138,9 +138,8 @@ unsafe impl Sync for HostBlock {}
 
 /// The host's large page (Linux's transparent huge page, its PMD size),
 /// decided once: none where the kernel has no transparent huge pages or
-/// cannot collapse a range into them on demand (`MADV_COLLAPSE`, Linux
-/// 6.1), whose backing would be left to its fault-time policy alone. A
-/// probe that could not run is the error, decided again at the next call.
+/// refuses `MADV_HUGEPAGE`. A probe that could not run is the error, decided
+/// again at the next call.
 fn large_page() -> Result<Option<usize>, AllocationFailure> {
     static LARGE: OnceLock<Option<usize>> = OnceLock::new();
     if let Some(&large) = LARGE.get() {
@@ -231,13 +230,14 @@ impl HostBlock {
         let mut block = Self { base, bytes, large: None };
         #[cfg(target_os = "linux")]
         if large_page.is_some() {
-            // Faulted in large pages where the kernel has them; collapsing
-            // then makes what faulted small large.
+            // Faulted in large pages opportunistically when free, falling back
+            // to host pages immediately when fragmented instead of stalling in
+            // synchronous kernel compaction.
             unsafe { host::prefer_large(base.as_ptr(), bytes)? };
         }
         fault_in(base, bytes, page);
         if let Some(large_page) = large_page {
-            let large = host::collapse(base.as_ptr(), bytes, large_page);
+            let large = host::count_large_pages(base.as_ptr(), bytes, large_page);
             let backing = LargeBacking { page: large_page, large, small: bytes / large_page - large };
             LARGE_BYTES.fetch_add((backing.large * backing.page) as u64, Ordering::Relaxed);
             SMALL_BYTES.fetch_add((backing.small * backing.page) as u64, Ordering::Relaxed);
@@ -363,7 +363,7 @@ fn fault_in(start: NonNull<u8>, bytes: usize, page: usize) {
     });
 }
 
-/// Minimum bytes per thread when faulting or collapsing a block in parallel:
+/// Minimum bytes per thread when faulting a block in parallel:
 /// blocks under twice this size (4 MiB) run inline on the calling thread with
 /// zero thread-spawn overhead, and larger blocks scale at most one thread per
 /// 2 MiB up to `seismic_threads::share()`.
@@ -432,26 +432,20 @@ mod host {
     }
 
     /// The large page transparent huge pages back memory in ([`thp_size`]),
-    /// where the kernel collapses a range into them on demand: probed on a
-    /// block of its own. None where the kernel refuses the range large
-    /// pages (`MADV_HUGEPAGE`: `EINVAL` from a kernel without transparent
-    /// huge pages, or a filter refusing the call) or has no `MADV_COLLAPSE`
-    /// (`EINVAL`, whatever the range); any other refusal of the collapse
-    /// (want of memory now) is still a kernel that collapses.
+    /// where the kernel accepts `MADV_HUGEPAGE`: probed on a block of its
+    /// own. None where the kernel refuses the range large pages (`EINVAL`
+    /// from a kernel without transparent huge pages, or a filter refusing
+    /// the call).
     #[cfg(target_os = "linux")]
     pub(super) fn large_page() -> Result<Option<usize>, AllocationFailure> {
         let large = thp_size(std::fs::read_to_string(THP_SIZE), page()?);
         let base = map(large, large)?;
-        let collapses = unsafe {
-            let collapses = prefer_large(base.as_ptr(), large).is_ok() && {
-                std::ptr::write_volatile(base.as_ptr(), 0);
-                libc::madvise(base.as_ptr().cast(), large, libc::MADV_COLLAPSE) == 0
-                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
-            };
+        let supported = unsafe {
+            let supported = prefer_large(base.as_ptr(), large).is_ok();
             unmap(base, large);
-            collapses
+            supported
         };
-        Ok(collapses.then_some(large))
+        Ok(supported.then_some(large))
     }
     #[cfg(not(target_os = "linux"))]
     pub(super) fn large_page() -> Result<Option<usize>, AllocationFailure> {
@@ -490,8 +484,7 @@ mod host {
     }
 
     /// Have the mapped `[start, start + bytes)`, whole large pages, fault
-    /// in them where the kernel has them ([`collapse`] then makes what
-    /// faulted small large).
+    /// in them where the kernel has them (`MADV_HUGEPAGE`).
     #[cfg(target_os = "linux")]
     pub(super) unsafe fn prefer_large(start: *mut u8, bytes: usize) -> Result<(), AllocationFailure> {
         match unsafe { libc::madvise(start.cast(), bytes, libc::MADV_HUGEPAGE) } {
@@ -500,29 +493,78 @@ mod host {
         }
     }
 
-    /// Make the backed `[start, start + bytes)`, whole large pages of
-    /// `large` bytes, large (`MADV_COLLAPSE`), each on its own thread's
-    /// part: how many are. One call per page is the kernel's whole effort:
-    /// its allocation reclaims and compacts directly, whatever the
-    /// transparent huge page `defrag` setting, before it refuses (madvise(2),
-    /// `MADV_COLLAPSE`). A page it refuses stays in host pages, which are
-    /// memory all the same.
+    /// Count how many of the backed `[start, start + bytes)`, whole large
+    /// pages of `large` bytes, the kernel backed with transparent huge pages,
+    /// by reading `AnonHugePages:` for the covering VMA(s) from
+    /// `/proc/self/smaps`. Returns 0 if `/proc/self/smaps` cannot be read.
     #[cfg(target_os = "linux")]
-    pub(super) fn collapse(start: *mut u8, bytes: usize, large: usize) -> usize {
-        let base = start as usize;
-        let collapsed = std::sync::atomic::AtomicUsize::new(0);
-        super::parallel(bytes / large, bytes, |first, end| {
-            for index in first..end {
-                let at = (base + index * large) as *mut libc::c_void;
-                if unsafe { libc::madvise(at, large, libc::MADV_COLLAPSE) } == 0 {
-                    collapsed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pub(super) fn count_large_pages(start: *mut u8, bytes: usize, large: usize) -> usize {
+        let Ok(file) = std::fs::File::open("/proc/self/smaps") else {
+            return 0;
+        };
+        parse_smaps_large_pages(std::io::BufReader::new(file), start as usize, bytes, large)
+    }
+
+    /// Parse `AnonHugePages:` entries from `smaps` for VMAs overlapping
+    /// `[base, base + bytes)` and return the count of whole `large`-byte
+    /// pages, clamped to `bytes / large`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn parse_smaps_large_pages(
+        mut reader: impl std::io::BufRead,
+        base: usize,
+        bytes: usize,
+        large: usize,
+    ) -> usize {
+        use std::io::BufRead;
+        let end = base.saturating_add(bytes);
+        let mut line = String::new();
+        let mut covering: Option<(usize, usize)> = None;
+        let mut anon_huge_bytes: usize = 0;
+        while let Ok(read) = reader.read_line(&mut line) {
+            if read == 0 {
+                break;
+            }
+            if let Some(first) = line.split_whitespace().next() {
+                if !first.ends_with(':') {
+                    covering = None;
+                    if let Some((start_hex, end_hex)) = first.split_once('-') {
+                        if let (Ok(vma_start), Ok(vma_end)) = (
+                            usize::from_str_radix(start_hex, 16),
+                            usize::from_str_radix(end_hex, 16),
+                        ) {
+                            if vma_start >= end {
+                                break;
+                            }
+                            if vma_end > base {
+                                covering = Some((vma_start, vma_end));
+                            }
+                        }
+                    }
+                } else if let Some((vma_start, vma_end)) = covering {
+                    if let Some(rest) = line.strip_prefix("AnonHugePages:") {
+                        if let Some(kb) = rest.split_whitespace().next().and_then(|s| s.parse::<usize>().ok()) {
+                            let huge_bytes = kb.saturating_mul(1024);
+                            if vma_start >= base && vma_end <= end {
+                                anon_huge_bytes = anon_huge_bytes.saturating_add(huge_bytes);
+                            } else {
+                                let overlap = vma_end.min(end).saturating_sub(vma_start.max(base));
+                                let vma_len = vma_end.saturating_sub(vma_start);
+                                if vma_len > 0 {
+                                    let share = ((huge_bytes as u128 * overlap as u128) / vma_len as u128) as usize;
+                                    anon_huge_bytes = anon_huge_bytes.saturating_add(share);
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        });
-        collapsed.into_inner()
+            line.clear();
+        }
+        (anon_huge_bytes / large).min(bytes / large)
     }
+
     #[cfg(not(target_os = "linux"))]
-    pub(super) fn collapse(_start: *mut u8, _bytes: usize, _large: usize) -> usize {
+    pub(super) fn count_large_pages(_start: *mut u8, _bytes: usize, _large: usize) -> usize {
         unreachable!("only Linux reports large pages")
     }
 
@@ -588,7 +630,7 @@ mod host {
         NonNull::new(base.cast()).ok_or(AllocationFailure::OutOfMemory)
     }
 
-    pub(super) fn collapse(_start: *mut u8, _bytes: usize, _large: usize) -> usize {
+    pub(super) fn count_large_pages(_start: *mut u8, _bytes: usize, _large: usize) -> usize {
         unreachable!("only Linux reports large pages")
     }
 
@@ -687,5 +729,33 @@ mod tests {
             assert!(block.large_pages().is_none());
             assert_eq!(large_page_backing(), before);
         }
+    }
+
+    #[test]
+    fn smaps_parser_counts_exact_split_and_merged_vmas() {
+        let large = 2usize << 20;
+        let smaps = "\
+10000000-10600000 rw-p 00000000 00:00 0
+Size:               6144 kB
+AnonHugePages:      4096 kB
+VmFlags: rd wr mr mw me ac hg sd
+20000000-20200000 rw-p 00000000 00:00 0
+Size:               2048 kB
+AnonHugePages:      2048 kB
+20200000-20400000 rw-p 00000000 00:00 0
+Size:               2048 kB
+AnonHugePages:         0 kB
+30000000-30800000 rw-p 00000000 00:00 0
+Size:               8192 kB
+AnonHugePages:      8192 kB
+";
+        // Exact single VMA with 2 of 3 huge pages backed.
+        assert_eq!(host::parse_smaps_large_pages(smaps.as_bytes(), 0x1000_0000, 3 * large, large), 2);
+        // Two split VMAs covering a 2-large-page block: 1 huge + 0 huge.
+        assert_eq!(host::parse_smaps_large_pages(smaps.as_bytes(), 0x2000_0000, 2 * large, large), 1);
+        // Merged VMA twice as large as the block: proportionally attributed and never exceeds block's pages.
+        assert_eq!(host::parse_smaps_large_pages(smaps.as_bytes(), 0x3000_0000, 2 * large, large), 2);
+        // Unmapped address range returns 0.
+        assert_eq!(host::parse_smaps_large_pages(smaps.as_bytes(), 0x4000_0000, 2 * large, large), 0);
     }
 }
