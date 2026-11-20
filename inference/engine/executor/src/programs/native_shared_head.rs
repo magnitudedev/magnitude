@@ -61,7 +61,7 @@ use magnitude_kernels::{
 };
 use seismic::{
     Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element, NativeGraph,
-    NativeGraphFamily, NativeGraphMetadata, NativeGraphPlan, NativePort,
+    NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan, NativePort,
     Table, Tensor, WorkflowTensor,
 };
 use std::{collections::BTreeMap, rc::Rc, sync::Arc};
@@ -1098,6 +1098,7 @@ pub(crate) fn certify_shared_head_family<L: Certified>(
 
 /// The storage and bound constants of the head's graph family over
 /// `classes`, from direct contract sizing ([`certify_shared_head_family`]).
+#[cfg(test)]
 pub(crate) fn checked_shared_head_family_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -1158,9 +1159,15 @@ impl PreparedSharedHeadGraphs {
         classes: impl IntoIterator<Item = SharedHeadGraphClass>,
     ) -> Result<Self, SubmitError> {
         let classes = classes.into_iter().collect::<Vec<_>>();
-        // What the planner charged for the family, from its own check.
-        let planned = checked_shared_head_family_storage(target_device.backend(), load, geometry, classes.iter().copied())
-            .map_err(|error| invalid(format!("shared head graph family: {error}")))?;
+        // Certify each class's layout so sealing verifies against and adopts
+        // the exact certified storage the planner charged.
+        let (planned, layouts) = certify_shared_head_family::<NativeGraphLayout>(
+            target_device.backend(),
+            load,
+            geometry,
+            classes.iter().copied(),
+        )
+        .map_err(|error| invalid(format!("shared head graph family: {error}")))?;
         let block = |index: usize| {
             kernels
                 .blocks
@@ -1178,7 +1185,7 @@ impl PreparedSharedHeadGraphs {
             let (form, numbers) =
                 split_shared_head(load, geometry, class, &scales).map_err(class_error)?;
             let parts = shared_head_graph::<NativeGraph>(
-                target_device.native_graph(),
+                target_device.native_graph_with_layout(&layouts[&class]),
                 SharedHeadEntries {
                     landing: landing.map(LandingEntries::native),
                     embedding: &kernels.embedding,
