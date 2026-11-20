@@ -57,7 +57,9 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
     let cold_machine = resolve(&[((), &|| field("Inactive(anon):"))], (), || 0).0;
     let clean_cache = clean_cache(
         ["Active(file):", "Inactive(file):", "Dirty:", "Writeback:"].map(field),
-        field("Shmem:").unwrap_or(0),
+        field("Shmem:")
+            .unwrap_or(0)
+            .saturating_add(field("Mapped:").unwrap_or(0)),
     );
     let free_beyond_target = beyond(free, reclaim_floor(sys, total, page));
     let immediate = u64::try_from(free_beyond_target.max(0))

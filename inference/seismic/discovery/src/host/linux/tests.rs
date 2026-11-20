@@ -166,6 +166,10 @@ fn clean_cache_cold_and_swap_are_zero_where_meminfo_has_none() {
         "{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nDirty: 20 kB\nWriteback: 10 kB\nShmem: 80 kB\n"
     ));
     assert_eq!(with_shmem.supply.clean_cache, 90 * 1024, "Shmem is tmpfs/shm, not droppable clean cache");
+    let with_mapped = sample_of(&format!(
+        "{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nDirty: 20 kB\nWriteback: 10 kB\nShmem: 50 kB\nMapped: 40 kB\n"
+    ));
+    assert_eq!(with_mapped.supply.clean_cache, 80 * 1024, "Mapped executables/libs are not droppable clean cache");
 }
 
 /// With no PSI anywhere there is no pressure level; with the machine's
@@ -349,15 +353,41 @@ fn v2_headroom_credits_only_clean_file_cache() {
     machine.file("/sys/fs/cgroup/worker/memory.current", "900\n");
     for (stat, reclaimable, remaining) in [
         ("active_file 200\ninactive_file 400\nfile_dirty 100\nfile_writeback 50\nanon 300\n", 450, 550),
+        ("active_file 200\ninactive_file 400\nfile_dirty 100\nfile_writeback 50\nfile_mapped 150\n", 300, 400),
         ("active_file 300\ninactive_file 300\nfile_dirty 700\nfile_writeback 0\n", 0, 100),
         ("active_file 0\ninactive_file 600\nfile_writeback 0\n", 0, 100),
-        ("active_file 600\ninactive_file 600\nfile_dirty 0\nfile_writeback 0\n", 1200, 1000),
+        ("active_file 600\ninactive_file 600\nfile_dirty 0\nfile_writeback 0\n", 900, 1000),
     ] {
         machine.file("/sys/fs/cgroup/worker/memory.stat", stat);
         let limits = limits(&*machine);
         assert_eq!((limits[0].used_bytes, limits[0].reclaimable_bytes), (900, reclaimable));
         assert_eq!(limits[0].scope(u64::MAX).supply.balance(), remaining);
     }
+    // A real multi-GiB container (e.g. 29.2 GiB rtx5090-bench with swap=0)
+    // reserves a 2 GiB OOM-safety floor below `memory.max` and excludes `file_mapped`.
+    let limit = 30 * GB;
+    let current = 20 * GB;
+    machine.file("/sys/fs/cgroup/worker/memory.max", &format!("{limit}\n"));
+    machine.file("/sys/fs/cgroup/worker/memory.current", &format!("{current}\n"));
+    machine.file(
+        "/sys/fs/cgroup/worker/memory.stat",
+        &format!(
+            "active_file {}\ninactive_file {}\nfile_dirty 0\nfile_writeback 0\nfile_mapped {}\n",
+            2 * GB,
+            2 * GB,
+            GB / 2
+        ),
+    );
+    let container = &limits(&*machine)[0];
+    assert_eq!(container.used_bytes, current + 2 * GB, "2 GiB OOM-safety floor reserved");
+    assert_eq!(container.reclaimable_bytes, 4 * GB - GB / 2, "file_mapped excluded from clean cache");
+    assert_eq!(container.scope(u64::MAX).supply.balance(), (limit - current - 2 * GB + 4 * GB - GB / 2) as i64);
+    // Small real container (128 MiB) scales proportionally without exceeding the limit.
+    let small_limit = 128 * 1024 * 1024;
+    machine.file("/sys/fs/cgroup/worker/memory.max", &format!("{small_limit}\n"));
+    machine.file("/sys/fs/cgroup/worker/memory.current", "0\n");
+    machine.file("/sys/fs/cgroup/worker/memory.stat", "active_file 0\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n");
+    assert_eq!(limits(&*machine)[0].used_bytes, small_limit / 12);
 }
 
 /// `RLIMIT_AS` is a limit enforced against `VmSize`.
@@ -427,7 +457,7 @@ fn an_unlimited_container_root_is_reported() {
     assert!(limits(&*machine).is_empty());
     machine.file("/sys/fs/cgroup/memory.max", "79337357312\n");
     assert!(diagnostics(&*machine).is_empty());
-    assert_eq!(limits(&*machine), [cgroup_v2("/", 79_337_357_312, 1000)]);
+    assert_eq!(limits(&*machine), [cgroup_v2("/", 79_337_357_312, 1000 + 2 * GB)]);
 }
 
 /// The host's own root cgroup (no `memory.max`) is no container.
