@@ -155,8 +155,12 @@ impl Geometry {
                 format!("{key} {top} is not a whole number of pools of {kpool} tokens"),
             ));
         }
-        // A row before its first complete pool reads its tail alone.
-        if !m.flag("attention.indexer.kpool_select_tail")? {
+        // A row before its first complete pool reads its tail alone; upstream
+        // defaults this to true when omitted (as in Unsloth's GGUFs).
+        if !m
+            .optional_flag("attention.indexer.kpool_select_tail")?
+            .unwrap_or(true)
+        {
             let key = m.key("attention.indexer.kpool_select_tail");
             return Err(FamilyError::metadata(&key, format!("{key}: every row reads its tail")));
         }
@@ -247,7 +251,12 @@ impl Geometry {
         let (heads, width, hidden) = (self.heads, self.kda_width, self.hidden);
         let inner = product(&[heads, width])?;
         let projection = [inner, hidden];
-        let plane = [1, inner, 1, self.taps];
+        // Upstream llama.cpp writes KDA conv kernels as [1, inner, 1, taps];
+        // Unsloth omits the leading singleton axis and writes [inner, 1, taps].
+        let plane: &[u64] = match layer.tensors.shape(&layer.name("ssm_conv1d_q.weight"))? {
+            [_, _, _] => &[inner, 1, self.taps],
+            _ => &[1, inner, 1, self.taps],
+        };
         Ok(GatedDelta {
             convolution_width: self.taps,
             key_heads: heads,
@@ -260,8 +269,8 @@ impl Geometry {
                 false,
             )?,
             convolution: layer.parts(
-                ("ssm_conv1d_q.weight", &plane),
-                &[("ssm_conv1d_k.weight", &plane), ("ssm_conv1d_v.weight", &plane)],
+                ("ssm_conv1d_q.weight", plane),
+                &[("ssm_conv1d_k.weight", plane), ("ssm_conv1d_v.weight", plane)],
                 true,
             )?,
             beta: layer.weight("ssm_beta.weight", &[heads, hidden])?,
@@ -524,13 +533,13 @@ fn mixers(m: &Metadata, blocks: u64, trunk: u64) -> Result<Vec<Mixer>, FamilyErr
             ));
         }
     }
-    if m.optional_flag("attention.indexer.index_share_mtp")? == Some(true) && trunk < blocks {
-        let key = m.key("attention.indexer.index_share_mtp");
-        return Err(FamilyError::metadata(
-            &key,
-            format!("{key}: MTP sharing an indexer is not interpreted by {FAMILY_ID}"),
-        ));
-    }
+    // `index_share_mtp` (HF `index_share_for_mtp_iteration`, true in Z.ai's
+    // GLM-5.3-Flash config) permits chained MTP iterations 1+ to reuse step 0's
+    // top-k pool selection. The MTP block still owns its full indexer weights
+    // (`blk.<mtp>.indexer.*`) and computes its own selection on step 0; running
+    // its own indexer on every draft step is valid and leaves target outputs
+    // unchanged. Validate its boolean type when present.
+    let _ = m.optional_flag("attention.indexer.index_share_mtp")?;
     Ok(mixers)
 }
 
