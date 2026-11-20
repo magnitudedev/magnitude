@@ -970,6 +970,9 @@ impl MetalDevice {
         })?;
         // Kept resident before it is handed out, wired where a set keeps it.
         let wiring = self.residency.wiring();
+        // The wired charge and the residency commit in held() must become
+        // observable together. Backed::take joins this change.
+        let _change = entry.change();
         let (charged, mapping) = match block {
             true => {
                 let (charged, mapping) = mapped_buffer(&self.handle, length, entry, wiring)?;
@@ -1307,6 +1310,64 @@ mod mapped_tests {
             Err(ExecutionError::AllocationCapacity { .. })
         ));
         assert_eq!(device.handle().current_allocated_bytes(), before);
+    }
+
+    /// Observe every boundary at which a host reading could see the ledger.
+    #[test]
+    fn a_shared_buffers_charge_and_residency_change_together() {
+        use seismic_memory::entry::{Change, Refused, Tally};
+        use seismic_topology::StoreIdentity;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct Observed {
+            tally: Tally,
+            residency: Arc<Residency>,
+            depth: Arc<AtomicUsize>,
+        }
+
+        struct Boundary(Observed);
+
+        impl Drop for Boundary {
+            fn drop(&mut self) {
+                let entry = &self.0;
+                if entry.depth.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    let resident = entry.residency.lock().count() > 0;
+                    assert_eq!(entry.tally.held() > 0, resident);
+                }
+            }
+        }
+
+        impl Entry for Observed {
+            fn store(&self) -> &StoreIdentity { self.tally.store() }
+            fn change(&self) -> Change {
+                self.depth.fetch_add(1, Ordering::Relaxed);
+                Change::held(Boundary(self.clone()))
+            }
+            fn on_close(&self, closed: Box<dyn FnOnce() + Send>) { self.tally.on_close(closed) }
+            fn closed(&self) -> bool { self.tally.closed() }
+            fn take(&self, change: &Change, bytes: u64, wiring: Wiring) -> Result<(), Refused> {
+                self.tally.take(change, bytes, wiring)
+            }
+            fn took(&self, change: &Change, bytes: u64, wiring: Wiring) { self.tally.took(change, bytes, wiring) }
+            fn freed(&self, change: &Change, bytes: u64, wiring: Wiring) { self.tally.freed(change, bytes, wiring) }
+        }
+
+        let device = crate::test_support::metal_device();
+        let record = seismic_lang::registry::TestDevice::opened(seismic_lang::registry::BackendName::Metal);
+        let entry: Arc<dyn Entry> = Arc::new(Observed {
+            tally: Tally::unbounded(StoreIdentity::HostRam),
+            residency: device.residency.clone(),
+            depth: Arc::new(AtomicUsize::new(0)),
+        });
+        for block in [false, true] {
+            let buffer = device.allocate_shared(1 << 16, &entry, block).unwrap();
+            assert_eq!(device.residency.lock().count(), 1);
+            drop(buffer);
+        }
+        if let Some(record) = record {
+            record.ran();
+        }
     }
 
     /// The set's residency is requested on each change while it holds
