@@ -219,13 +219,16 @@ impl State {
     /// Where pooled cache is held in a store whose pool of that class is not
     /// open.
     pub(super) fn unit(&self) -> u64 {
-        for kind in CacheKind::ALL {
-            if let Some(class) = Holding::Cache(kind).pool_class() {
-                let bytes = self.cache_of[kind.index()];
-                assert!(
-                    bytes == 0 || self.pools[class.index()].is_some(),
-                    "invariant violated: {kind:?} cache ({bytes} bytes) held in a store whose {class:?} pool never opened"
-                );
+        for entry in self.held.values() {
+            if entry.bytes > 0 {
+                if let Some(class) = entry.holding.pool_class().filter(|_| entry.holding.pooled()) {
+                    assert!(
+                        self.pools[class.index()].is_some(),
+                        "invariant violated: {:?} ({} bytes) held in a store whose {class:?} pool never opened",
+                        entry.holding,
+                        entry.bytes
+                    );
+                }
             }
         }
         let unit = self
