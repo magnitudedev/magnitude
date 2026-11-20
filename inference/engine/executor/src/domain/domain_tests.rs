@@ -2974,7 +2974,7 @@ fn a_two_row_pass_projects_its_front_row() {
         tokens: vec![crate::TokenId(7), crate::TokenId(8)],
         position: 10,
         conditioning: None,
-        demand: crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES,
+        demand: crate::batching::Demand::SELECT | crate::batching::Demand::DEVICE_FEATURES,
         select: vec![spec(10)],
         committed: 1,
         prime: None,

@@ -404,7 +404,7 @@ pub(super) fn continuations(
         .map(|operation| {
             let request = operation.request();
             let drafts_next = verifying.contains(&request)
-                || (fuses_draft_taps && operation.demand().contains(crate::batching::Demand::FEATURES));
+                || (fuses_draft_taps && operation.demand().computes_features());
             match drafts_next {
                 true => None,
                 false => continuation_of(operation, publishing.contains(&request), context),
@@ -457,7 +457,9 @@ pub(super) fn continuation_of(operation: &Operation, publishes: bool, context: u
     let select_only = crate::batching::Demand::SELECT;
     let host_bound = |spec: &crate::SelectSpec| spec.mask.is_some() || spec.history.is_some();
     if tokens.len() != 1 + front.len()
-        || (*demand != select_only && *demand != select_only | crate::batching::Demand::FEATURES)
+        || (*demand != select_only
+            && *demand != select_only | crate::batching::Demand::FEATURES
+            && *demand != select_only | crate::batching::Demand::DEVICE_FEATURES)
         || host_bound(spec)
         || front.iter().any(|front| host_bound(&front.select))
     {
@@ -1693,7 +1695,7 @@ mod tests {
             tokens: tokens.iter().copied().map(TokenId).collect(),
             position,
             conditioning: None,
-            demand: Demand::SELECT | Demand::FEATURES,
+            demand: Demand::SELECT | Demand::DEVICE_FEATURES,
             select: vec![spec(select)],
             committed: 1,
             prime: None,

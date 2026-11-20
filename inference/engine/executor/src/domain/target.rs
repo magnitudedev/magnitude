@@ -813,7 +813,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .flatten();
         // The front head launch behind a chained step follows it and its
         // drafter entry on the device: the step's outcome is its chain.
-        let chained = flight.front.is_some();
         let (chain, mut front_advances) = match flight.front {
             None => (Vec::new(), Vec::new()),
             Some(front) => self.finish_front(front)?,
@@ -993,16 +992,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             guessed[row] = *guesses.get(index).ok_or("target guess count differs")?;
         }
         let mut request_start = 0usize;
-        for (_, request_rows, _, kind, _) in &flight.requests {
+        for (_, request_rows, _, _, _) in &flight.requests {
             let request_end = request_start
                 .checked_add(*request_rows)
                 .expect("invariant violated: request row range overflows");
-            // A chained decode pass's features condition its front head
-            // launch on the device alone: no host reads them.
-            if chained && *kind == WorkKind::Decode {
-                request_start = request_end;
-                continue;
-            }
             let feature_outputs = upload
                 .out_rows
                 .iter()
@@ -1979,9 +1972,7 @@ fn row_demand(operation: &Operation, row: usize) -> crate::batching::Demand {
     match kind {
         WorkKind::Decode | WorkKind::Verify => *demand,
         WorkKind::Prefill | WorkKind::Replay if row + 1 == tokens.len() => *demand,
-        WorkKind::Prefill | WorkKind::Replay => {
-            *demand & (crate::batching::Demand::FEATURES | crate::batching::Demand::TAPS)
-        }
+        WorkKind::Prefill | WorkKind::Replay => demand.without_logits(),
     }
 }
 

@@ -899,10 +899,18 @@ impl Operation {
                 }
                 validate_forward_select(*kind, accepted, *demand, select)?;
                 if chain.is_some() {
-                    let entered = demand.contains(Demand::SELECT | Demand::FEATURES)
+                    let entered = demand.contains(Demand::SELECT)
                         && match kind {
-                            WorkKind::Decode => accepted == 1 && prime.is_none(),
-                            WorkKind::Prefill => prime.as_ref().is_some_and(|prime| prime.boundary) && front.is_empty(),
+                            WorkKind::Decode => {
+                                accepted == 1
+                                    && prime.is_none()
+                                    && demand.contains(Demand::DEVICE_FEATURES)
+                            }
+                            WorkKind::Prefill => {
+                                prime.as_ref().is_some_and(|prime| prime.boundary)
+                                    && front.is_empty()
+                                    && demand.contains(Demand::FEATURES)
+                            }
                             WorkKind::Verify | WorkKind::Replay => false,
                         };
                     if !entered {

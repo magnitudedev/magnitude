@@ -597,10 +597,7 @@ impl PackedRowTables {
                 packed.demand[row_index] = row.demand.bits();
                 packed.front[row_index] = offset + slot.front >= slot.rows.len();
 
-                if row
-                    .demand
-                    .intersects(Demand::LOGITS | Demand::FEATURES | Demand::SELECT)
-                {
+                if row.demand.computes_logits() || row.demand.computes_features() {
                     let out_index = packed.out_rows.len();
                     packed.out_rows.push(as_i32(row_index, "output row")?);
                     if let Some(select) = &row.select {

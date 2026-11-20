@@ -218,7 +218,7 @@ fn operation_validation_admits_only_a_chained_decodes_front_rows() {
         tokens: tokens.iter().copied().map(TokenId).collect(),
         position: 3,
         conditioning: None,
-        demand: Demand::SELECT | Demand::FEATURES,
+        demand: Demand::SELECT | if chain { Demand::DEVICE_FEATURES } else { Demand::FEATURES },
         select: (0..selects).map(|_| select()).collect(),
         committed,
         prime: None,
@@ -268,16 +268,19 @@ fn operation_validation_admits_a_chain_behind_a_decode_or_the_closing_chunk() {
             .collect(),
         chain: Some(ChainEntry { position: 2 }),
     };
-    let entered = Demand::SELECT | Demand::FEATURES;
+    let entered_decode = Demand::SELECT | Demand::DEVICE_FEATURES;
+    let entered_prefill = Demand::SELECT | Demand::FEATURES;
     let boundary = |boundary| Some(Priming { boundary, tokens: vec![TokenId(2), TokenId(3)], position: 2, draft_from: 2 });
-    assert!(chained(WorkKind::Decode, &[2], entered, 1, 1, None, 0).validate().is_ok(), "a one-row decode");
-    assert!(chained(WorkKind::Decode, &[2, 3, 4], entered, 1, 1, None, 2).validate().is_ok(), "a front pass");
-    assert!(chained(WorkKind::Prefill, &[2, 3], entered, 1, 2, boundary(true), 0).validate().is_ok(), "the closing chunk");
+    assert!(chained(WorkKind::Decode, &[2], entered_decode, 1, 1, None, 0).validate().is_ok(), "a one-row decode");
+    assert!(chained(WorkKind::Decode, &[2, 3, 4], entered_decode, 1, 1, None, 2).validate().is_ok(), "a front pass");
+    assert!(chained(WorkKind::Prefill, &[2, 3], entered_prefill, 1, 2, boundary(true), 0).validate().is_ok(), "the closing chunk");
     for (operation, case) in [
         (chained(WorkKind::Decode, &[2], Demand::SELECT, 1, 1, None, 0), "a decode demanding no features"),
-        (chained(WorkKind::Verify, &[2, 3], entered, 2, 1, None, 0), "a verification"),
-        (chained(WorkKind::Prefill, &[2, 3], entered, 1, 2, None, 0), "a chunk priming nothing"),
-        (chained(WorkKind::Prefill, &[2, 3], entered, 1, 2, boundary(false), 0), "a chunk priming within itself"),
+        (chained(WorkKind::Decode, &[2], entered_prefill, 1, 1, None, 0), "a chained decode demanding host features"),
+        (chained(WorkKind::Verify, &[2, 3], entered_decode, 2, 1, None, 0), "a verification"),
+        (chained(WorkKind::Prefill, &[2, 3], entered_prefill, 1, 2, None, 0), "a chunk priming nothing"),
+        (chained(WorkKind::Prefill, &[2, 3], entered_prefill, 1, 2, boundary(false), 0), "a chunk priming within itself"),
+        (chained(WorkKind::Prefill, &[2, 3], entered_decode, 1, 2, boundary(true), 0), "a closing chunk demanding only device features"),
     ] {
         assert!(matches!(operation.validate(), Err(OperationError::Chain)), "{case}");
     }

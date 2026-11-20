@@ -925,7 +925,7 @@ impl NativeTargetProgram {
                 .ok_or_else(|| invalid("readout demand is absent or invalid"))?;
             let selected = projected_output_rows[..actual_selected].contains(&output_index);
             selection_reads_logits |= selected && demand.contains(Demand::LOGITS);
-            features |= demand.contains(Demand::FEATURES);
+            features |= demand.computes_features();
             if demand.computes_logits() && !selected {
                 projected_output_rows.push(output_index);
             } else if selected && !demand.computes_logits() {
@@ -1809,7 +1809,7 @@ impl NativeTargetProgram {
         let mut tapped = false;
         for &bits in batch.demand.iter() {
             let demand = Demand::from_bits(bits).ok_or_else(|| invalid("row demand is invalid"))?;
-            tapped |= demand.contains(Demand::FEATURES);
+            tapped |= demand.computes_features();
         }
         let mut run = TargetRun {
             launch: RunLaunch {

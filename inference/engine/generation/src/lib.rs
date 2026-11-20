@@ -704,7 +704,11 @@ impl Generation {
                     // The method's state moves only once the round it
                     // starts is valid.
                     let mut method = self.method.fork_transition();
-                    let pass = |chain| {
+                    let pass = |chain: Option<ChainEntry>| {
+                        let demand = match chain {
+                            Some(_) => requirements.verify_demand.device_only_features(),
+                            None => requirements.verify_demand,
+                        };
                         RoundState::pass(
                             pending,
                             self.front_rows(two_row, allowance, limit, grant),
@@ -714,7 +718,7 @@ impl Generation {
                             self.options.sampling,
                             self.options.shaping,
                             self.options.seed,
-                            requirements.verify_demand,
+                            demand,
                             chain,
                         )
                     };

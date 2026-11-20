@@ -396,7 +396,7 @@ impl Sequence {
         let (demand, chain) = match (self.chains, self.grant) {
             (true, FrontGrant::Verify(_)) => (Demand::FEATURES, None),
             (true, FrontGrant::UpTo(_) | FrontGrant::Exactly(_)) => {
-                (Demand::FEATURES, Some(ChainEntry { position: self.position }))
+                (Demand::DEVICE_FEATURES, Some(ChainEntry { position: self.position }))
             }
             (false, _) => (Demand::NONE, None),
         };
