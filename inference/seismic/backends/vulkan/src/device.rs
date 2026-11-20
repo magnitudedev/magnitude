@@ -158,6 +158,9 @@ struct Staging {
     pool: vk::CommandPool,
     command: vk::CommandBuffer,
     range: Range,
+    /// Timeline value of the last submitted transfer using this staging
+    /// command buffer and range; 0 when no submission is in flight.
+    last_value: u64,
 }
 
 /// One step of unmapped device storage staged on the first queue
@@ -326,6 +329,97 @@ struct Held {
     handed: Handed,
 }
 
+/// Advance `queue`'s waiting and held submissions using the provided gate
+/// query, submit, handover-notify, and refusal hooks.
+///
+/// `queue.waiting` is only recorded after `submit` succeeds, and is cleared on
+/// gate-query failure so a refused submission or failed query never leaves a
+/// `HostTimeline` semaphore handle in `queue.waiting` past its owner's drop.
+fn release_queue(
+    queue: &mut Queue,
+    opening: GateOpening,
+    mut raised: impl FnMut(&[(vk::Semaphore, u64)]) -> Result<bool, ExecutionError>,
+    mut submit: impl FnMut(&Held) -> Result<(), ExecutionError>,
+    mut notify: impl FnMut(),
+    mut refuse: impl FnMut(&mut Queue, u64, ExecutionError),
+) {
+    if let Some((gates, _)) = &queue.waiting {
+        match raised(gates) {
+            Ok(true) => {
+                let (_, stamps) = queue.waiting.take().expect("a waiting submission");
+                stamps
+                    .opened
+                    .set((Instant::now(), opening))
+                    .expect("a waiting submission opens once");
+            }
+            Ok(false) => {}
+            Err(failed) => {
+                queue.waiting = None;
+                let value = queue.held.front().map_or(queue.next, |held| held.value);
+                refuse(queue, value, failed);
+                return;
+            }
+        }
+    }
+    while let Some(held) = queue.held.front() {
+        if queue.waiting.is_some() {
+            return;
+        }
+        let gates_raised = match raised(&held.waits) {
+            Ok(raised) => raised,
+            Err(failed) => {
+                let value = held.value;
+                refuse(queue, value, failed);
+                return;
+            }
+        };
+        let held = queue.held.pop_front().expect("a held submission is first");
+        notify();
+        if let Err(refused) = submit(&held) {
+            refuse(queue, held.value, refused);
+            return;
+        }
+        if !gates_raised {
+            queue.waiting = Some((held.waits, held.handed));
+            return;
+        }
+    }
+}
+
+/// Whether a staging command pool and buffer range are safe to destroy when an
+/// [`Opened`] drops: either no transfer is in flight (`last_value == 0`), the
+/// timeline wait confirmed completion, or the device is lost (Vulkan permits
+/// destroying objects after `VK_ERROR_DEVICE_LOST`). On a non-`DeviceLost`
+/// wait failure, the submission may still be in flight, so destruction is
+/// skipped to prevent Vulkan UB/UAF.
+fn staging_safe_to_destroy(
+    last_value: u64,
+    wait: impl FnOnce(u64) -> Result<(), ExecutionError>,
+) -> bool {
+    last_value == 0
+        || match wait(last_value) {
+            Ok(()) | Err(ExecutionError::DeviceLost(_)) => true,
+            Err(_) => false,
+        }
+}
+
+/// Wait for and reset a side-queue fence if dirty, clearing `fence_dirty` only
+/// once both wait and reset succeed. If `wait` fails, `reset` is skipped so a
+/// fence with a pending signal operation is never reset.
+fn clean_dirty_fence(
+    fence_dirty: &mut bool,
+    wait: impl FnOnce() -> Result<(), ExecutionError>,
+    reset: impl FnOnce() -> Result<(), ExecutionError>,
+) -> Result<(), ExecutionError> {
+    if !*fence_dirty {
+        return Ok(());
+    }
+    wait()?;
+    reset()?;
+    *fence_dirty = false;
+    Ok(())
+}
+
 impl Inner {
     /// Whether any Vulkan call on this logical device has observed
     /// `VK_ERROR_DEVICE_LOST`.
@@ -412,6 +506,37 @@ impl Inner {
         }
     }
 
+    /// Wait for the submission that took `value` to end, run or refused,
+    /// so the device uses nothing it used any more.
+    pub(crate) fn ended(&self, value: u64) -> Result<(), ExecutionError> {
+        let queue = self.queue.lock().expect("queue lock is never poisoned");
+        #[cfg(test)]
+        if queue.held.front().is_some_and(|held| held.value <= value) {
+            if let Some(notify) = self
+                .on_handover_wait
+                .lock()
+                .expect("handover hook lock is never poisoned")
+                .take()
+            {
+                let _ = notify.send(());
+            }
+        }
+        self.handover
+            .wait_while(queue, |queue| {
+                !self.is_lost() && queue.held.front().is_some_and(|held| held.value <= value)
+            })
+            .expect("queue lock is never poisoned")
+            .lost(value)?;
+        let semaphores = [self.timeline];
+        let values = [value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        self.vk("vkWaitSemaphores", |device| unsafe {
+            device.wait_semaphores(&info, u64::MAX)
+        })
+    }
+
     /// Give the queue every held submission, in order, up to and including
     /// the first whose gates are not all raised, unless one handed to it
     /// still waits on the host. That one waits on the host inside the
@@ -431,50 +556,26 @@ impl Inner {
         if self.is_lost() {
             return;
         }
-        let raised = |gates: &[(vk::Semaphore, u64)]| -> Result<bool, ExecutionError> {
-            for &(semaphore, value) in gates {
-                let reached = call(
-                    unsafe { self.device.get_semaphore_counter_value(semaphore) },
-                    "vkGetSemaphoreCounterValue",
-                )?;
-                if reached < value {
-                    return Ok(false);
+        let raw = queue.raw;
+        release_queue(
+            queue,
+            opening,
+            |gates| {
+                for &(semaphore, value) in gates {
+                    let reached = call(
+                        unsafe { self.device.get_semaphore_counter_value(semaphore) },
+                        "vkGetSemaphoreCounterValue",
+                    )?;
+                    if reached < value {
+                        return Ok(false);
+                    }
                 }
-            }
-            Ok(true)
-        };
-        if let Some((gates, _)) = &queue.waiting {
-            match raised(gates) {
-                Ok(true) => {
-                    let (_, stamps) = queue.waiting.take().expect("a waiting submission");
-                    stamps.opened.set((Instant::now(), opening)).expect("a waiting submission opens once");
-                }
-                Ok(false) => {}
-                Err(failed) => {
-                    let value = queue.held.front().map_or(queue.next, |held| held.value);
-                    return self.refuse(queue, value, failed);
-                }
-            }
-        }
-        while let Some(held) = queue.held.front() {
-            if queue.waiting.is_some() {
-                return;
-            }
-            match raised(&held.waits) {
-                Ok(true) => {}
-                Ok(false) => queue.waiting = Some((held.waits.clone(), held.handed.clone())),
-                Err(failed) => {
-                    let value = held.value;
-                    return self.refuse(queue, value, failed);
-                }
-            }
-            let held = queue.held.pop_front().expect("a held submission is first");
-            self.handover.notify_all();
-            if let Err(refused) = self.submit_now(queue.raw, &held) {
-                self.refuse(queue, held.value, refused);
-                return;
-            }
-        }
+                Ok(true)
+            },
+            |held| self.submit_now(raw, held),
+            || self.handover.notify_all(),
+            |queue, value, error| self.refuse(queue, value, error),
+        );
     }
 
     fn submit_now(&self, raw: vk::Queue, held: &Held) -> Result<(), ExecutionError> {
@@ -530,6 +631,7 @@ impl Inner {
             return;
         }
         queue.held.clear();
+        queue.waiting = None;
         if value == queue.next {
             queue.refused = Some((value, Refusal::Raised(refused)));
             self.handover.notify_all();
@@ -568,6 +670,10 @@ struct Side {
     pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Set once `queue_submit2` submits `command` with `fence`, cleared only
+    /// after both `wait_for_fences` and `reset_fences` succeed. While true,
+    /// `command` may be in flight or `fence` may still be signaled.
+    fence_dirty: bool,
 }
 
 pub(crate) struct Inner {
@@ -644,8 +750,10 @@ impl Drop for Opened {
             .expect("staging lock is never poisoned")
             .take()
         {
-            unsafe { self.inner.device.destroy_command_pool(staging.pool, None) };
-            self.inner.memory.release(&self.inner.device, &staging.range);
+            if staging_safe_to_destroy(staging.last_value, |value| self.inner.ended(value)) {
+                unsafe { self.inner.device.destroy_command_pool(staging.pool, None) };
+                self.inner.memory.release(&self.inner.device, &staging.range);
+            }
         }
         for chunk in self
             .free_chunks
@@ -1091,21 +1199,23 @@ impl Device {
             *guard = Some(inner.create_staging(&self.opened.pools, &self.opened.stores)?);
         }
         let staging = guard.as_mut().expect("staging was created above");
+        if staging.last_value != 0 {
+            self.ended(staging.last_value)?;
+            staging.last_value = 0;
+        }
         let step = step(&staging.range);
         let command = staging.command;
+        inner.vk("vkResetCommandBuffer", |device| unsafe {
+            device.reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
+        })?;
+        inner.vk("vkBeginCommandBuffer", |device| unsafe {
+            device.begin_command_buffer(
+                command,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        })?;
         unsafe {
-            call(
-                device.reset_command_buffer(command, vk::CommandBufferResetFlags::empty()),
-                "vkResetCommandBuffer",
-            )?;
-            call(
-                device.begin_command_buffer(
-                    command,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                ),
-                "vkBeginCommandBuffer",
-            )?;
             barrier(
                 device,
                 command,
@@ -1129,10 +1239,15 @@ impl Device {
                     | vk::AccessFlags2::MEMORY_READ
                     | vk::AccessFlags2::MEMORY_WRITE,
             );
-            call(device.end_command_buffer(command), "vkEndCommandBuffer")?;
         }
+        inner.vk("vkEndCommandBuffer", |device| unsafe {
+            device.end_command_buffer(command)
+        })?;
         let value = self.submit(command)?;
-        self.wait(value)?;
+        staging.last_value = value;
+        self.ended(value)?;
+        staging.last_value = 0;
+        self.queue().refused(value)?;
         Ok(guard)
     }
 
@@ -1237,34 +1352,7 @@ impl Device {
     /// anywhere on the logical device ends the wait with its loss
     /// ([`Inner::refuse`], [`Inner::lose`]).
     pub(crate) fn ended(&self, value: u64) -> Result<(), ExecutionError> {
-        let queue = self.queue();
-        #[cfg(test)]
-        if queue.held.front().is_some_and(|held| held.value <= value) {
-            if let Some(notify) = self
-                .inner
-                .on_handover_wait
-                .lock()
-                .expect("handover hook lock is never poisoned")
-                .take()
-            {
-                let _ = notify.send(());
-            }
-        }
-        self.inner
-            .handover
-            .wait_while(queue, |queue| {
-                !self.inner.is_lost() && queue.held.front().is_some_and(|held| held.value <= value)
-            })
-            .expect("queue lock is never poisoned")
-            .lost(value)?;
-        let semaphores = [self.inner.timeline];
-        let values = [value];
-        let info = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphores)
-            .values(&values);
-        self.inner.vk("vkWaitSemaphores", |device| unsafe {
-            device.wait_semaphores(&info, u64::MAX)
-        })
+        self.inner.ended(value)
     }
 
     fn queue(&self) -> MutexGuard<'_, Queue> {
@@ -1703,6 +1791,7 @@ impl Inner {
                 pool: vk::CommandPool::null(),
                 command: vk::CommandBuffer::null(),
                 fence: vk::Fence::null(),
+                fence_dirty: false,
             })
         });
         let executables = info
@@ -1906,6 +1995,7 @@ impl Inner {
             pool,
             command,
             range,
+            last_value: 0,
         })
     }
 }
@@ -1945,6 +2035,7 @@ impl Inner {
     /// On a device without a second queue, which zeroes on its first
     /// (`Device::allocate_block`).
     pub(crate) fn zero(&self, regions: &[(&Range, u64, u64)]) -> Result<(), ExecutionError> {
+        self.check_lost()?;
         let device = &self.device;
         let mut side = self
             .side
@@ -1977,36 +2068,59 @@ impl Inner {
                 }
             }
         }
+        let fence = side.fence;
+        if let Err(error) = clean_dirty_fence(
+            &mut side.fence_dirty,
+            || {
+                self.vk("vkWaitForFences", |device| unsafe {
+                    device.wait_for_fences(&[fence], true, u64::MAX)
+                })
+            },
+            || self.vk("vkResetFences", |device| unsafe { device.reset_fences(&[fence]) }),
+        ) {
+            return Err(match error {
+                ExecutionError::DeviceLost(_) => error,
+                other => self.lose(ExecutionError::DeviceLost(format!(
+                    "side-queue fence recovery failed: {other}"
+                ))),
+            });
+        }
         let command = side.command;
+        self.vk("vkResetCommandBuffer", |device| unsafe {
+            device.reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
+        })?;
+        self.vk("vkBeginCommandBuffer", |device| unsafe {
+            device.begin_command_buffer(
+                command,
+                &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        })?;
         unsafe {
-            call(
-                device.reset_command_buffer(command, vk::CommandBufferResetFlags::empty()),
-                "vkResetCommandBuffer",
-            )?;
-            call(
-                device.begin_command_buffer(
-                    command,
-                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                ),
-                "vkBeginCommandBuffer",
-            )?;
             for &(range, offset, bytes) in regions {
                 device.cmd_fill_buffer(command, range.raw(), range.offset() + offset, bytes, 0);
             }
-            call(device.end_command_buffer(command), "vkEndCommandBuffer")?;
-            let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
-            self.vk("vkQueueSubmit2", |device| {
-                device.queue_submit2(
-                    side.raw,
-                    &[vk::SubmitInfo2::default().command_buffer_infos(&commands)],
-                    side.fence,
-                )
-            })?;
-            self.vk("vkWaitForFences", |device| {
-                device.wait_for_fences(&[side.fence], true, u64::MAX)
-            })?;
-            self.vk("vkResetFences", |device| device.reset_fences(&[side.fence]))
         }
+        self.vk("vkEndCommandBuffer", |device| unsafe {
+            device.end_command_buffer(command)
+        })?;
+        let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
+        self.vk("vkQueueSubmit2", |device| unsafe {
+            device.queue_submit2(
+                side.raw,
+                &[vk::SubmitInfo2::default().command_buffer_infos(&commands)],
+                fence,
+            )
+        })?;
+        side.fence_dirty = true;
+        clean_dirty_fence(
+            &mut side.fence_dirty,
+            || {
+                self.vk("vkWaitForFences", |device| unsafe {
+                    device.wait_for_fences(&[fence], true, u64::MAX)
+                })
+            },
+            || self.vk("vkResetFences", |device| unsafe { device.reset_fences(&[fence]) }),
+        )
     }
 
 }
@@ -2056,6 +2170,7 @@ impl Drop for Inner {
 #[cfg(test)]
 mod reconcile_tests {
     use super::*;
+    use ash::vk::Handle;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const BLOCK: u64 = 256 << 20;
@@ -2243,5 +2358,145 @@ mod reconcile_tests {
     #[should_panic(expected = "dstOffset")]
     fn update_buffer_chunks_rejects_unaligned_offset() {
         let _ = update_buffer_chunks(2, &[1, 2, 3, 4]);
+    }
+
+    fn test_queue(held: Vec<Held>) -> Queue {
+        Queue {
+            raw: vk::Queue::null(),
+            next: held.last().map_or(1, |h| h.value + 1),
+            held: held.into(),
+            waiting: None,
+            refused: None,
+        }
+    }
+
+    fn test_held(value: u64, gates: Vec<(vk::Semaphore, u64)>) -> Held {
+        Held {
+            command: vk::CommandBuffer::null(),
+            value,
+            waits: gates,
+            signals: Vec::new(),
+            handed: Handed::default(),
+        }
+    }
+
+    #[test]
+    fn release_queue_leaves_waiting_none_when_submit_fails_with_non_device_lost() {
+        let gate = (vk::Semaphore::from_raw(0x1234), 1);
+        let mut queue = test_queue(vec![test_held(1, vec![gate])]);
+        let mut refused_value = None;
+
+        release_queue(
+            &mut queue,
+            GateOpening::Signalled,
+            |_| Ok(false),
+            |_| Err(ExecutionError::SubmissionFailed("transient host oom".into())),
+            || {},
+            |queue, value, error| {
+                queue.held.clear();
+                queue.refused = Some((value, Refusal::Raised(error)));
+                refused_value = Some(value);
+            },
+        );
+
+        assert_eq!(refused_value, Some(1));
+        assert!(queue.waiting.is_none(), "failed submit must not leave gate semaphore in queue.waiting");
+        assert!(queue.held.is_empty());
+    }
+
+    #[test]
+    fn release_queue_clears_waiting_when_raised_query_fails_with_non_device_lost() {
+        let gate = (vk::Semaphore::from_raw(0x5678), 1);
+        let mut queue = test_queue(vec![test_held(2, Vec::new())]);
+        queue.waiting = Some((vec![gate], Handed::default()));
+        let mut refused_value = None;
+
+        release_queue(
+            &mut queue,
+            GateOpening::Signalled,
+            |_| Err(ExecutionError::SubmissionFailed("query failed".into())),
+            |_| panic!("submit must not run when waiting gate query fails"),
+            || {},
+            |queue, value, error| {
+                queue.held.clear();
+                queue.refused = Some((value, Refusal::Raised(error)));
+                refused_value = Some(value);
+            },
+        );
+
+        assert_eq!(refused_value, Some(2));
+        assert!(queue.waiting.is_none(), "failed gate query must clear queue.waiting");
+    }
+
+    #[test]
+    fn release_queue_sets_waiting_only_after_submit_succeeds() {
+        let gate = (vk::Semaphore::from_raw(0x9abc), 1);
+        let mut queue = test_queue(vec![test_held(1, vec![gate]), test_held(2, Vec::new())]);
+        let mut submitted = Vec::new();
+
+        release_queue(
+            &mut queue,
+            GateOpening::Signalled,
+            |gates| Ok(gates.is_empty()),
+            |held| {
+                submitted.push(held.value);
+                Ok(())
+            },
+            || {},
+            |_, _, _| panic!("unexpected refusal"),
+        );
+
+        assert_eq!(submitted, vec![1]);
+        assert!(queue.waiting.is_some());
+        assert_eq!(queue.held.len(), 1);
+        assert_eq!(queue.held[0].value, 2);
+    }
+
+    #[test]
+    fn staging_safe_to_destroy_skips_destruction_on_non_device_lost_wait_failure() {
+        assert!(staging_safe_to_destroy(0, |_| panic!("zero last_value must not wait")));
+        assert!(staging_safe_to_destroy(5, |v| {
+            assert_eq!(v, 5);
+            Ok(())
+        }));
+        assert!(staging_safe_to_destroy(5, |_| Err(ExecutionError::DeviceLost("lost".into()))));
+        assert!(!staging_safe_to_destroy(5, |_| Err(ExecutionError::SubmissionFailed("wait failed".into()))));
+    }
+
+    #[test]
+    fn clean_dirty_fence_clears_flag_only_when_both_wait_and_reset_succeed() {
+        let mut dirty = false;
+        assert!(clean_dirty_fence(
+            &mut dirty,
+            || panic!("clean fence must not wait"),
+            || panic!("clean fence must not reset"),
+        )
+        .is_ok());
+        assert!(!dirty);
+
+        // Wait fails -> reset must not be called, flag stays dirty.
+        let mut dirty = true;
+        assert!(clean_dirty_fence(
+            &mut dirty,
+            || Err(ExecutionError::SubmissionFailed("wait failed".into())),
+            || panic!("reset must not run if wait failed"),
+        )
+        .is_err());
+        assert!(dirty);
+
+        // Wait succeeds, reset fails -> flag stays dirty.
+        let mut dirty = true;
+        assert!(clean_dirty_fence(
+            &mut dirty,
+            || Ok(()),
+            || Err(ExecutionError::SubmissionFailed("reset failed".into())),
+        )
+        .is_err());
+        assert!(dirty);
+
+        // Both succeed -> flag cleared.
+        let mut dirty = true;
+        assert!(clean_dirty_fence(&mut dirty, || Ok(()), || Ok(())).is_ok());
+        assert!(!dirty);
     }
 }
