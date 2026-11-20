@@ -1957,4 +1957,122 @@ mod tests {
             .await
             .expect("replacement refinish task completed");
     }
+
+    /// Cold multi-bundle assessment with both plain and drafted catalog models:
+    /// - A drafted model whose drafter fit arrives before measurement transitions
+    ///   `Assessing -> Pending -> refinish -> Estimated` alongside plain models.
+    /// - A drafted model still awaiting its drafter fit when measurement finishes is assessed
+    ///   directly in the measured environment once its drafter fit arrives, reaching `Estimated`
+    ///   with zero stuck `Assessing` or `Pending` entries.
+    #[test]
+    fn drafted_models_transition_pending_and_late_drafter_fit_to_estimated() {
+        use magnitude_service_contracts::models::{
+            ModelPerformance, ModelResidency, PerformanceEvidence,
+        };
+        let plain = assessment_subject("plain", CatalogModelSelection::Desired);
+        let drafted_early = assessment_subject("drafted-early", CatalogModelSelection::Desired);
+        let drafted_late = assessment_subject("drafted-late", CatalogModelSelection::Desired);
+        let mut current = assessment_pool_current();
+
+        // Initial catalog read: plain starts assessing immediately; both drafted models await
+        // their catalog drafter fit (`work: None`).
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            1,
+            &[
+                assessment_target(plain.clone(), "plain-pending"),
+                assessment_target(drafted_early.clone(), "awaiting-early"),
+                assessment_target(drafted_late.clone(), "awaiting-late"),
+            ],
+        );
+        current.replace_domain(AssessmentDomain::Custom, 1, &[]);
+        current.apply_outcome(&AssessmentOutcome {
+            key: AssessmentWorkKey("plain-pending".to_owned()),
+            result: Ok(fits(&plain, ModelPerformance::Pending)),
+        });
+
+        // Early drafted model's drafter fit resolves before measurement completes -> assessed to
+        // `Pending`.
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            2,
+            &[
+                assessment_target(plain.clone(), "plain-pending"),
+                assessment_target(drafted_early.clone(), "drafted-early-pending"),
+                assessment_target(drafted_late.clone(), "awaiting-late"),
+            ],
+        );
+        current.apply_outcome(&AssessmentOutcome {
+            key: AssessmentWorkKey("drafted-early-pending".to_owned()),
+            result: Ok(fits(&drafted_early, ModelPerformance::Pending)),
+        });
+        assert_eq!(current.assessed_keys().len(), 2);
+
+        // Measurement completes: both already-assessed models (plain + early drafted) refinish
+        // atomically to `Estimated`, while late drafted remains awaiting its fit.
+        let estimated = ModelPerformance::Estimated {
+            samples: vec![PerformanceEvidence {
+                context_tokens: 8_192,
+                estimated_tokens_per_second: 42.0,
+            }],
+        };
+        let key = |s: &str| AssessmentWorkKey(s.to_owned());
+        let rekeyed = [
+            (key("plain-pending"), key("plain-measured")),
+            (key("drafted-early-pending"), key("drafted-early-measured")),
+        ]
+        .into_iter()
+        .collect();
+        let outcomes = vec![
+            AssessmentOutcome {
+                key: key("plain-measured"),
+                result: Ok(fits(&plain, estimated.clone())),
+            },
+            AssessmentOutcome {
+                key: key("drafted-early-measured"),
+                result: Ok(fits(&drafted_early, estimated.clone())),
+            },
+        ];
+        let measured_env = AssessmentEnvironmentId("measured-environment".to_owned());
+        current.republish(&measured_env, MeasurementState::Measured, &rekeyed, &outcomes);
+
+        // Late drafted model's drafter fit now resolves under the measured environment.
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            3,
+            &[
+                assessment_target(plain.clone(), "plain-measured"),
+                assessment_target(drafted_early.clone(), "drafted-early-measured"),
+                assessment_target(drafted_late.clone(), "drafted-late-measured"),
+            ],
+        );
+        assert!(current.references_assessing(&key("drafted-late-measured")));
+        current.apply_outcome(&AssessmentOutcome {
+            key: key("drafted-late-measured"),
+            result: Ok(fits(&drafted_late, estimated.clone())),
+        });
+
+        assert!(current.settled(), "all plain and drafted models settled");
+        let ModelAssessmentDomainSnapshot::Available { entries, .. } =
+            current.domain(AssessmentDomain::Catalog)
+        else {
+            panic!("catalog slice must be available");
+        };
+        assert_eq!(entries.len(), 3);
+        for entry in entries {
+            assert!(
+                matches!(
+                    &entry.state,
+                    ModelAssessmentEntryState::Assessed { profiles, .. }
+                        if matches!(profiles.as_slice(), [ModelAssessment::Fits {
+                            residency: ModelResidency::Resident { performance },
+                            ..
+                        }] if *performance == estimated)
+                ),
+                "expected Estimated for {:?}, got {:?}",
+                entry.subject,
+                entry.state
+            );
+        }
+    }
 }

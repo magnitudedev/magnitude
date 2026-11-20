@@ -21,7 +21,8 @@ use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
 use magnitude_service_contracts::models::{
     AddedModel, CustomModelPart,
     CandidateDrafter, CandidateFile, CandidateInspection, CandidateInspectionProgressSink,
-    CandidateInspectionRequest, CandidateSource, CandidateVersion, CatalogModelState, CatalogModels, CustomModel,
+    CandidateInspectionRequest, CandidateSource, CandidateVersion, CatalogModelState, CatalogModels,
+    CatalogSupport, CustomModel,
     CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterCandidatesRequest,
     DrafterCandidatesResponse, DrafterCategory, DrafterChoice, DrafterLineage, DrafterReference,
     DrafterVerdict, HuggingFaceRepositoryId, LocalModels, ModelAssessment, ModelAssessmentProfile,
@@ -305,6 +306,12 @@ enum Reach {
     Hub,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordedCatalogDrafterFit {
+    fit: CatalogDrafterFit,
+    checked_built_in_heads: bool,
+}
+
 /// Computed lineage hints and automatic drafters, keyed by model (carrying its exact target
 /// package, the custom-model inputs revision it was computed at and what it read), and the bytes
 /// of every drafter reference whose header has been read, keyed by reference.
@@ -313,7 +320,7 @@ struct CandidateEnrichment {
         BTreeMap<ModelId, (String, u64, Reach, CustomModelEnrichmentResult)>,
     >,
     drafter_contents: std::sync::RwLock<super::BoundedMap<String, DrafterContent>>,
-    catalog_drafter_fits: std::sync::RwLock<BTreeMap<ModelId, CatalogDrafterFit>>,
+    catalog_drafter_fits: std::sync::RwLock<BTreeMap<ModelId, RecordedCatalogDrafterFit>>,
     catalog_drafter_fits_unreachable: std::sync::atomic::AtomicBool,
 }
 
@@ -402,22 +409,42 @@ impl CandidateEnrichment {
             .retain(|model_id, _| active_models.contains(model_id));
     }
 
-    /// Whether how a catalog model serves without its drafter is worked out.
-    fn has_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
+    /// Whether how a catalog model serves without its drafter is worked out to the extent needed:
+    /// `need_built_in_heads` is only required for installed models whose separate drafter may be
+    /// absent on disk.
+    fn has_catalog_drafter_fit(&self, model_id: &ModelId, need_built_in_heads: bool) -> bool {
         self.catalog_drafter_fits
             .read()
             .expect("catalog drafter fits lock poisoned")
-            .contains_key(model_id)
+            .get(model_id)
+            .is_some_and(|recorded| !need_built_in_heads || recorded.checked_built_in_heads)
     }
 
     /// Record how a catalog model serves without its drafter; whether that is new: it was not
     /// known before, or it changed what the model serves.
+    #[cfg(test)]
     fn record_catalog_drafter_fit(&self, model_id: ModelId, fit: CatalogDrafterFit) -> bool {
+        self.record_catalog_drafter_fit_with(model_id, fit, true)
+    }
+
+    fn record_catalog_drafter_fit_with(
+        &self,
+        model_id: ModelId,
+        fit: CatalogDrafterFit,
+        checked_built_in_heads: bool,
+    ) -> bool {
         let mut known = self
             .catalog_drafter_fits
             .write()
             .expect("catalog drafter fits lock poisoned");
-        known.insert(model_id, fit) != Some(fit)
+        let previous = known.get(&model_id).copied();
+        let next = RecordedCatalogDrafterFit {
+            fit,
+            checked_built_in_heads: checked_built_in_heads
+                || previous.is_some_and(|prev| prev.checked_built_in_heads),
+        };
+        known.insert(model_id, next);
+        previous.map(|prev| prev.fit) != Some(fit)
     }
 
     /// Record that the fits not worked out yet may not be soon: a fit failed, as every one does
@@ -475,12 +502,12 @@ impl CustomModelEnrichment for CandidateEnrichment {
             .read()
             .expect("catalog drafter fits lock poisoned")
             .get(model_id)
-            .copied()
+            .map(|recorded| recorded.fit)
             .unwrap_or_default()
     }
 
     fn knows_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
-        self.has_catalog_drafter_fit(model_id)
+        self.has_catalog_drafter_fit(model_id, false)
             || self
                 .catalog_drafter_fits_unreachable
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -682,9 +709,18 @@ impl ManagedModelCandidates {
     /// preparation cache for `ManagedModelAssessments`), without a redundant plain pass: for an
     /// exact catalog model `known_to_work` is always true, and the engine's `with >= without`
     /// invariant guarantees that a bound drafter that fits also fits plain.
+    #[cfg(test)]
     fn catalog_drafter_fit<'a>(
         &'a self,
         model_id: &'a ModelId,
+    ) -> BoxFuture<'a, Result<CatalogDrafterFit, InventoryError>> {
+        self.catalog_drafter_fit_with(model_id, true)
+    }
+
+    fn catalog_drafter_fit_with<'a>(
+        &'a self,
+        model_id: &'a ModelId,
+        check_built_in_heads: bool,
     ) -> BoxFuture<'a, Result<CatalogDrafterFit, InventoryError>> {
         Box::pin(async move {
             let matched = self
@@ -711,7 +747,9 @@ impl ManagedModelCandidates {
                 ServableModelBundle::Standalone { .. } => (false, false),
             };
             let bundle_key = servable_model_bundle_key_for_bundle(bundle);
-            let skip_own = embedded_catalog
+            let skip_own = !check_built_in_heads
+                || withheld
+                || embedded_catalog
                 || self
                     .assessor
                     .release_catalog()
@@ -951,54 +989,78 @@ impl ManagedModelCandidates {
         }
     }
 
-    /// Works out each catalog model's drafter fit once, retrying on failure until every one is
-    /// known. Runs independently of custom-model enrichment so catalog models never wait on local
-    /// scans or Hub presentation lookups.
+    /// Works out each active catalog model's drafter fit, retrying on failure until every one is
+    /// known and re-checking when catalog installations change (so installed models learn whether
+    /// built-in heads serve without a missing drafter, without blocking startup on uninstalled or
+    /// disabled models).
     async fn run_catalog_drafter_fits(&self, resolver: &ModelDomainResolver) {
-        while !self.fit_catalog_drafters(resolver).await {
-            tokio::time::sleep(ENRICHMENT_RETRY_DELAY).await;
+        let mut changes = self.catalog.watch_catalog().skip(1);
+        loop {
+            let complete = self.fit_catalog_drafters(resolver).await;
+            tokio::select! {
+                change = changes.next() => if change.is_none() { return },
+                () = tokio::time::sleep(ENRICHMENT_RETRY_DELAY), if !complete => {}
+            }
         }
     }
 
-    /// Whether each catalog model with a drafter fits only without it, once: it depends on the
-    /// release material and this computer, never on the files here. Whether every one is known.
+    /// Whether each supported or installed catalog model with a drafter fits only without it.
+    /// Notifies the catalog incrementally as each fit resolves so no single model holds the rest
+    /// in `Assessing`, and checks built-in heads only for installed models (since `desired`
+    /// configurations depend only on `withheld`). Whether every active model's fit is known.
     fn fit_catalog_drafters<'a>(&'a self, resolver: &'a ModelDomainResolver) -> BoxFuture<'a, bool> {
         Box::pin(async move {
-            let pending = self
-                .catalog
-                .list_catalog()
-                .await
-                .map(|response| response.models)
-                .unwrap_or_default()
+            let models = match self.catalog.list_catalog().await {
+                Ok(response) => response.models,
+                Err(error) => {
+                    tracing::warn!(%error, "catalog listing failed during drafter fit");
+                    return false;
+                }
+            };
+            let pending = models
                 .into_iter()
                 .filter(|model| {
                     model.desired.speculative_method.is_some()
-                        && !self.enrichment.has_catalog_drafter_fit(&model.id)
+                        && (matches!(model.support, CatalogSupport::Supported { .. })
+                            || matches!(model.local_state, CatalogModelState::Installed { .. }))
                 })
-                .map(|model| model.id)
+                .filter_map(|model| {
+                    let check_built_in_heads =
+                        matches!(model.local_state, CatalogModelState::Installed { .. });
+                    (!self
+                        .enrichment
+                        .has_catalog_drafter_fit(&model.id, check_built_in_heads))
+                    .then_some((model.id, check_built_in_heads))
+                })
                 .collect::<Vec<_>>();
             let mut complete = true;
-            let mut changed = false;
             let mut results = futures_util::stream::iter(pending)
-                .map(|model_id| async move {
-                    let result = self.catalog_drafter_fit(&model_id).await;
-                    (model_id, result)
+                .map(|(model_id, check_built_in_heads)| async move {
+                    let result = self
+                        .catalog_drafter_fit_with(&model_id, check_built_in_heads)
+                        .await;
+                    (model_id, check_built_in_heads, result)
                 })
                 .buffer_unordered(assessment_concurrency());
-            while let Some((model_id, result)) = results.next().await {
+            while let Some((model_id, check_built_in_heads, result)) = results.next().await {
                 match result {
                     Ok(fit) => {
-                        changed |= self.enrichment.record_catalog_drafter_fit(model_id, fit);
+                        if self.enrichment.record_catalog_drafter_fit_with(
+                            model_id,
+                            fit,
+                            check_built_in_heads,
+                        ) {
+                            resolver.catalog_drafter_fit_changed();
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(model.id = %model_id.as_str(), %error, "catalog drafter fit failed");
                         complete = false;
-                        changed |= self.enrichment.record_catalog_drafter_fits_unreachable();
+                        if self.enrichment.record_catalog_drafter_fits_unreachable() {
+                            resolver.catalog_drafter_fit_changed();
+                        }
                     }
                 }
-            }
-            if changed {
-                resolver.catalog_drafter_fit_changed();
             }
             complete
         })

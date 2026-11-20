@@ -6320,6 +6320,40 @@ fn a_catalog_drafter_fit_is_news_once_known_or_unreachable() {
     assert!(knows(&unreachable, &other));
 }
 
+/// An uninstalled catalog model records its drafter fit without checking built-in heads so it is
+/// released to assessment immediately; once installed, it still requires built-in heads to be
+/// checked and republishes if they are available.
+#[test]
+fn uninstalled_catalog_drafter_fit_releases_assessment_and_rechecks_built_in_heads_on_install() {
+    use magnitude_service_models::CustomModelEnrichment;
+    let enrichment = super::CandidateEnrichment::default();
+    let model = qwen_catalog_id();
+    assert!(!enrichment.has_catalog_drafter_fit(&model, false));
+    assert!(!enrichment.has_catalog_drafter_fit(&model, true));
+    assert!(enrichment.record_catalog_drafter_fit_with(
+        model.clone(),
+        CatalogDrafterFit::default(),
+        false,
+    ));
+    assert!(CustomModelEnrichment::knows_catalog_drafter_fit(&enrichment, &model));
+    assert!(enrichment.has_catalog_drafter_fit(&model, false));
+    assert!(
+        !enrichment.has_catalog_drafter_fit(&model, true),
+        "installed pass still checks built-in heads"
+    );
+    let with_heads = CatalogDrafterFit {
+        withheld: false,
+        built_in_heads: true,
+    };
+    assert!(enrichment.record_catalog_drafter_fit_with(model.clone(), with_heads, true));
+    assert!(enrichment.has_catalog_drafter_fit(&model, true));
+    assert_eq!(
+        CustomModelEnrichment::catalog_drafter_fit(&enrichment, &model),
+        with_heads
+    );
+    assert!(!enrichment.record_catalog_drafter_fit_with(model, with_heads, true));
+}
+
 /// What an assessment concludes from a header: its fingerprint and its whole header's verdict.
 type HeaderAnswer = (
     Result<
