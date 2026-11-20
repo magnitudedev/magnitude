@@ -264,6 +264,9 @@ struct PoolState {
     /// Whether a thread waits on released granules' and releasing blocks'
     /// flights ([`Pool::await_owed`]): one at a time.
     waiting: bool,
+    /// Callbacks registered via [`Pool::wake_on_release`], drained and fired
+    /// outside the pool lock once `releasing` is empty and `waiting` is false.
+    wakers: Vec<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     waiters: Vec<std::thread::JoinHandle<()>>,
 }
@@ -372,6 +375,7 @@ impl Pool {
                 stores: HashMap::new(),
                 releasing: Vec::new(),
                 waiting: false,
+                wakers: Vec::new(),
                 #[cfg(test)]
                 waiters: Vec::new(),
             }),
@@ -413,6 +417,48 @@ impl Pool {
         self.0.state().granules.owed()
     }
 
+    /// Whether the pool has blocks awaiting flight completion before dropping
+    /// to the OS/driver, or an `await_owed` waiter is in flight.
+    pub fn releasing(&self) -> bool {
+        let state = self.0.state();
+        !state.releasing.is_empty() || state.waiting
+    }
+
+    /// Register a one-shot callback to fire once every block currently
+    /// releasing or awaited by [`Self::await_owed`] has dropped to the
+    /// OS/driver. Fires immediately outside the pool lock if nothing is
+    /// releasing or awaited.
+    pub fn wake_on_release(&self, wake: impl FnOnce() + Send + 'static) {
+        let immediate = {
+            let mut state = self.0.state();
+            if state.releasing.is_empty() && !state.waiting {
+                Some(wake)
+            } else {
+                state.wakers.push(Box::new(wake));
+                None
+            }
+        };
+        if let Some(wake) = immediate {
+            wake();
+        }
+    }
+
+    /// Drain and fire registered release wakers outside the pool lock when no
+    /// blocks remain in `releasing` and no `await_owed` waiter is running.
+    fn fire_release_wakers(&self) {
+        let wakers = {
+            let mut state = self.0.state();
+            if state.releasing.is_empty() && !state.waiting {
+                std::mem::take(&mut state.wakers)
+            } else {
+                Vec::new()
+            }
+        };
+        for wake in wakers {
+            wake();
+        }
+    }
+
     /// Allocate one block, admitted by the pool's entry first: the pool's
     /// grow step, allocated outside the pool's lock. Refused
     /// (`ExecutionError::AllocationCapacity` where the entry refuses), nothing
@@ -446,6 +492,7 @@ impl Pool {
         };
         // Released outside the pool's lock, behind work that has ended.
         drop(released);
+        self.fire_release_wakers();
         bytes
     }
 
@@ -549,6 +596,7 @@ impl Pool {
             pool.0.state().waiting = false;
             pool.return_empty();
             pool.await_owed();
+            pool.fire_release_wakers();
         });
         #[cfg(test)]
         self.0.state().waiters.push(handle);
@@ -1624,5 +1672,68 @@ mod tests {
         flight.complete();
         pool.join_waiters();
         assert_eq!(tally.held(), absent + block, "block 1 releases once the flight completes");
+    }
+
+    /// `Pool::releasing()` stays true while blocks await an in-flight fence
+    /// and `Pool::wake_on_release` fires once the flight completes and the
+    /// block has physically dropped; when idle, `wake_on_release` fires
+    /// immediately.
+    #[test]
+    fn wake_on_release_fires_after_flight_completes_and_releasing_clears() {
+        let catalog = crate::devices::Devices::discover(&[]).unwrap();
+        let id = catalog.resolve(seismic_topology::ExecutorSelector::HostCpu).unwrap();
+        let device = catalog.open(id).unwrap();
+        let topology = catalog.topology();
+        let store = topology.first_store(topology.executor(id).unwrap(), Contract::DeviceOnly).unwrap();
+        let tally = crate::memory::Tally::unbounded(topology.store_identity(store).unwrap());
+        let (granule, block) = (1 << 16, 1 << 18);
+        let charges = PoolCharges::one(&Charges::in_store(&device, Contract::DeviceOnly, Arc::new(tally.clone())));
+        let pool = Pool::open(&charges, Contract::DeviceOnly, granule, block).unwrap();
+        let absent = tally.held();
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let geometry = SlabGeometry {
+            rows_per_slab: 4,
+            logical_rows: 32,
+            capacity: 8,
+            slab_bytes: BLOCK_ALIGNMENT,
+            slab_alignment: BLOCK_ALIGNMENT,
+            regions: vec![(i32s, vec![2], 0)],
+        };
+        let slabs = SlabStore::in_pool(&crate::memory::Charges::tally(&device), &pool, geometry, &[]).unwrap();
+        for _ in 0..8 {
+            slabs.add_slab(SlabFill::Zeroed).unwrap();
+        }
+        assert!(!pool.releasing(), "idle pool is not releasing");
+        let immediate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let immediate_flag = immediate.clone();
+        pool.wake_on_release(move || immediate_flag.store(true, Ordering::Release));
+        assert!(immediate.load(Ordering::Acquire), "wake_on_release fires immediately when idle");
+
+        // Free all 4 granules of block 1 while a flight is active on the pool.
+        struct CompleteOnDrop(Arc<Flight>);
+        impl Drop for CompleteOnDrop {
+            fn drop(&mut self) {
+                self.0.complete();
+            }
+        }
+        let flight = Arc::new(Flight::default());
+        let guard = CompleteOnDrop(flight.clone());
+        pool.0.absent.allocation.record_device_use(DeviceQueue::Transfer, Arc::new(InFlight(flight.clone())), false);
+        for slot in 4..8 {
+            assert!(slabs.free_slab(slot).unwrap());
+        }
+        assert_eq!(pool.return_freed(block).unwrap(), block, "block 1 marks returning and awaits flight");
+        assert!(pool.releasing(), "pool reports releasing while await_owed waits on flight");
+
+        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let woken_flag = woken.clone();
+        pool.wake_on_release(move || woken_flag.store(true, Ordering::Release));
+        assert!(!woken.load(Ordering::Acquire), "waker waits until flight completes and block drops");
+
+        drop(guard);
+        pool.join_waiters();
+        assert!(woken.load(Ordering::Acquire), "waker fired once releasing cleared");
+        assert!(!pool.releasing(), "pool is no longer releasing once block dropped");
+        assert_eq!(tally.held(), absent + block, "block 1 physically dropped to the tally");
     }
 }

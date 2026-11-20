@@ -991,8 +991,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     | crate::resources::AllocationError::Workflow(seismic::WorkflowError::TensorView(error)),
                 ) => match growth_failure(error, on_device, "a prompt group's class") {
                     // The device refused the bytes: the group runs with one
-                    // place, what was allocated idling until released.
-                    DomainError::Capacity(_) => Ok(()),
+                    // place; fit any partially allocated claims and idle them
+                    // as `CacheKind::GraphSlots` so `release_idle_slots` can
+                    // reclaim them instead of stranding them.
+                    DomainError::Capacity(_) => {
+                        let mut claims = class.into_claims();
+                        claims.iter_mut().for_each(crate::memory::ledger::Claim::fit_allocated);
+                        let allocated: Vec<_> = claims.into_iter().filter(|claim| claim.bytes() > 0).collect();
+                        if !allocated.is_empty() {
+                            self.idle_class.idle(allocated);
+                        }
+                        Ok(())
+                    }
                     error => Err(error),
                 },
                 Err(error) => Err(DomainError::invariant(error.to_string())),

@@ -401,7 +401,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // steps, moving no row, and the pool returns what they freed.
             let state = self.yield_state(&mut unchained)?;
             (released, returned) = (state.released, state.returned);
+            let pool = self.target_store.pool();
+            if pool.releasing() || pool.owed() > 0 {
+                pool.wake_on_release(move || wake.complete());
+                return Ok(Yielded::Pending);
+            }
             freed |= released + returned > 0;
+        }
+        if self.target_store.pool().releasing() {
+            self.target_store.pool().wake_on_release(move || wake.complete());
+            return Ok(Yielded::Pending);
         }
         if freed {
             return Ok(Yielded::Released { released, returned });

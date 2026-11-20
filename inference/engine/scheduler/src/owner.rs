@@ -2161,11 +2161,8 @@ trait MemoryStep: MemoryHost + Sized {
     /// and bank growth.
     fn follow_yields(&mut self, bindings: &mut StateBindings) -> Result<Yielded, RequestError> {
         let (before, started, wake) = (self.domain().held_bytes(), std::time::Instant::now(), self.completion());
-        let yielded = self.domain().release_yielded(bindings, wake).map_err(classify_domain_error)?;
-        let yielded = match (self.evict_owed_prefixes(), yielded) {
-            (true, Yielded::Pending | Yielded::Nothing) => Yielded::Released { released: 0, returned: 0 },
-            (_, yielded) => yielded,
-        };
+        let evicted = self.evict_owed_prefixes();
+        let yielded = combine_yielded(evicted, self.domain().release_yielded(bindings, wake).map_err(classify_domain_error)?);
         if let Yielded::Released { released, returned } = yielded {
             tracing::info!(
                 micros = started.elapsed().as_micros() as u64,
@@ -3961,6 +3958,16 @@ pub struct Relieved<T> {
     pub pending: bool,
 }
 
+/// Combine prefix eviction with the domain's `release_yielded` outcome:
+/// `Yielded::Pending` is preserved unconditionally so an async pool or slot
+/// release is never overwritten with `Yielded::Released`.
+fn combine_yielded(evicted_prefixes: bool, yielded: Yielded) -> Yielded {
+    match (evicted_prefixes, yielded) {
+        (true, Yielded::Nothing) => Yielded::Released { released: 0, returned: 0 },
+        (_, yielded) => yielded,
+    }
+}
+
 #[cfg(test)]
 mod branch_plan_tests {
     use super::{
@@ -5245,5 +5252,20 @@ mod front_rows_tests {
         let mut prompting = Generation::new_with_method(vec![TokenId(1), TokenId(2)], layout(), options(), None, fronting).unwrap();
         prompting.resume_at(None).unwrap();
         assert!(!chained(&Candidate::Ready(prompting)), "a front-decoding request's prompt chunk");
+    }
+
+    #[test]
+    fn follow_yields_preserves_pending_when_prefixes_evicted() {
+        assert_eq!(super::combine_yielded(true, Yielded::Pending), Yielded::Pending);
+        assert_eq!(super::combine_yielded(false, Yielded::Pending), Yielded::Pending);
+        assert_eq!(
+            super::combine_yielded(true, Yielded::Nothing),
+            Yielded::Released { released: 0, returned: 0 }
+        );
+        assert_eq!(super::combine_yielded(false, Yielded::Nothing), Yielded::Nothing);
+        assert_eq!(
+            super::combine_yielded(true, Yielded::Released { released: 128, returned: 64 }),
+            Yielded::Released { released: 128, returned: 64 }
+        );
     }
 }

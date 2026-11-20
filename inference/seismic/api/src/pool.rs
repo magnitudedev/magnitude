@@ -102,6 +102,18 @@ impl Pool {
         self.inner.owed()
     }
 
+    /// Whether the pool has blocks awaiting flight completion before dropping
+    /// to the OS/driver, or an `await_owed` waiter is in flight.
+    pub fn releasing(&self) -> bool {
+        self.inner.releasing()
+    }
+
+    /// Register a one-shot callback to fire once every block currently
+    /// releasing or awaited has dropped to the OS/driver.
+    pub fn wake_on_release(&self, wake: impl FnOnce() + Send + 'static) {
+        self.inner.wake_on_release(wake)
+    }
+
     /// Allocate one block, admitted by the pool's entry first. Refused with
     /// the entry's capacity error, nothing changes.
     pub fn grow(&self) -> Result<(), TensorError> {

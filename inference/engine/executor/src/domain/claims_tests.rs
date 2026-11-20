@@ -551,3 +551,43 @@ fn a_sequences_state_is_never_read_as_others_memory() {
     read_at(&ledger, epoch, GIB - growth, 3);
     assert_eq!(ledger.estimate().others(), others, "a closed request's slabs read as the process's own");
 }
+
+/// When `claim_group_class` hits a capacity refusal after partially allocating
+/// slots, fitting each claim and idling the non-zero claims into `IdleClass`
+/// converts them to `CacheKind::GraphSlots` instead of stranding them as
+/// `CommittedKind::GroupClass`.
+#[test]
+fn partial_group_class_refusal_idles_allocated_claims_as_graph_slots() {
+    use crate::memory::ledger::{CacheKind, CommittedKind};
+    let (_scope, ledger, _pools, _res, _slabs, _epoch) = grown_rows();
+    let before_allocated = ledger.estimate().allocated();
+    let partial = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::GroupClass, 128 * MIB))
+        .expect("room for group class");
+    let unallocated = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::GroupClass, 64 * MIB))
+        .expect("room for second store claim");
+    // Simulate partial allocation of 32 MiB on the first claim and 0 on the second.
+    ledger
+        .change(|_| partial.entry().take(&partial.entry().change(), 32 * MIB, seismic::memory::Wiring::Pageable))
+        .expect("partial allocation admitted");
+    let mut idle_class = super::IdleClass::default();
+    ledger.change(|_| {
+        let mut claims = vec![partial, unallocated];
+        claims.iter_mut().for_each(crate::memory::ledger::Claim::fit_allocated);
+        let allocated: Vec<_> = claims.into_iter().filter(|claim| claim.bytes() > 0).collect();
+        assert_eq!(allocated.len(), 1, "zero-byte unallocated claim drops without idling");
+        idle_class.idle(allocated);
+    });
+    let est = ledger.estimate();
+    assert_eq!(est.cache_of(CacheKind::GraphSlots), 32 * MIB, "partially allocated slots idle as GraphSlots cache");
+    assert_eq!(est.allocated(), before_allocated + 32 * MIB);
+    let released = idle_class.release();
+    assert_eq!(released.len(), 1);
+    ledger.change(|_| {
+        let cached = &released[0];
+        cached.entry().freed(&cached.entry().change(), 32 * MIB, seismic::memory::Wiring::Pageable);
+    });
+    drop(released);
+    assert_eq!(ledger.estimate().cache_of(CacheKind::GraphSlots), 0);
+}
