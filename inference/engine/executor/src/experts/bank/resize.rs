@@ -108,6 +108,10 @@ impl Stores {
     fn unclaim_in(store: &SlabTensor, group: usize, claimed: &[usize]) {
         for &record in claimed {
             if let Err(error) = store.free_slab(record) {
+                if matches!(error, TensorError::Execution(seismic::ExecutionError::DeviceLost(_))) {
+                    tracing::warn!("bank rollback stopped freeing claimed slabs of group {group} after device loss: {error}");
+                    return;
+                }
                 panic!("invariant violated: the bank's pool refused to free record {record} of group {group}, claimed and never read: {error}");
             }
         }

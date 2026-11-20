@@ -327,6 +327,91 @@ struct Held {
 }
 
 impl Inner {
+    /// Whether any Vulkan call on this logical device has observed
+    /// `VK_ERROR_DEVICE_LOST`.
+    pub(crate) fn is_lost(&self) -> bool {
+        self.lost.get().is_some()
+    }
+
+    /// Return the recorded device loss if this logical device has been lost.
+    fn check_lost(&self) -> Result<(), ExecutionError> {
+        match self.lost.get() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Record device loss under `queue`, draining held submissions and waking
+    /// every thread waiting on `handover`.
+    fn lose_locked(&self, queue: &mut Queue, error: ExecutionError) -> ExecutionError {
+        let first = self.lost.get_or_init(|| error).clone();
+        queue.held.clear();
+        queue.waiting = None;
+        queue.refused = Some((0, Refusal::Lost(first.clone())));
+        self.handover.notify_all();
+        first
+    }
+
+    /// Record device loss on this logical device, waking any blocked waiters.
+    pub(crate) fn lose(&self, error: ExecutionError) -> ExecutionError {
+        let mut queue = self.queue.lock().expect("queue lock is never poisoned");
+        self.lose_locked(&mut queue, error)
+    }
+
+    /// Execute one Vulkan call against this logical device, enforcing the
+    /// single device-wide lost state on entry and transitioning to lost on
+    /// `VK_ERROR_DEVICE_LOST`. Must not be called while holding `self.queue`.
+    pub(crate) fn vk<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce(&ash::Device) -> Result<T, vk::Result>,
+    ) -> Result<T, ExecutionError> {
+        self.check_lost()?;
+        match f(&self.device) {
+            Ok(value) => Ok(value),
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                let error = ExecutionError::DeviceLost(format!("{what}: {}", vk::Result::ERROR_DEVICE_LOST));
+                Err(self.lose(error))
+            }
+            Err(other) => Err(ExecutionError::SubmissionFailed(format!("{what} failed: {other}"))),
+        }
+    }
+
+    /// Wait at most `timeout` for timeline `semaphore` to reach `value`,
+    /// enforcing the single device-wide lost state before, after timeout,
+    /// and on error. Must not be called while holding `self.queue`.
+    pub(crate) fn wait_semaphore(
+        &self,
+        semaphore: vk::Semaphore,
+        value: u64,
+        timeout: std::time::Duration,
+    ) -> Result<bool, ExecutionError> {
+        self.check_lost()?;
+        let semaphores = [semaphore];
+        let values = [value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        let nanoseconds = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        match unsafe { self.device.wait_semaphores(&info, nanoseconds) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => {
+                self.check_lost()?;
+                Ok(false)
+            }
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                let error = ExecutionError::DeviceLost(format!(
+                    "vkWaitSemaphores: {}",
+                    vk::Result::ERROR_DEVICE_LOST
+                ));
+                Err(self.lose(error))
+            }
+            Err(other) => Err(ExecutionError::SubmissionFailed(format!(
+                "vkWaitSemaphores failed: {other}"
+            ))),
+        }
+    }
+
     /// Give the queue every held submission, in order, up to and including
     /// the first whose gates are not all raised, unless one handed to it
     /// still waits on the host. That one waits on the host inside the
@@ -343,6 +428,9 @@ impl Inner {
     /// every one behind it (or, with none held, the next taken): the device
     /// cannot make progress, and no gate is read as raised.
     fn release(&self, queue: &mut Queue, opening: GateOpening) {
+        if self.is_lost() {
+            return;
+        }
         let raised = |gates: &[(vk::Semaphore, u64)]| -> Result<bool, ExecutionError> {
             for &(semaphore, value) in gates {
                 let reached = call(
@@ -437,6 +525,10 @@ impl Inner {
     /// taken belongs to a submission handed over, which signals it itself,
     /// and a timeline signal must exceed the value it raises from.
     fn refuse(&self, queue: &mut Queue, value: u64, refused: ExecutionError) {
+        if matches!(refused, ExecutionError::DeviceLost(_)) {
+            self.lose_locked(queue, refused);
+            return;
+        }
         queue.held.clear();
         if value == queue.next {
             queue.refused = Some((value, Refusal::Raised(refused)));
@@ -449,17 +541,23 @@ impl Inner {
             .value(last)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
         let submit = vk::SubmitInfo2::default().signal_semaphore_infos(&signal);
-        let refusal = match call(
+        match call(
             unsafe { self.device.queue_submit2(queue.raw, &[submit], vk::Fence::null()) },
             "vkQueueSubmit2",
         ) {
-            Ok(()) => Refusal::Raised(refused),
-            Err(lost) => Refusal::Lost(ExecutionError::DeviceLost(format!(
-                "{refused}, and raising the timeline past the refused submissions then failed: {lost}"
-            ))),
-        };
-        queue.refused = Some((value, refusal));
-        self.handover.notify_all();
+            Ok(()) => {
+                queue.refused = Some((value, Refusal::Raised(refused)));
+                self.handover.notify_all();
+            }
+            Err(lost) => {
+                self.lose_locked(
+                    queue,
+                    ExecutionError::DeviceLost(format!(
+                        "{refused}, and raising the timeline past the refused submissions then failed: {lost}"
+                    )),
+                );
+            }
+        }
     }
 }
 
@@ -484,6 +582,15 @@ pub(crate) struct Inner {
     /// refused: a wait on one held waits on it before the driver does
     /// (`Device::ended`).
     handover: Condvar,
+    /// The first `VK_ERROR_DEVICE_LOST` observed on this logical device, if
+    /// any: device loss in Vulkan is device-wide and irreversible, so every
+    /// queue, timeline and waiter observes it immediately without blocking.
+    lost: OnceLock<ExecutionError>,
+    /// Test hook fired under `self.queue` right before `Device::ended` blocks
+    /// on `self.handover`, so device-loss unblock tests synchronize without
+    /// sleeping.
+    #[cfg(test)]
+    pub(crate) on_handover_wait: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// The family's second queue, where it has one: pool blocks are zeroed
     /// on it (`Inner::zero`) beside work the first runs.
     side: Option<Mutex<Side>>,
@@ -692,8 +799,12 @@ impl Device {
                 break registry;
             };
             if let Some(inner) = registry.opened[index].1.upgrade() {
-                drop(registry);
-                return Self::opening(inner, stores);
+                if !inner.is_lost() {
+                    drop(registry);
+                    return Self::opening(inner, stores);
+                }
+                registry.opened.swap_remove(index);
+                break registry;
             }
             let destroyed = registry.opened[index].2.clone();
             if destroyed.ended() {
@@ -703,6 +814,20 @@ impl Device {
             drop(registry);
             destroyed.wait();
         };
+        let device = Self::create_device(uuid, stores, probed)?;
+        registry.opened.push((uuid, Arc::downgrade(&device.inner), device.inner.destroyed.0.clone()));
+        drop(registry);
+        Ok(device)
+    }
+
+    /// Open a dedicated logical device not registered in the process registry,
+    /// for tests that simulate device loss without affecting sibling tests.
+    #[cfg(test)]
+    pub(crate) fn open_isolated(uuid: [u8; 16], stores: MemoryStores, probed: &Probed) -> Result<Self, OpenError> {
+        Self::create_device(uuid, stores, probed)
+    }
+
+    fn create_device(uuid: [u8; 16], stores: MemoryStores, probed: &Probed) -> Result<Self, OpenError> {
         let instance = crate::instance::instance().map_err(OpenError::Loader)?;
         let description = instance
             .physical_devices()
@@ -721,8 +846,6 @@ impl Device {
         // registered: no other open finds it until they are.
         let device = Self::opening(inner, stores)?;
         device.write_tables().map_err(OpenError::of)?;
-        registry.opened.push((uuid, Arc::downgrade(&device.inner), device.inner.destroyed.0.clone()));
-        drop(registry);
         Ok(device)
     }
 
@@ -1089,14 +1212,9 @@ impl Device {
     /// The timeline value every completed submission has reached; the
     /// device's loss where it cannot say.
     fn completed(&self) -> Result<u64, ExecutionError> {
-        call(
-            unsafe {
-                self.inner
-                    .device
-                    .get_semaphore_counter_value(self.inner.timeline)
-            },
-            "vkGetSemaphoreCounterValue",
-        )
+        self.inner.vk("vkGetSemaphoreCounterValue", |device| unsafe {
+            device.get_semaphore_counter_value(self.inner.timeline)
+        })
     }
 
     /// Whether the submission that took `value` completed, without waiting:
@@ -1122,13 +1240,27 @@ impl Device {
     /// so the device uses nothing it used any more; the device's loss
     /// where it cannot say. The driver waits only on a submission handed
     /// to the queue, or refused with the timeline raised past it: one held
-    /// is waited on here until it is either, so a refusal that loses the
-    /// device ends the wait with its loss ([`Inner::refuse`]).
+    /// is waited on here until it is either, so a refusal or device loss
+    /// anywhere on the logical device ends the wait with its loss
+    /// ([`Inner::refuse`], [`Inner::lose`]).
     pub(crate) fn ended(&self, value: u64) -> Result<(), ExecutionError> {
+        let queue = self.queue();
+        #[cfg(test)]
+        if queue.held.front().is_some_and(|held| held.value <= value) {
+            if let Some(notify) = self
+                .inner
+                .on_handover_wait
+                .lock()
+                .expect("handover hook lock is never poisoned")
+                .take()
+            {
+                let _ = notify.send(());
+            }
+        }
         self.inner
             .handover
-            .wait_while(self.queue(), |queue| {
-                queue.held.front().is_some_and(|held| held.value <= value)
+            .wait_while(queue, |queue| {
+                !self.inner.is_lost() && queue.held.front().is_some_and(|held| held.value <= value)
             })
             .expect("queue lock is never poisoned")
             .lost(value)?;
@@ -1137,10 +1269,9 @@ impl Device {
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        call(
-            unsafe { self.inner.device.wait_semaphores(&info, u64::MAX) },
-            "vkWaitSemaphores",
-        )
+        self.inner.vk("vkWaitSemaphores", |device| unsafe {
+            device.wait_semaphores(&info, u64::MAX)
+        })
     }
 
     fn queue(&self) -> MutexGuard<'_, Queue> {
@@ -1578,6 +1709,9 @@ impl Inner {
                 refused: None,
             }),
             handover: Condvar::new(),
+            lost: OnceLock::new(),
+            #[cfg(test)]
+            on_handover_wait: Mutex::new(None),
             side,
             executables,
             recording: Mutex::new(Recording {
@@ -1761,7 +1895,9 @@ impl Device {
             .expect("a transfer queue exists only beside a second queue")
             .lock()
             .expect("side queue lock is never poisoned");
-        call(unsafe { self.inner.device.queue_submit2(side.raw, submits, vk::Fence::null()) }, "vkQueueSubmit2")
+        self.inner.vk("vkQueueSubmit2", |device| unsafe {
+            device.queue_submit2(side.raw, submits, vk::Fence::null())
+        })
     }
 }
 
@@ -1827,16 +1963,17 @@ impl Inner {
             }
             call(device.end_command_buffer(command), "vkEndCommandBuffer")?;
             let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
-            call(
+            self.vk("vkQueueSubmit2", |device| {
                 device.queue_submit2(
                     side.raw,
                     &[vk::SubmitInfo2::default().command_buffer_infos(&commands)],
                     side.fence,
-                ),
-                "vkQueueSubmit2",
-            )?;
-            call(device.wait_for_fences(&[side.fence], true, u64::MAX), "vkWaitForFences")?;
-            call(device.reset_fences(&[side.fence]), "vkResetFences")
+                )
+            })?;
+            self.vk("vkWaitForFences", |device| {
+                device.wait_for_fences(&[side.fence], true, u64::MAX)
+            })?;
+            self.vk("vkResetFences", |device| device.reset_fences(&[side.fence]))
         }
     }
 
@@ -1852,7 +1989,9 @@ impl Drop for Inner {
     fn drop(&mut self) {
         let device = &self.device;
         unsafe {
-            let _ = device.device_wait_idle();
+            if !self.is_lost() {
+                let _ = device.device_wait_idle();
+            }
             let recording = self
                 .recording
                 .get_mut()
