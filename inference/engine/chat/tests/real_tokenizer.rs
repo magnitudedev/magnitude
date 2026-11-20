@@ -621,3 +621,104 @@ fn deepseek41_reads_fenced_json_output() {
         serde_json::json!({"answer": 4})
     );
 }
+
+/// GLM-5.3-Flash's template unconditionally opens `<think>` without inspecting
+/// `enable_thinking`. Closing the open reasoning block when `enable_thinking`
+/// is false lets GLM-5.3-Flash advertise `none` alongside its native efforts,
+/// prefill `<|assistant|><think></think>`, and parse/constrain plain text,
+/// tool-call, and JSON-schema replies with zero reasoning.
+#[test]
+fn glm53_disables_thinking_by_closing_open_think_block() {
+    use magnitude_chat::reasoning::ReasoningIntent;
+    let (tokenizer, templates, reference) = glm53();
+    let tokenizer = Arc::new(tokenizer);
+
+    let inspection = templates.inspect().unwrap();
+    let reasoning = &inspection.reasoning;
+    let efforts = reasoning
+        .mappings
+        .iter()
+        .map(|mapping| mapping.effort.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(efforts, ["none", "low", "high", "max"]);
+    assert_eq!(reasoning.default_effort.as_deref(), Some("max"));
+
+    // Both `chat_template_kwargs: {"enable_thinking": false}` and
+    // `ReasoningIntent::Disabled` close `<|assistant|><think></think>`.
+    let mut raw_disabled = ChatRequest::new(
+        vec![serde_json::json!({"role": "user", "content": "Say hello."})],
+        reference.now,
+    );
+    raw_disabled
+        .template_arguments
+        .insert("enable_thinking".into(), serde_json::json!(false));
+    let raw_prepared = PreparedChat::prepare(
+        &templates,
+        &tokenizer,
+        &raw_disabled,
+        &TemplateSelection::default(),
+    )
+    .unwrap();
+    assert!(raw_prepared.prompt().ends_with("<|assistant|><think></think>"));
+
+    let mut intent_disabled = ChatRequest::new(
+        vec![serde_json::json!({"role": "user", "content": "Say hello."})],
+        reference.now,
+    );
+    intent_disabled.reasoning = ReasoningIntent::Disabled;
+    let intent_prepared = PreparedChat::prepare(
+        &templates,
+        &tokenizer,
+        &intent_disabled,
+        &TemplateSelection::default(),
+    )
+    .unwrap();
+    assert_eq!(raw_prepared.prompt(), intent_prepared.prompt());
+
+    // Plain content reply parses with zero reasoning.
+    let plain = Generated::new(
+        &tokenizer,
+        &templates,
+        &raw_disabled,
+        "Hello!",
+        "<|endoftext|>",
+    );
+    let parsed_plain = plain.parsed().unwrap();
+    assert_eq!(parsed_plain.reasoning, "");
+    assert_eq!(parsed_plain.content, "Hello!");
+    assert!(parsed_plain.calls.is_empty());
+
+    // Required tool call with thinking disabled: grammar admits the direct call
+    // and parser extracts it with zero reasoning.
+    let mut tool_req = raw_disabled.clone();
+    tool_req.tools = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }
+    })];
+    tool_req.tool_choice = magnitude_chat::ToolChoice::Required;
+    let tool_gen = Generated::new(
+        &tokenizer,
+        &templates,
+        &tool_req,
+        "<tool_call>weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+        "<|endoftext|>",
+    );
+    tool_gen.admitted().unwrap();
+    let parsed_tool = tool_gen.parsed().unwrap();
+    assert_eq!(parsed_tool.reasoning, "");
+    assert_eq!(parsed_tool.content, "");
+    assert_eq!(parsed_tool.calls.len(), 1);
+    assert_eq!(parsed_tool.calls[0].name, "weather");
+    assert_eq!(
+        Value::Object(parsed_tool.calls[0].arguments.clone()),
+        serde_json::json!({"city": "Paris"})
+    );
+}
