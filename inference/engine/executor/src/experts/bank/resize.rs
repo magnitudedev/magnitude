@@ -1087,84 +1087,121 @@ impl ExpertBank {
             }
         }
 
-        // 3. Flush already-free or fenced pool granules FIRST before evicting
-        //    any live bank slots. Only evict the remaining deficit if flushing
-        //    did not satisfy `need`.
-        let already_returned = self
-            .cache
-            .changes()
-            .clone()
-            .back(|_| stores.pool.return_freed_sync(need))
-            .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
-        if already_returned >= need {
-            return Ok(already_returned);
-        }
-        let deficit = need - already_returned;
-
-        // 4. Compute exact target slots releasing `>= deficit` (accounting for
-        //    pool block size so `return_freed_sync` can vacate whole blocks,
-        //    without over-evicting past `deficit - already_free`).
-        let (from, floor) = match tier {
-            BankTier::Bank => (self.commitment().slots.load(Ordering::Acquire), self.floor(tier)),
-            BankTier::Host => (self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)), self.floor(tier)),
+        // 3. Loop across eviction passes until `total_returned >= need`, the
+        //    tier reaches its floor, or nothing further can be evicted.
+        //    A single eviction pass can free granules scattered across
+        //    partially-occupied pool blocks without emptying a whole block
+        //    yet; retrying with at least `block_bytes.max(deficit)` guarantees
+        //    forward progress until whole blocks are returned or floor is hit.
+        let mut total_returned = 0u64;
+        let mut total_released = 0u64;
+        let mut evicted_any = false;
+        let initial_from = match tier {
+            BankTier::Bank => self.commitment().slots.load(Ordering::Acquire),
+            BankTier::Host => self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)),
         };
+        let mut current_from = initial_from;
         let block_bytes = stores.pool.block_bytes();
-        let already_free = stores.pool.free_granules() as u64 * stores.pool.granule();
-        let target_blocks = deficit.div_ceil(block_bytes).saturating_mul(block_bytes);
-        let evict_bytes = match target_blocks.saturating_sub(already_free) {
-            0 if already_returned > 0 => return Ok(already_returned),
-            0 => deficit,
-            bytes => bytes,
-        };
         let charge_fn = self.tier_charge(tier);
         let charge = |at| Ok::<_, std::convert::Infallible>(charge_fn(&self.counts, at));
-        let shallowest = crate::planning::releasing(from, floor, 0, charge).unwrap_or_else(|never| match never {});
-        let deepest = crate::planning::releasing(from, floor, evict_bytes, charge).unwrap_or_else(|never| match never {});
-        let finish_without_eviction = || -> Result<u64, ReclaimError> {
-            match already_returned {
-                0 => Err(ReclaimError::AtFloor),
-                n => Ok(n),
+
+        while total_returned < need {
+            let deficit = need - total_returned;
+
+            // Flush already-free or fenced pool granules first before evicting
+            // more live bank slots.
+            let flushed = self
+                .cache
+                .changes()
+                .clone()
+                .back(|_| stores.pool.return_freed_sync(deficit))
+                .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            total_returned = total_returned.saturating_add(flushed);
+            if total_returned >= need {
+                break;
             }
-        };
-        let (Some(shallowest), Some(deepest)) = (shallowest, deepest) else {
-            return finish_without_eviction();
-        };
+            let deficit = need - total_returned;
 
-        // 5. Evict from the watcher; if in-flight bank traffic temporarily
-        //    pins slabs, hold traffic and wait for it to drain, then retry.
-        let evicting = self.evicting(tier);
-        let charged = stores.charged();
-        let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
-        let evicted = match self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)? {
-            Some(evicted) => Some(evicted),
-            None => {
-                let _hold = self.watcher.shared().hold_traffic();
-                self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
-                let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
-                self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)?
+            let (from, floor) = match tier {
+                BankTier::Bank => (self.commitment().slots.load(Ordering::Acquire), self.floor(tier)),
+                BankTier::Host => (self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)), self.floor(tier)),
+            };
+            current_from = from;
+            if from <= floor {
+                break;
             }
-        };
 
-        let Some(Evicted { slots, records, .. }) = evicted else {
-            return finish_without_eviction();
-        };
+            let evict_bytes = if !evicted_any {
+                let already_free = stores.pool.free_granules() as u64 * stores.pool.granule();
+                let target_blocks = deficit.div_ceil(block_bytes).saturating_mul(block_bytes);
+                match target_blocks.saturating_sub(already_free) {
+                    0 => deficit,
+                    bytes => bytes,
+                }
+            } else {
+                // Previous eviction freed granules without vacating enough
+                // whole blocks: evict at least one full pool block so
+                // fragmentation cannot stall progress.
+                block_bytes.max(deficit)
+            };
 
-        // 6. Commit new slot count, free slabs, trim BankCache, and
-        //    synchronously return freed blocks to the OS.
-        let to = slots as u64;
-        match tier {
-            BankTier::Bank => self.commitment().slots.store(to, Ordering::Release),
-            BankTier::Host => {
-                if let Some(host) = self.host() {
-                    host.commitment.slots.store(to, Ordering::Release);
+            let shallowest = crate::planning::releasing(from, floor, 0, charge).unwrap_or_else(|never| match never {});
+            let deepest = crate::planning::releasing(from, floor, evict_bytes, charge).unwrap_or_else(|never| match never {});
+            let (Some(shallowest), Some(deepest)) = (shallowest, deepest) else {
+                break;
+            };
+
+            // Evict from the watcher; if in-flight bank traffic temporarily
+            // pins slabs, hold traffic and wait for it to drain, then retry.
+            let evicting = self.evicting(tier);
+            let charged = stores.charged();
+            let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            let evicted = match self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)? {
+                Some(evicted) => Some(evicted),
+                None => {
+                    let _hold = self.watcher.shared().hold_traffic();
+                    self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
+                    let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+                    self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)?
+                }
+            };
+
+            let Some(Evicted { slots, records, .. }) = evicted else {
+                break;
+            };
+
+            let to = slots as u64;
+            if to >= from {
+                break;
+            }
+            match tier {
+                BankTier::Bank => self.commitment().slots.store(to, Ordering::Release),
+                BankTier::Host => {
+                    if let Some(host) = self.host() {
+                        host.commitment.slots.store(to, Ordering::Release);
+                    }
                 }
             }
+            let (released, returned) = self
+                .release_evicted(&stores, tier, to, charged, &records, Some(deficit))
+                .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            evicted_any = true;
+            current_from = to;
+            total_released = total_released.saturating_add(released);
+            total_returned = total_returned.saturating_add(returned);
         }
-        let (released, returned) = self
-            .release_evicted(&stores, tier, to, charged, &records, Some(deficit))
-            .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
-        let total_returned = already_returned.saturating_add(returned);
-        tracing::info!(?holding, from, to, need, already_returned, released, returned, "expert bank reclaimed synchronously for admission");
+
+        if evicted_any {
+            tracing::info!(
+                ?holding,
+                from = initial_from,
+                to = current_from,
+                need,
+                released = total_released,
+                returned = total_returned,
+                "expert bank reclaimed synchronously for admission"
+            );
+        }
         match total_returned {
             0 => Err(ReclaimError::AtFloor),
             n => Ok(n),

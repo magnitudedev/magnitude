@@ -449,7 +449,18 @@ impl State {
         }
         if let Some(paging) = reading.paging() {
             let room = in_use.saturating_add(figures.total());
-            self.boundary.observe(Observed { paging, held: counted.allocated, live: visible.allocated, room, unit: self.unit(), events, committed: self.committed });
+            let free = u64::try_from(figures.free_beyond_target.max(0)).unwrap_or(0).saturating_add(reading.clean_cache_supply());
+            let held = self.committed.saturating_add(self.cache);
+            self.boundary.observe(Observed {
+                paging,
+                allocated: counted.allocated,
+                held,
+                room,
+                free,
+                unit: self.unit(),
+                events,
+                committed: self.committed,
+            });
         }
         // Others' rise counts only where it is attributed to them, between
         // readings that show every change of the process's: their harm, or a
@@ -528,8 +539,9 @@ impl State {
     /// until a baseline judges harm, as growth into them could not be told
     /// from harm before; then others' alone. The process's own cold pages
     /// are never supply: where the OS counts them they are left out, and
-    /// where it does not, no cold page is supply while the process holds
-    /// pageable memory there, which may be any of them. A device store
+    /// where it does not, our own possible cold pages are conservatively
+    /// bounded by our pageable allocation (`allocated - wired`), so the
+    /// remaining machine cold reclaimable pages stay supply. A device store
     /// has none.
     fn cold_supply(&self, reading: &Reading, figures: seismic::Supply) -> u64 {
         let Some(paging) = reading.paging() else {
@@ -540,8 +552,7 @@ impl State {
         }
         match paging.own_cold {
             Some(_) => figures.cold_reclaimable.min(paging.cold),
-            None if self.allocated > self.wired => 0,
-            None => figures.cold_reclaimable,
+            None => figures.cold_reclaimable.saturating_sub(self.allocated.saturating_sub(self.wired)),
         }
     }
 }

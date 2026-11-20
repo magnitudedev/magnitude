@@ -1122,3 +1122,127 @@ fn an_idle_load_with_cache_above_its_floor_admits_new_work_when_cache_meets_harm
     let admitted = machine.ledger.change(|keeping| machine.ledger.reserve(&keeping.claims(), &machine.slot, RequestId(1), 2 * super::tests::page_rows()));
     assert!(admitted.is_ok(), "the first request is admitted once cache meets the shortage: {:?}", admitted.err());
 }
+
+/// Unified Metal (macOS, `own_cold == None`) with an unallocated request-slot
+/// reservation (`counted.allocated < committed + cache`) and pageable host
+/// memory:
+/// 1. `cold_supply()` preserves `cold_reclaimable - pageable` instead of
+///    zeroing all cold supply.
+/// 2. Repeated small background OS decompressions while free supply is
+///    abundant and `PressureLevel::Normal` do not tighten `cap` or shrink the
+///    bank.
+/// 3. Under genuine scarcity (`free == 0`), a small harm tick tightens `cap`
+///    in held units (`committed + cache`) without subtracting the unallocated
+///    reservation a second time, and a subsequent calm reading with abundant
+///    free supply lifts `cap`.
+#[test]
+fn unified_metal_preserves_cold_supply_avoids_spurious_ratchet_and_lifts_cap() {
+    let mut os = Os::new();
+    // 64 GB unified Metal with 48 GB wired ceiling, 16 GB others' working set,
+    // 16 GB cold (8 GB cold_reclaimable), 4 GB clean cache.
+    os.wired = Some((48 * GB, 4 * GB));
+    os.hot = 16 * GB;
+    os.cold = 16 * GB;
+    os.cache = 4 * GB;
+    // 20 GB wired weights + 1 GB unallocated request slot (not serving).
+    let mut machine = Machine::start(os, 20 * GB, GB, false);
+    // Add 512 MB of pageable host memory beside the wired weights.
+    let pageable = machine.ledger.change(|keeping| machine.ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 512 * MB)).expect("room");
+    machine.ledger.change(|_| {
+        let entry = pageable.entry();
+        entry.take(&entry.change(), 512 * MB, Wiring::Pageable)
+    }).expect("pageable host bytes");
+    let at = machine.at();
+    machine.os.grow(at, 512 * MB, Wiring::Pageable);
+
+    // Let the load's step close and a baseline be learned.
+    for _ in 0..6 {
+        machine.tick(SNAPSHOT_MS);
+        machine.read();
+    }
+    let before_bank = machine.ledger.estimate();
+    // `own_cold == None` with 512 MB pageable preserves `8 GB - 512 MB = 7.5 GB`
+    // of `cold_reclaimable` beside free_beyond_target and clean_cache.
+    let expected_free_and_clean = (machine.os.total - machine.os.used() - machine.os.target) + machine.os.cache;
+    let expected_cold_supply = (machine.os.cold / 2).saturating_sub(512 * MB);
+    assert_eq!(
+        before_bank.supply(),
+        (expected_free_and_clean + expected_cold_supply) as i64,
+        "pageable host memory bounds own cold pages without zeroing all cold_reclaimable"
+    );
+
+    // Grow the bank partway so abundant free supply (> 6 GB) remains beside the
+    // 1 GB unallocated request slot.
+    let grow_slots = 16u64; // 4 GB bank
+    let at = machine.at();
+    for _ in 0..grow_slots {
+        let granule = machine.ledger.cache(CacheKind::Bank, GRANULE, super::Reclaim::Unbacked).expect("room");
+        machine.ledger.change(|_| machine.pool.take(&machine.pool.change(), GRANULE, machine.wiring)).expect("pool block");
+        machine.os.grow(at, GRANULE, machine.wiring);
+        machine.bank.push(granule);
+    }
+    // Close the growth step.
+    for _ in 0..3 {
+        machine.tick(SNAPSHOT_MS);
+        machine.read();
+    }
+    let steady_bank = machine.bank_bytes();
+    assert_eq!(steady_bank, grow_slots * GRANULE);
+
+    // Repeated 4 MB background decompressions at steady cadence tighten `cap`
+    // by at most the first 4 MB excess (in held units, never subtracting the
+    // 1 GB unallocated slot) and learn the quiet baseline so subsequent ticks
+    // do not ratchet `cap` further.
+    let four_mb_pages = (4 * MB) / PAGE;
+    machine.os.harm += four_mb_pages;
+    machine.tick(SNAPSHOT_MS);
+    machine.read();
+    let first_est = machine.ledger.estimate();
+    let first_cap = first_est.cap().expect("first harm tick above zero baseline sets B");
+    let held_total = first_est.committed() + first_est.cache();
+    assert_eq!(
+        held_total.saturating_sub(first_cap),
+        4 * MB,
+        "cap ({first_cap}) must tighten by excess alone in held units (held_total={held_total})"
+    );
+    assert!(
+        first_est.import_room() + 4 * MB >= steady_bank,
+        "import_room ({}) must not drop by the 1 GB unallocated slot (bank={steady_bank})",
+        first_est.import_room()
+    );
+    for _ in 0..4 {
+        machine.os.harm += four_mb_pages;
+        machine.tick(SNAPSHOT_MS);
+        machine.read();
+        assert_eq!(machine.ledger.estimate().cap(), Some(first_cap), "steady background decompression must not ratchet B");
+        assert!(machine.ledger.shortage(&std::collections::BTreeSet::new()).is_none());
+    }
+
+    // Drain free+clean supply, then restore it so free supply rises by > unit
+    // on a calm reading, lifting `cap`.
+    let drain = (machine.os.total - machine.os.used() - machine.os.target) + machine.os.cache;
+    machine.os.hot += drain;
+    machine.os.reclaim();
+    for _ in 0..2 {
+        machine.tick(SNAPSHOT_MS);
+        machine.read();
+    }
+    assert_eq!(machine.ledger.estimate().guarantee(), 0);
+    machine.os.harm += 2 * four_mb_pages;
+    machine.tick(SNAPSHOT_MS);
+    machine.read();
+    let scarce_est = machine.ledger.estimate();
+    let cap = scarce_est.cap().expect("scarce harm tightens standing B");
+    assert!(
+        first_cap.saturating_sub(cap) <= 8 * MB,
+        "standing cap ({cap}) must tighten by excess alone from {first_cap}"
+    );
+
+    // When others release memory past what was free when `cap` was set, a calm
+    // reading lifts `cap`.
+    machine.os.hot -= drain + 2 * GB;
+    machine.tick(SNAPSHOT_MS);
+    machine.read();
+    assert_eq!(machine.ledger.estimate().cap(), None, "calm restored free supply lifts B");
+    drop(pageable);
+}

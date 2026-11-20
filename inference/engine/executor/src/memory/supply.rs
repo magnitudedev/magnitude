@@ -306,15 +306,19 @@ pub(crate) struct Boundary {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Observed {
     pub(crate) paging: Paging,
-    /// What the process held as the counters show it (at
-    /// `paging.counted.at`): what harm and steps are judged against.
+    /// What the process had physically allocated as the counters show it (at
+    /// `paging.counted.at`): what physical growth steps are judged against.
+    pub(crate) allocated: u64,
+    /// What the process holds in the ledger (`committed + cache`): the unit
+    /// that `cap` bounds across `import_room` and admission.
     pub(crate) held: u64,
-    /// What the process holds as the live figures show it: what a pressure
-    /// event lowers B from.
-    pub(crate) live: u64,
     /// What the process held and the supply beside it: what only others'
     /// changes move.
     pub(crate) room: u64,
+    /// Immediate supply beside the process (free pages beyond target and clean
+    /// file cache): bytes the OS can hand out without compressing anonymous
+    /// working sets.
+    pub(crate) free: u64,
     /// What one pressure event lowers B by: one block of the store's pool,
     /// the unit a shrink returns to the OS, of the cache there is.
     pub(crate) unit: u64,
@@ -331,6 +335,7 @@ struct Point {
     at: Instant,
     machine: u64,
     own: u64,
+    allocated: u64,
     held: u64,
 }
 
@@ -354,9 +359,10 @@ struct Cap {
     bytes: u64,
     /// The step's bytes: the evidence a regrowth needs.
     step: u64,
-    /// The room and others' cold pages when it was set.
+    /// The room, others' cold pages, and immediate free supply when it was set.
     room: u64,
     cold: u64,
+    free: u64,
 }
 
 /// Others' pages brought back past what the baseline's spread counts,
@@ -378,7 +384,7 @@ fn judge(unexplained: f64, harmed: u64, spread: f64, span: f64) -> (f64, u64) {
 impl Boundary {
     /// Fold in one reading.
     pub(crate) fn observe(&mut self, now: Observed) {
-        let Observed { paging, held, live, room, unit, events, committed } = now;
+        let Observed { paging, allocated, held, room, free, unit, events, committed } = now;
         self.committed = committed;
         let seismic::Counted { at, lag } = paging.counted;
         let cold = paging.cold;
@@ -390,14 +396,21 @@ impl Boundary {
             // one block less than it holds per event, the blocks' sum the
             // evidence a regrowth needs.
             let blocks = unit.saturating_mul(events);
-            let bytes = live.saturating_sub(blocks);
+            let bytes = held.saturating_sub(blocks);
             let cap = match self.cap {
                 Some(cap) => Cap { bytes: cap.bytes.min(bytes), step: cap.step.saturating_add(blocks), ..cap },
-                None => Cap { bytes, step: blocks, room, cold },
+                None => Cap { bytes, step: blocks, room, cold, free },
             };
             self.cap = Some(cap);
         }
-        let lifted = |cap: &Cap| room >= cap.room.saturating_add(cap.step) || cold >= cap.cold.saturating_add(cap.step);
+        let level = self.level;
+        let lifted = |cap: &Cap| {
+            room >= cap.room.saturating_add(cap.step)
+                || cold >= cap.cold.saturating_add(cap.step)
+                || (level.is_none()
+                    && free >= cap.free.saturating_add(cap.step.max(unit))
+                    && held.saturating_add(free) > cap.bytes.saturating_add(cap.step))
+        };
         let Some(harm) = paging.harm else {
             // No share of the process's is counted: nothing judges harm,
             // growth or a step; B, where pressure set it, lifts on others' release.
@@ -408,7 +421,7 @@ impl Boundary {
             return;
         };
         self.unjudged = false;
-        let point = Point { at, machine: harm.machine, own: harm.own, held };
+        let point = Point { at, machine: harm.machine, own: harm.own, allocated, held };
         // Harm is judged only over spans of at least the counters' lag: a
         // share of the process's own a fold shows late is then shown.
         let Some(last) = self.last.filter(|last| last.at < at && at.duration_since(last.at) >= lag) else {
@@ -436,7 +449,7 @@ impl Boundary {
         };
         let rate = (harmed as f64 - carried) / span;
         let risen = excess.is_some_and(|excess| excess > 0);
-        if held > last.held {
+        if allocated > last.allocated {
             let from = self.step.map_or(last.held, |step| step.from);
             self.step = Some(Step { from, grown: at });
             self.quiet = None;
@@ -445,18 +458,32 @@ impl Boundary {
             Some(step) if risen => {
                 // Harm within the window of the process's growth: the
                 // boundary is the holding before it.
-                self.settle(Cap { bytes: step.from, step: held.saturating_sub(step.from), room, cold });
+                self.settle(Cap { bytes: step.from, step: held.saturating_sub(step.from), room, cold, free });
             }
-            Some(step) if held <= last.held && last.at >= step.grown + window => self.step = None,
+            Some(step) if allocated <= last.allocated && last.at >= step.grown + window => self.step = None,
             Some(_) => {}
             None => {
                 if let Some(excess) = excess.filter(|excess| *excess > 0) {
-                    // Others' working set grew of itself: what the process
-                    // may hold falls by the harm's excess, once.
                     let excess = excess.saturating_mul(paging.page_bytes);
-                    let bytes = self.cap.map_or(held, |cap| cap.bytes.min(held)).saturating_sub(excess);
+                    // Others' working set grew of itself: what the process
+                    // may hold falls by the harm's excess, once. Tighten a
+                    // standing cap in place instead of snapping it down to
+                    // `held` or overwriting its regrowth anchor.
                     self.harmed = Some(excess);
-                    self.settle(Cap { bytes, step: excess, room, cold });
+                    self.cap = Some(match self.cap {
+                        Some(cap) => Cap {
+                            bytes: cap.bytes.saturating_sub(excess),
+                            step: cap.step.saturating_add(excess),
+                            ..cap
+                        },
+                        None => Cap {
+                            bytes: held.saturating_sub(excess),
+                            step: excess,
+                            room,
+                            cold,
+                            free,
+                        },
+                    });
                 }
                 let quiet = self.quiet.get_or_insert(Quiet { since: last.at, spread: 0.0 });
                 quiet.spread = quiet.spread.max(rate);
@@ -557,6 +584,7 @@ mod tests {
     }
 
     const GB: u64 = 1 << 30;
+    const MB: u64 = 1 << 20;
 
     /// The counters' lag, λ_h.
     const LAG: Duration = Duration::from_millis(100);
@@ -572,7 +600,7 @@ mod tests {
             pressure: Some(seismic::PressureLevel::Normal),
             counted: seismic::Counted { at, lag: LAG },
         };
-        Observed { paging, held: GB, live: GB, room: 2 * GB, unit: 0, events: 0, committed: 0 }
+        Observed { paging, allocated: GB, held: GB, room: 2 * GB, free: GB, unit: 0, events: 0, committed: 0 }
     }
 
     /// Whether harm sets B within one second of readings `cadence` apart,
@@ -608,5 +636,137 @@ mod tests {
             let verdicts = [Duration::from_millis(100), Duration::from_secs(1)].map(|cadence| judged_at(cadence, harming));
             assert_eq!(verdicts, [harming; 2], "harming: {harming}");
         }
+    }
+
+    /// Repeated small harm ticks while `held` sits 600 MB below a standing
+    /// `cap.bytes` subtract only `excess` from `cap.bytes` and preserve the
+    /// regrowth anchor instead of snapping `cap` down to `held` (no one-way
+    /// cap ratchet).
+    #[test]
+    fn repeated_small_harm_never_snaps_cap_down_to_held() {
+        let mut boundary = Boundary::default();
+        let start = Instant::now();
+        let unit = 256 * MB;
+        let obs = |at: Instant, machine: u64, held: u64, free: u64| Observed {
+            paging: Paging {
+                harm: Some(seismic::Harm { machine, own: 0 }),
+                page_bytes: 16 * 1024,
+                cold: 0,
+                own_cold: None,
+                pressure: Some(seismic::PressureLevel::Normal),
+                counted: seismic::Counted { at, lag: LAG },
+            },
+            allocated: held,
+            held,
+            room: held + free,
+            free,
+            unit,
+            events: 0,
+            committed: 20 * GB,
+        };
+        // Learn a zero-harm baseline at 30 GB held with 0 free (scarce).
+        boundary.observe(obs(start, 0, 30 * GB, 0));
+        boundary.observe(obs(start + Duration::from_secs(1), 0, 30 * GB, 0));
+        assert!(boundary.judges());
+
+        // First 3 MB harm tick sets cap at 30 GB - 3 MB.
+        let three_mb_pages = (3 * MB) / (16 * 1024);
+        boundary.observe(obs(start + Duration::from_secs(2), three_mb_pages, 30 * GB, 0));
+        let first_cap = boundary.cap().expect("first harm tick sets B");
+        assert_eq!(first_cap, 30 * GB - 3 * MB);
+
+        // Now `held` sits 600 MB below `cap.bytes` (e.g. bank headroom/reserve),
+        // and another 6 MB harm tick arrives (double rate so it exceeds the
+        // updated quiet baseline). Cap must fall by only 3 MB excess (the
+        // delta above the 3 MB/s baseline), NEVER snap down to `held`.
+        let held_below = first_cap - 600 * MB;
+        boundary.observe(obs(start + Duration::from_secs(3), three_mb_pages + 2 * three_mb_pages, held_below, 0));
+        let second_cap = boundary.cap().expect("cap remains standing");
+        assert!(
+            second_cap > held_below + 500 * MB,
+            "cap ({second_cap}) must tighten by excess alone, never snap down to held ({held_below})"
+        );
+        assert_eq!(second_cap, first_cap - 3 * MB);
+    }
+
+    /// Steady background OS decompressions raise the quiet baseline after the
+    /// first excess tick, so subsequent ticks at the same rate emit no further
+    /// Harm and never ratchet `cap` downward.
+    #[test]
+    fn steady_background_decompression_raises_baseline_without_ratcheting_cap() {
+        let mut boundary = Boundary::default();
+        let start = Instant::now();
+        let unit = 256 * MB;
+        let obs = |at: Instant, machine: u64| Observed {
+            paging: Paging {
+                harm: Some(seismic::Harm { machine, own: 0 }),
+                page_bytes: 16 * 1024,
+                cold: 0,
+                own_cold: None,
+                pressure: Some(seismic::PressureLevel::Normal),
+                counted: seismic::Counted { at, lag: LAG },
+            },
+            allocated: 30 * GB,
+            held: 30 * GB,
+            room: 36 * GB,
+            free: 6 * GB,
+            unit,
+            events: 0,
+            committed: 20 * GB,
+        };
+        boundary.observe(obs(start, 0));
+        boundary.observe(obs(start + Duration::from_secs(10), 0));
+        assert!(boundary.judges());
+
+        // First 4 MB tick sets cap to 30 GB - 4 MB and raises baseline to 4 MB / 10s.
+        let four_mb_pages = (4 * MB) / (16 * 1024);
+        let mut machine = four_mb_pages;
+        boundary.observe(obs(start + Duration::from_secs(20), machine));
+        assert_eq!(boundary.cap(), Some(30 * GB - 4 * MB));
+
+        // Subsequent 4 MB ticks at the same cadence are within the learned
+        // baseline: zero additional Harm and cap never ratchets further.
+        for tick in 3..=6 {
+            machine += four_mb_pages;
+            boundary.observe(obs(start + Duration::from_secs(tick * 10), machine));
+            assert_eq!(boundary.cap(), Some(30 * GB - 4 * MB), "steady background decompression must not ratchet B on tick {tick}");
+            assert_eq!(boundary.harmed(), None, "steady background decompression must not emit Harm on tick {tick}");
+        }
+    }
+
+    /// A standing `cap` lifts on a calm reading once `PressureLevel::Normal`
+    /// and abundant free supply exceeds `cap.bytes + cap.step`.
+    #[test]
+    fn cap_lifts_on_calm_when_abundant_free_supply_exceeds_cap_plus_step() {
+        let mut boundary = Boundary::default();
+        let start = Instant::now();
+        let unit = 256 * MB;
+        let obs = |at: Instant, machine: u64, free: u64| Observed {
+            paging: Paging {
+                harm: Some(seismic::Harm { machine, own: 0 }),
+                page_bytes: 16 * 1024,
+                cold: 0,
+                own_cold: None,
+                pressure: Some(seismic::PressureLevel::Normal),
+                counted: seismic::Counted { at, lag: LAG },
+            },
+            allocated: 30 * GB,
+            held: 30 * GB,
+            room: 30 * GB + free,
+            free,
+            unit,
+            events: 0,
+            committed: 20 * GB,
+        };
+        boundary.observe(obs(start, 0, 0));
+        boundary.observe(obs(start + Duration::from_secs(1), 0, 0));
+        // Scarce harm sets cap.
+        let pages = (4 * MB) / (16 * 1024);
+        boundary.observe(obs(start + Duration::from_secs(2), pages, 0));
+        assert_eq!(boundary.cap(), Some(30 * GB - 4 * MB));
+
+        // Calm reading with 2 GB free (> unit and allocated + free > cap + step) lifts cap.
+        boundary.observe(obs(start + Duration::from_secs(3), pages, 2 * GB));
+        assert_eq!(boundary.cap(), None, "abundant calm free supply lifts standing B");
     }
 }
