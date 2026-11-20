@@ -209,13 +209,18 @@ impl Extensions {
     fn ngram(
         &self,
         geometry: &Geometry,
-        weight: &mut Weight,
+        tensors: &mut Tensors,
+        prefix: &str,
         table: &WeightDescriptor,
     ) -> Result<Sublayer, Error> {
         let site = &self.ngram;
         let hidden = geometry.hidden;
         let wide = self.wide(hidden)?;
         let embedding = product(&[site.hash.context, site.hash.heads_per_order, site.width])?;
+        let taps = tensors.bind_conv1d(&format!("{prefix}ple_conv1d.weight"), wide, site.kernel)?;
+        let mut weight = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
+            Ok(tensors.bind(&format!("{prefix}{name}"), shape)?)
+        };
         Ok(Sublayer {
             input: InputNorm::None,
             op: Operator::NGramInput(Box::new(NGramInput {
@@ -231,7 +236,7 @@ impl Extensions {
                 epsilon: geometry.epsilon,
                 mixing: Some(NGramConvolution {
                     norm: weight("ple_norm_conv.weight", &[wide])?,
-                    taps: weight("ple_conv1d.weight", &[wide, site.kernel])?,
+                    taps,
                     kernel: site.kernel,
                     dilation: site.dilation,
                 }),
@@ -246,30 +251,37 @@ impl Extensions {
 fn block(
     geometry: &Geometry,
     extensions: &Extensions,
-    weight: &mut Weight,
+    tensors: &mut Tensors,
+    prefix: &str,
     layer: u64,
     kind: MixerKind,
 ) -> Result<Block, Error> {
     let mut sublayers = Vec::with_capacity(3);
     let mixer = match kind {
         MixerKind::Attention => {
-            let mut attention = geometry.attention(weight)?;
+            let mut weight = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
+                Ok(tensors.bind(&format!("{prefix}{name}"), shape)?)
+            };
+            let mut attention = geometry.attention(&mut weight)?;
             attention.history[0].reads =
-                extensions.reads(geometry, weight, extensions.blocks[layer as usize])?;
+                extensions.reads(geometry, &mut weight, extensions.blocks[layer as usize])?;
             Operator::Attention(Box::new(attention))
         }
         MixerKind::Recurrent => Operator::GatedDelta(Box::new(
-            geometry.gated_delta(weight, GateFunction::Sigmoid)?,
+            geometry.gated_delta(tensors, prefix, GateFunction::Sigmoid)?,
         )),
     };
+    let mut weight = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
+        Ok(tensors.bind(&format!("{prefix}{name}"), shape)?)
+    };
     sublayers.push(Sublayer {
-        input: mix_input(extensions.site(geometry, weight, "hc_attn", true)?),
+        input: mix_input(extensions.site(geometry, &mut weight, "hc_attn", true)?),
         op: mixer,
         output: OutputForm::Scatter,
     });
     sublayers.push(Sublayer {
-        input: mix_input(extensions.site(geometry, weight, "hc_ffn", true)?),
-        op: geometry.feed_forward(weight, geometry.intermediate)?,
+        input: mix_input(extensions.site(geometry, &mut weight, "hc_ffn", true)?),
+        op: geometry.feed_forward(&mut weight, geometry.intermediate)?,
         output: OutputForm::Scatter,
     });
     Ok(Block { sublayers })
@@ -291,28 +303,23 @@ pub fn inspect_components(
     let extensions = Extensions::read(&m, &layers, predictions)?;
     let geometry = Geometry::read(&m, true)?;
     let hidden = geometry.hidden;
-    let embedding = directory
-        .tensor("token_embd.weight")
-        .ok_or_else(|| invalid("missing qwen4exp embedding"))?;
-    let table = directory
-        .tensor("per_layer_token_embd.weight")
-        .ok_or_else(|| invalid("missing qwen4exp n-gram table"))?;
-    let (&[vocabulary, _], &[table_rows, _]) = (&embedding.shape[..], &table.shape[..]) else {
-        return Err(invalid("qwen4exp embedding tables must be matrices"));
-    };
     let context_limit = m.integer("context_length")?;
     let mut tensors = Tensors::new(directory);
+    let vocabulary = m.vocab_size(tensors.rows("token_embd.weight")?)?;
+    let table_rows = tensors.rows("per_layer_token_embd.weight")?;
     // A weight stored with an NVFP4 second-level scale is scaled by it.
-    let mut tensor = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
-        Ok(tensors.bind(name, shape)?)
-    };
-    let embedding = tensor("token_embd.weight", &[vocabulary, hidden])?;
-    let ngram_table = tensor(
+    let embedding = tensors.bind("token_embd.weight", &[vocabulary, hidden])?;
+    let ngram_table = tensors.bind(
         "per_layer_token_embd.weight",
         &[table_rows, extensions.ngram.width],
     )?;
-    let output = tensor("output.weight", &[vocabulary, hidden])?;
-    let exit = extensions.site(&geometry, &mut tensor, "output_hc", false)?;
+    let output = tensors.bind("output.weight", &[vocabulary, hidden])?;
+    let exit = extensions.site(
+        &geometry,
+        &mut |name, shape| Ok(tensors.bind(name, shape)?),
+        "output_hc",
+        false,
+    )?;
     let mut blocks = layers
         .iter()
         .enumerate()
@@ -321,7 +328,8 @@ pub fn inspect_components(
             block(
                 &geometry,
                 &extensions,
-                &mut |name, shape| tensor(&format!("{p}{name}"), shape),
+                &mut tensors,
+                &p,
                 layer as u64,
                 *kind,
             )
@@ -338,7 +346,8 @@ pub fn inspect_components(
     let p = format!("blk.{layer}.");
     before.sublayers.push(extensions.ngram(
         &geometry,
-        &mut |name, shape| tensor(&format!("{p}{name}"), shape),
+        &mut tensors,
+        &p,
         &ngram_table,
     )?);
     let vision = projector
@@ -382,7 +391,7 @@ pub fn inspect_components(
             &m,
             &definition,
             HeadComponent::Target,
-            &mut |name, shape| tensor(&format!("{p}{name}"), shape),
+            &mut |name, shape| Ok(tensors.bind(&format!("{p}{name}"), shape)?),
         )?);
     }
     m.finish()?;

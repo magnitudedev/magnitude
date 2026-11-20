@@ -33,10 +33,9 @@ pub fn describe_projector(
     feature_epsilon: f64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("muse-glimmer", ())], output_hidden)?;
-    let meta = ProjectorMetadata::new(directory);
-    meta.ignore("clip.has_vision_encoder");
-    meta.ignore("clip.projector_type");
+    let meta = ProjectorMetadata::open(directory);
     meta.ignore("clip.vision.image_size");
+    meta.invariant_flag("clip.use_gelu", true, "true (GELU feed-forward)")?;
     // Declared, and the target's (`projector_type`).
     meta.integer("clip.vision.projection_dim")?;
     let hidden = meta.integer("clip.vision.embedding_length")?;
@@ -54,12 +53,12 @@ pub fn describe_projector(
     let mut t = Tensors::new(directory);
     // The window side is the position table's side: llama.cpp and the
     // released model both tie them.
-    let table_rows = t.rows("v.position_embd.weight")?;
+    let (table_rows, table_cols) = t.matrix_or_batched_shape("v.position_embd.weight")?;
     let side = (table_rows as f64).sqrt() as u64;
-    if side * side != table_rows {
+    if side * side != table_rows || table_cols != hidden {
         return Err(invalid("projector position table is not square"));
     }
-    let table = t.bind("v.position_embd.weight", &[table_rows, hidden])?;
+    let table = t.bind_matrix_or_batched("v.position_embd.weight", table_rows, hidden)?;
     let layer_norm = |t: &mut Tensors, stem: &str| -> Result<VisionNorm, Error> {
         Ok(VisionNorm::Layer {
             weight: t.bind(&format!("{stem}.weight"), &[hidden])?,

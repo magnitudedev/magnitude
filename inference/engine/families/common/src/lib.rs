@@ -4,6 +4,7 @@
 //! varies between families: which keys and tensors mean what.
 
 pub mod binders;
+pub mod dialect;
 mod error;
 #[cfg(feature = "catalog-headers")]
 pub mod headers;

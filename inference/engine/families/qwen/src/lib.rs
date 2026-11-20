@@ -10,11 +10,8 @@ mod projector;
 
 pub use projector::describe_projector;
 
-use magnitude_artifacts::{
-    gguf::Directory,
-    UnsupportedReason,
-};
-use magnitude_family_common::{HeaderError, Metadata};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
     ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
     GateFunction, GatedDelta, HeadNorm, HistoryRows, HistorySource, MediaRowAttention,
@@ -170,16 +167,7 @@ pub struct Geometry {
 
 impl Geometry {
     pub fn read(m: &Metadata, routed: bool) -> Result<Self, Error> {
-        if let Some(scaling) = m
-            .value("rope.scaling.type")
-            .filter(|v| v.string() != Some("none"))
-        {
-            let kind = scaling.string().unwrap_or("unspecified").to_owned();
-            return Err(Error::unsupported(
-                vec![UnsupportedReason::RopeScaling { kind }],
-                "scaled Qwen rotary definitions are not yet qualified",
-            ));
-        }
+        m.reject_rope_scaling()?;
         let sections = <[u64; 4]>::try_from(m.counts("rope.dimension_sections")?).map_err(|_| {
             Error::invalid("Qwen rotary sections must contain four nonnegative integers")
         })?;
@@ -211,14 +199,17 @@ impl Geometry {
         let recurrent_value_heads = m.integer("ssm.time_step_rank")?;
         let recurrent_width = m.integer("ssm.state_size")?;
         let recurrent_inner = product(&[recurrent_value_heads, recurrent_width])?;
-        if m.integer("attention.value_length")? != attention_width
-            || m.integer("ssm.inner_size")? != recurrent_inner
-        {
-            return Err(Error::invalid(
-                "Qwen attention/recurrent inner size differs from head geometry",
-            ));
-        }
-        let epsilon = m.number("attention.layer_norm_rms_epsilon")?;
+        m.invariant_count(
+            "attention.value_length",
+            attention_width,
+            "equal to attention.key_length",
+        )?;
+        m.invariant_count(
+            "ssm.inner_size",
+            recurrent_inner,
+            "equal to ssm.time_step_rank * ssm.state_size",
+        )?;
+        let epsilon = m.positive_number("attention.layer_norm_rms_epsilon")?;
         let rotary = Rotary::Interleaved {
             width: m.integer("rope.dimension_count")?,
             base: m.number("rope.freq_base")?,
@@ -307,7 +298,8 @@ impl Geometry {
     /// Gated DeltaNet with tiled heads.
     pub fn gated_delta(
         &self,
-        weight: &mut Weight,
+        tensors: &mut Tensors,
+        prefix: &str,
         output_gate: GateFunction,
     ) -> Result<GatedDelta, Error> {
         let (channels, inner, value_heads, hidden) = (
@@ -316,6 +308,14 @@ impl Geometry {
             self.recurrent_value_heads,
             self.hidden,
         );
+        let convolution = tensors.bind_conv1d(
+            &format!("{prefix}ssm_conv1d.weight"),
+            channels,
+            self.convolution_width,
+        )?;
+        let mut weight = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
+            Ok(tensors.bind(&format!("{prefix}{name}"), shape)?)
+        };
         Ok(GatedDelta {
             convolution_width: self.convolution_width,
             key_heads: self.recurrent_key_heads,
@@ -323,7 +323,7 @@ impl Geometry {
             width: self.recurrent_width,
             head_mapping: RecurrentHeadMapping::Tiled,
             query_key_value: weight("attn_qkv.weight", &[channels, hidden])?,
-            convolution: weight("ssm_conv1d.weight", &[channels, self.convolution_width])?,
+            convolution,
             beta: weight("ssm_beta.weight", &[value_heads, hidden])?,
             decay: RecurrentDecay::PerHead {
                 alpha: weight("ssm_alpha.weight", &[value_heads, hidden])?,

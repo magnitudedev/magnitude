@@ -145,6 +145,25 @@ impl<'a> ProjectorMetadata<'a> {
         }
     }
 
+    /// Begins reading `clip.*` keys from a validated vision projector
+    /// `directory`, automatically accounting for the projector-identity keys
+    /// checked by [`projector_type`] (`clip.has_vision_encoder`,
+    /// `clip.projector_type`, `clip.vision.projector_type`) and a benign
+    /// `clip.has_audio_encoder = false` flag.
+    pub fn open(directory: &'a Directory) -> Self {
+        let meta = Self::new(directory);
+        meta.ignore("clip.has_vision_encoder");
+        meta.ignore("clip.projector_type");
+        meta.ignore("clip.vision.projector_type");
+        if matches!(
+            directory.value("clip.has_audio_encoder"),
+            Some(Value::Scalar(Scalar::Bool(false)))
+        ) {
+            meta.ignore("clip.has_audio_encoder");
+        }
+        meta
+    }
+
     fn strip(key: &str) -> &str {
         key.strip_prefix("clip.").unwrap_or(key)
     }
@@ -176,6 +195,21 @@ impl<'a> ProjectorMetadata<'a> {
     /// A required nonnegative integer (`>= 0`).
     pub fn count(&self, key: &str) -> Result<u64, HeaderError> {
         self.inner.count(Self::strip(key))
+    }
+
+    /// An optional nonnegative integer that defaults to `default` when absent.
+    pub fn default_count(&self, key: &str, default: u64) -> Result<u64, HeaderError> {
+        self.inner.default_count(Self::strip(key), default)
+    }
+
+    /// An optional nonnegative integer that must equal `expected` when present.
+    pub fn invariant_count(
+        &self,
+        key: &str,
+        expected: u64,
+        reason: &'static str,
+    ) -> Result<(), HeaderError> {
+        self.inner.invariant_count(Self::strip(key), expected, reason)
     }
 
     /// An optional positive integer (`> 0`).
@@ -223,6 +257,21 @@ impl<'a> ProjectorMetadata<'a> {
     /// A required boolean.
     pub fn bool(&self, key: &str) -> Result<bool, HeaderError> {
         self.inner.flag(Self::strip(key))
+    }
+
+    /// An optional boolean that defaults to `default` when absent.
+    pub fn default_flag(&self, key: &str, default: bool) -> Result<bool, HeaderError> {
+        self.inner.default_flag(Self::strip(key), default)
+    }
+
+    /// An optional boolean that must equal `expected` when present.
+    pub fn invariant_flag(
+        &self,
+        key: &str,
+        expected: bool,
+        reason: &'static str,
+    ) -> Result<(), HeaderError> {
+        self.inner.invariant_flag(Self::strip(key), expected, reason)
     }
 
     /// An optional string.
@@ -345,5 +394,34 @@ mod tests {
             meta.bounded_block_count("clip.vision.block_count"),
             Err(HeaderError::MetadataType { key, .. }) if key == "clip.vision.block_count"
         ));
+    }
+
+    #[test]
+    fn open_accounts_for_projector_identity_and_false_audio_only() {
+        let benign = directory(
+            &[
+                ("clip.has_vision_encoder", Value::Scalar(Scalar::Bool(true))),
+                ("clip.projector_type", Value::Scalar(Scalar::String("demo".into()))),
+                ("clip.vision.projector_type", Value::Scalar(Scalar::String("demo".into()))),
+                ("clip.has_audio_encoder", Value::Scalar(Scalar::Bool(false))),
+            ],
+            1,
+        );
+        assert_eq!(ProjectorMetadata::open(&benign).finish(), Ok(()));
+
+        let with_audio = directory(
+            &[
+                ("clip.has_vision_encoder", Value::Scalar(Scalar::Bool(true))),
+                ("clip.projector_type", Value::Scalar(Scalar::String("demo".into()))),
+                ("clip.has_audio_encoder", Value::Scalar(Scalar::Bool(true))),
+            ],
+            1,
+        );
+        assert_eq!(
+            ProjectorMetadata::open(&with_audio).finish(),
+            Err(HeaderError::UnknownMetadata(vec![
+                "clip.has_audio_encoder".into()
+            ]))
+        );
     }
 }

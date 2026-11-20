@@ -141,6 +141,25 @@ impl<'a> Metadata<'a> {
         self.required(key, value)
     }
 
+    /// An optional nonnegative integer that defaults to `default` when absent.
+    pub fn default_count(&self, key: &str, default: u64) -> Result<u64, HeaderError> {
+        Ok(self.optional_count(key)?.unwrap_or(default))
+    }
+
+    /// An optional nonnegative integer that must equal `expected` when present.
+    pub fn invariant_count(
+        &self,
+        key: &str,
+        expected: u64,
+        reason: &'static str,
+    ) -> Result<(), HeaderError> {
+        match self.optional_count(key)? {
+            None => Ok(()),
+            Some(value) if value == expected => Ok(()),
+            Some(_) => Err(self.malformed(key, reason)),
+        }
+    }
+
     /// A positive integer.
     pub fn optional_integer(&self, key: &str) -> Result<Option<u64>, HeaderError> {
         self.typed(key, "a positive integer", |value| {
@@ -184,6 +203,51 @@ impl<'a> Metadata<'a> {
     pub fn flag(&self, key: &str) -> Result<bool, HeaderError> {
         let value = self.optional_flag(key)?;
         self.required(key, value)
+    }
+
+    /// An optional boolean that defaults to `default` when absent.
+    pub fn default_flag(&self, key: &str, default: bool) -> Result<bool, HeaderError> {
+        Ok(self.optional_flag(key)?.unwrap_or(default))
+    }
+
+    /// An optional boolean that must equal `expected` when present.
+    pub fn invariant_flag(
+        &self,
+        key: &str,
+        expected: bool,
+        reason: &'static str,
+    ) -> Result<(), HeaderError> {
+        match self.optional_flag(key)? {
+            None => Ok(()),
+            Some(value) if value == expected => Ok(()),
+            Some(_) => Err(self.malformed(key, reason)),
+        }
+    }
+
+    /// The model's vocabulary size, inferred from the embedding table's rows
+    /// and verified against `<arch>.vocab_size` when that key is present.
+    pub fn vocab_size(&self, embedding_rows: u64) -> Result<u64, HeaderError> {
+        if let Some(declared) = self.optional_integer("vocab_size")? {
+            if declared != embedding_rows {
+                return Err(self.malformed(
+                    "vocab_size",
+                    "equal to the embedding table's row count",
+                ));
+            }
+        }
+        Ok(embedding_rows)
+    }
+
+    /// Admits an absent `rope.scaling.type` or `"none"`, and rejects any
+    /// other scaling type with [`HeaderError::RopeScaling`].
+    pub fn reject_rope_scaling(&self) -> Result<(), HeaderError> {
+        match self.value("rope.scaling.type") {
+            None => Ok(()),
+            Some(value) if value.string() == Some("none") => Ok(()),
+            Some(value) => Err(HeaderError::RopeScaling(
+                value.string().unwrap_or("unspecified").to_owned(),
+            )),
+        }
     }
 
     pub fn optional_string(&self, key: &str) -> Result<Option<&'a str>, HeaderError> {
@@ -299,6 +363,18 @@ impl<'a> Metadata<'a> {
             "a nonnegative integer or one per layer",
             layers,
             Element::unsigned,
+        )?;
+        self.required(key, value)
+    }
+
+    /// A finite number per layer, stated once for all layers or as an array
+    /// with one entry per layer.
+    pub fn uniform_or_layer_numbers(&self, key: &str, layers: u64) -> Result<Vec<f64>, HeaderError> {
+        let value = self.uniform_or_array(
+            key,
+            "a finite number or one per layer",
+            layers,
+            element_number,
         )?;
         self.required(key, value)
     }
@@ -461,5 +537,65 @@ mod tests {
             m.uniform_or_layer_counts("expert_used_count", 3),
             Err(HeaderError::MetadataType { key, .. }) if key == "arch.expert_used_count"
         ));
+    }
+
+    #[test]
+    fn policy_primitives_default_validate_and_reject_invariants() {
+        let absent = directory(&[]);
+        let m = Metadata::new(&absent, "arch");
+        assert_eq!(m.default_count("shared", 0), Ok(0));
+        assert_eq!(m.default_flag("norm", true), Ok(true));
+        assert_eq!(m.invariant_count("gating", 2, "2 (sigmoid)"), Ok(()));
+        assert_eq!(m.invariant_flag("tail", true, "true"), Ok(()));
+        assert_eq!(m.vocab_size(32_000), Ok(32_000));
+        assert_eq!(m.reject_rope_scaling(), Ok(()));
+        assert_eq!(m.finish(), Ok(()));
+
+        let matching = directory(&[
+            ("arch.shared", Value::Scalar(Scalar::Unsigned(2))),
+            ("arch.norm", Value::Scalar(Scalar::Bool(false))),
+            ("arch.gating", Value::Scalar(Scalar::Unsigned(2))),
+            ("arch.tail", Value::Scalar(Scalar::Bool(true))),
+            ("arch.vocab_size", Value::Scalar(Scalar::Unsigned(32_000))),
+            ("arch.rope.scaling.type", Value::Scalar(Scalar::String("none".into()))),
+        ]);
+        let m = Metadata::new(&matching, "arch");
+        assert_eq!(m.default_count("shared", 0), Ok(2));
+        assert_eq!(m.default_flag("norm", true), Ok(false));
+        assert_eq!(m.invariant_count("gating", 2, "2 (sigmoid)"), Ok(()));
+        assert_eq!(m.invariant_flag("tail", true, "true"), Ok(()));
+        assert_eq!(m.vocab_size(32_000), Ok(32_000));
+        assert_eq!(m.reject_rope_scaling(), Ok(()));
+        assert_eq!(m.finish(), Ok(()));
+
+        let mismatched = directory(&[
+            ("arch.gating", Value::Scalar(Scalar::Unsigned(1))),
+            ("arch.tail", Value::Scalar(Scalar::Bool(false))),
+            ("arch.vocab_size", Value::Scalar(Scalar::Unsigned(16_000))),
+            ("arch.rope.scaling.type", Value::Scalar(Scalar::String("yarn".into()))),
+        ]);
+        let m = Metadata::new(&mismatched, "arch");
+        assert_eq!(
+            m.invariant_count("gating", 2, "2 (sigmoid)"),
+            Err(HeaderError::MetadataType {
+                key: "arch.gating".into(),
+                expected: "2 (sigmoid)",
+            })
+        );
+        assert_eq!(
+            m.invariant_flag("tail", true, "true"),
+            Err(HeaderError::MetadataType {
+                key: "arch.tail".into(),
+                expected: "true",
+            })
+        );
+        assert!(matches!(
+            m.vocab_size(32_000),
+            Err(HeaderError::MetadataType { key, .. }) if key == "arch.vocab_size"
+        ));
+        assert_eq!(
+            m.reject_rope_scaling(),
+            Err(HeaderError::RopeScaling("yarn".into()))
+        );
     }
 }

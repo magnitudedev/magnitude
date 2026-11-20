@@ -58,13 +58,9 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, FamilyError> {
     projector_type(directory, &[(PROJECTOR_TYPE, ())], target_width)?;
-    let meta = ProjectorMetadata::new(directory);
-    meta.ignore("clip.has_vision_encoder");
-    meta.ignore("clip.projector_type");
+    let meta = ProjectorMetadata::open(directory);
     // The tower's feed-forward is SiLU.
-    if !meta.bool("clip.use_silu")? {
-        return Err(invalid("the projector's feed-forward must be SwiGLU (clip.use_silu)"));
-    }
+    meta.invariant_flag("clip.use_silu", true, "true (SwiGLU feed-forward)")?;
     let depth = meta.bounded_block_count("clip.vision.block_count")?;
     let hidden = meta.integer("clip.vision.embedding_length")?;
     let intermediate = meta.integer("clip.vision.feed_forward_length")?;
@@ -72,7 +68,7 @@ pub fn describe_projector(
     let patch = meta.integer("clip.vision.patch_size")?;
     let merge = meta.integer("clip.vision.spatial_merge_size")?;
     let output_hidden = meta.integer("clip.vision.projection_dim")?;
-    meta.integer("clip.vision.image_size")?;
+    meta.optional_integer("clip.vision.image_size")?;
     let min_pixels = meta.integer("clip.vision.image_min_pixels")?;
     let max_pixels = meta.integer("clip.vision.image_max_pixels")?;
     let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;

@@ -36,6 +36,8 @@ pub enum HeaderError {
     /// A rotary table over an odd, empty or oversized dimension range, or a
     /// base that does not decay.
     Rotary { rotated: u64, width: u64, base: f64 },
+    /// A rotary scaling type the family does not execute.
+    RopeScaling(String),
     /// YaRN parameters outside their admitted ranges.
     Yarn,
     Definition(DefinitionError),
@@ -86,6 +88,7 @@ impl fmt::Display for HeaderError {
                 formatter,
                 "invalid rotary: {rotated} of {width} dimensions at base {base}"
             ),
+            Self::RopeScaling(kind) => write!(formatter, "unsupported rope scaling {kind:?}"),
             Self::Yarn => formatter.write_str("invalid YaRN scaling"),
             Self::Definition(error) => error.fmt(formatter),
             Self::Payload { key, detail } => write!(formatter, "metadata {key}: {detail}"),
@@ -121,6 +124,9 @@ impl HeaderError {
             | Self::CompanionScale { name, .. } => {
                 vec![UnsupportedReason::UnrecognizedTensor { name: name.clone() }]
             }
+            Self::RopeScaling(kind) => vec![UnsupportedReason::RopeScaling {
+                kind: kind.clone(),
+            }],
             Self::Yarn => vec![UnsupportedReason::RopeScaling {
                 kind: "yarn".into(),
             }],

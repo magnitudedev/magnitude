@@ -121,13 +121,16 @@ fn window_media_rows(per_layer_inputs: bool) -> MediaRowAttention {
 /// reading the last `attention.sliding_window` rows.
 fn window_geometry(m: &Metadata, media_rows: MediaRowAttention) -> Result<KindGeometry, Error> {
     let width = m.integer("attention.key_length_swa")?;
-    if m.integer("attention.value_length_swa")? != width
-        || m.integer("rope.dimension_count_swa")? != width
-    {
-        return Err(invalid(
-            "Gemma window layers must rotate whole heads of equal key and value width",
-        ));
-    }
+    m.invariant_count(
+        "attention.value_length_swa",
+        width,
+        "equal to attention.key_length_swa",
+    )?;
+    m.invariant_count(
+        "rope.dimension_count_swa",
+        width,
+        "equal to attention.key_length_swa",
+    )?;
     Ok(KindGeometry {
         width,
         rotary: rotary::table(width, width, m.positive_number("rope.freq_base_swa")?)?,
@@ -141,13 +144,16 @@ fn window_geometry(m: &Metadata, media_rows: MediaRowAttention) -> Result<KindGe
 /// The geometry of full layers, binding the stored rotary divisors.
 fn full_geometry(m: &Metadata, b: &mut Tensors) -> Result<KindGeometry, Error> {
     let width = m.integer("attention.key_length")?;
-    if m.integer("attention.value_length")? != width
-        || m.integer("rope.dimension_count")? != width
-    {
-        return Err(invalid(
-            "Gemma full layers must span whole heads of equal key and value width",
-        ));
-    }
+    m.invariant_count(
+        "attention.value_length",
+        width,
+        "equal to attention.key_length",
+    )?;
+    m.invariant_count(
+        "rope.dimension_count",
+        width,
+        "equal to attention.key_length",
+    )?;
     // The stored divisors encode the rotated fraction; the importer checks
     // them against this table.
     let divisors = b.bind("rope_freqs.weight", &[width / 2])?;
@@ -230,16 +236,16 @@ pub fn inspect_components(
     let feed_forward = m.per_layer("feed_forward_length", layers)?;
     let kinds = layer_kinds(&m, layers)?;
     let softcap = m.positive_number("final_logit_softcapping")?;
-    let shared = m.count("attention.shared_kv_layers")?;
-    let per_layer_width = m.count("embedding_length_per_layer_input")?;
+    let shared = m.default_count("attention.shared_kv_layers", 0)?;
+    let per_layer_width = m.default_count("embedding_length_per_layer_input", 0)?;
     let owning = layers
         .checked_sub(shared)
         .filter(|owning| *owning > 0)
         .ok_or_else(|| invalid("Gemma shares history into more layers than it has"))?;
-    let experts = match m.value("expert_count") {
+    let experts = match m.optional_count("expert_count")?.filter(|&count| count > 0) {
         None => None,
-        Some(_) => Some(Experts {
-            count: m.integer("expert_count")?,
+        Some(count) => Some(Experts {
+            count,
             selected: m.integer("expert_used_count")?,
             intermediate: m.integer("expert_feed_forward_length")?,
         }),
@@ -248,7 +254,7 @@ pub fn inspect_components(
     let window = window_geometry(&m, window_media_rows(per_layer_width > 0))?;
 
     let mut b = Tensors::new(directory);
-    let vocabulary = b.rows("token_embd.weight")?;
+    let vocabulary = m.vocab_size(b.rows("token_embd.weight")?)?;
     let embedding = b.bind("token_embd.weight", &[vocabulary, hidden])?;
     let output_norm = b.bind("output_norm.weight", &[hidden])?;
     let full = full_geometry(&m, &mut b)?;

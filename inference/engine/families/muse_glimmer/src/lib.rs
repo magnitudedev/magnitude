@@ -98,10 +98,8 @@ pub fn inspect_components(
     let heads = m.integer("attention.head_count")?;
     let kv_heads = m.integer("attention.head_count_kv")?;
     let width = m.integer("attention.key_length")?;
-    if m.integer("attention.value_length")? != width {
-        return Err(invalid("Muse Glimmer key and value head widths differ"));
-    }
-    let epsilon = m.number("attention.layer_norm_rms_epsilon")?;
+    m.invariant_count("attention.value_length", width, "equal to attention.key_length")?;
+    let epsilon = m.positive_number("attention.layer_norm_rms_epsilon")?;
     let window = m.integer("attention.sliding_window")?;
     let windowed = window_layers(&m, layers)?;
 
@@ -125,14 +123,7 @@ pub fn inspect_components(
         .filter(|cap| *cap != 0.0);
 
     let mut tensors = Tensors::new(directory);
-    let vocabulary = tensors.rows("token_embd.weight")?;
-    if m.optional_integer("vocab_size")?
-        .is_some_and(|size| size != vocabulary)
-    {
-        return Err(invalid(
-            "Muse Glimmer vocabulary size differs from its embedding",
-        ));
-    }
+    let vocabulary = m.vocab_size(tensors.rows("token_embd.weight")?)?;
     let embedding = tensors.bind("token_embd.weight", &[vocabulary, hidden])?;
     // `W·(RMS(y)·w)·s = W·(RMS(y)·(s·w))`: the scale folds into the norm.
     let output_norm = tensors.bind_transformed(

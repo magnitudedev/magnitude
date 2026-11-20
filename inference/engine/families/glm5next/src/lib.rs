@@ -131,21 +131,14 @@ struct Geometry {
 
 impl Geometry {
     fn read(m: &Metadata, blocks: u64) -> Result<Self, FamilyError> {
-        let equal = |key: &str, value: u64, expected: u64| match value == expected {
-            true => Ok(()),
-            false => Err(FamilyError::metadata(
-                m.key(key),
-                format!("{} is {value}, {FAMILY_ID} states {expected}", m.key(key)),
-            )),
-        };
-        equal("rope.dimension_count", m.count("rope.dimension_count")?, 0)?;
-        equal("expert_gating_func", m.integer("expert_gating_func")?, SIGMOID)?;
-        equal("expert_group_count", m.integer("expert_group_count")?, 1)?;
-        equal("expert_group_used_count", m.integer("expert_group_used_count")?, 1)?;
+        m.invariant_count("rope.dimension_count", 0, "0 (no rotary positions)")?;
+        m.invariant_count("expert_gating_func", SIGMOID, "2 (sigmoid)")?;
+        m.invariant_count("expert_group_count", 1, "1 (no expert groups)")?;
+        m.invariant_count("expert_group_used_count", 1, "1 (no expert groups)")?;
         let latent = m.integer("attention.kv_lora_rank")?;
         // Each history row is the latent, read as key and value.
-        equal("attention.key_length", m.integer("attention.key_length")?, latent)?;
-        equal("attention.value_length", m.integer("attention.value_length")?, latent)?;
+        m.invariant_count("attention.key_length", latent, "equal to attention.kv_lora_rank")?;
+        m.invariant_count("attention.value_length", latent, "equal to attention.kv_lora_rank")?;
         let kpool = m.integer("attention.indexer.kpool")?;
         let top = m.integer("attention.indexer.top_k")?;
         if kpool < 2 || !top.is_multiple_of(kpool) {
@@ -157,22 +150,20 @@ impl Geometry {
         }
         // A row before its first complete pool reads its tail alone; upstream
         // defaults this to true when omitted (as in Unsloth's GGUFs).
-        if !m
-            .optional_flag("attention.indexer.kpool_select_tail")?
-            .unwrap_or(true)
-        {
-            let key = m.key("attention.indexer.kpool_select_tail");
-            return Err(FamilyError::metadata(&key, format!("{key}: every row reads its tail")));
-        }
+        m.invariant_flag(
+            "attention.indexer.kpool_select_tail",
+            true,
+            "true (every row reads its tail)",
+        )?;
         let clamp = |key: &str| -> Result<Vec<GluLimit>, FamilyError> {
-            m.layer_numbers(key, blocks)?
+            m.uniform_or_layer_numbers(key, blocks)?
                 .into_iter()
                 .map(|limit| binders::glu_limit(&m, key, limit))
                 .collect()
         };
         let expert_width = m.integer("expert_feed_forward_length")?;
         let shared_width = match (
-            m.count("expert_shared_count")?,
+            m.default_count("expert_shared_count", 0)?,
             m.optional_integer("expert_shared_feed_forward_length")?,
         ) {
             (0, None) => None,
@@ -203,7 +194,7 @@ impl Geometry {
             index_top: top / kpool,
             kpool,
             index_epsilon: m.positive_number("attention.layer_norm_epsilon")?,
-            dense: m.count("leading_dense_block_count")?,
+            dense: m.default_count("leading_dense_block_count", 0)?,
             dense_width: m.integer("feed_forward_length")?,
             experts: m.integer("expert_count")?,
             selected: m.integer("expert_used_count")?,
@@ -252,11 +243,14 @@ impl Geometry {
         let inner = product(&[heads, width])?;
         let projection = [inner, hidden];
         // Upstream llama.cpp writes KDA conv kernels as [1, inner, 1, taps];
-        // Unsloth omits the leading singleton axis and writes [inner, 1, taps].
-        let plane: &[u64] = match layer.tensors.shape(&layer.name("ssm_conv1d_q.weight"))? {
-            [_, _, _] => &[inner, 1, self.taps],
-            _ => &[1, inner, 1, self.taps],
-        };
+        // Unsloth omits the leading singleton axis ([inner, 1, taps]), and
+        // 2-D converters write [inner, taps].
+        let (plane, merge): (&[u64], bool) =
+            match layer.tensors.shape(&layer.name("ssm_conv1d_q.weight"))? {
+                [_, _] => (&[inner, self.taps], false),
+                [_, _, _] => (&[inner, 1, self.taps], true),
+                _ => (&[1, inner, 1, self.taps], true),
+            };
         Ok(GatedDelta {
             convolution_width: self.taps,
             key_heads: heads,
@@ -271,7 +265,7 @@ impl Geometry {
             convolution: layer.parts(
                 ("ssm_conv1d_q.weight", plane),
                 &[("ssm_conv1d_k.weight", plane), ("ssm_conv1d_v.weight", plane)],
-                true,
+                merge,
             )?,
             beta: layer.weight("ssm_beta.weight", &[heads, hidden])?,
             decay: RecurrentDecay::PerChannel {
@@ -558,7 +552,7 @@ pub fn inspect_components(
     recognize(directory)?;
     let m = Metadata::new(directory, FAMILY_ID);
     let blocks = m.bounded_block_count("block_count")?;
-    let predicted = m.optional_count("nextn_predict_layers")?.unwrap_or(0);
+    let predicted = m.default_count("nextn_predict_layers", 0)?;
     let trunk = blocks.checked_sub(predicted).filter(|trunk| *trunk > 0).ok_or_else(|| {
         let key = m.key("nextn_predict_layers");
         FamilyError::metadata(&key, format!("{key} leaves no trunk block"))
@@ -567,7 +561,7 @@ pub fn inspect_components(
     let geometry = Geometry::read(&m, blocks)?;
     let hidden = geometry.hidden;
     let mut tensors = Tensors::new(directory);
-    let vocabulary = m.integer("vocab_size")?;
+    let vocabulary = m.vocab_size(tensors.rows("token_embd.weight")?)?;
     let embedding = tensors.bind("token_embd.weight", &[vocabulary, hidden])?;
     let output = tensors.bind("output.weight", &[vocabulary, hidden])?;
     let output_norm = geometry.rms(tensors.bind("output_norm.weight", &[hidden])?);

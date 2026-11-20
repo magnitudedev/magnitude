@@ -24,7 +24,7 @@ use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
     DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
     FeedForwardUp, GateFunction, GateGranularity, HeadNorm, HistoryRows, HistorySource,
-    ImportTransform, InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
+    InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
     ProjectedRows, RowProducer, RowRounding, TokenDomain,
     Operator, OutputForm, OutputProjection, QueryKeys, QueryProjection, ResidualForm, RmsNorm,
     Rotary, RouteNormalization, RoutedFfn, Router,
@@ -124,13 +124,13 @@ impl Layers<'_> {
         } = *self;
         let rms = |weight: WeightDescriptor| RmsNorm { weight, epsilon };
         let p = format!("blk.{index}.");
-        let mut weight = |name: &str, shape: &[u64]| tensors.bind(&format!("{p}{name}"), shape);
         let op = match mixer {
             Mixer::Attention {
                 kv_heads,
                 domain,
                 rotary,
             } => {
+                let mut weight = |name: &str, shape: &[u64]| tensors.bind(&format!("{p}{name}"), shape);
                 let kv_heads = *kv_heads;
                 if !heads.is_multiple_of(kv_heads) {
                     return Err(invalid(format!(
@@ -179,8 +179,8 @@ impl Layers<'_> {
             Mixer::ShortConv => {
                 // `in_proj` stores the B, C and X projections as consecutive
                 // row blocks of the hidden width.
-                let fused = weight(
-                    "shortconv.in_proj.weight",
+                let fused = tensors.bind(
+                    &format!("{p}shortconv.in_proj.weight"),
                     &[product(&[3, hidden])?, hidden],
                 )?;
                 let chunk = |block: u64| {
@@ -188,17 +188,27 @@ impl Layers<'_> {
                         .slice_rows(block * hidden, hidden)
                         .map_err(|error| Error::invalid(error.to_string()))
                 };
+                let convolution = tensors.bind_conv1d(
+                    &format!("{p}shortconv.conv.weight"),
+                    hidden,
+                    convolution_width,
+                )?;
+                let output = tensors.bind(
+                    &format!("{p}shortconv.out_proj.weight"),
+                    &[hidden, hidden],
+                )?;
                 Operator::ShortConv(Box::new(ShortConv {
                     channels: hidden,
                     width: convolution_width,
                     input_gate: chunk(0)?,
                     output_gate: chunk(1)?,
                     value: chunk(2)?,
-                    convolution: weight("shortconv.conv.weight", &[hidden, convolution_width])?,
-                    output: weight("shortconv.out_proj.weight", &[hidden, hidden])?,
+                    convolution,
+                    output,
                 }))
             }
         };
+        let mut weight = |name: &str, shape: &[u64]| tensors.bind(&format!("{p}{name}"), shape);
         let feed_forward = match &experts {
             Some(e) if index as u64 >= leading_dense => Operator::RoutedFfn(Box::new(RoutedFfn {
                 experts: e.count,
@@ -334,26 +344,24 @@ pub fn inspect_components(
     }
     // Queries and outputs span the hidden width, so the head width follows.
     let width = hidden / heads;
-    for key in ["attention.key_length", "attention.value_length"] {
-        if m.optional_integer(key)?
-            .is_some_and(|length| length != width)
-        {
-            return Err(invalid(format!(
-                "{} differs from the hidden width per head",
-                m.key(key)
-            )));
-        }
-    }
+    m.invariant_count(
+        "attention.key_length",
+        width,
+        "equal to the hidden width per head",
+    )?;
+    m.invariant_count(
+        "attention.value_length",
+        width,
+        "equal to the hidden width per head",
+    )?;
     let epsilon = m.positive_number("attention.layer_norm_rms_epsilon")?;
     let base = m.positive_number("rope.freq_base")?;
-    if m.optional_integer("rope.dimension_count")?
-        .is_some_and(|dimensions| dimensions != width)
-    {
-        return Err(invalid(format!(
-            "{} differs from the head width: partial rotary is stated only by rope_freqs",
-            m.key("rope.dimension_count")
-        )));
-    }
+    m.reject_rope_scaling()?;
+    m.invariant_count(
+        "rope.dimension_count",
+        width,
+        "equal to the head width (partial rotary is stated only by rope_freqs)",
+    )?;
     let convolution_width = m.integer("shortconv.l_cache")?;
     if convolution_width < 2 {
         return Err(invalid("LFM2 short convolution needs at least two taps"));
@@ -372,7 +380,20 @@ pub fn inspect_components(
                     )))
                 }
             };
-            let leading_dense = m.optional_count("leading_dense_block_count")?.unwrap_or(0);
+            m.invariant_flag(
+                "expert_weights_norm",
+                true,
+                "true (LFM2-MoE normalizes routed expert weights)",
+            )?;
+            if m.optional_positive_number("expert_weights_scale")?
+                .is_some_and(|scale| scale != 1.0)
+            {
+                return Err(invalid(format!(
+                    "{} must be 1.0",
+                    m.key("expert_weights_scale")
+                )));
+            }
+            let leading_dense = m.default_count("leading_dense_block_count", 0)?;
             if leading_dense > layer_count {
                 return Err(invalid(format!(
                     "{} must not exceed the layer count",
@@ -396,12 +417,7 @@ pub fn inspect_components(
     let dense_intermediate = m.optional_integer("feed_forward_length")?;
 
     let mut tensors = Tensors::new(directory);
-    let vocabulary = tensors.rows("token_embd.weight")?;
-    if m.optional_integer("vocab_size")?
-        .is_some_and(|size| size != vocabulary)
-    {
-        return Err(invalid("LFM2 vocab_size differs from the embedding rows"));
-    }
+    let vocabulary = m.vocab_size(tensors.rows("token_embd.weight")?)?;
 
     let rms = |weight: WeightDescriptor| RmsNorm { weight, epsilon };
     let embedding = tensors.bind("token_embd.weight", &[vocabulary, hidden])?;
