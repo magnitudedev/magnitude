@@ -264,15 +264,6 @@ pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>]) -> 
         .collect()
 }
 
-/// The one resize toward `derived` targets ([`derive`]): a shrink before
-/// any growth; none where each holding holds its target.
-pub fn next_move(derived: &[(&HoldingTarget<'_>, u64)]) -> Option<(BankHolding, BankMove)> {
-    let moves: Vec<(BankHolding, BankMove)> =
-        derived.iter().filter_map(|(target, slots)| bank_move(*slots, target.at).map(|resize| (target.holding, resize))).collect();
-    let shrink = moves.iter().copied().find(|(_, resize)| matches!(resize, BankMove::Shrink { .. }));
-    shrink.or_else(|| moves.first().copied())
-}
-
 /// A bank holding's derived target in its store, beside what it holds now,
 /// in its own units (slots, or a table's records).
 #[derive(Clone, Debug, PartialEq, Eq)]

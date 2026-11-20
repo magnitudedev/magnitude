@@ -447,17 +447,21 @@ impl Boundary {
         if self.pressed.is_some() {
             // Each pressure event or standing dwell lowers B by one block
             // (or `events` blocks) even if an earlier async shrink is still
-            // releasing toward the previous cap.
+            // releasing toward the previous cap, never below committed memory.
             let step_units = events.max(1);
             let blocks = unit.saturating_mul(step_units);
-            let bytes = held.saturating_sub(blocks);
+            let bytes = held.saturating_sub(blocks).max(self.committed);
             let anchor = held.saturating_add(free);
             let cap = match self.cap {
-                Some(cap) => Cap {
-                    bytes: cap.bytes.saturating_sub(blocks).min(bytes),
-                    step: cap.step.saturating_add(blocks),
-                    ..cap
-                },
+                Some(cap) => {
+                    let next = cap.bytes.saturating_sub(blocks).min(bytes).max(self.committed);
+                    let lowered = cap.bytes.saturating_sub(next);
+                    Cap {
+                        bytes: next,
+                        step: cap.step.saturating_add(lowered),
+                        ..cap
+                    }
+                }
                 None => Cap { bytes, step: blocks, room, cold, free, anchor },
             };
             self.cap = Some(cap);
@@ -473,10 +477,11 @@ impl Boundary {
             cap.anchor = cap.anchor.min(held.saturating_add(free));
         }
         let pressure_calm = self.level.is_none()
-            || (self.level == Some(seismic::PressureLevel::Warn)
-                && self.pressed.is_none()
-                && paging.harm.is_some()
-                && !scarce_free);
+            || (self.pressed.is_none()
+                && (abundant_free
+                    || (self.level == Some(seismic::PressureLevel::Warn)
+                        && paging.harm.is_some()
+                        && !scarce_free)));
         let max_lift_gain = scarcity_cushion(total, unit).max(unit);
         let lifted = |cap: &Cap| {
             let min_gain = cap.step.min(max_lift_gain).max(unit);
@@ -512,7 +517,7 @@ impl Boundary {
         let harmed = harm.machine.saturating_sub(last.machine).saturating_sub(harm.own.saturating_sub(last.own));
         let harmed_bytes = harmed.saturating_mul(paging.page_bytes);
         let rate_bps = harmed_bytes as f64 / span;
-        let scarce = self.level == Some(seismic::PressureLevel::Critical) || scarce_free;
+        let scarce = (self.level == Some(seismic::PressureLevel::Critical) && !abundant_free) || scarce_free;
         let no_exogenous_relief = free <= last.free.saturating_add(EXOGENOUS_RELIEF_TOLERANCE)
             && room <= last.room.saturating_add(EXOGENOUS_RELIEF_TOLERANCE);
         let excess_span = ((rate_bps - THRASH_RATE_BPS).max(0.0) * span).round() as u64;
@@ -544,10 +549,11 @@ impl Boundary {
         match self.step {
             Some(step) if thrashing => {
                 // Sustained thrashing within our growth step's window: return
-                // B to the holding before the step began.
-                let delta = held.saturating_sub(step.from).max(unit).max(paging.page_bytes);
+                // B to the holding before the step began, never below committed.
+                let floor_from = step.from.max(self.committed);
+                let delta = held.saturating_sub(floor_from).max(unit).max(paging.page_bytes);
                 self.settle(Cap {
-                    bytes: step.from,
+                    bytes: floor_from,
                     step: delta,
                     room,
                     cold,
@@ -564,17 +570,22 @@ impl Boundary {
                 if let Some(excess) = confirmed_excess {
                     // Others' active working set is thrashing under scarcity:
                     // tighten B in place by the sustained excess without
-                    // snapping down to lower `held` or overwriting `anchor`.
+                    // snapping down to lower `held`, falling below committed,
+                    // or overwriting `anchor`.
                     self.harmed = Some(excess);
                     let anchor = held.saturating_add(free);
                     self.cap = Some(match self.cap {
-                        Some(cap) => Cap {
-                            bytes: cap.bytes.saturating_sub(excess),
-                            step: cap.step.saturating_add(excess),
-                            ..cap
-                        },
+                        Some(cap) => {
+                            let next = cap.bytes.saturating_sub(excess).max(self.committed);
+                            let lowered = cap.bytes.saturating_sub(next);
+                            Cap {
+                                bytes: next,
+                                step: cap.step.saturating_add(lowered),
+                                ..cap
+                            }
+                        }
                         None => Cap {
-                            bytes: held.saturating_sub(excess),
+                            bytes: held.saturating_sub(excess).max(self.committed),
                             step: excess.max(unit).max(paging.page_bytes),
                             room,
                             cold,
@@ -898,5 +909,66 @@ mod tests {
         boundary.observe(obs(start + Duration::from_secs(16), total, 2 * rate_pages, 20 * GB, 36 * GB, unit, 1, seismic::PressureLevel::Critical));
         assert_eq!(boundary.pressed(), None, "pressure event with >50% of total RAM free must not fire");
         assert_eq!(boundary.cap(), None);
+    }
+
+    /// Linux GGUF page-cache scenario (`total = 64 GiB`, `free_beyond_target = 16 GiB`,
+    /// `clean_cache = 24 GiB`, immediate reclaimable supply = `40 GiB > total / 2`):
+    /// `Critical` PSI blips and file-cache refaults must NOT fire `Pressure(Critical)`
+    /// or `Harm` or ratchet down `Cap`. Also verifies `Cap::bytes` never ratchets
+    /// below `committed` on repeated pressure events at floor.
+    #[test]
+    fn linux_gguf_clean_page_cache_suppresses_critical_psi_and_cap_stays_above_committed() {
+        let start = Instant::now();
+        let total = 64 * GB;
+        let unit = 256 * MB;
+        let page = 16 * 1024;
+        let sample = seismic::HostSample {
+            total,
+            supply: seismic::Supply {
+                free_beyond_target: (16 * GB) as i64,
+                clean_cache: 24 * GB,
+                cold_reclaimable: 0,
+            },
+            wired: None,
+            pressure: Some(seismic::PressureLevel::Critical),
+            ..seismic::host_samples::m4_pro()
+        };
+        let reading = Reading::host(&sample);
+        assert_eq!(reading.clean_cache_supply(), 24 * GB);
+        let immediate_supply = u64::try_from(reading.supply().free_beyond_target.max(0))
+            .unwrap_or(0)
+            .saturating_add(reading.clean_cache_supply());
+        assert_eq!(immediate_supply, 40 * GB);
+        assert!(immediate_supply > total / 2);
+
+        let mut boundary = Boundary::default();
+        boundary.observe(obs(start, total, 0, 22 * GB, immediate_supply, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(1), total, 0, 22 * GB, immediate_supply, unit, 0, seismic::PressureLevel::Normal));
+        assert!(boundary.judges());
+
+        // Critical PSI edge event + high-rate refaults (128 MiB/s over 2s) while
+        // free + clean_cache = 40 GiB (> 32 GiB): neither Pressure nor Harm fires.
+        let rate_pages = (128 * MB) / page;
+        boundary.observe(obs(start + Duration::from_secs(2), total, rate_pages, 22 * GB, immediate_supply, unit, 1, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), None, "Critical PSI with 40/64 GiB free+clean must not fire");
+        assert_eq!(boundary.harmed(), None);
+        assert_eq!(boundary.cap(), None);
+
+        boundary.observe(obs(start + Duration::from_secs(3), total, 2 * rate_pages, 22 * GB, immediate_supply, unit, 1, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), None, "repeated Critical PSI with 40/64 GiB free+clean must not fire");
+        assert_eq!(boundary.harmed(), None, "Critical PSI with >50% free+clean must not mark host scarce for Harm");
+        assert_eq!(boundary.cap(), None);
+
+        // Under genuine scarcity at floor (held == committed == 20 GiB), repeated
+        // pressure events never ratchet `cap.bytes` below committed.
+        let mut floored = Boundary::default();
+        for tick in 0..10 {
+            floored.observe(obs(start + Duration::from_secs(tick), total, 0, 20 * GB, 0, unit, 1, seismic::PressureLevel::Critical));
+            assert_eq!(floored.cap(), Some(20 * GB));
+        }
+        let mut lower_committed = obs(start + Duration::from_secs(10), total, 0, 20 * GB, 0, unit, 0, seismic::PressureLevel::Normal);
+        lower_committed.committed = 16 * GB;
+        floored.observe(lower_committed);
+        assert_eq!(floored.cap(), Some(20 * GB), "cap.bytes must never have ratcheted below the committed floor");
     }
 }

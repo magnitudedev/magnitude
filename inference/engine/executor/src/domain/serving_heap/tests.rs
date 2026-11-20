@@ -502,3 +502,118 @@ fn a_whole_banked_domain_prices_two_row_passes() {
         assert!(pricing.whole, "{backend:?}: 4/4 bank is whole");
     }
 }
+
+/// Distinct device (VRAM) and host (RAM) ledgers for multi-store bank move tests.
+fn discrete_ledgers(at: Instant) -> (Ledger, Ledger) {
+    use crate::memory::ledger::{Ledgers, LoadShape};
+    let scope = Ledgers::new();
+    let shape = std::sync::Arc::new(LoadShape { stores: Vec::new() });
+    let device = scope.ledger(seismic::StoreIdentity::DeviceMemory(seismic::PhysicalIdentity::Uuid([1; 16])), shape.clone());
+    let host = scope.ledger(seismic::StoreIdentity::HostRam, shape);
+    device.read(device.sampled(at), Reading::device(TOTAL, TOTAL - OTHERS, NO_LAG));
+    host.read(host.sampled(at), Reading::device(TOTAL, TOTAL - OTHERS, NO_LAG));
+    (device, host)
+}
+
+/// A sub-noise partial grow on `BankHolding::Experts` (`gained < min_partial`)
+/// must not shadow an eligible grow on `BankHolding::Host`, and shrink-before-grow
+/// priority across holdings is preserved.
+#[test]
+fn sub_noise_experts_grow_does_not_starve_host_grow() {
+    use crate::domain::BankHolding;
+    use crate::experts::derived::{BankMove, BankShape, HoldingTarget};
+    use crate::planning::BankTier;
+
+    let slot_bytes: u64 = 16 << 20;
+    let block_bytes: u64 = 2 << 20;
+    let (device, host) = discrete_ledgers(Instant::now());
+    let ledger_of = |tier| match tier {
+        BankTier::Bank => &device,
+        BankTier::Host => &host,
+    };
+
+    // sat_charge = 512 * 16 MiB = 8 GiB -> sat_charge / 64 = 128 MiB = min_partial.
+    // Growing Experts 100 -> 101 gains 16 MiB (< 128 MiB) while still below saturation (512).
+    let experts = HoldingTarget {
+        holding: BankHolding::Experts,
+        tier: BankTier::Bank,
+        at: 100,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 8, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+    let host_target = HoldingTarget {
+        holding: BankHolding::Host,
+        tier: BankTier::Host,
+        at: 146,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 0, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+
+    // Sanity check: Experts alone is filtered out by min_partial.
+    assert_eq!(super::select_bank_move(&[(&experts, 101)], ledger_of, None), None);
+    // With Host eligible to grow, Host is selected instead of returning None.
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 101), (&host_target, 512)], ledger_of, None),
+        Some((BankHolding::Host, BankMove::Grow { to: 512 })),
+    );
+    // Shrink on a later holding still beats an eligible grow on an earlier holding.
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 512), (&host_target, 100)], ledger_of, None),
+        Some((BankHolding::Host, BankMove::Shrink { to: 100 })),
+    );
+}
+
+/// An `ExogenousShrink` cooldown on `DeviceMemory` suppresses `BankHolding::Experts`
+/// regrow without starving `BankHolding::Host` on `HostRam`.
+#[test]
+fn exogenous_shrink_cooldown_on_device_does_not_starve_host_grow() {
+    use crate::domain::BankHolding;
+    use crate::experts::derived::{BankMove, BankShape, HoldingTarget};
+    use crate::planning::BankTier;
+
+    let slot_bytes: u64 = 16 << 20;
+    let block_bytes: u64 = 2 << 20;
+    let t0 = Instant::now();
+    let (device, host) = discrete_ledgers(t0);
+    let est = device.estimate();
+    let shrink = super::ExogenousShrink {
+        store: device.store(),
+        at: est.at().at(),
+        committed: est.committed(),
+        hold_room: est.hold_room(),
+        block: block_bytes,
+    };
+    // Advance within the 3 s cooldown with unchanged headroom/committed bytes.
+    read(&device, t0 + Duration::from_millis(100));
+
+    let ledger_of = |tier| match tier {
+        BankTier::Bank => &device,
+        BankTier::Host => &host,
+    };
+    let experts = HoldingTarget {
+        holding: BankHolding::Experts,
+        tier: BankTier::Bank,
+        at: 100,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 8, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+    let host_target = HoldingTarget {
+        holding: BankHolding::Host,
+        tier: BankTier::Host,
+        at: 146,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 0, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+
+    // Sanity check: saturation grow on Experts is suppressed by DeviceMemory cooldown.
+    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, Some(&shrink)), None);
+    // Host on HostRam is unaffected by DeviceMemory's cooldown and is selected to grow.
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 512), (&host_target, 512)], ledger_of, Some(&shrink)),
+        Some((BankHolding::Host, BankMove::Grow { to: 512 })),
+    );
+}
