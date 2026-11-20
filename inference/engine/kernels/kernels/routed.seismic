@@ -380,12 +380,13 @@ projection routed for metal:
 # its shared memory with its weights' operand sums (`shared_row`, WIDTH * 5
 # / 2 bytes), from the rows it would read: the activation row, or the row a
 # stage launch formed where the experts take NVFP4 operands. Gathered
-# (GATHERED, valid at every M), a chosen expert runs once over the rows of
-# each of its choices (`routed::gather`), its records streamed once a step,
-# over those rows in place. With the shared expert (`routed_expand`, its
-# row y = M * K), the stage launch forms every activation row, and at one
-# row the shared expert's block is a one-row block: the gathered launch
-# declares its row's bytes there (SHARED, M 1), and none otherwise. summed
+# (GATHERED, default 1, for 2..VERIFY_ROWS rows), a chosen expert runs once
+# over the rows of each of its choices (`routed::gather`), its records
+# streamed once a step, over those rows in place; one row (and calls past
+# VERIFY_ROWS) runs the per-choice launch so a one-row call keeps its
+# `shared_row` and skips staging when SHARED == 0. With the shared expert
+# (`routed_expand`, its row y = M * K), the stage launch forms every
+# activation row. summed
 # publishes each slot's projection in A (`published`, [M, K + SHARED, H])
 # for the entry's slot-order join. grouped: fixed 32-row (by expert) or
 # 64-row (every row) x 128-column mma.sync tiles, 3 cp.async stages; the
@@ -407,12 +408,12 @@ projection routed for cuda:
     let TILE_BLOCKS = STACKED * B + (1 - STACKED) for grouped
     let PRODUCT_ROWS = STACKED * B * T + (1 - STACKED) * M for grouped
     params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default 1 for choice | summed,
-        form GATHERED in [0, 1] default SHARED for choice, arithmetic INT8 in [0, 1] default 0 for grouped,
+        form GATHERED in [0, 1] default 1 for choice, arithmetic INT8 in [0, 1] default 0 for grouped,
         arithmetic OPERAND in [0, 1] default 0 for grouped)
     where each(W, WIDTH % 64 == 0)
     where (OPERAND == 0 or INT8 == 0) for grouped
     where (INT8 == 0 or each(W, form(W, INT8) == 1)) for grouped
-    scratch operands bytes (M * WIDTH * 2) when (SHARED == 1 or (GATHERED == 1 and PER_ROW == 0)) and any(W, operands(W) == 1) for choice
+    scratch operands bytes (M * WIDTH * 2) when (SHARED == 1 or (GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0)) and any(W, operands(W) == 1) for choice
     each W:
         scratch operands bytes (M * K * WIDTH * 2) when STACKED == 1 and (SHARED == 1 or M > 1) and operands(W) == 1 for summed
         scratch operands bytes (M * WIDTH * 2) when STACKED == 0 and operands(W) == 1 for summed
@@ -425,20 +426,19 @@ projection routed for cuda:
     scratch expand_grid bytes (12) when STACKED == 1 for grouped
     scratch quantize_grid bytes (12) when STACKED == 1 for grouped
     scratch down_grid bytes (12) when STACKED == 1 for grouped
-    launch stage for choice when (SHARED == 1 or (GATHERED == 1 and PER_ROW == 0)) and any(W, operands(W) == 1):
+    launch stage for choice when (SHARED == 1 or (GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0)) and any(W, operands(W) == 1):
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch choice for choice when GATHERED == 0 or PER_ROW == 1:
+    launch choice for choice when GATHERED == 0 or M < 2 or M > VERIFY_ROWS or PER_ROW == 1:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
-    launch gathered for choice when GATHERED == 1 and PER_ROW == 0:
+    launch gathered for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
-        shared_bytes (SHARED * (1 - min(1, M - 1)) * most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
     launch stage for summed when (SHARED == 1 or M > 1) and any(W, operands(W) == 1):
         staging
         threadgroups (M * (K + SHARED), 1, 1)
@@ -794,11 +794,9 @@ native routed_expand for metal from "metal/routed_expand.metal":
 # choice's blocks run only for its expert's first choice, over the rows of
 # every choice of that expert, so a step streams each chosen expert once).
 # Both forms share TPW and KSPLIT, so a choice's product has its one-row bits
-# in either. Gathered by default (the projection's, where a shared expert is
-# projected too): both forms read the rows the stage launch
-# formed, and at one row each choice is its expert's first and gathers its
-# own row alone, the per-choice GEMV after one table write and block
-# barrier. (Metal: the rows16 GEMV.)
+# in either. Gathered by default for 2..VERIFY_ROWS rows (the projection's);
+# one row runs the per-choice launch with `shared_row`. (Metal: the rows16
+# GEMV.)
 native routed_expand for cuda from "cuda/routed_expand.cu":
     static (H, K, F, S, GS, US)
     records (expert_gate, expert_up)
