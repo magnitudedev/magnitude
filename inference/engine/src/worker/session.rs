@@ -219,6 +219,11 @@ impl Session {
     /// load, stopped, its durable effects made, still holding the device.
     pub fn run(mut self) -> (WorkerExit, Loaded) {
         loop {
+            match self.progress() {
+                Ok(Flow::Continue) => {}
+                Ok(Flow::Exit(exit)) => return self.finish(exit),
+                Err(error) => return self.finish(WorkerExit::TransportFailed(error.to_string())),
+            }
             let inbound = self.signal.wait();
             for inbound in inbound {
                 let flow = match inbound {
@@ -232,11 +237,6 @@ impl Session {
                     Ok(Flow::Exit(exit)) => return self.finish(exit),
                     Err(error) => return self.finish(WorkerExit::TransportFailed(error.to_string())),
                 }
-            }
-            match self.progress() {
-                Ok(Flow::Continue) => {}
-                Ok(Flow::Exit(exit)) => return self.finish(exit),
-                Err(error) => return self.finish(WorkerExit::TransportFailed(error.to_string())),
             }
         }
     }
@@ -932,6 +932,35 @@ mod tests {
             WorkerMessage::Retired { request_id: retired },
             WorkerMessage::Unloaded { .. }
         ] if *output == id && *failed == id && *retired == id));
+    }
+
+    #[test]
+    fn run_exits_immediately_when_execution_stopped_before_session_started() {
+        struct AlreadyStopped;
+
+        impl Driven for AlreadyStopped {
+            type Stopped = UnloadCause;
+
+            fn command(&mut self, _: WorkerCommand, _: u64) -> Result<WorkerReply, String> {
+                unreachable!("no command is sent")
+            }
+
+            fn event(&mut self, _: Event, _: u64) {}
+
+            fn run(&mut self, _: u64) -> Result<Reread, UnloadCause> {
+                Err(UnloadCause::Shutdown)
+            }
+        }
+
+        let mut execution = Worker::spawn(|_| Ok(Box::new(AlreadyStopped)), 1).unwrap();
+        execution.stop();
+        let (session, sent) = recorded_session(execution, Arc::new(CensusWatch::default()));
+        let (exit, _) = session.run();
+        assert!(matches!(exit, WorkerExit::Unloaded(UnloadCause::Shutdown)));
+        assert!(matches!(
+            sent.lock().unwrap().as_slice(),
+            [WorkerMessage::Unloaded { cause: UnloadCause::Shutdown }]
+        ));
     }
 
     /// The room answers the session has sent the host, in order.
