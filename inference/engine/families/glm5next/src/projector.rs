@@ -37,27 +37,6 @@ const PROJECTOR_TYPE: &str = "glm5v";
 /// converter does not store it).
 const ROTARY_BASE: f64 = 10_000.0;
 
-/// Every `clip.*` key the interpretation reads.
-const KEYS: &[&str] = &[
-    "clip.has_vision_encoder",
-    "clip.projector_type",
-    "clip.use_silu",
-    "clip.vision.projection_dim",
-    "clip.vision.image_size",
-    "clip.vision.patch_size",
-    "clip.vision.embedding_length",
-    "clip.vision.feed_forward_length",
-    "clip.vision.block_count",
-    "clip.vision.attention.head_count",
-    "clip.vision.attention.layer_norm_epsilon",
-    "clip.vision.image_mean",
-    "clip.vision.image_std",
-    "clip.vision.spatial_merge_size",
-    "clip.vision.swiglu_clamp",
-    "clip.vision.image_min_pixels",
-    "clip.vision.image_max_pixels",
-];
-
 fn invalid(message: impl Into<String>) -> FamilyError {
     FamilyError::invalid(message)
 }
@@ -79,7 +58,9 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, FamilyError> {
     projector_type(directory, &[(PROJECTOR_TYPE, ())], target_width)?;
-    let meta = ProjectorMetadata::new(directory, KEYS)?;
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.projector_type");
     // The tower's feed-forward is SiLU.
     if !meta.bool("clip.use_silu")? {
         return Err(invalid("the projector's feed-forward must be SwiGLU (clip.use_silu)"));
@@ -271,6 +252,7 @@ pub fn describe_projector(
         blocks,
         merger,
     });
+    meta.finish()?;
     description
         .validate()
         .map_err(|error| invalid(error.to_string()))?;

@@ -42,42 +42,6 @@ use std::{error, fmt};
 /// The GGUF architecture this family claims.
 pub const ARCHITECTURE: &str = "nemotron_h_moe";
 
-/// Every architecture metadata key the family reads. The rope keys are
-/// written by the converter but unused: every attention layer is NoPE.
-const KNOWN_KEYS: &[&str] = &[
-    "block_count",
-    "context_length",
-    "embedding_length",
-    "vocab_size",
-    "feed_forward_length",
-    "attention.head_count",
-    "attention.head_count_kv",
-    "attention.key_length",
-    "attention.value_length",
-    "attention.layer_norm_rms_epsilon",
-    "attention.layer_norm_epsilon",
-    "rope.dimension_count",
-    "rope.freq_base",
-    "rope.scaling.finetuned",
-    "ssm.conv_kernel",
-    "ssm.state_size",
-    "ssm.group_count",
-    "ssm.inner_size",
-    "ssm.time_step_rank",
-    "expert_count",
-    "expert_used_count",
-    "expert_group_count",
-    "expert_group_used_count",
-    "expert_gating_func",
-    "expert_feed_forward_length",
-    "expert_shared_feed_forward_length",
-    "expert_shared_count",
-    "expert_weights_norm",
-    "expert_weights_scale",
-    "moe_latent_size",
-    "nextn_predict_layers",
-];
-
 /// Failure to recognize or interpret a Nemotron-H artifact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -528,7 +492,11 @@ pub fn inspect_components(
     identity: PackageIdentity,
 ) -> Result<ModelDefinition, Error> {
     recognize(directory)?;
-    let m = Metadata::new(directory, ARCHITECTURE, KNOWN_KEYS)?;
+    let m = Metadata::new(directory, ARCHITECTURE);
+    // The converter writes rope keys even though every attention layer is NoPE.
+    m.ignore("rope.dimension_count");
+    m.ignore("rope.freq_base");
+    m.ignore("rope.scaling.finetuned");
     let block_count = m.integer("block_count")?;
     let head_layers = m.optional_count("nextn_predict_layers")?.unwrap_or(0);
     if head_layers >= block_count {
@@ -598,7 +566,10 @@ pub fn inspect_components(
     // Converters since Nemotron 3.5 write only `layer_norm_epsilon`, which
     // llama.cpp then uses for the RMS norms too.
     let epsilon = match m.optional_number("attention.layer_norm_rms_epsilon")? {
-        Some(epsilon) => epsilon,
+        Some(epsilon) => {
+            m.ignore("attention.layer_norm_epsilon");
+            epsilon
+        }
         None => m.number("attention.layer_norm_epsilon")?,
     };
     let geometry = Geometry {
@@ -693,6 +664,7 @@ pub fn inspect_components(
         // Bound and checked, then deliberately not emitted (module docs).
         head.validate(&decoder, inputs.coordinate_axes)?;
     }
+    m.finish()?;
     binder.finish()?;
     let vision = projector
         .map(|projector| projector::describe_projector(projector, hidden))

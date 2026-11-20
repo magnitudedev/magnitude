@@ -11,10 +11,10 @@ mod projector;
 pub use projector::describe_projector;
 
 use magnitude_artifacts::{
-    gguf::{Directory, Element, Scalar, Value},
+    gguf::Directory,
     UnsupportedReason,
 };
-use magnitude_family_common::{architecture_keys, array_elements};
+use magnitude_family_common::{HeaderError, Metadata};
 use magnitude_family_contracts::{
     ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
     GateFunction, GatedDelta, HeadNorm, HistoryRows, HistorySource, MediaRowAttention,
@@ -35,138 +35,20 @@ pub fn product(dimensions: &[u64]) -> Result<u64, Error> {
 /// Binds a block's weight by its name within the block.
 pub type Weight<'a> = dyn FnMut(&str, &[u64]) -> Result<WeightDescriptor, Error> + 'a;
 
-/// Metadata of one family, read under its `{family}.` prefix.
-pub struct Metadata<'a> {
-    pub directory: &'a Directory,
-    pub prefix: String,
-}
-
-impl<'a> Metadata<'a> {
-    /// Reads `family.*` keys, refusing every one outside `keys` as
-    /// unrecognized metadata.
-    pub fn new(directory: &'a Directory, family: &str, keys: &[&str]) -> Result<Self, Error> {
-        let unknown = architecture_keys(directory, family)
-            .filter(|(key, _)| !keys.contains(key))
-            .map(|(_, entry)| entry.name.clone())
-            .collect::<Vec<_>>();
-        if !unknown.is_empty() {
-            let detail = format!("unknown Qwen metadata {unknown:?}");
-            return Err(Error::unsupported(
-                unknown
-                    .into_iter()
-                    .map(|key| UnsupportedReason::UnrecognizedMetadata { key })
-                    .collect(),
-                detail,
-            ));
-        }
-        Ok(Metadata {
-            directory,
-            prefix: format!("{family}."),
-        })
-    }
-    /// The full metadata name of `key`.
-    pub fn key(&self, key: &str) -> String {
-        format!("{}{key}", self.prefix)
-    }
-
-    /// A required key: a header without it does not describe a model of
-    /// the family.
-    pub fn value(&self, key: &str) -> Result<&Value, Error> {
-        let key = self.key(key);
-        self.directory
-            .value(&key)
-            .ok_or_else(|| {
-                let detail = format!("missing Qwen metadata {key}");
-                Error::missing_metadata(key, detail)
-            })
-    }
-    pub fn optional(&self, key: &str) -> Option<&Value> {
-        self.directory.value(&self.key(key))
-    }
-    /// A key present with a value outside what its reader admits.
-    pub fn malformed(&self, key: &str, expected: &str) -> Error {
-        let key = self.key(key);
-        let detail = format!("{key} must be {expected}");
-        Error::metadata(key, detail)
-    }
-    pub fn integer(&self, key: &str) -> Result<u64, Error> {
-        self.value(key)?
-            .unsigned()
-            .filter(|n| *n > 0)
-            .ok_or_else(|| self.malformed(key, "a positive integer"))
-    }
-    pub fn number(&self, key: &str) -> Result<f64, Error> {
-        match self.value(key)? {
-            Value::Scalar(Scalar::Float(n)) => Ok(*n),
-            Value::Scalar(Scalar::Unsigned(n)) => Ok(*n as f64),
-            Value::Scalar(Scalar::Signed(n)) => Ok(*n as f64),
-            _ => Err(self.malformed(key, "numeric")),
-        }
-    }
-    /// An array of nonnegative integers.
-    pub fn integers(&self, key: &str) -> Result<Vec<u64>, Error> {
-        let Value::Array(values) = self.value(key)? else {
-            return Err(self.malformed(key, "an integer array"));
-        };
-        array_elements(&self.key(key), values)?
-            .iter()
-            .map(|value| match value {
-                Element::Unsigned(n) => Some(n),
-                Element::Signed(n) => u64::try_from(n).ok(),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| self.malformed(key, "an array of nonnegative integers"))
-    }
-}
-
-/// The keys [`Geometry::read`] interprets in every Qwen 3.5 lineage
-/// artifact. `rope.scaling.type` is read to refuse scaled rotary.
-pub const GEOMETRY_KEYS: &[&str] = &[
-    "embedding_length",
-    "attention.head_count",
-    "attention.head_count_kv",
-    "attention.key_length",
-    "attention.value_length",
-    "attention.layer_norm_rms_epsilon",
-    "rope.dimension_count",
-    "rope.dimension_sections",
-    "rope.freq_base",
-    "rope.scaling.type",
-    "ssm.conv_kernel",
-    "ssm.group_count",
-    "ssm.inner_size",
-    "ssm.state_size",
-    "ssm.time_step_rank",
-];
-
-/// The keys [`Geometry::read`] interprets in a dense artifact.
-pub const DENSE_KEYS: &[&str] = &["feed_forward_length"];
-
-/// The keys [`Geometry::read`] interprets in a routed artifact, and the
-/// dense `feed_forward_length` converters write beside them (Ollama's as
-/// zero), which sizes no sublayer of an all-routed decoder and is ignored.
-pub const ROUTED_KEYS: &[&str] = &[
-    "feed_forward_length",
-    "expert_count",
-    "expert_used_count",
-    "expert_feed_forward_length",
-    "expert_shared_feed_forward_length",
-];
-
-/// The keys [`mixer_kinds`] interprets.
-pub const MIXER_KEYS: &[&str] = &["attention.recurrent_layers", "full_attention_interval"];
-
 /// The trailing prediction blocks `nextn_predict_layers` declares among the
 /// `block_count` stored blocks. More than one is not admitted until its GGUF
 /// roles and execution semantics are qualified.
 pub fn prediction_blocks(m: &Metadata, block_count: u64) -> Result<u64, Error> {
-    match m.optional("nextn_predict_layers") {
+    match m.optional_count("nextn_predict_layers")? {
         None => Ok(0),
-        Some(value) => value
-            .unsigned()
-            .filter(|layers| *layers <= 1 && *layers < block_count)
-            .ok_or_else(|| m.malformed("nextn_predict_layers", "at most one prediction layer")),
+        Some(layers) if layers <= 1 && layers < block_count => Ok(layers),
+        Some(_) => {
+            let key = m.key("nextn_predict_layers");
+            Err(Error::metadata(
+                &key,
+                format!("{key} must be at most one prediction layer"),
+            ))
+        }
     }
 }
 
@@ -214,27 +96,26 @@ pub fn mixer_kinds(
             })
             .collect()
     };
-    let Some(flags) = m.optional(FLAGS) else {
+    let blocks = layer_count + predictions;
+    let Some(flags) = m.optional_flags(FLAGS, blocks).map_err(|error| match error {
+        HeaderError::MetadataType { .. } => {
+            let key = m.key(FLAGS);
+            Error::metadata(
+                &key,
+                format!("{key} must be one flag for each of the {blocks} blocks"),
+            )
+        }
+        error => error.into(),
+    })? else {
         return Ok(by_interval(m.integer("full_attention_interval")?));
     };
-    let flags = match flags {
-        Value::Array(flags) => array_elements(&m.key(FLAGS), flags)?
-            .iter()
-            .map(|v| match v {
-                Element::Bool(recurrent) => Some(recurrent),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>(),
-        Value::Scalar(_) => None,
-    }
-    .ok_or_else(|| m.malformed(FLAGS, "an array of booleans"))?;
-    let blocks = layer_count + predictions;
-    if flags.len() as u64 != blocks {
-        return Err(m.malformed(FLAGS, &format!("one flag for each of the {blocks} blocks")));
-    }
     let (decoder, prediction) = flags.split_at(layer_count as usize);
     if prediction.iter().any(|recurrent| *recurrent) {
-        return Err(m.malformed(FLAGS, "false for the attention-only prediction blocks"));
+        let key = m.key(FLAGS);
+        return Err(Error::metadata(
+            &key,
+            format!("{key} must be false for the attention-only prediction blocks"),
+        ));
     }
     let kinds = decoder
         .iter()
@@ -246,12 +127,12 @@ pub fn mixer_kinds(
             }
         })
         .collect::<Vec<_>>();
-    if m.optional("full_attention_interval").is_some() {
-        let interval = m.integer("full_attention_interval")?;
+    if let Some(interval) = m.optional_integer("full_attention_interval")? {
         if kinds != by_interval(interval) {
-            return Err(m.malformed(
-                FLAGS,
-                &format!("the layer order full_attention_interval {interval} places"),
+            let key = m.key(FLAGS);
+            return Err(Error::metadata(
+                &key,
+                format!("{key} must match the layer order full_attention_interval {interval} places"),
             ));
         }
     }
@@ -290,7 +171,7 @@ pub struct Geometry {
 impl Geometry {
     pub fn read(m: &Metadata, routed: bool) -> Result<Self, Error> {
         if let Some(scaling) = m
-            .optional("rope.scaling.type")
+            .value("rope.scaling.type")
             .filter(|v| v.string() != Some("none"))
         {
             let kind = scaling.string().unwrap_or("unspecified").to_owned();
@@ -299,27 +180,16 @@ impl Geometry {
                 "scaled Qwen rotary definitions are not yet qualified",
             ));
         }
-        let Value::Array(sections) = m.value("rope.dimension_sections")? else {
-            return Err(Error::invalid(
-                "Qwen rotary sections must contain four integers",
-            ));
-        };
-        let sections = array_elements(&m.key("rope.dimension_sections"), sections)?
-            .iter()
-            .map(|v| match v {
-                Element::Unsigned(n) => Some(n),
-                Element::Signed(n) => u64::try_from(n).ok(),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .and_then(|v| <[u64; 4]>::try_from(v).ok())
-            .ok_or_else(|| {
-                Error::invalid("Qwen rotary sections must contain four nonnegative integers")
-            })?;
+        let sections = <[u64; 4]>::try_from(m.counts("rope.dimension_sections")?).map_err(|_| {
+            Error::invalid("Qwen rotary sections must contain four nonnegative integers")
+        })?;
         if sections[3] != 0 {
             return Err(Error::invalid("Qwen rotary fourth section must be zero"));
         }
         let experts = if routed {
+            // Converters write dense `feed_forward_length` (Ollama's as zero)
+            // beside routed keys; it sizes no sublayer of an all-routed decoder.
+            m.ignore("feed_forward_length");
             Some(Experts {
                 count: m.integer("expert_count")?,
                 selected: m.integer("expert_used_count")?,

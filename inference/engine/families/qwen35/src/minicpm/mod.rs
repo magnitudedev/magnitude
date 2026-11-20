@@ -11,25 +11,6 @@ use magnitude_family_contracts::{
     VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp, checked_product,
 };
 
-const KEYS: &[&str] = &[
-    "clip.has_vision_encoder",
-    "clip.projector_type",
-    "clip.vision.projection_dim",
-    "clip.vision.image_size",
-    "clip.vision.patch_size",
-    "clip.vision.embedding_length",
-    "clip.vision.feed_forward_length",
-    "clip.vision.block_count",
-    "clip.vision.attention.head_count",
-    "clip.vision.image_mean",
-    "clip.vision.image_std",
-    "clip.vision.projector.scale_factor",
-    "clip.vision.max_slice_nums",
-    "clip.vision.wa_layer_indexes",
-    "clip.use_gelu",
-    "clip.vision.attention.layer_norm_epsilon",
-];
-
 struct Reader<'a> {
     tensors: Tensors<'a>,
     epsilon: f64,
@@ -59,7 +40,10 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("minicpmv4_7", ())], target_width)?;
-    let meta = ProjectorMetadata::new(directory, KEYS)?;
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.projector_type");
+    meta.ignore("clip.vision.wa_layer_indexes");
     let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
     let mut r = Reader {
         tensors: Tensors::new(directory),
@@ -177,6 +161,7 @@ pub fn describe_projector(
         patch,
         merge: 2,
     };
+    meta.finish()?;
     r.tensors.finish().map_err(Error::from)?;
     let description = Box::new(VisionDescription {
         activation_dtype: ActivationDType::F16,

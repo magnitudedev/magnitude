@@ -14,7 +14,7 @@ use magnitude_artifacts::{
     Package, PackageIdentity,
     gguf::{Directory, Value},
 };
-use magnitude_family_common::Tensors;
+use magnitude_family_common::{Metadata, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, Block, Decoder, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
     GateFunction, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout,
@@ -22,8 +22,7 @@ use magnitude_family_contracts::{
     VocabularyProjection, WeightDescriptor,
 };
 use magnitude_family_qwen::{
-    DENSE_KEYS, GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, MixerKind, ROUTED_KEYS, Weight,
-    mixer_kinds, prediction_blocks, product, stores_prediction_blocks,
+    Geometry, MixerKind, Weight, mixer_kinds, prediction_blocks, product, stores_prediction_blocks,
 };
 
 pub use magnitude_family_qwen::Error;
@@ -54,15 +53,6 @@ pub const FAMILY_IDS: &[&str] = &["qwen35", "qwen35moe"];
 fn invalid(message: impl Into<String>) -> Error {
     Error::invalid(message)
 }
-
-/// The keys this family interprets beside the shared geometry and mixer
-/// keys.
-const QWEN35_KEYS: &[&str] = &[
-    "block_count",
-    "context_length",
-    "nextn_predict_layers",
-    "rope.section_order",
-];
 
 /// The rotary section order the catalog's MiniCPM-V conversions declare:
 /// the only declared order qualified on this family's rotary. Any other
@@ -136,20 +126,12 @@ pub fn inspect_components(
 ) -> Result<ModelDefinition, Error> {
     let architecture = recognize(directory)?;
     let family_id = architecture.family_id();
-    let width_keys = if architecture.is_routed() {
-        ROUTED_KEYS
-    } else {
-        DENSE_KEYS
-    };
-    let m = Metadata::new(
-        directory,
-        family_id,
-        &[QWEN35_KEYS, GEOMETRY_KEYS, MIXER_KEYS, width_keys].concat(),
-    )?;
-    if let Some(order) = m.optional("rope.section_order") {
-        if order.string() != Some(SECTION_ORDER) {
-            return Err(m.malformed("rope.section_order", "\"zyxt\""));
-        }
+    let m = Metadata::new(directory, family_id);
+    if m.optional_string("rope.section_order")?
+        .is_some_and(|order| order != SECTION_ORDER)
+    {
+        let key = m.key("rope.section_order");
+        return Err(Error::metadata(&key, format!("{key} must be \"zyxt\"")));
     }
     let block_count = m.integer("block_count")?;
     let speculative = prediction_blocks(&m, block_count)?;
@@ -231,6 +213,7 @@ pub fn inspect_components(
             component: HeadComponent::Target,
         })
     };
+    m.finish()?;
     tensors.finish()?;
     let vision = projector
         .map(|projector| {

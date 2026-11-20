@@ -11,28 +11,6 @@ use magnitude_family_contracts::{
     WeightDescriptor,
 };
 
-/// Every `clip.*` metadata key the Qwen3-VL projector interprets.
-const KEYS: &[&str] = &[
-    "clip.has_vision_encoder",
-    "clip.projector_type",
-    "clip.vision.projector_type",
-    "clip.use_gelu",
-    "clip.vision.block_count",
-    "clip.vision.embedding_length",
-    "clip.vision.feed_forward_length",
-    "clip.vision.attention.head_count",
-    "clip.vision.attention.layer_norm_epsilon",
-    "clip.vision.patch_size",
-    "clip.vision.spatial_merge_size",
-    "clip.vision.image_size",
-    "clip.vision.projection_dim",
-    "clip.vision.image_mean",
-    "clip.vision.image_std",
-    "clip.vision.image_min_pixels",
-    "clip.vision.image_max_pixels",
-    "clip.vision.is_deepstack_layers",
-];
-
 fn invalid(message: impl Into<String>) -> Error {
     Error::invalid(message)
 }
@@ -44,7 +22,10 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("qwen3vl_merger", ())], target_width)?;
-    let meta = ProjectorMetadata::new(directory, KEYS)?;
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.projector_type");
+    meta.ignore("clip.vision.projector_type");
     let depth = meta.bounded_block_count("clip.vision.block_count")?;
     let hidden = meta.integer("clip.vision.embedding_length")?;
     let intermediate = meta.integer("clip.vision.feed_forward_length")?;
@@ -71,6 +52,7 @@ pub fn describe_projector(
     {
         return Err(invalid("deepstack projector layers are unsupported"));
     }
+    meta.finish()?;
 
     let mut tensors = Tensors::new(directory);
     let mut tensor = |name: &str, shape: &[u64]| tensors.bind(name, shape);

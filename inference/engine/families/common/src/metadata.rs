@@ -4,6 +4,8 @@
 
 use crate::HeaderError;
 use magnitude_artifacts::gguf::{self, Directory, Element, Scalar, Value};
+use std::cell::RefCell;
+use std::collections::HashSet;
 
 /// Every metadata entry in `architecture`'s own namespace, with its name
 /// within that namespace.
@@ -42,26 +44,58 @@ pub fn array_elements<'a>(
 pub struct Metadata<'a> {
     directory: &'a Directory,
     prefix: String,
+    accounted: RefCell<HashSet<String>>,
+    ignored_prefixes: RefCell<Vec<String>>,
 }
 
 impl<'a> Metadata<'a> {
-    /// Reads `architecture.*` keys, rejecting every one outside `keys`.
-    pub fn new(
-        directory: &'a Directory,
-        architecture: &str,
-        keys: &[&str],
-    ) -> Result<Self, HeaderError> {
-        let unknown = architecture_keys(directory, architecture)
-            .filter(|(key, _)| !keys.contains(key))
-            .map(|(_, entry)| entry.name.clone())
-            .collect::<Vec<_>>();
-        if !unknown.is_empty() {
-            return Err(HeaderError::UnknownMetadata(unknown));
-        }
-        Ok(Self {
+    /// Begins reading `architecture.*` keys. Every read marks its key as
+    /// accounted for; [`Self::finish`] rejects any `<architecture>.*` key
+    /// that was neither read nor explicitly ignored.
+    pub fn new(directory: &'a Directory, architecture: &str) -> Self {
+        Self {
             directory,
             prefix: format!("{architecture}."),
-        })
+            accounted: RefCell::new(HashSet::new()),
+            ignored_prefixes: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Explicitly accounts for a known non-semantic or provenance key in
+    /// `architecture`'s namespace so [`Self::finish`] admits it.
+    pub fn ignore(&self, key: &str) {
+        self.accounted.borrow_mut().insert(key.to_owned());
+    }
+
+    /// Explicitly accounts for every key in `architecture`'s namespace whose
+    /// suffix starts with `prefix` (e.g. an uninterpreted sibling component).
+    pub fn ignore_prefix(&self, prefix: &str) {
+        self.ignored_prefixes.borrow_mut().push(prefix.to_owned());
+    }
+
+    /// Verifies that every `<architecture>.*` key in the directory was either
+    /// read or explicitly ignored.
+    pub fn finish(self) -> Result<(), HeaderError> {
+        let accounted = self.accounted.into_inner();
+        let ignored_prefixes = self.ignored_prefixes.into_inner();
+        let unknown = self
+            .directory
+            .metadata
+            .iter()
+            .filter_map(|entry| {
+                let key = entry.name.strip_prefix(&self.prefix)?;
+                let covered = accounted.contains(key)
+                    || ignored_prefixes
+                        .iter()
+                        .any(|prefix| key.starts_with(prefix));
+                (!covered).then(|| entry.name.clone())
+            })
+            .collect::<Vec<_>>();
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(HeaderError::UnknownMetadata(unknown))
+        }
     }
 
     /// The full metadata name of `key`.
@@ -70,6 +104,7 @@ impl<'a> Metadata<'a> {
     }
 
     pub fn value(&self, key: &str) -> Option<&'a Value> {
+        self.accounted.borrow_mut().insert(key.to_owned());
         self.directory.value(&self.key(key))
     }
 
@@ -274,6 +309,28 @@ impl<'a> Metadata<'a> {
         let value = self.optional_flags(key, layers)?;
         self.required(key, value)
     }
+
+    /// A required positive block count bounded by the directory's tensor count
+    /// (`1 <= count <= directory.tensors.len() as u64`), guarding per-block
+    /// allocations against untrusted headers.
+    pub fn bounded_block_count(&self, key: &str) -> Result<u64, HeaderError> {
+        let count = self.integer(key)?;
+        if count > self.directory.tensors.len() as u64 {
+            return Err(self.malformed(
+                key,
+                "a block count not exceeding the stored tensor count",
+            ));
+        }
+        Ok(count)
+    }
+
+    /// A required fixed-length array of finite numbers.
+    pub fn f64_array<const N: usize>(&self, key: &str) -> Result<[f64; N], HeaderError> {
+        let expected = "a fixed-length array of finite numbers";
+        let value = self.array(key, expected, Some(N as u64), element_number)?;
+        let parsed = self.required(key, value)?;
+        <[f64; N]>::try_from(parsed).map_err(|_| self.malformed(key, expected))
+    }
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -292,4 +349,57 @@ fn element_number(element: Element) -> Option<f64> {
         Element::String(_) | Element::Bool(_) => None,
     }
     .filter(|value| value.is_finite())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_artifacts::gguf::{ByteOrder, Metadata as Entry};
+
+    fn directory(entries: &[(&str, Value)]) -> Directory {
+        Directory {
+            version: 3,
+            byte_order: ByteOrder::Little,
+            alignment: 32,
+            data_offset: 0,
+            metadata: entries
+                .iter()
+                .map(|(name, value)| Entry {
+                    name: (*name).into(),
+                    value: value.clone(),
+                })
+                .collect(),
+            tensors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn finish_rejects_unaccounted_keys_and_admits_read_or_ignored() {
+        let dir = directory(&[
+            ("arch.block_count", Value::Scalar(Scalar::Unsigned(4))),
+            ("arch.provenance", Value::Scalar(Scalar::Unsigned(1))),
+            ("arch.sibling.a", Value::Scalar(Scalar::Unsigned(2))),
+            ("arch.sibling.b", Value::Scalar(Scalar::Bool(true))),
+            ("arch.unknown_switch", Value::Scalar(Scalar::Bool(true))),
+            ("general.name", Value::Scalar(Scalar::String("demo".into()))),
+        ]);
+
+        let m = Metadata::new(&dir, "arch");
+        assert_eq!(m.integer("block_count"), Ok(4));
+        m.ignore("provenance");
+        m.ignore_prefix("sibling.");
+        assert_eq!(
+            m.finish(),
+            Err(HeaderError::UnknownMetadata(vec![
+                "arch.unknown_switch".into()
+            ]))
+        );
+
+        let m = Metadata::new(&dir, "arch");
+        assert_eq!(m.integer("block_count"), Ok(4));
+        m.ignore("provenance");
+        m.ignore_prefix("sibling.");
+        assert_eq!(m.optional_flag("unknown_switch"), Ok(Some(true)));
+        assert_eq!(m.finish(), Ok(()));
+    }
 }

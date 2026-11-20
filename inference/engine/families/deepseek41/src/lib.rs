@@ -114,71 +114,6 @@ const INDEX_ROUNDING: RowRounding = RowRounding::Block(BlockRounding {
     amax_floor: 6.0 * f32::MIN_POSITIVE as f64,
 });
 
-/// The keys every V4.1 file states. The YaRN, compressed-theta and indexer
-/// keys describe compressed layers, which a file without them still states.
-const KEYS: &[&str] = &[
-    "block_count",
-    "context_length",
-    "embedding_length",
-    "attention.head_count",
-    "attention.head_count_kv",
-    "attention.key_length",
-    "attention.value_length",
-    "attention.layer_norm_rms_epsilon",
-    "attention.q_lora_rank",
-    "attention.sliding_window",
-    "attention.output_group_count",
-    "attention.output_lora_rank",
-    "attention.compress_ratios",
-    "attention.compress_rope_freq_base",
-    "attention.indexer.head_count",
-    "attention.indexer.key_length",
-    "attention.indexer.top_k",
-    "rope.dimension_count",
-    "rope.freq_base",
-    "rope.scaling.type",
-    "rope.scaling.factor",
-    "rope.scaling.original_context_length",
-    "rope.scaling.yarn_beta_fast",
-    "rope.scaling.yarn_beta_slow",
-    "expert_count",
-    "expert_used_count",
-    "expert_gating_func",
-    "expert_feed_forward_length",
-    "expert_shared_count",
-    "expert_weights_scale",
-    "expert_weights_norm",
-    "swiglu_clamp_exp",
-    "swiglu_clamp_shexp",
-    "hyper_connection.count",
-    "hyper_connection.sinkhorn_iterations",
-    "hyper_connection.epsilon",
-    "hash_layer_count",
-];
-
-/// The keys only compressed layers read: their kv and index sources and
-/// the candidate blocks. The converter omits each list no layer names.
-const COMPRESSED_KEYS: &[&str] = &[
-    "attention.kv_source_layers",
-    "attention.indexer.source_layers",
-    "attention.indexer.candidate_source_layer",
-    "attention.indexer.candidate_top_k_blocks",
-    "attention.indexer.candidate_block_size",
-];
-
-/// The keys only Engram layers read.
-const ENGRAM_KEYS: &[&str] = &[
-    "ple.layers",
-    "ple.ngram_size",
-    "ple.heads_per_ngram",
-    "ple.layer_multipliers",
-    "ple.head_offsets",
-    "ple.head_vocab_sizes",
-    "embedding_length_per_layer_input",
-    "engram.pad_token_id",
-    "engram.token_map",
-];
-
 /// llama.cpp's `expert_gating_func` for sqrt-softplus scores
 /// (`LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS`), the one V4.1 routes by.
 const SQRT_SOFTPLUS: u64 = 4;
@@ -390,6 +325,9 @@ impl Engram {
         if m.value("ple.layers").is_none() {
             return Ok(None);
         }
+        // Converter provenance keys for the Engram token-map compression.
+        m.ignore("engram.vocab_size");
+        m.ignore("engram.compressed_vocab_size");
         let layers = m.counts("ple.layers")?;
         let ngram = m.integer("ple.ngram_size")?;
         let context = ngram.checked_sub(1).filter(|context| *context > 0).ok_or_else(|| {
@@ -538,8 +476,20 @@ impl Geometry {
             count => Some(product(&[count, m.integer("expert_feed_forward_length")?])?),
         };
         let selected = m.integer("expert_used_count")?;
+        let hidden = m.integer("embedding_length")?;
+        let streams = m.integer("hyper_connection.count")?;
+        if let Some(out) = m.optional_integer("embedding_length_out")? {
+            let expected = product(&[hidden, streams])?;
+            if out != expected {
+                let key = m.key("embedding_length_out");
+                return Err(FamilyError::metadata(
+                    &key,
+                    format!("{key} is {out}, {FAMILY_ID} states {expected}"),
+                ));
+            }
+        }
         Ok(Self {
-            hidden: m.integer("embedding_length")?,
+            hidden,
             heads,
             width,
             query_rank: m.integer("attention.q_lora_rank")?,
@@ -561,7 +511,7 @@ impl Geometry {
                 false => RouteNormalization::None,
             },
             scale: m.positive_number("expert_weights_scale")?,
-            streams: m.integer("hyper_connection.count")?,
+            streams,
             clamps: clamp("swiglu_clamp_exp")?
                 .into_iter()
                 .zip(clamp("swiglu_clamp_shexp")?)
@@ -844,13 +794,11 @@ pub fn inspect_components(
             "{FAMILY_ID}'s vision projector is not interpreted yet"
         )));
     }
-    // Every layer kind's keys, to refuse the unbound forms by name.
-    let every = Metadata::new(
-        directory,
-        FAMILY_ID,
-        &[KEYS, COMPRESSED_KEYS, ENGRAM_KEYS].concat(),
-    )?;
-    let layers = every.integer("block_count")?;
+    let m = Metadata::new(directory, FAMILY_ID);
+    // Uninterpreted sibling DSpark drafter metadata carried on target GGUFs;
+    // any stray drafter tensors are still rejected by `Tensors::finish`.
+    m.ignore_prefix("dspark.");
+    let layers = m.integer("block_count")?;
     // Each layer requires distinct stored weights. Reject impossible counts
     // before allocating per-layer vectors from untrusted metadata.
     if layers > directory.tensors.len() as u64 {
@@ -858,16 +806,22 @@ pub fn inspect_components(
             "{FAMILY_ID} layer count exceeds available weight roles"
         )));
     }
-    let compressions = compressions(&every, layers)?;
-    let engram = Engram::read(&every, layers)?;
-    let compressed = compressions.iter().any(|layer| *layer != Compression::None);
-    let keys = [
-        KEYS,
-        if compressed { COMPRESSED_KEYS } else { &[] },
-        if engram.is_some() { ENGRAM_KEYS } else { &[] },
-    ]
-    .concat();
-    let m = Metadata::new(directory, FAMILY_ID, &keys)?;
+    let compressions = compressions(&m, layers)?;
+    let engram = Engram::read(&m, layers)?;
+    if compressions.iter().all(|layer| *layer == Compression::None) {
+        // The converter writes compressed-layer rotary keys even when no kept
+        // layer compresses its history.
+        for key in [
+            "attention.compress_rope_freq_base",
+            "rope.scaling.type",
+            "rope.scaling.factor",
+            "rope.scaling.original_context_length",
+            "rope.scaling.yarn_beta_fast",
+            "rope.scaling.yarn_beta_slow",
+        ] {
+            m.ignore(key);
+        }
+    }
     let geometry = Geometry::read(&m, layers)?;
     let hidden = geometry.hidden;
     let streams = geometry.streams;
@@ -982,6 +936,7 @@ pub fn inspect_components(
         vision: None,
         draft: None,
     };
+    m.finish()?;
     tensors.finish()?;
     definition
         .validate()

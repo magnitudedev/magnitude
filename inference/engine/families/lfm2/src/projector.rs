@@ -15,28 +15,6 @@ use magnitude_family_contracts::{
     VisionStem, VisionUp, WeightDescriptor,
 };
 
-/// Every `clip.*` metadata key the family reads.
-const KEYS: &[&str] = &[
-    "clip.has_vision_encoder",
-    "clip.use_silu",
-    "clip.vision.projector_type",
-    "clip.vision.projection_dim",
-    "clip.vision.image_size",
-    "clip.vision.patch_size",
-    "clip.vision.embedding_length",
-    "clip.vision.feed_forward_length",
-    "clip.vision.block_count",
-    "clip.vision.attention.head_count",
-    "clip.vision.attention.head_count_kv",
-    "clip.vision.attention.layer_norm_epsilon",
-    "clip.vision.spatial_merge_size",
-    "clip.vision.image_mean",
-    "clip.vision.image_std",
-    "clip.vision.image_min_pixels",
-    "clip.vision.image_max_pixels",
-    "clip.vision.image_resize_algo",
-];
-
 /// The tower's axial rotary base (`vision_config.rope_parameters.rope_theta`
 /// in the released configuration); the converter does not store it.
 const ROTARY_BASE: f64 = 1.0e6;
@@ -60,7 +38,10 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("lfm3vl", ())], target_width)?;
-    let meta = ProjectorMetadata::new(directory, KEYS)?;
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.vision.projector_type");
+    meta.ignore("clip.vision.image_size");
     // The tower's feed-forward is SwiGLU and its pixels are resampled
     // bicubically; anything else is another projector.
     if !meta.bool("clip.use_silu")?
@@ -81,6 +62,7 @@ pub fn describe_projector(
     let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
     let mean = meta.f64_array("clip.vision.image_mean")?;
     let std = meta.f64_array("clip.vision.image_std")?;
+    meta.finish()?;
     if hidden % heads != 0 || heads % kv_heads != 0 {
         return Err(invalid("projector heads do not group over the tower width"));
     }

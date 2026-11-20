@@ -27,27 +27,6 @@ use magnitude_family_contracts::{
     VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor,
 };
 
-/// Every `clip.*` metadata key the family reads.
-const KEYS: &[&str] = &[
-    "clip.has_vision_encoder",
-    "clip.projector_type",
-    "clip.use_gelu",
-    "clip.vision.nemotron_omni",
-    "clip.vision.projection_dim",
-    "clip.vision.image_size",
-    "clip.vision.patch_size",
-    "clip.vision.embedding_length",
-    "clip.vision.feed_forward_length",
-    "clip.vision.block_count",
-    "clip.vision.attention.head_count",
-    "clip.vision.attention.layer_norm_epsilon",
-    "clip.vision.image_mean",
-    "clip.vision.image_std",
-    "clip.vision.projector.scale_factor",
-    "clip.vision.image_min_pixels",
-    "clip.vision.image_max_pixels",
-];
-
 /// The released projector MLP's RMS norm epsilon (`NemotronH_Omni_RMSNorm`
 /// of `mlp1`); the converter does not store it.
 const PROJECTION_NORM_EPSILON: f64 = 1e-5;
@@ -146,7 +125,9 @@ pub fn describe_projector(
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("nemotron_omni", ())], target_width)
         .map_err(Error::ProjectorIdentity)?;
-    let meta = ProjectorMetadata::new(directory, KEYS)?;
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.projector_type");
     let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
     let mut r = Reader {
         meta,
@@ -293,6 +274,7 @@ pub fn describe_projector(
         patch,
         merge,
     };
+    r.meta.finish()?;
     r.tensors.finish()?;
     let description = Box::new(VisionDescription {
         // The squared ReLU publishes the square of its input, which f16

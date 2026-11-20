@@ -2,33 +2,14 @@
 //! separately, or stored after the target's last block in its own file.
 
 use super::{Error, FAMILY_ID, exit_norm, hyper_site, mix_input, recognize};
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
-use magnitude_family_common::Tensors;
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{Metadata, Tensors};
 use magnitude_family_contracts::{
     Block, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout,
     HyperConnectionMixing, ModelDefinition, Operator, OutputForm, ResidualForm, Sublayer,
     VocabularyProjection,
 };
-use magnitude_family_qwen::{
-    GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, ROUTED_KEYS, Weight, product,
-};
-
-/// The keys a prediction package interprets beside the shared Qwen
-/// geometry, mixer and routed keys. The package repeats its target's
-/// attention layout (`full_attention_interval`, the indexer's `top_k`),
-/// which its own unselected attention does not read.
-const HEAD_KEYS: &[&str] = &[
-    "block_count",
-    "context_length",
-    "nextn_predict_layers",
-    "nextn_shared_target_tensors",
-    "attention.compress_ratios",
-    "attention.indexer.head_count",
-    "attention.indexer.key_length",
-    "attention.indexer.top_k",
-    "hyper_connection.count",
-    "hyper_connection.low_rank",
-];
+use magnitude_family_qwen::{Geometry, Weight, product};
 
 /// Bind a separate prediction package to its Qwen4 `target`: the draft head
 /// it is. A package that is not a head of this target is a mismatch.
@@ -39,17 +20,15 @@ pub fn inspect_head(draft: &Directory, target: &ModelDefinition) -> Result<Head,
             "Qwen4 prediction head requires a Qwen4 target without a drafter",
         ));
     }
-    let m = Metadata::new(
-        draft,
-        FAMILY_ID,
-        &[HEAD_KEYS, GEOMETRY_KEYS, MIXER_KEYS, ROUTED_KEYS].concat(),
-    )?;
+    let m = Metadata::new(draft, FAMILY_ID);
+    // The prediction package repeats its target's attention layout, which its
+    // own unselected attention does not read.
+    m.ignore("full_attention_interval");
+    m.ignore("attention.recurrent_layers");
+    m.ignore("attention.indexer.top_k");
     if m.integer("nextn_predict_layers")? != 1
         || m.integer("block_count")? != target.decoder.blocks.len() as u64 + 1
-        || !matches!(
-            draft.value("qwen4exp.nextn_shared_target_tensors"),
-            Some(Value::Scalar(Scalar::Bool(true)))
-        )
+        || m.optional_flag("nextn_shared_target_tensors")? != Some(true)
     {
         return Err(Error::mismatch(
             "prediction package must contain one head sharing its target's token tables",
@@ -60,6 +39,7 @@ pub fn inspect_head(draft: &Directory, target: &ModelDefinition) -> Result<Head,
     let head = prediction_head(&m, target, HeadComponent::Draft, &mut |name, shape| {
         Ok(tensors.bind(&format!("{prefix}{name}"), shape)?)
     })?;
+    m.finish()?;
     tensors.finish()?;
     Ok(head)
 }
@@ -177,7 +157,7 @@ pub(crate) fn prediction_head(
     )?);
     // Published packages retain the indexer weights even though the prediction
     // block declares compression ratio zero and uses ordinary causal attention.
-    let ratios = m.integers("attention.compress_ratios")?;
+    let ratios = m.counts("attention.compress_ratios")?;
     if ratios.len() != decoder.blocks.len() + 1 || ratios.last() != Some(&0) {
         return Err(refuse("prediction head must declare unselected attention"));
     }

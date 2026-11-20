@@ -4,7 +4,9 @@ use magnitude_artifacts::{
     UnsupportedReason,
     gguf::{ByteOrder, Directory, Metadata as Entry, Scalar, Value},
 };
-use magnitude_family_qwen::{GEOMETRY_KEYS, Geometry, Metadata};
+use magnitude_family_common::Metadata;
+use magnitude_family_contracts::FamilyError;
+use magnitude_family_qwen::Geometry;
 
 fn header(metadata: &[(&str, Value)]) -> Directory {
     Directory {
@@ -29,11 +31,7 @@ fn rope_scaling_is_named() {
         "qwen35.rope.scaling.type",
         Value::Scalar(Scalar::String("yarn".into())),
     )]);
-    let error = Geometry::read(
-        &Metadata::new(&header, "qwen35", GEOMETRY_KEYS).unwrap(),
-        false,
-    )
-    .unwrap_err();
+    let error = Geometry::read(&Metadata::new(&header, "qwen35"), false).unwrap_err();
     assert_eq!(
         error.reasons,
         [UnsupportedReason::RopeScaling {
@@ -59,11 +57,13 @@ fn every_unknown_key_of_the_family_is_named() {
             Value::Scalar(Scalar::Float(4.0)),
         ),
     ]);
-    let Err(error) = Metadata::new(&header, "qwen35", GEOMETRY_KEYS) else {
+    let m = Metadata::new(&header, "qwen35");
+    assert_eq!(m.integer("embedding_length"), Ok(8));
+    let Err(error) = m.finish() else {
         panic!("unknown keys are refused");
     };
     assert_eq!(
-        error.reasons,
+        FamilyError::from(error).reasons,
         [
             UnsupportedReason::UnrecognizedMetadata {
                 key: "qwen35.attention.sliding_window".into()
@@ -81,15 +81,15 @@ fn missing_and_malformed_keys_are_named() {
         "qwen35.embedding_length",
         Value::Scalar(Scalar::String("wide".into())),
     )]);
-    let m = Metadata::new(&header, "qwen35", GEOMETRY_KEYS).unwrap();
+    let m = Metadata::new(&header, "qwen35");
     assert_eq!(
-        m.integer("attention.head_count").unwrap_err().reasons,
+        FamilyError::from(m.integer("attention.head_count").unwrap_err()).reasons,
         [UnsupportedReason::MissingMetadata {
             key: "qwen35.attention.head_count".into()
         }]
     );
     assert_eq!(
-        m.integer("embedding_length").unwrap_err().reasons,
+        FamilyError::from(m.integer("embedding_length").unwrap_err()).reasons,
         [UnsupportedReason::UnrecognizedMetadata {
             key: "qwen35.embedding_length".into()
         }]

@@ -29,26 +29,6 @@ const ACTIVATION: VisionActivation = VisionActivation::GeluTanh;
 /// header's epsilon is the RMS norms'.
 const LAYER_NORM_EPSILON: f64 = 1e-5;
 
-/// Every `clip.*` metadata key the vision interpretation reads.
-const KEYS: &[&str] = &[
-    "clip.has_vision_encoder",
-    "clip.vision.projector_type",
-    "clip.vision.projection_dim",
-    "clip.vision.image_size",
-    "clip.vision.patch_size",
-    "clip.vision.embedding_length",
-    "clip.vision.feed_forward_length",
-    "clip.vision.block_count",
-    "clip.vision.attention.head_count",
-    "clip.vision.attention.layer_norm_epsilon",
-    "clip.vision.image_mean",
-    "clip.vision.image_std",
-];
-
-/// Every `clip.` metadata key a vision interpretation may ignore
-/// (the audio encoder's keys describe a component that is not interpreted).
-const IGNORED_PREFIXES: &[&str] = &["clip.audio.", "clip.has_audio_encoder"];
-
 struct Reader<'a> {
     directory: &'a Directory,
     meta: ProjectorMetadata<'a>,
@@ -86,8 +66,9 @@ impl Reader<'_> {
     }
 
     /// Every vision tensor (`v.`, `mm.` except the audio embedder's
-    /// `mm.a.`) is bound.
+    /// `mm.a.`) is bound and every `clip.*` metadata key is accounted for.
     fn finish(self) -> Result<(), Error> {
+        self.meta.finish()?;
         let vision =
             |name: &&str| name.starts_with("v.") || (name.starts_with("mm.") && !name.starts_with("mm.a."));
         if let Some(name) = self.tensors.unbound().find(vision) {
@@ -136,7 +117,13 @@ pub fn describe_projector(
         &[("gemma4v", Form::Encoder), ("gemma4uv", Form::Unified)],
         output_hidden,
     )?;
-    let meta = ProjectorMetadata::with_ignored_prefixes(directory, KEYS, IGNORED_PREFIXES)?;
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.vision.projector_type");
+    meta.ignore("clip.vision.image_size");
+    // The audio encoder's keys describe a component that is not interpreted.
+    meta.ignore("clip.has_audio_encoder");
+    meta.ignore_prefix("clip.audio.");
     // Declared, and the target's (`projector_type`).
     meta.integer("clip.vision.projection_dim")?;
     let mut reader = Reader {
@@ -159,6 +146,8 @@ pub fn describe_projector(
 /// blocks, 3×3 average pooling × √C, an optional standardization, an
 /// unweighted RMS and one linear.
 fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescription>, Error> {
+    reader.meta.ignore("clip.vision.image_mean");
+    reader.meta.ignore("clip.vision.image_std");
     let hidden = reader.meta.integer("clip.vision.embedding_length")?;
     let intermediate = reader.meta.integer("clip.vision.feed_forward_length")?;
     let depth = reader.meta.bounded_block_count("clip.vision.block_count")?;
@@ -294,6 +283,8 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescript
 /// the converter stores its columns), a linear with bias, a layer norm, the
 /// per-axis position tables, a layer norm, an unweighted RMS and one linear.
 fn unified(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescription>, Error> {
+    reader.meta.ignore("clip.vision.feed_forward_length");
+    reader.meta.ignore("clip.vision.attention.head_count");
     let hidden = reader.meta.integer("clip.vision.embedding_length")?;
     let epsilon = reader
         .meta

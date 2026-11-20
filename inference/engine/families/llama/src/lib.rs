@@ -19,7 +19,7 @@ use magnitude_artifacts::{
     gguf::{Directory, Value},
     PackageIdentity, UnsupportedReason,
 };
-use magnitude_family_common::{architecture_keys, rotary, HeaderError, Metadata, Tensors};
+use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
     DefinitionError, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
@@ -32,37 +32,6 @@ use std::{error, fmt};
 
 /// The family identity every definition this crate builds carries.
 pub const FAMILY_ID: &str = "llama";
-
-/// Every `llama.*` key of the admitted feature set. Each is required and
-/// scalar; any other key names a feature this family does not admit.
-const ADMITTED_KEYS: [&str; 12] = [
-    "block_count",
-    "context_length",
-    "embedding_length",
-    "feed_forward_length",
-    "attention.head_count",
-    "attention.head_count_kv",
-    "attention.key_length",
-    "attention.value_length",
-    "attention.layer_norm_rms_epsilon",
-    "rope.dimension_count",
-    "rope.freq_base",
-    "vocab_size",
-];
-
-const GLOBAL_ROLES: [&str; 3] = ["token_embd.weight", "output_norm.weight", "output.weight"];
-
-const BLOCK_ROLES: [&str; 9] = [
-    "attn_norm.weight",
-    "attn_q.weight",
-    "attn_k.weight",
-    "attn_v.weight",
-    "attn_output.weight",
-    "ffn_norm.weight",
-    "ffn_gate.weight",
-    "ffn_up.weight",
-    "ffn_down.weight",
-];
 
 /// A feature of a `llama` artifact outside the admitted set: an unknown
 /// key, an admitted key given per layer, rope scaling, a tensor no admitted
@@ -251,70 +220,6 @@ impl From<HeaderError> for Error {
     }
 }
 
-/// Whether `name` is a tensor role of the admitted feature set (including
-/// encoding-driven `.scale` / `.input_scale` companions of admitted weights).
-fn admitted_role(name: &str) -> bool {
-    let direct = |candidate: &str| {
-        if GLOBAL_ROLES.contains(&candidate) {
-            return true;
-        }
-        candidate
-            .strip_prefix("blk.")
-            .and_then(|rest| rest.split_once('.'))
-            .is_some_and(|(index, role)| {
-                !index.is_empty()
-                    && index.bytes().all(|byte| byte.is_ascii_digit())
-                    && BLOCK_ROLES.contains(&role)
-            })
-    };
-    direct(name) || magnitude_family_common::is_companion_scale(name, direct)
-}
-
-/// Admit the `llama` feature set from metadata keys and tensor role names,
-/// without interpreting geometry, naming every feature outside it.
-pub fn admit(directory: &Directory) -> Result<(), Error> {
-    match directory
-        .value("general.architecture")
-        .and_then(Value::string)
-    {
-        Some(FAMILY_ID) => {}
-        architecture => return Err(Error::Architecture(architecture.map(str::to_owned))),
-    }
-    let mut features = Vec::new();
-    let mut scaled = false;
-    for (key, metadata) in architecture_keys(directory, FAMILY_ID) {
-        if key.starts_with("rope.scaling.") {
-            scaled = true;
-        } else if !ADMITTED_KEYS.contains(&key) {
-            features.push(Feature::UnknownMetadata(metadata.name.clone()));
-        } else if matches!(metadata.value, Value::Array(_)) {
-            features.push(Feature::PerLayerMetadata(metadata.name.clone()));
-        }
-    }
-    if scaled {
-        let kind = directory
-            .value("llama.rope.scaling.type")
-            .and_then(Value::string)
-            .unwrap_or("unspecified");
-        features.push(Feature::RopeScaling(kind.to_owned()));
-    }
-    features.extend(
-        directory
-            .tensors
-            .iter()
-            .filter(|tensor| !admitted_role(&tensor.name))
-            .map(|tensor| Feature::Tensor(tensor.name.clone())),
-    );
-    if directory.tensor("output.weight").is_none() {
-        features.push(Feature::TiedOutput);
-    }
-    if features.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Unadmitted(features))
-    }
-}
-
 fn product(dimensions: &[u64]) -> Result<u64, Error> {
     checked_product(dimensions).map_err(Error::Definition)
 }
@@ -326,11 +231,21 @@ pub fn inspect_components(
     projector: Option<&Directory>,
     identity: PackageIdentity,
 ) -> Result<ModelDefinition, Error> {
-    admit(directory)?;
+    match directory
+        .value("general.architecture")
+        .and_then(Value::string)
+    {
+        Some(FAMILY_ID) => {}
+        architecture => return Err(Error::Architecture(architecture.map(str::to_owned))),
+    }
     if projector.is_some() {
         return Err(Error::Projector);
     }
-    let m = Metadata::new(directory, FAMILY_ID, &ADMITTED_KEYS)?;
+    let m = Metadata::new(directory, FAMILY_ID);
+    if let Some(scaling) = m.value("rope.scaling.type") {
+        let kind = scaling.string().unwrap_or("unspecified").to_owned();
+        return Err(Error::Unadmitted(vec![Feature::RopeScaling(kind)]));
+    }
     let block_count = m.integer("block_count")?;
     let context_limit = m.integer("context_length")?;
     let hidden = m.integer("embedding_length")?;
@@ -378,6 +293,9 @@ pub fn inspect_components(
     let half_split = rotary::half_split_rows(width, width);
 
     let mut tensors = Tensors::new(directory);
+    if !tensors.contains("output.weight") {
+        return Err(Error::Unadmitted(vec![Feature::TiedOutput]));
+    }
     let embedding = tensors.bind("token_embd.weight", &[vocabulary, hidden])?;
     let output_norm = tensors.bind("output_norm.weight", &[hidden])?;
     let output = tensors.bind("output.weight", &[vocabulary, hidden])?;
@@ -446,6 +364,7 @@ pub fn inspect_components(
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
+    m.finish()?;
     tensors.finish()?;
 
     let definition = ModelDefinition {

@@ -255,7 +255,7 @@ fn unknown_corrector_metadata_is_refused() {
         Value::Scalar(Scalar::Float(0.1)),
     );
     assert_eq!(
-        recognize(&draft),
+        read(&draft, BOLT),
         Err(Error::Unadmitted {
             metadata: vec!["lilicorr.dropout".into()],
             tensors: Vec::new(),
