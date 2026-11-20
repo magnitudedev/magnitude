@@ -772,6 +772,7 @@ impl Unpriced {
         kind: &'static str,
         quote: &Quote,
         longest: Duration,
+        compiled: Duration,
     ) -> Duration {
         match self
             .classes
@@ -781,7 +782,13 @@ impl Unpriced {
             Some(price) => quote
                 .priced
                 .saturating_add(Duration::from_secs_f64(price * quote.unpriced as f64)),
-            None => forecast(quote, longest),
+            None => forecast(
+                quote,
+                match stage {
+                    Stage::Form => longest.max(compiled),
+                    Stage::Discovery | Stage::Measure | Stage::Promote | Stage::Confirm => longest,
+                },
+            ),
         }
     }
 
@@ -795,21 +802,22 @@ impl Unpriced {
     /// ones; what it leaves unpriced, its first point and the planning
     /// after its last, is held to what discovery has taken in this load,
     /// not to the longest operation any unit completed, which is one
-    /// unit's input build. Its pieces form nothing, each runs to its
-    /// cutoff ([`Unit::perform`]), and all of them precede candidate work,
-    /// whose pieces run where the budget ends and stay held to the bound.
+    /// unit's input build, nor to `census`'s compile duration. Its pieces
+    /// form nothing, each runs to its cutoff ([`Unit::perform`]), and all
+    /// of them precede candidate work, whose pieces run where the budget
+    /// ends and stay held to the bound.
     fn admitted(
         &self,
         stage: Stage,
         kind: &'static str,
         quote: &Quote,
         longest: Duration,
+        compiled: Duration,
     ) -> Duration {
         match stage {
-            Stage::Discovery => self.expected(stage, kind, quote, longest),
-            Stage::Form | Stage::Measure | Stage::Promote | Stage::Confirm => {
-                forecast(quote, longest)
-            }
+            Stage::Discovery => self.expected(stage, kind, quote, longest, compiled),
+            Stage::Form => forecast(quote, longest.max(compiled)),
+            Stage::Measure | Stage::Promote | Stage::Confirm => forecast(quote, longest),
         }
     }
 
@@ -890,9 +898,12 @@ fn device_ends(now: Duration, mut jobs: Vec<(Duration, Duration)>) -> Duration {
 }
 
 /// Spend `total` on the units' work, starting only work whose price fits
-/// what remains. `longest` is the longest single operation the load
-/// completed before the allocator began. The report is complete whether or
-/// not a unit's work fails.
+/// what remains. `longest` is the longest single non-compile operation the
+/// load completed before the allocator began; `compiled` is the longest
+/// single compile completed before it began (e.g. mandatory `census`), which
+/// bounds compile stages without seeding non-compile operations (`own.pass`,
+/// `Stage::Discovery`). The report is complete whether or not a unit's work
+/// fails.
 pub(crate) fn allocate<U: Unit>(
     units: &mut [U],
     context: &mut U::Context,
@@ -900,6 +911,7 @@ pub(crate) fn allocate<U: Unit>(
     workers: &mut impl Workers<U>,
     total: Duration,
     mut longest: Duration,
+    mut compiled: Duration,
 ) -> (Report, Result<(), U::Failure>) {
     let mut report = Report {
         budget: total,
@@ -921,8 +933,6 @@ pub(crate) fn allocate<U: Unit>(
     let mut alone = vec![false; units.len()];
     // In the order admitted.
     let mut flights = Vec::<Flight>::new();
-    // The longest compile that has ended.
-    let mut compiled = Duration::ZERO;
     // The allocator's own operations, priced as they are observed.
     let mut own = Own::default();
     // What an operation the units' quotes leave unpriced has taken, by
@@ -1085,6 +1095,7 @@ pub(crate) fn allocate<U: Unit>(
                                 units[unit].kind(),
                                 &work.quote,
                                 longest,
+                                compiled,
                             ) <= remaining.saturating_sub(owed[unit])
                     })
             })
@@ -1151,9 +1162,15 @@ pub(crate) fn allocate<U: Unit>(
         // When a new piece would be ready for the device were it started
         // now, and the device time it takes.
         let job = |unit: usize, work: &Work| {
-            let whole = expected.admitted(work.stage, units[unit].kind(), &work.quote, longest);
+            let whole = expected.admitted(
+                work.stage,
+                units[unit].kind(),
+                &work.quote,
+                longest,
+                compiled,
+            );
             if ahead(work) {
-                let compile = forecast(&work.forming, longest);
+                let compile = forecast(&work.forming, longest.max(compiled));
                 (now.saturating_add(compile), whole.saturating_sub(compile))
             } else {
                 (now, whole)
@@ -1172,7 +1189,9 @@ pub(crate) fn allocate<U: Unit>(
             jobs.push(job(unit, work));
             device_ends(now, jobs).saturating_add(owed[unit]) <= total
                 && (!ahead(work)
-                    || now.saturating_add(forecast(&work.forming, longest).max(compiled)) <= total)
+                    || now
+                        .saturating_add(forecast(&work.forming, longest.max(compiled)).max(compiled))
+                        <= total)
         };
         let (fitting, refused): (Vec<_>, Vec<_>) = offers
             .iter()
@@ -1215,7 +1234,13 @@ pub(crate) fn allocate<U: Unit>(
             .filter(|(unit, _)| !alone[*unit])
             .collect::<Vec<_>>();
         let priority = |(unit, work): &(usize, Work)| {
-            let price = expected.expected(work.stage, units[*unit].kind(), &work.quote, longest);
+            let price = expected.expected(
+                work.stage,
+                units[*unit].kind(),
+                &work.quote,
+                longest,
+                compiled,
+            );
             if work.stage == Stage::Discovery {
                 return discovery_effort[*unit].as_secs_f64();
             }
@@ -1466,8 +1491,14 @@ pub(crate) fn allocate<U: Unit>(
             (Some((unit, work, forming)), _, _) => {
                 start(units, unit, &work);
                 workers.start(unit, forming);
-                let whole = expected.admitted(work.stage, units[unit].kind(), &work.quote, longest);
-                let compile = forecast(&work.forming, longest);
+                let whole = expected.admitted(
+                    work.stage,
+                    units[unit].kind(),
+                    &work.quote,
+                    longest,
+                    compiled,
+                );
+                let compile = forecast(&work.forming, longest.max(compiled));
                 flights.push(Flight {
                     unit,
                     work,
@@ -2650,6 +2681,7 @@ mod tests {
             &mut Overlapping::new(clock, usize::MAX),
             SECOND * total as u32,
             longest,
+            Duration::ZERO,
         );
         outcome.expect("no synthetic work fails");
         (log.into_inner(), report)
@@ -2680,6 +2712,7 @@ mod tests {
             &clock,
             &mut Serial(clock.clone(), Vec::new()),
             SECOND * 600,
+            Duration::ZERO,
             Duration::ZERO,
         );
         outcome.unwrap();
@@ -2771,8 +2804,15 @@ mod tests {
     ) -> (Vec<(usize, Stage, Duration)>, Report, usize) {
         let mut log = Log::default();
         let mut workers = Overlapping::new(clock, threads);
-        let (report, outcome) =
-            allocate(units, &mut log, clock, &mut workers, total, Duration::ZERO);
+        let (report, outcome) = allocate(
+            units,
+            &mut log,
+            clock,
+            &mut workers,
+            total,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         outcome.expect("no synthetic work fails");
         (log.into_inner(), report, workers.most)
     }
@@ -3398,6 +3438,42 @@ mod tests {
         assert_eq!(report.overrun(), Duration::ZERO);
     }
 
+    /// A slow NVRTC/canonical compile from mandatory `census` (`compiled`)
+    /// does not seed non-compile operations (`own.pass`, `Stage::Discovery`)
+    /// on pass 0: discovery still starts with only 10 s of budget even when
+    /// `compiled` is 6 s (which would otherwise demand 24 s = 3 * 6 s + 6 s).
+    /// Compiles (`ahead` / `Stage::Form`) remain bounded by `compiled`.
+    #[test]
+    fn a_slow_census_compile_does_not_starve_discovery_or_pass_zero() {
+        let clock = Fake::default();
+        let mut units = vec![Synthetic {
+            unpriced_discovery: 3,
+            discovery: SECOND / 5,
+            compile: SECOND * 6,
+            ..Synthetic::new(0, &clock, 1., &[0.5])
+        }];
+        let mut log = Log::default();
+        let (report, outcome) = allocate(
+            &mut units,
+            &mut log,
+            &clock,
+            &mut Overlapping::new(&clock, usize::MAX),
+            SECOND * 5,
+            Duration::ZERO,
+            SECOND * 6,
+        );
+        outcome.expect("no synthetic work fails");
+        let log = log.into_inner();
+        assert_eq!(stages(&log), [(0, Stage::Discovery)]);
+        assert_eq!(units[0].discovered, units[0].points);
+        assert_eq!(
+            report.refused.len(),
+            1,
+            "the 6 s compile is still refused within the 5 s budget"
+        );
+        assert_eq!(report.overrun(), Duration::ZERO);
+    }
+
     /// Unpriced operations are ranked at the bound until their stage has
     /// run one, then at what that stage's took past their priced part.
     #[test]
@@ -3408,7 +3484,7 @@ mod tests {
             unpriced: 2,
         };
         assert_eq!(
-            expected.expected(Stage::Discovery, "a", &quote, SECOND * 10),
+            expected.expected(Stage::Discovery, "a", &quote, SECOND * 10, Duration::ZERO),
             SECOND / 2 + SECOND * 20
         );
         let one = Quote {
@@ -3418,22 +3494,22 @@ mod tests {
         expected.observe(Stage::Discovery, "a", &one, SECOND * 3 / 2);
         // Discovery of any kind of unit is priced alike.
         assert_eq!(
-            expected.expected(Stage::Discovery, "b", &quote, SECOND * 10),
+            expected.expected(Stage::Discovery, "b", &quote, SECOND * 10, Duration::ZERO),
             SECOND / 2 + SECOND * 2
         );
         // Another stage is still at the bound.
         assert_eq!(
-            expected.expected(Stage::Form, "a", &quote, SECOND * 10),
+            expected.expected(Stage::Form, "a", &quote, SECOND * 10, Duration::ZERO),
             SECOND / 2 + SECOND * 20
         );
         // A conversion is priced by those of its kind alone.
         expected.observe(Stage::Promote, "a", &one, SECOND * 3 / 2);
         assert_eq!(
-            expected.expected(Stage::Promote, "a", &quote, SECOND * 10),
+            expected.expected(Stage::Promote, "a", &quote, SECOND * 10, Duration::ZERO),
             SECOND / 2 + SECOND * 2
         );
         assert_eq!(
-            expected.expected(Stage::Promote, "b", &quote, SECOND * 10),
+            expected.expected(Stage::Promote, "b", &quote, SECOND * 10, Duration::ZERO),
             SECOND / 2 + SECOND * 20
         );
     }
@@ -3877,6 +3953,7 @@ mod tests {
                 &clock,
                 &mut workers,
                 clock.now() + SECOND * 600,
+                Duration::ZERO,
                 Duration::ZERO,
             );
             MEMORY.with(Cell::take);

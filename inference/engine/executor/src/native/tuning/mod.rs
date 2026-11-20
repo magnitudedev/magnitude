@@ -358,7 +358,13 @@ pub const STREAMING_ROWS: u64 = 8;
 /// completed, and stored the units that then left the objective with their
 /// defaults alone: 18 demanded units of a DeepSeek V4.1 load on Metal,
 /// attention_decode among them, behind routed_gate_up's 11.29 s build).
-pub const SEARCH_VERSION: u32 = 45;
+/// 46: mandatory canonical formation (`census`) is excluded from the optional
+/// search budget, and non-compile operations (`own.pass`, `Stage::Discovery`)
+/// are no longer seeded with `census`'s slowest compile duration (a result of
+/// 45 starved optional search to 0 stages when mandatory NVRTC compilation on
+/// mixed-quant MoE models exceeded the 60 s search budget or held pass 0 to
+/// 3–4x the slowest NVRTC compile).
+pub const SEARCH_VERSION: u32 = 46;
 /// The tuning budget of a served load: the time one first-load preparation
 /// spends tuning, on any device.
 pub const STANDARD_TUNING_BUDGET: Duration = Duration::from_secs(60);
@@ -1897,7 +1903,7 @@ pub struct FormedAhead {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BudgetReport {
     /// When the run's budget ended: its last search's tuning budget from
-    /// when that search began.
+    /// when that search began, excluding mandatory formation (`census`).
     pub budget_seconds: f64,
     /// Tuning time when the optional work ended, the records its units
     /// owed published.
@@ -3701,8 +3707,11 @@ pub(crate) struct Tuner<'a> {
     /// ([`Self::next_search`]): the run's progress is over all of them.
     searches: u32,
     /// When the search under way ends on the tuning clock: the tuning
-    /// budget from when it began.
+    /// budget from when it began, extended by mandatory formation (`census`).
     deadline: Duration,
+    /// Wall-clock time spent in mandatory formation (`census`) across rounds,
+    /// excluded from the optional search budget and progress clock.
+    census_elapsed: Duration,
     /// What became of the budget of the run's rounds that searched so far,
     /// reported once, when the run ends, however it ends (its `Drop`).
     spent: Option<BudgetReport>,
@@ -3725,9 +3734,13 @@ pub(crate) struct Tuner<'a> {
     /// taken in this load: the class a promotion's publication and each
     /// publication owed when the optional work stops are priced by.
     publishing: Rc<Cell<seismic::Observed>>,
-    /// The longest single operation the load has completed: what an
-    /// unpriced operation is held to ([`seismic::Quote::fits`]).
+    /// The longest single non-compile operation the load has completed: what
+    /// an unpriced non-compile operation is held to ([`seismic::Quote::fits`]).
     longest: Duration,
+    /// The longest single compile operation completed during mandatory
+    /// formation (`census`): bounds compile operations without seeding
+    /// non-compile stages (`Stage::Discovery`, `own.pass`).
+    longest_compile: Duration,
     /// What the load's tuning has held on the device, for its report.
     memory: TuningMemory,
     /// The units whose next piece was refused for its bytes for good: their
@@ -4052,6 +4065,7 @@ impl<'a> Tuner<'a> {
             first_load_search: false,
             searches: 1,
             deadline: context.settings.budget,
+            census_elapsed: Duration::ZERO,
             spent: None,
             tuned: Vec::new(),
             chosen: HashMap::new(),
@@ -4059,6 +4073,7 @@ impl<'a> Tuner<'a> {
             digests: std::cell::RefCell::new(HashMap::new()),
             publishing: Rc::new(Cell::new(seismic::Observed::default())),
             longest: Duration::ZERO,
+            longest_compile: Duration::ZERO,
             // What a search's process holds is counted from here, where
             // its tuner is made, not from its mandatory phase: counting
             // the units and opening their searches grows the process too
@@ -4154,6 +4169,7 @@ impl<'a> Tuner<'a> {
     /// published choice; a failure here is the only preparation failure of
     /// tuning.
     pub fn census(mut self, untuned: UntunedEntries<'a>) -> Result<Self, CatalogFailure> {
+        let census_started = Instant::now();
         let Phase::Count {
             launches,
             searching,
@@ -4290,7 +4306,7 @@ impl<'a> Tuner<'a> {
                 .grounded(grounded)
                 .map_err(|error| unit_failure(key, error))?;
             let forming = formed + forming.elapsed();
-            self.longest = self.longest.max(longest);
+            self.longest_compile = self.longest_compile.max(longest);
             let publishing = Instant::now();
             self.publish(key, false, || unit.record())
                 .map_err(|error| unit_failure(key, error))?;
@@ -4320,6 +4336,9 @@ impl<'a> Tuner<'a> {
             canonical,
             units: Vec::new(),
         };
+        let census_elapsed = census_started.elapsed();
+        self.census_elapsed += census_elapsed;
+        self.deadline += census_elapsed;
         if searches {
             self.report_progress();
         }
@@ -4387,6 +4406,7 @@ impl<'a> Tuner<'a> {
             ));
         }
         let longest = self.longest;
+        let longest_compile = self.longest_compile;
         // The pieces' compiles run on the load's worker threads while the
         // device measures; each started runs to its end.
         let mut threads = allocation::Threads::new(
@@ -4395,8 +4415,15 @@ impl<'a> Tuner<'a> {
             seismic::Forming::threads,
             self.memory.compile_host_bytes,
         );
-        let (report, outcome) =
-            allocation::allocate(&mut units, &mut self, &clock, &mut threads, budget, longest);
+        let (report, outcome) = allocation::allocate(
+            &mut units,
+            &mut self,
+            &clock,
+            &mut threads,
+            budget,
+            longest,
+            longest_compile,
+        );
         self.memory.compile_host_bytes = self
             .memory
             .compile_host_bytes
@@ -4534,7 +4561,12 @@ impl<'a> Tuner<'a> {
     fn report_progress(&self) {
         let total = (self.budget() * self.searches).as_millis() as usize;
         self.context.observer.event(&TuningEvent::Progress {
-            completed: (self.started.elapsed().as_millis() as usize).min(total),
+            completed: (self
+                .started
+                .elapsed()
+                .saturating_sub(self.census_elapsed)
+                .as_millis() as usize)
+                .min(total),
             total,
         });
     }

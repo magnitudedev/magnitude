@@ -891,6 +891,8 @@ struct FakeCase {
     launches: usize,
     /// What the census reports the defaults take at every point.
     defaults_seconds: f64,
+    /// Optional wall-clock sleep inside mandatory `grounded` (`census`).
+    grounding_sleep: Duration,
     defaults: Configuration,
     chosen: Configuration,
     /// When set, no candidate qualifies: the unit concludes on its
@@ -949,6 +951,7 @@ impl FakeCase {
             bindings: "fake".into(),
             launches: 1,
             defaults_seconds: 1e-3,
+            grounding_sleep: Duration::ZERO,
             defaults: configuration(&defaults),
             chosen: configuration(&chosen),
             unqualified: false,
@@ -1114,6 +1117,9 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
 
     fn grounded(&mut self, grounded: Option<seismic::Grounded>) -> Result<(), TuneError> {
         assert!(grounded.is_none(), "the fake compiles nothing on a thread");
+        if !self.case.grounding_sleep.is_zero() {
+            std::thread::sleep(self.case.grounding_sleep);
+        }
         self.case.formations.set(self.case.formations.get() + 1);
         self.formed = true;
         Ok(())
@@ -2137,7 +2143,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     let Some(TuningEvent::Budget(budget)) = events.last() else {
         panic!("tuning reports what became of its budget");
     };
-    assert_eq!(budget.budget_seconds, STANDARD_TUNING_BUDGET.as_secs_f64());
+    assert!(budget.budget_seconds >= STANDARD_TUNING_BUDGET.as_secs_f64());
     assert_eq!(budget.stages, expected.len());
     assert_eq!(budget.overrun_seconds, 0.);
     assert!(budget.unused_seconds > 0. && budget.refused.is_empty());
@@ -2310,15 +2316,25 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     );
     assert_eq!(stored_results(), 3);
 
-    // A unit whose longest completed operation already outlasts the budget
-    // starts no unpriced discovery: it keeps the default its mandatory
-    // phase published, and every later load consumes that choice.
+    // A unit whose canonical compile (`census`) reported a long operation
+    // still runs non-compile discovery, then refuses candidate measurement
+    // whose priced duration outlasts the remaining budget: it keeps the
+    // default its mandatory phase published, and every later load consumes
+    // that choice.
     let mut slow = FakeCase::new(&implementation, &statics, "implementation c");
     slow.defaults_seconds = STANDARD_TUNING_BUDGET.as_secs_f64();
     let (kept, started, _) = load_once(&slow, limits);
-    assert!(slow.seen.borrow().is_empty() && slow.stages.borrow().is_empty());
+    assert!(
+        !slow.stages.borrow().is_empty()
+            && slow
+                .stages
+                .borrow()
+                .iter()
+                .all(|stage| *stage == seismic::Stage::Discovery),
+        "discovery runs without being starved by census compile, while slow measure is refused"
+    );
     assert_eq!(kept.origin, TuningOrigin::Searched);
-    assert!(!started);
+    assert!(started);
     assert_eq!(kept.overall, slow.defaults);
     let canonical = kept.overall.specialization();
     // A final fallback needs the real declaration's complete launch maps;
@@ -4185,4 +4201,105 @@ fn a_record_serves_any_budget_no_larger_than_the_one_searched() {
     assert!(!reached_within(expired, 900_000, seconds(901)));
     assert!(reached_within(Some(SearchStop::Exhausted), 60_000, seconds(3600)));
     assert!(reached_within(None, 0, seconds(3600)));
+}
+
+/// Mandatory canonical formation (`census`) is excluded from the optional
+/// search budget: even when `census` takes longer than `settings.budget`,
+/// `Tuner::search` still receives its full search budget and runs discovery
+/// and candidate search rather than starving with `stages == 0`.
+#[test]
+fn mandatory_census_longer_than_budget_still_searches() {
+    let device = crate::test_support::open_backend(
+        &seismic::Devices::discover(&[]).unwrap(),
+        BackendName::Cpu,
+    )
+    .unwrap();
+    let charges = seismic::Charges::tally(&device);
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(
+                name.clone(),
+                if name == "DS" || name == "DB" {
+                    0
+                } else if name == "H" {
+                    8
+                } else {
+                    16
+                },
+            )
+        });
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+        image_cells: 0,
+    };
+    let search_budget = Duration::from_millis(50);
+    let census_sleep = Duration::from_millis(80);
+    let mut case = FakeCase::new(&implementation, &statics, "census-longer-than-budget");
+    case.grounding_sleep = census_sleep;
+    let recorder = Recorder::default();
+    let context = TuningContext {
+        definition: &definition,
+        weights: &ZeroTuningWeights,
+        observer: &recorder,
+        cache: None,
+        numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+        settings: TuningSettings {
+            budget: search_budget,
+            fresh: false,
+        },
+    };
+    let weights = TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import);
+    let mut tuner = Tuner::count(
+        &charges,
+        context,
+        limits,
+        weights,
+        fixture_invocations(&case, &statics, limits),
+    );
+    tuner.tune(&case, &implementation, &statics).unwrap();
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    tuner.tune(&case, &implementation, &statics).unwrap();
+    let mut tuner = tuner.search().unwrap();
+    let chosen = tuner.tune(&case, &implementation, &statics).unwrap();
+    let concluded = tuner.conclude();
+    let [tuned] = concluded.as_slice() else {
+        panic!("expected one tuned entry");
+    };
+    assert_eq!(chosen, case.chosen.specialization());
+    assert_eq!(tuned.overall, case.chosen);
+    assert!(
+        case.stages.borrow().contains(&seismic::Stage::Discovery)
+            && case.stages.borrow().contains(&seismic::Stage::Measure)
+            && case.stages.borrow().contains(&seismic::Stage::Promote),
+        "optional search ran discovery, measurement, and promotion: {:?}",
+        *case.stages.borrow()
+    );
+    let events = recorder.0.borrow();
+    let Some(TuningEvent::Budget(budget)) = events.last() else {
+        panic!("tuning reports what became of its budget");
+    };
+    assert!(
+        budget.stages > 0,
+        "search must not starve to 0 stages when census exceeds budget"
+    );
+    assert!(
+        budget.budget_seconds >= (search_budget + census_sleep).as_secs_f64(),
+        "deadline shifted by census duration: {} < {}",
+        budget.budget_seconds,
+        (search_budget + census_sleep).as_secs_f64()
+    );
+    assert_eq!(budget.overrun_seconds, 0.);
+    assert!(budget.unused_seconds > 0. && budget.refused.is_empty());
+    assert!((budget.used_seconds + budget.unused_seconds - budget.budget_seconds).abs() < 1e-9);
 }

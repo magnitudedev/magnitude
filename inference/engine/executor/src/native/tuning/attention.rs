@@ -2292,31 +2292,39 @@ mod tests {
     #[test]
     fn cuda_multirow_start_follows_served_rows_and_declared_domain() {
         use seismic::{BackendName, NativeSpecialization};
+        struct CudaDevice;
+        impl seismic::device::DeviceValues for CudaDevice {
+            fn value(&self, name: &str) -> u64 {
+                match name {
+                    "units" => 82,
+                    other => panic!("unexpected CUDA device property `{other}`"),
+                }
+            }
+            fn measured(&self, _name: &str) -> Option<u64> {
+                None
+            }
+        }
         let implementations = [
             seismic::generated::native_implementation_for_backend::<attention_decode::Entry>(
                 BackendName::Cuda,
             )
             .unwrap()
             .unwrap()
-            .device_independent()
-            .expect("the declaration reads no device property")
-            .owned(),
+            .at_device(&CudaDevice),
             seismic::generated::native_implementation_for_backend::<attention_decode_k8v4::Entry>(
                 BackendName::Cuda,
             )
             .unwrap()
             .unwrap()
-            .device_independent()
-            .expect("the declaration reads no device property")
-            .owned(),
+            .at_device(&CudaDevice),
         ];
         // Each entry's own history codec: the dense entry's dense, the affine
         // entry's K8/V4.
         let codecs = [magnitude_state::KvCodec::Dense, magnitude_state::KvCodec::AffineK8V4];
         for (implementation, codec) in implementations.into_iter().zip(codecs) {
-            // The affine entry's default SLICES: the fewest that hold a lane
-            // to 32 elements, or the most the group splits into.
-            for (group, width, max_rows, expected_warps, affine_slices) in [
+            // Default SLICES for both CUDA entries: the fewest that hold a lane
+            // to 32 elements, or the most the group splits into within default WARPS=4.
+            for (group, width, max_rows, expected_warps, expected_slices) in [
                 (2, 256, 8, 1, 1),
                 (6, 256, 8, 4, 2),
                 (8, 128, 8, 4, 1),
@@ -2390,13 +2398,11 @@ mod tests {
                 assert_eq!(choice.param("WARPS"), Some(expected_warps));
                 assert_eq!(choice.param("COLUMNS"), Some(1));
                 assert_eq!(choice.param("STAGES"), Some(2));
-                // The default is the vector form, the group whole except on
-                // the affine entry, which splits it so a lane holds at most
-                // 32 elements where it can.
-                let affine = implementation.statics.iter().any(|name| name == "KC");
+                // The default is the vector form, splitting the group so a lane
+                // holds at most 32 elements where it can (within default WARPS=4).
                 let default = implementation.default_specialization(&statics).unwrap();
                 assert_eq!(default.param("MATRIX"), Some(0));
-                assert_eq!(default.param("SLICES"), Some(if affine { affine_slices } else { 1 }));
+                assert_eq!(default.param("SLICES"), Some(expected_slices));
 
                 // A unit bounded to one row has no multi-row seed.
                 let single = TuningLimits {
