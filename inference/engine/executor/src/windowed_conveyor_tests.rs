@@ -11,7 +11,7 @@ use crate::{
     platform,
     test_support::available,
 };
-use magnitude_artifacts::{Package, gguf::Encoding};
+use magnitude_artifacts::Package;
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::KvCodec;
 use std::rc::Rc;
@@ -38,86 +38,6 @@ enum Mode {
 
 type StepBits = Vec<(Option<Vec<u32>>, Option<Vec<u32>>, Option<(u32, u8)>)>;
 
-fn half_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    if exponent <= 0 {
-        return sign;
-    }
-    let mantissa = (bits >> 13) & 0x3ff;
-    sign | ((exponent as u16) << 10) | mantissa as u16
-}
-
-fn write_gguf(manifest: &magnitude_artifacts::PackageManifest, path: &std::path::Path) {
-    let mut header = Vec::new();
-    let string = |bytes: &mut Vec<u8>, value: &str| {
-        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(value.as_bytes());
-    };
-    header.extend_from_slice(b"GGUF");
-    header.extend_from_slice(&3u32.to_le_bytes());
-    header.extend_from_slice(&(manifest.target.tensors.len() as u64).to_le_bytes());
-    header.extend_from_slice(&0u64.to_le_bytes());
-    let mut payload = Vec::new();
-    let mut state = 0x5eed_u64;
-    let mut next = move || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (state >> 33) as u32
-    };
-    for tensor in &manifest.target.tensors {
-        payload.resize(payload.len().div_ceil(32) * 32, 0);
-        string(&mut header, &tensor.name);
-        header.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
-        for extent in tensor.shape.iter().rev() {
-            header.extend_from_slice(&extent.to_le_bytes());
-        }
-        header.extend_from_slice(&(tensor.encoding as u32).to_le_bytes());
-        header.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        let values = tensor.shape.iter().product::<u64>() as usize;
-        match tensor.encoding {
-            Encoding::Iq4Nl | Encoding::Q4_0 => {
-                for _ in 0..values / 32 {
-                    payload.extend_from_slice(&0x2400u16.to_le_bytes());
-                    for _ in 0..16 {
-                        payload.push(next() as u8);
-                    }
-                }
-            }
-            Encoding::Q8_0 => {
-                for _ in 0..values / 32 {
-                    payload.extend_from_slice(&0x1400u16.to_le_bytes());
-                    for _ in 0..32 {
-                        payload.push(next() as u8);
-                    }
-                }
-            }
-            Encoding::F16 | Encoding::BF16 | Encoding::F32 => {
-                let decay_rate = tensor.name.ends_with(".ssm_a");
-                for _ in 0..values {
-                    let raw = ((next() % 2001) as f32 - 1000.0) / 16_000.0;
-                    let value = if decay_rate { -raw.abs() } else { raw };
-                    match tensor.encoding {
-                        Encoding::F16 => payload.extend_from_slice(&half_bits(value).to_le_bytes()),
-                        Encoding::BF16 => payload.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes()),
-                        _ => payload.extend_from_slice(&value.to_le_bytes()),
-                    }
-                }
-            }
-            Encoding::F8E4M3 => {
-                for _ in 0..values {
-                    let code = next();
-                    payload.push((((code >> 7) & 1) << 7 | (1 + (code >> 3) % 8) << 3 | (code & 7)) as u8);
-                }
-            }
-            other => panic!("the fixture stores no {other:?} tensor"),
-        }
-    }
-    header.resize(header.len().div_ceil(32) * 32, 0);
-    header.extend_from_slice(&payload);
-    std::fs::write(path, header).unwrap();
-}
-
 fn fixture(test: &str, mut definition: ModelDefinition) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
     let manifest = streamed_experts_manifest(&definition);
     let directory = std::env::temp_dir().join(format!(
@@ -130,7 +50,7 @@ fn fixture(test: &str, mut definition: ModelDefinition) -> (std::path::PathBuf, 
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("qwen4exp-windowed.gguf");
-    write_gguf(&manifest, &path);
+    crate::domain::fixtures::loaded::write_gguf(&manifest, &path, &|_| None);
     let package = Package::open_without_projector(&path).unwrap();
     definition.artifact_identity = package.manifest().identity;
     (directory, Rc::new(definition), Arc::new(package))
@@ -578,32 +498,34 @@ fn run_workload(
 /// ledger's committed floor bytes with zero accounting violations.
 #[test]
 fn a_windowed_conveyor_streams_cold_layers_bit_identically_within_its_bounded_ledger() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mut definition = qwen4exp_fixture_definition_of(3, 128);
     definition.decoder.context_limit = CONTEXT_LIMIT;
     let (directory, definition, package) = fixture("windowed-conveyor", definition);
-    for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
-        let (resident, _, _) = run_workload(&catalog, &definition, &package, backend, Mode::Resident);
-        let (unwindowed, unwindowed_committed, unwindowed_shape) =
-            run_workload(&catalog, &definition, &package, backend, Mode::UnwindowedFloor);
-        let (windowed, windowed_committed, windowed_shape) =
-            run_workload(&catalog, &definition, &package, backend, Mode::WindowedFloor);
+    {
+        let _placement = crate::test_support::process_placement();
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
+            let (resident, _, _) = run_workload(&catalog, &definition, &package, backend, Mode::Resident);
+            let (unwindowed, unwindowed_committed, unwindowed_shape) =
+                run_workload(&catalog, &definition, &package, backend, Mode::UnwindowedFloor);
+            let (windowed, windowed_committed, windowed_shape) =
+                run_workload(&catalog, &definition, &package, backend, Mode::WindowedFloor);
 
-        let (uw_slots, uw_widest, uw_windows) = unwindowed_shape.expect("unwindowed bank");
-        assert_eq!((uw_slots, uw_widest, uw_windows), (128, 128, 1), "{backend:?}: unwindowed floor holds all 128 scratch slots");
+            let (uw_slots, uw_widest, uw_windows) = unwindowed_shape.expect("unwindowed bank");
+            assert_eq!((uw_slots, uw_widest, uw_windows), (128, 128, 1), "{backend:?}: unwindowed floor holds all 128 scratch slots");
 
-        let (w_slots, w_widest, w_windows) = windowed_shape.expect("windowed bank");
-        assert!(
-            w_slots < w_widest && w_windows >= 4,
-            "{backend:?}: windowed floor stepped down to window_slots={w_slots} of {w_widest} (windows={w_windows})"
-        );
-        assert!(
-            windowed_committed < unwindowed_committed,
-            "{backend:?}: windowed floor commits fewer device ledger bytes ({windowed_committed} < {unwindowed_committed})"
-        );
-        assert_eq!(unwindowed, resident, "{backend:?}: unwindowed floor bank matches resident bit for bit");
-        assert_eq!(windowed, resident, "{backend:?}: windowed conveyor matches resident bit for bit across prompt groups and decode");
+            let (w_slots, w_widest, w_windows) = windowed_shape.expect("windowed bank");
+            assert!(
+                w_slots < w_widest && w_windows >= 4,
+                "{backend:?}: windowed floor stepped down to window_slots={w_slots} of {w_widest} (windows={w_windows})"
+            );
+            assert!(
+                windowed_committed < unwindowed_committed,
+                "{backend:?}: windowed floor commits fewer device ledger bytes ({windowed_committed} < {unwindowed_committed})"
+            );
+            assert_eq!(unwindowed, resident, "{backend:?}: unwindowed floor bank matches resident bit for bit");
+            assert_eq!(windowed, resident, "{backend:?}: windowed conveyor matches resident bit for bit across prompt groups and decode");
+        }
     }
     std::fs::remove_dir_all(&directory).ok();
 }
