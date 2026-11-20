@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::num::NonZeroU64;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use futures_util::future::BoxFuture;
@@ -2341,8 +2341,7 @@ impl<'de> Deserialize<'de> for HuggingFaceRepositoryId {
 impl HuggingFaceArtifactSelector {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelIdError> {
         let value = value.into();
-        let path = Path::new(&value);
-        if path.is_absolute() || value.starts_with('/') {
+        if value.starts_with('/') {
             return Err(model_id_error(
                 "artifact selector must be repository-relative",
             ));
@@ -2357,20 +2356,7 @@ impl HuggingFaceArtifactSelector {
                 "artifact selector must identify a GGUF file",
             ));
         }
-        if value.split('/').any(|component| component.is_empty()) {
-            return Err(model_id_error(
-                "artifact selector must not contain empty components",
-            ));
-        }
-        for component in path.components() {
-            let Component::Normal(component) = component else {
-                return Err(model_id_error(
-                    "artifact selector must be a normalized relative path",
-                ));
-            };
-            let component = component
-                .to_str()
-                .ok_or_else(|| model_id_error("artifact selector must be valid UTF-8"))?;
+        for component in value.split('/') {
             validate_normalized_component(component, "artifact selector component")?;
         }
         Ok(Self(value))
@@ -2578,7 +2564,8 @@ mod model_id_tests {
     use std::str::FromStr;
 
     use super::{
-        CatalogBaseId, CatalogVariantId, LocalModelHash, LocalModelLabel, ModelId, ParsedModelId,
+        CatalogBaseId, CatalogVariantId, HuggingFaceArtifactSelector, LocalModelHash,
+        LocalModelLabel, ModelId, ParsedModelId,
     };
 
     #[test]
@@ -2616,6 +2603,22 @@ mod model_id_tests {
         ] {
             assert!(ModelId::from_str(value).is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn artifact_selector_rejects_traversal_and_interior_dot_segments() {
+        for value in [
+            "./model.gguf",
+            "sub/./model.gguf",
+            "sub/../model.gguf",
+            "../model.gguf",
+        ] {
+            assert!(
+                HuggingFaceArtifactSelector::new(value).is_err(),
+                "accepted {value}"
+            );
+        }
+        assert!(HuggingFaceArtifactSelector::new("sub/model.gguf").is_ok());
     }
 
     #[test]
@@ -2855,6 +2858,10 @@ impl TryFrom<ModelStreamingStatusParts> for ModelStreamingStatus {
             floor_slots <= slots && slots <= ceiling_slots && ceiling_slots <= experts.get(),
             "an expert bank holds between its floor and its ceiling, at most every expert",
         )?;
+        OutOfBounds::check(
+            host.as_ref().is_none_or(|h| h.ceiling_slots <= experts.get()),
+            "a host tier holds at most every expert",
+        )?;
         Ok(Self { experts, slots, floor_slots, ceiling_slots, tiers, host, disk_bytes, tables, last_resize })
     }
 }
@@ -2995,6 +3002,16 @@ mod model_streaming_status_tests {
             "memoryDomainId": "system", "slots": 3, "ceilingSlots": 2, "bytes": 0
         }))
         .is_err());
+        let status_with_host = |host_ceiling: u64| {
+            serde_json::json!({
+                "experts": 256, "slots": 64, "floorSlots": 26, "ceilingSlots": 200,
+                "tiers": [],
+                "host": { "memoryDomainId": "system", "slots": 128, "ceilingSlots": host_ceiling, "bytes": 0 },
+                "diskBytes": 0, "tables": []
+            })
+        };
+        assert!(serde_json::from_value::<ModelStreamingStatus>(status_with_host(256)).is_ok());
+        assert!(serde_json::from_value::<ModelStreamingStatus>(status_with_host(257)).is_err());
         for resize in [
             serde_json::json!({ "_tag": "Grew", "from": 4, "by": 0, "atUnixMs": 1 }),
             serde_json::json!({ "_tag": "Grew", "from": 4, "by": 1, "cause": "reclaim", "atUnixMs": 1 }),

@@ -178,7 +178,7 @@ fn pipe(parent_reads: bool) -> io::Result<(File, OwnedHandle)> {
         let security = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: null_mut(),
-            bInheritHandle: 1,
+            bInheritHandle: 0,
         };
         let (mut read, mut write) = (null_mut(), null_mut());
         if CreatePipe(&mut read, &mut write, &security, 0) == 0 {
@@ -193,7 +193,12 @@ fn pipe(parent_reads: bool) -> io::Result<(File, OwnedHandle)> {
         } else {
             (write, read)
         };
-        if SetHandleInformation(parent.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) == 0 {
+        if SetHandleInformation(
+            child.as_raw_handle(),
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        ) == 0
+        {
             return Err(io::Error::last_os_error());
         }
         Ok((File::from(parent), child))
