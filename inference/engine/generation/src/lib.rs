@@ -1393,11 +1393,12 @@ impl Generation {
     /// Called after the execution owner releases numerical state. Logical history,
     /// grammar, queued output, and terminal decisions remain available.
     pub fn evicted(&mut self) -> Result<(), String> {
-        // Restore exactly the numerical prefix that existed before eviction.
+        // Restore at least the numerical prefix that existed before eviction,
+        // preserving an earlier target if eviction occurs again mid-replay.
         // A live decode normally has one accepted successor that has not yet
         // been fed through the model; replaying that token here would advance
         // past the point from which the next decode must start.
-        self.reconciliation_target = self.resident_position;
+        self.reconciliation_target = self.reconciliation_target.max(self.resident_position);
         self.method.evict();
         self.resident = false;
         Ok(())
@@ -1436,7 +1437,7 @@ impl Generation {
         if position > self.reconciliation_target {
             self.reconciliation_target = position;
             self.accepted_position = self.accepted_position.max(position);
-            self.cached_tokens = self.cached_tokens.max(position);
+            self.cached_tokens = self.cached_tokens.max(position.min(self.prompt.len()));
         }
         self.resident_position = position;
         self.resident = true;

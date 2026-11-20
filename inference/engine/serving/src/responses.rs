@@ -477,6 +477,10 @@ fn arguments(call: &ToolCall) -> String {
     serde_json::to_string(&call.arguments).expect("a JSON object serializes")
 }
 
+fn response_suffix(id: &str) -> &str {
+    id.strip_prefix("resp_").unwrap_or(id)
+}
+
 pub fn from_result(
     id: &str,
     created_at: u64,
@@ -485,17 +489,18 @@ pub fn from_result(
     output: &Output,
     completion: &Completion,
 ) -> ResponseObject {
+    let suffix = response_suffix(id);
     let mut items = Vec::new();
     if let Some(reasoning) = &output.reasoning {
         items.push(reasoning_item(
-            format!("rs_{}", &id[5..]),
+            format!("rs_{suffix}"),
             "completed",
             Some(reasoning.clone()),
         ));
     }
     if let Some(text) = &output.text {
         items.push(message_item(
-            format!("msg_{}", &id[5..]),
+            format!("msg_{suffix}"),
             "completed",
             Some(text.clone()),
         ));
@@ -608,7 +613,7 @@ impl StreamProjector {
         projection: ResponseProjection,
         concluded: oneshot::Sender<Vec<Value>>,
     ) -> Self {
-        let message_id = format!("msg_{}", &id[5..]);
+        let message_id = format!("msg_{}", response_suffix(&id));
         Self {
             id,
             message_id,
@@ -907,7 +912,7 @@ impl StreamProjector {
     }
 
     fn reasoning_id(&self) -> String {
-        format!("rs_{}", &self.id[5..])
+        format!("rs_{}", response_suffix(&self.id))
     }
 }
 
@@ -2344,5 +2349,55 @@ mod websocket_tests {
             "unexpected error: {}",
             error.body.message
         );
+    }
+
+    #[test]
+    fn response_ids_without_standard_prefix_never_panic() {
+        use magnitude_chat::output::{GenerationTimings, TokenUsage};
+
+        let request: ResponseCreateRequest = serde_json::from_value(serde_json::json!({
+            "model": "local-model",
+            "input": "hello",
+        }))
+        .unwrap();
+        let projection = response_projection(&request);
+        let output = Output {
+            reasoning: Some("think".into()),
+            text: Some("answer".into()),
+            tool_calls: Vec::new(),
+        };
+        let completion = Completion {
+            usage: TokenUsage::default(),
+            termination: Termination::Natural,
+            timings: GenerationTimings::default(),
+        };
+
+        for (id, expected_suffix) in [
+            ("resp_abc", "abc"),
+            ("abc", "abc"),
+            ("", ""),
+            ("r€sp_1", "r€sp_1"),
+        ] {
+            assert_eq!(response_suffix(id), expected_suffix);
+
+            let response = from_result(id, 0, "local-model", &projection, &output, &completion);
+            assert_eq!(response.output.len(), 2);
+            let serialized = serde_json::to_value(&response.output).unwrap();
+            assert_eq!(serialized[0]["id"], format!("rs_{expected_suffix}"));
+            assert_eq!(serialized[1]["id"], format!("msg_{expected_suffix}"));
+
+            let (tx, _rx) = mpsc::channel(1);
+            let (concluded_tx, _concluded_rx) = oneshot::channel();
+            let projector = StreamProjector::new(
+                id.to_owned(),
+                0,
+                "local-model".into(),
+                tx,
+                projection.clone(),
+                concluded_tx,
+            );
+            assert_eq!(projector.message_id, format!("msg_{expected_suffix}"));
+            assert_eq!(projector.reasoning_id(), format!("rs_{expected_suffix}"));
+        }
     }
 }

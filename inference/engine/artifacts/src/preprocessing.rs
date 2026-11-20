@@ -78,28 +78,44 @@ impl ImageProcessorConfig {
             .patch
             .checked_mul(self.merge)
             .ok_or("image processor factor overflows")?;
+        self.patch
+            .checked_mul(self.patch)
+            .ok_or("image processor patch area overflows")?;
+        let merge_area = self
+            .merge
+            .checked_mul(self.merge)
+            .ok_or("image processor merge area overflows")?;
+        let resize_invalid = match self.resize {
+            ImageResize::Slices {
+                resolution,
+                max_slices,
+            } => {
+                let min_resolution = 4usize
+                    .checked_mul(self.patch)
+                    .ok_or("image processor slice alignment overflows")?;
+                resolution
+                    .checked_mul(resolution)
+                    .ok_or("image processor slice resolution overflows")?;
+                resolution < min_resolution || max_slices == 0 || max_slices > 9
+            }
+            ImageResize::PixelBounds {
+                min_pixels,
+                max_pixels,
+            }
+            | ImageResize::PaddedCanvas {
+                min_pixels,
+                max_pixels,
+            } => min_pixels == 0 || min_pixels > max_pixels,
+            ImageResize::PatchBudget { max_patches } => max_patches < merge_area,
+            ImageResize::CellBudget { max_cells } => max_cells == 0,
+            ImageResize::PatchBounds {
+                min_patches,
+                max_patches,
+            } => min_patches == 0 || min_patches > max_patches || max_patches < merge_area,
+        };
         if factor == 0
             || self.frames == 0
-            || match self.resize {
-                ImageResize::Slices {
-                    resolution,
-                    max_slices,
-                } => resolution < 4 * self.patch || max_slices == 0 || max_slices > 9,
-                ImageResize::PixelBounds {
-                    min_pixels,
-                    max_pixels,
-                }
-                | ImageResize::PaddedCanvas {
-                    min_pixels,
-                    max_pixels,
-                } => min_pixels == 0 || min_pixels > max_pixels,
-                ImageResize::PatchBudget { max_patches } => max_patches == 0,
-                ImageResize::CellBudget { max_cells } => max_cells == 0,
-                ImageResize::PatchBounds {
-                    min_patches,
-                    max_patches,
-                } => min_patches == 0 || min_patches > max_patches,
-            }
+            || resize_invalid
             || self.mean.iter().any(|value| !value.is_finite())
             || self
                 .std
@@ -200,13 +216,14 @@ impl ImageProcessor {
             content: canvas,
         };
         match self.config.resize {
-            ImageResize::Slices { resolution, .. } => Ok(whole(slicing::best_size(
+            ImageResize::Slices { resolution, .. } => slicing::best_size(
                 height as f64,
                 width as f64,
                 resolution,
                 self.config.patch,
                 true,
-            ))),
+            )
+            .map(whole),
             ImageResize::PixelBounds {
                 min_pixels,
                 max_pixels,
@@ -524,31 +541,40 @@ fn pixel_bounds_size(
     min_pixels: usize,
     max_pixels: usize,
 ) -> Result<(usize, usize), String> {
-    let round_even = |value: usize| -> usize {
+    let scale_cells = |cells: usize| -> Result<usize, String> {
+        cells
+            .max(1)
+            .checked_mul(cell)
+            .ok_or_else(|| String::from("resized image extent overflows"))
+    };
+    let round_even = |value: usize| -> Result<usize, String> {
         let quotient = value / cell;
         let remainder = value % cell;
-        let rounded = if remainder * 2 < cell {
+        let complement = cell - remainder;
+        let rounded = if remainder < complement {
             quotient
-        } else if remainder * 2 > cell || quotient % 2 == 1 {
-            quotient + 1
+        } else if remainder > complement || quotient % 2 == 1 {
+            quotient
+                .checked_add(1)
+                .ok_or_else(|| String::from("resized image extent overflows"))?
         } else {
             quotient
         };
-        rounded.max(1) * cell
+        scale_cells(rounded)
     };
-    let mut output_height = round_even(height);
-    let mut output_width = round_even(width);
+    let mut output_height = round_even(height)?;
+    let mut output_width = round_even(width)?;
     let pixels = output_height
         .checked_mul(output_width)
         .ok_or("resized image extent overflows")?;
     if pixels > max_pixels {
         let beta = ((height as f64 * width as f64) / max_pixels as f64).sqrt();
-        output_height = (((height as f64 / beta) / cell as f64).floor() as usize).max(1) * cell;
-        output_width = (((width as f64 / beta) / cell as f64).floor() as usize).max(1) * cell;
+        output_height = scale_cells(((height as f64 / beta) / cell as f64).floor() as usize)?;
+        output_width = scale_cells(((width as f64 / beta) / cell as f64).floor() as usize)?;
     } else if pixels < min_pixels {
         let beta = (min_pixels as f64 / (height as f64 * width as f64)).sqrt();
-        output_height = ((height as f64 * beta / cell as f64).ceil() as usize).max(1) * cell;
-        output_width = ((width as f64 * beta / cell as f64).ceil() as usize).max(1) * cell;
+        output_height = scale_cells((height as f64 * beta / cell as f64).ceil() as usize)?;
+        output_width = scale_cells((width as f64 * beta / cell as f64).ceil() as usize)?;
     }
     output_height
         .checked_mul(output_width)
@@ -567,25 +593,45 @@ fn patch_budget_size(
     merge: usize,
     max_patches: usize,
 ) -> Result<(usize, usize), String> {
+    let patch_area = patch.checked_mul(patch).ok_or("patch budget overflows")?;
     let target_pixels = max_patches
-        .checked_mul(patch * patch)
+        .checked_mul(patch_area)
         .ok_or("patch budget overflows")?;
     let factor = (target_pixels as f64 / (height as f64 * width as f64)).sqrt();
-    let side = merge * patch;
-    let mut output_height = (factor * height as f64 / side as f64).floor() as usize * side;
-    let mut output_width = (factor * width as f64 / side as f64).floor() as usize * side;
+    let side = merge
+        .checked_mul(patch)
+        .ok_or("resized image extent overflows")?;
+    let merge_area = merge.checked_mul(merge).ok_or("patch budget overflows")?;
+    let mut output_height = ((factor * height as f64 / side as f64).floor() as usize)
+        .checked_mul(side)
+        .ok_or("resized image extent overflows")?;
+    let mut output_width = ((factor * width as f64 / side as f64).floor() as usize)
+        .checked_mul(side)
+        .ok_or("resized image extent overflows")?;
     if output_height == 0 && output_width == 0 {
         return Err("image resizes to no patch".into());
     }
-    let longest = (max_patches / (merge * merge)) * side;
+    let max_cells = max_patches / merge_area;
     if output_height == 0 {
         output_height = side;
-        output_width = ((width as f64 / height as f64).floor() as usize * side).min(longest);
+        output_width = ((width as f64 / height as f64).floor() as usize)
+            .min(max_cells)
+            .checked_mul(side)
+            .ok_or("resized image extent overflows")?;
     } else if output_width == 0 {
         output_width = side;
-        output_height = ((height as f64 / width as f64).floor() as usize * side).min(longest);
+        output_height = ((height as f64 / width as f64).floor() as usize)
+            .min(max_cells)
+            .checked_mul(side)
+            .ok_or("resized image extent overflows")?;
     }
-    if output_height * output_width > target_pixels {
+    if output_height == 0 || output_width == 0 {
+        return Err("image resizes to no patch".into());
+    }
+    let output_pixels = output_height
+        .checked_mul(output_width)
+        .ok_or("resized image extent overflows")?;
+    if output_pixels > target_pixels {
         return Err("resized image exceeds the patch budget".into());
     }
     Ok((output_height, output_width))
@@ -615,7 +661,13 @@ fn cell_budget_size(
         .flat_map(|&row| columns.iter().map(move |&column| (row, column)));
     let mut candidates = python_set_order(product)
         .into_iter()
-        .filter(|&(row, column)| row >= 1 && column >= 1 && row * column <= max_cells as u64)
+        .filter(|&(row, column)| {
+            row >= 1
+                && column >= 1
+                && row
+                    .checked_mul(column)
+                    .is_some_and(|cells| cells <= max_cells as u64)
+        })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         candidates.push((
@@ -678,18 +730,16 @@ fn patch_bounds_size(
     };
     let remainder = rows % merge;
     if remainder != 0 {
-        rows = if fits(rows + merge - remainder, columns) {
-            rows + merge - remainder
-        } else {
-            merge.max(rows - remainder)
+        rows = match rows.checked_add(merge - remainder) {
+            Some(up) if fits(up, columns) => up,
+            _ => merge.max(rows - remainder),
         };
     }
     let remainder = columns % merge;
     if remainder != 0 {
-        columns = if fits(rows, columns + merge - remainder) {
-            columns + merge - remainder
-        } else {
-            merge.max(columns - remainder)
+        columns = match columns.checked_add(merge - remainder) {
+            Some(up) if fits(rows, up) => up,
+            _ => merge.max(columns - remainder),
         };
     }
     if rows == 0 || columns == 0 || !fits(rows, columns) {
@@ -980,5 +1030,79 @@ mod tests {
         assert!(padded_canvas(16, 16, usize::MAX, 16, 64).is_err());
         assert!(padded_canvas(usize::MAX, 16, 16, 16, 64).is_err());
         assert!(padded_canvas(half_bits, half_bits, 16, 16, 64).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_overflows_and_under_sized_patch_budgets() {
+        let half_bits = 1usize << (usize::BITS / 2);
+        let base = |resize, patch, merge| ImageProcessorConfig {
+            resize,
+            resampling: Resampling::Bicubic,
+            patch,
+            merge,
+            frames: 1,
+            mean: [0.5, 0.5, 0.5],
+            std: [0.5, 0.5, 0.5],
+        };
+        assert!(base(ImageResize::CellBudget { max_cells: 4 }, half_bits, 1).validate().is_err());
+        assert!(base(ImageResize::CellBudget { max_cells: 4 }, 1, half_bits).validate().is_err());
+        assert!(
+            base(
+                ImageResize::Slices {
+                    resolution: 448,
+                    max_slices: 4,
+                },
+                usize::MAX / 2,
+                1,
+            )
+            .validate()
+            .is_err()
+        );
+        assert!(
+            base(
+                ImageResize::Slices {
+                    resolution: half_bits,
+                    max_slices: 4,
+                },
+                14,
+                1,
+            )
+            .validate()
+            .is_err()
+        );
+        assert!(
+            base(ImageResize::PatchBudget { max_patches: 3 }, 14, 2)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            base(
+                ImageResize::PatchBounds {
+                    min_patches: 1,
+                    max_patches: 3,
+                },
+                14,
+                2,
+            )
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sizing_helpers_reject_zero_extents_and_overflowing_arithmetic() {
+        let half_bits = 1usize << (usize::BITS / 2);
+        // PatchBudget with max_patches < merge * merge would previously yield (side, 0).
+        assert!(patch_budget_size(10, 100, 14, 2, 2).is_err());
+        assert!(patch_budget_size(100, 10, 14, 2, 2).is_err());
+        assert!(patch_budget_size(16, 16, half_bits, 1, 4).is_err());
+        assert!(patch_budget_size(16, 16, 1, half_bits, 4).is_err());
+
+        assert!(pixel_bounds_size(usize::MAX, 16, 16, 16, 64).is_err());
+        assert!(pixel_bounds_size(usize::MAX - 2, 16, usize::MAX - 1, 16, 64).is_err());
+
+        assert!(cell_budget_size(usize::MAX, usize::MAX, half_bits, usize::MAX).is_err());
+        assert!(patch_bounds_size(usize::MAX, usize::MAX, 1, 2, 1, usize::MAX).is_err());
+        assert!(patch_bounds_size(usize::MAX, 1, 1, usize::MAX / 2, 1, usize::MAX).is_err());
     }
 }

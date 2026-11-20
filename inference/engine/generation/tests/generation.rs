@@ -486,6 +486,40 @@ fn replay_from_a_prompt_prefix_stops_at_the_prompt_end() {
     assert_eq!(decode.round_forward().tokens, [TokenId(11)]);
 }
 
+#[test]
+fn eviction_mid_replay_preserves_reconciliation_target_and_clamps_cached_tokens() {
+    let mut generation = prefill(generation(None), 10);
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let (mut generation, _) = resolve(start(generation, 1), &[11], None);
+    let (mut generation, _) = resolve(start(generation, 1), &[12], None);
+    assert_eq!(generation.resident_position(), 4);
+
+    // Evict, start replaying from zero, and evict again mid-replay.
+    generation.evicted().unwrap();
+    generation.resume_at(None).unwrap();
+    let replay = start(generation, 1);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(1)]);
+    let (mut generation, _) = resolve(replay, &[], None);
+    assert_eq!(generation.resident_position(), 1);
+    generation.evicted().unwrap();
+
+    // Resuming at a generated position past the 2-token prompt must keep the
+    // original reconciliation target (4) and never report cached_tokens > prompt.len().
+    generation.resume_at(Some((3, &checkpoint))).unwrap();
+    assert_eq!(generation.resident_position(), 3);
+    assert!(generation.detailed_usage().cached_tokens <= 2);
+
+    let replay = start(generation, 4);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(11)]);
+    let (generation, _) = resolve(replay, &[], None);
+    assert_eq!(generation.resident_position(), 4);
+    let decode = start(generation, 1);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+    assert_eq!(decode.round_forward().tokens, [TokenId(12)]);
+}
+
 /// An admitted MTP generation that is not yet resident.
 fn mtp_fresh(prompt: &[u32], proposals: u8) -> Generation {
     let mut configured = options();
@@ -2045,6 +2079,65 @@ fn rounds_that_draft_nothing_defer_the_drafter_until_it_drafts_again() {
         assert_eq!(at, position);
         entered.extend(tokens.into_iter().zip(rows));
         assert_eq!(entered, pairs, "{}", method.identity());
+    }
+}
+
+#[test]
+fn shrinking_allowance_after_catch_up_drafts_within_the_new_allowance() {
+    let methods: [Arc<dyn Method>; 2] = [
+        Arc::new(Mtp::new("fixture", 3).unwrap()),
+        Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()),
+    ];
+    for method in methods {
+        let mut configured = options();
+        configured.max_tokens = 16;
+        configured.context_limit = 32;
+        configured.method = match method.identity().starts_with("mtp") {
+            true => MethodChoice::Mtp { proposals: 3 },
+            false => MethodChoice::DFlash { proposals: 3 },
+        };
+        let generation = resident(
+            Generation::new_with_method(
+                vec![TokenId(1), TokenId(2)],
+                InputLayout::new(2, vec![]).unwrap(),
+                configured,
+                None,
+                method.clone(),
+            )
+            .unwrap(),
+        );
+        let (mut generation, effects) = resolve(start(generation, 2), &[10], Some(feature(1)));
+        assert!(effects.is_empty());
+        generation.take(4).unwrap();
+
+        // Accumulate enough pending pairs (> entry_bound = proposals + 1 = 4)
+        // that the next drafting attempt must first run a catch-up flush.
+        let mut anchor = TokenId(10);
+        for round in 0..4u32 {
+            let decode = start(generation, 1);
+            let sample = 11 + round;
+            let (next, effects) = resolve(decode, &[sample], Some(feature(2 + u64::from(round))));
+            assert!(effects.is_empty());
+            generation = next;
+            generation.take(4).unwrap();
+            anchor = TokenId(sample);
+        }
+
+        // First attempt with allowance 4 (selects.len() == 3) triggers catch-up.
+        let (mut generation, catch_up) = draft(generation, 4);
+        let [catch_up] = <[Operation; 1]>::try_from(catch_up).unwrap();
+        assert!(head_parts(&catch_up).3.is_empty());
+        reconcile_head(&mut generation, &catch_up, &[]);
+
+        // Allowance shrinks to 2 (selects.len() == 1) before the actual draft:
+        // must draft 1 proposal rather than getting stuck on a cached width of 3.
+        let (mut generation, drafted) = draft(generation, 2);
+        let [drafted] = <[Operation; 1]>::try_from(drafted).unwrap();
+        assert_eq!(head_parts(&drafted).3.len(), 1, "{}", method.identity());
+        reconcile_head(&mut generation, &drafted, &[(20, 0)]);
+
+        let verify = start(generation, 2);
+        assert_eq!(verify.round_forward().tokens, [anchor, TokenId(20)]);
     }
 }
 

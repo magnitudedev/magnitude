@@ -706,28 +706,36 @@ impl MethodState for DrafterState {
         if !anchored && !prepares {
             return Propose::Tokens(Vec::new());
         }
-        let position = self
-            .round_state()
-            .target_position()
-            .expect("drafter state preserves its method boundary")
-            + self.skipped;
-        let generated = match (&mut self.control, self.generated) {
-            (_, Some(generated)) => generated,
-            (Some(control), None) => control.generate(selects.len(), position, anchored),
-            (None, None) => self.budget.generated_within(selects.len()),
-        };
-        self.generated = Some(generated);
-        if generated == 0 || generated > selects.len() {
-            return Propose::Tokens(Vec::new());
-        }
         // Rounds that drafted nothing left their pairs pending: the drafter
-        // enters them now, then this round drafts from its anchor.
-        if self.round_state().catching_up().0.is_some() {
+        // enters them before choosing a draft width, so a smaller allowance
+        // after catch-up cannot leave a cached choice wider than `selects`.
+        if anchored && self.round_state().catching_up().0.is_some() {
             let effects = self
                 .flush(request, 1, HeadPhase::Generation)
                 .expect("pending pairs slice by their own rows");
             return Propose::Pending(effects.operations);
         }
+        let position = self
+            .round_state()
+            .target_position()
+            .expect("drafter state preserves its method boundary")
+            + self.skipped;
+        if self
+            .generated
+            .is_some_and(|generated| generated > selects.len())
+        {
+            self.generated = None;
+        }
+        let generated = match (&mut self.control, self.generated) {
+            (_, Some(generated)) => generated,
+            (Some(control), None) => control.generate(selects.len(), position, anchored),
+            (None, None) => self.budget.generated_within(selects.len()),
+        };
+        if generated == 0 || generated > selects.len() {
+            self.generated = Some(0);
+            return Propose::Tokens(Vec::new());
+        }
+        self.generated = Some(generated);
         let Some(pending) = &self.pending else {
             unreachable!("a drafting round holds its anchor");
         };
@@ -746,6 +754,7 @@ impl MethodState for DrafterState {
             selects[..generated].to_vec(),
             self.drafter.form(),
         ) else {
+            self.generated = Some(0);
             return Propose::Tokens(Vec::new());
         };
         let operation = transaction.operation().clone();
