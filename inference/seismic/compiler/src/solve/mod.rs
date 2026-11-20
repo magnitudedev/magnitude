@@ -561,21 +561,6 @@ mod internals {
 
     impl Model {
         pub(super) fn cursor(&self, budget: SolverAllowance) -> Cursor<'_> {
-            Cursor {
-                model: self,
-                budget,
-                started: Instant::now(),
-                work: 0,
-                exclusions: Vec::new(),
-                complete: false,
-                exhausted: false,
-            }
-        }
-
-        fn instantiate(
-            &self,
-            exclusions: &[Vec<i64>],
-        ) -> (Arc<magnitude_solver::Model>, Vec<VarId>) {
             let mut builder = GenericBuilder::new();
             builder.units(self.units);
             let bindings = self
@@ -597,15 +582,6 @@ mod internals {
                     })
                 })
                 .collect::<Vec<_>>();
-            for values in exclusions {
-                builder.constraint(Constraint::ForbiddenTuple {
-                    variables: assignment_variables.clone(),
-                    values: values.clone(),
-                });
-            }
-            let model = Arc::new(builder.build().unwrap_or_else(|error| {
-                panic!("private Seismic cursor model is invalid: {error}")
-            }));
             let mapping = (0..self.variables.len())
                 .map(VarId)
                 .map(|variable| {
@@ -614,7 +590,18 @@ mod internals {
                     })
                 })
                 .collect();
-            (model, mapping)
+            Cursor {
+                model: self,
+                budget,
+                started: Instant::now(),
+                work: 0,
+                builder,
+                assignment_variables,
+                mapping,
+                exclusions_bytes: 0,
+                complete: false,
+                exhausted: false,
+            }
         }
 
         fn decode(&self, values: &[i64]) -> (&Implementation, RawAssignment) {
@@ -663,7 +650,10 @@ mod internals {
         budget: SolverAllowance,
         started: Instant,
         work: u64,
-        exclusions: Vec<Vec<i64>>,
+        builder: GenericBuilder,
+        assignment_variables: Vec<VarId>,
+        mapping: Vec<VarId>,
+        exclusions_bytes: u64,
         complete: bool,
         exhausted: bool,
     }
@@ -681,7 +671,9 @@ mod internals {
                     self.exhausted = true;
                     return AssignmentStep::BudgetExhausted(self.report());
                 }
-                let (model, mapping) = self.model.instantiate(&self.exclusions);
+                let model = Arc::new(self.builder.clone().build().unwrap_or_else(|error| {
+                    panic!("private Seismic cursor model is invalid: {error}")
+                }));
                 let mut search = Search::new(
                     model,
                     Options {
@@ -721,7 +713,8 @@ mod internals {
                     }
                 };
                 let witness = witness.expect("solver outcome supplies a witness");
-                let witness = mapping
+                let witness = self
+                    .mapping
                     .iter()
                     .map(|variable| witness[variable.0])
                     .collect::<Vec<_>>();
@@ -731,7 +724,16 @@ mod internals {
                     .iter()
                     .map(|variable| witness[variable.0])
                     .collect::<Vec<_>>();
-                self.exclusions.push(excluded);
+                let variables = self.assignment_variables.clone();
+                let excluded_bytes = (std::mem::size_of::<Constraint>()
+                    + excluded.capacity() * std::mem::size_of::<i64>()
+                    + variables.capacity() * std::mem::size_of::<VarId>())
+                    as u64;
+                self.builder.constraint(Constraint::ForbiddenTuple {
+                    variables,
+                    values: excluded,
+                });
+                self.exclusions_bytes = self.exclusions_bytes.saturating_add(excluded_bytes);
                 let (implementation, assignment) = self.model.decode(&witness);
                 if self.model.exact(implementation, &assignment) {
                     return AssignmentStep::Assignment(FeasibleAssignment(assignment));
@@ -748,17 +750,9 @@ mod internals {
         }
 
         fn retained_bytes(&self) -> u64 {
-            let exclusions = self
-                .exclusions
-                .iter()
-                .map(|values| {
-                    (std::mem::size_of::<Constraint>()
-                        + values.capacity() * std::mem::size_of::<i64>()
-                        + self.model.assignment_variables.capacity() * std::mem::size_of::<VarId>())
-                        as u64
-                })
-                .sum::<u64>();
-            self.model.retained_bytes.saturating_add(exclusions)
+            self.model
+                .retained_bytes
+                .saturating_add(self.exclusions_bytes)
         }
 
         pub(super) fn report(&self) -> CursorBudgetReport {

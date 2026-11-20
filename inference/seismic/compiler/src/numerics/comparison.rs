@@ -169,6 +169,17 @@ fn discrete_value(dtype: DType, bits: u64) -> f64 {
     }
 }
 
+/// Encode a projected `f64` value into the low bits of `dtype`'s raw payload.
+fn encode_f64_bits(dtype: DType, value: f64) -> u64 {
+    match dtype {
+        DType::F32 | DType::BF16 | DType::F16 => u64::from(conversion::quantize(dtype, value)),
+        DType::I32 => u64::from(value as i32 as u32),
+        DType::U32 => u64::from(value as u32),
+        DType::U64 => value as u64,
+        DType::Bool => u64::from(value != 0.0),
+    }
+}
+
 pub fn compare_element(
     policy: &PrecisionPolicy,
     output: &str,
@@ -176,69 +187,13 @@ pub fn compare_element(
     reference: f64,
     actual: f64,
 ) -> ElementComparison {
-    // Integer/Boolean semantics are never relaxed by a floating-point policy.
-    if matches!(dtype, DType::Bool | DType::I32 | DType::U32 | DType::U64) {
-        return ElementComparison {
-            accepted: reference == actual,
-            absolute_error: (reference - actual).abs(),
-            ..Default::default()
-        };
-    }
-    let Some(tolerance) = policy.tolerance(output) else {
-        return ElementComparison {
-            accepted: true,
-            ..Default::default()
-        };
-    };
-    let specials = match policy {
-        PrecisionPolicy::Bounded { specials, .. } => *specials,
-        _ => SpecialPolicy::PRESERVE,
-    };
-    if reference.is_nan() || actual.is_nan() {
-        let changed = reference.is_nan() != actual.is_nan();
-        return ElementComparison {
-            accepted: !specials.nan || !changed,
-            special_changed: changed,
-            ..Default::default()
-        };
-    }
-    if reference.is_infinite() || actual.is_infinite() {
-        let changed = reference != actual;
-        return ElementComparison {
-            accepted: !specials.infinity || !changed,
-            special_changed: changed,
-            ..Default::default()
-        };
-    }
-    let signed_zero_changed = reference == 0.0
-        && actual == 0.0
-        && reference.is_sign_negative() != actual.is_sign_negative();
-    let minimum_normal = match dtype {
-        DType::F32 | DType::BF16 => f32::MIN_POSITIVE as f64,
-        DType::F16 => 2.0_f64.powi(-14),
-        _ => unreachable!(),
-    };
-    let subnormal = |value: f64| value != 0.0 && value.abs() < minimum_normal;
-    let subnormal_changed = (subnormal(reference) || subnormal(actual)) && reference != actual;
-    let absolute_error = (reference - actual).abs();
-    let scale = reference.abs().max(tolerance.relative_floor.get());
-    let relative_error = if absolute_error == 0.0 {
-        0.0
-    } else {
-        absolute_error / scale
-    };
-    let ulps = ordered_bits(dtype, conversion::quantize(dtype, reference))
-        .abs_diff(ordered_bits(dtype, conversion::quantize(dtype, actual)));
-    ElementComparison {
-        accepted: absolute_error <= tolerance.envelope(reference)
-            && tolerance.ulps.is_none_or(|limit| ulps <= limit)
-            && (!specials.signed_zero || !signed_zero_changed)
-            && (!specials.subnormal || !subnormal_changed),
-        absolute_error,
-        relative_error,
-        ulps,
-        special_changed: signed_zero_changed || subnormal_changed,
-    }
+    compare_element_bits(
+        policy,
+        output,
+        dtype,
+        encode_f64_bits(dtype, reference),
+        encode_f64_bits(dtype, actual),
+    )
 }
 
 /// The rank of a floating payload in value order, from the dtype's own bit
@@ -487,6 +442,10 @@ mod tests {
             assert!(!accepts(&policy, DType::U32, 7, 8));
             assert!(!accepts(&policy, DType::Bool, 0, 1));
             assert!(accepts(&policy, DType::U32, u32::MAX, u32::MAX));
+            // U64 values above 2^53 share an f64 rounding but remain distinct by bits.
+            let high = 1u64 << 53;
+            assert!(!super::compare_element_bits(&policy, "value", DType::U64, high, high + 1).accepted);
+            assert!(super::compare_element_bits(&policy, "value", DType::U64, high + 1, high + 1).accepted);
         }
     }
 

@@ -259,6 +259,13 @@ impl TensorReader<'_> {
         let flat = self.view.map(|v| v.positions[index]).unwrap_or(index);
         Ok(self.storage().read(flat))
     }
+    pub fn read_bits(&self, index: usize) -> Result<u64, String> {
+        if index >= self.element_count() {
+            return Err("tensor index outside logical shape".into());
+        }
+        let flat = self.view.map(|v| v.positions[index]).unwrap_or(index);
+        Ok(self.storage().read_scalar(flat).bits())
+    }
     /// Borrow canonical storage when this reader covers the complete backing.
     /// Views with a different logical order are inspected elementwise instead.
     pub fn canonical_bytes(&self) -> Result<Option<&[u8]>, String> {
