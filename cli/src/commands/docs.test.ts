@@ -87,7 +87,7 @@ describe("Magnitude documentation", () => {
     if (result._tag === "Failure") return
     expect(result.output).toContain("# Model recommendations")
     expect(result.output).toContain("Epoch AI's Capabilities Index")
-    expect(result.output).toContain("estimated to decode at 20 tokens per second or more")
+    expect(result.output).toContain("estimated to decode at 16 tokens per second or more")
     expect(result.output).toContain("`--country US` recommends only")
     expect(result.output).toContain("each assessed context")
     expect(result.output).toContain("How intelligence is measured")

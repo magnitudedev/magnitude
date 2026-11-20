@@ -2034,6 +2034,11 @@ export const LocalModelFamilySchema = Schema.Struct({
 })
 export type LocalModelFamily = typeof LocalModelFamilySchema.Type
 
+/** The decode speed a chosen rung should reach: a long agent conversation stays responsive. */
+export const TARGET_TOKENS_PER_SECOND = 16
+/** The decode speed below which onboarding recommends no model. */
+export const ONBOARDING_FLOOR_TOKENS_PER_SECOND = 10
+
 /**
  * A tested model recommended for this machine. `rungs` is its ladder of quants, smallest to largest; `chosen` is
  * the rung chosen for this machine, none when no rung fits or its family is coming soon. `meetsTarget`: the chosen

@@ -15,6 +15,7 @@ import {
   CountryCodeSchema,
   LocalModelFamilySchema,
   ModelIdSchema,
+  TARGET_TOKENS_PER_SECOND,
   localModelIntelligence,
   type CatalogLocalModel,
   type CountryCode,
@@ -138,7 +139,7 @@ const renderRecommendation = (hardware: LocalInferenceHardware) => (
   return [
     `${index + 1}. ${formatLocalModelDisplayName(model)} - ${developer.name} (${developer.country}) - Intelligence ${intelligenceLabel(model)}`,
     `   ${modelQuant(model)} - ${formatStorageSize(model.storageBytes)} - ${assessmentSpeed(assessment)} - ${assessmentContext(assessment)} context - ${assessmentPlacement(assessment, memory)}`,
-    `   Model ID: ${model.modelId}${recommendation.meetsTarget || !assessmentSpeedKnown(assessment) ? "" : " - below 20 tok/s on this computer"}`,
+    `   Model ID: ${model.modelId}${recommendation.meetsTarget || !assessmentSpeedKnown(assessment) ? "" : ` - below ${TARGET_TOKENS_PER_SECOND} tok/s on this computer`}`,
     ...(expertFields.length > 0 ? [`   ${expertFields.map(([label, value]) => `${label} ${value}`).join(" - ")}`] : []),
     `   Acceleration ${accelerationLabel(model)}${capabilities.length > 0 ? ` - ${capabilities.join(", ")}` : ""}`,
     indent(renderQuantLadder(rungs, Option.some(model.modelId), memory), "   "),

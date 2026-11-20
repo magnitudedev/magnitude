@@ -1,7 +1,9 @@
 import { Array, Context, Effect, Layer, Option, Order, Schema, Stream } from "effect"
 import {
   LocalModelFamilySchema,
+  ONBOARDING_FLOOR_TOKENS_PER_SECOND,
   RecommendationsSchema,
+  TARGET_TOKENS_PER_SECOND,
   Models,
   comparisonTokensPerSecond,
   localModelCapabilities,
@@ -22,11 +24,6 @@ import { AcnChanges } from "./changes"
 import { LocalInferenceHardware } from "./local-inference-hardware"
 import { LocalModelSources, type CatalogModelSource } from "./local-model-sources"
 import { LocalModels } from "./local-models"
-
-/** The decode speed a chosen rung should reach: a long agent conversation stays responsive. */
-export const TARGET_TOKENS_PER_SECOND = 16
-/** The decode speed below which onboarding recommends no model. */
-export const ONBOARDING_FLOOR_TOKENS_PER_SECOND = 10
 
 export interface RecommendationInputs {
   readonly models: LocalModelsState["models"]
