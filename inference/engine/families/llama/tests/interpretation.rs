@@ -11,7 +11,7 @@ use magnitude_family_contracts::{
 };
 use magnitude_artifacts::UnsupportedReason;
 use magnitude_family_contracts::FamilyError;
-use magnitude_family_llama::{admit, inspect_components, Error, Feature, LlamaFamily};
+use magnitude_family_llama::{inspect_components, Error, Feature, LlamaFamily};
 
 fn identity() -> PackageIdentity {
     PackageIdentity {
@@ -146,7 +146,7 @@ fn features_outside_the_admitted_set_are_each_refused_by_name() {
         Value::Scalar(Scalar::String("yarn".into())),
     );
     assert_eq!(
-        admit(&scaled),
+        inspect(&scaled),
         Err(Error::Unadmitted(vec![Feature::RopeScaling("yarn".into())]))
     );
 
@@ -156,12 +156,10 @@ fn features_outside_the_admitted_set_are_each_refused_by_name() {
         "llama.attention.head_count_kv",
         Value::Array(vec![2_u64; 42].into()),
     );
-    assert_eq!(
-        admit(&per_layer),
-        Err(Error::Unadmitted(vec![Feature::PerLayerMetadata(
-            "llama.attention.head_count_kv".into()
-        )]))
-    );
+    assert!(matches!(
+        inspect(&per_layer),
+        Err(Error::Metadata { key, .. }) if key == "llama.attention.head_count_kv"
+    ));
 
     let mut unknown = minicpm5();
     set_metadata(
@@ -170,7 +168,7 @@ fn features_outside_the_admitted_set_are_each_refused_by_name() {
         Value::Scalar(Scalar::Float(12.0)),
     );
     assert_eq!(
-        admit(&unknown),
+        inspect(&unknown),
         Err(Error::Unadmitted(vec![Feature::UnknownMetadata(
             "llama.embedding_scale".into()
         )]))
@@ -185,41 +183,31 @@ fn features_outside_the_admitted_set_are_each_refused_by_name() {
         let mut extra = minicpm5();
         add_tensor(&mut extra, role, &[128]);
         assert_eq!(
-            admit(&extra),
-            Err(Error::Unadmitted(vec![Feature::Tensor(role.into())]))
+            inspect(&extra),
+            Err(Error::UnboundWeights(vec![role.into()]))
         );
     }
 
     let mut tied = minicpm5();
     tied.tensors.retain(|tensor| tensor.name != "output.weight");
-    assert_eq!(admit(&tied), Err(Error::Unadmitted(vec![Feature::TiedOutput])));
+    assert_eq!(inspect(&tied), Err(Error::Unadmitted(vec![Feature::TiedOutput])));
 
-    // Every refused feature is named at once, and the family error carries
-    // each as a reason.
-    let mut several = minicpm5();
-    add_tensor(&mut several, "rope_freqs.weight", &[64]);
-    several.tensors.retain(|tensor| tensor.name != "output.weight");
+    // The family still claims the architecture even on refused features, so the
+    // refusal names the feature instead of disowning the file.
+    let mut scaled_llama3 = minicpm5();
     set_metadata(
-        &mut several,
+        &mut scaled_llama3,
         "llama.rope.scaling.type",
         Value::Scalar(Scalar::String("llama3".into())),
     );
-    let error = FamilyError::from(inspect(&several).unwrap_err());
+    let error = FamilyError::from(inspect(&scaled_llama3).unwrap_err());
     assert_eq!(
         error.reasons,
-        [
-            UnsupportedReason::RopeScaling {
-                kind: "llama3".into()
-            },
-            UnsupportedReason::UnrecognizedTensor {
-                name: "rope_freqs.weight".into()
-            },
-            UnsupportedReason::TiedOutputHead,
-        ]
+        [UnsupportedReason::RopeScaling {
+            kind: "llama3".into()
+        }]
     );
-    // The family still claims the architecture, so the refusal names the
-    // features instead of disowning the file.
-    assert!(LlamaFamily.recognizes(&several));
+    assert!(LlamaFamily.recognizes(&scaled_llama3));
 
     let mut other = minicpm5();
     set_metadata(
@@ -228,7 +216,7 @@ fn features_outside_the_admitted_set_are_each_refused_by_name() {
         Value::Scalar(Scalar::String("mistral3".into())),
     );
     assert_eq!(
-        admit(&other),
+        inspect(&other),
         Err(Error::Architecture(Some("mistral3".into())))
     );
 }
@@ -248,7 +236,6 @@ fn namespaces_that_configure_nothing_are_ignored() {
     ] {
         set_metadata(&mut stamped, key, Value::Scalar(Scalar::String("x".into())));
     }
-    assert_eq!(admit(&stamped), Ok(()));
     assert_eq!(inspect(&stamped), inspect(&minicpm5()));
 }
 

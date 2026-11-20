@@ -2,8 +2,8 @@
 pub mod inputs;
 
 use crate::{Error, invalid};
-use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::{Tensors, architecture_keys, array_elements, projector_type};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{ProjectorMetadata, Tensors, projector_type};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
     VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription,
@@ -11,53 +11,11 @@ use magnitude_family_contracts::{
     VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp, checked_product,
 };
 
-const KEYS: &[&str] = &[
-    "clip.has_vision_encoder",
-    "clip.projector_type",
-    "clip.vision.projection_dim",
-    "clip.vision.image_size",
-    "clip.vision.patch_size",
-    "clip.vision.embedding_length",
-    "clip.vision.feed_forward_length",
-    "clip.vision.block_count",
-    "clip.vision.attention.head_count",
-    "clip.vision.image_mean",
-    "clip.vision.image_std",
-    "clip.vision.projector.scale_factor",
-    "clip.vision.max_slice_nums",
-    "clip.vision.wa_layer_indexes",
-    "clip.use_gelu",
-    "clip.vision.attention.layer_norm_epsilon",
-];
-
 struct Reader<'a> {
-    directory: &'a Directory,
     tensors: Tensors<'a>,
     epsilon: f64,
 }
 impl Reader<'_> {
-    fn count(&self, key: &str) -> Result<u64, Error> {
-        self.directory
-            .value(key)
-            .and_then(Value::unsigned)
-            .filter(|n| *n > 0)
-            .ok_or_else(|| invalid(format!("{key} must be a positive integer")))
-    }
-    fn triple(&self, key: &str) -> Result<[f64; 3], Error> {
-        let Some(Value::Array(values)) = self.directory.value(key) else {
-            return Err(invalid(format!("{key} must contain three numbers")));
-        };
-        let values = array_elements(key, values)?
-            .iter()
-            .map(|v| match v {
-                Element::Float(x) if x.is_finite() => Some(x),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .and_then(|v| v.try_into().ok())
-            .ok_or_else(|| invalid(format!("{key} must contain three finite numbers")))?;
-        Ok(values)
-    }
     fn norm(&mut self, name: &str, width: u64) -> Result<VisionNorm, Error> {
         Ok(VisionNorm::Layer {
             weight: self.tensors.bind(&format!("{name}.weight"), &[width])?,
@@ -82,41 +40,30 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("minicpmv4_7", ())], target_width)?;
-    if let Some((_, entry)) = architecture_keys(directory, PROJECTOR_ARCHITECTURE)
-        .find(|(_, entry)| !KEYS.contains(&entry.name.as_str()))
-    {
-        return Err(invalid(format!(
-            "unknown projector metadata {:?}",
-            entry.name
-        )));
-    }
-    let epsilon = match directory.value("clip.vision.attention.layer_norm_epsilon") {
-        Some(Value::Scalar(Scalar::Float(v))) if v.is_finite() && *v > 0.0 => *v,
-        _ => return Err(invalid("projector declares no positive layer norm epsilon")),
-    };
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.projector_type");
+    meta.ignore("clip.vision.wa_layer_indexes");
+    let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
     let mut r = Reader {
-        directory,
         tensors: Tensors::new(directory),
         epsilon,
     };
-    if r.count("clip.vision.projector.scale_factor")? != 2 {
+    if meta.integer("clip.vision.projector.scale_factor")? != 2 {
         return Err(invalid(
             "MiniCPM-V 16x intra-tower compression is not supported by this projector",
         ));
     }
-    if !matches!(
-        directory.value("clip.use_gelu"),
-        Some(Value::Scalar(Scalar::Bool(true)))
-    ) {
+    if !meta.bool("clip.use_gelu")? {
         return Err(invalid("MiniCPM-V requires the published GELU tower"));
     }
-    let hidden = r.count("clip.vision.embedding_length")?;
-    let output_hidden = r.count("clip.vision.projection_dim")?;
-    let intermediate = r.count("clip.vision.feed_forward_length")?;
-    let depth = r.count("clip.vision.block_count")?;
-    let heads = r.count("clip.vision.attention.head_count")?;
-    let patch = r.count("clip.vision.patch_size")?;
-    if hidden % heads != 0 || (hidden / heads) % 4 != 0 || depth > directory.tensors.len() as u64 {
+    let hidden = meta.integer("clip.vision.embedding_length")?;
+    let output_hidden = meta.integer("clip.vision.projection_dim")?;
+    let intermediate = meta.integer("clip.vision.feed_forward_length")?;
+    let depth = meta.bounded_block_count("clip.vision.block_count")?;
+    let heads = meta.integer("clip.vision.attention.head_count")?;
+    let patch = meta.integer("clip.vision.patch_size")?;
+    if hidden % heads != 0 || (hidden / heads) % 4 != 0 {
         return Err(invalid("invalid MiniCPM-V tower geometry"));
     }
     let [positions, position_hidden] = r.tensors.shape("v.position_embd.weight")? else {
@@ -145,7 +92,7 @@ pub fn describe_projector(
         norm: None,
         registers: None,
     };
-    let mut blocks = Vec::new();
+    let mut blocks = Vec::with_capacity(depth as usize);
     for layer in 0..depth {
         let p = format!("v.blk.{layer}");
         blocks.push(VisionBlock {
@@ -204,16 +151,17 @@ pub fn describe_projector(
     }
     let preprocessing = VisionPreprocessing {
         resize: VisionResize::Slices {
-            resolution: r.count("clip.vision.image_size")?,
-            max_slices: r.count("clip.vision.max_slice_nums")?,
+            resolution: meta.integer("clip.vision.image_size")?,
+            max_slices: meta.integer("clip.vision.max_slice_nums")?,
         },
         resampling: VisionResampling::Bicubic,
-        mean: r.triple("clip.vision.image_mean")?,
-        std: r.triple("clip.vision.image_std")?,
+        mean: meta.f64_array("clip.vision.image_mean")?,
+        std: meta.f64_array("clip.vision.image_std")?,
         channels: 3,
         patch,
         merge: 2,
     };
+    meta.finish()?;
     r.tensors.finish().map_err(Error::from)?;
     let description = Box::new(VisionDescription {
         activation_dtype: ActivationDType::F16,

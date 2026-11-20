@@ -12,6 +12,7 @@ mod slicing;
 /// the same bound for output leases retained across a request's lifetime.
 pub const MAX_IMAGES_PER_REQUEST: usize = 16;
 const ASPECT_LIMIT: usize = 200;
+const MAX_IMAGE_DIMENSION: u32 = 32_768;
 
 /// How an image is resized before it is cut into patches. Sides are
 /// multiples of the cell side, `patch · merge` pixels.
@@ -192,14 +193,7 @@ impl ImageProcessor {
     /// its pixels are resampled to: the canvas itself unless the canvas is
     /// padded.
     fn target(&self, height: usize, width: usize) -> Result<Target, String> {
-        if height == 0 || width == 0 {
-            return Err("image dimensions must be nonzero".into());
-        }
-        let short = height.min(width);
-        let long = height.max(width);
-        if long > short.saturating_mul(ASPECT_LIMIT) {
-            return Err("image aspect ratio exceeds processor limit".into());
-        }
+        validate_dimensions(height, width)?;
         let cell = self.config.patch * self.config.merge;
         let whole = |canvas| Target {
             canvas,
@@ -261,13 +255,32 @@ impl ImageProcessor {
         let mut rows = 0usize;
         let mut slice_grids = Vec::new();
         let sliced = matches!(self.config.resize, ImageResize::Slices { .. });
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+        limits.max_alloc = Some(MAX_PREPARED_BYTES as u64);
         for encoded in encoded_images {
-            let reader = ImageReader::new(Cursor::new(encoded))
+            let mut reader = ImageReader::new(Cursor::new(encoded))
                 .with_guessed_format()
                 .map_err(|error| format!("image format detection failed: {error}"))?;
+            reader.limits(limits.clone());
             let mut decoder = reader
                 .into_decoder()
                 .map_err(|error| format!("image decode setup failed: {error}"))?;
+            let (decoded_width, decoded_height) = decoder.dimensions();
+            let decoded_width = usize::try_from(decoded_width)
+                .map_err(|_| "image width exceeds processor domain")?;
+            let decoded_height = usize::try_from(decoded_height)
+                .map_err(|_| "image height exceeds processor domain")?;
+            validate_dimensions(decoded_height, decoded_width)?;
+            let color = decoder.color_type();
+            let bytes_per_pixel =
+                usize::from(color.bytes_per_pixel()).max(if color.has_alpha() { 16 } else { 12 });
+            decoded_width
+                .checked_mul(decoded_height)
+                .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+                .filter(|bytes| *bytes <= MAX_PREPARED_BYTES)
+                .ok_or("decoded image exceeds capacity")?;
             let orientation = decoder
                 .orientation()
                 .map_err(|error| format!("image orientation failed: {error}"))?;
@@ -405,6 +418,18 @@ fn pad(content: image::Rgb32FImage, width: usize, height: usize) -> image::Rgb32
     canvas
 }
 
+fn validate_dimensions(height: usize, width: usize) -> Result<(), String> {
+    if height == 0 || width == 0 {
+        return Err("image dimensions must be nonzero".into());
+    }
+    let short = height.min(width);
+    let long = height.max(width);
+    if long > short.saturating_mul(ASPECT_LIMIT) {
+        return Err("image aspect ratio exceeds processor limit".into());
+    }
+    Ok(())
+}
+
 /// GLM-5's `smart_resize` and `resize` for one frame of an image (the
 /// released processor's two-frame budgets are these pixel bounds): the sides
 /// rounded up to cell multiples; scaled up to the minimum or, past the
@@ -417,24 +442,44 @@ fn padded_canvas(
     min_pixels: usize,
     max_pixels: usize,
 ) -> Result<Target, String> {
-    let align = |value: usize| value.div_ceil(cell) * cell;
-    if max_pixels < cell * cell {
+    let align = |value: usize| -> Result<usize, String> {
+        value
+            .div_ceil(cell)
+            .checked_mul(cell)
+            .ok_or_else(|| String::from("resized image extent overflows"))
+    };
+    let cell_pixels = cell.checked_mul(cell).ok_or("image cell area overflows")?;
+    if max_pixels < cell_pixels {
         return Err("the pixel bound holds no cell".into());
     }
-    let (mut canvas_height, mut canvas_width) = (align(height), align(width));
-    if canvas_height * canvas_width < min_pixels {
+    let (mut canvas_height, mut canvas_width) = (align(height)?, align(width)?);
+    let canvas_pixels = canvas_height
+        .checked_mul(canvas_width)
+        .ok_or("resized image extent overflows")?;
+    if canvas_pixels < min_pixels {
         let scale = (min_pixels as f64 / (height as f64 * width as f64)).sqrt();
-        canvas_height = align(((height as f64 * scale).ceil() as usize).max(1));
-        canvas_width = align(((width as f64 * scale).ceil() as usize).max(1));
+        canvas_height = align(((height as f64 * scale).ceil() as usize).max(1))?;
+        canvas_width = align(((width as f64 * scale).ceil() as usize).max(1))?;
     }
-    if canvas_height * canvas_width > max_pixels {
+    let canvas_pixels = canvas_height
+        .checked_mul(canvas_width)
+        .ok_or("resized image extent overflows")?;
+    if canvas_pixels > max_pixels {
         let (mut low, mut high) = (1usize, height);
         (canvas_height, canvas_width) = (cell, cell);
         while low <= high {
-            let content_height = (low + high) / 2;
-            let content_width = ((width * content_height) / height).max(1);
-            let candidate = (align(content_height), align(content_width));
-            if candidate.0 * candidate.1 <= max_pixels {
+            let content_height = low + (high - low) / 2;
+            let content_width = (width
+                .checked_mul(content_height)
+                .ok_or("resized image extent overflows")?
+                / height)
+                .max(1);
+            let candidate = (align(content_height)?, align(content_width)?);
+            let candidate_pixels = candidate
+                .0
+                .checked_mul(candidate.1)
+                .ok_or("resized image extent overflows")?;
+            if candidate_pixels <= max_pixels {
                 (canvas_height, canvas_width) = candidate;
                 low = content_height + 1;
             } else {
@@ -443,10 +488,14 @@ fn padded_canvas(
         }
     }
     let mut scale = (canvas_height as f64 / height as f64).min(canvas_width as f64 / width as f64);
-    if height * width >= min_pixels {
+    let input_pixels = height
+        .checked_mul(width)
+        .ok_or("image pixel count overflows")?;
+    if input_pixels >= min_pixels {
         scale = scale.min(1.0);
     }
-    let content = |side: usize, canvas: usize| ((side as f64 * scale).floor() as usize).clamp(1, canvas);
+    let content =
+        |side: usize, canvas: usize| ((side as f64 * scale).floor() as usize).clamp(1, canvas);
     Ok(Target {
         canvas: (canvas_height, canvas_width),
         content: (content(height, canvas_height), content(width, canvas_width)),
@@ -849,4 +898,87 @@ fn resize(
         }
     }
     Ok(resized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    fn png_header(width: u32, height: u32, color_type: u8) -> Vec<u8> {
+        let mut out = Vec::from(*b"\x89PNG\r\n\x1a\n");
+        let mut ihdr = Vec::with_capacity(17);
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, color_type, 0, 0, 0]);
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(&ihdr);
+        out.extend_from_slice(&png_crc32(&ihdr).to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IDAT");
+        out.extend_from_slice(&png_crc32(b"IDAT").to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IEND");
+        out.extend_from_slice(&png_crc32(b"IEND").to_be_bytes());
+        out
+    }
+
+    fn test_processor() -> ImageProcessor {
+        ImageProcessor::new(ImageProcessorConfig {
+            resize: ImageResize::PixelBounds {
+                min_pixels: 28 * 28,
+                max_pixels: 256 * 256,
+            },
+            resampling: Resampling::Bicubic,
+            patch: 14,
+            merge: 2,
+            frames: 1,
+            mean: [0.5, 0.5, 0.5],
+            std: [0.5, 0.5, 0.5],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn prepare_rejects_oversized_image_headers_before_decoding() {
+        let processor = test_processor();
+
+        let over_dimension = png_header(MAX_IMAGE_DIMENSION + 1, 16, 2);
+        let err = processor.prepare(&[over_dimension]).unwrap_err();
+        assert!(
+            err.contains("image decode setup failed"),
+            "unexpected error for oversized dimension header: {err}"
+        );
+
+        let over_capacity = png_header(20_000, 20_000, 0);
+        let err = processor.prepare(&[over_capacity]).unwrap_err();
+        assert_eq!(err, "decoded image exceeds capacity");
+
+        let over_aspect = png_header(10_000, 10, 2);
+        let err = processor.prepare(&[over_aspect]).unwrap_err();
+        assert_eq!(err, "image aspect ratio exceeds processor limit");
+    }
+
+    #[test]
+    fn padded_canvas_rejects_overflowing_arithmetic() {
+        let half_bits = 1usize << (usize::BITS / 2);
+        assert!(padded_canvas(16, 16, usize::MAX, 16, 64).is_err());
+        assert!(padded_canvas(usize::MAX, 16, 16, 16, 64).is_err());
+        assert!(padded_canvas(half_bits, half_bits, 16, 16, 64).is_err());
+    }
 }

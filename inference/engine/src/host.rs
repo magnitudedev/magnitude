@@ -313,7 +313,7 @@ impl HostArtifacts {
         let templates = gguf_templates(package.templates(), package.tokenizer())
             .map_err(|detail| ResolveError::Unsupported(UnsupportedModel::chat_template(detail)))?;
         let inspection = templates
-            .inspect()
+            .inspect_cached()
             .map_err(|detail| ResolveError::Unsupported(UnsupportedModel::chat_template(detail)))?;
         let media = media_processor(&definition).map_err(unsupported)?;
         let input_adapter = family

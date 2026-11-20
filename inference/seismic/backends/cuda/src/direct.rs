@@ -6,6 +6,7 @@ use crate::buffer::Buffer;
 use crate::driver::{self, DriverError, Event, Handle, JitError, Module};
 use crate::executor::Device;
 use crate::nvrtc::NvrtcError;
+use seismic_compiler::direct_launch::{DirectLaunchRequest, LaunchGrid, ValidatedLaunch};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::graph_cost::GraphCensus;
 use seismic_native_target::{NativeCompilationError, ProgramStatistic, StatisticValue};
@@ -114,13 +115,14 @@ impl DirectModule {
         kernels: &[&str],
     ) -> Result<Self, NativeCompilationError> {
         let context = device.context();
-        let first = kernels.first().ok_or_else(|| {
-            NativeCompilationError::MalformedToolchainOutput("native module has no kernels".into())
-        })?;
-        let (module, _) = driver::load_module(context, image, first).map_err(jit_error)?;
-        let mut functions = Vec::with_capacity(kernels.len());
-        for kernel in kernels {
-            let raw = driver::module_function(&module, kernel).map_err(jit_error)?;
+        if kernels.is_empty() {
+            return Err(NativeCompilationError::MalformedToolchainOutput(
+                "native module has no kernels".into(),
+            ));
+        }
+        let (module, raw_functions) = driver::load_module(context, image, kernels).map_err(jit_error)?;
+        let mut functions = Vec::with_capacity(raw_functions.len());
+        for raw in raw_functions {
             let attribute = |key| {
                 driver::function_attribute(context, raw, key)
                     .map_err(driver_failure)
@@ -285,13 +287,46 @@ impl FormedLaunch {
     /// grid is formed as one block, which the driver requires of any node.
     fn form(device: &Device, launch: &DirectLaunch<'_>, enabled: bool) -> Result<Self, ExecutionError> {
         let function = &launch.module.functions[launch.function];
-        let threads = launch.block.iter().product::<u64>();
-        if threads > function.max_threads {
-            return Err(ExecutionError::SubmissionFailed(format!(
-                "native launch requests {threads} threads per block, but the function allows {}",
-                function.max_threads
-            )));
-        }
+        let grid = match enabled {
+            true => launch.grid,
+            false => launch.grid.map(|blocks| blocks.max(1)),
+        };
+        let block = match enabled {
+            true => launch.block,
+            false => launch.block.map(|threads| threads.max(1)),
+        };
+        // The prefix declares at least one word, so an entry without words
+        // still passes one zeroed word.
+        let words_bytes = if launch.words.is_empty() {
+            8u64
+        } else {
+            launch.words.len() as u64
+        };
+        let param_bytes = (launch.buffers.len() as u64)
+            .checked_add(1)
+            .and_then(|pointers| pointers.checked_mul(8))
+            .and_then(|pointer_bytes| pointer_bytes.checked_add(words_bytes))
+            .ok_or_else(|| {
+                ExecutionError::SubmissionFailed("native launch parameter size overflowed".into())
+            })?;
+        let ValidatedLaunch::Active {
+            grid: Some(grid),
+            group: Some(block),
+        } = device
+            .launch_contract(function.max_threads)
+            .validate(&DirectLaunchRequest {
+                buffer_slots: 0,
+                grid: LaunchGrid::Direct(grid),
+                group: Some(block),
+                static_shared_bytes: function.static_shared,
+                dynamic_shared_bytes: launch.shared_bytes,
+                param_bytes,
+            })?
+        else {
+            return Err(ExecutionError::SubmissionFailed(
+                "native launch has an empty grid or block".into(),
+            ));
+        };
         function.admit_shared(device, launch.shared_bytes)?;
         let mut pointers = Vec::with_capacity(launch.buffers.len() + 1);
         pointers.extend(
@@ -305,36 +340,19 @@ impl FormedLaunch {
                 .scalar_results
                 .map_or(0, |(buffer, offset)| buffer.pointer() + offset),
         );
-        // The prefix declares at least one word, so an entry without words
-        // still passes one zeroed word.
         let words = if launch.words.is_empty() {
             vec![0; 8]
         } else {
             launch.words.to_vec()
         };
-        let dimension = |value: u64| {
-            u32::try_from(value).map_err(|_| {
-                ExecutionError::SubmissionFailed("native launch geometry exceeds driver ABI".into())
-            })
-        };
-        let axes = |values: [u64; 3]| -> Result<[u32; 3], ExecutionError> {
-            Ok([
-                dimension(values[0])?,
-                dimension(values[1])?,
-                dimension(values[2])?,
-            ])
-        };
+        let shared_bytes = u32::try_from(launch.shared_bytes).map_err(|_| {
+            ExecutionError::SubmissionFailed("native launch geometry exceeds driver ABI".into())
+        })?;
         Ok(Self {
             function: function.raw,
-            grid: axes(match enabled {
-                true => launch.grid,
-                false => launch.grid.map(|blocks| blocks.max(1)),
-            })?,
-            block: axes(match enabled {
-                true => launch.block,
-                false => launch.block.map(|threads| threads.max(1)),
-            })?,
-            shared_bytes: dimension(launch.shared_bytes)?,
+            grid,
+            block,
+            shared_bytes,
             pointers,
             words,
             edge: launch.module.edge,
@@ -435,6 +453,10 @@ impl DirectGraphBuilder {
         self.word(driver::WordOperation::Wait, word, value, None)
     }
 
+    fn driver_error(&self, required: u64, error: driver::DriverError) -> ExecutionError {
+        graph_driver_error(required, || self.device.refusal_reading(), error)
+    }
+
     /// Add a write after the nodes added so far: `word` becomes `value` once
     /// they complete, their writes visible first (as
     /// [`DirectBatch::write_word`]), followed by an event-record node of its
@@ -443,16 +465,16 @@ impl DirectGraphBuilder {
     /// ([`DirectGraph::bind_word`]). It counts as two launches of the
     /// graph's memory.
     pub fn write_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
-        let written = Event::new(self.device.context()).map_err(submission)?;
+        let written = Event::new(self.device.context()).map_err(|error| self.driver_error(0, error))?;
         self.word(driver::WordOperation::Write, word, value, Some(written))
     }
 
     fn word(&mut self, operation: driver::WordOperation, word: &HostWord, value: u32, written: Option<Event>) -> Result<(), ExecutionError> {
         let address = word.device_address();
-        self.graph.push_word(operation, address, value).map_err(submission)?;
+        self.graph.push_word(operation, address, value).map_err(|error| self.driver_error(0, error))?;
         self.count_launch()?;
         if let Some(written) = &written {
-            self.graph.push_event(written).map_err(submission)?;
+            self.graph.push_event(written).map_err(|error| self.driver_error(0, error))?;
             self.count_launch()?;
         }
         let written = written.map(|written| (written, word.wake.clone()));
@@ -467,9 +489,9 @@ impl DirectGraphBuilder {
     pub fn mark(&mut self) -> Result<(), ExecutionError> {
         let rest = match &self.rest {
             Some(rest) => rest.clone(),
-            None => Arc::new(Event::stamp(self.device.context()).map_err(submission)?),
+            None => Arc::new(Event::stamp(self.device.context()).map_err(|error| self.driver_error(0, error))?),
         };
-        self.graph.push_mark(&rest).map_err(submission)?;
+        self.graph.push_mark(&rest).map_err(|error| self.driver_error(0, error))?;
         self.rest = Some(rest);
         self.count_launch()
     }
@@ -485,7 +507,7 @@ impl DirectGraphBuilder {
         let mut formed = FormedLaunch::form(&self.device, launch, enabled)?;
         let mut parameters = formed.parameters();
         let node = formed.node(&mut parameters);
-        self.graph.push_kernel(&node, formed.edge, after).map_err(submission)?;
+        self.graph.push_kernel(&node, formed.edge, after).map_err(|error| self.driver_error(0, error))?;
         self.formed.push(formed);
         self.enabled.push(enabled);
         // Its memory follows no parameter byte
@@ -507,19 +529,20 @@ impl DirectGraphBuilder {
         // The driver refusing memory for the graph is a capacity refusal of
         // what its census takes; any other failure the submission's.
         let required = crate::graph_cost::census_bytes(&self.device, census);
-        let refused = |error: driver::DriverError| match error.code {
-            crate::executor::OUT_OF_MEMORY => ExecutionError::DeviceRefused { required, reading: self.device.refusal_reading() },
-            _ => submission(error),
-        };
+        let refused = |error: driver::DriverError| self.driver_error(required, error);
         // The driver's instantiation and the record of what it took are one
         // change.
         let change = self.device.graphs().entry().change();
         let exec = self.graph.instantiate().map_err(refused)?;
         for (node, _) in self.enabled.iter().enumerate().filter(|(_, enabled)| !**enabled) {
-            exec.set_enabled(self.graph.node(node), false).map_err(submission)?;
+            exec.set_enabled(self.graph.node(node), false).map_err(refused)?;
         }
         exec.upload(self.device.stream()).map_err(refused)?;
-        let launched = Event::new(self.device.context()).map_err(submission)?;
+        // `cuGraphUpload` enqueues asynchronous work on the device stream;
+        // finish it before returning so back-to-back graph recordings
+        // (`cuda::record_run`) still observe an idle device.
+        self.device.stream().synchronize().map_err(refused)?;
+        let launched = Event::new(self.device.context()).map_err(refused)?;
         self.device.graphs().instantiated(&change, &self.device, census)?;
         Ok(DirectGraph {
             device: self.device.clone(),
@@ -532,7 +555,6 @@ impl DirectGraphBuilder {
             enabled: self.enabled,
             words: self.words,
             census,
-            scope: seismic_memory::entry::DropScope::default(),
         })
     }
 }
@@ -564,9 +586,6 @@ pub struct DirectGraph {
     census: GraphCensus,
     /// The device whose graph pool holds its driver memory.
     device: Device,
-    /// The change its drop runs in, which ends after every field has
-    /// dropped ([`DropScope`]): last.
-    scope: seismic_memory::entry::DropScope,
 }
 
 impl DirectGraph {
@@ -681,8 +700,7 @@ impl DirectGraph {
 
 impl Drop for DirectGraph {
     fn drop(&mut self) {
-        let change = self.scope.begin(self.device.graphs().entry());
-        self.device.graphs().dropped(change, &self.device, self.census);
+        self.device.graphs().dropped(self.census);
     }
 }
 
@@ -1205,6 +1223,20 @@ impl DirectSubmission {
     }
 }
 
+fn graph_driver_error(
+    required: u64,
+    reading: impl FnOnce() -> seismic_compiler::errors::RefusalReading,
+    error: driver::DriverError,
+) -> ExecutionError {
+    if error.is_device_loss() {
+        ExecutionError::DeviceLost(error.to_string())
+    } else if error.code == crate::executor::OUT_OF_MEMORY {
+        ExecutionError::DeviceRefused { required, reading: reading() }
+    } else {
+        submission(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,5 +1364,47 @@ extern "C" __global__ void mark(unsigned int* out, Words words, unsigned int* sc
         done.store(true, Ordering::Release);
         drop(holder);
         assert!(waiter.join().unwrap(), "waiter should observe done == true");
+    }
+
+    #[test]
+    fn graph_driver_error_classifies_oom_device_loss_and_other() {
+        use seismic_compiler::errors::{ExecutionError, RefusalReading};
+
+        let oom = super::graph_driver_error(
+            128,
+            || RefusalReading::Host,
+            crate::driver::DriverError {
+                operation: "graph kernel node",
+                code: crate::executor::OUT_OF_MEMORY,
+                description: "out of memory".into(),
+            },
+        );
+        assert!(oom.capacity_refusal().is_some(), "{oom:?}");
+        assert!(matches!(
+            oom,
+            ExecutionError::DeviceRefused { required: 128, reading: RefusalReading::Host }
+        ));
+
+        let lost = super::graph_driver_error(
+            0,
+            || RefusalReading::Host,
+            crate::driver::DriverError {
+                operation: "graph kernel node",
+                code: 700,
+                description: "illegal address".into(),
+            },
+        );
+        assert!(matches!(lost, ExecutionError::DeviceLost(_)));
+
+        let other = super::graph_driver_error(
+            0,
+            || RefusalReading::Host,
+            crate::driver::DriverError {
+                operation: "graph kernel node",
+                code: 1,
+                description: "invalid value".into(),
+            },
+        );
+        assert!(matches!(other, ExecutionError::SubmissionFailed(_)));
     }
 }

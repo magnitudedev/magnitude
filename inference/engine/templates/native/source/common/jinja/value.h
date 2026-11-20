@@ -101,7 +101,7 @@ using func_hptr = value(const func_args &);
 using func_handler = std::function<func_hptr>;
 using func_builtins = std::map<std::string, func_handler>;
 
-enum value_compare_op { eq, ge, gt, lt, ne };
+enum value_compare_op { eq, ge, gt, le, lt, ne };
 bool value_compare(const value & a, const value & b, value_compare_op op);
 
 struct value_t {
@@ -156,6 +156,7 @@ struct value_t {
     virtual bool is_none() const { return false; }
     virtual bool is_undefined() const { return false; }
     virtual const func_builtins & get_builtins() const { throw_type_error("has no builtins"); }
+    virtual const func_builtins & get_filters() const { return get_builtins(); }
 
     virtual bool has_key(const value &) { throw_type_error("is not an object value"); }
     virtual void insert(const value & /* key */, const value & /* val */) { throw_type_error("is not an object value"); }
@@ -194,7 +195,7 @@ protected:
 
 const func_builtins & global_builtins();
 
-std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ");
+std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ", bool sort_keys = false);
 
 // Note: only used for debugging purposes
 std::string value_to_string_repr(const value & val);
@@ -564,6 +565,9 @@ struct value_object_t : public value_t {
         }
     }
     void erase(const value & key) {
+        if (is_immutable()) {
+            throw std::runtime_error("Attempting to modify immutable type");
+        }
         if (unordered.erase(key) == 0) {
             return;
         }
@@ -621,6 +625,7 @@ struct value_object_t : public value_t {
         return it->second;
     }
     virtual const func_builtins & get_builtins() const override;
+    virtual const func_builtins & get_filters() const override;
     virtual bool is_hashable() const override {
         if (std::all_of(val_obj.begin(), val_obj.end(), [&](auto & pair) -> bool {
             const auto & val = pair.second;

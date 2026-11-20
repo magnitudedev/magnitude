@@ -230,7 +230,7 @@ impl StreamedLayers {
 
     /// The period of the widest layer's `E` steps of `rows` rows holding
     /// `held`, aggregated into distinct step patterns in order first seen with
-    /// their step counts: its layers' loads ([`layer_period`]) as runs of
+    /// their step counts: its layers' loads ([`fill_layer_period`]) as runs of
     /// consecutive layers whose inputs are one by construction, their misses
     /// and distinct experts `live`'s where it read and the generic model's
     /// elsewhere ([`LiveDecode::shares`], [`LiveDecode::routed`]).
@@ -241,19 +241,25 @@ impl StreamedLayers {
     /// across groups identifies each distinct step exactly.
     fn period(&self, live: Option<&LiveDecode>, held: HeldSlots, rows: f64) -> Vec<(Vec<LayerRun>, usize)> {
         let period = self.runs.iter().map(|run| run.experts).max().expect("a streamed plan streams a layer") as usize;
-        // Each run of identical inputs: its loads over the period and its
-        // layers.
-        let mut groups = Vec::<(Vec<LayerLoad>, usize)>::new();
+        let width = match live {
+            None => self.runs.len(),
+            Some(_) => self.layers(),
+        };
+        let mut flat = vec![LayerRun { load: LayerLoad::default(), layers: 0 }; period * width];
+        let mut col = 0;
         let mut layer = 0;
         for run in &self.runs {
             let model = |slots: usize| generic_shares(&run.model, slots as f64 / run.experts as f64);
-            let loads = |shares: &dyn Fn(usize) -> Shares, routed: f64| layer_period(shares, routed, self.choices, held, rows, period);
             match live {
-                None => groups.push((loads(&model, run.model.routed(rows)), run.layers)),
+                None => {
+                    fill_layer_period(&model, run.model.routed(rows), self.choices, held, rows, period, run.layers, &mut flat, width, col);
+                    col += 1;
+                }
                 Some(live) => {
                     for at in layer..layer + run.layers {
                         let routed = live.routed(at).unwrap_or_else(|| run.model.routed(rows));
-                        groups.push((loads(&|slots| live.shares(at, slots, model(slots)), routed), 1));
+                        fill_layer_period(&|slots| live.shares(at, slots, model(slots)), routed, self.choices, held, rows, period, 1, &mut flat, width, col);
+                        col += 1;
                     }
                 }
             }
@@ -262,10 +268,11 @@ impl StreamedLayers {
         const LINEAR_LIMIT: usize = 8;
         let mut patterns = Vec::<(Vec<LayerRun>, usize)>::new();
         let mut seen = HashMap::<Vec<(u64, u64)>, usize>::new();
-        let mut key = Vec::<(u64, u64)>::with_capacity(groups.len());
+        let mut key = Vec::<(u64, u64)>::with_capacity(width);
         for step in 0..period {
+            let row = &flat[step * width..(step + 1) * width];
             key.clear();
-            key.extend(groups.iter().map(|(loads, _)| (loads[step].tier, loads[step].file)));
+            key.extend(row.iter().map(|run| (run.load.tier, run.load.file)));
             if seen.is_empty() {
                 if let Some((_, count)) = patterns.iter_mut().find(|(runs, _)| {
                     runs.iter().zip(&key).all(|(run, &(tier, file))| run.load.tier == tier && run.load.file == file)
@@ -273,8 +280,7 @@ impl StreamedLayers {
                     *count += 1;
                     continue;
                 }
-                let runs = groups.iter().map(|(loads, layers)| LayerRun { load: loads[step], layers: *layers }).collect();
-                patterns.push((runs, 1));
+                patterns.push((row.to_vec(), 1));
                 if patterns.len() > LINEAR_LIMIT {
                     seen.reserve(patterns.len());
                     for (at, (runs, _)) in patterns.iter().enumerate() {
@@ -284,9 +290,8 @@ impl StreamedLayers {
             } else if let Some(&at) = seen.get(key.as_slice()) {
                 patterns[at].1 += 1;
             } else {
-                let runs = groups.iter().map(|(loads, layers)| LayerRun { load: loads[step], layers: *layers }).collect();
                 seen.insert(key.clone(), patterns.len());
-                patterns.push((runs, 1));
+                patterns.push((row.to_vec(), 1));
             }
         }
         patterns
@@ -298,6 +303,30 @@ impl StreamedLayers {
     /// cover them; none where `held` makes the bank whole.
     pub(crate) fn pass_reads(&self, read: ReadLine, held: HeldSlots, rows: f64) -> f64 {
         self.step_seconds(None, read, held, rows, FormSeconds { resident: 0., streamed: 0. }).total_seconds
+    }
+
+    /// The free path records needed for moves of `bytes` stored bytes along
+    /// `read`, the bank holding `held` with `hint_leads` lookahead layers
+    /// across `num_layers` routed layers and decode compute time `compute`.
+    /// Single owner shared by [`crate::BankPrices::paths`] and assessment's
+    /// path pricer.
+    pub fn path_records(
+        &self,
+        read: ReadLine,
+        compute: FormSeconds,
+        bytes: u64,
+        held: HeldSlots,
+        hint_leads: u64,
+        num_layers: u64,
+    ) -> Option<crate::PathRecords> {
+        let step = self.step_seconds(None, read, held, 1.0, compute).total_seconds;
+        let reads = self.pass_reads(read, held, 1.0);
+        let queue = if num_layers == 0 {
+            0.0
+        } else {
+            hint_leads as f64 * (reads / num_layers as f64)
+        };
+        crate::PathRecords::of(read, bytes, queue, crate::PathRecords::release(step, reads))
     }
 }
 
@@ -395,26 +424,52 @@ fn generic_shares(model: &MissModel, share: f64) -> Shares {
     Shares { misses: model.misses(share), requests: model.requests(share) }
 }
 
-/// A layer routing `routed` distinct experts a step and `choices` a row, its
-/// loads over a period of `period` steps of `rows` rows holding `held`: its misses and
+/// Fill column `col` of row-major `flat` (`period × width`) with a layer's
+/// loads over `period` steps of `rows` rows holding `held`: its misses and
 /// requests as `shares` give them at a bank of some slots, as whole counts
 /// over the period, the requests spread as evenly over it as integers allow
 /// and the misses as evenly over the requests, the file's among them as evenly
 /// again.
-fn layer_period(shares: &dyn Fn(usize) -> Shares, routed: f64, choices: u64, held: HeldSlots, rows: f64, period: usize) -> Vec<LayerLoad> {
+#[allow(clippy::too_many_arguments)]
+fn fill_layer_period(
+    shares: &dyn Fn(usize) -> Shares,
+    routed: f64,
+    choices: u64,
+    held: HeldSlots,
+    rows: f64,
+    period: usize,
+    layers: usize,
+    flat: &mut [LayerRun],
+    width: usize,
+    col: usize,
+) {
     let misses = |slots: usize| (shares(slots).misses * routed * period as f64).round() as usize;
     let total = misses(held.slots);
     let filed = misses(held.slots.max(held.host)).min(total);
     let missing = 1. - (1. - shares(held.slots).requests).powf(rows);
     let requests = ((missing * period as f64).round() as usize).clamp(total.min(1), total.min(period));
     let quiet = LayerLoad { routed, rows: choices as f64 * rows / routed, ..LayerLoad::default() };
-    let mut loads = vec![quiet; period];
+    let quiet_run = LayerRun { load: quiet, layers };
+    for step in 0..period {
+        flat[step * width + col] = quiet_run;
+    }
     for request in 0..requests {
         let (first, last) = (request * total / requests, (request + 1) * total / requests);
         let file = last * filed / total - first * filed / total;
-        loads[request * period / requests] = LayerLoad { tier: (last - first - file) as u64, file: file as u64, ..quiet };
+        flat[(request * period / requests) * width + col] = LayerRun {
+            load: LayerLoad { tier: (last - first - file) as u64, file: file as u64, ..quiet },
+            layers,
+        };
     }
-    loads
+}
+
+/// A layer routing `routed` distinct experts a step and `choices` a row, its
+/// loads over a period of `period` steps of `rows` rows holding `held`.
+#[cfg(test)]
+fn layer_period(shares: &dyn Fn(usize) -> Shares, routed: f64, choices: u64, held: HeldSlots, rows: f64, period: usize) -> Vec<LayerLoad> {
+    let mut flat = vec![LayerRun { load: LayerLoad::default(), layers: 1 }; period];
+    fill_layer_period(shares, routed, choices, held, rows, period, 1, &mut flat, 1, 0);
+    flat.into_iter().map(|run| run.load).collect()
 }
 
 /// A streamed decode step as the one cost function prices it

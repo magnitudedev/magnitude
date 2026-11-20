@@ -289,6 +289,25 @@ struct noop_statement : public statement {
     }
 };
 
+// evaluate an expression for its side effects without emitting output (`{% do ... %}`)
+struct do_statement : public statement {
+    statement_ptr expr;
+
+    explicit do_statement(statement_ptr && expr) : expr(std::move(expr)) {
+        chk_type<expression>(this->expr);
+    }
+    std::string type() const override { return "Do"; }
+    value execute_impl(context & ctx) override {
+        expr->execute(ctx);
+        return mk_val<value_undefined>();
+    }
+    void visit(context & ctx) override {
+        ctx.visitor(false, this, {
+            {"expr", {expr.get()}}
+        });
+    }
+};
+
 struct set_statement : public statement {
     statement_ptr assignee;
     statement_ptr val;

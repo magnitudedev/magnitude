@@ -9392,7 +9392,7 @@
             "items": {
               "$ref": "#/components/schemas/ModelInstance"
             },
-            "description": "Instances in lifecycle-update order, oldest first. The final matching\ninstance is therefore the current attempt for a model."
+            "description": "The latest terminal instance of each model in lifecycle-update order,\noldest first, followed by the current instance when present."
           }
         },
         "additionalProperties": false

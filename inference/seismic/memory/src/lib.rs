@@ -9,13 +9,54 @@
 pub mod entry;
 pub mod placement;
 pub mod pool;
+pub use pool::SlabFill;
 
 /// Alignment of the base of every workspace buffer placed in a graph arena.
 pub const BUFFER_ALIGNMENT: u64 = 256;
 
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+
+thread_local! {
+    /// Nesting depth of no-blocking-allocation scopes on this thread.
+    static NO_BLOCKING_ALLOC_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII guard marking a scope on the current thread where blocking memory
+/// allocations, frees, driver locks, and pool locks are forbidden.
+pub struct NoBlockingAllocationGuard {
+    _not_send: PhantomData<*const ()>,
+}
+
+/// Enter a no-blocking-allocation scope on this thread.
+pub fn enter_no_blocking_allocation() -> NoBlockingAllocationGuard {
+    NO_BLOCKING_ALLOC_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    NoBlockingAllocationGuard { _not_send: PhantomData }
+}
+
+impl Drop for NoBlockingAllocationGuard {
+    fn drop(&mut self) {
+        NO_BLOCKING_ALLOC_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "NoBlockingAllocationGuard depth underflow");
+            depth.set(current - 1);
+        });
+    }
+}
+
+/// Assert that the current thread is not inside a no-blocking-allocation
+/// scope.
+#[track_caller]
+pub fn assert_blocking_allocation_allowed(operation: &str) {
+    let depth = NO_BLOCKING_ALLOC_DEPTH.with(Cell::get);
+    assert!(
+        depth == 0,
+        "invariant violated: {operation} called inside a no-blocking-allocation scope"
+    );
+}
 
 /// Why a host allocation could not be made: the only real failure of a
 /// host buffer.
@@ -313,7 +354,7 @@ fn fault_in(start: NonNull<u8>, bytes: usize, page: usize) {
         base % page == 0 && bytes % page == 0,
         "invariant violated: a block of {bytes} bytes at {base:#x} is not whole {page}-byte pages"
     );
-    parallel(bytes / page, |first, end| {
+    parallel(bytes / page, bytes, |first, end| {
         for index in first..end {
             // SAFETY: within the fresh block, which this call alone touches,
             // each part on its own thread; zero is what it reads.
@@ -322,20 +363,40 @@ fn fault_in(start: NonNull<u8>, bytes: usize, page: usize) {
     });
 }
 
-/// Run `work` over `[0, items)` in contiguous parts, one on each of the
-/// process's threads (`seismic_threads::share`, at most one an item): on
-/// the calling thread where that is one.
-fn parallel(items: usize, work: impl Fn(usize, usize) + Sync) {
-    let threads = seismic_threads::share().get().min(items).max(1);
+/// Minimum bytes per thread when faulting or collapsing a block in parallel:
+/// blocks under twice this size (4 MiB) run inline on the calling thread with
+/// zero thread-spawn overhead, and larger blocks scale at most one thread per
+/// 2 MiB up to `seismic_threads::share()`.
+const MIN_PARALLEL_BYTES_PER_THREAD: usize = 2 << 20;
+
+/// Run `work` over `[0, items)` covering `bytes` in contiguous parts across at
+/// most `seismic_threads::share()` threads (at least
+/// [`MIN_PARALLEL_BYTES_PER_THREAD`] per thread, and at most one thread per
+/// item): inline on the calling thread when one thread suffices, with the
+/// calling thread running the first slice and falling back inline for any
+/// remaining slices if the host refuses to start a thread.
+fn parallel(items: usize, bytes: usize, work: impl Fn(usize, usize) + Sync) {
+    let threads = seismic_threads::share()
+        .get()
+        .min(items)
+        .min(bytes / MIN_PARALLEL_BYTES_PER_THREAD)
+        .max(1);
     if threads == 1 {
         return work(0, items);
     }
     let part = items.div_ceil(threads);
     std::thread::scope(|scope| {
-        for first in (0..items).step_by(part.max(1)) {
+        let mut first = part;
+        while first < items {
+            let end = (first + part).min(items);
             let work = &work;
-            seismic_threads::spawn_scoped(scope, "memory-split", move || work(first, (first + part).min(items))).expect("invariant violated: the host starts a thread");
+            if seismic_threads::spawn_scoped(scope, "memory-split", move || work(first, end)).is_err() {
+                work(first, items);
+                break;
+            }
+            first = end;
         }
+        work(0, part);
     });
 }
 
@@ -450,7 +511,7 @@ mod host {
     pub(super) fn collapse(start: *mut u8, bytes: usize, large: usize) -> usize {
         let base = start as usize;
         let collapsed = std::sync::atomic::AtomicUsize::new(0);
-        super::parallel(bytes / large, |first, end| {
+        super::parallel(bytes / large, bytes, |first, end| {
             for index in first..end {
                 let at = (base + index * large) as *mut libc::c_void;
                 if unsafe { libc::madvise(at, large, libc::MADV_COLLAPSE) } == 0 {

@@ -161,30 +161,70 @@ pub(super) fn block_binding_storage(bindings: &[GraphCounts]) -> Result<HostHeap
         .ok_or_else(|| "target binding storage overflows".to_owned())
 }
 
-/// The planned graphs accumulated: each adds its layout's plan heap, and a
-/// block graph the vectors its prepared graph owns.
-#[derive(Default)]
+/// The planned graphs accumulated: each adds its layout's plan heap, each
+/// distinct layout adds its shared topology heap once, and a block graph adds
+/// the vectors its prepared graph owns.
+#[derive(Clone, Default)]
 pub(super) struct PlannedHeap {
     pub(super) graphs: usize,
     pub(super) plans: HostHeap,
     pub(super) owned: HostHeap,
+    seen_layouts: super::certify::FxHashSet<u64>,
 }
 
 impl PlannedHeap {
     pub(super) fn seal(&mut self, layout: &impl Certified) -> Result<(), String> {
-        self.graphs += 1;
+        self.seal_many(layout, 1)
+    }
+
+    pub(super) fn seal_many(&mut self, layout: &impl Certified, count: u64) -> Result<(), String> {
+        if count == 0 {
+            return Ok(());
+        }
+        let n = usize::try_from(count).map_err(|_| "planned sealed graph count overflows")?;
+        self.graphs = self
+            .graphs
+            .checked_add(n)
+            .ok_or("planned sealed graph count overflows")?;
         self.plans = self
             .plans
-            .plus(layout.plan_heap())
+            .plus(
+                layout
+                    .plan_heap()
+                    .times(count)
+                    .ok_or("planned sealed graph heap overflows")?,
+            )
             .ok_or("planned sealed graph heap overflows")?;
+        if self.seen_layouts.insert(layout.layout_identity()) {
+            self.plans = self
+                .plans
+                .plus(layout.topology_heap())
+                .ok_or("planned sealed graph heap overflows")?;
+        }
         Ok(())
     }
 
     pub(super) fn seal_block<L: Certified>(&mut self, certified: &CertifiedBlockGraph<L>) -> Result<(), String> {
-        self.seal(&certified.layout)?;
+        self.seal_block_many(certified, 1)
+    }
+
+    pub(super) fn seal_block_many<L: Certified>(
+        &mut self,
+        certified: &CertifiedBlockGraph<L>,
+        count: u64,
+    ) -> Result<(), String> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.seal_many(&certified.layout, count)?;
         self.owned = self
             .owned
-            .plus(certified.owned)
+            .plus(
+                certified
+                    .owned
+                    .times(count)
+                    .ok_or("planned prepared graph heap overflows")?,
+            )
             .ok_or("planned prepared graph heap overflows")?;
         Ok(())
     }
@@ -196,6 +236,7 @@ pub(super) struct SealedHeap {
     pub(super) heap: HostHeap,
     /// The vectors the prepared block graphs own.
     pub(super) owned: HostHeap,
+    seen_layouts: super::certify::FxHashSet<u64>,
 }
 
 impl SealedHeap {
@@ -246,6 +287,23 @@ impl SealedHeap {
                 planned.bytes,
                 planned.allocations
             ));
+        }
+        if self.seen_layouts.insert(layout.identity()) {
+            let (held_topo, planned_topo) = (plan.topology_heap(), layout.topology_heap());
+            self.heap = self
+                .heap
+                .plus(held_topo)
+                .ok_or("sealed graph topology heap overflows")?;
+            if held_topo != planned_topo {
+                return Err(format!(
+                    "{} holds {} topology host bytes in {} allocations; its layout planned {} in {}",
+                    graph(),
+                    held_topo.bytes,
+                    held_topo.allocations,
+                    planned_topo.bytes,
+                    planned_topo.allocations
+                ));
+            }
         }
         Ok(())
     }

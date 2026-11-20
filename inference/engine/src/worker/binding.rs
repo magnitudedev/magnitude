@@ -2,7 +2,7 @@
 //! constraint plans cross the host/worker boundary as descriptions; the
 //! worker checks they were prepared for its tokenizer and instantiates the
 //! grammar matcher here.
-use magnitude_artifacts::InputLayout;
+use magnitude_artifacts::{InputLayout, PromptCoordinates};
 use magnitude_chat::{ByteBpeTokenizer, ConstraintPlan, PieceKind};
 use magnitude_generation::{Constraint, GenerationSeed, Options, TokenId};
 use magnitude_grammar::{CacheLimits, Vocabulary};
@@ -40,6 +40,7 @@ impl GenerationBinding {
         options: Options,
         tokens: &[TokenId],
         layout: &InputLayout,
+        coordinates: PromptCoordinates,
     ) -> Result<GenerationSeed, String> {
         let tokenizer = &self.tokenizer;
         if options.vocabulary != self.vocabulary.projection()
@@ -70,6 +71,12 @@ impl GenerationBinding {
                 Ok(Box::new(bound))
             })
             .transpose()?;
-        GenerationSeed::new(tokens.to_vec(), layout.clone(), options, constraint)
+        GenerationSeed::with_coordinates(
+            tokens.to_vec(),
+            layout.clone(),
+            coordinates,
+            options,
+            constraint,
+        )
     }
 }

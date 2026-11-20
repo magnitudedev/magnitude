@@ -916,6 +916,7 @@ impl Allocation {
 impl Drop for Allocation {
     /// Storage is released only after every submitted device use finishes.
     fn drop(&mut self) {
+        seismic_memory::assert_blocking_allocation_allowed("driver::Allocation::drop");
         let uses = self
             .access_group()
             .state
@@ -1003,6 +1004,7 @@ pub(crate) fn buffer_storage<T: TargetFamily, E: NativeExecutor<T>>(
 }
 
 pub(crate) fn write_zeros(storage: &dyn Storage, start: u64, byte_len: u64) -> Result<(), ExecutionError> {
+    seismic_memory::assert_blocking_allocation_allowed("driver::write_zeros");
     const CHUNK: usize = 1 << 20;
     let zeros = vec![0u8; CHUNK.min(usize::try_from(byte_len).unwrap_or(CHUNK))];
     let mut offset = 0u64;

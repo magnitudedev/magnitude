@@ -26,34 +26,6 @@ use magnitude_family_contracts::{
 /// The GGUF architecture of an assistant drafter.
 pub const ASSISTANT_ARCHITECTURE: &str = "gemma4-assistant";
 
-/// Every `gemma4-assistant.` metadata key this family interprets.
-const METADATA_KEYS: &[&str] = &[
-    "block_count",
-    "context_length",
-    "embedding_length",
-    "embedding_length_out",
-    "embedding_length_per_layer_input",
-    "feed_forward_length",
-    "nextn_predict_layers",
-    "attention.head_count",
-    "attention.head_count_kv",
-    "attention.key_length",
-    "attention.value_length",
-    "attention.key_length_swa",
-    "attention.value_length_swa",
-    "attention.layer_norm_rms_epsilon",
-    "attention.sliding_window",
-    "attention.sliding_window_pattern",
-    "attention.shared_kv_layers",
-    "rope.freq_base",
-    "rope.freq_base_swa",
-    "rope.dimension_count",
-    "rope.dimension_count_swa",
-    "output.cluster_count",
-    "output.cluster_top_k",
-    "output.cluster_token_order",
-];
-
 /// The target layer an assistant layer of `kind` reads, counted back from
 /// the target's last layer.
 fn source_offset(kind: LayerKind) -> u64 {
@@ -91,7 +63,7 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
         ));
     }
     let decoder = &target.decoder;
-    let m = Metadata::new(draft, ASSISTANT_ARCHITECTURE, METADATA_KEYS)?;
+    let m = Metadata::new(draft, ASSISTANT_ARCHITECTURE);
     let layers = m.integer("block_count")?;
     if layers > draft.tensors.len() as u64 {
         return Err(invalid(
@@ -134,9 +106,7 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
     let policy = match m.optional_integer("output.cluster_count")? {
         None => {
             if m.optional_integer("output.cluster_top_k")?.is_some()
-                || draft
-                    .value("gemma4-assistant.output.cluster_token_order")
-                    .is_some()
+                || m.value("output.cluster_token_order").is_some()
             {
                 return Err(invalid("partial assistant cluster readout policy"));
             }
@@ -215,6 +185,7 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
             ],
         });
     }
+    m.finish()?;
     b.finish()?;
     let head = Head {
         blocks: vec![HeadBlock {

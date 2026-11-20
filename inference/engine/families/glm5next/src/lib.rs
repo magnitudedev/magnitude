@@ -65,51 +65,6 @@ use magnitude_family_contracts::{
 
 pub const FAMILY_ID: &str = "glm5-next";
 
-/// The keys a GLM-5.3-Flash file may state, each read below; every other `glm5-next.*` key is refused.
-const KEYS: &[&str] = &[
-    "block_count",
-    "context_length",
-    "embedding_length",
-    "vocab_size",
-    "feed_forward_length",
-    "leading_dense_block_count",
-    "nextn_predict_layers",
-    "attention.head_count",
-    "attention.head_count_kv",
-    "attention.layer_norm_rms_epsilon",
-    "attention.layer_norm_epsilon",
-    "attention.q_lora_rank",
-    "attention.kv_lora_rank",
-    "attention.key_length",
-    "attention.value_length",
-    "attention.key_length_mla",
-    "attention.value_length_mla",
-    "attention.indexer.head_count",
-    "attention.indexer.key_length",
-    "attention.indexer.top_k",
-    "attention.indexer.kpool",
-    "attention.indexer.kpool_select_tail",
-    "attention.indexer.types",
-    "rope.dimension_count",
-    "ssm.conv_kernel",
-    "kda.head_dim",
-    "kda.gate_lower_bound",
-    "hyper_connection.count",
-    "hyper_connection.sinkhorn_iterations",
-    "hyper_connection.epsilon",
-    "expert_count",
-    "expert_used_count",
-    "expert_group_count",
-    "expert_group_used_count",
-    "expert_gating_func",
-    "expert_feed_forward_length",
-    "expert_shared_count",
-    "expert_weights_scale",
-    "expert_weights_norm",
-    "swiglu_clamp_exp",
-    "swiglu_clamp_shexp",
-];
-
 /// llama.cpp's `expert_gating_func` for sigmoid scores
 /// (`LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`), the one GLM routes by.
 const SIGMOID: u64 = 2;
@@ -167,7 +122,7 @@ struct Geometry {
     experts: u64,
     selected: u64,
     expert_width: u64,
-    shared: u64,
+    shared_width: Option<u64>,
     normalization: RouteNormalization,
     route_scale: f64,
     /// Each block's routed and shared (and dense) expansion clamps.
@@ -211,6 +166,22 @@ impl Geometry {
                 .map(|limit| binders::glu_limit(&m, key, limit))
                 .collect()
         };
+        let expert_width = m.integer("expert_feed_forward_length")?;
+        let shared_width = match (
+            m.count("expert_shared_count")?,
+            m.optional_integer("expert_shared_feed_forward_length")?,
+        ) {
+            (0, None) => None,
+            (0, Some(_)) => {
+                let key = m.key("expert_shared_feed_forward_length");
+                return Err(FamilyError::metadata(
+                    &key,
+                    format!("{key} set with no shared experts"),
+                ));
+            }
+            (_, Some(width)) => Some(width),
+            (count, None) => Some(product(&[count, expert_width])?),
+        };
         Ok(Self {
             hidden: m.integer("embedding_length")?,
             heads: m.integer("attention.head_count")?,
@@ -232,8 +203,8 @@ impl Geometry {
             dense_width: m.integer("feed_forward_length")?,
             experts: m.integer("expert_count")?,
             selected: m.integer("expert_used_count")?,
-            expert_width: m.integer("expert_feed_forward_length")?,
-            shared: m.count("expert_shared_count")?,
+            expert_width,
+            shared_width,
             normalization: match m.flag("expert_weights_norm")? {
                 true => RouteNormalization::SumPlusEpsilon(binders::ROUTE_EPSILON),
                 false => RouteNormalization::None,
@@ -445,10 +416,7 @@ impl Geometry {
                 selected: self.selected,
                 intermediate: self.expert_width,
                 hidden: self.hidden,
-                shared: match self.shared {
-                    0 => None,
-                    count => Some(product(&[count, self.expert_width])?),
-                },
+                shared: self.shared_width,
                 score: ScoreFunction::Sigmoid,
                 media_bias: false,
                 normalization: self.normalization,
@@ -490,7 +458,7 @@ impl Layer<'_, '_> {
 
     fn weight(&mut self, name: &str, shape: &[u64]) -> Result<WeightDescriptor, FamilyError> {
         let name = self.name(name);
-        Ok(self.tensors.bind_scaled(&name, shape)?)
+        Ok(self.tensors.bind(&name, shape)?)
     }
 
     /// The stored rows of the matrix `name`.
@@ -502,12 +470,10 @@ impl Layer<'_, '_> {
     /// matrices' rows.
     fn merged(&mut self, name: &str, stored: &[u64]) -> Result<WeightDescriptor, FamilyError> {
         let name = self.name(name);
-        let &[matrices, _, _] = stored else { unreachable!("a stack is stored as three axes") };
-        let scale = self.tensors.companion_scale(&name, matrices)?;
         Ok(self.tensors.bind_transformed(
             &name,
             stored,
-            scale.into_iter().chain([ImportTransform::MergeLeadingAxes]).collect(),
+            vec![ImportTransform::MergeLeadingAxes],
         )?)
     }
 
@@ -549,12 +515,20 @@ fn mixers(m: &Metadata, blocks: u64, trunk: u64) -> Result<Vec<Mixer>, FamilyErr
             )),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let types = m.flags("attention.indexer.types", trunk)?;
-    if let Some(block) = types.iter().position(|own| !own) {
-        let key = m.key("attention.indexer.types");
+    if let Some(types) = m.optional_flags("attention.indexer.types", trunk)? {
+        if let Some(block) = types.iter().position(|own| !own) {
+            let key = m.key("attention.indexer.types");
+            return Err(FamilyError::metadata(
+                &key,
+                format!("{key}: block {block} reuses another layer's selection, which {FAMILY_ID} does not interpret"),
+            ));
+        }
+    }
+    if m.optional_flag("attention.indexer.index_share_mtp")? == Some(true) && trunk < blocks {
+        let key = m.key("attention.indexer.index_share_mtp");
         return Err(FamilyError::metadata(
             &key,
-            format!("{key}: block {block} reuses another layer's selection, which {FAMILY_ID} does not interpret"),
+            format!("{key}: MTP sharing an indexer is not interpreted by {FAMILY_ID}"),
         ));
     }
     Ok(mixers)
@@ -573,7 +547,7 @@ pub fn inspect_components(
     identity: PackageIdentity,
 ) -> Result<ModelDefinition, FamilyError> {
     recognize(directory)?;
-    let m = Metadata::new(directory, FAMILY_ID, KEYS)?;
+    let m = Metadata::new(directory, FAMILY_ID);
     let blocks = m.integer("block_count")?;
     // Each block requires distinct stored weights. Reject impossible counts
     // before allocating per-block vectors from untrusted metadata.
@@ -592,9 +566,9 @@ pub fn inspect_components(
     let hidden = geometry.hidden;
     let mut tensors = Tensors::new(directory);
     let vocabulary = m.integer("vocab_size")?;
-    let embedding = tensors.bind_scaled("token_embd.weight", &[vocabulary, hidden])?;
-    let output = tensors.bind_scaled("output.weight", &[vocabulary, hidden])?;
-    let output_norm = geometry.rms(tensors.bind_scaled("output_norm.weight", &[hidden])?);
+    let embedding = tensors.bind("token_embd.weight", &[vocabulary, hidden])?;
+    let output = tensors.bind("output.weight", &[vocabulary, hidden])?;
+    let output_norm = geometry.rms(tensors.bind("output_norm.weight", &[hidden])?);
     let trunk_blocks = (0..trunk)
         .map(|block| {
             let layer = &mut Layer {
@@ -691,6 +665,7 @@ pub fn inspect_components(
         vision,
         draft: None,
     };
+    m.finish()?;
     definition
         .validate()
         .map_err(|error| FamilyError::invalid(error.to_string()))?;

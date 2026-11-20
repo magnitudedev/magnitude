@@ -57,9 +57,9 @@ pub(crate) fn target_outline_differences(
     (differences, [outlining, laying], graphs)
 }
 
-/// What a certified graph charges: its storage and its plan and binding heaps.
-fn charge<L: Certified>(layout: &L) -> (NativeGraphStorageBytes, HostHeap, HostHeap) {
-    (layout.storage_bytes(), layout.plan_heap(), layout.bound_heap())
+/// What a certified graph charges: its storage and its plan, topology, and binding heaps.
+fn charge<L: Certified>(layout: &L) -> (NativeGraphStorageBytes, HostHeap, HostHeap, HostHeap) {
+    (layout.storage_bytes(), layout.plan_heap(), layout.topology_heap(), layout.bound_heap())
 }
 
 fn field<T: PartialEq + Debug>(differences: &mut Vec<String>, name: &str, outlined: T, laid: T) {
@@ -70,7 +70,7 @@ fn field<T: PartialEq + Debug>(differences: &mut Vec<String>, name: &str, outlin
 
 fn blocks<L: Certified>(
     blocks: &[BTreeMap<Topology, super::certify::CertifiedBlockGraph<L>>],
-) -> Vec<BTreeMap<Topology, ((NativeGraphStorageBytes, HostHeap, HostHeap), HostHeap)>> {
+) -> Vec<BTreeMap<Topology, ((NativeGraphStorageBytes, HostHeap, HostHeap, HostHeap), HostHeap)>> {
     blocks
         .iter()
         .map(|graphs| {
@@ -124,7 +124,7 @@ fn group_bytes<L>(certificate: &TargetFamilyCertificate<L>, limits: ResourceLimi
 
 fn entries<L: Certified>(
     entries: &BTreeMap<EntryTokens, L>,
-) -> Vec<(EntryTokens, (NativeGraphStorageBytes, HostHeap, HostHeap))> {
+) -> Vec<(EntryTokens, (NativeGraphStorageBytes, HostHeap, HostHeap, HostHeap))> {
     entries.iter().map(|(&source, layout)| (source, charge(layout))).collect()
 }
 

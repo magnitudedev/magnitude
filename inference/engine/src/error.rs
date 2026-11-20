@@ -263,8 +263,10 @@ impl fmt::Display for WeightBoundBelowWeights {
     }
 }
 
+pub use magnitude_executor::assessment::PendingPrices;
+
 /// `ResolvedEngineConfiguration::preview`: read-only planning.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PreviewError {
     Unsupported(UnsupportedModel),
     Device(DeviceSelectionError),
@@ -273,8 +275,11 @@ pub enum PreviewError {
     /// The weight bound is below the load's least weights. Never retryable.
     WeightBound(WeightBoundBelowWeights),
     /// The plan prices its holdings on this machine's standing figures, which the measurement
-    /// job has not stored yet ([`PlanOutcome::PricesPending`]). Retryable once it has.
-    PricesPending { reason: String },
+    /// job has not stored yet. Retryable once it has.
+    PricesPending {
+        reason: String,
+        pending: PendingPrices,
+    },
     Internal { reason: String },
 }
 
@@ -287,8 +292,25 @@ impl fmt::Display for PreviewError {
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
-            Self::PricesPending { reason } => write!(formatter, "the plan's prices are pending: {reason}"),
+            Self::PricesPending { reason, .. } => write!(formatter, "the plan's prices are pending: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal preview failure: {reason}"),
+        }
+    }
+}
+
+impl From<PreviewError> for LoadError {
+    fn from(error: PreviewError) -> Self {
+        match error {
+            PreviewError::Unsupported(error) => Self::Unsupported(error),
+            PreviewError::Device(error) => Self::Device(error),
+            PreviewError::MemoryObservationUnavailable { reason } => {
+                Self::MemoryObservationUnavailable { reason }
+            }
+            PreviewError::WeightBound(bound) => Self::WeightBound(bound),
+            PreviewError::PricesPending { reason, pending } => {
+                Self::PricesPending { reason, pending }
+            }
+            PreviewError::Internal { reason } => Self::Internal { reason },
         }
     }
 }
@@ -297,7 +319,7 @@ impl std::error::Error for PreviewError {}
 
 /// Constructing a ready engine: worker startup, device resolution, planning,
 /// program preparation, allocation and weight import.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum LoadError {
     Artifact(ArtifactError),
     Unsupported(UnsupportedModel),
@@ -318,8 +340,11 @@ pub enum LoadError {
     /// The weight bound is below the load's least weights. Never retryable.
     WeightBound(WeightBoundBelowWeights),
     /// The plan prices its holdings on this machine's standing figures, which the measurement
-    /// job has not stored yet ([`PlanOutcome::PricesPending`]). Retryable once it has.
-    PricesPending { reason: String },
+    /// job has not stored yet. Retryable once it has.
+    PricesPending {
+        reason: String,
+        pending: PendingPrices,
+    },
     Internal { reason: String },
 }
 
@@ -354,7 +379,7 @@ impl fmt::Display for LoadError {
             Self::WorkerLost { reason } => write!(formatter, "worker lost during load: {reason}"),
             Self::Configuration { reason } => write!(formatter, "invalid engine configuration: {reason}"),
             Self::WeightBound(error) => error.fmt(formatter),
-            Self::PricesPending { reason } => write!(formatter, "the plan's prices are pending: {reason}"),
+            Self::PricesPending { reason, .. } => write!(formatter, "the plan's prices are pending: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal load failure: {reason}"),
         }
     }
@@ -568,7 +593,7 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         | PlanError::UnportedScale(_)
         | PlanError::Unstreamed(_)) => unsupported(&error),
         PlanError::WeightBound { bound, needed } => PlanOutcome::WeightBound(WeightBoundBelowWeights { bound, needed }),
-        PlanError::Unpriced { pending: true, reason } => PlanOutcome::PricesPending(reason),
+        PlanError::Pending(pending) => PlanOutcome::PricesPending(pending),
         PlanError::KernelDomain(violation) => PlanOutcome::Unsupported(kernel_domain(
             violation.backend.as_str(),
             violation.entry,
@@ -577,7 +602,7 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
         | PlanError::Resource(_)
-        | PlanError::Unpriced { pending: false, .. }) => PlanOutcome::Internal(error.to_string()),
+        | PlanError::Unavailable(_)) => PlanOutcome::Internal(error.to_string()),
     }
 }
 
@@ -628,10 +653,7 @@ pub(crate) enum PlanOutcome {
     /// The caller's weight bound is below the load's least weights: no
     /// property of the model or the backend.
     WeightBound(WeightBoundBelowWeights),
-    /// The plan prices its holdings on the machine's standing figures, which the measurement
-    /// job has not stored yet: no property of the model or the engine. The engine never waits
-    /// for them; whoever holds the device for the load waits without it.
-    PricesPending(String),
+    PricesPending(PendingPrices),
     Internal(String),
 }
 
@@ -696,7 +718,10 @@ impl From<PlanOutcome> for PreviewError {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
             PlanOutcome::WeightBound(error) => Self::WeightBound(error),
-            PlanOutcome::PricesPending(reason) => Self::PricesPending { reason },
+            PlanOutcome::PricesPending(pending) => Self::PricesPending {
+                reason: pending.to_string(),
+                pending,
+            },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }
@@ -707,7 +732,10 @@ impl From<PlanOutcome> for LoadError {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
             PlanOutcome::WeightBound(error) => Self::WeightBound(error),
-            PlanOutcome::PricesPending(reason) => Self::PricesPending { reason },
+            PlanOutcome::PricesPending(pending) => Self::PricesPending {
+                reason: pending.to_string(),
+                pending,
+            },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }

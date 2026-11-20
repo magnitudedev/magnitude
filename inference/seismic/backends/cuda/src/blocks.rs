@@ -12,7 +12,7 @@ use seismic_compiler::blocks::{
     BLOCK_CAP_BYTES,
 };
 use seismic_compiler::errors::ExecutionError;
-use seismic_memory::entry::{Backed, Carved, Charge, Entry, Wiring};
+use seismic_memory::entry::{Backed, CarvableCharge, Carved, Entry, Wiring};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Every range starts at least this aligned.
@@ -21,7 +21,7 @@ const MINIMUM_ALIGNMENT: u64 = 256;
 struct Block {
     /// The driver's allocation with its bytes, on the device store's own
     /// entry, which its ranges are carved from.
-    backed: Backed<Allocation>,
+    backed: Backed<Allocation, CarvableCharge>,
     dedicated: bool,
     free: Mutex<FreeRanges>,
 }
@@ -103,7 +103,8 @@ impl Blocks {
                         })?,
                     )
                     .map_err(crate::executor::allocation_error(size, || crate::executor::device_free(&self.context)))
-                })?;
+                })?
+                .into_carvable();
                 let size = backed.charge().bytes();
                 let block = Arc::new(Block {
                     backed,
@@ -119,7 +120,7 @@ impl Blocks {
             }
         };
         Ok(Range {
-            _carved: Charge::carve(block.backed.charge(), entry, bytes),
+            _carved: block.backed.charge().carve(entry, bytes),
             blocks: self.clone(),
             block,
             offset,
@@ -128,9 +129,11 @@ impl Blocks {
     }
 
     /// One block of its own ([`crate::Device::allocate_block`]): at least
-    /// `bytes`, whole allocation granules, zero, charged exactly to `entry`
-    /// and freed as it drops, never shared with a range.
-    pub(crate) fn allocate_block(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<DeviceBlock, ExecutionError> {
+    /// `bytes`, whole allocation granules, its bytes as `fill` says
+    /// (`SlabFill::Unwritten` skips synchronous zeroing so allocation never
+    /// synchronizes the transfer stream), charged exactly to `entry` and freed
+    /// as it drops, never shared with a range.
+    pub(crate) fn allocate_block(&self, bytes: u64, entry: &Arc<dyn Entry>, fill: seismic_memory::SlabFill) -> Result<DeviceBlock, ExecutionError> {
         let size = bytes
             .max(1)
             .checked_next_multiple_of(self.granularity)
@@ -140,7 +143,9 @@ impl Blocks {
         let refused = || crate::executor::allocation_error(size, || crate::executor::device_free(&self.context));
         let backed = Backed::take(entry, size, Wiring::Pageable, |_| {
             let allocation = Allocation::new(&self.context, host).map_err(refused())?;
-            driver::zero(&self.context, allocation.pointer, host).map_err(refused())?;
+            if fill == seismic_memory::SlabFill::Zeroed {
+                driver::zero(&self.context, allocation.pointer, host).map_err(refused())?;
+            }
             Ok::<_, ExecutionError>(allocation)
         })?;
         Ok(DeviceBlock { backed })

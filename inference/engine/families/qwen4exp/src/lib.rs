@@ -15,7 +15,7 @@ use magnitude_artifacts::{
     Package, PackageIdentity,
     gguf::{Directory, Value},
 };
-use magnitude_family_common::Tensors;
+use magnitude_family_common::{Metadata, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, Block, Decoder, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
     ExitSite, GateFunction, HeadComponent, HeadNorm, HeadWeights, HistoryReads,
@@ -27,8 +27,7 @@ use magnitude_family_contracts::{
     Operator, OutputForm, ResidualForm, Sublayer, WeightDescriptor,
 };
 use magnitude_family_qwen::{
-    GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, MixerKind, ROUTED_KEYS, Weight,
-    describe_projector, mixer_kinds, prediction_blocks, product,
+    Geometry, MixerKind, Weight, describe_projector, mixer_kinds, prediction_blocks, product,
     stores_prediction_blocks,
 };
 
@@ -41,30 +40,6 @@ pub const FAMILY_ID: &str = "qwen4exp";
 
 /// The family ids of every Qwen4 experimental architecture.
 pub const FAMILY_IDS: &[&str] = &[FAMILY_ID];
-
-/// The keys a target interprets beside the shared Qwen geometry, mixer and
-/// routed keys.
-const TARGET_KEYS: &[&str] = &[
-    "block_count",
-    "context_length",
-    "nextn_predict_layers",
-    "attention.compress_ratios",
-    "attention.indexer.head_count",
-    "attention.indexer.key_length",
-    "attention.indexer.top_k",
-    "embedding_length_per_layer_input",
-    "hyper_connection.count",
-    "hyper_connection.low_rank",
-    "ple.conv_kernel",
-    "ple.eos_token_id",
-    "ple.image_token_id",
-    "ple.head_offsets",
-    "ple.head_vocab_sizes",
-    "ple.heads_per_ngram",
-    "ple.layer_multipliers",
-    "ple.layers",
-    "ple.ngram_size",
-];
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::invalid(message)
@@ -116,7 +91,7 @@ impl Extensions {
     /// `predictions` blocks follow the decoder's layers; their ratios are
     /// the prediction head's to check.
     fn read(m: &Metadata, layers: &[MixerKind], predictions: u64) -> Result<Self, Error> {
-        let blocks = m.integers("attention.compress_ratios")?;
+        let blocks = m.counts("attention.compress_ratios")?;
         if blocks.len() as u64 != layers.len() as u64 + predictions
             || layers
                 .iter()
@@ -127,7 +102,7 @@ impl Extensions {
                 "qwen4exp compress ratios must name exactly the attention layers",
             ));
         }
-        let ngram_layers = m.integers("ple.layers")?;
+        let ngram_layers = m.counts("ple.layers")?;
         let [layer] = ngram_layers[..] else {
             return Err(invalid("qwen4exp must name exactly one n-gram layer"));
         };
@@ -138,16 +113,13 @@ impl Extensions {
         if ngram_size < 2 {
             return Err(invalid("qwen4exp n-grams span at least two tokens"));
         }
-        let eos = m
-            .value("ple.eos_token_id")?
-            .unsigned()
-            .ok_or_else(|| m.malformed("ple.eos_token_id", "an integer"))?;
+        let eos = m.count("ple.eos_token_id")?;
         let hash = NGramHash {
             context: ngram_size - 1,
             heads_per_order: m.integer("ple.heads_per_ngram")?,
-            multipliers: m.integers("ple.layer_multipliers")?,
-            sizes: m.integers("ple.head_vocab_sizes")?,
-            offsets: m.integers("ple.head_offsets")?,
+            multipliers: m.counts("ple.layer_multipliers")?,
+            sizes: m.counts("ple.head_vocab_sizes")?,
+            offsets: m.counts("ple.head_offsets")?,
             // Raw ids hash as themselves; the end of a sequence cuts the
             // lookback and is what a cut predecessor reads.
             token_map: None,
@@ -157,11 +129,7 @@ impl Extensions {
         };
         // Media rows hash the token that stands in their place, which this
         // key names.
-        if m.optional("ple.image_token_id")
-            .is_some_and(|token| token.unsigned().is_none())
-        {
-            return Err(m.malformed("ple.image_token_id", "an integer"));
-        }
+        m.optional_count("ple.image_token_id")?;
         Ok(Self {
             streams: m.integer("hyper_connection.count")?,
             rank: m.integer("hyper_connection.low_rank")?,
@@ -315,11 +283,7 @@ pub fn inspect_components(
     identity: PackageIdentity,
 ) -> Result<ModelDefinition, Error> {
     recognize(directory)?;
-    let m = Metadata::new(
-        directory,
-        FAMILY_ID,
-        &[TARGET_KEYS, GEOMETRY_KEYS, MIXER_KEYS, ROUTED_KEYS].concat(),
-    )?;
+    let m = Metadata::new(directory, FAMILY_ID);
     let block_count = m.integer("block_count")?;
     let predictions = prediction_blocks(&m, block_count)?;
     let layer_count = block_count - predictions;
@@ -347,7 +311,7 @@ pub fn inspect_components(
     let mut tensors = Tensors::new(directory);
     // A weight stored with an NVFP4 second-level scale is scaled by it.
     let mut tensor = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
-        Ok(tensors.bind_scaled(name, shape)?)
+        Ok(tensors.bind(name, shape)?)
     };
     let embedding = tensor("token_embd.weight", &[vocabulary, hidden])?;
     let ngram_table = tensor(
@@ -428,6 +392,7 @@ pub fn inspect_components(
             &mut |name, shape| tensor(&format!("{p}{name}"), shape),
         )?);
     }
+    m.finish()?;
     tensors.finish()?;
     definition
         .validate()

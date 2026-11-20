@@ -9,12 +9,17 @@ license.workspace = true
 # files needs no device runtime, only the owner of the process's threads.
 
 [dependencies]
-same-file.workspace = true
 seismic-threads.workspace = true
 tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 serde_json.workspace = true

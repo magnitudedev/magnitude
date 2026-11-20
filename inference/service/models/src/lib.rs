@@ -1,6 +1,13 @@
 //! Durable local model inventory, storage, and Hugging Face acquisition.
 
 #![cfg_attr(test, allow(clippy::disallowed_methods, reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::large_stack_frames,
+        reason = "libtest's generated main holds a description of each of the crate's tests in its one frame"
+    )
+)]
 
 mod cache;
 pub mod candidate_files;
@@ -41,10 +48,10 @@ pub use cache::{
     CachedModelAssessment, CachedModelPresentation, ModelCache, ModelCacheWorkspace, ModelIndexKind,
 };
 pub use catalog::{
-    CatalogLockAdvance, GeneratedReleaseCatalog, ReleaseCatalog, ReleaseRecommendableCatalog,
-    ResolvingRecommendableCatalog, advance_model_catalog_lock, catalog_lock_digest,
-    catalog_intelligence_check, catalog_source_digest, load_release_catalog, model_catalog_lock,
-    model_developers, IntelligenceCheck,
+    CatalogLockAdvance, GeneratedReleaseCatalog, ReleaseBundleHeaders, ReleaseCatalog,
+    ReleaseRecommendableCatalog, ResolvingRecommendableCatalog, advance_model_catalog_lock,
+    catalog_lock_digest, catalog_intelligence_check, catalog_source_digest, load_release_catalog,
+    model_catalog_lock, model_developers, IntelligenceCheck,
 };
 pub use catalog_acquisition::{AcquiredCatalogModel, AcquiredDrafter, AcquiredFile};
 pub use catalog_installations::ManagedCatalogInstallations;

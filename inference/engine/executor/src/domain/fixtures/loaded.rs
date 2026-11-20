@@ -98,11 +98,50 @@ pub fn chaining(
 /// blocks, a streamed load's expert stacks Q8_0 or Q4_0 blocks, everything else
 /// F16, BF16 or F32 as it lays them out), with small deterministic values:
 /// each float tensor `constant` names holds its value throughout.
+///
+/// The payload is generated in fixed-size chunks and streamed straight to the
+/// file, with no full-payload in-memory copy.
 pub(crate) fn write_gguf(
     manifest: &magnitude_artifacts::PackageManifest,
     path: &std::path::Path,
     constant: &dyn Fn(&str) -> Option<f32>,
 ) {
+    use std::io::Write;
+
+    const CHUNK_BYTES: usize = 1 << 20;
+
+    fn tensor_bytes(encoding: Encoding, values: usize) -> usize {
+        match encoding {
+            Encoding::Iq4Nl | Encoding::Q4_0 => {
+                assert_eq!(values % 32, 0, "{encoding:?} tensor must be a multiple of 32 values");
+                (values / 32) * 18
+            }
+            Encoding::Q8_0 => {
+                assert_eq!(values % 32, 0, "Q8_0 tensor must be a multiple of 32 values");
+                (values / 32) * 34
+            }
+            Encoding::F16 | Encoding::BF16 => values * 2,
+            Encoding::F32 => values * 4,
+            Encoding::F8E4M3 => values,
+            other => panic!("the fixture stores no {other:?} tensor"),
+        }
+    }
+
+    fn encode_float(encoding: Encoding, value: f32) -> [u8; 4] {
+        match encoding {
+            Encoding::F16 => {
+                let bytes = half_bits(value).to_le_bytes();
+                [bytes[0], bytes[1], 0, 0]
+            }
+            Encoding::BF16 => {
+                let bytes = ((value.to_bits() >> 16) as u16).to_le_bytes();
+                [bytes[0], bytes[1], 0, 0]
+            }
+            Encoding::F32 => value.to_le_bytes(),
+            other => unreachable!("not a float encoding: {other:?}"),
+        }
+    }
+
     let mut header = Vec::new();
     let string = |bytes: &mut Vec<u8>, value: &str| {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -112,75 +151,149 @@ pub(crate) fn write_gguf(
     header.extend_from_slice(&3u32.to_le_bytes());
     header.extend_from_slice(&(manifest.target.tensors.len() as u64).to_le_bytes());
     header.extend_from_slice(&0u64.to_le_bytes());
-    let mut payload = Vec::new();
-    let mut state = 0x5eed_u64;
-    let mut next = move || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (state >> 33) as u32
-    };
+
+    let mut offset = 0usize;
     for tensor in &manifest.target.tensors {
-        payload.resize(payload.len().div_ceil(32) * 32, 0);
+        offset = offset.div_ceil(32) * 32;
         string(&mut header, &tensor.name);
         header.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
         for extent in tensor.shape.iter().rev() {
             header.extend_from_slice(&extent.to_le_bytes());
         }
         header.extend_from_slice(&(tensor.encoding as u32).to_le_bytes());
-        header.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        header.extend_from_slice(&(offset as u64).to_le_bytes());
         let values = tensor.shape.iter().product::<u64>() as usize;
+        offset += tensor_bytes(tensor.encoding, values);
+    }
+    header.resize(header.len().div_ceil(32) * 32, 0);
+
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = std::io::BufWriter::with_capacity(CHUNK_BYTES, file);
+    writer.write_all(&header).unwrap();
+
+    let mut state = 0x5eed_u64;
+    let mut next_u64 = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut chunk = vec![0u8; CHUNK_BYTES];
+    let mut written = 0usize;
+    for tensor in &manifest.target.tensors {
+        let pad = written.div_ceil(32) * 32 - written;
+        if pad > 0 {
+            writer.write_all(&[0u8; 32][..pad]).unwrap();
+            written += pad;
+        }
+        let values = tensor.shape.iter().product::<u64>() as usize;
+        let bytes = tensor_bytes(tensor.encoding, values);
         match tensor.encoding {
-            // Both 32 values a block: d, then 16 bytes of 4-bit codes.
+            // Both 32 values a block: d = 1/64, then 16 bytes of 4-bit codes.
             Encoding::Iq4Nl | Encoding::Q4_0 => {
-                for _ in 0..values / 32 {
-                    // d = 1/64, then 32 random 4-bit codes.
-                    payload.extend_from_slice(&0x2400u16.to_le_bytes());
-                    for _ in 0..16 {
-                        payload.push(next() as u8);
+                let d = 0x2400u16.to_le_bytes();
+                let mut remaining = values / 32;
+                let per_chunk = CHUNK_BYTES / 18;
+                while remaining > 0 {
+                    let count = remaining.min(per_chunk);
+                    let out = &mut chunk[..count * 18];
+                    for block in out.chunks_exact_mut(18) {
+                        block[..2].copy_from_slice(&d);
+                        block[2..10].copy_from_slice(&next_u64().to_le_bytes());
+                        block[10..18].copy_from_slice(&next_u64().to_le_bytes());
                     }
+                    writer.write_all(out).unwrap();
+                    remaining -= count;
                 }
             }
+            // 32 values a block: d = 1/1024, then 32 8-bit codes.
             Encoding::Q8_0 => {
-                for _ in 0..values / 32 {
-                    // d = 1/1024, then 32 random 8-bit values.
-                    payload.extend_from_slice(&0x1400u16.to_le_bytes());
-                    for _ in 0..32 {
-                        payload.push(next() as u8);
+                let d = 0x1400u16.to_le_bytes();
+                let mut remaining = values / 32;
+                let per_chunk = CHUNK_BYTES / 34;
+                while remaining > 0 {
+                    let count = remaining.min(per_chunk);
+                    let out = &mut chunk[..count * 34];
+                    for block in out.chunks_exact_mut(34) {
+                        block[..2].copy_from_slice(&d);
+                        block[2..10].copy_from_slice(&next_u64().to_le_bytes());
+                        block[10..18].copy_from_slice(&next_u64().to_le_bytes());
+                        block[18..26].copy_from_slice(&next_u64().to_le_bytes());
+                        block[26..34].copy_from_slice(&next_u64().to_le_bytes());
                     }
+                    writer.write_all(out).unwrap();
+                    remaining -= count;
                 }
             }
             Encoding::F16 | Encoding::BF16 | Encoding::F32 => {
-                // A gated delta decay rate (`ssm_a`, -exp(A_log)) is negative,
-                // as every model's is, so the recurrent state decays: a
-                // positive one grows it exponentially along the prompt.
-                let decay_rate = tensor.name.ends_with(".ssm_a");
-                let constant = constant(&tensor.name);
-                for _ in 0..values {
-                    // Within ±1/16: a small value of the tensor's element.
-                    let value = constant.unwrap_or_else(|| {
-                        let value = ((next() % 2001) as f32 - 1000.0) / 16_000.0;
-                        if decay_rate { -value.abs() } else { value }
-                    });
-                    match tensor.encoding {
-                        Encoding::F16 => payload.extend_from_slice(&half_bits(value).to_le_bytes()),
-                        // Its F32 bits' upper half.
-                        Encoding::BF16 => payload.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes()),
-                        _ => payload.extend_from_slice(&value.to_le_bytes()),
+                let elem = match tensor.encoding {
+                    Encoding::F32 => 4,
+                    _ => 2,
+                };
+                let per_chunk = CHUNK_BYTES / elem;
+                if let Some(value) = constant(&tensor.name) {
+                    let encoded = encode_float(tensor.encoding, value);
+                    let fill = values.min(per_chunk);
+                    for slot in chunk[..fill * elem].chunks_exact_mut(elem) {
+                        slot.copy_from_slice(&encoded[..elem]);
+                    }
+                    let mut remaining = values;
+                    while remaining > 0 {
+                        let count = remaining.min(fill);
+                        writer.write_all(&chunk[..count * elem]).unwrap();
+                        remaining -= count;
+                    }
+                } else {
+                    // A gated delta decay rate (`ssm_a`, -exp(A_log)) is negative,
+                    // as every model's is, so the recurrent state decays: a
+                    // positive one grows it exponentially along the prompt.
+                    let decay_rate = tensor.name.ends_with(".ssm_a");
+                    let mut remaining = values;
+                    while remaining > 0 {
+                        let count = remaining.min(per_chunk);
+                        let out = &mut chunk[..count * elem];
+                        for slot in out.chunks_exact_mut(elem) {
+                            // Within ±1/16: a small value of the tensor's element.
+                            let value = ((next_u64() % 2001) as f32 - 1000.0) / 16_000.0;
+                            let value = if decay_rate { -value.abs() } else { value };
+                            slot.copy_from_slice(&encode_float(tensor.encoding, value)[..elem]);
+                        }
+                        writer.write_all(out).unwrap();
+                        remaining -= count;
                     }
                 }
             }
             // E4M3 codes of a sign, an exponent of one to eight and a mantissa: finite, none of the NaN codes.
             Encoding::F8E4M3 => {
-                for _ in 0..values {
-                    let code = next();
-                    payload.push((((code >> 7) & 1) << 7 | (1 + (code >> 3) % 8) << 3 | (code & 7)) as u8);
+                let e4m3 = |code: u8| (code & 0x80) | ((1 + ((code >> 3) & 7)) << 3) | (code & 7);
+                let mut remaining = values;
+                while remaining > 0 {
+                    let count = remaining.min(CHUNK_BYTES);
+                    let out = &mut chunk[..count];
+                    let mut chunks = out.chunks_exact_mut(8);
+                    for group in &mut chunks {
+                        let raw = next_u64().to_le_bytes();
+                        for (dst, src) in group.iter_mut().zip(raw) {
+                            *dst = e4m3(src);
+                        }
+                    }
+                    let rem = chunks.into_remainder();
+                    if !rem.is_empty() {
+                        let raw = next_u64().to_le_bytes();
+                        for (dst, src) in rem.iter_mut().zip(raw) {
+                            *dst = e4m3(src);
+                        }
+                    }
+                    writer.write_all(out).unwrap();
+                    remaining -= count;
                 }
             }
             other => panic!("the fixture stores no {other:?} tensor"),
         }
+        written += bytes;
     }
-    header.resize(header.len().div_ceil(32) * 32, 0);
-    header.extend_from_slice(&payload);
-    std::fs::write(path, header).unwrap();
+    assert_eq!(written, offset, "GGUF payload length matches header offsets");
+    writer.flush().unwrap();
 }
 
 /// The F16 bits nearest a small normal `value`.
@@ -217,9 +330,9 @@ impl Pricing {
         lines: crate::assessment::Priced<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>,
         convert: crate::assessment::Priced<Option<std::sync::Arc<[magnitude_cost_model::RecordLine]>>>,
     ) -> crate::LoadMeasures {
-        use crate::assessment::Priced;
+        use crate::assessment::{CostWalk, PendingPrices, PointRequest, Priced};
         fn pending<T>() -> Priced<T> {
-            Priced::Pending("not measured by the test".to_owned())
+            Priced::Pending(PendingPrices::standing(PointRequest::Costs(CostWalk::Required)))
         }
         let experts = self.planned.load().expert_bank().map(|bank| crate::ExpertMeasures {
             lines,
@@ -307,18 +420,18 @@ pub(crate) fn limits(rows: usize, lookahead: bool, chain_capacity: usize, logits
     }
 }
 
-/// How a load holds its routed experts: resident, streamed through an
-/// expert bank whose weights stay within a share of the resident load's,
-/// in a bank as an uncapped load holds them, or in a bank of about half
-/// the slots.
+/// How a load holds its routed experts: resident, in a bank as an uncapped
+/// load holds them, or in a partial bank of about half the slots.
 #[derive(Clone, Copy)]
 pub(crate) enum Banked {
     Resident,
-    /// The bank's cap as a fraction of the resident load's allocation.
-    Streamed { numerator: u64, denominator: u64 },
     /// No cap.
     Whole,
-    /// Capped at the whole bank's weights less half its slots'.
+    /// Capped at about half the bank's slots, derived from the planner's own
+    /// granule-charged `resident_charge` and bounded below resident weight
+    /// bytes (falling back to the planner's exact `PlanError::WeightBound::needed`
+    /// when below the bank's minimum) so a fitting partial bank never falls
+    /// back to resident placement.
     Half,
 }
 
@@ -459,19 +572,32 @@ impl Banked {
     ) -> crate::ExecutionPlanDraft {
         match self {
             Banked::Resident => draft,
-            Banked::Streamed { numerator, denominator } => {
-                let resident = draft.allocation_bytes(definition).unwrap();
-                draft
-                    .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(resident * numerator / denominator)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
-                    .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
-                    .into_draft()
-            }
             Banked::Whole => draft.with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft(),
             Banked::Half => {
-                let whole = draft.clone().with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft();
-                let bank = whole.load().expert_bank().unwrap_or_else(|| panic!("{backend:?}: the uncapped load banks its experts"));
-                let cap = whole.load().weight_bytes().unwrap() - bank.slot_bytes().unwrap() * (bank.widest().get() / 2);
-                draft.with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(cap)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft()
+                let prices = crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices());
+                let whole = draft
+                    .clone()
+                    .with_bank::<crate::AssessmentMemoryCharge>(definition, None, &prices)
+                    .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
+                    .into_draft();
+                let bank = whole
+                    .load()
+                    .expert_bank()
+                    .unwrap_or_else(|| panic!("{backend:?}: the uncapped load banks its experts"));
+                let whole_bytes = whole.load().weight_bytes().unwrap();
+                let widest = bank.widest().get();
+                let whole_charge = bank.resident_charge(widest).unwrap();
+                let target_bytes = whole_bytes - (whole_charge - bank.resident_charge(widest / 2).unwrap());
+                let resident = draft.load().weight_bytes().unwrap();
+                let cap = target_bytes.min(resident.saturating_sub(1));
+                match draft.clone().with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(cap)), &prices) {
+                    Ok(planned) => planned.into_draft(),
+                    Err(crate::PlanError::WeightBound { needed, .. }) => draft
+                        .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(needed)), &prices)
+                        .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
+                        .into_draft(),
+                    Err(error) => panic!("{backend:?}: {error}"),
+                }
             }
         }
     }
@@ -660,7 +786,7 @@ fn bind_domain(
     // tier of a capped bank backs its load-time slots in.
     let load = execution.load();
     let demand = match load.expert_bank() {
-        Some(bank) => load.clone().with_load_slots(bank.slots).unwrap().target_weight_demand(),
+        Some(bank) => load.clone().with_load_slots(bank.slots, bank.host_slots).unwrap().target_weight_demand(),
         None => load.target_weight_demand(),
     }
     .unwrap();
@@ -744,9 +870,9 @@ fn price(
 ) -> Pricing {
     let backend = request.backend;
     let pricing = Pricing { definition: request.definition.clone(), resident, planned, costs: crate::assessment::synthetic::costs() };
-    let pending = "not measured by the test";
+    let pending = crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required));
     domain
-        .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.into()), crate::assessment::Priced::Pending(pending.into())), bindings)
+        .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.clone()), crate::assessment::Priced::Pending(pending)), bindings)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     pricing
 }

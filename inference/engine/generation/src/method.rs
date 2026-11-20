@@ -38,6 +38,51 @@ pub struct MethodRequirements {
     pub head: bool,
 }
 
+/// What a retained [`MethodCheckpoint`] can resume: its method family and, for
+/// a drafter whose history already entered a successor token
+/// (`DraftTail::Entered`), which successor it entered. Shared by lookup
+/// (`MethodCheckpoint::resumes`) and retention deduplication
+/// (`CheckpointCompatibility::subsumes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointCompatibility {
+    Plain,
+    Mtp { entered: Option<TokenId> },
+    DFlash { entered: Option<TokenId> },
+}
+
+impl CheckpointCompatibility {
+    /// Whether a checkpoint with this compatibility can resume a generation
+    /// under `choice` whose next token past the checkpoint boundary is
+    /// `successor`.
+    pub fn resumes(self, choice: MethodChoice, successor: Option<TokenId>) -> bool {
+        match (choice, self) {
+            (MethodChoice::Plain, Self::Plain) => true,
+            (MethodChoice::Mtp { .. }, Self::Mtp { entered })
+            | (MethodChoice::DFlash { .. }, Self::DFlash { entered }) => {
+                entered.is_none_or(|token| successor == Some(token))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether an already-retained checkpoint with compatibility `self`
+    /// serves every request that `other` would serve. A trailing drafter
+    /// checkpoint (`entered: None`) serves every successor branch, so it
+    /// subsumes both trailing and entered checkpoints of the same method; an
+    /// entered checkpoint (`entered: Some(a)`) only subsumes another for the
+    /// same token `a`, never a different successor `b` or a trailing one.
+    pub fn subsumes(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Plain, Self::Plain) => true,
+            (Self::Mtp { entered: None }, Self::Mtp { .. })
+            | (Self::DFlash { entered: None }, Self::DFlash { .. }) => true,
+            (Self::Mtp { entered: Some(a) }, Self::Mtp { entered: Some(b) })
+            | (Self::DFlash { entered: Some(a) }, Self::DFlash { entered: Some(b) }) => a == b,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MethodCheckpoint {
     Plain,
@@ -46,6 +91,18 @@ pub enum MethodCheckpoint {
 }
 
 impl MethodCheckpoint {
+    pub fn compatibility(&self) -> CheckpointCompatibility {
+        match self {
+            Self::Plain => CheckpointCompatibility::Plain,
+            Self::Mtp(state) => CheckpointCompatibility::Mtp {
+                entered: state.entered(),
+            },
+            Self::DFlash(state) => CheckpointCompatibility::DFlash {
+                entered: state.entered(),
+            },
+        }
+    }
+
     /// Whether a generation under `choice` resumes from this checkpoint
     /// taken at `rows` target rows, where its path holds `successor` next
     /// (none past its path's end): it was taken under the same method, so
@@ -54,17 +111,7 @@ impl MethodCheckpoint {
     /// and one that entered the successor of its rows
     /// (`DraftTail::Entered`) entered this path's.
     pub fn resumes(&self, choice: MethodChoice, rows: usize, successor: Option<TokenId>) -> bool {
-        match (choice, self) {
-            (MethodChoice::Plain, Self::Plain) => true,
-            (MethodChoice::Mtp { .. }, Self::Mtp(state)) | (MethodChoice::DFlash { .. }, Self::DFlash(state)) => {
-                state.target_rows() == rows
-                    && match state.tail {
-                        DraftTail::Trailing { .. } => true,
-                        DraftTail::Entered(entered) => successor == Some(entered),
-                    }
-            }
-            _ => false,
-        }
+        self.accounts_for(rows) && self.compatibility().resumes(choice, successor)
     }
 
     /// Whether the checkpoint accounts for exactly `rows` target rows, so it
@@ -94,6 +141,16 @@ pub struct DraftCheckpoint {
     pub(crate) tail: DraftTail,
     /// Target rows the drafter's history omits (`DrafterState::skipped`).
     pub(crate) skipped: usize,
+}
+
+impl DraftCheckpoint {
+    /// The successor token already entered into the drafter's history, if any.
+    pub fn entered(&self) -> Option<TokenId> {
+        match self.tail {
+            DraftTail::Trailing { .. } => None,
+            DraftTail::Entered(token) => Some(token),
+        }
+    }
 }
 
 /// Where a drafter's history ends against the target's rows.
@@ -198,6 +255,26 @@ impl PendingRows {
 }
 
 impl DraftCheckpoint {
+    /// A trailing checkpoint with no pending pairs or open feature at `rows`
+    /// target rows (compatible with any successor token).
+    pub const fn trailing_at(rows: usize) -> Self {
+        Self {
+            position: rows,
+            tail: DraftTail::EMPTY,
+            skipped: 0,
+        }
+    }
+
+    /// A checkpoint at `rows` target rows whose drafter history has already
+    /// entered `token` as the successor of its last target row.
+    pub const fn entered_at(rows: usize, token: TokenId) -> Self {
+        Self {
+            position: rows,
+            tail: DraftTail::Entered(token),
+            skipped: 0,
+        }
+    }
+
     pub const fn position(&self) -> usize {
         self.position
     }

@@ -52,6 +52,7 @@ pub struct Device {
     /// The word a graph's word nodes name as it is recorded, before a
     /// replay binds its run's own ([`Self::placeholder_word`]).
     placeholder: Arc<crate::direct::HostWord>,
+    launch_limits: crate::profile::DeviceLaunchLimits,
 }
 
 /// One `cuMemGetInfo` sample.
@@ -107,6 +108,7 @@ impl Device {
         }
         let placeholder = Arc::new(crate::direct::HostWord::on(&context, &stores.host.own()).map_err(unavailable)?);
         let graphs = Arc::new(crate::graph_cost::GraphPool::new(stores.device.own(), context.clone()));
+        let launch_limits = crate::profile::DeviceLaunchLimits::query(&context.driver, context.ordinal())?;
         context.charge_own_to(stores.device.own());
         Ok(Self {
             context,
@@ -116,6 +118,7 @@ impl Device {
             blocks,
             graphs,
             placeholder,
+            launch_limits,
         })
     }
 
@@ -168,6 +171,20 @@ impl Device {
         &self.context
     }
 
+    pub(crate) fn launch_contract(
+        &self,
+        max_threads_per_block: u64,
+    ) -> seismic_compiler::direct_launch::DirectLaunchContract {
+        seismic_compiler::direct_launch::DirectLaunchContract {
+            max_buffer_slots: None,
+            max_grid: self.launch_limits.max_grid,
+            max_group_size: Some(self.launch_limits.max_block),
+            max_group_threads: Some(max_threads_per_block),
+            max_shared_bytes: Some(self.launch_limits.max_shared_bytes),
+            max_param_bytes: Some(self.launch_limits.max_param_bytes),
+        }
+    }
+
     /// The stores the device was opened with.
     pub(crate) fn stores(&self) -> &CudaStores {
         &self.stores
@@ -217,9 +234,9 @@ impl Device {
     /// of host pages (large pages where the host has them) backed whole and
     /// registered for the device (`cuMemHostRegister`), which reads it in
     /// place.
-    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>, fill: seismic_memory::SlabFill) -> Result<Buffer, ExecutionError> {
         match kind {
-            crate::topology::DEVICE_KIND => self.blocks.allocate_block(bytes, entry).map(Buffer::block),
+            crate::topology::DEVICE_KIND => self.blocks.allocate_block(bytes, entry, fill).map(Buffer::block),
             crate::topology::PINNED_KIND => {
                 if self.allocations_in_process_footprint()
                     && crate::driver::can_create_host_node(&self.context).map_err(submission_error)?

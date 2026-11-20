@@ -359,7 +359,7 @@ impl KernelCache {
 
     /// What failed `doing` in the cache: an error of the access, never a
     /// miss.
-    fn failed(&self, doing: &str, error: std::io::Error) -> String {
+    fn failed(&self, doing: &str, error: impl std::fmt::Display) -> String {
         format!("kernel cache {}: {doing}: {error}", self.root().display())
     }
 
@@ -558,7 +558,7 @@ mod tests {
 
     /// The evidence files under `root`, temporary files apart.
     fn evidence_files(root: &Path) -> usize {
-        seismic_io::Store::new(root.to_owned(), seismic_io::Privacy::Shared).list(Path::new(EVIDENCE)).unwrap().len()
+        seismic_io::Store::open(root.to_owned(), seismic_io::Privacy::Shared).unwrap().list(Path::new(EVIDENCE)).unwrap().len()
     }
 
     /// A stored choice names the evidence it was made from; replacing the

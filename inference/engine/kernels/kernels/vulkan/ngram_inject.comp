@@ -28,6 +28,7 @@ void ngram_publish(uint64_t index, uint64_t channel, uint64_t stream, uint64_t c
     const SlabOut window = SEISMIC_OUT_WINDOW;
     const int reach = int(uint(SEISMIC_PARAM_DILATION)) * (int(SEISMIC_DIM_K) - 1);
     const versions_slot slot = versions_slot_of(index);
+    if (slot.lo == slot.hi) return;
     const Out source = versions_out_bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0);
     const Out target = versions_out_bank(window, slot.target, SEISMIC_WINDOW_STRIDE_0);
     // The tape holds T = R - reach rows.

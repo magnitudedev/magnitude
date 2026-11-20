@@ -32,41 +32,13 @@ use magnitude_family_contracts::{
     ProjectedRows, RowProducer, RowRounding, TokenDomain,
     Operator, OutputForm, OutputProjection, PerLayerEntry, PerLayerInput,
     QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
-    RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
+    RouteNormalization, RoutedFfn, Router, RouterInput,
     ScoreFunction, Sublayer, SublayerIndex,
     UnweightedRms, ValueNorm, ValueSource, WeightDescriptor,
 };
 
 /// The GGUF architecture and family identity.
 pub const ARCHITECTURE: &str = "gemma4";
-
-/// Every `gemma4.` metadata key this family interprets. A key outside this
-/// set would change the model in a way the definition does not express.
-const METADATA_KEYS: &[&str] = &[
-    "block_count",
-    "context_length",
-    "embedding_length",
-    "embedding_length_per_layer_input",
-    "feed_forward_length",
-    "expert_count",
-    "expert_used_count",
-    "expert_feed_forward_length",
-    "attention.head_count",
-    "attention.head_count_kv",
-    "attention.key_length",
-    "attention.value_length",
-    "attention.key_length_swa",
-    "attention.value_length_swa",
-    "attention.layer_norm_rms_epsilon",
-    "attention.sliding_window",
-    "attention.sliding_window_pattern",
-    "attention.shared_kv_layers",
-    "rope.freq_base",
-    "rope.freq_base_swa",
-    "rope.dimension_count",
-    "rope.dimension_count_swa",
-    "final_logit_softcapping",
-];
 
 /// Full-attention layers rotate only the first quarter of each head's pairs
 /// ("proportional" rotary, `partial_rotary_factor = 0.25` in the released
@@ -245,7 +217,7 @@ pub fn inspect_components(
     identity: PackageIdentity,
 ) -> Result<ModelDefinition, Error> {
     recognize(directory)?;
-    let m = Metadata::new(directory, ARCHITECTURE, METADATA_KEYS)?;
+    let m = Metadata::new(directory, ARCHITECTURE);
     let layers = m.integer("block_count")?;
     // Each layer binds distinct stored weights; reject impossible counts
     // before allocating per-layer vectors from untrusted metadata.
@@ -414,6 +386,7 @@ pub fn inspect_components(
     if experts.is_some() && routed_layers == 0 {
         return Err(invalid("Gemma expert metadata names no routed layer"));
     }
+    m.finish()?;
     b.finish()?;
     let vision = projector
         .map(|projector| describe_projector(projector, hidden))
@@ -546,21 +519,16 @@ fn routed(b: &mut Tensors, shape: &Shape, p: &str, experts: &Experts) -> Result<
     let hidden = shape.hidden;
     let fused = format!("{p}ffn_gate_up_exps.weight");
     let fused_shape = [experts.count, product(&[2, experts.intermediate])?, hidden];
-    let mut half = |start: u64| {
-        b.bind_transformed(
-            &fused,
-            &fused_shape,
-            vec![ImportTransform::Rows(RowRange {
-                start,
-                rows: experts.intermediate,
-            })],
-        )
-    };
+    let fused = b.bind(&fused, &fused_shape)?;
     let expert_up = FeedForwardUp::Gated {
         activation: ActivationFunction::GeluTanh,
         limit: None,
-        gate: half(0)?,
-        up: half(experts.intermediate)?,
+        gate: fused
+            .slice_rows(0, experts.intermediate)
+            .map_err(|error| Error::invalid(error.to_string()))?,
+        up: fused
+            .slice_rows(experts.intermediate, experts.intermediate)
+            .map_err(|error| Error::invalid(error.to_string()))?,
     };
     let router_input = b.bind_transformed(
         &format!("{p}ffn_gate_inp.scale"),

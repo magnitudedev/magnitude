@@ -15,7 +15,7 @@ use magnitude_artifacts::catalog_headers::{
 };
 use magnitude_artifacts::gguf::{Directory, Encoding, Metadata, TensorDescriptor, Value};
 use magnitude_artifacts::PackageHeaders;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// The environment variable naming the catalog header export.
@@ -67,7 +67,7 @@ fn export() -> &'static HeaderIndex {
 
 /// The directory of one catalog component.
 pub fn component(component: &CatalogComponent) -> Directory {
-    open(&component.file(&root()))
+    open_shards(&component.shard_files(&root()))
 }
 
 /// The directory of the pinned artifact `name` ([`catalog_headers::artifacts`]).
@@ -77,12 +77,12 @@ pub fn artifact(name: &str) -> Directory {
         .iter()
         .find(|artifact| artifact.name == name)
         .unwrap_or_else(|| panic!("no pinned artifact is named {name}"));
-    open(&artifact.file(&root()))
+    open_shards(&[artifact.file(&root())])
 }
 
-fn open(file: &Path) -> Directory {
-    PackageHeaders::open(file, None)
-        .unwrap_or_else(|error| panic!("{file:?}: {error}"))
+fn open_shards(files: &[PathBuf]) -> Directory {
+    PackageHeaders::open_shards(files, None)
+        .unwrap_or_else(|error| panic!("{files:?}: {error}"))
         .target()
         .clone()
 }

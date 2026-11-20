@@ -33,6 +33,7 @@ kernel void short_conv_rows(
     const ulong rows = SEISMIC_DIM_M;
     if (group.y >= rows) {
         const versions::Slot slot = versions::slot_of(slots, group.y - rows, seismic_words);
+        if (slot.lo == slot.hi) return;
         const element::Out<element::F32> source = versions::bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0,
             seismic_words);
         const element::Out<element::F32> target = versions::bank(window, slot.target, SEISMIC_WINDOW_STRIDE_0,

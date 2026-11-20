@@ -138,6 +138,8 @@ pub struct ContractNodeShape {
     pub words: usize,
     /// Declared launches, active or not.
     pub launches: usize,
+    /// Total launch conditions declared across all launches.
+    pub conditions: usize,
     /// Parameter ordinal pairs required disjoint by `AliasRule::Disjoint`.
     pub disjoint: &'static [[usize; 2]],
     /// Whether the entry parks (`CallSchema::parks`).

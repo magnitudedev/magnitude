@@ -128,14 +128,14 @@ impl Estimate {
         self.cache_of[kind.index()]
     }
 
-    /// What entries hold, committed and cache.
-    fn held(&self) -> u64 {
+    /// What entries hold, committed and cache (yielded releasing cache excluded).
+    pub(crate) fn held(&self) -> u64 {
         self.committed + self.cache
     }
 
     /// What the process holds now in the store's room: its entries, and
     /// what cache shed to a shortage still releases.
-    pub(super) fn held_now(&self) -> u64 {
+    pub(crate) fn held_now(&self) -> u64 {
         self.held().saturating_add(self.shed)
     }
 
@@ -282,26 +282,27 @@ impl Estimate {
         self.pending
     }
 
-    /// The bytes the bank's cache (its slots above the floor and the
-    /// pool's spare granules) may hold (§4.4): the budget less committed
-    /// memory, every other cache and the guarantee; within B where it
-    /// stands; and no more than it holds where growth is not admissible
-    /// (a step's window open, or no baseline yet to judge harm by). Steady
-    /// decode moves none of it: its state growth draws within its request's
-    /// reservation, and others' rise counts only where attributed to them.
-    /// What moves it
-    /// within a block (others' jitter) the bank keeps
-    /// (`experts::derived::held_target`).
     /// The room the store leaves the bank and its records pool's spare
-    /// granules (`budget` less everything beside them and the guarantee,
-    /// bounded by any weight cap; the state pool's spare is beside them, as
-    /// no slot lies in its granules),
-    /// before runtime growth's harm-rate gate (`Self::target`). Load import
-    /// sizes what the store's room holds at open (`experts::derived::import_target`).
+    /// granules before growth's harm/step gate (`Self::target`): `budget` less
+    /// committed memory, other caches, unreleased shed cache, and the guarantee,
+    /// bounded by `cap`. Load import sizes what the store's room holds at open
+    /// (`experts::derived::import_target`).
     pub fn import_room(&self) -> u64 {
+        self.room_less(self.guarantee())
+    }
+
+    /// The room the store leaves the bank and its records pool's spare
+    /// granules for holding already-resident slots without subtracting the
+    /// transient `guarantee` derivative a second time (`budget` already
+    /// reflects others' growth).
+    pub fn hold_room(&self) -> u64 {
+        self.room_less(0)
+    }
+
+    fn room_less(&self, reserve: u64) -> u64 {
         let bank = self.cache_of(CacheKind::Bank) + self.bank_spare;
-        let beside = self.committed.saturating_add(self.cache - bank);
-        let room = self.budget().saturating_sub(beside.saturating_add(self.guarantee()));
+        let beside = self.committed.saturating_add(self.cache - bank).saturating_add(self.shed);
+        let room = self.budget().saturating_sub(beside.saturating_add(reserve));
         self.read.cap.map_or(room, |cap| room.min(cap.saturating_sub(beside)))
     }
 
@@ -449,7 +450,19 @@ impl State {
         }
         if let Some(paging) = reading.paging() {
             let room = in_use.saturating_add(figures.total());
-            self.boundary.observe(Observed { paging, held: counted.allocated, live: visible.allocated, room, unit: self.unit(), events, committed: self.committed });
+            let free = u64::try_from(figures.free_beyond_target.max(0)).unwrap_or(0).saturating_add(reading.clean_cache_supply());
+            let held = self.committed.saturating_add(self.cache).saturating_add(self.releasing - self.taken);
+            self.boundary.observe(Observed {
+                paging,
+                total: reading.total(),
+                allocated: counted.allocated,
+                held,
+                room,
+                free,
+                unit: self.unit(),
+                events,
+                committed: self.committed,
+            });
         }
         // Others' rise counts only where it is attributed to them, between
         // readings that show every change of the process's: their harm, or a
@@ -524,24 +537,33 @@ impl State {
         self.persistence.observe(at, cause.filter(|cause| matches!(cause, shortage::Cause::FloorShort { .. })));
     }
 
-    /// The cold pages of `reading` that are supply (§4.2): none on host RAM
-    /// until a baseline judges harm, as growth into them could not be told
-    /// from harm before; then others' alone. The process's own cold pages
-    /// are never supply: where the OS counts them they are left out, and
-    /// where it does not, no cold page is supply while the process holds
-    /// pageable memory there, which may be any of them. A device store
-    /// has none.
+    /// The cold pages of `reading` that are supply (§4.2): available from
+    /// reading #1 whenever host paging is monitored (`harm.is_some()`, e.g.
+    /// macOS and dedicated Linux cgroups) so model opens never fail while
+    /// gigabytes of cold app pages can be compressed/swapped. Left out (`0`)
+    /// when `harm.is_none()` (shared multi-tenant Linux cgroup where other
+    /// processes' inactive anon cannot be isolated). Where the OS isolates the
+    /// process's own cold pages (`own_cold = Some`), others' alone; where it
+    /// does not (`own_cold = None`), subtract only our own unwired idle caches
+    /// (`Prefix`, idle `Drafter`, idle `Vision`, `Spare`) bounded by our pageable
+    /// allocation, never active `Load`/`State`/`Bank` weights or KV reservations.
     fn cold_supply(&self, reading: &Reading, figures: seismic::Supply) -> u64 {
         let Some(paging) = reading.paging() else {
             return figures.cold_reclaimable;
         };
-        if !self.boundary.judges() {
+        if paging.harm.is_none() {
             return 0;
         }
         match paging.own_cold {
             Some(_) => figures.cold_reclaimable.min(paging.cold),
-            None if self.allocated > self.wired => 0,
-            None => figures.cold_reclaimable,
+            None => {
+                let own_idle = self.cache_of[CacheKind::Prefix.index()]
+                    .saturating_add(self.cache_of[CacheKind::Drafter.index()])
+                    .saturating_add(self.cache_of[CacheKind::Vision.index()])
+                    .saturating_add(self.cache_of[CacheKind::Spare.index()])
+                    .min(self.allocated.saturating_sub(self.wired));
+                figures.cold_reclaimable.saturating_sub(own_idle)
+            }
         }
     }
 }

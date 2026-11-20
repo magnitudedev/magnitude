@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -95,8 +95,7 @@ pub struct AppState {
     model_controller: Option<Arc<dyn ModelInstanceController>>,
     identity: ServerIdentity,
     authorization: Option<Arc<str>>,
-    resource_revision: Arc<AtomicU64>,
-    resource_changes: tokio::sync::broadcast::Sender<InferenceResourceInvalidation>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -217,7 +216,6 @@ impl Default for ServerIdentity {
 impl AppState {
     /// Management state with no domain configured; the `with_*` builders configure each.
     pub fn new() -> Self {
-        let (resource_changes, _) = tokio::sync::broadcast::channel(64);
         Self {
             catalog_models: None,
             local_models: None,
@@ -230,8 +228,7 @@ impl AppState {
             model_controller: None,
             identity: ServerIdentity::default(),
             authorization: None,
-            resource_revision: Arc::new(AtomicU64::new(0)),
-            resource_changes,
+            shutdown: None,
         }
     }
 
@@ -286,17 +283,9 @@ impl AppState {
         self.authorization = Some(capability.into());
         self
     }
-
-    fn invalidate_resources(&self, topics: impl IntoIterator<Item = InferenceResourceTopic>) {
-        for topic in topics {
-            let revision = self
-                .resource_revision
-                .fetch_add(1, Ordering::AcqRel)
-                .saturating_add(1);
-            let _ = self
-                .resource_changes
-                .send(InferenceResourceInvalidation { topic, revision });
-        }
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 }
 
@@ -437,10 +426,49 @@ async fn authorize(State(capability): State<Arc<str>>, request: Request, next: N
     }
 }
 
-async fn serve_openapi() -> Result<Json<OpenApiDocument>, ApiError> {
-    openapi()
-        .map(Json)
-        .map_err(|error| ApiError::server(format!("OpenAPI export failed: {error}")))
+async fn serve_openapi() -> Result<Response, ApiError> {
+    static JSON: OnceLock<String> = OnceLock::new();
+    let body: &'static str = if let Some(cached) = JSON.get() {
+        cached.as_str()
+    } else {
+        let document = openapi()
+            .map_err(|error| ApiError::server(format!("OpenAPI export failed: {error}")))?;
+        let serialized = serde_json::to_string(&document)
+            .map_err(|error| ApiError::server(format!("OpenAPI export failed: {error}")))?;
+        JSON.get_or_init(|| serialized).as_str()
+    };
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response())
+}
+
+async fn shutdown_triggered(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match shutdown {
+        Some(receiver) => {
+            let _ = receiver.wait_for(|shutdown| *shutdown).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+fn until_shutdown<S: futures_util::Stream + Send + 'static>(
+    stream: S,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> impl futures_util::Stream<Item = S::Item> + Send + 'static {
+    futures_util::stream::unfold(
+        (Box::pin(stream), shutdown),
+        |(mut stream, mut shutdown)| async move {
+            tokio::select! {
+                biased;
+                () = shutdown_triggered(&mut shutdown) => None,
+                item = futures_util::StreamExt::next(&mut stream) => {
+                    item.map(|item| (item, (stream, shutdown)))
+                }
+            }
+        },
+    )
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -860,27 +888,15 @@ async fn watch_inference_events(
             topic: InferenceResourceTopic::ModelAssessments,
             revision: event.revision,
         });
-    let direct_events = futures_util::stream::unfold(
-        state.resource_changes.subscribe(),
-        |mut receiver| async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => return Some((event, receiver)),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                }
-            }
-        },
-    );
     let events = futures_util::stream::select(
         futures_util::stream::select(
-            futures_util::stream::select(
-                futures_util::stream::select(instance_events, installation_events),
-                catalog_events,
-            ),
-            futures_util::stream::select(local_events, download_events),
+            futures_util::stream::select(instance_events, installation_events),
+            catalog_events,
         ),
-        futures_util::stream::select(assessment_events, direct_events),
+        futures_util::stream::select(
+            futures_util::stream::select(local_events, download_events),
+            assessment_events,
+        ),
     );
     let events = futures_util::StreamExt::filter(events, move |event| {
         std::future::ready(
@@ -894,7 +910,7 @@ async fn watch_inference_events(
             serde_json::to_string(&invalidation).expect("inference invalidation is serializable"),
         ))
     });
-    Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(until_shutdown(framed, state.shutdown)).keep_alive(KeepAlive::default()))
 }
 
 #[utoipa::path(get, path = "/api/v1/hardware", operation_id = "getHardware", tag = "system", responses(
@@ -1095,18 +1111,14 @@ async fn install_catalog_model(
             "catalog installation requires a catalog model ID",
         ));
     }
-    let result = state
+    state
         .catalog_models
         .as_ref()
         .ok_or_else(|| ApiError::server("catalog models are not configured"))?
         .install_catalog_model(&parsed_id)
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([
-        InferenceResourceTopic::Catalog,
-        InferenceResourceTopic::CatalogInstallations,
-    ]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(post, path = "/api/v1/catalog/models/{model_id}/components/{component}/install", operation_id = "installCatalogComponent", tag = "catalog",
@@ -1133,18 +1145,14 @@ async fn install_catalog_component(
             "catalog installation requires a catalog model ID",
         ));
     }
-    let result = state
+    state
         .catalog_models
         .as_ref()
         .ok_or_else(|| ApiError::server("catalog models are not configured"))?
         .install_catalog_component(&parsed_id, component)
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([
-        InferenceResourceTopic::Catalog,
-        InferenceResourceTopic::CatalogInstallations,
-    ]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(delete, path = "/api/v1/catalog/models/{model_id}/installation", operation_id = "removeCatalogModelInstallation", tag = "catalog",
@@ -1168,15 +1176,14 @@ async fn remove_catalog_model_installation(
             "catalog removal requires a catalog model ID",
         ));
     }
-    let result = state
+    state
         .catalog_models
         .as_ref()
         .ok_or_else(|| ApiError::server("catalog models are not configured"))?
         .remove_catalog_model_installation(&parsed_id)
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::Catalog]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(get, path = "/api/v1/catalog/installations", operation_id = "listCatalogInstallations", tag = "catalog",
@@ -1223,15 +1230,14 @@ async fn cancel_catalog_installation(
     State(state): State<AppState>,
     Path(operation_id): Path<String>,
 ) -> Result<Json<CatalogInstallationOperation>, ApiError> {
-    let result = state
+    state
         .catalog_installations
         .as_ref()
         .ok_or_else(|| ApiError::server("catalog installations are not configured"))?
         .cancel_catalog_installation(&CatalogInstallationOperationId(operation_id))
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::CatalogInstallations]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(post, path = "/api/v1/catalog/installations/{operation_id}/acknowledge-failure", operation_id = "acknowledgeCatalogInstallationFailure", tag = "catalog",
@@ -1241,15 +1247,14 @@ async fn acknowledge_catalog_installation_failure(
     State(state): State<AppState>,
     Path(operation_id): Path<String>,
 ) -> Result<Json<CatalogInstallationOperation>, ApiError> {
-    let result = state
+    state
         .catalog_installations
         .as_ref()
         .ok_or_else(|| ApiError::server("catalog installations are not configured"))?
         .acknowledge_catalog_installation_failure(&CatalogInstallationOperationId(operation_id))
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::CatalogInstallations]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 fn local_models_domain(state: &AppState) -> Result<&Arc<dyn LocalModels>, ApiError> {
@@ -1302,12 +1307,11 @@ async fn configure_local_models(
     State(state): State<AppState>,
     Json(configuration): Json<LocalModelsConfiguration>,
 ) -> Result<Json<LocalModelsConfiguration>, ApiError> {
-    let result = local_models_domain(&state)?
+    local_models_domain(&state)?
         .configure(configuration)
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::LocalModels]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(get, path = "/api/v1/local-models", operation_id = "listLocalModels", tag = "local-models",
@@ -1335,12 +1339,11 @@ async fn local_models(
 async fn refresh_local_models(
     State(state): State<AppState>,
 ) -> Result<Json<LocalModelsResponse>, ApiError> {
-    let result = local_models_domain(&state)?
+    local_models_domain(&state)?
         .refresh_local()
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::LocalModels]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(delete, path = "/api/v1/local-models/{model_id}/files", operation_id = "removeLocalModelFiles", tag = "local-models",
@@ -1365,12 +1368,11 @@ async fn remove_local_model_files(
             "local-model removal requires a custom model ID",
         ));
     }
-    let result = local_models_domain(&state)?
+    local_models_domain(&state)?
         .remove_local(&model_id)
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::LocalModels]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(post, path = "/api/v1/local-models/drafters/prune", operation_id = "pruneLocalDrafters", tag = "local-models",
@@ -1383,14 +1385,11 @@ async fn remove_local_model_files(
 async fn prune_local_drafters(
     State(state): State<AppState>,
 ) -> Result<Json<DrafterPruning>, ApiError> {
-    let result = local_models_domain(&state)?
+    local_models_domain(&state)?
         .prune_drafters()
         .await
-        .map_err(ApiError::from_inventory)?;
-    if !result.removed.is_empty() {
-        state.invalidate_resources([InferenceResourceTopic::LocalModels]);
-    }
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(post, path = "/api/v1/candidates/inspect", operation_id = "inspectModelCandidate", tag = "candidates",
@@ -1433,6 +1432,7 @@ async fn stream_model_candidate_inspection(
     Json(request): Json<CandidateInspectionRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let candidates = Arc::clone(model_candidates_domain(&state)?);
+    let mut shutdown = state.shutdown;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let progress = CandidateInspectionProgressSink::new(move |progress| {
         let _ = sender.send(progress);
@@ -1443,6 +1443,7 @@ async fn stream_model_candidate_inspection(
     // the response's own status, as the request/response inspection reports it.
     let stage = tokio::select! {
         biased;
+        () = shutdown_triggered(&mut shutdown) => InspectionStage::Done,
         Some(progress) = receiver.recv() => InspectionStage::Running { first: Some(progress), receiver, inspection },
         result = &mut inspection => match receiver.try_recv() {
             Ok(progress) => InspectionStage::Draining { first: Some(progress), receiver, result },
@@ -1506,7 +1507,7 @@ async fn stream_model_candidate_inspection(
             InspectionStage::Done => None,
         }
     });
-    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(until_shutdown(events, shutdown)).keep_alive(KeepAlive::default()))
 }
 
 /// The stream's progress through an inspection: running, then any progress still buffered once
@@ -1625,12 +1626,11 @@ async fn start_model_download(
     State(state): State<AppState>,
     Json(request): Json<StartModelDownloadRequest>,
 ) -> Result<Json<StartModelDownloadResponse>, ApiError> {
-    let result = model_downloads_domain(&state)?
+    model_downloads_domain(&state)?
         .start(request)
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::Downloads]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(post, path = "/api/v1/downloads/{download_id}/cancel", operation_id = "cancelModelDownload", tag = "downloads",
@@ -1645,12 +1645,11 @@ async fn cancel_model_download(
     State(state): State<AppState>,
     Path(download_id): Path<String>,
 ) -> Result<Json<ModelDownload>, ApiError> {
-    let result = model_downloads_domain(&state)?
+    model_downloads_domain(&state)?
         .cancel(&ModelDownloadId(download_id))
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::Downloads]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(post, path = "/api/v1/downloads/{download_id}/acknowledge-failure", operation_id = "acknowledgeModelDownloadFailure", tag = "downloads",
@@ -1666,12 +1665,11 @@ async fn acknowledge_model_download_failure(
     State(state): State<AppState>,
     Path(download_id): Path<String>,
 ) -> Result<Json<ModelDownload>, ApiError> {
-    let result = model_downloads_domain(&state)?
+    model_downloads_domain(&state)?
         .acknowledge_failure(&ModelDownloadId(download_id))
         .await
-        .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::Downloads]);
-    Ok(Json(result))
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(get, path = "/api/v1/model-assessments", operation_id = "getModelAssessments", tag = "models",
@@ -2218,6 +2216,15 @@ pub enum OpenApiExportError {
 }
 
 pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
+    static CACHED: OnceLock<OpenApiDocument> = OnceLock::new();
+    if let Some(document) = CACHED.get() {
+        return Ok(document.clone());
+    }
+    let document = build_openapi()?;
+    Ok(CACHED.get_or_init(|| document).clone())
+}
+
+fn build_openapi() -> Result<OpenApiDocument, OpenApiExportError> {
     let mut document = IcnOpenApi::openapi();
     preserve_typed_request_client_contract(&mut document);
     attach_stream_contract::<ChatCompletionStream>(
@@ -2432,23 +2439,6 @@ mod tests {
                 .expect("parameters")
                 .contains(&json!("reasoning"))
         );
-    }
-
-    #[tokio::test]
-    async fn direct_resource_invalidations_are_published_with_monotonic_revisions() {
-        let state = AppState::new();
-        let mut changes = state.resource_changes.subscribe();
-
-        state.invalidate_resources([
-            InferenceResourceTopic::Catalog,
-            InferenceResourceTopic::Catalog,
-        ]);
-
-        let models = changes.recv().await.expect("models invalidation");
-        let packages = changes.recv().await.expect("packages invalidation");
-        assert_eq!(models.topic, InferenceResourceTopic::Catalog);
-        assert_eq!(packages.topic, InferenceResourceTopic::Catalog);
-        assert!(packages.revision > models.revision);
     }
 
     #[tokio::test]
@@ -3549,7 +3539,6 @@ mod tests {
     #[tokio::test]
     async fn local_models_configuration_is_replaced_whole_and_read_back() {
         let state = local_models_state(StubLocalModels::new());
-        let mut changes = state.resource_changes.subscribe();
         let configuration = json!({
             "roots": [{ "kind": "Ollama", "path": "/home/u/.ollama/models", "enabled": true }],
             "added": [{
@@ -3572,10 +3561,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, configuration);
-        assert_eq!(
-            changes.recv().await.unwrap().topic,
-            InferenceResourceTopic::LocalModels
-        );
 
         let (status, body) = send(
             test_app(state),
@@ -3620,7 +3605,6 @@ mod tests {
             json!({ "_tag": "Architecture", "architecture": "deepseek4" })
         );
 
-        let mut changes = state.resource_changes.subscribe();
         let (status, body) = send(
             test_app(state),
             Request::post("/api/v1/local-models/refresh")
@@ -3630,10 +3614,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["revision"], 4);
-        assert_eq!(
-            changes.recv().await.unwrap().topic,
-            InferenceResourceTopic::LocalModels
-        );
     }
 
     #[tokio::test]
@@ -3855,7 +3835,6 @@ mod tests {
     #[tokio::test]
     async fn download_routes_list_start_cancel_and_acknowledge() {
         let state = AppState::new().with_model_downloads(Arc::new(StubModelDownloads));
-        let mut changes = state.resource_changes.subscribe();
 
         let (status, body) = send(
             test_app(state.clone()),
@@ -3880,10 +3859,6 @@ mod tests {
         assert_eq!(body["download"]["id"], "download-1");
         assert_eq!(body["download"]["forModel"], "hf:owner/repo/model.gguf");
         assert_eq!(body["download"]["state"]["totalBytes"], 100);
-        assert_eq!(
-            changes.recv().await.unwrap().topic,
-            InferenceResourceTopic::Downloads
-        );
 
         let (status, body) = send(
             test_app(state.clone()),

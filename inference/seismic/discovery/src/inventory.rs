@@ -16,7 +16,7 @@ pub struct Inventory {
     paths: Vec<PathBuf>,
     /// The program store discovery's probe answers are kept in.
     store: Arc<dyn ArtifactStore>,
-    state: Mutex<State>,
+    state: Mutex<Arc<State>>,
 }
 
 struct State {
@@ -45,14 +45,14 @@ impl Inventory {
         Self {
             paths,
             store,
-            state: Mutex::new(State {
+            state: Mutex::new(Arc::new(State {
                 topology: Arc::new(seismic_topology::build(Revision::next(), &gathered.reports)),
                 natives: gathered.natives,
-            }),
+            })),
         }
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
+    fn state(&self) -> MutexGuard<'_, Arc<State>> {
         self.state.lock().expect("inventory lock poisoned")
     }
 
@@ -71,18 +71,24 @@ impl Inventory {
 
     pub(crate) fn advance(&self, gathered: Gathered) -> Arc<DeviceTopology> {
         let mut state = self.state();
-        state.natives = gathered.natives;
         let unchanged = seismic_topology::build(state.topology.revision(), &gathered.reports);
-        if unchanged != *state.topology {
-            state.topology = Arc::new(seismic_topology::build(Revision::next(), &gathered.reports));
-        }
-        state.topology.clone()
+        let topology = if unchanged != *state.topology {
+            Arc::new(seismic_topology::build(Revision::next(), &gathered.reports))
+        } else {
+            state.topology.clone()
+        };
+        *state = Arc::new(State {
+            topology: topology.clone(),
+            natives: gathered.natives,
+        });
+        topology
     }
 
     /// One reading of host RAM ([`crate::HostSample`]), of `topology`'s
     /// volumes and of the grants of `executors`, taken now.
     pub fn sample(&self, topology: &DeviceTopology, executors: &[ExecutorId]) -> Sample {
-        status::sample(topology, executors, &self.state().natives)
+        let snapshot = self.state().clone();
+        status::sample(topology, executors, &snapshot.natives)
     }
 
     /// The persistent identity of an executor of the current revision, what

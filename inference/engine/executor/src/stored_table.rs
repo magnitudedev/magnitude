@@ -806,10 +806,28 @@ impl StoredTable {
             return self.shared.evict(state, (held - records) as usize);
         }
         // Each record a granule of the pool, which grows by a block where
-        // none is free, as its ledger entry admits.
+        // none is free, as its ledger entry admits. On refusal, roll back
+        // any partial slabs added in this resize so the table's backed slabs
+        // stay consistent with the abandoned growth claim.
+        let mut added = Vec::new();
         for _ in held..records {
-            if let Err(error) = state.slots.store.add_slab(seismic::SlabFill::Zeroed) {
-                return Ok(Err(error));
+            match state.slots.store.add_slab(seismic::SlabFill::Zeroed) {
+                Ok(slab) => added.push(slab),
+                Err(error) => {
+                    for slab in &added {
+                        state
+                            .slots
+                            .store
+                            .free_slab(*slab)
+                            .map_err(|e| format!("a stored table could not roll back slab {slab}: {e}"))?;
+                    }
+                    if !added.is_empty() {
+                        let pool = state.slots.store.pool();
+                        pool.return_freed(added.len() as u64 * pool.granule())
+                            .map_err(|e| format!("a stored table could not return rolled-back slabs: {e}"))?;
+                    }
+                    return Ok(Err(error));
+                }
             }
         }
         Ok(Ok(()))
@@ -2044,7 +2062,7 @@ mod tests {
                     StoredSlots::Whole { pool: pool.clone(), records: 1, record_rows: 4 },
                     form,
                     ranges(&path),
-                    Some(KeptRows::of(&kept, "table")),
+                    Some(KeptRows::of(&kept, "table").unwrap()),
                 )
                 .unwrap();
                 table.seed().unwrap();

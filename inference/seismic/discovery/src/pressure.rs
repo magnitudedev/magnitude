@@ -309,10 +309,11 @@ mod platform {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    /// Any stall (1 µs) within a window ([`PSI_WINDOW`]), NUL-terminated as
-    /// the kernel parses it.
+    /// Sustained stall (at least 50 ms within [`PSI_WINDOW`], i.e. 2.5%) so
+    /// sub-millisecond background allocation stalls never fire pressure events,
+    /// NUL-terminated as the kernel parses it.
     fn trigger() -> String {
-        format!("some 1 {}\0", PSI_WINDOW.as_micros())
+        format!("some 50000 {}\0", PSI_WINDOW.as_micros())
     }
 
     /// A PSI trigger set on one PSI file, and its edges.
@@ -647,17 +648,22 @@ mod platform {
         pub(super) fn wait(&self) -> Wake {
             let low = low_memory_notification();
             // Each notification is signalled while its state holds: wait for
-            // the states that do not hold now.
-            let mut handles = vec![self.wakes.0];
+            // the states that do not hold now. Place notification handles
+            // ahead of `self.wakes.0` because `WaitForMultipleObjects` returns
+            // the lowest-indexed signalled handle: a coincident pressure
+            // transition must never be swallowed by `Wake::Asked`.
+            let mut handles = Vec::with_capacity(3);
             match (signalled(low), signalled(self.high.0)) {
                 (true, _) => handles.push(self.high.0),
                 (false, true) => handles.push(low),
                 (false, false) => handles.extend([low, self.high.0]),
             }
+            let wake_index = handles.len();
+            handles.push(self.wakes.0);
             let ended = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
-            match ended.checked_sub(WAIT_OBJECT_0) {
-                Some(0) => Wake::Asked,
-                Some(index) if (index as usize) < handles.len() => Wake::Pressure,
+            match ended.checked_sub(WAIT_OBJECT_0).map(|i| i as usize) {
+                Some(index) if index < wake_index => Wake::Pressure,
+                Some(index) if index == wake_index => Wake::Asked,
                 _ => panic!("invariant violated: WaitForMultipleObjects returned {ended:#x}: {}", std::io::Error::last_os_error()),
             }
         }

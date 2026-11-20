@@ -26,14 +26,15 @@
 //!   owns a native object with its charge and makes the allocation and the
 //!   free inside one change. An object that cannot be one `Backed` (its own
 //!   drop makes effects beside its fields' frees, or it holds charges of
-//!   many effects) keeps its change open across its whole drop with a
-//!   [`DropScope`] as its last field, or holds a `&Change` across the
-//!   effect and its records. The objects that use a `DropScope` are named
-//!   at it.
+//!   many effects) wraps its fields in [`ScopedDrop`], which opens the change
+//!   on the dropping thread before running [`DropInChange::before_drop`] and
+//!   dropping the fields, or holds a `&Change` across the effect and its
+//!   records.
 
 use seismic_topology::StoreIdentity;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// An entry's refusal of bytes it was asked to admit: `required` more, of
 /// which it had room for `available`. Nothing was allocated.
@@ -65,26 +66,35 @@ pub enum Wiring {
 /// One change of the process's memory under way on this thread, from before
 /// its OS effect until its records are made: the guard of the embedder's
 /// change ([`Entry::change`]; backends take theirs only from there), ended as
-/// it drops. A change begun where this
-/// thread has one under way joins it. It ends on the thread that began it:
-/// the embedder panics where it drops elsewhere.
+/// it drops. A change begun where this thread has one under way joins it.
+///
+/// `!Send + !Sync`: a change ends on the thread that began it, enforced at
+/// compile time.
 #[must_use = "a change ends as it drops"]
 pub struct Change {
     /// The embedder's guard, held only for its drop.
-    _guard: Option<Box<dyn std::any::Any + Send + Sync>>,
+    _guard: Option<Box<dyn std::any::Any>>,
+    /// Enforces `!Send + !Sync` so a `Change` cannot cross threads.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Change {
     /// A change the embedder holds open by `guard` until it drops.
-    pub fn held(guard: impl std::any::Any + Send + Sync) -> Self {
-        Self { _guard: Some(Box::new(guard)) }
+    pub fn held(guard: impl std::any::Any) -> Self {
+        Self {
+            _guard: Some(Box::new(guard)),
+            _not_send: PhantomData,
+        }
     }
 
     /// No change: what [`Tally`], the entry with nothing beside its OS
     /// effects to hold off, returns from [`Entry::change`]. Crate-private,
     /// so a change comes only from an entry.
     pub(crate) fn none() -> Self {
-        Self { _guard: None }
+        Self {
+            _guard: None,
+            _not_send: PhantomData,
+        }
     }
 }
 
@@ -124,7 +134,7 @@ pub trait Entry: Send + Sync + 'static {
 /// the ledger takes the `&Change` it is made in; the charge's own end, which
 /// cannot be passed one, begins the change itself, so it too lies inside
 /// one. The free of what a charge backs is its owner's: a [`Backed`], or an
-/// object with a [`DropScope`], so the two are one change.
+/// object wrapped in a [`ScopedDrop`], so the two are one change.
 ///
 /// What this makes unwritable (each fails to compile for want of a
 /// `&Change`): `Charge::take(&entry, bytes, wiring)`, `charge.shrink(bytes)`,
@@ -151,18 +161,19 @@ impl Charge {
         Self { entry: entry.clone(), bytes, wiring }
     }
 
-    /// `bytes` of `from`'s charge, already held (a block's free space),
-    /// carved for `entry` (a range of the block), of the block's wiring:
-    /// `from` frees them and `entry` takes them, never refused, since the
-    /// process holds nothing more. Dropped, they return to `from`. It makes
-    /// no OS effect, so it is one change of its own.
-    pub fn carve(from: &Charge, entry: &Arc<dyn Entry>, bytes: u64) -> Carved {
-        assert_eq!(from.entry.store(), entry.store(), "invariant violated: a range carved for an entry of another store");
-        // One change: the bytes are never the block's and no one's between.
-        let change = entry.change();
-        from.entry.freed(&change, bytes, from.wiring);
-        entry.took(&change, bytes, from.wiring);
-        Carved { from: from.entry.clone(), charge: Self { entry: entry.clone(), bytes, wiring: from.wiring } }
+    /// Convert this charge into a [`CarvableCharge`] whose uncarved bytes can
+    /// be safely carved for child entries without over-carving, stale counts,
+    /// or drop-order double-frees.
+    pub fn into_carvable(mut self) -> CarvableCharge {
+        let bytes = std::mem::take(&mut self.bytes);
+        CarvableCharge {
+            pool: Arc::new(CarvePool {
+                entry: self.entry.clone(),
+                wiring: self.wiring,
+                total: bytes,
+                uncarved: Mutex::new(Some(bytes)),
+            }),
+        }
     }
 
     pub fn bytes(&self) -> u64 {
@@ -241,30 +252,78 @@ impl Charging<'_> {
     }
 }
 
-/// The change an object's own `Drop` runs in, for an object that cannot be
-/// one [`Backed`]: its own drop makes OS effects beside its fields' frees (a
-/// Metal buffer's pages discarded as it is released, `WiredAllocation`), it
-/// is a context or module whose release and its charges are many effects
-/// (CUDA's `Context` and `Module`), or the charges of its effects are pooled
-/// (CUDA's `DirectGraph`, its graphs' driver memory). Declared as the
-/// object's last field, begun first in its `Drop::drop`
-/// ([`Self::begin`]), it ends after every field has dropped, so the frees
-/// and the record of them are one change. A clone is another object: it
-/// begins its own change as it drops.
-#[derive(Default)]
-pub struct DropScope(Option<Change>);
+/// A value whose `Drop` (an optional OS/driver effect followed by dropping
+/// all of its fields) runs inside one [`Change`] opened on the dropping
+/// thread ([`ScopedDrop`]).
+pub trait DropInChange {
+    /// The ledger entry whose [`Change`] spans this value's drop, if any.
+    fn drop_entry(&self) -> Option<&Arc<dyn Entry>>;
 
-impl Clone for DropScope {
-    fn clone(&self) -> Self {
-        Self::default()
+    /// Optional OS/driver effect to run before fields drop, while the
+    /// [`Change`] returned by [`Self::drop_entry`] is held open.
+    fn before_drop(&mut self) {}
+}
+
+/// Owns a `T: DropInChange` and guarantees by construction that
+/// [`DropInChange::before_drop`] and every field drop of `T` execute inside
+/// one stack-local [`Change`] on the dropping thread.
+///
+/// Unlike a field-ordered drop guard, `ScopedDrop<T>` is `Send`/`Sync`
+/// whenever `T` is, never stores a [`Change`] in a struct, and cannot be
+/// broken by reordering fields.
+pub struct ScopedDrop<T: DropInChange> {
+    inner: Option<T>,
+}
+
+impl<T: DropInChange> ScopedDrop<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner: Some(inner) }
     }
 }
 
-impl DropScope {
-    /// Begin the change of `entry` that the object's drop runs in, and
-    /// return it, for the records the drop makes of its own.
-    pub fn begin(&mut self, entry: &Arc<dyn Entry>) -> &Change {
-        self.0.insert(entry.change())
+impl<T: DropInChange> std::ops::Deref for ScopedDrop<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.inner
+            .as_ref()
+            .expect("a scoped drop holds its value until it drops")
+    }
+}
+
+impl<T: DropInChange> std::ops::DerefMut for ScopedDrop<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.inner
+            .as_mut()
+            .expect("a scoped drop holds its value until it drops")
+    }
+}
+
+impl<T: DropInChange> Drop for ScopedDrop<T> {
+    fn drop(&mut self) {
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        let _change = inner.drop_entry().map(|entry| entry.change());
+        inner.before_drop();
+        drop(inner);
+    }
+}
+
+/// A charge type that [`Backed`] can pair with a native allocation.
+pub trait BackedCharge {
+    fn entry(&self) -> &Arc<dyn Entry>;
+}
+
+impl BackedCharge for Charge {
+    fn entry(&self) -> &Arc<dyn Entry> {
+        Charge::entry(self)
+    }
+}
+
+impl BackedCharge for CarvableCharge {
+    fn entry(&self) -> &Arc<dyn Entry> {
+        CarvableCharge::entry(self)
     }
 }
 
@@ -277,12 +336,12 @@ impl DropScope {
 /// [`Entry::change`] says; where that thread's free waits (a backend waiting
 /// for the device to finish with a block's storage), the wait is inside the
 /// change and holds readings off for its length.
-pub struct Backed<T> {
+pub struct Backed<T, C: BackedCharge = Charge> {
     /// Both until it drops, which takes them out.
-    parts: Option<(T, Charge)>,
+    parts: Option<(T, C)>,
 }
 
-impl<T> Backed<T> {
+impl<T> Backed<T, Charge> {
     /// `bytes` of `wiring` admitted on `entry`, then `allocate` run to make
     /// the native object they back, with the charge for it to settle (the
     /// bytes the backing rounded, [`Charging::took_more`], or returned,
@@ -314,7 +373,21 @@ impl<T> Backed<T> {
         Ok(Self { parts: Some((native, Charge::took(&change, entry, bytes, wiring))) })
     }
 
-    pub fn charge(&self) -> &Charge {
+    /// Convert this backed object's charge into a [`CarvableCharge`] so
+    /// sub-ranges can be safely carved from it.
+    pub fn into_carvable(mut self) -> Backed<T, CarvableCharge> {
+        let (native, charge) = self
+            .parts
+            .take()
+            .expect("a backed object holds its parts until it drops");
+        Backed {
+            parts: Some((native, charge.into_carvable())),
+        }
+    }
+}
+
+impl<T, C: BackedCharge> Backed<T, C> {
+    pub fn charge(&self) -> &C {
         &self.parts.as_ref().expect("a backed object holds its parts until it drops").1
     }
 
@@ -324,7 +397,7 @@ impl<T> Backed<T> {
     }
 }
 
-impl<T> std::ops::Deref for Backed<T> {
+impl<T, C: BackedCharge> std::ops::Deref for Backed<T, C> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -332,44 +405,172 @@ impl<T> std::ops::Deref for Backed<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for Backed<T> {
+impl<T, C: BackedCharge> std::ops::DerefMut for Backed<T, C> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.parts.as_mut().expect("a backed object holds its parts until it drops").0
     }
 }
 
-impl<T> Drop for Backed<T> {
+impl<T, C: BackedCharge> Drop for Backed<T, C> {
     /// The native object freed, then its bytes, inside one change.
     fn drop(&mut self) {
         let Some((native, charge)) = self.parts.take() else {
             return;
         };
-        let _change = charge.entry.change();
+        let _change = charge.entry().change();
         drop(native);
         drop(charge);
     }
 }
 
-/// A range carved from a block's free space ([`Charge::carve`]): its bytes
-/// are its entry's while it lives, and the block's again after.
+/// Shared state between a [`CarvableCharge`] (a block's charge) and every
+/// live [`Carved`] range carved from it.
+struct CarvePool {
+    entry: Arc<dyn Entry>,
+    wiring: Wiring,
+    total: u64,
+    /// `Some(uncarved)` while the parent `CarvableCharge` is live; `None`
+    /// once the parent has released its uncarved bytes.
+    uncarved: Mutex<Option<u64>>,
+}
+
+/// A block's charge whose uncarved bytes can be carved into [`Carved`]
+/// sub-ranges for other entries of the same store.
+///
+/// Tracks live uncarved bytes atomically with every [`Carved`] handle so
+/// over-carving is rejected, `uncarved_bytes()` is always exact, and the
+/// ledger never double-frees or leaks regardless of drop order.
+#[must_use]
+pub struct CarvableCharge {
+    pool: Arc<CarvePool>,
+}
+
+impl CarvableCharge {
+    /// Total bytes originally charged to this block.
+    pub fn bytes(&self) -> u64 {
+        self.pool.total
+    }
+
+    /// Bytes currently held on the parent entry (not carved out and not yet
+    /// released).
+    pub fn uncarved_bytes(&self) -> u64 {
+        self.pool
+            .uncarved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(0)
+    }
+
+    pub fn wiring(&self) -> Wiring {
+        self.pool.wiring
+    }
+
+    pub fn entry(&self) -> &Arc<dyn Entry> {
+        &self.pool.entry
+    }
+
+    /// Carve `bytes` from this block's uncarved space for `entry`, of the
+    /// block's wiring: the parent frees them and `entry` takes them inside
+    /// one change. Dropped, they return to the parent if it is still live.
+    pub fn carve(&self, entry: &Arc<dyn Entry>, bytes: u64) -> Carved {
+        assert_eq!(
+            self.pool.entry.store(),
+            entry.store(),
+            "invariant violated: a range carved for an entry of another store"
+        );
+        let mut guard = self
+            .pool
+            .uncarved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(rem) = guard.as_mut() else {
+            drop(guard);
+            panic!("invariant violated: carving from a released block charge");
+        };
+        if bytes > *rem {
+            let available = *rem;
+            drop(guard);
+            panic!(
+                "invariant violated: carving {bytes} bytes from a block with only {available} uncarved bytes"
+            );
+        }
+        // Hold both entries' change guards so neither a Tally nor an embedder
+        // entry ever records outside a change.
+        let _parent_change = self.pool.entry.change();
+        let change = entry.change();
+        self.pool.entry.freed(&change, bytes, self.pool.wiring);
+        entry.took(&change, bytes, self.pool.wiring);
+        *rem -= bytes;
+        Carved {
+            pool: self.pool.clone(),
+            entry: entry.clone(),
+            bytes,
+        }
+    }
+
+    /// Explicitly release all remaining uncarved bytes inside `change`.
+    /// Subsequent [`Drop`] is a no-op; any still-live [`Carved`] handles will
+    /// only free their own bytes on drop without returning them to the parent.
+    pub fn release(&self, change: &Change) {
+        let mut guard = self
+            .pool
+            .uncarved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rem) = guard.take() {
+            if rem != 0 {
+                self.pool.entry.freed(change, rem, self.pool.wiring);
+            }
+        }
+    }
+}
+
+impl Drop for CarvableCharge {
+    fn drop(&mut self) {
+        let mut guard = self
+            .pool
+            .uncarved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rem) = guard.take() {
+            if rem != 0 {
+                let change = self.pool.entry.change();
+                self.pool.entry.freed(&change, rem, self.pool.wiring);
+            }
+        }
+    }
+}
+
+/// A range carved from a block's free space ([`CarvableCharge::carve`]): its
+/// bytes are its entry's while it lives, and return to the block's parent
+/// entry on drop if the block is still live.
 #[must_use]
 pub struct Carved {
-    from: Arc<dyn Entry>,
-    charge: Charge,
+    pool: Arc<CarvePool>,
+    entry: Arc<dyn Entry>,
+    bytes: u64,
 }
 
 impl Carved {
     pub fn bytes(&self) -> u64 {
-        self.charge.bytes
+        self.bytes
     }
 }
 
 impl Drop for Carved {
     fn drop(&mut self) {
-        let change = self.charge.entry.change();
-        let bytes = std::mem::take(&mut self.charge.bytes);
-        self.charge.entry.freed(&change, bytes, self.charge.wiring);
-        self.from.took(&change, bytes, self.charge.wiring);
+        let mut guard = self
+            .pool
+            .uncarved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _parent_change = self.pool.entry.change();
+        let change = self.entry.change();
+        self.entry.freed(&change, self.bytes, self.pool.wiring);
+        if let Some(rem) = guard.as_mut() {
+            self.pool.entry.took(&change, self.bytes, self.pool.wiring);
+            *rem += self.bytes;
+        }
     }
 }
 
@@ -681,5 +882,91 @@ mod tests {
         let failed = Backed::take(&entry, 64, Wiring::Pageable, |_| Err::<Native, _>(Refused { required: 64, available: 0 }));
         assert!(failed.is_err());
         assert_eq!((tally.held(), open.load(Ordering::SeqCst)), (0, 0));
+    }
+
+    /// Carving tracks uncarved bytes accurately and frees exact total bytes
+    /// even if the parent `CarvableCharge` drops before a `Carved` handle
+    /// (zero double-free, zero leak).
+    #[test]
+    fn carvable_charge_is_exact_regardless_of_drop_order() {
+        let (parent_entry, parent_tally, parent_open) = Counted::new();
+        let (child_entry, child_tally, child_open) = Counted::new();
+        let change = parent_entry.change();
+        let block = Charge::took(&change, &parent_entry, 100, Wiring::Pageable).into_carvable();
+        drop(change);
+        assert_eq!((block.bytes(), block.uncarved_bytes(), parent_tally.held()), (100, 100, 100));
+
+        let c1 = block.carve(&child_entry, 40);
+        let c2 = block.carve(&child_entry, 25);
+        assert_eq!((block.uncarved_bytes(), parent_tally.held(), child_tally.held()), (35, 35, 65));
+
+        // Normal order: c1 drops while block is still live -> returns 40 to parent.
+        drop(c1);
+        assert_eq!((block.uncarved_bytes(), parent_tally.held(), child_tally.held()), (75, 75, 25));
+
+        // Reverse order: parent block drops while c2 is still live -> parent frees only its 75 uncarved bytes.
+        drop(block);
+        assert_eq!((parent_tally.held(), child_tally.held()), (0, 25));
+
+        // c2 drops after parent -> frees its 25 bytes without returning them to parent.
+        drop(c2);
+        assert_eq!(
+            (parent_tally.held(), child_tally.held(), parent_open.load(Ordering::SeqCst), child_open.load(Ordering::SeqCst)),
+            (0, 0, 0, 0)
+        );
+    }
+
+    /// Carving more than the remaining uncarved bytes panics immediately.
+    #[test]
+    #[should_panic(expected = "carving 60 bytes from a block with only 40 uncarved bytes")]
+    fn carvable_charge_rejects_over_carving() {
+        let (parent_entry, _, _) = Counted::new();
+        let (child_entry, _, _) = Counted::new();
+        let change = parent_entry.change();
+        let block = Charge::took(&change, &parent_entry, 100, Wiring::Pageable).into_carvable();
+        drop(change);
+        let _c1 = block.carve(&child_entry, 60);
+        let _c2 = block.carve(&child_entry, 60);
+    }
+
+    /// `ScopedDrop` runs `before_drop` and every field's `Drop` inside one
+    /// open `Change`.
+    #[test]
+    fn scoped_drop_keeps_change_open_across_effect_and_fields() {
+        let (entry, tally, open) = Counted::new();
+        let before_ran = Arc::new(AtomicUsize::new(0));
+        let frees = Arc::new(AtomicUsize::new(0));
+        struct Resource {
+            entry: Arc<dyn Entry>,
+            open: Arc<AtomicUsize>,
+            before_ran: Arc<AtomicUsize>,
+            _native: Native,
+            _charge: Charge,
+        }
+        impl DropInChange for Resource {
+            fn drop_entry(&self) -> Option<&Arc<dyn Entry>> {
+                Some(&self.entry)
+            }
+            fn before_drop(&mut self) {
+                assert!(self.open.load(Ordering::SeqCst) > 0, "before_drop outside a change");
+                self.before_ran.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let change = entry.change();
+        let charge = Charge::took(&change, &entry, 32, Wiring::Pageable);
+        drop(change);
+        let scoped = ScopedDrop::new(Resource {
+            entry: entry.clone(),
+            open: open.clone(),
+            before_ran: before_ran.clone(),
+            _native: Native(open.clone(), frees.clone()),
+            _charge: charge,
+        });
+        assert_eq!((tally.held(), open.load(Ordering::SeqCst)), (32, 0));
+        drop(scoped);
+        assert_eq!(
+            (tally.held(), open.load(Ordering::SeqCst), before_ran.load(Ordering::SeqCst), frees.load(Ordering::SeqCst)),
+            (0, 0, 1, 1)
+        );
     }
 }

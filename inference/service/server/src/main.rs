@@ -311,7 +311,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
             if bounds == LoadBounds::default() {
                 instances.attach_assessments(assessments.clone());
             }
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let mut state = AppState::new()
+                .with_shutdown(shutdown_rx)
                 .with_model_downloads(model_downloads)
                 .with_hugging_face_catalog(Arc::new(HuggingFaceDiscovery::new(
                     inventory.clone(),
@@ -379,6 +381,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                         },
                         None => interrupt_signal().await,
                     }
+                    shutdown_tx.send_replace(true);
                 })
                 .await?;
             tracing::info!("inference service stopped");

@@ -33,19 +33,20 @@ output is regenerable. On the hosts, `mrig` evicts the least recently used check
 
 ## Tuning parameters and defaults
 
-The tuning budget never grows. Keep declared spaces to configurations that could win.
+Defaults and tuning have distinct jobs:
 
-- **Remove a configuration only when both of these hold:**
-  1. *Reason:* reading the kernel explains why it cannot be the fastest, in terms of a quantity
-     computed from the shape and parameters, so the reason covers shapes not yet measured.
-  2. *Evidence:* tuning history shows it was never the fastest on any unit of that backend.
-
-  A reason without evidence, or evidence without a reason, is not enough.
-- **Write a removal as a `where` constraint or shorter value list**, with the reason and numbers in
-  a comment.
-- **The default is the first admitted configuration:** put first the value with the smallest
-  worst-case gap to the measured best.
-- **Judge each backend on its own devices**, and recheck for new GPU or model families.
+- **Predictable choices belong in defaults, not tuning.** When the right configuration follows
+  from genuine device capabilities or problem geometry (subgroup width, reduction length,
+  shared-memory/register pressure, hardware tensor ops), encode it as a default or `where`
+  constraint so it holds generically for *any* device with those properties — never overfit to a
+  single GPU we happened to measure, and never gate defaults or fixes on a specific PCI ID or
+  hardware model.
+- **Leave microarchitecture-specific trade-offs to the tuner.** Keep declared search spaces tight
+  (the tuning budget never grows) to configurations that can actually win across devices.
+- **Pruning requires both reason and evidence:** remove a configuration (via a `where` constraint
+  or shorter value list, with the reason and numbers in a comment) only when (1) reading the kernel
+  explains why it cannot win in terms of shape/parameters/capabilities, and (2) tuning history on
+  that backend's devices confirms it never won.
 
 ## Measurement
 

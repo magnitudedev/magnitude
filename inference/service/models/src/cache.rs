@@ -116,20 +116,18 @@ impl Drop for ModelCacheWorkspace {
 }
 
 impl ModelCache {
-    #[must_use]
-    pub fn new(cache_root: &Path) -> Self {
+    pub fn new(cache_root: &Path) -> Result<Self, seismic_io::StoreError> {
         Self::with_header_capacity(cache_root, HEADER_CAPACITY_BYTES)
     }
 
     /// A cache whose GGUF headers are bounded by `capacity` bytes: a build that must hold every header
     /// it reads until it ends (the release catalog's bundle) bounds them by none.
-    #[must_use]
-    pub fn with_header_capacity(cache_root: &Path, capacity: u64) -> Self {
-        let store = Arc::new(Store::new(cache_root.to_path_buf(), Privacy::Owner));
-        Self {
+    pub fn with_header_capacity(cache_root: &Path, capacity: u64) -> Result<Self, seismic_io::StoreError> {
+        let store = Arc::new(Store::open(cache_root.to_path_buf(), Privacy::Owner)?);
+        Ok(Self {
             headers: HeaderCache::new(Arc::clone(&store), capacity, HEADER_EVICTION_GRACE),
             store,
-        }
+        })
     }
 
     /// The inventory index as it is on disk, none where it is absent or is no JSON object.
@@ -159,12 +157,14 @@ impl ModelCache {
         serde_json::from_slice(&bytes).ok()
     }
 
-    /// Publish what `evidence` determines of `kind`, without a lock (see [`ModelCache`]). A
+    /// Publish what `evidence` determines of `kind` (see [`ModelCache`]). A
     /// failure, or a value larger than any index is read to, leaves what was there.
     pub fn write_index<T: Serialize>(&self, kind: ModelIndexKind, evidence: &str, value: &T) {
         if let Some(bytes) = encoded(value) {
-            let _ = self.store.publish(&index_path(kind, &evidence_digest(evidence)), Durability::Volatile, |file| {
-                io::Write::write_all(file, &bytes)
+            let _ = self.store.shared().and_then(|shared| {
+                shared.publish(&index_path(kind, &evidence_digest(evidence)), Durability::Volatile, |file| {
+                    io::Write::write_all(file, &bytes)
+                })
             });
         }
     }
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn inspected_presentation_is_pinned_to_commit_and_selected_file_across_reopen() {
         let directory = tempfile::tempdir().unwrap();
-        let cache = ModelCache::new(directory.path());
+        let cache = ModelCache::new(directory.path()).unwrap();
         let q4: ModelId = "hf:publisher/Qwen-Finetune-GGUF/model-Q4_K_M.gguf".parse().unwrap();
         let q8: ModelId = "hf:publisher/Qwen-Finetune-GGUF/model-Q8_0.gguf".parse().unwrap();
         let presentation = CachedModelPresentation {
@@ -361,7 +361,7 @@ mod tests {
         };
         let commit = "c".repeat(40);
         cache.write_model_presentation(&q4, &commit, &presentation);
-        let reopened = ModelCache::new(directory.path());
+        let reopened = ModelCache::new(directory.path()).unwrap();
         assert_eq!(reopened.read_model_presentation(&q4, &commit), Some(presentation.clone()));
         assert_eq!(reopened.read_model_presentation(&q8, &commit), None);
         assert_eq!(reopened.read_model_presentation(&q4, &"d".repeat(40)), None);
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn namespaces_are_typed_and_fail_as_misses() {
         let directory = tempfile::tempdir().unwrap();
-        let cache = ModelCache::new(directory.path());
+        let cache = ModelCache::new(directory.path()).unwrap();
 
         cache.write_index(ModelIndexKind::InventoryMetadata, "model evidence", &42_u64);
         assert_eq!(
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn workspaces_are_private_and_removed_on_drop() {
         let directory = tempfile::tempdir().unwrap();
-        let cache = ModelCache::new(directory.path());
+        let cache = ModelCache::new(directory.path()).unwrap();
         let path = {
             let workspace = cache.workspace().unwrap();
             let path = workspace.path().to_path_buf();
@@ -470,7 +470,7 @@ mod tests {
             drafter: magnitude_service_contracts::models::DrafterVerdict::None,
         };
 
-        let initial = ModelCache::new(directory.path());
+        let initial = ModelCache::new(directory.path()).unwrap();
         let capabilities = ModelCapabilities {
             vision: false,
             tools: true,
@@ -496,7 +496,7 @@ mod tests {
         initial.write_model_assessment("fits evidence", &fits);
         initial.write_model_assessment("non-fit evidence", &does_not_fit);
 
-        let reopened = ModelCache::new(directory.path());
+        let reopened = ModelCache::new(directory.path()).unwrap();
 
         assert_eq!(reopened.read_model_assessment("fits evidence"), Some(fits));
         assert_eq!(
@@ -508,9 +508,13 @@ mod tests {
     #[test]
     fn workspace_falls_back_when_the_cache_root_is_unusable() {
         let directory = tempfile::tempdir().unwrap();
-        let cache_root = directory.path().join("blocked-cache");
-        fs::write(&cache_root, b"not a directory").unwrap();
-        let cache = ModelCache::new(&cache_root);
+        let blocked = directory.path().join("blocked-cache");
+        fs::write(&blocked, b"not a directory").unwrap();
+        assert!(matches!(ModelCache::new(&blocked), Err(seismic_io::StoreError::Io { .. })));
+
+        let cache_root = directory.path().join("cache");
+        let cache = ModelCache::new(&cache_root).unwrap();
+        fs::write(cache_root.join(".work"), b"not a directory").unwrap();
         let path = {
             let workspace = cache.workspace().unwrap();
             let path = workspace.path().to_path_buf();

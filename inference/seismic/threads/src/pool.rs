@@ -10,14 +10,8 @@
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
-
-/// Maximum park slice for a waiting caller when the queue is empty and its
-/// remote job is still running, so newly pushed nested jobs are picked up
-/// promptly while completion still wakes immediately via the task's `Condvar`.
-const WAIT_SLICE: Duration = Duration::from_micros(100);
 
 #[derive(Clone, Copy)]
 struct Job {
@@ -38,9 +32,20 @@ impl Job {
     }
 }
 
+struct QueueState {
+    jobs: VecDeque<Job>,
+    /// Number of threads currently parked in [`WorkPool::wait_until`] waiting
+    /// for a task to finish or for newly pushed nested work to steal.
+    waiters: usize,
+}
+
 struct Shared {
-    queue: Mutex<VecDeque<Job>>,
-    wake: Condvar,
+    state: Mutex<QueueState>,
+    /// Wakes idle pool workers when jobs are pushed.
+    worker_wake: Condvar,
+    /// Wakes waiting `join` / `par_for` callers when jobs are pushed or a task
+    /// completes.
+    waiter_wake: Condvar,
 }
 
 struct WorkPool {
@@ -58,8 +63,12 @@ impl WorkPool {
     fn new() -> Self {
         let workers = crate::share().get().saturating_sub(1);
         let shared = Arc::new(Shared {
-            queue: Mutex::new(VecDeque::new()),
-            wake: Condvar::new(),
+            state: Mutex::new(QueueState {
+                jobs: VecDeque::new(),
+                waiters: 0,
+            }),
+            worker_wake: Condvar::new(),
+            waiter_wake: Condvar::new(),
         });
         for _ in 0..workers {
             let shared = Arc::clone(&shared);
@@ -71,48 +80,49 @@ impl WorkPool {
     }
 
     fn push(&self, job: Job) {
-        let mut queue = self
+        let mut state = self
             .shared
-            .queue
+            .state
             .lock()
             .expect("work pool queue mutex poisoned");
-        queue.push_back(job);
-        self.shared.wake.notify_one();
+        state.jobs.push_back(job);
+        if state.waiters > 0 {
+            self.shared.waiter_wake.notify_one();
+        }
+        self.shared.worker_wake.notify_one();
     }
 
     fn push_many(&self, count: usize, job: Job) {
-        let mut queue = self
+        let mut state = self
             .shared
-            .queue
+            .state
             .lock()
             .expect("work pool queue mutex poisoned");
-        queue.reserve(count);
+        state.jobs.reserve(count);
         for _ in 0..count {
-            queue.push_back(job);
+            state.jobs.push_back(job);
         }
         if count == 1 {
-            self.shared.wake.notify_one();
+            if state.waiters > 0 {
+                self.shared.waiter_wake.notify_one();
+            }
+            self.shared.worker_wake.notify_one();
         } else {
-            self.shared.wake.notify_all();
+            if state.waiters > 0 {
+                self.shared.waiter_wake.notify_all();
+            }
+            self.shared.worker_wake.notify_all();
         }
-    }
-
-    fn try_pop_back(&self) -> Option<Job> {
-        self.shared
-            .queue
-            .lock()
-            .expect("work pool queue mutex poisoned")
-            .pop_back()
     }
 
     fn try_remove(&self, data: *const ()) -> bool {
-        let mut queue = self
+        let mut state = self
             .shared
-            .queue
+            .state
             .lock()
             .expect("work pool queue mutex poisoned");
-        if let Some(pos) = queue.iter().rposition(|job| job.data == data) {
-            queue.remove(pos);
+        if let Some(pos) = state.jobs.iter().rposition(|job| job.data == data) {
+            state.jobs.remove(pos);
             true
         } else {
             false
@@ -120,28 +130,77 @@ impl WorkPool {
     }
 
     fn remove_all(&self, data: *const ()) -> usize {
-        let mut queue = self
+        let mut state = self
             .shared
-            .queue
+            .state
             .lock()
             .expect("work pool queue mutex poisoned");
-        let before = queue.len();
-        queue.retain(|job| job.data != data);
-        before - queue.len()
+        let before = state.jobs.len();
+        state.jobs.retain(|job| job.data != data);
+        before - state.jobs.len()
+    }
+
+    /// Run `mark_done` while holding the queue mutex and wake parked waiters if
+    /// it reports task completion. Updating the completion flag under the same
+    /// mutex that [`Self::wait_until`] checks before parking eliminates lost
+    /// wakeups.
+    fn finish_and_notify(&self, mark_done: impl FnOnce() -> bool) {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .expect("work pool queue mutex poisoned");
+        if mark_done() && state.waiters > 0 {
+            self.shared.waiter_wake.notify_all();
+        }
+    }
+
+    /// Help run queued work until `is_done()` returns true, parking on
+    /// `waiter_wake` whenever the queue is empty and waking immediately on
+    /// either task completion or newly pushed nested work.
+    fn wait_until(&self, is_done: impl Fn() -> bool) {
+        loop {
+            if is_done() {
+                return;
+            }
+            let job = {
+                let mut state = self
+                    .shared
+                    .state
+                    .lock()
+                    .expect("work pool queue mutex poisoned");
+                loop {
+                    if is_done() {
+                        return;
+                    }
+                    if let Some(job) = state.jobs.pop_back() {
+                        break job;
+                    }
+                    state.waiters += 1;
+                    state = self
+                        .shared
+                        .waiter_wake
+                        .wait(state)
+                        .expect("work pool queue mutex poisoned");
+                    state.waiters -= 1;
+                }
+            };
+            job.run();
+        }
     }
 }
 
 fn worker_loop(shared: &Shared) {
     loop {
         let job = {
-            let mut queue = shared.queue.lock().expect("work pool queue mutex poisoned");
+            let mut state = shared.state.lock().expect("work pool queue mutex poisoned");
             loop {
-                if let Some(job) = queue.pop_front() {
+                if let Some(job) = state.jobs.pop_front() {
                     break job;
                 }
-                queue = shared
-                    .wake
-                    .wait(queue)
+                state = shared
+                    .worker_wake
+                    .wait(state)
                     .expect("work pool queue mutex poisoned");
             }
         };
@@ -154,18 +213,17 @@ struct JoinTask<F, A> {
     /// Closure `a`, taken once by either the single worker that pops this job
     /// or the calling thread if it removes the job from the queue first.
     func: UnsafeCell<Option<F>>,
-    /// Written once by the worker before setting `*done = true`; read once by
-    /// the calling thread after observing `*done == true`.
+    /// Written once by the worker before release-storing `done = true`; read
+    /// once by the calling thread after acquire-loading `done == true`.
     result: UnsafeCell<Option<Result<A, crate::Panic>>>,
-    done: Mutex<bool>,
-    notify: Condvar,
+    done: AtomicBool,
 }
 
 // SAFETY: `func` is accessed exclusively by whichever thread owns the job
 // (either the single worker that popped it from the queue, or the calling
 // thread after removing it from the queue). `result` is written once by that
-// worker before releasing `done` with `*done = true`, and only read by the
-// calling thread after acquiring `done` and observing `*done == true`.
+// worker before release-storing `done = true`, and only read by the calling
+// thread after acquire-loading `done == true`.
 unsafe impl<F: Send, A: Send> Sync for JoinTask<F, A> {}
 
 unsafe fn run_join_task<F, A>(data: *const ())
@@ -174,7 +232,7 @@ where
     A: Send,
 {
     // SAFETY: `JoinGuard` ensures `data` points to a live `JoinTask<F, A>`
-    // until `*task.done == true` is observed after this mutex guard drops.
+    // until `task.done` is release-stored `true`.
     let task = unsafe { &*(data as *const JoinTask<F, A>) };
     // SAFETY: This job was popped from the queue by this thread alone, so no
     // other thread accesses `task.func`.
@@ -182,11 +240,13 @@ where
         .expect("invariant violated: join task executed twice");
     let outcome = task.submitter.run(func);
     // SAFETY: Only this thread writes `task.result`, and the caller does not
-    // read it until observing `*task.done == true` under `task.done`.
+    // read it until observing `task.done == true` with `Ordering::Acquire`.
     unsafe { *task.result.get() = Some(outcome) };
-    let mut done = task.done.lock().expect("join task mutex poisoned");
-    *done = true;
-    task.notify.notify_one();
+    // `task` must not be touched after `done.store(true, Ordering::Release)`.
+    WorkPool::global().finish_and_notify(|| {
+        task.done.store(true, Ordering::Release);
+        true
+    });
 }
 
 struct JoinGuard<'a, F: Send, A: Send> {
@@ -198,27 +258,8 @@ struct JoinGuard<'a, F: Send, A: Send> {
 
 impl<F: Send, A: Send> JoinGuard<'_, F, A> {
     fn wait_remote(&self) {
-        loop {
-            {
-                let done = self.task.done.lock().expect("join task mutex poisoned");
-                if *done {
-                    return;
-                }
-            }
-            if let Some(other) = self.pool.try_pop_back() {
-                other.run();
-                continue;
-            }
-            let done = self.task.done.lock().expect("join task mutex poisoned");
-            if *done {
-                return;
-            }
-            let _ = self
-                .task
-                .notify
-                .wait_timeout(done, WAIT_SLICE)
-                .expect("join task mutex poisoned");
-        }
+        self.pool
+            .wait_until(|| self.task.done.load(Ordering::Acquire));
     }
 }
 
@@ -233,9 +274,10 @@ impl<F: FnOnce() -> A + Send, A: Send> JoinGuard<'_, F, A> {
             return func();
         }
         self.wait_remote();
-        // SAFETY: `wait_remote` observed `*done == true` under `task.done`,
-        // synchronizing-with the worker's write to `task.result` and
-        // guaranteeing the worker will never touch `task` again.
+        // SAFETY: `wait_remote` observed `task.done == true` with
+        // `Ordering::Acquire`, synchronizing-with the worker's write to
+        // `task.result` and guaranteeing the worker will never touch `task`
+        // again.
         let outcome = unsafe { (*self.task.result.get()).take() }
             .expect("invariant violated: completed join task produced no result");
         match outcome {
@@ -277,8 +319,7 @@ where
         submitter: crate::Submitter::here(),
         func: UnsafeCell::new(Some(a)),
         result: UnsafeCell::new(None),
-        done: Mutex::new(false),
-        notify: Condvar::new(),
+        done: AtomicBool::new(false),
     };
     let task_ptr = (&task as *const JoinTask<FA, A>).cast::<()>();
     pool.push(Job {
@@ -306,14 +347,14 @@ struct ParForState<'a, T, Init, F, R, E> {
     /// Each index is claimed at most once via `next.fetch_add(1)`.
     slots: Vec<UnsafeCell<Option<Result<R, E>>>>,
     panic: Mutex<Option<crate::Panic>>,
-    remaining: Mutex<usize>,
-    notify: Condvar,
+    remaining: AtomicUsize,
 }
 
 // SAFETY: `items`, `init`, and `work` are `Sync`; each `slots[idx]` is written
 // at most once by the unique thread that claims `idx` from `next.fetch_add(1)`;
-// the calling thread only reads `slots` after observing `*remaining == 0` under
-// `remaining`, which synchronizes-with every helper thread's unlock.
+// the calling thread only reads `slots` after observing `remaining == 0` with
+// `Ordering::Acquire`, which synchronizes-with every helper thread's release
+// decrement.
 unsafe impl<T: Sync, Init: Sync, F: Sync, R: Send, E: Send> Sync
     for ParForState<'_, T, Init, F, R, E>
 {
@@ -328,7 +369,7 @@ where
     E: Send,
 {
     // SAFETY: `ParForGuard` guarantees `data` points to a live `ParForState`
-    // until `*state.remaining == 0` is observed after this mutex guard drops.
+    // until `state.remaining` reaches 0.
     let state = unsafe { &*(data as *const ParForState<'_, T, Init, F, R, E>) };
     let outcome = state.submitter.run(|| {
         let _scope = (state.init)();
@@ -353,14 +394,10 @@ where
             *slot = Some(panic);
         }
     }
-    let mut remaining = state
-        .remaining
-        .lock()
-        .expect("par_for remaining mutex poisoned");
-    *remaining -= 1;
-    if *remaining == 0 {
-        state.notify.notify_one();
-    }
+    // `state` must not be touched after `remaining.fetch_sub(1, Ordering::Release)`.
+    WorkPool::global().finish_and_notify(|| {
+        state.remaining.fetch_sub(1, Ordering::Release) == 1
+    });
 }
 
 struct ParForGuard<'s, 'a, T: Sync, Init: Sync, F: Sync, R: Send, E: Send> {
@@ -373,46 +410,13 @@ struct ParForGuard<'s, 'a, T: Sync, Init: Sync, F: Sync, R: Send, E: Send> {
 impl<T: Sync, Init: Sync, F: Sync, R: Send, E: Send> ParForGuard<'_, '_, T, Init, F, R, E> {
     fn wait_all(&mut self) {
         let removed = self.pool.remove_all(self.state_ptr);
-        if removed > 0 {
-            let mut remaining = self
-                .state
-                .remaining
-                .lock()
-                .expect("par_for remaining mutex poisoned");
-            *remaining -= removed;
-            if *remaining == 0 {
-                return;
-            }
+        if removed > 0
+            && self.state.remaining.fetch_sub(removed, Ordering::AcqRel) == removed
+        {
+            return;
         }
-        loop {
-            {
-                let remaining = self
-                    .state
-                    .remaining
-                    .lock()
-                    .expect("par_for remaining mutex poisoned");
-                if *remaining == 0 {
-                    return;
-                }
-            }
-            if let Some(other) = self.pool.try_pop_back() {
-                other.run();
-                continue;
-            }
-            let remaining = self
-                .state
-                .remaining
-                .lock()
-                .expect("par_for remaining mutex poisoned");
-            if *remaining == 0 {
-                return;
-            }
-            let _ = self
-                .state
-                .notify
-                .wait_timeout(remaining, WAIT_SLICE)
-                .expect("par_for remaining mutex poisoned");
-        }
+        self.pool
+            .wait_until(|| self.state.remaining.load(Ordering::Acquire) == 0);
     }
 
     fn finish(mut self) {
@@ -470,8 +474,7 @@ where
         next: AtomicUsize::new(0),
         slots: (0..n).map(|_| UnsafeCell::new(None)).collect(),
         panic: Mutex::new(None),
-        remaining: Mutex::new(helpers),
-        notify: Condvar::new(),
+        remaining: AtomicUsize::new(helpers),
     };
     let state_ptr = (&state as *const ParForState<'_, T, Init, F, R, E>).cast::<()>();
     pool.push_many(
@@ -555,7 +558,7 @@ mod tests {
         let from_b = std::panic::catch_unwind(|| {
             join(
                 || {
-                    std::thread::sleep(Duration::from_millis(2));
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                     1
                 },
                 || -> i32 { panic!("boom b") },

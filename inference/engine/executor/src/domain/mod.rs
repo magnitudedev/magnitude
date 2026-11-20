@@ -11,9 +11,9 @@ use crate::programs::{Chain, ProgramSubmission};
 use crate::programs::graph::readout;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader, ExecutionPlan,
-    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey, Guess, HeadConditioning,
+    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Guess, HeadConditioning,
     HeadLaunchInputs, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
-    Outcome, PoolClass, Priming, ProgramIdentity, RequestId, ResidentHead, ResidentVision,
+    Outcome, PoolClass, Priming, RequestId, ResidentHead, ResidentVision,
     ResourceDomain, ResourceDomainId, ResourceKind, RowResult, SelectSpec, Selected,
     StateLaunchInputs, StateWork, TargetLaunchInputs, TargetTokens, TokenId, ValidatedHeadLaunch,
     ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchInputs,
@@ -661,6 +661,28 @@ impl ResumeState {
     }
 }
 
+/// How urgently the domain's memory state asks for timed re-reads when idle
+/// between flights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryStanding {
+    /// No active shortage/wait/step and every bank holding is saturated.
+    Settled,
+    /// Calm state where at least one bank holding sits below saturation and can
+    /// opportunistically reclaim room if another app releases RAM.
+    Opportunity,
+    /// Active shortage, refused claim waiting, or open growth step.
+    Active,
+}
+
+#[derive(Clone, Debug)]
+struct ExogenousShrink {
+    store: seismic::StoreIdentity,
+    at: std::time::Instant,
+    committed: u64,
+    hold_room: u64,
+    block: u64,
+}
+
 /// Native executor with no erased stage or executor type parameters. The
 /// accepted map is vacant while that request's advance is in flight.
 pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
@@ -719,8 +741,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     queue: queue::Queue<F>,
     head: BTreeMap<RequestId, SequenceState>,
     input: BTreeMap<RequestId, RequestInput>,
-    /// Group identities of the target, head and encoder executables.
-    lane_identities: [ProgramIdentity; 3],
     /// When the last target selection was read to the host.
     selection_read: Option<Instant>,
     target_timing: Option<TargetHostTiming>,
@@ -786,6 +806,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// kept as its slots were made; elsewhere it records its graphs at
     /// first use, as any new shape's.
     shrink_step: bool,
+    /// Records the most recent bank shrink's reading state so transient external
+    /// room jitter cannot immediately ping-pong back into a small grow while
+    /// still letting own-claim frees and large app exits regrow immediately.
+    exogenous_shrink: Option<ExogenousShrink>,
     /// A cut of the expert bank begun beside a running chain, until the
     /// owner takes it ([`Self::take_running_release`]): the storage it
     /// resizes.
@@ -973,19 +997,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         &self,
         bank: &dyn ElasticBank,
     ) -> Result<Vec<crate::experts::derived::DerivedTarget>, DomainError> {
-        let ledgers = self.resources.ledgers();
-        self.derive_bank(bank, |derived| {
-            derived
-                .iter()
-                .map(|(target, slots)| crate::experts::derived::DerivedTarget {
-                    holding: target.holding,
-                    store: ledgers.of(target.tier).store(),
-                    held: target.at,
-                    target: *slots,
-                    block: target.shape.block_bytes(),
-                })
-                .collect()
-        })
+        derived_targets_for(self.resources.ledgers(), bank, self.decode_price()?.as_ref())
     }
 
     /// The device's graph budget (`seismic::Device::graph_budget`) and what
@@ -1042,11 +1054,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             (None, None) => {}
             (Some(experts), Some(bank)) => {
                 tracing::info!(
-                    read = experts.read.why().unwrap_or("measured"),
-                    lines = experts.lines.why().unwrap_or("measured"),
-                    pass = experts.pass.why().unwrap_or("measured"),
-                    tier_copy = experts.tier_copy.why().unwrap_or("measured"),
-                    convert = experts.convert.why().unwrap_or("measured"),
+                    read = experts.read.why().as_deref().unwrap_or("measured"),
+                    lines = experts.lines.why().as_deref().unwrap_or("measured"),
+                    pass = experts.pass.why().as_deref().unwrap_or("measured"),
+                    tier_copy = experts.tier_copy.why().as_deref().unwrap_or("measured"),
+                    convert = experts.convert.why().as_deref().unwrap_or("measured"),
                     "the experts are priced"
                 );
                 if let Some(Some(costs)) = experts.tier_copy.measured() {
@@ -1285,6 +1297,26 @@ struct StoreAnswer<'d> {
     owed: crate::memory::ledger::Owed,
 }
 
+/// Each of `bank`'s holdings beside its derived target, as the bank follows
+/// it (`experts::derived::derive`).
+fn derived_targets_for(
+    ledgers: &crate::memory::ledger::DeviceLedgers,
+    bank: &dyn ElasticBank,
+    decode_price: Option<&magnitude_cost_model::DecodePrice>,
+) -> Result<Vec<crate::experts::derived::DerivedTarget>, DomainError> {
+    let holdings = bank.targets(decode_price)?;
+    Ok(crate::experts::derived::derive(ledgers, &holdings)
+        .iter()
+        .map(|(target, slots)| crate::experts::derived::DerivedTarget {
+            holding: target.holding,
+            store: ledgers.of(target.tier).store(),
+            held: target.at,
+            target: *slots,
+            block: target.shape.block_bytes(),
+        })
+        .collect())
+}
+
 impl<'d> MemoryProbe<'d> {
     /// The domain's probe, of its parts apart from the program family.
     fn of(memory: &'d RefCell<DeviceReader>, ledgers: &'d crate::memory::ledger::DeviceLedgers, answered: &'d RefCell<Answered>, held: &ResizeHeld) -> Self {
@@ -1304,7 +1336,13 @@ impl<'d> MemoryProbe<'d> {
     /// is the one consumer of the shortage's answer. Its plans preempt none
     /// but `evictable`, the requests the owner can evict now, so the owner
     /// carries out every plan it is owed.
-    fn answer(&self, evictable: &std::collections::BTreeSet<RequestId>) -> Vec<StoreAnswer<'d>> {
+    fn answer(
+        &self,
+        evictable: &std::collections::BTreeSet<RequestId>,
+        targets: impl FnOnce() -> Vec<crate::experts::derived::DerivedTarget>,
+    ) -> Vec<StoreAnswer<'d>> {
+        let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
+        let targets = if traced { targets() } else { Vec::new() };
         let answers = stores(self.ledgers)
             .map(|ledger| {
                 // The reading's generation, before its response moves the
@@ -1338,6 +1376,52 @@ impl<'d> MemoryProbe<'d> {
             owed.admission_waits |= shortage.response.admission_waits;
             owed.relief.extend(shortage.response.relief.clone());
             owed.unload |= shortage.response.unload;
+        }
+        drop(answered);
+        if traced {
+            for StoreAnswer { ledger, generation, shortage, owed } in &answers {
+                let estimate = ledger.estimate();
+                let held = |holding| targets.iter().find(|target| target.holding == holding && target.store == ledger.store());
+                let (experts, host) = (held(BankHolding::Experts), held(BankHolding::Host));
+                tracing::debug!(
+                    target: MEMORY_TRACE,
+                    store = ?ledger.store(),
+                    generation,
+                    budget = estimate.budget(),
+                    supply = estimate.supply(),
+                    committed = estimate.committed(),
+                    cache = estimate.cache(),
+                    bank_cache = estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
+                    other_cache = estimate.cache() - estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
+                    // Zero where no weight cap bounds the store.
+                    cap = estimate.cap().unwrap_or(0),
+                    free = estimate.free(),
+                    others = estimate.others(),
+                    nonresident = estimate.nonresident(),
+                    unobserved_resident = estimate.unobserved_resident(),
+                    unobserved_readings = estimate.unobserved_readings(),
+                    accounting_violations = estimate.accounting_violations(),
+                    pressure_lost = ledger.pressure_lost(),
+                    unwired_shortfall = estimate.unwired_shortfall(),
+                    unwired_readings = estimate.unwired_readings(),
+                    // Zero where no wired ceiling bounds the store.
+                    wired_limit = estimate.wired_limit().unwrap_or(0),
+                    wire_count = estimate.wire_count().unwrap_or(0),
+                    allocated = estimate.allocated(),
+                    guarantee = estimate.guarantee(),
+                    pending = estimate.pending(),
+                    short = shortage.is_some(),
+                    yielded = owed.yielded,
+                    bank_slots = experts.map_or(0, |target| target.held),
+                    bank_target = experts.map_or(0, |target| target.target),
+                    // The least the bank shrinks by; zero where no bank holds
+                    // experts in the store.
+                    bank_block = experts.map_or(0, |target| target.block),
+                    host_slots = host.map_or(0, |target| target.held),
+                    host_target = host.map_or(0, |target| target.target),
+                    "memory read"
+                );
+            }
         }
         answers
     }
@@ -1377,7 +1461,11 @@ impl<'d> MemoryProbe<'d> {
     /// where a change beside the sample deferred the reading (the pressure
     /// stays owed to the next), or where the answer took none of the bank's
     /// cache.
-    fn running_pressure(&self, bank: &dyn ElasticBank) -> Option<RunningPressure> {
+    fn running_pressure(
+        &self,
+        bank: &dyn ElasticBank,
+        decode_price: Option<&magnitude_cost_model::DecodePrice>,
+    ) -> Option<RunningPressure> {
         let reader = self.memory.borrow();
         if self.resizing || !reader.pressured() {
             return None;
@@ -1393,7 +1481,9 @@ impl<'d> MemoryProbe<'d> {
         let before = bank_cache();
         // Beside a running chain the owner evicts nothing: the answer's
         // relief preempts no request.
-        drop(self.answer(&std::collections::BTreeSet::new()));
+        drop(self.answer(&std::collections::BTreeSet::new(), || {
+            derived_targets_for(self.ledgers, bank, decode_price).unwrap_or_default()
+        }));
         match before - bank_cache() {
             0 => None,
             bytes => Some(RunningPressure { bytes }),
@@ -1771,9 +1861,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The target launches graphs were sealed for: the launch row bound and
     /// the target store's span limit.
     fn target_class_limits(&self) -> crate::batching::ClassLimits {
+        let limits = self.execution.policy().limits();
         crate::batching::ClassLimits {
-            rows: self.execution.policy().limits().max_launch_rows,
+            rows: limits.max_launch_rows,
             segments: self.target_store.max_span_limit(),
+            slots: limits.max_launch_slots,
         }
     }
 
@@ -1788,9 +1880,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None if self.head_reads_target() => &self.target_store,
             None => panic!("invariant violated: a drafter launch on a load without a drafter"),
         };
+        let limits = self.execution.policy().limits();
         crate::batching::ClassLimits {
-            rows: self.execution.policy().limits().max_launch_rows,
+            rows: limits.max_launch_rows,
             segments: store.max_span_limit(),
+            slots: limits.max_launch_slots,
         }
     }
 
@@ -1856,57 +1950,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let cost = began.elapsed();
         let generation = self.memory_generation();
-        let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
-        let targets = match (traced, self.family.expert_bank()) {
+        let targets = match (tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG), self.family.expert_bank()) {
             (true, Some(bank)) => self.derived_targets(bank)?,
             _ => Vec::new(),
         };
-        for StoreAnswer { ledger, generation, shortage, owed } in probe.answer(evictable) {
-            if !traced {
-                continue;
-            }
-            let estimate = ledger.estimate();
-            let held = |holding| targets.iter().find(|target| target.holding == holding && target.store == ledger.store());
-            let (experts, host) = (held(BankHolding::Experts), held(BankHolding::Host));
-            tracing::debug!(
-                target: MEMORY_TRACE,
-                store = ?ledger.store(),
-                generation,
-                budget = estimate.budget(),
-                supply = estimate.supply(),
-                committed = estimate.committed(),
-                cache = estimate.cache(),
-                bank_cache = estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
-                other_cache = estimate.cache() - estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
-                // Zero where no weight cap bounds the store.
-                cap = estimate.cap().unwrap_or(0),
-                free = estimate.free(),
-                others = estimate.others(),
-                nonresident = estimate.nonresident(),
-                unobserved_resident = estimate.unobserved_resident(),
-                unobserved_readings = estimate.unobserved_readings(),
-                accounting_violations = estimate.accounting_violations(),
-                pressure_lost = ledger.pressure_lost(),
-                unwired_shortfall = estimate.unwired_shortfall(),
-                unwired_readings = estimate.unwired_readings(),
-                // Zero where no wired ceiling bounds the store.
-                wired_limit = estimate.wired_limit().unwrap_or(0),
-                wire_count = estimate.wire_count().unwrap_or(0),
-                allocated = estimate.allocated(),
-                guarantee = estimate.guarantee(),
-                pending = estimate.pending(),
-                short = shortage.is_some(),
-                yielded = owed.yielded,
-                bank_slots = experts.map_or(0, |target| target.held),
-                bank_target = experts.map_or(0, |target| target.target),
-                // The least the bank shrinks by; zero where no bank holds
-                // experts in the store.
-                bank_block = experts.map_or(0, |target| target.block),
-                host_slots = host.map_or(0, |target| target.held),
-                host_target = host.map_or(0, |target| target.target),
-                "memory read"
-            );
-        }
+        drop(probe.answer(evictable, || targets));
         let response = self.answered.borrow_mut().owed.take();
         Ok(MemoryReading::Read(MemoryRead { cost, generation, response }))
     }
@@ -1930,14 +1978,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.stores().map(crate::memory::ledger::Ledger::holdings_generation).sum()
     }
 
-    /// Whether anything stands that only a later reading can answer: a
-    /// store's own standing (`memory::ledger::Ledger::standing`: a real
-    /// shortage, a refused claim waiting, a growth the boundary holds
-    /// back), or the expert bank short of its saturation in any holding
-    /// (`experts::derived::BankShape::saturation_slots`), which only memory
-    /// another program frees can grow, and which the ledger, holding no
-    /// miss curve, cannot see.
-    pub fn memory_stands(&self) -> Result<bool, DomainError> {
+    /// How urgently the domain's ledgers and bank ask for timed re-reads when idle:
+    /// `Active` on an active shortage/wait/step, `Opportunity` when calm but a bank
+    /// holding is short of saturation, `Settled` otherwise.
+    pub fn memory_standing(&self) -> Result<MemoryStanding, DomainError> {
         if self.stores().any(|ledger| {
             matches!(
                 ledger.standing(),
@@ -1948,12 +1992,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 )
             )
         }) {
-            return Ok(true);
+            return Ok(MemoryStanding::Active);
         }
         let Some(bank) = self.family.expert_bank() else {
-            return Ok(false);
+            return Ok(MemoryStanding::Settled);
         };
-        self.derive_bank(bank, |derived| derived.iter().any(|(target, _)| target.at < target.shape.saturation_slots()))
+        let unsaturated = self.derive_bank(bank, |derived| derived.iter().any(|(target, _)| target.at < target.shape.saturation_slots()))?;
+        Ok(match unsaturated {
+            true => MemoryStanding::Opportunity,
+            false => MemoryStanding::Settled,
+        })
     }
 
     /// The sum of readings folded into the load's stores so far: unchanged
@@ -2039,8 +2087,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         spare: crate::TargetGraphOutputLease,
     ) -> Result<Chain<F::TargetSubmission>, crate::programs::ChainRefusal> {
         // The family is lent to the chain, so the probe borrows the rest.
+        let decode_price = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG)
+            .then(|| self.decode_price().ok().flatten())
+            .flatten();
         let probe = MemoryProbe::of(&self.memory, self.resources.ledgers(), &self.answered, &self.resize_held);
-        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank));
+        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank, decode_price.as_ref()));
         self.note_running_cut();
         submitted
     }
@@ -2184,20 +2235,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut head_launches = 0usize;
         let mut head_demand = Vec::new();
         let mut head_banks = 0usize;
-        // A step whose forwards chain runs one front head launch behind it,
-        // whose entry rows are the forwards' selected rows
-        // (`Operation::entry_rows`, `HeadPasses::Front`): every forward
-        // chains or none, within a front head launch's rows.
-        let chained = operations.iter().filter(|operation| operation.chain().is_some()).count();
-        if chained > 0 {
+        if let Some(index) = (0..operations.len()).find(|&index| !self.shares_launch(&operations[..index], &operations[index])) {
+            return Err(DomainError::Input(format!(
+                "operation {index} of a launch may not share it (`ExecutorDomain::shares_launch`)"
+            )));
+        }
+        // A step whose forwards chain (all of them, `Self::shares_launch`)
+        // runs one front head launch behind it.
+        if first.chain().is_some() {
             if !self.fronts() {
                 return Err(DomainError::Input("a chained forward on a load that does not front".into()));
-            }
-            let entries = operations.iter().map(Operation::entry_rows).sum::<usize>();
-            if chained != operations.len() || entries > self.chained_rows() {
-                return Err(DomainError::Input(
-                    "a launch of chained forwards chains every forward within a chained launch's rows".into(),
-                ));
             }
             head_launches += 1;
         }
@@ -2215,17 +2262,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             if let Operation::Forward {
                 request,
+                tokens,
                 prime: Some(prime),
                 ..
             } = operation
             {
                 if self.head_reads_target() {
                     panic!("invariant violated: a head reading target history keeps no history to prime");
-                }
-                if operations.len() != 1 {
-                    return Err(DomainError::Input(
-                        "a primed prompt chunk launches alone".into(),
-                    ));
                 }
                 let state = self.head.get(request).ok_or_else(|| {
                     DomainError::Input("a primed prompt chunk's drafter is not idle".into())
@@ -2235,25 +2278,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         "drafter entry position differs from accepted drafter state".into(),
                     ));
                 }
-                // A successor-dependent entry's pairs are its chunk's
-                // (`Operation::validate`); the domain holds the boundary
-                // feature of every accepted target prefix, which an entry
-                // pairing its first token across it reads.
-                if prime.boundary {
-                    let Operation::Forward { position, .. } = operation else {
-                        unreachable!()
-                    };
-                    if self
-                        .input
-                        .get(request)
-                        .and_then(|input| input.boundary.as_ref())
-                        .is_some()
-                        != (*position > 0)
-                    {
-                        return Err(DomainError::Input(
-                            "boundary priming differs from the accepted target prefix".into(),
-                        ));
-                    }
+                // An entry pairing its chunk's first token across the
+                // chunk's boundary reads the boundary feature of the accepted
+                // target prefix (`Priming::pairs_previous`); one entering
+                // only pairs inside the chunk reads none, whatever the
+                // prefix holds: the first chunk, or one resumed past rows a
+                // pass's entry already paired.
+                if prime.pairs_previous(tokens.len())
+                    && self.input.get(request).and_then(|input| input.boundary.as_ref()).is_none()
+                {
+                    return Err(DomainError::Input(
+                        "a drafter entry pairs across its chunk's boundary with no boundary feature".into(),
+                    ));
                 }
                 // The closing chunk's front head launch enters its row right
                 // past the drafter entry's.
@@ -2934,10 +2970,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // (`Self::open_group`).
         let arena = recorded.claim_arena(resources.ledgers().device());
         let id = resources.domain().clone();
-        let lane_identities = ["target", "head", "vision"].map(|lane| {
-            ProgramIdentity::new(format!("{id}:{lane}"))
-                .expect("a lane identity names its lane and is never empty")
-        });
         let domain = Box::new(Self {
             execution,
             definition,
@@ -2961,7 +2993,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             queue: queue::Queue::Empty,
             head: BTreeMap::new(),
             input: BTreeMap::new(),
-            lane_identities,
             selection_read: None,
             target_timing: None,
             trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
@@ -2981,6 +3012,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             measures: None,
             resize_held: ResizeHeld::default(),
             shrink_step: false,
+            exogenous_shrink: None,
             running_release: None,
             _owner: owner,
             teardown: Default::default(),
@@ -3013,21 +3045,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.resources.ledgers().measurement(self.domain.device())
     }
 
-    /// The compatibility key of an operation. Keying does not validate;
-    /// reservation validates every operation at the domain boundary.
-    pub fn group_key(&self, operation: &Operation) -> GroupKey {
-        let executable = operation.executable();
-        let lane = match executable {
-            crate::ExecutableKind::Target => 0,
-            crate::ExecutableKind::Head => 1,
-            crate::ExecutableKind::Encoder => 2,
+    /// Whether `operation` may join `launch`, the operations of one launch
+    /// so far (none: whether it may launch at all): the one owner of which operations share a launch, which
+    /// [`Self::requirements`] holds every launch to. A launch runs one
+    /// executable, its operations alike in commitment and draft shape, one
+    /// operation a request. An image's encoding and a primed prompt chunk
+    /// (whose drafter entry reads the chunk's own features) launch alone. A
+    /// step whose forwards chain runs one front head launch behind it, whose
+    /// entry rows are the forwards' selected rows (`Operation::entry_rows`,
+    /// `HeadPasses::Front`): every forward chains or none, within a chained
+    /// launch's rows ([`Self::chained_rows`]).
+    pub fn shares_launch(&self, launch: &[Operation], operation: &Operation) -> bool {
+        let rows = launch.iter().chain([operation]).map(Operation::entry_rows).sum::<usize>() <= self.chained_rows();
+        let Some(first) = launch.first() else {
+            return rows;
         };
-        GroupKey {
-            program_identity: self.lane_identities[lane].clone(),
-            executable,
-            commitment: operation.commitment(),
-            draft: operation.draft_shape(),
-        }
+        let alone = |operation: &Operation| {
+            matches!(operation, Operation::Encode { .. } | Operation::Forward { prime: Some(_), .. })
+        };
+        first.executable() == operation.executable()
+            && first.commitment() == operation.commitment()
+            && first.draft_shape() == operation.draft_shape()
+            && !alone(first)
+            && !alone(operation)
+            && launch.iter().all(|item| item.request() != operation.request())
+            && first.chain().is_some() == operation.chain().is_some()
+            && rows
     }
 
     /// Host timing of the most recently finished target step.

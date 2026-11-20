@@ -311,13 +311,8 @@ pub(crate) struct NGramStepPorts {
     pub table: StoredReadPorts,
 }
 
-/// The class scope of an n-gram input's nodes, whose `B` is its bank's
-/// request slots: in an attention block, the class's slots, beside the
-/// attention kernels' own static `B`.
-pub(crate) const NGRAM_SLOTS: &str = "ngram_slots";
-
 /// The n-gram input over the `[rows, S * H]` streams `residual`: the new
-/// streams and its ports, its nodes in [`NGRAM_SLOTS`].
+/// streams and its ports.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
     graph: &mut G,
@@ -331,7 +326,6 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
     residual: &WorkflowTensor,
     controls: Option<&RecurrentControlPorts>,
 ) -> Result<(WorkflowTensor, NGramPorts), GraphError> {
-    graph.set_class_scope(Some(NGRAM_SLOTS));
     let rows = &numbers.rows;
     let (s, h) = (Dim::from(topology.streams), &numbers.hidden);
     let rule = topology.rule;
@@ -372,7 +366,7 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
     // The table rows of each batch row, from the step's token rows: a
     // device tensor whatever their source (the entry's kept copy of the
     // host's tokens, or the previous step's selection), bound per run.
-    let tokens = graph.port_with_class_extent(Element::i32(), &[rows.clone(), Dim::from(2)], 0, "M")?;
+    let tokens = graph.port(Element::i32(), &[rows.clone(), Dim::from(2)])?;
     let tables = &topology.tables;
     let table = |graph: &mut G, element, extent: u64, table| GraphConstant::table(graph, element, &[Dim::from(extent)], table);
     let rule_tables = [
@@ -567,7 +561,6 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
         .into_iter()
         .chain([token_window_port])
         .collect();
-    graph.set_class_scope(None);
     Ok((
         streams,
         NGramPorts {

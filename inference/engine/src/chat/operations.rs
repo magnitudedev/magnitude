@@ -75,8 +75,14 @@ pub fn prepare(
             ]
             .into_iter()
             .flatten()
-            .map(|boundary| input.prompt_position_row(boundary))
-            .collect::<Vec<_>>();
+            .map(|boundary| {
+                input.prompt_position_row(boundary).ok_or_else(|| {
+                    ChatError::Internal(format!(
+                        "message boundary {boundary} exceeds prepared source boundaries"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
             cache_points.sort_unstable();
             cache_points.dedup();
             (input, cache_points)

@@ -356,6 +356,33 @@ impl DeviceLedgers {
         }
     }
 
+    fn fit_most<E>(
+        &self,
+        reading: &DeviceReading,
+        device: &seismic::Device,
+        least: u64,
+        most: u64,
+        demand: &impl Fn(u64) -> Result<crate::memory::ClaimDemand, E>,
+    ) -> Result<Result<u64, Short>, E> {
+        assert!(least <= most, "invariant violated: an admission's least count exceeds its most");
+        if self.fits(reading, device, demand(most)?).is_ok() {
+            return Ok(Ok(most));
+        }
+        if let Err(short) = self.fits(reading, device, demand(least)?) {
+            return Ok(Err(short));
+        }
+        // `fitting` fits, `over` does not.
+        let (mut fitting, mut over) = (least, most);
+        while over - fitting > 1 {
+            let middle = fitting + (over - fitting) / 2;
+            match self.fits(reading, device, demand(middle)?) {
+                Ok(()) => fitting = middle,
+                Err(_) => over = middle,
+            }
+        }
+        Ok(Ok(fitting))
+    }
+
     /// The most of `least..=most` whose `demand` fits, by halving at
     /// `reading`, the one the load holds, claimed as `kind` there in
     /// `claiming` ([`Self::claim_at`]), nothing allocated: `demand` never
@@ -372,26 +399,34 @@ impl DeviceLedgers {
         most: u64,
         demand: impl Fn(u64) -> Result<crate::memory::ClaimDemand, E>,
     ) -> Result<Result<(u64, Held), Short>, E> {
-        assert!(least <= most, "invariant violated: an admission's least count exceeds its most");
-        let fitting = match self.fits(reading, device, demand(most)?) {
-            Ok(()) => most,
-            Err(_) => {
-                if let Err(short) = self.fits(reading, device, demand(least)?) {
-                    return Ok(Err(short));
-                }
-                // `fitting` fits, `over` does not.
-                let (mut fitting, mut over) = (least, most);
-                while over - fitting > 1 {
-                    let middle = fitting + (over - fitting) / 2;
-                    match self.fits(reading, device, demand(middle)?) {
-                        Ok(()) => fitting = middle,
-                        Err(_) => over = middle,
-                    }
-                }
-                fitting
-            }
+        let fitting = match self.fit_most(reading, device, least, most, &demand)? {
+            Ok(fitting) => fitting,
+            Err(short) => return Ok(Err(short)),
         };
         Ok(self.claim_at(claiming, reading, device, kind, demand(fitting)?).map(|held| (fitting, held)))
+    }
+
+    /// Size two independent slot ceilings `(least_a..=most_a)` (e.g. GPU bank
+    /// slots) and `(least_b..=most_b)` (e.g. host tier slots down to 0) against
+    /// `reading` and claim the fitting pair in one `claim_at`.
+    pub fn admit_most_pair<E>(
+        &self,
+        claiming: &Claiming,
+        reading: &DeviceReading,
+        device: &seismic::Device,
+        kind: CommittedKind,
+        (least_a, most_a): (u64, u64),
+        (least_b, most_b): (u64, u64),
+        demand: impl Fn(u64, u64) -> Result<crate::memory::ClaimDemand, E>,
+    ) -> Result<Result<(u64, u64, Held), Short>, E> {
+        let fitting_a = match self.fit_most(reading, device, least_a, most_a, &|a| demand(a, least_b))? {
+            Ok(fitting) => fitting,
+            Err(short) => return Ok(Err(short)),
+        };
+        match self.admit_most(claiming, reading, device, kind, least_b, most_b, |b| demand(fitting_a, b))? {
+            Ok((fitting_b, held)) => Ok(Ok((fitting_a, fitting_b, held))),
+            Err(short) => Ok(Err(short)),
+        }
     }
 
     /// Read every store `device` reaches from `sample`, one instant's, and
@@ -532,9 +567,12 @@ impl DeviceLedgers {
     pub fn open_pool(&self, device: &seismic::Device, contract: seismic::Contract, class: PoolClass, granule: u64) -> Result<seismic::Pool, String> {
         let sizing = seismic::BlockSizing { granule, allocations: device.native_allocations() };
         let block = seismic::block_bytes(sizing).map_err(|error| format!("the {contract:?} store's {class:?} pool blocks: {error:?}"))?;
-        let entries = self.of_contract(device, contract).pool_block(class, NonZeroU64::new(block.held).expect("a block holds a granule"));
-        seismic::Pool::open(&entries.charges(device, contract), contract, granule, block.bytes)
-            .map_err(|error| format!("the {contract:?} store's {class:?} pool: {error}"))
+        let ledger = self.of_contract(device, contract);
+        let entries = ledger.pool_block(class, NonZeroU64::new(block.held).expect("a block holds a granule"));
+        let pool = seismic::Pool::open(&entries.charges(device, contract), contract, granule, block.bytes)
+            .map_err(|error| format!("the {contract:?} store's {class:?} pool: {error}"))?;
+        ledger.register_pool_reclaimer(class, Arc::new(PoolReclaimer(pool.downgrade())));
+        Ok(pool)
     }
 
     /// The ledger of the store `device` places `contract`'s fixed storage
@@ -615,6 +653,22 @@ impl DeviceLedgers {
             weights.claims.push(backing);
         }
         Ok(())
+    }
+}
+
+/// Synchronous reclaimer for a granule pool's spare/releasing blocks, held
+/// weakly so it never extends the pool's lifetime.
+struct PoolReclaimer(seismic::WeakPool);
+
+impl CacheReclaimer for PoolReclaimer {
+    fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+        let Some(pool) = self.0.upgrade() else {
+            return Err(ReclaimError::AtFloor);
+        };
+        match pool.return_freed_sync(need).map_err(|error| ReclaimError::Invariant(error.to_string()))? {
+            0 => Err(ReclaimError::AtFloor),
+            freed => Ok(freed),
+        }
     }
 }
 

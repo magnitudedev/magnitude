@@ -22,7 +22,7 @@ impl Device {
     /// host pages of its own at the page, whatever its size, backed and
     /// zero, charged exactly to `entry` ([`WritableBuffer::pages`]): the
     /// pool lays granules from the block's base at its granule alignment.
-    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<WritableBuffer, ExecutionError> {
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>, _fill: seismic_memory::SlabFill) -> Result<WritableBuffer, ExecutionError> {
         assert_eq!(kind, crate::topology::kind().id, "invariant violated: a CPU block of kind {kind}");
         WritableBuffer::pages(bytes, entry)
     }

@@ -259,5 +259,8 @@ fn timeline_nodes_are_in_the_planned_host_heap() {
     metadata.timeline(seismic::timeline::Signal);
     graph.export(&value).unwrap();
     metadata.export(&planned).unwrap();
-    assert_eq!(graph.seal().unwrap().host_heap(), metadata.plan_heap());
+    let plan = graph.seal().unwrap();
+    assert_eq!(plan.host_heap(), metadata.plan_heap());
+    assert_eq!(plan.topology_heap(), metadata.topology_heap());
+    assert!(plan.topology_heap().bytes > 0);
 }

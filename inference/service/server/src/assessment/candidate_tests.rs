@@ -1079,7 +1079,11 @@ fn cpu_environment() -> Arc<AssessmentEnvironment> {
     Arc::new(
         AssessmentEnvironment::new(
             Arc::new(structure),
-            magnitude_engine::assessment::Measurements::Pending,
+            magnitude_engine::assessment::Measurements::Pending(
+                magnitude_executor::assessment::PendingPrices::standing(
+                    magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+                ),
+            ),
         )
         .expect("the CPU environment"),
     )
@@ -5061,7 +5065,11 @@ fn budget_environment(budget: u64) -> Arc<AssessmentEnvironment> {
     Arc::new(
         AssessmentEnvironment::new(
             Arc::new(structure),
-            magnitude_engine::assessment::Measurements::Pending,
+            magnitude_engine::assessment::Measurements::Pending(
+                magnitude_executor::assessment::PendingPrices::standing(
+                    magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+                ),
+            ),
         )
         .expect("the CPU environment"),
     )
@@ -6225,7 +6233,12 @@ async fn a_model_refused_at_the_graph_bound_is_offered_once_its_graph_cost_lands
     });
     let structure = Arc::new(structure);
     let environment = Arc::new(
-        AssessmentEnvironment::new(Arc::clone(&structure), Measurements::Pending)
+        AssessmentEnvironment::new(
+            Arc::clone(&structure),
+            Measurements::Pending(magnitude_executor::assessment::PendingPrices::standing(
+                magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+            )),
+        )
             .expect("the CPU environment"),
     );
     let bound = environment.id.clone();
@@ -6240,7 +6253,9 @@ async fn a_model_refused_at_the_graph_bound_is_offered_once_its_graph_cost_lands
     .await;
     let (status, measurement) = tokio::sync::watch::channel(MeasurementStatus::stored(AssessmentSetup {
         structure: Arc::clone(&structure),
-        measurements: Measurements::Pending,
+        measurements: Measurements::Pending(magnitude_executor::assessment::PendingPrices::standing(
+            magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+        )),
     }));
     let assessments = crate::assessment::ManagedModelAssessments::start(
         Arc::clone(&fixture.assessor),

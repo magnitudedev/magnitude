@@ -184,11 +184,7 @@ impl TargetLaunchInputs {
                 || boundary.allocation().width() != boundary_width
                 || boundary.allocation().is_graph_backed()
                 || boundary.allocation().tensor().is_err()
-                || !self
-                    .batch
-                    .class()
-                    .demand()
-                    .contains(magnitude_batching::Demand::FEATURES)
+                || !self.batch.class().demand().computes_features()
             {
                 return Err(invalid(
                     "invalid independent boundary feature destination".into(),

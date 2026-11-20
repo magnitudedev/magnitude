@@ -2044,9 +2044,10 @@ fn render_contract_node_shape(
         }
         launch_when_dims_lit.push(']');
 
+        let conditions: usize = native.launches.iter().map(|l| l.conditions.len()).sum();
         let _ = writeln!(
             out,
-            "        seismic::BackendName::{variant} => Ok(seismic::ContractNodeShape {{ buffers: {buffers}usize, arguments: {arguments}usize, words: {words}usize, launches: {launches}usize, disjoint: {disjoint_lit}, parks: {}, result_ranks: {ranks_lit}, statics: {statics_lit}, sizing_dims: {sizing_dims_lit}, monotonic_sizing_dims: {monotonic_sizing_dims_lit}, launch_when_dims: {launch_when_dims_lit} }}),",
+            "        seismic::BackendName::{variant} => Ok(seismic::ContractNodeShape {{ buffers: {buffers}usize, arguments: {arguments}usize, words: {words}usize, launches: {launches}usize, conditions: {conditions}usize, disjoint: {disjoint_lit}, parks: {}, result_ranks: {ranks_lit}, statics: {statics_lit}, sizing_dims: {sizing_dims_lit}, monotonic_sizing_dims: {monotonic_sizing_dims_lit}, launch_when_dims: {launch_when_dims_lit} }}),",
             schema_info.parks
         );
     }

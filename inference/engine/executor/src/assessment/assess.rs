@@ -522,13 +522,14 @@ struct StateSizer {
     target_history: Vec<magnitude_state::HistoryDomainLayout>,
     target_recurrent: Vec<magnitude_state::ComponentSpec>,
     head_history: Vec<magnitude_state::HistoryDomainLayout>,
+    method: crate::PlannedMethod,
     limits: crate::ResourceLimits,
     capacity_bytes: ResourceCapacity,
     seeded_banks: Option<(u64, u32)>,
 }
 
 impl StateSizer {
-    fn from_state(state: crate::StateResourcePlan) -> Self {
+    fn from_state(state: crate::StateResourcePlan, method: crate::PlannedMethod) -> Self {
         let (
             target_history,
             target_recurrent,
@@ -541,6 +542,7 @@ impl StateSizer {
             target_history,
             target_recurrent,
             head_history,
+            method,
             limits,
             capacity_bytes,
             seeded_banks,
@@ -553,6 +555,7 @@ impl StateSizer {
             &self.target_recurrent,
             &self.head_history,
             context_limit,
+            self.method,
             self.limits,
             self.capacity_bytes,
             self.seeded_banks,
@@ -613,18 +616,14 @@ impl BankSlotModel {
             }
         }
 
-        let res_0 = bank.resident_charge(bank.slots)?;
+        let places_0 = bank.places_storage_demand(bank.places)?;
+        let paths_layout_0 = bank.paths_layout_demand(bank.paths)?;
+        let pooled_0 = bank.pooled_demand_at(bank.slots, bank.paths)?;
         let device_only =
             bank.host().contract(crate::planning::BankTier::Bank) == seismic::Contract::DeviceOnly;
-        let base_demand = if device_only {
-            ClaimDemand {
-                device: prepared_weight_demand
-                    .device
-                    .checked_sub(res_0)
-                    .ok_or_else(|| "bank weight demand underflows".to_owned())?,
-                ..prepared_weight_demand
-            }
-        } else {
+        let mut base_demand = prepared_weight_demand;
+        if !device_only {
+            let res_0 = bank.resident_charge_with_paths(bank.slots, bank.paths)?;
             let mut rec_0 = 0u64;
             for &(slot_bytes, experts) in &layers {
                 let bytes = slot_bytes
@@ -635,19 +634,20 @@ impl BankSlotModel {
                     .ok_or_else(|| "banked record bytes overflow".to_owned())?;
             }
             let lent_0 = rec_0.saturating_sub(res_0);
-            ClaimDemand {
-                device: prepared_weight_demand
-                    .device
-                    .checked_sub(res_0)
-                    .and_then(|d| d.checked_sub(lent_0))
-                    .ok_or_else(|| "bank weight demand underflows".to_owned())?,
-                shared: prepared_weight_demand
-                    .shared
-                    .checked_add(lent_0)
-                    .ok_or_else(|| "bank weight demand overflows".to_owned())?,
-                ..prepared_weight_demand
-            }
-        };
+            base_demand.device = base_demand
+                .device
+                .checked_sub(lent_0)
+                .ok_or_else(|| "bank weight demand underflows".to_owned())?;
+            base_demand.shared = base_demand
+                .shared
+                .checked_add(lent_0)
+                .ok_or_else(|| "bank weight demand overflows".to_owned())?;
+        }
+        for part in [places_0, paths_layout_0, pooled_0] {
+            base_demand = base_demand
+                .checked_minus(part)
+                .ok_or_else(|| "bank weight demand underflows".to_owned())?;
+        }
 
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         enum FixtureScope {
@@ -755,14 +755,27 @@ impl BankSlotModel {
         bank: &crate::planning::ExpertBankPlan,
         slots: u64,
     ) -> Result<ClaimDemand, String> {
-        let res = bank.resident_charge(slots)?;
-        let mut demand = self.base_demand;
-        if self.device_only {
-            demand.device = demand
-                .device
-                .checked_add(res)
-                .ok_or_else(|| "weight demand overflows".to_owned())?;
-        } else {
+        self.weight_demand_at(bank, slots, bank.places, bank.paths)
+    }
+
+    fn weight_demand_at(
+        &self,
+        bank: &crate::planning::ExpertBankPlan,
+        slots: u64,
+        places: u64,
+        paths: crate::planning::BankPaths,
+    ) -> Result<ClaimDemand, String> {
+        let places_demand = bank.places_storage_demand(places)?;
+        let paths_demand = bank.paths_layout_demand(paths)?;
+        let pooled_demand = bank.pooled_demand_at(slots, paths)?;
+        let mut demand = self
+            .base_demand
+            .checked_plus(places_demand)
+            .and_then(|d| d.checked_plus(paths_demand))
+            .and_then(|d| d.checked_plus(pooled_demand))
+            .ok_or_else(|| "weight demand overflows".to_owned())?;
+        if !self.device_only {
+            let res = bank.resident_charge_with_paths(slots, paths)?;
             let mut rec = 0u64;
             for &(slot_bytes, experts) in &self.layers {
                 let bytes = slot_bytes
@@ -775,8 +788,7 @@ impl BankSlotModel {
             let lent = rec.saturating_sub(res);
             demand.device = demand
                 .device
-                .checked_add(res)
-                .and_then(|d| d.checked_add(lent))
+                .checked_add(lent)
                 .ok_or_else(|| "weight demand overflows".to_owned())?;
             demand.shared = demand
                 .shared
@@ -1029,7 +1041,7 @@ impl StructuralCharge {
             state.startup_state_bytes().map_err(AssessmentError::Memory)?,
         );
         let (graph, target_cache, more) = graph(&state).map_err(AssessmentError::Graph)?;
-        let state_sizer = std::sync::Arc::new(StateSizer::from_state(state));
+        let state_sizer = std::sync::Arc::new(StateSizer::from_state(state, draft.policy().method()));
         let host_process =
             HostProcessBytes::from_graph_bounds(definition, draft.programs(), &graph, backend)
                 .map_err(AssessmentError::Memory)?;
@@ -1198,21 +1210,24 @@ impl StructuralCharge {
         self.compose_charge(state_bytes, weight_demand, startup_additional_bytes, pricing.cost())
     }
 
-    /// The charge of this banked structure at `slots` and `pricing`, using
-    /// precomputed `state_bytes` and `BankSlotModel` without cloning `draft`.
-    fn charge_at_slots(
+    /// The charge of this banked structure at `(slots, places, paths)` and
+    /// `pricing`, using precomputed `state_bytes` and `BankSlotModel` without
+    /// cloning `draft`.
+    fn charge_at_slots_places_and_paths(
         &self,
         state_bytes: (u64, u64),
         bank: &crate::planning::ExpertBankPlan,
         slots: u64,
+        places: u64,
+        paths: crate::planning::BankPaths,
         pricing: crate::platform::GraphPricing,
     ) -> Result<AssessmentMemoryCharge, AssessmentError> {
         let model = self
             .bank_slot_model
             .as_ref()
-            .expect("invariant violated: charge_at_slots requires a banked StructuralCharge");
+            .expect("invariant violated: charge_at_slots_places_and_paths requires a banked StructuralCharge");
         let weight_demand = model
-            .weight_demand(bank, slots)
+            .weight_demand_at(bank, slots, places, paths)
             .map_err(AssessmentError::Memory)?;
         let startup_additional_bytes = model
             .qualification_peak(slots)
@@ -1277,6 +1292,232 @@ fn planned_executor<'a>(
     })
 }
 
+/// O(1)-per-slot path record pricer derived from a prepared assessment's
+/// cached `TargetCensus` and measured executor/streamed figures, matching
+/// `magnitude_cost_model::BankPrices::paths` bit-for-bit without re-certifying
+/// graphs.
+struct BankPathPricer {
+    layers: magnitude_cost_model::StreamedLayers,
+    read: magnitude_cost_model::ReadLine,
+    compute: magnitude_cost_model::FormSeconds,
+    num_layers: u64,
+    least_move_bytes: u64,
+}
+
+impl BankPathPricer {
+    fn new(
+        context_limit: u64,
+        prepared: &PreparedExecutionAssessment,
+        bank: &crate::planning::ExpertBankPlan,
+        costs: &ExecutorCosts,
+        figures: &super::StreamedFigures,
+    ) -> Result<Option<Self>, AssessmentError> {
+        let super::Priced::Measured(layers) = super::streamed_layers(bank, costs, figures) else {
+            return Ok(None);
+        };
+        let limits = prepared.draft().policy().limits();
+        let prior = crate::planning::prior(context_limit, limits)?;
+        let target = prepared.target_census();
+        let priced = costs.figures(&target.censuses());
+        let pricing = Pricing {
+            figures: &priced,
+            lookahead: lookahead(prepared.draft()),
+        };
+        let compute = target.each(|census| {
+            magnitude_cost_model::step_seconds(census, &pricing, 1, prior.decode_depth)
+        })?;
+        let least_move_bytes = bank
+            .least_move_bytes()
+            .map_err(AssessmentError::Memory)?;
+        Ok(Some(Self {
+            layers,
+            read: figures.read,
+            compute,
+            num_layers: bank.layers().len() as u64,
+            least_move_bytes,
+        }))
+    }
+
+    fn paths_at(&self, slots: u64) -> Result<crate::planning::BankPaths, AssessmentError> {
+        let slots = usize::try_from(slots)
+            .map_err(|_| AssessmentError::Memory("a bank's slots exceed usize".into()))?;
+        let held = HeldSlots::bank(slots);
+        let records = self
+            .layers
+            .path_records(
+                self.read,
+                self.compute,
+                self.least_move_bytes,
+                held,
+                crate::planning::HINT_LEADS,
+                self.num_layers,
+            )
+            .unwrap_or(magnitude_cost_model::PathRecords::NONE);
+        Ok(crate::planning::BankPaths::Priced {
+            line: self.read,
+            records,
+        })
+    }
+}
+
+/// Clone `draft`'s `ExpertBankPlan` at `(slots, places, paths)` and size its
+/// linked host tier against `room` beside `charge`, without cloning
+/// `ModelLoadPlan` or `ProgramPlan`.
+fn size_bank_with_host_tier(
+    draft: &ExecutionPlanDraft,
+    slots: u64,
+    places: u64,
+    paths: crate::planning::BankPaths,
+    charge: &AssessmentMemoryCharge,
+    room: &crate::planning::StableRoom<'_>,
+) -> Result<Result<crate::planning::ExpertBankPlan, crate::UnstreamedExperts>, AssessmentError> {
+    use crate::planning::{HostTier, PassLaunches, SettleRoom};
+
+    let mut bank = draft
+        .load()
+        .expert_bank()
+        .expect("a bank form holds an expert bank")
+        .clone();
+    bank.places = places;
+    bank.paths = paths;
+    if slots < bank.floor() || slots > bank.widest().get() {
+        return Err(AssessmentError::Plan(
+            "an expert bank holds from its floor to its ceiling, at most every expert of each layer".into(),
+        ));
+    }
+    bank.slots = slots;
+    bank.ceiling = slots;
+    bank.resident = slots == bank.widest().get();
+    bank.pass = PassLaunches::FLOOR;
+    if draft.device().host_tier() != Some(HostTier::Linked) {
+        return Ok(Ok(bank));
+    }
+    let Some(ceiling) = bank.host_ceiling().filter(|&ceiling| ceiling > 0 && !bank.whole()) else {
+        return Ok(Ok(bank));
+    };
+    let left = |host_slots: u64| -> Result<i64, AssessmentError> {
+        let growth = bank.host_cache(host_slots).map_err(AssessmentError::Memory)?;
+        Ok(room.host_left(draft, charge, growth)?)
+    };
+    if left(0)? < 0 {
+        let reserve = bank.landing_records();
+        let reason = format!(
+            "host memory admits not even the tier's landing reserve of {reserve} records a group"
+        );
+        return Ok(Err(crate::UnstreamedExperts::Untiered {
+            backend: draft.device().backend(),
+            reason,
+        }));
+    }
+    let most = if left(ceiling)? >= 0 {
+        ceiling
+    } else {
+        let (mut lo, mut hi) = (0u64, ceiling);
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if left(mid)? >= 0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    bank.host_slots = most;
+    Ok(Ok(bank))
+}
+
+/// Settle a streamed bank rung through the same `BankPaths` fixed-point as
+/// runtime `ExecutionPlanDraft::with_paths`, binary-searching `floor..=ceiling_slots`
+/// at each fixed `paths`. Returns `Ok(Ok((bank, charge, fit)))` when the rung
+/// fits, or `Ok(Err(shortfall_fit))` when its floor does not fit.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn settle_bank_rung(
+    draft: &ExecutionPlanDraft,
+    structure: &StructuralCharge,
+    ceiling_slots: u64,
+    state_bytes: (u64, u64),
+    tier_places: u64,
+    path_pricer: Option<&BankPathPricer>,
+    pricing: crate::platform::GraphPricing,
+    room: &crate::planning::StableRoom<'_>,
+) -> Result<
+    Result<(crate::planning::ExpertBankPlan, AssessmentMemoryCharge, crate::AssessmentFit), crate::AssessmentFit>,
+    AssessmentError,
+> {
+    let bank_plan = draft
+        .load()
+        .expert_bank()
+        .expect("a bank form holds an expert bank");
+    let holds = |fit: &crate::AssessmentFit| matches!(fit.verdict, AssessmentFitVerdict::Fits);
+    let mut paths = match path_pricer {
+        Some(pricer) => pricer.paths_at(ceiling_slots)?,
+        None => bank_plan.paths,
+    };
+    let mut seen = Vec::new();
+    loop {
+        let floor = bank_plan.floor_with_paths(paths);
+        if floor > ceiling_slots {
+            return Err(AssessmentError::Plan(format!(
+                "priced bank floor ({floor}) exceeds ceiling ({ceiling_slots})"
+            )));
+        }
+        let floor_charge = structure.charge_at_slots_places_and_paths(
+            state_bytes,
+            bank_plan,
+            floor,
+            tier_places,
+            paths,
+            pricing,
+        )?;
+        let floor_fit = room.fit(&floor_charge)?;
+        if !holds(&floor_fit) {
+            return Ok(Err(floor_fit));
+        }
+        let (mut lo, mut short) = (floor, ceiling_slots + 1);
+        let mut best = (floor_charge, floor_fit);
+        while short - lo > 1 {
+            let mid = lo + (short - lo) / 2;
+            let charge = structure.charge_at_slots_places_and_paths(
+                state_bytes,
+                bank_plan,
+                mid,
+                tier_places,
+                paths,
+                pricing,
+            )?;
+            let fit = room.fit(&charge)?;
+            if holds(&fit) {
+                lo = mid;
+                best = (charge, fit);
+            } else {
+                short = mid;
+            }
+        }
+        let (slots, (charge, fit)) = (lo, best);
+        let next = match path_pricer {
+            Some(pricer) => pricer.paths_at(slots)?,
+            None => paths,
+        };
+        if next == paths {
+            match size_bank_with_host_tier(draft, slots, tier_places, paths, &charge, room)? {
+                Ok(sized) => return Ok(Ok((sized, charge, fit))),
+                Err(reason) => {
+                    return Err(AssessmentError::Plan(format!(
+                        "the bank's floor fits, yet its experts cannot stream beside it: {reason}"
+                    )));
+                }
+            }
+        }
+        assert!(
+            !seen.contains(&next),
+            "invariant violated: a bank's path records and slots cycle through {seen:?} without a fixed point"
+        );
+        seen.push(paths);
+        paths = next;
+    }
+}
+
 /// Whether the standard workload of one prepared model fits stable
 /// capacity at `definition`'s context (a served context up to the one it
 /// was prepared at), its experts held as a load holds them: whole where
@@ -1300,17 +1541,25 @@ pub fn assess_execution_fit(
         pricing,
         topology,
         status,
+        None,
     )
 }
 
 /// [`assess_execution_fit`] evaluated at `context_limit` without mutating or
 /// cloning `ModelDefinition`.
+///
+/// Adjusts `places`-dependent bank parts (`FileTable`, `ScratchTable`,
+/// `Routing`, `Keys`) to `prompt_places_at(limits, context_limit)`, and when
+/// `bank_prices` is `Some((costs, figures))` prices `BankPaths::Priced`
+/// staging/landing/reserve records via the same fixed-point as runtime
+/// `ExecutionPlanDraft::with_paths`.
 pub fn assess_execution_fit_at_context(
     context_limit: u64,
     prepared: &PreparedExecutionAssessment,
     pricing: crate::platform::GraphPricing,
     topology: &DeviceTopology,
     status: &Status,
+    bank_prices: Option<(&ExecutorCosts, &super::StreamedFigures)>,
 ) -> Result<ExecutionAssessment, AssessmentError> {
     let forms = &prepared.forms;
     let device = planned_executor(prepared.draft(), topology)?;
@@ -1346,6 +1595,23 @@ pub fn assess_execution_fit_at_context(
     let state_bytes = primary_form
         .structure
         .state_bytes_at_context(context_limit)?;
+    let tier_places = crate::planning::prompt_places_at(
+        prepared.draft().policy().limits(),
+        context_limit,
+    )
+    .max(1);
+    let path_pricer = match (forms.bank(), bank_prices) {
+        (Some(bank), Some((costs, figures))) => {
+            let bank_plan = bank
+                .form
+                .draft
+                .load()
+                .expert_bank()
+                .expect("a bank form holds an expert bank");
+            BankPathPricer::new(context_limit, prepared, bank_plan, costs, figures)?
+        }
+        _ => None,
+    };
     // Whole: a bank of every expert, else the experts' own allocations.
     if let Some(bank) = forms.bank().filter(|bank| bank.points.last() == Some(&bank.experts)) {
         let bank_plan = bank
@@ -1354,19 +1620,29 @@ pub fn assess_execution_fit_at_context(
             .load()
             .expert_bank()
             .expect("a bank form holds an expert bank");
-        let charge = bank.form.structure.charge_at_slots(
+        let whole_paths = match &path_pricer {
+            Some(pricer) => pricer.paths_at(bank.experts)?,
+            None => bank_plan.paths,
+        };
+        let charge = bank.form.structure.charge_at_slots_places_and_paths(
             state_bytes,
             bank_plan,
             bank.experts,
+            tier_places,
+            whole_paths,
             pricing,
         )?;
         let fit = room.fit(&charge)?;
         if holds(&fit) {
-            let sized = bank
-                .form
-                .draft
-                .bank_at_slots_with_host_tier(bank.experts, &charge, &room)?
-                .expect("a whole bank needs no host tier");
+            let sized = size_bank_with_host_tier(
+                &bank.form.draft,
+                bank.experts,
+                tier_places,
+                whole_paths,
+                &charge,
+                &room,
+            )?
+            .expect("a whole bank needs no host tier");
             return fits_with_bank(&bank.form.structure, bank.form.draft.load(), Some(sized), &charge, fit);
         }
     }
@@ -1387,62 +1663,33 @@ pub fn assess_execution_fit_at_context(
     // do, beside the host tier host memory holds; if the full-layer scratch
     // window's floor is short, walk the shared geometric `window_slots`
     // ladder (`BankForm::windowed`) for the largest fitting window.
-    let settle_points = |points: &[u64], at: &dyn Fn(u64) -> Result<(AssessmentMemoryCharge, crate::AssessmentFit), AssessmentError>, floor: (AssessmentMemoryCharge, crate::AssessmentFit)| -> Result<(u64, AssessmentMemoryCharge, crate::AssessmentFit), AssessmentError> {
-        let (mut fitting, mut short) = (0, points.len());
-        let mut held = floor;
-        while short - fitting > 1 {
-            let middle = fitting + (short - fitting) / 2;
-            let (charge, fit) = at(points[middle])?;
-            if holds(&fit) {
-                (fitting, held) = (middle, (charge, fit));
-            } else {
-                short = middle;
-            }
-        }
-        Ok((points[fitting], held.0, held.1))
-    };
     let least = match forms.bank() {
         Some(bank) => {
-            let bank_plan = bank
-                .form
-                .draft
-                .load()
-                .expert_bank()
-                .expect("a bank form holds an expert bank");
-            let floor_charge = bank.form.structure.charge_at_slots(
+            let ceiling_slots = *bank
+                .points
+                .last()
+                .expect("a bank form holds at least one slot point");
+            let mut least_fit = match settle_bank_rung(
+                &bank.form.draft,
+                &bank.form.structure,
+                ceiling_slots,
                 state_bytes,
-                bank_plan,
-                bank.points[0],
+                tier_places,
+                path_pricer.as_ref(),
                 pricing,
-            )?;
-            let mut least_fit = room.fit(&floor_charge)?;
-            if holds(&least_fit) {
-                let at = |slots: u64| -> Result<_, AssessmentError> {
-                    let charge = bank
-                        .form
-                        .structure
-                        .charge_at_slots(state_bytes, bank_plan, slots, pricing)?;
-                    let fit = room.fit(&charge)?;
-                    Ok((charge, fit))
-                };
-                let (slots, charge, fit) = settle_points(&bank.points, &at, (floor_charge, least_fit))?;
-                match bank.form.draft.bank_at_slots_with_host_tier(slots, &charge, &room)? {
-                    Ok(sized) => {
-                        return fits_with_bank(
-                            &bank.form.structure,
-                            bank.form.draft.load(),
-                            Some(sized),
-                            &charge,
-                            fit,
-                        );
-                    }
-                    Err(reason) => {
-                        return Err(AssessmentError::Plan(format!(
-                            "the bank's floor fits, yet its experts cannot stream beside it: {reason}"
-                        )));
-                    }
+                &room,
+            )? {
+                Ok((sized, charge, fit)) => {
+                    return fits_with_bank(
+                        &bank.form.structure,
+                        bank.form.draft.load(),
+                        Some(sized),
+                        &charge,
+                        fit,
+                    );
                 }
-            }
+                Err(shortfall) => shortfall,
+            };
             let _scope = crate::programs::graph::sizing::SizingScope::enter();
             for win in &bank.windowed {
                 let Some((rung, structure)) = win.structure(
@@ -1453,33 +1700,25 @@ pub fn assess_execution_fit_at_context(
                 )? else {
                     continue;
                 };
-                let win_bank = rung
-                    .draft
-                    .load()
-                    .expert_bank()
-                    .expect("a windowed bank rung holds an expert bank");
-                let win_charge =
-                    structure.charge_at_slots(state_bytes, win_bank, rung.points[0], pricing)?;
-                let win_fit = room.fit(&win_charge)?;
-                if holds(&win_fit) {
-                    let at_win = |slots: u64| -> Result<_, AssessmentError> {
-                        let charge =
-                            structure.charge_at_slots(state_bytes, win_bank, slots, pricing)?;
-                        let fit = room.fit(&charge)?;
-                        Ok((charge, fit))
-                    };
-                    let (slots, charge, fit) = settle_points(&rung.points, &at_win, (win_charge, win_fit))?;
-                    match rung.draft.bank_at_slots_with_host_tier(slots, &charge, &room)? {
-                        Ok(sized) => {
-                            return fits_with_bank(structure, rung.draft.load(), Some(sized), &charge, fit);
-                        }
-                        Err(reason) => {
-                            return Err(AssessmentError::Plan(format!(
-                                "the bank's floor fits, yet its experts cannot stream beside it: {reason}"
-                            )));
-                        }
+                let win_ceiling = *rung
+                    .points
+                    .last()
+                    .expect("a windowed bank rung holds at least one slot point");
+                let win_fit = match settle_bank_rung(
+                    &rung.draft,
+                    structure,
+                    win_ceiling,
+                    state_bytes,
+                    tier_places,
+                    path_pricer.as_ref(),
+                    pricing,
+                    &room,
+                )? {
+                    Ok((sized, charge, fit)) => {
+                        return fits_with_bank(structure, rung.draft.load(), Some(sized), &charge, fit);
                     }
-                }
+                    Err(shortfall) => shortfall,
+                };
                 if let (
                     AssessmentFitVerdict::DoesNotFit { deficit_bytes: cand, .. },
                     AssessmentFitVerdict::DoesNotFit { deficit_bytes: cur, .. },
@@ -1743,5 +1982,277 @@ pub(crate) mod tests {
             ExecutionAssessment::DoesNotFit(shortfall) => shortfall.fit_context_tokens,
         };
         assert_eq!(fit_context_tokens, 150_000);
+    }
+
+    fn rtx3090_cuda(host: u64) -> (DeviceTopology, Status, crate::platform::SelectedDevice) {
+        use crate::platform::GraphPricing;
+        const GRAPHS: seismic::GraphCost = seismic::GraphCost::Pooled {
+            graph: 92_663,
+            launch: 8_102,
+            granule: 2 << 20,
+        };
+        let topology = seismic::fixtures::recorded::rtx3090();
+        let info = topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == seismic::BackendName::Cuda)
+            .unwrap()
+            .clone();
+        let status = Status {
+            sample: seismic::Sample {
+                taken: std::time::SystemTime::now(),
+                host: crate::memory::ledger::tests::host_sample(u64::MAX, host),
+                volumes: Vec::new(),
+                executors: topology.executors().iter().map(|executor| executor.id()).collect(),
+                grants: Vec::new(),
+            },
+            runtime: Default::default(),
+        };
+        let release = ReleaseRate::of_machine(None);
+        let device = crate::platform::selected(&topology, &status, &release, info, GraphPricing::Measured(GRAPHS));
+        (topology, status, device)
+    }
+
+    /// A 256K MoE model evaluated at a 32K tier charges
+    /// `prompt_places_at(limits, 32768)` for `BankPart::{Keys, Routing,
+    /// FileTable, ScratchTable}` (matching a fresh `ModelLoadPlan` at 32K)
+    /// rather than freezing them at 256K.
+    #[test]
+    fn tier_scaled_bank_places_match_fresh_plan_at_smaller_context() {
+        use crate::planning::fixtures::{
+            gemma_moe_fixture_manifest, routed_fixture_definition, RoutedShape,
+        };
+        let (topology, status, device) = rtx3090_cuda(64 << 30);
+        let shape = RoutedShape {
+            layers: 4,
+            experts: 64,
+            selected: 8,
+            hidden: 1024,
+            intermediate: 512,
+        };
+        let prepare_at = |context_limit: u64| {
+            let mut definition = routed_fixture_definition(shape);
+            definition.decoder.context_limit = context_limit;
+            let manifest = gemma_moe_fixture_manifest(&definition);
+            let draft = ExecutionPlanner::prepare(
+                &device,
+                &manifest,
+                &definition,
+                ComponentSelection {
+                    head: false,
+                    vision: false,
+                },
+                ExecutionPath::Native,
+                PlannedMethod::Plain,
+                KvCodec::Dense,
+                LIMITS,
+            )
+            .unwrap();
+            let forms = draft
+                .floor_forms::<(), AssessmentError>(&definition, None, |draft| {
+                    StructuralCharge::of(&definition, draft).map(|charge| (charge, ()))
+                })
+                .unwrap();
+            prepare_execution_assessment(definition, forms).unwrap()
+        };
+
+        let prepared_256k = prepare_at(262_144);
+        let prepared_32k = prepare_at(32_768);
+        let places_256k = crate::planning::prompt_places_at(LIMITS, 262_144);
+        let places_32k = crate::planning::prompt_places_at(LIMITS, 32_768);
+        assert!(places_32k < places_256k);
+
+        let ExecutionAssessment::Fits(fit_from_256k) = assess_execution_fit_at_context(
+            32_768,
+            &prepared_256k,
+            device.graph_cost,
+            &topology,
+            &status,
+            None,
+        )
+        .unwrap()
+        else {
+            panic!("the 4-layer MoE fixture fits the RTX 3090 at 32K");
+        };
+        let bank_from_256k = fit_from_256k
+            .bank
+            .expect("the routed fixture holds an expert bank");
+        assert_eq!(bank_from_256k.places, places_32k);
+
+        let bank_256k = prepared_256k
+            .forms
+            .bank()
+            .unwrap()
+            .form
+            .draft
+            .load()
+            .expert_bank()
+            .unwrap();
+        let fresh_load_32k = prepared_32k.forms.bank().unwrap().form.draft.load();
+        let fresh_bank_32k = fresh_load_32k.expert_bank().unwrap();
+        assert_eq!(bank_256k.places, places_256k);
+        assert_eq!(fresh_bank_32k.places, places_32k);
+        assert!(
+            bank_256k.places_storage_demand(places_32k).unwrap().shared
+                < bank_256k.places_storage_demand(places_256k).unwrap().shared,
+            "32K tier must charge strictly less for places-dependent bank parts than 256K"
+        );
+        assert_eq!(
+            bank_256k
+                .storage_demand_at(bank_from_256k.slots, places_32k, bank_from_256k.paths)
+                .unwrap(),
+            fresh_bank_32k
+                .storage_demand_at(bank_from_256k.slots, fresh_bank_32k.places, bank_from_256k.paths)
+                .unwrap(),
+        );
+        let model_256k = prepared_256k
+            .forms
+            .bank()
+            .unwrap()
+            .form
+            .structure
+            .bank_slot_model
+            .as_ref()
+            .unwrap();
+        let tier_weight_demand = model_256k
+            .weight_demand_at(bank_256k, bank_from_256k.slots, places_32k, bank_from_256k.paths)
+            .unwrap();
+        let fresh_weight_demand =
+            ClaimDemand::checked_sum(fresh_load_32k.weight_demands().unwrap()).unwrap();
+        assert_eq!(tier_weight_demand, fresh_weight_demand);
+    }
+
+    /// With measured executor/streamed figures,
+    /// `assess_execution_fit_at_context` charges the exact same
+    /// `BankPaths::Priced` staging/reserve/landing records as runtime
+    /// `ExecutionPlanDraft::place` / `with_bank`.
+    #[test]
+    fn priced_assessment_matches_runtime_bank_paths_and_storage_demand() {
+        use crate::planning::fixtures::{
+            gemma_moe_fixture_manifest, routed_fixture_definition, RoutedShape,
+        };
+        let (topology, status, device) = rtx3090_cuda(64 << 30);
+        let mut definition = routed_fixture_definition(RoutedShape {
+            layers: 4,
+            experts: 64,
+            selected: 8,
+            hidden: 1024,
+            intermediate: 512,
+        });
+        definition.decoder.context_limit = 4096;
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        let forms = draft
+            .floor_forms::<(), AssessmentError>(&definition, None, |draft| {
+                StructuralCharge::of(&definition, draft).map(|charge| (charge, ()))
+            })
+            .unwrap();
+        let prepared = prepare_execution_assessment(definition.clone(), forms).unwrap();
+
+        let costs = crate::assessment::synthetic::costs();
+        let figures = crate::assessment::synthetic::streamed_figures();
+        let steps = costs.clone();
+        let prices = crate::assessment::Priced::Measured(crate::PlanPrices::new(
+            costs.clone(),
+            figures.clone(),
+            Box::new(move |def, banked| {
+                let launch = crate::assessment::launch_prices(
+                    def,
+                    &banked.held_whole(def)?,
+                    banked,
+                    &steps,
+                )?;
+                Ok(Box::new(move |rows, depth| Ok(launch.launch(rows, depth)?)))
+            }),
+        ));
+
+        let runtime = draft
+            .clone()
+            .with_bank::<AssessmentMemoryCharge>(&definition, None, &prices)
+            .unwrap();
+        let runtime_bank = runtime
+            .draft()
+            .load()
+            .expert_bank()
+            .expect("runtime plan holds an expert bank");
+        assert!(
+            matches!(
+                runtime_bank.paths,
+                crate::planning::BankPaths::Priced { records, .. }
+                    if records.ahead > 0 && records.reserve > 0
+            ),
+            "synthetic prices must yield nonzero priced path records, got {:?}",
+            runtime_bank.paths
+        );
+
+        let ExecutionAssessment::Fits(assessed_priced) = assess_execution_fit_at_context(
+            4096,
+            &prepared,
+            device.graph_cost,
+            &topology,
+            &status,
+            Some((&costs, &figures)),
+        )
+        .unwrap()
+        else {
+            panic!("priced assessment fits the RTX 3090");
+        };
+        let assessed_bank = assessed_priced
+            .bank
+            .expect("priced assessment holds an expert bank");
+        assert_eq!(assessed_bank.paths, runtime_bank.paths);
+        assert_eq!(assessed_bank.slots, runtime_bank.slots);
+        assert_eq!(
+            assessed_bank.storage_demand().unwrap(),
+            runtime_bank.storage_demand().unwrap(),
+        );
+        let bank_form = prepared.forms.bank().unwrap();
+        let prepared_bank = bank_form.form.draft.load().expert_bank().unwrap();
+        let assessed_weight_demand = bank_form
+            .form
+            .structure
+            .bank_slot_model
+            .as_ref()
+            .unwrap()
+            .weight_demand_at(
+                prepared_bank,
+                assessed_bank.slots,
+                assessed_bank.places,
+                assessed_bank.paths,
+            )
+            .unwrap();
+        let runtime_weight_demand =
+            ClaimDemand::checked_sum(runtime.draft().load().weight_demands().unwrap()).unwrap();
+        assert_eq!(assessed_weight_demand, runtime_weight_demand);
+
+        let ExecutionAssessment::Fits(assessed_unpriced) = assess_execution_fit_at_context(
+            4096,
+            &prepared,
+            device.graph_cost,
+            &topology,
+            &status,
+            None,
+        )
+        .unwrap()
+        else {
+            panic!("unpriced assessment fits the RTX 3090");
+        };
+        assert_eq!(
+            assessed_unpriced.bank.unwrap().paths,
+            crate::planning::BankPaths::Unpriced
+        );
     }
 }

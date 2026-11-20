@@ -136,6 +136,85 @@ impl InputLayout {
     }
 }
 
+/// The numerical 3-axis rotary coordinates of a prepared prompt and its
+/// continuation origin: prompt row `i` sits at `coordinates[i]`, and
+/// generated row `i >= coordinates.len()` sits at
+/// `[continuation + (i - coordinates.len()); 3]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawPromptCoordinates")]
+pub struct PromptCoordinates {
+    coordinates: Vec<[i32; 3]>,
+    continuation: usize,
+}
+
+#[derive(Deserialize)]
+struct RawPromptCoordinates {
+    coordinates: Vec<[i32; 3]>,
+    continuation: usize,
+}
+
+impl TryFrom<RawPromptCoordinates> for PromptCoordinates {
+    type Error = String;
+    fn try_from(raw: RawPromptCoordinates) -> Result<Self, String> {
+        Self::new(raw.coordinates, raw.continuation)
+    }
+}
+
+impl PromptCoordinates {
+    pub fn new(coordinates: Vec<[i32; 3]>, continuation: usize) -> Result<Self, String> {
+        if coordinates.len() > i32::MAX as usize
+            || continuation > i32::MAX as usize
+            || coordinates
+                .iter()
+                .any(|axes| axes.iter().any(|value| *value < 0))
+        {
+            return Err("prompt coordinates must be non-negative and within logical position range".into());
+        }
+        Ok(Self {
+            coordinates,
+            continuation,
+        })
+    }
+
+    pub fn linear(len: usize) -> Result<Self, String> {
+        if len > i32::MAX as usize {
+            return Err("prompt coordinates exceed logical position range".into());
+        }
+        Ok(Self {
+            coordinates: (0..len).map(|position| [position as i32; 3]).collect(),
+            continuation: len,
+        })
+    }
+
+    pub fn coordinates(&self) -> &[[i32; 3]] {
+        &self.coordinates
+    }
+
+    pub fn continuation(&self) -> usize {
+        self.continuation
+    }
+
+    pub fn len(&self) -> usize {
+        self.coordinates.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.coordinates.is_empty()
+    }
+
+    pub fn coordinate_at(&self, index: usize) -> Option<[i32; 3]> {
+        if let Some(axes) = self.coordinates.get(index) {
+            Some(*axes)
+        } else {
+            let continuation = self
+                .continuation
+                .checked_add(index - self.coordinates.len())
+                .and_then(|value| i32::try_from(value).ok())?;
+            Some([continuation; 3])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::InputLayout;

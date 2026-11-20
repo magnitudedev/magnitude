@@ -205,11 +205,13 @@ struct Prompt {
     tokens: Vec<magnitude_chat::TokenId>,
 }
 
-/// A conversation, its template-level request and its served prompt.
+/// A conversation, its template-level request, its served prompt, and each
+/// scored message's byte span in that prompt.
 struct Candidate {
     conversation: Conversation,
     request: ChatRequest,
     prompt: Prompt,
+    scored_bytes: Vec<Range<usize>>,
 }
 
 pub struct Renderer<'a> {
@@ -256,6 +258,7 @@ impl<'a> Renderer<'a> {
             conversation,
             request,
             prompt: prepared,
+            scored_bytes,
         } = candidate;
         let tokens = prepared
             .tokens
@@ -263,16 +266,10 @@ impl<'a> Renderer<'a> {
             .map(|token| token.0)
             .collect::<Vec<_>>();
         let offsets = self.offsets(&prepared)?;
-        let mut scored_spans = Vec::new();
-        for (index, _) in conversation
-            .scored
-            .iter()
-            .enumerate()
-            .filter(|(_, scored)| **scored)
-        {
-            let bytes = self.scored_bytes(&conversation, &request, &prepared, index)?;
-            scored_spans.push(token_range(&offsets, bytes));
-        }
+        let scored_spans = scored_bytes
+            .into_iter()
+            .map(|bytes| token_range(&offsets, bytes))
+            .collect();
         let asked = self.request(
             &conversation.messages[..conversation.generation_prefix],
             &conversation.tools,
@@ -352,14 +349,42 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// `conversation` as the engine serves it.
+    /// `conversation` as the engine serves it, with any generation-prompt
+    /// prefix that the template omitted from a historical scored assistant turn
+    /// spliced back before it so teacher-forcing sees the exact prompt the
+    /// model answered.
     fn candidate(&self, conversation: Conversation) -> Result<Candidate, String> {
         let request = self.request(&conversation.messages, &conversation.tools)?;
-        let prompt = self.prepare(&request)?;
+        let mut prompt = self.prepare(&request)?;
+        let mut scored_bytes = Vec::new();
+        let mut splices = Vec::new();
+        for (index, _) in conversation
+            .scored
+            .iter()
+            .enumerate()
+            .filter(|(_, scored)| **scored)
+        {
+            let (raw_bytes, reasoned) =
+                self.raw_scored_bytes(&conversation, &request, &prompt, index)?;
+            let asked = self.prepare(
+                &self.request(&conversation.messages[..index], &conversation.tools)?,
+            )?;
+            let (bytes, splice) =
+                reconcile_scored_prefix(&prompt.text, &asked.text, raw_bytes, reasoned)?;
+            if let Some(suffix) = splice {
+                splices.push((bytes.start, suffix));
+            }
+            scored_bytes.push(bytes);
+        }
+        if !splices.is_empty() {
+            let text = splice_generation_prefixes(&prompt.text, &splices, &mut scored_bytes);
+            prompt = self.encode(text)?;
+        }
         Ok(Candidate {
             conversation,
             request,
             prompt,
+            scored_bytes,
         })
     }
 
@@ -402,14 +427,15 @@ impl<'a> Renderer<'a> {
             .prepare(request, &TemplateSelection::default())
             .map(|(native, _)| native.description().prompt.clone())
             .map_err(|error| error.to_string())?;
-        let tokens = self.host.tokenizer().encode_sequence(&prompt)?.tokens;
+        self.encode(prompt)
+    }
+
+    fn encode(&self, text: String) -> Result<Prompt, String> {
+        let tokens = self.host.tokenizer().encode_sequence(&text)?.tokens;
         if tokens.is_empty() {
             return Err("the chat template produced no input tokens".into());
         }
-        Ok(Prompt {
-            text: prompt,
-            tokens,
-        })
+        Ok(Prompt { text, tokens })
     }
 
     /// SHA-256 of the template variant the request was prepared with.
@@ -451,21 +477,17 @@ impl<'a> Renderer<'a> {
         Ok(offsets)
     }
 
-    /// The prompt bytes a scored message renders as, the text its model
-    /// generated for it: where the prompt differs from the prompt with its
-    /// reasoning (where it has any) and its content (where it has any, or
-    /// tool calls, which are removed) each replaced by a probe. Reasoning
-    /// is scored as content is: a model whose template keeps reasoning on
-    /// generates it first, and an answer cut short may hold nothing else;
-    /// a reply that reasoned is scored from the end of the prompt it
-    /// answered, so the block's opener the model generated is in it.
-    fn scored_bytes(
+    /// The raw prompt bytes a scored message renders as, and whether it
+    /// carried `reasoning_content`: where the prompt differs from the prompt
+    /// with its reasoning (where it has any) and its content (where it has any,
+    /// or tool calls, which are removed) each replaced by a probe.
+    fn raw_scored_bytes(
         &self,
         conversation: &Conversation,
         request: &ChatRequest,
         prepared: &Prompt,
         scored: usize,
-    ) -> Result<Range<usize>, String> {
+    ) -> Result<(Range<usize>, bool), String> {
         // The chat adapter drops assistant turns without content, reasoning
         // or tool calls, and nothing else between assistant turns.
         let nonempty = |message: &Map<String, Value>, key: &str| match message.get(key) {
@@ -530,23 +552,73 @@ impl<'a> Renderer<'a> {
         if end <= start {
             return Err("a scored message renders no text".into());
         }
-        // A reply that reasoned is scored from where the prompt it answered
-        // ended: a template that leaves the reasoning block to the model has
-        // it generate the block's opener, which the reply's rendering shows
-        // before its reasoning.
-        let start = match reasoned {
-            false => start,
-            true => {
-                let asked = self.prepare(&self.request(&conversation.messages[..scored], &conversation.tools)?)?;
-                let asked = asked.text.as_bytes();
-                if asked.len() > start || !prompt.starts_with(asked) {
-                    return Err("a reasoned reply's rendering does not continue the prompt it answered".into());
-                }
-                asked.len()
-            }
-        };
-        Ok(start..end)
+        Ok((start..end, reasoned))
     }
+}
+
+/// Reconciles a scored reply's byte span in the rendered conversation against
+/// the prompt the model actually saw when generating it (`asked`).
+///
+/// - When the reply reasoned, `asked` must prefix `prompt[..bytes.start]` and
+///   the span widens back to `asked.len()` so any reasoning opener the model
+///   generated is included in the scored span.
+/// - When the reply did not reason and `asked` strictly extends
+///   `prompt[..bytes.start]` (as with templates whose `add_generation_prompt`
+///   under `enable_thinking: false` prefills an empty thought block such as
+///   `<|channel>thought\n<channel|>` or `<think></think>`, while their
+///   historical assistant rendering omits it), returns the missing suffix to
+///   splice immediately before `bytes.start`.
+fn reconcile_scored_prefix(
+    prompt: &str,
+    asked: &str,
+    bytes: Range<usize>,
+    reasoned: bool,
+) -> Result<(Range<usize>, Option<String>), String> {
+    if reasoned {
+        if asked.len() > bytes.start || !prompt.starts_with(asked) {
+            return Err(
+                "a reasoned reply's rendering does not continue the prompt it answered".into(),
+            );
+        }
+        return Ok((asked.len()..bytes.end, None));
+    }
+    if asked.len() > bytes.start
+        && prompt.is_char_boundary(bytes.start)
+        && asked.is_char_boundary(bytes.start)
+        && asked.starts_with(&prompt[..bytes.start])
+    {
+        return Ok((bytes.clone(), Some(asked[bytes.start..].to_owned())));
+    }
+    Ok((bytes, None))
+}
+
+/// Splices each `(at, suffix)` (in ascending `at` order) into `text`, shifting
+/// every span in `spans` whose start is at or past `at` by `suffix.len()`.
+fn splice_generation_prefixes(
+    text: &str,
+    splices: &[(usize, String)],
+    spans: &mut [Range<usize>],
+) -> String {
+    let extra: usize = splices.iter().map(|(_, suffix)| suffix.len()).sum();
+    let mut out = String::with_capacity(text.len() + extra);
+    let mut cursor = 0;
+    for (at, suffix) in splices {
+        assert!(*at >= cursor, "splices must be in ascending byte order");
+        out.push_str(&text[cursor..*at]);
+        out.push_str(suffix);
+        cursor = *at;
+    }
+    out.push_str(&text[cursor..]);
+    for span in spans.iter_mut() {
+        let shift: usize = splices
+            .iter()
+            .take_while(|(at, _)| *at <= span.start)
+            .map(|(_, suffix)| suffix.len())
+            .sum();
+        span.start += shift;
+        span.end += shift;
+    }
+    out
 }
 
 /// The tokens whose text overlaps `bytes`.
@@ -598,6 +670,83 @@ mod tests {
             })
             .collect::<Vec<_>>();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn reconcile_splices_missing_generation_prefix_suffix() {
+        // Gemma 4: add_generation_prompt with enable_thinking=false emits
+        // `<|channel>thought\n<channel|>`, which historical assistant turns omit.
+        let prompt = "<|turn>user\nGo on.<turn|>\n<|turn>model\n```python\npass<turn|>\n";
+        let start = "<|turn>user\nGo on.<turn|>\n<|turn>model\n".len();
+        let end = start + "```python\npass".len();
+        let asked = "<|turn>user\nGo on.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
+
+        let (span, splice) =
+            reconcile_scored_prefix(prompt, asked, start..end, false).unwrap();
+        assert_eq!(span, start..end);
+        assert_eq!(splice.as_deref(), Some("<|channel>thought\n<channel|>"));
+
+        let mut spans = vec![span];
+        let spliced = splice_generation_prefixes(
+            prompt,
+            &[(start, splice.unwrap())],
+            &mut spans,
+        );
+        assert!(spliced.starts_with(asked));
+        assert_eq!(&spliced[spans[0].clone()], "```python\npass");
+        assert_eq!(spans[0].start, asked.len());
+    }
+
+    #[test]
+    fn reconcile_leaves_matching_prefix_untouched() {
+        let prompt = "<|im_start|>assistant\n<think>\n\n</think>\n\nanswer<|im_end|>\n";
+        let asked = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let start = asked.len();
+        let end = start + "answer".len();
+
+        let (span, splice) =
+            reconcile_scored_prefix(prompt, asked, start..end, false).unwrap();
+        assert_eq!(span, start..end);
+        assert_eq!(splice, None);
+    }
+
+    #[test]
+    fn reconcile_widens_reasoned_span_and_rejects_mismatched_asked() {
+        let prompt = "<|turn>model\n<|channel>thought\nhmm\n<channel|>ok<turn|>\n";
+        let asked = "<|turn>model\n";
+        let start = "<|turn>model\n<|channel>thought\n".len();
+        let end = "<|turn>model\n<|channel>thought\nhmm\n<channel|>ok".len();
+
+        let (span, splice) =
+            reconcile_scored_prefix(prompt, asked, start..end, true).unwrap();
+        assert_eq!(span, asked.len()..end);
+        assert_eq!(splice, None);
+        assert_eq!(&prompt[span], "<|channel>thought\nhmm\n<channel|>ok");
+
+        let mismatched = "<|turn>model\n<|channel>thought\n<channel|>";
+        assert!(reconcile_scored_prefix(prompt, mismatched, start..end, true).is_err());
+    }
+
+    #[test]
+    fn splice_generation_prefixes_handles_multiple_scored_spans() {
+        let text = "U1 A1 T1 A2 end";
+        let mut spans = vec![3..5, 9..11];
+        let spliced = splice_generation_prefixes(
+            text,
+            &[(3, "<P1>".into()), (9, "<P2>".into())],
+            &mut spans,
+        );
+        assert_eq!(spliced, "U1 <P1>A1 T1 <P2>A2 end");
+        assert_eq!(&spliced[spans[0].clone()], "A1");
+        assert_eq!(&spliced[spans[1].clone()], "A2");
+
+        // Only first span spliced.
+        let mut spans_first = vec![3..5, 9..11];
+        let spliced_first =
+            splice_generation_prefixes(text, &[(3, "<P1>".into())], &mut spans_first);
+        assert_eq!(spliced_first, "U1 <P1>A1 T1 A2 end");
+        assert_eq!(&spliced_first[spans_first[0].clone()], "A1");
+        assert_eq!(&spliced_first[spans_first[1].clone()], "A2");
     }
 
     /// Every scored span is exactly its message's content (its tool calls'

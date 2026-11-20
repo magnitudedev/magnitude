@@ -13,6 +13,7 @@ use super::transport::{HostTransport, MessageReceiver, MessageSender};
 use crate::census::AllocationCensus;
 use crate::error::{LoadError, RequestError};
 use crate::execution::LoadAttempt;
+use crate::invocation::ReleaseGuard;
 use magnitude_executor::UnpreparedUnits;
 use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
@@ -21,7 +22,7 @@ use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
 use magnitude_scheduler::protocol::RoomAnswer;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     future::poll_fn,
     sync::{Arc, Mutex},
     task::{Poll, Waker},
@@ -78,17 +79,97 @@ impl RequestSlot {
     }
 }
 
+/// Keyed waiter registry: repeated `Poll::Pending` updates a waiter's slot in
+/// place instead of growing a `Vec`, and dropping a pending future removes its
+/// slot immediately.
+#[derive(Default)]
+struct WakerSet {
+    next: u64,
+    wakers: BTreeMap<u64, Waker>,
+}
+
+impl WakerSet {
+    fn register(&mut self, slot: &mut Option<u64>, waker: &Waker) {
+        let id = *slot.get_or_insert_with(|| {
+            let id = self.next;
+            self.next += 1;
+            id
+        });
+        match self.wakers.get_mut(&id) {
+            Some(existing) => {
+                if !existing.will_wake(waker) {
+                    existing.clone_from(waker);
+                }
+            }
+            None => {
+                self.wakers.insert(id, waker.clone());
+            }
+        }
+    }
+
+    fn remove(&mut self, slot: &mut Option<u64>) {
+        if let Some(id) = slot.take() {
+            self.wakers.remove(&id);
+        }
+    }
+
+    fn wake_all(&mut self) {
+        for (_, waker) in std::mem::take(&mut self.wakers) {
+            waker.wake();
+        }
+    }
+}
+
 /// One reply shared by every caller waiting for it.
 struct SharedReply<T> {
     value: Option<Result<T, RequestError>>,
-    wakers: Vec<Waker>,
+    wakers: WakerSet,
+}
+
+impl<T> Default for SharedReply<T> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            wakers: WakerSet::default(),
+        }
+    }
 }
 
 impl<T> SharedReply<T> {
     fn fulfill(&mut self, value: Result<T, RequestError>) {
         self.value = Some(value);
-        for waker in self.wakers.drain(..) {
-            waker.wake();
+        self.wakers.wake_all();
+    }
+
+    fn fulfill_if_pending(&mut self, value: Result<T, RequestError>) {
+        if self.value.is_none() {
+            self.fulfill(value);
+        }
+    }
+}
+
+struct WatcherGuard<'a> {
+    state: &'a Mutex<State>,
+    slot: Option<u64>,
+}
+
+impl Drop for WatcherGuard<'_> {
+    fn drop(&mut self) {
+        if self.slot.is_some() {
+            self.state.lock().unwrap().watchers.remove(&mut self.slot);
+        }
+    }
+}
+
+struct ReplyGuard<'a, T> {
+    reply: &'a Mutex<SharedReply<T>>,
+    slot: Option<u64>,
+}
+
+impl<T> Drop for ReplyGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.slot.is_some() {
+            self.reply.lock().unwrap().wakers.remove(&mut self.slot);
         }
     }
 }
@@ -99,6 +180,8 @@ type Shared<T> = Arc<Mutex<SharedReply<T>>>;
 struct State {
     next_id: u64,
     requests: HashMap<HostRequestId, RequestSlot>,
+    // Request handles and their output queues can disappear before executor state retires.
+    leases: HashMap<HostRequestId, ReleaseGuard>,
     observation: Option<Shared<MemoryObservation>>,
     /// The measurement room's pending claim, and the identity the next
     /// claim takes.
@@ -112,7 +195,7 @@ struct State {
     censuses: u64,
     /// Waiters on the connection's end or the census's next change
     /// ([`EngineClient::closed`], [`EngineClient::census`]).
-    watchers: Vec<Waker>,
+    watchers: WakerSet,
     /// The host asked the worker to shut down ([`EngineClient::shutdown`]): a connection that
     /// ends after that ends for the stop, however the worker's end came (its own unload, or
     /// its kill once it overran its exit).
@@ -123,6 +206,19 @@ struct State {
 }
 
 impl State {
+    fn open_request(&mut self, lease: ReleaseGuard) -> Result<HostRequestId, RequestError> {
+        if let Some(error) = &self.closed {
+            return Err(error.clone());
+        }
+        let id = HostRequestId(self.next_id);
+        self.next_id += 1;
+        self.requests.insert(id, RequestSlot::default());
+        if lease.is_held() {
+            self.leases.insert(id, lease);
+        }
+        Ok(id)
+    }
+
     /// Why a connection whose worker ended for `reason` ended: the host's stop, where the host
     /// asked for one, so a stopped model's requests end alike whenever its worker ends.
     fn lost(&self, reason: String) -> RequestError {
@@ -152,22 +248,38 @@ impl State {
         if let Some((_, reply)) = self.room.take() {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
+        self.leases.clear();
         self.closed = Some(error);
-        self.watchers.drain(..).for_each(Waker::wake);
+        self.watchers.wake_all();
     }
 
-    /// The pending measurement room claim's reply, which a claim while one
-    /// is pending joins; with the identity of a new claim, which its host
-    /// sends.
-    fn claim_room(&mut self) -> (Shared<RoomAnswer>, Option<RoomClaimId>) {
+    /// Begin a measurement room claim, or join the pending one. Returns the
+    /// shared reply and, if a new claim was opened, the claim ID to send.
+    fn begin_room_claim(&mut self) -> (Shared<RoomAnswer>, Option<RoomClaimId>) {
         if let Some((_, reply)) = &self.room {
             return (reply.clone(), None);
         }
         let claim = RoomClaimId(self.next_claim);
         self.next_claim += 1;
-        let reply = Arc::new(Mutex::new(SharedReply { value: None, wakers: Vec::new() }));
+        let reply = Arc::new(Mutex::new(SharedReply::default()));
         self.room = Some((claim, reply.clone()));
         (reply, Some(claim))
+    }
+
+    /// Clear a pending measurement room claim whose send failed, and fail its
+    /// shared reply so any caller that joined it wakes with the error.
+    fn abort_room_claim(
+        &mut self,
+        claim: RoomClaimId,
+        reply: &Shared<RoomAnswer>,
+        error: RequestError,
+    ) {
+        if self.room.as_ref().is_some_and(|(pending, pending_reply)| {
+            *pending == claim && Arc::ptr_eq(pending_reply, reply)
+        }) {
+            self.room = None;
+        }
+        reply.lock().unwrap().fulfill_if_pending(Err(error));
     }
 
     /// Withdraw the pending measurement room claim: it is answered as
@@ -180,6 +292,9 @@ impl State {
 
     fn deliver(&mut self, message: WorkerMessage) -> Result<(), String> {
         match message {
+            WorkerMessage::Retired { request_id } => {
+                self.leases.remove(&request_id);
+            }
             WorkerMessage::Admitted { request_id } => {
                 if let Some(slot) = self.requests.get_mut(&request_id) {
                     slot.admission = Some(Ok(()));
@@ -232,7 +347,7 @@ impl State {
             WorkerMessage::Census { census } => {
                 self.census = Some(census);
                 self.censuses += 1;
-                self.watchers.drain(..).for_each(Waker::wake);
+                self.watchers.wake_all();
             }
             WorkerMessage::MeasurementRoom { claim, room } => {
                 // A claim released before its answer has no one waiting, and
@@ -482,14 +597,18 @@ impl EngineClient {
     /// Why the worker stopped, once it has: the connection's end, awaited
     /// rather than polled.
     pub async fn closed(&self) -> RequestError {
-        std::future::poll_fn(|context| {
+        let mut guard = WatcherGuard {
+            state: &self.connection.state,
+            slot: None,
+        };
+        poll_fn(|context| {
             let mut state = self.connection.state.lock().unwrap();
-            match &state.closed {
-                Some(error) => Poll::Ready(error.clone()),
-                None => {
-                    state.watchers.push(context.waker().clone());
-                    Poll::Pending
-                }
+            if let Some(error) = state.closed.clone() {
+                state.watchers.remove(&mut guard.slot);
+                Poll::Ready(error)
+            } else {
+                state.watchers.register(&mut guard.slot, context.waker());
+                Poll::Pending
             }
         })
         .await
@@ -499,18 +618,23 @@ impl EngineClient {
     /// how many it pushed: each is a change the worker counted, never a
     /// sample. Why the worker stopped, once it has.
     pub async fn census(&self, seen: u64) -> Result<(u64, AllocationCensus), RequestError> {
-        std::future::poll_fn(|context| {
+        let mut guard = WatcherGuard {
+            state: &self.connection.state,
+            slot: None,
+        };
+        poll_fn(|context| {
             let mut state = self.connection.state.lock().unwrap();
             if state.censuses > seen {
+                state.watchers.remove(&mut guard.slot);
                 let census = state.census.clone().expect("a pushed census is kept");
                 return Poll::Ready(Ok((state.censuses, census)));
             }
-            match &state.closed {
-                Some(error) => Poll::Ready(Err(error.clone())),
-                None => {
-                    state.watchers.push(context.waker().clone());
-                    Poll::Pending
-                }
+            if let Some(error) = state.closed.clone() {
+                state.watchers.remove(&mut guard.slot);
+                Poll::Ready(Err(error))
+            } else {
+                state.watchers.register(&mut guard.slot, context.waker());
+                Poll::Pending
             }
         })
         .await
@@ -521,21 +645,16 @@ impl EngineClient {
     /// that cannot begin (memory reclaimed until only the model's unload
     /// could make its room) is, before anything of it is answered.
     pub async fn admit(&self, request: RequestOptions) -> Result<EngineRequest, RequestError> {
+        self.admit_with_lease(request, ReleaseGuard::none()).await
+    }
+
+    pub(crate) async fn admit_with_lease(&self, request: RequestOptions, lease: ReleaseGuard) -> Result<EngineRequest, RequestError> {
         if request.output_capacity == 0 {
             return Err(RequestError::InvalidRequest {
                 reason: "request output capacity must be positive".into(),
             });
         }
-        let id = {
-            let mut state = self.connection.state.lock().unwrap();
-            if let Some(error) = &state.closed {
-                return Err(error.clone());
-            }
-            let id = HostRequestId(state.next_id);
-            state.next_id += 1;
-            state.requests.insert(id, RequestSlot::default());
-            id
-        };
+        let id = self.connection.state.lock().unwrap().open_request(lease)?;
         // From here, dropping the handle cancels the request.
         let mut handle = EngineRequest {
             connection: self.connection.clone(),
@@ -543,14 +662,17 @@ impl EngineClient {
             output_capacity: request.output_capacity,
             finished: false,
         };
-        self.connection.send(HostMessage::Admit(Admission {
+        if let Err(error) = self.connection.send(HostMessage::Admit(Admission {
             request_id: id,
             input: request.input,
             options: request.options,
             constraint: request.constraint,
             retention: request.retention,
             output_capacity: request.output_capacity,
-        }))?;
+        })) {
+            self.connection.state.lock().unwrap().leases.remove(&id);
+            return Err(error);
+        }
         let admission = poll_fn(|cx| {
             let mut state = self.connection.state.lock().unwrap();
             let slot = state.requests.get_mut(&id).expect("live request slot");
@@ -590,38 +712,41 @@ impl EngineClient {
     /// until that release. One job claims at a time; a claim while one is
     /// pending joins it.
     pub async fn claim_measurement_room(&self, bytes: u64) -> Result<RoomAnswer, RequestError> {
-        let reply = {
+        let (reply, send_claim) = {
             let mut state = self.connection.state.lock().unwrap();
             if let Some(error) = &state.closed {
                 return Err(error.clone());
             }
-            let (reply, claim) = state.claim_room();
-            if let Some(claim) = claim {
-                // Sent under the state lock so the reply cannot arrive first.
-                self.connection.send(HostMessage::ClaimMeasurementRoom { claim, bytes })?;
-            }
-            reply
+            state.begin_room_claim()
         };
+        if let Some(claim) = send_claim {
+            if let Err(error) = self
+                .connection
+                .send(HostMessage::ClaimMeasurementRoom { claim, bytes })
+            {
+                self.connection
+                    .state
+                    .lock()
+                    .unwrap()
+                    .abort_room_claim(claim, &reply, error.clone());
+                return Err(error);
+            }
+        }
         Self::wait(reply).await
     }
 
     /// The measurement job holding the room was started as `process`: the
     /// worker credits its footprint against the room from now.
     pub fn attach_measurement_process(&self, process: magnitude_executor::ProcessId) -> Result<(), RequestError> {
-        let state = self.connection.state.lock().unwrap();
-        if let Some(error) = &state.closed {
-            return Err(error.clone());
-        }
-        // Sent under the state lock, so it follows the claim it names.
-        self.connection.send(HostMessage::AttachMeasurementProcess { process })
+        self.check()?;
+        self.connection
+            .send(HostMessage::AttachMeasurementProcess { process })
     }
 
     /// The measurement job ended: the bank may grow into its room again. A
     /// claim still pending is withdrawn.
     pub fn release_measurement_room(&self) -> Result<(), RequestError> {
-        let mut state = self.connection.state.lock().unwrap();
-        state.release_room();
-        // Sent under the state lock, so a later claim follows it.
+        self.connection.state.lock().unwrap().release_room();
         self.connection.send(HostMessage::ReleaseMeasurementRoom)
     }
 
@@ -641,36 +766,53 @@ impl EngineClient {
     /// Join the pending query of this kind, or send one.
     fn shared<T>(
         &self,
-        field: impl FnOnce(&mut State) -> &mut Option<Shared<T>>,
+        field: impl Fn(&mut State) -> &mut Option<Shared<T>>,
         query: HostMessage,
     ) -> Result<Shared<T>, RequestError> {
-        let mut state = self.connection.state.lock().unwrap();
-        if let Some(error) = &state.closed {
-            return Err(error.clone());
+        let (reply, should_send) = {
+            let mut state = self.connection.state.lock().unwrap();
+            if let Some(error) = &state.closed {
+                return Err(error.clone());
+            }
+            let slot = field(&mut state);
+            if let Some(reply) = slot {
+                (reply.clone(), false)
+            } else {
+                let reply = Arc::new(Mutex::new(SharedReply::default()));
+                *slot = Some(reply.clone());
+                (reply, true)
+            }
+        };
+        if should_send {
+            if let Err(error) = self.connection.send(query) {
+                let mut state = self.connection.state.lock().unwrap();
+                let slot = field(&mut state);
+                if slot
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(pending, &reply))
+                {
+                    *slot = None;
+                }
+                reply.lock().unwrap().fulfill_if_pending(Err(error.clone()));
+                return Err(error);
+            }
         }
-        let slot = field(&mut state);
-        if let Some(reply) = slot {
-            return Ok(reply.clone());
-        }
-        let reply = Arc::new(Mutex::new(SharedReply {
-            value: None,
-            wakers: Vec::new(),
-        }));
-        *slot = Some(reply.clone());
-        // Sent under the state lock so the reply cannot arrive first.
-        self.connection.send(query)?;
         Ok(reply)
     }
 
     async fn wait<T: Clone>(reply: Shared<T>) -> Result<T, RequestError> {
+        let mut guard = ReplyGuard {
+            reply: &reply,
+            slot: None,
+        };
         poll_fn(|cx| {
             let mut reply = reply.lock().unwrap();
-            match &reply.value {
-                Some(value) => Poll::Ready(value.clone()),
-                None => {
-                    reply.wakers.push(cx.waker().clone());
-                    Poll::Pending
-                }
+            if let Some(value) = reply.value.clone() {
+                reply.wakers.remove(&mut guard.slot);
+                Poll::Ready(value)
+            } else {
+                reply.wakers.register(&mut guard.slot, cx.waker());
+                Poll::Pending
             }
         })
         .await
@@ -808,19 +950,60 @@ mod tests {
     use super::*;
     use magnitude_scheduler::protocol::RoomRefusal;
 
+    #[test]
+    fn request_leases_survive_abandonment_until_retirement_or_worker_loss() {
+        let mut state = State::default();
+        let open = |state: &mut State| {
+            let held = Arc::new(());
+            let observe = Arc::downgrade(&held);
+            let id = state.open_request(ReleaseGuard::new(held)).unwrap();
+            (id, observe)
+        };
+        let (pending, pending_guard) = open(&mut state);
+        let (active, active_guard) = open(&mut state);
+        state.deliver(WorkerMessage::Admitted { request_id: active }).unwrap();
+        state.deliver(WorkerMessage::Failed {
+            request_id: active,
+            error: RequestError::internal("failed with work in flight"),
+        }).unwrap();
+        // A disconnect before admission and a consumer that read its terminal
+        // both remove their host slots while the worker still owns the requests.
+        state.requests.remove(&pending);
+        state.requests.remove(&active);
+        assert!(pending_guard.upgrade().is_some());
+        assert!(active_guard.upgrade().is_some());
+        state.deliver(WorkerMessage::Retired { request_id: pending }).unwrap();
+        assert!(pending_guard.upgrade().is_none());
+        assert!(active_guard.upgrade().is_some());
+        state.close(RequestError::WorkerLost { reason: "worker exited".into() });
+        assert!(active_guard.upgrade().is_none());
+    }
+
     /// The answer to a claim released before it arrived answers no later
     /// claim: only the answer naming the pending claim fulfils it.
     #[test]
     fn a_released_claims_answer_does_not_answer_a_later_claim() {
         let mut state = State::default();
-        let (first, Some(released)) = state.claim_room() else { panic!("a new claim") };
+        let (aborted, claim) = state.begin_room_claim();
+        let claim = claim.expect("first claim sends");
+        let (joined_aborted, send) = state.begin_room_claim();
+        assert!(send.is_none());
+        let send_error = RequestError::internal("send failed");
+        state.abort_room_claim(claim, &aborted, send_error.clone());
+        assert!(state.room.is_none(), "an unsent claim has no reply to join");
+        assert_eq!(joined_aborted.lock().unwrap().value, Some(Err(send_error)));
+
+        let (first, released) = state.begin_room_claim();
+        let released = released.expect("new claim after abort");
         state.release_room();
         assert_eq!(first.lock().unwrap().value, Some(Ok(RoomAnswer::Released)));
-        let (second, Some(claim)) = state.claim_room() else { panic!("a new claim") };
+        let (second, claim) = state.begin_room_claim();
+        let claim = claim.expect("new claim after release");
         assert_ne!(claim, released);
         state.deliver(WorkerMessage::MeasurementRoom { claim: released, room: Ok(RoomAnswer::Made) }).unwrap();
         assert_eq!(second.lock().unwrap().value, None, "the released claim's answer");
-        let (joined, None) = state.claim_room() else { panic!("a claim while one is pending joins it") };
+        let (joined, send) = state.begin_room_claim();
+        assert!(send.is_none(), "a claim while one is pending joins it");
         let short = Ok(RoomAnswer::Refused(RoomRefusal::Short { bytes: 1 }));
         state.deliver(WorkerMessage::MeasurementRoom { claim, room: short.clone() }).unwrap();
         assert_eq!(second.lock().unwrap().value, Some(short.clone()));

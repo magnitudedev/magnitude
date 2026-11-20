@@ -13,6 +13,9 @@ use objc2_metal::{
     MTLDevice, MTLDispatchType, MTLEvent,
     MTLResourceUsage, MTLSharedEvent, MTLSize, MTLStorageMode,
 };
+use seismic_compiler::direct_launch::{
+    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch,
+};
 use seismic_compiler::errors::ExecutionError;
 
 /// Metal's `setBytes` limit, which bounds a direct entry's argument words.
@@ -20,7 +23,7 @@ pub const DIRECT_WORD_BYTES_LIMIT: usize = 4096;
 
 /// Metal's buffer argument table size, which bounds a direct entry's
 /// buffers, argument words and scalar-result slots together.
-pub const DIRECT_BUFFER_SLOTS: usize = 31;
+pub const DIRECT_BUFFER_SLOTS: usize = crate::device_info::ARGUMENT_TABLE_ENTRIES as usize;
 
 /// One kernel function of an authored Metal library, compiled into a
 /// pipeline.
@@ -66,10 +69,12 @@ pub struct DirectLaunch<'a> {
 }
 
 impl DirectLaunch<'_> {
-    /// Whether the launch's grid is empty: it does no device work and
-    /// encodes nothing.
+    /// Whether the launch's grid or threadgroup is empty: it does no device
+    /// work and encodes nothing. An indirect launch's grid comes from its GPU
+    /// buffer, so only an empty threadgroup makes it empty on the host.
     pub fn is_empty(&self) -> bool {
-        self.threadgroups.contains(&0) || self.threads_per_threadgroup.contains(&0)
+        (self.grid.is_none() && self.threadgroups.contains(&0))
+            || self.threads_per_threadgroup.contains(&0)
     }
 }
 
@@ -730,10 +735,23 @@ pub struct DirectBatch {
     committed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// An observed or timed batch's record of its command buffers.
     recording: Option<Recording>,
-    command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    /// The open uncommitted command buffer (`None` only after `commit` takes it).
+    command: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// Whether anything is encoded in `command`.
     used: bool,
     encoding: Encoding,
+}
+
+impl Drop for DirectBatch {
+    /// Close any open encoder on the uncommitted command buffer and wait for
+    /// any already-committed prefix to complete so an unwind or early drop
+    /// never leaves an open encoder or frees caller storage while in flight.
+    fn drop(&mut self) {
+        self.end_open();
+        for command in self.committed.drain(..) {
+            crate::pooled(|| command.waitUntilCompleted());
+        }
+    }
 }
 
 /// Whether the command buffer ended: completed, or failed.
@@ -898,7 +916,7 @@ impl DirectBatch {
             device: device.clone(),
             committed: Vec::new(),
             recording: spans.map(|_| Recording::new(device)),
-            command: command_buffer(device)?,
+            command: Some(command_buffer(device)?),
             used: false,
             encoding: Encoding::Grouped {
                 open: None,
@@ -933,6 +951,8 @@ impl DirectBatch {
         }
         crate::pooled(|| {
             self.command
+                .as_ref()
+                .expect("DirectBatch holds its command buffer until consumed")
                 .encodeWaitForEvent_value(event.as_event(), value)
         });
         if let Some(recording) = &mut self.recording {
@@ -953,7 +973,10 @@ impl DirectBatch {
     fn cut(&mut self) -> Result<(), ExecutionError> {
         // Formed before the commit: a failure commits nothing.
         let next = command_buffer(&self.device)?;
-        let previous = std::mem::replace(&mut self.command, next);
+        let previous = self
+            .command
+            .replace(next)
+            .expect("DirectBatch holds its command buffer until consumed");
         let committed = self.encoding.commit(previous, self.recording.as_mut());
         self.committed.push(committed);
         Ok(())
@@ -966,6 +989,8 @@ impl DirectBatch {
         self.used = true;
         crate::pooled(|| {
             self.command
+                .as_ref()
+                .expect("DirectBatch holds its command buffer until consumed")
                 .encodeSignalEvent_value(event.as_event(), value)
         });
     }
@@ -1021,7 +1046,7 @@ impl DirectBatch {
             device: device.clone(),
             committed: Vec::new(),
             recording: Some(Recording::new(device)),
-            command: command_buffer(device)?,
+            command: Some(command_buffer(device)?),
             used: false,
             encoding: Encoding::Timed {
                 timing: Box::new(LaunchTiming {
@@ -1050,23 +1075,43 @@ impl DirectBatch {
             self.skip();
             return Ok(());
         }
-        let threads = launch
-            .threads_per_threadgroup
-            .iter()
-            .try_fold(1u64, |product, value| product.checked_mul(*value))
-            .ok_or_else(|| {
-                ExecutionError::SubmissionFailed("native threadgroup size overflowed".into())
+        let dynamic_shared_bytes =
+            crate::checked_threadgroup_memory_bytes(launch.threadgroup_bytes).ok_or_else(|| {
+                ExecutionError::SubmissionFailed(
+                    "native threadgroup memory size overflowed".into(),
+                )
             })?;
-        if threads > launch.pipeline.max_threads_per_threadgroup() {
-            return Err(ExecutionError::SubmissionFailed(format!(
-                "native launch requests {threads} threads per threadgroup, but the pipeline allows {}",
-                launch.pipeline.max_threads_per_threadgroup()
-            )));
-        }
-        if launch.words.len() > DIRECT_WORD_BYTES_LIMIT {
-            return Err(ExecutionError::SubmissionFailed(
-                "native ABI words exceed Metal setBytes limit".into(),
-            ));
+        let raw = self.device.handle().raw();
+        let max_size = raw.maxThreadsPerThreadgroup();
+        let contract = DirectLaunchContract {
+            max_buffer_slots: Some(DIRECT_BUFFER_SLOTS),
+            max_grid: [crate::device_info::MSL_GRID_INDEX_MAX; 3],
+            max_group_size: Some([
+                max_size.width as u64,
+                max_size.height as u64,
+                max_size.depth as u64,
+            ]),
+            max_group_threads: Some(launch.pipeline.max_threads_per_threadgroup()),
+            max_shared_bytes: Some(raw.maxThreadgroupMemoryLength() as u64),
+            max_param_bytes: Some(DIRECT_WORD_BYTES_LIMIT as u64),
+        };
+        let buffer_slots = launch.buffers.len().checked_add(2).ok_or_else(|| {
+            ExecutionError::SubmissionFailed("native buffer slot count overflowed".into())
+        })?;
+        let request = DirectLaunchRequest {
+            buffer_slots,
+            grid: match launch.grid {
+                Some(_) => LaunchGrid::Indirect,
+                None => LaunchGrid::Direct(launch.threadgroups),
+            },
+            group: Some(launch.threads_per_threadgroup),
+            static_shared_bytes: launch.pipeline.static_threadgroup_bytes(),
+            dynamic_shared_bytes,
+            param_bytes: launch.words.len() as u64,
+        };
+        if matches!(contract.validate(&request)?, ValidatedLaunch::Empty) {
+            self.skip();
+            return Ok(());
         }
         if let Encoding::Timed {
             lease: Some(lease), ..
@@ -1085,7 +1130,10 @@ impl DirectBatch {
             }
         }
         self.used = true;
-        let command = &self.command;
+        let command = self
+            .command
+            .as_ref()
+            .expect("DirectBatch holds its command buffer until consumed");
         let device = &self.device;
         let recording = self.recording.as_ref();
         match &mut self.encoding {
@@ -1151,16 +1199,29 @@ impl DirectBatch {
     /// order.
     pub fn commit(mut self) -> DirectSubmission {
         self.end_open();
-        let last = self.encoding.commit(self.command, self.recording.as_mut());
-        let mut commands = self.committed;
+        let command = self
+            .command
+            .take()
+            .expect("DirectBatch holds its command buffer until consumed");
+        let last = self.encoding.commit(command, self.recording.as_mut());
+        let mut commands = std::mem::take(&mut self.committed);
         commands.push(last);
+        let encoding = std::mem::replace(
+            &mut self.encoding,
+            Encoding::Grouped {
+                open: None,
+                next: MTLDispatchType::Serial,
+                held: Held::Nothing,
+                spans: None,
+            },
+        );
         DirectSubmission {
-            device: self.device,
+            device: self.device.clone(),
             commands,
-            observed: self.recording.map(|recording| Observed {
+            observed: self.recording.take().map(|recording| Observed {
                 calibration: recording.calibration,
                 commands: recording.committed,
-                timing: self.encoding.launch_timing(),
+                timing: encoding.launch_timing(),
             }),
         }
     }
@@ -1170,11 +1231,12 @@ impl DirectBatch {
     /// on, form the returned submission (`None` when there are none).
     pub fn abandon(mut self) -> Option<DirectSubmission> {
         self.end_open();
+        let commands = std::mem::take(&mut self.committed);
         // The batch's observation covers the whole batch: its committed
         // prefix, whose outcome is the failure, observes nothing.
-        (!self.committed.is_empty()).then(|| DirectSubmission {
-            device: self.device,
-            commands: self.committed,
+        (!commands.is_empty()).then(|| DirectSubmission {
+            device: self.device.clone(),
+            commands,
             observed: None,
         })
     }
@@ -1206,11 +1268,7 @@ fn encode_launch(
             launch.buffers.len() + 1,
         );
     }
-    if launch.threadgroup_bytes != 0 {
-        // Metal requires threadgroup memory lengths in multiples of 16.
-        let bytes = launch.threadgroup_bytes.div_ceil(16) * 16;
-        unsafe { encoder.setThreadgroupMemoryLength_atIndex(bytes as usize, 0) };
-    }
+    unsafe { crate::set_threadgroup_memory_length(encoder, launch.threadgroup_bytes, 0) };
     let threads = MTLSize {
         width: launch.threads_per_threadgroup[0] as usize,
         height: launch.threads_per_threadgroup[1] as usize,
@@ -1290,9 +1348,10 @@ impl DirectSubmission {
                 .iter()
                 .find_map(|command| command.error())
                 .map_or(Ok(true), |error| {
-                    Err(ExecutionError::SubmissionFailed(
-                        error.localizedDescription().to_string(),
-                    ))
+                    Err(self
+                        .device
+                        .handle()
+                        .command_buffer_error(&error, ExecutionError::SubmissionFailed))
                 })
         })
     }
@@ -1473,5 +1532,41 @@ mod tests {
             let lease = timestamps.lease(&device, || 0).unwrap();
             drop(lease);
         }
+    }
+
+    /// Dropping a `DirectBatch` without `commit()` or `abandon()` ends any
+    /// open compute encoder and waits for any already-committed prefix to
+    /// finish (verified via a signaled `SharedEvent` in the committed prefix).
+    #[test]
+    fn dropping_direct_batch_ends_open_encoder_and_waits_committed_prefix() {
+        let Ok(handle) = crate::DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let done = SharedEvent::new(&device).unwrap();
+        let gate = SharedEvent::new(&device).unwrap();
+        {
+            let mut batch = DirectBatch::new(&device).unwrap();
+            // Signal `done = 1` in the first command buffer, then cut via
+            // `wait_event` so that first command buffer is committed while a
+            // second remains uncommitted.
+            batch.signal_event(&done, 1);
+            batch.wait_event(&gate, 1).unwrap();
+            assert_eq!(batch.committed.len(), 1);
+            // Open an encoder on the uncommitted second command buffer so Drop
+            // must call `endEncoding()` before releasing it.
+            let command = batch.command.as_ref().unwrap();
+            let encoder = grouped_encoder(&device, command, MTLDispatchType::Serial, None, 0).unwrap();
+            if let Encoding::Grouped { open, .. } = &mut batch.encoding {
+                *open = Some((encoder, MTLDispatchType::Serial));
+            }
+            // Drop `batch` without commit() or abandon(): must end the open
+            // encoder and wait for the committed prefix (`done == 1`).
+        }
+        assert_eq!(
+            done.value(),
+            1,
+            "DirectBatch::drop must wait for already-committed command buffers"
+        );
     }
 }

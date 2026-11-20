@@ -91,19 +91,61 @@ pub(crate) fn census_bytes(device: &Device, census: seismic_compiler::graph_cost
 /// launches of every live graph priced at the device's cost
 /// ([`census_bytes`]), rounded to the granule once over them all, as the
 /// driver takes it. Never read from the device's memory, which other work
-/// moves. Each graph instantiated or dropped moves it by the change in that
-/// price, which the device store's own entry holds as one charge.
+/// moves. Because CUDA retains destroyed graph memory for subsequent graphs
+/// until the context is released, the pool's ledger charge and driver memory
+/// track the context-lifetime high-water mark: instantiating a graph raises
+/// the charge on [`driver::Context`] only when the live price exceeds the
+/// prior peak, dropping a graph reduces only the live census so later graphs
+/// reuse the pool without double-charging, and the retained peak is released
+/// in [`driver::Context::drop`].
 pub(crate) struct GraphPool {
     own: std::sync::Arc<dyn seismic_memory::entry::Entry>,
     context: std::sync::Arc<driver::Context>,
-    state: Mutex<Pooled>,
-    held: std::sync::atomic::AtomicU64,
+    state: Mutex<GraphPoolState>,
 }
 
-/// The live graphs' census and the charge that holds their price.
-struct Pooled {
-    census: GraphCensus,
-    charge: Option<seismic_memory::entry::Charge>,
+/// Pure high-water-mark accounting for a device's graph pool: live graph census
+/// and the monotonic context-lifetime peak bytes already charged.
+#[derive(Default)]
+struct GraphPoolState {
+    live: GraphCensus,
+    peak_bytes: u64,
+}
+
+impl GraphPoolState {
+    fn instantiated(
+        &mut self,
+        census: GraphCensus,
+        price_of: impl FnOnce(GraphCensus) -> u64,
+    ) -> Result<Option<u64>, ExecutionError> {
+        let live = self
+            .live
+            .plus(census)
+            .ok_or_else(|| failure("the live graphs' census overflows"))?;
+        let price = price_of(live);
+        if price == u64::MAX {
+            return Err(failure("the live graphs' census prices past the address range"));
+        }
+        self.live = live;
+        if price > self.peak_bytes {
+            self.peak_bytes = price;
+            Ok(Some(price))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn dropped(&mut self, census: GraphCensus) {
+        let left = |live: u64, dropped: u64| {
+            live.checked_sub(dropped)
+                .expect("a dropped graph was counted live")
+        };
+        self.live = GraphCensus {
+            graphs: left(self.live.graphs, census.graphs),
+            launches: left(self.live.launches, census.launches),
+            ..self.live
+        };
+    }
 }
 
 impl GraphPool {
@@ -111,52 +153,36 @@ impl GraphPool {
         own: std::sync::Arc<dyn seismic_memory::entry::Entry>,
         context: std::sync::Arc<driver::Context>,
     ) -> Self {
-        Self { own, context, state: Mutex::new(Pooled { census: GraphCensus::default(), charge: None }), held: 0.into() }
+        Self { own, context, state: Mutex::new(GraphPoolState::default()) }
     }
 
     /// The entry the graphs' memory is charged to: a graph's instantiation
-    /// and its record are one change, and so are its destruction and its
-    /// record.
+    /// and its record are one change.
     pub(crate) fn entry(&self) -> &std::sync::Arc<dyn seismic_memory::entry::Entry> {
         &self.own
     }
 
     /// A graph of `census` instantiated on `device`.
-    pub(crate) fn instantiated(&self, change: &seismic_memory::entry::Change, device: &Device, census: GraphCensus) -> Result<(), ExecutionError> {
-        self.moved(change, device, |live| live.plus(census))
-    }
-
-    /// A graph of `census` dropped on `device`.
-    pub(crate) fn dropped(&self, change: &seismic_memory::entry::Change, device: &Device, census: GraphCensus) {
-        self.moved(change, device, |live| {
-            let left = |live: u64, dropped: u64| live.checked_sub(dropped).expect("a dropped graph was counted live");
-            Some(GraphCensus { graphs: left(live.graphs, census.graphs), launches: left(live.launches, census.launches), ..live })
-        })
-        .expect("fewer live graphs price within what more did");
-    }
-
-    /// The pool's charge moved to the price of the census `moved` makes of
-    /// the live graphs, recorded inside `change`, the one the graph's
-    /// instantiation or destruction is made in.
-    fn moved(&self, change: &seismic_memory::entry::Change, device: &Device, moved: impl FnOnce(GraphCensus) -> Option<GraphCensus>) -> Result<(), ExecutionError> {
-        let mut pooled = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let census = moved(pooled.census).ok_or_else(|| failure("the live graphs' census overflows"))?;
-        let price = census_bytes(device, census);
-        if price == u64::MAX {
-            return Err(failure("the live graphs' census prices past the address range"));
-        }
-        let was = self.held.swap(price, std::sync::atomic::Ordering::Relaxed);
-        pooled.census = census;
-        // The new charge before the old one ends, so the entry never shows
-        // less than either.
-        let charge = seismic_memory::entry::Charge::took(change, &self.own, price, seismic_memory::entry::Wiring::Pageable);
-        drop(pooled.charge.replace(charge));
-        if price > was {
-            self.context.driver_allocated(price - was);
-        } else {
-            self.context.driver_freed(was - price);
+    pub(crate) fn instantiated(
+        &self,
+        change: &seismic_memory::entry::Change,
+        device: &Device,
+        census: GraphCensus,
+    ) -> Result<(), ExecutionError> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(new_peak) = state.instantiated(census, |live| census_bytes(device, live))? {
+            self.context.grow_graph_charge(change, &self.own, new_peak);
         }
         Ok(())
+    }
+
+    /// A graph of `census` dropped on `device`: reduces the live census so
+    /// subsequent graphs reuse the retained pool up to the high-water mark,
+    /// without freeing the ledger charge or driver memory (CUDA retains the
+    /// backing memory until the context drops).
+    pub(crate) fn dropped(&self, census: GraphCensus) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.dropped(census);
     }
 }
 
@@ -348,7 +374,8 @@ mod tests {
         let first = measure(&device, &programs).unwrap();
         let context = device.context();
         let (source, entry) = KERNEL;
-        let (_module, function) = driver::load_module(context, source.as_bytes(), entry).unwrap();
+        let (_module, functions) = driver::load_module(context, source.as_bytes(), &[entry]).unwrap();
+        let function = functions[0];
         let mut word = [0u8; 8];
         let mut parameters = [word.as_mut_ptr().cast::<c_void>()];
         let launch = node(function, &mut parameters);
@@ -380,7 +407,8 @@ mod tests {
         let device = opened.service;
         let context = device.context();
         let (source, entry) = KERNEL;
-        let (_module, function) = driver::load_module(context, source.as_bytes(), entry).unwrap();
+        let (_module, functions) = driver::load_module(context, source.as_bytes(), &[entry]).unwrap();
+        let function = functions[0];
         let mut word = [0u8; 8];
         let mut parameters = [word.as_mut_ptr().cast::<c_void>()];
         let launch = node(function, &mut parameters);
@@ -433,7 +461,8 @@ mod tests {
                 ".version 7.0\n.target sm_50\n.address_size 64\n\
                  .visible .entry seismic_graph(.param .align 8 .b8 seismic_words[{parameters}])\n{{\n\tret;\n}}\n\0"
             );
-            driver::load_module(context, source.as_bytes(), "seismic_graph").unwrap()
+            let (module, functions) = driver::load_module(context, source.as_bytes(), &["seismic_graph"]).unwrap();
+            (module, functions[0])
         };
         let (_small_module, small) = load(8);
         let (_medium_module, medium) = load(1040);
@@ -510,13 +539,16 @@ mod tests {
                  \tst.global.u32 [%a], %v;\n\tret;\n}}\n\0"
             )
         };
-        let (_fill_module, fill) = driver::load_module(context, source("fill", 1).as_bytes(), "fill").unwrap();
-        let (_twice_module, twice) = driver::load_module(context, source("twice", 2).as_bytes(), "twice").unwrap();
+        let (_fill_module, fill_fns) = driver::load_module(context, source("fill", 1).as_bytes(), &["fill"]).unwrap();
+        let fill = fill_fns[0];
+        let (_twice_module, twice_fns) = driver::load_module(context, source("twice", 2).as_bytes(), &["twice"]).unwrap();
+        let twice = twice_fns[0];
         let spin_source = ".version 7.0\n.target sm_50\n.address_size 64\n\
              .visible .entry spin(.param .u64 cycles)\n{\n\t.reg .u64 %s, %n, %c;\n\t.reg .pred %p;\n\
              \tld.param.u64 %n, [cycles];\n\tmov.u64 %s, %clock64;\nLOOP:\n\tmov.u64 %c, %clock64;\n\
              \tsub.u64 %c, %c, %s;\n\tsetp.lt.u64 %p, %c, %n;\n\t@%p bra LOOP;\n\tret;\n}\n\0";
-        let (_spin_module, spin) = driver::load_module(context, spin_source.as_bytes(), "spin").unwrap();
+        let (_spin_module, spin_fns) = driver::load_module(context, spin_source.as_bytes(), &["spin"]).unwrap();
+        let spin = spin_fns[0];
         const ELEMENTS: usize = 1024;
         let out = driver::HostMapped::new(context, &device.stores().host.own(), ELEMENTS * 4).unwrap();
         out.write_at(0, &[0u8; ELEMENTS * 4]);
@@ -678,7 +710,8 @@ mod tests {
             ".version 7.0\n.target sm_50\n.address_size 64\n\
              .visible .entry decode_node({params}, .param .align 8 .b8 words[{WORDS}])\n{{\n\tret;\n}}\n\0"
         );
-        let (_module, function) = driver::load_module(context, source.as_bytes(), "decode_node").unwrap();
+        let (_module, functions) = driver::load_module(context, source.as_bytes(), &["decode_node"]).unwrap();
+        let function = functions[0];
         let bindings = [0x7000_0000_0000u64, 0x7100_0000_0000u64];
         let pointers = (0..2).map(|_| std::cell::RefCell::new(vec![0u64; POINTERS])).collect::<Vec<_>>();
         let words = std::cell::RefCell::new(vec![0u8; WORDS]);
@@ -745,5 +778,49 @@ mod tests {
             unchanged.0, unchanged.1, updated.0, set / (LAUNCHES as u32 + 1), set / ((LAUNCHES as u32 + 1) * NODES as u32), updated.1,
             instances.0, instances.1
         );
+    }
+
+    /// CUDA retains destroyed graph memory for subsequent graphs until the
+    /// context is released: dropping a graph lowers only the live census so
+    /// later graphs reuse the retained pool without double-charging, while the
+    /// charged high-water mark never shrinks.
+    #[test]
+    fn graph_pool_high_water_mark_never_shrinks_on_drop() {
+        let cost = GraphCost::Pooled { graph: 128 << 10, launch: 8 << 10, granule: 2 << 20 };
+        let price_of = |census: GraphCensus| cost.bytes(census).unwrap().device;
+        let graph_with = |launches: u64| {
+            let mut acc = GraphCensus::default();
+            for _ in 0..launches {
+                acc = acc.plus(GraphCensus::launch(0)).unwrap();
+            }
+            GraphCensus::graph(acc).unwrap()
+        };
+
+        let mut pool = GraphPoolState::default();
+        let small = graph_with(10); // 128 KiB + 80 KiB -> 2 MiB granule
+        let medium = graph_with(300); // 128 KiB + 2.4 MiB -> 4 MiB granule
+
+        // First graph raises peak to 2 MiB.
+        assert_eq!(pool.instantiated(small, price_of).unwrap(), Some(2 << 20));
+        assert_eq!(pool.peak_bytes, 2 << 20);
+
+        // Second graph raises live total to ~2.7 MiB -> 4 MiB peak.
+        assert_eq!(pool.instantiated(medium, price_of).unwrap(), Some(4 << 20));
+        assert_eq!(pool.peak_bytes, 4 << 20);
+
+        // Dropping both lowers live census to 0, but peak stays at 4 MiB.
+        pool.dropped(medium);
+        pool.dropped(small);
+        assert_eq!(pool.live, GraphCensus::default());
+        assert_eq!(pool.peak_bytes, 4 << 20);
+
+        // Re-instantiating within the retained 4 MiB pool incurs no new charge.
+        assert_eq!(pool.instantiated(small, price_of).unwrap(), None);
+        assert_eq!(pool.instantiated(medium, price_of).unwrap(), None);
+        assert_eq!(pool.peak_bytes, 4 << 20);
+
+        // Exceeding 4 MiB grows peak only to the new granule (6 MiB).
+        assert_eq!(pool.instantiated(medium, price_of).unwrap(), Some(6 << 20));
+        assert_eq!(pool.peak_bytes, 6 << 20);
     }
 }

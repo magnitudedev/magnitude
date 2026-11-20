@@ -49,6 +49,7 @@ pub struct MetalSubmission {
 }
 
 pub struct MetalExecution {
+    device: MetalDevice,
     pending: Vec<PendingCommand>,
 }
 
@@ -157,22 +158,41 @@ impl NativeSubmission<Metal> for MetalSubmission {
         self.synchronize()
     }
 
-    fn submit(self) -> Self::Execution {
+    fn submit(mut self) -> Self::Execution {
         MetalExecution {
-            pending: self.pending,
+            device: self.device.clone(),
+            pending: std::mem::take(&mut self.pending),
         }
+    }
+}
+
+impl Drop for MetalSubmission {
+    /// Complete any committed commands still in flight if the submission drops
+    /// without being submitted (e.g. error return or unwind), so caller storage
+    /// is never freed while the GPU still reads it.
+    fn drop(&mut self) {
+        let _ = complete_pending(&self.device, &mut self.pending);
     }
 }
 
 impl NativeExecution for MetalExecution {
     fn complete(&mut self) -> Result<(), ExecutionError> {
-        complete_pending(&mut self.pending)
+        complete_pending(&self.device, &mut self.pending)
+    }
+}
+
+impl Drop for MetalExecution {
+    /// Complete any committed commands still in flight if the execution drops
+    /// before `complete()` runs, so caller storage is never freed while the
+    /// GPU still reads it.
+    fn drop(&mut self) {
+        let _ = complete_pending(&self.device, &mut self.pending);
     }
 }
 
 impl MetalSubmission {
     fn synchronize(&mut self) -> Result<(), ExecutionError> {
-        complete_pending(&mut self.pending)
+        complete_pending(&self.device, &mut self.pending)
     }
 
     fn write_words(
@@ -204,7 +224,7 @@ impl MetalSubmission {
             self.pending
                 .iter()
                 .filter(|pending| pending.words.overlaps(&words)),
-            |pending| complete_command(&pending.command),
+            |pending| complete_command(&self.device, &pending.command),
         );
         // Preserve every owner if a native wait panics, and preserve unrelated
         // issued work on an ordinary completion error.
@@ -304,6 +324,12 @@ impl MetalSubmission {
         let result_base_offset = results.base_offset;
         let participant = scratch_buffer(scratch.allocation(LaunchLocalKind::Participant), env);
         let registers = scratch_buffer(scratch.allocation(LaunchLocalKind::Register), env);
+        let threadgroup_bytes =
+            crate::checked_threadgroup_memory_bytes(total_values[0]).ok_or_else(|| {
+                ExecutionError::SubmissionFailed(
+                    "Metal threadgroup memory length overflowed".into(),
+                )
+            })?;
 
         let command = crate::pooled(|| {
             let command = self.device.command_buffer().ok_or_else(|| {
@@ -332,7 +358,7 @@ impl MetalSubmission {
                 );
                 set_optional_buffer(&encoder, participant, first_aux + 2);
                 set_optional_buffer(&encoder, registers, first_aux + 3);
-                encoder.setThreadgroupMemoryLength_atIndex(total_values[0] as usize, 0);
+                crate::set_threadgroup_memory_length(&encoder, threadgroup_bytes, 0);
             }
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
@@ -419,21 +445,29 @@ impl MetalSubmission {
     }
 }
 
-fn complete_command(command: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), ExecutionError> {
+fn complete_command(
+    device: &MetalDevice,
+    command: &ProtocolObject<dyn MTLCommandBuffer>,
+) -> Result<(), ExecutionError> {
     crate::pooled(|| {
         command.waitUntilCompleted();
         if let Some(error) = command.error() {
-            Err(ExecutionError::SynchronizationFailed(
-                error.localizedDescription().to_string(),
-            ))
+            Err(device
+                .handle()
+                .command_buffer_error(&error, ExecutionError::SynchronizationFailed))
         } else {
             Ok(())
         }
     })
 }
 
-fn complete_pending(pending: &mut Vec<PendingCommand>) -> Result<(), ExecutionError> {
-    let completed = complete_all(pending.iter(), |pending| complete_command(&pending.command));
+fn complete_pending(
+    device: &MetalDevice,
+    pending: &mut Vec<PendingCommand>,
+) -> Result<(), ExecutionError> {
+    let completed = complete_all(pending.iter(), |pending| {
+        complete_command(device, &pending.command)
+    });
     // Keep every command-buffer owner in `pending` until every wait returns.
     // If a foreign call panics, the runtime leaks the still-populated
     // execution owner and therefore cannot release in-flight ownership.
@@ -631,6 +665,40 @@ mod completion_tests {
 
         assert_eq!(completed, vec![0, 1, 2, 3]);
         assert_eq!(error, ExecutionError::SynchronizationFailed("first".into()));
+    }
+
+    #[test]
+    fn dropping_submission_or_execution_completes_pending_commands() {
+        let device = metal_device();
+        let pipeline = capture_pipeline(&device);
+        let output = device.allocate_bytes(2 * 8, &crate::test_support::entry()).unwrap();
+        let table = RuntimeBuffer {
+            tensor: None,
+            buffer: MetalBuffer::clone(&device.allocate_bytes(32, &crate::test_support::entry()).unwrap()),
+            base_offset: 0,
+            accessible_bytes: 16,
+        };
+
+        // Dropping MetalSubmission without submit() waits for its pending work.
+        {
+            let mut submission = MetalExecutor::new(device.clone())
+                .begin_submission()
+                .unwrap();
+            capture_words(&mut submission, &pipeline, &table, &output, [0, 42]);
+            assert_eq!(submission.pending.len(), 1);
+        }
+        assert_eq!(captured_words(&device, &output)[0], 42);
+
+        // Dropping MetalExecution without complete() waits for its pending work.
+        {
+            let mut submission = MetalExecutor::new(device.clone())
+                .begin_submission()
+                .unwrap();
+            capture_words(&mut submission, &pipeline, &table, &output, [1, 99]);
+            let execution = submission.submit();
+            assert_eq!(execution.pending.len(), 1);
+        }
+        assert_eq!(captured_words(&device, &output)[1], 99);
     }
 }
 

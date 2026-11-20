@@ -8,9 +8,10 @@ use crate::Metal;
 use objc2::rc::Retained;
 use objc2::Message;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSRange;
+use objc2_foundation::{NSError, NSRange};
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferError,
+    MTLCommandBufferErrorDomain, MTLCommandEncoder, MTLCommandQueue,
     MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLCopyAllDevices, MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice,
     MTLDevice, MTLDispatchType, MTLResidencySet, MTLResidencySetDescriptor, MTLResource,
@@ -19,7 +20,7 @@ use objc2_metal::{
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::DeviceService;
 use std::fmt;
-use seismic_memory::entry::{Backed, DropScope, Entry, Store, Wiring};
+use seismic_memory::entry::{Backed, DropInChange, Entry, ScopedDrop, Store, Wiring};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::{any::Any, ptr::NonNull};
 
@@ -113,6 +114,17 @@ impl DeviceHandle {
                 allocated: self.current_allocated_bytes(),
             },
         }
+    }
+
+    /// Map a failed command buffer's `NSError`: Metal reports working-set
+    /// exhaustion as `MTLCommandBufferErrorOutOfMemory`, which is a capacity
+    /// refusal; any other command-buffer error goes through `fallback`.
+    pub(crate) fn command_buffer_error(
+        &self,
+        error: &NSError,
+        fallback: fn(String) -> ExecutionError,
+    ) -> ExecutionError {
+        classify_command_buffer_error(error, || self.refused(0), fallback)
     }
 
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
@@ -367,13 +379,38 @@ struct Mapping {
 unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
+fn classify_command_buffer_error(
+    error: &NSError,
+    refused: impl FnOnce() -> ExecutionError,
+    fallback: fn(String) -> ExecutionError,
+) -> ExecutionError {
+    let domain = unsafe { MTLCommandBufferErrorDomain };
+    if *error.domain() == *domain && error.code() == MTLCommandBufferError::OutOfMemory.0 as isize {
+        refused()
+    } else {
+        fallback(error.localizedDescription().to_string())
+    }
+}
+
+fn classify_mmap_error(
+    len: usize,
+    error: std::io::Error,
+    refused: impl FnOnce(u64) -> ExecutionError,
+) -> ExecutionError {
+    if error.raw_os_error() == Some(libc::ENOMEM) {
+        refused(len as u64)
+    } else {
+        ExecutionError::AllocationFailed(format!("{len} bytes were not mapped: {error}"))
+    }
+}
+
 impl Mapping {
     /// A zero mapping of `len` bytes, whole host pages.
-    fn anonymous(len: usize) -> Result<Self, ExecutionError> {
+    fn anonymous(handle: &DeviceHandle, len: usize) -> Result<Self, ExecutionError> {
         let pointer = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
         match (pointer != libc::MAP_FAILED).then(|| NonNull::new(pointer.cast::<u8>())).flatten() {
             Some(pointer) => Ok(Self { pointer, len }),
-            None => Err(ExecutionError::AllocationFailed(format!("{len} bytes were not mapped: {}", std::io::Error::last_os_error()))),
+            None => Err(classify_mmap_error(len, std::io::Error::last_os_error(), |bytes| handle.refused(bytes))),
         }
     }
 
@@ -394,20 +431,30 @@ impl Drop for Mapping {
     }
 }
 
-/// A new buffer of `length` bytes over a mapping of its own, rounded up to
-/// whole host pages, every page backed, charged exactly to `entry` as
-/// `wiring`: no-copy, so Metal takes exactly the mapping's bytes. A refusal allocates and
-/// charges nothing.
-fn mapped_buffer(handle: &DeviceHandle, length: usize, entry: &Arc<dyn Entry>, wiring: Wiring) -> Result<(ChargedBuffer, Mapping), ExecutionError> {
+/// The host page size as `usize`.
+fn host_page_usize() -> Result<usize, ExecutionError> {
     let page = seismic_memory::host_page()
         .map_err(|error| ExecutionError::AllocationFailed(error.to_string()))?;
-    let page = usize::try_from(page).map_err(|_| {
+    usize::try_from(page).map_err(|_| {
         ExecutionError::AllocationFailed("host page size exceeds the host address space".into())
-    })?;
+    })
+}
+
+/// A new buffer of `length` bytes over a mapping of its own, rounded up to
+/// whole host pages (`page`), every page backed, charged exactly to `entry` as
+/// `wiring`: no-copy, so Metal takes exactly the mapping's bytes. A refusal allocates and
+/// charges nothing.
+fn mapped_buffer(
+    handle: &DeviceHandle,
+    length: usize,
+    page: usize,
+    entry: &Arc<dyn Entry>,
+    wiring: Wiring,
+) -> Result<(ChargedBuffer, Mapping), ExecutionError> {
     let length = length.checked_next_multiple_of(page).ok_or_else(|| ExecutionError::AllocationFailed(format!("{length} bytes exceed the host address space")))?;
     let mut mapping = None;
     let buffer = Backed::take(entry, length as u64, wiring, |_| {
-        let made = Mapping::anonymous(length)?;
+        let made = Mapping::anonymous(handle, length)?;
         made.back(page);
         let buffer = crate::pooled(|| unsafe {
             handle.raw().newBufferWithBytesNoCopy_length_options_deallocator(made.pointer.cast(), length, MTLResourceOptions::StorageModeShared, None)
@@ -419,21 +466,51 @@ fn mapped_buffer(handle: &DeviceHandle, length: usize, entry: &Arc<dyn Entry>, w
     Ok((buffer, mapping.expect("a charged buffer has its mapping")))
 }
 
+/// A charged `StorageModeShared` buffer of `length` bytes: backed by its own
+/// anonymous [`Mapping`] whenever `force_mapped` or `length > page` so its
+/// pages return to the OS within the drop (`release lag == 0`), avoiding IOGPU's
+/// ~3 s release lag on `newBufferWithLength_options`. Sub-page buffers
+/// (`length <= page` and `!force_mapped`) stay on `charged_buffer` to avoid
+/// per-buffer `mmap` VMAs.
+fn shared_buffer(
+    handle: &DeviceHandle,
+    length: usize,
+    entry: &Arc<dyn Entry>,
+    wiring: Wiring,
+    force_mapped: bool,
+) -> Result<(ChargedBuffer, Option<Mapping>), ExecutionError> {
+    let page = host_page_usize()?;
+    if force_mapped || length > page {
+        let (charged, mapping) = mapped_buffer(handle, length, page, entry, wiring)?;
+        Ok((charged, Some(mapping)))
+    } else {
+        Ok((charged_buffer(handle, length, MTLResourceOptions::StorageModeShared, entry, wiring)?, None))
+    }
+}
+
+struct WiredAllocationInner {
+    residency: Arc<Residency>,
+    buffer: ChargedBuffer,
+    /// A pool block's mapping, unmapped as it is released:
+    /// after the buffer over it. Held only for its drop.
+    _mapping: Option<Mapping>,
+}
+
+impl DropInChange for WiredAllocationInner {
+    fn drop_entry(&self) -> Option<&Arc<dyn Entry>> {
+        Some(self.buffer.entry())
+    }
+
+    fn before_drop(&mut self) {
+        self.residency.remove(&self.buffer);
+    }
+}
+
 /// A buffer's membership of its device's residency set, and the charge of
 /// its bytes. It is requested resident from the commit that adds it until
 /// this is dropped ([`Residency`]); its bytes are charged to the entry its
 /// allocation named until then ([`MetalDevice::allocate_bytes`]).
-pub struct WiredAllocation {
-    residency: Arc<Residency>,
-    buffer: ChargedBuffer,
-    /// A pool block's mapping, unmapped as it is released ([`Self::drop`]):
-    /// after the buffer over it. Held only for its drop.
-    _mapping: Option<Mapping>,
-    /// The change its drop runs in ([`DropScope`]): last, so the charge's
-    /// free and the unmapping, an OS effect of the drop beside the
-    /// buffer's release, are one change.
-    scope: DropScope,
-}
+pub struct WiredAllocation(ScopedDrop<WiredAllocationInner>);
 
 unsafe impl Send for WiredAllocation {}
 unsafe impl Sync for WiredAllocation {}
@@ -445,25 +522,16 @@ impl WiredAllocation {
         mapping: Option<Mapping>,
     ) -> Self {
         residency.add(&buffer);
-        Self {
+        Self(ScopedDrop::new(WiredAllocationInner {
             residency: residency.clone(),
             buffer,
             _mapping: mapping,
-            scope: DropScope::default(),
-        }
+        }))
     }
-}
 
-impl Drop for WiredAllocation {
-    /// The buffer leaves the residency set first, then its fields drop in
-    /// order: the buffer is released, and a block's mapping, which no work
-    /// reads any more (the granule pool returns a block only after its
-    /// granules' fences), is unmapped, its pages free within the drop. So
-    /// our own release of a block shows in the next host reading with a
-    /// release λ of 0, as anonymous memory's does.
-    fn drop(&mut self) {
-        self.scope.begin(self.buffer.entry());
-        self.residency.remove(&self.buffer);
+    #[cfg(test)]
+    fn buffer(&self) -> &ChargedBuffer {
+        &self.0.buffer
     }
 }
 
@@ -496,10 +564,34 @@ enum Storage {
     Private(Arc<Staging>),
 }
 
-/// The most bytes one staging copy holds in host RAM: its shared buffer is
-/// charged to no ledger entry, so a host access of any size takes at most
-/// this beside the bytes its caller holds.
+/// The most bytes one staging copy holds in host RAM: each chunk is charged
+/// to the device store's own ledger entry (`Wiring::Pageable`) and freed as
+/// soon as its blit finishes, so a host access of any size takes at most this
+/// beside the bytes its caller holds.
 const STAGING_CHUNK: usize = 16 << 20;
+
+struct StagedBufferInner {
+    buffer: ChargedBuffer,
+    _mapping: Option<Mapping>,
+}
+
+impl DropInChange for StagedBufferInner {
+    fn drop_entry(&self) -> Option<&Arc<dyn Entry>> {
+        Some(self.buffer.entry())
+    }
+}
+
+/// One transient staging buffer held for the duration of a single blit chunk.
+/// Its charge release and optional mapping unmap run together inside one change.
+struct StagedBuffer(ScopedDrop<StagedBufferInner>);
+
+impl std::ops::Deref for StagedBuffer {
+    type Target = StagedBufferInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// The device's single ordered command queue and the explicit
 /// `maxCommandBufferCount` it was created with (`None` for Metal's default
@@ -515,16 +607,17 @@ unsafe impl Send for CommandQueue {}
 unsafe impl Sync for CommandQueue {}
 
 /// The host's way to a private buffer's bytes: a blit on the device's
-/// queue between it and a shared buffer of the bytes, completed before the
-/// access returns, so it follows every command buffer committed before it
+/// queue between it and a charged shared buffer of the bytes, completed before
+/// the access returns, so it follows every command buffer committed before it
 /// in the queue's order.
 struct Staging {
     handle: DeviceHandle,
     queue: Arc<RwLock<CommandQueue>>,
+    entry: Arc<dyn Entry>,
 }
 
-// Metal's device and queue are thread-safe; a staging copy holds nothing
-// across calls.
+// Metal's device, queue, and ledger entry are thread-safe; a staging copy
+// holds nothing across calls.
 unsafe impl Send for Staging {}
 unsafe impl Sync for Staging {}
 
@@ -546,26 +639,25 @@ impl Staging {
             command.commit();
             command.waitUntilCompleted();
             match command.error() {
-                Some(error) => Err(ExecutionError::SynchronizationFailed(error.localizedDescription().to_string())),
+                Some(error) => Err(self.handle.command_buffer_error(&error, ExecutionError::SynchronizationFailed)),
                 None => Ok(()),
             }
         })
     }
 
-    /// A shared buffer of `length` bytes for a copy, `bytes` its contents
-    /// where given.
-    fn staged(&self, length: usize, bytes: Option<&[u8]>) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, ExecutionError> {
-        crate::pooled(|| match bytes {
-            Some(bytes) => unsafe {
-                self.handle.raw().newBufferWithBytes_length_options(
-                    NonNull::from(bytes).cast(),
-                    length,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            },
-            None => self.handle.raw().newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared),
-        })
-        .ok_or_else(|| self.handle.refused(length as u64))
+    /// A charged shared buffer of `length` bytes for a copy, `bytes` its
+    /// contents where given. Uses [`shared_buffer`] so chunks above page size
+    /// are unmapped immediately on drop (`release lag == 0`).
+    fn staged(&self, length: usize, bytes: Option<&[u8]>) -> Result<StagedBuffer, ExecutionError> {
+        let (buffer, mapping) = shared_buffer(&self.handle, length, &self.entry, Wiring::Pageable, false)?;
+        if let Some(bytes) = bytes {
+            // SAFETY: `buffer` is a writable shared buffer of at least `length` bytes.
+            unsafe { host_write(buffer.contents().as_ptr().cast::<u8>(), length as u64, 0, bytes) };
+        }
+        Ok(StagedBuffer(ScopedDrop::new(StagedBufferInner {
+            buffer,
+            _mapping: mapping,
+        })))
     }
 
     /// Write `bytes` at `offset` of `buffer`, of `length` bytes, staged
@@ -577,7 +669,7 @@ impl Staging {
             let staged = self.staged(chunk.len(), Some(chunk))?;
             // SAFETY: both ranges lie in their buffers, which outlive the copy.
             self.blit(|blit| unsafe {
-                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(&staged, 0, buffer, at, chunk.len())
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(&staged.buffer, 0, buffer, at, chunk.len())
             })?;
         }
         Ok(())
@@ -592,10 +684,10 @@ impl Staging {
             let staged = self.staged(chunk.len(), None)?;
             // SAFETY: both ranges lie in their buffers, which outlive the copy.
             self.blit(|blit| unsafe {
-                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(buffer, at, &staged, 0, chunk.len())
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(buffer, at, &staged.buffer, 0, chunk.len())
             })?;
             // SAFETY: the staged buffer is shared storage of `chunk.len()` bytes.
-            unsafe { host_read(staged.contents().as_ptr().cast::<u8>(), chunk.len() as u64, 0, chunk) };
+            unsafe { host_read(staged.buffer.contents().as_ptr().cast::<u8>(), chunk.len() as u64, 0, chunk) };
         }
         Ok(())
     }
@@ -810,7 +902,11 @@ impl MetalDevice {
                 TargetError::DeviceUnavailable(format!("could not create the Metal order buffer: {error}"))
             })?;
         let queue = Arc::new(RwLock::new(CommandQueue { raw: raw_queue, capacity: None }));
-        let staging = Arc::new(Staging { handle: handle.clone(), queue: queue.clone() });
+        let staging = Arc::new(Staging {
+            handle: handle.clone(),
+            queue: queue.clone(),
+            entry: store.own(),
+        });
         Ok(Self {
             handle,
             queue,
@@ -957,8 +1053,9 @@ impl MetalDevice {
         self.allocate_shared(bytes, entry, false)
     }
 
-    /// [`Self::allocate_bytes`], a pool block's where `block`: over a
-    /// mapping of its own, unmapped as it is released ([`Mapping`]).
+    /// [`Self::allocate_bytes`], routed through [`shared_buffer`]: backed by
+    /// its own [`Mapping`] whenever `block` or larger than a host page so its
+    /// pages return to the OS within the drop (`release lag == 0`).
     fn allocate_shared(
         &self,
         bytes: u64,
@@ -970,27 +1067,29 @@ impl MetalDevice {
         })?;
         // Kept resident before it is handed out, wired where a set keeps it.
         let wiring = self.residency.wiring();
-        let (charged, mapping) = match block {
-            true => {
-                let (charged, mapping) = mapped_buffer(&self.handle, length, entry, wiring)?;
-                (charged, Some(mapping))
-            }
-            false => (charged_buffer(&self.handle, length, MTLResourceOptions::StorageModeShared, entry, wiring)?, None),
-        };
+        // The wired charge and the residency commit in held() must become
+        // observable together. Backed::take joins this change.
+        let _change = entry.change();
+        let (charged, mapping) = shared_buffer(&self.handle, length, entry, wiring, block)?;
         Ok(self.held(charged, mapping, bytes, Storage::Shared))
     }
 
-    /// A private buffer of `bytes` in the device's own memory, zero (Metal
-    /// leaves a private buffer's contents undefined, so a blit zeroes it),
-    /// its bytes charged exactly to `entry` as device memory the driver
-    /// holds ([`Wiring::Pageable`]), kept resident for the device's work as
-    /// every buffer is ([`Residency`]).
-    fn allocate_private(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<WritableMetalBuffer, ExecutionError> {
+    /// A private buffer of `bytes` in the device's own memory, its bytes as
+    /// `fill` says (Metal leaves a private buffer's contents undefined, so a
+    /// blit zeroes it for [`seismic_memory::SlabFill::Zeroed`]; skipped for
+    /// [`seismic_memory::SlabFill::Unwritten`] so allocation never
+    /// synchronously waits on the device command queue), its bytes charged
+    /// exactly to `entry` as device memory the driver holds
+    /// ([`Wiring::Pageable`]), kept resident for the device's work as every
+    /// buffer is ([`Residency`]).
+    fn allocate_private(&self, bytes: u64, entry: &Arc<dyn Entry>, fill: seismic_memory::SlabFill) -> Result<WritableMetalBuffer, ExecutionError> {
         let length = usize::try_from(bytes.max(1)).map_err(|_| {
             ExecutionError::AllocationFailed(format!("{bytes} bytes exceed the host address space"))
         })?;
         let charged = charged_buffer(&self.handle, length, storage(crate::topology::PRIVATE_KIND), entry, Wiring::Pageable)?;
-        self.staging.zero(&charged, length)?;
+        if fill == seismic_memory::SlabFill::Zeroed {
+            self.staging.zero(&charged, length)?;
+        }
         Ok(self.held(charged, None, bytes, Storage::Private(self.staging.clone())))
     }
 
@@ -1012,14 +1111,14 @@ impl MetalDevice {
     /// ([`crate::topology::kinds`]): private storage, or shared storage, a
     /// pool block's over a mapping of its own where `block`
     /// ([`Self::allocate_shared`]).
-    fn allocate_kind(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>, block: bool) -> Result<WritableMetalBuffer, ExecutionError> {
+    fn allocate_kind(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>, block: bool, fill: seismic_memory::SlabFill) -> Result<WritableMetalBuffer, ExecutionError> {
         let unified = self.handle.has_unified_memory();
         assert!(
             crate::topology::kinds(unified).iter().any(|own| own.id == kind),
             "invariant violated: a Metal allocation of kind {kind}, which the device (unified memory: {unified}) does not have"
         );
         match kind {
-            crate::topology::PRIVATE_KIND => self.allocate_private(bytes, entry),
+            crate::topology::PRIVATE_KIND => self.allocate_private(bytes, entry, fill),
             _ => self.allocate_shared(bytes, entry, block),
         }
     }
@@ -1028,21 +1127,23 @@ impl MetalDevice {
     /// ledgers ([`crate::topology::own_kind`]), zero, charged exactly to
     /// `entry`.
     pub(crate) fn allocate_own(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<WritableMetalBuffer, ExecutionError> {
-        self.allocate_kind(crate::topology::own_kind(self.handle.has_unified_memory()), bytes, entry, false)
+        self.allocate_kind(crate::topology::own_kind(self.handle.has_unified_memory()), bytes, entry, false, seismic_memory::SlabFill::Zeroed)
     }
 
     /// One block of a granule pool (`seismic_memory::pool::Blocks`) of
-    /// `kind`, zero, charged exactly to `entry`: shared storage over a
-    /// mapping of its own ([`Self::allocate_shared`]), its pages returned
-    /// to the OS within the drop of its last handle ([`WiredAllocation`]'s
-    /// drop), or private storage ([`Self::allocate_private`]).
+    /// `kind`, its bytes as `fill` says, charged exactly to `entry`: shared
+    /// storage over a mapping of its own ([`Self::allocate_shared`]), its pages
+    /// returned to the OS within the drop of its last handle
+    /// ([`WiredAllocation`]'s drop), or private storage
+    /// ([`Self::allocate_private`]).
     pub fn allocate_block(
         &self,
         kind: u32,
         bytes: u64,
         entry: &Arc<dyn Entry>,
+        fill: seismic_memory::SlabFill,
     ) -> Result<WritableMetalBuffer, ExecutionError> {
-        self.allocate_kind(kind, bytes, entry, true)
+        self.allocate_kind(kind, bytes, entry, true, fill)
     }
 
 
@@ -1113,7 +1214,7 @@ impl DeviceService<Metal> for MetalDevice {
         // The profile advertises the alignment returned by
         // `heapBufferSizeAndAlignWithLength:options:` for this same shared
         // buffer class; direct device buffers satisfy that requirement.
-        self.allocate_kind(kind, bytes, entry, false)
+        self.allocate_kind(kind, bytes, entry, false, seismic_memory::SlabFill::Zeroed)
     }
 
     fn write(
@@ -1248,7 +1349,7 @@ mod mapped_tests {
             return;
         };
         let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
-        let buffer = device.allocate_private(3 << 12, &crate::test_support::entry()).unwrap();
+        let buffer = device.allocate_private(3 << 12, &crate::test_support::entry(), seismic_memory::SlabFill::Zeroed).unwrap();
         assert!(<MetalDevice as DeviceService<Metal>>::host_address(&device, &buffer).is_none());
         assert_eq!(device.residency.lock().count(), 1);
         let mut read = vec![1u8; 3 << 12];
@@ -1263,7 +1364,7 @@ mod mapped_tests {
         assert_eq!(device.residency.lock().count(), 0);
         // An access longer than one staging copy is staged a chunk at a
         // time, each landing at its own offset.
-        let long = device.allocate_private((STAGING_CHUNK + (3 << 12)) as u64, &crate::test_support::entry()).unwrap();
+        let long = device.allocate_private((STAGING_CHUNK + (3 << 12)) as u64, &crate::test_support::entry(), seismic_memory::SlabFill::Zeroed).unwrap();
         let written = (0..STAGING_CHUNK + 4096).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         long.write_bytes(4097, &written).unwrap();
         let mut back = vec![0u8; written.len()];
@@ -1296,10 +1397,68 @@ mod mapped_tests {
         tally.bound(0);
         let before = device.handle().current_allocated_bytes();
         assert!(matches!(
-            device.allocate_block(crate::topology::SHARED_KIND, 1 << 20, &entry),
+            device.allocate_block(crate::topology::SHARED_KIND, 1 << 20, &entry, seismic_memory::SlabFill::Zeroed),
             Err(ExecutionError::AllocationCapacity { .. })
         ));
         assert_eq!(device.handle().current_allocated_bytes(), before);
+    }
+
+    /// Observe every boundary at which a host reading could see the ledger.
+    #[test]
+    fn a_shared_buffers_charge_and_residency_change_together() {
+        use seismic_memory::entry::{Change, Refused, Tally};
+        use seismic_topology::StoreIdentity;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct Observed {
+            tally: Tally,
+            residency: Arc<Residency>,
+            depth: Arc<AtomicUsize>,
+        }
+
+        struct Boundary(Observed);
+
+        impl Drop for Boundary {
+            fn drop(&mut self) {
+                let entry = &self.0;
+                if entry.depth.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    let resident = entry.residency.lock().count() > 0;
+                    assert_eq!(entry.tally.held() > 0, resident);
+                }
+            }
+        }
+
+        impl Entry for Observed {
+            fn store(&self) -> &StoreIdentity { self.tally.store() }
+            fn change(&self) -> Change {
+                self.depth.fetch_add(1, Ordering::Relaxed);
+                Change::held(Boundary(self.clone()))
+            }
+            fn on_close(&self, closed: Box<dyn FnOnce() + Send>) { self.tally.on_close(closed) }
+            fn closed(&self) -> bool { self.tally.closed() }
+            fn take(&self, change: &Change, bytes: u64, wiring: Wiring) -> Result<(), Refused> {
+                self.tally.take(change, bytes, wiring)
+            }
+            fn took(&self, change: &Change, bytes: u64, wiring: Wiring) { self.tally.took(change, bytes, wiring) }
+            fn freed(&self, change: &Change, bytes: u64, wiring: Wiring) { self.tally.freed(change, bytes, wiring) }
+        }
+
+        let device = crate::test_support::metal_device();
+        let record = seismic_lang::registry::TestDevice::opened(seismic_lang::registry::BackendName::Metal);
+        let entry: Arc<dyn Entry> = Arc::new(Observed {
+            tally: Tally::unbounded(StoreIdentity::HostRam),
+            residency: device.residency.clone(),
+            depth: Arc::new(AtomicUsize::new(0)),
+        });
+        for block in [false, true] {
+            let buffer = device.allocate_shared(1 << 16, &entry, block).unwrap();
+            assert_eq!(device.residency.lock().count(), 1);
+            drop(buffer);
+        }
+        if let Some(record) = record {
+            record.ran();
+        }
     }
 
     /// The set's residency is requested on each change while it holds
@@ -1493,7 +1652,7 @@ mod mapped_tests {
         let entry = crate::test_support::entry();
         let buffer = device.allocate_bytes(1 << 16, &entry).unwrap();
         let wired = buffer._wired.as_ref().expect("an allocated buffer is in the set");
-        assert_eq!(wired.buffer.charge().wiring(), Wiring::Wired);
+        assert_eq!(wired.buffer().charge().wiring(), Wiring::Wired);
         assert_eq!(device.order.charge().wiring(), Wiring::Pageable);
     }
 
@@ -1513,7 +1672,7 @@ mod mapped_tests {
         let before = count();
         let started = std::time::Instant::now();
         let blocks = (0..512)
-            .map(|_| device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry()).unwrap())
+            .map(|_| device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry(), seismic_memory::SlabFill::Zeroed).unwrap())
             .collect::<Vec<_>>();
         let added = started.elapsed();
         assert_eq!(count() - before, blocks.len() as u64, "one buffer per block");
@@ -1540,7 +1699,7 @@ mod mapped_tests {
         };
         let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
         let block = 1u64 << 30;
-        let buffer = device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry()).unwrap();
+        let buffer = device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry(), seismic_memory::SlabFill::Zeroed).unwrap();
         // Touched: every page the process's.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         let ones = vec![1u8; page as usize];
@@ -1557,45 +1716,134 @@ mod mapped_tests {
         );
     }
 
-    /// `task_vm_info` (`TASK_VM_INFO`) through `phys_footprint`, laid out as
-    /// the kernel writes it.
-    #[allow(dead_code)]
-    #[repr(C)]
-    #[derive(Default)]
-    struct TaskVm {
-        virtual_size: u64,
-        region_count: i32,
-        page_size: i32,
-        resident_size: u64,
-        resident_size_peak: u64,
-        device: u64,
-        device_peak: u64,
-        internal: u64,
-        internal_peak: u64,
-        external: u64,
-        external_peak: u64,
-        reusable: u64,
-        reusable_peak: u64,
-        purgeable_volatile_pmap: u64,
-        purgeable_volatile_resident: u64,
-        purgeable_volatile_virtual: u64,
-        compressed: u64,
-        compressed_peak: u64,
-        compressed_lifetime: u64,
-        phys_footprint: u64,
+    /// A non-pool shared buffer above page size is also backed by its own
+    /// mapping (`shared_buffer`), so dropping its last handle returns its
+    /// pages to the OS within the drop (`release lag == 0`) rather than
+    /// suffering IOGPU's ~3 s release lag.
+    #[test]
+    fn a_released_non_pool_buffer_leaves_the_footprint_within_the_release() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let bytes = 256u64 << 20;
+        let buffer = device.allocate_bytes(bytes, &crate::test_support::entry()).unwrap();
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let ones = vec![1u8; page as usize];
+        for offset in (0..bytes).step_by(page as usize) {
+            buffer.write_bytes(offset, &ones).unwrap();
+        }
+        let before = footprint();
+        drop(buffer);
+        let after = footprint();
+        assert!(
+            before >= after + bytes,
+            "the release took {} of the buffer's {bytes} bytes off the footprint",
+            before.saturating_sub(after)
+        );
+    }
+
+    /// Private-buffer staging chunks are charged to the device store's own
+    /// ledger entry for the duration of each blit and released immediately
+    /// after, so a store without room refuses the staging allocation instead
+    /// of silently allocating uncharged host RAM.
+    #[test]
+    fn private_staging_is_charged_to_the_device_store_and_released() {
+        use seismic_memory::entry::Tally;
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let store = Arc::new(Tally::unbounded(seismic_topology::StoreIdentity::HostRam));
+        let device = MetalDevice::open(handle, store.clone()).unwrap();
+        let baseline = store.held();
+        let private = device
+            .allocate_private(64 << 10, &crate::test_support::entry(), seismic_memory::SlabFill::Zeroed)
+            .unwrap();
+        let payload = vec![0x5Au8; 64 << 10];
+        private.write_bytes(0, &payload).unwrap();
+        assert_eq!(store.held(), baseline, "staging charge is released after write");
+        let mut back = vec![0u8; payload.len()];
+        private.read_bytes(0, &mut back).unwrap();
+        assert_eq!(back, payload);
+        assert_eq!(store.held(), baseline, "staging charge is released after read");
+        // Bound the device store to its baseline so no staging chunk fits.
+        store.bound(baseline);
+        assert!(matches!(
+            private.write_bytes(0, &payload),
+            Err(ExecutionError::AllocationCapacity { .. })
+        ));
+        assert!(matches!(
+            private.read_bytes(0, &mut back),
+            Err(ExecutionError::AllocationCapacity { .. })
+        ));
+        assert_eq!(store.held(), baseline);
     }
 
     /// This process's physical footprint now, read live.
     fn footprint() -> u64 {
-        const TASK_VM_INFO: libc::task_flavor_t = 22;
-        let mut vm = TaskVm::default();
-        let words = (std::mem::size_of::<TaskVm>() / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
-        let mut count = words;
-        #[allow(deprecated)]
-        let task = unsafe { libc::mach_task_self() };
-        let status = unsafe { libc::task_info(task, TASK_VM_INFO, (&mut vm as *mut TaskVm).cast(), &mut count) };
-        assert_eq!(status, libc::KERN_SUCCESS, "task_info TASK_VM_INFO returned {status}");
-        assert_eq!(count, words, "task_vm_info reaches phys_footprint");
-        vm.phys_footprint
+        seismic_native_target::process::macos::task_vm_info()
+            .expect("task_info TASK_VM_INFO")
+            .phys_footprint
+    }
+
+    #[test]
+    fn mmap_enomem_maps_to_device_refused_and_other_errno_to_allocation_failed() {
+        use seismic_compiler::errors::RefusalReading;
+
+        let oom = super::classify_mmap_error(
+            4096,
+            std::io::Error::from_raw_os_error(libc::ENOMEM),
+            |required| ExecutionError::DeviceRefused { required, reading: RefusalReading::Host },
+        );
+        assert!(oom.capacity_refusal().is_some(), "{oom:?}");
+        assert!(matches!(oom, ExecutionError::DeviceRefused { required: 4096, .. }));
+
+        let other = super::classify_mmap_error(
+            4096,
+            std::io::Error::from_raw_os_error(libc::EINVAL),
+            |required| ExecutionError::DeviceRefused { required, reading: RefusalReading::Host },
+        );
+        assert!(other.capacity_refusal().is_none(), "{other:?}");
+        assert!(matches!(other, ExecutionError::AllocationFailed(_)));
+    }
+
+    #[test]
+    fn command_buffer_oom_maps_to_device_refused_and_other_error_to_fallback() {
+        use objc2_foundation::NSError;
+        use objc2_metal::{MTLCommandBufferError, MTLCommandBufferErrorDomain};
+        use seismic_compiler::errors::RefusalReading;
+
+        crate::pooled(|| {
+            let domain = unsafe { MTLCommandBufferErrorDomain };
+            let oom_ns = unsafe {
+                NSError::errorWithDomain_code_userInfo(
+                    domain,
+                    MTLCommandBufferError::OutOfMemory.0 as isize,
+                    None,
+                )
+            };
+            let oom = super::classify_command_buffer_error(
+                &oom_ns,
+                || ExecutionError::DeviceRefused { required: 0, reading: RefusalReading::Host },
+                ExecutionError::SubmissionFailed,
+            );
+            assert!(oom.capacity_refusal().is_some(), "{oom:?}");
+            assert!(matches!(oom, ExecutionError::DeviceRefused { required: 0, .. }));
+
+            let timeout_ns = unsafe {
+                NSError::errorWithDomain_code_userInfo(
+                    domain,
+                    MTLCommandBufferError::Timeout.0 as isize,
+                    None,
+                )
+            };
+            let timeout = super::classify_command_buffer_error(
+                &timeout_ns,
+                || ExecutionError::DeviceRefused { required: 0, reading: RefusalReading::Host },
+                ExecutionError::SubmissionFailed,
+            );
+            assert!(timeout.capacity_refusal().is_none(), "{timeout:?}");
+            assert!(matches!(timeout, ExecutionError::SubmissionFailed(_)));
+        });
     }
 }

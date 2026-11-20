@@ -160,6 +160,24 @@ struct ReadyResidency<R> {
     idle_deadline: Option<tokio::time::Instant>,
 }
 
+impl<R> ReadyResidency<R> {
+    fn stopping(&self, reason: ModelReleaseReason) -> ModelInstance {
+        ModelInstance {
+            id: self.instance.id.clone(),
+            model_id: self.instance.model_id.clone(),
+            lifecycle: ModelInstanceLifecycle::Stopping {
+                reason,
+                allocation: ModelStoppingAllocation::Resident {
+                    allocation: match &self.instance.lifecycle {
+                        ModelInstanceLifecycle::Ready { allocation, .. } => allocation.clone(),
+                        _ => unreachable!("Ready residency must project Ready lifecycle"),
+                    },
+                },
+            },
+        }
+    }
+}
+
 struct ResidentResources<R> {
     package_ids: Vec<ModelPackageId>,
     worker: Arc<dyn ResidencyWorker>,
@@ -218,11 +236,6 @@ enum ResidencyState<R> {
     Releasing(ReleasingResidency<R>),
 }
 
-struct TerminalInstance {
-    instance: ModelInstance,
-    updated_revision: u64,
-}
-
 /// Actor inputs that carry no resident payload: every lease, permit and driver task sends
 /// these, whatever is resident. They share the command channel so their order with load
 /// completion is preserved.
@@ -266,6 +279,7 @@ pub enum ResidencyNotification {
 
 enum ResidencyCommand<R> {
     Acquire(AcquisitionWaiter<R>),
+    AcquisitionCancelled,
     Lease {
         instance_id: ModelInstanceId,
         reply: tokio::sync::oneshot::Sender<Result<ResidencyLease<R>, InventoryError>>,
@@ -351,6 +365,23 @@ fn owner_stopped() -> InventoryError {
     InventoryError::Internal("model residency owner stopped".to_owned())
 }
 
+/// Wake the actor after a waiting caller disappears, even when a lease keeps its
+/// replacement from progressing. Close the reply before waking the owner.
+struct PendingAcquisition<'a, R> {
+    commands: &'a tokio::sync::mpsc::UnboundedSender<ResidencyCommand<R>>,
+    response: tokio::sync::oneshot::Receiver<Result<ResidencyGrant<R>, InventoryError>>,
+    pending: bool,
+}
+
+impl<R> Drop for PendingAcquisition<'_, R> {
+    fn drop(&mut self) {
+        if self.pending {
+            self.response.close();
+            let _ = self.commands.send(ResidencyCommand::AcquisitionCancelled);
+        }
+    }
+}
+
 impl<R: Send + 'static> ResidencyClient<R> {
     pub fn channel() -> (Self, ResidencyInbox<R>) {
         let (commands, command_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -391,7 +422,10 @@ impl<R: Send + 'static> ResidencyClient<R> {
                 reply,
             }))
             .map_err(|_| owner_stopped())?;
-        response.await.map_err(|_| owner_stopped())?
+        let mut acquisition = PendingAcquisition { commands: &self.commands, response, pending: true };
+        let result = (&mut acquisition.response).await;
+        acquisition.pending = false;
+        result.map_err(|_| owner_stopped())?
     }
 
     pub async fn lease(
@@ -651,7 +685,8 @@ pub struct ModelResidency<D: ModelResidencyDriver> {
     controller: D,
     state: ResidencyState<D::Resident>,
     queue: std::collections::VecDeque<AcquisitionWaiter<D::Resident>>,
-    terminals: std::collections::BTreeMap<ModelInstanceId, TerminalInstance>,
+    /// Each model's most recent terminal occurrence, in publication order.
+    terminals: Vec<ModelInstance>,
     revision: u64,
     next_lease_token: u64,
     /// The ready instance last published idle ([`ModelResidencyDriver::resident_idle`]).
@@ -667,7 +702,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             controller,
             state: ResidencyState::Vacant,
             queue: std::collections::VecDeque::new(),
-            terminals: std::collections::BTreeMap::new(),
+            terminals: Vec::new(),
             revision: 0,
             next_lease_token: 1,
             idle: None,
@@ -731,6 +766,12 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     fn handle(&mut self, command: ResidencyCommand<D::Resident>) {
         match command {
             ResidencyCommand::Acquire(waiter) => self.acquire(waiter),
+            ResidencyCommand::AcquisitionCancelled => {
+                if let ResidencyState::Loading(loading) = &mut self.state {
+                    loading.waiters.retain(|waiter| !waiter.reply.is_closed());
+                }
+                self.reconcile_waiters();
+            }
             ResidencyCommand::Lease { instance_id, reply } => {
                 let result = self.lease_exact(&instance_id);
                 let _ = reply.send(result);
@@ -848,6 +889,9 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     fn acquire(&mut self, waiter: AcquisitionWaiter<D::Resident>) {
+        if waiter.reply.is_closed() {
+            return;
+        }
         if let Some(failure) = self.retirement_failure() {
             let _ = waiter.reply.send(Err(Self::inventory_failure(failure)));
             return;
@@ -861,7 +905,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 loading.waiters.push(waiter);
             }
             ResidencyState::Ready(ready)
-                if ready.instance.model_id == waiter.target.model_id
+                if self.queue.is_empty() && ready.instance.model_id == waiter.target.model_id
                     && ready.configuration_key == waiter.target.configuration_key =>
             {
                 self.grant_ready(waiter);
@@ -871,9 +915,42 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 self.enqueue(waiter);
             }
             ResidencyState::Ready(_) => {
+                let first = self.queue.is_empty();
                 self.enqueue(waiter);
-                self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
+                if first {
+                    self.reconcile_waiters();
+                    if !self.queue.is_empty() && matches!(self.state, ResidencyState::Ready(_)) {
+                        self.publish_current();
+                    }
+                }
             }
+        }
+    }
+
+    /// A replacement waits on its caller's demand until the final lease returns.
+    /// Recheck the reply channels at that boundary even if its command beats the
+    /// cancellation wakeup. Requests for the resident at the head of the queue
+    /// can proceed on it once the earlier conflicting waiter is gone.
+    fn reconcile_waiters(&mut self) {
+        let had_waiters = !self.queue.is_empty();
+        self.queue.retain(|waiter| !waiter.reply.is_closed());
+        while let ResidencyState::Ready(ready) = &self.state {
+            let Some(next) = self.queue.front() else {
+                if had_waiters {
+                    self.publish_current();
+                }
+                break;
+            };
+            if next.target.model_id != ready.instance.model_id
+                || next.target.configuration_key != ready.configuration_key
+            {
+                if ready.resources.leases.is_empty() {
+                    self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
+                }
+                break;
+            }
+            let waiter = self.queue.pop_front().expect("the ready instance has a queued waiter");
+            self.grant_ready(waiter);
         }
     }
 
@@ -1038,7 +1115,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 instance_id.0
             )));
         };
-        if ready.instance.id != *instance_id {
+        if ready.instance.id != *instance_id || !self.queue.is_empty() {
             self.state = ResidencyState::Ready(ready);
             return Err(InventoryError::NotReady(format!(
                 "model instance {} is not loaded",
@@ -1055,10 +1132,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         instance_id: ModelInstanceId,
         reply: tokio::sync::oneshot::Sender<Result<(), InventoryError>>,
     ) {
-        if self.terminals.contains_key(&instance_id) {
-            let _ = reply.send(Ok(()));
-            return;
-        }
         match &self.state {
             ResidencyState::Loading(loading) if loading.instance.id == instance_id => {
                 self.stop_loading(reply);
@@ -1264,12 +1337,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 );
                 self.state = ResidencyState::Ready(ready);
                 self.publish_current();
-                self.queue.retain(|waiter| !waiter.reply.is_closed());
-                if self.queue.is_empty() {
-                    self.refresh_idle_deadline();
-                } else {
-                    self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
-                }
+                self.refresh_idle_deadline();
+                self.reconcile_waiters();
             }
             Err(failure) => {
                 for waiter in loading.waiters.drain(..) {
@@ -1294,19 +1363,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             self.state = state;
             return;
         };
-        let stopping = ModelInstance {
-            id: ready.instance.id.clone(),
-            model_id: ready.instance.model_id.clone(),
-            lifecycle: ModelInstanceLifecycle::Stopping {
-                reason,
-                allocation: ModelStoppingAllocation::Resident {
-                    allocation: match &ready.instance.lifecycle {
-                        ModelInstanceLifecycle::Ready { allocation, .. } => allocation.clone(),
-                        _ => unreachable!("Ready residency must project Ready lifecycle"),
-                    },
-                },
-            },
-        };
+        let stopping = ready.stopping(reason);
         if reason == ModelReleaseReason::UserStop || ready.resources.leases.is_empty() {
             let control = self.controller.start_worker_release(
                 ready.instance.id.clone(),
@@ -1359,6 +1416,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         }
         if refresh_idle_deadline {
             self.refresh_idle_deadline();
+            self.reconcile_waiters();
         }
     }
 
@@ -1601,7 +1659,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             ResidencyState::Ready(ready) => tracing::info!(
                 model.id = %ready.instance.model_id,
                 model.instance.id = %ready.instance.id.0,
-                residency.state = "ready",
+                residency.state = if self.queue.is_empty() { "ready" } else { "draining" },
                 residency.revision = self.revision,
                 "model residency transitioned"
             ),
@@ -1638,13 +1696,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             residency.revision = self.revision,
             "model residency terminalized instance"
         );
-        self.terminals.insert(
-            instance.id.clone(),
-            TerminalInstance {
-                instance,
-                updated_revision: self.revision,
-            },
-        );
+        self.terminals.retain(|prior| prior.model_id != instance.model_id);
+        self.terminals.push(instance);
         let _ = self
             .controller
             .client()
@@ -1655,27 +1708,16 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     fn snapshot(&self) -> ModelInstancesSnapshot {
-        let mut instances = self
-            .terminals
-            .values()
-            .map(|terminal| (terminal.updated_revision, terminal.instance.clone()))
-            .collect::<Vec<_>>();
         let current = match &self.state {
             ResidencyState::Vacant => None,
             ResidencyState::Loading(loading) => Some(loading.instance.clone()),
+            ResidencyState::Ready(ready) if !self.queue.is_empty() => Some(ready.stopping(ModelReleaseReason::Replacement)),
             ResidencyState::Ready(ready) => Some(ready.instance.clone()),
             ResidencyState::Releasing(releasing) => Some(releasing.instance.clone()),
         };
-        if let Some(current) = current {
-            instances.push((self.revision, current));
-        }
-        instances.sort_by_key(|(revision, _)| *revision);
         ModelInstancesSnapshot {
             revision: self.revision,
-            instances: instances
-                .into_iter()
-                .map(|(_, instance)| instance)
-                .collect(),
+            instances: self.terminals.iter().cloned().chain(current).collect(),
         }
     }
 
@@ -2403,6 +2445,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_models_latest_terminal_preserves_its_diagnosis_and_publication_order() {
+        let (client, _loads, _workers, actor) = test_residency(true);
+        let warm = |model| {
+            let client = &client;
+            async move {
+                let ResidencyGrant::Ready(instance) =
+                    client.acquire(test_target(model), ResidencyAcquisition::Warm).await.unwrap()
+                else { panic!("expected a warmed model") };
+                instance.id
+            }
+        };
+        let first = warm("model-a").await;
+        client.notifier().send(ResidencyNotification::WorkerFailed {
+            instance_id: first.clone(),
+            failure: ModelOperationFailure::Operation {
+                code: "worker_lost".into(), message: "first worker exited".into(), retryable: true,
+            },
+        });
+        // Queuing B after the failure waits for A's worker to retire.
+        let second = warm("model-b").await;
+        client.stop(second.clone()).await.unwrap();
+        let snapshot = client.snapshot().await.unwrap();
+        let [failed, stopped] = snapshot.instances.as_slice() else { panic!("two completed models") };
+        assert_eq!(failed.id, first);
+        assert!(matches!(failed.lifecycle, ModelInstanceLifecycle::Failed { .. }));
+        assert_eq!(stopped.id, second);
+        assert!(matches!(stopped.lifecycle, ModelInstanceLifecycle::Stopped { reason: ModelReleaseReason::UserStop }));
+        let retry = warm("model-a").await;
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(snapshot.instances.iter().map(|instance| &instance.id).collect::<Vec<_>>(), [&first, &second, &retry]);
+        client.stop(retry.clone()).await.unwrap();
+        let current = warm("model-c").await;
+        client.stop(first).await.expect("stopping a superseded occurrence is idempotent");
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(snapshot.instances.iter().map(|instance| &instance.id).collect::<Vec<_>>(), [&second, &retry, &current]);
+        assert!(matches!(snapshot.instances[2].lifecycle, ModelInstanceLifecycle::Ready { .. }));
+        client.stop(current).await.unwrap();
+        actor.abort();
+    }
+
+    #[tokio::test]
     async fn cancelled_waiter_detaches_without_cancelling_the_shared_load() {
         let (client, mut loads, _, actor) = test_residency(false);
         let cancelled = tokio::spawn({
@@ -2658,6 +2741,49 @@ mod tests {
                 actor.abort();
             }
         }).await.expect("retirement failure or retry lost a reply");
+    }
+
+    /// Queue commands in the current-thread actor's mailbox before yielding to
+    /// it. Each snapshot is a fence after the preceding commands.
+    #[tokio::test]
+    async fn vanished_replacement_preserves_the_ready_worker() {
+        let (client, mut loads, workers, actor) = test_residency(true);
+        let ResidencyGrant::Ready(instance) =
+            client.acquire(test_target("model-a"), ResidencyAcquisition::Warm).await.unwrap()
+        else { panic!("expected a warmed model") };
+        loads.recv().await.unwrap();
+        let replace = || Box::pin(client.acquire(test_target("model-b"), ResidencyAcquisition::Warm));
+
+        // Abandoned before admission, with no lease to protect the resident.
+        let mut queued = replace();
+        assert!(futures_util::poll!(&mut queued).is_pending());
+        drop(queued);
+        assert_eq!(client.snapshot().await.unwrap().instances.as_slice(), std::slice::from_ref(&instance));
+
+        // Cancel while draining and reopen admissions while the lease still exists.
+        let lease = client.lease(instance.id.clone()).await.unwrap();
+        let mut draining = replace();
+        assert!(futures_util::poll!(&mut draining).is_pending());
+        assert!(matches!(client.snapshot().await.unwrap().instances[0].lifecycle,
+            ModelInstanceLifecycle::Stopping { reason: ModelReleaseReason::Replacement, .. }));
+        let mut same = Box::pin(client.acquire(test_target("model-a"), ResidencyAcquisition::Warm));
+        assert!(futures_util::poll!(&mut same).is_pending());
+        drop(draining);
+        assert!(matches!(same.await.unwrap(), ResidencyGrant::Ready(ready) if ready == instance));
+        assert_eq!(client.snapshot().await.unwrap().instances.as_slice(), std::slice::from_ref(&instance));
+
+        // The final lease's notification is received before the cancellation wakeup.
+        let mut racing = replace();
+        assert!(futures_util::poll!(&mut racing).is_pending());
+        assert!(matches!(client.snapshot().await.unwrap().instances[0].lifecycle,
+            ModelInstanceLifecycle::Stopping { reason: ModelReleaseReason::Replacement, .. }));
+        drop(lease);
+        drop(racing);
+        assert_eq!(client.snapshot().await.unwrap().instances.as_slice(), std::slice::from_ref(&instance));
+        assert!(loads.try_recv().is_err());
+        assert_eq!(workers.lock().unwrap()[0].shutdown.load(Ordering::Acquire), 0);
+        client.stop(instance.id).await.unwrap();
+        actor.abort();
     }
 
     #[tokio::test]

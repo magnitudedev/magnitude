@@ -9,8 +9,8 @@ mod target;
 mod vision;
 
 pub use classes::{
-    row_class, row_classes, ClassError, ClassLimits, LaunchClass, MAX_CLASS_ROWS,
-    PREFILL_ROW_QUANTUM, SMALL_CLASS_ROWS,
+    power_of_two_class, power_of_two_classes, row_class, row_classes, slot_class, slot_classes,
+    ClassError, ClassLimits, LaunchClass, MAX_CLASS_ROWS, PREFILL_ROW_QUANTUM, SMALL_CLASS_ROWS,
 };
 pub use demand::Demand;
 pub use head::{BlockSlot, FrontContinuation, FrontSlot, HeadPasses, HeadSlot, ValidatedHeadBatch};

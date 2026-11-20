@@ -1,6 +1,7 @@
 //! Which projectors a family binds to a target: the one rule every vision
 //! family applies before interpreting a projector header.
 
+use crate::{HeaderError, Metadata};
 use magnitude_artifacts::{
     UnsupportedReason,
     gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value},
@@ -122,5 +123,227 @@ pub fn projector_type<K: Copy>(
             target: target_width,
         }),
         _ => Ok(kind),
+    }
+}
+
+/// Strict tracked reader for a projector's `clip.*` metadata.
+///
+/// Wraps [`Metadata`] over the `clip.` namespace so callers address keys by
+/// their full `clip.*` names. Every read marks its key as accounted for;
+/// [`Self::finish`] rejects any `clip.*` key that was neither read nor
+/// explicitly ignored. Container and provenance namespaces (`general.*`,
+/// `split.*`, `quantize.*`, `imatrix.*`, …) are left untouched.
+pub struct ProjectorMetadata<'a> {
+    inner: Metadata<'a>,
+}
+
+impl<'a> ProjectorMetadata<'a> {
+    /// Begins reading `clip.*` keys from `directory`.
+    pub fn new(directory: &'a Directory) -> Self {
+        Self {
+            inner: Metadata::new(directory, PROJECTOR_ARCHITECTURE),
+        }
+    }
+
+    fn strip(key: &str) -> &str {
+        key.strip_prefix("clip.").unwrap_or(key)
+    }
+
+    /// Explicitly accounts for a known non-semantic or already-validated `clip.*` key.
+    pub fn ignore(&self, key: &str) {
+        self.inner.ignore(Self::strip(key));
+    }
+
+    /// Explicitly accounts for every `clip.*` key starting with `prefix` (e.g. `"clip.audio."`).
+    pub fn ignore_prefix(&self, prefix: &str) {
+        self.inner.ignore_prefix(Self::strip(prefix));
+    }
+
+    /// Verifies that every `clip.*` key in the directory was either read or explicitly ignored.
+    pub fn finish(self) -> Result<(), HeaderError> {
+        self.inner.finish()
+    }
+
+    pub fn value(&self, key: &str) -> Option<&'a Value> {
+        self.inner.value(Self::strip(key))
+    }
+
+    /// An optional nonnegative integer (`>= 0`).
+    pub fn optional_count(&self, key: &str) -> Result<Option<u64>, HeaderError> {
+        self.inner.optional_count(Self::strip(key))
+    }
+
+    /// A required nonnegative integer (`>= 0`).
+    pub fn count(&self, key: &str) -> Result<u64, HeaderError> {
+        self.inner.count(Self::strip(key))
+    }
+
+    /// An optional positive integer (`> 0`).
+    pub fn optional_integer(&self, key: &str) -> Result<Option<u64>, HeaderError> {
+        self.inner.optional_integer(Self::strip(key))
+    }
+
+    /// A required positive integer (`> 0`).
+    pub fn integer(&self, key: &str) -> Result<u64, HeaderError> {
+        self.inner.integer(Self::strip(key))
+    }
+
+    /// A required positive block count bounded by the directory's tensor count
+    /// (`1 <= count <= directory.tensors.len() as u64`), guarding per-block
+    /// allocations against untrusted headers.
+    pub fn bounded_block_count(&self, key: &str) -> Result<u64, HeaderError> {
+        self.inner.bounded_block_count(Self::strip(key))
+    }
+
+    /// An optional finite number, stored as a float or an integer.
+    pub fn optional_number(&self, key: &str) -> Result<Option<f64>, HeaderError> {
+        self.inner.optional_number(Self::strip(key))
+    }
+
+    /// A required finite number, stored as a float or an integer.
+    pub fn number(&self, key: &str) -> Result<f64, HeaderError> {
+        self.inner.number(Self::strip(key))
+    }
+
+    /// An optional finite positive number (`> 0.0`).
+    pub fn optional_positive_number(&self, key: &str) -> Result<Option<f64>, HeaderError> {
+        self.inner.optional_positive_number(Self::strip(key))
+    }
+
+    /// A required finite positive number (`> 0.0`).
+    pub fn positive_number(&self, key: &str) -> Result<f64, HeaderError> {
+        self.inner.positive_number(Self::strip(key))
+    }
+
+    /// An optional boolean.
+    pub fn optional_bool(&self, key: &str) -> Result<Option<bool>, HeaderError> {
+        self.inner.optional_flag(Self::strip(key))
+    }
+
+    /// A required boolean.
+    pub fn bool(&self, key: &str) -> Result<bool, HeaderError> {
+        self.inner.flag(Self::strip(key))
+    }
+
+    /// An optional string.
+    pub fn optional_string(&self, key: &str) -> Result<Option<&'a str>, HeaderError> {
+        self.inner.optional_string(Self::strip(key))
+    }
+
+    /// A required string.
+    pub fn string(&self, key: &str) -> Result<&'a str, HeaderError> {
+        self.inner.string(Self::strip(key))
+    }
+
+    /// A required fixed-length array of finite numbers.
+    pub fn f64_array<const N: usize>(&self, key: &str) -> Result<[f64; N], HeaderError> {
+        self.inner.f64_array(Self::strip(key))
+    }
+
+    /// An optional boolean array of exact `length`.
+    pub fn optional_bool_array(
+        &self,
+        key: &str,
+        length: u64,
+    ) -> Result<Option<Vec<bool>>, HeaderError> {
+        self.inner.optional_flags(Self::strip(key), length)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_artifacts::gguf::{ByteOrder, Encoding, Metadata as Entry, TensorDescriptor};
+
+    fn directory(entries: &[(&str, Value)], tensor_count: usize) -> Directory {
+        Directory {
+            version: 3,
+            byte_order: ByteOrder::Little,
+            alignment: 32,
+            data_offset: 0,
+            metadata: entries
+                .iter()
+                .map(|(name, value)| Entry {
+                    name: (*name).into(),
+                    value: value.clone(),
+                })
+                .collect(),
+            tensors: (0..tensor_count)
+                .map(|index| TensorDescriptor {
+                    name: format!("v.blk.{index}.ln1.weight"),
+                    shape: vec![4],
+                    encoding: Encoding::F32,
+                    offset: 0,
+                    nbytes: 16,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn admits_container_namespaces_while_rejecting_unknown_clip_keys() {
+        let with_container_keys = directory(
+            &[
+                ("general.architecture", Value::Scalar(Scalar::String("clip".into()))),
+                ("quantize.imatrix.file", Value::Scalar(Scalar::String("imatrix.dat".into()))),
+                ("split.count", Value::Scalar(Scalar::Unsigned(2))),
+                ("clip.has_vision_encoder", Value::Scalar(Scalar::Bool(true))),
+                ("clip.vision.block_count", Value::Scalar(Scalar::Unsigned(1))),
+            ],
+            1,
+        );
+        let meta = ProjectorMetadata::new(&with_container_keys);
+        assert_eq!(meta.bool("clip.has_vision_encoder"), Ok(true));
+        assert_eq!(meta.integer("clip.vision.block_count"), Ok(1));
+        assert_eq!(meta.finish(), Ok(()));
+
+        let with_unknown_clip = directory(
+            &[
+                ("quantize.imatrix.file", Value::Scalar(Scalar::String("imatrix.dat".into()))),
+                ("split.count", Value::Scalar(Scalar::Unsigned(2))),
+                ("clip.has_vision_encoder", Value::Scalar(Scalar::Bool(true))),
+                ("clip.vision.unknown_flag", Value::Scalar(Scalar::Bool(true))),
+            ],
+            1,
+        );
+        let meta = ProjectorMetadata::new(&with_unknown_clip);
+        assert_eq!(meta.bool("clip.has_vision_encoder"), Ok(true));
+        assert_eq!(
+            meta.finish(),
+            Err(HeaderError::UnknownMetadata(vec![
+                "clip.vision.unknown_flag".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn bounded_block_count_rejects_counts_exceeding_tensor_count() {
+        let valid = directory(
+            &[("clip.vision.block_count", Value::Scalar(Scalar::Unsigned(2)))],
+            2,
+        );
+        let meta = ProjectorMetadata::new(&valid);
+        assert_eq!(meta.bounded_block_count("clip.vision.block_count"), Ok(2));
+        assert_eq!(meta.finish(), Ok(()));
+
+        let oversized = directory(
+            &[("clip.vision.block_count", Value::Scalar(Scalar::Unsigned(3)))],
+            2,
+        );
+        let meta = ProjectorMetadata::new(&oversized);
+        assert!(matches!(
+            meta.bounded_block_count("clip.vision.block_count"),
+            Err(HeaderError::MetadataType { key, .. }) if key == "clip.vision.block_count"
+        ));
+
+        let zero = directory(
+            &[("clip.vision.block_count", Value::Scalar(Scalar::Unsigned(0)))],
+            2,
+        );
+        let meta = ProjectorMetadata::new(&zero);
+        assert!(matches!(
+            meta.bounded_block_count("clip.vision.block_count"),
+            Err(HeaderError::MetadataType { key, .. }) if key == "clip.vision.block_count"
+        ));
     }
 }

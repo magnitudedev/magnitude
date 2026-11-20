@@ -906,9 +906,10 @@ fn qwen_adapter_prepares_a_repeated_image_once_for_every_placement() {
     // Each placeholder token expands to its span's rows; every other prompt
     // token is the row of the same token.
     let rows = (0..=tokens.len())
-        .map(|position| input.prompt_position_row(position))
+        .map(|position| input.prompt_position_row(position).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(rows, [0, 1, 5, 6, 7, 8, 12, 13]);
+    assert_eq!(input.prompt_position_row(tokens.len() + 1), None);
     for (position, token) in tokens.iter().enumerate() {
         if *token != TokenId(99) {
             assert_eq!(input.tokens()[rows[position]], *token);
@@ -918,7 +919,7 @@ fn qwen_adapter_prepares_a_repeated_image_once_for_every_placement() {
 }
 
 /// A closed input places every image it holds and holds every image its
-/// spans place.
+/// spans place, and rejects malformed `source_boundaries`.
 #[test]
 fn prepared_input_holds_exactly_the_images_its_spans_place() {
     use magnitude_family_contracts::{InputPreparationError, PreparedModelInput};
@@ -944,23 +945,42 @@ fn prepared_input_holds_exactly_the_images_its_spans_place() {
     let input = adapter
         .prepare(&model, plan, &[prepared_qwen_media(&model, 1)])
         .unwrap();
-    let close = |vision| {
+    let close = |vision, source_boundaries| {
         PreparedModelInput::new(
             &model,
             TokenPlan::new(input.tokens().to_vec(), input.layout().clone()).unwrap(),
             input.coordinates().to_vec(),
             input.continuation(),
+            source_boundaries,
             vision,
         )
         .map(|_| ())
     };
-    assert_eq!(close(input.vision().clone()), Ok(()));
+    assert_eq!(
+        close(input.vision().clone(), input.source_boundaries().to_vec()),
+        Ok(())
+    );
+    assert_eq!(
+        close(input.vision().clone(), vec![1, 1, 5, 6, 7]),
+        Err(InputPreparationError::InputAlignment)
+    );
+    assert_eq!(
+        close(input.vision().clone(), vec![0, 5, 1, 6, 7]),
+        Err(InputPreparationError::InputAlignment)
+    );
+    assert_eq!(
+        close(input.vision().clone(), vec![0, 1, 5, 6, 6]),
+        Err(InputPreparationError::InputAlignment)
+    );
     let mut unplaced = input.vision().clone();
     let image = unplaced.values().next().unwrap().clone();
     unplaced.insert("unplaced".into(), image);
-    assert_eq!(close(unplaced), Err(InputPreparationError::InputAlignment));
     assert_eq!(
-        close(Default::default()),
+        close(unplaced, input.source_boundaries().to_vec()),
+        Err(InputPreparationError::InputAlignment)
+    );
+    assert_eq!(
+        close(Default::default(), input.source_boundaries().to_vec()),
         Err(InputPreparationError::InputAlignment)
     );
 }

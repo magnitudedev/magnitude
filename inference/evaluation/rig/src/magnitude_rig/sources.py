@@ -118,6 +118,21 @@ def descends(commit: str, ancestor: str) -> bool:
                           capture_output=True).returncode == 0
 
 
+@functools.cache
+def distance(commit: str, ancestor: str) -> int | None:
+    """How many commits `commit` lies ahead of `ancestor` (0 when equal); None when `ancestor`
+    is not an ancestor of `commit` or either is unknown here."""
+    if not descends(commit, ancestor):
+        return None
+    if commit == ancestor:
+        return 0
+    result = subprocess.run(
+        ["git", "-C", str(checkout().parent), "rev-list", "--count", f"{ancestor}..{commit}"],
+        capture_output=True, text=True,
+    )
+    return int(result.stdout.strip()) if result.returncode == 0 else None
+
+
 def commit(ref: str) -> str:
     return _git("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}").decode().strip()
 

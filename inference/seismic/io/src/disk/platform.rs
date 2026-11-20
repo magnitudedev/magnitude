@@ -186,17 +186,50 @@ pub(crate) fn uncached(file: &File) -> Result<Through, Error> {
     Ok(Through::Dropped(file.try_clone()?))
 }
 
+/// Advise the kernel against read-ahead on `file` so cached reads never pull
+/// unrequested neighbour pages into the page cache.
+#[cfg(target_os = "linux")]
+fn advise_random(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: advice on the whole of a descriptor the caller owns.
+    let advised = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+    if advised != 0 {
+        return Err(io::Error::from_raw_os_error(advised));
+    }
+    Ok(())
+}
+
+/// Disable read-ahead on `file` so cached reads never pull unrequested
+/// neighbour pages into the unified buffer cache.
+#[cfg(target_os = "macos")]
+fn advise_random(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a flag on a descriptor the caller owns; F_RDAHEAD takes an int.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
+
 /// The file `file` has open, opened again (a new open file, whose flags are
-/// its own): past the cache where `direct`, through it where not. It is
-/// never what `file`'s path names now, which may be another file.
+/// its own): past the cache where `direct`, through it (advised random access)
+/// where not. It is never what `file`'s path names now, which may be another
+/// file.
 #[cfg(target_os = "linux")]
 pub(crate) fn reopen(file: &File, direct: bool) -> io::Result<File> {
     use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
     // `/proc/self/fd/N` opens the file descriptor N has open.
-    std::fs::OpenOptions::new()
+    let reopened = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(if direct { libc::O_DIRECT } else { 0 })
-        .open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    if !direct {
+        advise_random(&reopened)?;
+    }
+    Ok(reopened)
 }
 
 /// macOS opens no file by its descriptor, but by its identity: the
@@ -233,9 +266,13 @@ pub(crate) fn reopen(file: &File, direct: bool) -> io::Result<File> {
             "the open file's path names another file",
         ));
     }
-    // SAFETY: an fcntl on a descriptor this function owns.
-    if direct && unsafe { libc::fcntl(reopened.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
-        return Err(io::Error::last_os_error());
+    if direct {
+        // SAFETY: an fcntl on a descriptor this function owns.
+        if unsafe { libc::fcntl(reopened.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    } else {
+        advise_random(&reopened)?;
     }
     Ok(reopened)
 }
@@ -251,7 +288,7 @@ pub(crate) fn reopen(file: &File, direct: bool) -> io::Result<File> {
     extern "system" {
         fn ReOpenFile(original: RawHandle, access: u32, share: u32, flags: u32) -> RawHandle;
     }
-    let flags = if direct { FILE_FLAG_NO_BUFFERING } else { 0 };
+    let flags = if direct { FILE_FLAG_NO_BUFFERING } else { FILE_FLAG_RANDOM_ACCESS };
     // SAFETY: a reopen of a handle `file` owns; the new handle is the
     // returned file's alone.
     let handle = unsafe { ReOpenFile(file.as_raw_handle(), GENERIC_READ, SHARE_ALL, flags) };
@@ -280,14 +317,8 @@ pub(crate) fn reopen(file: &File, direct: bool) -> io::Result<File> {
 /// pages of a streamed load on a GB10.
 #[cfg(target_os = "linux")]
 pub(super) fn open_cached(path: &Path) -> io::Result<File> {
-    use std::os::fd::AsRawFd;
     let file = File::open(path)?;
-    // SAFETY: advice on the whole of a descriptor this function owns.
-    let advised =
-        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
-    if advised != 0 {
-        return Err(io::Error::from_raw_os_error(advised));
-    }
+    advise_random(&file)?;
     Ok(file)
 }
 
@@ -296,12 +327,8 @@ pub(super) fn open_cached(path: &Path) -> io::Result<File> {
 /// beside it, 1275 pages of an LFM2.5 8B load on an M4 Pro.
 #[cfg(target_os = "macos")]
 pub(super) fn open_cached(path: &Path) -> io::Result<File> {
-    use std::os::fd::AsRawFd;
     let file = File::open(path)?;
-    // SAFETY: a flag on a descriptor this function owns; F_RDAHEAD takes an int.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    advise_random(&file)?;
     Ok(file)
 }
 
@@ -310,7 +337,6 @@ pub(super) fn open_cached(path: &Path) -> io::Result<File> {
 #[cfg(windows)]
 pub(super) fn open_cached(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
     std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_RANDOM_ACCESS).open(path)
 }
 

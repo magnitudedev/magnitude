@@ -493,9 +493,11 @@ inline void step(Inputs inputs, Rule rule, GateInput gate, device const uchar *n
     const ulong head = group.x;
     const ulong block_row0 = ulong(group.y) * SEISMIC_TUNE_ROWS;
     const ulong row0 = block_row0 + ulong(simdgroup) * LANE_ROWS;
-    advance_rows<LANE_ROWS, SEISMIC_TUNE_ROWS, SPAN, SEISMIC_DIM_W, SEISMIC_TUNE_ROWS>(inputs,
-        rule.gates(head, seismic_words), delta, tape, mixed, slot, slot.lo, head, block_row0, row0, query_block,
-        key_block, value_block, beta_block, decay_block, thread_index, threads, simdgroup, lane, seismic_words);
+    if (slot.lo < slot.hi) {
+        advance_rows<LANE_ROWS, SEISMIC_TUNE_ROWS, SPAN, SEISMIC_DIM_W, SEISMIC_TUNE_ROWS>(inputs,
+            rule.gates(head, seismic_words), delta, tape, mixed, slot, slot.lo, head, block_row0, row0, query_block,
+            key_block, value_block, beta_block, decay_block, thread_index, threads, simdgroup, lane, seismic_words);
+    }
     const uint expected = uint(SEISMIC_DIM_W / SEISMIC_TUNE_ROWS * SEISMIC_DIM_B);
     if (!arrive::last(arrivals + head, expected, last, thread_index))
         return;

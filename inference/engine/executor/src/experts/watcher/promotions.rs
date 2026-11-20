@@ -55,20 +55,11 @@ use crate::experts::directory::{BankRecord, MissCurve, Point};
 use crate::experts::horizon::{Hold, Tokens};
 use crate::experts::staging::Staged;
 
-/// What promotions copy with: the device's copy engine, and each group's
-/// bank records (`BankRecordViews`), which a promotion copies its tier
-/// record into, routed tensor by routed tensor, each record whole: from the
-/// group's host tier records (`Group::tier`), which the copy engine reads.
+/// What promotions copy with: the device's copy engine. Destination bank
+/// record views are held in `Core::groups[group].bank` (delivered at open and
+/// via `Join::Bank`), so promotions never touch `Stores` or `Pool`.
 pub(in crate::experts) struct Copier {
     pub copies: crate::experts::copies::Copies,
-    pub bank: std::sync::Arc<dyn BankRecordViews>,
-}
-
-/// The bank's records as a promotion's copy writes them: record `record` of
-/// group `group`'s routed tensor `tensor` (in its record's order), a view of
-/// its storage while the bank holds it.
-pub(in crate::experts) trait BankRecordViews: Send + Sync {
-    fn view(&self, group: usize, tensor: usize, record: usize) -> seismic::Tensor;
 }
 
 /// What a reserve is sized within ([`reserve`]): each layer's group and
@@ -191,10 +182,10 @@ impl Promotions {
         if let Some(decoded) = decoded {
             self.size(core, decoded);
         }
-        if line(core, shared).is_none() {
+        let Some(copy) = line(core, shared) else {
             return false;
-        }
-        let asked = !held && self.ask(core, shared);
+        };
+        let asked = !held && self.ask(core, shared, copier, &copy);
         asked | carry(core, shared, copier, prefetch.reached())
     }
 
@@ -229,13 +220,25 @@ impl Promotions {
         }
     }
 
-    /// What the ranking asks now (`Directory::promotions`): each promotion
+    /// What the ranking asks now (`Directory::promotions`), capped to the
+    /// copy engine's remaining in-flight headroom: each promotion
     /// to copy, and each release's expert unmapped from the first step not
     /// yet begun, its wait in steps measured. Whether it asked any. The
     /// ranking's changes settle first, outside the steps' lock, and a turn
     /// that stirred nothing (no want, record or lease changed) takes no
     /// steps' lock.
-    fn ask(&mut self, core: &mut Core, shared: &Shared) -> bool {
+    fn ask(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, copy: &TierCopyCosts) -> bool {
+        let max_depth = record_bytes(core)
+            .into_iter()
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| copy.depth(bytes))
+            .max()
+            .unwrap_or(0);
+        let pending = copier.copies.flight() + core.directory.queued().len() + core.directory.backs_queued().len();
+        let budget = max_depth.saturating_sub(pending);
+        if budget == 0 && !core.directory.has_surrenders() {
+            return false;
+        }
         if !core.directory.settle_changes() {
             return false;
         }
@@ -244,7 +247,7 @@ impl Promotions {
         // the first step not yet begun.
         let (directory, drained) = (&mut core.directory, &mut self.drained);
         let asked = core.steps.unbegun_beside_frontier(|frontier, at| {
-            let asked = directory.promotions(at);
+            let asked = directory.promotions(at, budget);
             if decoding {
                 let releases = asked.releases.len() as u64;
                 *drained = (drained.0 + releases * (at.next() - frontier), drained.1 + releases);
@@ -334,9 +337,10 @@ pub(super) fn carry(core: &mut Core, shared: &Shared, copier: &Copier, progress:
     // The releases no step still reads.
     moved |= core.directory.drain(progress, &core.steps);
     let mut queued = core.directory.queued();
-    // A queued promotion whose tier record is gone copies nothing.
+    // A queued promotion whose tier record is gone, or whose expert dropped
+    // out of the ranking's pool meanwhile, copies nothing.
     queued.retain(|&(group, record, (layer, expert))| {
-        let kept = core.directory.tier_record(layer, expert).is_some();
+        let kept = core.directory.tier_record(layer, expert).is_some() && core.directory.reuse_now().in_top(layer, expert);
         if !kept {
             core.directory.unpromoted(group, record);
             moved = true;
@@ -375,7 +379,7 @@ fn post(core: &mut Core, copier: &Copier, depth: usize, (group, record, (layer, 
             .map(|(index, tensor)| crate::experts::copies::Run {
                 source: tensor.records.tensor(u64::from(tier.0)).clone(),
                 source_offset: 0,
-                destination: copier.bank.view(group, index, record.index()),
+                destination: groups[group].bank_view(index, record.index()),
                 destination_offset: 0,
                 bytes: tensor.records.bytes(),
             })
@@ -403,7 +407,7 @@ fn post_back(core: &mut Core, copier: &Copier, depth: usize, (group, record, _, 
             .iter()
             .enumerate()
             .map(|(index, tensor)| crate::experts::copies::Run {
-                source: copier.bank.view(group, index, record.index()),
+                source: groups[group].bank_view(index, record.index()),
                 source_offset: 0,
                 destination: tensor.records.tensor(u64::from(tier.0)).clone(),
                 destination_offset: 0,

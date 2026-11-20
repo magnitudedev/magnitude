@@ -162,10 +162,16 @@ fn clean_cache_cold_and_swap_are_zero_where_meminfo_has_none() {
         (whole.supply.clean_cache, whole.cold.machine, whole.supply.cold_reclaimable),
         (170 * 1024, 50 * 1024, 30 * 1024)
     );
+    let with_shmem = sample_of(&format!(
+        "{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nDirty: 20 kB\nWriteback: 10 kB\nShmem: 80 kB\n"
+    ));
+    assert_eq!(with_shmem.supply.clean_cache, 90 * 1024, "Shmem is tmpfs/shm, not droppable clean cache");
 }
 
 /// With no PSI anywhere there is no pressure level; with the machine's
-/// refused, the cgroup's is it; with both, the higher.
+/// refused, the cgroup's is it; with both, the higher. Sub-percent micro
+/// stalls remain Normal; sustained >= 1% some stall is Warn, >= 0.5% full is
+/// Critical.
 #[test]
 fn pressure_is_none_without_psi_and_the_cgroups_without_the_machines() {
     let psi = |some: &str, full: &str| {
@@ -175,10 +181,12 @@ fn pressure_is_none_without_psi_and_the_cgroups_without_the_machines() {
     machine.file("/proc/meminfo", MEMINFO);
     assert_eq!(sample(&*machine).pressure, None);
     machine.file("/sys/fs/cgroup/app/memory.pressure", &psi("0.12", "0.00"));
+    assert_eq!(sample(&*machine).pressure, Some(PressureLevel::Normal));
+    machine.file("/sys/fs/cgroup/app/memory.pressure", &psi("1.50", "0.00"));
     assert_eq!(sample(&*machine).pressure, Some(PressureLevel::Warn));
     machine.file("/proc/pressure/memory", &psi("0.00", "0.00"));
     assert_eq!(sample(&*machine).pressure, Some(PressureLevel::Warn));
-    machine.file("/proc/pressure/memory", &psi("0.12", "0.01"));
+    machine.file("/proc/pressure/memory", &psi("1.50", "0.60"));
     assert_eq!(sample(&*machine).pressure, Some(PressureLevel::Critical));
 }
 

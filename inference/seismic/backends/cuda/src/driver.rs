@@ -19,7 +19,7 @@ use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
-use seismic_memory::entry::{Backed, Charge, DropScope, Entry, Wiring};
+use seismic_memory::entry::{Backed, Change, Charge, DropInChange, Entry, ScopedDrop, Wiring};
 
 pub type Handle = *mut c_void;
 type ResultCode = c_int;
@@ -278,8 +278,7 @@ impl fmt::Display for DriverError {
 
 impl std::error::Error for DriverError {}
 
-/// The retained primary context of one device ordinal.
-pub(crate) struct Context {
+pub(crate) struct ContextInner {
     pub driver: Arc<Driver>,
     raw: Handle,
     ordinal: c_int,
@@ -311,10 +310,28 @@ pub(crate) struct Context {
     #[cfg(test)]
     limit_calls: std::sync::atomic::AtomicUsize,
     stack_charges: std::sync::Mutex<Vec<Charge>>,
-    /// The change its drop runs in, ended after the stack's charges are
-    /// freed ([`DropScope`]): last. A context's release and the free of its
-    /// charges are many effects, which no one [`Backed`] owns.
-    scope: DropScope,
+    /// Context-lifetime high-water mark and retained ledger charge for
+    /// instantiated CUDA graphs (`graph_cost::GraphPool`): CUDA retains
+    /// destroyed graph memory until the context is released, so this charge
+    /// only grows while the context lives and drops inside `ScopedDrop`.
+    graph_charge: std::sync::Mutex<(u64, Option<Charge>)>,
+}
+
+/// The retained primary context of one device ordinal.
+pub(crate) struct Context(ScopedDrop<ContextInner>);
+
+impl std::ops::Deref for Context {
+    type Target = ContextInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Context {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 // The raw handle is an opaque driver object usable from any thread once made
@@ -332,7 +349,7 @@ impl Context {
                 "primary context retain",
             )?;
         }
-        let mut context = Self {
+        let mut context = Self(ScopedDrop::new(ContextInner {
             driver,
             raw,
             ordinal,
@@ -344,8 +361,8 @@ impl Context {
             #[cfg(test)]
             limit_calls: std::sync::atomic::AtomicUsize::new(0),
             stack_charges: std::sync::Mutex::new(Vec::new()),
-            scope: DropScope::default(),
-        };
+            graph_charge: std::sync::Mutex::new((0, None)),
+        }));
         context.transfer = {
             let _current = context.enter()?;
             let mut stream = std::ptr::null_mut();
@@ -521,6 +538,27 @@ impl Context {
         Ok(())
     }
 
+    /// Raise the context-lifetime charge held for instantiated graphs to
+    /// `peak_bytes`: CUDA retains destroyed graph memory until the context is
+    /// released, so this charge only grows while the context lives and drops
+    /// in [`Context::drop`] alongside `stack_charges`.
+    pub(crate) fn grow_graph_charge(&self, change: &Change, entry: &Arc<dyn Entry>, peak_bytes: u64) {
+        let mut guard = self
+            .graph_charge
+            .lock()
+            .expect("the graph charge lock is never poisoned");
+        if peak_bytes <= guard.0 {
+            return;
+        }
+        let delta = peak_bytes - guard.0;
+        guard.0 = peak_bytes;
+        // Take the new charge before dropping the old one so the entry never
+        // dips below either.
+        let next = Charge::took(change, entry, peak_bytes, Wiring::Pageable);
+        drop(guard.1.replace(next));
+        self.driver_allocated(delta);
+    }
+
     pub fn ordinal(&self) -> c_int {
         self.ordinal
     }
@@ -559,15 +597,29 @@ impl Context {
     }
 }
 
-impl Drop for Context {
-    /// The context's release, which returns the stack it holds, and the
-    /// free of the bytes charged for that stack are one change.
-    fn drop(&mut self) {
-        if let Some(entry) = self.own_entry.get() {
-            self.scope.begin(entry);
-        }
+impl DropInChange for ContextInner {
+    fn drop_entry(&self) -> Option<&Arc<dyn Entry>> {
+        self.own_entry.get()
+    }
+
+    /// The context's release, which returns the stack and retained graph pool
+    /// memory it holds, runs before the fields' charges drop inside one change.
+    fn before_drop(&mut self) {
         if !self.transfer.is_null() {
-            if let Ok(_current) = self.enter() {
+            let mut previous = std::ptr::null_mut();
+            let entered = unsafe {
+                self.driver
+                    .check((self.driver.context_get)(&mut previous), "current context query")
+                    .and_then(|()| {
+                        self.driver
+                            .check((self.driver.context_set)(self.raw), "set current context")
+                    })
+                    .map(|()| Current {
+                        driver: &self.driver,
+                        previous,
+                    })
+            };
+            if let Ok(_current) = entered {
                 unsafe {
                     (self.driver.stream_destroy)(self.transfer);
                 }
@@ -575,6 +627,18 @@ impl Drop for Context {
         }
         unsafe {
             (self.driver.primary_context_release)(self.ordinal);
+        }
+        let graph_peak = {
+            let mut guard = self
+                .graph_charge
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut guard.0, 0)
+        };
+        if graph_peak > 0 {
+            if let Some(memory) = self.driver_memory.get() {
+                memory.freed(graph_peak);
+            }
         }
     }
 }
@@ -1111,11 +1175,7 @@ impl HostNodeBlock {
                     }
                     return Err(failed(error));
                 }
-                // CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3 for the device and the host.
-                let access = [
-                    AccessDescription { location: MemoryLocation::device(context.ordinal()), flags: 3 },
-                    AccessDescription { location: MemoryLocation::host_numa(0), flags: 3 },
-                ];
+                let access = host_node_access(context.ordinal(), location);
                 if let Err(error) = unsafe {
                     driver.check(set_access(base, whole_usize, access.as_ptr(), access.len()), "set access")
                 } {
@@ -1141,6 +1201,14 @@ impl HostNodeBlock {
     }
 }
 
+fn host_node_access(ordinal: c_int, host: MemoryLocation) -> [AccessDescription; 2] {
+    // CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3 for the device and the host.
+    [
+        AccessDescription { location: MemoryLocation::device(ordinal), flags: 3 },
+        AccessDescription { location: host, flags: 3 },
+    ]
+}
+
 impl HostNode {
     pub fn device(&self) -> u64 {
         self.base
@@ -1163,21 +1231,21 @@ impl Drop for HostNode {
         else {
             return;
         };
-        let _current = self
-            .context
-            .enter()
-            .unwrap_or_else(|error| panic!("a host-node block's context enters: {error}"));
+        let Ok(_current) = self.context.enter() else {
+            tracing::warn!("CUDA host-node block drop: failed to enter context; skipping teardown");
+            return;
+        };
         let _changing = self.context.changing_memory();
         unsafe {
-            driver
-                .check(unmap(self.base, self.bytes), "unmap")
-                .unwrap_or_else(|error| panic!("a host-node block no work uses unmaps: {error}"));
-            driver
-                .check(release(self.handle), "physical release")
-                .unwrap_or_else(|error| panic!("a host-node block no work uses releases: {error}"));
-            driver
-                .check(free(self.base, self.bytes), "address free")
-                .unwrap_or_else(|error| panic!("a host-node block's address range frees: {error}"));
+            if let Err(error) = driver.check(unmap(self.base, self.bytes), "unmap") {
+                tracing::warn!("CUDA host-node block drop: {error}");
+            }
+            if let Err(error) = driver.check(release(self.handle), "physical release") {
+                tracing::warn!("CUDA host-node block drop: {error}");
+            }
+            if let Err(error) = driver.check(free(self.base, self.bytes), "address free") {
+                tracing::warn!("CUDA host-node block drop: {error}");
+            }
         }
         self.context.driver_freed(self.bytes as u64);
     }
@@ -1941,26 +2009,22 @@ impl Drop for Allocation {
 /// One loaded module; unloaded with its context. The device memory its
 /// load took is charged to the device's own entry while it is loaded, where
 /// the device was opened with one (`Context::charge_own_to`).
-pub(crate) struct Module {
+pub(crate) struct ModuleInner {
     pub raw: Handle,
     pub context: Arc<Context>,
     /// What its load took, as the device's free memory read it.
     taken: u64,
     /// Those bytes on the device's own entry; freed after the unload.
     _charge: Option<Charge>,
-    /// The change its drop runs in ([`DropScope`]): last.
-    scope: DropScope,
 }
 
-unsafe impl Send for Module {}
-unsafe impl Sync for Module {}
+impl DropInChange for ModuleInner {
+    fn drop_entry(&self) -> Option<&Arc<dyn Entry>> {
+        self._charge.as_ref().map(Charge::entry)
+    }
 
-impl Drop for Module {
     /// The unload and the free of its bytes are one change.
-    fn drop(&mut self) {
-        if let Some(charge) = &self._charge {
-            self.scope.begin(charge.entry());
-        }
+    fn before_drop(&mut self) {
         if let Ok(_current) = self.context.enter() {
             unsafe {
                 let _changing = self.context.changing_memory();
@@ -1970,6 +2034,19 @@ impl Drop for Module {
         }
     }
 }
+
+pub(crate) struct Module(ScopedDrop<ModuleInner>);
+
+impl std::ops::Deref for Module {
+    type Target = ModuleInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Send for Module {}
+unsafe impl Sync for Module {}
 
 /// A JIT link state; retains its log buffers until destroyed.
 struct Linker {
@@ -2086,21 +2163,36 @@ pub(crate) fn compile_image(context: &Arc<Context>, source: &str) -> Result<Vec<
     Ok(unsafe { std::slice::from_raw_parts(image.cast::<u8>(), size) }.to_vec())
 }
 
-/// cubin -> loaded module + entry function handle.
+/// Load a CUBIN/PTX image and every entry function of it inside one
+/// [`Context::taken_by`] window: where modules load lazily (the default from
+/// driver API 12.2), `cuFuncLoad` allocates device memory on demand (and could
+/// otherwise wait behind a kernel spinning on the host at first launch), so
+/// every function is looked up and loaded here before measuring the module's
+/// memory delta. A driver that loads lazily without `cuFuncLoad` (12.2 and
+/// 12.3) still loads at first launch.
 pub(crate) fn load_module(
     context: &Arc<Context>,
     image: &[u8],
-    entry: &str,
-) -> Result<(Module, Handle), JitError> {
+    entries: &[&str],
+) -> Result<(Module, Vec<Handle>), JitError> {
     let driver = &context.driver;
-    let mut raw = std::ptr::null_mut();
+    // Entry names are ASCII without NUL.
+    let names: Vec<std::ffi::CString> = entries
+        .iter()
+        .map(|entry| {
+            std::ffi::CString::new(*entry)
+                .expect("PTX emitter precondition: entry names contain no NUL byte")
+        })
+        .collect();
     let mut log = vec![0u8; 16384];
     // ERROR_LOG_BUFFER(5)/SIZE(6)
     let mut options = [5, 6];
     let mut values = [log.as_mut_ptr().cast::<c_void>(), log.len() as *mut c_void];
-    // The load and the record of what it took are one change.
+    // The load (module + eager cuFuncLoad of every kernel) and the record of
+    // what it took are one change.
     let change = context.own_entry.get().map(|entry| (entry, entry.change()));
     let loaded = context.taken_by(|| {
+        let mut raw = std::ptr::null_mut();
         let status = unsafe {
             (driver.module_load)(
                 &mut raw,
@@ -2110,65 +2202,58 @@ pub(crate) fn load_module(
                 values.as_mut_ptr(),
             )
         };
-        Ok(driver.check(status, "native image loading"))
+        if let Err(error) = driver.check(status, "native image loading") {
+            return Ok(Err(JitError::Toolchain {
+                error,
+                log: log_text(&log),
+            }));
+        }
+        let mut functions = Vec::with_capacity(names.len());
+        for name in &names {
+            let mut function: Handle = std::ptr::null_mut();
+            let lookup = unsafe {
+                driver.check(
+                    (driver.module_function)(&mut function, raw, name.as_ptr()),
+                    "kernel lookup",
+                )
+            };
+            if let Err(error) = lookup {
+                unsafe {
+                    (driver.module_unload)(raw);
+                }
+                return Ok(Err(JitError::Driver(error)));
+            }
+            if let Some(load) = driver.function_load {
+                let loaded = unsafe { driver.check(load(function), "kernel loading") };
+                if let Err(error) = loaded {
+                    unsafe {
+                        (driver.module_unload)(raw);
+                    }
+                    return Ok(Err(JitError::Driver(error)));
+                }
+            }
+            functions.push(function);
+        }
+        Ok(Ok((raw, functions)))
     });
     let (loaded, taken) = loaded.map_err(JitError::Driver)?;
-    loaded.map_err(|error| JitError::Toolchain {
-        error,
-        log: log_text(&log),
-    })?;
+    let (raw, functions) = loaded?;
     context.driver_allocated(taken);
-    let module = Module {
+    let module = Module(ScopedDrop::new(ModuleInner {
         raw,
         context: context.clone(),
         taken,
-        _charge: change.as_ref().map(|(entry, change)| Charge::took(change, entry, taken, Wiring::Pageable)),
-        scope: DropScope::default(),
-    };
-    let _current = context.enter().map_err(JitError::Driver)?;
-    // Entry names are `seismic_kernel_<n>`: ASCII without NUL.
-    let name = std::ffi::CString::new(entry)
-        .expect("PTX emitter precondition: entry names contain no NUL byte");
-    let mut function: Handle = std::ptr::null_mut();
-    unsafe {
-        driver
-            .check(
-                (driver.module_function)(&mut function, module.raw, name.as_ptr()),
-                "kernel lookup",
-            )
+        _charge: change
+            .as_ref()
+            .map(|(entry, change)| Charge::took(change, entry, taken, Wiring::Pageable)),
+    }));
+    drop(change);
+    for &function in &functions {
+        context
+            .reserve_function_stack(function)
             .map_err(JitError::Driver)?;
     }
-    context
-        .reserve_function_stack(function)
-        .map_err(JitError::Driver)?;
-    Ok((module, function))
-}
-
-/// Function `entry` of `module`, loaded now: where modules load lazily
-/// (the default from driver API 12.2) a function would otherwise load at its
-/// first launch, a driver call that can wait behind a kernel spinning on the
-/// host, so every function is loaded as its module is prepared, never while
-/// serving. A driver that loads lazily but cannot load a function on demand
-/// (12.2 and 12.3) loads it at its first launch.
-pub(crate) fn module_function(module: &Module, entry: &str) -> Result<Handle, JitError> {
-    let _current = module.context.enter().map_err(JitError::Driver)?;
-    let name = std::ffi::CString::new(entry)
-        .expect("PTX probe entry precondition: entry names contain no NUL byte");
-    let mut function = std::ptr::null_mut();
-    let driver = &module.context.driver;
-    unsafe {
-        driver
-            .check((driver.module_function)(&mut function, module.raw, name.as_ptr()), "kernel lookup")
-            .map_err(JitError::Driver)?;
-        if let Some(load) = driver.function_load {
-            driver.check(load(function), "kernel loading").map_err(JitError::Driver)?;
-        }
-    }
-    module
-        .context
-        .reserve_function_stack(function)
-        .map_err(JitError::Driver)?;
-    Ok(function)
+    Ok((module, functions))
 }
 
 /// Whether the module defines the global variable `name`.
@@ -2280,6 +2365,18 @@ mod tests {
         assert_eq!(device_memory_granularity(true, refused).unwrap_err().code, 801);
     }
 
+    #[test]
+    fn host_node_access_uses_device_host_numa_location() {
+        let host = MemoryLocation::host_numa(3);
+        let access = host_node_access(2, host);
+        assert_eq!(access[0].location.kind, 1);
+        assert_eq!(access[0].location.id, 2);
+        assert_eq!(access[0].flags, 3);
+        assert_eq!(access[1].location.kind, 3);
+        assert_eq!(access[1].location.id, 3);
+        assert_eq!(access[1].flags, 3);
+    }
+
     fn stack_limit(context: &Context) -> usize {
         let _current = context.enter().unwrap();
         let mut limit = 0usize;
@@ -2318,8 +2415,8 @@ mod tests {
         let calls = || context.limit_calls.load(std::sync::atomic::Ordering::Relaxed);
         let before = calls();
         for _ in 0..3 {
-            let (_module, function) = load_module(&context, &cubin.image, "framed").unwrap();
-            let local = function_attribute(&context, function, LOCAL_SIZE_BYTES).unwrap() as usize;
+            let (_module, functions) = load_module(&context, &cubin.image, &["framed"]).unwrap();
+            let local = function_attribute(&context, functions[0], LOCAL_SIZE_BYTES).unwrap() as usize;
             assert!(local > 0 && local <= RESERVED_STACK_BYTES, "the fixture's frame ({local} B) is within the reservation");
         }
         assert_eq!(calls(), before, "a covered function calls the driver's stack limit");
@@ -2350,8 +2447,8 @@ mod tests {
             return;
         };
         let held = stack_growth(ordinal).bytes();
-        let (_module, function) = load_module(&context, &cubin.image, "deep").unwrap();
-        let local = function_attribute(&context, function, LOCAL_SIZE_BYTES).unwrap() as usize;
+        let (_module, functions) = load_module(&context, &cubin.image, &["deep"]).unwrap();
+        let local = function_attribute(&context, functions[0], LOCAL_SIZE_BYTES).unwrap() as usize;
         assert!(local > reserved, "the fixture's frame ({local} B) exceeds the reservation");
         assert!(stack_limit(&context) >= local);
         let sms = driver.attribute(16, ordinal).unwrap() as u64;

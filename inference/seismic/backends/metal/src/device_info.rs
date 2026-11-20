@@ -82,6 +82,9 @@ pub struct MetalDeviceInfo {
     pub(crate) language: LanguageVersion,
     /// `MTLDevice.maxThreadsPerThreadgroup`, per axis.
     pub(crate) max_threads_per_threadgroup: [u64; 3],
+    /// Device-wide ceiling on total threads per threadgroup, observed from a
+    /// trivial compute pipeline's `maxTotalThreadsPerThreadgroup` (<= 1024).
+    pub(crate) max_total_threads_per_threadgroup: u64,
     /// `MTLDevice.maxBufferLength`.
     pub(crate) max_buffer_bytes: u64,
     /// `MTLDevice.heapBufferSizeAndAlignWithLength:options:` alignment for
@@ -176,7 +179,7 @@ impl MetalDeviceInfo {
             .join(",");
         format!(
             "backend={};arch={};os={};unified={};families={families};msl={};threads={:?};\
-             buffer={};alignment={};scalar={};bfloat={};matrix={};mma={combinations};\
+             max_total_threads={};buffer={};alignment={};scalar={};bfloat={};matrix={};mma={combinations};\
              {};args={};reserved={}",
             self.backend_revision,
             self.architecture,
@@ -184,6 +187,7 @@ impl MetalDeviceInfo {
             self.unified_memory,
             self.language.label(),
             self.max_threads_per_threadgroup,
+            self.max_total_threads_per_threadgroup,
             self.max_buffer_bytes,
             self.buffer_alignment,
             dtypes(&self.scalar_collective_dtypes),

@@ -650,10 +650,22 @@ impl BoundTargetGraphs {
             .keeps
             .get(index)
             .ok_or_else(|| format!("target block {index} does not exist"))?;
-        let key = (block_class(keeps, rows, segments, slots, listed, scored), Stage::Run(stage));
-        match tapped || !self.prepared.block_taps(index).positions().any() {
-            true => self.staged(index, key),
-            false => sealed_and_bound(&self.prepared.blocks_by_class[index].untapped, &self.bound[index].untapped, index, key),
+        let axes = self
+            .prepared
+            .stage_axes
+            .of(index, crate::programs::graph::RowForm::of(rows), stage);
+        let key = (
+            axes.project(block_class(keeps, rows, segments, slots, listed, scored)),
+            Stage::Run(stage),
+        );
+        match super::classes::uses_untapped(
+            self.prepared.block_taps(index).positions().any(),
+            rows,
+            self.prepared.untapped_rows,
+            tapped,
+        ) {
+            false => self.staged(index, key),
+            true => sealed_and_bound(&self.prepared.blocks_by_class[index].untapped, &self.bound[index].untapped, index, key),
         }
     }
 

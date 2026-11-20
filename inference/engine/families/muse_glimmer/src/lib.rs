@@ -38,27 +38,6 @@ use magnitude_family_common::{rotary, Metadata, Tensors};
 
 pub const ARCHITECTURE: &str = "muse-glimmer";
 
-/// Every `muse-glimmer.*` key the adapter interprets; any other is rejected.
-const KEYS: &[&str] = &[
-    "block_count",
-    "context_length",
-    "embedding_length",
-    "feed_forward_length",
-    "vocab_size",
-    "attention.head_count",
-    "attention.head_count_kv",
-    "attention.key_length",
-    "attention.value_length",
-    "attention.layer_norm_rms_epsilon",
-    "attention.sliding_window",
-    "attention.sliding_window_pattern",
-    "rope.dimension_count",
-    "rope.freq_base",
-    "rope.freq_base_swa",
-    "logit_scale",
-    "final_logit_softcapping",
-];
-
 /// The epsilon of the post-sublayer norms. The architecture fixes it; headers
 /// do not state it.
 const POST_NORM_EPSILON: f64 = 1e-8;
@@ -112,7 +91,7 @@ pub fn inspect_components(
     if !recognize(directory) {
         return Err(invalid("not a Muse Glimmer artifact"));
     }
-    let m = Metadata::new(directory, ARCHITECTURE, KEYS)?;
+    let m = Metadata::new(directory, ARCHITECTURE);
     let layers = m.integer("block_count")?;
     // Every layer binds distinct stored weights; reject impossible counts
     // before allocating per-layer vectors from untrusted metadata.
@@ -133,7 +112,10 @@ pub fn inspect_components(
 
     let rotated = m.optional_integer("rope.dimension_count")?.unwrap_or(width);
     let base = match m.optional_number("rope.freq_base_swa")? {
-        Some(base) => base,
+        Some(base) => {
+            m.ignore("rope.freq_base");
+            base
+        }
         None => m.number("rope.freq_base")?,
     };
     let rotary = rotary::table(rotated, width, base)?;
@@ -290,6 +272,7 @@ pub fn inspect_components(
             .transpose()?,
         draft: None,
     };
+    m.finish()?;
     definition
         .validate()
         .map_err(|error| invalid(error.to_string()))?;

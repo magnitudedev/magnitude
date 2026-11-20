@@ -15,7 +15,7 @@
 //!   ([`seismic::memory::Entry::change`]), so no record is written outside
 //!   one; and a native object and its charge are one owner whose allocation
 //!   and free run inside the change (`seismic::memory::Backed`, or an
-//!   object's `seismic::memory::DropScope` where it cannot be one). The
+//!   object's `seismic::memory::ScopedDrop` where it cannot be one). The
 //!   ledger's `Locked` panic remains for an embedder's own records.
 //! - **Who may begin one.** The owner's thread, as an owner's change
 //!   ([`Changes::change`], [`OpenChange`]: a load, a domain); any thread, as

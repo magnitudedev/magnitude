@@ -28,7 +28,7 @@ use magnitude_family_contracts::{
     ProjectedRows, RowProducer, RowRounding, TokenDomain,
     Operator, OutputForm, OutputProjection, QueryKeys, QueryProjection, ResidualForm, RmsNorm,
     Rotary, RouteNormalization, RoutedFfn, Router,
-    RouterInput, RowRange, ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
+    RouterInput, ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
     WeightDescriptor,
 };
 
@@ -46,69 +46,6 @@ impl Architecture {
             Self::Dense => "lfm2",
             Self::Routed => "lfm2moe",
             Self::Lfm3 => "lfm3",
-        }
-    }
-
-    /// Every metadata key under the architecture prefix this interpretation
-    /// understands. Any other key may change the forward pass (sliding
-    /// windows, rope scaling, expert weight scales), so it is rejected rather
-    /// than ignored.
-    const fn metadata_keys(self) -> &'static [&'static str] {
-        const DENSE: &[&str] = &[
-            "block_count",
-            "context_length",
-            "embedding_length",
-            "feed_forward_length",
-            "vocab_size",
-            "attention.head_count",
-            "attention.head_count_kv",
-            "attention.key_length",
-            "attention.value_length",
-            "attention.layer_norm_rms_epsilon",
-            "rope.freq_base",
-            "shortconv.l_cache",
-        ];
-        const ROUTED: &[&str] = &[
-            "block_count",
-            "context_length",
-            "embedding_length",
-            "feed_forward_length",
-            "vocab_size",
-            "attention.head_count",
-            "attention.head_count_kv",
-            "attention.key_length",
-            "attention.value_length",
-            "attention.layer_norm_rms_epsilon",
-            "rope.freq_base",
-            "shortconv.l_cache",
-            "expert_count",
-            "expert_used_count",
-            "expert_feed_forward_length",
-            "expert_gating_func",
-            "leading_dense_block_count",
-        ];
-        const LFM3: &[&str] = &[
-            "block_count",
-            "context_length",
-            "embedding_length",
-            "feed_forward_length",
-            "vocab_size",
-            "attention.head_count",
-            "attention.head_count_kv",
-            "attention.key_length",
-            "attention.value_length",
-            "attention.layer_norm_rms_epsilon",
-            "attention.sliding_window",
-            "attention.sliding_window_pattern",
-            "rope.freq_base",
-            "rope.freq_base_swa",
-            "rope.dimension_count",
-            "shortconv.l_cache",
-        ];
-        match self {
-            Self::Dense => DENSE,
-            Self::Routed => ROUTED,
-            Self::Lfm3 => LFM3,
         }
     }
 }
@@ -246,20 +183,17 @@ impl Layers<'_> {
                     "shortconv.in_proj.weight",
                     &[product(&[3, hidden])?, hidden],
                 )?;
-                let chunk = |block: u64| WeightDescriptor {
-                    name: fused.name.clone(),
-                    shape: vec![hidden, hidden],
-                    transforms: vec![ImportTransform::Rows(RowRange {
-                        start: block * hidden,
-                        rows: hidden,
-                    })],
+                let chunk = |block: u64| {
+                    fused
+                        .slice_rows(block * hidden, hidden)
+                        .map_err(|error| Error::invalid(error.to_string()))
                 };
                 Operator::ShortConv(Box::new(ShortConv {
                     channels: hidden,
                     width: convolution_width,
-                    input_gate: chunk(0),
-                    output_gate: chunk(1),
-                    value: chunk(2),
+                    input_gate: chunk(0)?,
+                    output_gate: chunk(1)?,
+                    value: chunk(2)?,
                     convolution: weight("shortconv.conv.weight", &[hidden, convolution_width])?,
                     output: weight("shortconv.out_proj.weight", &[hidden, hidden])?,
                 }))
@@ -383,7 +317,7 @@ pub fn inspect_components(
         }
     };
     let family_id = architecture.family_id();
-    let m = Metadata::new(directory, family_id, architecture.metadata_keys())?;
+    let m = Metadata::new(directory, family_id);
 
     let layer_count = m.integer("block_count")?;
     // Each layer requires distinct stored weights. Reject impossible counts
@@ -563,6 +497,8 @@ pub fn inspect_components(
         .enumerate()
         .map(|(index, mixer)| layers.block(&mut tensors, index, mixer))
         .collect::<Result<Vec<_>, Error>>()?;
+    drop(layers);
+    m.finish()?;
     tensors.finish()?;
     let definition = ModelDefinition {
         family: FamilyId(family_id.into()),

@@ -5,7 +5,8 @@
 use super::operations::{prepare, InputBound, PreparedInput};
 use crate::error::RequestError;
 use crate::host::HostArtifacts;
-use crate::worker::{protocol::RequestState, EngineClient, RequestEvent, RequestOptions};
+use crate::invocation::Invocation;
+use crate::worker::{protocol::RequestState, RequestEvent, RequestOptions};
 use magnitude_chat::{
     conformance::OutputSchemas,
     generation::{generation_options, ModelLimits},
@@ -20,7 +21,6 @@ use magnitude_chat::{
 use magnitude_scheduler::prefix_cache::PrefixRetention;
 use std::{
     collections::BTreeMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -88,23 +88,26 @@ impl Events {
 
 /// Run one generation, publishing its lifecycle to `events`.
 pub async fn generate(
-    host: Arc<HostArtifacts>,
-    engine: EngineClient,
+    invocation: Invocation,
     request: GenerationRequest,
     limits: SessionLimits,
     events: mpsc::Sender<SessionEvent>,
 ) {
     let events = Events { sender: events };
-    let _ = run(host, engine, request, limits, &events).await;
+    tokio::select! {
+        biased;
+        () = events.sender.closed() => {}
+        _ = run(invocation, request, limits, &events) => {}
+    }
 }
 
 async fn run(
-    host: Arc<HostArtifacts>,
-    engine: EngineClient,
+    invocation: Invocation,
     request: GenerationRequest,
     limits: SessionLimits,
     events: &Events,
 ) -> Result<(), Abandoned> {
+    let Invocation { host, engine, release } = invocation;
     let started = Instant::now();
     events.send(SessionEvent::Progress(Progress::Preparing)).await?;
     let prepared = {
@@ -152,7 +155,7 @@ async fn run(
     };
     // Answered once it began: one that cannot begin is refused, before
     // anything of it is answered.
-    let admission = engine.admit(RequestOptions {
+    let admission = engine.admit_with_lease(RequestOptions {
         input,
         options,
         constraint: chat.input().constraint.clone(),
@@ -161,11 +164,7 @@ async fn run(
             PromptCache::Disabled => PrefixRetention::Transient,
         },
         output_capacity: limits.output_capacity,
-    });
-    let admission = tokio::select! {
-        admission = admission => admission,
-        () = events.sender.closed() => return Err(Abandoned),
-    };
+    }, release).await;
     let mut admitted = match admission {
         Ok(admitted) => admitted,
         Err(error) => {
@@ -194,10 +193,7 @@ async fn run(
     let mut prefill_reported = None;
     loop {
         let event = if clock.first_output.is_none() {
-            let received = tokio::select! {
-                received = tokio::time::timeout(PROGRESS_INTERVAL, admitted.receive()) => received,
-                () = events.sender.closed() => return Err(Abandoned),
-            };
+            let received = tokio::time::timeout(PROGRESS_INTERVAL, admitted.receive()).await;
             match received {
                 Ok(event) => event,
                 Err(_) => {
@@ -222,10 +218,7 @@ async fn run(
                 }
             }
         } else {
-            tokio::select! {
-                event = admitted.receive() => event,
-                () = events.sender.closed() => return Err(Abandoned),
-            }
+            admitted.receive().await
         };
         let Some(event) = event else {
             return events

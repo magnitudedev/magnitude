@@ -410,6 +410,7 @@ void recurrent_sequential(const uint rows) {
     const uint block_row = gl_WorkGroupID.y * block_rows;
     const uint first_row = block_row + SEISMIC_SUBGROUP * rows;
     const recurrent_slot slot = recurrent_slot_of(gl_WorkGroupID.z);
+    if (slot.lo == slot.hi) return;
     float state[RECURRENT_MAX_ROWS][RECURRENT_CPL];
     recurrent_load_version(in_, slot, rows, head, first_row, state);
     recurrent_publish_window(in_, slot, head * gl_NumWorkGroups.y + gl_WorkGroupID.y, RECURRENT_NV * gl_NumWorkGroups.y);

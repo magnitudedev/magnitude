@@ -18,6 +18,18 @@ use std::{
 /// payload fits well within it.
 pub const MAX_FRAME_BYTES: u32 = 1 << 30;
 
+/// Maximum frame buffer capacity retained across messages; oversized buffers
+/// are released once the frame completes so large payloads are not pinned.
+const RETAINED_BUFFER_CAPACITY: usize = 1 << 20;
+
+fn trim_buffer(buffer: &mut Vec<u8>) {
+    if buffer.capacity() > RETAINED_BUFFER_CAPACITY {
+        *buffer = Vec::new();
+    } else {
+        buffer.clear();
+    }
+}
+
 #[derive(Debug)]
 pub enum TransportError {
     Io(io::Error),
@@ -166,39 +178,60 @@ impl<R: Read + Send + 'static, M: DeserializeOwned + 'static> MessageReceiver<M>
         if length > MAX_FRAME_BYTES {
             return Err(TransportError::FrameTooLarge(u64::from(length)));
         }
-        self.buffer.resize(length as usize, 0);
-        self.reader
+        let length = length as usize;
+        self.buffer.clear();
+        self.buffer.try_reserve_exact(length).map_err(|_| {
+            TransportError::Io(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("failed to allocate {length}-byte frame buffer"),
+            ))
+        })?;
+        self.buffer.resize(length, 0);
+        let result = self
+            .reader
             .read_exact(&mut self.buffer)
-            .map_err(TransportError::Io)?;
-        postcard::from_bytes(&self.buffer)
-            .map(Some)
-            .map_err(TransportError::Decode)
+            .map_err(TransportError::Io)
+            .and_then(|()| {
+                postcard::from_bytes(&self.buffer)
+                    .map(Some)
+                    .map_err(TransportError::Decode)
+            });
+        trim_buffer(&mut self.buffer);
+        result
     }
 }
 
 impl<W: Write + Send + 'static, M: Serialize + 'static> MessageSender<M> for FrameWriter<W, M> {
     fn send(&mut self, message: M) -> Result<(), TransportError> {
         self.buffer.clear();
+        self.buffer.try_reserve_exact(4).map_err(|_| {
+            TransportError::Io(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "failed to allocate frame header buffer",
+            ))
+        })?;
         self.buffer.extend_from_slice(&[0; 4]);
         let buffer = std::mem::take(&mut self.buffer);
         let mut buffer =
             postcard::to_extend(&message, buffer).map_err(TransportError::Encode)?;
-        let length = buffer.len() - 4;
-        let length = u32::try_from(length)
-            .ok()
-            .filter(|length| *length <= MAX_FRAME_BYTES)
-            .ok_or(TransportError::FrameTooLarge(length as u64))?;
-        buffer[..4].copy_from_slice(&length.to_le_bytes());
-        let written = self
-            .writer
-            .write_all(&buffer)
-            .and_then(|()| self.writer.flush())
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::BrokenPipe => TransportError::Closed,
-                _ => TransportError::Io(error),
-            });
+        let result = (|| {
+            let length = buffer.len() - 4;
+            let length = u32::try_from(length)
+                .ok()
+                .filter(|length| *length <= MAX_FRAME_BYTES)
+                .ok_or(TransportError::FrameTooLarge(length as u64))?;
+            buffer[..4].copy_from_slice(&length.to_le_bytes());
+            self.writer
+                .write_all(&buffer)
+                .and_then(|()| self.writer.flush())
+                .map_err(|error| match error.kind() {
+                    io::ErrorKind::BrokenPipe => TransportError::Closed,
+                    _ => TransportError::Io(error),
+                })
+        })();
         self.buffer = buffer;
-        written
+        trim_buffer(&mut self.buffer);
+        result
     }
 }
 
@@ -275,6 +308,46 @@ mod tests {
             receiver.receive().unwrap(),
             Some(HostMessage::Credit { request_id: HostRequestId(7), batches: 3 })
         ));
+        assert!(receiver.receive().unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_frame_buffers_shrink_after_transfer() {
+        let large = vec![0x5Au8; RETAINED_BUFFER_CAPACITY + 64 * 1024];
+        let small = vec![0xA5u8; 64];
+        let bytes = {
+            let (_, mut sender) =
+                FramedTransport::<io::Empty, Vec<u8>, Vec<u8>, Vec<u8>>::new(
+                    io::empty(),
+                    Vec::new(),
+                )
+                .split();
+            sender.send(large.clone()).unwrap();
+            assert!(
+                sender.buffer.capacity() <= RETAINED_BUFFER_CAPACITY,
+                "sender retained {} bytes after oversized frame",
+                sender.buffer.capacity()
+            );
+            sender.send(small.clone()).unwrap();
+            assert!(sender.buffer.capacity() > 0);
+            assert!(sender.buffer.capacity() <= RETAINED_BUFFER_CAPACITY);
+            sender.writer
+        };
+        let (mut receiver, _) =
+            FramedTransport::<_, io::Sink, Vec<u8>, Vec<u8>>::new(
+                io::Cursor::new(bytes),
+                io::sink(),
+            )
+            .split();
+        assert_eq!(receiver.receive().unwrap(), Some(large));
+        assert!(
+            receiver.buffer.capacity() <= RETAINED_BUFFER_CAPACITY,
+            "receiver retained {} bytes after oversized frame",
+            receiver.buffer.capacity()
+        );
+        assert_eq!(receiver.receive().unwrap(), Some(small));
+        assert!(receiver.buffer.capacity() > 0);
+        assert!(receiver.buffer.capacity() <= RETAINED_BUFFER_CAPACITY);
         assert!(receiver.receive().unwrap().is_none());
     }
 }

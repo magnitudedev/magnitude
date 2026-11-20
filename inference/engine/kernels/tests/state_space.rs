@@ -996,3 +996,67 @@ fn gate_matches_the_portable_body_and_host_model() {
         }
     }
 }
+
+/// Trailing power-of-two padded empty slots (`segments = [actual_rows, actual_rows]`,
+/// `previous = -1`, `following = -1`) leave outputs and all banks bit-identical
+/// to an unpadded launch for both `state_space_step` and `state_space_chunk`.
+#[test]
+fn padded_empty_slots_match_unpadded_for_step_and_chunk() {
+    let geometry = Geometry {
+        banks: 8,
+        tape: 4,
+        ..SMALL
+    };
+    let slots = vec![slot(3, 3, 0, 1), slot(2, 1, 2, 3), slot(1, 1, 4, 5)];
+    let case = Case::new(geometry, 8, slots, 88);
+    let active_elems = 6 * geometry.heads * geometry.head_width;
+    for device in devices() {
+        let backend = device.backend().as_str();
+        for chunk in [false, true] {
+            let expected = case.native(&device, chunk, 16, false);
+            let charges = seismic::Charges::tally(&device);
+            let mut bound = case.bind(&device, false);
+            bound.slots = SlotTensors::padded(&device, &case.slots, case.rows, 4);
+            let specialization = case.specialization(&device, 16);
+            let activation = case.activation();
+            let mixed: Tensor = if chunk {
+                declared::prepared(
+                    &device,
+                    &state_space_chunk::native_entry_with(state_space_chunk::Elements { A: activation }),
+                    &specialization,
+                )
+                .unwrap()
+                .call(&charges, bound.chunk_args(case.slab_banks))
+                .unwrap()
+                .value
+            } else {
+                declared::prepared(
+                    &device,
+                    &state_space_step::native_entry_with(state_space_step::Elements { A: activation }),
+                    &specialization,
+                )
+                .unwrap()
+                .call(&charges, bound.step_args(case.slab_banks))
+                .unwrap()
+                .value
+            };
+            let actual = Outcome {
+                mixed: read(&mixed),
+                window: read(&bound.window),
+                state: read(&bound.state),
+                tape: read(&bound.tape),
+            };
+            let mode = if chunk { "chunk" } else { "step" };
+            assert!(
+                same_bits(&actual.mixed[..active_elems], &expected.mixed[..active_elems]),
+                "{backend} {mode}: padded-slot mixed output differs"
+            );
+            assert!(
+                same_bits(&actual.window, &expected.window)
+                    && same_bits(&actual.state, &expected.state)
+                    && same_bits(&actual.tape, &expected.tape),
+                "{backend} {mode}: padded-slot bank arenas differ"
+            );
+        }
+    }
+}

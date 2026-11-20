@@ -26,7 +26,7 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::{
     rotary::{self, Yarn, YarnAmplitude},
-    architecture_keys, HeaderError, Metadata, Tensors,
+    HeaderError, Metadata, Tensors,
 };
 use magnitude_family_contracts::{
     checked_product, ActivationFunction, Affine, Attention, AttentionGate, Block, BlockAttention,
@@ -44,127 +44,18 @@ use std::{error, fmt};
 /// The GGUF architecture of a DFlash-family block drafter.
 pub const ARCHITECTURE: &str = "dflash";
 
-/// Every admitted `dflash.*` key; any other key names a feature this family
-/// does not admit.
-const ADMITTED_KEYS: [&str; 30] = [
-    "block_count",
-    "context_length",
-    "embedding_length",
-    "embedding_scale",
-    "final_logit_softcapping",
-    "feed_forward_length",
-    "attention.head_count",
-    "attention.head_count_kv",
-    "attention.key_length",
-    "attention.value_length",
-    "attention.layer_norm_rms_epsilon",
-    "attention.sliding_window",
-    "attention.sliding_window_pattern",
-    "attention.causal",
-    "rope.freq_base",
-    "rope.dimension_sections",
-    "rope.scaling.type",
-    "rope.scaling.factor",
-    "rope.scaling.original_context_length",
-    "rope.scaling.yarn_beta_fast",
-    "rope.scaling.yarn_beta_slow",
-    "rope.scaling.yarn_attn_factor",
-    "block_size",
-    "target_layers",
-    "sample_from_anchor",
-    "has_confidence_head",
-    "conv_kernel_size",
-    "conv_group_size",
-    "selector_rank",
-    "selector_top_k",
-];
-
-/// Keys that hold one value per draft layer or a list.
-const ARRAY_KEYS: [&str; 3] = [
-    "target_layers",
-    "attention.sliding_window_pattern",
-    "rope.dimension_sections",
-];
-
-/// The LiLiCorr corrector's metadata namespace and its admitted keys.
+/// The LiLiCorr corrector's metadata namespace.
 const LILICORR: &str = "lilicorr";
-const LILICORR_KEYS: [&str; 8] = [
-    "hidden_size",
-    "candidate_topk",
-    "num_heads",
-    "num_layers",
-    "factor_dim",
-    "mlp_hidden_size",
-    "vector_eps",
-    "logit_scale",
-];
 
 /// The corrector's feature norm epsilon: the reference implementation's
 /// layer norm default (PyTorch `nn.LayerNorm`, llama.cpp `ggml_norm` at
 /// 1e-5); the header does not carry it.
 const CORRECTOR_FEATURE_EPSILON: f64 = 1e-5;
 
-/// The corrector's draft-wide roles, stored as `lilicorr.<role>.<part>`.
-const LILICORR_ROLES: [&str; 12] = [
-    "token_proj",
-    "pass_hidden_proj",
-    "context_proj",
-    "slot_embedding",
-    "rank_embedding",
-    "attention_bias",
-    "output_norm",
-    "anchor_norm",
-    "factor_input_proj",
-    "out_head",
-    "in_head",
-    "anchor_out_head",
-];
-
 const MASK_TOKEN: &str = "tokenizer.ggml.mask_token_id";
 
 /// The declaration of the draft's block attention, which is never inferred.
 const CAUSALITY: &str = "dflash.attention.causal";
-
-/// Draft-wide roles. Reduced vocabulary (`d2t`) is not admitted.
-const GLOBAL_ROLES: [&str; 15] = [
-    "output.weight",
-    "output.scale",
-    "fc.weight",
-    "fc.scale",
-    "enc.output_norm.weight",
-    "output_norm.weight",
-    "token_embd.weight",
-    "markov_w1.weight",
-    "markov_w2.weight",
-    "markov_w2.scale",
-    "conf_proj.weight",
-    "conf_proj.bias",
-    "selector_hidden.weight",
-    "selector_predecessor.weight",
-    "selector_successor.weight",
-];
-
-/// Per-block roles, each stored as `blk.N.<role>.<part>` with a `weight`,
-/// an NVFP4 `scale` or (a corrector layer's) a `bias` part.
-const BLOCK_ROLES: [&str; 14] = [
-    "attn_norm",
-    "attn_q",
-    "attn_k",
-    "attn_v",
-    "attn_q_norm",
-    "attn_k_norm",
-    "attn_output",
-    "attn_sinks",
-    "ffn_norm",
-    "ffn_gate",
-    "ffn_up",
-    "ffn_down",
-    "attn_conv_proj",
-    "ffn_conv_proj",
-];
-
-/// DFlash2's per-layer convolution bases, stored without a `.weight` suffix.
-const BLOCK_PARAMETERS: [&str; 2] = ["attn_conv_base", "ffn_conv_base"];
 
 /// Failure to recognize or interpret a `dflash` draft.
 #[derive(Clone, Debug, PartialEq)]
@@ -322,82 +213,16 @@ impl From<HeaderError> for Error {
     }
 }
 
-fn is_index(text: &str) -> bool {
-    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-/// Whether `name` is a tensor role of a `dflash` draft. Which roles a draft
-/// binds is decided when it is inspected; this admits role names only.
-fn known_role(name: &str) -> bool {
-    if GLOBAL_ROLES.contains(&name) {
-        return true;
-    }
-    let part = |role: &str, roles: &[&str]| {
-        role.rsplit_once('.').is_some_and(|(role, suffix)| {
-            roles.contains(&role) && matches!(suffix, "weight" | "scale" | "bias")
-        })
-    };
-    if let Some(role) = name.strip_prefix("lilicorr.") {
-        return part(role, &LILICORR_ROLES)
-            || role
-                .strip_prefix("layers.")
-                .and_then(|rest| rest.split_once('.'))
-                .is_some_and(|(index, role)| {
-                    is_index(index) && matches!(role, "attn.in_proj.weight" | "attn.in_proj.bias")
-                });
-    }
-    name.strip_prefix("blk.")
-        .and_then(|rest| rest.split_once('.'))
-        .is_some_and(|(index, role)| {
-            is_index(index) && (BLOCK_PARAMETERS.contains(&role) || part(role, &BLOCK_ROLES))
-        })
-}
-
-/// Recognize a `dflash` draft from metadata keys and tensor role names,
-/// without interpreting geometry. No target family claims this
-/// architecture, and this family claims nothing else.
+/// Recognize a `dflash` draft from its declared architecture, without
+/// interpreting geometry. No target family claims this architecture, and this
+/// family claims nothing else.
 pub fn recognize(directory: &Directory) -> Result<(), Error> {
     match directory
         .value("general.architecture")
         .and_then(Value::string)
     {
-        Some(ARCHITECTURE) => {}
-        architecture => return Err(Error::Architecture(architecture.map(str::to_owned))),
-    }
-    let mut metadata = Vec::new();
-    for (key, entry) in architecture_keys(directory, ARCHITECTURE) {
-        if !ADMITTED_KEYS.contains(&key) {
-            metadata.push(entry.name.clone());
-        } else if key != "attention.causal"
-            && matches!(entry.value, Value::Array(_)) != ARRAY_KEYS.contains(&key)
-        {
-            return Err(Error::Metadata {
-                key: entry.name.clone(),
-                expected: "of its admitted arity",
-            });
-        }
-    }
-    // The corrector's keys are scalars of its own namespace.
-    for (key, entry) in architecture_keys(directory, LILICORR) {
-        if !LILICORR_KEYS.contains(&key) {
-            metadata.push(entry.name.clone());
-        } else if matches!(entry.value, Value::Array(_)) {
-            return Err(Error::Metadata {
-                key: entry.name.clone(),
-                expected: "of its admitted arity",
-            });
-        }
-    }
-    let tensors = directory
-        .tensors
-        .iter()
-        .filter(|tensor| !known_role(&tensor.name))
-        .map(|tensor| tensor.name.clone())
-        .collect::<Vec<_>>();
-    if metadata.is_empty() && tensors.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Unadmitted { metadata, tensors })
+        Some(ARCHITECTURE) => Ok(()),
+        architecture => Err(Error::Architecture(architecture.map(str::to_owned))),
     }
 }
 
@@ -480,7 +305,7 @@ pub fn inspect(
     layer_entry: &dyn Fn(u64) -> Result<TapPoint, FamilyError>,
 ) -> Result<DraftDefinition, Error> {
     recognize(directory)?;
-    let m = Metadata::new(directory, ARCHITECTURE, &ADMITTED_KEYS)?;
+    let m = Metadata::new(directory, ARCHITECTURE);
     let decoder = &target.decoder;
     let block_count = m.integer("block_count")?;
     // The longest sequence the draft was trained on: no layer reads further
@@ -498,6 +323,14 @@ pub fn inspect(
             "draft width {hidden} differs from the target's {}",
             decoder.hidden
         )));
+    }
+    if !matches!(
+        decoder.residual,
+        magnitude_family_contracts::ResidualForm::Single
+    ) {
+        return Err(Error::Target(
+            "draft models require a single-stream target residual".into(),
+        ));
     }
     if m.integer("attention.value_length")? != width {
         return Err(Error::Geometry(
@@ -546,19 +379,19 @@ pub fn inspect(
     // Projections and tables carry their NVFP4 second-level scale (`X.scale`
     // beside `X.weight`, `[1]` F32) when the file stores one.
     let mut binder = Tensors::new(directory);
-    let fusion = binder.bind_scaled(
+    let fusion = binder.bind(
         "fc.weight",
         &[hidden, product(&[taps.len() as u64, hidden])?],
     )?;
-    let fusion_norm = rms(binder.bind_scaled("enc.output_norm.weight", &[hidden])?);
-    let output_norm = rms(binder.bind_scaled("output_norm.weight", &[hidden])?);
+    let fusion_norm = rms(binder.bind("enc.output_norm.weight", &[hidden])?);
+    let output_norm = rms(binder.bind("output_norm.weight", &[hidden])?);
     let embedding = if binder.contains("token_embd.weight") {
-        DraftEmbedding::Own(binder.bind_scaled("token_embd.weight", &[decoder.vocabulary, hidden])?)
+        DraftEmbedding::Own(binder.bind("token_embd.weight", &[decoder.vocabulary, hidden])?)
     } else {
         DraftEmbedding::Target
     };
     let output = if binder.contains("output.weight") {
-        Some(binder.bind_scaled("output.weight", &[decoder.vocabulary, hidden])?)
+        Some(binder.bind("output.weight", &[decoder.vocabulary, hidden])?)
     } else {
         None
     };
@@ -573,7 +406,7 @@ pub fn inspect(
             } else {
                 None
             };
-            let mut weight = |name: &str, shape: &[u64]| binder.bind_scaled(&role(name), shape);
+            let mut weight = |name: &str, shape: &[u64]| binder.bind(&role(name), shape);
             let attention = Attention {
                 heads,
                 kv_heads,
@@ -688,8 +521,8 @@ pub fn inspect(
         let table = [decoder.vocabulary, rank];
         let markov = MarkovHead {
             rank,
-            embedding: binder.bind_scaled("markov_w1.weight", &table)?,
-            projection: binder.bind_scaled("markov_w2.weight", &table)?,
+            embedding: binder.bind("markov_w1.weight", &table)?,
+            projection: binder.bind("markov_w2.weight", &table)?,
         };
         if m.optional_flag("has_confidence_head")? == Some(false) {
             return Err(Error::Geometry(
@@ -734,6 +567,7 @@ pub fn inspect(
         mask_token,
         layout,
     };
+    m.finish()?;
     draft
         .validate(decoder, target.inputs.coordinate_axes)
         .map_err(Error::Definition)?;
@@ -773,7 +607,7 @@ fn block_convolutions(
                         &format!("blk.{index}.{name}_conv_base"),
                         &[2, kernel, hidden],
                     )?,
-                    projection: binder.bind_scaled(
+                    projection: binder.bind(
                         &format!("blk.{index}.{name}_conv_proj.weight"),
                         &[coefficients, hidden],
                     )?,
@@ -808,9 +642,9 @@ fn candidate_selector(
     Ok(CandidateSelector {
         rank,
         top_k,
-        hidden: binder.bind_scaled("selector_hidden.weight", &[rank, hidden])?,
-        predecessor: binder.bind_scaled("selector_predecessor.weight", &codebook)?,
-        successor: binder.bind_scaled("selector_successor.weight", &codebook)?,
+        hidden: binder.bind("selector_hidden.weight", &[rank, hidden])?,
+        predecessor: binder.bind("selector_predecessor.weight", &codebook)?,
+        successor: binder.bind("selector_successor.weight", &codebook)?,
     })
 }
 
@@ -829,7 +663,7 @@ fn candidate_corrector(
     block_size: u64,
     epsilon: f64,
 ) -> Result<CandidateCorrector, Error> {
-    let m = Metadata::new(directory, LILICORR, &LILICORR_KEYS)?;
+    let m = Metadata::new(directory, LILICORR);
     let width = m.integer("hidden_size")?;
     let top_k = m.integer("candidate_topk")?;
     let heads = m.integer("num_heads")?;
@@ -838,6 +672,7 @@ fn candidate_corrector(
     let mlp = m.integer("mlp_hidden_size")?;
     let vector_epsilon = m.positive_number("vector_eps")?;
     let logit_scale = m.positive_number("logit_scale")?;
+    m.finish()?;
     if width == 0
         || top_k == 0
         || heads == 0
@@ -858,7 +693,7 @@ fn candidate_corrector(
                       inputs: u64|
      -> Result<Affine, Error> {
         Ok(Affine {
-            weight: binder.bind_scaled(&format!("{stem}.weight"), &[outputs, inputs])?,
+            weight: binder.bind(&format!("{stem}.weight"), &[outputs, inputs])?,
             bias: bind_vector(binder, &format!("{stem}.bias"), outputs)?,
         })
     };

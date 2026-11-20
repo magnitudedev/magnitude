@@ -104,7 +104,8 @@ template <class B> struct Window {
     u32 row_packets, source_packets, tiles_x, packets, windows, pitch, unit;
     bool whole;
 
-    __device__ __forceinline__ explicit Window(const seismic_words_t &seismic_words_value) {
+    template <class W = seismic_words_t>
+    __device__ __forceinline__ explicit Window(const W &seismic_words_value) {
         const u64 n = B::n(seismic_words_value);
         tiles_x = (u32)repack::tiles_x<B>(seismic_words_value);
         row_packets = streaming_window_row_packets((u64)tiles_x * S::TILE_COLUMNS, B::group());
@@ -144,18 +145,22 @@ template <class B> struct Copy {
     u64 first_scale;
 
     // The packet's codes where the source is planar.
-    __device__ __forceinline__ const u8 *packet(const seismic_words_t &, u64, u64 n, u64 packet) const {
+    template <class W = seismic_words_t>
+    __device__ __forceinline__ const u8 *packet(const W &, u64, u64 n, u64 packet) const {
         return copy + (n % Window<B>::ROWS) * pitch + (packet - first) * Window<B>::PACKET;
     }
-    __device__ __forceinline__ u64 row_bytes(const seismic_words_t &) const {
+    template <class W = seismic_words_t>
+    __device__ __forceinline__ u64 row_bytes(const W &) const {
         return pitch;
     }
     // The scale of the tile holding packet `packet` of row `n`.
-    __device__ __forceinline__ const u8 *scale(const seismic_words_t &, u64, u64 n, u64 packet) const {
+    template <class W = seismic_words_t>
+    __device__ __forceinline__ const u8 *scale(const W &, u64, u64 n, u64 packet) const {
         return scales + (B::grid_tile_rows() == 1u ? (n % Window<B>::ROWS) * Window<B>::SCALE_PITCH : 0u) +
                (packet * B::group() / B::grid_tile_columns() - first_scale) * B::scale_bytes();
     }
-    __device__ __forceinline__ u64 scale_row_bytes(const seismic_words_t &) const {
+    template <class W = seismic_words_t>
+    __device__ __forceinline__ u64 scale_row_bytes(const W &) const {
         return B::grid_tile_rows() == 1u ? Window<B>::SCALE_PITCH : 0u;
     }
 };
@@ -206,11 +211,21 @@ template <class B> struct Dense {
 // record's, spans of its flattened elements (`streaming_dense_span`) for a
 // block of `threads` threads, each staged through the window and converted
 // from it.
-template <class B> __device__ __forceinline__ u32 dense_element() {
+template <class B> __host__ __device__ constexpr u32 dense_element() {
     return u32(sizeof(typename Dense<B>::Source::storage));
 }
-template <class B>
-__device__ __forceinline__ u64 record_items(const seismic_words_t &seismic_words_value, u32 threads) {
+// The narrowest load unit `B`'s windows or spans can ever use at runtime:
+// compile-time dead narrow units below this floor are never emitted.
+template <class B> __host__ __device__ constexpr u32 min_load_unit() {
+    if constexpr (B::dense())
+        return dense_element<B>();
+    else if constexpr (B::planar())
+        return 1u;
+    else
+        return Window<B>::NARROW;
+}
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ u64 record_items(const W &seismic_words_value, u32 threads) {
     if constexpr (B::dense())
         return streaming_dense_items(u32(B::n(seismic_words_value) * B::k(seismic_words_value)), dense_element<B>(),
                                      streaming_dense_span(dense_element<B>(), threads, SEISMIC_CONST_WINDOW_BYTES));
@@ -221,7 +236,8 @@ __device__ __forceinline__ u64 record_items(const seismic_words_t &seismic_words
 // A row tile's destination bytes: its rows are whole and consecutive in each
 // layout (a row's packets or planes before the next row's, an mma16 tile's
 // rows whole within a row tile, mma16's padding rows the last tile's own).
-template <class B> __device__ __forceinline__ u64 tile_bytes(const seismic_words_t &seismic_words_value) {
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ u64 tile_bytes(const W &seismic_words_value) {
     return repack::Shape<B>::TILE_ROWS * B::out_stride_1(seismic_words_value) * B::out_stride_bytes(seismic_words_value);
 }
 
@@ -229,8 +245,8 @@ template <class B> __device__ __forceinline__ u64 tile_bytes(const seismic_words
 struct DenseItem {
     u32 first, count;
 };
-template <class B>
-__device__ __forceinline__ DenseItem dense_item_of(const seismic_words_t &seismic_words_value, u32 item) {
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ DenseItem dense_item_of(const W &seismic_words_value, u32 item) {
     const u32 element = dense_element<B>();
     const u32 span = streaming_dense_span(element, blockDim.x, SEISMIC_CONST_WINDOW_BYTES) / element;
     const u32 elements = u32(B::n(seismic_words_value) * B::k(seismic_words_value));
@@ -241,9 +257,9 @@ __device__ __forceinline__ DenseItem dense_item_of(const seismic_words_t &seismi
 // by the whole block: each element decoded to F32 and rounded into the
 // destination, `import_dense`'s conversion, from the window the item's bytes
 // were stored into.
-template <class B>
+template <class B, class W = seismic_words_t>
 __device__ __forceinline__ void convert_span(const u8 *window, const u8 *destination,
-                                             const seismic_words_t &seismic_words_value, u64 slot, u32 item) {
+                                             const W &seismic_words_value, u64 slot, u32 item) {
     typedef typename Dense<B>::Source Source;
     typedef typename Dense<B>::Destination Destination;
     // A dense record's elements are written only through the owner's handle.
@@ -291,8 +307,9 @@ template <class B> struct Placed {
     u32 scale_spans = 0, scale_count = 0;
 
     // Item `item` of the record at `source` into the record at `destination`.
+    template <class Words = seismic_words_t>
     __device__ __forceinline__ Placed(const Window<B> &window, const u8 *source, u8 *destination,
-                                      const seismic_words_t &seismic_words_value, u64 item) {
+                                      const Words &seismic_words_value, u64 item) {
         typedef Window<B> W;
         row_tile = (u32)(item / window.windows);
         window_index = (u32)(item % window.windows);
@@ -333,14 +350,16 @@ __device__ __forceinline__ u8 *mirror() {
 // `repack::convert_tile`'s destination policy into the mirror: a row tile's
 // row `n` at its place in the tile.
 template <class B> struct Mirror {
-    __device__ static __forceinline__ u8 *row(u8 *mirror, const seismic_words_t &seismic_words_value, u64, u64 n) {
+    template <class W = seismic_words_t>
+    __device__ static __forceinline__ u8 *row(u8 *mirror, const W &seismic_words_value, u64, u64 n) {
         return mirror + (n % repack::Shape<B>::TILE_ROWS) * B::out_stride_1(seismic_words_value) *
                             B::out_stride_bytes(seismic_words_value);
     }
 };
 
 // Whether a binding's row tiles are placed through the mirror: they fit it.
-template <class B> __device__ __forceinline__ bool mirrored(const seismic_words_t &seismic_words_value) {
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ bool mirrored(const W &seismic_words_value) {
     return tile_bytes<B>(seismic_words_value) <= SEISMIC_CONST_MIRROR_BYTES;
 }
 
@@ -351,9 +370,9 @@ template <class B> __device__ __forceinline__ bool mirrored(const seismic_words_
 // stage words. A warp's tiles at once lie a group apart (`Shape::UNITS`
 // tiles: the same unit of consecutive groups), so its lanes run the same
 // code.
-template <class B, class O, class Sh>
+template <class B, class O, class Sh, class W = seismic_words_t>
 __device__ __forceinline__ void convert_tiles(const Window<B> &window, const Placed<B> &placed, u8 *out,
-                                              const seismic_words_t &seismic_words_value, Sh &shared) {
+                                              const W &seismic_words_value, Sh &shared) {
     typedef repack::Shape<B> S;
     constexpr u32 TILES = S::WARP_TILES, LANES = 32u / TILES;
     const u32 warp = threadIdx.x / 32, share = threadIdx.x % 32 / LANES, lane = threadIdx.x % LANES;
@@ -385,8 +404,8 @@ template <class Unit> __device__ __forceinline__ void write_units(u8 *to, u64 by
 
 // The mirror's stored rows of `placed`'s row tile written to the record by
 // the block, in the widest units the record keeps: whole lines.
-template <class B>
-__device__ __forceinline__ void write_tile(const Placed<B> &placed, const seismic_words_t &seismic_words_value) {
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ void write_tile(const Placed<B> &placed, const W &seismic_words_value) {
     typedef repack::Shape<B> S;
     const u64 row_bytes = B::out_stride_1(seismic_words_value) * B::out_stride_bytes(seismic_words_value);
     // Stored rows: mma16's are whole mma16 tiles, rows beyond N zero.
@@ -443,12 +462,26 @@ struct Held {
                   "every unit's share fits the held words");
     uint4 words[WORDS];
 
-    // Component `c` of word `w`.
-    __device__ __forceinline__ u32 &component(u32 w, u32 c) {
-        return c == 0 ? words[w].x : c == 1 ? words[w].y : c == 2 ? words[w].z : words[w].w;
+    // Component `c` of word `w`, indexed by compile-time constant `i` over the
+    // small `WORDS` register array so narrow non-unrolled loops never force
+    // `words` into local memory.
+    __device__ __forceinline__ u32 get_component(u32 w, u32 c) const {
+        u32 value = 0u;
+#pragma unroll
+        for (u32 i = 0; i < WORDS; ++i)
+            if (i == w)
+                value = c == 0 ? words[i].x : c == 1 ? words[i].y : c == 2 ? words[i].z : words[i].w;
+        return value;
     }
-    __device__ __forceinline__ u32 component(u32 w, u32 c) const {
-        return c == 0 ? words[w].x : c == 1 ? words[w].y : c == 2 ? words[w].z : words[w].w;
+    __device__ __forceinline__ void set_component(u32 w, u32 c, u32 value) {
+#pragma unroll
+        for (u32 i = 0; i < WORDS; ++i)
+            if (i == w) {
+                if (c == 0) words[i].x = value;
+                else if (c == 1) words[i].y = value;
+                else if (c == 2) words[i].z = value;
+                else words[i].w = value;
+            }
     }
 
     // Unit `k` of UNIT bytes, at byte k UNIT of the words.
@@ -456,33 +489,36 @@ struct Held {
         if constexpr (UNIT == 16) {
             words[k] = value;
         } else if constexpr (UNIT == 8) {
-            component(k / 2, k % 2 * 2) = value.x;
-            component(k / 2, k % 2 * 2 + 1) = value.y;
+            set_component(k / 2, k % 2 * 2, value.x);
+            set_component(k / 2, k % 2 * 2 + 1, value.y);
         } else if constexpr (UNIT == 4) {
-            component(k / 4, k % 4) = value;
+            set_component(k / 4, k % 4, value);
         } else {
             constexpr u32 PER = 4u / UNIT, MASK = UNIT == 2 ? 0xffffu : 0xffu;
             const u32 shift = k % PER * UNIT * 8u;
-            u32 &word = component(k / (4u * PER), k / PER % 4u);
-            word = (word & ~(MASK << shift)) | (u32(value) << shift);
+            const u32 w = k / (4u * PER), c = k / PER % 4u;
+            const u32 word = (get_component(w, c) & ~(MASK << shift)) | (u32(value) << shift);
+            set_component(w, c, word);
         }
     }
     template <u32 UNIT> __device__ __forceinline__ typename LoadUnit<UNIT>::type get(u32 k) const {
         if constexpr (UNIT == 16) {
             return words[k];
         } else if constexpr (UNIT == 8) {
-            return uint2{component(k / 2, k % 2 * 2), component(k / 2, k % 2 * 2 + 1)};
+            return uint2{get_component(k / 2, k % 2 * 2), get_component(k / 2, k % 2 * 2 + 1)};
         } else if constexpr (UNIT == 4) {
-            return component(k / 4, k % 4);
+            return get_component(k / 4, k % 4);
         } else {
             constexpr u32 PER = 4u / UNIT, MASK = UNIT == 2 ? 0xffffu : 0xffu;
-            return typename LoadUnit<UNIT>::type((component(k / (4u * PER), k / PER % 4u) >> (k % PER * UNIT * 8u)) & MASK);
+            return typename LoadUnit<UNIT>::type(
+                (get_component(k / (4u * PER), k / PER % 4u) >> (k % PER * UNIT * 8u)) & MASK);
         }
     }
 
     // Each of the thread's units of `span`, `visit(k, span, unit within the
     // span)`, in order: the span and unit carried from one to the next, not
-    // divided out of each.
+    // divided out of each. Only the 16-byte hot path (few iterations) is
+    // unrolled; narrow fallbacks keep a rolled loop to avoid IR explosion.
     template <u32 UNIT, class Visit> __device__ __forceinline__ static void each(const Span &span, Visit visit) {
         const u32 span_units = span.bytes / UNIT;
         if (span_units == 0)
@@ -490,15 +526,29 @@ struct Held {
         const u32 step_spans = SEISMIC_CONST_WINDOW_THREADS / span_units,
                   step_units = SEISMIC_CONST_WINDOW_THREADS % span_units;
         u32 at = threadIdx.x / span_units, unit = threadIdx.x % span_units;
+        if constexpr (UNIT == 16u) {
 #pragma unroll
-        for (u32 k = 0; k < units<UNIT>(); ++k) {
-            if (at < span.spans)
-                visit(k, at, unit);
-            at += step_spans;
-            unit += step_units;
-            if (unit >= span_units) {
-                unit -= span_units;
-                ++at;
+            for (u32 k = 0; k < units<UNIT>(); ++k) {
+                if (at < span.spans)
+                    visit(k, at, unit);
+                at += step_spans;
+                unit += step_units;
+                if (unit >= span_units) {
+                    unit -= span_units;
+                    ++at;
+                }
+            }
+        } else {
+#pragma unroll 1
+            for (u32 k = 0; k < units<UNIT>(); ++k) {
+                if (at < span.spans)
+                    visit(k, at, unit);
+                at += step_spans;
+                unit += step_units;
+                if (unit >= span_units) {
+                    unit -= span_units;
+                    ++at;
+                }
             }
         }
     }
@@ -519,28 +569,39 @@ struct Held {
     // Load `span`'s window: issued, not awaited, until stored. A launch of
     // WINDOW_THREADS threads over records that keep their windows' unit
     // (views of whole records of 16-byte aligned tensors; a scratch slot
-    // keeps it only where its records do), each checked.
-    __device__ __forceinline__ void load(const Span &span) {
-        if (blockDim.x != SEISMIC_CONST_WINDOW_THREADS || reinterpret_cast<u64>(span.from) % span.unit != 0u)
+    // keeps it only where its records do), each checked. `MIN_UNIT` is the
+    // binding's compile-time unit floor so unreachable narrow cases are never
+    // emitted.
+    template <u32 MIN_UNIT = 1u> __device__ __forceinline__ void load(const Span &span) {
+        if (blockDim.x != SEISMIC_CONST_WINDOW_THREADS || span.unit < MIN_UNIT ||
+            reinterpret_cast<u64>(span.from) % span.unit != 0u)
             __trap();
-        switch (span.unit) {
-        case 16: load_as<16>(span); break;
-        case 8: load_as<8>(span); break;
-        case 4: load_as<4>(span); break;
-        case 2: load_as<2>(span); break;
-        default: load_as<1>(span); break;
+        if constexpr (MIN_UNIT == 16u) {
+            load_as<16>(span);
+        } else {
+            switch (span.unit) {
+            case 16: load_as<16>(span); break;
+            case 8: if constexpr (MIN_UNIT <= 8u) load_as<8>(span); break;
+            case 4: if constexpr (MIN_UNIT <= 4u) load_as<4>(span); break;
+            case 2: if constexpr (MIN_UNIT <= 2u) load_as<2>(span); break;
+            default: if constexpr (MIN_UNIT <= 1u) load_as<1>(span); break;
+            }
         }
     }
 
     // Store the units loaded of `span`'s window into the block's window at
     // `window`, its spans `pitch` bytes apart.
-    __device__ __forceinline__ void store(const Span &span, u32 pitch, u8 *window) const {
-        switch (span.unit) {
-        case 16: store_as<16>(span, pitch, window); break;
-        case 8: store_as<8>(span, pitch, window); break;
-        case 4: store_as<4>(span, pitch, window); break;
-        case 2: store_as<2>(span, pitch, window); break;
-        default: store_as<1>(span, pitch, window); break;
+    template <u32 MIN_UNIT = 1u> __device__ __forceinline__ void store(const Span &span, u32 pitch, u8 *window) const {
+        if constexpr (MIN_UNIT == 16u) {
+            store_as<16>(span, pitch, window);
+        } else {
+            switch (span.unit) {
+            case 16: store_as<16>(span, pitch, window); break;
+            case 8: if constexpr (MIN_UNIT <= 8u) store_as<8>(span, pitch, window); break;
+            case 4: if constexpr (MIN_UNIT <= 4u) store_as<4>(span, pitch, window); break;
+            case 2: if constexpr (MIN_UNIT <= 2u) store_as<2>(span, pitch, window); break;
+            default: if constexpr (MIN_UNIT <= 1u) store_as<1>(span, pitch, window); break;
+            }
         }
     }
 };
@@ -607,9 +668,9 @@ template <u32 ITERS> struct HeldScales {
 // Where window `window_index` of row tile `row_tile` of the record entry
 // (from, to) names lies: from stored record `from` of `source` (negative:
 // `listed_source`'s scratch slot) into record `to` of `destination`.
-template <class B>
+template <class B, class W = seismic_words_t>
 __device__ __forceinline__ Placed<B> place_of(const Window<B> &window, const u8 *source, const u8 *destination,
-                                              const seismic_words_t &seismic_words_value, int from, int to,
+                                              const W &seismic_words_value, int from, int to,
                                               u64 row_tile, u64 window_index) {
     return Placed<B>(window, listed_source(source, destination, from), slab::region(destination, (u64)to),
                      seismic_words_value, row_tile * window.windows + window_index);
@@ -619,10 +680,12 @@ __device__ __forceinline__ Placed<B> place_of(const Window<B> &window, const u8 
 // stored bytes already in the block's window (`Held::store`), placed by the
 // block: through the mirror where the binding's row tiles fit it, written
 // whole once its last window is placed (`write_tile`), else into the record.
-template <class B, class Sh>
-__device__ __forceinline__ void convert_window(const Window<B> &window, const u8 *source, const u8 *destination,
-                                               const seismic_words_t &seismic_words_value, int from, int to,
-                                               u64 row_tile, u64 window_index, Sh &shared) {
+// Marked `__noinline__` so callers share one conversion body per unique
+// binding type rather than inlining duplicate `convert_tile` graphs.
+template <class B, class Sh, class W = seismic_words_t>
+__device__ __noinline__ void convert_window(const Window<B> &window, const u8 *source, const u8 *destination,
+                                            const W &seismic_words_value, int from, int to,
+                                            u64 row_tile, u64 window_index, Sh &shared) {
     const Placed<B> placed =
         place_of<B>(window, source, destination, seismic_words_value, from, to, row_tile, window_index);
     if (!mirrored<B>(seismic_words_value)) {

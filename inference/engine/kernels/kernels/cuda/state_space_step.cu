@@ -37,7 +37,9 @@ __global__ void state_space_step(SEISMIC_KERNEL_PARAMS) {
         state_space::zero_uncovered<LANE_ROWS>(in, head, row0);
         return;
     }
-    const state_space::Slot slot = state_space::bind(in, versions::slot_of(in.slots, blockIdx.z, seismic_words_value));
+    const versions::Slot raw = versions::slot_of(in.slots, blockIdx.z, seismic_words_value);
+    if (raw.lo == raw.hi) return;
+    const state_space::Slot slot = state_space::bind(in, raw);
     state_space::Rows<LANE_ROWS> rows;
     state_space::load_version<LANE_ROWS>(in, slot, head, row0, threadIdx.x % 32, rows);
     seismic_dependency_start();

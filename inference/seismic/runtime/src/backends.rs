@@ -637,6 +637,7 @@ impl DeviceInner {
         alignment: u64,
         access: Option<Arc<driver::AccessGroup>>,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        seismic_memory::assert_blocking_allocation_allowed("DeviceInner::allocate_contract");
         self.ran_work();
         self.kind.allocate_contract(charge, bytes, alignment, access)
     }
@@ -648,9 +649,11 @@ impl DeviceInner {
         bytes: u64,
         entry: &Arc<dyn crate::memory::Entry>,
         access: Arc<driver::AccessGroup>,
+        fill: seismic_memory::SlabFill,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        seismic_memory::assert_blocking_allocation_allowed("DeviceInner::allocate_block");
         self.ran_work();
-        self.kind.allocate_block(kinds, bytes, entry, access)
+        self.kind.allocate_block(kinds, bytes, entry, access, fill)
     }
 
     /// [`OpenedKind::map_read_only_host_region`] on this device.
@@ -659,6 +662,7 @@ impl DeviceInner {
         region: crate::api::HostRegion,
         alignment: u64,
     ) -> Result<Arc<driver::Allocation>, crate::api::TensorError> {
+        seismic_memory::assert_blocking_allocation_allowed("DeviceInner::map_read_only_host_region");
         self.ran_work();
         self.kind.map_read_only_host_region(region, alignment).map_err(crate::api::TensorError::Execution)
     }
@@ -856,31 +860,23 @@ impl OpenedKind {
         bytes: u64,
         entry: &Arc<dyn crate::memory::Entry>,
         access: Arc<driver::AccessGroup>,
+        fill: seismic_memory::SlabFill,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
         let allocate = |kind: u32| match self {
             Self::Cpu(device) => {
-                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry))
+                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry, fill))
             }
             #[cfg(target_os = "macos")]
             Self::Metal(device) => {
-                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry))
+                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry, fill))
             }
             Self::Cuda(device) => {
-                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry))
+                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry, fill))
             }
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.allocate_block(kind, bytes, entry, access.clone()),
+            Self::Vulkan(device) => device.allocate_block(kind, bytes, entry, access.clone(), fill),
         };
-        // A kind short of room passes the block to the next; any other
-        // failure is the block's, and returns.
-        let (last, earlier) = kinds.split_last().expect("a pool's store has a kind its contract places in");
-        for &kind in earlier {
-            match allocate(kind) {
-                Err(ExecutionError::AllocationCapacity { .. }) => continue,
-                done => return done,
-            }
-        }
-        allocate(*last)
+        allocate_across_kinds(kinds, allocate)
     }
 
 
@@ -894,6 +890,7 @@ impl OpenedKind {
         allocation: Arc<driver::Allocation>,
         bytes: u64,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        seismic_memory::assert_blocking_allocation_allowed("OpenedKind::zeroed");
         match self {
             Self::Cpu(_) => {}
             #[cfg(target_os = "macos")]
@@ -1092,9 +1089,72 @@ where
     }))
 }
 
+/// Allocate in the first kind of `kinds` that admits it: a kind short of room
+/// (any capacity refusal: [`ExecutionError::capacity_refusal`]) passes the
+/// block to the next; any other failure returns immediately.
+fn allocate_across_kinds<T>(
+    kinds: &[u32],
+    mut allocate: impl FnMut(u32) -> Result<T, ExecutionError>,
+) -> Result<T, ExecutionError> {
+    let (last, earlier) = kinds.split_last().expect("a pool's store has a kind its contract places in");
+    for &kind in earlier {
+        match allocate(kind) {
+            Err(ref error) if error.capacity_refusal().is_some() => continue,
+            done => return done,
+        }
+    }
+    allocate(*last)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::allocate_across_kinds;
+    use seismic_compiler::errors::{ExecutionError, RefusalReading};
     use seismic_lang::registry::BackendName;
+
+    #[test]
+    fn allocate_across_kinds_falls_back_on_capacity_and_device_refused() {
+        let mut tried = Vec::new();
+        let landed = allocate_across_kinds(&[1, 2, 3], |kind| {
+            tried.push(kind);
+            match kind {
+                1 => Err(ExecutionError::AllocationCapacity { available: 0, required: 64u64.into() }),
+                2 => Err(ExecutionError::DeviceRefused { required: 64, reading: RefusalReading::Host }),
+                3 => Ok(kind),
+                _ => unreachable!(),
+            }
+        })
+        .expect("third kind admits");
+        assert_eq!(landed, 3);
+        assert_eq!(tried, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn allocate_across_kinds_stops_on_non_capacity_error_and_returns_last_refusal() {
+        let mut tried = Vec::new();
+        let failed = allocate_across_kinds::<u32>(&[1, 2], |kind| {
+            tried.push(kind);
+            Err(ExecutionError::AllocationFailed(format!("kind {kind}")))
+        });
+        assert!(matches!(failed, Err(ExecutionError::AllocationFailed(_))));
+        assert_eq!(tried, vec![1]);
+
+        let mut tried = Vec::new();
+        let lost = allocate_across_kinds::<u32>(&[1, 2], |kind| {
+            tried.push(kind);
+            Err(ExecutionError::DeviceLost(format!("kind {kind}")))
+        });
+        assert!(matches!(lost, Err(ExecutionError::DeviceLost(_))));
+        assert_eq!(tried, vec![1]);
+
+        let mut tried = Vec::new();
+        let refused = allocate_across_kinds::<u32>(&[1, 2], |kind| {
+            tried.push(kind);
+            Err(ExecutionError::DeviceRefused { required: u64::from(kind), reading: RefusalReading::Host })
+        });
+        assert!(matches!(refused, Err(ExecutionError::DeviceRefused { required: 2, .. })));
+        assert_eq!(tried, vec![1, 2]);
+    }
 
     /// A stored tuning result is valid only for the programs it measured:
     /// the toolchain's material that formed them (Metal's: the OS build and

@@ -153,12 +153,80 @@ template <u32 LANES> __device__ __forceinline__ u32 lanes_mask() {
     return LANES == 32 ? 0xffffffffu : ((1u << LANES) - 1u) << (threadIdx.x % 32u / LANES * LANES);
 }
 
+// Conversion type identity: two bindings with the same (source, destination)
+// representations share one ConversionKey type, so callers can deduplicate
+// identical conversion instantiations at compile time.
+template <class Src, class Dst> struct ConversionKey {};
+
+// Runtime tensor geometry of a binding, decoupled from its compile-time
+// conversion type so one conversion template instantiation serves every tensor
+// that shares that conversion.
+struct Geometry {
+    u64 n, k;
+    u64 source_stride_0, source_stride_1, source_stride_2, source_matrix_bytes;
+    u64 out_stride_0, out_stride_1, out_stride_2, out_row_stride_bytes, out_stride_bytes, out_matrix_bytes,
+        out_row_groups;
+    u64 row_plane[4], row_plane_bytes[4], row_plane_tail[4];
+
+    template <class B> __device__ static __forceinline__ Geometry of(const seismic_words_t &w) {
+        using detail::Role;
+        return Geometry{
+            B::n(w),
+            B::k(w),
+            B::source_stride_0(w),
+            B::source_stride_1(w),
+            B::source_stride_2(w),
+            B::source_matrix_bytes(w),
+            B::out_stride_0(w),
+            B::out_stride_1(w),
+            B::out_stride_2(w),
+            B::out_row_stride_bytes(w),
+            B::out_stride_bytes(w),
+            B::out_matrix_bytes(w),
+            B::out_row_groups(w),
+            {B::row_plane(Role::codes, w), B::row_plane(Role::high, w), B::row_plane(Role::scales, w),
+             B::row_plane(Role::supers, w)},
+            {B::row_plane_bytes(Role::codes, w), B::row_plane_bytes(Role::high, w), B::row_plane_bytes(Role::scales, w),
+             B::row_plane_bytes(Role::supers, w)},
+            {B::row_plane_tail(Role::codes, w), B::row_plane_tail(Role::high, w), B::row_plane_tail(Role::scales, w),
+             B::row_plane_tail(Role::supers, w)},
+        };
+    }
+};
+
+// A binding that reuses `Proto`'s compile-time conversion and element facts
+// while reading tensor dimensions and strides from a runtime `Geometry`.
+template <class Proto> struct RuntimeBinding : Proto {
+    __device__ static __forceinline__ u64 n(const Geometry &g) { return g.n; }
+    __device__ static __forceinline__ u64 k(const Geometry &g) { return g.k; }
+    __device__ static __forceinline__ u64 source_stride_0(const Geometry &g) { return g.source_stride_0; }
+    __device__ static __forceinline__ u64 source_stride_1(const Geometry &g) { return g.source_stride_1; }
+    __device__ static __forceinline__ u64 source_stride_2(const Geometry &g) { return g.source_stride_2; }
+    __device__ static __forceinline__ u64 source_matrix_bytes(const Geometry &g) { return g.source_matrix_bytes; }
+    __device__ static __forceinline__ u64 out_stride_0(const Geometry &g) { return g.out_stride_0; }
+    __device__ static __forceinline__ u64 out_stride_1(const Geometry &g) { return g.out_stride_1; }
+    __device__ static __forceinline__ u64 out_stride_2(const Geometry &g) { return g.out_stride_2; }
+    __device__ static __forceinline__ u64 out_row_stride_bytes(const Geometry &g) { return g.out_row_stride_bytes; }
+    __device__ static __forceinline__ u64 out_stride_bytes(const Geometry &g) { return g.out_stride_bytes; }
+    __device__ static __forceinline__ u64 out_matrix_bytes(const Geometry &g) { return g.out_matrix_bytes; }
+    __device__ static __forceinline__ u64 out_row_groups(const Geometry &g) { return g.out_row_groups; }
+    __device__ static __forceinline__ u64 row_plane(detail::Role role, const Geometry &g) {
+        return g.row_plane[u32(role)];
+    }
+    __device__ static __forceinline__ u64 row_plane_bytes(detail::Role role, const Geometry &g) {
+        return g.row_plane_bytes[u32(role)];
+    }
+    __device__ static __forceinline__ u64 row_plane_tail(detail::Role role, const Geometry &g) {
+        return g.row_plane_tail[u32(role)];
+    }
+};
+
 // Tiles of a matrix: a whole weight's conversion launch. A tile past
 // the stored extent places nothing.
-template <class B> __device__ __forceinline__ u64 tiles_x(const seismic_words_t &seismic_words_value) {
+template <class B, class W = seismic_words_t> __device__ __forceinline__ u64 tiles_x(const W &seismic_words_value) {
     return (B::k(seismic_words_value) + 255) / 256 * (256 / Shape<B>::TILE_COLUMNS);
 }
-template <class B> __device__ __forceinline__ u64 tiles_y(const seismic_words_t &seismic_words_value) {
+template <class B, class W = seismic_words_t> __device__ __forceinline__ u64 tiles_y(const W &seismic_words_value) {
     return (B::n(seismic_words_value) + Shape<B>::TILE_ROWS - 1) / Shape<B>::TILE_ROWS;
 }
 
@@ -166,22 +234,28 @@ template <class B> __device__ __forceinline__ u64 tiles_y(const seismic_words_t 
 // its codes plane (a row's packets' codes after the row before's), then its
 // grid of one scale per tile, a tile row's after the one before's.
 namespace planar {
-template <class B> __device__ __forceinline__ u64 row_packets(const seismic_words_t &seismic_words_value) {
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ u64 row_packets(const W &seismic_words_value) {
     return (B::k(seismic_words_value) + B::group() - 1) / B::group();
 }
-template <class B> __device__ __forceinline__ u64 codes_bytes(const seismic_words_t &seismic_words_value) {
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ u64 codes_bytes(const W &seismic_words_value) {
     return B::n(seismic_words_value) * row_packets<B>(seismic_words_value) * B::code_bytes();
 }
-template <class B> __device__ __forceinline__ u64 grid_columns(const seismic_words_t &seismic_words_value) {
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ u64 grid_columns(const W &seismic_words_value) {
     return (B::k(seismic_words_value) + B::grid_tile_columns() - 1) / B::grid_tile_columns();
 }
-template <class B> __device__ __forceinline__ u64 grid_bytes(const seismic_words_t &seismic_words_value) {
-    return (B::n(seismic_words_value) + B::grid_tile_rows() - 1) / B::grid_tile_rows() * grid_columns<B>(seismic_words_value) *
-           B::scale_bytes();
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ u64 grid_bytes(const W &seismic_words_value) {
+    return (B::n(seismic_words_value) + B::grid_tile_rows() - 1) / B::grid_tile_rows() *
+           grid_columns<B>(seismic_words_value) * B::scale_bytes();
 }
 // The byte of the scale of packet `packet` of row `n` in the grid.
-template <class B> __device__ __forceinline__ u64 scale_at(const seismic_words_t &seismic_words_value, u64 n, u64 packet) {
-    return (n / B::grid_tile_rows() * grid_columns<B>(seismic_words_value) + packet * B::group() / B::grid_tile_columns()) *
+template <class B, class W = seismic_words_t>
+__device__ __forceinline__ u64 scale_at(const W &seismic_words_value, u64 n, u64 packet) {
+    return (n / B::grid_tile_rows() * grid_columns<B>(seismic_words_value) +
+            packet * B::group() / B::grid_tile_columns()) *
            B::scale_bytes();
 }
 } // namespace planar
@@ -192,8 +266,8 @@ template <class B> struct Strided {
     const u8 *source;
 
     // The packet's codes, or its bytes whole of a source of one plane.
-    __device__ __forceinline__ const u8 *packet(const seismic_words_t &seismic_words_value, u64 b, u64 n,
-                                                u64 packet) const {
+    template <class W = seismic_words_t>
+    __device__ __forceinline__ const u8 *packet(const W &seismic_words_value, u64 b, u64 n, u64 packet) const {
         if constexpr (B::planar()) {
             return source + b * B::source_matrix_bytes(seismic_words_value) +
                    (n * planar::row_packets<B>(seismic_words_value) + packet) * B::code_bytes();
@@ -203,7 +277,8 @@ template <class B> struct Strided {
                                 B::source_packet_size();
         }
     }
-    __device__ __forceinline__ u64 row_bytes(const seismic_words_t &seismic_words_value) const {
+    template <class W = seismic_words_t>
+    __device__ __forceinline__ u64 row_bytes(const W &seismic_words_value) const {
         if constexpr (B::planar())
             return planar::row_packets<B>(seismic_words_value) * B::code_bytes();
         else
@@ -211,14 +286,15 @@ template <class B> struct Strided {
     }
     // A planar source's scale of the tile holding packet `packet` of row
     // `n`, in its grid after the matrix's codes.
-    __device__ __forceinline__ const u8 *scale(const seismic_words_t &seismic_words_value, u64 b, u64 n,
-                                               u64 packet) const {
+    template <class W = seismic_words_t>
+    __device__ __forceinline__ const u8 *scale(const W &seismic_words_value, u64 b, u64 n, u64 packet) const {
         return source + b * B::source_matrix_bytes(seismic_words_value) + planar::codes_bytes<B>(seismic_words_value) +
                planar::scale_at<B>(seismic_words_value, n, packet);
     }
     // The bytes between the scales of consecutive rows of a tile: its rows'
     // own where a tile is a row, none where it spans the tile's rows.
-    __device__ __forceinline__ u64 scale_row_bytes(const seismic_words_t &seismic_words_value) const {
+    template <class W = seismic_words_t>
+    __device__ __forceinline__ u64 scale_row_bytes(const W &seismic_words_value) const {
         return B::grid_tile_rows() == 1u ? planar::grid_columns<B>(seismic_words_value) * B::scale_bytes() : 0u;
     }
 };
@@ -226,8 +302,8 @@ template <class B> struct Strided {
 // Addressing of the bound destination tensor: the start of stored row `n`
 // of matrix `b` (a packet layout's row is its packets).
 template <class B> struct Rows {
-    __device__ static __forceinline__ u8 *row(u8 *destination, const seismic_words_t &seismic_words_value, u64 b,
-                                              u64 n) {
+    template <class W = seismic_words_t>
+    __device__ static __forceinline__ u8 *row(u8 *destination, const W &seismic_words_value, u64 b, u64 n) {
         return destination + (b * B::out_stride_0(seismic_words_value) + n * B::out_stride_1(seismic_words_value)) *
                                  B::out_stride_bytes(seismic_words_value);
     }
@@ -355,10 +431,10 @@ __device__ __forceinline__ void store(u8 *out, const u32 *words, u32 bytes, u32 
 // packet `packet` (`occupied` when the tile holds source columns), unit
 // `unit` of the group, read through `source`, staging in `stage`. Lane l
 // computes row l's words.
-template <class B, class A, u32 LANES> struct Tile {
+template <class B, class A, u32 LANES, class W = seismic_words_t> struct Tile {
     typedef Shape<B> S;
     A source;
-    const seismic_words_t &seismic_words_value;
+    const W &seismic_words_value;
     u64 b, row0;
     u32 packet, unit, lane, mask;
     bool occupied;
@@ -445,9 +521,9 @@ template <class B> __device__ __forceinline__ void place_entry(u8 *entries, u32 
 struct Place {
     // ---- packet: the record is the packet form ----------------------------
 
-    template <class B, class O>
+    template <class B, class O, class W = seismic_words_t>
     __device__ static __forceinline__ u8 *destination_packet(u8 *destination,
-                                                             const seismic_words_t &seismic_words_value, u64 b, u64 n,
+                                                             const W &seismic_words_value, u64 b, u64 n,
                                                              u64 packet) {
         return O::row(destination, seismic_words_value, b, n) +
                packet * B::out_stride_2(seismic_words_value) * B::packet_size();
@@ -455,8 +531,8 @@ struct Place {
 
     // Row `lane`'s words [first, first + count) and [second, second + more),
     // staged one after the other from staged word 0.
-    template <class B, class A, u32 LANES>
-    __device__ static __forceinline__ void stage_record(const Tile<B, A, LANES> &tile, const u32 *words, u32 first,
+    template <class B, class A, u32 LANES, class W>
+    __device__ static __forceinline__ void stage_record(const Tile<B, A, LANES, W> &tile, const u32 *words, u32 first,
                                                         u32 count, u32 second, u32 more) {
         typedef Shape<B> S;
         __syncwarp(tile.mask);
@@ -473,8 +549,8 @@ struct Place {
     // every real row into its destination packet (rows out_stride_1 packets
     // apart), coalesced, in copies of `unit` bytes (`copy_unit`); every argument
     // but `low` a constant.
-    template <class B, class A, u32 LANES>
-    __device__ static __forceinline__ void store_bytes(const Tile<B, A, LANES> &tile, u8 *out, u32 slot, u32 bytes,
+    template <class B, class A, u32 LANES, class W>
+    __device__ static __forceinline__ void store_bytes(const Tile<B, A, LANES, W> &tile, u8 *out, u32 slot, u32 bytes,
                                                        u32 unit, u32 low) {
         typedef Shape<B> S;
         const u32 units = bytes / unit, real = tile.real();
@@ -492,9 +568,9 @@ struct Place {
         }
     }
 
-    template <class B, class A, class O, u32 LANES>
+    template <class B, class A, class O, u32 LANES, class W = seismic_words_t>
     __device__ static __forceinline__ void packet_tile(const A &source, u8 *destination,
-                                                       const seismic_words_t &seismic_words_value, u64 b, u32 tile_x,
+                                                       const W &seismic_words_value, u64 b, u32 tile_x,
                                                        u32 tile_y, u32 lane, u32 mask, u32 *shared) {
         typedef Shape<B> S;
         static_assert(S::CODES_END * 4 <= B::packet_size(), "the codes are whole words of a packet");
@@ -504,8 +580,8 @@ struct Place {
         const u64 packets = (B::k(seismic_words_value) + S::GROUP - 1) / S::GROUP;
         if (column0 >= packets * S::GROUP || row0 >= B::n(seismic_words_value)) return;
         const u32 packet = column0 / S::GROUP;
-        const Tile<B, A, LANES> tile{source, seismic_words_value, b, row0, packet, column0 % S::GROUP / S::TILE_COLUMNS,
-                                     lane, mask, true, shared};
+        const Tile<B, A, LANES, W> tile{source, seismic_words_value, b, row0, packet,
+                                        column0 % S::GROUP / S::TILE_COLUMNS, lane, mask, true, shared};
         u8 *out = destination_packet<B, O>(destination, seismic_words_value, b, row0, packet);
         u32 words[S::WORDS], loaded[S::FIXED_LOADS];
         tile.fixed_load(loaded);
@@ -527,8 +603,8 @@ struct Place {
 
     // Row `row`'s alignment tail of `role`'s plane: from its end to the next
     // plane's start (or the row's end).
-    template <class B>
-    __device__ static __forceinline__ void zero_tail(u8 *row, Role role, const seismic_words_t &seismic_words_value) {
+    template <class B, class W = seismic_words_t>
+    __device__ static __forceinline__ void zero_tail(u8 *row, Role role, const W &seismic_words_value) {
         zero_bytes(row + B::row_plane(role, seismic_words_value) + B::row_plane_bytes(role, seismic_words_value),
                    B::row_plane_tail(role, seismic_words_value));
     }
@@ -541,9 +617,9 @@ struct Place {
     // group's factors are in lane order too (`B::record_factor`). A unit's words
     // are two entries each.
 
-    template <class B, class A, class O, u32 LANES>
+    template <class B, class A, class O, u32 LANES, class W = seismic_words_t>
     __device__ static __forceinline__ void records_tile(const A &source, u8 *destination,
-                                                        const seismic_words_t &seismic_words_value, u64 b, u32 tile_x,
+                                                        const W &seismic_words_value, u64 b, u32 tile_x,
                                                         u32 tile_y, u32 lane, u32 mask, u32 *shared) {
         typedef Shape<B> S;
         constexpr u64 ENTRY_BYTES = B::records_entry_bytes();
@@ -564,9 +640,9 @@ struct Place {
         const u64 stored_rows = (B::n(seismic_words_value) + S::MMA_ROWS - 1) / S::MMA_ROWS * S::MMA_ROWS;
         if (column0 >= stored_columns || row0 >= stored_rows) return;
         const u64 rows = min(u64(S::TILE_ROWS), stored_rows - row0);
-        const Tile<B, A, LANES> tile{source, seismic_words_value, b, row0, column0 / S::GROUP,
-                                     column0 % S::GROUP / S::TILE_COLUMNS, lane, mask,
-                                     column0 < packets * S::GROUP, shared};
+        const Tile<B, A, LANES, W> tile{source, seismic_words_value, b, row0, column0 / S::GROUP,
+                                        column0 % S::GROUP / S::TILE_COLUMNS, lane, mask,
+                                        column0 < packets * S::GROUP, shared};
         // Row `lane`'s mma16 tile.
         u8 *mma = O::row(destination, seismic_words_value, b, row0 + lane - lane % S::MMA_ROWS);
         const u32 r = lane % S::MMA_ROWS;
@@ -605,8 +681,8 @@ struct Place {
     // Destination of byte `position` of an mma16 tile's code-plane sequence V:
     // the tile's rows' plane payloads (`row_bytes` each) concatenated in row
     // order.
-    template <class O>
-    __device__ static __forceinline__ u8 *tile_plane_byte(u8 *destination, const seismic_words_t &seismic_words_value,
+    template <class O, class W = seismic_words_t>
+    __device__ static __forceinline__ u8 *tile_plane_byte(u8 *destination, const W &seismic_words_value,
                                                           u64 b, u64 tile_row0, u64 position, u64 row_bytes,
                                                           u64 offset) {
         return O::row(destination, seismic_words_value, b, tile_row0 + position / row_bytes) + offset +
@@ -619,8 +695,8 @@ struct Place {
     // (`PackedRowLayout::code_bit`): slot `j` of a step holds the code of
     // (`B::fragment_row`, `B::fragment_column`) at bit `bits` j, stored in units
     // of `unit`.
-    template <class B, class A, class O, u32 LANES>
-    __device__ static __forceinline__ void place_fragments(const Tile<B, A, LANES> &tile, u8 *destination, u64 rows,
+    template <class B, class A, class O, u32 LANES, class W>
+    __device__ static __forceinline__ void place_fragments(const Tile<B, A, LANES, W> &tile, u8 *destination, u64 rows,
                                                            u32 column0, const u32 *staged, u32 bits, u32 at, u64 offset,
                                                            u64 row_bytes, u32 unit) {
         typedef Shape<B> S;
@@ -646,9 +722,9 @@ struct Place {
         }
     }
 
-    template <class B, class A, class O, u32 LANES>
+    template <class B, class A, class O, u32 LANES, class W = seismic_words_t>
     __device__ static __forceinline__ void planes_tile(const A &source, u8 *destination,
-                                                       const seismic_words_t &seismic_words_value, u64 b, u32 tile_x,
+                                                       const W &seismic_words_value, u64 b, u32 tile_x,
                                                        u32 tile_y, u32 lane, u32 mask, u32 *shared) {
         typedef Shape<B> S;
         static_assert(!S::FRAGMENTS || (32 % S::CODES_WORDS == 0 && (S::HIGH_WORDS == 0 || 32 % S::HIGH_WORDS == 0)),
@@ -666,9 +742,9 @@ struct Place {
                                     : B::n(seismic_words_value);
         if (column0 >= stored_columns || row0 >= stored_rows) return;
         const u64 rows = min(u64(S::TILE_ROWS), stored_rows - row0);
-        const Tile<B, A, LANES> tile{source, seismic_words_value, b, row0, column0 / S::GROUP,
-                                     column0 % S::GROUP / S::TILE_COLUMNS, lane, mask,
-                                     column0 < packets * S::GROUP, shared};
+        const Tile<B, A, LANES, W> tile{source, seismic_words_value, b, row0, column0 / S::GROUP,
+                                        column0 % S::GROUP / S::TILE_COLUMNS, lane, mask,
+                                        column0 < packets * S::GROUP, shared};
         u8 *row = O::row(destination, seismic_words_value, b, row0 + lane);
         u32 words[S::WORDS], loaded[S::FIXED_LOADS];
         tile.fixed_load(loaded);
@@ -774,9 +850,9 @@ struct Place {
 // warp, or a share of it that places a tile of its own, `Shape::WARP_TILES`),
 // staging in their `shared` (`Shape::SHARED_WORDS` words). A tile outside the
 // matrix's stored extent places nothing.
-template <class B, class A = Strided<B>, class O = Rows<B>, u32 LANES = 32>
+template <class B, class A = Strided<B>, class O = Rows<B>, u32 LANES = 32, class W = seismic_words_t>
 __device__ __forceinline__ void convert_tile(const A &source, u8 *destination,
-                                             const seismic_words_t &seismic_words_value, u64 b, u32 tile_x, u32 tile_y,
+                                             const W &seismic_words_value, u64 b, u32 tile_x, u32 tile_y,
                                              u32 lane, u32 *shared) {
     typedef Shape<B> S;
     static_assert(S::TILE_ROWS % (B::packet() ? 1u : S::MMA_ROWS) == 0, "a row tile holds whole mma16 tiles");
@@ -832,6 +908,9 @@ __device__ __forceinline__ void convert_tile(const A &source, u8 *destination,
 
 #define REPACK_BINDING(Name, C, S, D, DIM_N, DIM_K)                                                         \
     struct Name {                                                                                           \
+        typedef repack::ConversionKey<struct ELEMENT_CAT(repack_rep_, ELEMENT_CAT(S, _REPRESENTATION)),     \
+                                      struct ELEMENT_CAT(repack_rep_, ELEMENT_CAT(D, _REPRESENTATION))>     \
+            Conversion;                                                                                     \
         /* The elements. */                                                                                 \
         __host__ __device__ static constexpr bool converts() {                                              \
             return ELEMENT_PICK(ELEMENT_IS_ONE(C))(true, false);                                             \

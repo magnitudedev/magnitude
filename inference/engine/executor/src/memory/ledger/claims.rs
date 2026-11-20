@@ -4,7 +4,7 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use super::admission::{Over, Short};
+use super::admission::{AdmitPolicy, Over, Reclaim, Short};
 use super::changes::{Claiming, Keeping};
 use super::charges::Holder;
 use super::estimate::Estimate;
@@ -61,6 +61,8 @@ impl ArenaClaim {
 pub struct Cached {
     record: Holder,
     kind: CacheKind,
+    #[cfg(test)]
+    pub(super) _reclaimer: Option<Arc<dyn super::admission::CacheReclaimer>>,
 }
 
 impl Ledger {
@@ -78,7 +80,14 @@ impl Ledger {
     pub fn claim_at(&self, claiming: &Claiming, held: Option<&Estimate>, kind: CommittedKind, bytes: u64) -> Result<Claim, Short> {
         claiming.of_scope(&self.store.changes);
         assert!(!matches!(kind, CommittedKind::Request(_) | CommittedKind::Grant(_)), "a {kind:?} claim is taken by its own path");
-        let id = self.state().take_in(&self.store.identity, held.map(|held| held.read), kind, bytes)?;
+        let id = self.admit_or_reclaim(AdmitPolicy {
+            at: held.map(|held| held.read),
+            kind,
+            bytes,
+            of: |_| true,
+            within_boundary: false,
+            allow_guarantee: true,
+        })?;
         Ok(Claim::held(self.clone(), id, kind))
     }
 
@@ -106,7 +115,7 @@ impl Ledger {
     /// For a request's state, which is reserved by its own path.
     pub fn claim_units(&self, claiming: &Claiming, kind: CommittedKind, unit: NonZeroU64, most: u64) -> (Claim, u64) {
         claiming.of_scope(&self.store.changes);
-        let (id, units) = self.state().take_units(&self.store.identity, kind, unit, most);
+        let (id, units) = self.admit_units(kind, unit, most);
         (Claim::held(self.clone(), id, kind), units)
     }
 
@@ -117,32 +126,52 @@ impl Ledger {
     /// first; its own entry ([`Cached::entry`]) otherwise. Refused where
     /// free room is short of them. Free room is the budget less everything
     /// held; the bank's target subtracts the guarantee before it asks.
-    pub fn cache(&self, kind: CacheKind, bytes: u64) -> Result<Cached, Short> {
+    pub fn cache(&self, kind: CacheKind, bytes: u64, reclaim: Reclaim) -> Result<Cached, Short> {
         let mut state = self.state();
         let room = state.room_for(&self.store.identity, Holding::Cache(kind), bytes);
         if room < bytes {
             return Err(Over { bytes: bytes - room }.of(&self.store.identity, bytes));
         }
         let id = state.insert(Holding::Cache(kind), bytes);
+        state.reclaim.insert(id, reclaim);
         drop(state);
-        Ok(Cached { record: Holder::new(self.clone(), id), kind })
+        Ok(Cached {
+            record: Holder::new(self.clone(), id),
+            kind,
+            #[cfg(test)]
+            _reclaimer: None,
+        })
     }
 
-    /// Hold `bytes` of free room as a [`CommittedKind::Backing`] claim in
-    /// `class`'s pool: a bank's growth or a state store's, whose slots the
-    /// pool backs as it goes, charging its blocks to the pool's entry, and
-    /// cache once it ends ([`Claim::into_backed_cache`]). Refused as
-    /// [`Self::cache`] refuses.
+    /// Hold `bytes` as a [`CommittedKind::Backing`] claim in `class`'s pool:
+    /// a bank's growth or a state store's, whose slots the pool backs as it
+    /// goes, charging its blocks to the pool's entry, and cache once it ends
+    /// ([`Claim::into_backed_cache`]). State slab backing (`PoolClass::State`)
+    /// reclaims cache (including bank slots above floor) synchronously so
+    /// physical memory is freed before the pool allocates; bank growth
+    /// (`PoolClass::Records`) draws only on free room, its own spare granules,
+    /// and worthless cache without cannibalizing bank cache or the guarantee.
     pub fn backing(&self, claiming: &Claiming, class: PoolClass, bytes: u64) -> Result<Claim, Short> {
         claiming.of_scope(&self.store.changes);
         let kind = CommittedKind::Backing(class);
-        let mut state = self.state();
-        let room = state.room_for(&self.store.identity, Holding::Committed(kind), bytes);
-        if room < bytes {
-            return Err(Over { bytes: bytes - room }.of(&self.store.identity, bytes));
-        }
-        let id = state.insert(Holding::Committed(kind), bytes);
-        drop(state);
+        let id = match class {
+            PoolClass::State => self.admit_or_reclaim(AdmitPolicy {
+                at: None,
+                kind,
+                bytes,
+                of: |_| true,
+                within_boundary: false,
+                allow_guarantee: true,
+            })?,
+            PoolClass::Records => self.admit_or_reclaim(AdmitPolicy {
+                at: None,
+                kind,
+                bytes,
+                of: |ck: CacheKind| !ck.valued(),
+                within_boundary: false,
+                allow_guarantee: false,
+            })?,
+        };
         Ok(Claim::held(self.clone(), id, kind))
     }
 }
@@ -211,10 +240,11 @@ impl Claim {
     }
 
     /// The backing ended: the claim's bytes, the granules the pool backed
-    /// for it, are cache of `kind` ([`Self::into_cache`]).
-    pub fn into_backed_cache(self, kind: CacheKind) -> Cached {
+    /// for it, are cache of `kind` with reclamation policy `reclaim`
+    /// ([`Self::into_cache`]).
+    pub fn into_backed_cache(self, kind: CacheKind, reclaim: Reclaim) -> Cached {
         assert!(matches!(self.kind, CommittedKind::Backing(_)), "invariant violated: a {:?} claim ends as a backing", self.kind);
-        self.into_cache(kind)
+        self.into_cache(kind, reclaim)
     }
 
     /// Split off `bytes` of it, none allocated, as a records
@@ -243,7 +273,7 @@ impl Claim {
     /// # Panics
     /// Where it is not allocated whole: cache is memory the process holds.
     /// A pooled claim's granules are allocated by the pool.
-    pub fn into_cache(self, kind: CacheKind) -> Cached {
+    pub fn into_cache(self, kind: CacheKind, reclaim: Reclaim) -> Cached {
         let Claim { record, .. } = self;
         let mut state = record.ledger.state();
         let entry = *state.entry(record.id);
@@ -254,9 +284,18 @@ impl Claim {
             entry.allocated,
             entry.bytes
         );
+        if matches!(reclaim, Reclaim::Unbacked) {
+            assert_eq!(entry.allocated, 0, "invariant violated: Reclaim::Unbacked cache holds {} allocated bytes", entry.allocated);
+        }
         state.turn(record.id, Holding::Cache(kind));
+        state.reclaim.insert(record.id, reclaim);
         drop(state);
-        Cached { record, kind }
+        Cached {
+            record,
+            kind,
+            #[cfg(test)]
+            _reclaimer: None,
+        }
     }
 }
 
@@ -273,20 +312,20 @@ impl Keeping<'_> {
     /// # Panics
     /// Where the change claims already ([`Keeping::may_keep`]).
     pub fn keep(&self, holding: Vec<Cached>, kind: CommittedKind) -> Result<Vec<Claim>, Vec<Cached>> {
-        let mut kept: Vec<(Claim, CacheKind)> = Vec::with_capacity(holding.len());
+        let mut kept: Vec<(Claim, CacheKind, Reclaim)> = Vec::with_capacity(holding.len());
         let mut holding = holding.into_iter();
         while let Some(cached) = holding.next() {
             self.may_keep(&cached.ledger().store.changes);
             let was = cached.kind;
             match cached.commit(kind) {
-                Ok(claim) => kept.push((claim, was)),
+                Ok((claim, reclaim)) => kept.push((claim, was, reclaim)),
                 Err(taken) => {
-                    let cached = kept.into_iter().map(|(claim, was)| claim.into_cache(was)).chain([taken]).chain(holding).collect();
+                    let cached = kept.into_iter().map(|(claim, was, reclaim)| claim.into_cache(was, reclaim)).chain([taken]).chain(holding).collect();
                     return Err(cached);
                 }
             }
         }
-        Ok(kept.into_iter().map(|(claim, _)| claim).collect())
+        Ok(kept.into_iter().map(|(claim, _, _)| claim).collect())
     }
 }
 
@@ -295,7 +334,7 @@ impl Cached {
         &self.record.ledger
     }
 
-    fn id(&self) -> EntryId {
+    pub(super) fn id(&self) -> EntryId {
         self.record.id
     }
 
@@ -319,7 +358,7 @@ impl Cached {
 
     /// The holding committed of `kind` in place ([`Keeping::keep`]), or
     /// returned as it is where claims took some of it in process.
-    fn commit(self, kind: CommittedKind) -> Result<Claim, Cached> {
+    fn commit(self, kind: CommittedKind) -> Result<(Claim, Reclaim), Cached> {
         let mut state = self.ledger().state();
         let entry = *state.entry(self.id());
         if entry.releasing > 0 || (!entry.holding.pooled() && entry.allocated != entry.bytes) {
@@ -327,8 +366,9 @@ impl Cached {
             return Err(self);
         }
         state.turn(self.id(), Holding::Committed(kind));
+        let reclaim = state.reclaim.remove(&self.id()).unwrap_or(Reclaim::Deferred);
         drop(state);
-        Ok(Claim { record: self.record, kind })
+        Ok((Claim { record: self.record, kind }, reclaim))
     }
 
     /// What it is worth per byte now, as its holder measures it: it yields
@@ -389,7 +429,15 @@ impl Cached {
         let rest = entry.bytes.checked_sub(bytes).expect("a split takes no more than the holding has");
         state.resize(self.id(), rest);
         let id = state.insert(Holding::Cache(kind), bytes);
+        if let Some(reclaim) = state.reclaim.get(&self.id()).cloned() {
+            state.reclaim.insert(id, reclaim);
+        }
         drop(state);
-        Cached { record: Holder::new(self.ledger().clone(), id), kind }
+        Cached {
+            record: Holder::new(self.ledger().clone(), id),
+            kind,
+            #[cfg(test)]
+            _reclaimer: None,
+        }
     }
 }

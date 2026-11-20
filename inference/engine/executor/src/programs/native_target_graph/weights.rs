@@ -692,12 +692,9 @@ pub(crate) fn landed_read<'a, G: GraphDraft + 'a, T>(
     class: Option<&'static str>,
     reader: impl FnOnce(&mut G) -> Result<T, GraphError>,
 ) -> Result<(T, LandedReadPorts), GraphError> {
-    let port = |graph: &mut G, element, extents: &[&Dim], axis| match class {
-        Some(dimension) => graph.port_with_class_extent(element, extents, axis, dimension),
-        None => graph.port(element, extents),
-    };
+    let _ = class;
     let two = Dim::from(2);
-    let mut notice = port(graph, Element::i32(), &[rows, &two], 0)?;
+    let mut notice = graph.port(Element::i32(), &[rows, &two])?;
     graph.enqueue::<selection_notice::Entry>(
         landing.notice,
         &[("M", rows)],
@@ -711,8 +708,8 @@ pub(crate) fn landed_read<'a, G: GraphDraft + 'a, T>(
     // The import's `[B, N, K]` view of the landing rows.
     let width = plan.shape.get(1).ok_or_else(|| format!("landed table {:?} is not a matrix", plan.role))?;
     let one = Dim::from(1);
-    let staging = port(graph, plan.upload, &[&one, rows, width], 1)?;
-    let landed = port(graph, plan.resident, &[&one, rows, width], 1)?;
+    let staging = graph.port(plan.upload, &[&one, rows, width])?;
+    let landed = graph.port(plan.resident, &[&one, rows, width])?;
     let dimensions = [("B", &one), ("N", rows), ("K", width)];
     let converted = match landing.import {
         LandingImport::Dense(entry) => {

@@ -58,6 +58,14 @@ pub struct FormationTarget {
     /// subgroup operation after a lane-varying loop, and the seal pass
     /// declares `MaximallyReconvergesKHR` on every module that relies on it.
     pub maximal_reconvergence: bool,
+    /// Merge early returns in modules declaring `MaximallyReconvergesKHR`
+    /// (`DeadBranchElim` + `MergeReturn`): set on `vk::DriverId::AMD_PROPRIETARY`
+    /// (Windows `amdvlk64.dll` 32.0.31019.6049 / driver `26.10.19.06 (LLPC)`)
+    /// where `spirv-val`-valid modules with early returns and maximal
+    /// reconvergence crash `vkCreateComputePipelines`, and false elsewhere
+    /// (including `AMD_OPEN_SOURCE` and NVIDIA, where `MergeReturn` regressed
+    /// `attention_decode_k8v4` by +17.67%).
+    pub merge_maximal_reconvergence_returns: bool,
 }
 
 impl FormationTarget {
@@ -80,15 +88,17 @@ impl FormationTarget {
         denorm_preserve_32: false,
         subgroup_uniform_control_flow: true,
         maximal_reconvergence: false,
+        merge_maximal_reconvergence_returns: false,
     };
 
     /// The target a device with `properties` forms in. The cooperative-
     /// matrix path needs fp16 arithmetic and 32-lane hardware subgroups, and
     /// is formed only where `matrix_path` ([`DeviceInfo::matrix_path`]).
-    pub fn of(properties: &Properties, matrix_path: bool) -> Self {
+    pub fn of(properties: &Properties, matrix_path: bool, merge_maximal_reconvergence_returns: bool) -> Self {
         let subgroup_lanes = u32::try_from(properties.subgroup_width.get()).expect("a subgroup's lanes fit u32");
         let float16 = properties.float16.holds();
         let matrix_hardware = properties.matrix.holds() && float16 && subgroup_lanes == SUBGROUP_WIDTH;
+        let maximal_reconvergence = properties.maximal_reconvergence.holds();
         Self {
             subgroup_lanes,
             float16,
@@ -101,7 +111,8 @@ impl FormationTarget {
             rounding_rte_32: properties.rounding_rte_32.holds(),
             denorm_preserve_32: properties.denorm_preserve_32.holds(),
             subgroup_uniform_control_flow: properties.subgroup_uniform_control_flow.holds(),
-            maximal_reconvergence: properties.maximal_reconvergence.holds(),
+            maximal_reconvergence,
+            merge_maximal_reconvergence_returns: maximal_reconvergence && merge_maximal_reconvergence_returns,
         }
     }
 
@@ -112,6 +123,7 @@ impl FormationTarget {
         matches!(self.subgroup_lanes, 32 | 64)
             && (!self.matrix_hardware || (self.float16 && self.subgroup_lanes == SUBGROUP_WIDTH))
             && (!self.matrix || self.matrix_hardware)
+            && (!self.merge_maximal_reconvergence_returns || self.maximal_reconvergence)
     }
 
     /// The target as it enters the formation identity: every field by name
@@ -131,12 +143,14 @@ impl FormationTarget {
             denorm_preserve_32,
             subgroup_uniform_control_flow,
             maximal_reconvergence,
+            merge_maximal_reconvergence_returns,
         } = *self;
         format!(
             "subgroup_lanes={subgroup_lanes};float16={float16};matrix={matrix};matrix_hardware={matrix_hardware};wide_accumulators={wide_accumulators};\
              mixed_dot={mixed_dot};f32_atomic_add={f32_atomic_add};shared_int64_atomics={shared_int64_atomics};\
              rounding_rte_32={rounding_rte_32};denorm_preserve_32={denorm_preserve_32};\
-             subgroup_uniform_control_flow={subgroup_uniform_control_flow};maximal_reconvergence={maximal_reconvergence}"
+             subgroup_uniform_control_flow={subgroup_uniform_control_flow};maximal_reconvergence={maximal_reconvergence};\
+             merge_maximal_reconvergence_returns={merge_maximal_reconvergence_returns}"
         )
     }
 
@@ -148,6 +162,7 @@ impl FormationTarget {
             denorm_preserve_32: self.denorm_preserve_32,
             subgroup_uniform_control_flow: self.subgroup_uniform_control_flow,
             maximal_reconvergence: self.maximal_reconvergence,
+            merge_maximal_reconvergence_returns: self.merge_maximal_reconvergence_returns,
         }
     }
 
@@ -167,6 +182,7 @@ impl FormationTarget {
             denorm_preserve_32,
             subgroup_uniform_control_flow,
             maximal_reconvergence,
+            merge_maximal_reconvergence_returns,
         } = *self;
         let other_lanes = if subgroup_lanes == SUBGROUP_WIDTH {
             2 * SUBGROUP_WIDTH
@@ -220,6 +236,10 @@ impl FormationTarget {
             },
             Self {
                 maximal_reconvergence: !maximal_reconvergence,
+                ..*self
+            },
+            Self {
+                merge_maximal_reconvergence_returns: !merge_maximal_reconvergence_returns,
                 ..*self
             },
         ]
@@ -526,7 +546,8 @@ impl DeviceInfo {
 
     /// The target this device, of `properties`, forms in.
     pub fn formation(&self, properties: &Properties) -> FormationTarget {
-        let target = FormationTarget::of(properties, self.matrix_path);
+        let merge_returns = self.driver_id == vk::DriverId::AMD_PROPRIETARY.as_raw();
+        let target = FormationTarget::of(properties, self.matrix_path, merge_returns);
         assert!(
             target.consistent(),
             "device properties produced an inconsistent formation target: {target:?}"
@@ -744,20 +765,10 @@ pub(crate) fn describe(
     unsafe { raw.get_physical_device_features2(physical, &mut features) };
     let core = features.features;
     let families = unsafe { raw.get_physical_device_queue_family_properties(physical) };
-    let compute_only = families.iter().position(|family| {
-        family.queue_flags.contains(vk::QueueFlags::COMPUTE)
-            && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-            && family.timestamp_valid_bits > 0
-    });
-    let universal = families.iter().position(|family| {
-        family.queue_flags.contains(vk::QueueFlags::COMPUTE) && family.timestamp_valid_bits > 0
-    });
-    let queue_family = compute_only.or(universal);
-    let transfer_only = families.iter().position(|family| {
-        family.queue_flags.contains(vk::QueueFlags::TRANSFER)
-            && !family.queue_flags.intersects(vk::QueueFlags::COMPUTE | vk::QueueFlags::GRAPHICS)
-    });
-    let side_family = transfer_only.or(queue_family.filter(|&family| families[family].queue_count > 1)).map(|family| family as u32);
+    let (queue_family, dedicated_compute_queue, side_family) = select_queue_families(
+        &families,
+        v12.driver_id == vk::DriverId::MESA_RADV,
+    );
 
     let memory = memory_layout(&unsafe { raw.get_physical_device_memory_properties(physical) });
     let device_type = match base.device_type {
@@ -824,7 +835,7 @@ pub(crate) fn describe(
                 .map_or(0, |family| families[family].timestamp_valid_bits),
         },
         queue_family: queue_family.map_or(0, |family| family as u32),
-        dedicated_compute_queue: compute_only.is_some(),
+        dedicated_compute_queue,
         queue_count: queue_family.map_or(0, |family| families[family].queue_count),
         side_family,
         pipeline_statistics: executables.pipeline_executable_info == vk::TRUE,
@@ -901,6 +912,47 @@ pub(crate) fn describe(
         info,
         floor,
     })
+}
+
+/// Select the primary compute queue family and optional side transfer/zeroing
+/// queue family.
+///
+/// Most devices prefer a dedicated compute-only family (avoiding contention
+/// with desktop graphics), falling back to a universal family. Under Mesa RADV
+/// (`prefer_universal_compute = true`), AMDGPU's MES async-compute rings
+/// (`comp_*`) suffer timeouts and GPUVM faults across RDNA3 hardware, while
+/// the universal family (`gfx_0.0.0`) runs compute on the same CUs at full
+/// throughput; the compute-only family (when distinct) is used as `side_family`
+/// for transfer/fill commands (`vkCmdCopyBuffer` / `vkCmdFillBuffer`).
+fn select_queue_families(
+    families: &[vk::QueueFamilyProperties],
+    prefer_universal_compute: bool,
+) -> (Option<usize>, bool, Option<u32>) {
+    let compute_only = families.iter().position(|family| {
+        family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+            && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            && family.timestamp_valid_bits > 0
+    });
+    let universal = families.iter().position(|family| {
+        family.queue_flags.contains(vk::QueueFlags::COMPUTE) && family.timestamp_valid_bits > 0
+    });
+    let queue_family = if prefer_universal_compute {
+        universal.or(compute_only)
+    } else {
+        compute_only.or(universal)
+    };
+    let dedicated_compute_queue = queue_family.is_some() && queue_family == compute_only;
+    let transfer_only = families.iter().position(|family| {
+        family.queue_flags.contains(vk::QueueFlags::TRANSFER)
+            && !family
+                .queue_flags
+                .intersects(vk::QueueFlags::COMPUTE | vk::QueueFlags::GRAPHICS)
+    });
+    let side_family = transfer_only
+        .or(compute_only.filter(|&family| Some(family) != queue_family))
+        .or(queue_family.filter(|&family| families[family].queue_count > 1))
+        .map(|family| family as u32);
+    (queue_family, dedicated_compute_queue, side_family)
 }
 
 /// The heaps and types of `properties`, in the driver's order.
@@ -1009,5 +1061,29 @@ mod tests {
         assert_eq!(allocation.host, vec![3, 1]);
         assert_eq!(allocation.staging, Some(3));
         assert_eq!(allocation.device_heaps, vec![0]);
+    }
+
+    #[test]
+    fn radv_uses_universal_compute_queue_and_compute_only_side_queue() {
+        let families = [
+            vk::QueueFamilyProperties::default()
+                .queue_flags(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER)
+                .queue_count(1)
+                .timestamp_valid_bits(64),
+            vk::QueueFamilyProperties::default()
+                .queue_flags(vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER)
+                .queue_count(4)
+                .timestamp_valid_bits(64),
+        ];
+        assert_eq!(
+            select_queue_families(&families, true),
+            (Some(0), false, Some(1)),
+            "Mesa RADV should use universal queue 0 for compute and compute-only family 1 as side queue"
+        );
+        assert_eq!(
+            select_queue_families(&families, false),
+            (Some(1), true, Some(1)),
+            "non-RADV drivers should keep preferring compute-only family 1"
+        );
     }
 }

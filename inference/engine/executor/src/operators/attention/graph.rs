@@ -509,9 +509,9 @@ impl CheckedAttentionEntries {
             project: [
                 ("NW", binding.norm),
                 ("QW", binding.query_segment()),
-                ("GW", binding.gate),
-                ("KW", binding.key),
-                ("VW", binding.value),
+                ("GW", binding.gate_segment()),
+                ("KW", binding.key_segment()),
+                ("VW", binding.value_segment()),
                 ("A", binding.activation),
                 ("Y", binding.activation),
             ],
@@ -2821,30 +2821,34 @@ mod tests {
     #[test]
     fn decode_classes_attend_with_the_decode_entry_where_it_holds_them() {
         use seismic::{BackendName, DType};
-        let binding = |shape| AttentionBinding {
-            shape,
-            key_value_only: false,
-            norm: Element::bf16(),
-            query: Element::bf16(),
-            low_rank_query: None,
-            gate: Element::bf16(),
-            key: Element::bf16(),
-            value: Element::bf16(),
-            output: Element::bf16(),
-            activation: Element::bf16(),
-            history: match shape.form.values {
-                AttentionValues::StoredKey => {
-                    CodecSpec::stored_key(DType::BF16, shape.widths.width as usize)
-                }
-                AttentionValues::Projected | AttentionValues::RawKey => {
-                    CodecSpec::dense(DType::BF16, shape.widths.width as usize, shape.widths.width as usize)
-                }
-            },
-            tail: SublayerTail::Residual,
-            selection: None,
-            grouped: None,
-            absorbed: None,
-            picked: None,
+        let binding = |shape: AttentionShape| {
+            AttentionBinding::new(
+                shape,
+                false,
+                Element::bf16(),
+                Element::bf16(),
+                None,
+                (shape.gate_rows() > 0).then_some(Element::bf16()),
+                (shape.key_rows() > 0).then_some(Element::bf16()),
+                (shape.value_rows() > 0).then_some(Element::bf16()),
+                Element::bf16(),
+                Element::bf16(),
+                match shape.form.values {
+                    AttentionValues::StoredKey => {
+                        CodecSpec::stored_key(DType::BF16, shape.widths.width as usize)
+                    }
+                    AttentionValues::Projected | AttentionValues::RawKey => CodecSpec::dense(
+                        DType::BF16,
+                        shape.widths.width as usize,
+                        shape.widths.width as usize,
+                    ),
+                },
+                SublayerTail::Residual,
+                None,
+                None,
+                None,
+                None,
+            )
         };
         let v41 = AttentionShape {
             form: AttentionForm {

@@ -1113,7 +1113,7 @@ pub(super) fn binding(
         }
     };
     let query = projection(query_kind(attention))?;
-    let segment = |present: bool, kind| if present { projection(kind) } else { Ok(query) };
+    let segment = |present: bool, kind| present.then(|| projection(kind)).transpose();
     let selection = selected_read(&attention.fresh().reads)?
         .map(|read| {
             let gate = match read.keys.pool {
@@ -1152,19 +1152,21 @@ pub(super) fn binding(
             "a rounded or index-list layer's history planned other than dense",
         ));
     }
-    Ok(AttentionBinding {
-        selection,
-        picked,
-        key_value_only: false,
+    Ok(AttentionBinding::new(
         shape,
-        norm: lookup(WeightKind::InputNorm)?,
+        false,
+        lookup(WeightKind::InputNorm)?,
         query,
         low_rank_query,
-        gate: segment(shape.gate_rows() > 0, WeightKind::AttentionGate)?,
-        key: segment(shape.key_rows() > 0, WeightKind::Key)?,
-        value: segment(shape.value_rows() > 0, WeightKind::Value)?,
-        output: projection(WeightKind::AttentionOutput)?,
-        grouped: grouped_output(attention)
+        segment(shape.gate_rows() > 0, WeightKind::AttentionGate)?,
+        segment(shape.key_rows() > 0, WeightKind::Key)?,
+        segment(shape.value_rows() > 0, WeightKind::Value)?,
+        projection(WeightKind::AttentionOutput)?,
+        activation,
+        history,
+        tail(output, &lookup)?,
+        selection,
+        grouped_output(attention)
             .map(|shape| {
                 Ok::<_, PlanError>(GroupedOutputBinding {
                     shape,
@@ -1172,7 +1174,7 @@ pub(super) fn binding(
                 })
             })
             .transpose()?,
-        absorbed: absorbed
+        absorbed
             .map(|shape| {
                 Ok::<_, PlanError>(AbsorbedQueryBinding {
                     shape,
@@ -1180,10 +1182,8 @@ pub(super) fn binding(
                 })
             })
             .transpose()?,
-        activation,
-        history,
-        tail: tail(output, &lookup)?,
-    })
+        picked,
+    ))
 }
 
 /// The history codec `attention` reads under the storage policy `history`
@@ -1677,6 +1677,113 @@ pub(crate) mod tests {
                     backend != BackendName::Cuda,
                     "{backend:?}"
                 );
+                let state = ResourcePlanner::state_plan(
+                    &definition,
+                    &load,
+                    PlannedMethod::Plain,
+                    codec,
+                    limits,
+                    ResourceCapacity {
+                        domain_bytes: 16 * 1024 * 1024 * 1024,
+                        tensor_operations: crate::TensorOperations::Absent,
+                        allocations: seismic::NativeAllocations::EXACT,
+                    },
+                )
+                .unwrap();
+                let certified = checked_target_family_storage(
+                    backend,
+                    &load,
+                    &definition.decoder,
+                    &state,
+                    plan.target(),
+                    limits,
+                );
+                certified.unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+            }
+        }
+
+        /// When a low-rank query's `down` weight (`QueryDown`, the projection's
+        /// query segment) carries a different element from its `up` weight
+        /// (`Query`), absent `gate`, `key`, and `value` segments resolve to
+        /// `query_segment()` (not `query`) so `attention_project` typechecks
+        /// its zero-row views of `QueryDown` on every backend.
+        #[test]
+        fn mixed_quant_low_rank_query_absent_segments_bind_query_segment() {
+            let (mut definition, mut manifest) = selected(true, false);
+            // Block 0 has an absent gate and present key/value; block 1 shares
+            // block 0's history so gate, key, and value are all absent.
+            let Operator::Attention(block0) = &mut definition.decoder.blocks[0].sublayers[0].op
+            else {
+                unreachable!("each block opens with attention");
+            };
+            block0.history[0].reads = HistoryReads::Visible;
+
+            let Operator::Attention(block1) = &mut definition.decoder.blocks[1].sublayers[0].op
+            else {
+                unreachable!("each block opens with attention");
+            };
+            block1.history = vec![HistorySource::visible(HistoryRows::Shared {
+                source: SublayerIndex {
+                    block: 0,
+                    sublayer: 0,
+                },
+                part: 0,
+            })];
+            definition.validate().unwrap();
+            // Give `QueryDown` (`attn_q_a`) a different quantization from
+            // `Query` (`attn_q_b`, BF16), as in mixed-quant GGUFs.
+            let mut offset = 0;
+            for descriptor in &mut manifest.target.tensors {
+                if descriptor.name.ends_with(".attn_q_a") {
+                    descriptor.encoding = Encoding::Q8_0;
+                    descriptor.nbytes =
+                        source_element(descriptor.encoding, *descriptor.shape.last().unwrap())
+                            .unwrap()
+                            .canonical_byte_len(&descriptor.shape)
+                            .unwrap();
+                }
+                descriptor.offset = offset;
+                offset += descriptor.nbytes;
+            }
+            manifest.target.files[0].size = offset;
+
+            let limits = limits();
+            for backend in BackendName::ALL {
+                let codec = KvCodec::Dense;
+                let load = ModelLoadPlan::derive(
+                    &manifest,
+                    &definition,
+                    ComponentSelection {
+                        head: false,
+                        vision: false,
+                    },
+                    resident_layout(ExecutionPath::Native, backend),
+                    crate::PlannedMethod::Plain,
+                    crate::planning::fixtures::LIMITS,
+                )
+                .unwrap();
+                let plan = load.program_plan(&definition, codec).unwrap();
+
+                let MixerProgramSlot::Attention(b0) = plan.target().blocks()[0].mixer() else {
+                    panic!("block 0 is attention");
+                };
+                assert_ne!(b0.query, b0.query_segment());
+                assert_eq!(b0.gate(), None);
+                assert!(b0.key().is_some());
+                assert!(b0.value().is_some());
+                assert_eq!(b0.gate_segment(), b0.query_segment());
+                assert_eq!(b0.key_segment(), b0.key().unwrap());
+                assert_eq!(b0.value_segment(), b0.value().unwrap());
+
+                let MixerProgramSlot::Attention(b1) = plan.target().blocks()[1].mixer() else {
+                    panic!("block 1 is attention");
+                };
+                assert_ne!(b1.query, b1.query_segment());
+                assert_eq!((b1.gate(), b1.key(), b1.value()), (None, None, None));
+                assert_eq!(b1.gate_segment(), b1.query_segment());
+                assert_eq!(b1.key_segment(), b1.query_segment());
+                assert_eq!(b1.value_segment(), b1.query_segment());
+
                 let state = ResourcePlanner::state_plan(
                     &definition,
                     &load,

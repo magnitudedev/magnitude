@@ -350,22 +350,29 @@ impl InventoryConfig {
             .map_err(io_error)
     }
 
+    fn user_home_dir() -> Option<PathBuf> {
+        std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+            .map(PathBuf::from)
+    }
+
     pub fn default_root() -> Result<PathBuf, InventoryError> {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
+        let home = Self::user_home_dir().ok_or_else(|| {
             InventoryError::InvalidRequest(
                 "cannot determine the user home directory for the model store".to_owned(),
             )
         })?;
-        Ok(PathBuf::from(home).join(".magnitude/models"))
+        Ok(home.join(".magnitude").join("models"))
     }
 
     pub fn default_cache_root() -> Result<PathBuf, InventoryError> {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
+        let home = Self::user_home_dir().ok_or_else(|| {
             InventoryError::InvalidRequest(
                 "cannot determine the user home directory for the cache".to_owned(),
             )
         })?;
-        Ok(PathBuf::from(home).join(".magnitude/cache"))
+        Ok(home.join(".magnitude").join("cache"))
     }
 
     /// Adds enabled Hugging Face cache locations to the initial configuration.
@@ -660,11 +667,8 @@ impl ManagedModelStore {
         let mut components = resolve(&weights)?;
         let weights_path = composed
             .package
-            .files
-            .iter()
-            .filter(|file| file.role == ModelFileRole::Weights)
+            .primary_weights()
             .map(|file| file.path.clone())
-            .min()
             .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;
         for projector in resolve(&stored)? {
             let declared = stored
@@ -705,7 +709,8 @@ impl ManagedModelStore {
         Box::pin(async move {
             config.prepare_roots().await?;
             let client = hub_client(&config, None)?;
-            let cache = ModelCache::with_header_capacity(&config.cache_root, config.header_cache_capacity);
+            let cache = ModelCache::with_header_capacity(&config.cache_root, config.header_cache_capacity)
+                .map_err(io_error)?;
             let catalog_affiliations = CatalogAffiliations::load(&config.root);
             let local_models = Arc::new(RwLock::new(config.local_models.clone()));
             let manager = Self {
@@ -1598,7 +1603,7 @@ fn scan(
     }
     crate::local_roots::scan_attached_drafters(local, &mut discovered);
     let (mut cached_models, cached_evidence) =
-        load_inventory_index(&ModelCache::new(&config.cache_root));
+        load_inventory_index(&ModelCache::new(&config.cache_root).map_err(io_error)?);
     // The durable entry controls cache validity. Overlay only transient runtime state for an entry
     // that independently survived durable schema validation.
     for (id, durable) in &mut cached_models {
@@ -1703,7 +1708,7 @@ fn scan_managed(
         return Ok(());
     }
     // A committed removal's models are gone, whatever of their files is left on disk.
-    let removed = crate::store_fs::committed_entries(&crate::store_fs::model_store(&config.root))?;
+    let removed = crate::store_fs::committed_entries(&crate::store_fs::model_store(&config.root)?)?;
     let found = output.len();
     let mut count = 0;
     for repo_entry in read_dir_sorted(&managed)? {
@@ -2634,12 +2639,14 @@ pub(crate) fn components_for_group(
 ) -> Result<Vec<ModelComponent>, InventoryError> {
     let mut components = Vec::new();
     for (offset, path) in group.paths.iter().enumerate() {
-        let relative = path.strip_prefix(root).map_err(|_| {
-            InventoryError::Io("discovered model escaped its configured root".to_owned())
-        })?;
+        let relative = PathBuf::from(crate::identity::normalize_relative_posix(
+            path.strip_prefix(root).map_err(|_| {
+                InventoryError::Io("discovered model escaped its configured root".to_owned())
+            })?,
+        ));
         let metadata = path.metadata().map_err(io_error)?;
         components.push(ModelComponent {
-            path: relative.to_path_buf(),
+            path: relative,
             role: if group.paths.len() == 1 {
                 ComponentRole::Weights
             } else {
@@ -2652,19 +2659,21 @@ pub(crate) fn components_for_group(
         });
     }
     if let Some(projector) = group.projector.as_ref() {
-        let relative = projector.strip_prefix(root).map_err(|_| {
-            InventoryError::Io("discovered projector escaped its configured root".to_owned())
-        })?;
+        let relative = PathBuf::from(crate::identity::normalize_relative_posix(
+            projector.strip_prefix(root).map_err(|_| {
+                InventoryError::Io("discovered projector escaped its configured root".to_owned())
+            })?,
+        ));
         let metadata = projector.metadata().map_err(io_error)?;
         components.push(ModelComponent {
-            path: relative.to_path_buf(),
+            path: relative.clone(),
             role: ComponentRole::Projector,
             size_bytes: metadata.len(),
             content: content_identity_for_file(projector, &metadata, blobs),
             shard_index: None,
             relationship: components.first().map(|model| {
                 magnitude_service_contracts::ComponentRelationship::ProjectorFor {
-                    projector: relative.to_path_buf(),
+                    projector: relative,
                     model: model.path.clone(),
                 }
             }),
@@ -3019,7 +3028,7 @@ mod tests {
             .canonicalize()
             .expect("canonical temp")
             .join("store");
-        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let cache = ModelCache::new(&temporary.path().join("cache")).unwrap();
         let repository = "owner/model";
         let commit = "commit";
         let repository_root = store.join("hub").join(hf_repo_dir(repository));
@@ -3142,7 +3151,7 @@ mod tests {
             .canonicalize()
             .expect("canonical temp")
             .join("store");
-        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let cache = ModelCache::new(&temporary.path().join("cache")).unwrap();
         let repository = "owner/model";
         let repository_root = store.join("hub").join(hf_repo_dir(repository));
         let snapshot = repository_root.join("snapshots/commit");
@@ -3537,6 +3546,7 @@ mod tests {
 
         // Another process reads the resident model's file.
         let elsewhere = crate::store_fs::model_store(&store)
+            .unwrap()
             .lease(&Path::new("readers").join(hf_repo_dir("owner/model")).join("commit/model-Q4.gguf"))
             .unwrap();
         let released = AtomicBool::new(false);
@@ -3627,7 +3637,7 @@ mod tests {
         let reopened = store_of(temporary.path(), &store, &installed).await;
         assert!(!snapshots.join("b/model.gguf").exists(), "the opening finishes the removal");
         assert!(reopened.list_installed().await.unwrap().packages.is_empty());
-        assert!(crate::store_fs::model_store(&store).list(Path::new("removed")).unwrap().is_empty(), "its record goes with its garbage");
+        assert!(crate::store_fs::model_store(&store).unwrap().list(Path::new("removed")).unwrap().is_empty(), "its record goes with its garbage");
     }
 
     #[tokio::test]
@@ -4129,7 +4139,7 @@ mod tests {
                 .canonicalize()
                 .expect("canonical temporary root"),
             LinkedFiles::WithinRoot,
-            &ModelCache::new(&temporary.path().join("cache")),
+            &ModelCache::new(&temporary.path().join("cache")).unwrap(),
             &RecognizedArchitectures::default(),
             &BTreeMap::new(),
             &mut UnreadableDirectories::new(),
@@ -4155,7 +4165,7 @@ mod tests {
             &folder,
             &folder,
             LinkedFiles::WithinRoot,
-            &ModelCache::new(&temporary.path().join("cache")),
+            &ModelCache::new(&temporary.path().join("cache")).unwrap(),
             &RecognizedArchitectures::default(),
             &BTreeMap::new(),
             &mut UnreadableDirectories::new(),
@@ -4177,7 +4187,7 @@ mod tests {
             write_dflash_drafter, write_model, write_mtp_model, write_projector,
         };
         let temporary = tempfile::tempdir().unwrap();
-        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let cache = ModelCache::new(&temporary.path().join("cache")).unwrap();
         let models = temporary.path().join("models");
         write_model(&models.join("laguna-s-2.1-Q4_K_M.gguf"), "laguna");
         write_dflash_drafter(&models.join("unlabelled-companion.gguf"), "drafter");
@@ -4233,7 +4243,7 @@ mod tests {
     fn declared_projector_wins_over_directory_guess() {
         use crate::test_gguf::{write_model, write_projector};
         let temporary = tempfile::tempdir().unwrap();
-        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let cache = ModelCache::new(&temporary.path().join("cache")).unwrap();
         let models = temporary.path().join("models");
         write_model(&models.join("model.gguf"), "model");
         write_projector(&models.join("mmproj-f16.gguf"), "f16");
@@ -4362,7 +4372,7 @@ mod tests {
             serde_json::to_string(&(&stale.content_id.0, "model.gguf")).unwrap();
         index["evidence"][&id]["metadata_key"] = serde_json::json!(earlier_key);
         fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
-        ModelCache::new(&cache_root).write_index(
+        ModelCache::new(&cache_root).unwrap().write_index(
             ModelIndexKind::InventoryMetadata,
             &earlier_key,
             &CachedModelMetadata {

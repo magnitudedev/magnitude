@@ -467,6 +467,9 @@ pub trait Rule<'a> {
         let head = group[0] as usize;
         let rows = state_rows(group[1], block_rows, r.width);
         let slot = r.slot(group[2] as usize);
+        if slot.lo == slot.hi {
+            return;
+        }
         if rows.start == 0 {
             r.publish_window(&slot, head);
         }
@@ -501,6 +504,9 @@ pub trait Rule<'a> {
         let head = group[0] as usize;
         let rows = state_rows(group[1], block_rows, r.width);
         let slot = r.slot(group[2] as usize);
+        if slot.lo == slot.hi {
+            return;
+        }
         if rows.start == 0 {
             r.publish_window(&slot, head);
         }

@@ -41,8 +41,6 @@ pub enum WorkerCommand {
     /// The measurement job holding the room was started as `process`: its
     /// footprint is credited against the room from now.
     AttachMeasurementProcess { process: magnitude_executor::ProcessId },
-    /// The measurement job ended: its room is free again.
-    ReleaseMeasurementRoom,
     /// The measurement job stored new records: price the experts again
     /// from what is stored.
     Reprice,

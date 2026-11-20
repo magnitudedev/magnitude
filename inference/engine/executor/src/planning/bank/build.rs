@@ -219,14 +219,19 @@ impl ModelLoadPlan {
         Ok(self)
     }
 
-    /// The plan committing `slots` of its bank at the load, its ceiling and
-    /// its forms kept: the bank grows back to it while it serves, and the
-    /// programs planned are the load's.
-    pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {
+    /// The plan committing `slots` of its bank and `host_slots` of its host
+    /// tier at the load, its ceiling and its forms kept: the bank grows back
+    /// to it while it serves, and the programs planned are the load's.
+    pub fn with_load_slots(self, slots: u64, host_slots: u64) -> Result<Self, PlanError> {
         let bank = self.bank.as_ref().ok_or(PlanError::Topology("a plan without a bank has no slots"))?;
-        let (ceiling, resident) = (bank.ceiling, bank.resident);
+        let (ceiling, resident, planned_host) = (bank.ceiling, bank.resident, bank.host_slots);
+        if host_slots > planned_host {
+            return Err(PlanError::Topology("load host slots exceed the planned host tier"));
+        }
         let mut load = self.with_bank_slots(slots, ceiling)?;
-        load.bank.as_mut().expect("the load was just resized").resident = resident;
+        let built = load.bank.as_mut().expect("the load was just resized");
+        built.resident = resident;
+        built.host_slots = host_slots;
         Ok(load)
     }
 

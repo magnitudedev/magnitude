@@ -10,6 +10,7 @@ mod declared;
 use magnitude_kernels::{
     dense_expand, dense_output, embedding_rows, project_rows, readout_features_rows,
     readout_head_rows, readout_project_rows, readout_selected_rows, sample_rows, shape_rows,
+    short_conv_project,
 };
 mod cuda_common;
 
@@ -1627,6 +1628,99 @@ fn cuda_shape_rows_match_portable_semantics() {
             }
         }
     }
+}
+
+/// `BLOCKS == 2` declares the single-stream int8 GEMM layout bound
+/// (`INT8_LAYOUT`), so `projection dense for cuda` admits it only for unpaired
+/// (`SERVED == 1`) projections: `short_conv_project` (segmented with a paired
+/// `(b_weight, x_weight)` segment) rejects `BLOCKS = 2` and runs `BLOCKS = 1`
+/// cleanly at `M = 128`, while `project_rows` (`SERVED == 1`) still admits
+/// `BLOCKS = 2`.
+#[test]
+fn short_conv_project_int8_blocks_admission() {
+    let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
+    let format = Format::rounded(magnitude_ggml::Encoding::Q8_0);
+    let (h, ch, rows) = (256usize, 256usize, 128usize);
+    let sc = Mapped::new(
+        short_conv_project::native_entry_with(short_conv_project::Elements {
+            NW: Element::bf16(),
+            BW: format.resident(),
+            CW: format.resident(),
+            XW: format.resident(),
+            A: Element::bf16(),
+        }),
+        move |_: &Device, blocks: u64| {
+            NativeSpecialization::new()
+                .with_static("H", h as u64)
+                .with_static("CH", ch as u64)
+                .with_static("BS", 0)
+                .with_static("CS", 0)
+                .with_static("XS", 0)
+                .with_param("INT8", 1)
+                .with_launch_param(DENSE_PAIR_GEMM, "BLOCKS", blocks)
+        },
+    );
+    assert!(sc.admits(&device, 1), "short_conv_project must admit INT8=1 BLOCKS=1");
+    assert!(
+        !sc.admits(&device, 2),
+        "short_conv_project has a paired segment (SERVED == 2) and must reject BLOCKS=2"
+    );
+
+    let single = Mapped::new(
+        project_rows::native_entry_with(project_rows::Elements {
+            A: Element::bf16(),
+            W: format.resident(),
+            Y: Element::f32(),
+        }),
+        move |_: &Device, blocks: u64| {
+            NativeSpecialization::new()
+                .with_static("G", 1)
+                .with_static("K", h as u64)
+                .with_static("N", ch as u64)
+                .with_static("WS", 0)
+                .with_param("INT8", 1)
+                .with_launch_param(DENSE_PAIR_GEMM, "BLOCKS", blocks)
+        },
+    );
+    assert!(single.admits(&device, 2), "unpaired single projection must still admit INT8=1 BLOCKS=2");
+
+    let mut rng = Rng(42);
+    let (bw, _) = timing_weight(&charges, format, false, [ch as u64, h as u64], &mut rng);
+    let (cw, _) = timing_weight(&charges, format, false, [ch as u64, h as u64], &mut rng);
+    let (xw, _) = timing_weight(&charges, format, false, [ch as u64, h as u64], &mut rng);
+    let residual = f32_tensor(
+        &device,
+        &[rows as u64, h as u64],
+        &(0..rows * h).map(|_| rng.uniform(-1.0, 1.0)).collect::<Vec<_>>(),
+    );
+    let norm = bf16_tensor(
+        &device,
+        &[h as u64],
+        &(0..h).map(|_| bf16_round(rng.uniform(0.5, 1.5))).collect::<Vec<_>>(),
+    );
+    let absent = f32_tensor(&device, &[0], &[]);
+    let out = sc
+        .kernel(&device, 1)
+        .call(
+            &charges,
+            short_conv_project::Args {
+                residual: &residual,
+                norm: &norm,
+                b_weight: &bw,
+                c_weight: &cw,
+                x_weight: &xw,
+                eps: 1e-5,
+                b_scale: &absent,
+                c_scale: &absent,
+                x_scale: &absent,
+            },
+        )
+        .unwrap()
+        .value;
+    let values = read_f32(&out);
+    assert_eq!(values.len(), rows * 2 * ch);
+    assert!(values.iter().all(|v| v.is_finite()), "non-finite output from short_conv_project");
 }
 
 /// The types the `dense_output` shape timings cover: every decode-axis class

@@ -211,6 +211,27 @@ impl HostWords {
     pub(super) fn views(&self, records: u32) -> Vec<Records> {
         self.tier.iter().map(|tensor| Records::new(rows(tensor, u64::from(records)), RECORD).unwrap()).collect()
     }
+
+    /// Each routed tensor's first `records` bank records, delivered into
+    /// `Group::bank` at open.
+    pub(super) fn bank_views(&self, records: u64) -> Vec<Vec<Option<Tensor>>> {
+        self.bank.0.iter().map(|tensor| rows(tensor, records)).collect()
+    }
+
+    /// Per-record routed tensor views for newly joined bank `records`,
+    /// matching `Join::Bank::views`.
+    pub(super) fn bank_record_views(&self, records: &[usize]) -> Vec<Vec<Tensor>> {
+        records
+            .iter()
+            .map(|&record| {
+                self.bank
+                    .0
+                    .iter()
+                    .map(|tensor| tensor.slice_leading(record as u64, record as u64 + 1).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
 }
 
 /// `tensor`'s first `count` rows, each a view of its own.
@@ -221,13 +242,6 @@ fn rows(tensor: &Tensor, count: u64) -> Vec<Option<Tensor>> {
 /// Each routed tensor's bank records, one host-shared row a record of the
 /// bank's one group: what promotions copy into, a record at a time.
 struct BankRows(Vec<Tensor>);
-
-impl BankRecordViews for BankRows {
-    fn view(&self, group: usize, tensor: usize, record: usize) -> Tensor {
-        assert_eq!(group, 0, "the harness's bank is one group");
-        self.0[tensor].slice_leading(record as u64, record as u64 + 1).unwrap()
-    }
-}
 
 type LayerWords = (MapView, ExchangeTable, ExchangeTable, Words, Words, Words, Words);
 
@@ -470,7 +484,7 @@ pub(super) fn lending_windowed(
     // (the CPU's, complete as queued), from each tensor's tier records into
     // its bank records.
     let copies = crate::experts::copies::Copies::new(seismic::Transfer::new(&device).unwrap(), steps.events().clone());
-    let copier = (placer == Placer::Tier && promotes).then(|| super::Copier { copies: copies.clone(), bank: host.bank.clone() });
+    let copier = (placer == Placer::Tier && promotes).then(|| super::Copier { copies: copies.clone() });
     let tier_tensors = host
         .views(tier)
         .into_iter()
@@ -605,6 +619,10 @@ pub(super) fn lending_windowed(
         groups: vec![Group {
             commits: commits.clone(),
             tier: Some(tier_tensors),
+            bank: match placer {
+                Placer::Tier => host.bank_views(records),
+                Placer::Bank => Vec::new(),
+            },
             records: match placer {
                 Placer::Tier => records as usize,
                 Placer::Bank => 0,
@@ -653,6 +671,12 @@ pub(super) fn lending_windowed(
     // discrete load's do: one record at a time, its latency none.
     let transfer = magnitude_cost_model::ReadLine::new(0., 1e-10).unwrap();
     watcher.shared().price_copy(&crate::assessment::TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer, back: transfer });
+    {
+        let mut state = residency::lock(&watcher.state);
+        for layer in 0..state.core.layers.len() {
+            state.core.directory.price_copies(layer, Some(0.));
+        }
+    }
     Harness {
         _pool: (!ALONE.get()).then(|| POOL.read().unwrap_or_else(std::sync::PoisonError::into_inner)),
         watcher,

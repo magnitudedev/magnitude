@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 /// Version of these passes and of the emitted contract; part of the
 /// formation identity and SPIR-V cache key, so a kept module was formed
 /// under the current contract.
-pub const SEAL_VERSION: u32 = 11;
+pub const SEAL_VERSION: u32 = 12;
 
 /// The execution modes a sealed module declares beyond the fixed ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,15 @@ pub struct Environment {
     /// `MaximallyReconvergesKHR` is declared where a module relies on
     /// invocations rejoining after a lane-varying loop.
     pub maximal_reconvergence: bool,
+    /// Early returns in modules declaring `MaximallyReconvergesKHR` are
+    /// merged into one return block per function (`DeadBranchElim` +
+    /// `MergeReturn`). Scoped to `vk::DriverId::AMD_PROPRIETARY` (observed on
+    /// Windows `amdvlk64.dll` 32.0.31019.6049 / driver `26.10.19.06 (LLPC)`),
+    /// where `spirv-val`-valid modules declaring `MaximallyReconvergesKHR`
+    /// with early returns segfault in `vkCreateComputePipelines`; disabled
+    /// elsewhere because `MergeReturn` regressed `attention_decode_k8v4` by
+    /// +17.67% on NVIDIA Vulkan.
+    pub merge_maximal_reconvergence_returns: bool,
 }
 
 const OP_EXTENSION: u32 = 10;
@@ -984,6 +993,7 @@ mod tests {
         denorm_preserve_32: false,
         subgroup_uniform_control_flow: false,
         maximal_reconvergence: true,
+        merge_maximal_reconvergence_returns: false,
     };
 
     /// Whether `module` declares `MaximallyReconvergesKHR` on its entry

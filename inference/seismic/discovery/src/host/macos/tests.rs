@@ -166,9 +166,10 @@ fn a_snapshot_pairs_with_the_paging_read_when_it_was_first_served() {
 }
 
 /// The file floor is the file pages standing where the OS compressed
-/// more than was free above its target, kept until it next does so;
-/// compression beside more free memory moves none, and none stands
-/// before the OS first chose to compress.
+/// more than was free above its target (excluding speculative pages as
+/// `vm.page_free_count` does), held while compressions or tight free persist,
+/// decaying and releasing once compressions cease and free recovers
+/// comfortably above target, and clamped to current external pages.
 #[test]
 fn the_file_floor_is_what_the_os_keeps_as_it_compresses() {
     let statistics = |compressions, free, external| libc::vm_statistics64 {
@@ -196,14 +197,45 @@ fn the_file_floor_is_what_the_os_keeps_as_it_compresses() {
     let pressed = statistics(30_000, 4_500, 95_000);
     assert_eq!(file_floor(Some(&rest), &pressed, target), 95_000);
     let kept = snapshot(pressed, 95_000);
+    // Still tight near target without new compressions: floor stays standing,
+    // clamped to current external pages.
+    assert_eq!(
+        file_floor(Some(&kept), &statistics(30_000, 7_000, 140_000), target),
+        95_000
+    );
+    assert_eq!(
+        file_floor(Some(&kept), &statistics(30_000, 7_000, 80_000), target),
+        80_000
+    );
+    // Modest calm recovery (2x..4x target) halves the temporary floor; full
+    // calm recovery (>= 4x target) clears it completely so a past transient
+    // spike never permanently blacklists gigabytes of file cache.
+    assert_eq!(
+        file_floor(Some(&kept), &statistics(30_000, 10_000, 140_000), target),
+        47_500
+    );
     assert_eq!(
         file_floor(Some(&kept), &statistics(30_000, 60_000, 140_000), target),
-        95_000
+        0
     );
     assert_eq!(
         file_floor(Some(&kept), &statistics(60_000, 4_200, 88_000), target),
         88_000
     );
+}
+
+/// Live `vm.page_pageable_external_count` and `vm.vm_page_xpmapped_min`
+/// yield skew-free clean cache above the kernel's executable floor.
+#[test]
+fn live_external_respects_xpmapped_min() {
+    let mac = Mac::new().counts(&[
+        ("vm.page_free_count", 100_000),
+        ("vm.vm_page_free_target", 4_000),
+        ("vm.page_pageable_external_count", 250_000),
+        ("vm.vm_page_xpmapped_min", 100_000),
+    ]);
+    let s = sample(&mac);
+    assert_eq!(s.supply.clean_cache, 150_000 * (16 << 10));
 }
 
 /// `iogpu.wired_limit_mb` of zero is the OS's default, which the ledger

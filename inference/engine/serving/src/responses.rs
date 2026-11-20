@@ -3,20 +3,23 @@
 //! without generating, and `previous_response_id` continues from the most
 //! recent concluded response's input and output with new input.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::future::{Future, ready};
 use std::convert::Infallible;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, Stream, StreamExt};
+use futures_util::stream::SplitSink;
 use magnitude_chat::output::{Completion, Output, OutputEvent, Progress, Termination};
 use magnitude_chat::request::{
     AssistantTurn, Conversation, Entry, GenerationControls, OutputFormat, PromptCache,
@@ -1709,7 +1712,7 @@ pub async fn responses_websocket(
     upgrade.on_upgrade(move |socket| serve_responses_websocket(socket, state, headers))
 }
 
-async fn send_websocket_value(socket: &mut WebSocket, value: Value) -> bool {
+async fn send_websocket_value(socket: &mut SplitSink<WebSocket, Message>, value: Value) -> bool {
     socket
         .send(Message::Text(value.to_string().into()))
         .await
@@ -1730,7 +1733,7 @@ pub(crate) fn websocket_error_event(error: &ApiError, sequence_number: u64) -> V
 }
 
 async fn send_websocket_error(
-    socket: &mut WebSocket,
+    socket: &mut SplitSink<WebSocket, Message>,
     error: &ApiError,
     sequence: &AtomicU64,
 ) -> bool {
@@ -1852,91 +1855,186 @@ fn warmup_events(id: &str) -> [Value; 2] {
     ]
 }
 
-async fn serve_responses_websocket(mut socket: WebSocket, state: Serving, headers: HeaderMap) {
+/// Process one turn at a time against its predecessor. Read control frames even
+/// during model acquisition, admission and backpressured output.
+async fn serve_responses_websocket(socket: WebSocket, state: Serving, headers: HeaderMap) {
+    let (mut writer, reader) = socket.split();
+    // Axum answers pings while the socket is polled. End input as soon as a
+    // peer closes, even when other turn frames precede the close.
+    let mut input = reader
+        .take_while(|frame| ready(matches!(frame, Ok(message) if !matches!(message, Message::Close(_)))))
+        .filter_map(|frame| ready(match frame {
+            Ok(message @ (Message::Text(_) | Message::Binary(_))) => Some(message.into_data()),
+            _ => None,
+        }));
     let mut history = WebsocketHistory::default();
-    while let Some(message) = socket.next().await {
-        let sequence = AtomicU64::new(0);
-        let request = match message {
-            Ok(Message::Text(text)) => serde_json::from_str::<Value>(&text),
-            Ok(Message::Binary(bytes)) => serde_json::from_slice::<Value>(&bytes),
-            Ok(Message::Ping(bytes)) => {
-                if socket.send(Message::Pong(bytes)).await.is_err() {
-                    return;
-                }
-                continue;
-            }
-            Ok(Message::Pong(_)) => continue,
-            Ok(Message::Close(_)) | Err(_) => return,
+    let mut queued = QueuedTurns::default();
+    loop {
+        let data = match queued.pop() {
+            Some(data) => data,
+            None => match input.next().await {
+                Some(data) => data,
+                None => return,
+            },
         };
-        let request = match request {
-            Ok(request) => request,
-            Err(error) => {
-                let error = ApiError::invalid(format!("Invalid JSON: {error}"));
-                if !send_websocket_error(&mut socket, &error, &sequence).await {
-                    return;
-                }
-                continue;
-            }
-        };
-        let logical = match history.resolve(request) {
-            Ok(logical) => logical,
-            Err(error) => {
-                if !send_websocket_error(&mut socket, &error, &sequence).await {
-                    return;
-                }
-                continue;
-            }
-        };
-        let request = serde_json::from_value::<ResponseCreateRequest>(logical.request)
-            .map_err(|error| ApiError::invalid(error.to_string()));
-        let previous = logical.previous.as_deref();
-        if !logical.generate {
-            // A warmup is refused exactly as its generation would be.
-            if let Err(error) = request.and_then(adapt) {
-                history.evict(previous);
-                if !send_websocket_error(&mut socket, &error, &sequence).await {
-                    return;
-                }
-                continue;
-            }
-            let id = state.next_id("resp_icn_");
-            for event in warmup_events(&id) {
-                if !send_websocket_value(&mut socket, event).await {
-                    return;
-                }
-            }
-            history.record(id, logical.input, Vec::new());
-            continue;
-        }
-        let started = match request {
-            Ok(request) => start_response_stream(state.clone(), &headers, request).await,
-            Err(error) => Err(error),
-        };
-        let mut stream = match started {
-            Ok(stream) => stream,
-            Err(error) => {
-                history.evict(previous);
-                if !send_websocket_error(&mut socket, &error, &sequence).await {
-                    return;
-                }
-                continue;
-            }
-        };
-        while let Some(event) = stream.events.recv().await {
-            if !send_websocket_value(&mut socket, event).await {
+        let turn = websocket_turn(&mut writer, &state, &headers, &mut history, data);
+        match queued.serve(turn, &mut input).await {
+            TurnEnd::Finished(true) => {}
+            TurnEnd::Finished(false) | TurnEnd::Disconnected => return,
+            TurnEnd::QueueFull => {
+                let _ = writer.send(Message::Close(Some(CloseFrame {
+                    code: close_code::SIZE,
+                    reason: "queued requests exceed the connection's byte limit".into(),
+                }))).await;
                 return;
             }
         }
-        match stream.concluded.await {
-            Ok(output) => history.record(stream.id, logical.input, output),
-            Err(_) => history.evict(previous),
+    }
+}
+
+#[derive(Default)]
+struct QueuedTurns {
+    data: VecDeque<Bytes>,
+    bytes: usize,
+}
+
+enum TurnEnd {
+    Finished(bool),
+    Disconnected,
+    QueueFull,
+}
+
+impl QueuedTurns {
+    fn charge(data: &Bytes) -> usize {
+        size_of::<Bytes>() + data.len()
+    }
+
+    fn pop(&mut self) -> Option<Bytes> {
+        let data = self.data.pop_front()?;
+        self.bytes -= Self::charge(&data);
+        Some(data)
+    }
+
+    async fn serve(
+        &mut self,
+        turn: impl Future<Output = bool>,
+        input: &mut (impl Stream<Item = Bytes> + Unpin),
+    ) -> TurnEnd {
+        tokio::pin!(turn);
+        loop {
+            tokio::select! {
+                finished = &mut turn => return TurnEnd::Finished(finished),
+                frame = input.next() => match frame {
+                    None => return TurnEnd::Disconnected,
+                    Some(data) => {
+                        let charge = Self::charge(&data);
+                        if charge > crate::MAX_HTTP_BODY_BYTES - self.bytes {
+                            return TurnEnd::QueueFull;
+                        }
+                        self.bytes += charge;
+                        self.data.push_back(data);
+                    }
+                },
+            }
         }
     }
+}
+
+async fn websocket_turn(
+    socket: &mut SplitSink<WebSocket, Message>,
+    state: &Serving,
+    headers: &HeaderMap,
+    history: &mut WebsocketHistory,
+    data: Bytes,
+) -> bool {
+    let sequence = AtomicU64::new(0);
+    let request = serde_json::from_slice::<Value>(&data);
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            let error = ApiError::invalid(format!("Invalid JSON: {error}"));
+            return send_websocket_error(socket, &error, &sequence).await;
+        }
+    };
+    let logical = match history.resolve(request) {
+        Ok(logical) => logical,
+        Err(error) => {
+            return send_websocket_error(socket, &error, &sequence).await;
+        }
+    };
+    let request = serde_json::from_value::<ResponseCreateRequest>(logical.request)
+        .map_err(|error| ApiError::invalid(error.to_string()));
+    let previous = logical.previous.as_deref();
+    if !logical.generate {
+        // A warmup is refused exactly as its generation would be.
+        if let Err(error) = request.and_then(adapt) {
+            history.evict(previous);
+            return send_websocket_error(socket, &error, &sequence).await;
+        }
+        let id = state.next_id("resp_icn_");
+        for event in warmup_events(&id) {
+            if !send_websocket_value(socket, event).await {
+                return false;
+            }
+        }
+        history.record(id, logical.input, Vec::new());
+        return true;
+    }
+    let started = match request {
+        Ok(request) => start_response_stream(state.clone(), headers, request).await,
+        Err(error) => Err(error),
+    };
+    let mut stream = match started {
+        Ok(stream) => stream,
+        Err(error) => {
+            history.evict(previous);
+            return send_websocket_error(socket, &error, &sequence).await;
+        }
+    };
+    while let Some(event) = stream.events.recv().await {
+        if !send_websocket_value(socket, event).await {
+            return false;
+        }
+    }
+    match stream.concluded.await {
+        Ok(output) => history.record(stream.id, logical.input, output),
+        Err(_) => history.evict(previous),
+    }
+    true
 }
 
 #[cfg(test)]
 mod websocket_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn websocket_disconnect_drops_the_turn_even_with_queued_requests() {
+        let (live, retired) = oneshot::channel::<()>();
+        let turn = async move {
+            let _live = live;
+            std::future::pending::<bool>().await
+        };
+        let first = Bytes::from_static(b"first");
+        let second = Bytes::from_static(b"second");
+        let mut input = futures_util::stream::iter([first.clone(), second.clone()]);
+        let mut queued = QueuedTurns::default();
+        assert!(matches!(queued.serve(turn, &mut input).await, TurnEnd::Disconnected));
+        assert!(retired.await.is_err());
+        assert_eq!(queued.pop(), Some(first));
+        assert_eq!(queued.pop(), Some(second));
+        assert_eq!(queued.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_queued_frames_share_the_request_byte_limit() {
+        let frame = Bytes::from(vec![0; crate::MAX_HTTP_BODY_BYTES / 2]);
+        let mut input = futures_util::stream::iter([frame.clone(), frame.clone()]);
+        let mut queued = QueuedTurns::default();
+        assert!(matches!(queued.serve(std::future::pending(), &mut input).await, TurnEnd::QueueFull));
+        assert_eq!(queued.pop(), Some(frame));
+        assert!(queued.pop().is_none());
+        assert!(QueuedTurns::charge(&Bytes::new()) > 0);
+    }
 
     fn tool() -> Value {
         serde_json::json!({

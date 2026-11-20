@@ -186,17 +186,6 @@ pub(crate) struct PerLayerEntryPorts {
     pub projection_bound: Option<NativePort>,
 }
 
-/// The class slice of the per-layer entry over each of `rows`: every row
-/// axis is the batch row class. The entry imports name their row axis `N`.
-pub(crate) fn per_layer_entry_class_slice(
-    rows: impl IntoIterator<Item = u64> + Clone,
-) -> seismic::NativeGraphClassSlice {
-    seismic::NativeGraphClassSlice::new()
-        .dimension("M", rows.clone())
-        .scoped("import_dense", "N", rows.clone())
-        .scoped("repack_weight", "N", rows)
-}
-
 /// The per-layer entry over `rows` batch rows, its `projection` and `norm`
 /// weights' views.
 pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
@@ -226,14 +215,14 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
     let projection = graph.weight_port(projection.resident, &projection.shape)?;
     let norm = graph.weight_port(norm.resident, &norm.shape)?;
     let absent = graph.port(Element::f32(), &[0])?;
-    let hidden = graph.port_with_class_extent(Element::f32(), &[rows.clone(), width.clone()], 0, "M")?;
+    let hidden = graph.port(Element::f32(), &[rows.clone(), width.clone()])?;
     let table_dimensions = [("B", Dim::from(1)), ("N", rows.clone()), ("K", channels.clone())];
     let gathered = match entries.table {
         TableEntry::Dense(kernel) => graph.input_for(kernel, "source", &table_dimensions)?,
         TableEntry::Repack(kernel) => graph.input_for(kernel, "source", &table_dimensions)?,
     };
     let mut destination =
-        graph.port_with_class_extent(Element::f32(), &[rows.clone(), channels.clone()], 0, "M")?;
+        graph.port(Element::f32(), &[rows.clone(), channels.clone()])?;
     let rounded = graph
         .enqueue(
             entries.round,

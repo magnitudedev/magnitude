@@ -1062,8 +1062,8 @@ fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
         costs: Ok(crate::LoadCosts { prices: prices.clone() }),
         experts: Some(crate::ExpertMeasures {
             lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
-            read: crate::assessment::Priced::Pending("unmeasured".into()),
-            pass: crate::assessment::Priced::Pending("unpriced".into()),
+            read: crate::assessment::Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required))),
+            pass: crate::assessment::Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required))),
             tier_copy: crate::assessment::Priced::Measured(Some(crate::assessment::TierCopyCosts {
                 blocks,
                 whole_seconds: 0.001,
@@ -1656,6 +1656,7 @@ fn vision_input(placements: &[(usize, &str)], count: usize) -> PreparedModelInpu
         TokenPlan::new(tokens, InputLayout::new(count, spans).unwrap()).unwrap(),
         (0..count as i32).map(|position| [position; 3]).collect(),
         count,
+        (0..=count).collect(),
         placements
             .iter()
             .map(|&(_, identity)| (identity.to_owned(), image()))
@@ -2881,9 +2882,9 @@ fn causal_heads_launch_apart_from_chained_drafts() {
         proposals: vec![select.clone(); proposals],
         form: crate::DraftForm::Chained,
     };
-    assert_ne!(domain.group_key(&head(1, 0)), domain.group_key(&head(2, 2)));
-    assert_eq!(domain.group_key(&head(1, 0)), domain.group_key(&head(2, 0)));
-    assert_eq!(domain.group_key(&head(1, 1)), domain.group_key(&head(2, 3)));
+    assert!(!domain.shares_launch(&[head(1, 0)], &head(2, 2)));
+    assert!(domain.shares_launch(&[head(1, 0)], &head(2, 0)));
+    assert!(domain.shares_launch(&[head(1, 1)], &head(2, 3)));
 }
 
 /// V4.1's compressed layer forms (`attention::tests::selected::compressed`:
@@ -2974,7 +2975,7 @@ fn a_two_row_pass_projects_its_front_row() {
         tokens: vec![crate::TokenId(7), crate::TokenId(8)],
         position: 10,
         conditioning: None,
-        demand: crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES,
+        demand: crate::batching::Demand::SELECT | crate::batching::Demand::DEVICE_FEATURES,
         select: vec![spec(10)],
         committed: 1,
         prime: None,
@@ -3070,4 +3071,125 @@ fn evicting_or_closing_a_request_reaches_the_expert_bank() {
     open(&mut domain, &mut bindings, closed);
     domain.release_state(&[evicted]).unwrap();
     domain.close(closed).unwrap();
+}
+
+/// Every reading answered by `MemoryProbe::answer` — including readings taken
+/// beside a running chain (`running_pressure`) — emits a `memory read` trace
+/// record at `MEMORY_TRACE` carrying the exact generation stored in
+/// `answered.generations`.
+#[test]
+fn memory_probe_answer_emits_memory_read_trace_for_every_answered_generation() {
+    use std::sync::{Arc, Mutex};
+
+    struct Capture(Arc<Mutex<Vec<u64>>>);
+
+    struct Visitor {
+        message: Option<String>,
+        generation: Option<u64>,
+    }
+
+    impl tracing::field::Visit for Visitor {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "generation" {
+                self.generation = Some(value);
+            }
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = Some(value.to_owned());
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == crate::MEMORY_TRACE
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() != crate::MEMORY_TRACE {
+                return;
+            }
+            let mut visitor = Visitor { message: None, generation: None };
+            event.record(&mut visitor);
+            if visitor.message.as_deref() == Some("memory read") {
+                if let Some(generation) = visitor.generation {
+                    self.0.lock().unwrap().push(generation);
+                }
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    let (domain, _bindings) = fixture(None);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    tracing::subscriber::with_default(Capture(seen.clone()), || {
+        let probe = domain.memory_probe();
+        assert!(probe.read(None, false));
+        drop(probe.answer(&std::collections::BTreeSet::new(), Vec::new));
+    });
+    let recorded: Vec<u64> = domain.answered.borrow().generations.iter().map(|(_, g)| *g).collect();
+    assert!(!recorded.is_empty());
+    let traced = seen.lock().unwrap().clone();
+    assert_eq!(traced, recorded, "every answered generation must have a matching memory read record");
+}
+
+/// Which operations share a launch has one owner
+/// ([`ExecutorDomain::shares_launch`]), the scheduler's grouping and every
+/// reservation alike. A chained decode pass (as one parked on memory, which
+/// rejoins a later round whatever that round's passes are) never joins an
+/// unchained one, nor a chained launch at its rows; a launch that holds
+/// either is refused as input before anything is reserved.
+#[test]
+fn a_chained_pass_shares_a_launch_only_with_chained_passes_within_their_rows() {
+    let (domain, _) = fixture(None);
+    let pass = |id: u64, chained: bool| Operation::Forward {
+        request: RequestId(id),
+        kind: WorkKind::Decode,
+        tokens: vec![crate::TokenId(1)],
+        position: 1,
+        conditioning: None,
+        demand: if chained {
+            crate::batching::Demand::SELECT | crate::batching::Demand::DEVICE_FEATURES
+        } else {
+            crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES
+        },
+        select: vec![crate::SelectSpec {
+            sampling: crate::Sampling::Greedy,
+            seed: 0,
+            position: 1,
+            domain: 0,
+            mask: None,
+            shaping: crate::Shaping::default(),
+            history: None,
+        }],
+        committed: 1,
+        prime: None,
+        front: Vec::new(),
+        chain: chained.then_some(crate::ChainEntry { position: 1 }),
+    };
+    assert!(domain.shares_launch(&[pass(1, false)], &pass(2, false)));
+    assert!(!domain.shares_launch(&[pass(1, false)], &pass(2, true)));
+    assert!(!domain.shares_launch(&[pass(1, true)], &pass(2, false)));
+    assert!(!domain.shares_launch(&[pass(1, false)], &pass(1, false)), "one operation a request");
+    // Each chained pass enters its one selected row.
+    let rows = domain.chained_rows();
+    let chained = (0..=rows as u64).map(|id| pass(id, true)).collect::<Vec<_>>();
+    for index in 1..rows {
+        assert!(domain.shares_launch(&chained[..index], &chained[index]), "pass {index} of {rows}");
+    }
+    assert!(!domain.shares_launch(&chained[..rows], &chained[rows]), "a chained launch's rows are {rows}");
+    for launch in [vec![pass(1, false), pass(2, true)], vec![pass(1, true), pass(2, false)], chained] {
+        assert!(matches!(domain.requirements(&launch), Err(DomainError::Input(_))), "{launch:?}");
+    }
 }

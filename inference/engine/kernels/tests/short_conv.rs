@@ -437,3 +437,41 @@ fn tape_versions_equal_runs_that_stopped_there() {
         }
     }
 }
+
+/// Trailing power-of-two padded empty slots (`segments = [actual_rows, actual_rows]`,
+/// `previous = -1`, `following = -1`) leave outputs and all banks bit-identical
+/// to an unpadded launch.
+#[test]
+fn padded_empty_slots_match_unpadded_bits() {
+    let geometry = Geometry {
+        channels: 16,
+        taps: 3,
+        banks: 8,
+        tape: 4,
+    };
+    let slots = vec![slot(3, 3, 0, 1), slot(2, 1, 2, 3), slot(1, 1, 4, 5)];
+    let case = Case::new(geometry, 8, slots, 77);
+    for device in devices() {
+        let backend = device.backend().as_str();
+        let expected = case.native(&device, Element::f32(), false);
+        let charges = seismic::Charges::tally(&device);
+        let mut bound = case.bind(&device, false);
+        bound.slots = SlotTensors::padded(&device, &case.slots, case.rows, 4);
+        let gated = kernel(&device, Element::f32())
+            .call(&charges, bound.args(case.slab_banks))
+            .unwrap()
+            .value;
+        let actual = Outcome {
+            gated: read(&gated),
+            window: read(&bound.window),
+        };
+        assert!(
+            same_bits(&actual.gated[..6 * geometry.channels], &expected.gated[..6 * geometry.channels]),
+            "{backend}: padded-slot gated output differs"
+        );
+        assert!(
+            same_bits(&actual.window, &expected.window),
+            "{backend}: padded-slot window arena differs"
+        );
+    }
+}

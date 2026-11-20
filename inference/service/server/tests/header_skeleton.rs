@@ -113,11 +113,11 @@ fn every_catalog_targets_skeleton_assesses_as_its_whole_header() {
             continue;
         }
         let name = component.model.as_str();
-        let file = component.file(&headers::root());
+        let files = component.shard_files(&headers::root());
 
         // The whole header is the package's, every shard merged as production builds it.
         let started = Instant::now();
-        let whole = PackageHeaders::open(&file, None)
+        let whole = PackageHeaders::open_shards(&files, None)
             .unwrap_or_else(|error| panic!("{name}: {error}"))
             .target()
             .clone();
@@ -125,10 +125,10 @@ fn every_catalog_targets_skeleton_assesses_as_its_whole_header() {
 
         let root = tempfile::tempdir().unwrap();
         let source = Skeletons {
-            cache: ModelCache::new(root.path()),
+            cache: ModelCache::new(root.path()).unwrap(),
             timing: Mutex::new([Duration::ZERO; 2]),
         };
-        let skeletal = PackageHeaders::open_from(&file, None, &source)
+        let skeletal = PackageHeaders::open_shards_from(&files, None, &source)
             .unwrap_or_else(|error| panic!("{name}: {error}"))
             .target()
             .clone();

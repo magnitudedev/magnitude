@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use magnitude_artifacts::catalog_headers::{self, HeaderIndex};
-use magnitude_artifacts::gguf::{Directory, inspect_header, split_paths};
+use magnitude_artifacts::gguf::inspect_header;
 use magnitude_service_models::{catalog_lock_digest, catalog_source_digest};
 use serde_json::json;
 
@@ -32,7 +32,7 @@ struct Facts {
     types: BTreeMap<u32, (String, u64)>,
 }
 
-fn facts(path: &Path) -> anyhow::Result<(Directory, Facts)> {
+fn facts(path: &Path) -> anyhow::Result<Facts> {
     let (directory, unknown) = match inspect_header(path) {
         Err(magnitude_artifacts::Error::UnknownTensorTypes { types, directory }) => {
             (*directory, types)
@@ -53,7 +53,7 @@ fn facts(path: &Path) -> anyhow::Result<(Directory, Facts)> {
         types.insert(id, (format!("UNKNOWN_{id}"), u64::from(count)));
     }
     let version = directory.version;
-    Ok((directory, Facts { version, types }))
+    Ok(Facts { version, types })
 }
 
 /// Writes the audit of the header export `exported` to `output`, and fails when a file declares
@@ -67,17 +67,13 @@ pub fn run(exported: &Path, output: &Path) -> anyhow::Result<()> {
     let mut resolutions = Vec::new();
     for component in &index.components {
         let use_name = format!("{} {}", component.model, component.role);
-        let first = component.file(exported);
-        let (directory, _) = facts(&first)?;
-        let shards = split_paths(&first, &directory)?.unwrap_or_else(|| vec![first.clone()]);
-        for shard in shards {
-            let name = shard.file_name().expect("a shard file name");
+        for (relative, shard) in component.shards.iter().zip(component.shard_files(exported)) {
             uses.entry(File {
                 repository: component.repository.clone(),
                 revision: component.revision.clone(),
-                path: component.path.with_file_name(name),
+                path: relative.clone(),
             })
-            .or_insert_with(|| (shard.clone(), Vec::new()))
+            .or_insert_with(|| (shard, Vec::new()))
             .1
             .push(use_name.clone());
         }
@@ -86,13 +82,13 @@ pub fn run(exported: &Path, output: &Path) -> anyhow::Result<()> {
             "role": component.role.to_string(),
             "repository": component.repository,
             "revision": component.revision,
-            "primary": component.path,
+            "primary": component.file(),
         }));
     }
     let mut observed = BTreeSet::new();
     let mut artifacts = Vec::new();
     for (file, (exported_file, mut file_uses)) in uses {
-        let (_, facts) = facts(&exported_file)?;
+        let facts = facts(&exported_file)?;
         file_uses.sort();
         observed.extend(facts.types.values().map(|(name, _)| name.clone()));
         let tensor_types = facts

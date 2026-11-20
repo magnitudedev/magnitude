@@ -228,10 +228,12 @@ impl TransferQueue {
 
     /// The command buffers of completed batches, free again.
     fn reclaim(&self, state: &mut State) -> Result<(), ExecutionError> {
-        let reached = call(
-            unsafe { self.device.inner.device.get_semaphore_counter_value(self.semaphore) },
-            "vkGetSemaphoreCounterValue",
-        )?;
+        let reached = self
+            .device
+            .inner
+            .vk("vkGetSemaphoreCounterValue", |device| unsafe {
+                device.get_semaphore_counter_value(self.semaphore)
+            })?;
         let (done, flying): (Vec<_>, Vec<_>) = state.flying.drain(..).partition(|&(value, _)| value <= reached);
         state.flying = flying;
         state.free.extend(done.into_iter().map(|(_, command)| command));
@@ -248,15 +250,7 @@ impl TransferQueue {
     /// Wait at most `timeout` for batch `value`; whether it completed, or
     /// why the device can make no progress.
     pub fn wait(&self, value: u64, timeout: Duration) -> Result<bool, ExecutionError> {
-        let semaphores = [self.semaphore];
-        let values = [value];
-        let info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values);
-        let nanoseconds = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
-        match unsafe { self.device.inner.device.wait_semaphores(&info, nanoseconds) } {
-            Ok(()) => Ok(true),
-            Err(vk::Result::TIMEOUT) => Ok(false),
-            Err(error) => call(Err(error), "vkWaitSemaphores"),
-        }
+        self.device.inner.wait_semaphore(self.semaphore, value, timeout)
     }
 }
 
@@ -266,6 +260,9 @@ impl Drop for TransferQueue {
     /// the wait fails (the device is lost) they are never freed: a batch may
     /// still use them.
     fn drop(&mut self) {
+        if self.device.inner.is_lost() {
+            return;
+        }
         let state = self.state.get_mut().expect("transfer lock is never poisoned");
         let last = state.flying.iter().map(|&(value, _)| value).max().unwrap_or(0);
         let semaphores = [self.semaphore];

@@ -2187,7 +2187,8 @@ fn mtp_on_a_fronting_load_decodes_in_front_passes_entering_the_head() {
     let round = started(generation, 4, FrontGrant::UpTo(1));
     let paired = forward(&round);
     assert_eq!((paired.tokens.clone(), paired.chain), (vec![TokenId(10), TokenId(11)], Some(ChainEntry { position: 17 })));
-    assert!(paired.demand.contains(Demand::SELECT | Demand::FEATURES));
+    assert_eq!(paired.demand, Demand::SELECT | Demand::DEVICE_FEATURES);
+    assert!(!paired.demand.contains(Demand::FEATURES));
     assert_eq!(kinds(&paired), [(2, FrontKind::Host(GuessKind::Head))]);
     let operation = paired.into_operation(RequestId(1), 17, None).unwrap();
     assert_eq!(

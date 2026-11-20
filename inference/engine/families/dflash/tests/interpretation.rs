@@ -349,13 +349,6 @@ fn drafts_and_targets_are_recognized_by_disjoint_families() {
             .and_then(Value::string)
             .unwrap()
             .to_owned();
-        // DeepSeek V4.1's DSpark drafts with its target's hyper-connection
-        // blocks, which this family does not read yet (the drafter is
-        // deferred; its target is the deepseek41 family's).
-        if architecture == "dflash" && file.starts_with("deepseek") {
-            assert!(!recognizes(&directory), "{file}");
-            continue;
-        }
         // The catalog's other drafts are a Gemma assistant or an MTP head.
         assert_eq!(
             recognizes(&directory),
@@ -407,7 +400,7 @@ fn an_unbound_or_foreign_weight_is_refused() {
         nbytes: 0,
     });
     assert_eq!(
-        recognize(&directory).unwrap_err(),
+        inspect_qwen(&directory, &model).unwrap_err(),
         Error::Unadmitted { metadata: Vec::new(), tensors: vec!["foreign.weight".into()] }
     );
     // A layer beyond `block_count` is a known role no layer binds.

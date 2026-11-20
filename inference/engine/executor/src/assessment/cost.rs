@@ -142,7 +142,7 @@ pub fn expert_lines(host: &[HostLines], pass: &ExpertPass) -> Priced<Arc<[Expert
     match lines {
         None => match pass.host_unobtainable() {
             Some(unread) => Priced::Unavailable(format!("the executor's costs cannot read host storage, the link line's: {unread}")),
-            None => Priced::Pending("the executor's costs have not read host storage, the link line's".into()),
+            None => Priced::Pending(super::PendingPrices::standing(super::PointRequest::Costs(super::CostWalk::Whole))),
         },
         Some(Ok(lines)) => Priced::Measured(lines),
         Some(Err(error)) => Priced::Unavailable(format!("a GPU line: {error}")),

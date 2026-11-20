@@ -178,12 +178,6 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 }
                 Ok(WorkerReply::Acknowledged)
             }
-            WorkerCommand::ReleaseMeasurementRoom => {
-                if let Execution::Serving(owner) | Execution::Draining(owner, _) = &mut self.execution {
-                    owner.release_measurement_room();
-                }
-                Ok(WorkerReply::Acknowledged)
-            }
             WorkerCommand::Reprice => {
                 match &mut self.execution {
                     // The costs the load planned on, found pending again, end it.
@@ -206,6 +200,11 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 }
                 Execution::Stopped(_) => {}
             },
+            Event::ReleaseMeasurementRoom => {
+                if let Execution::Serving(owner) | Execution::Draining(owner, _) = &mut self.execution {
+                    owner.release_measurement_room();
+                }
+            }
             Event::Cancel(request) => match &mut self.execution {
                 Execution::Serving(owner) | Execution::Draining(owner, _) => owner.cancel(request),
                 Execution::Stopped(_) => {}

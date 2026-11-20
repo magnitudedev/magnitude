@@ -268,8 +268,15 @@ def _collect(out, *, rest: bool) -> int:
             code = 1
         else:
             arguments.argv, arguments.answering = launched["command"], launched["run"]
-            with contextlib.redirect_stdout(printed):
-                code = arguments.handler(arguments)
+            try:
+                with contextlib.redirect_stdout(printed):
+                    code = arguments.handler(arguments)
+            except Exception as error:
+                printed.write(
+                    f"mrig: answering {launched['run']} failed ({type(error).__name__}: {error}); "
+                    f"results in {launched['results']}\n"
+                )
+                code = 1
         record_answer(Path(launched["results"]), printed.getvalue(), code)
         print(f"mrig: {launched['run']} ended without its caller; fetched, and its answer:", file=out)
         print(printed.getvalue().rstrip(), file=out, flush=True)

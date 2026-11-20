@@ -21,7 +21,7 @@
 //! `maxMemoryAllocationCount`, so the device's memory objects stay within
 //! the count by construction, whatever allocates them.
 
-use crate::device::{call, Inner};
+use crate::device::Inner;
 use crate::instance::Instance;
 use ash::vk;
 use seismic_compiler::blocks::{
@@ -29,7 +29,7 @@ use seismic_compiler::blocks::{
     BLOCK_CAP_BYTES,
 };
 use seismic_compiler::errors::ExecutionError;
-use seismic_memory::entry::{Carved, Change, Charge, Entry, Store, Wiring};
+use seismic_memory::entry::{CarvableCharge, Carved, Change, Charge, Entry, Store, Wiring};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 /// Every allocation starts at least this aligned.
@@ -96,7 +96,7 @@ enum Held {
     /// entry for a pool's block, whose ranges are carved from it; to its
     /// allocation's entry for a block of its own ([`Memory::block`]). Freed
     /// as the block is ([`Memory::free`]), in the change that destroys it.
-    Charged(Mutex<Charge>),
+    Charged(CarvableCharge),
     /// The logical device's own ([`Memory::driver_block`]): uncounted among
     /// the blocks, so each reconciliation charges it as the driver's memory
     /// ([`DriverMemory`]) to every live open's own entry, like the logical
@@ -133,7 +133,7 @@ impl Holding<'_> {
 
     fn held(self) -> Held {
         match self {
-            Self::Charged(_, charge) => Held::Charged(Mutex::new(charge)),
+            Self::Charged(_, charge) => Held::Charged(charge.into_carvable()),
             Self::Driver(_) => Held::Driver,
         }
     }
@@ -550,27 +550,26 @@ impl Memory {
     pub(crate) fn free(&self, device: &ash::Device, block: &Block) {
         // The memory's destruction and the free of its bytes are one change.
         let charged = match &block.held {
-            Held::Charged(charge) => {
-                let charge = charge.lock().expect("block charge lock poisoned");
-                Some((charge.entry().change(), charge))
-            }
+            Held::Charged(charge) => Some((charge.entry().change(), charge)),
             Held::Driver => None,
         };
         let _transition = self.transition();
         self.device_blocks.fetch_sub(block.counted_bytes(&self.device_heaps), Ordering::SeqCst);
         destroy_block(device, block);
         self.objects.fetch_sub(1, Ordering::SeqCst);
-        if let Some((change, mut charge)) = charged {
-            let bytes = charge.bytes();
-            if bytes > 0 {
-                charge.shrink(&change, bytes);
-            }
+        if let Some((change, charge)) = charged {
+            charge.release(&change);
         }
     }
 
     /// The device memory objects Seismic holds now: every block.
     pub(crate) fn objects(&self) -> u64 {
         self.objects.load(Ordering::SeqCst)
+    }
+
+    /// The device's limit on simultaneous memory allocations.
+    pub(crate) fn object_limit(&self) -> u64 {
+        self.object_limit
     }
 
     /// Reconcile the driver's memory ([`DriverMemory`]): read the blocks and
@@ -829,10 +828,6 @@ fn create_block(
     dedicated: bool,
     mut holding: Holding<'_>,
 ) -> Result<Arc<Block>, ExecutionError> {
-    let allocation = |error: ExecutionError| match error {
-        ExecutionError::SubmissionFailed(message) => ExecutionError::AllocationFailed(message),
-        other => other,
-    };
     // Every memory object holds at least the device's least
     // (`Memory::least_object`), its free space a pool block's to use and
     // a block of its own's to strand.
@@ -853,7 +848,13 @@ fn create_block(
         )
         .sharing_mode(if families.len() > 1 { vk::SharingMode::CONCURRENT } else { vk::SharingMode::EXCLUSIVE })
         .queue_family_indices(if families.len() > 1 { families } else { &[] });
-    let buffer = call(unsafe { device.create_buffer(&info, None) }, "vkCreateBuffer").map_err(allocation)?;
+    let buffer = crate::device::memory_call(
+        unsafe { device.create_buffer(&info, None) },
+        "vkCreateBuffer",
+        bytes,
+        memory_owner,
+        ExecutionError::AllocationFailed,
+    )?;
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
     let refuse = |error: ExecutionError| -> Result<Arc<Block>, ExecutionError> {
         unsafe { device.destroy_buffer(buffer, None) };
@@ -878,49 +879,33 @@ fn create_block(
         .allocation_size(allocated_bytes)
         .memory_type_index(pool.memory_type)
         .push_next(&mut flags);
-    let memory = match unsafe { device.allocate_memory(&allocate, None) } {
+    let memory = match crate::device::memory_call(
+        unsafe { device.allocate_memory(&allocate, None) },
+        "vkAllocateMemory",
+        bytes,
+        memory_owner,
+        ExecutionError::AllocationFailed,
+    ) {
         Ok(memory) => memory,
-        Err(result) => {
+        Err(error) => {
             unsafe { device.destroy_buffer(buffer, None) };
-            return Err(match result {
-                // The driver's own refusal, with its budget read now.
-                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
-                    let budget = memory_owner.memory_budget();
-                    ExecutionError::DeviceRefused {
-                        required: bytes,
-                        reading: seismic_compiler::errors::RefusalReading::HeapBudget {
-                            budget: budget.heap_budget_bytes,
-                            usage: budget.heap_usage_bytes,
-                        },
-                    }
-                }
-                vk::Result::ERROR_OUT_OF_HOST_MEMORY => ExecutionError::DeviceRefused {
-                    required: bytes,
-                    reading: seismic_compiler::errors::RefusalReading::Host,
-                },
-                // The count reached: only where the blocks hold more than
-                // the heaps (`Memory::least_object`).
-                vk::Result::ERROR_TOO_MANY_OBJECTS => ExecutionError::DeviceRefused {
-                    required: bytes,
-                    reading: seismic_compiler::errors::RefusalReading::MemoryObjects {
-                        limit: memory_owner.object_limit,
-                        held: memory_owner.objects(),
-                    },
-                },
-                other => {
-                    ExecutionError::AllocationFailed(format!("vkAllocateMemory failed: {other}"))
-                }
-            });
+            return Err(error);
         }
     };
-    let bound = call(
+    let bound = crate::device::memory_call(
         unsafe { device.bind_buffer_memory(buffer, memory, 0) },
         "vkBindBufferMemory",
+        bytes,
+        memory_owner,
+        ExecutionError::AllocationFailed,
     );
     let mapped = bound.and_then(|()| match pool.mapped {
-        true => call(
+        true => crate::device::memory_call(
             unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) },
             "vkMapMemory",
+            bytes,
+            memory_owner,
+            ExecutionError::AllocationFailed,
         )
         .map(|pointer| pointer.cast::<u8>()),
         false => Ok(std::ptr::null_mut()),
@@ -932,7 +917,7 @@ fn create_block(
                 device.destroy_buffer(buffer, None);
                 device.free_memory(memory, None);
             }
-            return Err(allocation(error));
+            return Err(error);
         }
     };
     let address = unsafe {
@@ -985,7 +970,7 @@ impl Range {
         let Held::Charged(charge) = &self.block.held else {
             panic!("a range carved from a block the driver holds: only a pool's ranges are carved");
         };
-        Charge::carve(&charge.lock().expect("block charge lock poisoned"), entry, self.bytes)
+        charge.carve(entry, self.bytes)
     }
 
     /// Offset of the range in its block's `VkBuffer`.
@@ -1144,10 +1129,10 @@ mod tests {
             mapped: std::ptr::null_mut(),
             dedicated: false,
             free: Mutex::new(FreeRanges::new(bytes)),
-            held: Held::Charged(Mutex::new({
+            held: Held::Charged({
                 let entry = tally();
-                Charge::took(&entry.change(), &entry, bytes, Wiring::Pageable)
-            })),
+                Charge::took(&entry.change(), &entry, bytes, Wiring::Pageable).into_carvable()
+            }),
         })
     }
 

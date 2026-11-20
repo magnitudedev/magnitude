@@ -23,7 +23,7 @@ use super::{
     publication::{
         CapacityResource, ModelUnloadCause, PublicationPermit, PublicationQueue,
         PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
-        RequestError, RequestTimings, ServiceCapacityError,
+        RequestError, RequestTimings, Retirement, ServiceCapacityError,
     },
     round_driver::{RoundError, lower_round, reconcile_forward},
     serving::ServingCensus,
@@ -228,7 +228,7 @@ fn selection_charge(operations: &[Operation]) -> usize {
 /// Whether `candidate`'s next round is a pass in the form its launch grants
 /// (`Generation::chains`): a front pass, entering the MTP head behind it,
 /// or a verify pass, entering nothing. A launch's forwards chain all or
-/// none (`ExecutorDomain::requirements`), and its passes are of the one
+/// none (`ExecutorDomain::shares_launch`), and its passes are of the one
 /// form its regime prices ([`FrontRows`]), within a chained launch's rows
 /// (`ExecutorDomain::chained_rows`), so a decode launch takes the selected
 /// requests alike in this with the first.
@@ -413,6 +413,7 @@ struct Record {
     branches: BTreeSet<usize>,
     /// The host's stream; `None` once the host released the request.
     publication: Option<PublicationSender>,
+    retirement: Retirement,
     publication_batch_limit: usize,
     pending_publication: Option<Vec<OutputToken>>,
     publication_permits: VecDeque<PublicationPermit>,
@@ -1554,6 +1555,15 @@ impl<F: ProgramFamily> Service<F> {
         generation
             .set_prefix_reuse(prefix_cache)
             .map_err(AdmissionError::invariant("admission"))?;
+        if !input.tokens().is_empty()
+            && (input.tokens() != generation.prompt()
+                || input.layout() != generation.layout()
+                || input.prompt_coordinates() != *generation.coordinates())
+        {
+            return Err(AdmissionError::invariant("admission")(
+                "prepared input does not match generation prompt, layout, or coordinates".into(),
+            ));
+        }
         let path = PrefixPath::of(&generation);
         if cache_points
             .iter()
@@ -1599,6 +1609,7 @@ impl<F: ProgramFamily> Service<F> {
                     terminal_retained: false,
                     branches: plan.branches,
                     publication: Some(sender),
+                    retirement: receiver.retirement(),
                     publication_batch_limit: output_capacity,
                     pending_publication: None,
                     publication_permits: VecDeque::new(),
@@ -2054,7 +2065,14 @@ trait MemoryStep: MemoryHost + Sized {
             },
         };
         if let Some(bindings) = bindings {
+            let sizing = [BankTier::Bank, BankTier::Host].map(|tier| self.domain().sizing_terms(tier));
             self.follow_yields(bindings)?;
+            // `follow_cache_targets` runs only here (in `between_flights`) for
+            // external `HostRam` pressure and bank growth targets — never to
+            // make room for claims, which reclaim synchronously inside
+            // `Ledger::admit_or_reclaim`. Both paths reach the same bank shrink
+            // release (`ExpertBank::release_evicted`).
+            self.follow_cache_targets(bindings, sizing)?;
         }
         let Some(read) = read else {
             return Ok(Observed { unload: false, reread: Reread::Unread });
@@ -2088,9 +2106,21 @@ trait MemoryStep: MemoryHost + Sized {
         let changed = preempted
             || waited != response.admission_waits
             || self.domain().memory_generation() != read.generation;
-        let reread = match self.domain().memory_stands().map_err(classify_domain_error)? {
-            true => Reread::Stands { cost: read.cost, changed, ceiling: self.domain().others_interval() },
-            false => Reread::Settled,
+        const ACTIVE_MIN_REREAD: std::time::Duration = std::time::Duration::from_millis(50);
+        const ACTIVE_MAX_REREAD: std::time::Duration = std::time::Duration::from_secs(1);
+        const OPPORTUNITY_REREAD: std::time::Duration = std::time::Duration::from_secs(2);
+        let reread = match self.domain().memory_standing().map_err(classify_domain_error)? {
+            magnitude_executor::MemoryStanding::Active => Reread::Stands {
+                cost: read.cost.max(ACTIVE_MIN_REREAD),
+                changed,
+                ceiling: self.domain().others_interval().map(|interval| interval.clamp(ACTIVE_MIN_REREAD, ACTIVE_MAX_REREAD)),
+            },
+            magnitude_executor::MemoryStanding::Opportunity => Reread::Stands {
+                cost: OPPORTUNITY_REREAD,
+                changed: false,
+                ceiling: Some(OPPORTUNITY_REREAD),
+            },
+            magnitude_executor::MemoryStanding::Settled => Reread::Settled,
         };
         Ok(Observed { unload: false, reread })
     }
@@ -2114,12 +2144,14 @@ trait MemoryStep: MemoryHost + Sized {
     }
 
     /// Follow the expert bank's derived target
-    /// (`ExecutorDomain::follow_cache_targets`): a resize it begins is held as
-    /// begun, a growth as one and a shrink as the target's. One deferred or
-    /// running is followed again at the next boundary, which derives afresh.
-    /// Whether the bank owes a shrink: one begun, running, or deferred to a
-    /// boundary the flight that defers it brings; its finish advances the
-    /// epoch, so what waits on memory retries then.
+    /// (`ExecutorDomain::follow_cache_targets`): called only from `observe`
+    /// (`between_flights`) for external `HostRam` pressure and bank growth
+    /// targets, never for claims (which reclaim synchronously through
+    /// `Ledger::admit_or_reclaim`); both shrink paths reach the same bank
+    /// shrink release (`ExpertBank::release_evicted`). A resize it begins is
+    /// held as begun, a growth as one and a shrink as the target's. One
+    /// deferred or running is followed again at the next boundary, which
+    /// derives afresh.
     fn follow_cache_targets(
         &mut self,
         bindings: &mut StateBindings,
@@ -2142,24 +2174,18 @@ trait MemoryStep: MemoryHost + Sized {
         Ok(cause == BankBegunFor::Shrink)
     }
 
-    /// Free what the ledger took of the load's cache, as its holders do:
-    /// the domain's own kinds at once (`ExecutorDomain::release_yielded`),
-    /// the retained prefixes worth least while their cache is owed
-    /// ([`MemoryHost::evict_owed_prefixes`]), and the expert bank, which
-    /// follows its target derived afresh ([`Self::follow_cache_targets`]):
-    /// a claim that took the bank's cache allocates it only once the bank's
-    /// shrink frees it, so a shrink owed is pending. The one release order
-    /// every boundary and every claim short of memory follow. Each release
-    /// is recorded with what the process held on each side of it, and what
-    /// waits on memory retries once one freed any.
+    /// Free what the ledger took of the load's non-bank cache, as its holders
+    /// do: the domain's own kinds at once (`ExecutorDomain::release_yielded`)
+    /// and the retained prefixes worth least while their cache is owed
+    /// ([`MemoryHost::evict_owed_prefixes`]). The expert bank reclaims
+    /// synchronously inside `Ledger::admit_or_reclaim` before any claim is
+    /// handed out, never asynchronously on yield; `follow_cache_targets` runs
+    /// only in `observe` (`between_flights`) for external `HostRam` pressure
+    /// and bank growth.
     fn follow_yields(&mut self, bindings: &mut StateBindings) -> Result<Yielded, RequestError> {
-        let sizing = [BankTier::Bank, BankTier::Host].map(|tier| self.domain().sizing_terms(tier));
         let (before, started, wake) = (self.domain().held_bytes(), std::time::Instant::now(), self.completion());
-        let yielded = self.domain().release_yielded(bindings, wake).map_err(classify_domain_error)?;
-        let yielded = match (self.evict_owed_prefixes(), yielded) {
-            (true, Yielded::Pending | Yielded::Nothing) => Yielded::Released { released: 0, returned: 0 },
-            (_, yielded) => yielded,
-        };
+        let evicted = self.evict_owed_prefixes();
+        let yielded = combine_yielded(evicted, self.domain().release_yielded(bindings, wake).map_err(classify_domain_error)?);
         if let Yielded::Released { released, returned } = yielded {
             tracing::info!(
                 micros = started.elapsed().as_micros() as u64,
@@ -2171,11 +2197,7 @@ trait MemoryStep: MemoryHost + Sized {
             );
             self.advance_epoch();
         }
-        let shrinking = self.follow_cache_targets(bindings, sizing)?;
-        Ok(match (yielded, shrinking) {
-            (Yielded::Nothing, true) => Yielded::Pending,
-            (yielded, _) => yielded,
-        })
+        Ok(yielded)
     }
 
     /// At a flight boundary, finish the idle graph slots' release off the
@@ -3784,7 +3806,8 @@ impl<F: ProgramFamily> Service<F> {
     /// Close a terminal request's executor state and forget it.
     fn retire(&mut self, id: RequestId) -> Result<(), RequestError> {
         self.domain.close(id).map_err(invariant("request retirement"))?;
-        self.requests.remove(&id);
+        let request = self.requests.remove(&id).expect("retiring a terminal request");
+        request.record.retirement.retire();
         self.epoch.advance();
         Ok(())
     }
@@ -3957,6 +3980,16 @@ enum Residency {
 pub struct Relieved<T> {
     pub current: Result<T, DomainError>,
     pub pending: bool,
+}
+
+/// Combine prefix eviction with the domain's `release_yielded` outcome:
+/// `Yielded::Pending` is preserved unconditionally so an async pool or slot
+/// release is never overwritten with `Yielded::Released`.
+fn combine_yielded(evicted_prefixes: bool, yielded: Yielded) -> Yielded {
+    match (evicted_prefixes, yielded) {
+        (true, Yielded::Nothing) => Yielded::Released { released: 0, returned: 0 },
+        (_, yielded) => yielded,
+    }
 }
 
 #[cfg(test)]
@@ -4145,13 +4178,7 @@ mod timing_tests {
     /// orphan the queued chunk, discarding a whole chunk of device work.
     #[test]
     fn only_live_work_outside_the_round_competes_with_a_queued_chunk() {
-        let record = || Record {
-            waiting_since: 0, service_ns: 0, clock: RequestClock::Waiting, error: None, preemption_debt: 0,
-            prefix_cache: true, prefix_source: None,
-            prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
-            publication: None, publication_batch_limit: 4, pending_publication: None,
-            publication_permits: VecDeque::new(),
-        };
+        let record = || Record { prefix_cache: true, ..super::front_rows_tests::record() };
         let request = |stage| Request {
             record: record(),
             state: State::Between(super::termination_tests::generation(), stage),
@@ -4633,6 +4660,8 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         }
         let reached = owner.as_ref().unwrap().snapshot(id).unwrap().resident_position;
         assert!(reached < PROMPT, "stopped mid-prompt, at {reached}");
+        let retirement = receiver.retirement();
+        assert!(retirement.poll(Waker::noop()).is_pending());
         owner.as_mut().unwrap().stop(id);
         let finish = loop {
             run(&mut owner);
@@ -4645,6 +4674,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         assert_eq!(finish, FinishReason::Cancelled);
         let served = owner.as_mut().unwrap();
         assert!(served.snapshot(id).is_none(), "the stopped request is retired");
+        assert!(retirement.poll(Waker::noop()).is_ready());
         let sharing = prompt();
         let hit = served.service.prefix_cache.lookup(PrefixPath::of(&sharing), PROMPT).unwrap().expect("its prompt work is cached");
         assert_eq!(hit.position(), reached, "cached where it reached");
@@ -4786,11 +4816,12 @@ mod front_rows_tests {
     }
 
     /// A request's record, its prefix uncached and no stream attached.
-    fn record() -> Record {
+    pub(super) fn record() -> Record {
         Record {
             waiting_since: 0, service_ns: 0, clock: RequestClock::Waiting, error: None, preemption_debt: 0,
             prefix_cache: false, prefix_source: None,
             prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
+            retirement: PublicationQueue::bounded(1, |_| {}).unwrap().1.retirement(),
             publication: None, publication_batch_limit: 4, pending_publication: None,
             publication_permits: VecDeque::new(),
         }
@@ -5243,5 +5274,20 @@ mod front_rows_tests {
         let mut prompting = Generation::new_with_method(vec![TokenId(1), TokenId(2)], layout(), options(), None, fronting).unwrap();
         prompting.resume_at(None).unwrap();
         assert!(!chained(&Candidate::Ready(prompting)), "a front-decoding request's prompt chunk");
+    }
+
+    #[test]
+    fn follow_yields_preserves_pending_when_prefixes_evicted() {
+        assert_eq!(super::combine_yielded(true, Yielded::Pending), Yielded::Pending);
+        assert_eq!(super::combine_yielded(false, Yielded::Pending), Yielded::Pending);
+        assert_eq!(
+            super::combine_yielded(true, Yielded::Nothing),
+            Yielded::Released { released: 0, returned: 0 }
+        );
+        assert_eq!(super::combine_yielded(false, Yielded::Nothing), Yielded::Nothing);
+        assert_eq!(
+            super::combine_yielded(true, Yielded::Released { released: 128, returned: 64 }),
+            Yielded::Released { released: 128, returned: 64 }
+        );
     }
 }

@@ -22,7 +22,7 @@ use magnitude_scheduler::ServiceLimits;
 use seismic::Devices;
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ExecutionPlanningError {
     /// The service's token allowance needs more rows than one launch class admits.
     LaunchRows { required: usize, admitted: usize },
@@ -124,10 +124,10 @@ pub fn plan_resident(
 /// Every load, whole or streamed, is priced on its executor's costs as it
 /// serves (`execution::load_measures`), so none plans before the
 /// measurement job stored the costs' required figures: while they are
-/// pending the load waits for them (`PlanError::Unpriced`), holding nothing
+/// pending the load waits for them (`PlanError::Pending`), holding nothing
 /// of the device, once per machine. Without a kernel cache nothing is
 /// measured for it and its prices are unavailable: a whole plan holds
-/// without them, and a streamed one fails (`PlanError::Unpriced`, an
+/// without them, and a streamed one fails (`PlanError::Unavailable`, an
 /// internal error).
 pub fn plan_banked<C: HeldCharge>(
     manifest: &ExecutionManifest,
@@ -137,7 +137,9 @@ pub fn plan_banked<C: HeldCharge>(
     room: &impl SettleRoom,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
     let measurements = match manifest.kernel_cache.as_deref() {
-        None => Measurements::Unavailable { reason: "the load keeps no kernel cache, which holds the machine's figures".into() },
+        None => Measurements::Unavailable {
+            reason: "the load keeps no kernel cache, which holds the machine's figures".into(),
+        },
         Some(kernels) => crate::assessment::stored_measurements(
             &selected.reading.topology,
             &selected.info,
@@ -145,11 +147,8 @@ pub fn plan_banked<C: HeldCharge>(
             manifest.store(),
         ),
     };
-    if let Measurements::Pending = measurements {
-        return Err(ExecutionPlanningError::Plan(PlanError::Unpriced {
-            pending: true,
-            reason: "the executor's costs are not measured yet".into(),
-        }));
+    if let Measurements::Pending(pending) = measurements {
+        return Err(ExecutionPlanningError::Plan(PlanError::Pending(pending)));
     }
     let prices = plan_prices(&measurements, &resident);
     let short = match holding {
@@ -179,7 +178,7 @@ pub fn plan_banked<C: HeldCharge>(
 /// or their streamed figures are: a plan that holds a bank waits for them.
 pub fn plan_prices(measurements: &Measurements, plan: &ExecutionPlanDraft) -> Priced<PlanPrices> {
     match measurements {
-        Measurements::Pending => Priced::Pending("the executor's costs are not measured yet".into()),
+        Measurements::Pending(pending) => Priced::Pending(pending.clone()),
         Measurements::Unavailable { reason } => Priced::Unavailable(reason.clone()),
         Measurements::Measured { costs, streamed, .. } => streamed.as_ref().and_then(|figures| {
             let (resident, steps) = (plan.clone(), ExecutorCosts::clone(costs));

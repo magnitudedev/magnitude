@@ -259,9 +259,9 @@ impl AttentionFixture {
         let zeros = |element, extents: &[u64]| semantic_zeros(charges, element, extents, ATTENTION, label);
         let input_norm = rows.norm(charges, binding.norm, hidden, ATTENTION, label)?;
         let query = zeros(binding.query_segment(), &[binding.query_segment_rows(), hidden])?;
-        let gate = zeros(binding.gate, &[shape.gate_rows(), hidden])?;
-        let key = zeros(binding.key, &[shape.key_rows(), hidden])?;
-        let value = zeros(binding.value, &[shape.value_rows(), hidden])?;
+        let gate = zeros(binding.gate_segment(), &[shape.gate_rows(), hidden])?;
+        let key = zeros(binding.key_segment(), &[shape.key_rows(), hidden])?;
+        let value = zeros(binding.value_segment(), &[shape.value_rows(), hidden])?;
         let (output_q, output_w) = binding.output_input();
         let output = zeros(binding.output, &[hidden, output_q * output_w])?;
         let grouped = binding

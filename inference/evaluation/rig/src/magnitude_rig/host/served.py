@@ -26,11 +26,15 @@ ANSWERS = "answers.json"
 # The request options evaluation renders with (the harness's standard ones): every answer is
 # asked with them, so the harness renders its judged conversation as the service did.
 OPTIONS = {"chat_template_kwargs": {"enable_thinking": False}}
-SCENARIOS = ("lifecycle", "stop", "stop-prepare", "failure", "repeat")
+SCENARIOS = ("lifecycle", "stop", "stop-prepare", "failure", "repeat", "turns")
 # The most tokens an answer generates; a prompt's own bound is at most its canonical answer's.
 ANSWER_TOKENS = 64
 # Answers a `repeat` run asks past the first of each prompt.
 REPEATS = 16
+# The pieces a `turns` run's first answer streams before it is cancelled: past the deepest a
+# stopped request must reach to be retained for resumption (`MIN_PREFIX_HIT`, 64 tokens), so the
+# next turn resumes a prefix decoded past it.
+TURN_PIECES = 96
 LOAD_SECONDS = 1500.0
 JOB_SECONDS = 180.0
 START_SECONDS = 120.0
@@ -231,6 +235,32 @@ class Service:
         started.set()
         return {"pieces": len(pieces), "ended": ended, "text": "".join(pieces)}
 
+    def cancelled(self, model: str, prompt: dict, pieces: int) -> dict:
+        """An answer streamed until `pieces` pieces, then cancelled by closing its connection; its
+        text, and how it ended where it ended before."""
+        request = urllib.request.Request(self.origin + "/v1/chat/completions", method="POST", headers={"content-type": "application/json"}, data=json.dumps({
+            "model": model, **request_body(prompt),
+            "max_tokens": pieces * 4, "temperature": 0, "seed": 1, "stream": True, **OPTIONS,
+        }).encode())
+        streamed, ended = [], None
+        try:
+            with urllib.request.urlopen(request, timeout=300) as reply:
+                for line in reply:
+                    if not line.startswith(b"data: ") or line.startswith(b"data: [DONE]"):
+                        continue
+                    chunk = json.loads(line[6:])
+                    if "error" in chunk:
+                        raise Failed(f"cancelled answer: {chunk['error']}")
+                    for choice in chunk.get("choices", ()):
+                        ended = choice.get("finish_reason") or ended
+                        if piece := choice.get("delta", {}).get("content"):
+                            streamed.append(piece)
+                    if len(streamed) >= pieces or ended:
+                        break
+        except urllib.error.HTTPError as error:
+            raise Failed(f"cancelled answer: {error.code} {error.read()[:600]!r}") from None
+        return {"pieces": len(streamed), "ended": ended, "text": "".join(streamed)}
+
     def end(self) -> int | None:
         self.process.stdin.close()
         try:
@@ -274,7 +304,7 @@ class Run:
         self.resident = (*(("--context-tokens", str(arguments.context)) if arguments.context else ()), *plain)
         self.install()
         self.template = json.loads(Path(arguments.template).read_text())
-        # The template's lanes 0 and 1 as asked (`instruments/served.py` `prompts`).
+        # The template's lanes 0 and 1 as asked (`prompts`).
         self.messages, self.other = json.loads(Path(arguments.prompts).read_text())
 
     def install(self) -> None:
@@ -609,6 +639,45 @@ def repeat(run: Run) -> None:
     run.note("service ended", code=service.end())
 
 
+def turns(run: Run) -> None:
+    """A conversation's next turn on a load that drafts: its first answer is cancelled past the
+    depth a stopped request is retained at, and the next turn, the conversation with that answer
+    and one more question, resumes the prefix the first decoded and answers whole."""
+    service = Service(run, "turns", run.capped)
+    model = service.model(run.arguments.model)
+    instance = service.load(model)
+    run.note("load ready", streaming=json.dumps(streaming(instance))[:300])
+    first = service.cancelled(model, run.messages, TURN_PIECES)
+    run.note("first turn cancelled", pieces=first["pieces"], ended=first["ended"], text=first["text"][:60])
+    if first["ended"] or first["pieces"] < TURN_PIECES:
+        raise Failed(f"the first turn ended ({first['ended']}) at {first['pieces']} pieces, before its cancel")
+    following = {**run.messages, "messages": [*run.messages["messages"], {"role": "assistant", "content": first["text"]},
+                                              {"role": "user", "content": "Go on."}]}
+    second = service.chat(model, following)
+    run.note("second turn", finish=second["finish"], usage=second["usage"], first=second["first_seconds"],
+             decode_ms=second["decode_ms"], text=second["text"][:60])
+    if second["finish"] not in ("stop", "length") or not second["pieces"]:
+        raise Failed(f"the second turn ended {second['finish']} after {len(second['pieces'])} pieces")
+    run.note("service ended", code=service.end())
+
+
+def prompts(template: Path, rendered: Path, output: Path) -> None:
+    """Each rendered lane of `template` as the service is asked it: the conversation the harness
+    sized (its kept history) up to the probe's question, its offered tools, and the most tokens its
+    answer may take, at most its canonical answer's (the last scored span), so the conversation
+    answered fits the template's context as the canonical one does. Runs in the side's venv."""
+    from magnitude_fixtures import TemplateFile
+
+    sessions = TemplateFile.read(template).sessions
+    asked = []
+    for line in map(json.loads, rendered.read_text().splitlines()):
+        conversation = sessions[line["lane"]].conversation_with(line["history"])
+        start, end = line["scored_spans"][-1]
+        asked.append({"lane": line["lane"], "messages": conversation.messages[:conversation.prefix],
+                      "tools": conversation.tools, "answer_tokens": min(ANSWER_TOKENS, end - start)})
+    output.write_text(json.dumps(asked))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     for name in ("--service", "--bundle", "--models", "--artifacts", "--template", "--prompts", "--scratch", "--run-dir",
@@ -622,7 +691,7 @@ def main() -> int:
     code = 0
     try:
         {"lifecycle": lifecycle, "stop": stop, "stop-prepare": stop_prepare, "failure": failure,
-         "repeat": repeat}[run.arguments.scenario](run)
+         "repeat": repeat, "turns": turns}[run.arguments.scenario](run)
     except Failed as why:
         run.note("FAILED", why=str(why))
         code = 1

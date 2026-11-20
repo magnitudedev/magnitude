@@ -1434,8 +1434,7 @@ def test_served_asks_a_tool_conversation_whole(tmp_path):
     at the history the harness sized it to, its answer held to its canonical answer's tokens."""
     import json
     from magnitude_fixtures import Source, TemplateFile
-    from magnitude_rig.host.served import request_body
-    from magnitude_rig.instruments.served import prompts
+    from magnitude_rig.host.served import prompts, request_body
     tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
     session = {"key": "tools", "tools": [tool], "messages": [
         {"role": "system", "content": "s"},
@@ -1461,3 +1460,49 @@ def test_served_asks_a_tool_conversation_whole(tmp_path):
     assert body["tools"] == [tool] and whole["answer_tokens"] == 10
     # Sized without its history unit, the conversation keeps its head and its probe.
     assert [m["content"] for m in request_body(short)["messages"]] == ["s", "again"] and short["lane"] == 1
+
+
+def test_placement_prefers_idle_warm_and_closest_ancestor_over_cold(monkeypatch):
+    """Placement prefers a capable idle host whose checkout already built the requested source
+    (exact tree > closest ancestor commit > any warm build) over a cold idle host even before
+    incremental build timings exist, and falls back to earliest `_start` when none is warm."""
+    from types import SimpleNamespace
+    from magnitude_rig import engine, sources
+    from magnitude_rig.connection import Remote
+
+    def make_candidate(alias: str, checkout: dict | None, slowest: float, busy: bool = False):
+        remote = Remote(alias, True, False, "Linux", "x86_64", "python3", "/r", "/m", "/p.zip", {}, ("cuda",), True)
+        status = {
+            "entries": [{"kind": "device"}] if busy else [],
+            "building": [],
+            "device_lock_held_elsewhere": None,
+            "waits": {"build": 0.0, "device": 300.0 if busy else 0.0},
+            "checkouts": [checkout],
+            "slowest": slowest,
+        }
+        side = SimpleNamespace(source=SimpleNamespace(identity=SimpleNamespace(commit="head", dirty_digest=None)))
+        work = SimpleNamespace(device="device", sides=(side,))
+        return engine.Candidate(remote, status, work, {}, 0.0, (slowest,))
+
+    monkeypatch.setattr(sources, "distance", lambda commit, anc: {"near": 1, "far": 50}.get(anc))
+
+    def rank(candidates):
+        monkeypatch.setattr(engine, "_candidates", lambda req, names, rid: (list(candidates), [], set()))
+        hosts = SimpleNamespace(known=lambda: tuple(c.remote.alias for c in candidates), host=lambda a: a)
+        req = SimpleNamespace(host=None, backend="cuda")
+        return [c.remote.alias for c in engine._ranked(req, hosts, "run-1")[0]]
+
+    cold_fast = make_candidate("cold-fast", None, slowest=60.0)
+    warm_other = make_candidate("warm-other", {"shared": False, "built": True, "same_tree": False, "commit": "other"}, slowest=600.0)
+    warm_far = make_candidate("warm-far", {"shared": False, "built": True, "same_tree": False, "commit": "far"}, slowest=600.0)
+    warm_near = make_candidate("warm-near", {"shared": False, "built": True, "same_tree": False, "commit": "near"}, slowest=600.0)
+    warm_exact = make_candidate("warm-exact", {"shared": False, "built": True, "same_tree": True, "commit": "head"}, slowest=600.0)
+    assert rank([cold_fast, warm_other, warm_far, warm_near, warm_exact]) == [
+        "warm-exact", "warm-near", "warm-far", "warm-other", "cold-fast",
+    ]
+
+    # When no capable idle host is warm, earliest expected `_start` governs (breaking exact
+    # `_start` ties by warmth).
+    cold_slow = make_candidate("cold-slow", None, slowest=300.0)
+    busy_warm = make_candidate("busy-warm", {"shared": False, "built": True, "same_tree": True, "commit": "head"}, slowest=10.0, busy=True)
+    assert rank([cold_slow, busy_warm, cold_fast]) == ["cold-fast", "busy-warm", "cold-slow"]

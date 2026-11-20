@@ -1,6 +1,6 @@
 use crate::{
     gguf::{self, Directory, FileHeaders, GgufArtifact, HeaderSource, TensorDescriptor},
-    ArtifactIdentity, Error, PackageIdentity, TemplatePayload, TokenizerPayload,
+    ArtifactIdentity, Error, PackageIdentity, SplitError, TemplatePayload, TokenizerPayload,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -149,31 +149,19 @@ impl PackageHeaders {
         projector: Option<&Path>,
         headers: &dyn HeaderSource,
     ) -> Result<Self, Error> {
-        if target_shards.is_empty() {
-            return Err(Error::Invalid("split GGUF has no shards".into()));
-        }
-        let projector_identity = projector.map(FileIdentity::of).transpose()?;
-        if let (Some(projector_path), Some(projector_id)) = (projector, &projector_identity) {
-            for shard in target_shards {
-                if shard.as_path() == projector_path || FileIdentity::of(shard)? == *projector_id {
-                    return Err(Error::Invalid(
-                        "target and projector must be distinct package components".into(),
-                    ));
-                }
-            }
-        }
+        require_distinct_files(
+            target_shards.iter().map(PathBuf::as_path),
+            projector,
+            headers,
+            DISTINCT_PROJECTOR,
+        )?;
         let target = HeaderComponent::inspect_shards(target_shards, headers)?;
-        if let (Some(projector_path), Some(projector_id)) = (projector, &projector_identity) {
-            for file in &target.files {
-                if file.path.as_path() == projector_path
-                    || FileIdentity::of(&file.path)? == *projector_id
-                {
-                    return Err(Error::Invalid(
-                        "target and projector must be distinct package components".into(),
-                    ));
-                }
-            }
-        }
+        require_distinct_files(
+            target.files.iter().map(|file| file.path.as_path()),
+            projector,
+            headers,
+            DISTINCT_PROJECTOR,
+        )?;
         let projector = projector
             .map(|projector| HeaderComponent::inspect(projector, headers))
             .transpose()?;
@@ -206,7 +194,7 @@ impl PackageHeaders {
     /// [`Self::add_draft`] with the draft's header from `headers`.
     pub fn add_draft_from(&mut self, draft: &Path, headers: &dyn HeaderSource) -> Result<(), Error> {
         let component = HeaderComponent::inspect(draft, headers)?;
-        self.add_preopened_draft(draft, component.directory, component.files)
+        self.add_preopened_draft_with(draft, component.directory, component.files, headers)
     }
 
     /// Attach a previously inspected draft component ([`Self::inspect_component`])
@@ -218,19 +206,23 @@ impl PackageHeaders {
         directory: Directory,
         files: Vec<ComponentFile>,
     ) -> Result<(), Error> {
-        let draft_id = FileIdentity::of(draft)?;
+        self.add_preopened_draft_with(draft, directory, files, &FileHeaders)
+    }
+
+    fn add_preopened_draft_with(
+        &mut self,
+        draft: &Path,
+        directory: Directory,
+        files: Vec<ComponentFile>,
+        headers: &dyn HeaderSource,
+    ) -> Result<(), Error> {
         let others = self
             .target
             .files
             .iter()
-            .chain(self.projector.iter().flat_map(|projector| &projector.files));
-        for file in others {
-            if file.path == draft || FileIdentity::of(&file.path)? == draft_id {
-                return Err(Error::Invalid(
-                    "the draft must be a distinct package component".into(),
-                ));
-            }
-        }
+            .chain(self.projector.iter().flat_map(|projector| &projector.files))
+            .map(|file| file.path.as_path());
+        require_distinct_files(others, [draft], headers, DISTINCT_DRAFT)?;
         self.draft = Some((HeaderComponent { directory, files }, ArtifactIdentity::for_open()));
         Ok(())
     }
@@ -333,36 +325,32 @@ impl Package {
         target_shards: &[PathBuf],
         projector: Option<&Path>,
     ) -> Result<Self, Error> {
-        let first = target_shards
-            .first()
-            .ok_or_else(|| Error::Invalid("split GGUF has no shards".into()))?;
-        if let Some(projector_path) = projector {
-            let canonical_projector = projector_path.canonicalize()?;
-            for shard in target_shards {
-                if shard.canonicalize()? == canonical_projector {
-                    return Err(Error::Invalid(
-                        "target and projector must be distinct package components".into(),
-                    ));
-                }
-            }
-        }
+        require_distinct_files(
+            target_shards.iter().map(PathBuf::as_path),
+            projector,
+            &FileHeaders,
+            DISTINCT_PROJECTOR,
+        )?;
         let target = GgufArtifact::open_shards(target_shards)?;
         let projector = projector.map(GgufArtifact::open).transpose()?;
-        if let Some(projector) = &projector {
-            for target in target.sources() {
-                for projector in projector.sources() {
-                    if same_file(target, projector)? {
-                        return Err(Error::Invalid(
-                            "target and projector must be distinct package components".into(),
-                        ));
-                    }
-                }
-            }
-        }
+        require_distinct_files(
+            target.sources().map(|source| source.path()),
+            projector
+                .iter()
+                .flat_map(GgufArtifact::sources)
+                .map(|source| source.path()),
+            &FileHeaders,
+            DISTINCT_PROJECTOR,
+        )?;
         let identity = PackageIdentity {
             target: target.identity(),
             projector: projector.as_ref().map(GgufArtifact::identity),
         };
+        let first = target
+            .sources()
+            .next()
+            .expect("open_shards returns at least one shard")
+            .path();
         let store = model_store(first)?;
         let tokenizer = TokenizerPayload::from_directory(target.directory());
         let templates = TemplatePayload::from_directory(
@@ -385,9 +373,7 @@ impl Package {
     pub fn open_target_shards_discovering_projector(
         target_shards: &[PathBuf],
     ) -> Result<Self, Error> {
-        let first = target_shards
-            .first()
-            .ok_or_else(|| Error::Invalid("split GGUF has no shards".into()))?;
+        let first = target_shards.first().ok_or(SplitError::Empty)?;
         let projector = discover_projector(first)?;
         Self::open_target_shards(target_shards, projector.as_deref())
     }
@@ -444,16 +430,14 @@ impl Package {
         let others = self
             .target
             .sources()
-            .chain(self.projector.iter().flat_map(GgufArtifact::sources));
-        for other in others {
-            for source in draft.sources() {
-                if same_file(other, source)? {
-                    return Err(Error::Invalid(
-                        "the draft must be a distinct package component".into(),
-                    ));
-                }
-            }
-        }
+            .chain(self.projector.iter().flat_map(GgufArtifact::sources))
+            .map(|source| source.path());
+        require_distinct_files(
+            others,
+            draft.sources().map(|source| source.path()),
+            &FileHeaders,
+            DISTINCT_DRAFT,
+        )?;
         self.draft = Some(draft);
         Ok(self)
     }
@@ -501,44 +485,78 @@ impl Package {
     }
 }
 
+const DISTINCT_PROJECTOR: &str = "target and projector must be distinct package components";
+const DISTINCT_DRAFT: &str = "the draft must be a distinct package component";
+
+/// Cross-platform underlying-file identity used for every duplicate-component
+/// check in this module: `(dev, ino)` on Unix, canonicalized and normalized
+/// path on non-Unix, with an absolute-path fallback when metadata or
+/// canonicalization is unavailable (e.g. virtual [`HeaderSource`] paths).
 #[derive(PartialEq, Eq)]
 enum FileIdentity {
     #[cfg(unix)]
     Inode(u64, u64),
-    #[cfg(not(unix))]
-    Canonical(PathBuf),
+    Path(PathBuf),
 }
 
 impl FileIdentity {
-    fn of(path: &Path) -> Result<Self, Error> {
+    fn of(path: &Path) -> Self {
         #[cfg(unix)]
-        {
+        if let Ok(metadata) = std::fs::metadata(path) {
             use std::os::unix::fs::MetadataExt;
-            let metadata = std::fs::metadata(path)?;
-            Ok(Self::Inode(metadata.dev(), metadata.ino()))
+            return Self::Inode(metadata.dev(), metadata.ino());
         }
         #[cfg(not(unix))]
-        {
-            Ok(Self::Canonical(path.canonicalize()?))
-        }
+        let resolved = path
+            .canonicalize()
+            .or_else(|_| std::path::absolute(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+        #[cfg(unix)]
+        let resolved = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        Self::Path(normalize_identity_path(resolved))
     }
 }
 
-fn same_file(
-    left: &std::sync::Arc<crate::FileSource>,
-    right: &std::sync::Arc<crate::FileSource>,
-) -> Result<bool, Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let left = left.metadata()?;
-        let right = right.metadata()?;
-        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+pub(crate) fn same_disk_file(left: &Path, right: &Path) -> Result<bool, Error> {
+    if left == right {
+        return Ok(true);
     }
-    #[cfg(not(unix))]
-    {
-        Ok(left.path() == right.path())
+    Ok(FileIdentity::of(left) == FileIdentity::of(right))
+}
+
+fn normalize_identity_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(raw) = path.to_str() {
+        let stripped = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            raw.strip_prefix(r"\\?\").unwrap_or(raw).to_owned()
+        };
+        return PathBuf::from(stripped.replace('/', r"\").to_lowercase());
     }
+    path
+}
+
+/// Verify that no file in `left` refers to the same underlying file as any
+/// file in `right`, using `headers`'s file-identity check.
+fn require_distinct_files<'a>(
+    left: impl IntoIterator<Item = &'a Path>,
+    right: impl IntoIterator<Item = &'a Path>,
+    headers: &dyn HeaderSource,
+    message: &'static str,
+) -> Result<(), Error> {
+    let right: Vec<&Path> = right.into_iter().collect();
+    if right.is_empty() {
+        return Ok(());
+    }
+    for path in left {
+        for other in &right {
+            if headers.same_file(path, other)? {
+                return Err(Error::Invalid(message.into()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn component_files(artifact: &GgufArtifact) -> Vec<ComponentFile> {
@@ -574,7 +592,7 @@ pub fn model_store(target: &Path) -> Result<PathBuf, Error> {
 
 fn discover_projector(target: &Path) -> Result<Option<PathBuf>, Error> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let canonical_target = target.canonicalize()?;
+    let target_id = FileIdentity::of(target);
     let mut projectors = Vec::new();
     for entry in std::fs::read_dir(parent)? {
         let path = entry?.path();
@@ -584,9 +602,7 @@ fn discover_projector(target: &Path) -> Result<Option<PathBuf>, Error> {
         if path.is_file()
             && name.starts_with("mmproj-")
             && name.ends_with(".gguf")
-            && path
-                .canonicalize()
-                .is_ok_and(|path| path != canonical_target)
+            && FileIdentity::of(&path) != target_id
         {
             projectors.push(path);
         }
@@ -761,5 +777,56 @@ mod tests {
         let expected = blobs.canonicalize().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(stored.unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_distinct_files_rejects_symlinks_hardlinks_and_virtual_duplicates() {
+        let root = temporary_directory("distinct-files");
+        let target = root.join("model.gguf");
+        let other = root.join("projector.gguf");
+        let symlink = root.join("mmproj-link.gguf");
+        let hardlink = root.join("mmproj-hard.gguf");
+        std::fs::write(&target, b"GGUF").unwrap();
+        std::fs::write(&other, b"GGUF").unwrap();
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        std::fs::hard_link(&target, &hardlink).unwrap();
+
+        assert!(super::require_distinct_files(
+            [target.as_path()],
+            [other.as_path()],
+            &super::FileHeaders,
+            super::DISTINCT_PROJECTOR,
+        )
+        .is_ok());
+        assert!(super::require_distinct_files(
+            [target.as_path()],
+            [symlink.as_path()],
+            &super::FileHeaders,
+            super::DISTINCT_PROJECTOR,
+        )
+        .is_err());
+        assert!(super::require_distinct_files(
+            [target.as_path()],
+            [hardlink.as_path()],
+            &super::FileHeaders,
+            super::DISTINCT_PROJECTOR,
+        )
+        .is_err());
+        // Sibling discovery also skips hardlinks/symlinks pointing to target.
+        assert_eq!(super::discover_projector(&target).unwrap(), None);
+
+        // Fallback path identity still rejects duplicate virtual/missing paths.
+        let missing = root.join("missing.gguf");
+        let missing_dot = root.join(".").join("missing.gguf");
+        assert!(super::require_distinct_files(
+            [missing.as_path()],
+            [missing_dot.as_path()],
+            &super::FileHeaders,
+            super::DISTINCT_DRAFT,
+        )
+        .is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

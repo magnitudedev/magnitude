@@ -18,6 +18,7 @@ void short_conv_publish(uint64_t index, uint64_t channel) {
     const int taps = int(SEISMIC_DIM_C) - 1;
     const uint64_t bank_elements = SEISMIC_WINDOW_STRIDE_0;
     const versions_slot slot = versions_slot_of(index);
+    if (slot.lo == slot.hi) return;
     const Out source = versions_out_bank(window, slot.source, bank_elements);
     const Out target = versions_out_bank(window, slot.target, bank_elements);
     const int published = taps + versions_tape_rows(slot, int(SEISMIC_DIM_T));

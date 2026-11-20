@@ -3,7 +3,7 @@
 //! Tensor bytes are not decoded or uploaded here. `TensorSlice` describes the
 //! validated stored range; residency code chooses its numerical interpretation.
 
-use crate::{ArtifactIdentity, Error, FileSource};
+use crate::{ArtifactIdentity, Error, FileSource, SplitError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -1124,6 +1124,13 @@ pub struct FileHeader {
 /// its aligned tensor-data offset, parsed by [`read_header`].
 pub trait HeaderSource: Sync {
     fn header(&self, path: &Path) -> Result<FileHeader, Error>;
+
+    /// Whether `left` and `right` name the same underlying file in this source.
+    /// Disk-backed sources compare filesystem identity; in-memory sources
+    /// override this without touching the filesystem.
+    fn same_file(&self, left: &Path, right: &Path) -> Result<bool, Error> {
+        crate::package::same_disk_file(left, right)
+    }
 }
 
 /// Headers read from the files they describe.
@@ -1140,58 +1147,33 @@ impl HeaderSource for FileHeaders {
 
 /// Inspect the headers of one GGUF component whose files are `paths` (in shard
 /// order). A single path is either an unsplit GGUF or the first shard of a
-/// split GGUF (its sibling shards found by [`split_paths`]). Multiple paths
-/// are validated and merged as the explicit shards of a split GGUF without
-/// requiring standard shard filenames or a shared directory. Tensor payloads
-/// need not exist. Returns the component directory and its files (absolute,
-/// in shard order) with their sizes.
+/// split GGUF (its sibling shards resolved by [`resolve_shard_paths`]).
+/// Multiple paths are validated and merged as the explicit shards of a split
+/// GGUF without requiring standard shard filenames or a shared directory.
+/// Tensor payloads need not exist. Returns the component directory and its
+/// files (absolute, in shard order) with their sizes.
 pub fn inspect_component_headers(
     paths: &[PathBuf],
     headers: &dyn HeaderSource,
 ) -> Result<(Directory, Vec<(PathBuf, u64)>), Error> {
-    let read = |path: &Path| -> Result<(FileHeader, PathBuf), Error> {
+    let read = |path: &Path| -> Result<(Directory, (PathBuf, u64)), Error> {
         let header = headers.header(path)?;
         header.directory.require_execution_byte_order()?;
-        Ok((header, std::path::absolute(path)?))
+        Ok((header.directory, (std::path::absolute(path)?, header.size)))
     };
-    match paths {
-        [] => Err(invalid("split GGUF has no shards")),
-        [path] => {
-            let (first, first_path) = read(path)?;
-            match split_paths(path, &first.directory)? {
-                None => Ok((first.directory, vec![(first_path, first.size)])),
-                Some(split) => {
-                    let rest =
-                        seismic_threads::pool::par_for_results(&split[1..], |shard| read(shard))?;
-                    let mut files = Vec::with_capacity(split.len());
-                    let mut shards = Vec::with_capacity(split.len());
-                    files.push((first_path, first.size));
-                    shards.push(first.directory);
-                    for (header, path) in rest {
-                        files.push((path, header.size));
-                        shards.push(header.directory);
-                    }
-                    Ok((merge_shards(shards)?.0, files))
-                }
-            }
-        }
-        many => {
-            let loaded = seismic_threads::pool::par_for_results(many, |shard| read(shard))?;
-            let mut files = Vec::with_capacity(many.len());
-            let mut shards = Vec::with_capacity(many.len());
-            for (header, path) in loaded {
-                files.push((path, header.size));
-                shards.push(header.directory);
-            }
-            Ok((merge_shards(shards)?.0, files))
-        }
-    }
+    let (directory, shards) = resolve_and_merge_shards(
+        paths,
+        read,
+        |batch| seismic_threads::pool::par_for_results(batch, |shard| read(shard)),
+    )?;
+    Ok((directory, shards.into_iter().map(|(file, _, _)| file).collect()))
 }
 
 /// Inspect the headers of the GGUF component `path` names: the file itself,
 /// or every shard when it is the first shard of a split GGUF (see
-/// [`split_paths`]). Tensor payloads need not exist. Returns the component
-/// directory and its files (absolute, in shard order) with their sizes.
+/// [`resolve_shard_paths`]). Tensor payloads need not exist. Returns the
+/// component directory and its files (absolute, in shard order) with their
+/// sizes.
 pub fn inspect_component_header(
     path: &Path,
     headers: &dyn HeaderSource,
@@ -1210,23 +1192,37 @@ const SPLIT_INDEX: &str = "split.no";
 const SPLIT_COUNT: &str = "split.count";
 const SPLIT_TENSORS: &str = "split.tensors.count";
 
+/// Maximum shards admitted in a single split GGUF. Prevents a crafted
+/// `split.count` from triggering an unbounded `Vec<PathBuf>` allocation in
+/// [`split_paths`].
+const MAX_SPLIT_SHARDS: u64 = 4096;
+
 /// This file's `(index, count)` within a split GGUF, or `None` when it is
 /// not split (no split metadata, or a count of one).
-fn split_position(directory: &Directory) -> Result<Option<(u64, u64)>, Error> {
+fn split_position(directory: &Directory) -> Result<Option<(u64, u64)>, SplitError> {
     let number = |key: &str| {
         directory
             .value(key)
             .map(|value| {
-                value
-                    .unsigned()
-                    .ok_or_else(|| invalid(format!("{key} is not an unsigned integer")))
+                value.unsigned().ok_or_else(|| {
+                    SplitError::InconsistentMetadata(format!("{key} is not an unsigned integer"))
+                })
             })
             .transpose()
     };
     match (number(SPLIT_INDEX)?, number(SPLIT_COUNT)?) {
         (None, None) | (Some(0), Some(1)) => Ok(None),
-        (Some(index), Some(count)) if index < count => Ok(Some((index, count))),
-        _ => Err(invalid("inconsistent GGUF split metadata")),
+        (Some(index), Some(count)) if index < count => {
+            if count > MAX_SPLIT_SHARDS {
+                return Err(SplitError::InconsistentMetadata(format!(
+                    "{SPLIT_COUNT} ({count}) exceeds maximum supported shards ({MAX_SPLIT_SHARDS})"
+                )));
+            }
+            Ok(Some((index, count)))
+        }
+        _ => Err(SplitError::InconsistentMetadata(
+            "inconsistent GGUF split metadata".into(),
+        )),
     }
 }
 
@@ -1234,29 +1230,31 @@ fn split_position(directory: &Directory) -> Result<Option<(u64, u64)>, Error> {
 /// order, by the split naming convention `<prefix>-NNNNN-of-MMMMM.gguf`;
 /// `None` when the file is not split. Only a first shard names a split
 /// component.
-pub fn split_paths(first: &Path, directory: &Directory) -> Result<Option<Vec<PathBuf>>, Error> {
+fn split_paths(first: &Path, directory: &Directory) -> Result<Option<Vec<PathBuf>>, SplitError> {
     let Some((index, count)) = split_position(directory)? else {
         return Ok(None);
     };
     if index != 0 {
-        return Err(invalid(format!(
-            "{} is shard {} of a split GGUF; open its first shard",
-            first.display(),
-            index + 1
-        )));
+        return Err(SplitError::NotFirstShard {
+            path: first.to_path_buf(),
+            index,
+            count,
+        });
     }
     let name = first
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| invalid("split GGUF shard name is not UTF-8"))?;
+        .ok_or_else(|| SplitError::MisnamedFirstShard {
+            path: first.to_path_buf(),
+            count,
+        })?;
     let suffix = split_file_suffix(1, count);
     let prefix = name
         .strip_suffix(&suffix)
         .filter(|prefix| !prefix.is_empty())
-        .ok_or_else(|| {
-            invalid(format!(
-                "first shard {name:?} of a {count}-file split GGUF is not named <prefix>{suffix}"
-            ))
+        .ok_or_else(|| SplitError::MisnamedFirstShard {
+            path: first.to_path_buf(),
+            count,
         })?;
     Ok(Some(
         (1..=count)
@@ -1271,20 +1269,78 @@ fn split_file_suffix(number: u64, count: u64) -> String {
     format!("-{number:05}-of-{count:05}.gguf")
 }
 
+/// Resolve a component reference (`paths`) into its ordered shard paths.
+///
+/// A single path is resolved using its parsed header's `split.no`/`split.count`
+/// and the `<prefix>-NNNNN-of-MMMMM.gguf` naming convention (matching
+/// llama.cpp). An explicit multi-shard list is taken as given (validated later
+/// by shard split metadata when merged).
+pub fn resolve_shard_paths(
+    paths: &[PathBuf],
+    first_directory: &Directory,
+) -> Result<Vec<PathBuf>, SplitError> {
+    match paths {
+        [] => Err(SplitError::Empty),
+        [first] => Ok(split_paths(first, first_directory)?.unwrap_or_else(|| vec![first.clone()])),
+        explicit => Ok(explicit.to_vec()),
+    }
+}
+
+/// Single owner for resolving a component reference into its ordered shard
+/// list, opening each shard once, and validating/merging split metadata.
+fn resolve_and_merge_shards<T>(
+    paths: &[PathBuf],
+    open_one: impl Fn(&Path) -> Result<(Directory, T), Error>,
+    open_many: impl Fn(&[PathBuf]) -> Result<Vec<(Directory, T)>, Error>,
+) -> Result<(Directory, Vec<(T, u64, u64)>), Error> {
+    let loaded = match paths {
+        [] => return Err(SplitError::Empty.into()),
+        [single] => {
+            let (first_dir, first_item) = open_one(single)?;
+            let resolved = resolve_shard_paths(paths, &first_dir)?;
+            if resolved.len() == 1 {
+                let data_offset = first_dir.data_offset;
+                return Ok((first_dir, vec![(first_item, data_offset, 0)]));
+            }
+            let mut all = Vec::with_capacity(resolved.len());
+            all.push((first_dir, first_item));
+            all.extend(open_many(&resolved[1..])?);
+            all
+        }
+        explicit => open_many(explicit)?,
+    };
+    let mut directories = Vec::with_capacity(loaded.len());
+    let mut items = Vec::with_capacity(loaded.len());
+    let mut data_offsets = Vec::with_capacity(loaded.len());
+    for (dir, item) in loaded {
+        data_offsets.push(dir.data_offset);
+        directories.push(dir);
+        items.push(item);
+    }
+    let (merged, bases) = merge_shards(directories)?;
+    let shards = items
+        .into_iter()
+        .zip(data_offsets)
+        .zip(bases)
+        .map(|((item, data_offset), base)| (item, data_offset, base))
+        .collect();
+    Ok((merged, shards))
+}
+
 /// Merge the shard directories of one split GGUF, in shard order, with
 /// where each shard's data section starts in the merged data section.
 fn merge_shards(shards: Vec<Directory>) -> Result<(Directory, Vec<u64>), Error> {
-    let count = u64::try_from(shards.len()).map_err(|_| invalid("split shard count overflows"))?;
-    let first = shards
-        .first()
-        .ok_or_else(|| invalid("split GGUF has no shards"))?;
+    let count = u64::try_from(shards.len()).map_err(|_| SplitError::OffsetOverflow)?;
+    let first = shards.first().ok_or(SplitError::Empty)?;
     let (version, byte_order, alignment) = (first.version, first.byte_order, first.alignment);
     let declared_tensors = first
         .value(SPLIT_TENSORS)
         .map(|value| {
-            value
-                .unsigned()
-                .ok_or_else(|| invalid(format!("{SPLIT_TENSORS} is not an unsigned integer")))
+            value.unsigned().ok_or_else(|| {
+                SplitError::InconsistentMetadata(format!(
+                    "{SPLIT_TENSORS} is not an unsigned integer"
+                ))
+            })
         })
         .transpose()?;
     let mut bases = Vec::with_capacity(shards.len());
@@ -1293,37 +1349,32 @@ fn merge_shards(shards: Vec<Directory>) -> Result<(Directory, Vec<u64>), Error> 
     let mut metadata = None;
     let mut base = 0u64;
     for (index, shard) in shards.into_iter().enumerate() {
-        let index = u64::try_from(index).map_err(|_| invalid("split shard index overflows"))?;
+        let index = u64::try_from(index).map_err(|_| SplitError::OffsetOverflow)?;
         if split_position(&shard)? != Some((index, count)) {
-            return Err(invalid(format!(
-                "shard {} does not declare itself shard {} of {count}",
-                index + 1,
-                index + 1
-            )));
+            return Err(SplitError::ShardPositionMismatch {
+                expected: index + 1,
+                count,
+            }
+            .into());
         }
         if (shard.version, shard.byte_order, shard.alignment) != (version, byte_order, alignment) {
-            return Err(invalid(
-                "split GGUF shards differ in version, byte order or alignment",
-            ));
+            return Err(SplitError::HeaderMismatch.into());
         }
         let mut end = 0u64;
         for tensor in shard.tensors {
             if !names.insert(tensor.name.clone()) {
-                return Err(invalid(format!(
-                    "tensor {:?} appears in more than one split shard",
-                    tensor.name
-                )));
+                return Err(SplitError::DuplicateTensor { name: tensor.name }.into());
             }
             end = end.max(
                 tensor
                     .offset
                     .checked_add(tensor.nbytes)
-                    .ok_or_else(|| invalid("GGUF tensor end overflows"))?,
+                    .ok_or(SplitError::OffsetOverflow)?,
             );
             tensors.push(TensorDescriptor {
                 offset: base
                     .checked_add(tensor.offset)
-                    .ok_or_else(|| invalid("split GGUF data offset overflows"))?,
+                    .ok_or(SplitError::OffsetOverflow)?,
                 ..tensor
             });
         }
@@ -1332,17 +1383,18 @@ fn merge_shards(shards: Vec<Directory>) -> Result<(Directory, Vec<u64>), Error> 
             .checked_add(end)
             .and_then(|end| end.checked_add(alignment - 1))
             .map(|end| end & !(alignment - 1))
-            .ok_or_else(|| invalid("split GGUF data offset overflows"))?;
+            .ok_or(SplitError::OffsetOverflow)?;
         if metadata.is_none() {
             metadata = Some(shard.metadata);
         }
     }
     if let Some(declared) = declared_tensors {
         if u64::try_from(tensors.len()).ok() != Some(declared) {
-            return Err(invalid(format!(
-                "split GGUF declares {declared} tensors but its shards hold {}",
-                tensors.len()
-            )));
+            return Err(SplitError::TensorCountMismatch {
+                declared,
+                actual: tensors.len(),
+            }
+            .into());
         }
     }
     Ok((
@@ -1351,7 +1403,7 @@ fn merge_shards(shards: Vec<Directory>) -> Result<(Directory, Vec<u64>), Error> 
             byte_order,
             alignment,
             data_offset: 0,
-            metadata: metadata.ok_or_else(|| invalid("split GGUF has no shards"))?,
+            metadata: metadata.ok_or(SplitError::Empty)?,
             tensors,
         },
         bases,
@@ -1538,61 +1590,36 @@ pub struct GgufArtifact {
 
 impl GgufArtifact {
     /// Open the GGUF component `path` names: the file, or every shard when
-    /// it is the first shard of a split GGUF (see [`split_paths`]). The
-    /// artifact lives as long as its model is loaded, so its directory is
+    /// it is the first shard of a split GGUF (see [`resolve_shard_paths`]).
+    /// The artifact lives as long as its model is loaded, so its directory is
     /// detached from the header bytes ([`Directory::detach`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         Self::open_shards(&[path.as_ref().to_path_buf()])
     }
 
-    /// Open a GGUF component from its explicit shard paths (in shard order).
-    /// A single path is either an unsplit GGUF or the first shard of a split
-    /// GGUF (its sibling shards found by [`split_paths`]). Multiple paths are
-    /// opened directly as the shards of a split GGUF without requiring
-    /// standard shard filenames or a shared directory. The artifact lives as
-    /// long as its model is loaded, so its directory is detached from the
-    /// header bytes ([`Directory::detach`]).
+    /// Open a GGUF component from its ordered shard paths (see
+    /// [`resolve_shard_paths`]). The artifact lives as long as its model is
+    /// loaded, so its directory is detached from the header bytes
+    /// ([`Directory::detach`]).
     pub fn open_shards(paths: &[PathBuf]) -> Result<Self, Error> {
-        let (mut directory, shards) = match paths {
-            [] => return Err(invalid("split GGUF has no shards")),
-            [path] => {
-                let first = Arc::new(FileSource::open(path)?);
-                let directory = read_file_directory(&first, true)?;
-                match split_paths(path, &directory)? {
-                    None => {
-                        let data_offset = directory.data_offset;
-                        (
-                            directory,
-                            vec![Shard {
-                                source: first,
-                                data_offset,
-                                base: 0,
-                            }],
-                        )
-                    }
-                    Some(split) => {
-                        let mut sources = vec![first];
-                        let mut directories = vec![directory];
-                        for shard in &split[1..] {
-                            let source = Arc::new(FileSource::open(shard)?);
-                            directories.push(read_file_directory(&source, true)?);
-                            sources.push(source);
-                        }
-                        assemble_shards(sources, directories)?
-                    }
-                }
-            }
-            many => {
-                let mut sources = Vec::with_capacity(many.len());
-                let mut directories = Vec::with_capacity(many.len());
-                for shard in many {
-                    let source = Arc::new(FileSource::open(shard)?);
-                    directories.push(read_file_directory(&source, true)?);
-                    sources.push(source);
-                }
-                assemble_shards(sources, directories)?
-            }
+        let open = |path: &Path| -> Result<(Directory, Arc<FileSource>), Error> {
+            let source = Arc::new(FileSource::open(path)?);
+            let directory = read_file_directory(&source, true)?;
+            Ok((directory, source))
         };
+        let (mut directory, resolved) = resolve_and_merge_shards(
+            paths,
+            open,
+            |batch| batch.iter().map(|shard| open(shard)).collect(),
+        )?;
+        let shards = resolved
+            .into_iter()
+            .map(|(source, data_offset, base)| Shard {
+                source,
+                data_offset,
+                base,
+            })
+            .collect();
         directory.detach()?;
         Ok(Self {
             directory,
@@ -1645,28 +1672,6 @@ impl GgufArtifact {
             encoding: tensor.encoding,
         })
     }
-}
-
-fn assemble_shards(
-    sources: Vec<Arc<FileSource>>,
-    directories: Vec<Directory>,
-) -> Result<(Directory, Vec<Shard>), Error> {
-    let offsets = directories
-        .iter()
-        .map(|directory| directory.data_offset)
-        .collect::<Vec<_>>();
-    let (directory, bases) = merge_shards(directories)?;
-    let shards = sources
-        .into_iter()
-        .zip(offsets)
-        .zip(bases)
-        .map(|((source, data_offset), base)| Shard {
-            source,
-            data_offset,
-            base,
-        })
-        .collect();
-    Ok((directory, shards))
 }
 
 #[cfg(test)]
@@ -1815,11 +1820,11 @@ mod tests {
 
         assert!(matches!(
             GgufArtifact::open_shards(&[]),
-            Err(Error::Invalid(message)) if message.contains("no shards")
+            Err(Error::Split(SplitError::Empty))
         ));
         assert!(matches!(
             inspect_component_headers(&[], &FileHeaders),
-            Err(Error::Invalid(message)) if message.contains("no shards")
+            Err(Error::Split(SplitError::Empty))
         ));
 
         std::fs::remove_dir_all(root).unwrap();
@@ -1859,11 +1864,11 @@ mod tests {
         let swapped = vec![shard0.clone(), shard2.clone(), shard1.clone()];
         assert!(matches!(
             GgufArtifact::open_shards(&swapped),
-            Err(Error::Invalid(message)) if message.contains("does not declare itself shard 2")
+            Err(Error::Split(SplitError::ShardPositionMismatch { expected: 2, count: 3 }))
         ));
         assert!(matches!(
             inspect_component_headers(&swapped, &FileHeaders),
-            Err(Error::Invalid(message)) if message.contains("does not declare itself shard 2")
+            Err(Error::Split(SplitError::ShardPositionMismatch { expected: 2, count: 3 }))
         ));
 
         let bad_count = write_shard(
@@ -1878,13 +1883,50 @@ mod tests {
         let mismatched_tensors = vec![bad_count, shard1, shard2];
         assert!(matches!(
             GgufArtifact::open_shards(&mismatched_tensors),
-            Err(Error::Invalid(message)) if message.contains("declares 5 tensors")
+            Err(Error::Split(SplitError::TensorCountMismatch { declared: 5, actual: 2 }))
         ));
         assert!(matches!(
             inspect_component_headers(&mismatched_tensors, &FileHeaders),
-            Err(Error::Invalid(message)) if message.contains("declares 5 tensors")
+            Err(Error::Split(SplitError::TensorCountMismatch { declared: 5, actual: 2 }))
         ));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn split_position_and_resolve_shard_paths_reject_excessive_split_count() {
+        let directory_with_split = |index: u64, count: u64| Directory {
+            version: 3,
+            byte_order: ByteOrder::Little,
+            alignment: 32,
+            data_offset: 0,
+            metadata: vec![
+                Metadata {
+                    name: SPLIT_INDEX.into(),
+                    value: Value::Scalar(Scalar::Unsigned(index)),
+                },
+                Metadata {
+                    name: SPLIT_COUNT.into(),
+                    value: Value::Scalar(Scalar::Unsigned(count)),
+                },
+            ],
+            tensors: Vec::new(),
+        };
+
+        let at_limit = directory_with_split(0, MAX_SPLIT_SHARDS);
+        assert_eq!(split_position(&at_limit), Ok(Some((0, MAX_SPLIT_SHARDS))));
+
+        for excessive in [MAX_SPLIT_SHARDS + 1, 10_000_000_000] {
+            let crafted = directory_with_split(0, excessive);
+            assert!(matches!(
+                split_position(&crafted),
+                Err(SplitError::InconsistentMetadata(_))
+            ));
+            let path = PathBuf::from(format!("model-00001-of-{excessive:05}.gguf"));
+            assert!(matches!(
+                resolve_shard_paths(&[path], &crafted),
+                Err(SplitError::InconsistentMetadata(_))
+            ));
+        }
     }
 }

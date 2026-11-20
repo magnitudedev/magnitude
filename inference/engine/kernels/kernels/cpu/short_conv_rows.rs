@@ -38,6 +38,9 @@ fn short_conv_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
     };
     if item >= rows {
         let slot = slots.slot(item - rows);
+        if slot.lo == slot.hi {
+            return;
+        }
         for tap in 0..taps + slot.recorded(cx.dim_t() as usize) {
             let source = input(&slot, (slot.stop + tap) as isize - taps as isize);
             // SAFETY: each slot's work item writes its own successor bank,

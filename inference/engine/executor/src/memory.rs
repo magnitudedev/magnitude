@@ -67,6 +67,17 @@ impl ClaimDemand {
         })
     }
 
+    /// Exact subtraction of a constituent storage demand.
+    pub fn checked_minus(self, other: Self) -> Option<Self> {
+        Some(Self {
+            device: self.device.checked_sub(other.device)?,
+            upload: self.upload.checked_sub(other.upload)?,
+            shared: self.shared.checked_sub(other.shared)?,
+            staged: self.staged.checked_sub(other.staged)?,
+            host: self.host.checked_sub(other.host)?,
+        })
+    }
+
     /// Exact composition of every one of `demands` ([`Self::checked_plus`]).
     pub fn checked_sum(demands: impl IntoIterator<Item = Self>) -> Option<Self> {
         demands.into_iter().try_fold(Self::default(), Self::checked_plus)

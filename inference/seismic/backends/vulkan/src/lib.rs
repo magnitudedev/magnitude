@@ -179,6 +179,7 @@ mod tests {
             denorm_preserve_32: true,
             subgroup_uniform_control_flow: true,
             maximal_reconvergence: true,
+            merge_maximal_reconvergence_returns: false,
         };
         // Sealed as for a module that relies on its selections rejoining.
         let sealed = seal::seal(&compiled, declared, true, false).expect("seal");
@@ -272,6 +273,7 @@ mod tests {
             denorm_preserve_32: false,
             subgroup_uniform_control_flow: true,
             maximal_reconvergence: false,
+            merge_maximal_reconvergence_returns: false,
         };
         // Each invocation starts at its lane: they leave at different
         // iterations.

@@ -938,27 +938,28 @@ impl Calibration {
         }
     }
 
-    /// Precompute true-route shadow probabilities across all depths `0..DEPTHS`
+    /// Precompute true-route shadow inputs into `scratch` (zero allocations)
     /// for one step at this layer. Depth `d` knows the true routes of tokens
     /// `1..=min(d, truths.len())` ahead (standing with rate 1), and carries
     /// forward past `d` from the deepest known true route's `route[Form::Front]`
-    /// calibration table.
-    pub(super) fn prepare_shadow(
-        &mut self,
+    /// calibration table. Per-expert probabilities are computed on the stack
+    /// only for the experts queried by [`ShadowPrepared::rank`].
+    pub(super) fn prepare_shadow<'a>(
+        &'a mut self,
+        scratch: &'a mut ShadowScratch,
         truths: &[super::shadows::TrueRoute<'_>],
         epoch: u64,
         history: &History,
         layer: usize,
-    ) -> ShadowPrepared {
+    ) -> ShadowPrepared<'a> {
         let experts = self.experts;
         let known = truths.len().min(DEPTHS - 1);
-        let mut truth_chosen: Vec<Vec<bool>> = Vec::with_capacity(known);
-        let mut truth_samples: Vec<Vec<SampleEntry>> = Vec::with_capacity(known);
-        for truth in truths.iter().take(known) {
-            let mut chose = vec![false; experts];
+        for (idx, truth) in truths.iter().take(known).enumerate() {
+            let chose = &mut scratch.truth_chosen[idx][..experts];
+            chose.fill(false);
             match truth {
                 super::shadows::TrueRoute::Row { rows, depth } => {
-                    extract_rows_keys(rows, Some(*depth), None, &mut self.scratch_keys, Some(&mut chose));
+                    extract_rows_keys(rows, Some(*depth), None, &mut self.scratch_keys, Some(chose));
                 }
                 super::shadows::TrueRoute::Unkeyed { experts: picked } => {
                     self.scratch_keys.fill(0.0);
@@ -968,50 +969,29 @@ impl Calibration {
                     }
                 }
             }
-            let mut entries = vec![SampleEntry::default(); experts];
+            let entries = &mut scratch.truth_samples[idx][..experts];
             build_route_sample(
                 experts,
                 &self.scratch_keys,
                 history,
                 layer,
                 &mut self.scratch_order,
-                &mut entries,
+                entries,
             );
-            truth_chosen.push(chose);
-            truth_samples.push(entries);
         }
 
         let form = self.latest_form().unwrap_or(Form::Front);
-        let history_probs: Vec<f64> = (0..experts).map(|e| self.history_prob(e, history, layer)).collect();
-        let last_reads = self.last_read.clone();
-        // Per depth `d` in `0..DEPTHS`, precompute `[f64; DEPTHS]` per expert.
-        let mut depth_probs: Vec<Vec<[f64; DEPTHS]>> = Vec::with_capacity(DEPTHS);
-        for d in 0..DEPTHS {
-            let eff = d.min(known);
-            let mut per_expert = Vec::with_capacity(experts);
-            for e in 0..experts {
-                let probs = std::array::from_fn(|index| {
-                    let g = index + 1;
-                    if g <= eff {
-                        f64::from(u8::from(truth_chosen[g - 1][e]))
-                    } else if eff == 0 {
-                        self.route_prob(form, g, 0, e, epoch, history, layer)
-                    } else {
-                        let entry = truth_samples[eff - 1][e];
-                        let lead = g - eff;
-                        self.route[Form::Front.index()][lead - 1].prob(
-                            usize::from(entry.lo),
-                            usize::from(entry.hi),
-                            f64::from(entry.prior),
-                            epoch,
-                        )
-                    }
-                });
-                per_expert.push(probs);
-            }
-            depth_probs.push(per_expert);
+        for e in 0..experts {
+            scratch.history_probs[e] = self.history_prob(e, history, layer);
         }
-        ShadowPrepared { depth_probs, history_probs, last_reads }
+        ShadowPrepared {
+            cal: self,
+            scratch,
+            known,
+            epoch,
+            form,
+            has_latest: self.latest_meta.is_some(),
+        }
     }
 
     /// Exact memory footprint in bytes (constant in run length and τ).
@@ -1085,14 +1065,46 @@ impl Calibration {
     }
 }
 
-/// Precomputed per-depth true-route shadow probabilities for one layer's step.
-pub(super) struct ShadowPrepared {
-    depth_probs: Vec<Vec<[f64; DEPTHS]>>,
+/// Reusable fixed-size scratch buffers for [`Calibration::prepare_shadow`]
+/// (allocated once in [`super::shadows::Shadows::new`], constant in run length).
+pub(super) struct ShadowScratch {
+    truth_chosen: Vec<Vec<bool>>,
+    truth_samples: Vec<Vec<SampleEntry>>,
     history_probs: Vec<f64>,
-    last_reads: Vec<Option<Step>>,
 }
 
-impl ShadowPrepared {
+impl ShadowScratch {
+    pub(super) fn new(max_experts: usize) -> Self {
+        let slots = DEPTHS.saturating_sub(1);
+        Self {
+            truth_chosen: (0..slots).map(|_| vec![false; max_experts]).collect(),
+            truth_samples: (0..slots).map(|_| vec![SampleEntry::default(); max_experts]).collect(),
+            history_probs: vec![0.0; max_experts],
+        }
+    }
+
+    pub(super) fn bytes(&self) -> u64 {
+        let chosen: usize = self.truth_chosen.capacity() * size_of::<Vec<bool>>()
+            + self.truth_chosen.iter().map(|v| v.capacity() * size_of::<bool>()).sum::<usize>();
+        let samples: usize = self.truth_samples.capacity() * size_of::<Vec<SampleEntry>>()
+            + self.truth_samples.iter().map(|v| v.capacity() * size_of::<SampleEntry>()).sum::<usize>();
+        let hist = self.history_probs.capacity() * size_of::<f64>();
+        (size_of::<Self>() + chosen + samples + hist) as u64
+    }
+}
+
+/// Borrowed view of one layer's prepared true-route shadow inputs.
+pub(super) struct ShadowPrepared<'a> {
+    cal: &'a Calibration,
+    scratch: &'a ShadowScratch,
+    known: usize,
+    epoch: u64,
+    form: Form,
+    has_latest: bool,
+}
+
+impl ShadowPrepared<'_> {
+    #[inline]
     pub(super) fn rank(
         &self,
         expert: usize,
@@ -1100,10 +1112,37 @@ impl ShadowPrepared {
         horizon: super::super::horizon::Horizon,
         a_bar: f64,
     ) -> super::Rank {
-        let probs = self.depth_probs[depth][expert];
-        let p_inf = self.history_probs[expert];
+        let eff = depth.min(self.known);
+        let p_inf = self.scratch.history_probs[expert];
+        let probs = std::array::from_fn(|index| {
+            let g = index + 1;
+            if g <= eff {
+                f64::from(u8::from(self.scratch.truth_chosen[g - 1][expert]))
+            } else if eff == 0 {
+                if self.has_latest {
+                    let entry = self.cal.latest_rows[0][expert];
+                    self.cal.route[self.form.index()][g - 1].prob(
+                        usize::from(entry.lo),
+                        usize::from(entry.hi),
+                        f64::from(entry.prior),
+                        self.epoch,
+                    )
+                } else {
+                    p_inf
+                }
+            } else {
+                let entry = self.scratch.truth_samples[eff - 1][expert];
+                let lead = g - eff;
+                self.cal.route[Form::Front.index()][lead - 1].prob(
+                    usize::from(entry.lo),
+                    usize::from(entry.hi),
+                    f64::from(entry.prior),
+                    self.epoch,
+                )
+            }
+        });
         let expected = super::expected_from(probs, p_inf, horizon, a_bar, None);
-        super::Rank::new(expected, self.last_reads[expert])
+        super::Rank::new(expected, self.cal.last_read[expert])
     }
 }
 

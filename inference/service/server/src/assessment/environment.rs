@@ -123,7 +123,7 @@ impl AssessmentEnvironment {
         measurements: Measurements,
     ) -> Self {
         let measured = match &measurements {
-            Measurements::Pending => json!("pending"),
+            Measurements::Pending(_) => json!("pending"),
             Measurements::Unavailable { reason } => json!({ "unavailable": reason }),
             Measurements::Measured { records, .. } => json!({ "records": records.as_ref() }),
         };
@@ -214,9 +214,14 @@ mod tests {
 
     #[test]
     fn a_different_backend_hardware_or_measurement_is_a_different_environment() {
-        let id = environment_id(cpu_structure(), Measurements::Pending);
+        let pending = || {
+            Measurements::Pending(magnitude_executor::assessment::PendingPrices::standing(
+                magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+            ))
+        };
+        let id = environment_id(cpu_structure(), pending());
         assert_eq!(
-            environment_id(cpu_structure(), Measurements::Pending),
+            environment_id(cpu_structure(), pending()),
             id,
             "the identity is stable"
         );
@@ -231,7 +236,7 @@ mod tests {
             .cloned()
         {
             other.selected.info = executor;
-            assert_ne!(environment_id(other, Measurements::Pending), id);
+            assert_ne!(environment_id(other, pending()), id);
         }
 
         let unavailable = Measurements::Unavailable {

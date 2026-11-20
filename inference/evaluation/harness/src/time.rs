@@ -1802,7 +1802,10 @@ fn expert_lines(engine: &Engine) -> Result<std::sync::Arc<[magnitude_cost_model:
             let costs = engine.domain.expert_costs().ok_or("a streamed cell's load streams no experts")?;
             Ok(lines.iter().zip(costs.landings).map(|(lines, landing)| lines.landed_by(landing)).collect())
         }
-        Some(magnitude_executor::assessment::Priced::Pending(why) | magnitude_executor::assessment::Priced::Unavailable(why)) => {
+        Some(magnitude_executor::assessment::Priced::Pending(pending)) => {
+            Err(unavailable(format!("no expert lines: {pending}")))
+        }
+        Some(magnitude_executor::assessment::Priced::Unavailable(why)) => {
             Err(unavailable(format!("no expert lines: {why}")))
         }
         None => Err("a streamed cell's load streams no experts".into()),
@@ -2403,7 +2406,8 @@ fn estimated(
     };
     let figures = match streamed {
         Priced::Measured(figures) => figures,
-        Priced::Pending(why) | Priced::Unavailable(why) => return Err(unavailable(format!("the streamed figures: {why}"))),
+        Priced::Pending(pending) => return Err(unavailable(format!("the streamed figures: {pending}"))),
+        Priced::Unavailable(why) => return Err(unavailable(format!("the streamed figures: {why}"))),
     };
     let costs = engine.domain.expert_costs().ok_or("the load streams no experts")?;
     let own = costs.slots;

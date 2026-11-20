@@ -212,6 +212,14 @@ pub fn stored_measurements(topology: &DeviceTopology, info: &seismic::Executor, 
     let records = KernelCache::measurement_records(kernels);
     let walked = ExecutorCosts::stored(topology, info, &records);
     let costs_outstanding = StoredCosts::outstanding_of(&walked);
+    let outstanding = match PointRequests::new(kernels).outstanding(topology, info, storage, &records, costs_outstanding) {
+        Ok(outstanding) => outstanding,
+        Err(error) => {
+            return Measurements::Unavailable {
+                reason: format!("the point requests: {error}"),
+            };
+        }
+    };
     match walked {
         Ok(StoredCosts::Complete {
             costs,
@@ -223,15 +231,7 @@ pub fn stored_measurements(topology: &DeviceTopology, info: &seismic::Executor, 
             // The job has points left to measure: a later point of the
             // standing requests, or a load's runtime request. Neither
             // enters an estimate.
-            let pending = pending
-                || match PointRequests::new(kernels).outstanding(topology, info, storage, &records, costs_outstanding) {
-                    Ok(outstanding) => !outstanding.is_empty(),
-                    Err(error) => {
-                        return Measurements::Unavailable {
-                            reason: format!("the point requests: {error}"),
-                        };
-                    }
-                };
+            let pending = pending || !outstanding.is_empty();
             Measurements::Measured {
                 costs: Arc::new(costs),
                 records: Arc::new(cost_records),
@@ -239,7 +239,10 @@ pub fn stored_measurements(topology: &DeviceTopology, info: &seismic::Executor, 
                 streamed,
             }
         }
-        Ok(StoredCosts::Missing(_)) => Measurements::Pending,
+        Ok(StoredCosts::Missing(_)) => Measurements::Pending(
+            magnitude_executor::assessment::PendingPrices::new(outstanding)
+                .expect("missing executor costs must have outstanding requests"),
+        ),
         Err(error) => Measurements::Unavailable {
             reason: error.to_string(),
         },
@@ -252,8 +255,9 @@ pub fn stored_measurements(topology: &DeviceTopology, info: &seismic::Executor, 
 #[derive(Clone)]
 pub enum Measurements {
     /// The job has not stored the probe or a figure no other prices yet:
-    /// fit is assessed and speed is pending.
-    Pending,
+    /// fit is assessed and speed is pending, carrying the non-empty
+    /// outstanding requests.
+    Pending(magnitude_executor::assessment::PendingPrices),
     /// The stored records give no costs, and why: the probe is recorded
     /// unobtainable (the executor cannot stream its own weights), the
     /// records cannot be read, or the measurement job could not open the
@@ -611,6 +615,14 @@ pub fn finish_model_assessment(
     let definition = execution.definition();
     let structure = &setup.structure;
     let pricing = structure.selected.graph_cost;
+    let bank_prices = match &setup.measurements {
+        Measurements::Measured {
+            costs,
+            streamed: Priced::Measured(figures),
+            ..
+        } => Some((&**costs, figures)),
+        _ => None,
+    };
     let served = served_tier(tiers.len(), |index| {
         let tier = tiers[index];
         let fit = assess_execution_fit_at_context(
@@ -619,6 +631,7 @@ pub fn finish_model_assessment(
             pricing,
             &structure.topology,
             &structure.status,
+            bank_prices,
         )
         .map_err(ModelAssessmentError::Assessment)?;
         Ok::<_, ModelAssessmentError>(match fit {
@@ -722,7 +735,7 @@ fn resident_performance(
     request: &AssessmentRequest,
 ) -> Result<Performance, AssessmentError> {
     Ok(match measurements {
-        Measurements::Pending => Performance::Pending,
+        Measurements::Pending(_) => Performance::Pending,
         Measurements::Unavailable { reason } => Performance::Unavailable {
             reason: reason.clone(),
         },
@@ -745,7 +758,7 @@ fn streamed_performance_pair(
     held_b: magnitude_cost_model::HeldSlots,
 ) -> Result<(Performance, Performance), AssessmentError> {
     match measurements {
-        Measurements::Pending => Ok((Performance::Pending, Performance::Pending)),
+        Measurements::Pending(_) => Ok((Performance::Pending, Performance::Pending)),
         Measurements::Unavailable { reason } => Ok((
             Performance::Unavailable { reason: reason.clone() },
             Performance::Unavailable { reason: reason.clone() },
@@ -879,12 +892,7 @@ pub fn streamed_estimate(
 pub fn priced_costs(
     walked: Result<StoredCosts, magnitude_executor::assessment::ExecutorCostsError>,
 ) -> magnitude_executor::assessment::Priced<ExecutorCosts> {
-    use magnitude_executor::assessment::Priced;
-    match walked {
-        Ok(StoredCosts::Complete { costs, .. }) => Priced::Measured(costs),
-        Ok(StoredCosts::Missing(point)) => Priced::Pending(format!("the executor's costs are not measured yet ({point:?})")),
-        Err(error) => Priced::Unavailable(error.to_string()),
-    }
+    StoredCosts::priced(walked)
 }
 
 /// Assess one package on the setup's selected device.
@@ -1672,8 +1680,8 @@ fn inventory(
     let refused = |outcome: PlanOutcome| match outcome {
         PlanOutcome::Unsupported(unsupported) => Ok(Err(unsupported)),
         PlanOutcome::WeightBound(error) => Err(ModelAssessmentError::WeightBound(error)),
+        PlanOutcome::PricesPending(_) => unreachable!("assessment plans without banking"),
         PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
-        PlanOutcome::PricesPending(reason) => unpriced(&reason),
     };
     let plan = match plan_backend(manifest, backend) {
         Ok(plan) => plan,
@@ -1707,16 +1715,10 @@ impl Refusal {
         match outcome {
             PlanOutcome::Unsupported(unsupported) => Self::Unsupported(unsupported),
             PlanOutcome::WeightBound(error) => Self::Failed(ModelAssessmentError::WeightBound(error)),
+            PlanOutcome::PricesPending(_) => unreachable!("assessment plans without banking"),
             PlanOutcome::Internal(reason) => Self::Failed(ModelAssessmentError::Planning(reason)),
-            PlanOutcome::PricesPending(reason) => unpriced(&reason),
         }
     }
-}
-
-/// Assessment plans its structure and outlines its floor forms (`ExecutionPlanDraft::floor_forms`),
-/// never a priced settle (`with_bank`): no plan of its waits on the machine's prices.
-fn unpriced(reason: &str) -> ! {
-    unreachable!("an assessment plan settled on the machine's prices, which are pending: {reason}")
 }
 
 /// `manifest` planned on the selected device, each way of holding its

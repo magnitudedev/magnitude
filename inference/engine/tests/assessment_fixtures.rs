@@ -204,7 +204,9 @@ fn cpu_structure() -> AssessmentStructure {
 fn cpu_setup() -> AssessmentSetup {
     AssessmentSetup {
         structure: Arc::new(cpu_structure()),
-        measurements: Measurements::Pending,
+        measurements: Measurements::Pending(magnitude_executor::assessment::PendingPrices::standing(
+            magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+        )),
     }
 }
 
@@ -1208,8 +1210,13 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
 
     // A machine whose figures are pending leaves a plan that must stream
     // pending: no plan is sized unpriced.
-    let Err(PlanError::Unpriced { pending: true, .. }) =
-        draft.clone().with_bank::<AssessmentMemoryCharge>(definition, None, &Priced::Pending("the job has not run".into()))
+    let Err(PlanError::Pending(_)) = draft.clone().with_bank::<AssessmentMemoryCharge>(
+        definition,
+        None,
+        &Priced::Pending(magnitude_executor::assessment::PendingPrices::standing(
+            magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+        )),
+    )
     else {
         panic!("a streamed plan with pending prices is pending");
     };

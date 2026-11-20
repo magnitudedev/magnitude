@@ -89,12 +89,13 @@ fn ngram_rows[M, B, N, C, P, T, V, NB](tokens: &tensor[M, 2] i32,
                         let head = (distance - 1) * P + p
                         rows[row * C * P + head, 0] = i32(offsets[head] + mixed % sizes[head])
                         rows[row * C * P + head, 1] = tokens[row, 1]
-        for tap in 0..C + T:
-            if tap < C or publish + tap - C < hi:
-                if stop[slot] + tap < C:
-                    window[target, tap, 0] = window[source, taped + stop[slot] + tap, 0]
-                else:
-                    window[target, tap, 0] = u32(tokens[publish + tap - C, 0] + 1)
+        if lo < hi:
+            for tap in 0..C + T:
+                if tap < C or publish + tap - C < hi:
+                    if stop[slot] + tap < C:
+                        window[target, tap, 0] = window[source, taped + stop[slot] + tap, 0]
+                    else:
+                        window[target, tap, 0] = u32(tokens[publish + tap - C, 0] + 1)
     return rows
 
 # Each row's per-stream gate sigmoid(g[s]) and the inverse of the RMS of
@@ -199,13 +200,14 @@ fn ngram_inject[M, B, N, R, S, H, K](hidden: &tensor[M, S * H] f32,
                             sum = fma(convolution[channel, tap], input, sum)
                         let added = scales[row, stream] * value[row, column] + sum / (1.0 + exp(-sum))
                         result[row, channel] = hidden[row, channel] + added
-        for tap in 0..R:
-            if tap < reach or publish + tap - reach < hi:
-                for channel in 0..S * H:
-                    if stop[slot] + tap < reach:
-                        window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
-                    else:
-                        window[target, tap, channel] = u[publish + tap - reach, channel]
+        if lo < hi:
+            for tap in 0..R:
+                if tap < reach or publish + tap - reach < hi:
+                    for channel in 0..S * H:
+                        if stop[slot] + tap < reach:
+                            window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
+                        else:
+                            window[target, tap, channel] = u[publish + tap - reach, channel]
     return result
 
 # Every backend: a thread per item, item y < M forming row y's C * P rows,

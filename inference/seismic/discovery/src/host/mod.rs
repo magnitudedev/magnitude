@@ -24,7 +24,7 @@ pub(crate) use linux::Tree;
 
 use seismic_topology::{CacheSize, Firmware, HostNode, PciLocation, Processors, Reported};
 use std::fmt;
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(target_os = "macos", test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -200,20 +200,22 @@ pub struct Supply {
     /// that its reclaim has not yet refilled), so a fall of free memory
     /// shows whole, above the floor or below it: macOS
     /// `vm.page_free_count + vm.page_purgeable_count` less
-    /// `vm.vm_page_free_target`; Linux `MemFree` less the zones' low
-    /// watermarks (`/proc/zoneinfo`); Windows the free and zero lists, the
-    /// OS keeping no floor of them. In a binding limit, the limit less its
-    /// usage.
+    /// `vm.vm_page_free_target` (with a small multi-GB reserve floor);
+    /// Linux `MemFree` less the zones' low watermarks (`/proc/zoneinfo`);
+    /// Windows `Free & Zero` less Windows' host safety floor. In a binding
+    /// limit, the limit less its usage.
     pub free_beyond_target: i64,
     /// File pages no one has dirtied, which the OS drops without writing:
-    /// macOS file-backed pages (`external_page_count` of a
-    /// `host_statistics64` snapshot; macOS counts no dirty file page) above
-    /// those it keeps while it compresses others' memory, the file pages
-    /// standing where it last compressed more than was free above its
-    /// target (none before);
-    /// Linux `Active(file) + Inactive(file) −
-    /// Dirty − Writeback`, within a cgroup its `active_file + inactive_file −
-    /// file_dirty − file_writeback`; Windows the standby lists.
+    /// macOS live file-backed pages (`vm.page_pageable_external_count`, else
+    /// `external_page_count`) above the larger of `vm.vm_page_xpmapped_min`
+    /// and any temporary compression floor while the OS compresses others'
+    /// memory;
+    /// Linux `Active(file) + Inactive(file) − Dirty − Writeback − Shmem`
+    /// (`Shmem` / tmpfs / shared memory excluded because it cannot drop
+    /// without swap), within a cgroup its `active_file + inactive_file −
+    /// file_dirty − file_writeback − shmem`; Windows reclaimable standby
+    /// lists (`Normal Priority` + `Reserve`, keeping `Standby Cache Core`
+    /// protected), bounded with free pages by available system commit.
     pub clean_cache: u64,
     /// What compressing or swapping the cold anonymous pages frees, bounded
     /// by where they can go: macOS [`HostSample::cold`] times what the
@@ -240,9 +242,10 @@ impl Supply {
 }
 
 /// `free` less `floor`, signed: what [`Supply::free_beyond_target`] holds.
+/// Clamped to `i64::MIN..=i64::MAX` so OS limits above `i64::MAX` (such as
+/// Linux `RLIMIT_AS` or Windows working-set/job caps) never panic.
 pub(crate) fn beyond(free: u64, floor: u64) -> i64 {
-    let signed = |bytes: u64| i64::try_from(bytes).expect("a store's bytes fit i64");
-    signed(free) - signed(floor)
+    (i128::from(free) - i128::from(floor)).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 /// When a sample's counters show the machine, by the OS's mechanism that
@@ -356,11 +359,9 @@ pub enum WiredLimit {
 ///   descendant; in a cgroup shared with any other process, an ancestor's,
 ///   or without a cgroup v2 memory controller, there is no share, and no
 ///   harm.
-/// - Windows: hard faults, each resolved by one paging read: the machine's
-///   paging reads (`\Memory\Page Reads/sec`'s count) and the process's
-///   `HardFaultCount`. Windows counts no process's pages brought in
-///   (`\Memory\Pages Input/sec` has no per-process count), so the unit
-///   is a read, of at least one page.
+/// - Windows: none. Windows has no unprivileged counter that separates
+///   reclaimed-page refaults from cold file, DLL, or memory-mapped reads
+///   (`\Memory\Page Reads/sec` and `HardFaultCount` count all hard faults).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Harm {
     pub machine: u64,
@@ -372,10 +373,12 @@ pub struct Harm {
 pub enum PressureLevel {
     Normal,
     /// macOS `kern.memorystatus_vm_pressure_level` warn; Linux PSI `some
-    /// avg10` above zero; Windows the low-memory resource notification.
+    /// avg10 >= 1.0`; Windows the low-memory resource notification or commit
+    /// headroom within the host safety floor.
     Warn,
-    /// macOS critical; Linux PSI `full avg10` above zero. Windows reports
-    /// no level past low memory.
+    /// macOS critical; Linux PSI `full avg10 >= 0.5`; Windows critical
+    /// commit exhaustion (`<= floor / 2`) or low-memory notification with
+    /// physical availability within the host safety floor.
     Critical,
 }
 
@@ -401,10 +404,10 @@ pub struct Lag {
 /// A 32-bit cumulative OS count widened to 64 bits across its wraps: every
 /// reading of the count goes through one, so no wrap is missed while a
 /// reading is taken more often than the count can wrap (4.3 billion events).
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct Widened(Mutex<Option<(u32, u64)>>);
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(target_os = "macos", test))]
 impl Widened {
     pub(crate) const fn new() -> Self {
         Self(Mutex::new(None))

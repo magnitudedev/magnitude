@@ -117,7 +117,7 @@ pub(in crate::experts) use self::core::{
 };
 pub(crate) use parks::{ParkKind, ParkSite, Parks};
 pub(crate) use passes::{DEPTHS, Measured};
-pub(in crate::experts) use promotions::{BankRecordViews, Copier};
+pub(in crate::experts) use promotions::Copier;
 pub(crate) use resize::{Candidates, Evicted, Evicting, Join};
 pub(crate) use steps::{AheadOf, DecodeRow, ExpertStep, ScratchGroup, Recording, Step, StepFailure, StepRoute, low_word};
 pub use routes::{RecordedRoutes, RoutedStep};

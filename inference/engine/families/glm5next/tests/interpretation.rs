@@ -354,6 +354,38 @@ fn a_header_with_unread_missing_or_uninterpreted_metadata_is_refused_naming_it()
     types[7] = false;
     headers::set(&mut shared, &key("attention.indexer.types"), array(types, Scalar::Bool));
     assert!(refusal(&shared).contains(&key("attention.indexer.types")));
+    let mut share_mtp = published.clone();
+    headers::set(&mut share_mtp, &key("attention.indexer.index_share_mtp"), Value::Scalar(Scalar::Bool(true)));
+    assert!(refusal(&share_mtp).contains(&key("attention.indexer.index_share_mtp")));
+}
+
+#[test]
+fn admits_shared_ffn_length_and_unshared_mtp_indexer_switch() {
+    let published = published();
+    let key = |name: &str| format!("{FAMILY_ID}.{name}");
+    let shared_width = published
+        .value(&key("expert_shared_count"))
+        .and_then(Value::unsigned)
+        .unwrap()
+        * published
+            .value(&key("expert_feed_forward_length"))
+            .and_then(Value::unsigned)
+            .unwrap();
+    let mut quant = published.clone();
+    headers::set(
+        &mut quant,
+        &key("expert_shared_feed_forward_length"),
+        Value::Scalar(Scalar::Unsigned(shared_width)),
+    );
+    headers::set(
+        &mut quant,
+        &key("attention.indexer.index_share_mtp"),
+        Value::Scalar(Scalar::Bool(false)),
+    );
+    quant
+        .metadata
+        .retain(|entry| entry.name != key("attention.indexer.types"));
+    assert_eq!(inspect(&quant).unwrap(), inspect(&published).unwrap());
 }
 
 /// How a synthetic weight is stored: the NVFP4 file's forms

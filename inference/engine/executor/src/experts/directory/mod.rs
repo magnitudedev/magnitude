@@ -698,7 +698,7 @@ impl Directory {
             stirred: false,
             withheld: None,
             reserve: vec![0; records.len()],
-            copy_hits: vec![Some(0.); layers.len()],
+            copy_hits: vec![None; layers.len()],
             asked: 0,
             time,
             write_backs: vec![None; layers.len()],
@@ -1061,7 +1061,13 @@ impl Directory {
             .enumerate()
             .map(|(group, records)| {
                 let rank = store_rank(reuse.ranker(group, tier, Reader::Move), &self.prompt_reads);
-                records.refill_victims(rank, lending)
+                // Protect unconsumed read-aheads (landed for a step Reuse has not
+                // yet logged) from immediate eviction before their step runs.
+                let protected = |staged @ (layer, _): Staged, read: Option<Step>| {
+                    let unconsumed = read.is_some_and(|step| reuse.lead_of(layer, step).is_some());
+                    (unconsumed, rank(staged, read))
+                };
+                records.refill_victims(protected, lending)
             })
             .collect()
     }
@@ -1174,35 +1180,44 @@ impl Directory {
         self.stirred || self.bank.changed() || self.read_since_withheld() || self.host.iter().any(HostRecords::surrenders)
     }
 
+    /// Whether any host tier has copies to surrender (`HostRecords::surrenders`).
+    pub fn has_surrenders(&self) -> bool {
+        self.host.iter().any(HostRecords::surrenders)
+    }
+
     /// Whether the ranking logged a read since promotions last withheld a
     /// want ([`Self::withheld`]).
     fn read_since_withheld(&self) -> bool {
         self.withheld.is_some_and(|reads| self.reuse_now().reads() != reads)
     }
 
-    /// What the ranking asks now, in time proportional to what changed:
+    /// What the ranking asks now, in time proportional to what changed,
+    /// capped to `budget` copy-engine slots:
     /// the ranking's changes of its pools (`Reuse::take_changes`) are
     /// settled first, and only where a want, a victim or a free record was
     /// gained or lost since ([`Self::stirred`]) is anything asked. In each
     /// group, each expert the ranking's pool of it holds, the bank lacks and
-    /// its host tier keeps (`wanted`) takes a free record, which no step
+    /// its host tier keeps (`wanted`) takes a free record (up to the
+    /// remaining `budget`), which no step
     /// reads, so its copy begins at once: the bank then holds the group's
     /// pool, as the ranking does (`Reuse`). Each record is
     /// its promotion's from now until its copy has completed
     /// ([`Self::promoted`]) or failed ([`Self::unpromoted`]). Then, while the
-    /// group's free and releasing records fall short of its reserve and the
-    /// wants left without one, the record of its least reused expert
-    /// outside the pool (`unwanted`) is released
-    /// ([`Self::left_bank`]): free once every step that may read it has
-    /// ended ([`Self::drain`]), and written back into the host tier first
-    /// where that pays (its exit, [`Self::exit`]). Before anything, each host
+    /// group's free and releasing records fall short of its reserve plus the
+    /// wants left without a record that fit within the remaining `budget`,
+    /// the record of its least reused expert outside the pool (`unwanted`) is
+    /// released ([`Self::left_bank`]): free once every step that may read it
+    /// has ended ([`Self::drain`]), and written back into the host tier first
+    /// where that pays (its exit, [`Self::exit`]). Held experts beyond the
+    /// copy-engine budget stay mapped and serving hits until the copy engine
+    /// is ready to copy their replacements. Before anything, each host
     /// tier gives up the copies of what the bank holds now
     /// ([`HostRecords::surrender`]): the tiers are disjoint. So a promotion never waits for a record to
     /// drain while the reserve covers what the ranking asks meanwhile; only
     /// the records a promotion may take cover a want
     /// ([`BankRecords::covering`]). Neither ever takes a lent record, the
     /// scratch's ([`BankRecords::usable`]).
-    pub fn promotions(&mut self, at: &Unbegun) -> Wants {
+    pub fn promotions(&mut self, at: &Unbegun, budget: usize) -> Wants {
         // The tier gives up what the bank holds now: its records ready for
         // other experts once no step may still read them.
         for host in &mut self.host {
@@ -1219,6 +1234,8 @@ impl Directory {
         if !stirred {
             return asked;
         }
+        let mut budget_left = budget;
+        let mut capped = false;
         let mut withheld = false;
         for group in 0..self.homes.len() {
             let members = self.homes[group].iter().map(|&(_, layer)| layer).collect::<Vec<_>>();
@@ -1238,13 +1255,17 @@ impl Directory {
             };
             withheld |= priced.withheld;
             let wanted = priced.earning;
+            let take = wanted.len().min(budget_left);
+            capped |= wanted.len() > budget_left;
             let free = self
                 .bank
                 .free(group)
                 .filter(|&record| self.bank.usable(group, record))
-                .take(wanted.len())
+                .take(take)
                 .collect::<Vec<_>>();
-            let short = wanted.len() - free.len();
+            let promoted = free.len();
+            budget_left -= promoted;
+            let short = wanted.len() - promoted;
             for ((layer, expert), record) in wanted.into_iter().zip(free) {
                 let promotion = Promotion { group, record: bank_record(record), layer, expert };
                 self.bank.promote(&promotion);
@@ -1252,22 +1273,32 @@ impl Directory {
                 self.resettle(layer, expert);
                 asked.promotions.push(promotion);
             }
-            // A want left without a record releases one now.
+            // A want left without a record releases one now, capped to the
+            // remaining copy-engine budget so held experts stay mapped and
+            // serving hits until the copy engine is ready for their
+            // replacements.
             let covering = self.bank.covering(group);
-            let releases = short.saturating_sub(covering).max((self.reserve[group] + short).saturating_sub(covering));
+            let want_releases = short.min(budget_left);
+            capped |= short > budget_left;
+            let releases = (self.reserve[group] + want_releases).saturating_sub(covering);
             if releases == 0 {
                 continue;
             }
             for (Ranked { layer, expert, .. }, record) in victims.into_iter().take(releases) {
                 let exit = self.exit_now(group, record, (layer, expert));
+                if exit.back.is_some() {
+                    budget_left = budget_left.saturating_sub(1);
+                }
                 let record = bank_record(record);
                 self.bank.release(group, record, at.into(), exit);
                 self.left_bank(layer, expert, None);
                 asked.releases.push(Release { group, record, layer, expert });
             }
         }
-        // What it took is asked for: only what changes after asks again.
+        // What it took is asked for: only what changes after asks again,
+        // unless copy-engine budget capped remaining wants.
         self.bank.take_changed();
+        self.stirred |= capped;
         self.withheld = withheld.then(|| self.reuse_now().reads());
         asked
     }

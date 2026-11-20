@@ -112,14 +112,18 @@ pub(super) struct State {
     /// The readings at which the wire count showed less than the process
     /// wires ([`Estimate::unwired_shortfall`]).
     pub(super) unwired_readings: u64,
+    /// Reclamation strategy for every cache and pool entry, keyed by `EntryId`,
+    /// set at entry creation and removed on [`Self::release`].
+    pub(super) reclaim: HashMap<EntryId, super::admission::Reclaim>,
 }
 
 /// One of a store's granule pools: its entry, which every block is charged
-/// to, and its block, the unit a shrink returns to the OS.
-#[derive(Clone, Copy, Debug)]
+/// to, its block, the unit a shrink returns to the OS, and its optional
+/// reclaimer owned for the pool's lifetime (holding only a weak pool handle).
 pub(super) struct Pool {
     pub(super) entry: EntryId,
     pub(super) block: NonZeroU64,
+    pub(super) reclaimer: Option<Arc<dyn super::admission::CacheReclaimer>>,
 }
 
 /// A view's hold of its store's state: every change of what the process
@@ -206,19 +210,39 @@ impl State {
         Own { allocated: self.allocated, wired: self.wired }
     }
 
-    /// What one pressure event lowers the boundary by: one block of the
-    /// cache, the largest of its pools'.
+    /// What one pressure event lowers the boundary by: the largest shrink unit
+    /// of the cache held in this store — the largest open pool's block where a
+    /// pool is open, or the largest non-pooled cache entry otherwise — capped
+    /// at the cache held.
     ///
     /// # Panics
-    /// Where cache is held in a store no pool of which ever opened.
+    /// Where pooled cache is held in a store whose pool of that class is not
+    /// open.
     pub(super) fn unit(&self) -> u64 {
-        match self.pools.iter().flatten().map(|pool| pool.block.get()).max() {
-            Some(block) => block.min(self.cache),
-            None => {
-                assert_eq!(self.cache, 0, "invariant violated: cache held in a store whose pool never opened");
-                0
+        for kind in CacheKind::ALL {
+            if let Some(class) = Holding::Cache(kind).pool_class() {
+                let bytes = self.cache_of[kind.index()];
+                assert!(
+                    bytes == 0 || self.pools[class.index()].is_some(),
+                    "invariant violated: {kind:?} cache ({bytes} bytes) held in a store whose {class:?} pool never opened"
+                );
             }
         }
+        let unit = self
+            .pools
+            .iter()
+            .flatten()
+            .map(|pool| pool.block.get())
+            .max()
+            .or_else(|| {
+                self.held
+                    .values()
+                    .filter(|entry| matches!(entry.holding, Holding::Cache(_)) && !entry.holding.pooled())
+                    .map(|entry| entry.bytes)
+                    .max()
+            })
+            .unwrap_or(0);
+        unit.min(self.cache)
     }
 
     /// What pooled holdings of `class` hold: the granules the class's
@@ -236,22 +260,22 @@ impl State {
     /// The free granules of the pool of `class`: its entry's bytes, none
     /// before it opens.
     pub(super) fn spare_of(&self, class: PoolClass) -> u64 {
-        self.pools[class.index()].map_or(0, |pool| self.held[&pool.entry].bytes)
+        self.pools[class.index()].as_ref().map_or(0, |pool| self.held[&pool.entry].bytes)
     }
 
     /// Keep `class`'s pool's entry holding its spare granules: what it
     /// allocated that no pooled holding of its class holds. Called on every
     /// change of either.
     fn repool(&mut self, class: PoolClass) {
-        let Some(pool) = self.pools[class.index()] else {
+        let Some(entry_id) = self.pools[class.index()].as_ref().map(|pool| pool.entry) else {
             return;
         };
-        let entry = self.held[&pool.entry];
+        let entry = self.held[&entry_id];
         let spare = self.spare_at(class, entry.allocated);
         if spare != entry.bytes {
             self.count(Holding::Pool(class), entry.bytes, false);
             self.count(Holding::Pool(class), spare, true);
-            self.entry(pool.entry).bytes = spare;
+            self.entry(entry_id).bytes = spare;
         }
     }
 
@@ -260,10 +284,10 @@ impl State {
     /// claim in process or shed to a shortage. Only what the pool allocated
     /// releases; none without a pool of `class`.
     fn release_pooled(&mut self, class: PoolClass, bytes: u64, taken: bool) {
-        let Some(pool) = self.pools[class.index()] else {
+        let Some(entry_id) = self.pools[class.index()].as_ref().map(|pool| pool.entry) else {
             return;
         };
-        let entry = self.entry(pool.entry);
+        let entry = self.entry(entry_id);
         let released = bytes.min(entry.allocated);
         entry.allocated -= released;
         entry.releasing += released;
@@ -451,10 +475,11 @@ impl State {
     /// Entry `id` was let go: its bytes are free.
     pub(super) fn release(&mut self, id: EntryId) {
         for pool in &mut self.pools {
-            if pool.is_some_and(|pool| pool.entry == id) {
+            if pool.as_ref().is_some_and(|pool| pool.entry == id) {
                 *pool = None;
             }
         }
+        self.reclaim.remove(&id);
         let entry = self.held.remove(&id).expect("a holder's entry is in its ledger");
         self.allocated -= entry.allocated + entry.releasing;
         self.wired -= entry.wired;
@@ -473,7 +498,7 @@ impl State {
     /// a pooled holding the spare granules of its class's pool too, which it
     /// holds in place.
     pub(super) fn room_for(&self, store: &seismic::StoreIdentity, holding: Holding, bytes: u64) -> u64 {
-        let pool = holding.pool_class().filter(|_| holding.pooled()).and_then(|class| self.pools[class.index()]);
+        let pool = holding.pool_class().filter(|_| holding.pooled()).and_then(|class| self.pools[class.index()].as_ref());
         let spare = pool.map_or(0, |pool| self.held[&pool.entry].bytes);
         self.free_for(self.reading(store, None), holding, bytes).saturating_add(spare)
     }

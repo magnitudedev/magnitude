@@ -11,7 +11,7 @@ pub mod environment;
 mod inspection_progress;
 pub mod measurement;
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use futures_util::{StreamExt, future::BoxFuture, stream::BoxStream};
 use magnitude_service_contracts::InventoryError;
@@ -20,16 +20,12 @@ use magnitude_service_contracts::models::{
     CatalogSupport, CustomModel, CustomModelState, EffectiveModel, LocalModels, MeasurementState,
     ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntry, ModelAssessmentEntryState,
     ModelAssessmentSubject, ModelAssessments, ModelAssessmentsInvalidation,
-    ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure, ModelId,
-    ModelServingConfiguration, ServingProfile,
+    ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure, ModelId, ServingProfile,
 };
-use magnitude_service_models::{
-    CachedModelAssessment, ServableModelBundleKey, servable_model_bundle_key_for_bundle,
-};
+use magnitude_service_models::CachedModelAssessment;
 
 use assessor::{
-    AssessmentOutcome, AssessmentWork, AssessmentWorkKey, ModelAssessor, PreparationResult,
-    inventory_model_failure,
+    AssessmentOutcome, AssessmentWork, AssessmentWorkKey, ModelAssessor, inventory_model_failure,
 };
 use environment::AssessmentEnvironment;
 use measurement::MeasurementStatus;
@@ -46,40 +42,6 @@ struct AssessmentTarget {
     entry: ModelAssessmentEntry,
     key: AssessmentWorkKey,
     work: Option<AssessmentWork>,
-}
-
-/// One preparation per bundle on one structure, shared by every profile, source slice and
-/// environment that names it: a preparation reads only the structure, and nothing of it the
-/// records price (`AssessmentEnvironment::structure_id`), so no record prepares a bundle again.
-#[derive(Default)]
-struct PreparationCoordinator {
-    cells: Mutex<
-        std::collections::BTreeMap<
-            (Arc<str>, ServableModelBundleKey),
-            Weak<tokio::sync::OnceCell<PreparationResult>>,
-        >,
-    >,
-}
-
-impl PreparationCoordinator {
-    fn prepare(
-        &self,
-        environment: &AssessmentEnvironment,
-        configuration: &ModelServingConfiguration,
-    ) -> Arc<tokio::sync::OnceCell<PreparationResult>> {
-        let key = (
-            Arc::clone(&environment.structure_id),
-            servable_model_bundle_key_for_bundle(&configuration.bundle),
-        );
-        let mut cells = self.cells.lock().expect("preparation cells lock poisoned");
-        cells.retain(|_, cell| cell.strong_count() > 0);
-        if let Some(cell) = cells.get(&key).and_then(Weak::upgrade) {
-            return cell;
-        }
-        let cell = Arc::new(tokio::sync::OnceCell::new());
-        cells.insert(key, Arc::downgrade(&cell));
-        cell
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -498,7 +460,6 @@ pub struct ManagedModelAssessments {
     current: std::sync::RwLock<AssessmentPoolCurrent>,
     changes: tokio::sync::broadcast::Sender<ModelAssessmentsInvalidation>,
     active: Mutex<ActiveAssessments>,
-    preparations: PreparationCoordinator,
     concurrency: Arc<tokio::sync::Semaphore>,
     host: HostDevice,
 }
@@ -645,7 +606,6 @@ impl ManagedModelAssessments {
             }),
             changes,
             active: Mutex::new(ActiveAssessments::new()),
-            preparations: PreparationCoordinator::default(),
             concurrency: Arc::new(tokio::sync::Semaphore::new(concurrency)),
             host,
         });
@@ -715,9 +675,7 @@ impl ManagedModelAssessments {
         let environment = self.assessor.environment();
         match self.assessor.configuration_for(&subject) {
             Ok(configuration) => {
-                let preparation = self.preparations.prepare(&environment, &configuration);
-                let work =
-                    ModelAssessor::work_for(&environment, configuration, profile, preparation);
+                let work = ModelAssessor::work_for(&environment, configuration, profile);
                 AssessmentTarget {
                     entry: ModelAssessmentEntry {
                         subject,
@@ -926,7 +884,6 @@ impl ManagedModelAssessments {
                         &environment,
                         work.configuration.clone(),
                         work.profile.profile.clone(),
-                        self.preparations.prepare(&environment, &work.configuration),
                     );
                     (key.clone(), next)
                 })
@@ -1135,7 +1092,9 @@ fn assessment_concurrency() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_service_contracts::models::{ModelPackageId, ServableModelBundle};
+    use magnitude_service_contracts::models::{
+        ModelPackageId, ModelServingConfiguration, ServableModelBundle,
+    };
     use std::path::PathBuf;
 
     fn test_configuration(model_id: &str) -> ModelServingConfiguration {
@@ -1418,18 +1377,17 @@ mod tests {
         let environment = Arc::new(
             AssessmentEnvironment::new(
                 Arc::new(structure),
-                magnitude_engine::assessment::Measurements::Pending,
+                magnitude_engine::assessment::Measurements::Pending(
+                    magnitude_executor::assessment::PendingPrices::standing(
+                        magnitude_executor::assessment::PointRequest::Costs(magnitude_executor::assessment::CostWalk::Required),
+                    ),
+                ),
             )
             .expect("the CPU environment"),
         );
         let configuration = test_configuration(subject.model_id().as_str());
         let profile = configuration.profile.clone();
-        let work = ModelAssessor::work_for(
-            &environment,
-            configuration,
-            profile,
-            Arc::new(tokio::sync::OnceCell::new()),
-        );
+        let work = ModelAssessor::work_for(&environment, configuration, profile);
         let measured = work.key.clone();
         let pending = AssessmentWorkKey("pending".to_owned());
         let assessed = current.assessed_keys();

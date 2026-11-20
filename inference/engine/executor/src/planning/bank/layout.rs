@@ -1,4 +1,4 @@
-use super::{BankBinding, ExpertBankPlan, RecordTensors, RoutedTensor};
+use super::{BankBinding, BankPaths, ExpertBankPlan, RecordTensors, RegionWords, RoutedTensor};
 use crate::memory::ClaimDemand;
 use crate::planning::resources::FlightDepth;
 use crate::planning::weights::representation_bytes;
@@ -1066,5 +1066,72 @@ impl ExpertBankPlan {
     /// The physical demand of the placed parts' words of `places` places.
     pub fn placed_demand(&self, places: std::num::NonZeroU64) -> Result<ClaimDemand, String> {
         self.demand(self.placed_allocations(places)?.iter())
+    }
+
+    /// The physical storage demanded by the `places`-dependent per-layer
+    /// bank parts (`BankPart::FileTable`, `ScratchTable`, `Routing`, `Keys`)
+    /// at `places` chain places, using the exact same `RegionWords` and
+    /// `BankAllocation` sizing as [`Self::layout`].
+    pub fn places_storage_demand(&self, places: u64) -> Result<ClaimDemand, String> {
+        let words = RegionWords {
+            choices: self.choices(),
+            rounds: self.rounds(),
+            flight: self.flights.steps(places),
+            sites: self.flights.steps(1),
+        };
+        let file = BankAllocation::Words {
+            element: Element::i32(),
+            extents: words.file().extents().to_vec(),
+        };
+        let scratch = BankAllocation::Protocol {
+            element: Element::i32(),
+            extents: words.scratch().extents().to_vec(),
+        };
+        let routing = BankAllocation::Words {
+            element: Element::i32(),
+            extents: vec![words.flight, words.routing_words()],
+        };
+        let common = self.demand([&file, &scratch, &routing].into_iter())?;
+        let mut total = ClaimDemand::default();
+        for layer in self.layers() {
+            let keys = BankAllocation::Words {
+                element: Element::i32(),
+                extents: vec![words.flight, constants::VERIFY_ROWS, layer.experts],
+            };
+            let keys_demand = keys.storage_demand(self.host())?;
+            total = total
+                .checked_plus(common)
+                .and_then(|t| t.checked_plus(keys_demand))
+                .ok_or_else(|| "bank places storage demand overflows".to_owned())?;
+        }
+        Ok(total)
+    }
+
+    /// The physical storage demanded by the `paths`-dependent layout
+    /// allocations (`BankPart::Commits` for each group and all `staging`
+    /// pools) at `paths`, using the exact same `BankAllocation` sizing as
+    /// [`Self::layout`].
+    pub fn paths_layout_demand(&self, paths: BankPaths) -> Result<ClaimDemand, String> {
+        let mut total = ClaimDemand::default();
+        for group in 0..self.groups().len() {
+            let commits = BankAllocation::Words {
+                element: Element::i32(),
+                extents: vec![self.records_with_paths(group, paths)],
+            };
+            total = total
+                .checked_plus(commits.storage_demand(self.host())?)
+                .ok_or_else(|| "bank paths storage demand overflows".to_owned())?;
+        }
+        let staging_records = self.demand_records() + paths.records().ahead;
+        for pool in &self.staging_pools().0 {
+            let staging = BankAllocation::Shared {
+                element: pool.source,
+                extents: vec![staging_records, pool.matrix[0], pool.matrix[1]],
+            };
+            total = total
+                .checked_plus(staging.storage_demand(self.host())?)
+                .ok_or_else(|| "bank staging storage demand overflows".to_owned())?;
+        }
+        Ok(total)
     }
 }

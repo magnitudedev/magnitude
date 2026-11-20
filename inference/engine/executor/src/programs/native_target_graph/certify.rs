@@ -1,12 +1,13 @@
 use super::{
     GroupRows,
-    block::{BlockGraphInputs, ClassNumber, certify_block},
+    block::{BlockGraphInputs, certify_block_group, probe_block_axes},
     classes::{
-        BlockListings, BlockServed, FamilyOutline, Holder, Passes, Topology,
-        bank_layer_by_block, block_class_numbers, block_class_slice, block_listings,
+        BlockListings, BlockServed, ClassAxes, FamilyOutline, Holder, Passes, StageAxes, Topology,
+        bank_layer_by_block, block_listings,
         block_listings_and_controls, block_routed, block_sealed_stages, block_served,
         block_stages, block_upload_regions, chained_once_runs, class_topology, decode_launch,
-        once_class, once_graphs, segment_classes, slot_scores,
+        has_untapped_graph, once_class, once_graphs, run_task_classes, segment_classes,
+        slot_classes, slot_scores,
     },
     entry::{EntryTokens, certify_entry, notice_bytes, notice_rows, target_view},
     heap::{
@@ -25,7 +26,7 @@ use crate::{
     operators::{
         BlockKeeps, paired_block,
         per_layer::graph::{
-            CheckedPerLayerEntryEntries, per_layer_entry, per_layer_entry_class_slice, split_entry,
+            CheckedPerLayerEntryEntries, per_layer_entry, split_entry,
         },
         routed::split::{OnceStage, RunStage, Stage},
     },
@@ -40,7 +41,7 @@ use crate::{
 };
 use magnitude_family_contracts::{Decoder, WeightKind, WeightRole, WeightScope};
 use seismic::{
-    BackendName, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphClassSlice,
+    BackendName, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph,
     NativeGraphLayout,
 };
 use std::any::Any;
@@ -355,6 +356,9 @@ pub(super) struct TargetFamilyCertificate<L = NativeGraphLayout> {
     /// its undrafted shape's, as a load without the drafter certifies them;
     /// none for a block that taps nothing.
     pub(super) untapped: Vec<BTreeMap<Topology, CertifiedBlockGraph<L>>>,
+    /// Per block, the class axes each `(RowForm, RunStage)` actually reads,
+    /// derived once at certification.
+    pub(super) stage_axes: StageAxes,
     /// The passes a group runs (`group_pass_rows`).
     pub(super) passes: Passes,
 }
@@ -369,6 +373,8 @@ pub(super) struct CertifiedBlockGraph<L = NativeGraphLayout> {
     /// port of the graph, and the layout holds its classes to its ports,
     /// so the template's lengths are each class's.
     pub(super) owned: HostHeap,
+    /// The class axes this stage actually reads (`probe_block_axes`).
+    pub(super) axes: ClassAxes,
 }
 
 pub(super) fn certify_target_family<L: Certified + Send + Sync>(
@@ -413,7 +419,7 @@ pub(super) fn certify_target_and_undrafted<L: Certified + Send + Sync>(
 /// class of a block's pass or fill.
 #[derive(Clone)]
 enum Included {
-    Classes(Vec<GraphConstant>, Vec<u64>),
+    PerRow(Vec<(u64, Vec<GraphConstant>)>),
     Once(Vec<GraphConstant>),
 }
 
@@ -580,6 +586,7 @@ struct CertifiedCore<L> {
     distinct_blocks: Vec<(usize, usize, Option<usize>, Arc<ShapeLayouts<L>>, Arc<ShapeLayouts<L>>)>,
     distinct_untapped: Vec<(usize, Arc<ShapeLayouts<L>>, Arc<ShapeLayouts<L>>)>,
     untapped_holders: Vec<Option<Holder>>,
+    stage_axes: StageAxes,
 }
 
 /// Run `work` for each item in `items` across the persistent assessment pool,
@@ -645,87 +652,102 @@ fn certify_once_block<L: Certified>(
     rows: u64,
 ) -> Result<(L, Vec<GraphConstant>, HostHeap), GraphError> {
     let slot = ctx.plan.blocks()[index];
-    let (slice, classes) = match stage {
-        OnceStage::Pass => (
-            NativeGraphClassSlice::new().dimension("M", [rows]),
-            &[(None, "M", ClassNumber::Rows)][..],
-        ),
-        OnceStage::Fill => (NativeGraphClassSlice::new(), &[][..]),
-    };
-    let certified = certify_block::<L>(
+    let staged = once_class(rows, stage);
+    let base_inputs = BlockGraphInputs::of_class(
+        ctx.load,
+        ctx.geometry,
+        ctx.state,
+        index,
+        staged,
+        rows,
+        ctx.outline.carries[index],
+    );
+    let (layout, per_row, owned) = certify_block_group::<L>(
         ctx.outline.backend,
         slot,
         None,
-        BlockGraphInputs::of_class(
-            ctx.load,
-            ctx.geometry,
-            ctx.state,
-            index,
-            once_class(rows, stage),
-            rows,
-            ctx.outline.carries[index],
-        ),
-        classes,
-        &[vec![slice]],
+        &base_inputs,
+        &[staged],
     )
     .map_err(|error| error.context(format!("target block {index}'s {stage:?}")))?;
-    let [(layout, (constants, owned))] = <[_; 1]>::try_from(certified)
-        .unwrap_or_else(|_| unreachable!("one slice set certifies to one layout"));
+    let constants = per_row.into_iter().flat_map(|(_, c)| c).collect();
     Ok((layout, constants, owned))
 }
 
 fn certify_run_task<L: Certified>(
     ctx: &CertifyContext<'_>,
     task: &RunTask,
-    prefill_tiles: &[Vec<u64>],
+    prefill_listings: &[BlockListings],
     pass_rows: u64,
 ) -> Result<(usize, Topology, CertifiedBlockGraph<L>, Included), GraphError> {
     let index = task.block_index;
     let slot = ctx.plan.blocks()[index];
     let paired = paired_block(&ctx.geometry.blocks[index]).map_err(|error| error.to_string())?;
+    let keeps = paired.keeps();
     let regime_rows = &ctx.regimes[task.regime_idx];
-    let listings: &[u64] = if task.listed { &prefill_tiles[task.slot_idx] } else { &[] };
-    let classes = block_class_numbers(&paired, !listings.is_empty());
+    let empty_listings = BlockListings::default();
+    let listings = if task.listed {
+        &prefill_listings[task.slot_idx]
+    } else {
+        &empty_listings
+    };
+    let tap = ctx
+        .outline
+        .tap_width
+        .map(|width| (width, ctx.outline.tapped[index].positions()))
+        .filter(|(_, positions)| !task.of_untapped && positions.any());
+    let base_listed = listings.tiles.first().copied().unwrap_or(0);
     let drafted = (
-        (task.largest, 1, 1, listings.last().copied().unwrap_or(0), u64::from(task.scored)),
+        (task.largest, 1, 1, base_listed, u64::from(task.scored)),
         Stage::Run(task.stage),
     );
-    let slices = regime_rows
-        .iter()
-        .map(|&rows| {
-            block_class_slice(&paired, rows, ctx.outline.max_slots, ctx.outline.max_segments, listings)
-        })
-        .collect::<Vec<_>>();
-    let certified = certify_block::<L>(
+    let base_inputs = BlockGraphInputs {
+        residual: !task.of_untapped && ctx.outline.exports_residual(index),
+        ..BlockGraphInputs::of_class(
+            ctx.load,
+            ctx.geometry,
+            ctx.state,
+            index,
+            drafted,
+            pass_rows,
+            ctx.outline.carries[index],
+        )
+    };
+    let axes = probe_block_axes(
         ctx.outline.backend,
         slot,
-        ctx.outline
-            .tap_width
-            .map(|width| (width, ctx.outline.tapped[index].positions()))
-            .filter(|(_, positions)| !task.of_untapped && positions.any()),
-        BlockGraphInputs {
-            residual: !task.of_untapped && ctx.outline.exports_residual(index),
-            ..BlockGraphInputs::of_class(
-                ctx.load,
-                ctx.geometry,
-                ctx.state,
-                index,
-                drafted,
-                pass_rows,
-                ctx.outline.carries[index],
-            )
-        },
-        &classes,
-        &[slices],
+        tap,
+        &base_inputs,
+        keeps,
+        ctx.outline.max_slots,
+        ctx.outline.max_segments,
+        task.listed,
     )
     .map_err(|error| error.context(format!("target block {index}")))?;
-    let [(layout, (constants, owned))] = <[_; 1]>::try_from(certified)
-        .unwrap_or_else(|_| unreachable!("one slice set certifies to one layout"));
+    let concrete = run_task_classes(
+        keeps,
+        regime_rows,
+        ctx.outline.max_slots,
+        ctx.outline.max_segments,
+        listings,
+        task.listed,
+        task.scored,
+        task.stage,
+        axes,
+    );
+    let (layout, per_row, owned) = certify_block_group::<L>(
+        ctx.outline.backend,
+        slot,
+        tap,
+        &base_inputs,
+        &concrete,
+    )
+    .map_err(|error| error.context(format!("target block {index}")))?;
     Ok((
         task.slot_idx,
         class_topology(drafted),
-        CertifiedBlockGraph { layout, owned },
-        Included::Classes(constants, regime_rows.clone()),
+        CertifiedBlockGraph { layout, owned, axes },
+        Included::PerRow(per_row),
     ))
 }
 
@@ -733,16 +755,16 @@ fn collect_run_tasks(
     ctx: &CertifyContext<'_>,
     entries: &[(usize, bool, bool, bool)],
     group: bool,
-) -> Result<(Vec<Vec<u64>>, Vec<RunTask>), GraphError> {
+) -> Result<(Vec<BlockListings>, Vec<RunTask>), GraphError> {
     let has_prefill = !crate::operators::attention::graph::decodes(ctx.outline.largest_rows);
-    let mut prefill_tiles: Vec<Vec<u64>> = Vec::with_capacity(entries.len());
+    let mut prefill_listings: Vec<BlockListings> = Vec::with_capacity(entries.len());
     let mut tasks: Vec<RunTask> = Vec::new();
     for (slot_idx, &(index, of_untapped, split, resident)) in entries.iter().enumerate() {
         let slot = ctx.plan.blocks()[index];
-        let tiles = if has_prefill {
-            block_listings(ctx.state, ctx.outline.backend, slot, index, ctx.outline.largest_rows)?.tiles
+        let listings = if has_prefill {
+            block_listings(ctx.state, ctx.outline.backend, slot, index, ctx.outline.largest_rows)?
         } else {
-            Vec::new()
+            BlockListings::default()
         };
         let scores = slot_scores(slot);
         let is_attention = matches!(slot.mixer(), crate::MixerProgramSlot::Attention(_));
@@ -758,7 +780,7 @@ fn collect_run_tasks(
                 .into_iter()
                 .chain(scores.then_some((false, true)));
             for (listed, scored) in topologies {
-                if listed && (is_decode || tiles.is_empty()) {
+                if listed && (is_decode || listings.tiles.is_empty()) {
                     continue;
                 }
                 for &stage in stages.iter().filter(|&&stage| (stage == RunStage::Combine) == group) {
@@ -776,7 +798,7 @@ fn collect_run_tasks(
                 }
             }
         }
-        prefill_tiles.push(tiles);
+        prefill_listings.push(listings);
     }
     // Schedule heaviest tasks first (Attention, listed, largest rows)
     // to minimize tail latency under work-stealing.
@@ -786,7 +808,7 @@ fn collect_run_tasks(
         std::cmp::Reverse(t.largest),
         t.slot_idx,
     ));
-    Ok((prefill_tiles, tasks))
+    Ok((prefill_listings, tasks))
 }
 
 impl<L: Certified + Send + Sync> FamilyLayouts<L> {
@@ -798,31 +820,32 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
         plan: &TargetProgramPlan,
         outline: &FamilyOutline,
     ) -> Result<Self, GraphError> {
-        let FamilyOutline { ref row_classes, largest_rows, .. } = *outline;
+        let FamilyOutline { ref row_classes, .. } = *outline;
         let entries = [EntryTokens::Uploaded, EntryTokens::Selected]
             .into_iter()
-            .map(|source| Ok((source, certify_entry(backend, load, geometry, source, row_classes, largest_rows)?)))
+            .map(|source| Ok((source, certify_entry(backend, load, geometry, source, row_classes)?)))
             .collect::<Result<BTreeMap<_, _>, GraphError>>()?;
         let per_layer = match (plan.per_layer(), &geometry.entry.per_layer) {
             (None, None) => None,
             (Some(binding), Some(entry)) => {
                 let checked = CheckedPerLayerEntryEntries::new(binding);
-                let mut graph = L::new_draft(backend);
                 let (topology, numbers) = split_entry(&binding, entry);
                 let topology = crate::programs::graph::facts::constant_reals(topology);
-                per_layer_entry(
-                    &mut graph,
-                    checked.entries(),
-                    &topology,
-                    &crate::programs::graph::facts::constant(numbers),
-                    &target_view(load, WeightKind::PerLayerModelProjection)?,
-                    &target_view(load, WeightKind::PerLayerProjectionNorm)?,
-                    &seismic::Dim::from(largest_rows),
-                )?;
-                let layout = L::certify_one(
-                    graph,
-                    vec![per_layer_entry_class_slice(row_classes.iter().copied())],
-                )
+                let numbers = crate::programs::graph::facts::constant(numbers);
+                let projection = target_view(load, WeightKind::PerLayerModelProjection)?;
+                let norm = target_view(load, WeightKind::PerLayerProjectionNorm)?;
+                let (layout, _) = L::certify_group(backend, row_classes, |mut graph, rows| {
+                    per_layer_entry(
+                        &mut graph,
+                        checked.entries(),
+                        &topology,
+                        &numbers,
+                        &projection,
+                        &norm,
+                        &seismic::Dim::from(rows),
+                    )?;
+                    Ok((graph, ()))
+                })
                 .map_err(|error| error.context("per-layer entry graph"))?;
                 Some(layout)
             }
@@ -915,10 +938,10 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
     ) -> Result<(), GraphError> {
         let entry_scope = EntryScope::of(load);
         if self.entry_scope != entry_scope {
-            let FamilyOutline { ref row_classes, largest_rows, .. } = *outline;
+            let FamilyOutline { ref row_classes, .. } = *outline;
             self.entries = [EntryTokens::Uploaded, EntryTokens::Selected]
                 .into_iter()
-                .map(|source| Ok((source, certify_entry(backend, load, geometry, source, row_classes, largest_rows)?)))
+                .map(|source| Ok((source, certify_entry(backend, load, geometry, source, row_classes)?)))
                 .collect::<Result<BTreeMap<_, _>, GraphError>>()?;
             self.entry_scope = entry_scope;
             self.entry_generation += 1;
@@ -1153,6 +1176,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             per_layer: self.per_layer.clone(),
             blocks,
             untapped,
+            stage_axes: core.stage_axes,
             passes: core.passes,
         })
     }
@@ -1380,7 +1404,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             }
             let (layout, constants, owned) = certify_once_block::<L>(ctx, index, OnceStage::Pass, rows)?;
             let workspace = layout.storage_bytes().workspace;
-            self.insert_once(key_hash, key, CertifiedBlockGraph { layout, owned }, constants);
+            self.insert_once(key_hash, key, CertifiedBlockGraph { layout, owned, axes: ClassAxes::default() }, constants);
             Ok(workspace)
         })
     }
@@ -1551,7 +1575,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
                         certify_once_block::<L>(ctx, *block_index, *stage, *rows)?;
                     Ok::<_, GraphError>(GroupTaskResult::Once(
                         *once_idx,
-                        CertifiedBlockGraph { layout, owned },
+                        CertifiedBlockGraph { layout, owned, axes: ClassAxes::default() },
                         constants,
                     ))
                 }
@@ -1640,7 +1664,12 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             for (graph, included) in launches.values().chain(groups.values()) {
                 let storage = graph.layout.storage_bytes();
                 match included {
-                    Included::Classes(constants, rows) => family.include_classes(storage, constants, rows)?,
+                    Included::PerRow(per_row) => {
+                        family.include(
+                            storage,
+                            per_row.iter().flat_map(|(_, constants)| constants.iter().cloned()),
+                        );
+                    }
                     Included::Once(constants) => family.include(storage, constants.iter().cloned()),
                 }
             }
@@ -1648,16 +1677,20 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
         let untapped_rows = outline.untapped_rows;
         for (_, launches, groups) in &distinct_untapped_pairs {
             for (graph, included) in launches.values().chain(groups.values()) {
-                let Included::Classes(constants, rows) = included else {
+                let Included::PerRow(per_row) = included else {
                     unreachable!("an untapped shape certifies only run graphs")
                 };
-                let rows = rows
+                if per_row
                     .iter()
-                    .copied()
-                    .filter(|&rows| rows <= untapped_rows)
-                    .collect::<Vec<_>>();
-                if !rows.is_empty() {
-                    family.include_classes(graph.layout.storage_bytes(), constants, &rows)?;
+                    .any(|(rows, _)| has_untapped_graph(true, *rows, untapped_rows))
+                {
+                    family.include(
+                        graph.layout.storage_bytes(),
+                        per_row
+                            .iter()
+                            .filter(|(rows, _)| has_untapped_graph(true, *rows, untapped_rows))
+                            .flat_map(|(_, constants)| constants.iter().cloned()),
+                    );
                 }
             }
         }
@@ -1679,6 +1712,22 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
                 by_holder.insert((holder, topology), graph);
             }
         }
+        let mut distinct_stage_axes: FxHashMap<usize, Arc<BTreeMap<(RowForm, RunStage), ClassAxes>>> = fx_map();
+        for (index, _, _, launches, groups) in &distinct_block_pairs {
+            let mut map: BTreeMap<(RowForm, RunStage), ClassAxes> = BTreeMap::new();
+            for (&(form, _, _, stage, _), (graph, _)) in launches.iter().chain(groups.iter()) {
+                if let Stage::Run(run) = stage {
+                    let entry = map.entry((form, run)).or_default();
+                    *entry = entry.union(graph.axes);
+                }
+            }
+            distinct_stage_axes.insert(*index, Arc::new(map));
+        }
+        let stage_axes = StageAxes::new(
+            (0..plan.blocks().len())
+                .map(|index| Arc::clone(&distinct_stage_axes[&outline.first_of_shape(index)]))
+                .collect(),
+        );
         let constants = family.constant_heap()?;
         let composition = TargetFamilyComposition::compose(
             &outline,
@@ -1693,6 +1742,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             &by_holder,
             &holder_maps,
             &ids.untapped_holders,
+            &stage_axes,
             constants,
         )?;
         #[cfg(debug_assertions)]
@@ -1710,6 +1760,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             &by_holder,
             &holder_maps,
             &ids.untapped_holders,
+            &stage_axes,
             constants,
         )?;
         // The floor group's buffers and the pass's and the selection notice,
@@ -1738,6 +1789,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             distinct_blocks: distinct_block_pairs,
             distinct_untapped: distinct_untapped_pairs,
             untapped_holders: ids.untapped_holders,
+            stage_axes,
         })
     }
 }
@@ -1758,42 +1810,6 @@ enum Graphed {
     PerLayer,
     Block(usize, Topology),
     Untapped(usize, Topology),
-}
-
-fn seal_many<L: Certified>(planned: &mut PlannedHeap, layout: &L, count: u64) -> Result<(), GraphError> {
-    let n = usize::try_from(count).map_err(|_| GraphError::from("planned sealed graph count overflows"))?;
-    planned.graphs = planned
-        .graphs
-        .checked_add(n)
-        .ok_or("planned sealed graph count overflows")?;
-    planned.plans = planned
-        .plans
-        .plus(
-            layout
-                .plan_heap()
-                .times(count)
-                .ok_or("planned sealed graph heap overflows")?,
-        )
-        .ok_or("planned sealed graph heap overflows")?;
-    Ok(())
-}
-
-fn seal_block_many<L: Certified>(
-    planned: &mut PlannedHeap,
-    certified: &CertifiedBlockGraph<L>,
-    count: u64,
-) -> Result<(), GraphError> {
-    seal_many(planned, &certified.layout, count)?;
-    planned.owned = planned
-        .owned
-        .plus(
-            certified
-                .owned
-                .times(count)
-                .ok_or("planned prepared graph heap overflows")?,
-        )
-        .ok_or("planned prepared graph heap overflows")?;
-    Ok(())
 }
 
 fn add_count(counts: &mut GraphCounts, stage: Stage, n: usize) {
@@ -1818,6 +1834,7 @@ impl TargetFamilyComposition {
         by_holder: &FxHashMap<(Holder, Topology), &CertifiedBlockGraph<L>>,
         holder_maps: &FxHashMap<Holder, (&ShapeLayouts<L>, &ShapeLayouts<L>)>,
         untapped_holders: &[Option<Holder>],
+        stage_axes: &StageAxes,
         constants: HostHeap,
     ) -> Result<Self, GraphError> {
         let FamilyOutline {
@@ -1908,7 +1925,7 @@ impl TargetFamilyComposition {
         let mut planned_most = PlannedHeap::default();
         let mut bound = HostHeap::default();
         for layout in entries.values().chain(per_layer) {
-            seal_many(&mut planned_most, layout, row_count)?;
+            planned_most.seal_many(layout, row_count)?;
             bound = bound
                 .plus(
                     layout
@@ -1918,11 +1935,7 @@ impl TargetFamilyComposition {
                 )
                 .ok_or("planned graph binding heap overflows")?;
         }
-        let mut planned_least = PlannedHeap {
-            graphs: planned_most.graphs,
-            plans: planned_most.plans,
-            owned: planned_most.owned,
-        };
+        let mut planned_least = planned_most.clone();
         let mut sealed_most = GraphCounts::default();
         let mut sealed_least = GraphCounts::default();
         let mut block_bindings = vec![GraphCounts::default(); block_count];
@@ -1944,7 +1957,11 @@ impl TargetFamilyComposition {
             let seal_u_l = seals_untapped_least[index];
 
             for &rows in row_classes {
-                let slot_count = if block_keeps.bank() { rows.min(max_slots) } else { 1 };
+                let slot_count = if block_keeps.bank() {
+                    slot_classes(rows.min(max_slots)).count() as u64
+                } else {
+                    1
+                };
                 let listings = if crate::operators::attention::graph::decodes(rows) {
                     &empty_listings
                 } else {
@@ -1959,20 +1976,27 @@ impl TargetFamilyComposition {
                         .filter(|&s| listings.segments(s, max_segments) == s)
                         .count() as u64
                 };
-                let n_plain = history_segs * slot_count;
-                let n_scored = if block_keeps.history() && block_scores {
-                    history_segs * slot_count
-                } else {
-                    0
-                };
-                let n_listed = listing_segs * slot_count * (listings.tiles.len() as u64);
 
                 let form = RowForm::of(rows);
                 let stages = block_sealed_stages(served, index, rows);
-                let has_untapped = rows <= untapped_rows && u_holder.is_some();
+                let has_untapped = has_untapped_graph(u_holder.is_some(), rows, untapped_rows);
 
                 for &stage in stages {
                     let run_stage = Stage::Run(stage);
+                    let axes = stage_axes.of(index, form, stage);
+                    let stage_segs = if axes.segments { history_segs } else { 1 };
+                    let stage_slots = if axes.slots { slot_count } else { 1 };
+                    let n_plain = stage_segs * stage_slots;
+                    let n_scored = if axes.segments && block_keeps.history() && block_scores {
+                        stage_segs * stage_slots
+                    } else {
+                        0
+                    };
+                    let n_listed = if axes.listed {
+                        listing_segs * stage_slots * (listings.tiles.len() as u64)
+                    } else {
+                        0
+                    };
                     for (listed, scored, count) in [
                         (false, false, n_plain),
                         (false, true, n_scored),
@@ -1996,11 +2020,11 @@ impl TargetFamilyComposition {
                             .ok_or("planned graph binding heap overflows")?;
                         add_count(&mut block_bindings[index], run_stage, count_usize);
                         if seal_own_m {
-                            seal_block_many(&mut planned_most, certified, count)?;
+                            planned_most.seal_block_many(certified, count)?;
                             add_count(&mut sealed_most, run_stage, count_usize);
                         }
                         if seal_own_l {
-                            seal_block_many(&mut planned_least, certified, count)?;
+                            planned_least.seal_block_many(certified, count)?;
                             add_count(&mut sealed_least, run_stage, count_usize);
                         }
                         intern(Graphed::Block(first, topology));
@@ -2019,11 +2043,11 @@ impl TargetFamilyComposition {
                                 .ok_or("planned graph binding heap overflows")?;
                             block_bindings[index].untapped += count_usize;
                             if seal_u_m {
-                                seal_block_many(&mut planned_most, u_certified, count)?;
+                                planned_most.seal_block_many(u_certified, count)?;
                                 add_count(&mut sealed_most, run_stage, count_usize);
                             }
                             if seal_u_l {
-                                seal_block_many(&mut planned_least, u_certified, count)?;
+                                planned_least.seal_block_many(u_certified, count)?;
                                 add_count(&mut sealed_least, run_stage, count_usize);
                             }
                             let u_graphed = match uh {
@@ -2045,11 +2069,11 @@ impl TargetFamilyComposition {
                     .ok_or("planned graph binding heap overflows")?;
                 add_count(&mut block_bindings[index], stage, 1);
                 if seal_own_m {
-                    seal_block_many(&mut planned_most, certified, 1)?;
+                    planned_most.seal_block_many(certified, 1)?;
                     add_count(&mut sealed_most, stage, 1);
                 }
                 if seal_own_l {
-                    seal_block_many(&mut planned_least, certified, 1)?;
+                    planned_least.seal_block_many(certified, 1)?;
                     add_count(&mut sealed_least, stage, 1);
                 }
                 let id = intern(Graphed::Block(first, topology));
@@ -2109,7 +2133,7 @@ impl TargetFamilyComposition {
                             let form = RowForm::of(rows);
                             let block_iter = b_launches.iter().chain(b_groups.iter());
                             let untapped_iter = u_maps
-                                .filter(|_| rows <= untapped_rows)
+                                .filter(|_| has_untapped_graph(true, rows, untapped_rows))
                                 .into_iter()
                                 .flat_map(|(ul, ug)| ul.iter().chain(ug.iter()));
                             block_iter
@@ -2274,10 +2298,11 @@ impl TargetFamilyComposition {
                         continue;
                     }
                     for &stage in RunStage::sealed(g.is_split, g.resident, rows) {
-                        let topo = (form, listed > 0, scored, Stage::Run(stage), 0);
+                        let axes = stage_axes.of(g.first, form, stage);
+                        let topo = (form, listed > 0 && axes.listed, scored && axes.segments, Stage::Run(stage), 0);
                         let id = graphed_ids[&Graphed::Block(g.first, topo)];
                         runs[id as usize] += g.count;
-                        if rows <= untapped_rows {
+                        if has_untapped_graph(g.u_holder.is_some(), rows, untapped_rows) {
                             if let Some(uh) = g.u_holder {
                                 let u_graphed = match uh {
                                     Holder::Block(block) => Graphed::Block(outline.first_of_shape(block), topo),
@@ -2389,6 +2414,7 @@ fn verify_composition_against_enumeration<L: Certified>(
     by_holder: &FxHashMap<(Holder, Topology), &CertifiedBlockGraph<L>>,
     holder_maps: &FxHashMap<Holder, (&ShapeLayouts<L>, &ShapeLayouts<L>)>,
     untapped_holders: &[Option<Holder>],
+    stage_axes: &StageAxes,
     constants: HostHeap,
 ) -> Result<(), GraphError> {
     let certified_of = |index: usize, class: StagedClass, of_untapped: bool| -> Result<&CertifiedBlockGraph<L>, GraphError> {
@@ -2404,8 +2430,9 @@ fn verify_composition_against_enumeration<L: Certified>(
                 ))
             })
     };
+    let stage_axes_fn = |index: usize, form: RowForm, stage: RunStage| stage_axes.of(index, form, stage);
     let enumerate = |unread| {
-        enumerate_block_graphs(outline, served, passes, state, plan, BlockOutputScales::Planned(unread))
+        enumerate_block_graphs(outline, served, passes, state, plan, BlockOutputScales::Planned(unread), stage_axes_fn)
     };
     let enumeration = enumerate(UnreadScales::Distinct)?;
     let least = match enumeration.exact {
@@ -2517,7 +2544,7 @@ fn verify_composition_against_enumeration<L: Certified>(
                     let form = RowForm::of(rows);
                     let block_iter = b_launches.iter().chain(b_groups.iter());
                     let untapped_iter = u_maps
-                        .filter(|_| rows <= outline.untapped_rows)
+                        .filter(|_| has_untapped_graph(true, rows, outline.untapped_rows))
                         .into_iter()
                         .flat_map(|(ul, ug)| ul.iter().chain(ug.iter()));
                     block_iter
@@ -2581,7 +2608,7 @@ fn verify_composition_against_enumeration<L: Certified>(
         let id = intern(graphed);
         run_entries.push((index, staged, id));
     }
-    let launch_runs = LaunchRuns::of(served, run_entries);
+    let launch_runs = LaunchRuns::of(served, stage_axes_fn, run_entries);
     let windows = load.expert_bank().map_or(1, crate::ExpertBankPlan::windows);
     let k = graphed_table.len();
     let mut most = vec![0u64; k];

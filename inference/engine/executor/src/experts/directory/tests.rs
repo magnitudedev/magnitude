@@ -34,7 +34,7 @@ impl Directory {
 
     /// What the ranking asks now.
     fn promote(&mut self) -> Wants {
-        steps().unbegun(|at| self.promotions(at))
+        steps().unbegun(|at| self.promotions(at, usize::MAX))
     }
 
     /// Carry `promotion` through its copy to its completion: its expert.
@@ -199,6 +199,7 @@ fn a_prompt_group_is_lent_its_bank_records_and_returns_them_free() {
 #[test]
 fn no_promotion_is_planned_into_a_lent_record() {
     let mut directory = Directory::new(&[4], &[0], &[8], tiered(&[8], 1, 8, 2));
+    directory.price_copies(0, Some(0.));
     assert_eq!(directory.reuse_now().records(0), 2, "the pool is the records less the lent ones");
     for expert in 0..6 {
         let record = directory.land(0, expert, 0).unwrap();
@@ -406,6 +407,7 @@ fn the_directory_keeps_the_host_tier_disjoint_from_the_bank() {
     assert_eq!(directory.land(0, 5, 1), None, "the one ready record is the demand reserve");
     // Step 2 reads 3 from the tier; the ranking promotes it into a free
     // record: its tier copy banked until the next ask gives it up.
+    directory.price_copies(0, Some(0.));
     log(&directory, 2, 0, &[3]);
     let promoted = directory.promote();
     assert_eq!(promoted.promotions, [Promotion { group: 0, record: BankRecord(0), layer: 0, expert: 3 }], "4 is never read");
@@ -486,8 +488,10 @@ fn a_promotion_waits_until_its_reads_earn_its_copy() {
             times.moved(0, crate::experts::horizon::Tier::Compute);
         }
     }
-    (0..2).for_each(|layer| directory.price_copies(layer, Some(4.)));
+    // Unpriced by default (`None`): no promotion runs before `price_copies`.
     log(&directory, 1, 0, &[4]);
+    assert_eq!(directory.promote(), Wants::default(), "unpriced promotions are never treated as free");
+    (0..2).for_each(|layer| directory.price_copies(layer, Some(4.)));
     assert_eq!(directory.promote(), Wants::default(), "no read earns a copy priced past the turnover");
     assert!(!directory.settle_changes(), "nothing read or priced since, nothing asked");
     log(&directory, 2, 0, &[4]);
@@ -548,6 +552,7 @@ fn a_want_earns_its_copy_and_its_victim_is_released() {
 fn promotions_bring_the_groups_pool_into_the_bank() {
     // Layers 0 and 1 pool three records; their tier keeps every expert.
     let mut directory = Directory::new(&[3], &[0, 0], &[8, 8], HostTier::replay(vec![16]));
+    (0..2).for_each(|layer| directory.price_copies(layer, Some(0.)));
     for (layer, expert) in (0..2).flat_map(|layer| (0..8).map(move |expert| (layer, expert))) {
         let record = directory.land(layer, expert, 0).unwrap();
         directory.landed(layer, record, expert, None);
@@ -615,6 +620,7 @@ fn the_stack_counts_every_decode_reads_misses_at_its_depth() {
 #[test]
 fn a_reserve_lets_a_promotion_copy_at_once() {
     let mut directory = Directory::new(&[3], &[0], &[8], HostTier::replay(vec![16]));
+    directory.price_copies(0, Some(0.));
     for expert in 0..8 {
         let record = directory.land(0, expert, 0).unwrap();
         directory.landed(0, record, expert, None);
@@ -646,6 +652,57 @@ fn a_reserve_lets_a_promotion_copy_at_once() {
     );
     directory.drain(Point::START, &steps());
     assert_eq!(directory.promote(), Wants::default(), "the reserve is whole again");
+}
+
+/// `Directory::promotions` caps both promotions from free records and
+/// victim releases to the copy engine's remaining `budget`, leaving
+/// remaining held experts mapped and serving hits until copy-engine
+/// headroom opens up, while keeping `settle_changes()` true so capped
+/// wants are revisited once budget is available.
+#[test]
+fn promotions_and_releases_are_capped_by_copy_engine_budget() {
+    // Part 1: 4 free records, 4 earning wants, budget = 2 -> only 2 promoted.
+    let mut directory = Directory::new(&[4], &[0], &[8], HostTier::replay(vec![8]));
+    directory.price_copies(0, Some(0.));
+    for expert in 0..8 {
+        let record = directory.land(0, expert, 0).unwrap();
+        directory.landed(0, record, expert, None);
+    }
+    for step in 1..=16 {
+        log(&directory, step, 0, &[0, 1, 2, 3]);
+    }
+    let first = steps().unbegun(|at| directory.promotions(at, 2));
+    assert_eq!(first.promotions.len(), 2, "at most budget promotions issued");
+    assert!(first.releases.is_empty());
+    assert!(directory.settle_changes(), "capped wants keep stirred true for the next budget window");
+    // Budget 0 promotes nothing and still keeps stirred true.
+    assert_eq!(steps().unbegun(|at| directory.promotions(at, 0)), Wants::default());
+    assert!(directory.settle_changes());
+    // Next budget window of 2 promotes the remaining 2 wants.
+    let second = steps().unbegun(|at| directory.promotions(at, 2));
+    assert_eq!(second.promotions.len(), 2, "remaining wants promoted once budget opens");
+    assert!(!directory.settle_changes(), "no remaining wants once all 4 are promoted");
+    for promotion in first.promotions.into_iter().chain(second.promotions) {
+        directory.complete(&promotion);
+    }
+    assert!((0..4).all(|expert| directory.held(0, expert).is_some()));
+
+    // Part 2: All 4 records are held by experts 0..4; now experts 4..8
+    // become the top-4 wants. With budget = 2, only 2 victims are released
+    // and the other 2 held experts stay mapped in VRAM.
+    for step in 17..=80 {
+        log(&directory, step, 0, &[4, 5, 6, 7]);
+    }
+    let third = steps().unbegun(|at| directory.promotions(at, 2));
+    assert!(third.promotions.is_empty(), "no free records yet");
+    assert_eq!(third.releases.len(), 2, "only budget victims released, not all 4");
+    let still_held = (0..4).filter(|&expert| directory.held(0, expert).is_some()).count();
+    assert_eq!(still_held, 2, "remaining 2 held experts stay mapped and serving hits");
+    // While those 2 releases are still covering, another call with budget = 2
+    // releases 0 additional victims.
+    let fourth = steps().unbegun(|at| directory.promotions(at, 2));
+    assert!(fourth.releases.is_empty(), "covering releases satisfy want_releases; no extra eviction");
+    assert_eq!((0..4).filter(|&expert| directory.held(0, expert).is_some()).count(), 2);
 }
 
 /// The directory ranks its victims by their expected uses, recency the
@@ -821,7 +878,7 @@ fn written_back_victim(priced: bool) -> Directory {
 fn a_released_victim_is_written_back_where_it_pays() {
     for priced in [false, true] {
         let mut directory = written_back_victim(priced);
-        let asked = played().unbegun(|at| directory.promotions(at));
+        let asked = played().unbegun(|at| directory.promotions(at, usize::MAX));
         assert_eq!(asked.releases, [Release { group: 0, record: BankRecord(0), layer: 0, expert: 1 }]);
         if !priced {
             assert!(directory.backs_queued().is_empty() && directory.located(0, 1) == Located::Lacked, "unpriced, only the file holds it");
@@ -852,7 +909,7 @@ fn a_demand_for_an_expert_with_a_pending_write_back_reads_from_file_and_supersed
     let mut directory = written_back_victim(true);
     let steps = steps();
     steps.begin_through(164);
-    let asked = steps.unbegun(|at| directory.promotions(at));
+    let asked = steps.unbegun(|at| directory.promotions(at, usize::MAX));
     assert_eq!(asked.releases, [Release { group: 0, record: BankRecord(0), layer: 0, expert: 1 }]);
     let [(0, record, (0, 1), back_tier)] = directory.backs_queued()[..] else {
         panic!("expected queued write-back: {:?}", directory.backs_queued());

@@ -193,3 +193,100 @@ def test_stale_is_what_no_row_at_the_trees_sources_credits(results, tmp_path):
     (tree / "k" / "src" / "lib.rs").write_text("two")
     assert {item.binary.key: (item.tests, item.why) for item in ledger.Ledger(rows).stale(
         tree, "metal", GPU, "release", universe)}["k:doc:k"] == (None, "changed since its last run, r1")
+
+
+def test_missing_provenance_executable_raises_ledger_error_and_reports_cleanly(tmp_path):
+    """An ended run whose ran executable is absent from provenance-source.json raises LedgerError
+    and is reported as a failed ledger by test._cargo instead of crashing collection."""
+    import json
+    from types import SimpleNamespace
+    import pytest
+    from magnitude_rig import ledger
+    from magnitude_rig.instruments import JobResult, test as test_instrument
+
+    run = tmp_path / "r-mismatch"
+    job = run / "test"
+    job.mkdir(parents=True)
+    (job / "host.json").write_text(json.dumps({"alias": "m4-pro-01", "hardware": {}}))
+    (job / ledger.RAN).write_text(json.dumps([{
+        "binary": "service/server:lib:magnitude_service_server",
+        "executable": "magnitude_service_server-22a812f04e6a7244",
+        "code": 0,
+        "listed": ["a"],
+        "ignored": [],
+        "outcomes": {"a": "ok"},
+        "counts": None,
+        "executions": {"a": RAN},
+    }]))
+    (run / ledger.PROVENANCE.format(side="source")).write_text(json.dumps({
+        "executables": [{
+            "path": "/checkouts/other/target/debug/deps/magnitude_service_server-8f04a62ff35448ef",
+            "environment": {},
+            "sources_digest": "d" * 64,
+        }],
+    }))
+    with pytest.raises(ledger.LedgerError, match="magnitude_service_server-22a812f04e6a7244"):
+        ledger.rows(run, job, "metal", "debug")
+
+    arguments = SimpleNamespace(backend="metal", arguments=["-p", "magnitude-service-server", "--lib"],
+                                suite="cargo", timed=False)
+    lines, passed = test_instrument._cargo(
+        arguments,
+        {"test": JobResult(directory=job, log=job / "job.log", code=0)},
+    )
+    assert passed
+    assert any(line.startswith("ledger failed: ") and "magnitude_service_server-22a812f04e6a7244" in line for line in lines)
+
+
+def test_materialize_reusing_output_copies_matching_provenance(tmp_path):
+    """When two checkouts build the same (tree, build) and produce different Cargo executable
+    hashes, the second run's materialize() adopts the materialized output's provenance.json so
+    provenance-source.json matches the executables in outputs/<tree>-<build>/tests.json."""
+    import json
+    import os
+    from magnitude_rig.host import agent
+
+    rig = agent.Rig(str(tmp_path))
+    output = tmp_path / "outputs" / "tree-build"
+    output.mkdir(parents=True)
+
+    def make_checkout(name: str, exe_name: str, digest: str):
+        checkout = tmp_path / "checkouts" / name
+        deps = checkout / "target" / "debug" / "deps"
+        pkg = checkout / "src" / "service" / "server"
+        deps.mkdir(parents=True)
+        pkg.mkdir(parents=True)
+        exe = deps / exe_name
+        exe.write_bytes(b"elf")
+        manifest = pkg / "Cargo.toml"
+        manifest.write_text("[package]\nname = 'magnitude-service-server'\n")
+        proven = tmp_path / f"provenance-{name}.json"
+        proven.write_text(json.dumps({
+            "kept": [],
+            "executables": [{"path": str(exe), "environment": {}, "sources_digest": digest}],
+        }))
+        return checkout, exe, manifest, proven
+
+    _, exe_a, manifest_a, proven_a = make_checkout("slot-a", "magnitude_service_server-22a812f04e6a7244", "a" * 64)
+    _, exe_b, manifest_b, proven_b = make_checkout("slot-b", "magnitude_service_server-8f04a62ff35448ef", "b" * 64)
+
+    runner_a = object.__new__(agent.Runner)
+    runner_a.rig = rig
+    runner_a.outputs = {"source": str(output)}
+    runner_a.checkouts = {"source": "slot-a"}
+    runner_a.tests = [(str(exe_a), str(manifest_a), "magnitude_service_server", "lib")]
+    runner_a.scripts = {}
+    runner_a.build_scripts = {}
+    assert runner_a.materialize("source", str(proven_a)) == 1
+    assert (output / agent.OUTPUT_PROVENANCE).exists()
+
+    runner_b = object.__new__(agent.Runner)
+    runner_b.rig = rig
+    runner_b.outputs = {"source": str(output)}
+    runner_b.checkouts = {"source": "slot-b"}
+    runner_b.tests = [(str(exe_b), str(manifest_b), "magnitude_service_server", "lib")]
+    runner_b.scripts = {}
+    runner_b.build_scripts = {}
+    assert runner_b.materialize("source", str(proven_b)) == 0
+    adopted = json.loads(proven_b.read_text())
+    assert [os.path.basename(e["path"]) for e in adopted["executables"]] == ["magnitude_service_server-22a812f04e6a7244"]

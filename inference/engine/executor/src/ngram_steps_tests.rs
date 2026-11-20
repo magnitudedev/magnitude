@@ -74,15 +74,17 @@ fn forward(request: RequestId, kind: WorkKind, tokens: &[u32], position: usize, 
 /// allocated.
 #[test]
 fn a_native_loads_arena_claim_is_its_scratch_and_bound_constants() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) = fixture("arena-claim");
-    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cpu].into_iter().filter(|&backend| available(&catalog, backend)) {
-        let (domain, _bindings, _, _) = load(&catalog, &definition, &package, backend, limits(2, true, 1, 0), Banked::Resident);
-        let (claim, allocated, constants) = domain.arena_terms();
-        assert!(constants > 0, "{backend:?}: the fixture binds constants");
-        assert!(claim >= constants, "{backend:?}: the arena claim of {claim} bytes holds its {constants} constant bytes");
-        assert_eq!(claim, allocated, "{backend:?}: the arena claim is what its allocations charged");
+    {
+        let _placement = crate::test_support::process_placement();
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        for backend in [seismic::BackendName::Metal, seismic::BackendName::Cpu].into_iter().filter(|&backend| available(&catalog, backend)) {
+            let (domain, _bindings, _, _) = load(&catalog, &definition, &package, backend, limits(2, true, 1, 0), Banked::Resident);
+            let (claim, allocated, constants) = domain.arena_terms();
+            assert!(constants > 0, "{backend:?}: the fixture binds constants");
+            assert!(claim >= constants, "{backend:?}: the arena claim of {claim} bytes holds its {constants} constant bytes");
+            assert_eq!(claim, allocated, "{backend:?}: the arena claim is what its allocations charged");
+        }
     }
     std::fs::remove_dir_all(&directory).ok();
 }
@@ -92,9 +94,9 @@ fn a_native_loads_arena_claim_is_its_scratch_and_bound_constants() {
 /// claims the queued lookahead and reads its token rows from the selection.
 #[test]
 fn an_ngram_decoder_steps_on_host_and_selected_tokens() {
+    let (directory, definition, package) = fixture("ngram-steps");
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    let (directory, definition, package) = fixture("ngram-steps");
     let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
         let (mut domain, mut bindings, _, _) =
@@ -162,8 +164,6 @@ const ROW_CLASS_KL: f64 = 1e-4;
 fn a_verification_row_scores_its_history_as_plain_decode_does() {
     const PROMPT: usize = 37;
     const ROWS: usize = magnitude_kernels::constants::VERIFY_ROWS as usize;
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
     let proposals = (ROWS - 1) as u8;
     let loads = [
@@ -188,6 +188,8 @@ fn a_verification_row_scores_its_history_as_plain_decode_does() {
             Banked::Half,
         ),
     ];
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let token = |position: usize| (position * 37 + 11) as u32 % 256;
     // Every row selects greedily, as a served round does, and exports its
     // logits.
@@ -306,9 +308,9 @@ fn a_verification_row_scores_its_history_as_plain_decode_does() {
 /// the selections the resident load makes.
 #[test]
 fn a_streamed_decoder_steps_twice_through_its_bank() {
+    let (directory, definition, package) = fixture_of("streamed-steps", streamed_experts_manifest);
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    let (directory, definition, package) = fixture_of("streamed-steps", streamed_experts_manifest);
     let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
         let selections = |banked| {
@@ -330,7 +332,7 @@ fn a_streamed_decoder_steps_twice_through_its_bank() {
             tokens
         };
         let resident = selections(Banked::Resident);
-        let streamed = selections(Banked::Streamed { numerator: 1, denominator: 2 });
+        let streamed = selections(Banked::Half);
         assert_eq!(streamed, resident, "{backend:?}: a streamed load selects as the resident one");
     }
     std::fs::remove_dir_all(&directory).ok();
@@ -376,15 +378,18 @@ fn a_partial_banks_shared_graphs_read_each_layers_own_experts() {
     banked_shared_graphs_score_as_resident("partial-bank-shared", definition, &STREAMING_BACKENDS, Banked::Half);
 }
 
-/// A partial bank of a general routed model (no shared expert: the layers
-/// Gemma's routed shape gives, 128 experts choosing 8), whose gate/up runs
-/// in two passes around the tier wait (the up-only wait after its latent
-/// projection included), scores as the resident load does, each streamed
-/// decode launch meeting every residency
+/// A partial bank of a general routed model (no shared expert: 128 experts
+/// choosing 8), whose gate/up runs in two passes around the tier wait (the
+/// up-only wait after its latent projection included), scores as the resident
+/// load does, each streamed decode launch meeting every residency
 /// ([`Scores::assert_every_residency`]).
 #[test]
 fn a_partial_banks_general_routed_layers_score_as_resident() {
-    let definition = routed_fixture_definition(RoutedShape { layers: 4, experts: 128, selected: 8, hidden: 2816, intermediate: 1152 });
+    let mut definition = routed_fixture_definition(RoutedShape { layers: 12, experts: 128, selected: 8, hidden: 192, intermediate: 64 });
+    // `routed_fixture_definition` defaults to 16K context for planning tests;
+    // this test runs a 2-token prompt and 32 decode steps, so 128 matches
+    // `fixture_definition` and keeps the bank's floor below the model's weight.
+    definition.decoder.context_limit = 128;
     banked_shared_graphs_score_as_resident("partial-bank-general", definition, &STREAMING_BACKENDS, Banked::Half);
 }
 
@@ -516,9 +521,9 @@ fn run_fronting_prompt(
 /// The bank's record counts each pass with front rows that completed.
 #[test]
 fn two_row_exact_rows_score_alike_across_guesses_and_banks() {
+    let (directory, definition, package) = fronting_fixture("two-row-exact");
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    let (directory, definition, package) = fronting_fixture("two-row-exact");
     let request = RequestId(1);
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
         // Each pass's exact row's bits and its selection, of the passes of
@@ -598,9 +603,9 @@ fn pipelined_two_row_passes_claim_their_successors_and_emit_their_unpipelined_to
     /// The front rows each pass the host builds runs at most, by index: a
     /// pass of none claims the queued one.
     const DEPTHS: [usize; 12] = [0, 1, 0, 2, 2, 0, 0, 1, 2, 0, 1, 0];
+    let (directory, definition, package) = fronting_fixture("two-row-pipelined");
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    let (directory, definition, package) = fronting_fixture("two-row-pipelined");
     let request = RequestId(1);
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
         // Each pass, `lookahead` or not: its rows, its exact row's token and
@@ -620,19 +625,33 @@ fn pipelined_two_row_passes_claim_their_successors_and_emit_their_unpipelined_to
             let mut passes = Vec::new();
             // The front rows' record of the load.
             let front = |domain: &ExecutorDomain| domain.expert_costs().expect("a banked load's record").front;
+            let mut queued_passes = 0usize;
+            let mut claimed_passes = 0usize;
             for (index, depth) in DEPTHS.into_iter().enumerate() {
                 let rows = two_row.pass(crate::FrontGrant::UpTo(depth));
                 let guesses = rows.guesses().to_vec();
                 let before = front(&domain);
-                assert_eq!(domain.queued_steps(), usize::from(lookahead && index > 0), "{backend:?} pass {index}: the passes queued behind the one before");
+                let queued = domain.queued_steps();
+                if lookahead && index > 0 {
+                    // The bank's watcher may stage a policy update (e.g. the
+                    // hint gate's first flip after timing) and break the
+                    // lookahead pipeline for one boundary via
+                    // `ElasticBank::wants_gap()` so `write_staged()` can update
+                    // device-visible policy words while no step is in flight.
+                    assert!(queued <= 1, "{backend:?} pass {index}: at most one pass queued behind the one before");
+                    queued_passes += queued;
+                } else {
+                    assert_eq!(queued, 0, "{backend:?} pass {index}: no pass is queued");
+                }
                 let operation = front_pass(request, &rows, exact, 2 + index, crate::batching::Demand::NONE);
                 let (mut pending, next, claimed) = launched(&mut domain, bindings, &[operation], backend);
                 let pending = pending.pop().expect("one pass");
                 assert_eq!(
                     claimed,
-                    lookahead && index > 0 && guesses.is_empty(),
+                    queued == 1 && guesses.is_empty(),
                     "{backend:?} pass {index}: whether it claims the queued pass"
                 );
+                claimed_passes += usize::from(claimed);
                 let Outcome::Forward { rows: results, guesses: chain } = pending.outcome().clone() else {
                     panic!("{backend:?}: a pass's outcome")
                 };
@@ -656,6 +675,14 @@ fn pipelined_two_row_passes_claim_their_successors_and_emit_their_unpipelined_to
                 passes.push((rows, exact, chain.clone()));
                 two_row.guessed(chain);
                 bindings = next;
+            }
+            if lookahead {
+                assert!(
+                    queued_passes >= DEPTHS.len() - 3,
+                    "{backend:?}: lookahead queued most passes ({queued_passes}/{})",
+                    DEPTHS.len() - 1
+                );
+                assert!(claimed_passes > 0, "{backend:?}: at least one exact-only pass claimed its queued successor");
             }
             // The guesses the verdicts judged and those that stood, by kind
             // and by depth.
@@ -709,15 +736,18 @@ fn banked_shared_graphs_score_as_resident(
     backends: &[seismic::BackendName],
     banked: Banked,
 ) {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) = fixture_with(test, definition, streamed_experts_manifest);
-    for &backend in backends.iter().filter(|&&backend| available(&catalog, backend)) {
-        let scores = scores(&catalog, &definition, &package, backend, banked, Start::AtOnce);
-        if matches!(banked, Banked::Half) {
-            scores.assert_every_residency(backend);
+    let stored = stored_experts(&package, &definition);
+    {
+        let _placement = crate::test_support::process_placement();
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        for &backend in backends.iter().filter(|&&backend| available(&catalog, backend)) {
+            let scores = scores(&catalog, &definition, &package, &stored, backend, banked, Start::AtOnce);
+            if matches!(banked, Banked::Half) {
+                scores.assert_every_residency(backend);
+            }
+            scores.assert_as_resident(backend, "the banked load's logits and selection");
         }
-        scores.assert_as_resident(backend, "the banked load's logits and selection");
     }
     std::fs::remove_dir_all(&directory).ok();
 }
@@ -731,22 +761,29 @@ fn banked_shared_graphs_score_as_resident(
 /// resident load does ([`Scores::assert_as_resident`]).
 #[test]
 fn a_capped_partial_banks_tier_grows_within_its_cap_and_serves_every_miss() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let backend = seismic::BackendName::Cuda;
-    // Only a CUDA device across a link has a host tier: on unified memory
-    // (GB10's) the bank is the one store, and there is no tier to grow.
-    let topology = catalog.topology();
-    let linked = seismic::testing::selected(&topology, backend).is_some_and(|executor| {
-        matches!(crate::platform::host_tier(&topology, executor), Some(crate::planning::HostTier::Linked))
-    });
+    let linked = {
+        let _placement = crate::test_support::process_placement();
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        // Only a CUDA device across a link has a host tier: on unified memory
+        // (GB10's) the bank is the one store, and there is no tier to grow.
+        let topology = catalog.topology();
+        seismic::testing::selected(&topology, backend).is_some_and(|executor| {
+            matches!(crate::platform::host_tier(&topology, executor), Some(crate::planning::HostTier::Linked))
+        })
+    };
     if !linked {
         return;
     }
     let definition = qwen4exp_fixture_definition_of(9, 256);
     let (directory, definition, package) = fixture_with("tier-grown", definition, streamed_experts_manifest);
-    scores(&catalog, &definition, &package, backend, Banked::Half, Start::TierGrown)
-        .assert_as_resident(backend, "the grown tier's load scores as the resident one");
+    let stored = stored_experts(&package, &definition);
+    {
+        let _placement = crate::test_support::process_placement();
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        scores(&catalog, &definition, &package, &stored, backend, Banked::Half, Start::TierGrown)
+            .assert_as_resident(backend, "the grown tier's load scores as the resident one");
+    }
     std::fs::remove_dir_all(&directory).ok();
 }
 
@@ -757,13 +794,16 @@ fn a_capped_partial_banks_tier_grows_within_its_cap_and_serves_every_miss() {
 /// some).
 #[test]
 fn misses_the_device_lands_score_as_resident() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let definition = qwen4exp_fixture_definition_of(9, 256);
     let (directory, definition, package) = fixture_with("device-landed", definition, streamed_experts_manifest);
-    for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
-        scores(&catalog, &definition, &package, backend, Banked::Half, Start::AtOnce)
-            .assert_as_resident(backend, "the misses the device landed score as the resident load's");
+    let stored = stored_experts(&package, &definition);
+    {
+        let _placement = crate::test_support::process_placement();
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
+            scores(&catalog, &definition, &package, &stored, backend, Banked::Half, Start::AtOnce)
+                .assert_as_resident(backend, "the misses the device landed score as the resident load's");
+        }
     }
     std::fs::remove_dir_all(&directory).ok();
 }
@@ -989,11 +1029,11 @@ fn scores(
     catalog: &seismic::Devices,
     definition: &Rc<ModelDefinition>,
     package: &Arc<Package>,
+    stored: &[[Stack; 3]],
     backend: seismic::BackendName,
     banked: Banked,
     start: Start,
 ) -> Scores {
-    let stored = stored_experts(package, definition);
     let expansion = definition
         .decoder
         .sublayers()
@@ -1012,7 +1052,7 @@ fn scores(
         match banked {
             Banked::Resident => {}
             Banked::Whole => assert_eq!(whole, Some(true), "{backend:?}: the uncapped load holds every expert in its bank"),
-            Banked::Streamed { .. } | Banked::Half => {
+            Banked::Half => {
                 assert_eq!(whole, Some(false), "{backend:?}: the capped load banks part of its experts")
             }
         }
@@ -1109,7 +1149,7 @@ fn test_measures(domain: &ExecutorDomain, pricing: &Pricing) -> crate::LoadMeasu
             .map(|bank| ExpertLines { host: HostLines { record_bytes: bank.record_bytes, ..reference.host }, ..reference })
             .collect(),
     );
-    pricing.measures(lines, Priced::Pending("not measured by the test".to_owned()))
+    pricing.measures(lines, Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required))))
 }
 
 /// The token a step's last row selected.
@@ -1131,12 +1171,12 @@ fn selected_token(outcome: &Outcome, backend: seismic::BackendName) -> u32 {
 /// then decode, and select the resident load's tokens.
 #[test]
 fn a_streamed_load_runs_its_prompt_groups_then_decodes() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) = fixture_of("streamed-groups", streamed_experts_manifest);
     let mut long = (*definition).clone();
     long.decoder.context_limit = SPLIT_CONTEXT;
     let definition = Rc::new(long);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let chunks = (SPLIT_CONTEXT as usize - 2) / SPLIT_CHUNK_ROWS;
     let prompts = Prompts { requests: 2, chunks, rows: SPLIT_CHUNK_ROWS };
     let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
@@ -1146,7 +1186,7 @@ fn a_streamed_load_runs_its_prompt_groups_then_decodes() {
             steps.iter().filter_map(|(bits, _)| bits.last().and_then(|(_, _, selected)| *selected)).collect::<Vec<_>>()
         };
         let resident = selected(Banked::Resident);
-        let streamed = selected(Banked::Streamed { numerator: 1, denominator: 2 });
+        let streamed = selected(Banked::Half);
         assert_eq!(streamed, resident, "{backend:?}: a streamed load's prompt groups select as the resident load's");
     }
     std::fs::remove_dir_all(&directory).ok();
@@ -1441,12 +1481,12 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
 #[test]
 #[ignore = "needs a CUDA device: run with --ignored on one"]
 fn drafter_steps_record_no_graph_beyond_their_charge() {
+    let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
+    let (directory, definition, package) = fixture_with("drafter-graphs", mtp, crate::planning::fixtures::fixture_manifest);
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let cuda = seismic::BackendName::Cuda;
     assert!(available(&catalog, cuda), "the test runs on a host with a CUDA device");
-    let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
-    let (directory, definition, package) = fixture_with("drafter-graphs", mtp, crate::planning::fixtures::fixture_manifest);
     let method = PlannedMethod::Mtp {
         greedy_proposals: DrafterSteps::PROPOSALS as u8,
         sampled_proposals: DrafterSteps::PROPOSALS as u8,
@@ -1492,10 +1532,10 @@ fn drafter_steps_record_no_graph_beyond_their_charge() {
 /// selects.
 #[test]
 fn a_head_without_selection_drafts_from_a_multi_row_entry_pass() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
     let (directory, definition, package) = fixture_with("head-multi-row-entry", mtp, crate::planning::fixtures::fixture_manifest);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let method = PlannedMethod::Mtp {
         greedy_proposals: DrafterSteps::PROPOSALS as u8,
         sampled_proposals: DrafterSteps::PROPOSALS as u8,
@@ -2103,11 +2143,11 @@ fn a_chain_of_prompt_chunks_equals_its_chunks_one_step_at_a_time() {
 #[test]
 fn a_zero_valued_engram_input_leaves_its_attention_decoder_unchanged() {
     use crate::planning::fixtures::{ENGRAM_VALUE, engram_fixture_definition};
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let zero = |name: &str| (name == ENGRAM_VALUE).then_some(0.0);
     let (directory, with, package) =
         fixture_valued("engram-zero", engram_fixture_definition(), stored_table_manifest, &zero);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     // The same file, its Engram tensors unread.
     let mut without = (*with).clone();
     without.decoder.blocks[0].sublayers.truncate(2);
@@ -2138,10 +2178,10 @@ fn a_zero_valued_engram_input_leaves_its_attention_decoder_unchanged() {
 #[test]
 fn engram_requests_decode_together_as_each_alone() {
     use crate::planning::fixtures::engram_fixture_definition;
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) =
         fixture_valued("engram-slots", engram_fixture_definition(), stored_table_manifest, &|_: &str| None);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let requests = [RequestId(1), RequestId(2)];
     // Each request's logits at its two decode steps, the requests decoding
     // `together` in one launch or each alone.
@@ -2387,12 +2427,12 @@ const SPLIT_CONTEXT: u64 = 4096;
 /// context (at 512 to 16,384 tokens), so no group of it splits.
 #[test]
 fn a_group_longer_than_its_pass_equals_its_chunks_in_one_pass() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) = fixture("split-pass");
     let mut long = (*definition).clone();
     long.decoder.context_limit = SPLIT_CONTEXT;
     let definition = Rc::new(long);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     // The longest prompt the context holds beside its two decode rows.
     let chunks = (SPLIT_CONTEXT as usize - 2) / SPLIT_CHUNK_ROWS;
     let cpu = seismic::BackendName::Cpu;
@@ -2526,10 +2566,10 @@ fn launched(
 /// decode step waits only on an absent expert, which no load guarantees.
 #[test]
 fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) =
         fixture_with("starved-step", qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let prompt = (0..CHUNK_ROWS as u32).map(|row| (row * 37 + 11) % 256).collect::<Vec<_>>();
     let backends = [seismic::BackendName::Cuda, seismic::BackendName::Metal];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
@@ -2606,12 +2646,12 @@ fn starved_step(
 /// sequence whose prompt was never starved.
 #[test]
 fn a_starved_chunk_of_a_chain_concludes_it_and_the_rerun_scores_as_unstarved() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     // At the kl's shape, where a banked load's prompt runs as one chain
     // (`a_banked_loads_prompt_groups_score_as_resident`).
     let (directory, definition, package) =
         fixture_with("starved-chain", qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mut long = (*definition).clone();
     long.decoder.context_limit = SPLIT_CONTEXT;
     let definition = Rc::new(long);
@@ -2664,10 +2704,10 @@ fn a_starved_chunk_of_a_chain_concludes_it_and_the_rerun_scores_as_unstarved() {
 /// for it forever.) A teardown past [`TEARDOWN_BOUND`] ends the process.
 #[test]
 fn a_streamed_load_dropped_with_a_running_successor_tears_down() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) =
         fixture_with("queued-teardown", qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let request = RequestId(1);
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
         let (mut domain, mut bindings, _, _) =
@@ -2706,10 +2746,10 @@ const TEARDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 /// that keeps submission order (the park declares the map host-written).
 #[test]
 fn a_lone_prompt_chunk_at_a_half_bank_is_finite() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) =
         fixture_with("lone-chunks", qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mut long = (*definition).clone();
     long.decoder.context_limit = SPLIT_CONTEXT;
     let definition = Rc::new(long);
@@ -3072,14 +3112,14 @@ fn an_own_site_mean_exit_sinkhorn_decoder_matches_its_host_reference() {
 /// backend's `attention_project` keeps (the CPU keeps neither).
 #[test]
 fn a_kimi_delta_layer_qualifies_on_every_backend() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (_directory, definition, package) = fixture_valued(
         "kimi-delta-qualifies",
         crate::planning::fixtures::glm_slice_fixture_definition(),
         crate::planning::fixtures::fixture_manifest,
         &|_| None,
     );
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let backends = [
         seismic::BackendName::Cuda,
         seismic::BackendName::Metal,
@@ -3093,8 +3133,6 @@ fn a_kimi_delta_layer_qualifies_on_every_backend() {
 
 fn assert_sinkhorn_decoder_matches_its_host_reference(form: SinkhornForm) {
     use magnitude_family_contracts::{ExitSite, SinkhornInput};
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let constant = |name: &str| match name {
         "o" => Some(0.0),
         _ if name.ends_with("_hc_scale") => Some(16.0),
@@ -3112,6 +3150,8 @@ fn assert_sinkhorn_decoder_matches_its_host_reference(form: SinkhornForm) {
         crate::planning::fixtures::fixture_manifest,
         &constant,
     );
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let tensors = std::cell::RefCell::new(std::collections::HashMap::<String, Rc<Vec<f32>>>::new());
     let tensor = |name: &str| -> Rc<Vec<f32>> {
         tensors
@@ -3220,11 +3260,11 @@ fn assert_sinkhorn_decoder_matches_its_host_reference(form: SinkhornForm) {
 /// weights to the unbanked CPU resident load.
 #[test]
 fn cpu_loads_whole_and_tier_placed_expert_banks() {
-    let _placement = crate::test_support::process_placement();
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let backend = seismic::BackendName::Cpu;
     let (directory, definition, package) =
         fixture_with("cpu-whole-and-tier-banks", qwen4exp_fixture_definition_of(2, 16), streamed_experts_manifest);
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
 
     let limits = limits(2, false, 1, 1);
     let release = platform::ReleaseRate::of_machine(None);
@@ -3339,7 +3379,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         let mut recorded = crate::memory::ledger::Recorded::default();
         let load = execution.load();
         let demand = match load.expert_bank() {
-            Some(bank) => load.clone().with_load_slots(bank.slots).unwrap().target_weight_demand(),
+            Some(bank) => load.clone().with_load_slots(bank.slots, bank.host_slots).unwrap().target_weight_demand(),
             None => load.target_weight_demand(),
         }
         .unwrap();
@@ -3491,5 +3531,63 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         .expect("tier-placed bank carves its Bank and Host record holdings cleanly");
     }
 
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+/// A prompt chunk resumed level with its head (a turn continuing a prefix
+/// decoded in front passes, whose last pass's head launch entered its
+/// selection: the prefix cache's resumed state, or a request continuing in
+/// place) primes the head with its pairs past its first token, at its own
+/// position (`Priming::pairs_previous` false). It reads no boundary
+/// feature, and launches though the decoded prefix holds none: a decode
+/// pass keeps no boundary feature. On every backend experts stream on, the
+/// closing chunk of such a turn runs and its head launch makes the head's
+/// guess.
+#[test]
+fn a_prompt_chunk_resumed_level_with_its_head_primes_without_a_boundary_feature() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (directory, definition, package) = fronting_fixture("resumed-priming");
+    let request = RequestId(1);
+    for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
+        let (mut domain, mut bindings) = load_fronting(&catalog, &definition, &package, backend, false, 1, Banked::Whole);
+        domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+        domain.open_served(&mut bindings, request, None).unwrap();
+        // The first turn: its prompt at 0..2, then one front pass at 2 that
+        // leaves the head level with the target at 3.
+        let (pending, _, returned) = run_fronting_prompt(&mut domain, bindings, request, backend);
+        let rows = crate::Rows::front(Vec::new(), 0);
+        let operation = front_pass(request, &rows, pending, 2, crate::batching::Demand::NONE);
+        let (mut outcomes, returned, _) = launched(&mut domain, returned, &[operation], backend);
+        let outcome = outcomes.pop().expect("one pass");
+        let selected = TokenId(selected_token(outcome.outcome(), backend));
+        let decision = PhysicalDecision { accepted_rows: 1, ahead: crate::AheadVerdict::new(&rows, &[selected]) };
+        domain.reconcile(outcome, decision).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        // The next turn's closing chunk at 3, its first token the pass's
+        // selection, which the head entered already.
+        let tokens = vec![selected, TokenId(7), TokenId(9)];
+        let prime = crate::Priming { boundary: true, tokens: tokens[1..].to_vec(), position: 3, draft_from: 6 };
+        assert!(!prime.pairs_previous(tokens.len()));
+        let chunk = Operation::Forward {
+            request,
+            kind: WorkKind::Prefill,
+            select: vec![greedy(5)],
+            committed: tokens.len(),
+            chain: Some(crate::ChainEntry { position: prime.position + prime.tokens.len() }),
+            prime: Some(prime),
+            tokens,
+            position: 3,
+            conditioning: None,
+            demand: crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES,
+            front: Vec::new(),
+        };
+        domain.requirements(std::slice::from_ref(&chunk)).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        let (outcome, _) = run(&mut domain, returned, chunk, false, backend);
+        let Outcome::Forward { guesses, .. } = outcome else { panic!("{backend:?}: a prompt's outcome") };
+        assert!(
+            matches!(guesses.as_slice(), [crate::Guess { kind: crate::GuessKind::Head, .. }]),
+            "{backend:?}: the closing chunk's chain is the head's guess alone: {guesses:?}"
+        );
+    }
     std::fs::remove_dir_all(&directory).ok();
 }

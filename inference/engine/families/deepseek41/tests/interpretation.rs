@@ -8,7 +8,7 @@ use magnitude_artifacts::{
     gguf::{self, Array, Directory, Elements, Scalar, Value},
     ArtifactIdentity, PackageIdentity,
 };
-use magnitude_family_common::{architecture_keys, Metadata};
+use magnitude_family_common::Metadata;
 use magnitude_family_contracts::{
     Attention, BlockElement, BlockRounding, BlockScale, ExitNorm, ExitSite, ExpertSelection, FeedForwardUp, GluLimit, HeadNorm,
     HistoryReads, HistoryRows, HistorySource, HyperConnectionMixing, HyperConnectionWeights,
@@ -363,10 +363,7 @@ fn the_compressed_layers_rotary_is_yarn_at_unit_amplitude() {
         5.680529398e-07,
     ];
     let directory = slice();
-    let keys = architecture_keys(&directory, FAMILY_ID)
-        .map(|(key, _)| key)
-        .collect::<Vec<_>>();
-    let m = Metadata::new(&directory, FAMILY_ID, &keys).unwrap();
+    let m = Metadata::new(&directory, FAMILY_ID);
     let Rotary::Table {
         pairs,
         layout,
@@ -613,6 +610,63 @@ fn slice_b_rows_equal_the_reference_rows_of_the_r1_fixtures() {
         chunked.extend(input.hash.rows(&tokens[..split], &tokens[split..]));
         assert_eq!(chunked, rows);
     }
+}
+
+#[test]
+fn admits_output_embedding_width_engram_provenance_and_dspark_sibling_metadata() {
+    let baseline = header(SLICE_B);
+    let hidden = baseline
+        .value(&format!("{FAMILY_ID}.embedding_length"))
+        .and_then(Value::unsigned)
+        .unwrap();
+    let streams = baseline
+        .value(&format!("{FAMILY_ID}.hyper_connection.count"))
+        .and_then(Value::unsigned)
+        .unwrap();
+    let mut extended = baseline.clone();
+    set(
+        &mut extended,
+        &format!("{FAMILY_ID}.embedding_length_out"),
+        Value::Scalar(Scalar::Unsigned(hidden * streams)),
+    );
+    set(
+        &mut extended,
+        &format!("{FAMILY_ID}.engram.vocab_size"),
+        Value::Scalar(Scalar::Unsigned(129_280)),
+    );
+    set(
+        &mut extended,
+        &format!("{FAMILY_ID}.engram.compressed_vocab_size"),
+        Value::Scalar(Scalar::Unsigned(65_536)),
+    );
+    for (suffix, value) in [
+        ("dspark.block_size", Value::Scalar(Scalar::Unsigned(16))),
+        ("dspark.noise_token_id", Value::Scalar(Scalar::Unsigned(0))),
+        ("dspark.markov_rank", Value::Scalar(Scalar::Unsigned(64))),
+        ("dspark.expert_count", Value::Scalar(Scalar::Unsigned(16))),
+        ("dspark.expert_used_count", Value::Scalar(Scalar::Unsigned(2))),
+    ] {
+        set(&mut extended, &format!("{FAMILY_ID}.{suffix}"), value);
+    }
+    assert_eq!(inspect(&extended).unwrap(), inspect(&baseline).unwrap());
+
+    let mut wrong_out = baseline.clone();
+    set(
+        &mut wrong_out,
+        &format!("{FAMILY_ID}.embedding_length_out"),
+        Value::Scalar(Scalar::Unsigned(hidden * streams + 1)),
+    );
+    let err = inspect(&wrong_out).unwrap_err().to_string();
+    assert!(err.contains("deepseek41.embedding_length_out"), "{err}");
+
+    let mut unknown = baseline;
+    set(
+        &mut unknown,
+        &format!("{FAMILY_ID}.unknown_switch"),
+        Value::Scalar(Scalar::Bool(true)),
+    );
+    let err = inspect(&unknown).unwrap_err().to_string();
+    assert!(err.contains("deepseek41.unknown_switch"), "{err}");
 }
 
 fn set(directory: &mut Directory, name: &str, value: Value) {

@@ -3147,3 +3147,89 @@ fn step_timing_at_decode_shapes() {
         }
     }
 }
+
+/// Trailing power-of-two padded empty slots (`segments = [actual_rows, actual_rows]`,
+/// `previous = -1`, `following = -1`) leave outputs and all banks bit-identical
+/// to an unpadded launch for both Gated DeltaNet and Kimi Delta Attention
+/// (`step` and `chunk`).
+#[test]
+fn padded_empty_slots_match_unpadded_for_gated_and_kimi_delta() {
+    let slots = vec![slot(3, 3, 0, 1), slot(2, 1, 2, 3), slot(1, 1, 4, 5)];
+    let gated_geom = Geometry {
+        banks: 8,
+        tape: 4,
+        ..SMALL
+    };
+    let kimi_geom = Geometry {
+        decay_width: SMALL.width,
+        banks: 8,
+        tape: 4,
+        ..SMALL
+    };
+    let gated_case = Case::new(gated_geom, 8, slots.clone(), false, 101);
+    let mut kimi_case = Case::new(kimi_geom, 8, slots, false, 102);
+    kimi_case.decay_lower = Some(-5.0);
+    let ints = |device: &Device, shape: &[u64], values: &[i32]| {
+        Tensor::from_host(
+            &seismic::Charges::tally(device),
+            Element::i32(),
+            shape,
+            &values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    for device in devices() {
+        let backend = device.backend().as_str();
+        for (label, case) in [("gated", &gated_case), ("kimi", &kimi_case)] {
+            let active = 6 * case.geometry.value_heads * case.geometry.width;
+            for chunk in [None, Some(32u64)] {
+                let expected = case.native(&device, Element::f32(), chunk);
+                let mut t = case.tensors_with_reused_slab(&device, Element::f32(), false);
+                let padded_slots = 4u64;
+                let mut segs = Vec::with_capacity((padded_slots as usize + 1) * 2);
+                let mut row = 0i32;
+                for s in &case.slots {
+                    segs.extend([row, row + s.rows as i32]);
+                    row += s.rows as i32;
+                }
+                segs.extend([row, row, row, row]);
+                let mut stop: Vec<i32> = case.slots.iter().map(|s| s.stop as i32).collect();
+                let mut prev: Vec<i32> = case.slots.iter().map(|s| s.previous as i32).collect();
+                let mut tape: Vec<i32> = case.slots.iter().map(|s| s.taped as i32).collect();
+                let mut next: Vec<i32> = case.slots.iter().map(|s| s.following as i32).collect();
+                stop.push(0);
+                prev.push(-1);
+                tape.push(0);
+                next.push(-1);
+                t.segments = ints(&device, &[padded_slots + 1, 2], &segs);
+                t.stop = ints(&device, &[padded_slots], &stop);
+                t.previous = ints(&device, &[padded_slots], &prev);
+                t.previous_tape = ints(&device, &[padded_slots], &tape);
+                t.following = ints(&device, &[padded_slots], &next);
+                let rows = match chunk {
+                    None if case.per_channel() => 32.min(case.geometry.width as u64 / 2),
+                    None => 32.min(case.geometry.width as u64),
+                    Some(mapping) => mapping,
+                };
+                let gated = t.run(&device, case, Element::f32(), chunk.is_some(), &case.specialization(&device, rows));
+                let actual = Outcome {
+                    gated: read(&gated),
+                    window: read(&t.window),
+                    delta: read(&t.delta),
+                    tape: read(&t.tape),
+                };
+                let mode = if chunk.is_some() { "chunk" } else { "step" };
+                assert!(
+                    actual.gated[..active].iter().zip(&expected.gated[..active]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{backend} {label} {mode}: padded-slot gated output differs"
+                );
+                assert!(
+                    actual.window.iter().zip(&expected.window).all(|(a, b)| a.to_bits() == b.to_bits())
+                        && actual.delta.iter().zip(&expected.delta).all(|(a, b)| a.to_bits() == b.to_bits())
+                        && actual.tape.iter().zip(&expected.tape).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{backend} {label} {mode}: padded-slot bank arenas differ"
+                );
+            }
+        }
+    }
+}

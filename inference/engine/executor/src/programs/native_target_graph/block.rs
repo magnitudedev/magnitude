@@ -41,7 +41,7 @@ use magnitude_family_contracts::{Decoder, ExitNorm, SublayerIndex, WeightKind, W
 #[cfg(test)]
 use seismic::{NativeGraphMetadata, NativeGraphStorageBytes};
 use seismic::{
-    Argument, BackendName, Device, Dim, Element, HostHeap, NativeGraphClassSlice, NativeGraphLayout,
+    Argument, BackendName, Device, Dim, Element, HostHeap, NativeGraphLayout,
     NativeGraphPlan, NativePort, NativeTimelinePort, OperandCarry, OperandForms, Table,
     WorkflowTensor,
 };
@@ -1137,7 +1137,7 @@ fn checked_block_graph<G: ElementBoundDraft + 'static>(
         .input
         .clone()
         .map(|carry| {
-            carry.try_map(|width| GraphDraft::port_with_class_extent(&mut graph, Element::f32(), &[rows, &width], 0, "M"))
+            carry.try_map(|width| GraphDraft::port(&mut graph, Element::f32(), &[rows, &width]))
         })
         .transpose()?;
     let tap_elements = [("A", shape.activation)];
@@ -1177,42 +1177,106 @@ fn checked_block_graph<G: ElementBoundDraft + 'static>(
     Ok((graph, constants, owned))
 }
 
-/// A class dimension of a block graph's slices.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum ClassNumber {
-    Rows,
-    Segments,
-    Listed,
-    Slots,
-}
-
-/// The block graph `inputs` names of `slot` on `backend`, with its draft
-/// taps (`tap`), certified over each slice set of `slice_sets`, each with its
-/// constants and owned heap.
-pub(super) fn certify_block<L: Certified>(
+/// Derives which class axes (`segments`, `slots`, `listed`) this block graph
+/// actually reads by probing `AxisProbeDraft` across concrete flips of each
+/// axis against `base_inputs`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn probe_block_axes(
     backend: BackendName,
     slot: TargetBlockProgramSlot,
     tap: Option<(u64, TapPositions)>,
-    inputs: BlockGraphInputs<'_>,
-    _classes: &[(Option<&'static str>, &'static str, ClassNumber)],
-    slice_sets: &[Vec<NativeGraphClassSlice>],
-) -> Result<Vec<(L, (Vec<GraphConstant>, HostHeap))>, GraphError> {
-    let entries = CheckedBlockEntries::new(inputs.state, backend, slot)?;
-    let (mut banks, mut parks) = (Vec::new(), Vec::new());
-    let bank = layer_bank(
-        inputs.stage,
-        entries.bank.as_ref().map(CheckedBankEntries::entries::<L::Draft>),
-        &mut banks,
-        &mut parks,
-    );
-    let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
-    let planned = inputs.weights()?;
-    let (graph, constants, owned) = checked_block_graph(L::new_draft(backend), &entries, &shape, &numbers, &planned)?;
-    let certified = L::certify_draft(graph, slice_sets)?;
-    Ok(certified
-        .into_iter()
-        .map(|layout| (layout, (constants.clone(), owned)))
-        .collect())
+    base_inputs: &BlockGraphInputs<'_>,
+    keeps: crate::operators::BlockKeeps,
+    max_slots: u64,
+    max_segments: u64,
+    listed: bool,
+) -> Result<super::classes::ClassAxes, GraphError> {
+    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot)?;
+    let planned = base_inputs.weights()?;
+    let probe = |inputs: &BlockGraphInputs<'_>| -> Result<u64, GraphError> {
+        let (mut banks, mut parks) = (Vec::new(), Vec::new());
+        let bank = layer_bank(
+            inputs.stage,
+            entries
+                .bank
+                .as_ref()
+                .map(CheckedBankEntries::entries::<crate::programs::graph::sizing::AxisProbeDraft>),
+            &mut banks,
+            &mut parks,
+        );
+        let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
+        let (draft, _, _) = checked_block_graph(
+            crate::programs::graph::sizing::AxisProbeDraft::new(backend),
+            &entries,
+            &shape,
+            &numbers,
+            &planned,
+        )?;
+        Ok(draft.fingerprint())
+    };
+    let base_fp = probe(base_inputs)?;
+    let segments = if keeps.history() {
+        let mut flipped = *base_inputs;
+        flipped.segments = max_segments.max(2);
+        probe(&flipped)? != base_fp
+    } else {
+        false
+    };
+    let slots = if keeps.bank() {
+        let mut flipped = *base_inputs;
+        flipped.slots = max_slots.max(2);
+        probe(&flipped)? != base_fp
+    } else {
+        false
+    };
+    let listed = if listed && base_inputs.listed > 0 {
+        let mut flipped = *base_inputs;
+        flipped.listed = base_inputs.listed + 1;
+        probe(&flipped)? != base_fp
+    } else {
+        false
+    };
+    Ok(super::classes::ClassAxes { segments, slots, listed })
+}
+
+/// The block graph `base_inputs` names of `slot` on `backend`, with its draft
+/// taps (`tap`), certified directly over every concrete class in `classes`,
+/// returning its certified layout, per-row constants, and owned heap.
+pub(super) fn certify_block_group<L: Certified>(
+    backend: BackendName,
+    slot: TargetBlockProgramSlot,
+    tap: Option<(u64, TapPositions)>,
+    base_inputs: &BlockGraphInputs<'_>,
+    classes: &[StagedClass],
+) -> Result<(L, Vec<(u64, Vec<GraphConstant>)>, HostHeap), GraphError> {
+    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot)?;
+    let planned = base_inputs.weights()?;
+    let (layout, aux) = L::certify_group(backend, classes, |draft, staged| {
+        let ((rows, segments, slots, listed, scored), stage) = staged;
+        let inputs = BlockGraphInputs {
+            rows,
+            segments,
+            slots,
+            listed,
+            scored: scored > 0,
+            stage,
+            ..*base_inputs
+        };
+        let (mut banks, mut parks) = (Vec::new(), Vec::new());
+        let bank = layer_bank(
+            inputs.stage,
+            entries.bank.as_ref().map(CheckedBankEntries::entries::<L::Draft>),
+            &mut banks,
+            &mut parks,
+        );
+        let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
+        let (graph, constants, owned) = checked_block_graph(draft, &entries, &shape, &numbers, &planned)?;
+        Ok((graph, (rows, constants, owned)))
+    })?;
+    let owned = aux.first().map(|(_, _, owned)| *owned).unwrap_or_default();
+    debug_assert!(aux.iter().all(|(_, _, other)| *other == owned));
+    let per_row = aux.into_iter().map(|(rows, constants, _)| (rows, constants)).collect();
+    Ok((layout, per_row, owned))
 }
 
 /// The metadata graph of block `inputs` names of `slot`, with its draft taps

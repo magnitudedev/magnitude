@@ -263,7 +263,9 @@ __global__ void state_space_chunk_scan(SEISMIC_KERNEL_PARAMS) {
         zero_uncovered<LANE_ROWS>(in, head, row0);
         return;
     }
-    const Slot slot = bind(in, versions::slot_of(in.slots, blockIdx.z, seismic_words_value));
+    const versions::Slot raw = versions::slot_of(in.slots, blockIdx.z, seismic_words_value);
+    if (raw.lo == raw.hi) return;
+    const Slot slot = bind(in, raw);
     Rows<LANE_ROWS> rows;
     load_version<LANE_ROWS>(in, slot, head, row0, threadIdx.x % 32, rows);
     publish_window(in, slot, head, blockIdx.y, gridDim.y);

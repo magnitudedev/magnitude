@@ -755,13 +755,7 @@ fn occurrence<'a>(
     record: &'a InstalledPackageRecord,
 ) -> Option<Occurrence<'a>> {
     let base = record_base(managed_root, record)?;
-    let primary_file = record
-        .installed
-        .package
-        .files
-        .iter()
-        .filter(|file| file.role == ModelFileRole::Weights)
-        .min_by(|left, right| left.path.cmp(&right.path))?;
+    let primary_file = record.installed.package.primary_weights()?;
     let selector = primary_file
         .path
         .components()
@@ -5460,7 +5454,7 @@ mod tests {
         /// Holds both repositories' locks, so admitted package work stays queued, as behind other
         /// downloads on a slow link, and never reaches the network.
         fn queue(&self) -> Vec<seismic_io::OwnedRecord> {
-            let store = crate::store_fs::model_store(&self.fixture.store);
+            let store = crate::store_fs::model_store(&self.fixture.store).unwrap();
             ["owner/Model-GGUF", "owner/Model-DFlash-GGUF"]
                 .into_iter()
                 .map(|repository| store.lock_owned(&crate::store_fs::repository_record(repository)).unwrap())

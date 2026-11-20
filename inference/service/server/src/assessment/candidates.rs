@@ -12,10 +12,9 @@ use std::sync::{Arc, Mutex, Weak};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use magnitude_artifacts::Error as ArtifactError;
-use magnitude_artifacts::gguf::{Array, Directory, FileHeader, HeaderSource};
+use magnitude_artifacts::gguf::{Array, Directory, FileHeader, FileHeaders, HeaderSource};
 use magnitude_engine::assessment::{
     ModelPackagePaths, PreparedModelAssessment, finish_model_assessment,
-    prepare_model_assessment_from,
 };
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
@@ -83,6 +82,9 @@ struct TargetMaterial {
     projector: Option<PathBuf>,
     identity: String,
     headers: BTreeMap<PathBuf, String>,
+    /// The exact package when this material came from a `ServableModelBundle`, so assessment can
+    /// share `ModelAssessor`'s preparation cache and in-memory release catalog headers.
+    package: Option<ModelPackage>,
     _guards: Vec<Guard>,
 }
 
@@ -97,6 +99,9 @@ struct DrafterMaterial {
     path: PathBuf,
     identity: String,
     headers: BTreeMap<PathBuf, String>,
+    /// The exact draft package when this material came from a `ServableModelBundle`, so assessment
+    /// can share `ModelAssessor`'s preparation cache and in-memory release catalog headers.
+    package: Option<ModelPackage>,
     _guards: Vec<Guard>,
 }
 
@@ -598,17 +603,59 @@ impl ManagedModelCandidates {
     /// How a catalog model serves without its catalog drafter. Catalog models use their catalog
     /// drafter unless it doesn't fit: withheld when the engine binds it and the model doesn't fit
     /// with it, so the model is served plain, and loads when it fits plain or is refused with its
-    /// own shortfall. Its built-in heads serve
-    /// while the drafter is not on this computer when they are automatic: the engine binds them
-    /// and they keep the model fitting.
+    /// own shortfall. Its built-in heads serve while the drafter is not on this computer when they
+    /// are automatic: the engine binds them and they keep the model fitting.
+    ///
+    /// Assesses the catalog model's own speculative bundle directly (warming `ModelAssessor`'s
+    /// preparation cache for `ManagedModelAssessments`), without a redundant plain pass: for an
+    /// exact catalog model `known_to_work` is always true, and the engine's `with >= without`
+    /// invariant guarantees that a bound drafter that fits also fits plain.
     fn catalog_drafter_fit<'a>(
         &'a self,
         model_id: &'a ModelId,
     ) -> BoxFuture<'a, Result<CatalogDrafterFit, InventoryError>> {
         Box::pin(async move {
-            let target = self.model_target(model_id, Reach::Hub).await?;
-            let candidates = self.enumerate_drafters(&target, None, false).await?;
-            Ok(catalog_drafter_fit(&candidates))
+            let matched = self
+                .lineage
+                .variant(model_id)
+                .ok_or_else(|| InventoryError::NotFound(model_id.as_str().to_owned()))?;
+            let bundle = &matched.model.configuration.bundle;
+            let (target, drafter) = self.catalog_bundle_materials(bundle).await?;
+            let (withheld, embedded_catalog) = match bundle {
+                ServableModelBundle::SpeculativeDecoding {
+                    draft_source,
+                    method,
+                    ..
+                } => {
+                    let drafted = self
+                        .assess(&target, drafter.as_ref(), engine_method(method))
+                        .await?;
+                    let verdict = verdict_of(&drafted.profile);
+                    (
+                        is_bound(&verdict) && !fits(&drafted.profile),
+                        matches!(draft_source, SpeculativeDraftSource::Embedded),
+                    )
+                }
+                ServableModelBundle::Standalone { .. } => (false, false),
+            };
+            let bundle_key = servable_model_bundle_key_for_bundle(bundle);
+            let skip_own = embedded_catalog
+                || self
+                    .assessor
+                    .release_catalog()
+                    .target_has_embedded_heads(&bundle_key)
+                    == Some(false);
+            let built_in_heads = if skip_own {
+                false
+            } else {
+                let own = self.assess(&target, None, ModelMethod::Auto).await?;
+                let verdict = verdict_of(&own.profile);
+                is_bound(&verdict) && fits(&own.profile)
+            };
+            Ok(CatalogDrafterFit {
+                withheld,
+                built_in_heads,
+            })
         })
     }
 
@@ -714,6 +761,11 @@ impl ManagedModelCandidates {
         });
         resolver.set_custom_model_enrichment(self.enrichment.clone());
         let _ = self.resolver.set(Arc::clone(&resolver));
+        let catalog_fits = Arc::clone(self);
+        let catalog_resolver = Arc::clone(&resolver);
+        magnitude_service_utils::owner::spawn("catalog drafter fits", async move {
+            catalog_fits.run_catalog_drafter_fits(&catalog_resolver).await;
+        });
         for reach in [Reach::Local, Reach::Hub] {
             let candidates = Arc::clone(self);
             let resolver = Arc::clone(&resolver);
@@ -723,8 +775,7 @@ impl ManagedModelCandidates {
         }
     }
 
-    /// The enrichment pass of `reach` (see `start_enrichment`); the Hub pass also works out each
-    /// catalog model's drafter fit.
+    /// The enrichment pass of `reach` (see `start_enrichment`).
     async fn enrich_custom_models(&self, resolver: &ModelDomainResolver, reach: Reach) {
         let enrichment = &self.enrichment;
         let mut changes = self.local.watch_local();
@@ -765,10 +816,6 @@ impl ManagedModelCandidates {
                     }
                 }
             }
-            // Catalog drafter fits come before the custom models: every catalog model with a
-            // drafter is held assessing until its fit is known.
-            let catalog_failed =
-                reach == Reach::Hub && !self.fit_catalog_drafters(resolver, revision).await;
             // Models with no result yet come first, so a model just added or installed is
             // never kept waiting behind recomputing the others; each result is published as
             // soon as it is known, and a pass restarts as soon as the inputs move again.
@@ -816,45 +863,59 @@ impl ManagedModelCandidates {
             }
             tokio::select! {
                 change = changes.next() => if change.is_none() { return },
-                () = tokio::time::sleep(ENRICHMENT_RETRY_DELAY), if !failed.is_empty() || catalog_failed => {}
+                () = tokio::time::sleep(ENRICHMENT_RETRY_DELAY), if !failed.is_empty() => {}
             }
+        }
+    }
+
+    /// Works out each catalog model's drafter fit once, retrying on failure until every one is
+    /// known. Runs independently of custom-model enrichment so catalog models never wait on local
+    /// scans or Hub presentation lookups.
+    async fn run_catalog_drafter_fits(&self, resolver: &ModelDomainResolver) {
+        while !self.fit_catalog_drafters(resolver).await {
+            tokio::time::sleep(ENRICHMENT_RETRY_DELAY).await;
         }
     }
 
     /// Whether each catalog model with a drafter fits only without it, once: it depends on the
     /// release material and this computer, never on the files here. Whether every one is known.
-    fn fit_catalog_drafters<'a>(&'a self, resolver: &'a ModelDomainResolver, revision: u64) -> BoxFuture<'a, bool> {
+    fn fit_catalog_drafters<'a>(&'a self, resolver: &'a ModelDomainResolver) -> BoxFuture<'a, bool> {
         Box::pin(async move {
-            let catalog = self
+            let pending = self
                 .catalog
                 .list_catalog()
                 .await
                 .map(|response| response.models)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|model| {
+                    model.desired.speculative_method.is_some()
+                        && !self.enrichment.has_catalog_drafter_fit(&model.id)
+                })
+                .map(|model| model.id)
+                .collect::<Vec<_>>();
             let mut complete = true;
-            for model in catalog {
-                if resolver.custom_model_inputs_revision().ok() != Some(revision) {
-                    break;
-                }
-                if model.desired.speculative_method.is_none()
-                    || self.enrichment.has_catalog_drafter_fit(&model.id)
-                {
-                    continue;
-                }
-                match self.catalog_drafter_fit(&model.id).await {
+            let mut changed = false;
+            let mut results = futures_util::stream::iter(pending)
+                .map(|model_id| async move {
+                    let result = self.catalog_drafter_fit(&model_id).await;
+                    (model_id, result)
+                })
+                .buffer_unordered(assessment_concurrency());
+            while let Some((model_id, result)) = results.next().await {
+                match result {
                     Ok(fit) => {
-                        if self.enrichment.record_catalog_drafter_fit(model.id, fit) {
-                            resolver.catalog_drafter_fit_changed();
-                        }
+                        changed |= self.enrichment.record_catalog_drafter_fit(model_id, fit);
                     }
                     Err(error) => {
-                        tracing::warn!(model.id = %model.id.as_str(), %error, "catalog drafter fit failed");
+                        tracing::warn!(model.id = %model_id.as_str(), %error, "catalog drafter fit failed");
                         complete = false;
-                        if self.enrichment.record_catalog_drafter_fits_unreachable() {
-                            resolver.catalog_drafter_fit_changed();
-                        }
+                        changed |= self.enrichment.record_catalog_drafter_fits_unreachable();
                     }
                 }
+            }
+            if changed {
+                resolver.catalog_drafter_fit_changed();
             }
             complete
         })
@@ -890,8 +951,17 @@ impl ManagedModelCandidates {
         let content = match reference {
             DrafterReference::Catalog { model_id } => {
                 let matched = self.lineage.variant(model_id)?;
-                let file = catalog_draft_reference(&matched.model)?;
-                Box::pin(self.learn_drafter_content(&file)).await?
+                let bundle_key =
+                    servable_model_bundle_key_for_bundle(&matched.model.configuration.bundle);
+                if let Some(content) = self.assessor.release_catalog().draft_content(&bundle_key) {
+                    if let Some(file) = catalog_draft_reference(&matched.model) {
+                        self.remember_drafter_content(&file, &content);
+                    }
+                    content
+                } else {
+                    let file = catalog_draft_reference(&matched.model)?;
+                    Box::pin(self.learn_drafter_content(&file)).await?
+                }
             }
             DrafterReference::HuggingFace {
                 repository,
@@ -919,12 +989,13 @@ impl ManagedModelCandidates {
     /// preparation shares the measured device where that is the host's cores, as the pool's
     /// attempts do ([`super::HostDevice`]): a catalog model's drafter fit is worked out for minutes
     /// after a start, beside the measurement job.
-    async fn assess(
-        &self,
-        target: &TargetMaterial,
-        drafter: Option<&DrafterMaterial>,
+    fn assess<'a>(
+        &'a self,
+        target: &'a TargetMaterial,
+        drafter: Option<&'a DrafterMaterial>,
         method: ModelMethod,
-    ) -> Result<CachedModelAssessment, InventoryError> {
+    ) -> BoxFuture<'a, Result<CachedModelAssessment, InventoryError>> {
+        Box::pin(async move {
         let environment = self.assessor.environment();
         let evidence = assessment_evidence(
             &environment.id,
@@ -941,47 +1012,37 @@ impl ManagedModelCandidates {
             return Ok(cached);
         }
         let _share = self.host.share().await;
-        let paths = ModelPackagePaths {
-            target_shards: target.target_shards.clone(),
-            projector: target.projector.clone(),
-            draft: drafter.map(|drafter| drafter.path.clone()),
-            method,
-        };
-        let known = target
-            .headers
-            .iter()
-            .chain(drafter.iter().flat_map(|drafter| &drafter.headers))
-            .map(|(path, digest)| (path.clone(), digest.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let store = Arc::clone(self.models());
-        let setup_environment = Arc::clone(&environment);
-        let (prepared, fallback_context) = magnitude_service_utils::blocking::run(move || {
-            StoredHeaders::read(&store, known, |headers| {
-                let prepared = prepare_model_assessment_from(
-                    &paths,
-                    headers,
-                    &setup_environment.setup.structure,
-                );
-                // An unsupported file is profiled at its training context when its header names
-                // one; without one it has no profile.
-                let fallback_context = match &prepared {
-                    Ok(PreparedModelAssessment::Unsupported { .. }) => headers
-                        .header(paths.target())
-                        .ok()
-                        .and_then(|header| {
-                            magnitude_service_models::gguf::training_context_length(
-                                &header.directory,
-                            )
-                        })
-                        .unwrap_or_default(),
-                    _ => 0,
-                };
-                (prepared, fallback_context)
+        let (prepared, fallback_context) = if let Some(bundle) =
+            bundle_for_assessment(target, drafter, method)
+        {
+            let prepared = self
+                .assessor
+                .prepare_bundle_cached(&environment, bundle)
+                .await
+                .map_err(|failure| InventoryError::ModelOperation {
+                    code: failure.code,
+                    message: failure.message,
+                    retryable: failure.retryable,
+                })?;
+            let fallback_context = match prepared.as_ref() {
+                PreparedModelAssessment::Unsupported { .. } => target
+                    .package
+                    .as_ref()
+                    .and_then(|package| package.properties.maximum_context_length)
+                    .unwrap_or_default(),
+                PreparedModelAssessment::Planned { .. } => 0,
+            };
+            (prepared, fallback_context)
+        } else {
+            let (paths, source) = self.candidate_header_source(target, drafter, method)?;
+            let setup_environment = Arc::clone(&environment);
+            let (prepared, fallback_context) = magnitude_service_utils::blocking::run(move || {
+                source.prepare(&paths, &setup_environment.setup.structure)
             })
-        })
-        .await;
-        let prepared = prepared.map_err(preparation_error)?;
-        let context = match &prepared {
+            .await?;
+            (Arc::new(prepared), fallback_context)
+        };
+        let context = match prepared.as_ref() {
             PreparedModelAssessment::Planned { facts, .. } => facts.context_limit,
             PreparedModelAssessment::Unsupported { .. } => fallback_context,
         };
@@ -1005,6 +1066,52 @@ impl ManagedModelCandidates {
         let cached = model_assessment(assessed, &key, profile, &environment)?;
         self.models().write_model_assessment(&evidence, &cached);
         Ok(cached)
+        })
+    }
+
+    fn candidate_header_source(
+        &self,
+        target: &TargetMaterial,
+        drafter: Option<&DrafterMaterial>,
+        method: ModelMethod,
+    ) -> Result<(ModelPackagePaths, CandidateHeaderSource), InventoryError> {
+        if drafter.is_none()
+            && let Some(target_pkg) = &target.package
+            && let Some(headers) = self.assessor.release_catalog().bundle_headers(
+                &ServableModelBundle::Standalone {
+                    package: target_pkg.clone(),
+                },
+            )?
+        {
+            let paths = ModelPackagePaths {
+                target_shards: headers.target_shards().to_vec(),
+                projector: headers.projector().map(PathBuf::from),
+                draft: None,
+                method,
+            };
+            return Ok((paths, CandidateHeaderSource::Release(headers)));
+        }
+        let paths = ModelPackagePaths {
+            target_shards: target.target_shards.clone(),
+            projector: target.projector.clone(),
+            draft: drafter.map(|drafter| drafter.path.clone()),
+            method,
+        };
+        let known = target
+            .headers
+            .iter()
+            .chain(drafter.iter().flat_map(|drafter| &drafter.headers))
+            .map(|(path, digest)| (path.clone(), digest.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let source = if known.is_empty() {
+            CandidateHeaderSource::Files
+        } else {
+            CandidateHeaderSource::Stored {
+                store: Arc::clone(self.models()),
+                known,
+            }
+        };
+        Ok((paths, source))
     }
 
     /// The assessment cached in this service's environment, while it is current there.
@@ -1108,6 +1215,7 @@ impl ManagedModelCandidates {
             projector,
             identity,
             headers: preview_headers(&prepared),
+            package: None,
             _guards: vec![Arc::new(prepared)],
         })
     }
@@ -1142,6 +1250,7 @@ impl ManagedModelCandidates {
             path,
             identity,
             headers: preview_headers(&prepared),
+            package: None,
             _guards: vec![Arc::new(prepared)],
         })
     }
@@ -1165,6 +1274,7 @@ impl ManagedModelCandidates {
             projector,
             identity: identity.join(","),
             headers,
+            package: None,
             _guards: Vec::new(),
         })
     }
@@ -1175,6 +1285,7 @@ impl ManagedModelCandidates {
             headers: BTreeMap::from([(path.clone(), identity.clone())]),
             identity,
             path,
+            package: None,
             _guards: Vec::new(),
         })
     }
@@ -1218,14 +1329,90 @@ impl ManagedModelCandidates {
         Box::pin(async move {
             let resolved = self.assessor.resolve_material(bundle).await?;
             let (target_shards, projector) = resolved_paths(&resolved.target_model)?;
-            let identity = format!("package:{}", bundle_target(&resolved.bundle).id.0);
+            let target_package = bundle_target(&resolved.bundle).clone();
+            let identity = format!("package:{}", target_package.id.0);
             Ok(TargetMaterial {
                 target_shards,
                 projector,
                 identity,
                 headers: BTreeMap::new(),
+                package: Some(target_package),
                 _guards: vec![Arc::new(resolved)],
             })
+        })
+    }
+
+    /// Target and separate-draft header material for a catalog bundle, resolved in one lookup from
+    /// the in-memory release headers when present or `ModelAssessor::resolve_material` otherwise.
+    fn catalog_bundle_materials<'a>(
+        &'a self,
+        bundle: &'a ServableModelBundle,
+    ) -> BoxFuture<'a, Result<(TargetMaterial, Option<DrafterMaterial>), InventoryError>> {
+        Box::pin(async move {
+            let target_package = bundle_target(bundle).clone();
+            let separate_draft = match bundle {
+                ServableModelBundle::SpeculativeDecoding {
+                    draft_source: SpeculativeDraftSource::Separate { draft },
+                    ..
+                } => Some(draft.clone()),
+                _ => None,
+            };
+            if let Some(headers) = self.assessor.release_catalog().bundle_headers(bundle)? {
+                let target = TargetMaterial {
+                    target_shards: headers.target_shards().to_vec(),
+                    projector: headers.projector().map(PathBuf::from),
+                    identity: format!("package:{}", target_package.id.0),
+                    headers: BTreeMap::new(),
+                    package: Some(target_package),
+                    _guards: Vec::new(),
+                };
+                let drafter = match separate_draft {
+                    Some(draft) => {
+                        let path = headers
+                            .draft()
+                            .ok_or_else(|| {
+                                InventoryError::Integrity(
+                                    "catalog speculative bundle has no draft header".to_owned(),
+                                )
+                            })?
+                            .to_path_buf();
+                        Some(DrafterMaterial {
+                            path,
+                            identity: format!("package:{}", draft.id.0),
+                            headers: BTreeMap::new(),
+                            package: Some(draft),
+                            _guards: Vec::new(),
+                        })
+                    }
+                    None => None,
+                };
+                return Ok((target, drafter));
+            }
+            let resolved = self.assessor.resolve_material(bundle.clone()).await?;
+            let (target_shards, projector) = resolved_paths(&resolved.target_model)?;
+            let draft_path = separate_draft
+                .as_ref()
+                .map(|_| draft_weight_path(resolved.draft_model.as_ref()))
+                .transpose()?;
+            let guard: Guard = Arc::new(resolved);
+            let target = TargetMaterial {
+                target_shards,
+                projector,
+                identity: format!("package:{}", target_package.id.0),
+                headers: BTreeMap::new(),
+                package: Some(target_package),
+                _guards: vec![Arc::clone(&guard)],
+            };
+            let drafter = separate_draft
+                .zip(draft_path)
+                .map(|(draft, path)| DrafterMaterial {
+                    path,
+                    identity: format!("package:{}", draft.id.0),
+                    headers: BTreeMap::new(),
+                    package: Some(draft),
+                    _guards: vec![guard],
+                });
+            Ok((target, drafter))
         })
     }
 
@@ -1244,30 +1431,14 @@ impl ManagedModelCandidates {
             else {
                 return Ok(None);
             };
-            let identity = format!("package:{}", draft.id.0);
-            let path = resolved
-                .draft_model
-                .as_ref()
-                .and_then(|model| {
-                    model
-                        .components
-                        .iter()
-                        .filter(|component| {
-                            matches!(
-                                component.role,
-                                ComponentRole::Weights | ComponentRole::Draft
-                            )
-                        })
-                        .map(|component| component.path.clone())
-                        .min()
-                })
-                .ok_or_else(|| {
-                    InventoryError::Integrity("the draft resolved without weights".to_owned())
-                })?;
+            let draft_package = draft.clone();
+            let identity = format!("package:{}", draft_package.id.0);
+            let path = draft_weight_path(resolved.draft_model.as_ref())?;
             Ok(Some(DrafterMaterial {
                 path,
                 identity,
                 headers: BTreeMap::new(),
+                package: Some(draft_package),
                 _guards: vec![Arc::new(resolved)],
             }))
         })
@@ -2113,13 +2284,53 @@ impl ManagedModelCandidates {
             .get_or_init(|| async {
                 let representatives = self.lineage.representatives().collect::<Vec<_>>();
                 let facts = futures_util::stream::iter(representatives.into_iter().map(|candidate| async move {
+                    let model_id = candidate.model_id;
+                    let bundle = candidate.model.configuration.bundle.clone();
+                    match self.assessor.release_catalog().bundle_headers(&bundle) {
+                        Ok(Some(headers)) => {
+                            let result = magnitude_service_utils::blocking::run(move || {
+                                let (directory, _) =
+                                    magnitude_artifacts::gguf::inspect_component_headers(
+                                        headers.target_shards(),
+                                        &headers,
+                                    )
+                                    .map_err(|error| {
+                                        InventoryError::Integrity(format!(
+                                            "release bundle target headers could not be read: {error}"
+                                        ))
+                                    })?;
+                                let fingerprint =
+                                    EngineModelFingerprint::from_directory(&directory)
+                                        .map_err(|error| {
+                                            InventoryError::Integrity(format!(
+                                                "release bundle target headers could not be fingerprinted: {error}"
+                                            ))
+                                        })?;
+                                Ok::<_, InventoryError>(Some(super::assessor::model_fingerprint(
+                                    &fingerprint,
+                                )))
+                            })
+                            .await;
+                            return match result {
+                                Ok(fingerprint) => Some((model_id, fingerprint)),
+                                Err(error) => {
+                                    tracing::warn!(%error, model.id = %model_id.as_str(), "catalog fingerprint failed");
+                                    None
+                                }
+                            };
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, model.id = %model_id.as_str(), "catalog bundle headers invalid");
+                            return None;
+                        }
+                        Ok(None) => {}
+                    }
                     let resolved = self
                         .assessor
-                        .resolve_material(candidate.model.configuration.bundle.clone())
+                        .resolve_material(bundle)
                         .await
-                        .map_err(|error| tracing::warn!(%error, model.id = %candidate.model_id.as_str(), "catalog fingerprint material is unavailable"))
+                        .map_err(|error| tracing::warn!(%error, model.id = %model_id.as_str(), "catalog fingerprint material is unavailable"))
                         .ok()?;
-                    let model_id = candidate.model_id;
                     magnitude_service_utils::blocking::run(move || {
                         let target_shards = resolved_paths(&resolved.target_model).ok()?.0;
                         let target = target_shards.first()?;
@@ -2428,10 +2639,25 @@ impl ManagedModelCandidates {
                 .lineage
                 .variant(model_id)
                 .ok_or_else(|| InventoryError::NotFound(model_id.as_str().to_owned()))?;
+            let bundle = matched.model.configuration.bundle.clone();
+            let material = if let Some(headers) =
+                self.assessor.release_catalog().bundle_headers(&bundle)?
+            {
+                let target_package = bundle_target(&bundle).clone();
+                let identity = format!("package:{}", target_package.id.0);
+                TargetMaterial {
+                    target_shards: headers.target_shards().to_vec(),
+                    projector: headers.projector().map(PathBuf::from),
+                    identity,
+                    headers: BTreeMap::new(),
+                    package: Some(target_package),
+                    _guards: Vec::new(),
+                }
+            } else {
+                self.target_material(bundle).await?
+            };
             Ok(DrafterTarget {
-                material: self
-                    .target_material(matched.model.configuration.bundle.clone())
-                    .await?,
+                material,
                 repository: None,
                 primary: None,
                 folders: Vec::new(),
@@ -2692,20 +2918,41 @@ impl ManagedModelCandidates {
                 return Ok(DrafterList::default());
             }
             let fits_plain = fits(&bare.profile);
+            let catalog_match = target
+                .catalog
+                .as_ref()
+                .and_then(|model_id| self.lineage.variant(model_id));
+            let skip_own = catalog_match.as_ref().is_some_and(|matched| {
+                matches!(
+                    &matched.model.configuration.bundle,
+                    ServableModelBundle::SpeculativeDecoding {
+                        draft_source: SpeculativeDraftSource::Embedded,
+                        ..
+                    }
+                ) || {
+                    let bundle_key =
+                        servable_model_bundle_key_for_bundle(&matched.model.configuration.bundle);
+                    self.assessor
+                        .release_catalog()
+                        .target_has_embedded_heads(&bundle_key)
+                        == Some(false)
+                }
+            });
             // The target as the engine takes it on its own: with its built-in heads when it has any.
             progress.drafters_planned(1);
-            let own = self
-                .assess(&target.material, None, ModelMethod::Auto)
-                .await;
-            progress.drafter_checked();
-            let own = own?;
-            let matches = match &target.catalog {
-                Some(model_id) => self
-                    .lineage
-                    .variant(model_id)
-                    .map(|matched| (matched, DrafterLineage::Exact))
-                    .into_iter()
-                    .collect(),
+            let own = if skip_own {
+                progress.drafter_checked();
+                bare.clone()
+            } else {
+                let own = self
+                    .assess(&target.material, None, ModelMethod::Auto)
+                    .await;
+                progress.drafter_checked();
+                own?
+            };
+            let matches = match catalog_match {
+                Some(matched) => vec![(matched, DrafterLineage::Exact)],
+                None if target.catalog.is_some() => Vec::new(),
                 None => self.catalog_matches(target, own.fingerprint.as_ref()).await,
             };
             let matched = matches.first().cloned();
@@ -2866,14 +3113,64 @@ impl ManagedModelCandidates {
         let (drafter, size_bytes, on_this_computer) = match draft_source {
             SpeculativeDraftSource::Embedded => (None, 0, true),
             SpeculativeDraftSource::Separate { draft } => {
-                let material = self
-                    .drafter_material(matched.model.configuration.bundle.clone())
-                    .await
-                    .map_err(
-                        |error| tracing::warn!(%error, "catalog drafter material is unavailable"),
-                    )
-                    .ok()
-                    .flatten()?;
+                // Only reuse virtual in-memory `ReleaseBundleHeaders` paths when the target is
+                // also a bundle package (so `assess` routes both through `prepare_bundle_cached`);
+                // a disk/Hub target reads its draft from disk via `FileHeaders`/`StoredHeaders`.
+                let material = if target.material.package.is_some() {
+                    match self
+                        .assessor
+                        .release_catalog()
+                        .bundle_headers(&matched.model.configuration.bundle)
+                    {
+                        Ok(Some(headers)) => {
+                            let Some(path) = headers.draft() else {
+                                tracing::warn!(
+                                    model.id = %matched.model_id.as_str(),
+                                    "catalog speculative bundle has no draft header"
+                                );
+                                return None;
+                            };
+                            DrafterMaterial {
+                                path: path.to_path_buf(),
+                                identity: format!("package:{}", draft.id.0),
+                                headers: BTreeMap::new(),
+                                package: Some(draft.clone()),
+                                _guards: Vec::new(),
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                model.id = %matched.model_id.as_str(),
+                                "catalog drafter bundle headers invalid"
+                            );
+                            return None;
+                        }
+                        Ok(None) => match self
+                            .drafter_material(matched.model.configuration.bundle.clone())
+                            .await
+                        {
+                            Ok(Some(material)) => material,
+                            Ok(None) => return None,
+                            Err(error) => {
+                                tracing::warn!(%error, "catalog drafter material is unavailable");
+                                return None;
+                            }
+                        },
+                    }
+                } else {
+                    match self
+                        .drafter_material(matched.model.configuration.bundle.clone())
+                        .await
+                    {
+                        Ok(Some(material)) => material,
+                        Ok(None) => return None,
+                        Err(error) => {
+                            tracing::warn!(%error, "catalog drafter material is unavailable");
+                            return None;
+                        }
+                    }
+                };
                 let reference = DrafterReference::Catalog {
                     model_id: matched.model_id.clone(),
                 };
@@ -3694,6 +3991,68 @@ fn is_commit(revision: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+enum CandidateHeaderSource {
+    Release(magnitude_service_models::ReleaseBundleHeaders),
+    Files,
+    Stored {
+        store: Arc<ManagedModelStore>,
+        known: BTreeMap<PathBuf, String>,
+    },
+}
+
+impl CandidateHeaderSource {
+    fn prepare(
+        self,
+        paths: &ModelPackagePaths,
+        structure: &magnitude_engine::assessment::AssessmentStructure,
+    ) -> Result<(PreparedModelAssessment, u32), InventoryError> {
+        match self {
+            Self::Release(headers) => ModelAssessor::prepare_from_headers(paths, &headers, structure),
+            Self::Files => ModelAssessor::prepare_from_headers(paths, &FileHeaders, structure),
+            Self::Stored { store, known } => StoredHeaders::read(&store, known, |headers| {
+                ModelAssessor::prepare_from_headers(paths, headers, structure)
+            }),
+        }
+    }
+}
+
+fn bundle_for_assessment(
+    target: &TargetMaterial,
+    drafter: Option<&DrafterMaterial>,
+    method: ModelMethod,
+) -> Option<ServableModelBundle> {
+    let target_pkg = target.package.as_ref()?;
+    match (drafter, method) {
+        (None, ModelMethod::Plain) => Some(ServableModelBundle::Standalone {
+            package: target_pkg.clone(),
+        }),
+        (None, ModelMethod::Mtp) => Some(ServableModelBundle::SpeculativeDecoding {
+            target: target_pkg.clone(),
+            draft_source: SpeculativeDraftSource::Embedded,
+            method: SpeculativeMethod::Mtp,
+        }),
+        (Some(drafter), method) => {
+            let draft_pkg = drafter.package.as_ref()?;
+            let method = match method {
+                ModelMethod::DFlash => SpeculativeMethod::DFlash,
+                ModelMethod::DFlash2 => SpeculativeMethod::DFlash2,
+                ModelMethod::DSpark => SpeculativeMethod::DSpark,
+                ModelMethod::LiLiCorr => SpeculativeMethod::LiLiCorr,
+                ModelMethod::Mtp => SpeculativeMethod::Mtp,
+                ModelMethod::Plain | ModelMethod::Auto => return None,
+            };
+            Some(ServableModelBundle::SpeculativeDecoding {
+                target: target_pkg.clone(),
+                draft_source: SpeculativeDraftSource::Separate {
+                    draft: draft_pkg.clone(),
+                },
+                method,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn engine_method(method: &SpeculativeMethod) -> ModelMethod {
     match method {
         SpeculativeMethod::Mtp => ModelMethod::Mtp,
@@ -3803,18 +4162,22 @@ fn snapshot_weights(
         .collect()
 }
 
-/// How a catalog model serves without its catalog drafter, from its drafter candidates.
-fn catalog_drafter_fit(candidates: &[DrafterCandidate]) -> CatalogDrafterFit {
-    CatalogDrafterFit {
-        withheld: candidates.iter().any(|candidate| {
-            candidate.category == DrafterCategory::CatalogDrafter
-                && is_bound(&candidate.verdict)
-                && !candidate.automatic
-        }),
-        built_in_heads: candidates
-            .iter()
-            .any(|candidate| candidate.category == DrafterCategory::BuiltIn && candidate.automatic),
-    }
+fn draft_weight_path(draft_model: Option<&ResolvedModel>) -> Result<PathBuf, InventoryError> {
+    draft_model
+        .and_then(|model| {
+            model
+                .components
+                .iter()
+                .filter(|component| {
+                    matches!(
+                        component.role,
+                        ComponentRole::Weights | ComponentRole::Draft
+                    )
+                })
+                .map(|component| component.path.clone())
+                .min()
+        })
+        .ok_or_else(|| InventoryError::Integrity("the draft resolved without weights".to_owned()))
 }
 
 /// The candidates automatic choice may take, in its order (see `DrafterCandidate::automatic`).

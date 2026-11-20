@@ -23,7 +23,10 @@ use magnitude_engine::composition::{ReadinessMismatch, ReadyEngine};
 use magnitude_engine::error::{LoadError, PreviewError, RequestError};
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
-use magnitude_engine::worker::{EngineClient, Preparation, load_prepared};
+use magnitude_engine::worker::{
+    AcquiredDevice, EngineClient, Preparation, PricedError, PricedFailure, load_prepared,
+    run_priced,
+};
 use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation, RoomAnswer};
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, LoadedPackages,
@@ -199,7 +202,7 @@ impl ModelInstances {
     }
 
     /// A fresh memory observation from the resident worker, when one is resident.
-    pub async fn resident_memory(&self) -> Option<MemoryObservation> {
+    pub async fn resident_memory(&self) -> Result<Option<MemoryObservation>, RequestError> {
         self.supervisor.observe_resident().await
     }
 
@@ -457,8 +460,8 @@ fn served_profile(
                 ),
             ))),
             ModelAssessment::Unsupported {
-                reasons, detail, ..
-            } => Some(ServedProfile::Refused(InventoryError::ModelUnsupported {
+                profile: assessed, reasons, detail,
+            } if assessed.as_ref().is_none_or(|assessed| assessed == profile) => Some(ServedProfile::Refused(InventoryError::ModelUnsupported {
                 message: format!("Magnitude can't run {model_id}: {detail}"),
                 reasons: reasons.clone(),
             })),
@@ -527,32 +530,18 @@ pub(super) async fn preview(
     magnitude_service_utils::blocking::run(move || resolved.manifest.preview(&catalog)).await
 }
 
-/// `preview`'s outcome once the measurement job has stored the machine's standing figures the
-/// plan is priced on, met as every host meets a pending plan (`magnitude_engine::preview::priced`).
-/// A load needs the device's share for its lifetime, and the job takes the device only when
-/// nothing holds it: so a preview whose prices are pending defers the operation holding nothing
-/// of the device. `defer` asks the job for the figures, the job is told of the requests, and the
-/// preview is taken again after the next hold's end, the job's among them once it has stored what
-/// it measured; a preview still pending then asks again, so a job that ended without the figures
-/// (it failed, or measured another load's) is asked anew, never waited on forever.
-pub(super) async fn priced<T, P, D>(
+/// Ask the measurement job for pending figures via `defer` and wait for the next device release,
+/// holding nothing of the device. Subscribes to `device.releases()` before `defer` so a release
+/// that finishes during `defer` is never missed.
+pub(super) async fn settle_prices(
     device: &DeviceLock,
-    mut preview: impl FnMut() -> P,
-    mut defer: impl FnMut() -> D,
-) -> Result<T, ModelOperationFailure>
-where
-    P: std::future::Future<Output = Result<T, PreviewError>>,
-    D: std::future::Future<Output = Result<(), ModelOperationFailure>>,
-{
-    let measured = || {
-        let mut releases = device.releases();
-        device.requested();
-        async move {
-            releases.released().await;
-            Ok(())
-        }
-    };
-    magnitude_engine::preview::priced(&mut preview, &mut defer, measured).await?.map_err(preview_failure)
+    defer: impl std::future::Future<Output = Result<(), ModelOperationFailure>>,
+) -> Result<(), ModelOperationFailure> {
+    let mut releases = device.releases();
+    defer.await?;
+    device.requested();
+    releases.released().await;
+    Ok(())
 }
 
 /// Ask the measurement job for the standing figures `resolved`'s plan is priced on.
@@ -787,155 +776,140 @@ impl EngineResidency {
         Box::pin(async move {
             let environment = &self.environment;
             let resolved = Arc::new(environment.configurations.resolve(&configuration).await?);
-            // The preview stands unless the load waits for the device or for memory below, which
-            // change the room its plan settles into.
-            let mut previewed = Some(
-                priced(
-                    &environment.device,
-                    || preview(&environment.catalog, &resolved.configuration),
-                    || self.defer_unpriced(instance_id, &resolved.configuration),
-                )
-                .await?,
-            );
-            // The load shares the device through residency's demand: its workers hold the share
-            // until each is proven retired, and residency until its demand ends. A load after a
-            // release takes the share residency kept, so no job starts between them; the measurement
-            // job beside the released model, preempted by its release, is gone first. The first load
-            // takes the share: a job holding the device (the measurement job or a catalog
-            // optimization, of this bundle or any other) is preempted, the load waits for its process
-            // to be gone, and the records an optimization published stand.
-            let held = self.demand.lock().expect("device demand").clone();
-            let device = match held {
-                Some(device) => {
-                    environment.device.admit_request().await;
-                    device
-                }
-                None => {
-                    let device = Arc::new(match environment.device.try_share() {
-                        Some(device) => device,
-                        None => {
-                            self.progress(instance_id, ModelLoadStage::Queued, None);
-                            tracing::info!(
-                                "load preempts the job holding the device and waits for its kill"
-                            );
-                            let device = environment.device.share().await;
-                            previewed = None;
-                            self.progress(instance_id, ModelLoadStage::Preparing, None);
-                            device
-                        }
-                    });
-                    *self.demand.lock().expect("device demand") = Some(Arc::clone(&device));
-                    device
-                }
-            };
-            let preview = match previewed {
-                Some(preview) => preview,
-                None => {
-                    priced(
-                        &environment.device,
-                        || preview(&environment.catalog, &resolved.configuration),
-                        || self.defer_unpriced(instance_id, &resolved.configuration),
-                    )
-                    .await?
-                }
-            };
-            let plan = load_plan(&preview)?;
-            self.progress(instance_id, ModelLoadStage::Preparing, Some(&plan));
-
-            // A load never searches kernels. The Load worker reports tuning units without a record:
-            // with none it is the load, one worker. Otherwise it places nothing and ends, a
-            // Prepare worker searches what is missing and is proven gone, and a second Load worker
-            // serves what is stored (the engine's one sequence, `load_prepared`).
             let manifest = resolved.manifest.clone();
-            // The sequence runs on a blocking thread, which outlives this task when the load is
-            // stopped: it starts each worker through `sequence`, which a stop closes, and holds it
-            // until it is done with every worker, which the stop waits for.
-            let driver = self.clone();
-            let load_instance = instance_id.clone();
-            let load_plan = plan.clone();
-            // The bundle's catalog optimization, if one waits, shows this Prepare and ends once it
-            // has prepared the bundle.
-            let preparation = self.preparations.load(
-                servable_model_bundle_key_for_bundle(&configuration.bundle),
-                plan.device.clone(),
-            );
-            let loaded = magnitude_service_utils::blocking::run(move || {
-                // One progression across the workers: a Prepare fills `optimizing`, the Load the
-                // rest.
-                let progression = RefCell::new(LoadProgression::default());
-                let notifier = driver.client.notifier();
-                let report = |progress: LoadProgress| {
-                    if let Some((stage, fraction, details)) = progression.borrow_mut().advance(progress) {
-                        notifier.send(ResidencyNotification::LoadProgress {
-                            instance_id: load_instance.clone(),
-                            stage,
-                            fraction,
-                            details,
-                            planned_allocation: Some(load_plan.clone()),
-                        });
-                    }
-                };
-                // The worker last started, for a failure's diagnostics; a spawn failure itself.
-                let last_worker = RefCell::new(None);
-                let spawn_failure = RefCell::new(None);
-                let spawn = || {
-                    let stopped = |reason: String| LoadError::WorkerLost { reason };
-                    let Some(spawned) = sequence.start(|| driver.spawn_load_worker(&load_instance, &device)) else {
-                        return Err(stopped("the load was stopped".into()));
-                    };
-                    match spawned {
-                        Ok(spawned) => {
-                            *last_worker.borrow_mut() = Some(Arc::clone(&spawned.worker));
-                            Ok(spawned)
+            let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
+
+            let ((worker, connection), preview, _device) = run_priced(
+                || preview(&environment.catalog, &resolved.configuration),
+                || settle_prices(&environment.device, self.defer_unpriced(instance_id, &resolved.configuration)),
+                |_| async {
+                    let held = self.demand.lock().expect("device demand").clone();
+                    match held {
+                        Some(device) => {
+                            environment.device.admit_request().await;
+                            Ok(AcquiredDevice::immediate(device))
                         }
-                        Err(failure) => {
-                            let reason = failure.message();
-                            *spawn_failure.borrow_mut() = Some(failure);
-                            Err(stopped(reason))
+                        None => {
+                            let (device, waited) = match environment.device.try_share() {
+                                Some(device) => (Arc::new(device), false),
+                                None => {
+                                    self.progress(instance_id, ModelLoadStage::Queued, None);
+                                    tracing::info!(
+                                        "load preempts the job holding the device and waits for its kill"
+                                    );
+                                    let device = Arc::new(environment.device.share().await);
+                                    self.progress(instance_id, ModelLoadStage::Preparing, None);
+                                    (device, true)
+                                }
+                            };
+                            *self.demand.lock().expect("device demand") = Some(Arc::clone(&device));
+                            Ok(AcquiredDevice { device, waited })
                         }
                     }
-                };
-                let preparation = RefCell::new(preparation);
-                let loaded = load_prepared(
-                    &manifest,
-                    |unprepared| {
-                        spawn()?
-                            .connect(manifest.clone(), unprepared, &report)
-                            .map_err(|(_, error)| error)
-                    },
-                    || spawn().map(SpawnedWorker::into_process),
-                    |progress: LoadProgress| {
-                        preparation.borrow_mut().report(progress.clone());
-                        report(progress);
-                    },
-                );
-                match loaded {
-                    Ok((loaded, prepared)) => {
-                        match prepared {
-                            // The load is not failed by its preparation: units without a record
-                            // serve their canonical defaults, and a later load prepares them.
-                            Preparation::Incomplete(error) => tracing::warn!(
-                                %error,
-                                "kernel preparation did not finish; the load serves canonical defaults \
-                                 for the units without a tuning record"
-                            ),
-                            Preparation::Unneeded | Preparation::Prepared | Preparation::Unshared => {
-                                preparation.into_inner().prepared();
+                },
+                |device| {
+                    self.demand.lock().expect("device demand").take();
+                    drop(device);
+                },
+                sequence,
+                |preview, device, sequence| {
+                    let plan = load_plan(preview);
+                    let driver = self.clone();
+                    let load_instance = instance_id.clone();
+                    let manifest = manifest.clone();
+                    let worker_device = Arc::clone(device);
+                    let bundle_key = bundle_key.clone();
+                    async move {
+                        let plan = plan.map_err(PricedFailure::Host)?;
+                        driver.progress(&load_instance, ModelLoadStage::Preparing, Some(&plan));
+                        let preparation = driver.preparations.load(bundle_key, plan.device.clone());
+                        magnitude_service_utils::blocking::run(move || {
+                            let progression = RefCell::new(LoadProgression::default());
+                            let notifier = driver.client.notifier();
+                            let report = |progress: LoadProgress| {
+                                if let Some((stage, fraction, details)) =
+                                    progression.borrow_mut().advance(progress)
+                                {
+                                    notifier.send(ResidencyNotification::LoadProgress {
+                                        instance_id: load_instance.clone(),
+                                        stage,
+                                        fraction,
+                                        details,
+                                        planned_allocation: Some(plan.clone()),
+                                    });
+                                }
+                            };
+                            let last_worker = RefCell::new(None);
+                            let spawn_failure = RefCell::new(None);
+                            let spawn = || {
+                                let stopped = |reason: String| LoadError::WorkerLost { reason };
+                                let Some(spawned) = sequence.start(|| {
+                                    driver.spawn_load_worker(&load_instance, &worker_device)
+                                }) else {
+                                    return Err(stopped("the load was stopped".into()));
+                                };
+                                match spawned {
+                                    Ok(spawned) => {
+                                        *last_worker.borrow_mut() = Some(Arc::clone(&spawned.worker));
+                                        Ok(spawned)
+                                    }
+                                    Err(failure) => {
+                                        let reason = failure.message();
+                                        *spawn_failure.borrow_mut() = Some(failure);
+                                        Err(stopped(reason))
+                                    }
+                                }
+                            };
+                            let preparation = RefCell::new(preparation);
+                            let loaded = load_prepared(
+                                &manifest,
+                                |unprepared| {
+                                    spawn()?
+                                        .connect(manifest.clone(), unprepared, &report)
+                                        .map_err(|(_, error)| error)
+                                },
+                                || spawn().map(SpawnedWorker::into_process),
+                                |progress: LoadProgress| {
+                                    preparation.borrow_mut().report(progress.clone());
+                                    report(progress);
+                                },
+                            );
+                            match loaded {
+                                Ok((loaded, prepared)) => {
+                                    match prepared {
+                                        Preparation::Incomplete(error) => tracing::warn!(
+                                            %error,
+                                            "kernel preparation did not finish; the load serves \
+                                             canonical defaults for the units without a tuning record"
+                                        ),
+                                        Preparation::Unneeded
+                                        | Preparation::Prepared
+                                        | Preparation::Unshared => {
+                                            preparation.into_inner().prepared();
+                                        }
+                                    }
+                                    Ok(loaded)
+                                }
+                                Err(error) => Err(match spawn_failure.take() {
+                                    Some(failure) => PricedFailure::Host(failure),
+                                    None => PricedFailure::Load(error, last_worker.take(), sequence),
+                                }),
                             }
-                        }
-                        Ok(loaded)
+                        })
+                        .await
                     }
-                    Err(error) => Err(match (spawn_failure.take(), last_worker.take()) {
-                        (Some(failure), _) => failure,
-                        (None, Some(worker)) => load_failure(error, &worker),
-                        (None, None) => {
-                            ModelOperationFailure::new("worker_exited", error.to_string(), true)
-                        }
-                    }),
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                PricedError::Preview(error) => preview_failure(error),
+                PricedError::Host(failure) => failure,
+                PricedError::Load(error, Some(worker)) => load_failure(error, &worker),
+                PricedError::Load(error, None) => {
+                    ModelOperationFailure::new("worker_exited", error.to_string(), true)
                 }
-            })
-            .await;
-            let (worker, connection) = loaded?;
+            })?;
+            let plan = load_plan(&preview)?;
 
             // The worker read its own package: it must agree with the host's resolution on the
             // package identity, the chat templates and the input modalities. This is the end of the
@@ -1173,6 +1147,14 @@ mod tests {
         assert!(failure.message().contains("2100000000") && failure.message().contains("2130136892"));
     }
 
+    fn sample_pending_prices() -> magnitude_engine::error::PendingPrices {
+        magnitude_engine::error::PendingPrices::new(magnitude_executor::assessment::Outstanding {
+            standing: vec![magnitude_executor::assessment::PointRequest::GraphCost],
+            loads: Vec::new(),
+        })
+        .expect("non-empty pending set")
+    }
+
     /// A load on a machine with none of the standing figures its plan is priced on stored is
     /// deferred before it takes the device: it shows `Queued`, asks the measurement job for the
     /// figures once and tells it so, and holds nothing of the device, which the job takes. Once
@@ -1189,25 +1171,34 @@ mod tests {
             let (device, stored, requests, previews) =
                 (device.clone(), Arc::clone(&stored), Arc::clone(&requests), Arc::clone(&previews));
             async move {
-                priced(
-                    &device,
+                run_priced(
                     || {
                         previews.fetch_add(1, Ordering::Relaxed);
                         let priced = stored.load(Ordering::Relaxed);
                         async move {
                             match priced {
                                 true => Ok("the plan"),
-                                false => Err(PreviewError::PricesPending { reason: "nothing is measured".into() }),
+                                false => Err(PreviewError::PricesPending {
+                                    reason: "nothing is measured".into(),
+                                    pending: sample_pending_prices(),
+                                }),
                             }
                         }
                     },
                     || {
-                        shown.send(ModelLoadStage::Queued).expect("stages");
-                        requests.fetch_add(1, Ordering::Relaxed);
-                        async { Ok(()) }
+                        settle_prices(&device, async {
+                            shown.send(ModelLoadStage::Queued).expect("stages");
+                            requests.fetch_add(1, Ordering::Relaxed);
+                            Ok(())
+                        })
                     },
+                    |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+                    |()| {},
+                    (),
+                    |&plan, &(), ()| std::future::ready(Ok::<_, PricedFailure<ModelOperationFailure, ()>>(plan)),
                 )
                 .await
+                .map(|(plan, _, _)| plan)
             }
         });
         // The job is told of the load's requests, and takes the device the load left to it.
@@ -1223,6 +1214,49 @@ mod tests {
         assert_eq!(requests.load(Ordering::Relaxed), 1, "the figures are asked for once");
         assert_eq!(previews.load(Ordering::Relaxed), 2, "the load previews again only once the job ended");
         assert!(device.try_share().is_some(), "the load then takes its share");
+    }
+
+    /// If a device release ends without changing this load's pending figures (for example, the
+    /// measurement job failed or measured another load's points), `run_priced` sees the same
+    /// pending set after one settle and fails with `PricesPending` instead of looping forever.
+    #[tokio::test]
+    async fn an_unpriced_load_fails_when_a_measurement_release_stores_nothing() {
+        let device = DeviceLock::default();
+        let previews = Arc::new(AtomicU64::new(0));
+        let mut changes = device.changes();
+        let load = tokio::spawn({
+            let (device, previews) = (device.clone(), Arc::clone(&previews));
+            async move {
+                run_priced(
+                    || {
+                        previews.fetch_add(1, Ordering::Relaxed);
+                        async {
+                            Err::<&str, _>(PreviewError::PricesPending {
+                                reason: "nothing is measured".into(),
+                                pending: sample_pending_prices(),
+                            })
+                        }
+                    },
+                    || settle_prices(&device, async { Ok(()) }),
+                    |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+                    |()| {},
+                    (),
+                    |&plan, &(), ()| {
+                        std::future::ready(Ok::<_, PricedFailure<ModelOperationFailure, ()>>(plan))
+                    },
+                )
+                .await
+            }
+        });
+        changes.changed().await;
+        let job = device.try_job().expect("a deferred load holds nothing of the device");
+        drop(job);
+        let outcome = load.await.expect("load");
+        assert!(matches!(
+            outcome,
+            Err(PricedError::Preview(PreviewError::PricesPending { .. }))
+        ));
+        assert_eq!(previews.load(Ordering::Relaxed), 2, "re-previews once after settle, then stops");
     }
 
     fn snapshot(model: &str, assessment: serde_json::Value) -> ModelAssessmentsSnapshot {
@@ -1368,6 +1402,16 @@ mod tests {
     }
 
     #[test]
+    fn an_unsupported_model_without_a_profile_is_refused_at_every_ceiling() {
+        let snapshot = snapshot(MODEL, serde_json::json!({
+            "_tag": "Unsupported",
+            "reasons": [],
+            "detail": "cannot read model header",
+        }));
+        assert!(matches!(served_profile(&snapshot, &model_id(MODEL), &CEILING), ServedProfile::Refused(_)));
+    }
+
+    #[test]
     fn a_load_the_engine_cannot_run_is_refused_with_its_reasons() {
         let snapshot = snapshot(
             MODEL,
@@ -1378,8 +1422,9 @@ mod tests {
                 "detail": "no family recognizes deepseek4",
             }),
         );
+        assert!(matches!(served_profile(&snapshot, &model_id(MODEL), &CEILING), ServedProfile::Unassessed));
         let ServedProfile::Refused(InventoryError::ModelUnsupported { message, reasons }) =
-            served_profile(&snapshot, &model_id(MODEL), &CEILING)
+            served_profile(&snapshot, &model_id(MODEL), &ServingProfile { context_length: 131_072 })
         else {
             panic!("expected an unsupported refusal");
         };

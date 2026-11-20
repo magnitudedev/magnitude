@@ -20,11 +20,11 @@
 //! ([`VisionResize::PaddedCanvas`]) within the pixel bounds the metadata
 //! states.
 
-use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::{array_elements, projector_type, Tensors};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{ProjectorMetadata, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, FamilyError, ImportTransform, MergerStage,
-    RmsNorm, RowRange, VisionActivation, VisionAttention, VisionAttentionScale,
+    RmsNorm, VisionActivation, VisionAttention, VisionAttentionScale,
     VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward, VisionLinear,
     VisionMerger, VisionNorm, VisionOperator, VisionPreprocessing, VisionResampling,
     VisionResize, VisionStem, VisionUp, WeightDescriptor,
@@ -37,71 +37,12 @@ const PROJECTOR_TYPE: &str = "glm5v";
 /// converter does not store it).
 const ROTARY_BASE: f64 = 10_000.0;
 
-/// Every `clip.*` key the interpretation reads.
-const KEYS: &[&str] = &[
-    "clip.has_vision_encoder",
-    "clip.projector_type",
-    "clip.use_silu",
-    "clip.vision.projection_dim",
-    "clip.vision.image_size",
-    "clip.vision.patch_size",
-    "clip.vision.embedding_length",
-    "clip.vision.feed_forward_length",
-    "clip.vision.block_count",
-    "clip.vision.attention.head_count",
-    "clip.vision.attention.layer_norm_epsilon",
-    "clip.vision.image_mean",
-    "clip.vision.image_std",
-    "clip.vision.spatial_merge_size",
-    "clip.vision.swiglu_clamp",
-    "clip.vision.image_min_pixels",
-    "clip.vision.image_max_pixels",
-];
-
 fn invalid(message: impl Into<String>) -> FamilyError {
     FamilyError::invalid(message)
 }
 
 fn product(dimensions: &[u64]) -> Result<u64, FamilyError> {
     checked_product(dimensions).map_err(|error| invalid(error.to_string()))
-}
-
-struct Reader<'a> {
-    directory: &'a Directory,
-}
-
-impl Reader<'_> {
-    fn count(&self, key: &str) -> Result<u64, FamilyError> {
-        self.directory
-            .value(key)
-            .and_then(Value::unsigned)
-            .filter(|value| *value > 0)
-            .ok_or_else(|| invalid(format!("{key} must be a positive integer")))
-    }
-
-    fn number(&self, key: &str) -> Result<f64, FamilyError> {
-        match self.directory.value(key) {
-            Some(Value::Scalar(Scalar::Float(value))) if value.is_finite() && *value > 0.0 => {
-                Ok(*value)
-            }
-            _ => Err(invalid(format!("{key} must be a positive number"))),
-        }
-    }
-
-    fn triple(&self, key: &str) -> Result<[f64; 3], FamilyError> {
-        let Some(Value::Array(values)) = self.directory.value(key) else {
-            return Err(invalid(format!("{key} must contain three numbers")));
-        };
-        array_elements(key, values)?
-            .iter()
-            .map(|value| match value {
-                Element::Float(value) if value.is_finite() => Some(value),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .and_then(|values| values.try_into().ok())
-            .ok_or_else(|| invalid(format!("{key} must contain three finite numbers")))
-    }
 }
 
 /// The merger's LayerNorm epsilon. The released model builds that norm as
@@ -117,40 +58,26 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, FamilyError> {
     projector_type(directory, &[(PROJECTOR_TYPE, ())], target_width)?;
-    if let Some(entry) = directory
-        .metadata
-        .iter()
-        .find(|entry| !entry.name.starts_with("general.") && !KEYS.contains(&entry.name.as_str()))
-    {
-        return Err(FamilyError::metadata(
-            entry.name.clone(),
-            format!("unknown projector metadata {:?}", entry.name),
-        ));
-    }
-    let r = Reader { directory };
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.projector_type");
     // The tower's feed-forward is SiLU.
-    if !matches!(
-        directory.value("clip.use_silu"),
-        Some(Value::Scalar(Scalar::Bool(true)))
-    ) {
+    if !meta.bool("clip.use_silu")? {
         return Err(invalid("the projector's feed-forward must be SwiGLU (clip.use_silu)"));
     }
-    let depth = r.count("clip.vision.block_count")?;
-    let hidden = r.count("clip.vision.embedding_length")?;
-    let intermediate = r.count("clip.vision.feed_forward_length")?;
-    let heads = r.count("clip.vision.attention.head_count")?;
-    let patch = r.count("clip.vision.patch_size")?;
-    let merge = r.count("clip.vision.spatial_merge_size")?;
-    let output_hidden = r.count("clip.vision.projection_dim")?;
-    r.count("clip.vision.image_size")?;
-    let min_pixels = r.count("clip.vision.image_min_pixels")?;
-    let max_pixels = r.count("clip.vision.image_max_pixels")?;
-    let epsilon = r.number("clip.vision.attention.layer_norm_epsilon")?;
-    let limit = r.number("clip.vision.swiglu_clamp")?;
-    if !hidden.is_multiple_of(heads)
-        || !(hidden / heads).is_multiple_of(4)
-        || depth > directory.tensors.len() as u64
-    {
+    let depth = meta.bounded_block_count("clip.vision.block_count")?;
+    let hidden = meta.integer("clip.vision.embedding_length")?;
+    let intermediate = meta.integer("clip.vision.feed_forward_length")?;
+    let heads = meta.integer("clip.vision.attention.head_count")?;
+    let patch = meta.integer("clip.vision.patch_size")?;
+    let merge = meta.integer("clip.vision.spatial_merge_size")?;
+    let output_hidden = meta.integer("clip.vision.projection_dim")?;
+    meta.integer("clip.vision.image_size")?;
+    let min_pixels = meta.integer("clip.vision.image_min_pixels")?;
+    let max_pixels = meta.integer("clip.vision.image_max_pixels")?;
+    let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
+    let limit = meta.positive_number("clip.vision.swiglu_clamp")?;
+    if !hidden.is_multiple_of(heads) || !(hidden / heads).is_multiple_of(4) {
         return Err(invalid("projector heads do not split into 2-D rotary heads"));
     }
     let width = hidden / heads;
@@ -184,19 +111,12 @@ pub fn describe_projector(
         registers: None,
     };
 
-    // One stored QKV projection, imported as three row ranges.
+    // One stored QKV projection, imported as three row ranges (preserving any companion scale).
     let qkv_rows = product(&[3, hidden])?;
-    let part = |stored: &WeightDescriptor, index: u64| WeightDescriptor {
-        name: stored.name.clone(),
-        shape: {
-            let mut shape = stored.shape.clone();
-            shape[0] = hidden;
-            shape
-        },
-        transforms: vec![ImportTransform::Rows(RowRange {
-            start: index * hidden,
-            rows: hidden,
-        })],
+    let part = |stored: &WeightDescriptor, index: u64| {
+        stored
+            .slice_rows(index * hidden, hidden)
+            .map_err(|error| FamilyError::invalid(error.to_string()))
     };
     let mut blocks = Vec::with_capacity(depth as usize);
     for index in 0..depth {
@@ -204,16 +124,18 @@ pub fn describe_projector(
         let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
         let qkv = weight("attn_qkv.weight", &[qkv_rows, hidden])?;
         let qkv_bias = weight("attn_qkv.bias", &[qkv_rows])?;
-        let split = |index| biased(part(&qkv, index), part(&qkv_bias, index));
+        let split = |index| -> Result<VisionLinear, FamilyError> {
+            Ok(biased(part(&qkv, index)?, part(&qkv_bias, index)?))
+        };
         blocks.push(VisionBlock {
             operator_norm: rms(weight("ln1.weight", &[hidden])?),
             operator: VisionOperator::Attention(VisionAttention {
                 heads,
                 kv_heads: heads,
                 width,
-                query: split(0),
-                key: split(1),
-                value: split(2),
+                query: split(0)?,
+                key: split(1)?,
+                value: split(2)?,
                 query_norm: Some(RmsNorm {
                     weight: weight("attn_q_norm.weight", &[width])?,
                     epsilon,
@@ -319,8 +241,8 @@ pub fn describe_projector(
                 max_pixels,
             },
             resampling: VisionResampling::Bicubic,
-            mean: r.triple("clip.vision.image_mean")?,
-            std: r.triple("clip.vision.image_std")?,
+            mean: meta.f64_array("clip.vision.image_mean")?,
+            std: meta.f64_array("clip.vision.image_std")?,
             channels: 3,
             patch,
             merge,
@@ -330,6 +252,7 @@ pub fn describe_projector(
         blocks,
         merger,
     });
+    meta.finish()?;
     description
         .validate()
         .map_err(|error| invalid(error.to_string()))?;

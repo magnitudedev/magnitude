@@ -82,26 +82,45 @@ impl VolumeWrites {
     /// A download of `required_bytes`, beside the bytes the volume leaves
     /// it after every live download's: admitted, its bytes then reserved
     /// until it writes them or ends, where they fit; refused otherwise.
+    #[cfg(test)]
     fn admit(
         self: &Arc<Self>,
         required_bytes: u64,
     ) -> Result<(u64, Result<DownloadWrites, DownloadError>), DownloadError> {
-        let mut ledger = self.ledger();
-        let available_bytes = self.space(&ledger)?.saturating_sub(ledger.committed);
-        if required_bytes > available_bytes {
-            return Ok((
-                available_bytes,
-                Err(insufficient_space(required_bytes, available_bytes)),
-            ));
-        }
-        ledger.committed += required_bytes;
+        let (available_bytes, result) = self.admit_batch(&[required_bytes])?;
         Ok((
             available_bytes,
-            Ok(DownloadWrites {
-                volume: Arc::clone(self),
-                remaining: AtomicU64::new(required_bytes),
-            }),
+            result.map(|mut writes| writes.pop().expect("one size yields one handle")),
         ))
+    }
+
+    /// A batch of downloads whose individual byte needs are `sizes`, admitted
+    /// atomically under one ledger lock: checks `sum(sizes) <= available`, then
+    /// commits each package's own size to its own [`DownloadWrites`] handle so
+    /// companions never double-count each other.
+    fn admit_batch(
+        self: &Arc<Self>,
+        sizes: &[u64],
+    ) -> Result<(u64, Result<Vec<DownloadWrites>, DownloadError>), DownloadError> {
+        let mut ledger = self.ledger();
+        let available_bytes = self.space(&ledger)?.saturating_sub(ledger.committed);
+        let total_required = sizes.iter().copied().fold(0_u64, u64::saturating_add);
+        if total_required > available_bytes {
+            return Ok((
+                available_bytes,
+                Err(insufficient_space(total_required, available_bytes)),
+            ));
+        }
+        ledger.committed = ledger.committed.saturating_add(total_required);
+        let handles = sizes
+            .iter()
+            .copied()
+            .map(|size| DownloadWrites {
+                volume: Arc::clone(self),
+                remaining: AtomicU64::new(size),
+            })
+            .collect();
+        Ok((available_bytes, Ok(handles)))
     }
 }
 
@@ -424,7 +443,7 @@ impl DownloadIntegrity {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum DownloadErrorKind {
     Cancelled,
     InsufficientDiskSpace {
@@ -444,7 +463,7 @@ enum DownloadErrorKind {
     Internal,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[error("{message}")]
 struct DownloadError {
     kind: DownloadErrorKind,
@@ -505,6 +524,15 @@ impl DownloadError {
             },
         })
     }
+}
+
+enum SpaceAdmission {
+    Checked {
+        required_bytes: u64,
+        available_bytes: u64,
+        writes: Result<DownloadWrites, DownloadError>,
+    },
+    Failed(DownloadError),
 }
 
 impl ManagedModelStore {
@@ -605,18 +633,44 @@ impl ManagedModelStore {
         }
         drop(operations);
         // Packages admitted together, such as a model and its separate draft, need disk space
-        // together, so each checks against their combined need and reports the same shortfall.
-        let admitted_bytes = admitted
-            .iter()
-            .fold(0_u64, |sum, (.., own)| sum.saturating_add(*own));
-        for (key, operation_id, package, operation, own) in admitted {
-            let companion_bytes = admitted_bytes.saturating_sub(own);
-            let manager = self.clone();
-            magnitude_service_utils::owner::spawn("a download", async move {
-                manager
-                    .run_download(key, operation_id, package, operation, companion_bytes)
-                    .await;
-            });
+        // together. Admit the whole batch atomically under one ledger lock so each package
+        // reserves only its own bytes and never double-counts its companions.
+        if !admitted.is_empty() {
+            let sizes = admitted
+                .iter()
+                .map(|(.., own)| *own)
+                .collect::<Vec<_>>();
+            let total_required = sizes.iter().copied().fold(0_u64, u64::saturating_add);
+            let admissions: Vec<SpaceAdmission> = match self.volume.admit_batch(&sizes) {
+                Ok((available_bytes, Ok(handles))) => handles
+                    .into_iter()
+                    .map(|writes| SpaceAdmission::Checked {
+                        required_bytes: total_required,
+                        available_bytes,
+                        writes: Ok(writes),
+                    })
+                    .collect(),
+                Ok((available_bytes, Err(error))) => (0..admitted.len())
+                    .map(|_| SpaceAdmission::Checked {
+                        required_bytes: total_required,
+                        available_bytes,
+                        writes: Err(error.clone()),
+                    })
+                    .collect(),
+                Err(error) => (0..admitted.len())
+                    .map(|_| SpaceAdmission::Failed(error.clone()))
+                    .collect(),
+            };
+            for ((key, operation_id, package, operation, _own), admitted_space) in
+                admitted.into_iter().zip(admissions)
+            {
+                let manager = self.clone();
+                magnitude_service_utils::owner::spawn("a download", async move {
+                    manager
+                        .run_download(key, operation_id, package, operation, admitted_space)
+                        .await;
+                });
+            }
         }
         Ok(streams)
     }
@@ -693,10 +747,10 @@ impl ManagedModelStore {
         operation_id: String,
         package: ValidatedDownloadPackage,
         operation: Arc<DownloadOperation>,
-        companion_bytes: u64,
+        admitted_space: SpaceAdmission,
     ) {
         let result = self
-            .run_download_locked(&operation_id, package, &operation, companion_bytes)
+            .run_download_locked(&operation_id, package, &operation, admitted_space)
             .await;
         if let Err(failure) = result {
             let model_id = current_model_id(&operation.sender.borrow());
@@ -839,7 +893,7 @@ impl ManagedModelStore {
         operation_id: &str,
         package: ValidatedDownloadPackage,
         operation: &DownloadOperation,
-        companion_bytes: u64,
+        admitted_space: SpaceAdmission,
     ) -> Result<(), DownloadError> {
         operation.ensure_active()?;
         let (repository, _) = package.repository_revision();
@@ -849,7 +903,7 @@ impl ManagedModelStore {
             .map_err(inventory_download_error)?;
         let components = package.components().to_vec();
         let result = self
-            .run_download_inner(operation_id, package, operation, companion_bytes)
+            .run_download_inner(operation_id, package, operation, admitted_space)
             .await;
         if result
             .as_ref()
@@ -874,7 +928,7 @@ impl ManagedModelStore {
         operation_id: &str,
         package: ValidatedDownloadPackage,
         operation: &DownloadOperation,
-        companion_bytes: u64,
+        admitted_space: SpaceAdmission,
     ) -> Result<(), DownloadError> {
         operation.ensure_active()?;
         let (repository, revision) = package.repository_revision();
@@ -932,20 +986,26 @@ impl ManagedModelStore {
             .component_sources(&repo_root, &components)
             .await
             .map_err(download_io)?;
-        let required_bytes = space_bytes(&components, &sources).saturating_add(companion_bytes);
-        // What the volume has above its reserve, which its writer's space owns.
-        let (available_bytes, admitted) = self.volume.admit(required_bytes)?;
-        operation
-            .sender
-            .send_replace(ModelDownloadEvent::CheckingSpace {
-                operation_id: operation_id.to_owned(),
-                model_id: model_id.clone(),
+        let writes = match admitted_space {
+            SpaceAdmission::Checked {
                 required_bytes,
                 available_bytes,
-                completed_bytes,
-                total_bytes,
-            });
-        let writes = admitted?;
+                writes,
+            } => {
+                operation
+                    .sender
+                    .send_replace(ModelDownloadEvent::CheckingSpace {
+                        operation_id: operation_id.to_owned(),
+                        model_id: model_id.clone(),
+                        required_bytes,
+                        available_bytes,
+                        completed_bytes,
+                        total_bytes,
+                    });
+                writes?
+            }
+            SpaceAdmission::Failed(error) => return Err(error),
+        };
 
         let started_at = now();
         let planned = InventoryModel {
@@ -1209,7 +1269,7 @@ async fn publish_package_snapshot(
     for component in components {
         publish_snapshot_link(repo_root, staged.path(), component).await?;
     }
-    magnitude_service_utils::blocking::run(move || staged.publish())
+    magnitude_service_utils::blocking::run(move || staged.publish().map_err(std::io::Error::other))
         .await
         .map_err(download_io)?;
     sync_parent(snapshot).await
@@ -1710,6 +1770,17 @@ async fn recover_completed_blob(
     {
         return Ok(true);
     }
+    if blob_len == component.size_bytes
+        && matches!(component.content, ContentIdentity::Sha256 { .. })
+    {
+        let control = TransferControl::new(SOURCE_STALL_TIMEOUT);
+        if let Ok(integrity) =
+            verified_integrity(&paths.blob, component, &mut |_, _| {}, &control).await
+        {
+            atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
+            return Ok(true);
+        }
+    }
 
     discard_component_files(paths).await?;
     Ok(false)
@@ -1777,8 +1848,11 @@ async fn regular_file_len(path: &Path) -> Option<u64> {
     (metadata.is_file() && !metadata.file_type().is_symlink()).then_some(metadata.len())
 }
 
+/// Removes a component's in-progress partial file and integrity checkpoint. Published blobs
+/// (`paths.blob`) are immutable and may be live-shared by other snapshots or active readers, so
+/// downloads never unlink them.
 async fn discard_component_files(paths: &DownloadComponentPaths) -> Result<(), DownloadError> {
-    for path in [&paths.partial, &paths.blob, &paths.checkpoint] {
+    for path in [&paths.partial, &paths.checkpoint] {
         match tokio::fs::symlink_metadata(path).await {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
                 tokio::fs::remove_file(path).await.map_err(download_io)?;
@@ -3112,6 +3186,7 @@ mod tests {
 
         // Holding the repository lock keeps fresh work from reaching the network.
         let repository_lock = crate::store_fs::model_store(&manager.config.root)
+            .unwrap()
             .lock_owned(&repository_record("owner/repository"))
             .expect("repository lock");
         start().await.expect("retry");
@@ -3161,6 +3236,7 @@ mod tests {
                 .expect("checkpoint");
             // The operation waits on the repository lock, so it is cancelled before any transfer.
             let repository_lock = crate::store_fs::model_store(&manager.config.root)
+            .unwrap()
                 .lock_owned(&repository_record("owner/repository"))
                 .expect("repository lock");
             let mut stream = manager
@@ -3211,6 +3287,7 @@ mod tests {
             .insert(key.clone(), Arc::clone(&settling));
         // Holding the repository lock keeps the new operation from reaching the network.
         let repository_lock = crate::store_fs::model_store(&manager.config.root)
+            .unwrap()
             .lock_owned(&repository_record("owner/repository"))
             .expect("repository lock");
 
@@ -4032,6 +4109,72 @@ mod tests {
         // Its end releases the rest.
         drop(first);
         assert!(volume.admit(60).expect("space").1.is_ok());
+    }
+
+    #[test]
+    fn admit_batch_admits_multi_package_bundle_without_double_counting() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let twenty_gb = Arc::new(VolumeWrites::new(Arc::new(|written: u64| {
+            Ok::<_, std::convert::Infallible>((20 * GB).saturating_sub(written))
+        })));
+        let (available, admitted) = twenty_gb.admit_batch(&[10 * GB, 5 * GB]).expect("space");
+        assert_eq!(available, 20 * GB);
+        let handles = admitted.expect("15 GB bundle fits in 20 GB");
+        assert_eq!(handles.len(), 2);
+        // Both handles can admit and write their own bytes without double-counting each other.
+        handles[0].admit().expect("first package write admitted");
+        handles[1].admit().expect("second package write admitted");
+        handles[0].wrote(10 * GB);
+        handles[1].wrote(5 * GB);
+        handles[0].admit().expect("volume still holds remaining");
+        drop(handles);
+
+        let ten_gb = Arc::new(VolumeWrites::new(Arc::new(|written: u64| {
+            Ok::<_, std::convert::Infallible>((10 * GB).saturating_sub(written))
+        })));
+        let (available, refused) = ten_gb.admit_batch(&[10 * GB, 5 * GB]).expect("space");
+        assert_eq!(available, 10 * GB);
+        assert!(matches!(
+            refused,
+            Err(DownloadError {
+                kind: DownloadErrorKind::InsufficientDiskSpace {
+                    required_bytes,
+                    available_bytes,
+                },
+                ..
+            }) if required_bytes == 15 * GB && available_bytes == 10 * GB
+        ));
+    }
+
+    #[tokio::test]
+    async fn recover_completed_blob_verifies_on_disk_without_checkpoint_and_preserves_published_blob() {
+        let contents = b"verified published model blob";
+        let component = model_component(contents);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = DownloadComponentPaths::new(directory.path(), &blob_key(&component.content));
+        tokio::fs::write(&paths.blob, contents)
+            .await
+            .expect("published blob");
+
+        assert!(
+            recover_completed_blob(&paths, &component)
+                .await
+                .expect("stream verification without checkpoint"),
+            "valid published blob is recovered by stream-verifying SHA-256 on disk"
+        );
+        assert!(paths.blob.is_file());
+        assert!(paths.checkpoint.is_file());
+
+        tokio::fs::write(&paths.partial, b"stale partial")
+            .await
+            .expect("partial");
+        discard_component_files(&paths).await.expect("discard");
+        assert!(
+            paths.blob.is_file(),
+            "discard_component_files must never unlink a published blob"
+        );
+        assert!(!paths.partial.exists());
+        assert!(!paths.checkpoint.exists());
     }
 
     #[test]

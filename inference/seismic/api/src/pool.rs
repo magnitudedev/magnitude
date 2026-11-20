@@ -15,6 +15,18 @@ pub struct Pool {
     inner: seismic_runtime::pool::Pool,
 }
 
+/// A weak handle to a [`Pool`], holding no strong reference to its storage.
+#[derive(Clone)]
+pub struct WeakPool {
+    inner: seismic_runtime::pool::WeakPool,
+}
+
+impl WeakPool {
+    pub fn upgrade(&self) -> Option<Pool> {
+        self.inner.upgrade().map(|inner| Pool { inner })
+    }
+}
+
 /// The charges a pool's memory is made through, of one device: its blocks
 /// through one, its absent granule through the other.
 #[derive(Clone)]
@@ -85,6 +97,23 @@ impl Pool {
         self.inner.free_granules()
     }
 
+    /// Bytes freed for outside demand not yet returned to the OS or driver.
+    pub fn owed(&self) -> u64 {
+        self.inner.owed()
+    }
+
+    /// Whether the pool has blocks awaiting flight completion before dropping
+    /// to the OS/driver, or an `await_owed` waiter is in flight.
+    pub fn releasing(&self) -> bool {
+        self.inner.releasing()
+    }
+
+    /// Register a one-shot callback to fire once every block currently
+    /// releasing or awaited has dropped to the OS/driver.
+    pub fn wake_on_release(&self, wake: impl FnOnce() + Send + 'static) {
+        self.inner.wake_on_release(wake)
+    }
+
     /// Allocate one block, admitted by the pool's entry first. Refused with
     /// the entry's capacity error, nothing changes.
     pub fn grow(&self) -> Result<(), TensorError> {
@@ -101,6 +130,17 @@ impl Pool {
     /// on the pool while it copies. The bytes returned.
     pub fn return_freed(&self, freed: u64) -> Result<u64, TensorError> {
         self.inner.return_freed(freed)
+    }
+
+    /// Synchronously return `freed` bytes to the OS or driver, waiting on any
+    /// in-flight fences so every returned block is physically freed before
+    /// returning.
+    pub fn return_freed_sync(&self, freed: u64) -> Result<u64, TensorError> {
+        self.inner.return_freed_sync(freed)
+    }
+
+    pub fn downgrade(&self) -> WeakPool {
+        WeakPool { inner: self.inner.downgrade() }
     }
 
     pub(crate) fn inner(&self) -> &seismic_runtime::pool::Pool {

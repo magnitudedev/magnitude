@@ -9,11 +9,15 @@
 //! tables buffer's.
 
 use crate::device::{
-    barrier, call, Device, Handed, Recording, Retired, RetiredCommand, ARGUMENT_CHUNK_BYTES,
+    barrier, call, memory_call, Device, Handed, Recording, Retired, RetiredCommand,
+    ARGUMENT_CHUNK_BYTES,
 };
 use crate::formation::DirectModule;
 use crate::memory::{Buffer, Range};
 use ash::vk::{self, Handle};
+use seismic_compiler::direct_launch::{
+    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch,
+};
 use seismic_compiler::errors::ExecutionError;
 use seismic_native_target::{GateOpening, ParkAnswer};
 use seismic_compiler::graph_cost::GraphCensus;
@@ -54,10 +58,11 @@ impl DirectLaunch<'_> {
         }
     }
 
-    /// Whether the launch does no device work (an empty grid): it is
-    /// recorded as nothing.
+    /// Whether the launch does no device work (an empty direct grid): it is
+    /// recorded as nothing. An indirect launch's grid comes from its GPU
+    /// buffer, so it is never empty on the host.
     pub fn is_empty(&self) -> bool {
-        self.groups.contains(&0)
+        self.grid.is_none() && self.groups.contains(&0)
     }
 
     /// The launch's argument block: each buffer's address, the
@@ -152,6 +157,12 @@ fn push_constants(arguments: u64, tables: u64) -> [u8; 16] {
     bytes
 }
 
+/// How a validated Vulkan direct launch dispatches.
+enum Dispatch<'a> {
+    Direct([u32; 3]),
+    Indirect(&'a Buffer, u64),
+}
+
 /// Record one launch: its barrier after the previous launch's writes, the
 /// pipeline, the argument block and tables addresses, the dispatch.
 unsafe fn record_launch(
@@ -159,7 +170,7 @@ unsafe fn record_launch(
     command: vk::CommandBuffer,
     launch: &DirectLaunch<'_>,
     address: u64,
-    groups: [u32; 3],
+    dispatch: Dispatch<'_>,
     first: bool,
 ) {
     let raw = &device.inner.device;
@@ -178,12 +189,12 @@ unsafe fn record_launch(
         0,
         &push_constants(address, device.tables()),
     );
-    match launch.grid {
-        Some((buffer, offset)) => {
+    match dispatch {
+        Dispatch::Indirect(buffer, offset) => {
             let range = buffer.range();
             raw.cmd_dispatch_indirect(command, range.raw(), range.offset() + offset);
         }
-        None => raw.cmd_dispatch(command, groups[0], groups[1], groups[2]),
+        Dispatch::Direct(groups) => raw.cmd_dispatch(command, groups[0], groups[1], groups[2]),
     }
 }
 
@@ -200,23 +211,39 @@ unsafe fn compute_barrier(raw: &ash::Device, command: vk::CommandBuffer) {
     );
 }
 
-/// The group counts of a non-empty launch, checked against the device.
-fn groups(device: &Device, launch: &DirectLaunch<'_>) -> Result<Option<[u32; 3]>, ExecutionError> {
-    if launch.groups.contains(&0) {
-        return Ok(None);
+/// Validate a launch against the device's limits and return its dispatch mode
+/// (`None` when an empty direct launch should be skipped).
+fn validate_launch<'a>(
+    device: &Device,
+    launch: &DirectLaunch<'a>,
+) -> Result<Option<Dispatch<'a>>, ExecutionError> {
+    let contract = DirectLaunchContract {
+        max_buffer_slots: None,
+        max_grid: device.info().limits.max_group_count,
+        max_group_size: None,
+        max_group_threads: None,
+        max_shared_bytes: None,
+        max_param_bytes: Some(ARGUMENT_CHUNK_BYTES),
+    };
+    let request = DirectLaunchRequest {
+        buffer_slots: 0,
+        grid: match launch.grid {
+            Some(_) => LaunchGrid::Indirect,
+            None => LaunchGrid::Direct(launch.groups),
+        },
+        group: None,
+        static_shared_bytes: 0,
+        dynamic_shared_bytes: 0,
+        param_bytes: argument_block_bytes(launch.buffers.len() as u64, launch.words.len() as u64),
+    };
+    match contract.validate(&request)? {
+        ValidatedLaunch::Empty => Ok(None),
+        ValidatedLaunch::Active { grid, .. } => Ok(Some(match (launch.grid, grid) {
+            (Some((buffer, offset)), None) => Dispatch::Indirect(buffer, offset),
+            (None, Some(groups)) => Dispatch::Direct(groups),
+            _ => unreachable!("DirectLaunchContract matches LaunchGrid variant"),
+        })),
     }
-    let limit = device.info().limits.max_group_count;
-    let mut groups = [0u32; 3];
-    for axis in 0..3 {
-        if launch.groups[axis] > limit[axis] {
-            return Err(ExecutionError::SubmissionFailed(format!(
-                "native launch requests {} groups on axis {axis}; the device allows {}",
-                launch.groups[axis], limit[axis]
-            )));
-        }
-        groups[axis] = launch.groups[axis] as u32;
-    }
-    Ok(Some(groups))
 }
 
 fn begin(
@@ -229,9 +256,12 @@ fn begin(
     if let Some(inheritance) = inheritance {
         info = info.inheritance_info(inheritance);
     }
-    call(
+    memory_call(
         unsafe { device.inner.device.begin_command_buffer(command, &info) },
         "vkBeginCommandBuffer",
+        0,
+        &device.inner.memory,
+        ExecutionError::SubmissionFailed,
     )
 }
 
@@ -307,9 +337,12 @@ impl DirectGraphBuilder {
 
     fn end_segment(&self) -> Result<(), ExecutionError> {
         let recording = self.device.locked();
-        let ended = call(
+        let ended = memory_call(
             unsafe { self.device.inner.device.end_command_buffer(self.command()) },
             "vkEndCommandBuffer",
+            0,
+            &self.device.inner.memory,
+            ExecutionError::SubmissionFailed,
         );
         drop(recording);
         ended
@@ -324,10 +357,10 @@ impl DirectGraphBuilder {
         self.begin_segment()
     }
 
-    /// Append a launch after every launch added before it; an empty grid
-    /// adds nothing.
+    /// Append a launch after every launch added before it; an empty direct
+    /// grid adds nothing.
     pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
-        let Some(groups) = groups(&self.device, launch)? else {
+        let Some(dispatch) = validate_launch(&self.device, launch)? else {
             return Ok(());
         };
         let mut recording = self.device.recording()?;
@@ -339,7 +372,7 @@ impl DirectGraphBuilder {
                 self.command(),
                 launch,
                 address,
-                groups,
+                dispatch,
                 !self.launched,
             )
         };
@@ -551,17 +584,14 @@ impl Stamps {
     /// passed both (waited for here).
     pub fn seconds(&self, from: usize, to: usize) -> Result<f64, ExecutionError> {
         let mut values = vec![0u64; self.marks as usize];
-        call(
-            unsafe {
-                self.device.inner.device.get_query_pool_results(
-                    self.pool,
-                    0,
-                    &mut values,
-                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-                )
-            },
-            "vkGetQueryPoolResults",
-        )?;
+        self.device.inner.vk("vkGetQueryPoolResults", |device| unsafe {
+            device.get_query_pool_results(
+                self.pool,
+                0,
+                &mut values,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        })?;
         let limits = self.device.info().limits;
         let ticks = values[to].wrapping_sub(values[from]) & mask(limits.timestamp_valid_bits);
         Ok(ticks as f64 * limits.timestamp_period / 1e9)
@@ -771,10 +801,9 @@ impl<S: Side> HostTimeline<S> {
         let info = vk::SemaphoreSignalInfo::default()
             .semaphore(self.semaphore)
             .value(value);
-        call(
-            unsafe { self.device.inner.device.signal_semaphore(&info) },
-            "vkSignalSemaphore",
-        )?;
+        self.device.inner.vk("vkSignalSemaphore", |device| unsafe {
+            device.signal_semaphore(&info)
+        })?;
         // The submissions held on this gate go to the queue now
         // (`Device::submit_with`).
         self.device.release(opening);
@@ -783,31 +812,17 @@ impl<S: Side> HostTimeline<S> {
 
     /// The value reached; the device's loss where it cannot say.
     pub fn value(&self) -> Result<u64, ExecutionError> {
-        call(
-            unsafe {
-                self.device
-                    .inner
-                    .device
-                    .get_semaphore_counter_value(self.semaphore)
-            },
-            "vkGetSemaphoreCounterValue",
-        )
+        self.device
+            .inner
+            .vk("vkGetSemaphoreCounterValue", |device| unsafe {
+                device.get_semaphore_counter_value(self.semaphore)
+            })
     }
 
     /// Wait at most `timeout` for the timeline to reach `value`; whether it
     /// did, or the device's loss where it cannot say.
     pub fn wait(&self, value: u64, timeout: std::time::Duration) -> Result<bool, ExecutionError> {
-        let semaphores = [self.semaphore];
-        let values = [value];
-        let info = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphores)
-            .values(&values);
-        let nanoseconds = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
-        match unsafe { self.device.inner.device.wait_semaphores(&info, nanoseconds) } {
-            Ok(()) => Ok(true),
-            Err(vk::Result::TIMEOUT) => Ok(false),
-            Err(error) => call(Err(error), "vkWaitSemaphores"),
-        }
+        self.device.inner.wait_semaphore(self.semaphore, value, timeout)
     }
 }
 
@@ -862,7 +877,7 @@ impl<T: Timing> DirectBatch<T> {
         let timing = match T::open(device, &mut recording, launches) {
             Ok(timing) => timing,
             Err(error) => {
-                recording.free_command(command);
+                recording.free_command(&device.inner.device, command);
                 return Err(error);
             }
         };
@@ -936,7 +951,7 @@ impl<T: Timing> DirectBatch<T> {
     }
 
     pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
-        let Some(groups) = groups(&self.device, launch)? else {
+        let Some(dispatch) = validate_launch(&self.device, launch)? else {
             self.skip();
             return Ok(());
         };
@@ -944,7 +959,7 @@ impl<T: Timing> DirectBatch<T> {
         let mut recording = device.recording()?;
         let address = self.arguments.write(&device, &mut recording, launch)?;
         if self.timing.mark(&device.inner.device, self.command, self.launched) {
-            unsafe { record_launch(&device, self.command, launch, address, groups, true) };
+            unsafe { record_launch(&device, self.command, launch, address, dispatch, true) };
         } else {
             unsafe {
                 record_launch(
@@ -952,7 +967,7 @@ impl<T: Timing> DirectBatch<T> {
                     self.command,
                     launch,
                     address,
-                    groups,
+                    dispatch,
                     !self.launched,
                 )
             };
@@ -1645,6 +1660,83 @@ mod park_tests {
             let device = Device::open(description.info.uuid, crate::unbounded_stores(&description.info), &Default::default()).expect("a device meeting the floor opens");
             case(&device, false);
             case(&device, true);
+        }
+    }
+
+    /// Device loss observed anywhere on the logical device immediately wakes
+    /// waiters blocked on held or gated submissions and propagates to every
+    /// timeline and submission without deadlocking.
+    #[test]
+    fn device_loss_unblocks_waiters_held_behind_a_shut_park() {
+        for description in crate::test_devices() {
+            let device = Device::open_isolated(
+                description.info.uuid,
+                crate::unbounded_stores(&description.info),
+                &Default::default(),
+            )
+            .expect("a device meeting the floor opens");
+            let reached = Arc::new(HostTimeline::<Reached>::new(&device).unwrap());
+            let park = Arc::new(HostTimeline::<Gate>::new(&device).unwrap());
+            let mut gated = DirectBatch::new(&device).unwrap();
+            gated.wait_timeline(&park, 2);
+            let gated = gated.commit().unwrap();
+            let mut held = DirectBatch::new(&device).unwrap();
+            held.signal_timeline(&reached, 1);
+            let held = held.commit().unwrap();
+
+            let (entered_tx, entered_rx) = mpsc::channel();
+            *device
+                .inner
+                .on_handover_wait
+                .lock()
+                .expect("handover hook lock is never poisoned") = Some(entered_tx);
+
+            let (done_tx, done_rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let result = held.finish();
+                let _ = done_tx.send(result);
+            });
+            entered_rx
+                .recv_timeout(BOUND)
+                .expect("waiter must enter the handover wait behind the shut park");
+            assert!(
+                done_rx.try_recv().is_err(),
+                "waiter must remain blocked behind the shut park before device loss"
+            );
+
+            // Simulate VK_ERROR_DEVICE_LOST reported by any queue/call on this device.
+            let lost = device
+                .inner
+                .lose(ExecutionError::DeviceLost("simulated device loss".into()));
+            assert!(matches!(lost, ExecutionError::DeviceLost(_)));
+
+            let held_result = done_rx
+                .recv_timeout(BOUND)
+                .expect("device loss must unblock waiters held behind a shut park");
+            assert!(
+                matches!(held_result, Err(ExecutionError::DeviceLost(_))),
+                "expected DeviceLost for held submission, got {held_result:?}"
+            );
+            waiter.join().unwrap();
+
+            let gated_result = returns("gated submission fails promptly on device loss", move || {
+                gated.finish()
+            });
+            assert!(
+                matches!(gated_result, Err(ExecutionError::DeviceLost(_))),
+                "expected DeviceLost for gated submission, got {gated_result:?}"
+            );
+            assert!(matches!(reached.value(), Err(ExecutionError::DeviceLost(_))));
+            assert!(matches!(reached.wait(1, BOUND), Err(ExecutionError::DeviceLost(_))));
+            assert!(matches!(park.signal(2), Err(ExecutionError::DeviceLost(_))));
+
+            // Unblock the real Vulkan semaphore before device teardown since
+            // this test simulated loss on a healthy driver.
+            let info = vk::SemaphoreSignalInfo::default()
+                .semaphore(park.semaphore)
+                .value(2);
+            unsafe { device.inner.device.signal_semaphore(&info) }
+                .expect("unblock simulated-loss test semaphore before teardown");
         }
     }
 }

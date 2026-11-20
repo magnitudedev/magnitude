@@ -248,6 +248,91 @@ fn an_open_refused_short_idles_the_components_it_kept() {
     drop(room);
 }
 
+/// An exogenous supply drop shrinking the bank suppresses immediate small
+/// bounce-back regrows during the 3 s cooldown (stopping 10 ms ping-pong),
+/// while letting the bank regrow after the cooldown expires or immediately
+/// when released memory jumps past the rebound margin.
+#[test]
+fn exogenous_shrink_damps_ping_pong_until_cooldown_or_large_release() {
+    use crate::domain::ProgramFamily as _;
+    let read_host = |ledger: &Ledger, free_beyond_target: i64, at: Instant| {
+        let sample = seismic::HostSample {
+            at,
+            page_bytes: 16 * 1024,
+            total: TOTAL,
+            supply: seismic::Supply { free_beyond_target, clean_cache: 0, cold_reclaimable: 0 },
+            counted: seismic::Counted { at, lag: Duration::ZERO },
+            cold: seismic::ColdPages::default(),
+            own_reclaimed: Some(seismic::OwnReclaimed::NONE),
+            wired: None,
+            harm: Some(seismic::Harm { machine: 0, own: 0 }),
+            pressure: Some(seismic::PressureLevel::Normal),
+            lag: NO_LAG,
+        };
+        ledger.read(ledger.sampled(at), Reading::host(&sample));
+    };
+    let pending_move = |d: &crate::domain::ExecutorDomain<crate::domain::fixtures::TestFamily>| {
+        let bank = d.family.expert_bank().expect("bank");
+        d.next_bank_move(bank).unwrap()
+    };
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        let row = bank_row(&domain);
+        let ledger = domain.resources.ledgers().device().clone();
+        // Set baseline headroom leaving bank comfortable at 4 slots (1 slot free), then establish calm baseline.
+        let mut t = Instant::now();
+        read_host(&ledger, row as i64, t);
+        t += Duration::from_millis(100);
+        read_host(&ledger, row as i64, t);
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}");
+
+        // Exogenous deficit (-2.5 rows) drops hold_room -> bank shrinks below 4 slots.
+        t += Duration::from_millis(100);
+        read_host(&ledger, -((row * 5 / 2) as i64), t);
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
+        while domain.advance_expert_bank(wake()).unwrap().is_none() {}
+        let shrunk_to = domain.family.expert_bank().expect("bank").slots();
+        assert!(shrunk_to < 4, "{backend:?}: shrunk_to={shrunk_to}");
+
+        // Within 100ms, exogenous pressure recovers modestly (enough to regrow,
+        // still below the rebound margin): 3s cooldown suppresses ping-pong.
+        t += Duration::from_millis(100);
+        read_host(&ledger, (row * 2) as i64, t);
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}: ping-pong suppressed during cooldown");
+        assert_eq!(pending_move(&domain), None, "{backend:?}");
+
+        // After > 3s calm availability at the same room, cooldown expires cleanly.
+        t += Duration::from_secs(4);
+        read_host(&ledger, (row * 2) as i64, t);
+        assert!(
+            matches!(
+                pending_move(&domain),
+                Some((crate::BankHolding::Experts, crate::experts::derived::BankMove::Grow { to })) if to > shrunk_to
+            ),
+            "{backend:?}: regrows past shrunk_to={shrunk_to} after cooldown"
+        );
+    }
+
+    // Large exogenous release (>= rebound margin) bypasses the 3s cooldown immediately.
+    let backend = bank_backends()[0];
+    let (mut domain, mut bindings) = banked(backend, 4, 4);
+    let row = bank_row(&domain);
+    let ledger = domain.resources.ledgers().device().clone();
+    let mut t = Instant::now();
+    read_host(&ledger, row as i64, t);
+    t += Duration::from_millis(100);
+    read_host(&ledger, -((row * 5 / 2) as i64), t);
+    assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)));
+    while domain.advance_expert_bank(wake()).unwrap().is_none() {}
+    t += Duration::from_millis(50);
+    read_host(&ledger, (row * 6) as i64, t);
+    assert_eq!(
+        pending_move(&domain),
+        Some((crate::BankHolding::Experts, crate::experts::derived::BankMove::Grow { to: 4 })),
+        "large exogenous release bypasses cooldown immediately"
+    );
+}
+
 /// A component an earlier claim took part of is no longer whole: the next
 /// open keeps none of it and unloads it whole.
 #[test]

@@ -47,7 +47,9 @@ fn every_unknown_architecture_key_is_named() {
         ],
         &[],
     );
-    let Err(error) = Metadata::new(&header, "arch", &["block_count"]) else {
+    let m = Metadata::new(&header, "arch");
+    assert_eq!(m.integer("block_count"), Ok(1));
+    let Err(error) = m.finish() else {
         panic!("unknown keys are refused");
     };
     assert_eq!(
@@ -87,7 +89,9 @@ fn only_the_architecture_namespace_is_read_strictly() {
         ],
         &[],
     );
-    assert!(Metadata::new(&header, "arch", &["block_count"]).is_ok());
+    let m = Metadata::new(&header, "arch");
+    assert_eq!(m.integer("block_count"), Ok(1));
+    assert!(m.finish().is_ok());
     assert_eq!(
         architecture_keys(&header, "arch")
             .map(|(key, entry)| (key, entry.name.as_str()))

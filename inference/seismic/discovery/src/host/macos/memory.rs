@@ -40,11 +40,12 @@ pub(super) struct Snapshot {
 /// The file pages the OS keeps while it compresses others' memory, as the
 /// snapshot `statistics` after `before` shows them: where the OS compressed
 /// more pages between the two than were free above its free-page target
-/// `free_target`, it chose compressing over every file page still standing,
-/// so those are its floor (a mapped library or binary in use); otherwise
-/// the floor `before` showed, none before the OS first chose so. Compression
-/// with more free than it compressed is the OS's own, not a press's, and
-/// moves no floor.
+/// `free_target` (`free_count` excludes `speculative_count` as
+/// `vm.page_free_count` does), it chose compressing over every file page still
+/// standing, so those are its floor (a mapped library or binary in use);
+/// when compression stops and free pages recover comfortably above target, the
+/// temporary floor decays rather than latching permanently; clamped to the
+/// snapshot's external file pages.
 pub(super) fn file_floor(
     before: Option<&Snapshot>,
     statistics: &libc::vm_statistics64,
@@ -53,11 +54,19 @@ pub(super) fn file_floor(
     let Some(before) = before else { return 0 };
     let compressed =
         u64::from(statistics.compressions).saturating_sub(u64::from(before.statistics.compressions));
-    let free = u64::from(statistics.free_count) + u64::from(statistics.purgeable_count);
-    match compressed > free.saturating_sub(free_target) {
-        true => u64::from(statistics.external_page_count),
-        false => before.file_floor,
-    }
+    let external = u64::from(statistics.external_page_count);
+    let free = u64::from(statistics.free_count).saturating_sub(u64::from(statistics.speculative_count))
+        + u64::from(statistics.purgeable_count);
+    let floor = if compressed > free.saturating_sub(free_target) {
+        external
+    } else if compressed == 0 && free >= free_target.saturating_mul(4) {
+        0
+    } else if compressed == 0 && free > free_target.saturating_mul(2) {
+        before.file_floor / 2
+    } else {
+        before.file_floor
+    };
+    floor.min(external)
 }
 
 /// The snapshot the latest sample was served, and when that sample began.
@@ -117,7 +126,17 @@ pub(super) fn paired(
         Some(Served { snapshot, .. })
             if snapshot_bytes(&snapshot.statistics) == snapshot_bytes(&statistics) =>
         {
-            snapshot
+            if at.saturating_duration_since(snapshot.counted.at) >= STATISTICS_WINDOW {
+                // Beyond XNU's 1s cache window, identical statistics show that no
+                // event occurred; advance `counted.at` so journal settlement never stalls.
+                Snapshot {
+                    counted: Counted { at, lag: STATISTICS_WINDOW },
+                    own,
+                    ..snapshot
+                }
+            } else {
+                snapshot
+            }
         }
         before => {
             let lag = before.as_ref().map_or(STATISTICS_WINDOW, |before| {
@@ -138,52 +157,9 @@ pub(super) fn paired(
     }
 }
 
-/// `task_vm_info` (`TASK_VM_INFO`) through revision 7, laid out as the
-/// kernel writes it and read in part.
-#[allow(dead_code)]
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(crate) struct TaskVm {
-    virtual_size: u64,
-    region_count: i32,
-    page_size: i32,
-    resident_size: u64,
-    resident_size_peak: u64,
-    device: u64,
-    device_peak: u64,
-    internal: u64,
-    internal_peak: u64,
-    external: u64,
-    external_peak: u64,
-    reusable: u64,
-    reusable_peak: u64,
-    purgeable_volatile_pmap: u64,
-    purgeable_volatile_resident: u64,
-    purgeable_volatile_virtual: u64,
-    compressed: u64,
-    compressed_peak: u64,
-    compressed_lifetime: u64,
-    phys_footprint: u64,
-    min_address: u64,
-    max_address: u64,
-    /// `ledger_phys_footprint_peak` and the twenty purgeable and tag
-    /// ledgers after it.
-    ledgers: [i64; 21],
-    limit_bytes_remaining: u64,
-    decompressions: i32,
-    ledger_swapins: i64,
-    ledger_tag_neural_nofootprint_total: i64,
-    ledger_tag_neural_nofootprint_peak: i64,
-}
-
-pub(super) const TASK_VM_INFO: libc::task_flavor_t = 22;
-/// `TASK_VM_INFO_REV7_COUNT`: the structure in natural-sized words.
-pub(super) const TASK_VM_INFO_REV7_COUNT: libc::mach_msg_type_number_t =
-    (std::mem::size_of::<TaskVm>() / std::mem::size_of::<libc::natural_t>())
-        as libc::mach_msg_type_number_t;
-/// `TASK_VM_INFO_REV6_COUNT`: through `ledger_swapins`.
-pub(super) const TASK_VM_INFO_REV6_COUNT: libc::mach_msg_type_number_t =
-    TASK_VM_INFO_REV7_COUNT - 4;
+/// `task_vm_info` (`TASK_VM_INFO`) through revision 7, owned by
+/// `seismic_native_target::process::macos::TaskVmInfo`.
+pub(crate) use seismic_native_target::process::macos::TaskVmInfo as TaskVm;
 
 /// The process's task's decompressions, widened across their wraps.
 static OWN_DECOMPRESSIONS: Widened = Widened::new();
@@ -195,11 +171,9 @@ static OWN_DECOMPRESSIONS: Widened = Widened::new();
 /// # Panics
 /// Where the swap-ins read negative.
 fn own_paging(vm: &TaskVm, page: u64) -> u64 {
-    let swapins = u64::try_from(vm.ledger_swapins).unwrap_or_else(|_| {
-        panic!(
-            "invariant violated: task_vm_info.ledger_swapins is {}",
-            vm.ledger_swapins
-        )
+    let ledger_swapins = vm.ledger_swapins;
+    let swapins = u64::try_from(ledger_swapins).unwrap_or_else(|_| {
+        panic!("invariant violated: task_vm_info.ledger_swapins is {ledger_swapins}")
     });
     OWN_DECOMPRESSIONS.of(vm.decompressions as u32) + swapins / page
 }
@@ -342,7 +316,18 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
         || 0,
     )
     .0;
-    let free_target = sysctl_always(sys, "vm.vm_page_free_target");
+    let free_target_raw = sysctl_always(sys, "vm.vm_page_free_target");
+    // Preserve at least a small OS reserve cushion on multi-GB Macs where XNU's
+    // raw free_target (4000 pages = 64 MiB on 64 GiB) leaves almost no buffer
+    // against background app spikes before hitting the compressor.
+    let reserve_pages = (total / page / 256).min((256 << 20) / page);
+    let free_target = if free_target_raw > 0 {
+        free_target_raw.max(reserve_pages)
+    } else {
+        0
+    };
+    let external_live = sysctl_count(sys, "vm.page_pageable_external_count");
+    let xpmapped_min = sysctl_count(sys, "vm.vm_page_xpmapped_min").unwrap_or(0);
     let wired_limit = wired_limit(sys);
     let swap = swap_free(sys);
     let pressure = pressure_level(sys);
@@ -361,17 +346,35 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
     // without displacing someone, and a fall below it is a fall all the
     // same.
     let free_beyond_target = beyond(pages(free + purgeable), pages(free_target));
-    // The inactive queue is not split by kind: at least its pages that no
-    // file backs, both counts of the one snapshot.
+    // Inactive anonymous pages (`inactive` minus non-speculative file-backed
+    // pages and volatile purgeable pages, which are already counted 100% in
+    // `free_beyond_target`), computed within the one snapshot so supply can
+    // never exceed `total` nor double-count volatile pages.
+    let external_snap = u64::from(statistics.external_page_count);
+    let non_spec_external = external_snap.saturating_sub(u64::from(statistics.speculative_count));
     let cold = pages(
         u64::from(statistics.inactive_count)
-            .saturating_sub(u64::from(statistics.external_page_count)),
+            .saturating_sub(non_spec_external)
+            .saturating_sub(purgeable),
     );
-    // The file pages above the floor the OS keeps: a press takes them
-    // before the OS compresses anyone's memory.
-    let clean_cache = pages(u64::from(statistics.external_page_count).saturating_sub(file_floor));
+    // Live file-backed pages (`vm.page_pageable_external_count` when present,
+    // preventing 1s clock skew against `vm.page_free_count`), minus the larger
+    // of XNU's executable-mapped floor (`vm.vm_page_xpmapped_min`) and any
+    // dynamic compression floor (`file_floor`).
+    let external = external_live.unwrap_or(external_snap);
+    let protected_file = file_floor.max(xpmapped_min);
+    let clean_cache = pages(external.saturating_sub(protected_file));
     let stored = pages(u64::from(statistics.compressor_page_count));
     let logical = pages(statistics.total_uncompressed_pages_in_compressor);
+    // `free_beyond_target` and `clean_cache` come from live `vm.*` sysctls while
+    // `cold` comes from the 1s `host_statistics64` snapshot; bound `cold_reclaimable`
+    // so an app exiting inside that window never causes `supply.total() > total`.
+    let immediate = u64::try_from(free_beyond_target.max(0))
+        .unwrap_or(0)
+        .saturating_add(clean_cache);
+    let cold_reclaimable = cold
+        .min(compressed_saving(cold, stored, logical).saturating_add(swap))
+        .min(total.saturating_sub(immediate));
     HostSample {
         at,
         page_bytes: page,
@@ -379,7 +382,7 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
         supply: Supply {
             free_beyond_target,
             clean_cache,
-            cold_reclaimable: cold.min(compressed_saving(cold, stored, logical).saturating_add(swap)),
+            cold_reclaimable,
         },
         counted,
         cold: ColdPages {

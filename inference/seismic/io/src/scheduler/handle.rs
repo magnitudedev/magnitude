@@ -56,9 +56,12 @@ impl std::ops::Deref for Handle {
 impl Drop for Handle {
     /// Cancel what no worker has taken; what one has reads on.
     fn drop(&mut self) {
-        let Some(queued) = self.engine.queue().cancel(self.id) else {
+        let Some((queued, wake)) = self.engine.queue().cancel(self.id) else {
             return;
         };
+        if wake > 0 {
+            self.engine.wake(wake);
+        }
         let cancelled = Arc::new(Error::Cancelled);
         let ranges = queued.pieces.iter().flat_map(|piece| piece.parts.iter().map(|part| part.range));
         let failed = ranges.collect::<std::collections::BTreeSet<_>>().into_iter().map(|range| (range, cancelled.clone()));

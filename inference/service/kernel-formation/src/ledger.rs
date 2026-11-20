@@ -84,8 +84,8 @@ impl Ledger {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let directory = path.parent().expect("a ledger lives in a directory");
         let name = PathBuf::from(path.file_name().expect("a ledger is a file"));
-        let store = seismic_io::Store::new(directory.to_owned(), seismic_io::Privacy::Shared);
-        let records = parsed(store.shared()?.read(&name, u64::MAX)?);
+        let store = seismic_io::Store::open(directory.to_owned(), seismic_io::Privacy::Shared).map_err(std::io::Error::other)?;
+        let records = parsed(store.shared().and_then(|shared| shared.read(&name, u64::MAX)).map_err(std::io::Error::other)?);
         Ok(Self {
             store,
             name,
@@ -123,8 +123,8 @@ impl Ledger {
     /// one atomic step ([`seismic_io::Exclusive::write`]), so a reader finds
     /// it as it was or as this compaction wrote it, never part written.
     pub fn compact(&self) -> std::io::Result<()> {
-        let held = self.store.exclusive()?;
-        let appended = parsed(held.examine(&self.name, u64::MAX)?);
+        let held = self.store.exclusive().map_err(std::io::Error::other)?;
+        let appended = parsed(held.examine(&self.name, u64::MAX).map_err(std::io::Error::other)?);
         let text = {
             let mut records = self.records();
             records.verdicts.extend(appended.verdicts);
@@ -138,7 +138,7 @@ impl Ledger {
             }
             text
         };
-        held.write(&self.name, text.as_bytes(), seismic_io::Durability::Volatile)
+        held.write(&self.name, text.as_bytes(), seismic_io::Durability::Volatile).map_err(std::io::Error::other)
     }
 
     fn records(&self) -> std::sync::MutexGuard<'_, Records> {

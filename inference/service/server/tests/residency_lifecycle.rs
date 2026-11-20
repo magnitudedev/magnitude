@@ -326,7 +326,7 @@ async fn hardware(
     let resident = main
         .instances
         .resident_memory()
-        .await
+        .await?
         .expect("a resident worker answers an observation");
     let hardware = HardwareInventory::new(
         served.catalog.inventory().clone(),

@@ -230,7 +230,13 @@ fn host_preparation_binds_before_generation_and_rejects_identity_mismatches() {
     let plan = prepared.input().constraint.as_ref();
     let text = text_input(prepared.input().tokens.clone());
     let generation = binding
-        .seed(plan, options.clone(), text.tokens(), text.layout())
+        .seed(
+            plan,
+            options.clone(),
+            text.tokens(),
+            text.layout(),
+            text.prompt_coordinates(),
+        )
         .unwrap();
     assert_eq!(generation.constraint_position(), Some(0));
     assert!(generation.selection_mask().unwrap().is_some());
@@ -243,25 +249,44 @@ fn host_preparation_binds_before_generation_and_rejects_identity_mismatches() {
             options.clone(),
             interpreted.tokens(),
             interpreted.layout(),
+            interpreted.prompt_coordinates(),
         )
         .unwrap();
     assert_eq!(interpreted_generation.prompt(), interpreted_tokens);
     let mut bad = plan.unwrap().clone();
     bad.tokenizer_identity = "another tokenizer".into();
     assert!(binding
-        .seed(Some(&bad), options.clone(), text.tokens(), text.layout())
+        .seed(
+            Some(&bad),
+            options.clone(),
+            text.tokens(),
+            text.layout(),
+            text.prompt_coordinates(),
+        )
         .is_err());
     let mut bad_options = options.clone();
     bad_options.stop_tokens.clear();
     assert!(binding
-        .seed(plan, bad_options, text.tokens(), text.layout())
+        .seed(
+            plan,
+            bad_options,
+            text.tokens(),
+            text.layout(),
+            text.prompt_coordinates(),
+        )
         .is_err());
 
     let mut mtp_options = options;
     mtp_options.method = MethodChoice::Mtp { proposals: 2 };
     let mut mtp_binding = GenerationBinding::new(tokenizer, 272, limits).unwrap();
     let mtp = mtp_binding
-        .seed(plan, mtp_options, text.tokens(), text.layout())
+        .seed(
+            plan,
+            mtp_options,
+            text.tokens(),
+            text.layout(),
+            text.prompt_coordinates(),
+        )
         .unwrap();
     assert_eq!(mtp.method(), MethodChoice::Mtp { proposals: 2 });
 }

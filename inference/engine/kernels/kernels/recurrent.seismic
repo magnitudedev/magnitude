@@ -179,13 +179,14 @@ fn gated_delta_convolve[M, B, S, P, CH, C, T](projection: &tensor[M, P] A,
                             previous = f32(projection[lo + local + tap - (C - 1), channel])
                         sum = fma(convolution[channel, tap], previous, sum)
                     convolved[row, channel] = sum / (1.0 + exp(-sum))
-        for tap in 0..C - 1 + T:
-            if tap < C - 1 or publish + tap - (C - 1) < hi:
-                for channel in 0..CH:
-                    if stop[slot] + tap < C - 1:
-                        window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
-                    else:
-                        window[target, tap, channel] = projection[publish + tap - (C - 1), channel]
+        if lo < hi:
+            for tap in 0..C - 1 + T:
+                if tap < C - 1 or publish + tap - (C - 1) < hi:
+                    for channel in 0..CH:
+                        if stop[slot] + tap < C - 1:
+                            window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
+                        else:
+                            window[target, tap, channel] = projection[publish + tap - (C - 1), channel]
     return convolved
 
 # `delta_advance`: the delta rule both recurrent forms share. Per slot, rows
@@ -238,7 +239,7 @@ fn delta_advance[M, B, S, NK, NV, W, T, DW](
                             state[head, state_row, column] = fma(innovation,
                                 tape[source, entry, NV * W + key_head * W + column],
                                 state[head, state_row, column] * factor)
-        if publish == lo:
+        if lo < hi and publish == lo:
             for head in 0..NV:
                 for state_row in 0..W:
                     for column in 0..W:

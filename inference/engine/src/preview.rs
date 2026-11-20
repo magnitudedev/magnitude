@@ -7,7 +7,6 @@
 use crate::error::{classify_plan, classify_platform, PlanOutcome, PreviewError};
 use crate::options::ExecutionManifest;
 use crate::planning::{plan_execution, ExecutionPlanningError};
-use magnitude_executor::{AssessmentMemoryTerms, ResourceCapacity, ResourcePlanner};
 use seismic::{BackendName, Devices, ExecutorSelector};
 use serde::{Deserialize, Serialize};
 
@@ -28,39 +27,6 @@ pub struct LoadPreview {
 fn internal(reason: impl Into<String>) -> PreviewError {
     PreviewError::Internal {
         reason: reason.into(),
-    }
-}
-
-/// An operation's preview once the plan's prices are measured: the one way
-/// a pending plan (`PreviewError::PricesPending`, every pending figure a
-/// plan prices on) is met, by every host. While pending, `request` asks the
-/// measurement job for the figures and `measured` resolves once a job has
-/// run (a host's own job in its process, or its scheduler's), and the plan
-/// is taken again: pending never ends the operation. Only `request` or
-/// `measured` failing does, and a host's `measured` fails where its job
-/// measured nothing of what is pending, so nothing waits forever on a job
-/// that cannot measure it. Async, so a host that waits on its scheduler
-/// can drop the wait; a host that measures in its own thread resolves each
-/// step at once ([`now`]).
-pub async fn priced<T, E, P, R, M>(
-    mut preview: impl FnMut() -> P,
-    mut request: impl FnMut() -> R,
-    mut measured: impl FnMut() -> M,
-) -> Result<Result<T, PreviewError>, E>
-where
-    P: std::future::Future<Output = Result<T, PreviewError>>,
-    R: std::future::Future<Output = Result<(), E>>,
-    M: std::future::Future<Output = Result<(), E>>,
-{
-    loop {
-        match preview().await {
-            Err(PreviewError::PricesPending { reason }) => {
-                tracing::info!(%reason, "the load waits for the machine's standing figures");
-                request().await?;
-                measured().await?;
-            }
-            previewed => return Ok(previewed),
-        }
     }
 }
 
@@ -88,60 +54,12 @@ impl ExecutionManifest {
             ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
             error => PreviewError::from(PlanOutcome::Internal(error.to_string())),
         })?;
-        let (draft, bounds) = (planned.draft(), planned.charge().bounds);
-        let definition = &manifest.definition;
-        let policy = draft.policy();
-        let terms = AssessmentMemoryTerms::derive(
-            definition,
-            draft.load(),
-            policy.selection(),
-            policy.codec(),
-            policy.method(),
-            policy.limits(),
-        )
-        .map_err(internal)?;
-        let state = ResourcePlanner::state_plan(
-            definition,
-            draft.load(),
-            policy.method(),
-            policy.codec(),
-            policy.limits(),
-            ResourceCapacity {
-                domain_bytes: magnitude_executor::StableRoom::of_selected(&selected).capacity().map_err(|error| internal(error.to_string()))?,
-                tensor_operations: magnitude_executor::TensorOperations::of(
-                    selected.info.forms_tensor_operations(),
-                ),
-                allocations: selected.info.limits().allocations(),
-            },
-        )
-        .map_err(|error| internal(error.to_string()))?;
-        let initial_state = state
-            .target_state()
-            .initial_committed_bytes()
-            .and_then(|target| {
-                let head = state
-                    .head_state()
-                    .map(|head| head.initial_committed_bytes())
-                    .transpose()?
-                    .unwrap_or(0);
-                target
-                    .checked_add(head)
-                    .ok_or_else(|| "initial state byte count overflow".to_owned())
-            })
+        let required_bytes = planned
+            .charge()
+            .startup_required_bytes(&selected.reading.topology, &selected.info)
             .map_err(internal)?;
-        let required_bytes = [
-            terms.target_weights,
-            terms.head_weights,
-            terms.vision_weights,
-            initial_state,
-            bounds.prepared_resource_bytes().map_err(internal)?,
-            bounds.startup_additional_bytes,
-        ]
-        .into_iter()
-        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
-        .ok_or_else(|| internal("startup byte count overflow"))?;
         Ok(LoadPreview {
-            context_tokens: definition.decoder.context_limit,
+            context_tokens: manifest.definition.decoder.context_limit,
             device: selected.info.selector(),
             backend,
             required_bytes,
@@ -152,6 +70,7 @@ impl ExecutionManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::{run_priced, AcquiredDevice, PricedError, PricedFailure};
     use magnitude_executor::{fixtures, platform::{DeviceRequest, ReleaseRate}, ExecutionPath};
     use std::cell::Cell;
 
@@ -181,29 +100,33 @@ mod tests {
         let selected = crate::planning::select_load_device(&catalog, &manifest).unwrap();
         assert!(matches!(manifest.preview(&catalog), Err(PreviewError::PricesPending { .. })), "nothing is measured yet");
         let (requests, jobs) = (Cell::new(0), Cell::new(0));
-        let previewed = now(priced(
+        let ((), preview, ()) = now(run_priced(
             || std::future::ready(manifest.preview(&catalog)),
             || {
                 requests.set(requests.get() + 1);
-                std::future::ready(manifest.request_prices(&catalog))
+                let result = manifest.request_prices(&catalog).and_then(|()| {
+                    jobs.set(jobs.get() + 1);
+                    // The request is stored for the job before it runs.
+                    let records = magnitude_executor::KernelCache::measurement_records(cache.path());
+                    let costs = magnitude_executor::assessment::ExecutorCosts::stored(&catalog.topology(), &selected.info, &records).unwrap().outstanding();
+                    let outstanding = magnitude_executor::assessment::PointRequests::new(cache.path())
+                        .outstanding(&catalog.topology(), &selected.info, cache.path(), &records, costs)
+                        .unwrap();
+                    assert!(!outstanding.is_empty(), "the job has the load's figures to measure");
+                    crate::execution::store_fixed_costs(&catalog.topology(), &selected.info, cache.path());
+                    match jobs.get() {
+                        1 => Ok(()),
+                        _ => Err("a job that stored the costs left the plan pending".to_owned()),
+                    }
+                });
+                std::future::ready(result)
             },
-            || {
-                jobs.set(jobs.get() + 1);
-                // The request is stored for the job before it runs.
-                let records = magnitude_executor::KernelCache::measurement_records(cache.path());
-                let costs = magnitude_executor::assessment::ExecutorCosts::stored(&catalog.topology(), &selected.info, &records).unwrap().outstanding();
-                let outstanding = magnitude_executor::assessment::PointRequests::new(cache.path())
-                    .outstanding(&catalog.topology(), &selected.info, cache.path(), &records, costs)
-                    .unwrap();
-                assert!(!outstanding.is_empty(), "the job has the load's figures to measure");
-                crate::execution::store_fixed_costs(&catalog.topology(), &selected.info, cache.path());
-                std::future::ready(match jobs.get() {
-                    1 => Ok(()),
-                    _ => Err("a job that stored the costs left the plan pending".to_owned()),
-                })
-            },
-        ));
-        let preview = previewed.expect("the job ran").expect("the plan is priced once its costs are stored");
+            |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+            |()| {},
+            (),
+            |_, &(), ()| std::future::ready(Ok::<_, PricedFailure<String, (), ()>>(())),
+        ))
+        .expect("the plan is priced once its costs are stored");
         assert_eq!(preview.backend, BackendName::Cpu);
         assert_eq!((requests.get(), jobs.get()), (1, 1), "asked once, measured once, planned again");
     }
@@ -213,17 +136,69 @@ mod tests {
     /// never waited on.
     #[test]
     fn only_a_failed_measurement_or_a_plan_that_fails_ends_a_priced_preview() {
-        let failed = now(priced(
-            || std::future::ready(Err::<(), _>(PreviewError::PricesPending { reason: "nothing is measured".into() })),
-            || std::future::ready(Ok(())),
+        let sample_pending = crate::error::PendingPrices::new(
+            magnitude_executor::assessment::Outstanding {
+                standing: vec![magnitude_executor::assessment::PointRequest::GraphCost],
+                loads: Vec::new(),
+            },
+        )
+        .unwrap();
+        let failed = now(run_priced(
+            || {
+                std::future::ready(Err::<(), _>(PreviewError::PricesPending {
+                    reason: "nothing is measured".into(),
+                    pending: sample_pending.clone(),
+                }))
+            },
             || std::future::ready(Err("the job measured nothing")),
+            |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+            |()| {},
+            (),
+            |_, &(), ()| std::future::ready(Ok::<_, PricedFailure<&str, (), ()>>(())),
         ));
-        assert_eq!(failed, Err("the job measured nothing"));
-        let unsupported = now(priced(
+        assert!(matches!(failed, Err(PricedError::Host("the job measured nothing"))));
+        let unsupported = now(run_priced(
             || std::future::ready(Err::<(), _>(PreviewError::Internal { reason: "no plan".into() })),
             || std::future::ready(Err::<(), &str>("never asked")),
-            || std::future::ready(Err("never measured")),
+            |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+            |()| {},
+            (),
+            |_, &(), ()| std::future::ready(Ok::<_, PricedFailure<&str, (), ()>>(())),
         ));
-        assert_eq!(unsupported, Ok(Err(PreviewError::Internal { reason: "no plan".into() })));
+        assert!(matches!(
+            unsupported,
+            Err(PricedError::Preview(PreviewError::Internal { ref reason })) if reason == "no plan"
+        ));
+    }
+
+    /// `LoadPreview::required_bytes` delegates directly to the planned
+    /// charge's `startup_required_bytes` for the selected device.
+    #[test]
+    fn preview_required_bytes_matches_planned_charge_startup_required_bytes() {
+        let cache = tempfile::tempdir().unwrap();
+        let definition = fixtures::tiny_definition();
+        let model = crate::options::ModelPolicy::default().resolve(&definition).unwrap();
+        let manifest = ExecutionManifest::new(
+            fixtures::tiny_manifest(&definition),
+            definition,
+            model,
+            crate::options::standard_service_limits(),
+            ExecutionPath::Native,
+            DeviceRequest::Backend(BackendName::Cpu),
+            Some(cache.path().to_owned()),
+            Some(cache.path().to_owned()),
+            ReleaseRate::of_machine(None),
+        )
+        .unwrap();
+        let catalog = Devices::discover(&[]).unwrap();
+        let selected = crate::planning::select_load_device(&catalog, &manifest).unwrap();
+        crate::execution::store_fixed_costs(&catalog.topology(), &selected.info, cache.path());
+        let preview = manifest.preview(&catalog).unwrap();
+        let planned = plan_execution::<magnitude_executor::AssessmentMemoryCharge>(&manifest, &selected).unwrap();
+        let expected = planned
+            .charge()
+            .startup_required_bytes(&selected.reading.topology, &selected.info)
+            .unwrap();
+        assert_eq!(preview.required_bytes, expected);
     }
 }

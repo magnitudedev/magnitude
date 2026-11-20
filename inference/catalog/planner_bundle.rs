@@ -15,6 +15,8 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::ops::Range;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use flate2::Compression;
 use flate2::bufread::GzDecoder;
@@ -157,17 +159,19 @@ pub struct PlannerBundle<'a> {
     inputs: BTreeMap<String, Input>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Chunk {
     digest: [u8; 32],
     compressed: Range<usize>,
     length: usize,
+    decompressed: OnceLock<Box<[u8]>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Input {
     length: usize,
     chunks: Vec<usize>,
+    verified: AtomicBool,
 }
 
 impl<'a> PlannerBundle<'a> {
@@ -200,6 +204,7 @@ impl<'a> PlannerBundle<'a> {
                 digest,
                 compressed: start..cursor,
                 length,
+                decompressed: OnceLock::new(),
             });
         }
         let input_count = read_u32(bytes, &mut cursor)?;
@@ -238,6 +243,7 @@ impl<'a> PlannerBundle<'a> {
                     Input {
                         length,
                         chunks: input_chunks,
+                        verified: AtomicBool::new(false),
                     },
                 )
                 .is_some()
@@ -290,16 +296,38 @@ impl<'a> PlannerBundle<'a> {
             .get(digest)
             .ok_or_else(|| format!("planner bundle is missing input {digest}"))?;
         let mut input = Vec::with_capacity(entry.length);
-        for chunk in &entry.chunks {
-            self.decompress(&self.chunks[*chunk], &mut input)
+        for &chunk in &entry.chunks {
+            let bytes = self
+                .chunk_bytes(chunk)
                 .map_err(|error| format!("planner input {digest}: {error}"))?;
+            input.extend_from_slice(bytes);
         }
-        if sha256(&input) != digest {
-            return Err(format!(
-                "planner input {digest} failed integrity validation"
-            ));
+        if !entry.verified.load(Ordering::Acquire) {
+            if sha256(&input) != digest {
+                return Err(format!(
+                    "planner input {digest} failed integrity validation"
+                ));
+            }
+            entry.verified.store(true, Ordering::Release);
         }
         Ok(input)
+    }
+
+    fn chunk_bytes(&self, index: usize) -> Result<&[u8], String> {
+        let chunk = &self.chunks[index];
+        if let Some(bytes) = chunk.decompressed.get() {
+            return Ok(bytes);
+        }
+        let mut bytes = Vec::with_capacity(chunk.length);
+        self.decompress(chunk, &mut bytes)?;
+        if Sha256::digest(&bytes).as_slice() != chunk.digest {
+            return Err("chunk failed integrity validation".to_owned());
+        }
+        let _ = chunk.decompressed.set(bytes.into_boxed_slice());
+        Ok(chunk
+            .decompressed
+            .get()
+            .expect("planner chunk cache just initialized"))
     }
 
     fn decompress(&self, chunk: &Chunk, output: &mut Vec<u8>) -> Result<(), String> {

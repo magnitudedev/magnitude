@@ -78,7 +78,7 @@ mod resident_weights;
 mod resources;
 
 pub use completion::{Completed, Completion, CompletionWake};
-pub use experts::derived::import_slots;
+pub use experts::derived::{import_host_slots, import_slots};
 /// A process whose footprint a grant is credited by (`memory::ledger::Grant`).
 pub use seismic::ProcessId;
 pub use stored_table::{Prefetched, TableWaits};
@@ -87,7 +87,7 @@ pub use device_resources::{
     ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, FrontRegime, TwoRowPricing, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, PlanningRoom, DomainError, DomainRequirements, DomainReservation, ExecutorDomain, Unchained,
+    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, FrontRegime, MemoryStanding, TwoRowPricing, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, PlanningRoom, DomainError, DomainRequirements, DomainReservation, ExecutorDomain, Unchained,
     ExpertMeasures, LoadCosts, LoadMeasures, ExpertCover, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent,
     ExpertTargets, HeadFlight, LaunchDuration, LoadCharge, MemoryRead, MemoryReading, MemoryResponse, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
@@ -132,7 +132,7 @@ pub use native::{
 };
 pub use operation::{
     AheadVerdict, ChainEntry, CommittedClass, DraftForm, DraftShape, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, FrontKind, FrontRow, FrontRows, Guess, GuessKind,
-    GroupKey, HeadPhase, Operation, OperationError, Outcome, Priming, ProgramIdentity, RequestId,
+    HeadPhase, Operation, OperationError, Outcome, Priming, RequestId,
     ResourceDomainId, RowResult, Rows, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };
 pub use two_row::{BuiltForm, CHAINED_ROWS, FrontGrant, FrontPass, TwoRowDecode, fronted_requests};
@@ -146,7 +146,7 @@ pub use planning::{
     growth_target,
     ArtifactComponent, ArtifactComponentKind, AssessmentFit, AssessmentFitVerdict,
     AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryBounds, TargetGraphBounds, UndraftedBounds, VisionGraphBounds,
-    AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, AttentionValues,
+    AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, AttentionValues, StoreDemands, prompt_places_at,
     RoundingArgs,
     BackendPlan,
     BankAllocation, BankBinding, BankTier, ConveyorCarrier, ExpertBankPlan, Holding, StoredPart, StoredStack,

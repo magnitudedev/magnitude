@@ -4,10 +4,8 @@
 //! interpreted; every vision tensor is bound once.
 
 use crate::{invalid, product, Error};
-use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::{
-    architecture_keys, array_elements, projector_type, HeaderError, Tensors,
-};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{HeaderError, ProjectorMetadata, Tensors, projector_type};
 use magnitude_family_contracts::{
     CellReduction, ImportTransform, LinearClamp, MergerStage, PositionSampling, RmsNorm,
     Standardize, UnweightedRms, VisionActivation, VisionAttention, VisionAttentionScale,
@@ -31,45 +29,13 @@ const ACTIVATION: VisionActivation = VisionActivation::GeluTanh;
 /// header's epsilon is the RMS norms'.
 const LAYER_NORM_EPSILON: f64 = 1e-5;
 
-/// Every `clip.` metadata key a vision interpretation reads or may ignore
-/// (the audio encoder's keys describe a component that is not interpreted).
-const IGNORED_PREFIXES: &[&str] = &["clip.audio.", "clip.has_audio_encoder"];
-
 struct Reader<'a> {
     directory: &'a Directory,
+    meta: ProjectorMetadata<'a>,
     tensors: Tensors<'a>,
 }
 
 impl Reader<'_> {
-    fn unsigned(&self, key: &str) -> Result<u64, Error> {
-        self.directory
-            .value(key)
-            .and_then(Value::unsigned)
-            .ok_or_else(|| invalid(format!("projector metadata {key} must be an integer")))
-    }
-
-    fn number(&self, key: &str) -> Result<f64, Error> {
-        match self.directory.value(key) {
-            Some(Value::Scalar(Scalar::Float(value))) if value.is_finite() => Ok(*value),
-            _ => Err(invalid(format!("projector metadata {key} must be a number"))),
-        }
-    }
-
-    fn triple(&self, key: &str) -> Result<[f64; 3], Error> {
-        let values = match self.directory.value(key) {
-            Some(Value::Array(values)) if values.len() == 3 => array_elements(key, values)?
-                .iter()
-                .map(|value| match value {
-                    Element::Float(value) if value.is_finite() => Some(value),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>(),
-            _ => None,
-        }
-        .ok_or_else(|| invalid(format!("projector metadata {key} must hold three numbers")))?;
-        Ok([values[0], values[1], values[2]])
-    }
-
     fn tensor(&mut self, name: &str, shape: &[u64]) -> Result<WeightDescriptor, Error> {
         Ok(self.tensors.bind(name, shape)?)
     }
@@ -100,8 +66,9 @@ impl Reader<'_> {
     }
 
     /// Every vision tensor (`v.`, `mm.` except the audio embedder's
-    /// `mm.a.`) is bound.
+    /// `mm.a.`) is bound and every `clip.*` metadata key is accounted for.
     fn finish(self) -> Result<(), Error> {
+        self.meta.finish()?;
         let vision =
             |name: &&str| name.starts_with("v.") || (name.starts_with("mm.") && !name.starts_with("mm.a."));
         if let Some(name) = self.tensors.unbound().find(vision) {
@@ -150,38 +117,20 @@ pub fn describe_projector(
         &[("gemma4v", Form::Encoder), ("gemma4uv", Form::Unified)],
         output_hidden,
     )?;
-    for (_, entry) in architecture_keys(directory, PROJECTOR_ARCHITECTURE) {
-        let known = IGNORED_PREFIXES
-            .iter()
-            .any(|prefix| entry.name.starts_with(prefix))
-            || [
-                "clip.has_vision_encoder",
-                "clip.vision.projector_type",
-                "clip.vision.projection_dim",
-                "clip.vision.image_size",
-                "clip.vision.patch_size",
-                "clip.vision.embedding_length",
-                "clip.vision.feed_forward_length",
-                "clip.vision.block_count",
-                "clip.vision.attention.head_count",
-                "clip.vision.attention.layer_norm_epsilon",
-                "clip.vision.image_mean",
-                "clip.vision.image_std",
-            ]
-            .contains(&entry.name.as_str());
-        if !known {
-            return Err(invalid(format!(
-                "unknown projector metadata key {:?}",
-                entry.name
-            )));
-        }
-    }
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.vision.projector_type");
+    meta.ignore("clip.vision.image_size");
+    // The audio encoder's keys describe a component that is not interpreted.
+    meta.ignore("clip.has_audio_encoder");
+    meta.ignore_prefix("clip.audio.");
+    // Declared, and the target's (`projector_type`).
+    meta.integer("clip.vision.projection_dim")?;
     let mut reader = Reader {
         directory,
+        meta,
         tensors: Tensors::new(directory),
     };
-    // Declared, and the target's (`projector_type`).
-    reader.unsigned("clip.vision.projection_dim")?;
     let description = match form {
         Form::Encoder => encoder(&mut reader, output_hidden)?,
         Form::Unified => unified(&mut reader, output_hidden)?,
@@ -197,13 +146,17 @@ pub fn describe_projector(
 /// blocks, 3×3 average pooling × √C, an optional standardization, an
 /// unweighted RMS and one linear.
 fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescription>, Error> {
-    let hidden = reader.unsigned("clip.vision.embedding_length")?;
-    let intermediate = reader.unsigned("clip.vision.feed_forward_length")?;
-    let depth = reader.unsigned("clip.vision.block_count")?;
-    let heads = reader.unsigned("clip.vision.attention.head_count")?;
-    let patch = reader.unsigned("clip.vision.patch_size")?;
-    let epsilon = reader.number("clip.vision.attention.layer_norm_epsilon")?;
-    if heads == 0 || hidden % heads != 0 || (hidden / heads) % 4 != 0 || patch == 0 {
+    reader.meta.ignore("clip.vision.image_mean");
+    reader.meta.ignore("clip.vision.image_std");
+    let hidden = reader.meta.integer("clip.vision.embedding_length")?;
+    let intermediate = reader.meta.integer("clip.vision.feed_forward_length")?;
+    let depth = reader.meta.bounded_block_count("clip.vision.block_count")?;
+    let heads = reader.meta.integer("clip.vision.attention.head_count")?;
+    let patch = reader.meta.integer("clip.vision.patch_size")?;
+    let epsilon = reader
+        .meta
+        .positive_number("clip.vision.attention.layer_norm_epsilon")?;
+    if hidden % heads != 0 || (hidden / heads) % 4 != 0 {
         return Err(invalid("projector heads do not split into 2-D rotary heads"));
     }
     let width = hidden / heads;
@@ -213,7 +166,7 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescript
         weight: Some(weight),
         epsilon,
     };
-    let mut blocks = Vec::new();
+    let mut blocks = Vec::with_capacity(depth as usize);
     for index in 0..depth {
         let p = format!("v.blk.{index}.");
         let query = reader.linear(&format!("{p}attn_q"), hidden, hidden)?;
@@ -330,12 +283,16 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescript
 /// the converter stores its columns), a linear with bias, a layer norm, the
 /// per-axis position tables, a layer norm, an unweighted RMS and one linear.
 fn unified(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescription>, Error> {
-    let hidden = reader.unsigned("clip.vision.embedding_length")?;
-    let epsilon = reader.number("clip.vision.attention.layer_norm_epsilon")?;
-    if reader.unsigned("clip.vision.block_count")? != 0 {
+    reader.meta.ignore("clip.vision.feed_forward_length");
+    reader.meta.ignore("clip.vision.attention.head_count");
+    let hidden = reader.meta.integer("clip.vision.embedding_length")?;
+    let epsilon = reader
+        .meta
+        .positive_number("clip.vision.attention.layer_norm_epsilon")?;
+    if reader.meta.count("clip.vision.block_count")? != 0 {
         return Err(invalid("a unified Gemma projector has no encoder blocks"));
     }
-    let patch = reader.unsigned("clip.vision.patch_size")? * POOLING;
+    let patch = reader.meta.integer("clip.vision.patch_size")? * POOLING;
     let pixels = product(&[3, patch, patch])?;
     let layer_norm = |reader: &mut Reader, stem: &str, width| -> Result<VisionNorm, Error> {
         Ok(VisionNorm::Layer {
@@ -362,8 +319,8 @@ fn unified(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescript
                 max_patches: SOFT_TOKENS,
             },
             resampling: VisionResampling::Bicubic,
-            mean: reader.triple("clip.vision.image_mean")?,
-            std: reader.triple("clip.vision.image_std")?,
+            mean: reader.meta.f64_array("clip.vision.image_mean")?,
+            std: reader.meta.f64_array("clip.vision.image_std")?,
             channels: 3,
             patch,
             merge: 1,

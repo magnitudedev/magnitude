@@ -65,6 +65,10 @@ enum DownloadAttempt {
     },
 }
 
+/// Maximum number of terminal (completed/failed/cancelled) model downloads retained in memory.
+/// Active downloads and all attempt records referenced by retained downloads are always preserved.
+const MAX_RETAINED_TERMINAL_DOWNLOADS: usize = 128;
+
 #[derive(Clone)]
 pub struct ManagedModelDownloads {
     manager: Arc<ManagedModelStore>,
@@ -365,9 +369,18 @@ impl ManagedModelDownloads {
             Some(projected)
         };
         if download.is_some() {
+            self.prune_terminal_records();
             self.invalidate();
         }
         Ok(StartModelDownloadResponse { download })
+    }
+
+    fn prune_terminal_records(&self) {
+        let (Ok(mut records), Ok(mut downloads)) = (self.records.write(), self.downloads.write())
+        else {
+            return;
+        };
+        prune_terminal_maps(&mut records, &mut downloads, MAX_RETAINED_TERMINAL_DOWNLOADS);
     }
 
     fn update(&self, id: &DownloadAttemptId, attempt: DownloadAttempt) {
@@ -462,6 +475,7 @@ impl ManagedModelDownloads {
                 self.stop_failed_bundle_work(&id).await;
             }
             if is_terminal {
+                self.prune_terminal_records();
                 terminal = true;
                 break;
             }
@@ -478,13 +492,16 @@ impl ManagedModelDownloads {
                 },
             );
             self.stop_failed_bundle_work(&id).await;
+            self.prune_terminal_records();
         }
     }
 
     /// A model download fails as a whole when one of its packages fails. Its other package work is
     /// stopped like a cancellation, so a retry admits fresh work instead of joining an attempt that
-    /// belongs to the failed occurrence.
+    /// belongs to the failed occurrence. Serialized with `self.starts` so a delayed stop cannot
+    /// cancel a newly-admitted retry for the same package.
     async fn stop_failed_bundle_work(&self, failed: &DownloadAttemptId) {
+        let _start_guard = self.starts.lock().await;
         let siblings = {
             let (Ok(attempts), Ok(downloads)) = (self.records.read(), self.downloads.read()) else {
                 return;
@@ -518,6 +535,42 @@ impl ManagedModelDownloads {
             }
         }
     }
+}
+
+fn prune_terminal_maps(
+    records: &mut BTreeMap<DownloadAttemptId, AttemptRecord>,
+    downloads: &mut BTreeMap<ModelDownloadId, DownloadRecord>,
+    max_terminal: usize,
+) {
+    let mut terminal_downloads = downloads
+        .values()
+        .filter(|record| {
+            !matches!(
+                model_download(record, records).state,
+                ModelDownloadState::Pending { .. } | ModelDownloadState::Downloading { .. }
+            )
+        })
+        .map(|record| (record.sequence, record.id.clone()))
+        .collect::<Vec<_>>();
+    if let Some(excess) = terminal_downloads.len().checked_sub(max_terminal)
+        && excess > 0
+    {
+        terminal_downloads.sort_by_key(|(sequence, _)| *sequence);
+        for (_, id) in terminal_downloads.into_iter().take(excess) {
+            downloads.remove(&id);
+        }
+    }
+    let referenced = downloads
+        .values()
+        .flat_map(|record| record.attempt_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    records.retain(|id, record| {
+        referenced.contains(id)
+            || matches!(
+                record.attempt,
+                DownloadAttempt::Pending { .. } | DownloadAttempt::Downloading { .. }
+            )
+    });
 }
 
 fn bundle_packages(bundle: &ServableModelBundle) -> Vec<&ModelPackage> {
@@ -810,6 +863,9 @@ impl ModelDownloads for ManagedModelDownloads {
     fn cancel(&self, id: &ModelDownloadId) -> BoxFuture<'_, Result<ModelDownload, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
+            // Serialize with `start_requested` so a stale cancel cannot kill a newly-started
+            // retry for the same package.
+            let _start_guard = self.starts.lock().await;
             let (record, unshared_attempt_ids) = {
                 let attempts = self.records.read().map_err(|_| {
                     InventoryError::Internal("download registry lock poisoned".to_owned())
@@ -893,6 +949,8 @@ impl ModelDownloads for ManagedModelDownloads {
             })?;
             let download = model_download(&record, &attempts);
             drop(attempts);
+            self.prune_terminal_records();
+            drop(_start_guard);
             self.invalidate();
             Ok(download)
         })
@@ -1308,5 +1366,62 @@ mod tests {
                 total_bytes: 20,
             }
         );
+    }
+
+    #[test]
+    fn terminal_record_pruning_caps_terminal_downloads_and_drops_unreferenced_attempts() {
+        let pkg = package("package_test", 10);
+        let mut records = BTreeMap::new();
+        let mut downloads = BTreeMap::new();
+        for index in 0..135_u64 {
+            let attempt_id = DownloadAttemptId(format!("attempt_{index:03}"));
+            let download_id = ModelDownloadId(format!("download_{index:03}"));
+            let attempt = if index == 0 || index == 134 {
+                DownloadAttempt::Pending {
+                    id: attempt_id.clone(),
+                    package_id: pkg.id.clone(),
+                }
+            } else {
+                DownloadAttempt::Completed {
+                    id: attempt_id.clone(),
+                    package_id: pkg.id.clone(),
+                }
+            };
+            records.insert(
+                attempt_id.clone(),
+                AttemptRecord {
+                    attempt,
+                    package: pkg.clone(),
+                    sequence: index + 1,
+                },
+            );
+            downloads.insert(
+                download_id.clone(),
+                DownloadRecord {
+                    id: download_id,
+                    bundle: ServableModelBundle::Standalone {
+                        package: pkg.clone(),
+                    },
+                    for_model: test_model(),
+                    attempt_ids: vec![attempt_id],
+                    cancelled: false,
+                    failure_acknowledged: false,
+                    sequence: index + 1,
+                },
+            );
+        }
+
+        prune_terminal_maps(&mut records, &mut downloads, MAX_RETAINED_TERMINAL_DOWNLOADS);
+
+        // 2 active (0, 134) + 128 newest terminal (6..=133) = 130 retained.
+        assert_eq!(downloads.len(), MAX_RETAINED_TERMINAL_DOWNLOADS + 2);
+        assert_eq!(records.len(), MAX_RETAINED_TERMINAL_DOWNLOADS + 2);
+        assert!(downloads.contains_key(&ModelDownloadId("download_000".to_owned())));
+        assert!(downloads.contains_key(&ModelDownloadId("download_134".to_owned())));
+        assert!(!downloads.contains_key(&ModelDownloadId("download_001".to_owned())));
+        assert!(!downloads.contains_key(&ModelDownloadId("download_005".to_owned())));
+        assert!(downloads.contains_key(&ModelDownloadId("download_006".to_owned())));
+        assert!(!records.contains_key(&DownloadAttemptId("attempt_005".to_owned())));
+        assert!(records.contains_key(&DownloadAttemptId("attempt_006".to_owned())));
     }
 }

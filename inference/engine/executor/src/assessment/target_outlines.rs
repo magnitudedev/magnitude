@@ -59,7 +59,7 @@ fn every_served_target_outlines_its_family_as_its_load_lays_it_out(backend: Back
                 .unwrap_or_else(|error| panic!("{name}: its catalog draft binds: {error}"));
             let manifest = ComponentManifest {
                 files: vec![ComponentFile {
-                    path: draft.path.clone(),
+                    path: draft.file().to_path_buf(),
                     size: directory.tensors.iter().map(|tensor| tensor.nbytes).sum(),
                 }],
                 identity: ArtifactIdentity([9; 32]),
@@ -73,7 +73,7 @@ fn every_served_target_outlines_its_family_as_its_load_lays_it_out(backend: Back
             }
             let manifest = magnitude_artifacts::PackageManifest {
                 draft,
-                ..target_manifest(&component.path, &target, identity)
+                ..target_manifest(component.file(), &target, identity)
             };
             let layout = resident_layout(ExecutionPath::Native, backend);
             // A load need not have a resident form on every backend.

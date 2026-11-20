@@ -158,3 +158,19 @@ fn a_load_imports_what_its_first_reading_keeps() {
     assert_eq!(target_slots(room, &shape(), &charge), imported, "the first reading keeps the import");
     assert_eq!(bank_move(held_target(room, imported, 0, &shape(), &charge), imported), None, "and resizes nothing");
 }
+
+/// A transient rise spike (`guarantee > 0`) lowers `grow_room` by `2x` (`budget`
+/// drop + `guarantee`) while `hold_room` drops only once (`budget` drop): a
+/// resident bank never shrinks on the transient `2x` derivative kick and holds
+/// through two-thirds-block app jitter that old symmetric `held_target` would
+/// have shrank and bounced back 10 ms later.
+#[test]
+fn asymmetric_hold_room_stops_guarantee_derivative_kick_oscillation() {
+    let base = (132 - 8) * SLOT;
+    let jitter = SLOT * 2 / 3;
+    let hold_room = base - jitter;
+    let grow_room = base - 2 * jitter;
+    assert_eq!(held_target(grow_room, 132, 0, &shape(), &charge), 130, "symmetric target over-shrinks by 2x");
+    assert_eq!(held_target_in(hold_room, grow_room, 132, 0, &shape(), &charge), 132, "hold_room absorbs single-block jitter");
+    assert_eq!(held_target_in(base - SLOT, base - 2 * SLOT, 132, 0, &shape(), &charge), 131, "actual 1-slot drop sheds 1 slot, not 2");
+}

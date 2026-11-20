@@ -471,12 +471,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// The state the stores' holders reference: the rows and banks some
-    /// sequence or checkpoint holds (`StateStore::referenced_bytes`).
-    fn referenced_state_bytes(&self) -> u64 {
-        self.target_store.referenced_bytes() + self.head_store.as_ref().map_or(0, |store| store.referenced_bytes())
-    }
-
     /// The state the stores commit: every history and bank slab they back,
     /// whether a holder references it or not.
     pub fn committed_state_bytes(&self) -> u64 {
@@ -875,10 +869,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.resources.releasing_slots()
     }
 
-    /// At a flight boundary: the idle graph slots' release, once the load's
-    /// release thread has ended it (`AllocatedResources::released_slots`);
-    /// none while it runs.
+    /// At a flight boundary: drain any settled owed blocks from the state
+    /// pools (so fenced granules from an earlier state shrink or rollback
+    /// vacate on the next boundary once their flight ends) and poll the idle
+    /// graph slots' release (`AllocatedResources::released_slots`).
     pub fn advance_slot_release(&mut self) -> Option<crate::resources::SlotsReleased> {
+        let changes = self.resources.ledgers().changes().clone();
+        for pool in std::iter::once(self.target_store.pool()).chain(self.head_store.as_ref().map(|store| store.pool())) {
+            if pool.owed() > 0 {
+                if let Err(error) = changes.change(|_| pool.return_freed(0)) {
+                    tracing::error!(%error, "state pool could not drain settled owed blocks");
+                }
+            }
+        }
         self.resources.released_slots()
     }
 
@@ -988,8 +991,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     | crate::resources::AllocationError::Workflow(seismic::WorkflowError::TensorView(error)),
                 ) => match growth_failure(error, on_device, "a prompt group's class") {
                     // The device refused the bytes: the group runs with one
-                    // place, what was allocated idling until released.
-                    DomainError::Capacity(_) => Ok(()),
+                    // place; fit any partially allocated claims and idle them
+                    // as `CacheKind::GraphSlots` so `release_idle_slots` can
+                    // reclaim them instead of stranding them.
+                    DomainError::Capacity(_) => {
+                        let mut claims = class.into_claims();
+                        claims.iter_mut().for_each(crate::memory::ledger::Claim::fit_allocated);
+                        let allocated: Vec<_> = claims.into_iter().filter(|claim| claim.bytes() > 0).collect();
+                        if !allocated.is_empty() {
+                            self.idle_class.idle(allocated);
+                        }
+                        Ok(())
+                    }
                     error => Err(error),
                 },
                 Err(error) => Err(DomainError::invariant(error.to_string())),
@@ -1269,13 +1282,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 /// the state stores' first slabs, which construction backs as granules
 /// within it.
 pub fn request_slot_bytes(execution: &ExecutionPlan) -> Result<u64, String> {
-    let resources = execution.resources();
-    let initial = resources
-        .head_state()
-        .map_or(Ok(0), |state| state.initial_slab_bytes())
-        .and_then(|head| resources.target_state().initial_slab_bytes().map(|target| target + head))?;
-    let opening = crate::memory::ledger::LoadShape::of(execution).state_bytes(crate::memory::ledger::RequestRows::of(execution).opening(0));
-    Ok(opening.max(initial))
+    Ok(execution.resources().request_slot_bytes())
 }
 
 /// The row a sequence's state claim reaches through a group that advances
@@ -1300,7 +1307,7 @@ pub(super) struct IdleClass(Vec<crate::memory::ledger::Cached>);
 impl IdleClass {
     /// Idle `claims`, a class's committed in place, as cache.
     pub(super) fn idle(&mut self, claims: impl IntoIterator<Item = crate::memory::ledger::Claim>) {
-        self.0.extend(claims.into_iter().map(|claim| claim.into_cache(crate::memory::ledger::CacheKind::GraphSlots)));
+        self.0.extend(claims.into_iter().map(|claim| claim.into_cache(crate::memory::ledger::CacheKind::GraphSlots, crate::memory::ledger::Reclaim::Deferred)));
     }
 
     /// Whether a claim took any of the slots' cache in process: they then
@@ -1356,8 +1363,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let changed = change(self, keeping);
             // The slabs alone: the stores' address tables are committed by
             // their own claim, never room the reservations' rows fill.
+            // Both `backed` and `referenced` are counted in pool slab granules
+            // so `written`, `prefix`, and `spare` share one unit.
             let backed = self.target_store.backed_slab_bytes() + self.head_store.as_ref().map_or(0, |store| store.backed_slab_bytes());
-            let referenced = self.referenced_state_bytes();
+            let referenced = self.target_store.referenced_slab_bytes() + self.head_store.as_ref().map_or(0, |store| store.referenced_slab_bytes());
             let ledger = self.resources.ledgers().device();
             let written = self
                 .state_claims
@@ -1442,7 +1451,11 @@ impl SlabCache {
         }
         // Refused where the room is held already, so not held twice.
         if bytes > held {
-            self.held.extend(ledger.cache(self.kind, bytes - held).ok());
+            let reclaim = match self.kind {
+                crate::memory::ledger::CacheKind::Spare => crate::memory::ledger::Reclaim::Unbacked,
+                _ => crate::memory::ledger::Reclaim::Deferred,
+            };
+            self.held.extend(ledger.cache(self.kind, bytes - held, reclaim).ok());
         }
         self.held.retain(|cached| cached.bytes() > 0);
         self.settled = self.held();
@@ -1511,7 +1524,7 @@ impl StateSlabs {
         let within = spare.min(room);
         self.unbacked = room - within;
         if let Some(pending) = self.pending.take() {
-            let cached = pending.into_backed_cache(crate::memory::ledger::CacheKind::Spare);
+            let cached = pending.into_backed_cache(crate::memory::ledger::CacheKind::Spare, crate::memory::ledger::Reclaim::Unbacked);
             self.spare.held.push(cached);
         }
         self.prefix.settle(ledger, prefix);

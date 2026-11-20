@@ -185,14 +185,9 @@ fn bundle_parts(
 
 /// A package's primary weights file: the sole weights file, or the first shard.
 fn primary_weights(package: &ModelPackage) -> Result<&ModelFile, InventoryError> {
-    package
-        .files
-        .iter()
-        .filter(|file| file.role == ModelFileRole::Weights)
-        .min_by(|left, right| left.path.cmp(&right.path))
-        .ok_or_else(|| {
-            InventoryError::Integrity(format!("package {} has no weights", package.id.0))
-        })
+    package.primary_weights().ok_or_else(|| {
+        InventoryError::Integrity(format!("package {} has no weights", package.id.0))
+    })
 }
 
 fn acquired(snapshot: &Path, file: &ModelFile) -> AcquiredFile {

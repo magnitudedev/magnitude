@@ -10,18 +10,63 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// A pooled store's records of one routed tensor, resolved on demand so no
+/// slab view stays pinned while the record is idle (which would block the
+/// pool from vacating its block on a shrink).
+pub(crate) trait RecordStore: Send + Sync {
+    /// A view of `record`, or `None` where the store holds no slab for it.
+    fn view(&self, record: u64) -> Option<Tensor>;
+    /// One past the highest backed record index.
+    fn count(&self) -> u64;
+}
+
+/// One held record view: keeps the slab's [`Tensor`] (and thus its granule
+/// hold) alive for the duration of an active host read or write, and drops
+/// it once done so the pool may vacate its block.
+pub(crate) struct HeldRecord(Arc<Record>);
+
+impl HeldRecord {
+    pub fn as_ptr(&self) -> *const u8 {
+        self.0.base.as_ptr()
+    }
+
+    /// Where this record begins in host memory.
+    pub fn address(&self) -> NonNull<u8> {
+        self.0.base
+    }
+
+    /// The first `bytes` of this record, to read.
+    ///
+    /// # Safety
+    ///
+    /// No read lands in the record, and no device work writes it, while the
+    /// slice lives.
+    pub unsafe fn as_slice(&self, bytes: u64) -> &[u8] {
+        assert!(bytes <= self.0.bytes, "{bytes} bytes of record of {}", self.0.bytes);
+        // SAFETY: the record lies within the host-shared view `self` keeps
+        // alive, and the caller excludes every writer.
+        unsafe { std::slice::from_raw_parts(self.0.base.as_ptr(), bytes as usize) }
+    }
+}
+
 /// Records the host addresses: reads land in them, landings convert into
 /// them, copies and the CPU site read them. Each is a view the host
 /// addresses of at least `bytes` bytes, by record index, or a hole where its
 /// store holds no storage for it: a record's place never matters, so the
 /// records of a store that allows holes are addressed as they are. Shared:
-/// each clone, and each read's request, holds the views they lie in.
+/// fixed sets hold their views for their life, while pooled sets resolve
+/// slab views on demand so idle slabs remain movable by pool compaction.
 #[derive(Clone)]
 pub(crate) struct Records(Arc<Set>);
 
+enum Backing {
+    Fixed(Vec<Option<Arc<Record>>>),
+    Pooled(Arc<dyn RecordStore>),
+}
+
 struct Set {
     bytes: u64,
-    records: Vec<Option<Arc<Record>>>,
+    backing: Backing,
 }
 
 /// One record's memory: its view, which keeps it alive, and where the host
@@ -62,7 +107,13 @@ impl Records {
     /// refused unless it holds `bytes` and the host addresses it.
     pub fn new(views: Vec<Option<Tensor>>, bytes: u64) -> Result<Self, String> {
         let records = views.into_iter().map(|view| view.map(|view| Record::of(view, bytes)).transpose()).collect::<Result<_, _>>()?;
-        Ok(Self(Arc::new(Set { bytes, records })))
+        Ok(Self(Arc::new(Set { bytes, backing: Backing::Fixed(records) })))
+    }
+
+    /// Records of `bytes` each resolved on demand from `store`: holds no
+    /// slab views while idle so the pool can vacate its blocks on shrink.
+    pub fn pooled(store: Arc<dyn RecordStore>, bytes: u64) -> Self {
+        Self(Arc::new(Set { bytes, backing: Backing::Pooled(store) }))
     }
 
     /// `tensor`'s `count` leading rows as records of `bytes` each, one after
@@ -79,15 +130,19 @@ impl Records {
     }
 
     /// These records, record `record` (a hole, or past every record) now
-    /// `view`, or a hole where none: a growth's, or an eviction's.
+    /// `view`, or a hole where none: a growth's, or an eviction's. A pooled
+    /// set resolves live slabs on demand and needs no replacement.
     pub fn with(&self, record: u64, view: Option<Tensor>) -> Result<Self, String> {
-        let mut records = self.0.records.clone();
+        let Backing::Fixed(existing) = &self.0.backing else {
+            return Ok(self.clone());
+        };
+        let mut records = existing.clone();
         let index = usize::try_from(record).map_err(|_| "a record index exceeds the host")?;
         if index >= records.len() {
             records.resize(index + 1, None);
         }
         records[index] = view.map(|view| Record::of(view, self.0.bytes)).transpose()?;
-        Ok(Self(Arc::new(Set { bytes: self.0.bytes, records })))
+        Ok(Self(Arc::new(Set { bytes: self.0.bytes, backing: Backing::Fixed(records) })))
     }
 
     /// The bytes of one record.
@@ -97,47 +152,55 @@ impl Records {
 
     /// One past the last record, a hole or not.
     pub fn count(&self) -> u64 {
-        self.0.records.len() as u64
+        match &self.0.backing {
+            Backing::Fixed(records) => records.len() as u64,
+            Backing::Pooled(store) => store.count(),
+        }
     }
 
     /// Whether record `record` is held: no hole.
     pub fn holds(&self, record: u64) -> bool {
-        self.held(record).is_some()
+        match &self.0.backing {
+            Backing::Fixed(records) => usize::try_from(record).ok().and_then(|record| records.get(record)).and_then(Option::as_ref).is_some(),
+            Backing::Pooled(store) => store.view(record).is_some(),
+        }
     }
 
-    fn held(&self, record: u64) -> Option<&Arc<Record>> {
-        usize::try_from(record).ok().and_then(|record| self.0.records.get(record)).and_then(Option::as_ref)
+    /// Hold record `record`'s view for the duration of an active host read
+    /// or write, resolving on demand for pooled records.
+    pub fn hold(&self, record: u64) -> HeldRecord {
+        match &self.0.backing {
+            Backing::Fixed(records) => {
+                let held = usize::try_from(record)
+                    .ok()
+                    .and_then(|record| records.get(record))
+                    .and_then(Option::as_ref)
+                    .unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count()));
+                HeldRecord(held.clone())
+            }
+            Backing::Pooled(store) => {
+                let tensor = store.view(record).unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count()));
+                let held = Record::of(tensor, self.0.bytes)
+                    .unwrap_or_else(|error| panic!("invariant violated: pooled record {record} is not host-addressable: {error}"));
+                HeldRecord(held)
+            }
+        }
     }
 
-    fn at(&self, record: u64) -> &Arc<Record> {
-        self.held(record).unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count()))
+    /// The view record `record` lies in: what a device copy or landing
+    /// holds while in flight.
+    pub fn tensor(&self, record: u64) -> Tensor {
+        match &self.0.backing {
+            Backing::Fixed(records) => usize::try_from(record)
+                .ok()
+                .and_then(|record| records.get(record))
+                .and_then(Option::as_ref)
+                .unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count()))
+                .tensor
+                .clone(),
+            Backing::Pooled(store) => store.view(record).unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count())),
+        }
     }
-
-    /// The view record `record` lies in: what a device copy reads or writes.
-    pub fn tensor(&self, record: u64) -> &Tensor {
-        &self.at(record).tensor
-    }
-
-    /// The first `bytes` of record `record`, to read.
-    ///
-    /// # Safety
-    ///
-    /// No read lands in the record, and no device work writes it, while the
-    /// slice lives.
-    pub unsafe fn record(&self, record: u64, bytes: u64) -> &[u8] {
-        let held = self.at(record);
-        assert!(bytes <= held.bytes, "{bytes} bytes of record {record} of {}", held.bytes);
-        // SAFETY: the record lies within the host-shared view `self` keeps
-        // alive, and the caller excludes every writer.
-        unsafe { std::slice::from_raw_parts(held.base.as_ptr(), bytes as usize) }
-    }
-
-    /// Where record `record` begins in host memory: what a writer of part
-    /// of it (one piece of a landing's conversion) writes through.
-    pub fn address(&self, record: u64) -> NonNull<u8> {
-        self.at(record).base
-    }
-
 }
 
 /// One range of a model file read into a record: `bytes` at `offset` of
@@ -403,7 +466,7 @@ impl ExpertSource {
         for (at, read) in reads.into_iter().enumerate() {
             let (ranges, served) = &mut by_file[read.file];
             served.push((at, read.file, read.offset, read.bytes));
-            let into: Arc<dyn seismic_io::Destination> = read.into.at(read.record).clone();
+            let into: Arc<dyn seismic_io::Destination> = read.into.hold(read.record).0;
             ranges.push(Range { offset: read.offset, length: read.bytes, into, at: read.within as usize });
         }
         let mut requests = Vec::new();
@@ -496,8 +559,8 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         assert!(matches!(landed.wait_until(deadline), Some(Outcome::Read)));
         // SAFETY: the job has ended, and no device work touches the records.
-        assert!(unsafe { records.record(0, RECORD) } == &bytes[RECORD as usize..], "record 0 holds the file's second half");
-        assert!(unsafe { records.record(1, RECORD) } == &bytes[..RECORD as usize], "record 1 holds its first half");
+        assert!(unsafe { records.hold(0).as_slice(RECORD) } == &bytes[RECORD as usize..], "record 0 holds the file's second half");
+        assert!(unsafe { records.hold(1).as_slice(RECORD) } == &bytes[..RECORD as usize], "record 1 holds its first half");
         drop(landed);
         std::fs::remove_file(path).unwrap();
     }
@@ -673,7 +736,7 @@ mod tests {
         // Each sink's slots' addresses.
         let sinks = [
             ("heap", (0..slots).map(|slot| heap.as_ptr() as usize + (slot * record) as usize).collect::<Vec<_>>()),
-            ("bank", (0..slots).map(|slot| bank.address(slot).as_ptr() as usize).collect()),
+            ("bank", (0..slots).map(|slot| bank.hold(slot).address().as_ptr() as usize).collect()),
         ];
         for round in 0..2 {
             for (name, sink) in &sinks {
@@ -739,7 +802,7 @@ mod tests {
         let reader = Arc::new(Reader::open_urgent(&model.path, CachePolicy::Uncached, &model.urgent()).unwrap());
         let device = cuda();
         let (bank, _pooled) = model.bank(&device);
-        let sink = (0..2 * model.read as u64).map(|slot| bank.address(slot).as_ptr() as usize).collect::<Vec<_>>();
+        let sink = (0..2 * model.read as u64).map(|slot| bank.hold(slot).address().as_ptr() as usize).collect::<Vec<_>>();
         let spin = |length: Duration| {
             let began = Instant::now();
             while began.elapsed() < length {

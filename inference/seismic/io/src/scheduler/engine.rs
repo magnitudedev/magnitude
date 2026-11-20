@@ -167,6 +167,8 @@ impl Engine {
                 let mut left = self.returned.lock().expect("returned reads");
                 left.push(returned);
                 self.left.store(left.len(), Ordering::Release);
+                drop(left);
+                self.work.notify_one();
             }
             Err(TryLockError::Poisoned(_)) => panic!("read queue poisoned"),
         }
@@ -261,10 +263,12 @@ struct Pool {
     devices: HashMap<Volume, Device>,
 }
 
-/// One claim on the pool ([`Need`]): its volume (a device) and its pieces
-/// queued or in flight, shared with its need.
+/// One claim on the pool ([`Need`]): its volume (a device), its own device
+/// shape and peak piece count, and its pieces queued or in flight, shared
+/// with its need.
 struct Claim {
     volume: Volume,
+    device: Device,
     live: Arc<AtomicUsize>,
 }
 
@@ -295,6 +299,14 @@ impl Device {
         }
     }
 
+    /// Fold another claim's bounds into this device's aggregate bounds.
+    fn merge(&mut self, other: &Device) {
+        self.due = self.due.max(other.due);
+        self.knee = self.knee.max(other.knee);
+        self.smallest = self.smallest.min(other.smallest);
+        self.depth = self.depth.max(other.depth);
+    }
+
     /// The pieces its links can hold in flight at once: their due pieces
     /// join the due bytes in flight up to the due depth and their pieces
     /// read ahead join those up to the knee, each kind's first past it
@@ -318,21 +330,22 @@ impl Pool {
         let claimed = Device::of(&volume.shape);
         self.devices
             .entry(volume.id)
-            .and_modify(|device| {
-                device.due = device.due.max(claimed.due);
-                device.knee = device.knee.max(claimed.knee);
-                device.smallest = device.smallest.min(claimed.smallest);
-                device.depth = device.depth.max(claimed.depth);
-            })
+            .and_modify(|device| device.merge(&claimed))
             .or_insert(claimed);
-        self.needs.insert(id, Claim { volume: volume.id, live });
+        self.needs.insert(id, Claim { volume: volume.id, device: claimed, live });
         id
     }
 
     /// Claim `id` submitted pieces, the smallest `smallest` bytes: its
     /// device's most pieces queued or in flight at once, over its claims.
     fn submitted(&mut self, id: u64, smallest: Option<u64>) {
-        let volume = self.needs.get(&id).expect("a live need's claim").volume;
+        let claim = self.needs.get_mut(&id).expect("a live need's claim");
+        let volume = claim.volume;
+        let claim_live = claim.live.load(Ordering::Acquire);
+        claim.device.most = claim.device.most.max(claim_live);
+        if let Some(smallest) = smallest {
+            claim.device.smallest = claim.device.smallest.min(smallest);
+        }
         let live = self
             .needs
             .values()
@@ -346,13 +359,25 @@ impl Pool {
         }
     }
 
-    /// Claim `id` ended: its device, with its last claim, holds no workers.
-    /// Whether the target shrank: only a device's last claim ending, of a
-    /// device that held workers, shrinks it.
+    /// Claim `id` ended: recompute its device from the remaining claims on
+    /// that volume (or remove it if none remain). Returns whether `target()`
+    /// shrank.
     fn release(&mut self, id: u64) -> bool {
+        let before = self.target();
         let volume = self.needs.remove(&id).expect("a live need's claim").volume;
-        let last = !self.needs.values().any(|claim| claim.volume == volume);
-        last && self.devices.remove(&volume).is_some_and(|device| device.workers() > 0)
+        let old_most = self.devices.remove(&volume).expect("a claimed device").most;
+        let mut remaining = self.needs.values().filter(|claim| claim.volume == volume);
+        if let Some(first) = remaining.next() {
+            let mut merged = first.device;
+            let mut sum_most = first.device.most;
+            for claim in remaining {
+                merged.merge(&claim.device);
+                sum_most = sum_most.saturating_add(claim.device.most);
+            }
+            merged.most = sum_most.min(old_most);
+            self.devices.insert(volume, merged);
+        }
+        self.target() < before
     }
 
     /// The workers the devices' links can hold in flight at once
@@ -407,7 +432,11 @@ impl Need {
         let mut pool = self.engine.pool.lock().expect("read pool");
         self.live.fetch_add(pieces.len(), Ordering::AcqRel);
         pool.submitted(self.id, pieces.iter().map(|piece| piece.end - piece.start).min());
-        self.engine.grow(pool)
+        let result = self.engine.grow(pool);
+        if result.is_err() {
+            self.live.fetch_sub(pieces.len(), Ordering::AcqRel);
+        }
+        result
     }
 
     /// `count` of its pieces ended: each once, where the queue counts it
@@ -455,6 +484,10 @@ fn work(engine: &'static Engine, flight: &InFlight) {
                 if engine.retire() {
                     engine.flights.lock().expect("read workers' flights").retain(|other| !Arc::ptr_eq(other, flight));
                     return;
+                }
+                if engine.left.load(Ordering::Acquire) != 0 {
+                    engine.end_returned(&mut queue);
+                    continue;
                 }
                 queue = engine.work.wait(queue).expect("read queue");
                 engine.end_returned(&mut queue);
@@ -508,10 +541,10 @@ fn work(engine: &'static Engine, flight: &InFlight) {
                 Err(failed) => failed,
             })
         });
-        match read {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match read {
             Ok(failed) => taken.state.pieces_ended(1, failed, None),
             Err(panic) => taken.state.pieces_ended(1, [], Some(panic)),
-        }
+        }));
     }
 }
 
@@ -678,5 +711,27 @@ mod tests {
         assert_eq!(buffers.bytes(), 0);
         buffers.give(buffers.take(1));
         assert_eq!(buffers.bytes(), 0, "no reader is open");
+    }
+
+    /// Releasing a deeper claim on a shared volume shrinks `target()` to what
+    /// the remaining smaller claim actually needs rather than staying pinned
+    /// at the departed claim's depth.
+    #[test]
+    fn releasing_a_deeper_claim_shrinks_target_while_smaller_claim_remains() {
+        let mut pool = Pool::default();
+        let small_volume = VolumeReads {
+            id: Volume(1),
+            shape: Shape { due: 2 * MIB, knee: 2 * MIB, due_read: 512 * KIB, ahead_read: 2 * MIB, cores: 0.25 },
+        };
+        let (big_live, small_live) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let big = pool.claim(&decode(1), big_live.clone());
+        let small = pool.claim(&small_volume, small_live.clone());
+        assert_eq!(submit(&mut pool, big, &big_live, 100, 512 * KIB), 68);
+        assert_eq!(submit(&mut pool, small, &small_live, 10, 512 * KIB), 0);
+        assert_eq!(pool.target(), 68);
+        assert!(pool.release(big), "dropping the deeper claim must shrink target");
+        assert_eq!(pool.target(), 6, "remaining claim needs 4 due + 1 knee + 1 = 6 workers");
+        assert!(pool.release(small));
+        assert_eq!(pool.target(), 0);
     }
 }

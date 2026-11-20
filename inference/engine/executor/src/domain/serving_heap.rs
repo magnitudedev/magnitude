@@ -7,11 +7,18 @@
 //! the seconds its holding saves per byte, counted over its uses since it
 //! was retained and never decayed, the order the ledger takes cache in.
 
-use super::{BankHolding, BankStep, DomainError, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
+use super::{BankHolding, BankStep, DomainError, ExogenousShrink, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
 use crate::experts::derived::BankMove;
 use crate::memory::ledger::{CacheKind, Cached, Claim, CommittedKind, Keeping, Value};
 use magnitude_cost_model::WorkloadRates;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Cooldown after an exogenous bank shrink before a modest room recovery can
+/// regrow, damping desktop app allocation/GC ping-pong while letting large exits
+/// or freed own-claims regrow immediately.
+const EXOGENOUS_REGROW_COOLDOWN: Duration = Duration::from_secs(3);
+const REBOUND_MARGIN_MIN: u64 = 512 * (1 << 20);
+const PARTIAL_GROW_MIN_CAP: u64 = 256 * (1 << 20);
 
 /// What the form and depth of a decode launch's guessed rows are decided
 /// on ([`ExecutorDomain::two_row_pricing`]): the decode's passes as the
@@ -209,7 +216,7 @@ impl IdleComponent {
             OptionalComponent::Drafter => CacheKind::Drafter,
             OptionalComponent::Vision => CacheKind::Vision,
         };
-        let cache = |claims: Vec<Claim>| claims.into_iter().map(|claim| claim.into_cache(kind)).collect::<Vec<_>>();
+        let cache = |claims: Vec<Claim>| claims.into_iter().map(|claim| claim.into_cache(kind, crate::memory::ledger::Reclaim::Deferred)).collect::<Vec<_>>();
         (!weights.is_empty() || !binding.is_empty()).then(|| Self { component, weights: cache(weights), binding: cache(binding) })
     }
 
@@ -243,10 +250,41 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The one resize toward `bank`'s derived targets
-    /// (`experts::derived::next_move`), at the decode's price now: the
-    /// targets the domain reports (`Self::derive_bank`).
+    /// (`experts::derived::next_move`), at the decode's price now: filters out
+    /// sub-noise partial grows on small-slot banks and post-shrink ping-pong
+    /// rebounds while letting shrinks, saturation grows, own-claim frees, and
+    /// large exogenous releases through immediately.
     fn next_bank_move(&self, bank: &dyn super::ElasticBank) -> Result<Option<(BankHolding, BankMove)>, DomainError> {
-        self.derive_bank(bank, crate::experts::derived::next_move)
+        self.derive_bank(bank, |derived| {
+            let Some((holding, mv)) = crate::experts::derived::next_move(derived) else {
+                return None;
+            };
+            let BankMove::Grow { to } = mv else {
+                return Some((holding, mv));
+            };
+            let (target, _) = derived.iter().find(|(t, _)| t.holding == holding)?;
+            let sat = target.shape.saturation_slots();
+            let sat_charge = (target.charge)(sat);
+            let floor_charge = (target.charge)(target.shape.floor_slots());
+            let sat_cache = sat_charge.saturating_sub(floor_charge);
+            let gained = (target.charge)(to).saturating_sub((target.charge)(target.at));
+            let min_partial = target.shape.block_bytes().max((sat_charge / 64).min(PARTIAL_GROW_MIN_CAP));
+            if to < sat && gained < min_partial {
+                return None;
+            }
+            let ledger = self.resources.ledgers().of(target.tier);
+            if let Some(shrink) = self.exogenous_shrink.as_ref().filter(|s| s.store == ledger.store()) {
+                let est = ledger.estimate();
+                let own_committed_freed = est.committed() < shrink.committed;
+                let elapsed = est.at().at().saturating_duration_since(shrink.at);
+                let rebound_margin = shrink.block.saturating_mul(4).max(REBOUND_MARGIN_MIN).min(sat_cache.max(shrink.block));
+                let large_release = est.hold_room() >= shrink.hold_room.saturating_add(rebound_margin);
+                if !own_committed_freed && elapsed < EXOGENOUS_REGROW_COOLDOWN && !large_release {
+                    return None;
+                }
+            }
+            Some((holding, mv))
+        })
     }
 
     /// Begin one growth of `holding` to `to`, its derived target
@@ -257,6 +295,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let step = bank.grow(self.resources.ledgers(), holding, to, wake)?;
         if let BankStep::Begun(tier) = step {
             self.resize_held.begin(tier, started);
+            let grew_store = self.resources.ledgers().of(tier).store();
+            if self.exogenous_shrink.as_ref().is_some_and(|s| s.store == grew_store) {
+                self.exogenous_shrink = None;
+            }
         }
         Ok(step)
     }
@@ -296,6 +338,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             BankStep::Begun(tier) => {
                 self.resize_held.begin(tier, started);
                 self.shrink_step = true;
+                let block = bank
+                    .targets(self.decode_price()?.as_ref())?
+                    .into_iter()
+                    .find(|t| t.holding == holding)
+                    .map_or(0, |t| t.shape.block_bytes());
+                let ledger = self.resources.ledgers().of(tier);
+                let est = ledger.estimate();
+                self.exogenous_shrink = Some(ExogenousShrink {
+                    store: ledger.store(),
+                    at: est.at().at(),
+                    committed: est.committed(),
+                    hold_room: est.hold_room(),
+                    block,
+                });
             }
             _ => self.resize_held.hold(started, super::HeldSource::Decision),
         }
@@ -348,18 +404,34 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// A kind whose figures are not priced yet keeps the ledger's value of a
     /// new entry.
     pub fn value_cache(&mut self, prefix: Option<(u64, u64)>) -> Result<(), DomainError> {
-        let price = self.decode_price()?;
-        if let (Some(bank), Some(price), Some(held), Some(plan)) = (self.family.expert_bank(), price.as_ref(), self.held_slots()?, self.expert_bank_plan()) {
-            let floor = usize::try_from(plan.floor()).expect("invariant violated: a bank's slots exceed the host's");
-            let saved = price.step(magnitude_cost_model::HeldSlots { slots: floor.min(held.slots), ..held }).total_seconds - price.step(held).total_seconds;
-            // A bank at its floor holds no cache to value.
-            if let Some(bytes) = std::num::NonZeroU64::new(self.resources.ledgers().device().estimate().cache_of(CacheKind::Bank)) {
+        // A bank at its floor holds no cache to value; check before pricing the step.
+        let mut held_step_seconds = None;
+        if let (Some(bytes), Some(bank), Some(plan)) = (
+            std::num::NonZeroU64::new(self.resources.ledgers().device().estimate().cache_of(CacheKind::Bank)),
+            self.family.expert_bank(),
+            self.expert_bank_plan(),
+        ) {
+            if let (Some(price), Some(held)) = (self.decode_price()?, self.held_slots()?) {
+                let floor = usize::try_from(plan.floor()).expect("invariant violated: a bank's slots exceed the host's");
+                let saved = if floor.min(held.slots) == held.slots {
+                    0.0
+                } else {
+                    let at_held = price.step(held).total_seconds;
+                    held_step_seconds = Some(at_held);
+                    price.step(magnitude_cost_model::HeldSlots { slots: floor, ..held }).total_seconds - at_held
+                };
                 bank.value(Value::recompute(saved.max(0.0), self.served.decode_steps, bytes));
             }
         }
-        if let (Some(rates), Some((tokens, hits)), Some(bytes)) = (self.serving_prior()?, prefix, std::num::NonZeroU64::new(self.retained_entry_bytes())) {
-            let seconds = tokens as f64 / rates.prefill_tokens_per_s;
-            self.state_slabs.value_prefix(Value::recompute(seconds, hits, bytes));
+        if let (Some((tokens, hits)), Some(bytes)) = (prefix, std::num::NonZeroU64::new(self.retained_entry_bytes())) {
+            let rates = match held_step_seconds {
+                Some(seconds) => self.serving_prior_at(Some(seconds))?,
+                None => self.serving_prior()?,
+            };
+            if let Some(rates) = rates {
+                let seconds = tokens as f64 / rates.prefill_tokens_per_s;
+                self.state_slabs.value_prefix(Value::recompute(seconds, hits, bytes));
+            }
         }
         if let Some(read) = self.expert_measures().and_then(|measures| measures.read.measured().copied()) {
             let served = self.served;
@@ -401,7 +473,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // steps, moving no row, and the pool returns what they freed.
             let state = self.yield_state(&mut unchained)?;
             (released, returned) = (state.released, state.returned);
+            let pool = self.target_store.pool();
+            if pool.releasing() || pool.owed() > 0 {
+                pool.wake_on_release(move || wake.complete());
+                return Ok(Yielded::Pending);
+            }
             freed |= released + returned > 0;
+        }
+        if self.target_store.pool().releasing() {
+            self.target_store.pool().wake_on_release(move || wake.complete());
+            return Ok(Yielded::Pending);
         }
         if freed {
             return Ok(Yielded::Released { released, returned });
@@ -532,6 +613,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// step until the load serves its own. None before the load's step is
     /// measured.
     pub fn serving_prior(&self) -> Result<Option<WorkloadRates>, DomainError> {
+        if self.launch_prices().is_none() {
+            return Ok(None);
+        }
+        let priced = match self.family.expert_bank() {
+            Some(_) => self.decode_price()?.zip(self.held_slots()?).map(|(price, held)| price.step(held).total_seconds),
+            None => None,
+        };
+        self.serving_prior_at(priced)
+    }
+
+    fn serving_prior_at(&self, priced: Option<f64>) -> Result<Option<WorkloadRates>, DomainError> {
         let Some(prices) = self.launch_prices() else {
             return Ok(None);
         };
@@ -541,10 +633,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .launch(rows, depth)
                 .map(|forms| forms.resident)
                 .map_err(|error| DomainError::invariant(format!("the decode step: {error}")))
-        };
-        let priced = match self.family.expert_bank() {
-            Some(_) => self.decode_price()?.zip(self.held_slots()?).map(|(price, held)| price.step(held).total_seconds),
-            None => None,
         };
         let step_seconds = match priced {
             Some(seconds) => seconds,
@@ -594,6 +682,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .filter(|queued| queued.iter().map(|(request, _)| request).collect::<std::collections::BTreeSet<_>>() == launched)
         {
             return Ok(crate::FrontPass::Claim(queued.into_iter().collect()));
+        }
+        if fronted.is_empty() {
+            return Ok(crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() });
         }
         Ok(match self.two_row_pricing()? {
             Some(pricing) => pricing.built(requests, fronted)?,

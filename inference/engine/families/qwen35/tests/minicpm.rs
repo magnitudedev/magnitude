@@ -256,3 +256,58 @@ fn sixteen_images_use_atomic_digits_for_multi_token_ids() {
             .any(|tokens| tokens == [TokenId(105), TokenId(201), TokenId(200), TokenId(106)])
     );
 }
+
+/// MiniCPM expands a single image marker into ID tokens, overview span, detail
+/// slice spans, and delimiters; `prompt_position_row` maps every source
+/// boundary (including post-image message boundaries) directly to its prepared
+/// row, and two inputs with the same overview crop but different detail tilings
+/// carry distinct overview RoPE coordinates.
+#[test]
+fn minicpm_source_boundaries_and_overview_coordinates_reflect_detail_tiling() {
+    let d = definition(false);
+    let adapter = minicpm::inputs::adapter(&d, &Markers).unwrap();
+    let prompt = vec![TokenId(10), TokenId(100), TokenId(11), TokenId(12)];
+    let plan = |tokens: &[TokenId]| {
+        TokenPlan::new(tokens.to_vec(), InputLayout::new(tokens.len(), vec![]).unwrap()).unwrap()
+    };
+
+    // Unsliced image: overview only ([0, 0] detail grid).
+    let unsliced = adapter
+        .prepare(&d, plan(&prompt), &[media(&d, 1, [0, 0])])
+        .unwrap();
+    // Sliced image: identical overview crop [1, 4, 4] followed by a 2x2 detail
+    // grid of [1, 4, 4] slices (canvas [4, 4] instead of [2, 2]).
+    let sliced = adapter
+        .prepare(&d, plan(&prompt), &[media(&d, 5, [2, 2])])
+        .unwrap();
+
+    // Every source boundary maps to the exact prepared row of its token.
+    for prepared in [&unsliced, &sliced] {
+        for (source, &token) in prompt.iter().enumerate() {
+            let row = prepared.prompt_position_row(source).unwrap();
+            if token != TokenId(100) {
+                assert_eq!(prepared.tokens()[row], token);
+            }
+        }
+        assert_eq!(
+            prepared.prompt_position_row(prompt.len()),
+            Some(prepared.tokens().len())
+        );
+        assert_eq!(prepared.prompt_position_row(prompt.len() + 1), None);
+    }
+
+    // Both inputs share the same overview crop identity and overview span
+    // range, yet their overview RoPE coordinates differ because the sliced
+    // input scales overview coordinates across the 2x2 detail canvas.
+    let unsliced_overview = &unsliced.layout().spans()[0];
+    let sliced_overview = &sliced.layout().spans()[0];
+    assert_eq!(unsliced_overview, sliced_overview);
+    assert_eq!(
+        &unsliced.tokens()[..unsliced_overview.end],
+        &sliced.tokens()[..sliced_overview.end]
+    );
+    assert_ne!(
+        &unsliced.coordinates()[unsliced_overview.start..unsliced_overview.end],
+        &sliced.coordinates()[sliced_overview.start..sliced_overview.end]
+    );
+}

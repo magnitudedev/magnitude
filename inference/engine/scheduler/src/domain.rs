@@ -5,7 +5,7 @@
 //! identifies the lane the service must submit next.
 
 use magnitude_executor::{
-    Completion, CompletionWake, DomainError, DomainRequirements, GroupKey, HeadFlight, NativeFamily, Operation,
+    Completion, CompletionWake, DomainError, DomainRequirements, HeadFlight, NativeFamily, Operation,
     PendingOperationOutcome, PrimingCompletionFlight, TargetContinuation, ProgramFamily, ReservedResources, StateBindings, SubmitFailure,
     TargetFlight, VisionFlight,
 };
@@ -30,16 +30,12 @@ impl DomainLane {
 
 pub struct OperationGroup {
     lane: DomainLane,
-    key: GroupKey,
     operations: Vec<Operation>,
 }
 
 impl OperationGroup {
     pub fn lane(&self) -> DomainLane {
         self.lane
-    }
-    pub fn key(&self) -> &GroupKey {
-        &self.key
     }
     pub fn operations(&self) -> &[Operation] {
         &self.operations
@@ -60,52 +56,28 @@ impl OperationGroup {
             .expect("group has at least two operations");
         let tail = Self {
             lane: self.lane,
-            key: self.key.clone(),
             operations: vec![last],
         };
         Ok((self, tail))
     }
 }
 
-/// Whether `operation` is a prompt chunk with a drafter entry drafted behind
-/// it, which launches alone (its entry reads the chunk's own features).
-fn primes(operation: &Operation) -> bool {
-    matches!(operation, Operation::Forward { prime: Some(_), .. })
-}
-
-/// Preserve input order while coalescing adjacent compatible operations. A
-/// request may occupy only one slot in a group; another operation starts a new
-/// group so dependencies never leap across an intervening lane. The domain
-/// validates every operation when a group is reserved.
+/// Preserve input order while coalescing adjacent operations that may share
+/// a launch (`ExecutorDomain::shares_launch`, which every reservation holds
+/// the group to); another operation starts a new group, so dependencies
+/// never leap across an intervening lane.
 pub fn group<F: ProgramFamily>(
     domain: &ExecutorDomain<F>,
     operations: Vec<Operation>,
 ) -> Vec<OperationGroup> {
     let mut groups: Vec<OperationGroup> = Vec::new();
     for operation in operations {
-        let lane = DomainLane::for_operation(&operation);
-        let key = domain.group_key(&operation);
-        let request = operation.request();
-        let alone = primes(&operation);
-        let existing = groups.last_mut().filter(|group| {
-            group.lane == lane
-                && group.key == key
-                && group.lane != DomainLane::Encoder
-                && !alone
-                && !group.operations.iter().any(primes)
-                && group
-                    .operations
-                    .iter()
-                    .all(|item| item.request() != request)
-        });
-        if let Some(existing) = existing {
-            existing.operations.push(operation);
-        } else {
-            groups.push(OperationGroup {
-                lane,
-                key,
+        match groups.last_mut().filter(|group| domain.shares_launch(&group.operations, &operation)) {
+            Some(existing) => existing.operations.push(operation),
+            None => groups.push(OperationGroup {
+                lane: DomainLane::for_operation(&operation),
                 operations: vec![operation],
-            });
+            }),
         }
     }
     groups
@@ -237,18 +209,10 @@ pub fn requirements<F: ProgramFamily>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_executor::{
-        CommittedClass, Demand, ExecutableKind, ProgramIdentity, RequestId, TokenId, WorkKind,
-    };
+    use magnitude_executor::{Demand, RequestId, TokenId, WorkKind};
 
     #[test]
-    fn capacity_split_preserves_request_order_and_launch_identity() {
-        let key = GroupKey {
-            program_identity: ProgramIdentity::new("target").unwrap(),
-            executable: ExecutableKind::Target,
-            commitment: CommittedClass::AllCommitted,
-            draft: None,
-        };
+    fn capacity_split_preserves_request_order_and_lane() {
         let operation = |id| Operation::Forward {
             request: RequestId(id),
             kind: WorkKind::Decode,
@@ -264,12 +228,11 @@ mod tests {
         };
         let group = OperationGroup {
             lane: DomainLane::Target,
-            key: key.clone(),
             operations: vec![operation(1), operation(2), operation(3)],
         };
         let (leading, trailing) = group.split_last().ok().unwrap();
-        assert_eq!(leading.key(), &key);
-        assert_eq!(trailing.key(), &key);
+        assert_eq!(leading.lane(), DomainLane::Target);
+        assert_eq!(trailing.lane(), DomainLane::Target);
         assert_eq!(
             leading
                 .operations()

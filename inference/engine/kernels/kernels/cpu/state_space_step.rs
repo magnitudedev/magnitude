@@ -52,6 +52,9 @@ fn state_space_step<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
         return;
     }
     let slot = s.slots.slot(group[2] as usize);
+    if slot.lo == slot.hi {
+        return;
+    }
     if rows.start == 0 {
         s.publish_window(&slot, head);
     }

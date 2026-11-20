@@ -196,8 +196,11 @@ impl Urgent {
     /// took 576 µs against 437.
     pub fn depths(&self) -> Vec<u64> {
         let widest = self.parts.iter().copied().max().expect("a request has a range").max(LEAST_READ);
-        std::iter::successors(Some(1), |&depth| Some(if depth < EVERY_DEPTH_TO { depth + 1 } else { depth + depth / 4 }))
-            .take_while(|depth| depth * widest <= WIDEST_WINDOW)
+        std::iter::once(1)
+            .chain(
+                std::iter::successors(Some(2), |&depth| Some(if depth < EVERY_DEPTH_TO { depth + 1 } else { depth + depth / 4 }))
+                    .take_while(|depth| depth.saturating_mul(widest) <= WIDEST_WINDOW),
+            )
             .collect()
     }
 
@@ -499,14 +502,13 @@ fn median_error(values: &[f64]) -> f64 {
     1.253 * (quartile(3) - quartile(1)) / 1.349 / (sorted.len() as f64).sqrt()
 }
 
-/// A random aligned offset of `file` that a read of `length` bytes from it
-/// lies within the file's blocks.
+/// A random aligned offset of `file` such that `offset + length <= file.size`
+/// holds whenever `length <= file.size`.
 fn random_offset(file: &SourceFile, state: &mut u64, length: u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
     *state ^= *state << 17;
-    let span = file.size.div_ceil(ALIGNMENT) * ALIGNMENT;
-    *state % (span.saturating_sub(length) / ALIGNMENT + 1) * ALIGNMENT
+    *state % (file.size.saturating_sub(length) / ALIGNMENT + 1) * ALIGNMENT
 }
 
 /// The bytes a second `file` reads at, and the cores its reads occupy, with
@@ -699,4 +701,19 @@ fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64)
     }
     let wall = began.elapsed().as_secs_f64();
     Ok((bytes as f64 / wall, (process_cpu_seconds()? - cpu) / wall))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{latency_knee, Curve, Urgent, WIDEST_WINDOW};
+
+    /// A tensor wider than `WIDEST_WINDOW` still probes depth 1 so
+    /// `latency_knee` never sees an empty range line.
+    #[test]
+    fn urgent_depths_includes_one_when_widest_exceeds_widest_window() {
+        let urgent = Urgent { parts: vec![WIDEST_WINDOW + 1024], records: 1 };
+        assert_eq!(urgent.depths(), vec![1]);
+        let line = vec![Curve::range_point(&urgent, 1, 1e9, 0.0, 0.1)];
+        assert_eq!(latency_knee(&urgent, &line), urgent.span());
+    }
 }

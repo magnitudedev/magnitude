@@ -165,6 +165,10 @@ impl State {
     fn entry_take(&mut self, store: &seismic::StoreIdentity, id: EntryId, bytes: u64, wiring: seismic::memory::Wiring) -> Result<(), seismic::memory::Refused> {
         let entry = *self.entry(id);
         assert!(!entry.holding.pooled(), "invariant violated: {:?} is charged; the pool's entry allocates its granules", entry.holding);
+        assert!(
+            !matches!(self.reclaim.get(&id), Some(super::admission::Reclaim::Unbacked)),
+            "invariant violated: Reclaim::Unbacked cache entry {id} allocates physical memory"
+        );
         let Some(at) = self.read else {
             assert!(
                 entry.holding == Holding::Committed(CommittedKind::Device),
@@ -295,7 +299,7 @@ impl Ledger {
         let mut state = self.state();
         assert!(state.pools[class.index()].is_none(), "invariant violated: {:?} opens a second {class:?} pool", self.store.identity);
         let entry = state.insert(Holding::Pool(class), 0);
-        state.pools[class.index()] = Some(Pool { entry, block });
+        state.pools[class.index()] = Some(Pool { entry, block, reclaimer: None });
         let absent = state.insert(Holding::Committed(CommittedKind::Absent(class)), 0);
         drop(state);
         super::store::PoolEntries { blocks: Arc::new(Record::new(self.clone(), entry)), absent: Arc::new(Record::new(self.clone(), absent)) }
@@ -333,25 +337,89 @@ impl seismic::memory::Store for Ledger {
     }
 }
 
+#[cfg(test)]
+struct TestReclaimer {
+    store: std::sync::Weak<super::state::Store>,
+    id: std::sync::Mutex<Option<EntryId>>,
+}
+
+#[cfg(test)]
+impl super::CacheReclaimer for TestReclaimer {
+    fn reclaim(&self, need: u64) -> Result<u64, super::ReclaimError> {
+        let Some(store) = self.store.upgrade() else {
+            return Err(super::ReclaimError::AtFloor);
+        };
+        let Some(id) = *self.id.lock().expect("test reclaimer id") else {
+            return Err(super::ReclaimError::AtFloor);
+        };
+        let mut state = store.state.lock().expect("ledger lock poisoned");
+        let Some(&entry) = state.held.get(&id) else {
+            return Err(super::ReclaimError::AtFloor);
+        };
+        let free = entry.bytes.min(need);
+        if free == 0 {
+            return Err(super::ReclaimError::AtFloor);
+        }
+        if entry.holding.pooled() {
+            let class = entry.holding.pool_class().expect("pooled cache has a pool class");
+            let pool_id = state.pools[class.index()].as_ref().expect("pooled cache has open pool").entry;
+            state.resize(id, entry.bytes - free);
+            state.entry_freed(pool_id, free, seismic::memory::Wiring::Pageable);
+        } else {
+            state.entry_freed(id, free, seismic::memory::Wiring::Pageable);
+        }
+        Ok(free)
+    }
+}
+
 /// A test's allocations, each made as a change of its own.
 #[cfg(test)]
 impl Ledger {
-    /// [`Self::cache`] of memory a test made, charged as Seismic charges
-    /// it: to the store's pool entry for pooled cache, its own entry
-    /// otherwise; pageable, as host memory no device wires is.
-    pub(crate) fn cached(&self, kind: CacheKind, bytes: u64) -> Result<Cached, Short> {
-        let cached = self.cache(kind, bytes)?;
+    /// [`Self::cache`] of memory a test made with an explicit [`super::Reclaim`]
+    /// policy, charged as Seismic charges it.
+    pub(crate) fn cached_with(&self, kind: CacheKind, bytes: u64, reclaim: super::Reclaim) -> Result<Cached, Short> {
+        let cached = self.cache(kind, bytes, reclaim)?;
         let charged = self.change(|_| match Holding::Cache(kind).pooled() {
             true => {
                 let mut state = self.state();
                 let class = Holding::Cache(kind).pool_class().expect("pooled cache has a pool class");
-                let pool = state.pools[class.index()].expect("a test's pooled cache lies in its class's open pool").entry;
+                let pool = state.pools[class.index()].as_ref().expect("a test's pooled cache lies in its class's open pool").entry;
                 state.entry_take(&self.store.identity, pool, bytes, seismic::memory::Wiring::Pageable)
             }
             false => cached.entry().take(&cached.entry().change(), bytes, seismic::memory::Wiring::Pageable),
         });
         charged.expect("a cache holding's own bytes are admitted");
         Ok(cached)
+    }
+
+    /// [`Self::cache`] of memory a test made, backed by a synchronous test
+    /// [`super::CacheReclaimer`] that physically frees the entry's bytes on
+    /// reclaim, charged as Seismic charges it.
+    pub(crate) fn cached(&self, kind: CacheKind, bytes: u64) -> Result<Cached, Short> {
+        let reclaimer = Arc::new(TestReclaimer {
+            store: Arc::downgrade(&self.store),
+            id: std::sync::Mutex::new(None),
+        });
+        let mut cached = self.cached_with(kind, bytes, super::Reclaim::Backed(Arc::downgrade(&reclaimer) as std::sync::Weak<dyn super::CacheReclaimer>))?;
+        *reclaimer.id.lock().expect("test reclaimer id") = Some(cached.id());
+        cached._reclaimer = Some(reclaimer);
+        Ok(cached)
+    }
+}
+
+#[cfg(test)]
+impl super::claims::Claim {
+    /// Turns this claim into a test [`Cached`] entry backed by a synchronous
+    /// [`TestReclaimer`] that physically frees the entry's bytes on reclaim.
+    pub(crate) fn into_test_cache(self, kind: CacheKind) -> Cached {
+        let reclaimer = Arc::new(TestReclaimer {
+            store: Arc::downgrade(&self.ledger().store),
+            id: std::sync::Mutex::new(None),
+        });
+        let mut cached = self.into_cache(kind, super::Reclaim::Backed(Arc::downgrade(&reclaimer) as std::sync::Weak<dyn super::CacheReclaimer>));
+        *reclaimer.id.lock().expect("test reclaimer id") = Some(cached.id());
+        cached._reclaimer = Some(reclaimer);
+        cached
     }
 }
 

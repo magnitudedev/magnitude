@@ -98,25 +98,12 @@ impl Sys for LiveSys {
     }
 
     fn task_vm(&self) -> TaskVm {
-        let mut vm = TaskVm::default();
-        let mut count = memory::TASK_VM_INFO_REV7_COUNT;
-        #[allow(deprecated)]
-        let task = unsafe { libc::mach_task_self() };
-        let status = unsafe {
-            libc::task_info(
-                task,
-                memory::TASK_VM_INFO,
-                (&mut vm as *mut TaskVm).cast(),
-                &mut count,
-            )
-        };
-        assert_eq!(
-            status,
-            libc::KERN_SUCCESS,
-            "invariant violated: task_info TASK_VM_INFO returned {status}"
-        );
+        let (vm, count) = seismic_native_target::process::macos::task_vm_info_with_count()
+            .unwrap_or_else(|status| {
+                panic!("invariant violated: task_info TASK_VM_INFO returned {status}")
+            });
         assert!(
-            count >= memory::TASK_VM_INFO_REV6_COUNT,
+            count >= seismic_native_target::process::macos::TASK_VM_INFO_REV6_COUNT,
             "invariant violated: task_vm_info has {count} words, without decompressions and ledger_swapins"
         );
         vm
@@ -135,13 +122,18 @@ impl Sys for LiveSys {
     }
 
     fn hardware_profiler_json(&self) -> Option<Vec<u8>> {
-        let output = read(
-            "/usr/sbin/system_profiler SPHardwareDataType -json",
-            std::process::Command::new("/usr/sbin/system_profiler")
-                .args(["SPHardwareDataType", "-json"])
-                .output(),
-        )?;
-        output.status.success().then_some(output.stdout)
+        static PROFILER: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+        PROFILER
+            .get_or_init(|| {
+                let output = read(
+                    "/usr/sbin/system_profiler SPHardwareDataType -json",
+                    std::process::Command::new("/usr/sbin/system_profiler")
+                        .args(["SPHardwareDataType", "-json"])
+                        .output(),
+                )?;
+                output.status.success().then_some(output.stdout)
+            })
+            .clone()
     }
 }
 

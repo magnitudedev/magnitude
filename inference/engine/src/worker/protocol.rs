@@ -306,6 +306,8 @@ pub enum WorkerMessage {
     /// The model stopped serving. Every open request has already received
     /// its terminal outcome; the worker exits after this message.
     Unloaded { cause: UnloadCause },
+    /// The scheduler has released the request's execution resources.
+    Retired { request_id: HostRequestId },
 }
 
 #[cfg(test)]

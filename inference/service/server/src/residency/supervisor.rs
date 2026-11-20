@@ -78,11 +78,14 @@ impl MemorySupervisor {
         }
     }
 
-    /// A fresh memory observation from the resident worker; `None` when no worker is resident or
-    /// it stopped serving before answering.
-    pub async fn observe_resident(&self) -> Option<MemoryObservation> {
-        let engine = Arc::clone(&self.inner.lock().as_ref()?.engine);
-        engine.observe().await.ok()
+    /// Read the worker resident at the start of the observation. Its failure is the
+    /// result of that reading, even if the resident changes while it is answering.
+    pub async fn observe_resident(&self) -> Result<Option<MemoryObservation>, RequestError> {
+        let engine = self.inner.lock().as_ref().map(|resident| Arc::clone(&resident.engine));
+        match engine {
+            Some(engine) => engine.observe().await.map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Supervise a ready worker until its engine stops serving or another is supervised.
@@ -229,19 +232,7 @@ mod tests {
         }
 
         fn observe(&self) -> BoxFuture<'_, Result<MemoryObservation, RequestError>> {
-            Box::pin(async {
-                Ok(MemoryObservation {
-                    census: magnitude_engine::census::AllocationCensus {
-                        stores: Vec::new(),
-                        serving: magnitude_engine::census::ServingCensus {
-                            group_places: std::num::NonZeroUsize::MIN,
-                            group_capacity: std::num::NonZeroUsize::MIN,
-                            experts: None,
-                        },
-                    },
-                    stores: Vec::new(),
-                })
-            })
+            Box::pin(async { Err(RequestError::Overloaded) })
         }
 
         fn census(&self, _: u64) -> BoxFuture<'_, Result<(u64, AllocationCensus), RequestError>> {
@@ -311,6 +302,15 @@ mod tests {
             engine: Arc::new(ScriptedEngine),
         });
         worker
+    }
+
+    #[tokio::test]
+    async fn an_observation_reports_an_absent_worker_or_its_error() {
+        let fixture = fixture();
+        let supervisor = MemorySupervisor { inner: fixture.inner.clone() };
+        assert!(matches!(supervisor.observe_resident().await, Ok(None)));
+        supervise(&fixture);
+        assert!(matches!(supervisor.observe_resident().await, Err(RequestError::Overloaded)));
     }
 
     /// An engine unload for memory pressure releases the instance as such, without terminating

@@ -447,18 +447,57 @@ def _start(candidate: Candidate) -> float:
     return max(built, status["waits"][kind])
 
 
+def _warmth_rank(candidate: Candidate) -> tuple[int, int]:
+    """How warm `candidate`'s checkouts are for `candidate.work`'s sides: `(worst_tier, distance)`,
+    smaller is warmer.
+    - Tier 0: already built this exact tree (or sharing a live build of it).
+    - Tier 1: already built this build at an ancestor commit, ordered by commits behind.
+    - Tier 2: already built this build at another commit (warm dependencies).
+    - Tier 3: cold (no free checkout has built this build)."""
+    worst, total_distance = 0, 0
+    for side, checkout in zip(candidate.work.sides, candidate.status["checkouts"], strict=True):
+        if checkout is None or not (checkout["shared"] or checkout["built"]):
+            tier, dist = 3, 0
+        elif checkout["shared"] or checkout.get("same_tree") or (
+            checkout["commit"] == side.source.identity.commit and side.source.identity.dirty_digest is None
+        ):
+            tier, dist = 0, 0
+        elif checkout["commit"] is not None and (behind := sources.distance(side.source.identity.commit, checkout["commit"])) is not None:
+            tier, dist = 1, behind
+        else:
+            tier, dist = 2, 0
+        worst = max(worst, tier)
+        total_distance += dist
+    return worst, total_distance
+
+
 def _ranked(request: Request, hosts: Hosts, run_id: str) -> tuple[list[Candidate], set[str]]:
-    """The candidates, the one where the run's jobs would start earliest (`_start`) first; among
-    equals, the one run `run_id` ranks first by a hash of the two, so runs placed at the same
-    moment, before any sees another on a host, still spread across equal hosts; and the hosts
-    that could not be read (`_candidates`)."""
+    """The candidates, preferring a capable idle host whose checkout already built the requested
+    source (exact tree, then closest ancestor commit, then any warm build of the same steps) over
+    a cold host; when no idle host is warm (or comparing hosts of equal warmth), earliest expected
+    job start (`_start`) governs, breaking ties by a hash of `run_id` and alias so simultaneous
+    runs spread across equal idle hosts; and the hosts that could not be read (`_candidates`)."""
     named = hosts.resolve(request.host) if request.host else tuple(hosts.host(a) for a in hosts.known())
     candidates, skipped, unreadable = _candidates(request, named, run_id)
     if not candidates:
         where = request.host or "any host"
         detail = "; ".join(skipped) if skipped else f"none runs {request.backend}"
         raise HostError(f"no {request.backend} host among {where}: {detail}")
-    ranked = sorted(candidates, key=lambda c: (_start(c), hashlib.sha256(f"{run_id} {c.remote.alias}".encode()).digest()))
+
+    def key(candidate: Candidate):
+        start = _start(candidate)
+        warmth = _warmth_rank(candidate)
+        idle_warm = _idle(candidate) and warmth[0] < 3
+        return (
+            not math.isfinite(start),
+            0 if idle_warm else 1,
+            warmth if idle_warm else (3, 0),
+            start,
+            warmth,
+            hashlib.sha256(f"{run_id} {candidate.remote.alias}".encode()).digest(),
+        )
+
+    ranked = sorted(candidates, key=key)
     return ranked, unreadable
 
 

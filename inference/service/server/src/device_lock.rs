@@ -67,11 +67,10 @@ pub struct IdleResident {
 pub struct DeviceLock {
     lock: Arc<RwLock<()>>,
     released: Arc<watch::Sender<u64>>,
-    /// How many shares have waited on a job: each one preempts the job holding the device then.
-    wanted: Arc<watch::Sender<u64>>,
     /// Counts the point requests stored by loads that hold no share ([`Self::requested`]).
     requested: Arc<watch::Sender<u64>>,
-    /// The shares held, the idle resident model, and whether a measurement runs beside it.
+    /// The shares held, shares waiting to preempt a job, the idle resident model, and whether a
+    /// job holds the device.
     sharing: Arc<watch::Sender<Sharing>>,
     /// When a measurement may start beside the idle resident model.
     quiet: Arc<Mutex<Quiet>>,
@@ -131,11 +130,18 @@ impl Quiet {
     }
 }
 
-/// The shares held, the resident model while no request holds it, and the job holding the
-/// device, to itself or beside that model: while one does, no share is taken.
+/// The shares held, shares waiting to preempt a job, the resident model while no request holds
+/// it, and the job holding the device, to itself or beside that model: while one does, no share
+/// is taken.
 #[derive(Clone, Default)]
 struct Sharing {
     shares: usize,
+    /// Shares currently waiting to preempt a job ([`DeviceLock::share`]): while non-zero, no job
+    /// starts and any running job's [`Preemption::preempted`] resolves.
+    wanted_shares: usize,
+    /// Incremented each time a share begins waiting, so a single waiting share preempts a job
+    /// once and a retirement retry sleeps between tries until another share arrives.
+    wanted_epoch: u64,
     idle: Option<IdleResident>,
     /// Counts the idle model's changes: each preempts a measurement beside it.
     idleness: u64,
@@ -151,11 +157,35 @@ impl Default for DeviceLock {
         Self {
             lock: Arc::default(),
             released: Arc::new(watch::Sender::new(0)),
-            wanted: Arc::new(watch::Sender::new(0)),
             requested: Arc::new(watch::Sender::new(0)),
             sharing: Arc::new(watch::Sender::new(Sharing::default())),
             quiet: Arc::default(),
         }
+    }
+}
+
+/// RAII guard for a [`DeviceLock::share`] waiting to preempt a job: increments `wanted_shares`
+/// on creation and decrements it on drop (whether the share is acquired or the wait is
+/// cancelled).
+struct ShareWaiter {
+    sharing: Arc<watch::Sender<Sharing>>,
+}
+
+impl ShareWaiter {
+    fn new(sharing: Arc<watch::Sender<Sharing>>) -> Self {
+        sharing.send_modify(|sharing| {
+            sharing.wanted_shares += 1;
+            sharing.wanted_epoch = sharing.wanted_epoch.wrapping_add(1);
+        });
+        Self { sharing }
+    }
+}
+
+impl Drop for ShareWaiter {
+    fn drop(&mut self) {
+        self.sharing.send_modify(|sharing| {
+            sharing.wanted_shares -= 1;
+        });
     }
 }
 
@@ -258,43 +288,58 @@ impl DeviceJob {
     }
 }
 
-/// When the shares wanted since a job took the device preempt it, and, beside an idle resident
-/// model, any change of the idle model since.
+/// When a waiting share preempts a job holding the device, and, beside an idle resident model,
+/// any change of the idle model since.
 #[derive(Clone)]
 pub struct Preemption {
-    wanted: watch::Receiver<u64>,
-    /// Beside an idle model: the device's sharing, and its idleness last seen, first when the
-    /// job took the device.
-    idle: Option<(watch::Receiver<Sharing>, u64)>,
+    sharing: watch::Receiver<Sharing>,
+    /// The share-waiter epoch last seen by [`Self::preempted`], so a waiting share resolves
+    /// immediately on first poll (level-triggered on `wanted_shares > 0`) without busy-spinning
+    /// a retirement retry loop until another share arrives.
+    seen_wanted: Option<u64>,
+    /// Beside an idle model: its idleness last seen, first when the job took the device.
+    idle_idleness: Option<u64>,
     /// Whether the job was preempted: [`Self::preempted`] returned, from any of its clones.
     fired: Arc<AtomicBool>,
 }
 
 impl Preemption {
-    /// Return once a share is wanted, or the idle model the job runs beside changed, since the
-    /// job took the device or since this last returned: each preemption is seen once, as a
-    /// change of a watch is.
+    /// Return once a share is waiting (`wanted_shares > 0`), resolving immediately if one is
+    /// already waiting, or, beside an idle resident model, once that model's idleness changed
+    /// since the job took the device or since this last returned.
     pub async fn preempted(&mut self) {
-        match &mut self.idle {
-            None => changed(&mut self.wanted).await,
-            Some((sharing, idleness)) => {
-                let seen = *idleness;
-                tokio::select! {
-                    () = changed(&mut self.wanted) => {}
-                    // The sender lives as long as the lock the hold is of.
-                    changed = sharing.wait_for(|sharing| sharing.idleness != seen) => {
-                        if let Ok(sharing) = changed {
-                            *idleness = sharing.idleness;
-                        }
-                    }
+        let seen_wanted = self.seen_wanted;
+        let idle_idleness = self.idle_idleness;
+        let updated = self
+            .sharing
+            .wait_for(|sharing| {
+                (sharing.wanted_shares > 0 && seen_wanted != Some(sharing.wanted_epoch))
+                    || idle_idleness.is_some_and(|seen| sharing.idleness != seen)
+            })
+            .await
+            .map(|sharing| (sharing.wanted_shares, sharing.wanted_epoch, sharing.idleness));
+        match updated {
+            Ok((wanted_shares, wanted_epoch, idleness)) => {
+                if wanted_shares > 0 && seen_wanted != Some(wanted_epoch) {
+                    self.seen_wanted = Some(wanted_epoch);
+                }
+                if let Some(idle) = &mut self.idle_idleness {
+                    *idle = idleness;
                 }
             }
+            // The sender lives as long as the lock the hold is of.
+            Err(_) => std::future::pending::<()>().await,
         }
         self.fired.store(true, Ordering::Release);
     }
 
-    fn new(wanted: watch::Receiver<u64>, idle: Option<(watch::Receiver<Sharing>, u64)>) -> Self {
-        Self { wanted, idle, fired: Arc::default() }
+    fn new(sharing: watch::Receiver<Sharing>, idle_idleness: Option<u64>) -> Self {
+        Self {
+            sharing,
+            seen_wanted: None,
+            idle_idleness,
+            fired: Arc::default(),
+        }
     }
 }
 
@@ -369,7 +414,7 @@ impl DeviceLock {
         if let Some(share) = self.try_share() {
             return share;
         }
-        self.wanted.send_modify(|wanted| *wanted += 1);
+        let _waiter = ShareWaiter::new(Arc::clone(&self.sharing));
         self.share_after_measurement().await
     }
 
@@ -473,16 +518,18 @@ impl DeviceLock {
         Releases(self.released.subscribe())
     }
 
-    /// Take the device for a job, without waiting: `None` while residency shares it or another
-    /// job holds it. Only shares wanted from here on preempt the job.
+    /// Take the device for a job, without waiting: `None` while residency shares it, a share is
+    /// waiting to preempt a job, or another job holds it.
     pub fn try_job(&self) -> Option<DeviceJob> {
-        let preemption = Preemption::new(self.wanted.subscribe(), None);
+        if self.sharing.borrow().wanted_shares > 0 {
+            return None;
+        }
         let guard = Arc::clone(&self.lock).try_write_owned().ok()?;
         // A measurement beside a resident model whose share has ended holds the device until it
         // ends; no share starts while the write guard is held, so none starts beside it.
         let mut taken = false;
         self.sharing.send_if_modified(|sharing| {
-            taken = !sharing.job;
+            taken = !sharing.job && sharing.wanted_shares == 0;
             if taken {
                 sharing.job = true;
             }
@@ -492,7 +539,7 @@ impl DeviceLock {
             hold: JobHold::Exclusive(Some(guard)),
             sharing: Arc::clone(&self.sharing),
             released: Arc::clone(&self.released),
-            preemption,
+            preemption: Preemption::new(self.sharing.subscribe(), None),
             quiet: None,
             finished: false,
         })
@@ -500,15 +547,21 @@ impl DeviceLock {
 
     /// Take the device for the measurement job beside the idle resident model, without waiting,
     /// once the model has been idle for its quiet period ([`Quiet`]); until then, `Err` of when
-    /// it will have been. `Err(None)` unless that model is idle, its share is the one held, and
-    /// nothing else runs beside it, all read in one decision with the model's idleness.
+    /// it will have been. `Err(None)` unless that model is idle, its share is the one held, no
+    /// share is waiting, and nothing else runs beside it, all read in one decision with the
+    /// model's idleness.
     fn try_beside(&self) -> Result<DeviceJob, Option<Instant>> {
-        let wanted = self.wanted.subscribe();
         let period = self.quiet.lock().expect("quiet lock").period();
         let now = Instant::now();
         let mut taken = Err(None);
         self.sharing.send_if_modified(|sharing| {
-            if let (Some(idle), 1, false, Some(since)) = (&sharing.idle, sharing.shares, sharing.job, sharing.idle_since) {
+            if let (Some(idle), 1, false, 0, Some(since)) = (
+                &sharing.idle,
+                sharing.shares,
+                sharing.job,
+                sharing.wanted_shares,
+                sharing.idle_since,
+            ) {
                 taken = match since + period {
                     quiet if quiet <= now => {
                         sharing.job = true;
@@ -524,7 +577,7 @@ impl DeviceLock {
             hold: JobHold::Beside { resident },
             sharing: Arc::clone(&self.sharing),
             released: Arc::clone(&self.released),
-            preemption: Preemption::new(wanted, Some((self.sharing.subscribe(), idleness))),
+            preemption: Preemption::new(self.sharing.subscribe(), Some(idleness)),
             quiet: Some(Arc::clone(&self.quiet)),
             finished: false,
         })
@@ -844,5 +897,106 @@ mod tests {
         let job = lock.measurement().await;
         assert!(job.beside().is_none());
         assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// A background job started via `try_job` or `try_beside` while a `share()` is waiting is
+    /// immediately refused so it can never slip in and miss preemption; dropping a waiting
+    /// `share()` decrements `wanted_shares` and unblocks jobs again.
+    #[tokio::test(start_paused = true)]
+    async fn a_job_cannot_slip_in_while_a_share_is_waiting() {
+        // Exclusive job: once `share()` is waiting, releasing the first job still refuses
+        // `try_job()` until the waiting share completes.
+        let lock = DeviceLock::default();
+        let mut job = lock.try_job().unwrap();
+        let waiting = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.share().await }
+        });
+        job.preempted().await;
+        drop(job);
+        assert!(
+            lock.try_job().is_none(),
+            "a job must not slip in while a share is waiting"
+        );
+        let share = waiting.await.unwrap();
+        drop(share);
+        assert!(lock.try_job().is_some());
+
+        // Beside an idle resident model: once `share()` is waiting, releasing the beside job
+        // still refuses `try_beside()` until the waiting share completes.
+        let lock = DeviceLock::default();
+        let _resident = lock.try_share().unwrap();
+        lock.resident_idle(idle("load", Arc::new(Room)));
+        let mut job = lock.measurement().await;
+        assert!(job.beside().is_some());
+        let waiting = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.share().await }
+        });
+        job.preempted().await;
+        drop(job);
+        assert!(
+            lock.try_beside().is_err(),
+            "a beside job must not slip in while a share is waiting"
+        );
+        let share = waiting.await.unwrap();
+        drop(share);
+
+        // Cancelling a waiting `share()` releases its `ShareWaiter` guard and unblocks `job()`.
+        let lock = DeviceLock::default();
+        let mut job = lock.try_job().unwrap();
+        let mut share_fut = Box::pin(lock.share());
+        assert!(futures_util::FutureExt::now_or_never(&mut share_fut).is_none());
+        job.preempted().await;
+        drop(job);
+        assert!(lock.try_job().is_none(), "waiting share still holds off jobs");
+        let waiting_job = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.job().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting_job.is_finished());
+        // Drop the cancelled `share()` future without ever completing it.
+        drop(share_fut);
+        let _acquired = waiting_job.await.unwrap();
+    }
+
+    /// `Preemption::preempted()` is level-triggered on `wanted_shares > 0`: if a share is
+    /// already waiting before `preempted()` is first polled, it resolves immediately.
+    #[tokio::test]
+    async fn preemption_resolves_immediately_when_a_share_is_already_waiting() {
+        use futures_util::FutureExt;
+
+        let lock = DeviceLock::default();
+        let mut job = lock.try_job().unwrap();
+        let waiting = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.share().await }
+        });
+        // Wait until `share()` has registered its `ShareWaiter` (`wanted_shares > 0`).
+        let mut sharing = lock.sharing.subscribe();
+        sharing
+            .wait_for(|sharing| sharing.wanted_shares > 0)
+            .await
+            .unwrap();
+
+        // A `Preemption` cloned after `wanted_shares > 0` (and never polled before) must resolve
+        // immediately on its first poll.
+        let mut cloned = job.preemption();
+        assert!(
+            cloned.preempted().now_or_never().is_some(),
+            "cloned preemption must resolve immediately when wanted_shares > 0"
+        );
+        assert!(
+            job.preempted().now_or_never().is_some(),
+            "job preemption must resolve immediately when wanted_shares > 0"
+        );
+        // Polling again for the same waiting share waits for a further share rather than spinning.
+        assert!(
+            job.preempted().now_or_never().is_none(),
+            "same waiting share must not busy-spin a second preemption poll"
+        );
+        drop(job);
+        drop(waiting.await.unwrap());
     }
 }

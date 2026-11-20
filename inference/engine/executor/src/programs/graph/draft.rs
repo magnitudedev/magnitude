@@ -3,7 +3,7 @@
 //! storage layout and interval placement in either route.
 
 use super::GraphError;
-use super::sizing::{SizedCall, SizingDraft, SizingOutline};
+use super::sizing::{AxisProbeDraft, SizedCall, SizingDraft, SizingGroupDraft, SizingOutline};
 use crate::native::RangedKernels;
 use seismic::{
     BackendName, Dim, Element, EntryContract, KernelRequest, LaunchEncoding, NativeGraph,
@@ -51,19 +51,6 @@ pub(crate) trait GraphDraft: Sized {
     /// Declare an external weight value port (tagged for assessment's decode
     /// demand census). Default delegates to [`Self::port`].
     fn weight_port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
-    where
-        Dim: From<D>,
-    {
-        self.port(element, extents)
-    }
-    fn set_class_scope(&mut self, _scope: Option<&'static str>) {}
-    fn port_with_class_extent<D: Clone>(
-        &mut self,
-        element: Element,
-        extents: &[D],
-        _extent_axis: usize,
-        _class_dimension: &'static str,
-    ) -> Result<NativePort, GraphError>
     where
         Dim: From<D>,
     {
@@ -314,21 +301,6 @@ impl GraphDraft for NativeGraphMetadata {
     {
         Ok(self.port(element, extents)?)
     }
-    fn set_class_scope(&mut self, scope: Option<&'static str>) {
-        self.set_class_scope(scope);
-    }
-    fn port_with_class_extent<D: Clone>(
-        &mut self,
-        element: Element,
-        extents: &[D],
-        extent_axis: usize,
-        class_dimension: &'static str,
-    ) -> Result<NativePort, GraphError>
-    where
-        Dim: From<D>,
-    {
-        Ok(self.port_with_class_extent(element, extents, extent_axis, class_dimension)?)
-    }
     fn local_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
@@ -450,31 +422,54 @@ impl ElementBoundDraft for SizingDraft {
     }
 }
 
-/// What a structural regime's classes certify to: the layout a load seals
-/// them into ([`seismic::NativeGraphLayout`]), or the direct contract-sized
-/// outline ([`SizingOutline`]) that assessment charges. Every family's
-/// enumeration builds either from the same topology builder and class slices.
+impl ElementBoundDraft for SizingGroupDraft {
+    fn bind<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Binding<'a, E> {
+        elements
+    }
+    fn bind_ranged<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Ranged<'a, E> {
+        elements
+    }
+}
+
+impl ElementBoundDraft for AxisProbeDraft {
+    fn bind<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Binding<'a, E> {
+        elements
+    }
+    fn bind_ranged<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Ranged<'a, E> {
+        elements
+    }
+}
+
+/// What a structural regime's concrete classes certify to: the layout a load
+/// seals them into ([`seismic::NativeGraphLayout`]), or the direct
+/// contract-sized outline ([`SizingOutline`]) that assessment charges. Every
+/// family certifies a group by evaluating its concrete classes through one
+/// builder closure and taking the element-wise maximum over buffers and active
+/// launches — no scope or slice declarations exist.
 pub(crate) trait Certified: Clone {
     type Draft: ElementBoundDraft + 'static;
 
-    fn new_draft(backend: BackendName) -> Self::Draft;
-    fn certify_draft(
-        draft: Self::Draft,
-        slice_sets: &[Vec<seismic::NativeGraphClassSlice>],
-    ) -> Result<Vec<Self>, GraphError>;
-    fn certify_one(
-        draft: Self::Draft,
-        slices: Vec<seismic::NativeGraphClassSlice>,
-    ) -> Result<Self, GraphError> {
-        let [certified]: [_; 1] = Self::certify_draft(draft, &[slices])?
-            .try_into()
-            .unwrap_or_else(|results: Vec<_>| {
-                panic!("one slice set certified to {} results", results.len())
-            });
-        Ok(certified)
-    }
+    /// Certify a single layout covering every concrete class in `classes`.
+    /// `build` is called once per class; the first class's auxiliary value is
+    /// returned alongside the certified layout. Topology divergence within the
+    /// group is rejected as an invariant error.
+    fn certify_group<C: Copy, Aux>(
+        backend: BackendName,
+        classes: &[C],
+        build: impl FnMut(Self::Draft, C) -> Result<(Self::Draft, Aux), GraphError>,
+    ) -> Result<(Self, Vec<Aux>), GraphError>;
     fn storage_bytes(&self) -> NativeGraphStorageBytes;
     fn plan_heap(&self) -> seismic::HostHeap;
+    fn topology_heap(&self) -> seismic::HostHeap;
+    fn layout_identity(&self) -> u64;
     fn bound_heap(&self) -> seismic::HostHeap;
     fn sizing_census(&self) -> Option<(&[SizedCall], &[KernelRequest], usize)> {
         None
@@ -484,24 +479,35 @@ pub(crate) trait Certified: Clone {
 impl Certified for seismic::NativeGraphLayout {
     type Draft = NativeGraphMetadata;
 
-    fn new_draft(backend: BackendName) -> Self::Draft {
-        NativeGraphMetadata::new_template(backend)
-    }
-    fn certify_draft(
-        draft: Self::Draft,
-        slice_sets: &[Vec<seismic::NativeGraphClassSlice>],
-    ) -> Result<Vec<Self>, GraphError> {
-        let template = draft.seal_template()?;
-        slice_sets
-            .iter()
-            .map(|slices| template.certify(slices).map_err(GraphError::from))
-            .collect()
+    fn certify_group<C: Copy, Aux>(
+        backend: BackendName,
+        classes: &[C],
+        mut build: impl FnMut(Self::Draft, C) -> Result<(Self::Draft, Aux), GraphError>,
+    ) -> Result<(Self, Vec<Aux>), GraphError> {
+        if classes.is_empty() {
+            return Err(GraphError::Invalid("graph group has no concrete classes".to_owned()));
+        }
+        let mut drafts = Vec::with_capacity(classes.len());
+        let mut auxes = Vec::with_capacity(classes.len());
+        for &class in classes {
+            let (draft, aux) = build(NativeGraphMetadata::new(backend), class)?;
+            drafts.push(draft);
+            auxes.push(aux);
+        }
+        let layout = NativeGraphMetadata::certify_group(drafts)?;
+        Ok((layout, auxes))
     }
     fn storage_bytes(&self) -> NativeGraphStorageBytes {
         self.storage_bytes()
     }
     fn plan_heap(&self) -> seismic::HostHeap {
         self.plan_heap()
+    }
+    fn topology_heap(&self) -> seismic::HostHeap {
+        self.topology_heap()
+    }
+    fn layout_identity(&self) -> u64 {
+        self.identity()
     }
     fn bound_heap(&self) -> seismic::HostHeap {
         self.bound_heap()
@@ -509,22 +515,45 @@ impl Certified for seismic::NativeGraphLayout {
 }
 
 impl Certified for SizingOutline {
-    type Draft = SizingDraft;
+    type Draft = SizingGroupDraft;
 
-    fn new_draft(backend: BackendName) -> Self::Draft {
-        SizingDraft::new(backend)
-    }
-    fn certify_draft(
-        draft: Self::Draft,
-        slice_sets: &[Vec<seismic::NativeGraphClassSlice>],
-    ) -> Result<Vec<Self>, GraphError> {
-        draft.certify_each(slice_sets)
+    fn certify_group<C: Copy, Aux>(
+        backend: BackendName,
+        classes: &[C],
+        mut build: impl FnMut(Self::Draft, C) -> Result<(Self::Draft, Aux), GraphError>,
+    ) -> Result<(Self, Vec<Aux>), GraphError> {
+        let Some((&first, rest)) = classes.split_first() else {
+            return Err(GraphError::Invalid("graph group has no concrete classes".to_owned()));
+        };
+        let _scope = super::sizing::SizingScope::enter();
+        let mut auxes = Vec::with_capacity(classes.len());
+        let (first_draft, first_aux) = build(SizingGroupDraft::Full(SizingDraft::new(backend)), first)?;
+        auxes.push(first_aux);
+        let SizingGroupDraft::Full(first_draft) = first_draft else {
+            unreachable!("first class always builds a Full SizingDraft");
+        };
+        let mut group = first_draft.begin_group()?;
+        for &class in rest {
+            let (bounds_draft, aux) = build(SizingGroupDraft::Bounds(group.next_bounds()), class)?;
+            auxes.push(aux);
+            let SizingGroupDraft::Bounds(bounds) = bounds_draft else {
+                unreachable!("subsequent classes always build a Bounds draft");
+            };
+            group = bounds.into_group()?;
+        }
+        Ok((group.finish()?, auxes))
     }
     fn storage_bytes(&self) -> NativeGraphStorageBytes {
         self.storage_bytes()
     }
     fn plan_heap(&self) -> seismic::HostHeap {
         self.plan_heap()
+    }
+    fn topology_heap(&self) -> seismic::HostHeap {
+        self.topology_heap()
+    }
+    fn layout_identity(&self) -> u64 {
+        self.identity()
     }
     fn bound_heap(&self) -> seismic::HostHeap {
         self.bound_heap()

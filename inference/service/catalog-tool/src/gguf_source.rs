@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Subcommand;
 use magnitude_artifacts::gguf::{
-    Directory, TensorDescriptor, inspect_header, read_header, split_paths,
+    Directory, TensorDescriptor, inspect_header, read_header, resolve_shard_paths,
 };
 use magnitude_service_contracts::inventory::{
     HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
@@ -128,12 +128,10 @@ impl Gguf {
             tensors: HashMap::new(),
         };
         let shard = gguf.read_shard(first.clone()).await?;
-        let paths = match resolved_hub_shards {
-            Some(shards) if shards.len() > 1 => Some(shards),
-            _ => split_paths(&first, &shard.directory)?,
-        };
+        let candidate_paths = resolved_hub_shards.unwrap_or_else(|| vec![first]);
+        let paths = resolve_shard_paths(&candidate_paths, &shard.directory)?;
         gguf.add(shard)?;
-        for path in paths.into_iter().flatten().skip(1) {
+        for path in paths.into_iter().skip(1) {
             let shard = gguf.read_shard(path).await?;
             gguf.add(shard)?;
         }

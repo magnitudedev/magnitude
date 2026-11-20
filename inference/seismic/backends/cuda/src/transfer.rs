@@ -273,7 +273,7 @@ extern "C" __global__ void spin(unsigned int* out, Words words, unsigned int* sc
             // SAFETY: within the mapping, which no device work reaches yet.
             unsafe { host.as_ptr().add(at as usize).write(pattern(at)) };
         }
-        let destination = device.allocate_block(crate::topology::DEVICE_KIND, BYTES, &crate::test_entry()).unwrap();
+        let destination = device.allocate_block(crate::topology::DEVICE_KIND, BYTES, &crate::test_entry(), seismic_memory::SlabFill::Zeroed).unwrap();
         (source, destination)
     }
 
@@ -426,7 +426,7 @@ extern "C" __global__ void sum(const unsigned long long* data, unsigned long lon
         let cubin = crate::nvrtc::compile_cubin_named(SUM, "sum.cu", architecture, &["sum"]).unwrap();
         let module = DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();
         const READ: u64 = 1 << 30;
-        let block = |kind| device.allocate_block(kind, READ, &crate::test_entry()).unwrap();
+        let block = |kind| device.allocate_block(kind, READ, &crate::test_entry(), seismic_memory::SlabFill::Zeroed).unwrap();
         let (host, own) = (block(crate::topology::PINNED_KIND), block(crate::topology::DEVICE_KIND));
         assert!(host.host_address().is_some() && own.host_address().is_none());
         let out = device.allocate_mapped(8, &crate::test_entry()).unwrap();

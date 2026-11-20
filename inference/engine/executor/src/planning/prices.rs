@@ -96,13 +96,13 @@ impl PlanPrices {
 }
 
 /// The prices a load's settle takes of `priced`: a bank waits for prices
-/// that are not measured (`PlanError::Unpriced`, which every host meets by
-/// having them measured, `preview::priced`).
+/// that are not measured yet (`PlanError::Pending`), or fails where they
+/// cannot be obtained (`PlanError::Unavailable`).
 pub(crate) fn measured<T>(priced: Priced<T>) -> Result<T, PlanError> {
     match priced {
         Priced::Measured(prices) => Ok(prices),
-        Priced::Pending(reason) => Err(PlanError::Unpriced { pending: true, reason }),
-        Priced::Unavailable(reason) => Err(PlanError::Unpriced { pending: false, reason }),
+        Priced::Pending(pending) => Err(PlanError::Pending(pending)),
+        Priced::Unavailable(reason) => Err(PlanError::Unavailable(reason)),
     }
 }
 

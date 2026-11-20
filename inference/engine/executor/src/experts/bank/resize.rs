@@ -13,42 +13,44 @@
 use super::ExpertBank;
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, RunningBegun, RunningPressure, Trip};
 use crate::experts::source::Records;
-use crate::experts::watcher::{BankRecordViews, Candidates, Evicted, Evicting, Join, ScratchGroup};
-use crate::memory::ledger::Changes;
+use crate::experts::watcher::{Candidates, Evicted, Evicting, Join, ScratchGroup};
+use crate::memory::ledger::{CacheReclaimer, Changes, ReclaimError};
 use crate::planning::{BankTier, Placer};
 use crate::storage_thread::{Done, StorageThread};
 use crate::CompletionWake;
 use seismic::{Pool, SlabTensor, Tensor, TensorError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 /// One store's records: each group's slab store in the store's pool, a
 /// record a slab, its leading `lent` records over the lender's lent
 /// allocation for the load's life, each region one routed tensor's record
-/// of `record_bytes`.
+/// of `record_bytes`. `SlabTensor` provides interior mutability so no outer
+/// per-group mutex is ever held across `add_slab` / `allocate_block`.
 pub(super) struct Stores {
     pool: Pool,
-    groups: Vec<Mutex<SlabTensor>>,
+    block: seismic::BlockSize,
+    groups: Vec<SlabTensor>,
     lent: Vec<u64>,
     record_bytes: Vec<Vec<u64>>,
 }
 
 impl Stores {
     /// `groups`, each a store with its leading `lent` records and its
-    /// regions' record bytes, in `pool`.
-    pub(super) fn new(pool: Pool, groups: Vec<(SlabTensor, u64, Vec<u64>)>) -> Self {
+    /// regions' record bytes, in `pool` whose blocks are sized by `block`.
+    pub(super) fn new(pool: Pool, block: seismic::BlockSize, groups: Vec<(SlabTensor, u64, Vec<u64>)>) -> Self {
         let (mut stores, mut lent, mut record_bytes) = (Vec::new(), Vec::new(), Vec::new());
         for (store, leading, bytes) in groups {
-            stores.push(Mutex::new(store));
+            stores.push(store);
             lent.push(leading);
             record_bytes.push(bytes);
         }
-        Self { pool, groups: stores, lent, record_bytes }
+        Self { pool, block, groups: stores, lent, record_bytes }
     }
 
-    fn group(&self, group: usize) -> MutexGuard<'_, SlabTensor> {
-        self.groups[group].lock().expect("a bank group's store")
+    fn group(&self, group: usize) -> &SlabTensor {
+        &self.groups[group]
     }
 
     /// The records group `group` holds: its slabs, lent ones included.
@@ -56,10 +58,14 @@ impl Stores {
         self.group(group).backed().len() as u64
     }
 
-    /// What the pool charges the records: a granule each beyond the lent
-    /// ones, which the lender's lent allocation holds.
+    /// What the pool charges the records: whole blocks (`BlockSize::charge`)
+    /// holding a granule for each record beyond the lent ones (the same
+    /// formula as `ExpertBankPlan::resident_charge` and `host_charge`).
     pub(super) fn charged(&self) -> u64 {
-        (0..self.groups.len()).map(|group| self.present(group) - self.lent[group]).sum::<u64>() * self.pool.granule()
+        let granules: u64 = (0..self.groups.len()).map(|group| self.present(group) - self.lent[group]).sum();
+        self.block
+            .charge(self.pool.granule(), granules)
+            .expect("invariant violated: bank record charge overflows")
     }
 
     /// The tensor kernels bind as group `group`'s region `region`: its
@@ -72,17 +78,20 @@ impl Stores {
     /// Claim records of group `group` until it holds `records`, each a
     /// granule of the pool (`SlabTensor::add_slab`: a free one in process,
     /// else the pool grows by a block its ledger entry admits), unwritten:
-    /// the watcher writes a record before any step reads it. The records
-    /// claimed, the lowest free first; on a refusal, none (those claimed
-    /// before it are freed, never having been read).
+    /// claimed records join the watcher free (`Directory::grow` /
+    /// `Directory::grow_host`) and are never published to the device until a
+    /// promotion copy or file read writes every byte and completes. The
+    /// records claimed, the lowest free first; on a refusal, none (those
+    /// claimed before it are freed, never having been read).
     pub(super) fn claim_to(&self, group: usize, records: u64) -> Result<Vec<usize>, TensorError> {
-        let mut store = self.group(group);
+        seismic::memory::assert_blocking_allocation_allowed("Stores::claim_to");
+        let store = self.group(group);
         let mut claimed = Vec::new();
         while (store.backed().len() as u64) < records {
             match store.add_slab(seismic::SlabFill::Unwritten) {
                 Ok(record) => claimed.push(record),
                 Err(refusal) => {
-                    Self::unclaim_in(&mut store, group, &claimed);
+                    Self::unclaim_in(store, group, &claimed);
                     return Err(refusal);
                 }
             }
@@ -93,12 +102,16 @@ impl Stores {
     /// Free `claimed` of group `group`, which nothing read: a refusal
     /// breaks the pool's invariant.
     fn unclaim(&self, group: usize, claimed: &[usize]) {
-        Self::unclaim_in(&mut self.group(group), group, claimed);
+        Self::unclaim_in(self.group(group), group, claimed);
     }
 
-    fn unclaim_in(store: &mut SlabTensor, group: usize, claimed: &[usize]) {
+    fn unclaim_in(store: &SlabTensor, group: usize, claimed: &[usize]) {
         for &record in claimed {
             if let Err(error) = store.free_slab(record) {
+                if matches!(error, TensorError::Execution(seismic::ExecutionError::DeviceLost(_))) {
+                    tracing::warn!("bank rollback stopped freeing claimed slabs of group {group} after device loss: {error}");
+                    return;
+                }
                 panic!("invariant violated: the bank's pool refused to free record {record} of group {group}, claimed and never read: {error}");
             }
         }
@@ -107,6 +120,7 @@ impl Stores {
     /// Return `records` of group `group` to the pool: each granule free
     /// once the last flight that read it completes. Never waits.
     pub(super) fn free(&self, group: usize, records: &[u32]) -> Result<(), TensorError> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::free");
         let store = self.group(group);
         records.iter().try_for_each(|&record| store.free_slab(record as usize).map(drop))
     }
@@ -115,39 +129,78 @@ impl Stores {
     /// every empty block, then the emptiest emptied while those fall short
     /// (`seismic::Pool::return_freed`). The bytes returned.
     fn return_freed(&self, freed: u64) -> Result<u64, TensorError> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::return_freed");
         self.pool.return_freed(freed)
     }
 
+    /// The backed record indices currently held in group `group`.
+    pub(super) fn backed(&self, group: usize) -> Vec<usize> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::backed");
+        self.group(group).backed()
+    }
+
     /// Record `record` of group `group`'s region `region`, while it is
-    /// held.
+    /// held. Safe inside a no-blocking-allocation scope: `Stores::groups`
+    /// holds no outer mutex and `SlabTensor::slab_region` acquires only the
+    /// `Slots::slabs` leaf lock (never held across allocation or submission).
     pub(super) fn view(&self, group: usize, region: usize, record: usize) -> Option<Tensor> {
         self.group(group).slab_region(record, region).expect("a record and region lie in their group's store")
     }
 
-    /// Each group's routed tensors' records the host addresses, as held
-    /// now, through the last held: holes where none is.
-    pub(super) fn records(&self) -> Result<Vec<Vec<Records>>, String> {
-        (0..self.groups.len())
-            .map(|group| {
-                let store = self.group(group);
-                let held = store.backed().last().map_or(0, |record| record + 1);
-                (0..store.region_count())
+    /// All routed tensor views for each slot in `records` of group `group`,
+    /// delivered into residency's `Group::bank` at open and on `Join::Bank`.
+    pub(super) fn record_views(&self, group: usize, records: &[usize]) -> Vec<Vec<Tensor>> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::record_views");
+        let regions = self.group(group).region_count();
+        records
+            .iter()
+            .map(|&record| {
+                (0..regions)
                     .map(|region| {
-                        let views = (0..held)
-                            .map(|record| store.slab_region(record, region).expect("a record and region lie in their group's store"))
-                            .collect();
-                        Records::new(views, self.record_bytes[group][region])
+                        self.view(group, region, record).unwrap_or_else(|| {
+                            panic!("invariant violated: record {record} of group {group} holds no storage")
+                        })
                     })
                     .collect()
             })
             .collect()
     }
+
+    /// Each group's routed tensors' records the host addresses, resolved on
+    /// demand from the live slab store so idle slabs hold no view and the
+    /// pool can vacate their blocks on a shrink.
+    pub(super) fn records(self: &Arc<Self>) -> Result<Vec<Vec<Records>>, String> {
+        Ok((0..self.groups.len())
+            .map(|group| {
+                let regions = self.group(group).region_count();
+                (0..regions)
+                    .map(|region| {
+                        Records::pooled(
+                            Arc::new(StoreRegion { stores: self.clone(), group, region }),
+                            self.record_bytes[group][region],
+                        )
+                    })
+                    .collect()
+            })
+            .collect())
+    }
 }
 
-impl BankRecordViews for Stores {
-    fn view(&self, group: usize, tensor: usize, record: usize) -> Tensor {
-        Stores::view(self, group, tensor, record)
-            .unwrap_or_else(|| panic!("invariant violated: a promotion copies into record {record} of group {group}, which the bank holds no storage for"))
+/// On-demand record resolver for one `(group, region)` of [`Stores`].
+struct StoreRegion {
+    stores: Arc<Stores>,
+    group: usize,
+    region: usize,
+}
+
+impl crate::experts::source::RecordStore for StoreRegion {
+    fn view(&self, record: u64) -> Option<Tensor> {
+        let record = usize::try_from(record).ok()?;
+        self.stores.view(self.group, self.region, record)
+    }
+
+    fn count(&self) -> u64 {
+        self.stores.group(self.group).backed().last().map_or(0, |record| record + 1) as u64
     }
 }
 
@@ -161,6 +214,9 @@ pub(super) struct Commitment {
     pub(super) resize: Resize,
     pub(super) releasing: Option<Releasing>,
     pub(super) shrunk: Option<BankResized>,
+    /// A growth stopped synchronously by [`ExpertBank::reclaim`], queued for
+    /// the next `advance` to report so the caller consumes its resize cleanly.
+    pub(super) stopped_growth: Option<BankResized>,
     /// A shrink begun beside a running chain the domain has not yet taken
     /// ([`ExpertBank::take_running_begun`]).
     pub(super) running: Option<RunningBegun>,
@@ -168,7 +224,7 @@ pub(super) struct Commitment {
 
 impl Commitment {
     pub(super) fn new(slots: Arc<AtomicU64>) -> Self {
-        Self { slots, resize: Resize::Idle, releasing: None, shrunk: None, running: None }
+        Self { slots, resize: Resize::Idle, releasing: None, shrunk: None, stopped_growth: None, running: None }
     }
 
     /// Whether a resize of the store runs until an advance finishes it: a
@@ -298,7 +354,7 @@ pub(super) type RecordsAt = Arc<dyn Fn(usize, u64) -> u64 + Send + Sync>;
 /// held, `watcher::Shared::backing_slot`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn grow_by_slots<S>(
-    stores: &Stores,
+    stores: &Arc<Stores>,
     (from, to): (u64, u64),
     records: &RecordsAt,
     joining: Joining,
@@ -312,9 +368,9 @@ pub(super) fn grow_by_slots<S>(
     let mut reached = from;
     let mut joined: Option<(Instant, Instant)> = None;
     let mut spent = Spent::default();
-    // The views of the records the host lands into, which each slot's join
-    // carries as they are then.
-    let mut views = match joining {
+    // Pooled records resolve newly claimed slabs on demand, holding no
+    // persistent views.
+    let views = match joining {
         Joining::Bank => None,
         Joining::Landed => match stores.records() {
             Ok(views) => Some(views),
@@ -327,48 +383,52 @@ pub(super) fn grow_by_slots<S>(
         };
         spent.slots += 1;
         let claiming = Instant::now();
-        let claimed = changes.back(|_| {
+        // Acquire `rises` before `changes.back` (matching `domain::observe`
+        // order). `SlabTensor::add_slab` grows the pool outside slab/pool locks
+        // via single-flight `GrowGate` when no granule is free.
+        let claimed = {
             let _rises = rises.lock().expect("the bank's charge rises");
-            let mut claimed: Vec<Vec<usize>> = Vec::with_capacity(groups);
-            for group in 0..groups {
-                match stores.claim_to(group, records(group, at)) {
-                    Ok(records) => claimed.push(records),
-                    Err(refusal) => {
-                        // The slot joins nothing: what its groups claimed
-                        // before returns at once, never read.
-                        for (group, records) in claimed.iter().enumerate() {
-                            stores.unclaim(group, records);
+            changes.back(|_| {
+                let mut claimed: Vec<Vec<usize>> = Vec::with_capacity(groups);
+                for group in 0..groups {
+                    match stores.claim_to(group, records(group, at)) {
+                        Ok(records) => claimed.push(records),
+                        Err(refusal) => {
+                            // The slot joins nothing: what its groups claimed
+                            // before returns at once, never read.
+                            for (group, records) in claimed.iter().enumerate() {
+                                stores.unclaim(group, records);
+                            }
+                            return Err(refusal);
                         }
-                        return Err(refusal);
                     }
                 }
-            }
-            Ok(claimed)
-        });
+                Ok(claimed)
+            })
+        };
         let claimed = match claimed {
             Ok(claimed) => claimed,
             Err(refusal) => return Grown { at: reached, joined, cut: Cut::Refused(refusal), spent },
         };
         let joining_at = Instant::now();
         spent.claim += joining_at - claiming;
-        let join = match &mut views {
-            None => Join::Bank { records: claimed },
+        let join = match &views {
+            None => {
+                let bank_views = claimed
+                    .iter()
+                    .enumerate()
+                    .map(|(group, records)| stores.record_views(group, records))
+                    .collect();
+                Join::Bank { records: claimed, views: bank_views }
+            }
             Some(views) => {
-                let formed = claimed.iter().enumerate().try_for_each(|(group, records)| {
-                    for &record in records {
-                        for (region, view) in views[group].iter_mut().enumerate() {
-                            *view = view.with(record as u64, stores.view(group, region, record))?;
-                        }
-                    }
-                    Ok::<_, String>(())
-                });
                 let records = claimed
                     .iter()
                     .map(|records| {
                         records.iter().map(|&record| u32::try_from(record).map_err(|_| "landed records exceed u32".to_owned())).collect::<Result<Vec<_>, _>>()
                     })
                     .collect::<Result<Vec<_>, _>>();
-                match formed.and(records) {
+                match records {
                     Ok(records) => Join::Landed { records, views: views.clone() },
                     Err(reason) => return Grown { at: reached, joined, cut: Cut::Unjoined(reason), spent },
                 }
@@ -390,26 +450,30 @@ impl Growing {
     /// acquired, and where its time went; or why the store is broken (a
     /// slot claimed could not join).
     pub(super) fn ended(&self, holding: BankHolding, charged: impl FnOnce() -> u64) -> Option<Result<(BankResized, Spent), String>> {
-        let (Grown { at, joined, cut, spent }, released) = self.done.lock().expect("bank growth outcome").take()?;
+        let done = self.done.lock().expect("bank growth outcome").take()?;
+        Some(self.finish(holding, done, charged))
+    }
+
+    pub(super) fn finish(&self, holding: BankHolding, (Grown { at, joined, cut, spent }, released): (Grown, Instant), charged: impl FnOnce() -> u64) -> Result<(BankResized, Spent), String> {
         let refused = match cut {
             Cut::None => None,
             Cut::Refused(refusal) => Some(refusal),
-            Cut::Unjoined(reason) => return Some(Err(reason)),
+            Cut::Unjoined(reason) => return Err(reason),
         };
         // No slot joined: refused at its first, or stopped before it.
         let Some((first, last)) = joined else {
-            return Some(Ok(match refused {
+            return Ok(match refused {
                 Some(refusal) => (BankResized::GrowthRefused { holding, at, refusal }, spent),
                 None => (BankResized::Stopped { holding, at }, spent),
-            }));
+            });
         };
         let Some(grown) = charged().checked_sub(self.charged) else {
-            return Some(Err("a growth lowered its records' charge".to_owned()));
+            return Err("a growth lowered its records' charge".to_owned());
         };
         let zero = Duration::ZERO;
         let begun = Begun { decided: self.decided, queued: zero, planned: zero, trip: Trip::default() };
         let times = begun.times(first, last, released);
-        Some(Ok((BankResized::Grown { holding, from: self.from, to: at, grown, refused, times }, spent)))
+        Ok((BankResized::Grown { holding, from: self.from, to: at, grown, refused, times }, spent))
     }
 }
 
@@ -590,6 +654,22 @@ impl ExpertBank {
         self.watcher.shared().events().notify();
     }
 
+    /// Drain settled blocks owed to the OS/driver from `stores`'s pool at a
+    /// flight boundary: fenced granules released by an earlier async shrink
+    /// settle once their flight completes, and vacating here returns them on
+    /// the very next boundary instead of leaving them trapped in fragmented
+    /// blocks.
+    fn drain_owed(&self, stores: &Stores, label: &str) -> Result<u64, DomainError> {
+        if stores.pool.owed() == 0 {
+            return Ok(0);
+        }
+        self.cache
+            .changes()
+            .clone()
+            .change(|_| stores.return_freed(0))
+            .map_err(|error| DomainError::invariant(format!("the {label}'s pool could not return settled blocks: {error}")))
+    }
+
     /// Finish a host tier's resize: its growth once its thread ended it, or
     /// its shrink. Its outcome, and whether a domain resize began it (the
     /// open's backing to its planned slots did not, so its end is reported
@@ -599,9 +679,17 @@ impl ExpertBank {
             return Ok(None);
         };
         let tier = &mut *tier;
-        if let Some(shrunk) = tier.commitment.shrunk.take() {
+        if let Some(stopped) = tier.commitment.stopped_growth.take() {
+            self.drain_owed(&tier.stores, "host tier")?;
+            return Ok(Some((stopped, true)));
+        }
+        if let Some(mut shrunk) = tier.commitment.shrunk.take() {
+            if let BankResized::Shrunk { returned, .. } = &mut shrunk {
+                *returned += self.drain_owed(&tier.stores, "host tier")?;
+            }
             return Ok(Some((shrunk, true)));
         }
+        self.drain_owed(&tier.stores, "host tier")?;
         let Resize::Growing(growing) = &tier.commitment.resize else {
             return Ok(None);
         };
@@ -680,33 +768,47 @@ impl ExpertBank {
         }
     }
 
-    /// Return a shrink's `evicted` records of `stores` to their pool, the
-    /// records charged `charged` before it, then what they freed to the OS:
-    /// the pool's empty blocks, and where those return less, its emptiest
-    /// blocks emptied for it, their copies enqueued and never waited for
-    /// (`seismic::Pool::return_freed`), the bank's
-    /// cache of `tier`'s holding cut to what stays above its floor
-    /// ([`Self::above_floor`], `BankCache::fit`): one change. The shrink,
-    /// done.
+    /// Return a shrink's `evicted` records of `stores` to their pool, cut
+    /// `BankCache` to `above_floor(tier, to)`, and return freed blocks to the
+    /// OS (`return_freed_sync` when `sync_need` is `Some` for synchronous
+    /// admission reclaim, `return_freed` otherwise for `between_flights`
+    /// external-pressure shrinks). The one shrink-release path both reach.
+    fn release_evicted(
+        &self,
+        stores: &Stores,
+        tier: BankTier,
+        to: u64,
+        charged: u64,
+        evicted: &[Vec<u32>],
+        sync_need: Option<u64>,
+    ) -> Result<(u64, u64), DomainError> {
+        let holding = match tier {
+            BankTier::Bank => BankHolding::Experts,
+            BankTier::Host => BankHolding::Host,
+        };
+        self.cache.changes().clone().back(|_| {
+            for (group, records) in evicted.iter().enumerate() {
+                stores.free(group, records).map_err(|refusal| DomainError::invariant(format!("the expert bank's pool refused a shrink's release: {refusal}")))?;
+            }
+            let released = charged.checked_sub(stores.charged()).ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
+            self.cache.fit(holding, self.above_floor(tier, to));
+            let returned = match sync_need {
+                Some(need) => stores.pool.return_freed_sync(released.max(need)),
+                None => stores.return_freed(released),
+            }
+            .map_err(|error| DomainError::invariant(format!("the expert bank's pool could not return a shrink's blocks: {error}")))?;
+            tracing::debug!(?holding, released, returned, sync = sync_need.is_some(), "a shrink's granules return to the pool, its empty blocks to the OS");
+            Ok((released, returned))
+        })
+    }
+
     fn release(&self, stores: &Stores, tier: BankTier, (from, to): (u64, u64), charged: u64, evicted: &[Vec<u32>], begun: Begun) -> Result<BankResized, DomainError> {
         let holding = match tier {
             BankTier::Bank => BankHolding::Experts,
             BankTier::Host => BankHolding::Host,
         };
         let releasing = Instant::now();
-        let released = self.cache.changes().clone().change(|_| {
-            for (group, records) in evicted.iter().enumerate() {
-                stores.free(group, records).map_err(|refusal| DomainError::invariant(format!("the expert bank's pool refused a shrink's release: {refusal}")))?;
-            }
-            let released = charged.checked_sub(stores.charged()).ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
-            self.cache.fit(holding, self.above_floor(tier, to));
-            let returned = stores
-                .return_freed(released)
-                .map_err(|error| DomainError::invariant(format!("the expert bank's pool could not return a shrink's blocks: {error}")))?;
-            tracing::debug!(?holding, released, returned, "a shrink's granules return to the pool, its empty blocks to the OS");
-            Ok::<_, DomainError>((released, returned))
-        })?;
-        let (released, returned) = released;
+        let (released, returned) = self.release_evicted(stores, tier, to, charged, evicted, None)?;
         let times = begun.times(releasing, releasing, Instant::now());
         Ok(BankResized::Shrunk { holding, from, to, released, returned, times })
     }
@@ -738,6 +840,10 @@ impl ExpertBank {
     /// thread ended it.
     pub(super) fn advance(&self) -> Result<Option<BankResized>, DomainError> {
         let mut commitment = self.commitment();
+        if let Some(stopped) = commitment.stopped_growth.take() {
+            self.drain_owed(&self.stores, "expert bank")?;
+            return Ok(Some(stopped));
+        }
         if let Some(releasing) = commitment.releasing.take() {
             match self.released(releasing) {
                 Ok(shrunk) => commitment.shrunk = Some(shrunk),
@@ -747,9 +853,13 @@ impl ExpertBank {
                 }
             }
         }
-        if let Some(shrunk) = commitment.shrunk.take() {
+        if let Some(mut shrunk) = commitment.shrunk.take() {
+            if let BankResized::Shrunk { returned, .. } = &mut shrunk {
+                *returned += self.drain_owed(&self.stores, "expert bank")?;
+            }
             return Ok(Some(shrunk));
         }
+        self.drain_owed(&self.stores, "expert bank")?;
         let Resize::Growing(growing) = &commitment.resize else {
             return Ok(None);
         };
@@ -876,5 +986,247 @@ impl ExpertBank {
     /// [`ElasticBank::running_begun`](crate::domain::ElasticBank::running_begun).
     pub(super) fn take_running_begun(&self) -> Option<RunningBegun> {
         self.commitment().running.take()
+    }
+
+    /// Synchronously reclaim at least `need` bytes of `tier`'s bank cache back
+    /// to the OS (down to `tier`'s floor): stop and await any running growth,
+    /// compute exact target slots releasing `>= need` from exact slot & granule
+    /// sizes (no 1-block jitter tolerance), evict from the watcher (waiting on
+    /// in-flight bank traffic if needed), free slabs, trim `BankCache`, and
+    /// synchronously return freed blocks to the OS (`return_freed_sync`).
+    pub(super) fn reclaim(&self, tier: BankTier, need: u64) -> Result<u64, ReclaimError> {
+        if need == 0 {
+            return Ok(0);
+        }
+        let holding = match tier {
+            BankTier::Bank => BankHolding::Experts,
+            BankTier::Host => BankHolding::Host,
+        };
+        let stores: Arc<Stores> = match tier {
+            BankTier::Bank => self.stores.clone(),
+            BankTier::Host => match self.host() {
+                Some(host) => host.stores.clone(),
+                None => return Err(ReclaimError::AtFloor),
+            },
+        };
+
+        // 1. Stop any running growth on `tier` and await its current slot
+        //    outside the commitment lock so no deadlock is possible.
+        let stopped = match tier {
+            BankTier::Bank => {
+                let mut commitment = self.commitment();
+                match std::mem::replace(&mut commitment.resize, Resize::Idle) {
+                    Resize::Growing(growing) => {
+                        growing.stop.store(true, Ordering::Release);
+                        Some((growing, false))
+                    }
+                    other => {
+                        commitment.resize = other;
+                        None
+                    }
+                }
+            }
+            BankTier::Host => {
+                let Some(mut host) = self.host() else {
+                    return Err(ReclaimError::AtFloor);
+                };
+                match std::mem::replace(&mut host.commitment.resize, Resize::Idle) {
+                    Resize::Growing(growing) => {
+                        growing.stop.store(true, Ordering::Release);
+                        let was_backing = std::mem::take(&mut host.backing);
+                        Some((growing, was_backing))
+                    }
+                    other => {
+                        host.commitment.resize = other;
+                        None
+                    }
+                }
+            }
+        };
+        if let Some((growing, was_backing)) = stopped {
+            self.watcher.shared().events().notify();
+            let outcome = growing.done.wait();
+            match growing.finish(holding, outcome, || stores.charged()) {
+                Ok((resized, _spent)) => {
+                    self.cache.settle(&resized);
+                    let slots = match tier {
+                        BankTier::Bank => self.commitment().slots.load(Ordering::Acquire),
+                        BankTier::Host => self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)),
+                    };
+                    self.cache.fit(holding, self.above_floor(tier, slots));
+                    if !was_backing {
+                        match tier {
+                            BankTier::Bank => self.commitment().stopped_growth = Some(resized),
+                            BankTier::Host => {
+                                if let Some(mut host) = self.host() {
+                                    host.commitment.stopped_growth = Some(resized);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(reason) => {
+                    match tier {
+                        BankTier::Bank => self.commitment().resize = Resize::Broken(reason.clone()),
+                        BankTier::Host => {
+                            if let Some(mut host) = self.host() {
+                                host.commitment.resize = Resize::Broken(reason.clone());
+                            }
+                        }
+                    }
+                    return Err(ReclaimError::Invariant(reason));
+                }
+            }
+        }
+
+        // 2. Flush any pending `releasing` from an earlier running shrink on Bank.
+        if tier == BankTier::Bank {
+            let releasing = self.commitment().releasing.take();
+            if let Some(releasing) = releasing {
+                self.released(releasing).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            }
+        }
+
+        // 3. Loop across eviction passes until `total_returned >= need`, the
+        //    tier reaches its floor, or nothing further can be evicted.
+        //    A single eviction pass can free granules scattered across
+        //    partially-occupied pool blocks without emptying a whole block
+        //    yet; retrying with at least `block_bytes.max(deficit)` guarantees
+        //    forward progress until whole blocks are returned or floor is hit.
+        let mut total_returned = 0u64;
+        let mut total_released = 0u64;
+        let mut evicted_any = false;
+        let initial_from = match tier {
+            BankTier::Bank => self.commitment().slots.load(Ordering::Acquire),
+            BankTier::Host => self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)),
+        };
+        let mut current_from = initial_from;
+        let block_bytes = stores.pool.block_bytes();
+        let charge_fn = self.tier_charge(tier);
+        let charge = |at| Ok::<_, std::convert::Infallible>(charge_fn(&self.counts, at));
+
+        while total_returned < need {
+            let deficit = need - total_returned;
+
+            // Flush already-free or fenced pool granules first before evicting
+            // more live bank slots.
+            let flushed = self
+                .cache
+                .changes()
+                .clone()
+                .back(|_| stores.pool.return_freed_sync(deficit))
+                .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            total_returned = total_returned.saturating_add(flushed);
+            if total_returned >= need {
+                break;
+            }
+            let deficit = need - total_returned;
+
+            let (from, floor) = match tier {
+                BankTier::Bank => (self.commitment().slots.load(Ordering::Acquire), self.floor(tier)),
+                BankTier::Host => (self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)), self.floor(tier)),
+            };
+            current_from = from;
+            if from <= floor {
+                break;
+            }
+
+            let evict_bytes = if !evicted_any {
+                let already_free = stores.pool.free_granules() as u64 * stores.pool.granule();
+                let target_blocks = deficit.div_ceil(block_bytes).saturating_mul(block_bytes);
+                match target_blocks.saturating_sub(already_free) {
+                    0 => deficit,
+                    bytes => bytes,
+                }
+            } else {
+                // Previous eviction freed granules without vacating enough
+                // whole blocks: evict at least one full pool block so
+                // fragmentation cannot stall progress.
+                block_bytes.max(deficit)
+            };
+
+            let shallowest = crate::planning::releasing(from, floor, 0, charge).unwrap_or_else(|never| match never {});
+            let deepest = crate::planning::releasing(from, floor, evict_bytes, charge).unwrap_or_else(|never| match never {});
+            let (Some(shallowest), Some(deepest)) = (shallowest, deepest) else {
+                break;
+            };
+
+            // Evict from the watcher; if in-flight bank traffic temporarily
+            // pins slabs, hold traffic and wait for it to drain, then retry.
+            let evicting = self.evicting(tier);
+            let charged = stores.charged();
+            let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            let evicted = match self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)? {
+                Some(evicted) => Some(evicted),
+                None => {
+                    let _hold = self.watcher.shared().hold_traffic();
+                    self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
+                    let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+                    self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)?
+                }
+            };
+
+            let Some(Evicted { slots, records, .. }) = evicted else {
+                break;
+            };
+
+            let to = slots as u64;
+            if to >= from {
+                break;
+            }
+            match tier {
+                BankTier::Bank => self.commitment().slots.store(to, Ordering::Release),
+                BankTier::Host => {
+                    if let Some(host) = self.host() {
+                        host.commitment.slots.store(to, Ordering::Release);
+                    }
+                }
+            }
+            let (released, returned) = self
+                .release_evicted(&stores, tier, to, charged, &records, Some(deficit))
+                .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            evicted_any = true;
+            current_from = to;
+            total_released = total_released.saturating_add(released);
+            total_returned = total_returned.saturating_add(returned);
+        }
+
+        if evicted_any {
+            tracing::info!(
+                ?holding,
+                from = initial_from,
+                to = current_from,
+                need,
+                released = total_released,
+                returned = total_returned,
+                "expert bank reclaimed synchronously for admission"
+            );
+        }
+        match total_returned {
+            0 => Err(ReclaimError::AtFloor),
+            n => Ok(n),
+        }
+    }
+}
+
+/// Synchronous [`CacheReclaimer`] for one tier of an [`ExpertBank`], holding
+/// only a weak reference so it never extends the bank's lifetime.
+pub(super) struct BankReclaimer {
+    bank: Weak<ExpertBank>,
+    tier: BankTier,
+}
+
+impl BankReclaimer {
+    pub(super) fn new(bank: &Arc<ExpertBank>, tier: BankTier) -> Arc<Self> {
+        Arc::new(Self { bank: Arc::downgrade(bank), tier })
+    }
+}
+
+impl CacheReclaimer for BankReclaimer {
+    fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+        let Some(bank) = self.bank.upgrade() else {
+            return Err(ReclaimError::AtFloor);
+        };
+        bank.reclaim(self.tier, need)
     }
 }

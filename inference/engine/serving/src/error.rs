@@ -42,7 +42,7 @@ pub enum ModelUnavailable {
 }
 
 /// Every failure a protocol handler can report.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ServingError {
     /// The protocol request is malformed or uses unsupported controls.
     InvalidRequest(String),

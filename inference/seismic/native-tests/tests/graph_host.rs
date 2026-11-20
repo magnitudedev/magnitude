@@ -61,7 +61,8 @@ fn sealed_and_planned_heap(device: &Device, nodes: usize) -> (HostHeap, HostHeap
         )
         .unwrap();
     graph.export(&value).unwrap();
-    let sealed = graph.seal().unwrap().host_heap();
+    let plan = graph.seal().unwrap();
+    let sealed = plan.host_heap().plus(plan.topology_heap()).unwrap();
 
     let mut graph = NativeGraphMetadata::new(device.backend());
     let input = graph.port(Element::f32(), &[m, n]).unwrap();
@@ -92,7 +93,10 @@ fn sealed_and_planned_heap(device: &Device, nodes: usize) -> (HostHeap, HostHeap
         )
         .unwrap();
     graph.export(&value).unwrap();
-    (sealed, graph.plan_heap())
+    let planned = graph.plan_heap().plus(graph.topology_heap()).unwrap();
+    assert_eq!(plan.host_heap(), graph.plan_heap());
+    assert_eq!(plan.topology_heap(), graph.topology_heap());
+    (sealed, planned)
 }
 
 /// A sealed plan's host heap is the sum of its vectors' capacities, and the
@@ -242,5 +246,68 @@ fn graph_completion_retains_inputs_until_its_outcome_is_taken() {
         completion.wait().unwrap();
         assert_eq!(observer.charged_bytes(), None);
         drop(outputs);
+    }
+}
+
+/// Plans sealed from one `NativeGraphLayout` share their immutable
+/// `SealedTopology` allocation via `Arc` and each plan's `host_heap()` equals
+/// the layout's `plan_heap()`.
+#[test]
+fn plans_of_one_layout_share_topology() {
+    for device in seismic_native_tests::every_device() {
+        let layout = NativeGraphMetadata::certify_group([1u64, 4].into_iter().map(|m| {
+            let mut metadata = NativeGraphMetadata::new(device.backend());
+            let input = metadata.port(Element::f32(), &[m, 8u64]).unwrap();
+            let value = metadata
+                .enqueue::<scale_rows::Entry>(
+                    &[],
+                    &[("M", m), ("N", 8u64)],
+                    scale_rows::WorkflowArgs {
+                        x: input.tensor().into(),
+                        factor: seismic::Argument::from(2.0),
+                    },
+                )
+                .unwrap()
+                .value;
+            metadata.export(&value).unwrap();
+            metadata
+        }))
+        .unwrap();
+
+        let seal_for = |m: u64| {
+            let kernel = scale_rows::native_for_device(
+                &device,
+                &NativeSpecialization::new().with_param("ROWS", 1),
+            )
+            .unwrap();
+            let mut graph = device.native_graph_with_layout(&layout);
+            let input = graph.port(Element::f32(), &[m, 8]).unwrap();
+            let value = graph
+                .enqueue(
+                    &kernel,
+                    scale_rows::WorkflowArgs {
+                        x: input.tensor().into(),
+                        factor: seismic::Argument::from(2.0),
+                    },
+                )
+                .unwrap()
+                .value;
+            graph.export(&value).unwrap();
+            graph.seal().unwrap()
+        };
+
+        let plan_a = seal_for(1);
+        let plan_b = seal_for(4);
+        assert!(plan_a.shares_topology(&plan_b), "{:?}: plans should share topology", device.backend());
+        assert_eq!(plan_a.topology_identity(), plan_b.topology_identity());
+        assert_eq!(plan_a.host_heap(), layout.plan_heap(), "{:?}: plan_a heap", device.backend());
+        assert_eq!(plan_b.host_heap(), layout.plan_heap(), "{:?}: plan_b heap", device.backend());
+        assert_eq!(plan_a.topology_heap(), layout.topology_heap(), "{:?}: plan_a topology heap", device.backend());
+        assert_eq!(plan_b.topology_heap(), layout.topology_heap(), "{:?}: plan_b topology heap", device.backend());
+        assert!(layout.topology_heap().bytes > 0 && layout.topology_heap().allocations > 0);
+        // Combined family heap charges per-plan slices twice and the shared topology once.
+        let planned_total = layout.plan_heap().times(2).unwrap().plus(layout.topology_heap()).unwrap();
+        let held_total = plan_a.host_heap().plus(plan_b.host_heap()).unwrap().plus(plan_a.topology_heap()).unwrap();
+        assert_eq!(held_total, planned_total, "{:?}: combined planned == held with shared topology", device.backend());
     }
 }

@@ -337,7 +337,7 @@ PROTOCOL = 7
 CLAIMED = ("checkout:", "output:")
 # In `<root>/outputs/<tree>-<build>/`: a build's output (`Runner.materialize`), complete once
 # `OUTPUT_DONE` is there, kept while a live run holds it.
-OUTPUTS, OUTPUT_DONE, TESTS = "outputs", "complete", "tests.json"
+OUTPUTS, OUTPUT_DONE, OUTPUT_PROVENANCE, TESTS = "outputs", "complete", "provenance.json", "tests.json"
 # Cargo's target kinds whose test executable is named by `--<kind> NAME`; every other kind (lib,
 # rlib, proc-macro, cdylib...) is the package's library, `--lib`.
 NAMED_KINDS = ("bin", "test", "bench", "example")
@@ -1599,17 +1599,24 @@ class Runner:
         """Complete the side's output from its build, once: every executable of the target's
         profile and example directories that its build provenance (`proven`, its record) kept,
         and every test executable the build produced, linked at
-        its path under the output's `target`, and the list of the test executables with their
-        packages' directories in the output's source (`TESTS`). The executables linked."""
+        its path under the output's `target`, the list of the test executables with their
+        packages' directories in the output's source (`TESTS`), and the build provenance
+        (`OUTPUT_PROVENANCE`) matching those executables. When another build of the same tree and
+        build already completed the output, its `OUTPUT_PROVENANCE` replaces `proven` so the run's
+        provenance names the exact executables its jobs execute. The executables linked."""
         output, checkout = self.outputs[side], self.rig.checkout(self.checkouts[side])
         tests, self.tests, self.scripts, self.build_scripts = self.tests, [], {}, {}
+        output_provenance = os.path.join(output, OUTPUT_PROVENANCE)
         if os.path.exists(os.path.join(output, OUTPUT_DONE)):
+            if os.path.exists(output_provenance):
+                shutil.copyfile(output_provenance, proven)
             return 0
         target, into = os.path.realpath(os.path.join(checkout, "target")), os.path.join(output, "target")
         staged = os.path.join(output, ".target.%d" % os.getpid())
         os.makedirs(staged)
         with open(proven) as stream:
-            executables = set(json.load(stream)["kept"]) | {path for path, *_ in tests}
+            proof = json.load(stream)
+        executables = set(proof["kept"]) | {path for path, *_ in tests}
         for path in executables:
             relative = os.path.relpath(path, target)
             os.makedirs(os.path.dirname(os.path.join(staged, relative)), exist_ok=True)
@@ -1622,7 +1629,10 @@ class Runner:
                            "directory": os.path.join(output, "src", package),
                            "binary": binary_key(package, kind, name)})
         moved = self._move_in(staged, into, (os.path.join(output, TESTS), listed),
+                              (output_provenance, proof),
                               (os.path.join(output, OUTPUT_DONE), _now()))
+        if not moved and os.path.exists(output_provenance):
+            shutil.copyfile(output_provenance, proven)
         return len(executables) if moved else 0
 
     def _units(self, request: dict):
@@ -2232,6 +2242,7 @@ def report(root: str, sides: list, ahead_of: str | None = None, env: dict | None
                 "name": name, "source": _read(os.path.join(base, name, SOURCE)),
                 "size": _recorded(os.path.join(base, name, "size")),
                 "warmth": SAME if shared is not None else warmth_of(base, name, source),
+                "same_tree": shared is not None or _read(os.path.join(base, name, TREE)) == tree,
                 "commit": _read(os.path.join(base, name, COMMIT)),
                 "built": build in _references(os.path.join(base, name)), "shared": shared is not None,
             })

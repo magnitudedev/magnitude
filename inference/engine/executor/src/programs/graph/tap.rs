@@ -72,7 +72,7 @@ impl<'a, G: GraphDraft + 'a> Taps<'a, G> {
             rows: rows.clone(),
             positions: tap.positions,
             ports: TapPorts {
-                taps: graph.port_with_class_extent(activation, &[rows, width], 0, "M")?,
+                taps: graph.port(activation, &[rows, width])?,
                 entry: None,
                 middle: None,
                 output: None,

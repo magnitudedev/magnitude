@@ -781,7 +781,7 @@ pub fn measure_load(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut Stat
     let experts = domain.family.bank.is_some().then(|| crate::ExpertMeasures {
         lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
         read: crate::assessment::Priced::Measured(READ),
-        pass: crate::assessment::Priced::Pending("unpriced".into()),
+        pass: crate::assessment::Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required))),
         tier_copy: crate::assessment::Priced::Measured(None),
         convert: crate::assessment::Priced::Measured(None),
     });
@@ -1216,7 +1216,9 @@ impl FakeBank {
             .change(|_| (0..committed).try_for_each(|_| self.slots.add_slab(seismic::SlabFill::Unwritten).map(drop)))
             .expect("the fixture's ledger holds its bank");
         let above = committed.saturating_sub(1) * self.row();
-        let cache = ledger.cache(crate::memory::ledger::CacheKind::Bank, above).expect("the fixture's ledger holds its bank");
+        let cache = ledger
+            .cache(crate::memory::ledger::CacheKind::Bank, above, crate::memory::ledger::Reclaim::Deferred)
+            .expect("the fixture's ledger holds its bank");
         self.cache.hold(crate::BankHolding::Experts, cache);
     }
 

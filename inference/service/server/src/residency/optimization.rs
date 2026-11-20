@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use magnitude_engine::worker::Preparation as WorkerPreparation;
+use magnitude_engine::worker::{
+    AcquiredDevice, Preparation as WorkerPreparation, PricedError, PricedFailure, run_priced,
+};
 use magnitude_engine::worker::protocol::LoadProgress;
 use magnitude_service_contracts::models::{
     CatalogOptimizationProgress, CatalogOptimizationStage, ModelId, ModelLoadDevice,
@@ -21,7 +23,7 @@ use magnitude_service_contracts::models::{
 use magnitude_service_models::{ServableModelBundleKey, servable_model_bundle_key_for_bundle};
 use tokio::sync::watch;
 
-use super::controller::{ResidencyEnvironment, load_plan, preview, priced, request_prices};
+use super::controller::{ResidencyEnvironment, load_plan, preview, request_prices, settle_prices};
 use super::worker::EngineWorker;
 use super::{ModelOperationFailure, ResidencyWorker as _};
 use crate::device_lock::{DeviceHold, DeviceJob, DeviceLock};
@@ -264,7 +266,13 @@ impl Drop for PreparationGuard {
             .remove(&self.key)
             .and_then(|job| job.worker);
         if let Some(worker) = worker {
-            worker.end("preparation_ended", "the installation's optimization ended");
+            if tokio::runtime::Handle::try_current().is_ok() {
+                drop(magnitude_service_utils::blocking::run(move || {
+                    worker.end("preparation_ended", "the installation's optimization ended");
+                }));
+            } else {
+                worker.end("preparation_ended", "the installation's optimization ended");
+            }
         }
     }
 }
@@ -305,81 +313,114 @@ async fn prepare(
 ) -> Result<Preparation, ModelOperationFailure> {
     let configuration = environment.model_variants.serving_configuration(model_id)?;
     let key = servable_model_bundle_key_for_bundle(&configuration.bundle);
-    let Some(mut job) = jobs.register(key, Arc::clone(&progress)) else {
+    let Some(job) = jobs.register(key, Arc::clone(&progress)) else {
         return Ok(Preparation::Skipped("the bundle is already being prepared"));
     };
     let resolved = environment.configurations.resolve(&configuration).await?;
-    // A model this device cannot load has nothing to tune for.
-    // Its plan waits for its prices as a load's does, holding nothing of the device.
-    let previewed = priced(
-        &environment.device,
-        || preview(&environment.catalog, &resolved.configuration),
-        || request_prices(&environment.catalog, &resolved.configuration),
-    );
-    let Ok(preview) = previewed.await else {
-        return Ok(Preparation::Skipped("the load preview failed"));
-    };
-    let device = load_plan(&preview)?.device;
-    job.select(device.clone());
     let manifest = resolved.manifest.clone();
-    loop {
-        let Some(hold) = take_device(&environment.device, &mut job).await else {
-            return Ok(Preparation::Skipped("its model was loaded, and the load prepared it"));
-        };
-        job.report(CatalogOptimizationProgress::preparing(Some(device.clone())));
-        let mut preemption = hold.preemption();
-        let spawned = EngineWorker::spawn(&environment.launcher, DeviceHold::Job(hold)).map_err(
-            |error| ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true),
-        )?;
-        let worker = Arc::clone(&spawned.worker);
-        job.attach(Arc::clone(&worker));
-        let preparing = magnitude_service_utils::blocking::run({
+    // A model this device cannot load has nothing to tune for; its plan and Prepare wait for
+    // standing figures through `run_priced` while holding nothing of the device.
+    let outcome = run_priced(
+        || preview(&environment.catalog, &resolved.configuration),
+        || settle_prices(&environment.device, request_prices(&environment.catalog, &resolved.configuration)),
+        |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+        |()| {},
+        job,
+        |previewed, &(), mut job| {
+            let device = load_plan(previewed).map(|plan| plan.device);
             let manifest = manifest.clone();
             let progress = Arc::clone(&progress);
-            let mut progression = OptimizationProgression::new(device.clone());
-            move || {
-                magnitude_engine::worker::prepare(
-                    &manifest,
-                    || Ok(spawned.into_process()),
-                    move |update| {
-                        if let Some(update) = progression.advance(update) {
-                            progress(update);
+            async move {
+                let device = device.map_err(PricedFailure::Host)?;
+                loop {
+                    job.select(device.clone());
+                    let Some(hold) = take_device(&environment.device, &mut job).await else {
+                        return Ok(Preparation::Skipped(
+                            "its model was loaded, and the load prepared it",
+                        ));
+                    };
+                    job.report(CatalogOptimizationProgress::preparing(Some(device.clone())));
+                    let mut preemption = hold.preemption();
+                    let launcher = environment.launcher.clone();
+                    let spawned = magnitude_service_utils::blocking::run(move || {
+                        EngineWorker::spawn(&launcher, DeviceHold::Job(hold))
+                    })
+                    .await
+                    .map_err(|error| {
+                        PricedFailure::Host(ModelOperationFailure::new(
+                            "worker_spawn_failed",
+                            format!("{error:#}"),
+                            true,
+                        ))
+                    })?;
+                    let worker = Arc::clone(&spawned.worker);
+                    job.attach(Arc::clone(&worker));
+                    let preparing = magnitude_service_utils::blocking::run({
+                        let manifest = manifest.clone();
+                        let progress = Arc::clone(&progress);
+                        let mut progression = OptimizationProgression::new(device.clone());
+                        move || {
+                            magnitude_engine::worker::prepare(
+                                &manifest,
+                                || Ok(spawned.into_process()),
+                                move |update| {
+                                    if let Some(update) = progression.advance(update) {
+                                        progress(update);
+                                    }
+                                },
+                            )
                         }
-                    },
-                )
+                    });
+                    tokio::pin!(preparing);
+                    // A load wanting the device preempts the job: its worker is killed, and the
+                    // load proceeds once it is proven retired.
+                    let (prepared, preempted) = tokio::select! {
+                        prepared = &mut preparing => (prepared, false),
+                        () = preemption.preempted() => {
+                            let worker = Arc::clone(&worker);
+                            magnitude_service_utils::blocking::run(move || {
+                                worker.end("preparation_preempted", "a load takes the device");
+                            })
+                            .await;
+                            (preparing.as_mut().await, true)
+                        }
+                    };
+                    match prepared {
+                        Ok(WorkerPreparation::Prepared | WorkerPreparation::Unneeded) => {
+                            return Ok(Preparation::Prepared);
+                        }
+                        Ok(WorkerPreparation::Unshared) => {
+                            return Ok(Preparation::Skipped(
+                                "the configuration names no kernel cache",
+                            ));
+                        }
+                        Ok(WorkerPreparation::Incomplete(_)) | Err(_) if preempted => {
+                            tracing::info!(
+                                %model_id,
+                                "installed model optimization preempted; it waits for the device again"
+                            );
+                        }
+                        Ok(WorkerPreparation::Incomplete(error)) | Err(error) => {
+                            return Err(PricedFailure::Load(error, worker, job));
+                        }
+                    }
+                }
             }
-        });
-        tokio::pin!(preparing);
-        // A load wanting the device preempts the job: its worker is killed, and the load proceeds
-        // once it is proven retired.
-        let (prepared, preempted) = tokio::select! {
-            prepared = &mut preparing => (prepared, false),
-            () = preemption.preempted() => {
-                worker.end("preparation_preempted", "a load takes the device");
-                (preparing.as_mut().await, true)
-            }
-        };
-        match prepared {
-            Ok(WorkerPreparation::Prepared | WorkerPreparation::Unneeded) => {
-                return Ok(Preparation::Prepared);
-            }
-            Ok(WorkerPreparation::Unshared) => {
-                return Ok(Preparation::Skipped("the configuration names no kernel cache"));
-            }
-            Ok(WorkerPreparation::Incomplete(_)) | Err(_) if preempted => {
-                tracing::info!(%model_id, "installed model optimization preempted; it waits for the device again");
-            }
-            Ok(WorkerPreparation::Incomplete(error)) | Err(error) => {
-                return Err(ModelOperationFailure::new(
-                    "model_optimization_failed",
-                    match worker.diagnostics() {
-                        diagnostics if diagnostics.is_empty() => error.to_string(),
-                        diagnostics => format!("{error}; worker diagnostics: {diagnostics}"),
-                    },
-                    error.retryable(),
-                ));
-            }
-        }
+        },
+    )
+    .await;
+    match outcome {
+        Ok((preparation, _, ())) => Ok(preparation),
+        Err(PricedError::Preview(_)) => Ok(Preparation::Skipped("the load preview failed")),
+        Err(PricedError::Host(failure)) => Err(failure),
+        Err(PricedError::Load(error, worker)) => Err(ModelOperationFailure::new(
+            "model_optimization_failed",
+            match worker.diagnostics() {
+                diagnostics if diagnostics.is_empty() => error.to_string(),
+                diagnostics => format!("{error}; worker diagnostics: {diagnostics}"),
+            },
+            error.retryable(),
+        )),
     }
 }
 

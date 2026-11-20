@@ -2552,3 +2552,200 @@ fn glm_mtp_head_qualifies_on_the_selected_device() {
     )
     .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
 }
+
+#[test]
+fn head_family_certificates_cover_non_monotonic_prefill_scratch_across_backends() {
+    let hidden = crate::planning::fixtures::mix_site_hidden();
+    let definition = crate::planning::fixtures::with_mtp_head(
+        crate::planning::fixtures::fixture_definition_of(hidden),
+    );
+    let manifest = crate::planning::fixtures::fixture_manifest(&definition);
+    let method = PlannedMethod::Mtp {
+        greedy_proposals: 1,
+        sampled_proposals: 1,
+        widths: crate::DraftWidths::Adaptive,
+    };
+    let limits = crate::ResourceLimits {
+        max_launch_rows: 512,
+        max_launch_slots: 16,
+        max_selected_rows: 16,
+        max_drafting_slots: 16,
+        exported_logits_rows: 0,
+        max_images_per_request: 1,
+        max_image_cells: 0,
+        lookahead: false,
+        chain_capacity: std::num::NonZeroUsize::MIN,
+        conversations: std::num::NonZeroUsize::MIN,
+    };
+    for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Cpu] {
+        let layout = crate::resident_layout(
+            crate::ExecutionPath::Native,
+            backend,
+        );
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: true,
+                vision: false,
+            },
+            layout,
+            method,
+            limits,
+        )
+        .unwrap();
+        let state = crate::ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            method,
+            KvCodec::Dense,
+            limits,
+            crate::ResourceCapacity {
+                domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+        )
+        .unwrap();
+        let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+        let head = definition.head.as_ref().unwrap();
+        let head_block = crate::operators::CausalHeadBlock::of(head, &head.blocks[0]).unwrap();
+        let geometry = state.head_state().unwrap().head_geometry().unwrap();
+        let classes = crate::programs::native_head::head_graph_classes(
+            limits,
+            geometry,
+            method.draft_rows(),
+            load.fronts(),
+        )
+        .unwrap();
+        assert!(
+            classes.iter().any(|c| c.entry_rows == 32 && c.steps() == 0)
+                && classes.iter().any(|c| c.entry_rows == 512 && c.steps() == 0),
+            "{backend:?}: expected both 32 and 512 prefill entry_rows classes"
+        );
+        crate::programs::native_head::verify_head_family_certificates(
+            backend,
+            &load,
+            &definition.decoder,
+            head_block,
+            plan.head().unwrap().blocks()[0],
+            &classes,
+        )
+        .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        let family = crate::programs::native_head::checked_head_family_storage(
+            backend,
+            &load,
+            &definition.decoder,
+            head_block,
+            plan.head().unwrap().blocks()[0],
+            classes,
+        )
+        .unwrap();
+        let pools = AssessmentGraphResourceBounds::derive(
+            &definition,
+            &load,
+            &state,
+            method,
+            KvCodec::Dense,
+            limits,
+            backend,
+        )
+        .unwrap();
+        assert_eq!(
+            pools.head.unwrap().workspace_bytes,
+            family.storage.workspace,
+            "{backend:?}: assessment head workspace must match certified layout"
+        );
+    }
+}
+
+/// On unified memory (Metal), `StoreDemands` puts `allocation_bytes + host_bytes()`
+/// in the single store without double-counting `staging_bytes` (which is already
+/// inside `allocation_bytes`), and `StableRoom::room` agrees with `assess_fit`
+/// on the remaining allocation bytes (including `host_bytes()`).
+#[test]
+fn unified_store_demands_and_stable_room_agree_with_assess_fit() {
+    let m4_pro = recorded::m4_pro();
+    let status = unopened(&m4_pro);
+    let metal = executor(&m4_pro, BackendName::Metal);
+    let host_ram = m4_pro.host_ram().id();
+    let staged = 256 * 1024 * 1024;
+    let host_tables = 512 * 1024 * 1024;
+    let charge = AssessmentMemoryCharge {
+        host_table_bytes: host_tables,
+        ..fixture_charge(4 * GIB, staged)
+    };
+    let demands = charge.store_demands(&m4_pro, metal).unwrap();
+    let expected_total = charge.allocation_bytes + charge.host_bytes().unwrap();
+    assert_eq!(demands, crate::StoreDemands::Unified { total: expected_total });
+    // `assess_fit` must charge the exact same total in the unified allocation domain
+    // without double-counting `staging_bytes`.
+    let fit = charge.assess_fit(&m4_pro, metal, &status).unwrap();
+    let alloc_domain = domain(&fit, host_ram);
+    assert_eq!(alloc_domain.required_bytes, expected_total);
+    // `StableRoom::room` must match `assess_fit`'s remaining allocation bytes.
+    let room = crate::StableRoom { topology: &m4_pro, executor: metal, status: &status };
+    let fit_remaining = u64::try_from(alloc_domain.remaining_bytes.max(0)).unwrap();
+    let stable_fit = room.fit(&charge).unwrap();
+    let stable_alloc = stable_fit
+        .domains
+        .iter()
+        .find(|d| d.role == DomainRole::Allocation)
+        .unwrap();
+    assert_eq!(u64::try_from(stable_alloc.remaining_bytes.max(0)).unwrap(), fit_remaining);
+}
+
+/// On discrete GPUs, `StoreDemands::Split` routes every weight contract through
+/// `executor.paths(kind)` so `weight_demand.shared` (`Contract::HostShared`),
+/// `weight_demand.host` (`Contract::Host`), and backend-dependent
+/// `weight_demand.upload` (pinned host RAM on CUDA vs ReBAR VRAM on Vulkan)
+/// agree byte-for-byte with `assess_fit` on both VRAM and Host RAM.
+#[test]
+fn discrete_store_demands_match_assess_fit_for_shared_and_upload_weights() {
+    let rtx3090 = recorded::rtx3090();
+    let status = unopened(&rtx3090);
+    let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
+    let device_w = 2 * GIB;
+    let upload_w = 128 * 1024 * 1024;
+    let host_w = 512 * 1024 * 1024;
+    let shared_w = 256 * 1024 * 1024;
+    let staging = 64 * 1024 * 1024;
+    let host_tables = 32 * 1024 * 1024;
+    let weight_demand = ClaimDemand {
+        device: device_w,
+        upload: upload_w,
+        host: host_w,
+        shared: shared_w,
+        ..ClaimDemand::default()
+    };
+    let total_weights = weight_demand.checked_bytes().unwrap();
+    let mut charge = fixture_charge(total_weights, staging);
+    charge.weight_demand = weight_demand;
+    charge.host_table_bytes = host_tables;
+
+    for backend in [BackendName::Cuda, BackendName::Vulkan] {
+        let exec = executor(&rtx3090, backend);
+        let demands = charge.store_demands(&rtx3090, exec).unwrap();
+        let fit = charge.assess_fit(&rtx3090, exec, &status).unwrap();
+        let (device_req, host_req) = match demands {
+            crate::StoreDemands::Split { device, host } => (device, host),
+            crate::StoreDemands::Unified { .. } => panic!("{backend:?} on RTX 3090 must be split"),
+        };
+        assert_eq!(
+            device_req,
+            domain(&fit, gpu).required_bytes,
+            "{backend:?}: device store demand must match assess_fit VRAM required_bytes"
+        );
+        assert_eq!(
+            host_req,
+            domain(&fit, host_ram).required_bytes,
+            "{backend:?}: host store demand must match assess_fit Host RAM required_bytes"
+        );
+        // `weight_demand.shared` must NEVER be charged to VRAM on either discrete backend.
+        assert_eq!(
+            device_req + host_req,
+            charge.allocation_bytes + charge.host_bytes().unwrap() + staging,
+            "{backend:?}: total across device + host stores conserved"
+        );
+    }
+}

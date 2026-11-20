@@ -5,37 +5,15 @@
 //! cell concatenation into a two-stage GELU projector.
 
 use crate::Error;
-use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::{array_elements, projector_type, Tensors};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{ProjectorMetadata, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage, RmsNorm,
-    RowRange, VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan,
+    VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan,
     VisionBlock, VisionDescription, VisionFeedForward, VisionGatedConvolution, VisionLinear,
     VisionMerger, VisionNorm, VisionOperator, VisionPreprocessing, VisionResampling, VisionResize,
     VisionStem, VisionUp, WeightDescriptor,
 };
-
-/// Every projector metadata key the family reads, beside `general.*`.
-const KEYS: &[&str] = &[
-    "clip.has_vision_encoder",
-    "clip.use_silu",
-    "clip.vision.projector_type",
-    "clip.vision.projection_dim",
-    "clip.vision.image_size",
-    "clip.vision.patch_size",
-    "clip.vision.embedding_length",
-    "clip.vision.feed_forward_length",
-    "clip.vision.block_count",
-    "clip.vision.attention.head_count",
-    "clip.vision.attention.head_count_kv",
-    "clip.vision.attention.layer_norm_epsilon",
-    "clip.vision.spatial_merge_size",
-    "clip.vision.image_mean",
-    "clip.vision.image_std",
-    "clip.vision.image_min_pixels",
-    "clip.vision.image_max_pixels",
-    "clip.vision.image_resize_algo",
-];
 
 /// The tower's axial rotary base (`vision_config.rope_parameters.rope_theta`
 /// in the released configuration); the converter does not store it.
@@ -53,29 +31,6 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::invalid(message)
 }
 
-fn positive(directory: &Directory, key: &str) -> Result<u64, Error> {
-    directory
-        .value(key)
-        .and_then(Value::unsigned)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| invalid(format!("{key} must be a positive integer")))
-}
-
-fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
-    let Some(Value::Array(values)) = directory.value(key) else {
-        return Err(invalid(format!("{key} must contain three numbers")));
-    };
-    let values = array_elements(key, values)?
-        .iter()
-        .map(|value| match value {
-            Element::Float(value) if value.is_finite() => Some(value),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| invalid(format!("{key} must contain three finite numbers")))?;
-    <[f64; 3]>::try_from(values).map_err(|_| invalid(format!("{key} must contain three numbers")))
-}
-
 /// Interpret an LFM3-VL projector inventory for a target of `target_width`
 /// without importing it.
 pub fn describe_projector(
@@ -83,42 +38,31 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("lfm3vl", ())], target_width)?;
-    if let Some(entry) = directory
-        .metadata
-        .iter()
-        .find(|entry| !entry.name.starts_with("general.") && !KEYS.contains(&entry.name.as_str()))
-    {
-        return Err(invalid(format!(
-            "unknown projector metadata {:?}",
-            entry.name
-        )));
-    }
+    let meta = ProjectorMetadata::new(directory);
+    meta.ignore("clip.has_vision_encoder");
+    meta.ignore("clip.vision.projector_type");
+    meta.ignore("clip.vision.image_size");
     // The tower's feed-forward is SwiGLU and its pixels are resampled
     // bicubically; anything else is another projector.
-    if !matches!(directory.value("clip.use_silu"), Some(Value::Scalar(Scalar::Bool(true))))
-        || directory
-            .value("clip.vision.image_resize_algo")
-            .and_then(Value::string)
-            != Some("bicubic")
+    if !meta.bool("clip.use_silu")?
+        || meta.string("clip.vision.image_resize_algo")? != "bicubic"
     {
         return Err(invalid("LFM3-VL projector activation or resampling"));
     }
-    let depth = positive(directory, "clip.vision.block_count")?;
-    let hidden = positive(directory, "clip.vision.embedding_length")?;
-    let intermediate = positive(directory, "clip.vision.feed_forward_length")?;
-    let heads = positive(directory, "clip.vision.attention.head_count")?;
-    let kv_heads = positive(directory, "clip.vision.attention.head_count_kv")?;
-    let patch = positive(directory, "clip.vision.patch_size")?;
-    let merge = positive(directory, "clip.vision.spatial_merge_size")?;
-    let output_hidden = positive(directory, "clip.vision.projection_dim")?;
-    let min_pixels = positive(directory, "clip.vision.image_min_pixels")?;
-    let max_pixels = positive(directory, "clip.vision.image_max_pixels")?;
-    let epsilon = match directory.value("clip.vision.attention.layer_norm_epsilon") {
-        Some(Value::Scalar(Scalar::Float(value))) if value.is_finite() && *value > 0.0 => *value,
-        _ => return Err(invalid("projector declares no positive layer norm epsilon")),
-    };
-    let mean = triple(directory, "clip.vision.image_mean")?;
-    let std = triple(directory, "clip.vision.image_std")?;
+    let depth = meta.bounded_block_count("clip.vision.block_count")?;
+    let hidden = meta.integer("clip.vision.embedding_length")?;
+    let intermediate = meta.integer("clip.vision.feed_forward_length")?;
+    let heads = meta.integer("clip.vision.attention.head_count")?;
+    let kv_heads = meta.integer("clip.vision.attention.head_count_kv")?;
+    let patch = meta.integer("clip.vision.patch_size")?;
+    let merge = meta.integer("clip.vision.spatial_merge_size")?;
+    let output_hidden = meta.integer("clip.vision.projection_dim")?;
+    let min_pixels = meta.integer("clip.vision.image_min_pixels")?;
+    let max_pixels = meta.integer("clip.vision.image_max_pixels")?;
+    let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
+    let mean = meta.f64_array("clip.vision.image_mean")?;
+    let std = meta.f64_array("clip.vision.image_std")?;
+    meta.finish()?;
     if hidden % heads != 0 || heads % kv_heads != 0 {
         return Err(invalid("projector heads do not group over the tower width"));
     }
@@ -157,26 +101,23 @@ pub fn describe_projector(
             // `in_proj` stores the B, C and X projections as consecutive row
             // blocks of the tower width.
             let fused = weight("conv2d_in_proj.weight", &[gated_rows, hidden])?;
-            let chunk = |block: u64| VisionLinear {
-                weight: WeightDescriptor {
-                    name: fused.name.clone(),
-                    shape: vec![hidden, hidden],
-                    transforms: vec![ImportTransform::Rows(RowRange {
-                        start: block * hidden,
-                        rows: hidden,
-                    })],
-                },
-                bias: None,
-                clamp: None,
+            let chunk = |block: u64| -> Result<VisionLinear, Error> {
+                Ok(VisionLinear {
+                    weight: fused
+                        .slice_rows(block * hidden, hidden)
+                        .map_err(|error| invalid(error.to_string()))?,
+                    bias: None,
+                    clamp: None,
+                })
             };
             let kernel = directory
                 .tensor(&format!("{p}conv2d_spatial.weight"))
                 .and_then(|tensor| tensor.shape.last().copied())
                 .ok_or_else(|| invalid("missing projector convolution kernel"))?;
             VisionOperator::GatedConvolution(VisionGatedConvolution {
-                input_gate: chunk(0),
-                output_gate: chunk(1),
-                value: chunk(2),
+                input_gate: chunk(0)?,
+                output_gate: chunk(1)?,
+                value: chunk(2)?,
                 kernel: weight("conv2d_spatial.weight", &[hidden, 1, kernel, kernel])?,
                 output: linear(weight("conv2d_out_proj.weight", &[hidden, hidden])?),
             })

@@ -130,7 +130,7 @@ mod tests {
     use super::*;
     use crate::assessment::demand::{layout_of, Call};
     use crate::assessment::executor_costs::{
-        HistoryCosts, MeasuredCost, Placement, RouteCosts, WeightRate, DECODE_LINE,
+        HistoryCosts, MeasuredCost, Placement, RouteCosts, WeightRate,
     };
     use crate::assessment::launches::{Declarations, Kernel};
     use magnitude_state::KvCodec;
@@ -259,12 +259,13 @@ mod tests {
     #[test]
     fn a_decode_of_one_row_is_bandwidth_bound() {
         let costs = crate::assessment::fixtures::costs();
+        let decode = costs.decode_line.expect("the fixture populates decode_line");
         let demand = call(projection());
         let step = step(&demand, &costs, true, 1, 1_000).unwrap();
         let call = only(step.clone());
         assert!(!call.compute_bound());
         assert_eq!(call.bytes, 4e9 / 300e9);
-        assert_eq!(call.compute, 8e9 * (DECODE_LINE.fixed + DECODE_LINE.row));
+        assert_eq!(call.compute, 8e9 * (decode.fixed + decode.row));
         assert_eq!(
             step.total(),
             1.2 * (4e9 / 300e9 + call.launches as f64 * 5e-6) + 50e-6
@@ -490,7 +491,7 @@ mod tests {
     fn a_format_without_a_pilot_is_priced_at_the_activation_dtypes_figures() {
         let mut costs = crate::assessment::fixtures::costs();
         costs.first.activation.bytes_per_second.value = 150e9;
-        // Slower than DECODE_LINE at one row (~1.79 TFLOP/s) so the decode
+        // Slower than the fixture's decode_line at one row (~1.79 TFLOP/s) so the decode
         // step prices arithmetic at the activation dtype's matrix throughput.
         costs.activation_matrix.as_mut().unwrap().flops.value = 1e12;
         costs.first
@@ -566,6 +567,7 @@ mod tests {
         costs.first.formats.clear();
         costs.matrices.clear();
         costs.activation_matrix = None;
+        costs.decode_line = None;
         costs.dense = HistoryCosts::new(KvCodec::Dense, Vec::new()).unwrap();
         let demand = call(Work {
             weights: vec![Bytes {

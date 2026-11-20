@@ -245,6 +245,7 @@ void state_space_chunk_scan() {
         return;
     }
     const versions_slot slot = versions_slot_of(gl_WorkGroupID.z);
+    if (slot.lo == slot.hi) return;
     float rows[SS_LANE_ROWS][SS_COLUMNS];
     ss_load_version(slot, head, row0, rows);
     ss_publish_window(slot, head, gl_WorkGroupID.y, gl_NumWorkGroups.y);

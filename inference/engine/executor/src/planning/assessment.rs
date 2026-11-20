@@ -592,6 +592,37 @@ pub struct AssessmentMemoryCharge {
     pub held_pass: super::PassLaunches,
 }
 
+/// Per-store memory demand decomposed from [`AssessmentMemoryCharge`] and the
+/// executor's store contracts: the single owner read by assessment,
+/// `StableRoom`, `PlanningRoom`, and `SettleRoom`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreDemands {
+    /// Unified memory where host RAM is the allocation store (Metal, CPU).
+    Unified { total: u64 },
+    /// Split device VRAM and system RAM stores (discrete CUDA / Vulkan).
+    Split { device: u64, host: u64 },
+}
+
+impl StoreDemands {
+    /// Bytes required in the device's allocation store (`total` on unified,
+    /// `device` on split).
+    pub fn allocation_bytes(self) -> u64 {
+        match self {
+            Self::Unified { total } => total,
+            Self::Split { device, .. } => device,
+        }
+    }
+
+    /// Bytes required in host RAM when host RAM is a separate store (`Some(host)`
+    /// on split, `None` on unified).
+    pub fn host_store_bytes(self) -> Option<u64> {
+        match self {
+            Self::Unified { .. } => None,
+            Self::Split { host, .. } => Some(host),
+        }
+    }
+}
+
 /// A complete fit result: every domain the load touches, and whether the
 /// workload fits all of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1764,14 +1795,110 @@ impl AssessmentMemoryCharge {
             .ok_or_else(|| "host charge overflows".to_owned())
     }
 
-    /// What this charge asks of host RAM: its host-side bytes, its host
-    /// storage (a linked host tier's records) and its staging window, all
-    /// held together from the binding of the weights on.
-    pub fn host_demand(&self) -> Result<u64, String> {
-        self.host_bytes()?
-            .checked_add(self.weight_demand.host)
-            .and_then(|bytes| bytes.checked_add(self.staging_bytes))
-            .ok_or_else(|| "host charge overflows".to_owned())
+    /// Weight bytes whose executor placement lands in `host_ram` on a split
+    /// (discrete) topology. Queries `executor.paths(kind)` directly so
+    /// `Contract::Host`, `Contract::HostShared`, and backend-dependent
+    /// `Contract::Upload` (pinned host RAM on CUDA vs ReBAR VRAM on Vulkan)
+    /// agree with [`Self::assess_fit`] / [`Fit::demand`].
+    fn split_host_weight_bytes(
+        &self,
+        topology: &DeviceTopology,
+        executor: &Executor,
+    ) -> Result<u64, String> {
+        let host_ram = topology.host_ram().id();
+        let mut host_weights = 0u64;
+        for kind in crate::memory::CLAIMED {
+            let store = executor
+                .paths(kind)
+                .first()
+                .and_then(|path| topology.access_path(*path))
+                .map(|path| path.store());
+            if store == Some(host_ram) {
+                let bytes = self
+                    .weight_demand
+                    .storage_bytes(kind)
+                    .ok_or_else(|| "host weight demand overflows".to_owned())?;
+                host_weights = host_weights
+                    .checked_add(bytes)
+                    .ok_or_else(|| "host weight demand overflows".to_owned())?;
+            }
+        }
+        Ok(host_weights)
+    }
+
+    /// Per-store memory demand decomposed once from [`Self::weight_demand`] and
+    /// `executor`'s store contracts in `topology`: the single owner used by
+    /// assessment, `StableRoom`, `PlanningRoom`, and `SettleRoom`.
+    ///
+    /// - Unified (`DomainRole::Allocation` for host RAM — Metal, CPU): every
+    ///   allocation and host-side byte lands in the single store, with
+    ///   `staging_bytes` counted once inside `allocation_bytes`.
+    /// - Split (discrete CUDA / Vulkan): weight contracts whose executor path
+    ///   lands in host RAM (`Host`, `HostShared`, and non-ReBAR `Upload`) land
+    ///   in host RAM beside `host_bytes()` and `staging_bytes`, leaving only
+    ///   device-store bytes in `device`.
+    pub fn store_demands(
+        &self,
+        topology: &DeviceTopology,
+        executor: &Executor,
+    ) -> Result<StoreDemands, String> {
+        let host_bytes = self.host_bytes()?;
+        let unified_host = DomainRole::of(topology, executor, topology.host_ram().id())
+            == DomainRole::Allocation;
+        if unified_host {
+            let total = self
+                .allocation_bytes
+                .checked_add(host_bytes)
+                .ok_or_else(|| "unified allocation charge overflows".to_owned())?;
+            Ok(StoreDemands::Unified { total })
+        } else {
+            let host_weights = self.split_host_weight_bytes(topology, executor)?;
+            let device = self
+                .allocation_bytes
+                .checked_sub(host_weights)
+                .ok_or_else(|| "host weight storage exceeds allocation charge".to_owned())?;
+            let host = host_bytes
+                .checked_add(host_weights)
+                .and_then(|bytes| bytes.checked_add(self.staging_bytes))
+                .ok_or_else(|| "host charge overflows".to_owned())?;
+            Ok(StoreDemands::Split { device, host })
+        }
+    }
+
+    /// Startup device-store bytes required to load this plan (weights in the
+    /// device store + prepared resources + startup state + startup additional
+    /// bytes, plus host-side bytes on unified memory). Used by `LoadPreview`.
+    pub fn startup_required_bytes(
+        &self,
+        topology: &DeviceTopology,
+        executor: &Executor,
+    ) -> Result<u64, String> {
+        let weight_bytes = self
+            .weight_demand
+            .checked_bytes()
+            .ok_or_else(|| "weight demand overflows".to_owned())?;
+        let prepared = weight_bytes
+            .checked_add(self.bounds.prepared_resource_bytes()?)
+            .ok_or_else(|| "startup prepared bytes overflow".to_owned())?;
+        let loading = self
+            .startup_state_bytes
+            .checked_add(self.bounds.startup_additional_bytes)
+            .ok_or_else(|| "startup loading bytes overflow".to_owned())?;
+        let raw_startup = prepared
+            .checked_add(loading)
+            .ok_or_else(|| "startup byte count overflow".to_owned())?;
+        let unified_host = DomainRole::of(topology, executor, topology.host_ram().id())
+            == DomainRole::Allocation;
+        if unified_host {
+            raw_startup
+                .checked_add(self.host_bytes()?)
+                .ok_or_else(|| "unified startup byte count overflow".to_owned())
+        } else {
+            let host_weights = self.split_host_weight_bytes(topology, executor)?;
+            raw_startup
+                .checked_sub(host_weights)
+                .ok_or_else(|| "host weight storage exceeds startup charge".to_owned())
+        }
     }
 
     /// What `domains`, this charge's fit, require in all: the weights (their

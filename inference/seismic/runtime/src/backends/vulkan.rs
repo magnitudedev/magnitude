@@ -90,9 +90,10 @@ impl VulkanOpened {
         bytes: u64,
         entry: &Arc<dyn crate::memory::Entry>,
         access: Arc<driver::AccessGroup>,
+        fill: seismic_memory::SlabFill,
     ) -> Result<Arc<Allocation>, ExecutionError> {
         self.allocation_limits().admit_bytes(bytes)?;
-        let buffer = self.service.allocate_block(kind, bytes, entry)?;
+        let buffer = self.service.allocate_block(kind, bytes, entry, fill)?;
         Ok(Allocation::new_in(
             driver::fresh_allocation_identity(),
             bytes,

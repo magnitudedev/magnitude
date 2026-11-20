@@ -1419,13 +1419,16 @@ def test_a_served_corruption_nats_below_the_top_fails_whatever_the_tail_differs_
     assert not passed and lines[1] == "a: 2/3 tokens their row's top, worst 1.500 nats at token 1, 1 past 0.1000 FAILED"
 
 
-def test_a_served_judgement_without_a_measured_difference_bounds_nothing(tmp_path):
-    """A service-shaped computation equal to the reference bit for bit moves no margin: the bound
-    would fail every honest near tie, so the judgement fails as unsound."""
+def test_a_served_judgement_with_zero_bound_requires_every_token_to_be_top(tmp_path):
+    """When the service-shaped computation moves no competing margin (B = 0), every answered token
+    must be its row's top: exact agreement passes, and any token below its row's top fails."""
     from magnitude_rig.instruments.served import judged
-    run = _judged_answers(tmp_path, [[0.0, -9.0]], [0], {"tokens": 1, "finish": "length"}, deltas={})
+    run = _judged_answers(tmp_path / "top", [[0.0, -9.0]], [0], {"tokens": 1, "finish": "length"}, deltas={})
     lines, passed = judged(run / "served", run / "judge")
-    assert not passed and lines[0].startswith("the service-shaped computation moved no margin of a token competing with its row's top")
+    assert passed and lines[1] == "a: 1/1 tokens their row's top, worst 0.000 nats"
+    run = _judged_answers(tmp_path / "below", [[0.0, -0.05]], [1], {"tokens": 1, "finish": "length"}, deltas={})
+    lines, passed = judged(run / "served", run / "judge")
+    assert not passed and lines[1] == "a: 0/1 tokens their row's top, worst 0.050 nats at token 0, 1 past 0.0000 FAILED"
 
 
 def test_a_served_answer_the_harness_tokenized_otherwise_is_unjudged(tmp_path):

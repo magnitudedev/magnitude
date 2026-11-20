@@ -54,6 +54,7 @@ void ngram_rows() {
     const uint64_t heads_per_order = SEISMIC_DIM_P;
     if (item >= launch_rows) {
         const versions_slot slot = versions_slot_of(item - launch_rows);
+        if (slot.lo == slot.hi) return;
         const uint64_t source = versions_bank(window, slot.source, bank_bytes);
         const uint64_t target = versions_bank(window, slot.target, bank_bytes);
         const int published = context + versions_tape_rows(slot, int(SEISMIC_DIM_T));

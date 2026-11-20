@@ -371,9 +371,9 @@ impl AttentionProjectTuning {
         attention_project::Elements {
             NW: b.norm,
             QW: b.query_segment(),
-            GW: b.gate,
-            KW: b.key,
-            VW: b.value,
+            GW: b.gate_segment(),
+            KW: b.key_segment(),
+            VW: b.value_segment(),
             A: b.activation,
             Y: b.activation,
         }
@@ -405,9 +405,9 @@ impl EntryTuning for AttentionProjectTuning {
             "NW={},QW={},GW={},KW={},VW={},A={}",
             b.norm.name(),
             b.query_segment().name(),
-            b.gate.name(),
-            b.key.name(),
-            b.value.name(),
+            b.gate_segment().name(),
+            b.key_segment().name(),
+            b.value_segment().name(),
             b.activation.name()
         )
     }

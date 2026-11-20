@@ -551,7 +551,11 @@ fn split_gguf_opens_as_one_component() {
     // Only the first shard names the component.
     assert!(matches!(
         gguf::GgufArtifact::open(&paths[1]),
-        Err(Error::Invalid(message)) if message.contains("open its first shard")
+        Err(Error::Split(magnitude_artifacts::SplitError::NotFirstShard {
+            index: 1,
+            count: 3,
+            ..
+        }))
     ));
     std::fs::remove_file(&paths[2]).unwrap();
     assert!(matches!(
@@ -615,13 +619,16 @@ fn split_gguf_requires_the_split_naming_and_consistent_shards() {
     std::fs::copy(&paths[0], &renamed).unwrap();
     assert!(matches!(
         gguf::GgufArtifact::open(&renamed),
-        Err(Error::Invalid(message)) if message.contains("is not named")
+        Err(Error::Split(magnitude_artifacts::SplitError::MisnamedFirstShard { count: 3, .. }))
     ));
     // A shard declaring another position is rejected.
     std::fs::copy(&paths[1], &paths[2]).unwrap();
     assert!(matches!(
         gguf::GgufArtifact::open(&paths[0]),
-        Err(Error::Invalid(message)) if message.contains("does not declare itself shard 3")
+        Err(Error::Split(magnitude_artifacts::SplitError::ShardPositionMismatch {
+            expected: 3,
+            count: 3
+        }))
     ));
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -142,6 +142,8 @@ struct State {
     receiver_open: bool,
     sender_open: bool,
     receiver_waker: Option<Waker>,
+    retired: bool,
+    retirement_waker: Option<Waker>,
     /// The request became resident: it began, before anything it publishes.
     began: bool,
 }
@@ -182,6 +184,8 @@ impl PublicationQueue {
                 receiver_open: true,
                 sender_open: true,
                 receiver_waker: None,
+                retired: false,
+                retirement_waker: None,
                 began: false,
             }),
             wake_worker: Box::new(wake_worker),
@@ -444,7 +448,40 @@ pub struct PublicationReceiver {
     terminal_seen: bool,
 }
 
+/// Physical retirement is independent of a request publishing its terminal
+/// outcome or losing its receiver. The scheduler signals it after closing
+/// the domain request, and the session may wait after dropping the receiver.
+pub struct Retirement(Arc<Shared>);
+
+impl Retirement {
+    pub(crate) fn retire(self) {
+        let wake = {
+            let mut state = self.0.state.lock().unwrap();
+            assert!(!state.retired, "request retired twice");
+            state.retired = true;
+            state.retirement_waker.take()
+        };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+    }
+
+    pub fn poll(&self, waker: &Waker) -> Poll<()> {
+        let mut state = self.0.state.lock().unwrap();
+        if state.retired {
+            Poll::Ready(())
+        } else {
+            state.retirement_waker = Some(waker.clone());
+            Poll::Pending
+        }
+    }
+}
+
 impl PublicationReceiver {
+    pub fn retirement(&self) -> Retirement {
+        Retirement(Arc::clone(&self.shared))
+    }
+
     /// Whether the request has begun ([`PublicationSender::began`]): set
     /// before anything it publishes, so a publication read while this is
     /// false came of a request that never became resident. A receiver
@@ -540,6 +577,19 @@ mod tests {
             Poll::Ready(event) => event,
             Poll::Pending => panic!("expected a ready publication"),
         }
+    }
+
+    #[test]
+    fn retirement_survives_the_terminal_and_the_receiver() {
+        let (sender, mut receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
+        let owner = receiver.retirement();
+        let session = receiver.retirement();
+        sender.fail(RequestError::WorkerClosed);
+        assert!(matches!(next(&mut receiver), Some(Publication::Failed(_))));
+        drop(receiver);
+        assert!(session.poll(Waker::noop()).is_pending());
+        owner.retire();
+        assert!(session.poll(Waker::noop()).is_ready());
     }
 
     #[test]

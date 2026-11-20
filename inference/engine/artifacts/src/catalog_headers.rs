@@ -28,9 +28,10 @@ pub struct HeaderIndex {
     pub artifacts: Vec<ArtifactHeader>,
 }
 
-/// One component of a catalog model's variant: the file a load opens (the
-/// first shard of a split GGUF, whose other shards are exported beside it) at
-/// its locked source.
+/// One component of a catalog model's variant: its ordered shard paths at its
+/// locked source (one entry for a single-file component; every shard in load
+/// order for a split GGUF, including shards whose filename does not follow
+/// `<prefix>-NNNNN-of-MMMMM.gguf`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogComponent {
@@ -39,7 +40,7 @@ pub struct CatalogComponent {
     pub role: ComponentRole,
     pub repository: String,
     pub revision: String,
-    pub path: PathBuf,
+    pub shards: Vec<PathBuf>,
 }
 
 /// A component's role in its catalog model's variant.
@@ -62,9 +63,19 @@ impl std::fmt::Display for ComponentRole {
 }
 
 impl CatalogComponent {
-    /// The component's file under an export directory.
-    pub fn file(&self, root: &Path) -> PathBuf {
-        source_file(root, &self.repository, &self.revision, &self.path)
+    /// The component's primary (first) shard path within its repository.
+    pub fn file(&self) -> &Path {
+        self.shards
+            .first()
+            .expect("invariant violated: catalog component has no shards")
+    }
+
+    /// The component's ordered shard files under an export directory.
+    pub fn shard_files(&self, root: &Path) -> Vec<PathBuf> {
+        self.shards
+            .iter()
+            .map(|shard| source_file(root, &self.repository, &self.revision, shard))
+            .collect()
     }
 }
 

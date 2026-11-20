@@ -1,9 +1,86 @@
 use std::{fmt, io, path::PathBuf};
 
+/// Why a split GGUF's shard list or split metadata could not be resolved or merged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitError {
+    /// An empty shard list was supplied.
+    Empty,
+    /// A single path names shard `index + 1` of `count` rather than the first shard.
+    NotFirstShard {
+        path: PathBuf,
+        index: u64,
+        count: u64,
+    },
+    /// A split first shard's filename is not valid UTF-8 or does not match
+    /// `<prefix>-00001-of-<count:05>.gguf`.
+    MisnamedFirstShard {
+        path: PathBuf,
+        count: u64,
+    },
+    /// Malformed or inconsistent `split.no` / `split.count` / `split.tensors.count` metadata.
+    InconsistentMetadata(String),
+    /// Shard at 1-based position `expected` does not declare itself shard `expected` of `count`.
+    ShardPositionMismatch {
+        expected: u64,
+        count: u64,
+    },
+    /// Split shards disagree on GGUF version, byte order, or alignment.
+    HeaderMismatch,
+    /// A tensor name appears in more than one split shard.
+    DuplicateTensor {
+        name: String,
+    },
+    /// Declared `split.tensors.count` does not match the merged shard tensor count.
+    TensorCountMismatch {
+        declared: u64,
+        actual: usize,
+    },
+    /// Shard count, index, or merged data offset overflowed `u64`.
+    OffsetOverflow,
+}
+
+impl fmt::Display for SplitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("split GGUF has no shards"),
+            Self::NotFirstShard { path, index, count } => write!(
+                f,
+                "{} is shard {} of {count} in a split GGUF; open its first shard",
+                path.display(),
+                index + 1
+            ),
+            Self::MisnamedFirstShard { path, count } => write!(
+                f,
+                "first shard {} of a {count}-file split GGUF is not named <prefix>-00001-of-{count:05}.gguf",
+                path.display()
+            ),
+            Self::InconsistentMetadata(detail) => f.write_str(detail),
+            Self::ShardPositionMismatch { expected, count } => write!(
+                f,
+                "shard {expected} does not declare itself shard {expected} of {count}"
+            ),
+            Self::HeaderMismatch => {
+                f.write_str("split GGUF shards differ in version, byte order or alignment")
+            }
+            Self::DuplicateTensor { name } => {
+                write!(f, "tensor {name:?} appears in more than one split shard")
+            }
+            Self::TensorCountMismatch { declared, actual } => write!(
+                f,
+                "split GGUF declares {declared} tensors but its shards hold {actual}"
+            ),
+            Self::OffsetOverflow => f.write_str("split GGUF shard index or data offset overflows"),
+        }
+    }
+}
+
+impl std::error::Error for SplitError {}
+
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
     Invalid(String),
+    Split(SplitError),
     Truncated { offset: u64 },
     AmbiguousProjectors(Vec<PathBuf>),
     /// A well-formed header whose tensors use type ids this parser doesn't know (a quantization
@@ -36,6 +113,7 @@ impl fmt::Display for Error {
         match self {
             Self::Io(error) => write!(f, "artifact source: {error}"),
             Self::Invalid(message) => f.write_str(message),
+            Self::Split(error) => fmt::Display::fmt(error, f),
             Self::Truncated { offset } => write!(f, "truncated GGUF header at byte {offset}"),
             Self::PayloadRead { key, error } => {
                 write!(f, "the payload of GGUF metadata {key:?}: {error}")
@@ -78,6 +156,7 @@ impl Error {
     pub fn unreadable(&self) -> bool {
         match self {
             Self::Invalid(_)
+            | Self::Split(_)
             | Self::Truncated { .. }
             | Self::ShortPayload
             | Self::TrailingPayload => true,
@@ -113,6 +192,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) | Self::PayloadRead { error, .. } => Some(error),
             Self::Invalid(_)
+            | Self::Split(_)
             | Self::Truncated { .. }
             | Self::AmbiguousProjectors(_)
             | Self::UnknownTensorTypes { .. }
@@ -139,6 +219,12 @@ impl From<seismic_io::Error> for Error {
             seismic_io::Error::Io(error) => Self::Io(error),
             error => Self::Io(io::Error::other(error)),
         }
+    }
+}
+
+impl From<SplitError> for Error {
+    fn from(error: SplitError) -> Self {
+        Self::Split(error)
     }
 }
 

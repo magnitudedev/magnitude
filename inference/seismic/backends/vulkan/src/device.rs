@@ -25,6 +25,84 @@ pub(crate) fn call<T>(result: Result<T, vk::Result>, what: &str) -> Result<T, Ex
     })
 }
 
+/// Map a Vulkan call that allocates, maps, or backs device/host memory or
+/// command objects: device loss stays `DeviceLost`, memory/object exhaustion
+/// maps to `DeviceRefused`, and any other error goes through `fallback`.
+pub(crate) fn memory_call<T>(
+    result: Result<T, vk::Result>,
+    what: &str,
+    required: u64,
+    memory: &Memory,
+    fallback: fn(String) -> ExecutionError,
+) -> Result<T, ExecutionError> {
+    result.map_err(|error| {
+        classify_vk_error(
+            error,
+            what,
+            required,
+            || memory.memory_budget(),
+            || (memory.object_limit(), memory.objects()),
+            fallback,
+        )
+    })
+}
+
+fn classify_vk_error(
+    error: vk::Result,
+    what: &str,
+    required: u64,
+    budget: impl FnOnce() -> crate::MemoryBudget,
+    objects: impl FnOnce() -> (u64, u64),
+    fallback: fn(String) -> ExecutionError,
+) -> ExecutionError {
+    match error {
+        vk::Result::ERROR_DEVICE_LOST => ExecutionError::DeviceLost(format!("{what}: {error}")),
+        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
+            let budget = budget();
+            ExecutionError::DeviceRefused {
+                required,
+                reading: seismic_compiler::errors::RefusalReading::HeapBudget {
+                    budget: budget.heap_budget_bytes,
+                    usage: budget.heap_usage_bytes,
+                },
+            }
+        }
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_MEMORY_MAP_FAILED => {
+            ExecutionError::DeviceRefused {
+                required,
+                reading: seismic_compiler::errors::RefusalReading::Host,
+            }
+        }
+        vk::Result::ERROR_TOO_MANY_OBJECTS => {
+            let (limit, held) = objects();
+            ExecutionError::DeviceRefused {
+                required,
+                reading: seismic_compiler::errors::RefusalReading::MemoryObjects { limit, held },
+            }
+        }
+        other => fallback(format!("{what} failed: {other}")),
+    }
+}
+
+/// Structural retention cap for submission free lists (`free_commands`,
+/// `free_queries`, `free_chunks`): one ready resource for the next submission
+/// plus one per active in-flight submission (`recording.retired.len()`).
+/// Steady-state pipelines stay warm without allocator churn, while burst
+/// overflow is released back to Vulkan as flights drain.
+fn free_cap(in_flight: usize) -> usize {
+    in_flight.saturating_add(1)
+}
+
+/// Drain excess entries beyond `cap` from the tail so steady-state low-index
+/// entries remain pooled and overflow entries are released first.
+fn trim_to_cap<T>(pool: &mut Vec<T>, cap: usize) -> Vec<T> {
+    if pool.len() > cap {
+        pool.drain(cap..).collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Why a device could not be opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenError {
@@ -122,9 +200,14 @@ pub(crate) struct Recording {
 }
 
 impl Recording {
-    /// Return an unused primary command buffer.
-    pub(crate) fn free_command(&mut self, command: vk::CommandBuffer) {
+    /// Return an unused primary command buffer, freeing excess beyond the
+    /// active in-flight retention cap (`free_cap`).
+    pub(crate) fn free_command(&mut self, device: &ash::Device, command: vk::CommandBuffer) {
         self.free_commands.push(command);
+        let excess = trim_to_cap(&mut self.free_commands, free_cap(self.retired.len()));
+        if !excess.is_empty() {
+            unsafe { device.free_command_buffers(self.pool, &excess) };
+        }
     }
 }
 
@@ -244,6 +327,91 @@ struct Held {
 }
 
 impl Inner {
+    /// Whether any Vulkan call on this logical device has observed
+    /// `VK_ERROR_DEVICE_LOST`.
+    pub(crate) fn is_lost(&self) -> bool {
+        self.lost.get().is_some()
+    }
+
+    /// Return the recorded device loss if this logical device has been lost.
+    fn check_lost(&self) -> Result<(), ExecutionError> {
+        match self.lost.get() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Record device loss under `queue`, draining held submissions and waking
+    /// every thread waiting on `handover`.
+    fn lose_locked(&self, queue: &mut Queue, error: ExecutionError) -> ExecutionError {
+        let first = self.lost.get_or_init(|| error).clone();
+        queue.held.clear();
+        queue.waiting = None;
+        queue.refused = Some((0, Refusal::Lost(first.clone())));
+        self.handover.notify_all();
+        first
+    }
+
+    /// Record device loss on this logical device, waking any blocked waiters.
+    pub(crate) fn lose(&self, error: ExecutionError) -> ExecutionError {
+        let mut queue = self.queue.lock().expect("queue lock is never poisoned");
+        self.lose_locked(&mut queue, error)
+    }
+
+    /// Execute one Vulkan call against this logical device, enforcing the
+    /// single device-wide lost state on entry and transitioning to lost on
+    /// `VK_ERROR_DEVICE_LOST`. Must not be called while holding `self.queue`.
+    pub(crate) fn vk<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce(&ash::Device) -> Result<T, vk::Result>,
+    ) -> Result<T, ExecutionError> {
+        self.check_lost()?;
+        match f(&self.device) {
+            Ok(value) => Ok(value),
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                let error = ExecutionError::DeviceLost(format!("{what}: {}", vk::Result::ERROR_DEVICE_LOST));
+                Err(self.lose(error))
+            }
+            Err(other) => Err(ExecutionError::SubmissionFailed(format!("{what} failed: {other}"))),
+        }
+    }
+
+    /// Wait at most `timeout` for timeline `semaphore` to reach `value`,
+    /// enforcing the single device-wide lost state before, after timeout,
+    /// and on error. Must not be called while holding `self.queue`.
+    pub(crate) fn wait_semaphore(
+        &self,
+        semaphore: vk::Semaphore,
+        value: u64,
+        timeout: std::time::Duration,
+    ) -> Result<bool, ExecutionError> {
+        self.check_lost()?;
+        let semaphores = [semaphore];
+        let values = [value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        let nanoseconds = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        match unsafe { self.device.wait_semaphores(&info, nanoseconds) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => {
+                self.check_lost()?;
+                Ok(false)
+            }
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                let error = ExecutionError::DeviceLost(format!(
+                    "vkWaitSemaphores: {}",
+                    vk::Result::ERROR_DEVICE_LOST
+                ));
+                Err(self.lose(error))
+            }
+            Err(other) => Err(ExecutionError::SubmissionFailed(format!(
+                "vkWaitSemaphores failed: {other}"
+            ))),
+        }
+    }
+
     /// Give the queue every held submission, in order, up to and including
     /// the first whose gates are not all raised, unless one handed to it
     /// still waits on the host. That one waits on the host inside the
@@ -260,6 +428,9 @@ impl Inner {
     /// every one behind it (or, with none held, the next taken): the device
     /// cannot make progress, and no gate is read as raised.
     fn release(&self, queue: &mut Queue, opening: GateOpening) {
+        if self.is_lost() {
+            return;
+        }
         let raised = |gates: &[(vk::Semaphore, u64)]| -> Result<bool, ExecutionError> {
             for &(semaphore, value) in gates {
                 let reached = call(
@@ -354,6 +525,10 @@ impl Inner {
     /// taken belongs to a submission handed over, which signals it itself,
     /// and a timeline signal must exceed the value it raises from.
     fn refuse(&self, queue: &mut Queue, value: u64, refused: ExecutionError) {
+        if matches!(refused, ExecutionError::DeviceLost(_)) {
+            self.lose_locked(queue, refused);
+            return;
+        }
         queue.held.clear();
         if value == queue.next {
             queue.refused = Some((value, Refusal::Raised(refused)));
@@ -366,17 +541,23 @@ impl Inner {
             .value(last)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
         let submit = vk::SubmitInfo2::default().signal_semaphore_infos(&signal);
-        let refusal = match call(
+        match call(
             unsafe { self.device.queue_submit2(queue.raw, &[submit], vk::Fence::null()) },
             "vkQueueSubmit2",
         ) {
-            Ok(()) => Refusal::Raised(refused),
-            Err(lost) => Refusal::Lost(ExecutionError::DeviceLost(format!(
-                "{refused}, and raising the timeline past the refused submissions then failed: {lost}"
-            ))),
-        };
-        queue.refused = Some((value, refusal));
-        self.handover.notify_all();
+            Ok(()) => {
+                queue.refused = Some((value, Refusal::Raised(refused)));
+                self.handover.notify_all();
+            }
+            Err(lost) => {
+                self.lose_locked(
+                    queue,
+                    ExecutionError::DeviceLost(format!(
+                        "{refused}, and raising the timeline past the refused submissions then failed: {lost}"
+                    )),
+                );
+            }
+        }
     }
 }
 
@@ -401,6 +582,15 @@ pub(crate) struct Inner {
     /// refused: a wait on one held waits on it before the driver does
     /// (`Device::ended`).
     handover: Condvar,
+    /// The first `VK_ERROR_DEVICE_LOST` observed on this logical device, if
+    /// any: device loss in Vulkan is device-wide and irreversible, so every
+    /// queue, timeline and waiter observes it immediately without blocking.
+    lost: OnceLock<ExecutionError>,
+    /// Test hook fired under `self.queue` right before `Device::ended` blocks
+    /// on `self.handover`, so device-loss unblock tests synchronize without
+    /// sleeping.
+    #[cfg(test)]
+    pub(crate) on_handover_wait: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// The family's second queue, where it has one: pool blocks are zeroed
     /// on it (`Inner::zero`) beside work the first runs.
     side: Option<Mutex<Side>>,
@@ -609,8 +799,12 @@ impl Device {
                 break registry;
             };
             if let Some(inner) = registry.opened[index].1.upgrade() {
-                drop(registry);
-                return Self::opening(inner, stores);
+                if !inner.is_lost() {
+                    drop(registry);
+                    return Self::opening(inner, stores);
+                }
+                registry.opened.swap_remove(index);
+                break registry;
             }
             let destroyed = registry.opened[index].2.clone();
             if destroyed.ended() {
@@ -620,6 +814,20 @@ impl Device {
             drop(registry);
             destroyed.wait();
         };
+        let device = Self::create_device(uuid, stores, probed)?;
+        registry.opened.push((uuid, Arc::downgrade(&device.inner), device.inner.destroyed.0.clone()));
+        drop(registry);
+        Ok(device)
+    }
+
+    /// Open a dedicated logical device not registered in the process registry,
+    /// for tests that simulate device loss without affecting sibling tests.
+    #[cfg(test)]
+    pub(crate) fn open_isolated(uuid: [u8; 16], stores: MemoryStores, probed: &Probed) -> Result<Self, OpenError> {
+        Self::create_device(uuid, stores, probed)
+    }
+
+    fn create_device(uuid: [u8; 16], stores: MemoryStores, probed: &Probed) -> Result<Self, OpenError> {
         let instance = crate::instance::instance().map_err(OpenError::Loader)?;
         let description = instance
             .physical_devices()
@@ -638,8 +846,6 @@ impl Device {
         // registered: no other open finds it until they are.
         let device = Self::opening(inner, stores)?;
         device.write_tables().map_err(OpenError::of)?;
-        registry.opened.push((uuid, Arc::downgrade(&device.inner), device.inner.destroyed.0.clone()));
-        drop(registry);
         Ok(device)
     }
 
@@ -785,16 +991,18 @@ impl Device {
     /// is mappable, else on the second queue, beside work the first runs
     /// or holds parked; on a device without one, on the first queue behind
     /// its submissions.
-    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>, fill: seismic_memory::SlabFill) -> Result<Buffer, ExecutionError> {
         let range = self.inner.memory.block(&self.inner.device, kind, bytes, entry)?;
         // Freed by its drop where zeroing fails.
         let buffer = Buffer::new(self.inner.clone(), range, None);
-        let range = buffer.range();
-        match range.mapped() {
-            // SAFETY: the block's own mapping, which nothing else reaches yet.
-            Some(base) => unsafe { std::ptr::write_bytes(base, 0, range.bytes() as usize) },
-            None if self.inner.side.is_some() => self.inner.zero(&[(range, 0, range.bytes())])?,
-            None => drop(self.transfer(range, |_| Staged::Zero)?),
+        if fill == seismic_memory::SlabFill::Zeroed {
+            let range = buffer.range();
+            match range.mapped() {
+                // SAFETY: the block's own mapping, which nothing else reaches yet.
+                Some(base) => unsafe { std::ptr::write_bytes(base, 0, range.bytes() as usize) },
+                None if self.inner.side.is_some() => self.inner.zero(&[(range, 0, range.bytes())])?,
+                None => drop(self.transfer(range, |_| Staged::Zero)?),
+            }
         }
         Ok(buffer)
     }
@@ -1004,14 +1212,9 @@ impl Device {
     /// The timeline value every completed submission has reached; the
     /// device's loss where it cannot say.
     fn completed(&self) -> Result<u64, ExecutionError> {
-        call(
-            unsafe {
-                self.inner
-                    .device
-                    .get_semaphore_counter_value(self.inner.timeline)
-            },
-            "vkGetSemaphoreCounterValue",
-        )
+        self.inner.vk("vkGetSemaphoreCounterValue", |device| unsafe {
+            device.get_semaphore_counter_value(self.inner.timeline)
+        })
     }
 
     /// Whether the submission that took `value` completed, without waiting:
@@ -1037,13 +1240,27 @@ impl Device {
     /// so the device uses nothing it used any more; the device's loss
     /// where it cannot say. The driver waits only on a submission handed
     /// to the queue, or refused with the timeline raised past it: one held
-    /// is waited on here until it is either, so a refusal that loses the
-    /// device ends the wait with its loss ([`Inner::refuse`]).
+    /// is waited on here until it is either, so a refusal or device loss
+    /// anywhere on the logical device ends the wait with its loss
+    /// ([`Inner::refuse`], [`Inner::lose`]).
     pub(crate) fn ended(&self, value: u64) -> Result<(), ExecutionError> {
+        let queue = self.queue();
+        #[cfg(test)]
+        if queue.held.front().is_some_and(|held| held.value <= value) {
+            if let Some(notify) = self
+                .inner
+                .on_handover_wait
+                .lock()
+                .expect("handover hook lock is never poisoned")
+                .take()
+            {
+                let _ = notify.send(());
+            }
+        }
         self.inner
             .handover
-            .wait_while(self.queue(), |queue| {
-                queue.held.front().is_some_and(|held| held.value <= value)
+            .wait_while(queue, |queue| {
+                !self.inner.is_lost() && queue.held.front().is_some_and(|held| held.value <= value)
             })
             .expect("queue lock is never poisoned")
             .lost(value)?;
@@ -1052,10 +1269,9 @@ impl Device {
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        call(
-            unsafe { self.inner.device.wait_semaphores(&info, u64::MAX) },
-            "vkWaitSemaphores",
-        )
+        self.inner.vk("vkWaitSemaphores", |device| unsafe {
+            device.wait_semaphores(&info, u64::MAX)
+        })
     }
 
     fn queue(&self) -> MutexGuard<'_, Queue> {
@@ -1088,13 +1304,16 @@ impl Device {
     ) -> Result<vk::CommandBuffer, ExecutionError> {
         if level == vk::CommandBufferLevel::PRIMARY {
             if let Some(command) = recording.free_commands.pop() {
-                call(
+                memory_call(
                     unsafe {
                         self.inner
                             .device
                             .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
                     },
                     "vkResetCommandBuffer",
+                    0,
+                    &self.inner.memory,
+                    ExecutionError::SubmissionFailed,
                 )?;
                 return Ok(command);
             }
@@ -1103,9 +1322,12 @@ impl Device {
             .command_pool(recording.pool)
             .level(level)
             .command_buffer_count(1);
-        call(
+        memory_call(
             unsafe { self.inner.device.allocate_command_buffers(&info) },
             "vkAllocateCommandBuffers",
+            0,
+            &self.inner.memory,
+            ExecutionError::SubmissionFailed,
         )
         .map(|commands| commands[0])
     }
@@ -1126,9 +1348,12 @@ impl Device {
         let info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(queries);
-        call(
+        memory_call(
             unsafe { self.inner.device.create_query_pool(&info, None) },
             "vkCreateQueryPool",
+            0,
+            &self.inner.memory,
+            ExecutionError::SubmissionFailed,
         )
         .map(|pool| (pool, queries))
     }
@@ -1484,6 +1709,9 @@ impl Inner {
                 refused: None,
             }),
             handover: Condvar::new(),
+            lost: OnceLock::new(),
+            #[cfg(test)]
+            on_handover_wait: Mutex::new(None),
             side,
             executables,
             recording: Mutex::new(Recording {
@@ -1538,6 +1766,7 @@ impl Inner {
     }
 
     fn retire_up_to(&self, recording: &mut Recording, completed: u64) {
+        let mut touched_opens: Vec<Arc<Opened>> = Vec::new();
         let mut index = 0;
         while index < recording.retired.len() {
             if recording.retired[index].0.value <= completed {
@@ -1551,11 +1780,18 @@ impl Inner {
                 }
                 recording.free_queries.extend(retired.queries);
                 match owner.upgrade() {
-                    Some(opened) => opened
-                        .free_chunks
-                        .lock()
-                        .expect("free chunks lock is never poisoned")
-                        .extend(retired.arguments),
+                    Some(opened) => {
+                        if !retired.arguments.is_empty() {
+                            opened
+                                .free_chunks
+                                .lock()
+                                .expect("free chunks lock is never poisoned")
+                                .extend(retired.arguments);
+                            if !touched_opens.iter().any(|existing| Arc::ptr_eq(existing, &opened)) {
+                                touched_opens.push(opened);
+                            }
+                        }
+                    }
                     None => {
                         for chunk in retired.arguments {
                             self.memory.release(&self.device, &chunk);
@@ -1564,6 +1800,29 @@ impl Inner {
                 }
             } else {
                 index += 1;
+            }
+        }
+        let cap = free_cap(recording.retired.len());
+        let excess_commands = trim_to_cap(&mut recording.free_commands, cap);
+        if !excess_commands.is_empty() {
+            unsafe {
+                self.device
+                    .free_command_buffers(recording.pool, &excess_commands)
+            };
+        }
+        for (pool, _) in trim_to_cap(&mut recording.free_queries, cap) {
+            unsafe { self.device.destroy_query_pool(pool, None) };
+        }
+        for opened in touched_opens {
+            let excess_chunks = {
+                let mut free = opened
+                    .free_chunks
+                    .lock()
+                    .expect("free chunks lock is never poisoned");
+                trim_to_cap(&mut free, cap)
+            };
+            for chunk in excess_chunks {
+                self.memory.release(&self.device, &chunk);
             }
         }
     }
@@ -1636,7 +1895,9 @@ impl Device {
             .expect("a transfer queue exists only beside a second queue")
             .lock()
             .expect("side queue lock is never poisoned");
-        call(unsafe { self.inner.device.queue_submit2(side.raw, submits, vk::Fence::null()) }, "vkQueueSubmit2")
+        self.inner.vk("vkQueueSubmit2", |device| unsafe {
+            device.queue_submit2(side.raw, submits, vk::Fence::null())
+        })
     }
 }
 
@@ -1702,17 +1963,17 @@ impl Inner {
             }
             call(device.end_command_buffer(command), "vkEndCommandBuffer")?;
             let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
-            call(
+            self.vk("vkQueueSubmit2", |device| {
                 device.queue_submit2(
                     side.raw,
                     &[vk::SubmitInfo2::default().command_buffer_infos(&commands)],
                     side.fence,
-                ),
-                "vkQueueSubmit2",
-            )?;
-            let waited = call(device.wait_for_fences(&[side.fence], true, u64::MAX), "vkWaitForFences");
-            call(device.reset_fences(&[side.fence]), "vkResetFences")?;
-            waited
+                )
+            })?;
+            self.vk("vkWaitForFences", |device| {
+                device.wait_for_fences(&[side.fence], true, u64::MAX)
+            })?;
+            self.vk("vkResetFences", |device| device.reset_fences(&[side.fence]))
         }
     }
 
@@ -1728,7 +1989,9 @@ impl Drop for Inner {
     fn drop(&mut self) {
         let device = &self.device;
         unsafe {
-            let _ = device.device_wait_idle();
+            if !self.is_lost() {
+                let _ = device.device_wait_idle();
+            }
             let recording = self
                 .recording
                 .get_mut()
@@ -1801,7 +2064,7 @@ mod reconcile_tests {
             let kind = device.opened.pools.device().kinds()[0];
             for _ in 0..20 {
                 drop(device.allocate(BLOCK, 256, &driver).expect("a pooled block allocates"));
-                drop(device.allocate_block(kind, BLOCK, &driver).expect("a block of its own allocates"));
+                drop(device.allocate_block(kind, BLOCK, &driver, seismic_memory::SlabFill::Zeroed).expect("a block of its own allocates"));
             }
             stop.store(true, Ordering::Relaxed);
             reconciler.join().unwrap();
@@ -1811,5 +2074,102 @@ mod reconcile_tests {
             assert_eq!(charged, unheld, "the charge is what the driver holds");
             assert!(charged.abs_diff(before) < BLOCK / 2, "a block charged as the driver's: moved {}", charged.abs_diff(before));
         }
+    }
+
+    #[test]
+    fn classify_vk_error_maps_all_oom_and_device_loss_codes() {
+        use seismic_compiler::errors::RefusalReading;
+
+        let budget = || crate::MemoryBudget {
+            heap_budget_bytes: 1000,
+            heap_usage_bytes: 900,
+        };
+        let objects = || (4096, 4096);
+
+        let lost = classify_vk_error(
+            vk::Result::ERROR_DEVICE_LOST,
+            "vkCreateBuffer",
+            64,
+            budget,
+            objects,
+            ExecutionError::AllocationFailed,
+        );
+        assert!(matches!(lost, ExecutionError::DeviceLost(_)));
+
+        let dev_oom = classify_vk_error(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            "vkAllocateMemory",
+            64,
+            budget,
+            objects,
+            ExecutionError::AllocationFailed,
+        );
+        assert!(dev_oom.capacity_refusal().is_some(), "{dev_oom:?}");
+        assert!(matches!(
+            dev_oom,
+            ExecutionError::DeviceRefused {
+                required: 64,
+                reading: RefusalReading::HeapBudget { budget: 1000, usage: 900 },
+            }
+        ));
+
+        for host_code in [vk::Result::ERROR_OUT_OF_HOST_MEMORY, vk::Result::ERROR_MEMORY_MAP_FAILED] {
+            let host_oom = classify_vk_error(
+                host_code,
+                "vkMapMemory",
+                64,
+                budget,
+                objects,
+                ExecutionError::AllocationFailed,
+            );
+            assert!(host_oom.capacity_refusal().is_some(), "{host_oom:?}");
+            assert!(matches!(
+                host_oom,
+                ExecutionError::DeviceRefused { required: 64, reading: RefusalReading::Host }
+            ));
+        }
+
+        let too_many = classify_vk_error(
+            vk::Result::ERROR_TOO_MANY_OBJECTS,
+            "vkAllocateMemory",
+            64,
+            budget,
+            objects,
+            ExecutionError::AllocationFailed,
+        );
+        assert!(too_many.capacity_refusal().is_some(), "{too_many:?}");
+        assert!(matches!(
+            too_many,
+            ExecutionError::DeviceRefused {
+                required: 64,
+                reading: RefusalReading::MemoryObjects { limit: 4096, held: 4096 },
+            }
+        ));
+
+        let other = classify_vk_error(
+            vk::Result::ERROR_INITIALIZATION_FAILED,
+            "vkCreateQueryPool",
+            0,
+            budget,
+            objects,
+            ExecutionError::SubmissionFailed,
+        );
+        assert!(other.capacity_refusal().is_none(), "{other:?}");
+        assert!(matches!(other, ExecutionError::SubmissionFailed(_)));
+    }
+
+    #[test]
+    fn free_cap_and_trim_to_cap_retain_steady_state_prefix_and_evict_overflow_tail() {
+        assert_eq!(free_cap(0), 1);
+        assert_eq!(free_cap(3), 4);
+
+        let mut pool = vec![10, 20, 30, 40, 50];
+        let evicted = trim_to_cap(&mut pool, free_cap(1));
+        assert_eq!(pool, vec![10, 20]);
+        assert_eq!(evicted, vec![30, 40, 50]);
+
+        let none = trim_to_cap(&mut pool, free_cap(2));
+        assert!(none.is_empty());
+        assert_eq!(pool, vec![10, 20]);
     }
 }

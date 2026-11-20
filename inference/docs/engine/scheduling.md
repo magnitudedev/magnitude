@@ -35,7 +35,7 @@ pass is the largest whose arena fits beside it.
 
 Prices come from the machine's generic measurements and the model's headers alone
 (`PlanPrices`). While the measurements are pending, every load waits for them, whole or
-streamed (`PlanError::Unpriced`), holding nothing of the device. Where they are
+streamed (`PlanError::Pending`), holding nothing of the device. Where they are
 unavailable (no kernel cache), a whole load plans without them and a streamed load fails
 as an internal error.
 

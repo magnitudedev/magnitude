@@ -109,6 +109,10 @@ def configured(configuration: str, environment: dict) -> str:
     return " ".join([configuration, *(f"{name}={environment[name]}" for name in sorted(environment))])
 
 
+class LedgerError(Exception):
+    """A run's test outcomes could not be matched to its build provenance for the ledger."""
+
+
 def rows(results_dir: Path, job: Path, backend: str, configuration: str, doc: dict | None = None) -> list[dict]:
     """The ledger rows of a test run (its results directory, its job's) on `backend`, built in
     `configuration`; `doc`, its documentation tests' outcomes by crate, each the row of its
@@ -120,9 +124,15 @@ def rows(results_dir: Path, job: Path, backend: str, configuration: str, doc: di
     found = []
 
     def row(binary: str, executable: str, listed: list, ignored: list, by_place: dict) -> dict:
+        entry = proven.get(executable)
+        if entry is None:
+            raise LedgerError(
+                f"test executable {executable!r} ({binary}) of run {results_dir.name} is absent from "
+                f"{PROVENANCE.format(side='source')}"
+            )
         return {"run": results_dir.name, "binary": binary, "executable": executable, "host": facts["alias"],
-                "configuration": configured(configuration, proven[executable]["environment"]),
-                "digest": proven[executable]["sources_digest"], "listed": listed, "ignored": ignored,
+                "configuration": configured(configuration, entry["environment"]),
+                "digest": entry["sources_digest"], "listed": listed, "ignored": ignored,
                 "hardware": {place: hardware(facts, place) for place in by_place}, "results": by_place}
 
     for record in ran:

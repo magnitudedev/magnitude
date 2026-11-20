@@ -424,15 +424,15 @@ impl Queue {
         link.room()
     }
 
-    /// Cancel request `id`: its pieces no worker took, none where every one
-    /// was.
-    pub(crate) fn cancel(&mut self, id: u64) -> Option<Queued> {
+    /// Cancel request `id`: its pieces no worker took and the workers to wake
+    /// for the pieces its link may start now, none where every piece was taken.
+    pub(crate) fn cancel(&mut self, id: u64) -> Option<(Queued, usize)> {
         let (volume, want) = self.wants.remove(&id)?;
         let link = self.links.get_mut(&volume).expect("a queued request's link");
         let request = link.map(&want).remove(&(want, id)).expect("a queued request");
         crate::timeline::note(crate::timeline::Kind::Cancel, id, (request.pieces.len() as i64, 0, 0));
         settle(&mut self.waits, id, |wait| wait.cancelled(&mut link.book, Instant::now()));
         request.need.ended(request.pieces.len());
-        Some(request)
+        Some((request, link.room()))
     }
 }

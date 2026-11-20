@@ -172,7 +172,9 @@ fn compiled(
     .map_err(malformed)?;
     validate(&sealed).map_err(NativeCompilationError::MalformedToolchainOutput)?;
     let reads_subgroups = !joins.is_empty() || uniformity::reads_subgroups(&sealed).map_err(malformed)?;
-    Ok((shipped(sealed, &joins)?, reads_subgroups))
+    let merges_returns =
+        findings.relies_on_maximal_reconvergence && environment.merge_maximal_reconvergence_returns;
+    Ok((shipped(sealed, &joins, merges_returns)?, reads_subgroups))
 }
 
 /// The launch `kernel` of `source` compiled to SPIR-V by glslang and
@@ -1107,92 +1109,120 @@ fn by_value(
 /// give, but for the numbering of its ids. It is rewritten as SPIR-V
 /// assembly, where every id is a token, and assembled again with its ids
 /// kept and the header's version and generator glslang wrote (drivers key
-/// workarounds on the generator), then validated as formation validates. A
-/// module without joins is shipped as it is.
-fn shipped(module: Vec<u32>, joins: &[uniformity::HardwareJoin]) -> Result<Vec<u32>, NativeCompilationError> {
+/// workarounds on the generator), then validated as formation validates.
+/// Where `merges_returns` (the module declares `MaximallyReconvergesKHR` and
+/// the environment enables `merge_maximal_reconvergence_returns`), early
+/// returns are merged into one return block per function in a single optimizer
+/// pass (`DeadBranchElim`, which the pass requires, then `MergeReturn`):
+/// `vk::DriverId::AMD_PROPRIETARY` (observed on Windows `amdvlk64.dll`
+/// 32.0.31019.6049 / driver `26.10.19.06 (LLPC)`) segfaults (`0xC0000005`) in
+/// `vkCreateComputePipelines` on `spirv-val`-valid modules declaring
+/// `MaximallyReconvergesKHR` with early returns. A module without joins or
+/// merged returns is shipped as it is.
+fn shipped(
+    module: Vec<u32>,
+    joins: &[uniformity::HardwareJoin],
+    merges_returns: bool,
+) -> Result<Vec<u32>, NativeCompilationError> {
     use spirv_tools::assembler::{Assembler, AssemblerOptions};
     const OP_FUNCTION_CALL: u32 = 57;
-    if joins.is_empty() {
-        return Ok(module);
-    }
-    let functions = joins.iter().map(|join| join.ids[0]).collect::<std::collections::HashSet<_>>();
-    // Each call's result, by the argument it is.
-    let mut argument = std::collections::HashMap::new();
-    for instruction in seal::instructions(&module).map_err(malformed)? {
-        let words = &module[instruction.start..instruction.start + instruction.words];
-        if instruction.opcode == OP_FUNCTION_CALL && functions.contains(&words[3]) {
-            argument.insert(words[2], words[4]);
+    let mut shipped = if joins.is_empty() {
+        module
+    } else {
+        let functions = joins.iter().map(|join| join.ids[0]).collect::<std::collections::HashSet<_>>();
+        // Each call's result, by the argument it is.
+        let mut argument = std::collections::HashMap::new();
+        for instruction in seal::instructions(&module).map_err(malformed)? {
+            let words = &module[instruction.start..instruction.start + instruction.words];
+            if instruction.opcode == OP_FUNCTION_CALL && functions.contains(&words[3]) {
+                argument.insert(words[2], words[4]);
+            }
         }
-    }
-    let substitute = |mut id: u32| {
-        while let Some(next) = argument.get(&id) {
-            id = *next;
-        }
-        id
-    };
-    // Ids nothing shipped may name: the joins' own, and the calls'.
-    let dropped = joins
-        .iter()
-        .flat_map(|join| join.ids)
-        .chain(argument.keys().copied())
-        .collect::<std::collections::HashSet<_>>();
-    let text = assembly(&module)?;
-    // Each kept line, with the function type it declares.
-    let mut kept = Vec::new();
-    let mut in_join = false;
-    for line in text.lines() {
-        let ids = named_ids(line);
-        let mut tokens = line.split_whitespace();
-        let first = tokens.next().unwrap_or_default();
-        let defined = first.starts_with('%').then(|| ids[0].1);
-        let opcode = if defined.is_some() { tokens.nth(1).unwrap_or_default() } else { first };
-        if in_join {
-            in_join = opcode != "OpFunctionEnd";
-            continue;
-        }
-        if opcode == "OpFunction" && defined.is_some_and(|id| functions.contains(&id)) {
-            in_join = true;
-            continue;
-        }
-        if defined.is_some_and(|id| argument.contains_key(&id)) {
-            continue;
-        }
-        if ids.iter().any(|(_, id)| dropped.contains(id)) {
-            if matches!(opcode, "OpName" | "OpMemberName" | "OpDecorate" | "OpDecorateId" | "OpDecorateString" | "OpMemberDecorate") {
+        let substitute = |mut id: u32| {
+            while let Some(next) = argument.get(&id) {
+                id = *next;
+            }
+            id
+        };
+        // Ids nothing shipped may name: the joins' own, and the calls'.
+        let dropped = joins
+            .iter()
+            .flat_map(|join| join.ids)
+            .chain(argument.keys().copied())
+            .collect::<std::collections::HashSet<_>>();
+        let text = assembly(&module)?;
+        // Each kept line, with the function type it declares.
+        let mut kept = Vec::new();
+        let mut in_join = false;
+        for line in text.lines() {
+            let ids = named_ids(line);
+            let mut tokens = line.split_whitespace();
+            let first = tokens.next().expect("spirv-dis line has an opcode");
+            let defined = first.starts_with('%').then(|| ids[0].1);
+            let opcode = if defined.is_some() {
+                tokens.nth(1).expect("spirv-dis line has an opcode")
+            } else {
+                first
+            };
+            if in_join {
+                in_join = opcode != "OpFunctionEnd";
                 continue;
             }
-            assert!(
-                ids.iter().all(|(_, id)| !dropped.contains(id) || argument.contains_key(id)),
-                "a hardware join is named other than by its calls: {line}"
-            );
+            if opcode == "OpFunction" && defined.is_some_and(|id| functions.contains(&id)) {
+                in_join = true;
+                continue;
+            }
+            if defined.is_some_and(|id| argument.contains_key(&id)) {
+                continue;
+            }
+            if ids.iter().any(|(_, id)| dropped.contains(id)) {
+                if matches!(opcode, "OpName" | "OpMemberName" | "OpDecorate" | "OpDecorateId" | "OpDecorateString" | "OpMemberDecorate") {
+                    continue;
+                }
+                assert!(
+                    ids.iter().all(|(_, id)| !dropped.contains(id) || argument.contains_key(id)),
+                    "a hardware join is named other than by its calls: {line}"
+                );
+            }
+            let mut rewritten = String::with_capacity(line.len());
+            let mut at = 0;
+            for (span, id) in &ids {
+                rewritten.push_str(&line[at..span.start]);
+                rewritten.push_str(&format!("%{}", substitute(*id)));
+                at = span.end;
+            }
+            rewritten.push_str(&line[at..]);
+            kept.push((rewritten, defined.filter(|_| opcode == "OpTypeFunction")));
         }
-        let mut rewritten = String::with_capacity(line.len());
-        let mut at = 0;
-        for (span, id) in &ids {
-            rewritten.push_str(&line[at..span.start]);
-            rewritten.push_str(&format!("%{}", substitute(*id)));
-            at = span.end;
-        }
-        rewritten.push_str(&line[at..]);
-        kept.push((rewritten, defined.filter(|_| opcode == "OpTypeFunction")));
+        // The ids the kept lines name besides those they declare.
+        let named = kept
+            .iter()
+            .flat_map(|(line, _)| named_ids(line).into_iter().skip(usize::from(line.starts_with('%'))))
+            .map(|(_, id)| id)
+            .collect::<std::collections::HashSet<_>>();
+        let text = kept
+            .iter()
+            .filter(|(_, function_type)| function_type.is_none_or(|id| named.contains(&id)))
+            .map(|(line, _)| format!("{line}\n"))
+            .collect::<String>();
+        let mut shipped = spirv_tools::assembler::create(Some(target()))
+            .assemble(&text, AssemblerOptions { preserve_numeric_ids: true })
+            .map(|binary| binary.as_words().to_vec())
+            .map_err(toolchain)?;
+        shipped[1..3].copy_from_slice(&module[1..3]);
+        shipped
+    };
+    if merges_returns {
+        shipped = optimized(
+            &shipped,
+            &[
+                spirv_tools::opt::Passes::DeadBranchElim,
+                spirv_tools::opt::Passes::MergeReturn,
+            ],
+        )?;
+    } else if !joins.is_empty() {
+        validate(&shipped).map_err(NativeCompilationError::MalformedToolchainOutput)?;
     }
-    // The ids the kept lines name besides those they declare.
-    let named = kept
-        .iter()
-        .flat_map(|(line, _)| named_ids(line).into_iter().skip(usize::from(line.starts_with('%'))))
-        .map(|(_, id)| id)
-        .collect::<std::collections::HashSet<_>>();
-    let text = kept
-        .iter()
-        .filter(|(_, function_type)| function_type.is_none_or(|id| named.contains(&id)))
-        .map(|(line, _)| format!("{line}\n"))
-        .collect::<String>();
-    let mut shipped = spirv_tools::assembler::create(Some(target()))
-        .assemble(&text, AssemblerOptions { preserve_numeric_ids: true })
-        .map(|binary| binary.as_words().to_vec())
-        .map_err(toolchain)?;
-    shipped[1..3].copy_from_slice(&module[1..3]);
-    validate(&shipped).map_err(NativeCompilationError::MalformedToolchainOutput)?;
     Ok(shipped)
 }
 
@@ -1551,6 +1581,7 @@ mod tests {
         denorm_preserve_32: false,
         subgroup_uniform_control_flow: true,
         maximal_reconvergence: false,
+        merge_maximal_reconvergence_returns: false,
     };
 
     /// `body` as the launch `probe` of a source with a u64 and a float
@@ -2096,5 +2127,62 @@ mod tests {
         }
         compile(&source("", &strided(false)), "probe", maximal).expect("the rounds form forms where declared");
         formed("", &strided(false));
+    }
+
+    /// A module declaring `MaximallyReconvergesKHR` merges early returns only
+    /// when `merge_maximal_reconvergence_returns` is set
+    /// (`vk::DriverId::AMD_PROPRIETARY`); when false, the shipped SPIR-V is
+    /// bit-for-bit identical to the sealed module (early returns preserved and
+    /// no synthetic `OpLoopMerge` added).
+    #[test]
+    fn a_module_with_maximal_reconvergence_merges_early_returns() {
+        const OP_FUNCTION: u32 = 54;
+        const OP_FUNCTION_END: u32 = 56;
+        const OP_RETURN: u32 = 253;
+        const OP_RETURN_VALUE: u32 = 254;
+        let max_returns = |module: &[u32]| {
+            let (mut current, mut max) = (0usize, 0usize);
+            for instruction in seal::instructions(module).expect("valid module") {
+                match instruction.opcode {
+                    OP_FUNCTION => current = 0,
+                    OP_RETURN | OP_RETURN_VALUE => current += 1,
+                    OP_FUNCTION_END => max = max.max(current),
+                    _ => {}
+                }
+            }
+            max
+        };
+        let helper = "void maybe_store(uint x) { if (x == 0u) return; data.x[x] = 1ul; }";
+        let body = format!("maybe_store(gl_WorkGroupID.x); {}", strided(true));
+        let glsl = source(helper, &body);
+        let merged_env = seal::Environment {
+            maximal_reconvergence: true,
+            merge_maximal_reconvergence_returns: true,
+            ..ENVIRONMENT
+        };
+        let merged = compile(&glsl, "probe", merged_env).expect("compiles");
+        assert!(
+            max_returns(&merged) <= 1,
+            "expected at most one return per function when merging returns, found {}",
+            max_returns(&merged)
+        );
+        let unmerged_env = seal::Environment {
+            maximal_reconvergence: true,
+            merge_maximal_reconvergence_returns: false,
+            ..ENVIRONMENT
+        };
+        let unmerged = compile(&glsl, "probe", unmerged_env).expect("compiles");
+        assert!(
+            max_returns(&unmerged) > 1,
+            "expected early returns preserved when merge_maximal_reconvergence_returns is false, found {}",
+            max_returns(&unmerged)
+        );
+        // Without the workaround, `shipped()` must not rewrite the sealed SPIR-V at all.
+        let cleaned = cleaned(&glsl, "probe").expect("cleaned");
+        let sealed = seal::seal(&cleaned, unmerged_env, false, true).expect("sealed");
+        assert_eq!(
+            unmerged, sealed,
+            "expected bit-for-bit identical SPIR-V when merge_maximal_reconvergence_returns is false"
+        );
     }
 }

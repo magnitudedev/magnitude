@@ -4,9 +4,6 @@ pub use magnitude_artifacts::TokenId;
 use std::{fmt, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProgramIdentity(Arc<str>);
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceDomainId(Arc<str>);
 
 macro_rules! identity {
@@ -33,7 +30,6 @@ macro_rules! identity {
     };
 }
 
-identity!(ProgramIdentity);
 identity!(ResourceDomainId);
 
 /// Engine-wide identity of an admitted request: unique in the process, and
@@ -685,14 +681,6 @@ pub enum CommittedClass {
     HasTentative,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GroupKey {
-    pub program_identity: ProgramIdentity,
-    pub executable: ExecutableKind,
-    pub commitment: CommittedClass,
-    pub draft: Option<DraftShape>,
-}
-
 impl Operation {
     pub const fn request(&self) -> RequestId {
         match self {
@@ -899,10 +887,18 @@ impl Operation {
                 }
                 validate_forward_select(*kind, accepted, *demand, select)?;
                 if chain.is_some() {
-                    let entered = demand.contains(Demand::SELECT | Demand::FEATURES)
+                    let entered = demand.contains(Demand::SELECT)
                         && match kind {
-                            WorkKind::Decode => accepted == 1 && prime.is_none(),
-                            WorkKind::Prefill => prime.as_ref().is_some_and(|prime| prime.boundary) && front.is_empty(),
+                            WorkKind::Decode => {
+                                accepted == 1
+                                    && prime.is_none()
+                                    && demand.contains(Demand::DEVICE_FEATURES)
+                            }
+                            WorkKind::Prefill => {
+                                prime.as_ref().is_some_and(|prime| prime.boundary)
+                                    && front.is_empty()
+                                    && demand.contains(Demand::FEATURES)
+                            }
                             WorkKind::Verify | WorkKind::Replay => false,
                         };
                     if !entered {

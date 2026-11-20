@@ -15,8 +15,8 @@ use crate::{Metal, BACKEND_REVISION};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSProcessInfo, NSString};
 use objc2_metal::{
-    MTLCompileOptions, MTLDevice, MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLLibraryError,
-    MTLLibraryErrorDomain, MTLMathFloatingPointFunctions, MTLMathMode,
+    MTLCompileOptions, MTLComputePipelineState, MTLDevice, MTLGPUFamily, MTLLanguageVersion,
+    MTLLibrary, MTLLibraryError, MTLLibraryErrorDomain, MTLMathFloatingPointFunctions, MTLMathMode,
 };
 use seismic_compiler::errors::TargetError;
 use seismic_compiler::target::{
@@ -98,6 +98,7 @@ fn discover_device(
     let raw = handle.raw();
     let MetalProbeAnswers::Accepted {
         language,
+        max_total_threads_per_threadgroup,
         scalar_collective_dtypes,
         bfloat_arithmetic,
         matrix_dtypes,
@@ -118,6 +119,7 @@ fn discover_device(
         families: observed_families(raw),
         language,
         max_threads_per_threadgroup: [size.width as u64, size.height as u64, size.depth as u64],
+        max_total_threads_per_threadgroup,
         max_buffer_bytes: handle.max_allocation_bytes(),
         // What every buffer the device allocates satisfies: the least of its
         // kinds' alignments.
@@ -213,10 +215,11 @@ impl KernelAbiModel<Metal> for MetalKernelAbi {
 fn limits_of(specs: &MetalDeviceInfo) -> TargetLimits {
     TargetLimits {
         max_workgroup_size: specs.max_threads_per_threadgroup,
-        // The exact total is pipeline-specific. This device-wide product is
-        // only an outer representability bound; every admitted kernel uses
-        // its reflected `maxTotalThreadsPerThreadgroup`.
-        max_workgroup_threads: specs.max_threads_per_threadgroup.into_iter().product(),
+        // Device-wide ceiling on total threads per threadgroup (<= 1024),
+        // observed from a trivial compute pipeline's
+        // `maxTotalThreadsPerThreadgroup`. Concrete kernels may reflect a
+        // tighter per-pipeline bound.
+        max_workgroup_threads: specs.max_total_threads_per_threadgroup,
         max_grid: [MSL_GRID_INDEX_MAX; 3],
         max_workgroup_bytes: specs.properties.shared_bytes_per_group.get(),
         // Metal exposes no authoritative private-stack capacity. Participant
@@ -531,6 +534,9 @@ pub enum MetalProbeAnswers {
     Accepted {
         /// The highest language version the compiler accepts.
         language: LanguageVersion,
+        /// Device-wide `maxTotalThreadsPerThreadgroup` reflected from the
+        /// trivial language-probe pipeline (<= 1024).
+        max_total_threads_per_threadgroup: u64,
         /// Scalar dtypes whose SIMD-group reductions and shuffles form.
         scalar_collective_dtypes: BTreeSet<DType>,
         bfloat_arithmetic: bool,
@@ -637,8 +643,28 @@ impl MetalProbeAnswers {
         let tensor_matmul_forms = metal4 && forms(language, "seismic_tensor_probe", TENSOR_PROBE, true);
         let tensor_headers_form =
             metal4 && forms(language, "seismic_tensor_headers", TENSOR_HEADERS_PROBE, false);
+        let axis_max = {
+            let size = raw.maxThreadsPerThreadgroup();
+            [size.width as u64, size.height as u64, size.depth as u64]
+                .into_iter()
+                .max()
+                .unwrap_or(0)
+        };
+        let max_total_threads_per_threadgroup =
+            match probe_pipeline(raw, language, "seismic_language_probe", &language_probe) {
+                Ok(state) => (state.maxTotalThreadsPerThreadgroup() as u64).min(axis_max),
+                Err(Probe::NotRun(error)) => {
+                    not_run.push(format!(
+                        "seismic_language_probe (msl-{}: {error})",
+                        language.label()
+                    ));
+                    axis_max
+                }
+                Err(Probe::Rejected | Probe::Formed) => axis_max,
+            };
         let answers = Self::Accepted {
             language,
+            max_total_threads_per_threadgroup,
             scalar_collective_dtypes,
             bfloat_arithmetic,
             matrix_dtypes,
@@ -815,6 +841,27 @@ impl Probe {
     }
 }
 
+/// One probe kernel compiled at `language` and formed into a compute pipeline.
+fn probe_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    language: LanguageVersion,
+    function: &str,
+    body: &str,
+) -> Result<objc2::rc::Retained<ProtocolObject<dyn MTLComputePipelineState>>, Probe> {
+    crate::pooled(|| {
+        let source = NSString::from_str(&format!("{PROBE_PRELUDE}{body}"));
+        let library = device
+            .newLibraryWithSource_options_error(&source, Some(&compile_options(language)))
+            .map_err(|error| Probe::of_library(&error))?;
+        let function = library
+            .newFunctionWithName(&NSString::from_str(function))
+            .unwrap_or_else(|| panic!("a compiled Metal probe library lacks its kernel `{function}`"));
+        device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|error| Probe::of_pipeline(&error))
+    })
+}
+
 /// One probe kernel compiled at `language`, and its pipeline formed where
 /// `pipeline` ([`Probe::of_library`], [`Probe::of_pipeline`]).
 fn probe(
@@ -824,22 +871,22 @@ fn probe(
     body: &str,
     pipeline: bool,
 ) -> Probe {
+    if pipeline {
+        return match probe_pipeline(device, language, function, body) {
+            Ok(_) => Probe::Formed,
+            Err(outcome) => outcome,
+        };
+    }
     crate::pooled(|| {
         let source = NSString::from_str(&format!("{PROBE_PRELUDE}{body}"));
         let library = match device.newLibraryWithSource_options_error(&source, Some(&compile_options(language))) {
             Ok(library) => library,
             Err(error) => return Probe::of_library(&error),
         };
-        let function = library
+        let _function = library
             .newFunctionWithName(&NSString::from_str(function))
             .unwrap_or_else(|| panic!("a compiled Metal probe library lacks its kernel `{function}`"));
-        if !pipeline {
-            return Probe::Formed;
-        }
-        match device.newComputePipelineStateWithFunction_error(&function) {
-            Ok(_) => Probe::Formed,
-            Err(error) => Probe::of_pipeline(&error),
-        }
+        Probe::Formed
     })
 }
 

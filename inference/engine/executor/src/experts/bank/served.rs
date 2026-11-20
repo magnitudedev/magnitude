@@ -67,7 +67,10 @@ impl ServedBank {
             // settles it.
             match target.holding {
                 BankHolding::Host if served.bank.plan.host_slots > 0 => {}
-                holding => served.bank.cache.hold(holding, recorded.carve(&store, CommittedKind::Backing(crate::memory::ledger::PoolClass::Records), above).into_backed_cache(CacheKind::Bank)),
+                holding => {
+                    let reclaim = served.bank.cache.reclaim_for(holding);
+                    served.bank.cache.hold(holding, recorded.carve(&store, CommittedKind::Backing(crate::memory::ledger::PoolClass::Records), above).into_backed_cache(CacheKind::Bank, reclaim));
+                }
             }
         }
 
@@ -349,7 +352,7 @@ impl ElasticBank for ServedBank {
     fn targets(&self, price: Option<&DecodePrice>) -> Result<Vec<HoldingTarget<'_>>, DomainError> {
         let plan = &self.bank.plan;
         let counts = &self.bank.counts;
-        let block = plan.granule();
+        let block = plan.block().held;
         let at = self.bank.slots();
         let mut targets = vec![HoldingTarget {
             holding: BankHolding::Experts,
@@ -360,7 +363,7 @@ impl ElasticBank for ServedBank {
             charge: Box::new(move |slots| counts.resident_charge(slots)),
         }];
         if let Some((host, ceiling)) = self.bank.host_tier() {
-            let block = plan.host_granule().expect("invariant violated: a host tier beside a plan without its pool");
+            assert!(plan.host_granule().is_some(), "invariant violated: a host tier beside a plan without its pool");
             let bound = match self.bank.host_backing() {
                 true => host,
                 false => ceiling,
@@ -383,7 +386,7 @@ impl ElasticBank for ServedBank {
                 tier: self.storage(holding)?,
                 at: records,
                 owed: self.bank.cache.owed(holding, self.above_floor(holding, records)?),
-                shape: BankShape::curved(granule, held.plan.floor, held.plan.records.get(), Some(held.table.curve().saturation()), records),
+                shape: BankShape::curved(block.held, held.plan.floor, held.plan.records.get(), Some(held.table.curve().saturation()), records),
                 charge: Box::new(move |records| {
                     crate::planning::BankTable::charge(block, granule, records).expect("invariant violated: a table's charge fits u64 at every size it holds")
                 }),
@@ -458,9 +461,10 @@ impl ElasticBank for ServedBank {
             Some(finished) => Some(finished),
             None => match self.bank.advance_host()? {
                 Some((finished, true)) => Some(finished),
-                // The host tier's backing at open settles its claim alone.
+                // The host tier's backing at open settles its cache entry alone.
                 Some((backed, false)) => {
                     self.bank.cache.settle(&backed);
+                    self.bank.cache.fit(BankHolding::Host, self.above_floor(BankHolding::Host, self.bank.host_slots())?);
                     self.finished.lock().expect("table resize outcome").pop_front()
                 }
                 None => self.finished.lock().expect("table resize outcome").pop_front(),
@@ -468,6 +472,9 @@ impl ElasticBank for ServedBank {
         };
         if let Some(resized) = &finished {
             self.bank.cache.settle(resized);
+            if let BankResized::Grown { holding, .. } = *resized {
+                self.bank.cache.fit(holding, self.above_floor(holding, self.size(holding))?);
+            }
         }
         Ok(finished)
     }

@@ -191,19 +191,21 @@ impl PreparedChat {
         request: &ChatRequest,
         selection: &TemplateSelection<'_>,
     ) -> Option<usize> {
+        if !self.has_internal_added_token() {
+            return None;
+        }
         let mut probe = request.clone();
         probe
             .messages
             .last_mut()?
             .as_object_mut()?
             .insert("content".into(), CONTENT_PROBE.into());
-        let (native, _) = bundle.prepare(&probe, selection).ok()?;
+        let probed = bundle.render_prompt(&probe, selection).ok()?;
         let prompt = self.prompt();
-        let probed = &native.description().prompt;
         if prompt == probed {
             return None;
         }
-        self.shared_boundary(probed)
+        self.shared_boundary(&probed)
     }
 
     /// The prompt token position where the conversation's next turn leaves
@@ -224,14 +226,23 @@ impl PreparedChat {
         request: &ChatRequest,
         selection: &TemplateSelection<'_>,
     ) -> Option<usize> {
+        if !self.has_internal_added_token() {
+            return None;
+        }
         let mut probe = request.clone();
         for role in ["assistant", "user"] {
             probe
                 .messages
                 .push(serde_json::json!({"role": role, "content": CONTENT_PROBE}));
         }
-        let (native, _) = bundle.prepare(&probe, selection).ok()?;
-        self.shared_boundary(&native.description().prompt)
+        let probed = bundle.render_prompt(&probe, selection).ok()?;
+        self.shared_boundary(&probed)
+    }
+
+    fn has_internal_added_token(&self) -> bool {
+        self.added_token_ends
+            .iter()
+            .any(|end| end.position < self.input.tokens.len())
     }
 
     /// The position after the last added token within the bytes this prompt

@@ -335,12 +335,15 @@ pub struct KeptRows {
 impl KeptRows {
     /// The file in `directory` of the table `table` describes: everything
     /// its rows and their slots depend on.
-    pub fn of(directory: &Path, table: &str) -> Self {
+    pub fn of(directory: &Path, table: &str) -> Result<Self, seismic_io::StoreError> {
         let name = Sha256::digest(table.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        Self { store: seismic_io::Store::new(directory.to_owned(), seismic_io::Privacy::Shared), name: PathBuf::from(format!("{name}.rows")) }
+        Ok(Self {
+            store: seismic_io::Store::open(directory.to_owned(), seismic_io::Privacy::Shared)?,
+            name: PathBuf::from(format!("{name}.rows")),
+        })
     }
 
     /// Where the rows are kept.
@@ -366,7 +369,7 @@ impl KeptRows {
 
     pub(crate) fn write(&self, rows: &[u64]) {
         let text = std::iter::once(rows.len()).map(|count| count.to_string()).chain(rows.iter().map(u64::to_string)).collect::<Vec<_>>().join(" ") + "\n";
-        let _ = self.store.publish(&self.name, seismic_io::Durability::Volatile, |file| std::io::Write::write_all(file, text.as_bytes()));
+        let _ = self.store.shared().and_then(|shared| shared.publish(&self.name, seismic_io::Durability::Volatile, |file| std::io::Write::write_all(file, text.as_bytes())));
     }
 }
 
@@ -1182,7 +1185,7 @@ mod tests {
             crate::planning::TableFlights { flights: crate::FlightDepth::SERIAL, lanes: 1, fronts: false },
             DirectoryForm::Dense,
             Box::new(Rows),
-            kept.map(|directory| KeptRows::of(directory, "table")),
+            kept.map(|directory| KeptRows::of(directory, "table").unwrap()),
         )
         .unwrap();
         table.seed(&charges).unwrap();
@@ -1351,7 +1354,7 @@ mod tests {
             "magnitude-device-table-{}",
             std::process::id()
         ));
-        let file = KeptRows::of(&kept, "table").path();
+        let file = KeptRows::of(&kept, "table").unwrap().path();
         let table = device_table(Some(&kept));
         crate::settle::owe(Rc::downgrade(&table));
         let table = ResidentTable::streamed(table);
@@ -1369,7 +1372,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "3 1 3 6\n");
         // A file torn short, or of rows another count than it states, keeps
         // none.
-        let kept_rows = KeptRows::of(&kept, "table");
+        let kept_rows = KeptRows::of(&kept, "table").unwrap();
         for torn in ["3 1 3 6", "3 1 3\n", "1 3 6"] {
             std::fs::write(&file, torn).unwrap();
             assert_eq!(kept_rows.read(), Vec::<u64>::new(), "{torn:?}");

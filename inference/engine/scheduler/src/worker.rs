@@ -31,6 +31,8 @@ pub enum Event {
     Publication(RequestId, PublicationWake),
     /// A request whose admission reply was dropped, or whose host cancelled it.
     Cancel(RequestId),
+    /// The measurement job ended. Its grant and traffic hold are released in arrival order.
+    ReleaseMeasurementRoom,
     /// The OS signalled memory pressure: the owner reads memory at once.
     MemoryPressure,
     /// The owner's timed re-read of memory is due ([`Reread`]): it reads
@@ -527,6 +529,9 @@ impl<C: Clone + Send + 'static> Client<C> {
         })
     }
     /// Reserved lifecycle path; it cannot carry arbitrary caller behavior.
+    pub fn release_measurement_room(&self) {
+        self.mailbox.push(Event::ReleaseMeasurementRoom);
+    }
     pub fn cancel(&self, request: RequestId) {
         self.mailbox.push(Event::Cancel(request));
     }
@@ -652,6 +657,7 @@ mod tests {
                     Event::Completion => "completion",
                     Event::Publication(..) => "publication",
                     Event::Cancel(_) => "cancel",
+                    Event::ReleaseMeasurementRoom => "release room",
                     Event::MemoryPressure => "pressure",
                     Event::Reread => "reread",
                     Event::Close => {
@@ -936,11 +942,14 @@ mod tests {
             client.dispatch(WorkerCommand::Observe),
             Err(DispatchError::Full)
         ));
+        client.release_measurement_room();
         client.cancel(RequestId(1));
         let mut seen = Vec::new();
         while !seen.contains(&"cancel") {
             seen.push(observed.recv_timeout(TIMEOUT).unwrap());
         }
+        let ordered: Vec<_> = seen.into_iter().filter(|event| *event != "run").collect();
+        assert_eq!(ordered, ["command", "command", "command", "command", "release room", "cancel"]);
         drop(held);
         worker.close();
     }

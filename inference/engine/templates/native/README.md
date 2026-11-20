@@ -141,6 +141,17 @@ reasoning. Chat turns, which have no grammar, still rely on the stream: it also 
 reading when output ends between sections (after a closed GPT-OSS or Muse Glimmer analysis, after
 Cohere2 MoE reasoning with no text) or inside constrained output a stop string cut short.
 
+Patch 0038 completes the Jinja2 and HuggingFace `transformers` chat-template features missing from
+upstream. It adds the standard global builtins (`dict`, `zip`, `enumerate`, `len`, `str`, `int`,
+`float`, `bool`, `list`, `min`, `max`, `sum`, `abs`, `round`, `sorted`, `reversed`, `any`, `all`),
+separates filter dispatch from member lookup on objects so filters such as `default` and `length`
+never shadow dict keys like `param.default`, implements `tojson(sort_keys=...)`, `from_json`,
+distinct `select`/`reject` vs `selectattr`/`rejectattr`, the `le` test, `is iterable` on dicts,
+`sum`/`list`/`replace(..., count)`/`str.join`, dict/string/list methods (`update`, `pop`,
+`setdefault`, `copy`, `clear`, `find`, `rfind`, `splitlines`, `removeprefix`, `removesuffix`,
+`count`, tuple `startswith`/`endswith`, whitespace `split`/`rsplit`, negative string indexing,
+`extend`, `insert`, `remove`, `index`), `{% do ... %}` (`jinja2.ext.do`), and `{% for ch in str %}`.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

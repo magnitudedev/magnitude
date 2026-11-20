@@ -32,7 +32,7 @@ fn a_growth_joins_each_slot_as_every_group_holds_it() {
     let charges = seismic::Charges::tally(&device);
     let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
     let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&charges, &pool, 1, 8, &regions).unwrap(), 0, vec![64])).collect();
-    let stores = Stores::new(pool, groups);
+    let stores = Arc::new(Stores::new(pool, seismic::BlockSize { bytes: 2 * granule, held: 2 * granule }, groups));
     let opened = ledger.estimate().allocated();
     let records: RecordsAt = Arc::new(|_, at| at);
     // The first slot's records, claimed as the bank opened; the growth's
@@ -51,7 +51,8 @@ fn a_growth_joins_each_slot_as_every_group_holds_it() {
         Joining::Bank,
         &changes,
         |join| {
-            let Join::Bank { records } = join else { panic!("a bank's join") };
+            let Join::Bank { records, views } = join else { panic!("a bank's join") };
+            assert_eq!(views.len(), records.len(), "views delivered for every group");
             let at = records[0][0] as u64 + 1;
             assert_eq!(records, vec![vec![at as usize - 1]; 2], "each group claims the slot's record in its lowest hole");
             assert!((0..2).all(|group| stores.present(group) >= at), "slot {at} joined before every group holds it");
@@ -108,7 +109,7 @@ fn a_pools_absent_granule_is_committed_never_spare() {
     let charges = seismic::Charges::tally(&device);
     let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
     let groups = vec![(seismic::SlabTensor::in_pool(&charges, &pool, 1, 2, &regions).unwrap(), 0, vec![64])];
-    let stores = Stores::new(pool, groups);
+    let stores = Arc::new(Stores::new(pool, seismic::BlockSize { bytes: 2 * granule, held: 2 * granule }, groups));
     let opened = ledger.estimate();
     assert!(opened.allocated() >= granule, "the pool allocated its absent granule as it opened");
     assert_eq!((opened.cache(), opened.committed()), (0, opened.allocated()), "committed, none of it spare");
@@ -193,7 +194,7 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
     let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
     // A store of a slot for each of the ninety.
     let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&charges, &pool, 1, SLOTS, &regions).unwrap(), 0, vec![64])).collect();
-    let stores = Arc::new(Stores::new(pool, groups));
+    let stores = Arc::new(Stores::new(pool, seismic::BlockSize { bytes: 2 * granule, held: 2 * granule }, groups));
     let opened = ledger.estimate().allocated();
     let records: RecordsAt = Arc::new(|_, at| at);
     changes.change(|_| (0..2).for_each(|group| assert_eq!(stores.claim_to(group, 1).unwrap(), [0])));
@@ -259,7 +260,7 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
 fn growing_ended_reads_reached_slots_and_charge_after_done_is_taken() {
     use super::resize::{Cut, Growing, Grown, Spent};
     use crate::{BankHolding, BankResized};
-    let done: crate::storage_thread::Done<Grown> = Arc::new(Mutex::new(None));
+    let done: crate::storage_thread::Done<Grown> = crate::storage_thread::Done::new();
     let growing = Growing {
         from: 39,
         charged: 39 * 1024,
@@ -290,4 +291,106 @@ fn growing_ended_reads_reached_slots_and_charge_after_done_is_taken() {
         matches!(resized, BankResized::Grown { holding: BankHolding::Experts, from: 39, to: 40, grown: 1024, refused: None, .. }),
         "{resized:?}"
     );
+}
+
+/// `Stores::records()` resolves slab views on demand without pinning idle
+/// slabs, so a shrink that punches holes across blocks can vacate and return
+/// blocks to the OS; holding an active `HeldRecord` pins only that record's
+/// slab until dropped.
+#[test]
+fn pooled_records_do_not_pin_idle_slabs_against_pool_vacation() {
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+    let regions = [seismic::SlabRegion { element: seismic::Element::i32(), row_shape: vec![16] }];
+    let layout = seismic::SlabLayout::for_regions(1, 8, &regions).unwrap();
+    let granule = layout.slab_bytes.next_multiple_of(layout.slab_alignment);
+    let block_bytes = 4 * granule;
+    let scope = crate::memory::ledger::Ledgers::strict();
+    let _owner = scope.changes().own();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }));
+    ledger.read(ledger.sampled(Instant::now()), crate::memory::supply::Reading::device(1 << 40, 1 << 40, crate::domain::fixtures::NO_LAG));
+    let changes = scope.changes().clone();
+    let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(block_bytes).unwrap());
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, block_bytes).unwrap();
+    let store = seismic::SlabTensor::in_pool(&charges, &pool, 1, 8, &regions).unwrap();
+    let stores = Arc::new(Stores::new(pool.clone(), seismic::BlockSize { bytes: block_bytes, held: block_bytes }, vec![(store, 0, vec![64])]));
+    let claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * granule))
+        .expect("8 slabs fit");
+    // Claim 8 slabs across 2 blocks of 4 granules each.
+    changes.change(|_| assert_eq!(stores.claim_to(0, 8).unwrap().len(), 8));
+    let records = stores.records().unwrap();
+    // Free 2 slabs in block 0 and 2 slabs in block 1 (holes in both blocks,
+    // neither empty on its own).
+    stores.free(0, &[0, 1, 4, 5]).unwrap();
+    // While active holds pin a live slab in both blocks (slot 3 in block 0,
+    // slot 7 in block 1), neither block can vacate; once one hold drops,
+    // `return_freed` skips the still-pinned block and vacates the other.
+    let held_0 = records[0][0].hold(3);
+    let held_1 = records[0][0].hold(7);
+    let returned_while_both_held = changes.change(|_| pool.return_freed(4 * granule).unwrap());
+    assert_eq!(returned_while_both_held, 0, "active holds on both blocks defer vacation");
+    drop(held_0);
+    let returned = changes.change(|_| pool.return_freed(0).unwrap());
+    assert!(returned >= block_bytes, "idle pooled records must not pin slabs: returned {returned}");
+    drop(held_1);
+    // The moved slabs remain readable through `records` at their new addresses.
+    let _ = records[0][0].hold(3);
+    let _ = records[0][0].hold(7);
+    changes.change(|_| drop((claim, records, stores)));
+}
+
+/// `Stores::charged` reports whole-block charge (`BlockSize::charge`), matching
+/// `ExpertBankPlan::resident_charge` and `BankCache::fit`, and `Pool::owed`
+/// reflects deferred owed bytes until settled blocks drain via `return_freed(0)`
+/// or `return_freed_sync`.
+#[test]
+fn stores_charged_uses_whole_blocks_and_owed_drains_settled_blocks() {
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+    let regions = [seismic::SlabRegion { element: seismic::Element::bool(), row_shape: vec![64] }];
+    let layout = seismic::SlabLayout::for_regions(1, 8, &regions).unwrap();
+    let granule = layout.slab_bytes.next_multiple_of(layout.slab_alignment);
+    let block_bytes = 4 * granule;
+    let block = seismic::BlockSize { bytes: block_bytes, held: block_bytes };
+    let scope = crate::memory::ledger::Ledgers::strict();
+    let _owner = scope.changes().own();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }));
+    ledger.read(ledger.sampled(Instant::now()), crate::memory::supply::Reading::device(1 << 40, 1 << 40, crate::domain::fixtures::NO_LAG));
+    let changes = scope.changes().clone();
+    let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(block_bytes).unwrap());
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, block_bytes).unwrap();
+    let store = seismic::SlabTensor::in_pool(&charges, &pool, 1, 8, &regions).unwrap();
+    let stores = Arc::new(Stores::new(pool.clone(), block, vec![(store, 0, vec![64])]));
+    let claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * granule))
+        .expect("8 slabs fit");
+
+    // 1..=4 granules charge 1 whole block; 5..=8 granules charge 2 whole blocks.
+    assert_eq!(stores.charged(), 0);
+    changes.change(|_| assert_eq!(stores.claim_to(0, 1).unwrap().len(), 1));
+    assert_eq!(stores.charged(), block_bytes);
+    changes.change(|_| assert_eq!(stores.claim_to(0, 4).unwrap().len(), 3));
+    assert_eq!(stores.charged(), block_bytes);
+    changes.change(|_| assert_eq!(stores.claim_to(0, 8).unwrap().len(), 4));
+    assert_eq!(stores.charged(), 2 * block_bytes);
+
+    // Free 2 slabs in each block while both blocks are pinned by views:
+    // `return_freed` defers and `pool.owed()` stays non-zero.
+    let records = stores.records().unwrap();
+    stores.free(0, &[0, 1, 4, 5]).unwrap();
+    assert_eq!(stores.charged(), block_bytes, "4 remaining granules fit 1 block");
+    let held_0 = records[0][0].hold(3);
+    let held_1 = records[0][0].hold(7);
+    assert_eq!(changes.change(|_| pool.return_freed(block_bytes).unwrap()), 0);
+    assert!(pool.owed() > 0, "deferred return keeps pool.owed() > 0");
+
+    // Once a view drops, draining via `return_freed(0)` vacates and pays `owed`.
+    drop(held_0);
+    let drained = changes.change(|_| pool.return_freed(0).unwrap());
+    assert!(drained >= block_bytes, "return_freed(0) drained settled block: {drained}");
+    assert_eq!(pool.owed(), 0, "owed clears once block returns");
+
+    drop(held_1);
+    changes.change(|_| drop((claim, records, stores)));
 }

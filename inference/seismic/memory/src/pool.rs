@@ -29,6 +29,86 @@ use crate::entry::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+/// What a new slab's or pool block's bytes hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlabFill {
+    /// Zero, as kernels that read a slab before writing it require.
+    Zeroed,
+    /// Whatever its backing storage held: skips synchronous device zeroing on
+    /// block allocation and slab claim. Valid only when the holder writes
+    /// every byte before device work reads the slab. Granules installed from
+    /// an `Unwritten` block are tracked `zero: false`, so any later `Zeroed`
+    /// claim still zeroes its slab before use.
+    Unwritten,
+}
+
+/// Single-flight coordinator for out-of-lock pool growth: at most one thread
+/// allocates a block at a time while concurrent callers wait for that growth
+/// to install and then re-check for a free granule before deciding whether
+/// another growth is needed.
+#[derive(Default)]
+pub struct GrowGate {
+    growing: std::sync::Mutex<bool>,
+    done: std::sync::Condvar,
+}
+
+/// Outcome of [`GrowGate::enter_or_wait`].
+pub enum GrowTurn<'a> {
+    /// This thread owns the single active growth until the guard drops.
+    Grow(GrowGuard<'a>),
+    /// Another thread finished a growth while this thread waited; re-check
+    /// free granules before growing again.
+    Waited,
+}
+
+/// RAII guard for the active grower: clears `growing` and wakes all waiters
+/// on normal completion, error, or panic.
+pub struct GrowGuard<'a> {
+    gate: &'a GrowGate,
+}
+
+impl GrowGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Either become the sole grower ([`GrowTurn::Grow`]) or block until the
+    /// current grower finishes ([`GrowTurn::Waited`]). Never called while
+    /// holding the pool state lock.
+    pub fn enter_or_wait(&self) -> GrowTurn<'_> {
+        self.enter_or_wait_inner(|| {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enter_or_wait_with(&self, on_park: impl FnOnce()) -> GrowTurn<'_> {
+        self.enter_or_wait_inner(on_park)
+    }
+
+    fn enter_or_wait_inner(&self, on_park: impl FnOnce()) -> GrowTurn<'_> {
+        let mut growing = self.growing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *growing {
+            let mut parked = Some(on_park);
+            while *growing {
+                if let Some(notify) = parked.take() {
+                    notify();
+                }
+                growing = self.done.wait(growing).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            return GrowTurn::Waited;
+        }
+        *growing = true;
+        GrowTurn::Grow(GrowGuard { gate: self })
+    }
+}
+
+impl Drop for GrowGuard<'_> {
+    fn drop(&mut self) {
+        let mut growing = self.gate.growing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *growing = false;
+        self.gate.done.notify_all();
+    }
+}
+
 /// A backend's plain allocator, which a pool's blocks come from.
 pub trait Blocks: Send + Sync + 'static {
     /// One ordinary allocation, freed when dropped.
@@ -37,14 +117,16 @@ pub trait Blocks: Send + Sync + 'static {
     /// completion, a CUDA event, a Vulkan fence, the CPU backend's join).
     type Fence: Fence;
     type Error: Send;
-    /// Allocate one block of `bytes`, every byte zero and every page backed
-    /// before it returns, never lazily: the ledger counts the block from the
-    /// moment it is made, so a block backed later would read as others'
-    /// memory falling and then rising. Its exact native bytes are charged to
-    /// `entry`, admitted before the native allocation (refused, nothing is
-    /// allocated), and held with the block: dropping it returns its memory
-    /// to the OS and frees the charge at once.
-    fn allocate(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Self::Block, Self::Error>;
+    /// Allocate one block of `bytes`, every page backed before it returns,
+    /// never lazily: the ledger counts the block from the moment it is made,
+    /// so a block backed later would read as others' memory falling and then
+    /// rising. When `fill` is [`SlabFill::Zeroed`], every byte reads zero;
+    /// when [`SlabFill::Unwritten`], synchronous device zeroing is skipped
+    /// because the holder writes every byte before device work reads it. Its
+    /// exact native bytes are charged to `entry`, admitted before the native
+    /// allocation (refused, nothing is allocated), and held with the block:
+    /// dropping it returns its memory to the OS and frees the charge at once.
+    fn allocate(&self, bytes: u64, entry: &Arc<dyn Entry>, fill: SlabFill) -> Result<Self::Block, Self::Error>;
     /// The bytes `block` holds in its store, at least those asked for: its
     /// allocation's rounding and the driver objects it took included, as
     /// charged to its entry.
@@ -252,8 +334,6 @@ pub struct GranulePool<B: Blocks, H> {
     blocks: B,
     granule: u64,
     block_bytes: u64,
-    /// What its blocks are charged to.
-    entry: Arc<dyn Entry>,
     held: BTreeMap<BlockId, Block<B::Block, H>>,
     /// Claimable granules, oldest block first: claims fill the oldest
     /// blocks, leaving the newest to empty.
@@ -275,18 +355,18 @@ pub struct GranulePool<B: Blocks, H> {
 
 impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
     /// An empty pool of `granule`-byte granules in `block_bytes`-byte blocks
-    /// ([`block_bytes`]), its blocks charged to `entry`.
+    /// ([`block_bytes`]).
     ///
     /// # Panics
     /// Where a block is not a whole number of granules, at least one, or
     /// holds more than `u32::MAX` of them.
-    pub fn new(blocks: B, granule: u64, block_bytes: u64, entry: Arc<dyn Entry>) -> Self {
+    pub fn new(blocks: B, granule: u64, block_bytes: u64) -> Self {
         assert!(
             granule > 0 && block_bytes >= granule && block_bytes % granule == 0,
             "invariant violated: a block of {block_bytes} bytes is not whole {granule}-byte granules"
         );
         assert!(block_bytes / granule <= u64::from(u32::MAX), "invariant violated: a block holds at most u32::MAX granules");
-        Self { blocks, granule, block_bytes, entry, held: BTreeMap::new(), free: BTreeSet::new(), fenced: Vec::new(), holding: 0, owed: 0, next: 0 }
+        Self { blocks, granule, block_bytes, held: BTreeMap::new(), free: BTreeSet::new(), fenced: Vec::new(), holding: 0, owed: 0, next: 0 }
     }
 
     pub fn granule(&self) -> u64 {
@@ -365,23 +445,24 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         Some(Claimed { granule, address: self.address(granule), zero })
     }
 
-    /// Allocate one block, its granules free and zero: the pool's grow
-    /// step, admitted by its entry first. Refused (by the entry or the
-    /// backend), nothing changes.
-    pub fn grow(&mut self) -> Result<BlockId, B::Error> {
-        let block = self.blocks.allocate(self.block_bytes, &self.entry)?;
+    /// Install an already-allocated `block` (allocated outside any lock via
+    /// [`Blocks::allocate`]) into the pool, with its granules' zero state set
+    /// from `fill` (`true` for [`SlabFill::Zeroed`], `false` for
+    /// [`SlabFill::Unwritten`]).
+    pub fn install(&mut self, block: B::Block, fill: SlabFill) -> BlockId {
         let held = self.blocks.held(&block);
         assert!(held >= self.block_bytes, "invariant violated: a block of {} bytes holds {held}", self.block_bytes);
         let id = BlockId(self.next);
         self.next += 1;
         let count = (self.block_bytes / self.granule) as u32;
         let address = self.blocks.address(&block);
+        let zero = fill == SlabFill::Zeroed;
         self.held.insert(
             id,
-            Block { block, held, address, granules: vec![Granule::Free { zero: true }; count as usize], vacating: false, returning: false },
+            Block { block, held, address, granules: vec![Granule::Free { zero }; count as usize], vacating: false, returning: false },
         );
         self.free.extend((0..count).map(|index| GranuleId { block: id, index }));
-        Ok(id)
+        id
     }
 
     /// Release `granule` from its holder, which has repointed its table off
@@ -402,30 +483,40 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         }
     }
 
-    /// The held block with the fewest live granules, where it has fewer than
-    /// the free granules elsewhere: the cheapest to empty for outside
-    /// demand ([`Self::vacate`]). None where no block can be emptied.
+    /// The held block with the fewest held granules, where it has no more
+    /// held granules than the free granules elsewhere: the cheapest to empty
+    /// for outside demand ([`Self::vacate`]). None where no block can be
+    /// emptied.
     pub fn emptiest(&mut self) -> Option<BlockId> {
+        self.emptiest_excluding(&BTreeSet::new())
+    }
+
+    /// [`Self::emptiest`], skipping any block in `skip` (e.g. blocks whose
+    /// live granules are currently pinned by an active view).
+    pub fn emptiest_excluding(&mut self, skip: &BTreeSet<BlockId>) -> Option<BlockId> {
         self.settle();
         let free = self.free.len();
         self.held
             .iter()
-            .filter(|(_, block)| !block.vacating)
+            .filter(|(id, block)| !block.vacating && !skip.contains(id))
             .map(|(&id, block)| {
-                let live = block.granules.iter().filter(|state| !matches!(state, Granule::Free { .. })).count();
-                let own_free = block.granules.len() - live;
-                (live, id, free - own_free)
+                let held = block.granules.iter().filter(|state| matches!(state, Granule::Held(_))).count();
+                let own_free = block.granules.iter().filter(|state| matches!(state, Granule::Free { .. })).count();
+                (held, id, free - own_free)
             })
-            .filter(|&(live, _, elsewhere)| live <= elsewhere)
-            .min_by_key(|&(live, id, _)| (live, std::cmp::Reverse(id)))
+            .filter(|&(held, _, elsewhere)| held <= elsewhere)
+            .min_by_key(|&(held, id, _)| (held, std::cmp::Reverse(id)))
             .map(|(_, id, _)| id)
     }
 
     /// Begin emptying `block` for outside demand: each live granule gets a
     /// free granule in another block to be copied into, held by its holder
-    /// from now, and the block's granules take no claims. None where a
-    /// granule of it awaits a flight or too few are free elsewhere; the
-    /// block is then unchanged.
+    /// from now, and the block's granules take no claims. Granules already
+    /// awaiting a flight (`Granule::Fenced`) stay fenced and need no copy:
+    /// once the moved granules are released and [`Self::vacated`] marks the
+    /// block returning, it returns as every fenced granule's flight
+    /// completes. None where too few granules are free elsewhere; the block
+    /// is then unchanged.
     ///
     /// # Panics
     /// Where `block` is not held or already vacating.
@@ -433,9 +524,6 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         self.settle();
         let of = self.held_block(block);
         assert!(!of.vacating, "invariant violated: block {block:?} is already vacating");
-        if of.granules.iter().any(|state| matches!(state, Granule::Fenced)) {
-            return None;
-        }
         let live = of
             .granules
             .iter()
