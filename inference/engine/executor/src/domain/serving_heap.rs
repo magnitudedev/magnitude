@@ -26,14 +26,16 @@ const PARTIAL_GROW_MIN_CAP: u64 = 256 * (1 << 20);
 /// launch prices as they stand, the counted decode's context, the rows a
 /// launch of chained decode passes holds
 /// (`crate::ResourceLimits::chained_rows`), the acceptable rows a pass of
-/// the load's method may verify (its draft rows), and the host's turn after
-/// a verify pass (`overhead`, none before one is timed).
+/// the load's method may verify (its draft rows), whether the bank holds
+/// every streamed layer's experts (`whole`), and the host's turn after a
+/// verify pass (`overhead`, none before one is timed).
 pub struct TwoRowPricing {
     measured: Option<crate::experts::Measured>,
     prices: magnitude_cost_model::LaunchPrices,
     depth: u32,
     rows: usize,
     verifies: usize,
+    whole: bool,
     pub(super) overhead: Option<f64>,
 }
 
@@ -83,14 +85,19 @@ impl TwoRowPricing {
     /// The regime a launch of `requests` requests, `fronted` of them able
     /// to run guessed rows, is decided by
     /// (`magnitude_cost_model::Regime::pass`, the one owner of it); none
-    /// where no request can, or before the measured passes counted a miss
-    /// and the ranking's shadows read a decode step.
+    /// where no request can, before a decode pass is timed, or on a partial
+    /// bank with measured misses before the ranking's shadows read a decode
+    /// step.
     ///
-    /// The regime is the measured passes': their resident compute at each
-    /// depth the launch may run, measured where the window holds passes of
-    /// it, else the measured depth's nearest below it (or above) scaled by
-    /// the launch prices' compute at the two (the prior a measurement
-    /// refines); the ranking's misses at each depth of foresight
+    /// At a whole bank (or a partial bank whose measured window missed
+    /// nothing), every path term and stall is zero, so no front row pays
+    /// and the regime prices verify passes against plain decode on resident
+    /// compute, verify stand rates, and the host's turn after a verify pass.
+    /// Otherwise the regime is the measured passes': their resident compute
+    /// at each depth the launch may run, measured where the window holds
+    /// passes of it, else the measured depth's nearest below it (or above)
+    /// scaled by the launch prices' compute at the two (the prior a
+    /// measurement refines); the ranking's misses at each depth of foresight
     /// (`Reuse::shadows`); the first front row's stand rate; the stall a
     /// miss held a plain pass; and every term besides the GPU's
     /// (`magnitude_cost_model::Terms::each_path`), each its seconds a miss
@@ -101,14 +108,22 @@ impl TwoRowPricing {
         let Some(measured) = self.measured.as_ref().filter(|_| fronted > 0) else {
             return Ok(None);
         };
-        let (Some(paths), Some(front), Some(verify)) = (
-            measured.paths.clone(),
-            measured.needed[0].into_iter().collect::<Option<Vec<_>>>(),
-            measured.needed[1].into_iter().collect::<Option<Vec<_>>>(),
-        ) else {
-            return Ok(None);
+        let (paths, needed, stall) = match (!self.whole).then(|| measured.paths.clone()).flatten() {
+            Some(paths) => {
+                let (Some(front), Some(verify)) = (
+                    measured.needed[0].into_iter().collect::<Option<Vec<_>>>(),
+                    measured.needed[1].into_iter().collect::<Option<Vec<_>>>(),
+                ) else {
+                    return Ok(None);
+                };
+                (paths, magnitude_cost_model::NeededByForm { front, verify }, measured.stall)
+            }
+            None => (
+                Vec::new(),
+                magnitude_cost_model::NeededByForm::both(vec![magnitude_cost_model::Needed::Executed(0.); crate::experts::DEPTHS]),
+                None,
+            ),
         };
-        let needed = magnitude_cost_model::NeededByForm { front, verify };
         let deepest = (1..crate::experts::DEPTHS)
             .rev()
             .find(|&depth| crate::two_row::fronted_requests(self.rows, requests, depth).min(fronted) > 0)
@@ -122,10 +137,10 @@ impl TwoRowPricing {
             let fronting = crate::two_row::fronted_requests(self.rows, requests, depth).min(fronted);
             self.prices
                 .front(rows(requests)?, rows(fronting)?, rows(depth)?, self.depth, &routes)
-                .map(|form| form.streamed)
+                .map(|form| if self.whole { form.resident } else { form.streamed })
                 .map_err(|error| DomainError::invariant(format!("the decode launch: {error}")))
         };
-        let measured_at = |depth: usize| measured.terms[depth].map(|terms| terms.compute);
+        let measured_at = |depth: usize| measured.terms_for(self.whole && depth > 0, depth).map(|terms| terms.compute);
         let resident = (0..=deepest)
             .map(|depth| match measured_at(depth) {
                 Some(resident) => Ok(resident),
@@ -138,7 +153,7 @@ impl TwoRowPricing {
             })
             .collect::<Result<Vec<_>, DomainError>>()?;
         let accepts = measured.accepts[..self.verifies.min(measured.accepts.len())].to_vec();
-        let regime = magnitude_cost_model::Regime { resident, needed, stand: measured.stand, accepts, stall: measured.stall, overhead: self.overhead, paths };
+        let regime = magnitude_cost_model::Regime { resident, needed, stand: measured.stand, accepts, stall, overhead: self.overhead, paths };
         let (depth, pass) = (regime.depth(), regime.pass());
         Ok(Some(FrontRegime { regime, running: measured.depth.min(deepest), depth, pass }))
     }
@@ -641,22 +656,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         prior.rates(step_seconds, resident).map(Some)
     }
 
-    /// What a decode launch now pairs on ([`TwoRowPricing`]): none without a
-    /// priced bank, or at a whole one, where no launch pairs, so a load that
-    /// cannot pair plans no request's two-row pass. Taken afresh for every
-    /// launch from the bank's live size, its watcher's measured passes, the
-    /// host's turns after verify passes and the pass queued behind the last
-    /// flight.
+    /// What a decode launch now prices its guessed rows on
+    /// ([`TwoRowPricing`]): none without a priced bank. Taken afresh for
+    /// every launch from the bank's live size (including whether it is
+    /// whole, where no front row pays and verify passes are priced against
+    /// plain decode on resident compute), its watcher's measured passes,
+    /// and the host's turns after verify passes.
     pub fn two_row_pricing(&self) -> Result<Option<TwoRowPricing>, DomainError> {
         let (Some(price), Some(held), Some(prices), Some(bank)) = (self.decode_price()?, self.held_slots()?, self.launch_prices(), self.family.expert_bank()) else {
             return Ok(None);
         };
-        Ok((!price.whole(held)).then(|| TwoRowPricing {
+        Ok(Some(TwoRowPricing {
             measured: bank.measured(),
             prices: prices.clone(),
             depth: price.depth(),
             rows: self.chained_rows(),
             verifies: self.execution.policy().method().draft_rows(),
+            whole: price.whole(held),
             overhead: self.verify_turns.mean(bank.bank_epoch()),
         }))
     }
