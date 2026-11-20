@@ -14,22 +14,26 @@ use crate::worker::EngineClient;
 use serde::{Deserialize, Serialize};
 use std::{fmt, future::Future, sync::Arc};
 
-/// Released when the invocation (and every request it admitted) is dropped:
+/// Held through host preparation and, after admission is sent, worker retirement:
 /// a service instance lease, or nothing for a standalone engine.
 pub struct ReleaseGuard {
-    _held: Option<Box<dyn Send + Sync>>,
+    held: Option<Box<dyn Send + Sync>>,
 }
 
 impl ReleaseGuard {
     pub fn new(guard: impl Send + Sync + 'static) -> Self {
         Self {
-            _held: Some(Box::new(guard)),
+            held: Some(Box::new(guard)),
         }
+    }
+
+    pub(crate) fn is_held(&self) -> bool {
+        self.held.is_some()
     }
 
     /// A binding that owns nothing beyond the engine itself.
     pub const fn none() -> Self {
-        Self { _held: None }
+        Self { held: None }
     }
 }
 

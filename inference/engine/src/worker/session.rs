@@ -20,7 +20,7 @@ use magnitude_family_contracts::ModelDefinition;
 use magnitude_scheduler::{
     owner::Status,
     protocol::{AdmitRequest, RequestSnapshot, RoomAnswer, RoomGrant, WorkerCommand, WorkerReply},
-    publication::{Publication, PublicationReceiver},
+    publication::{Publication, PublicationReceiver, Retirement},
     worker::{Call, CallError, Client, DispatchError, Worker},
 };
 use std::{
@@ -169,8 +169,9 @@ pub(crate) struct Session {
     client: Client<UnloadCause>,
     admissions: Vec<PendingAdmission>,
     streams: BTreeMap<HostRequestId, Stream>,
-    /// Commands the host awaits no reply to (stops, the measurement room's
-    /// release, repricing): only a refusal is reported.
+    /// Scheduler retirement is observed independently of host output credit.
+    retiring: BTreeMap<HostRequestId, Retirement>,
+    /// Commands the host awaits no reply to (stops, process attachment, repricing).
     unanswered: Vec<Call<UnloadCause>>,
     /// The measurement room's claim, until its answer is sent.
     room: Option<(RoomClaimId, RoomClaim)>,
@@ -201,6 +202,7 @@ impl Session {
             client,
             admissions: Vec::new(),
             streams: BTreeMap::new(),
+            retiring: BTreeMap::new(),
             unanswered: Vec::new(),
             room: None,
             statuses: Vec::new(),
@@ -329,11 +331,10 @@ impl Session {
                     progress: None,
                 })?,
             },
-            HostMessage::Observe => {
-                if let Ok(call) = self.dispatch(WorkerCommand::Observe) {
-                    self.observations.push(call);
-                }
-            }
+            HostMessage::Observe => match self.dispatch(WorkerCommand::Observe) {
+                Ok(call) => self.observations.push(call),
+                Err(error) => self.send(WorkerMessage::Observed { observation: Err(undispatched(error)) })?,
+            },
             HostMessage::ClaimMeasurementRoom { claim, bytes } => {
                 match self.dispatch(WorkerCommand::ClaimMeasurementRoom { bytes }) {
                     Ok(call) => self.room = Some((claim, RoomClaim::Dispatched(call))),
@@ -347,7 +348,7 @@ impl Session {
             HostMessage::ReleaseMeasurementRoom => {
                 // A claim not yet answered is withdrawn with it.
                 self.room = None;
-                self.unanswer(WorkerCommand::ReleaseMeasurementRoom);
+                self.client.release_measurement_room();
             }
             HostMessage::Reprice => self.unanswer(WorkerCommand::Reprice),
             // Answered once the load has stopped (`Session::finish`).
@@ -379,15 +380,9 @@ impl Session {
                     stop: false,
                     cancelled: false,
                 }),
-                Err(error) => self.send(WorkerMessage::AdmissionRefused {
-                    request_id: id,
-                    error: undispatched(error),
-                })?,
+                Err(error) => self.refuse(id, undispatched(error))?,
             },
-            Err(error) => self.send(WorkerMessage::AdmissionRefused {
-                request_id: id,
-                error,
-            })?,
+            Err(error) => self.refuse(id, error)?,
         }
         Ok(())
     }
@@ -443,15 +438,22 @@ impl Session {
         ))
     }
 
+    fn refuse(&self, id: HostRequestId, error: RequestError) -> Result<(), TransportError> {
+        self.send(WorkerMessage::AdmissionRefused { request_id: id, error })?;
+        self.send(WorkerMessage::Retired { request_id: id })
+    }
+
     fn fail_stream(
         &mut self,
         id: HostRequestId,
         error: DispatchError<UnloadCause>,
     ) -> Result<(), TransportError> {
-        if self.streams.remove(&id).is_some() {
-            self.send(WorkerMessage::Failed {
-                request_id: id,
-                error: undispatched(error),
+        if let Some(stream) = self.streams.remove(&id) {
+            let error = undispatched(error);
+            self.send(if stream.answered {
+                WorkerMessage::Failed { request_id: id, error }
+            } else {
+                WorkerMessage::AdmissionRefused { request_id: id, error }
             })?;
         }
         Ok(())
@@ -578,6 +580,13 @@ impl Session {
             self.send(WorkerMessage::Census { census })?;
         }
         self.forward_streams()?;
+        let mut outbound = self.outbound.lock().unwrap();
+        for (id, _) in self.retiring.extract_if(.., |_, retirement| {
+            self.unloading.is_some() || retirement.poll(&waker).is_ready()
+        }) {
+            outbound.send(WorkerMessage::Retired { request_id: id })?;
+        }
+        drop(outbound);
         if let Some(cause) = &self.unloading {
             if self.streams.is_empty() && self.admissions.is_empty() {
                 let cause = cause.clone();
@@ -595,14 +604,10 @@ impl Session {
         pending: PendingAdmission,
         reply: Result<WorkerReply, CallError<UnloadCause>>,
     ) -> Result<(), TransportError> {
-        let refused = |error| WorkerMessage::AdmissionRefused {
-            request_id: pending.id,
-            error,
-        };
         match reply {
             Ok(WorkerReply::Admitted { request, receiver }) => {
+                self.retiring.insert(pending.id, receiver.retirement());
                 if pending.cancelled {
-                    // Dropping the receiver releases the request.
                     return Ok(());
                 }
                 // Its host is answered once it begins.
@@ -623,13 +628,11 @@ impl Session {
                 }
                 Ok(())
             }
-            Ok(WorkerReply::AdmissionRefused(error)) => self.send(refused(error.into())),
-            Ok(_) => self.send(refused(RequestError::internal(
-                "execution owner returned an invalid admission reply",
-            ))),
-            Err(CallError::Refused(reason)) => self.send(refused(RequestError::internal(reason))),
+            Ok(WorkerReply::AdmissionRefused(error)) => self.refuse(pending.id, error.into()),
+            Ok(_) => unreachable!("the owner returned an invalid admission reply"),
+            Err(CallError::Refused(reason)) => self.refuse(pending.id, RequestError::internal(reason)),
             Err(CallError::Stopped(cause)) => {
-                self.send(refused(RequestError::ModelUnloaded { cause }))
+                self.refuse(pending.id, RequestError::ModelUnloaded { cause })
             }
         }
     }
@@ -639,18 +642,15 @@ impl Session {
     /// admitted once it began (became resident), or once it published
     /// anything else first; one that failed before it began is refused, so
     /// a request is never answered admitted and then refused for what kept
-    /// it from beginning. The host drains its buffer before a request's
-    /// terminal outcome, so a terminal behind exhausted credit arrives with
-    /// the next credit.
+    /// it from beginning. Once execution stops it produces nothing more: move
+    /// the bounded remainder of each stream to the host in order, so a paused
+    /// reader cannot keep the stopped worker alive.
     fn forward_streams(&mut self) -> Result<(), TransportError> {
         let mut context = Context::from_waker(&self.waker);
         let mut finished = BTreeSet::new();
         let mut messages = Vec::new();
         for (&id, stream) in &mut self.streams {
-            // Read before the publication below: the request begins before
-            // anything it publishes.
-            messages.extend(stream.answer(id, None));
-            while stream.credit > 0 {
+            while stream.credit > 0 || self.unloading.is_some() {
                 let publication = stream.receiver.poll_next(&mut context);
                 if let Poll::Ready(publication) = &publication {
                     let answer = stream.answer(id, Some(publication.as_ref()));
@@ -662,9 +662,16 @@ impl Session {
                     messages.extend(answer);
                 }
                 match publication {
-                    Poll::Pending => break,
+                    Poll::Pending => {
+                        // poll_next armed the wake before we check began. A
+                        // concurrent begin is visible here or wakes us again.
+                        messages.extend(stream.answer(id, None));
+                        break;
+                    }
                     Poll::Ready(Some(Publication::Output(tokens))) => {
-                        stream.credit -= 1;
+                        if self.unloading.is_none() {
+                            stream.credit -= 1;
+                        }
                         messages.push(WorkerMessage::Output {
                             request_id: id,
                             tokens,
@@ -750,14 +757,14 @@ fn progress(snapshot: RequestSnapshot) -> RequestProgress {
 mod tests {
     use super::*;
     use crate::inputs::{BpeConfig, ByteBpeTokenizer, PieceKind, TokenId};
-    use crate::worker::execution::ExecutionOwner;
+    use crate::worker::execution::{CensusWatch, ExecutionOwner};
     use magnitude_chat::{Normalization, PieceEncoding};
     use magnitude_executor::fixtures::{bank_backends, banked, tiny_definition};
     use magnitude_generation::Plain;
     use magnitude_scheduler::{
         owner::Owner,
         publication::{PublicationQueue, RequestError as Scheduled},
-        worker::{Driven, Wakes},
+        worker::{Driven, Event, Reread, Wakes},
         ServiceLimits,
     };
     use std::time::{Duration, Instant};
@@ -838,7 +845,7 @@ mod tests {
             locality_seconds: 1.0,
             conversations: std::num::NonZeroUsize::MIN,
         };
-        let census = Arc::new(crate::worker::execution::CensusWatch::default());
+        let census = Arc::new(CensusWatch::default());
         let owner_census = census.clone();
         let spawned = Worker::spawn(
             move |wakes| {
@@ -852,6 +859,10 @@ mod tests {
             usize::MAX,
         );
         let execution = spawned.unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        recorded_session(execution, census)
+    }
+
+    fn recorded_session(execution: Worker<UnloadCause>, census: Arc<CensusWatch>) -> (Session, Arc<Mutex<Vec<WorkerMessage>>>) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let outbound: Outbound = Arc::new(Mutex::new(Box::new(Recorded(sent.clone()))));
         let loaded = Loaded {
@@ -861,6 +872,66 @@ mod tests {
             census,
         };
         (Session::new(outbound, Arc::new(Signal::default()), loaded), sent)
+    }
+
+    fn control_session() -> (Session, Arc<Mutex<Vec<WorkerMessage>>>) {
+        struct Control { closing: bool }
+
+        impl Driven for Control {
+            type Stopped = UnloadCause;
+
+            fn command(&mut self, command: WorkerCommand, _: u64) -> Result<WorkerReply, String> {
+                assert!(matches!(command, WorkerCommand::Status { .. }));
+                Ok(WorkerReply::Status(None))
+            }
+
+            fn event(&mut self, event: Event, _: u64) {
+                assert!(matches!(event, Event::Close));
+                self.closing = true;
+            }
+
+            fn run(&mut self, _: u64) -> Result<Reread, UnloadCause> {
+                if self.closing { Err(UnloadCause::Shutdown) } else { Ok(Reread::Settled) }
+            }
+        }
+
+        let execution = Worker::spawn(|_| Ok(Box::new(Control { closing: false })), 1).unwrap();
+        recorded_session(execution, Arc::new(CensusWatch::default()))
+    }
+
+    #[test]
+    fn observation_is_answered_when_the_command_queue_is_full() {
+        let (mut session, sent) = control_session();
+        let _held = session.dispatch(WorkerCommand::Status { request: RequestId(1) }).unwrap();
+        session.handle(HostMessage::Observe).unwrap();
+        assert!(matches!(sent.lock().unwrap().as_slice(), [WorkerMessage::Observed {
+            observation: Err(RequestError::Overloaded)
+        }]));
+    }
+
+    #[test]
+    fn unloading_drains_accepted_output_before_retirement_without_credit() {
+        let (mut session, sent) = control_session();
+        let (mut sender, mut stream) = stream();
+        stream.credit = 0;
+        stream.answered = true;
+        let id = HostRequestId(5);
+        session.retiring.insert(id, stream.receiver.retirement());
+        session.streams.insert(id, stream);
+        sender.try_output(vec![magnitude_generation::OutputToken { index: 0, token: TokenId(7) }]).unwrap();
+        sender.fail(Scheduled::WorkerClosed);
+        session.forward_streams().unwrap();
+        assert!(sent.lock().unwrap().is_empty());
+
+        session.loaded.execution.stop();
+        assert!(matches!(session.progress(), Ok(Flow::Exit(_))));
+        let sent = sent.lock().unwrap();
+        assert!(matches!(sent.as_slice(), [
+            WorkerMessage::Output { request_id: output, .. },
+            WorkerMessage::Failed { request_id: failed, .. },
+            WorkerMessage::Retired { request_id: retired },
+            WorkerMessage::Unloaded { .. }
+        ] if *output == id && *failed == id && *retired == id));
     }
 
     /// The room answers the session has sent the host, in order.

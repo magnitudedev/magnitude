@@ -38,7 +38,7 @@ impl From<InvocationError> for ServingError {
 }
 
 /// One engine invocation: its host artifacts, worker client and release
-/// guard. The guard lives until the generation's session ends.
+/// guard. The worker client holds the guard through request retirement.
 pub struct EngineInvocation {
     invocation: Invocation,
     limits: SessionLimits,
@@ -52,18 +52,10 @@ impl EngineInvocation {
 
 impl ModelInvocation for EngineInvocation {
     fn generate(self: Box<Self>, request: GenerationRequest) -> GenerationStream {
-        let Invocation {
-            host,
-            engine,
-            release,
-        } = self.invocation;
         let (session_sender, mut session_events) = mpsc::channel(EVENT_CAPACITY);
         let (sender, receiver) = mpsc::channel(EVENT_CAPACITY);
-        tokio::spawn(chat::generate(host, engine, request, self.limits, session_sender));
+        tokio::spawn(chat::generate(self.invocation, request, self.limits, session_sender));
         tokio::spawn(async move {
-            // The release guard is held until the session publishes its
-            // terminal event or the consumer goes away.
-            let _release = release;
             loop {
                 let event = tokio::select! {
                     event = session_events.recv() => event,

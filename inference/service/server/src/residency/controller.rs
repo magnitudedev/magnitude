@@ -199,7 +199,7 @@ impl ModelInstances {
     }
 
     /// A fresh memory observation from the resident worker, when one is resident.
-    pub async fn resident_memory(&self) -> Option<MemoryObservation> {
+    pub async fn resident_memory(&self) -> Result<Option<MemoryObservation>, RequestError> {
         self.supervisor.observe_resident().await
     }
 
@@ -457,8 +457,8 @@ fn served_profile(
                 ),
             ))),
             ModelAssessment::Unsupported {
-                reasons, detail, ..
-            } => Some(ServedProfile::Refused(InventoryError::ModelUnsupported {
+                profile: assessed, reasons, detail,
+            } if assessed.as_ref().is_none_or(|assessed| assessed == profile) => Some(ServedProfile::Refused(InventoryError::ModelUnsupported {
                 message: format!("Magnitude can't run {model_id}: {detail}"),
                 reasons: reasons.clone(),
             })),
@@ -1368,6 +1368,16 @@ mod tests {
     }
 
     #[test]
+    fn an_unsupported_model_without_a_profile_is_refused_at_every_ceiling() {
+        let snapshot = snapshot(MODEL, serde_json::json!({
+            "_tag": "Unsupported",
+            "reasons": [],
+            "detail": "cannot read model header",
+        }));
+        assert!(matches!(served_profile(&snapshot, &model_id(MODEL), &CEILING), ServedProfile::Refused(_)));
+    }
+
+    #[test]
     fn a_load_the_engine_cannot_run_is_refused_with_its_reasons() {
         let snapshot = snapshot(
             MODEL,
@@ -1378,8 +1388,9 @@ mod tests {
                 "detail": "no family recognizes deepseek4",
             }),
         );
+        assert!(matches!(served_profile(&snapshot, &model_id(MODEL), &CEILING), ServedProfile::Unassessed));
         let ServedProfile::Refused(InventoryError::ModelUnsupported { message, reasons }) =
-            served_profile(&snapshot, &model_id(MODEL), &CEILING)
+            served_profile(&snapshot, &model_id(MODEL), &ServingProfile { context_length: 131_072 })
         else {
             panic!("expected an unsupported refusal");
         };

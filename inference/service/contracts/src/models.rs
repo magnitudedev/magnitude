@@ -373,8 +373,8 @@ mod schema {
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     pub struct ModelInstancesSnapshot {
         pub revision: u64,
-        /// Instances in lifecycle-update order, oldest first. The final matching
-        /// instance is therefore the current attempt for a model.
+        /// The latest terminal instance of each model in lifecycle-update order,
+        /// oldest first, followed by the current instance when present.
         pub instances: Vec<ModelInstance>,
     }
 

@@ -23,7 +23,7 @@ use super::{
     publication::{
         CapacityResource, ModelUnloadCause, PublicationPermit, PublicationQueue,
         PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
-        RequestError, RequestTimings, ServiceCapacityError,
+        RequestError, RequestTimings, Retirement, ServiceCapacityError,
     },
     round_driver::{RoundError, lower_round, reconcile_forward},
     serving::ServingCensus,
@@ -413,6 +413,7 @@ struct Record {
     branches: BTreeSet<usize>,
     /// The host's stream; `None` once the host released the request.
     publication: Option<PublicationSender>,
+    retirement: Retirement,
     publication_batch_limit: usize,
     pending_publication: Option<Vec<OutputToken>>,
     publication_permits: VecDeque<PublicationPermit>,
@@ -1608,6 +1609,7 @@ impl<F: ProgramFamily> Service<F> {
                     terminal_retained: false,
                     branches: plan.branches,
                     publication: Some(sender),
+                    retirement: receiver.retirement(),
                     publication_batch_limit: output_capacity,
                     pending_publication: None,
                     publication_permits: VecDeque::new(),
@@ -3792,7 +3794,8 @@ impl<F: ProgramFamily> Service<F> {
     /// Close a terminal request's executor state and forget it.
     fn retire(&mut self, id: RequestId) -> Result<(), RequestError> {
         self.domain.close(id).map_err(invariant("request retirement"))?;
-        self.requests.remove(&id);
+        let request = self.requests.remove(&id).expect("retiring a terminal request");
+        request.record.retirement.retire();
         self.epoch.advance();
         Ok(())
     }
@@ -4163,13 +4166,7 @@ mod timing_tests {
     /// orphan the queued chunk, discarding a whole chunk of device work.
     #[test]
     fn only_live_work_outside_the_round_competes_with_a_queued_chunk() {
-        let record = || Record {
-            waiting_since: 0, service_ns: 0, clock: RequestClock::Waiting, error: None, preemption_debt: 0,
-            prefix_cache: true, prefix_source: None,
-            prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
-            publication: None, publication_batch_limit: 4, pending_publication: None,
-            publication_permits: VecDeque::new(),
-        };
+        let record = || Record { prefix_cache: true, ..super::front_rows_tests::record() };
         let request = |stage| Request {
             record: record(),
             state: State::Between(super::termination_tests::generation(), stage),
@@ -4651,6 +4648,8 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         }
         let reached = owner.as_ref().unwrap().snapshot(id).unwrap().resident_position;
         assert!(reached < PROMPT, "stopped mid-prompt, at {reached}");
+        let retirement = receiver.retirement();
+        assert!(retirement.poll(Waker::noop()).is_pending());
         owner.as_mut().unwrap().stop(id);
         let finish = loop {
             run(&mut owner);
@@ -4663,6 +4662,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         assert_eq!(finish, FinishReason::Cancelled);
         let served = owner.as_mut().unwrap();
         assert!(served.snapshot(id).is_none(), "the stopped request is retired");
+        assert!(retirement.poll(Waker::noop()).is_ready());
         let sharing = prompt();
         let hit = served.service.prefix_cache.lookup(PrefixPath::of(&sharing), PROMPT).unwrap().expect("its prompt work is cached");
         assert_eq!(hit.position(), reached, "cached where it reached");
@@ -4804,11 +4804,12 @@ mod front_rows_tests {
     }
 
     /// A request's record, its prefix uncached and no stream attached.
-    fn record() -> Record {
+    pub(super) fn record() -> Record {
         Record {
             waiting_since: 0, service_ns: 0, clock: RequestClock::Waiting, error: None, preemption_debt: 0,
             prefix_cache: false, prefix_source: None,
             prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
+            retirement: PublicationQueue::bounded(1, |_| {}).unwrap().1.retirement(),
             publication: None, publication_batch_limit: 4, pending_publication: None,
             publication_permits: VecDeque::new(),
         }

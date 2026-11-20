@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use futures_util::future::BoxFuture;
+use magnitude_engine::error::RequestError;
 use magnitude_engine::worker::protocol::MemoryObservation;
 use magnitude_executor::platform::Fit;
 use magnitude_service_contracts::{
@@ -42,11 +43,11 @@ pub fn execution_backend(backend: BackendName) -> ExecutionBackend {
 
 /// The resident worker's memory observations, when a model is loaded.
 pub trait ResidentMemory: Send + Sync + 'static {
-    fn observe(&self) -> BoxFuture<'_, Option<MemoryObservation>>;
+    fn observe(&self) -> BoxFuture<'_, Result<Option<MemoryObservation>, RequestError>>;
 }
 
 impl ResidentMemory for ModelInstances {
-    fn observe(&self) -> BoxFuture<'_, Option<MemoryObservation>> {
+    fn observe(&self) -> BoxFuture<'_, Result<Option<MemoryObservation>, RequestError>> {
         Box::pin(self.resident_memory())
     }
 }
@@ -149,7 +150,7 @@ impl HardwareProvider for HardwareInventory {
         let volumes = Arc::clone(&self.volumes);
         let serving = self.serving;
         Box::pin(async move {
-            let resident = self.resident.observe().await;
+            let resident = self.resident.observe().await.map_err(observation_error)?;
             magnitude_service_utils::blocking::run(move || {
                 Self::snapshot_with(&inventory, &volumes, serving, resident.as_ref())
             })
