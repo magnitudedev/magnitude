@@ -251,18 +251,23 @@ impl From<HeaderError> for Error {
     }
 }
 
-/// Whether `name` is a tensor role of the admitted feature set.
+/// Whether `name` is a tensor role of the admitted feature set (including
+/// encoding-driven `.scale` / `.input_scale` companions of admitted weights).
 fn admitted_role(name: &str) -> bool {
-    if GLOBAL_ROLES.contains(&name) {
-        return true;
-    }
-    name.strip_prefix("blk.")
-        .and_then(|rest| rest.split_once('.'))
-        .is_some_and(|(index, role)| {
-            !index.is_empty()
-                && index.bytes().all(|byte| byte.is_ascii_digit())
-                && BLOCK_ROLES.contains(&role)
-        })
+    let direct = |candidate: &str| {
+        if GLOBAL_ROLES.contains(&candidate) {
+            return true;
+        }
+        candidate
+            .strip_prefix("blk.")
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(index, role)| {
+                !index.is_empty()
+                    && index.bytes().all(|byte| byte.is_ascii_digit())
+                    && BLOCK_ROLES.contains(&role)
+            })
+    };
+    direct(name) || magnitude_family_common::is_companion_scale(name, direct)
 }
 
 /// Admit the `llama` feature set from metadata keys and tensor role names,

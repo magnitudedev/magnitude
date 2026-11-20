@@ -77,7 +77,7 @@ use magnitude_family_contracts::{
     HyperConnections, ImportTransform, InputNorm, InputSemantics, MediaRowAttention,
     ProjectedRows, RowProducer, RowRounding, TokenDomain,
     ModelDefinition, NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputProjection, OutputRotary, QueryKeys, QueryProjection, ResidualForm, RmsNorm,
-    Rotary, RotaryLayout, RotaryPairing, RotaryPlacement, RouteNormalization, RoutedFfn, RowRange, ScoreFunction, Sublayer,
+    Rotary, RotaryLayout, RotaryPairing, RotaryPlacement, RouteNormalization, RoutedFfn, ScoreFunction, Sublayer,
     ValueNorm,
     ValueSource, WeightDescriptor,
 };
@@ -786,20 +786,13 @@ impl Geometry {
             product(&[self.streams + 1, self.hidden])?,
             product(&[heads, width])?,
         ];
-        let scale = tensors.companion_scale(&fused, 1)?;
-        let mut rows = |start, rows| {
-            tensors.bind_transformed(
-                &fused,
-                &stored,
-                scale
-                    .iter()
-                    .cloned()
-                    .chain([ImportTransform::Rows(RowRange { start, rows })])
-                    .collect(),
-            )
-        };
-        let key = rows(0, wide)?;
-        let value = rows(wide, self.hidden)?;
+        let fused = tensors.bind(&fused, &stored)?;
+        let key = fused
+            .slice_rows(0, wide)
+            .map_err(|error| FamilyError::invalid(error.to_string()))?;
+        let value = fused
+            .slice_rows(wide, self.hidden)
+            .map_err(|error| FamilyError::invalid(error.to_string()))?;
         let gate = tensors.bind_transformed(
             &format!("{p}engram_gate.weight"),
             &[self.streams, self.hidden],
@@ -892,7 +885,7 @@ pub fn inspect_components(
     };
     // An FP8 projection binds with its UE8M0 grid.
     let mut tensor = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, FamilyError> {
-        Ok(tensors.bind_scaled(name, shape)?)
+        Ok(tensors.bind(name, shape)?)
     };
     let embedding = tensor("token_embd.weight", &[vocabulary, hidden])?;
     let output = tensor("output.weight", &[vocabulary, hidden])?;
@@ -936,7 +929,7 @@ pub fn inspect_components(
     // table, its rows at its own offsets.
     if let Some(engram) = engram {
         let name = "per_layer_token_embd.weight";
-        let table = tensors.bind_scaled(name, &[tensors.rows(name)?, engram.width])?;
+        let table = tensors.bind(name, &[tensors.rows(name)?, engram.width])?;
         for (layer, hash) in engram.layers {
             let sublayer = geometry.engram(&mut tensors, layer, hash, engram.width, &table)?;
             layer

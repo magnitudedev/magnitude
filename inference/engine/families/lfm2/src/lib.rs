@@ -28,7 +28,7 @@ use magnitude_family_contracts::{
     ProjectedRows, RowProducer, RowRounding, TokenDomain,
     Operator, OutputForm, OutputProjection, QueryKeys, QueryProjection, ResidualForm, RmsNorm,
     Rotary, RouteNormalization, RoutedFfn, Router,
-    RouterInput, RowRange, ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
+    RouterInput, ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
     WeightDescriptor,
 };
 
@@ -246,20 +246,17 @@ impl Layers<'_> {
                     "shortconv.in_proj.weight",
                     &[product(&[3, hidden])?, hidden],
                 )?;
-                let chunk = |block: u64| WeightDescriptor {
-                    name: fused.name.clone(),
-                    shape: vec![hidden, hidden],
-                    transforms: vec![ImportTransform::Rows(RowRange {
-                        start: block * hidden,
-                        rows: hidden,
-                    })],
+                let chunk = |block: u64| {
+                    fused
+                        .slice_rows(block * hidden, hidden)
+                        .map_err(|error| Error::invalid(error.to_string()))
                 };
                 Operator::ShortConv(Box::new(ShortConv {
                     channels: hidden,
                     width: convolution_width,
-                    input_gate: chunk(0),
-                    output_gate: chunk(1),
-                    value: chunk(2),
+                    input_gate: chunk(0)?,
+                    output_gate: chunk(1)?,
+                    value: chunk(2)?,
                     convolution: weight("shortconv.conv.weight", &[hidden, convolution_width])?,
                     output: weight("shortconv.out_proj.weight", &[hidden, hidden])?,
                 }))

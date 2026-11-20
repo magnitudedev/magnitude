@@ -287,6 +287,12 @@ impl PreparedModelInput {
         vision: BTreeMap<String, PreparedVisionInput>,
     ) -> Result<Self, InputPreparationError> {
         let (tokens, layout) = tokens.into_parts();
+        if tokens
+            .iter()
+            .any(|token| u64::from(token.0) >= definition.decoder.vocabulary)
+        {
+            return Err(InputPreparationError::TokenDomain);
+        }
         let spans = layout.spans();
         if coordinates.len() != tokens.len()
             || continuation > i32::MAX as usize

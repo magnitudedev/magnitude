@@ -4,7 +4,7 @@ use crate::{Error, product};
 use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
 use magnitude_family_common::{array_elements, projector_type, Tensors};
 use magnitude_family_contracts::{
-    ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling, RowRange,
+    ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
     VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionOperator,
     VisionPositions, VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp,
@@ -136,18 +136,11 @@ pub fn describe_projector(
         bias,
         epsilon,
     };
-    // One stored QKV projection, imported as three row ranges.
-    let rows = |weight: &WeightDescriptor, part: u64| WeightDescriptor {
-        name: weight.name.clone(),
-        shape: {
-            let mut shape = weight.shape.clone();
-            shape[0] = hidden;
-            shape
-        },
-        transforms: vec![ImportTransform::Rows(RowRange {
-            start: part * hidden,
-            rows: hidden,
-        })],
+    // One stored QKV projection, imported as three row ranges (preserving any companion scale).
+    let rows = |weight: &WeightDescriptor, part: u64| {
+        weight
+            .slice_rows(part * hidden, hidden)
+            .map_err(|error| Error::invalid(error.to_string()))
     };
     let qkv_rows = product(&[3, hidden])?;
     let mut blocks = Vec::with_capacity(depth as usize);
@@ -156,10 +149,12 @@ pub fn describe_projector(
         let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
         let qkv = weight("attn_qkv.weight", &[qkv_rows, hidden])?;
         let qkv_bias = weight("attn_qkv.bias", &[qkv_rows])?;
-        let split = |part| VisionLinear {
-            weight: rows(&qkv, part),
-            bias: Some(rows(&qkv_bias, part)),
-            clamp: None,
+        let split = |part| -> Result<VisionLinear, Error> {
+            Ok(VisionLinear {
+                weight: rows(&qkv, part)?,
+                bias: Some(rows(&qkv_bias, part)?),
+                clamp: None,
+            })
         };
         blocks.push(VisionBlock {
             operator_norm: layer_norm(
@@ -170,9 +165,9 @@ pub fn describe_projector(
                 heads,
                 kv_heads: heads,
                 width: hidden / heads,
-                query: split(0),
-                key: split(1),
-                value: split(2),
+                query: split(0)?,
+                key: split(1)?,
+                value: split(2)?,
                 query_norm: None,
                 key_norm: None,
                 value_norm: None,

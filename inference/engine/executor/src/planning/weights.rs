@@ -4937,7 +4937,7 @@ mod scale_grid_tests {
     fn import(path: &std::path::Path, layout: Layout, weight: &Gridded) -> Result<(WeightPlan, Vec<f32>), String> {
         let artifact = GgufArtifact::open(path).unwrap();
         let descriptor = magnitude_family_common::Tensors::new(artifact.directory())
-            .bind_scaled(&format!("{}.weight", weight.stem), weight.shape)
+            .bind(&format!("{}.weight", weight.stem), weight.shape)
             .unwrap();
         let plan = plan(&artifact.directory().tensors, &descriptor, layout).unwrap();
         let stored = Stored::from_gguf(&artifact, &descriptor).unwrap();

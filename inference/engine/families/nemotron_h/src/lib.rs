@@ -339,7 +339,7 @@ impl Geometry {
             groups: g.groups,
             convolution_width: g.convolution_width,
             projection: binder
-                .bind_scaled(&format!("{prefix}ssm_in.weight"), &[projected, hidden])?,
+                .bind(&format!("{prefix}ssm_in.weight"), &[projected, hidden])?,
             convolution: binder.bind(
                 &format!("{prefix}ssm_conv1d.weight"),
                 &[channels, g.convolution_width],
@@ -362,7 +362,7 @@ impl Geometry {
                 vec![ImportTransform::Flatten],
             )?),
             norm_group,
-            output: binder.bind_scaled(&format!("{prefix}ssm_out.weight"), &[hidden, g.inner])?,
+            output: binder.bind(&format!("{prefix}ssm_out.weight"), &[hidden, g.inner])?,
         })))
     }
 
@@ -383,10 +383,10 @@ impl Geometry {
                 up: FeedForwardUp::Plain {
                     activation: ActivationFunction::ReluSquared,
                     up: binder
-                        .bind_scaled(&format!("{prefix}ffn_up.weight"), &[intermediate, hidden])?,
+                        .bind(&format!("{prefix}ffn_up.weight"), &[intermediate, hidden])?,
                 },
                 down: binder
-                    .bind_scaled(&format!("{prefix}ffn_down.weight"), &[hidden, intermediate])?,
+                    .bind(&format!("{prefix}ffn_down.weight"), &[hidden, intermediate])?,
             })));
         }
         let e = self.experts.as_ref().ok_or_else(|| {
@@ -427,12 +427,12 @@ impl Geometry {
                     intermediate: shared,
                     up: FeedForwardUp::Plain {
                         activation: ActivationFunction::ReluSquared,
-                        up: binder.bind_scaled(
+                        up: binder.bind(
                             &format!("{prefix}ffn_up_shexp.weight"),
                             &[shared, hidden],
                         )?,
                     },
-                    down: binder.bind_scaled(
+                    down: binder.bind(
                         &format!("{prefix}ffn_down_shexp.weight"),
                         &[hidden, shared],
                     )?,
@@ -464,12 +464,12 @@ impl Geometry {
             },
             expert_up: FeedForwardUp::Plain {
                 activation: ActivationFunction::ReluSquared,
-                up: binder.bind_scaled(
+                up: binder.bind(
                     &format!("{prefix}ffn_up_exps.weight"),
                     &[experts, intermediate, expert_hidden],
                 )?,
             },
-            expert_down: binder.bind_scaled(
+            expert_down: binder.bind(
                 &format!("{prefix}ffn_down_exps.weight"),
                 &[experts, expert_hidden, intermediate],
             )?,
@@ -630,7 +630,7 @@ pub fn inspect_components(
     } else {
         "token_embd.weight"
     };
-    let output = binder.bind_scaled(output_name, &[vocabulary, hidden])?;
+    let output = binder.bind(output_name, &[vocabulary, hidden])?;
     let output_norm = binder.bind("output_norm.weight", &[hidden])?;
 
     let target_layers = block_count - head_layers;

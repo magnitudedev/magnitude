@@ -663,6 +663,11 @@ impl DraftDefinition {
                 }
             }
         }
+        if !matches!(decoder.residual, ResidualForm::Single) {
+            return Err(DefinitionError::new(
+                "draft models require a single-stream target residual",
+            ));
+        }
         let fused = checked_product(&[self.taps.len() as u64, hidden])?;
         expect_shape(&self.fusion, &[hidden, fused], "draft fusion projection")?;
         decoder::validate_rms(&self.fusion_norm, hidden, "draft fusion norm")?;

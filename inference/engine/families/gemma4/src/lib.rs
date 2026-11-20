@@ -32,7 +32,7 @@ use magnitude_family_contracts::{
     ProjectedRows, RowProducer, RowRounding, TokenDomain,
     Operator, OutputForm, OutputProjection, PerLayerEntry, PerLayerInput,
     QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
-    RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
+    RouteNormalization, RoutedFfn, Router, RouterInput,
     ScoreFunction, Sublayer, SublayerIndex,
     UnweightedRms, ValueNorm, ValueSource, WeightDescriptor,
 };
@@ -546,21 +546,16 @@ fn routed(b: &mut Tensors, shape: &Shape, p: &str, experts: &Experts) -> Result<
     let hidden = shape.hidden;
     let fused = format!("{p}ffn_gate_up_exps.weight");
     let fused_shape = [experts.count, product(&[2, experts.intermediate])?, hidden];
-    let mut half = |start: u64| {
-        b.bind_transformed(
-            &fused,
-            &fused_shape,
-            vec![ImportTransform::Rows(RowRange {
-                start,
-                rows: experts.intermediate,
-            })],
-        )
-    };
+    let fused = b.bind(&fused, &fused_shape)?;
     let expert_up = FeedForwardUp::Gated {
         activation: ActivationFunction::GeluTanh,
         limit: None,
-        gate: half(0)?,
-        up: half(experts.intermediate)?,
+        gate: fused
+            .slice_rows(0, experts.intermediate)
+            .map_err(|error| Error::invalid(error.to_string()))?,
+        up: fused
+            .slice_rows(experts.intermediate, experts.intermediate)
+            .map_err(|error| Error::invalid(error.to_string()))?,
     };
     let router_input = b.bind_transformed(
         &format!("{p}ffn_gate_inp.scale"),

@@ -24,7 +24,7 @@ use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
 use magnitude_family_common::{array_elements, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, FamilyError, ImportTransform, MergerStage,
-    RmsNorm, RowRange, VisionActivation, VisionAttention, VisionAttentionScale,
+    RmsNorm, VisionActivation, VisionAttention, VisionAttentionScale,
     VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward, VisionLinear,
     VisionMerger, VisionNorm, VisionOperator, VisionPreprocessing, VisionResampling,
     VisionResize, VisionStem, VisionUp, WeightDescriptor,
@@ -184,19 +184,12 @@ pub fn describe_projector(
         registers: None,
     };
 
-    // One stored QKV projection, imported as three row ranges.
+    // One stored QKV projection, imported as three row ranges (preserving any companion scale).
     let qkv_rows = product(&[3, hidden])?;
-    let part = |stored: &WeightDescriptor, index: u64| WeightDescriptor {
-        name: stored.name.clone(),
-        shape: {
-            let mut shape = stored.shape.clone();
-            shape[0] = hidden;
-            shape
-        },
-        transforms: vec![ImportTransform::Rows(RowRange {
-            start: index * hidden,
-            rows: hidden,
-        })],
+    let part = |stored: &WeightDescriptor, index: u64| {
+        stored
+            .slice_rows(index * hidden, hidden)
+            .map_err(|error| FamilyError::invalid(error.to_string()))
     };
     let mut blocks = Vec::with_capacity(depth as usize);
     for index in 0..depth {
@@ -204,16 +197,18 @@ pub fn describe_projector(
         let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
         let qkv = weight("attn_qkv.weight", &[qkv_rows, hidden])?;
         let qkv_bias = weight("attn_qkv.bias", &[qkv_rows])?;
-        let split = |index| biased(part(&qkv, index), part(&qkv_bias, index));
+        let split = |index| -> Result<VisionLinear, FamilyError> {
+            Ok(biased(part(&qkv, index)?, part(&qkv_bias, index)?))
+        };
         blocks.push(VisionBlock {
             operator_norm: rms(weight("ln1.weight", &[hidden])?),
             operator: VisionOperator::Attention(VisionAttention {
                 heads,
                 kv_heads: heads,
                 width,
-                query: split(0),
-                key: split(1),
-                value: split(2),
+                query: split(0)?,
+                key: split(1)?,
+                value: split(2)?,
                 query_norm: Some(RmsNorm {
                     weight: weight("attn_q_norm.weight", &[width])?,
                     epsilon,

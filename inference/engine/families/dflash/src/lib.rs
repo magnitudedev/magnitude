@@ -334,9 +334,12 @@ fn known_role(name: &str) -> bool {
     }
     let part = |role: &str, roles: &[&str]| {
         role.rsplit_once('.').is_some_and(|(role, suffix)| {
-            roles.contains(&role) && matches!(suffix, "weight" | "scale" | "bias")
+            roles.contains(&role) && matches!(suffix, "weight" | "scale" | "input_scale" | "bias")
         })
     };
+    if magnitude_family_common::is_companion_scale(name, |weight| GLOBAL_ROLES.contains(&weight)) {
+        return true;
+    }
     if let Some(role) = name.strip_prefix("lilicorr.") {
         return part(role, &LILICORR_ROLES)
             || role
@@ -499,6 +502,14 @@ pub fn inspect(
             decoder.hidden
         )));
     }
+    if !matches!(
+        decoder.residual,
+        magnitude_family_contracts::ResidualForm::Single
+    ) {
+        return Err(Error::Target(
+            "draft models require a single-stream target residual".into(),
+        ));
+    }
     if m.integer("attention.value_length")? != width {
         return Err(Error::Geometry(
             "value head width differs from key head width".into(),
@@ -546,19 +557,19 @@ pub fn inspect(
     // Projections and tables carry their NVFP4 second-level scale (`X.scale`
     // beside `X.weight`, `[1]` F32) when the file stores one.
     let mut binder = Tensors::new(directory);
-    let fusion = binder.bind_scaled(
+    let fusion = binder.bind(
         "fc.weight",
         &[hidden, product(&[taps.len() as u64, hidden])?],
     )?;
-    let fusion_norm = rms(binder.bind_scaled("enc.output_norm.weight", &[hidden])?);
-    let output_norm = rms(binder.bind_scaled("output_norm.weight", &[hidden])?);
+    let fusion_norm = rms(binder.bind("enc.output_norm.weight", &[hidden])?);
+    let output_norm = rms(binder.bind("output_norm.weight", &[hidden])?);
     let embedding = if binder.contains("token_embd.weight") {
-        DraftEmbedding::Own(binder.bind_scaled("token_embd.weight", &[decoder.vocabulary, hidden])?)
+        DraftEmbedding::Own(binder.bind("token_embd.weight", &[decoder.vocabulary, hidden])?)
     } else {
         DraftEmbedding::Target
     };
     let output = if binder.contains("output.weight") {
-        Some(binder.bind_scaled("output.weight", &[decoder.vocabulary, hidden])?)
+        Some(binder.bind("output.weight", &[decoder.vocabulary, hidden])?)
     } else {
         None
     };
@@ -573,7 +584,7 @@ pub fn inspect(
             } else {
                 None
             };
-            let mut weight = |name: &str, shape: &[u64]| binder.bind_scaled(&role(name), shape);
+            let mut weight = |name: &str, shape: &[u64]| binder.bind(&role(name), shape);
             let attention = Attention {
                 heads,
                 kv_heads,
@@ -688,8 +699,8 @@ pub fn inspect(
         let table = [decoder.vocabulary, rank];
         let markov = MarkovHead {
             rank,
-            embedding: binder.bind_scaled("markov_w1.weight", &table)?,
-            projection: binder.bind_scaled("markov_w2.weight", &table)?,
+            embedding: binder.bind("markov_w1.weight", &table)?,
+            projection: binder.bind("markov_w2.weight", &table)?,
         };
         if m.optional_flag("has_confidence_head")? == Some(false) {
             return Err(Error::Geometry(
@@ -773,7 +784,7 @@ fn block_convolutions(
                         &format!("blk.{index}.{name}_conv_base"),
                         &[2, kernel, hidden],
                     )?,
-                    projection: binder.bind_scaled(
+                    projection: binder.bind(
                         &format!("blk.{index}.{name}_conv_proj.weight"),
                         &[coefficients, hidden],
                     )?,
@@ -808,9 +819,9 @@ fn candidate_selector(
     Ok(CandidateSelector {
         rank,
         top_k,
-        hidden: binder.bind_scaled("selector_hidden.weight", &[rank, hidden])?,
-        predecessor: binder.bind_scaled("selector_predecessor.weight", &codebook)?,
-        successor: binder.bind_scaled("selector_successor.weight", &codebook)?,
+        hidden: binder.bind("selector_hidden.weight", &[rank, hidden])?,
+        predecessor: binder.bind("selector_predecessor.weight", &codebook)?,
+        successor: binder.bind("selector_successor.weight", &codebook)?,
     })
 }
 
@@ -858,7 +869,7 @@ fn candidate_corrector(
                       inputs: u64|
      -> Result<Affine, Error> {
         Ok(Affine {
-            weight: binder.bind_scaled(&format!("{stem}.weight"), &[outputs, inputs])?,
+            weight: binder.bind(&format!("{stem}.weight"), &[outputs, inputs])?,
             bias: bind_vector(binder, &format!("{stem}.bias"), outputs)?,
         })
     };

@@ -21,7 +21,7 @@ use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
 use magnitude_family_common::{array_elements, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage,
-    PositionSampling, RowRange, VisionActivation, VisionAttention, VisionAttentionScale,
+    PositionSampling, VisionActivation, VisionAttention, VisionAttentionScale,
     VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward, VisionLinear,
     VisionMerger, VisionNorm, VisionOperator, VisionPositions, VisionPreprocessing,
     VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor,
@@ -145,23 +145,26 @@ impl Reader<'_> {
             .tensors
             .bind(&format!("{fused}.weight"), &[rows, hidden])?;
         let bias = self.tensors.bind(&format!("{fused}.bias"), &[rows])?;
-        let part = |stored: &WeightDescriptor, index: u64| {
-            let mut shape = stored.shape.clone();
-            shape[0] = hidden;
-            WeightDescriptor {
-                name: stored.name.clone(),
-                shape,
-                transforms: vec![ImportTransform::Rows(RowRange {
-                    start: index * hidden,
-                    rows: hidden,
-                })],
-            }
+        let part = |stored: &WeightDescriptor, index: u64| -> Result<WeightDescriptor, Error> {
+            Ok(stored.slice_rows(index * hidden, hidden)?)
         };
-        Ok([0, 1, 2].map(|index| VisionLinear {
-            weight: part(&weight, index),
-            bias: Some(part(&bias, index)),
-            clamp: None,
-        }))
+        Ok([
+            VisionLinear {
+                weight: part(&weight, 0)?,
+                bias: Some(part(&bias, 0)?),
+                clamp: None,
+            },
+            VisionLinear {
+                weight: part(&weight, 1)?,
+                bias: Some(part(&bias, 1)?),
+                clamp: None,
+            },
+            VisionLinear {
+                weight: part(&weight, 2)?,
+                bias: Some(part(&bias, 2)?),
+                clamp: None,
+            },
+        ])
     }
 }
 

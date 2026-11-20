@@ -10,6 +10,14 @@ use magnitude_family_contracts::{
 };
 use std::collections::{HashMap, HashSet};
 
+/// Whether `name` is a companion scale (`<stem>.scale` or `<stem>.input_scale`)
+/// of a weight `<stem>.weight` admitted by `admits_weight`.
+pub fn is_companion_scale(name: &str, admits_weight: impl FnOnce(&str) -> bool) -> bool {
+    name.strip_suffix(".scale")
+        .or_else(|| name.strip_suffix(".input_scale"))
+        .is_some_and(|stem| admits_weight(&format!("{stem}.weight")))
+}
+
 pub struct Tensors<'a> {
     directory: &'a Directory,
     by_name: HashMap<&'a str, &'a TensorDescriptor>,
@@ -58,7 +66,9 @@ impl<'a> Tensors<'a> {
         }
     }
 
-    /// Binds `name` as stored; its stored shape must be `shape`.
+    /// Binds `name` as stored, automatically attaching its stored companion
+    /// scale when its encoding carries one (`F8E4M3` block scale grid or
+    /// `Nvfp4` per-tensor/per-matrix scale); its stored shape must be `shape`.
     pub fn bind(&mut self, name: &str, shape: &[u64]) -> Result<WeightDescriptor, HeaderError> {
         // A vector stored with a leading unit axis (`[1, n]`, as some converters write a parameter
         // vector) holds the same elements in the same order as `[n]`.
@@ -80,8 +90,9 @@ impl<'a> Tensors<'a> {
         Ok(())
     }
 
-    /// Binds `name`, stored exactly as `stored`, through exact import
-    /// `transforms`; the descriptor's shape is the one they produce.
+    /// Binds `name`, stored exactly as `stored`, automatically attaching its
+    /// encoding-driven companion scale (if any) before applying `transforms`;
+    /// the descriptor's shape is the one they produce.
     pub fn bind_transformed(
         &mut self,
         name: &str,
@@ -97,38 +108,28 @@ impl<'a> Tensors<'a> {
             });
         }
         checked_product(stored)?;
+        let matrices = match stored {
+            [stack, _, _] => *stack,
+            _ => 1,
+        };
+        let mut all_transforms = Vec::with_capacity(transforms.len() + 1);
+        if let Some(scale) = self.companion_scale(name, matrices)? {
+            all_transforms.push(scale);
+        }
+        all_transforms.extend(transforms);
         let mut descriptor = WeightDescriptor {
             name: name.to_owned(),
             shape: stored.to_vec(),
-            transforms,
+            transforms: all_transforms,
         };
         descriptor.shape = descriptor.transformed_shape(stored)?;
         self.bound.insert(tensor.name.as_str());
         Ok(descriptor)
     }
 
-    /// Binds `name` as stored, scaled by its stored companion scale (see
-    /// [`Self::companion_scale`]) when the file has one: `shape`'s outermost
-    /// extent is the matrix count of a stacked (rank 3) weight, else one.
-    pub fn bind_scaled(
-        &mut self,
-        name: &str,
-        shape: &[u64],
-    ) -> Result<WeightDescriptor, HeaderError> {
-        let mut weight = self.bind(name, shape)?;
-        let matrices = match shape {
-            [stack, _, _] => *stack,
-            _ => 1,
-        };
-        if let Some(scale) = self.companion_scale(name, matrices)? {
-            weight.transforms.push(scale);
-        }
-        Ok(weight)
-    }
-
     /// Binds one weight stored in parts: `first`, then the rows of each of
     /// `appended` in order (`ImportTransform::AppendRows`), each `(name,
-    /// stored shape)`. Every part is bound as [`Self::bind_scaled`] binds it
+    /// stored shape)`. Every part is bound as [`Self::bind`] binds it
     /// and read after its scale as stored or, under `merge_leading_axes`,
     /// with its leading axes merged (`MergeLeadingAxes`), to a matrix or
     /// vector of `first`'s row width: under no scale, or under its own grid
@@ -141,13 +142,13 @@ impl<'a> Tensors<'a> {
     ) -> Result<WeightDescriptor, HeaderError> {
         let read: &[ImportTransform] = if merge_leading_axes { &[ImportTransform::MergeLeadingAxes] } else { &[] };
         let (name, shape) = first;
-        let mut weight = self.bind_scaled(name, shape)?;
+        let mut weight = self.bind(name, shape)?;
         let scale = weight.transforms.clone();
         weight.transforms.extend_from_slice(read);
         let width = weight.transformed_shape(shape)?.get(1..).unwrap_or_default().to_vec();
         let mut parts = Vec::with_capacity(appended.len());
         for &(part, stored) in appended {
-            let mut bound = self.bind_scaled(part, stored)?;
+            let mut bound = self.bind(part, stored)?;
             let grid = match (&scale[..], &bound.transforms[..]) {
                 ([], []) => None,
                 (
@@ -211,6 +212,9 @@ impl<'a> Tensors<'a> {
         if let Some(grid) = ImportTransform::scale_grid(weight, stored.encoding) {
             let scale = self.lookup(&grid).ok_or(HeaderError::MissingWeight(grid))?;
             return self.scale_grid(stored, scale).map(Some);
+        }
+        if stored.encoding != Encoding::Nvfp4 {
+            return Ok(None);
         }
         let Some(scale) = self.lookup(&name) else {
             return Ok(None);
@@ -480,7 +484,7 @@ mod tests {
             for (shape, tile) in [(vec![2, 8], [32, 32]), (vec![64, 8], [1, 32]), (vec![1, 2], [64, 128])] {
                 let directory = directory(Some((codes.stored(), shape)));
                 let mut tensors = Tensors::new(&directory);
-                let weight = tensors.bind_scaled(WEIGHT, &SHAPE).unwrap();
+                let weight = tensors.bind(WEIGHT, &SHAPE).unwrap();
                 assert_eq!(weight.transforms, [ImportTransform::ScaleBlocks { tensor: SCALE.into(), tile, codes }]);
                 tensors.finish().unwrap();
             }
@@ -498,8 +502,8 @@ mod tests {
             ("blk.0.ffn_down.scale", vec![2, 4], Encoding::F32),
         ]);
         let mut tensors = Tensors::new(&directory);
-        let ue8m0 = tensors.bind_scaled(WEIGHT, &SHAPE).unwrap();
-        let f32 = tensors.bind_scaled("blk.0.ffn_down.weight", &[256, 512]).unwrap();
+        let ue8m0 = tensors.bind(WEIGHT, &SHAPE).unwrap();
+        let f32 = tensors.bind("blk.0.ffn_down.weight", &[256, 512]).unwrap();
         tensors.finish().unwrap();
         assert_eq!(
             ue8m0.transforms,
@@ -522,7 +526,7 @@ mod tests {
         let stack = [3, 64, 256];
         let directory = shaped(&stack, Some((Encoding::F32, vec![3, 2, 8])));
         let mut tensors = Tensors::new(&directory);
-        let weight = tensors.bind_scaled(WEIGHT, &stack).unwrap();
+        let weight = tensors.bind(WEIGHT, &stack).unwrap();
         assert_eq!(weight.shape, stack);
         assert_eq!(
             weight.transforms,
@@ -531,7 +535,7 @@ mod tests {
         tensors.finish().unwrap();
         for grid in [vec![2, 2, 8], vec![2, 8], vec![3, 3, 8]] {
             let directory = shaped(&stack, Some((Encoding::F32, grid)));
-            let error = Tensors::new(&directory).bind_scaled(WEIGHT, &stack).unwrap_err();
+            let error = Tensors::new(&directory).bind(WEIGHT, &stack).unwrap_err();
             assert!(error.to_string().contains(SCALE), "{error}");
         }
     }
@@ -551,7 +555,7 @@ mod tests {
             Some((Encoding::F32, vec![3, 8])),
             None,
         ] {
-            let error = Tensors::new(&directory(scale.clone())).bind_scaled(WEIGHT, &SHAPE).unwrap_err();
+            let error = Tensors::new(&directory(scale.clone())).bind(WEIGHT, &SHAPE).unwrap_err();
             assert!(error.to_string().contains(SCALE), "{error}");
             if scale.is_some() {
                 assert!(error.to_string().contains("an I8 or F32 grid"), "{error}");
@@ -568,7 +572,7 @@ mod tests {
         for codes in ScaleCodes::ALL {
             for (weight, grid) in [([300, 4096], vec![10, 128]), ([192, 256], vec![2, 8])] {
                 let directory = shaped(&weight, Some((codes.stored(), grid)));
-                let error = Tensors::new(&directory).bind_scaled(WEIGHT, &weight).unwrap_err();
+                let error = Tensors::new(&directory).bind(WEIGHT, &weight).unwrap_err();
                 assert!(error.to_string().contains(SCALE), "{error}");
             }
         }

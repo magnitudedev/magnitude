@@ -108,6 +108,31 @@ impl WeightDescriptor {
         }
     }
 
+    /// Slice `rows` rows starting at `start` along the logical row axis,
+    /// preserving every prior import transform (companion scales, flatten,
+    /// etc.).
+    pub fn slice_rows(&self, start: u64, rows: u64) -> Result<Self, DefinitionError> {
+        let axis = row_axis(&self.shape).ok_or_else(|| {
+            DefinitionError::new(format!("{:?} has no row axis to slice", self.name))
+        })?;
+        let end = start.checked_add(rows);
+        if rows == 0 || end.is_none_or(|end| end > self.shape[axis]) {
+            return Err(DefinitionError::new(format!(
+                "row range of {:?} exceeds its rows",
+                self.name
+            )));
+        }
+        let mut shape = self.shape.clone();
+        shape[axis] = rows;
+        let mut transforms = self.transforms.clone();
+        transforms.push(ImportTransform::Rows(RowRange { start, rows }));
+        Ok(Self {
+            name: self.name.clone(),
+            shape,
+            transforms,
+        })
+    }
+
     /// The progressive plane and code depth the descriptor places: its
     /// sole transform's, if that is `ImportTransform::Progressive`.
     pub fn progressive(&self) -> Option<(ProgressivePlane, ProgressiveCodeDepth)> {

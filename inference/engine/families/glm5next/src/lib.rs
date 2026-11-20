@@ -490,7 +490,7 @@ impl Layer<'_, '_> {
 
     fn weight(&mut self, name: &str, shape: &[u64]) -> Result<WeightDescriptor, FamilyError> {
         let name = self.name(name);
-        Ok(self.tensors.bind_scaled(&name, shape)?)
+        Ok(self.tensors.bind(&name, shape)?)
     }
 
     /// The stored rows of the matrix `name`.
@@ -502,12 +502,10 @@ impl Layer<'_, '_> {
     /// matrices' rows.
     fn merged(&mut self, name: &str, stored: &[u64]) -> Result<WeightDescriptor, FamilyError> {
         let name = self.name(name);
-        let &[matrices, _, _] = stored else { unreachable!("a stack is stored as three axes") };
-        let scale = self.tensors.companion_scale(&name, matrices)?;
         Ok(self.tensors.bind_transformed(
             &name,
             stored,
-            scale.into_iter().chain([ImportTransform::MergeLeadingAxes]).collect(),
+            vec![ImportTransform::MergeLeadingAxes],
         )?)
     }
 
@@ -592,9 +590,9 @@ pub fn inspect_components(
     let hidden = geometry.hidden;
     let mut tensors = Tensors::new(directory);
     let vocabulary = m.integer("vocab_size")?;
-    let embedding = tensors.bind_scaled("token_embd.weight", &[vocabulary, hidden])?;
-    let output = tensors.bind_scaled("output.weight", &[vocabulary, hidden])?;
-    let output_norm = geometry.rms(tensors.bind_scaled("output_norm.weight", &[hidden])?);
+    let embedding = tensors.bind("token_embd.weight", &[vocabulary, hidden])?;
+    let output = tensors.bind("output.weight", &[vocabulary, hidden])?;
+    let output_norm = geometry.rms(tensors.bind("output_norm.weight", &[hidden])?);
     let trunk_blocks = (0..trunk)
         .map(|block| {
             let layer = &mut Layer {

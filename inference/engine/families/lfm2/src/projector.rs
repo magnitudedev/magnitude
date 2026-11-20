@@ -9,7 +9,7 @@ use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
 use magnitude_family_common::{array_elements, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage, RmsNorm,
-    RowRange, VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan,
+    VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan,
     VisionBlock, VisionDescription, VisionFeedForward, VisionGatedConvolution, VisionLinear,
     VisionMerger, VisionNorm, VisionOperator, VisionPreprocessing, VisionResampling, VisionResize,
     VisionStem, VisionUp, WeightDescriptor,
@@ -157,26 +157,23 @@ pub fn describe_projector(
             // `in_proj` stores the B, C and X projections as consecutive row
             // blocks of the tower width.
             let fused = weight("conv2d_in_proj.weight", &[gated_rows, hidden])?;
-            let chunk = |block: u64| VisionLinear {
-                weight: WeightDescriptor {
-                    name: fused.name.clone(),
-                    shape: vec![hidden, hidden],
-                    transforms: vec![ImportTransform::Rows(RowRange {
-                        start: block * hidden,
-                        rows: hidden,
-                    })],
-                },
-                bias: None,
-                clamp: None,
+            let chunk = |block: u64| -> Result<VisionLinear, Error> {
+                Ok(VisionLinear {
+                    weight: fused
+                        .slice_rows(block * hidden, hidden)
+                        .map_err(|error| invalid(error.to_string()))?,
+                    bias: None,
+                    clamp: None,
+                })
             };
             let kernel = directory
                 .tensor(&format!("{p}conv2d_spatial.weight"))
                 .and_then(|tensor| tensor.shape.last().copied())
                 .ok_or_else(|| invalid("missing projector convolution kernel"))?;
             VisionOperator::GatedConvolution(VisionGatedConvolution {
-                input_gate: chunk(0),
-                output_gate: chunk(1),
-                value: chunk(2),
+                input_gate: chunk(0)?,
+                output_gate: chunk(1)?,
+                value: chunk(2)?,
                 kernel: weight("conv2d_spatial.weight", &[hidden, 1, kernel, kernel])?,
                 output: linear(weight("conv2d_out_proj.weight", &[hidden, hidden])?),
             })
