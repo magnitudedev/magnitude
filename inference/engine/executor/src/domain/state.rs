@@ -1071,6 +1071,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`memory::ledger::Ledger::plan_relief`); none where nothing covers it
     /// or the resource is no store's.
     pub fn plan_relief(&self, resource: ResourceKind, lacks: u64, allow: crate::memory::ledger::Relief) -> Option<crate::memory::ledger::ReliefPlan> {
+        self.plan_relief_excluding(resource, lacks, allow, &std::collections::BTreeSet::new())
+    }
+
+    pub fn plan_relief_excluding(
+        &self,
+        resource: ResourceKind,
+        lacks: u64,
+        allow: crate::memory::ledger::Relief,
+        exhausted: &std::collections::BTreeSet<crate::memory::ledger::EntryId>,
+    ) -> Option<crate::memory::ledger::ReliefPlan> {
         use crate::memory::ledger::Frees;
         let ledgers = self.resources.ledgers();
         let (ledger, frees) = match resource {
@@ -1079,7 +1089,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ResourceKind::HostStaging => (ledgers.host(), Frees::Room),
             _ => return None,
         };
-        ledger.plan_relief(lacks, allow, frees)
+        ledger.plan_relief_excluding(lacks, allow, frees, exhausted)
     }
 
     /// Carry out `plan` whole in its store (`memory::ledger::Ledger::execute`):
@@ -1414,15 +1424,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 /// spare slabs past the committed room are spare granules. No slab byte is
 /// held twice, and none reads as other programs' memory.
 pub(super) struct StateSlabs {
-    /// The committed room no slab backed at the last settle: what a growth
-    /// draws on before anything is held anew.
-    unbacked: u64,
     /// The spare slabs past the committed room.
     spare: SlabCache,
     /// The slabs retained prefixes alone reference.
     prefix: SlabCache,
-    /// What a growth adds past the committed room, held before the stores
-    /// allocate it in the pool: spare once settled ([`Self::settle`]).
+    /// What a growth adds past the pool's pooled holdings, held before the
+    /// stores allocate it in the pool: spare once settled ([`Self::settle`]).
     pending: Option<crate::memory::ledger::Claim>,
 }
 
@@ -1488,23 +1495,24 @@ impl SlabCache {
 impl Default for StateSlabs {
     fn default() -> Self {
         use crate::memory::ledger::CacheKind;
-        Self { unbacked: 0, spare: SlabCache::new(CacheKind::Spare), prefix: SlabCache::new(CacheKind::Prefix), pending: None }
+        Self { spare: SlabCache::new(CacheKind::Spare), prefix: SlabCache::new(CacheKind::Prefix), pending: None }
     }
 }
 
 impl StateSlabs {
-    /// Hold, before the stores allocate a growth of `bytes`, what it adds
-    /// past the committed room no slab backs yet, as a pooled claim in
-    /// `claiming` ([`Self::settle`] makes it spare). Refused, as its store refuses it,
-    /// where free room lacks it; nothing is held then. A request's rows
-    /// within its reservation add nothing.
+    /// Hold, before the stores allocate a growth of `bytes`, what the state
+    /// pool actually lacks in pooled holdings (`Ledger::pool_shortfall`), as a
+    /// pooled claim in `claiming` ([`Self::settle`] makes it spare). Refused,
+    /// as its store refuses it, where free room and reclaimable cache lack it;
+    /// nothing is held then. A request's rows within its reservation add
+    /// nothing.
     pub(super) fn reserve(
         &mut self,
         claiming: &crate::memory::ledger::Claiming,
         ledger: &crate::memory::ledger::Ledger,
         bytes: u64,
     ) -> Result<(), crate::memory::ledger::Short> {
-        let required = bytes.saturating_sub(self.unbacked);
+        let required = ledger.pool_shortfall(crate::memory::ledger::PoolClass::State, bytes);
         if required == 0 {
             return Ok(());
         }
@@ -1545,7 +1553,6 @@ impl StateSlabs {
         let spare = backed - written - prefix;
         let room = committed.saturating_sub(written);
         let within = spare.min(room);
-        self.unbacked = room - within;
         if let Some(pending) = self.pending.take() {
             let cached = pending.into_backed_cache(crate::memory::ledger::CacheKind::Spare, crate::memory::ledger::Reclaim::Unbacked);
             self.spare.held.push(cached);
@@ -1592,7 +1599,9 @@ fn growth_failure(error: seismic::TensorError, bytes: u64, growth: &str) -> Doma
             DomainError::Capacity(CapacityError {
                 resource: ResourceKind::DeviceMemory,
                 required: bytes,
-                available: execution.capacity_refusal().map_or(0, |(_, available)| available),
+                available: execution
+                    .capacity_refusal()
+                    .map_or(0, |(_, available)| if available < bytes { available } else { 0 }),
             })
         }
         other => DomainError::Device(crate::DeviceError::Execution(format!("{growth}: {other}"))),

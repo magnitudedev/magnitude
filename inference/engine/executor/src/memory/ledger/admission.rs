@@ -383,7 +383,14 @@ impl State {
         let estimate = self.estimate_at(read);
         let holding = Holding::Committed(policy.kind);
         let own_pool = holding.pool_class().filter(|_| holding.pooled());
-        let own_spare = own_pool.map_or(0, |class| self.spare_of(class));
+        // `Backing(PoolClass::State)` is only requested when the state store
+        // must allocate a fresh slab block (no free granules exist in the pool):
+        // any non-zero `spare_of(State)` is uncounted live slabs, not reusable
+        // free granules, so it must not mask `external` demand from reclaim.
+        let own_spare = match holding {
+            Holding::Committed(CommittedKind::Backing(PoolClass::State)) => 0,
+            _ => own_pool.map_or(0, |class| self.spare_of(class)),
+        };
         let external = policy.bytes.saturating_sub(own_spare);
         let alloc_needed = match (holding, external) {
             (_, 0) => 0,

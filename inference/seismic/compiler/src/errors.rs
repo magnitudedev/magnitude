@@ -240,14 +240,23 @@ impl ExecutionError {
     /// The capacity refusal this error is, as the bytes required and the
     /// bytes available: a ledger's ([`Self::AllocationCapacity`], a demand
     /// beyond u64 never free) or the driver's own
-    /// ([`Self::DeviceRefused`], available as its reading's room). Every
-    /// caller that classifies a refusal reads it here alone.
+    /// ([`Self::DeviceRefused`], available as its reading's room when below
+    /// `required`, or `0` when the driver refused `required` despite reporting
+    /// nominal room >= `required`, e.g. under fragmentation or a contiguous
+    /// allocation limit). Every caller that classifies a refusal reads it here
+    /// alone, and `available < required` holds whenever `required > 0`.
     pub fn capacity_refusal(&self) -> Option<(u64, u64)> {
         match self {
             Self::AllocationCapacity { required, available } => {
-                Some((u64::try_from(required).unwrap_or(u64::MAX), *available))
+                let required = u64::try_from(required).unwrap_or(u64::MAX);
+                let available = if *available < required { *available } else { 0 };
+                Some((required, available))
             }
-            Self::DeviceRefused { required, reading } => Some((*required, reading.room())),
+            Self::DeviceRefused { required, reading } => {
+                let room = reading.room();
+                let available = if room < *required { room } else { 0 };
+                Some((*required, available))
+            }
             _ => None,
         }
     }
@@ -478,3 +487,41 @@ impl fmt::Display for BuildError {
     }
 }
 impl std::error::Error for BuildError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_refusal_never_reports_available_at_or_above_required() {
+        let fragmented = ExecutionError::DeviceRefused {
+            required: 73_021_440,
+            reading: RefusalReading::HeapBudget {
+                budget: 13_589_544_960,
+                usage: 10_033_353_600,
+            },
+        };
+        assert_eq!(fragmented.capacity_refusal(), Some((73_021_440, 0)));
+
+        let tight = ExecutionError::DeviceRefused {
+            required: 73_021_440,
+            reading: RefusalReading::HeapBudget {
+                budget: 100_000_000,
+                usage: 80_000_000,
+            },
+        };
+        assert_eq!(tight.capacity_refusal(), Some((73_021_440, 20_000_000)));
+
+        let ledger_over = ExecutionError::AllocationCapacity {
+            required: 64u64.into(),
+            available: 128,
+        };
+        assert_eq!(ledger_over.capacity_refusal(), Some((64, 0)));
+
+        let ledger_under = ExecutionError::AllocationCapacity {
+            required: 64u64.into(),
+            available: 32,
+        };
+        assert_eq!(ledger_under.capacity_refusal(), Some((64, 32)));
+    }
+}

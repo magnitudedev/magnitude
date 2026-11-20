@@ -36,10 +36,15 @@ pub struct ReliefPlan {
 }
 
 /// What executing a plan leaves its holder to do: the requests to preempt,
-/// and the cache bytes it shed, which their holders free.
+/// the cache bytes it shed (which their holders free), the cache bytes
+/// already freed synchronously by [`Reclaim::Backed`] reclaimers, and any
+/// [`Reclaim::Backed`] entries whose reclaimer reported `AtFloor` / `0` bytes
+/// so callers can exclude them on the next relief pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Owed {
     pub yielded: u64,
+    pub reclaimed: u64,
+    pub exhausted: Vec<EntryId>,
     pub preempt: Vec<RequestId>,
 }
 
@@ -64,9 +69,23 @@ impl State {
     /// The relief that covers `need` in `store` for what `frees` names,
     /// taking what `allow` admits; none where all of it together does not.
     pub(super) fn plan_relief(&self, store: &seismic::StoreIdentity, need: u64, allow: Relief, frees: Frees) -> Option<ReliefPlan> {
+        self.plan_relief_excluding(store, need, allow, frees, &BTreeSet::new())
+    }
+
+    /// Like [`Self::plan_relief`], skipping entries in `exhausted` whose
+    /// reclaimers already reported `AtFloor` or `0` freed bytes.
+    pub(super) fn plan_relief_excluding(
+        &self,
+        store: &seismic::StoreIdentity,
+        need: u64,
+        allow: Relief,
+        frees: Frees,
+        exhausted: &BTreeSet<EntryId>,
+    ) -> Option<ReliefPlan> {
         let mut order: Vec<(Value, CacheKind, EntryId, u64)> = self
             .held
             .iter()
+            .filter(|(id, _)| !exhausted.contains(id))
             .filter_map(|(id, entry)| match entry.holding {
                 Holding::Cache(kind) if entry.bytes > 0 => Some((entry.value, kind, *id, entry.bytes)),
                 Holding::Pool(_) if entry.bytes > 0 => Some((entry.value, CacheKind::Spare, *id, entry.bytes)),
@@ -104,6 +123,11 @@ impl Ledger {
         self.state().plan_relief(&self.store.identity, need, allow, frees)
     }
 
+    /// Like [`Self::plan_relief`], skipping entries in `exhausted`.
+    pub fn plan_relief_excluding(&self, need: u64, allow: Relief, frees: Frees, exhausted: &BTreeSet<EntryId>) -> Option<ReliefPlan> {
+        self.state().plan_relief_excluding(&self.store.identity, need, allow, frees, exhausted)
+    }
+
     /// Carry out `plan` whole, in `claiming`, a change's claim phase: its
     /// cache yields now, each holder freeing
     /// what was taken of it by its own rule; its requests are the holder's
@@ -117,6 +141,8 @@ impl Ledger {
         claiming.of_scope(&self.store.changes);
         assert_eq!(plan.store, self.store.identity, "invariant violated: a relief plan executes in its own store");
         let mut yielded = 0u64;
+        let mut reclaimed = 0u64;
+        let mut exhausted = Vec::new();
         for (id, bytes) in plan.yields {
             let action = {
                 let mut state = self.state();
@@ -128,7 +154,10 @@ impl Ledger {
                 match state.reclaim.get(&id) {
                     Some(Reclaim::Backed(weak)) => match weak.upgrade() {
                         Some(reclaimer) => Some((reclaimer, need)),
-                        None => None,
+                        None => {
+                            exhausted.push(id);
+                            None
+                        }
                     },
                     Some(Reclaim::Deferred | Reclaim::Unbacked) | None => {
                         state.yields(id, need, false, false);
@@ -139,14 +168,19 @@ impl Ledger {
             };
             if let Some((reclaimer, need)) = action {
                 match reclaimer.reclaim(need) {
-                    Ok(freed) => yielded += freed.max(need),
-                    Err(ReclaimError::AtFloor) => {}
+                    Ok(0) | Err(ReclaimError::AtFloor) => {
+                        exhausted.push(id);
+                    }
+                    Ok(freed) => {
+                        reclaimed += freed;
+                        yielded += freed;
+                    }
                     Err(ReclaimError::Invariant(reason)) => {
                         panic!("invariant violated: relief cache reclaim failed for entry {id} (need {need} bytes): {reason}");
                     }
                 }
             }
         }
-        Owed { yielded, preempt: plan.preempt }
+        Owed { yielded, reclaimed, exhausted, preempt: plan.preempt }
     }
 }

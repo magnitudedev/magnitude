@@ -30,7 +30,7 @@ pub(super) struct Store {
 }
 
 /// Which entry of a store.
-pub(super) type EntryId = u64;
+pub type EntryId = u64;
 
 /// A store's entries and its latest reading. The totals are the entries'
 /// sums, kept with them.

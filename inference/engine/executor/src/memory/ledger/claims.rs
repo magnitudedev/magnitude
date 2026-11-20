@@ -174,6 +174,20 @@ impl Ledger {
         };
         Ok(Claim::held(self.clone(), id, kind))
     }
+
+    /// Bytes `class`'s pool lacks in pooled holdings before allocating `bytes`
+    /// more: the exact `lacks` `State::entry_take` checks on the pool's entry.
+    pub fn pool_shortfall(&self, class: PoolClass, bytes: u64) -> u64 {
+        let state = self.state();
+        match state.pools[class.index()].as_ref() {
+            Some(pool) => {
+                let entry = state.held[&pool.entry];
+                let allocated = entry.allocated.checked_add(bytes).expect("a store's bytes fit u64");
+                state.spare_at(class, allocated) - entry.bytes
+            }
+            None => state.spare_at(class, bytes),
+        }
+    }
 }
 
 impl Claim {

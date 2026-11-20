@@ -2418,6 +2418,7 @@ trait MemoryStep: MemoryHost + Sized {
         mut attempt: impl FnMut(&mut Self, &mut StateBindings) -> Result<Result<T, DomainError>, RequestError>,
     ) -> Result<Relieved<T>, RequestError> {
         let mut current = first;
+        let mut exhausted: BTreeSet<magnitude_executor::memory::ledger::EntryId> = BTreeSet::new();
         loop {
             let pending = match &current {
                 Err(DomainError::Capacity(capacity)) => match self.follow_yields(bindings)? {
@@ -2430,24 +2431,29 @@ trait MemoryStep: MemoryHost + Sized {
                             true => Relief::CacheAndRequests(&evictable),
                             false => Relief::CacheOnly,
                         };
-                        match self.domain().plan_relief(capacity.resource, lacks, allow) {
+                        match self.domain().plan_relief_excluding(capacity.resource, lacks, allow, &exhausted) {
                             None => Some(false),
                             Some(plan) => {
                                 let owed = self.domain().execute_relief(plan);
+                                let newly_exhausted = owed.exhausted.iter().fold(false, |any, &id| exhausted.insert(id) || any);
                                 if !owed.preempt.is_empty() {
                                     self.preempt(&owed.preempt)?;
                                 }
-                                // Pending only on a change under way (a
-                                // shrink begun, slots releasing): cache the
-                                // plan took that its holders freed none of
-                                // frees nothing later, and a wait on it is
-                                // one nothing wakes.
+                                // Retry when physical memory was freed synchronously
+                                // (reclaimed cache or preempted requests) or by
+                                // `follow_yields`. If only logical/deferred cache
+                                // was drained from the ledger without freeing
+                                // physical memory, or a reclaimer reported
+                                // `AtFloor`, loop to plan relief from the
+                                // remaining cache tiers (e.g. `CacheKind::Bank`)
+                                // before giving up.
                                 match self.follow_yields(bindings)? {
                                     Yielded::Released { .. } => None,
                                     Yielded::Pending => Some(true),
-                                    Yielded::Nothing => match owed.preempt.is_empty() {
-                                        true => Some(false),
-                                        false => None,
+                                    Yielded::Nothing => match owed.reclaimed > 0 || !owed.preempt.is_empty() {
+                                        true => None,
+                                        false if owed.yielded > 0 || newly_exhausted => continue,
+                                        false => Some(false),
                                     },
                                 }
                             }

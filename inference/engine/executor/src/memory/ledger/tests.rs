@@ -2280,7 +2280,88 @@ fn non_pooled_entry_take_refuses_when_only_pool_spare_remains() {
     // A non-pooled Device entry asking for 2 GB cannot take the records pool's
     // spare bytes: it must return Err(Refused), never panic.
     let own = seismic::memory::Store::own(&ledger);
-    let result = ledger.change(|_| own.take(&own.change(), 2 * GB, Pageable));
-    assert!(result.is_err(), "non-pooled entry_take must refuse when only pool spare covers the shortfall");
+    let refused = ledger
+        .change(|_| own.take(&own.change(), 2 * GB, Pageable))
+        .expect_err("non-pooled entry_take must refuse when only pool spare covers the shortfall");
+    assert_eq!(refused, seismic::memory::Refused { required: 2 * GB, available: 1 * GB });
+    // A pool entry refusing when free room < lacks must also report available < required,
+    // never adding unrelated cache bytes onto `available`.
+    let pool_refused = ledger
+        .change(|_| pools.state.take(&pools.state.change(), 2 * GB, Pageable))
+        .expect_err("pool entry_take must refuse when free room < lacks");
+    assert_eq!(pool_refused, seismic::memory::Refused { required: 2 * GB, available: 1 * GB });
     ledger.change(|_| pools.records.freed(&pools.records.change(), 3 * GB, Pageable));
+}
+
+#[test]
+fn relief_skips_at_floor_pool_and_reclaims_bank_synchronously() {
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 4 * GB, 4 * GB, None);
+
+    // State pool has 1 GB of unfreeable spare bytes (reclaimer returns AtFloor).
+    ledger.change(|_| pools.state.take(&pools.state.change(), 1 * GB, Pageable)).expect("state pool fits");
+    struct FloorPool;
+    impl CacheReclaimer for FloorPool {
+        fn reclaim(&self, _need: u64) -> Result<u64, ReclaimError> {
+            Err(ReclaimError::AtFloor)
+        }
+    }
+    ledger.register_pool_reclaimer(PoolClass::State, Arc::new(FloorPool));
+
+    // Bank holds 3 GB of reclaimable cache (worth > 0 so it ranks after Pool spare).
+    struct BankReclaim {
+        ledger: Ledger,
+        pool: Arc<dyn seismic::memory::Entry>,
+        piece: std::sync::Mutex<Option<Cached>>,
+    }
+    impl CacheReclaimer for BankReclaim {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            let mut guard = self.piece.lock().unwrap();
+            let Some(cached) = guard.take() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let bytes = cached.bytes();
+            let cut = bytes.min(need);
+            self.ledger.change(|_| {
+                drop(cached);
+                self.pool.freed(&self.pool.change(), bytes, Pageable);
+            });
+            Ok(cut)
+        }
+    }
+    let bank_claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 3 * GB))
+        .expect("bank backing fits");
+    ledger.change(|_| pools.records.take(&pools.records.change(), 3 * GB, Pageable)).expect("records pool allocates");
+    let reclaimer = Arc::new(BankReclaim {
+        ledger: ledger.clone(),
+        pool: pools.records.clone(),
+        piece: std::sync::Mutex::new(None),
+    });
+    let weak = Arc::downgrade(&reclaimer) as std::sync::Weak<dyn CacheReclaimer>;
+    let bank_cache = ledger.change(|_| bank_claim.into_backed_cache(CacheKind::Bank, Reclaim::Backed(weak)));
+    bank_cache.value(Value::per_byte(1.0, NonZeroU64::new(GB).unwrap()));
+    *reclaimer.piece.lock().unwrap() = Some(bank_cache);
+
+    // First relief pass picks Pool(State) spare (worth 0) -> AtFloor -> recorded in `exhausted`.
+    let mut exhausted = std::collections::BTreeSet::new();
+    let plan1 = ledger
+        .plan_relief_excluding(1 * GB, Relief::CacheOnly, Frees::Room, &exhausted)
+        .expect("first plan covers 1 GB from state pool spare");
+    let owed1 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan1));
+    assert_eq!(owed1.reclaimed, 0);
+    assert_eq!(owed1.yielded, 0);
+    assert!(!owed1.exhausted.is_empty());
+    exhausted.extend(owed1.exhausted);
+
+    // Second relief pass excludes exhausted Pool(State) and synchronously reclaims Bank.
+    let plan2 = ledger
+        .plan_relief_excluding(1 * GB, Relief::CacheOnly, Frees::Room, &exhausted)
+        .expect("second plan covers 1 GB from bank cache");
+    let owed2 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan2));
+    assert_eq!(owed2.reclaimed, 1 * GB);
+    assert!(owed2.exhausted.is_empty());
+
+    ledger.change(|_| pools.state.freed(&pools.state.change(), 1 * GB, Pageable));
 }
