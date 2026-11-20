@@ -125,6 +125,8 @@ systemctl --user disable --now magnitude
 rm ~/.config/systemd/user/magnitude.service
 systemctl --user daemon-reload
 ```
+
+If you turned on lingering only for this, turn it off with `sudo loginctl disable-linger $USER`.
 </Tab>
 <Tab title="Windows">
 A scheduled task runs `serve` as the account that installed Magnitude. From an administrator PowerShell, set `$account` and `$userProfile` to that account and its profile folder:
