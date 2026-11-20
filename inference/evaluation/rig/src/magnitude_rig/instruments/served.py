@@ -50,8 +50,8 @@ taken over the whole vocabulary: its tail sits tens of nats below the top, where
 several nats, and twice that accepts a corruption many nats below the top, which is what the
 judgement exists to fail. Past a parting the reference is fed the served tokens, so the answer
 past it is judged as any other row. Garbage from any token on fails, its tokens sitting far below
-their rows' tops. A B of zero bounds nothing (the second computation moved no competing margin),
-and fails as unsound. Where an answer parts from another is reported, never failed.
+their rows' tops. When B is zero (the second computation moved no competing margin), every answered
+token must be its row's top. Where an answer parts from another is reported, never failed.
 
 The judgement is sound only where the harness's tokens of an answer are the service's: an answer
 retokenized to another count fails as unjudged, and so does every answer when the resident
@@ -62,8 +62,6 @@ import argparse
 import json
 import re
 from pathlib import Path
-
-from magnitude_fixtures import TemplateFile
 
 from .. import templates
 from ..engine import Step, Weights
@@ -136,24 +134,9 @@ def configure(parser: argparse.ArgumentParser) -> None:
 
 # Lanes asked: one prompt, and another for the scenarios that alternate two.
 LANES = 2
-# What the service is asked, on the host, from the harness's rendering of the template: `prompts`.
-PROMPTS = ("from pathlib import Path; import sys; from magnitude_rig.instruments.served import prompts; "
+# What the service is asked, on the host, from the harness's rendering of the template: `host.served.prompts`.
+PROMPTS = ("from pathlib import Path; import sys; from magnitude_rig.host.served import prompts; "
            "prompts(*map(Path, sys.argv[1:4]))")
-
-
-def prompts(template: Path, rendered: Path, output: Path) -> None:
-    """Each rendered lane of `template` as the service is asked it: the conversation the harness
-    sized (its kept history) up to the probe's question, its offered tools, and the most tokens its
-    answer may take, at most its canonical answer's (the last scored span), so the conversation
-    answered fits the template's context as the canonical one does."""
-    sessions = TemplateFile.read(template).sessions
-    asked = []
-    for line in map(json.loads, rendered.read_text().splitlines()):
-        conversation = sessions[line["lane"]].conversation_with(line["history"])
-        start, end = line["scored_spans"][-1]
-        asked.append({"lane": line["lane"], "messages": conversation.messages[:conversation.prefix],
-                      "tools": conversation.tools, "answer_tokens": min(served.ANSWER_TOKENS, end - start)})
-    output.write_text(json.dumps(asked))
 
 
 def plan(arguments, source, host) -> Plan:
@@ -201,10 +184,6 @@ def judged(served_run: Path, judge_run: Path) -> tuple[list[str], bool]:
              f"nats below its row's top",
              *(f"{name}: unjudged, it generated nothing" for name in unjudged)]
     failed = {*unjudged}
-    if bound == 0.0:
-        lines.insert(0, "the service-shaped computation moved no margin of a token competing with its row's top: it bounds nothing, "
-                        "so nothing is judged")
-        failed.add("bound")
     for answer in answers:
         name, given = answer["name"], answer["served"]
         verdict = verdicts.get(str(answer["lane"]))

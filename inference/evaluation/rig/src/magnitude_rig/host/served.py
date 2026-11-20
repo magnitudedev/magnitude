@@ -304,7 +304,7 @@ class Run:
         self.resident = (*(("--context-tokens", str(arguments.context)) if arguments.context else ()), *plain)
         self.install()
         self.template = json.loads(Path(arguments.template).read_text())
-        # The template's lanes 0 and 1 as asked (`instruments/served.py` `prompts`).
+        # The template's lanes 0 and 1 as asked (`prompts`).
         self.messages, self.other = json.loads(Path(arguments.prompts).read_text())
 
     def install(self) -> None:
@@ -659,6 +659,23 @@ def turns(run: Run) -> None:
     if second["finish"] not in ("stop", "length") or not second["pieces"]:
         raise Failed(f"the second turn ended {second['finish']} after {len(second['pieces'])} pieces")
     run.note("service ended", code=service.end())
+
+
+def prompts(template: Path, rendered: Path, output: Path) -> None:
+    """Each rendered lane of `template` as the service is asked it: the conversation the harness
+    sized (its kept history) up to the probe's question, its offered tools, and the most tokens its
+    answer may take, at most its canonical answer's (the last scored span), so the conversation
+    answered fits the template's context as the canonical one does. Runs in the side's venv."""
+    from magnitude_fixtures import TemplateFile
+
+    sessions = TemplateFile.read(template).sessions
+    asked = []
+    for line in map(json.loads, rendered.read_text().splitlines()):
+        conversation = sessions[line["lane"]].conversation_with(line["history"])
+        start, end = line["scored_spans"][-1]
+        asked.append({"lane": line["lane"], "messages": conversation.messages[:conversation.prefix],
+                      "tools": conversation.tools, "answer_tokens": min(ANSWER_TOKENS, end - start)})
+    output.write_text(json.dumps(asked))
 
 
 def main() -> int:

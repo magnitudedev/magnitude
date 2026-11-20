@@ -1434,8 +1434,7 @@ def test_served_asks_a_tool_conversation_whole(tmp_path):
     at the history the harness sized it to, its answer held to its canonical answer's tokens."""
     import json
     from magnitude_fixtures import Source, TemplateFile
-    from magnitude_rig.host.served import request_body
-    from magnitude_rig.instruments.served import prompts
+    from magnitude_rig.host.served import prompts, request_body
     tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
     session = {"key": "tools", "tools": [tool], "messages": [
         {"role": "system", "content": "s"},

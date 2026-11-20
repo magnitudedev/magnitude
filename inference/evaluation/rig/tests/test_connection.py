@@ -1,13 +1,19 @@
 """Remote command boundaries preserve native arguments and process status."""
 
+import ast
 import base64
+import io
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import unittest
+import zipfile
+from pathlib import Path
 
-from magnitude_rig.connection import CommandFailed, HostRun, Remote, windows_command
+from magnitude_rig.connection import HOST_PACKAGE, CommandFailed, HostRun, Remote, windows_command
 
 
 class RemoteCommandTests(unittest.TestCase):
@@ -61,6 +67,45 @@ class RemoteCommandTests(unittest.TestCase):
         self.assertEqual([event["event"] for event in events], ["output", "ended"])
         with self.assertRaises(CommandFailed):
             follow("sys.exit(3)")
+
+    def test_instrument_remote_imports_stay_inside_host_package(self):
+        """Every `magnitude_rig.*` module named by an instrument's remote command string must be
+        packaged in `HOST_PACKAGE`, and `magnitude_rig.host.served.prompts` must import from that
+        zip alone (isolated from the controller source tree)."""
+        with zipfile.ZipFile(io.BytesIO(HOST_PACKAGE)) as archive:
+            packaged = set()
+            for name in archive.namelist():
+                if name.endswith("/__init__.py"):
+                    packaged.add(name[:-len("/__init__.py")].replace("/", "."))
+                elif name.endswith(".py") and name != "__main__.py":
+                    packaged.add(name[:-len(".py")].replace("/", "."))
+        instruments_dir = Path(__file__).resolve().parent.parent / "src" / "magnitude_rig" / "instruments"
+        missing = []
+        for path in sorted(instruments_dir.glob("*.py")):
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    for module in re.findall(r"magnitude_rig(?:\.[A-Za-z_][A-Za-z0-9_]*)+", node.value):
+                        if module not in packaged:
+                            missing.append((path.name, module))
+        self.assertEqual(missing, [], f"instrument remote command references unpackaged module(s): {missing}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            zip_path = Path(directory) / "agent.zip"
+            zip_path.write_bytes(HOST_PACKAGE)
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            env["PYTHONPATH"] = str(zip_path)
+            result = subprocess.run(
+                [sys.executable, "-S", "-c",
+                 "import sys; sys.path = [p for p in sys.path if 'magnitude' not in p or p.endswith('agent.zip')]; "
+                 "from magnitude_rig.host.served import prompts; print(prompts.__name__)"],
+                cwd=directory,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(result.stdout.strip(), "prompts")
 
 
 if __name__ == "__main__":
