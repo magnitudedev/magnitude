@@ -642,9 +642,9 @@ impl Pool {
             };
             vacating
         };
-        let block: BlockId = vacating.block;
+        let block: BlockId = vacating.block();
         let mut by_store = std::collections::BTreeMap::<u64, Vec<Move<Holder>>>::new();
-        for moved in &vacating.moves {
+        for moved in vacating.moves() {
             by_store.entry(moved.holder.store).or_default().push(*moved);
         }
         let (mut failure, mut stays) = (None, false);
@@ -684,13 +684,15 @@ impl Pool {
             // A slab stayed in the block: it serves again, the slabs moved
             // out staying at their new granules. Skip this block in this
             // return pass so another block can still vacate.
-            pool.state().granules.unvacate(block);
+            pool.state().granules.unvacate(vacating);
             skip.insert(block);
-        }
-        match (failure, stays) {
-            (Some(error), _) => Err(error),
-            (None, true) => Ok(VacateStep::Skipped),
-            (None, false) => Ok(VacateStep::Vacated(pool.state().granules.vacated(block))),
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(VacateStep::Skipped),
+            }
+        } else {
+            debug_assert!(failure.is_none());
+            Ok(VacateStep::Vacated(pool.state().granules.vacated(vacating)))
         }
     }
 }

@@ -200,8 +200,18 @@ pub struct Move<H> {
 #[must_use = "a vacating block takes no claims until it empties or is unvacated"]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Vacating<H> {
-    pub block: BlockId,
-    pub moves: Vec<Move<H>>,
+    block: BlockId,
+    moves: Vec<Move<H>>,
+}
+
+impl<H> Vacating<H> {
+    pub fn block(&self) -> BlockId {
+        self.block
+    }
+
+    pub fn moves(&self) -> &[Move<H>] {
+        &self.moves
+    }
 }
 
 pub use seismic_topology::NativeAllocations;
@@ -261,6 +271,13 @@ impl BlockSize {
 /// granules).
 pub const MAX_BLOCK_UNITS: u64 = 64;
 
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
 /// A pool's block: whole granules, at least the backend's least
 /// allocation, of the fewest granules whose bytes are a multiple of its
 /// granularity (the least common multiple of the two), so the backend's
@@ -282,7 +299,7 @@ pub fn block_bytes(sizing: BlockSizing) -> Result<BlockSize, SizingError> {
     let unit = least.max(granularity);
     let most = (unit.checked_mul(MAX_BLOCK_UNITS).ok_or(SizingError::Overflow)? / granule).max(fewest);
     let mut best: Option<BlockSize> = None;
-    for granules in fewest..=most {
+    let mut consider = |granules: u64| -> Result<(), SizingError> {
         let block = held(granules).ok_or(SizingError::Overflow)?;
         let waste = block.held - block.bytes;
         // Least waste per granule: `waste / granules` below the best's.
@@ -292,8 +309,25 @@ pub fn block_bytes(sizing: BlockSizing) -> Result<BlockSize, SizingError> {
         if better {
             best = Some(block);
         }
-        if waste == 0 {
-            break;
+        Ok(())
+    };
+    let step = granularity / gcd(granule, granularity);
+    if let Some(exact) = fewest.checked_next_multiple_of(step).filter(|&g| g <= most) {
+        consider(exact)?;
+    } else {
+        // For each granularity multiple `k * granularity`, waste per granule
+        // `(k * granularity) / g - granule` is strictly decreasing in `g`, so
+        // the unique optimum for that `k` is `g = min(most, (k * granularity) / granule)`.
+        let k_min = held(fewest).ok_or(SizingError::Overflow)?.held / granularity;
+        let k_max = held(most).ok_or(SizingError::Overflow)?.held / granularity;
+        if k_max - k_min <= most - fewest {
+            for k in k_min..=k_max {
+                consider(((k * granularity) / granule).min(most))?;
+            }
+        } else {
+            for granules in fewest..=most {
+                consider(granules)?;
+            }
         }
     }
     let block = best.expect("a block of the fewest granules is sized");
@@ -313,6 +347,22 @@ enum Granule<H> {
     Fenced,
 }
 
+/// Lifecycle state of one pool block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockState {
+    /// Taking claims and eligible for vacation or empty return.
+    Serving,
+    /// Being emptied ([`GranulePool::vacate`]): its granules take no claims
+    /// and [`GranulePool::return_empty`] will not remove it until it
+    /// transitions via [`GranulePool::vacated`] or [`GranulePool::unvacate`].
+    /// `moves` counts held granules still remaining in this block.
+    Vacating { moves: u32 },
+    /// Emptied, every live granule copied out and released
+    /// ([`GranulePool::vacated`]): it returns once its released granules'
+    /// flights complete, and has paid what is owed by its bytes already.
+    Returning,
+}
+
 struct Block<K, H> {
     block: K,
     /// The bytes it holds in its store, charged to the pool's entry while
@@ -320,12 +370,7 @@ struct Block<K, H> {
     held: u64,
     address: u64,
     granules: Vec<Granule<H>>,
-    /// Being emptied ([`GranulePool::vacate`]): its granules take no claims.
-    vacating: bool,
-    /// Emptied, every live granule copied out and released
-    /// ([`GranulePool::vacated`]): it returns once its released granules'
-    /// flights complete, and has paid what is owed by its bytes already.
-    returning: bool,
+    state: BlockState,
 }
 
 /// One store's granule pool over `B`'s blocks, its granules held by `H`
@@ -343,12 +388,16 @@ pub struct GranulePool<B: Blocks, H> {
     /// Granules a holder holds, in every block: the rest are free or
     /// fenced.
     holding: u64,
+    /// Held granules currently in `BlockState::Vacating` blocks whose copies
+    /// hold a second destination granule in `holding`: subtracted from
+    /// `holding` in [`Self::unheld_bytes`] so concurrent `take`/`owe` never
+    /// double-count moving granules.
+    in_flight_moves: u64,
     /// Bytes its holders freed for outside demand that have not yet
     /// returned to the OS ([`Self::owe`]): each block returned or returning
     /// pays them, and so does each claim that takes a granule back into
     /// use. Never more than the bytes of the granules free or fenced outside
-    /// returning blocks, but while a vacate's copies are made (a move holds
-    /// both of its granules).
+    /// returning blocks.
     owed: u64,
     next: u64,
 }
@@ -366,7 +415,18 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
             "invariant violated: a block of {block_bytes} bytes is not whole {granule}-byte granules"
         );
         assert!(block_bytes / granule <= u64::from(u32::MAX), "invariant violated: a block holds at most u32::MAX granules");
-        Self { blocks, granule, block_bytes, held: BTreeMap::new(), free: BTreeSet::new(), fenced: Vec::new(), holding: 0, owed: 0, next: 0 }
+        Self {
+            blocks,
+            granule,
+            block_bytes,
+            held: BTreeMap::new(),
+            free: BTreeSet::new(),
+            fenced: Vec::new(),
+            holding: 0,
+            in_flight_moves: 0,
+            owed: 0,
+            next: 0,
+        }
     }
 
     pub fn granule(&self) -> u64 {
@@ -459,7 +519,7 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         let zero = fill == SlabFill::Zeroed;
         self.held.insert(
             id,
-            Block { block, held, address, granules: vec![Granule::Free { zero }; count as usize], vacating: false, returning: false },
+            Block { block, held, address, granules: vec![Granule::Free { zero }; count as usize], state: BlockState::Serving },
         );
         self.free.extend((0..count).map(|index| GranuleId { block: id, index }));
         id
@@ -474,6 +534,11 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
     pub fn release(&mut self, granule: GranuleId, last_read: Option<Arc<B::Fence>>) {
         assert!(self.holder(granule).is_some(), "invariant violated: releasing unheld granule {granule:?}");
         self.holding -= 1;
+        if let BlockState::Vacating { moves } = &mut self.held.get_mut(&granule.block).expect("a held block").state {
+            assert!(*moves > 0, "invariant violated: releasing held granule {granule:?} in vacating block with 0 moves");
+            *moves -= 1;
+            self.in_flight_moves -= 1;
+        }
         match last_read {
             Some(fence) if !fence.completed() => {
                 *self.slot(granule) = Granule::Fenced;
@@ -498,7 +563,7 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         let free = self.free.len();
         self.held
             .iter()
-            .filter(|(id, block)| !block.vacating && !skip.contains(id))
+            .filter(|(id, block)| matches!(block.state, BlockState::Serving) && !skip.contains(id))
             .map(|(&id, block)| {
                 let held = block.granules.iter().filter(|state| matches!(state, Granule::Held(_))).count();
                 let own_free = block.granules.iter().filter(|state| matches!(state, Granule::Free { .. })).count();
@@ -519,11 +584,11 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
     /// is then unchanged.
     ///
     /// # Panics
-    /// Where `block` is not held or already vacating.
+    /// Where `block` is not held or not serving.
     pub fn vacate(&mut self, block: BlockId) -> Option<Vacating<H>> {
         self.settle();
         let of = self.held_block(block);
-        assert!(!of.vacating, "invariant violated: block {block:?} is already vacating");
+        assert!(matches!(of.state, BlockState::Serving), "invariant violated: block {block:?} is {:?}, not Serving", of.state);
         let live = of
             .granules
             .iter()
@@ -537,7 +602,9 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         if elsewhere.len() < live.len() {
             return None;
         }
-        self.held.get_mut(&block).expect("a held block").vacating = true;
+        let move_count = live.len() as u32;
+        self.held.get_mut(&block).expect("a held block").state = BlockState::Vacating { moves: move_count };
+        self.in_flight_moves += u64::from(move_count);
         self.free.retain(|granule| granule.block != block);
         let moves = live
             .into_iter()
@@ -554,17 +621,21 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         Some(Vacating { block, moves })
     }
 
-    /// Give up emptying `block` (a copy out of it failed): its free
+    /// Give up emptying `vacating` (a copy out of it failed): its free
     /// granules take claims again, and the granules a holder still holds
     /// stay where they are. Granules already copied out stay at their new
     /// places.
     ///
     /// # Panics
-    /// Where `block` is not held or not vacating.
-    pub fn unvacate(&mut self, block: BlockId) {
+    /// Where `vacating`'s block is not held or not vacating.
+    pub fn unvacate(&mut self, vacating: Vacating<H>) {
+        let block = vacating.block;
         let of = self.held.get_mut(&block).unwrap_or_else(|| panic!("invariant violated: block {block:?} is not held"));
-        assert!(of.vacating && !of.returning, "invariant violated: block {block:?} is not vacating, or already returning");
-        of.vacating = false;
+        let BlockState::Vacating { moves } = of.state else {
+            panic!("invariant violated: block {block:?} is {:?}, not Vacating", of.state);
+        };
+        self.in_flight_moves -= u64::from(moves);
+        of.state = BlockState::Serving;
         let free = of
             .granules
             .iter()
@@ -575,7 +646,7 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         self.free.extend(free);
     }
 
-    /// Every live granule of vacating `block` was copied out and its source
+    /// Every live granule of `vacating` was copied out and its source
     /// released ([`Self::release`], behind the flight that copies it): the
     /// block is returning. No claim takes it back; it returns as its
     /// released granules' flights complete ([`Self::return_empty`],
@@ -583,16 +654,20 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
     /// returned does. The bytes it holds.
     ///
     /// # Panics
-    /// Where `block` is not held, not vacating, or a holder still holds a
-    /// granule of it.
-    pub fn vacated(&mut self, block: BlockId) -> u64 {
+    /// Where `vacating`'s block is not held, not vacating, or a holder still
+    /// holds a granule of it.
+    pub fn vacated(&mut self, vacating: Vacating<H>) -> u64 {
+        let block = vacating.block;
         let of = self.held.get_mut(&block).unwrap_or_else(|| panic!("invariant violated: block {block:?} is not held"));
-        assert!(of.vacating && !of.returning, "invariant violated: block {block:?} is not vacating, or already returning");
+        let BlockState::Vacating { moves } = of.state else {
+            panic!("invariant violated: block {block:?} is {:?}, not Vacating", of.state);
+        };
         assert!(
             !of.granules.iter().any(|state| matches!(state, Granule::Held(_))),
             "invariant violated: a holder still holds a granule of vacated block {block:?}"
         );
-        of.returning = true;
+        assert_eq!(moves, 0, "invariant violated: vacated block {block:?} still has {moves} in-flight moves");
+        of.state = BlockState::Returning;
         let held = of.held;
         self.owed -= self.owed.min(held);
         held
@@ -609,10 +684,13 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
 
     /// Bytes of the granules no holder holds, free or awaiting a flight,
     /// outside returning blocks: those have paid already. A returning block
-    /// holds no held granule ([`Self::vacated`]).
+    /// holds no held granule ([`Self::vacated`]). In-flight move pairs hold
+    /// both source and destination in `holding`, so `in_flight_moves` is
+    /// subtracted to avoid double-counting them.
     fn unheld_bytes(&self) -> u64 {
-        let serving = self.held.values().filter(|block| !block.returning).count() as u64;
-        (serving * (self.block_bytes / self.granule) - self.holding) * self.granule
+        let non_returning = self.held.values().filter(|block| !matches!(block.state, BlockState::Returning)).count() as u64;
+        let effective_holding = self.holding.saturating_sub(self.in_flight_moves);
+        (non_returning * (self.block_bytes / self.granule)).saturating_sub(effective_holding) * self.granule
     }
 
     /// What is owed is at most what could return: the granules still free
@@ -632,7 +710,8 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
     pub fn awaiting(&mut self) -> u64 {
         self.settle();
         let held = &self.held;
-        self.fenced.iter().filter(|(granule, _)| !held[&granule.block].returning).count() as u64 * self.granule
+        self.fenced.iter().filter(|(granule, _)| !matches!(held[&granule.block].state, BlockState::Returning)).count() as u64
+            * self.granule
     }
 
     /// The completions a return waits for ([`after`]): those of a
@@ -644,28 +723,31 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         let fences = self
             .fenced
             .iter()
-            .filter(|(granule, _)| owed || held[&granule.block].returning)
+            .filter(|(granule, _)| owed || matches!(held[&granule.block].state, BlockState::Returning))
             .map(|(_, fence)| fence.clone())
             .collect::<Vec<_>>();
         (!fences.is_empty()).then_some(fences)
     }
 
-    /// Take every block whose granules are all free out of the pool, each
-    /// with the bytes its return reports: those it holds, but none for a
-    /// returning block, whose bytes its vacate reported
-    /// ([`Self::vacated`]). Dropping one returns it to the OS and frees its
-    /// charge from the pool's entry, which its caller does outside whatever
-    /// guards the pool, since a backend may wait for the device to finish
-    /// with a block's storage before releasing it. What they hold pays what
-    /// is owed first, but a returning block's, which paid as it was
-    /// vacated; a block returned beyond it owes nothing.
+    /// Take every block whose granules are all free out of the pool (excluding
+    /// blocks currently [`BlockState::Vacating`]), each with the bytes its
+    /// return reports: those it holds, but none for a returning block, whose
+    /// bytes its vacate reported ([`Self::vacated`]). Dropping one returns it
+    /// to the OS and frees its charge from the pool's entry, which its caller
+    /// does outside whatever guards the pool, since a backend may wait for the
+    /// device to finish with a block's storage before releasing it. What they
+    /// hold pays what is owed first, but a returning block's, which paid as it
+    /// was vacated; a block returned beyond it owes nothing.
     #[must_use = "a returned block is released as it drops"]
     pub fn return_empty(&mut self) -> Vec<(B::Block, u64)> {
         self.settle();
         let empty = self
             .held
             .iter()
-            .filter(|(_, block)| block.granules.iter().all(|state| matches!(state, Granule::Free { .. })))
+            .filter(|(_, block)| {
+                !matches!(block.state, BlockState::Vacating { .. })
+                    && block.granules.iter().all(|state| matches!(state, Granule::Free { .. }))
+            })
             .map(|(&id, _)| id)
             .collect::<Vec<_>>();
         empty
@@ -673,7 +755,7 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
             .map(|id| {
                 let block = self.held.remove(&id).expect("an empty block is held");
                 self.free.retain(|granule| granule.block != id);
-                if block.returning {
+                if matches!(block.state, BlockState::Returning) {
                     return (block.block, 0);
                 }
                 self.owed -= self.owed.min(block.held);
@@ -696,7 +778,7 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
 
     fn free(&mut self, granule: GranuleId) {
         *self.slot(granule) = Granule::Free { zero: false };
-        if !self.held_block(granule.block).vacating {
+        if matches!(self.held_block(granule.block).state, BlockState::Serving) {
             self.free.insert(granule);
         }
     }

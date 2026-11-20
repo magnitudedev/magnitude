@@ -206,15 +206,15 @@ fn a_block_returns_only_once_its_live_granules_are_copied_out() {
     pool.release(kept.granule, None);
     assert_eq!(pool.emptiest(), Some(newer), "one live granule, and one free elsewhere");
     let vacating = pool.vacate(newer).expect("a granule is free elsewhere");
-    assert_eq!(vacating.moves.len(), 1, "only live granules are copied");
-    let copy = vacating.moves[0];
+    assert_eq!(vacating.moves().len(), 1, "only live granules are copied");
+    let copy = vacating.moves()[0];
     assert_eq!((copy.holder, copy.from, copy.to), (Holder::Bank(1), moved.granule, kept.granule));
     assert_eq!(copy.to.block, older);
     // The holder copied and repointed: it releases the source behind the
     // flight that read it.
     let read = flight();
     pool.release(copy.from, Some(read.clone()));
-    assert_eq!(pool.vacated(newer), 2 * GRANULE, "every live granule moved out: the block is returning");
+    assert_eq!(pool.vacated(vacating), 2 * GRANULE, "every live granule moved out: the block is returning");
     assert_eq!(returned(&mut pool), 0, "the copy's source is read until its flight completes");
     read.complete();
     assert_eq!(returned(&mut pool), 0, "the block returns, its bytes reported by its vacate");
@@ -242,10 +242,10 @@ fn a_vacated_block_pays_what_is_owed_and_returns_behind_its_copy() {
     assert_eq!(returned(&mut pool), 0);
     assert_eq!(pool.emptiest(), Some(newer));
     let vacating = pool.vacate(newer).expect("a granule is free elsewhere");
-    assert_eq!(vacating.moves.len(), 1);
+    assert_eq!(vacating.moves().len(), 1);
     let copy = flight();
-    pool.release(vacating.moves[0].from, Some(copy.clone()));
-    assert_eq!(pool.vacated(newer), 2 * GRANULE);
+    pool.release(vacating.moves()[0].from, Some(copy.clone()));
+    assert_eq!(pool.vacated(vacating), 2 * GRANULE);
     assert_eq!(pool.owed(), 0, "the returning block paid the debt");
     assert_eq!(pool.awaiting(), 0, "its fenced source is the returning block's, which paid");
     assert_eq!(pool.awaited().map(|fences| fences.len()), Some(1), "its return awaits the copy though nothing is owed");
@@ -273,8 +273,8 @@ fn an_unvacated_block_takes_claims_again() {
     assert!(pool.take(Holder::Kv(2)).is_none(), "a vacating block takes no claims");
     // The copy failed: its destination goes back free, the block back to
     // service, its live granule where it was.
-    pool.release(vacating.moves[0].to, None);
-    pool.unvacate(vacating.block);
+    pool.release(vacating.moves()[0].to, None);
+    pool.unvacate(vacating);
     assert_eq!(pool.holder(live.granule), Some(Holder::Bank(0)));
     assert_eq!(pool.free_granules(), 2);
     let claimed = (0..2).map(|slot| pool.take(Holder::Kv(slot + 3)).unwrap().granule.block).collect::<BTreeSet<_>>();
@@ -413,8 +413,8 @@ fn a_debt_is_never_more_than_the_unheld_granules() {
     assert_eq!(pool.owed(), 2 * GRANULE);
     let vacating = pool.vacate(newer).expect("one live granule, one free elsewhere");
     assert_eq!(pool.owed(), 2 * GRANULE, "a move pays nothing");
-    pool.release(vacating.moves[0].from, None);
-    assert_eq!(pool.vacated(newer), 2 * GRANULE);
+    pool.release(vacating.moves()[0].from, None);
+    assert_eq!(pool.vacated(vacating), 2 * GRANULE);
     assert_eq!(pool.owed(), 0, "the vacated block pays the debt");
     assert_eq!(returned(&mut pool), 0, "and returns, its bytes reported by its vacate");
 }
@@ -570,13 +570,13 @@ fn a_block_with_fenced_granules_vacates_and_returns_behind_all_flights() {
 
     assert_eq!(pool.emptiest(), Some(newer), "newer has 2 held granules and 2 free elsewhere");
     let vacating = pool.vacate(newer).expect("fenced granules in newer do not block vacation");
-    assert_eq!(vacating.moves.len(), 2, "only held granules move; fenced ones stay fenced");
-    assert!(vacating.moves.iter().all(|m| m.from.block == newer && m.to.block == older));
+    assert_eq!(vacating.moves().len(), 2, "only held granules move; fenced ones stay fenced");
+    assert!(vacating.moves().iter().all(|m| m.from.block == newer && m.to.block == older));
     let copy = flight();
-    for moved in &vacating.moves {
+    for moved in vacating.moves() {
         pool.release(moved.from, Some(copy.clone()));
     }
-    assert_eq!(pool.vacated(newer), 4 * GRANULE);
+    assert_eq!(pool.vacated(vacating), 4 * GRANULE);
     assert_eq!(pool.owed(), 0);
     assert_eq!(pool.awaited().map(|fences| fences.len()), Some(4), "awaits both read and copy fences");
 
@@ -607,4 +607,153 @@ fn emptiest_excluding_skips_blocked_blocks() {
     assert_eq!(pool.emptiest_excluding(&skip), Some(second), "skips third and picks second");
     let skip: BTreeSet<_> = [third, second].into_iter().collect();
     assert_eq!(pool.emptiest_excluding(&skip), Some(first), "skips third and second and picks first");
+}
+
+/// `return_empty()` must never remove a block in `BlockState::Vacating`, even
+/// when all of its granules become `Free` before `vacated()` or `unvacate()`
+/// runs (e.g. when a concurrent release frees the last granule while the pool
+/// mutex is dropped during `vacate_emptiest`).
+#[test]
+fn return_empty_does_not_steal_vacating_block() {
+    // 1. Vacated path: all granules become Free while Vacating, return_empty
+    //    leaves the block in place, vacated() succeeds, and then return_empty
+    //    removes it as a Returning block.
+    let (mut pool, _, tally) = pool(2);
+    grow(&mut pool, &tally).unwrap();
+    let newer = grow(&mut pool, &tally).unwrap();
+    let older_slot = pool.take(Holder::Kv(0)).unwrap();
+    pool.take(Holder::Kv(1)).unwrap();
+    let newer_slot = pool.take(Holder::Bank(0)).unwrap();
+    assert_eq!(newer_slot.granule.block, newer);
+    pool.release(older_slot.granule, None);
+
+    let vacating = pool.vacate(newer).expect("one free granule elsewhere");
+    assert_eq!(vacating.block(), newer);
+    assert_eq!(vacating.moves().len(), 1);
+    // Source granule is released immediately (no fence), leaving every granule
+    // in `newer` Free while `newer` is still in `BlockState::Vacating`.
+    pool.release(vacating.moves()[0].from, None);
+    assert!(pool.return_empty().is_empty(), "return_empty must not steal a Vacating block");
+    assert_eq!(pool.held_bytes(), 4 * GRANULE);
+
+    assert_eq!(pool.vacated(vacating), 2 * GRANULE, "vacated succeeds on the still-held block");
+    assert_eq!(returned(&mut pool), 0, "Returning block now leaves with 0 bytes (already reported)");
+    assert_eq!((pool.held_bytes(), tally.held()), (2 * GRANULE, 2 * GRANULE));
+
+    // 2. Unvacate path: all granules become Free while Vacating, return_empty
+    //    does not steal it, unvacate() succeeds, and then return_empty removes it.
+    let third = grow(&mut pool, &tally).unwrap();
+    let vacating = pool.vacate(third).expect("empty block vacates with 0 moves");
+    assert!(vacating.moves().is_empty());
+    assert!(pool.return_empty().is_empty(), "return_empty must not steal a 0-move Vacating block");
+    pool.unvacate(vacating);
+    assert_eq!(returned(&mut pool), 2 * GRANULE, "Serving empty block returns after unvacate");
+    assert_eq!((pool.held_bytes(), tally.held()), (2 * GRANULE, 2 * GRANULE));
+}
+
+/// Concurrent `owe()` or `take()` while a `vacate()` is in flight must not
+/// double-count moving granules in `unheld_bytes()` or erase owed OS returns.
+#[test]
+fn owe_and_take_during_vacate_do_not_erase_owed_bytes() {
+    let (mut pool, _, tally) = pool(2);
+    let b0 = grow(&mut pool, &tally).unwrap();
+    let b1 = grow(&mut pool, &tally).unwrap();
+    let b2 = grow(&mut pool, &tally).unwrap();
+    // Claim 2 granules in b0, 2 in b1, 1 in b2, then release 1 in b0 and 1 in b1
+    // so b0/b1/b2 each have 1 held + 1 free (3 held, 3 free total).
+    let g0 = pool.take(Holder::Bank(0)).unwrap();
+    pool.take(Holder::Bank(1)).unwrap();
+    let g2 = pool.take(Holder::Bank(2)).unwrap();
+    pool.take(Holder::Bank(3)).unwrap();
+    let g4 = pool.take(Holder::Bank(4)).unwrap();
+    assert_eq!((g0.granule.block, g2.granule.block, g4.granule.block), (b0, b1, b2));
+    pool.release(g0.granule, None);
+    pool.release(g2.granule, None);
+    pool.owe(3 * GRANULE);
+    assert_eq!(pool.owed(), 3 * GRANULE);
+
+    // Begin vacating b2: its 1 live granule moves into b0's free slot, so
+    // `holding` increases by 1 while `in_flight_moves` increases by 1.
+    let vacating = pool.vacate(b2).expect("b2 has 1 live granule and 2 free elsewhere");
+    assert_eq!(vacating.moves().len(), 1);
+
+    // `owe(0)` runs `cap_owed()`: must NOT clamp owed from 3 down to 2.
+    pool.owe(0);
+    assert_eq!(pool.owed(), 3 * GRANULE, "in-flight move must not reduce unheld_bytes");
+
+    // A concurrent `take()` claims the remaining free granule in b1: owed
+    // should decrease by exactly 1 granule (to 2), not by 2 (to 1).
+    let reused = pool.take(Holder::Kv(0)).expect("b1 still has 1 free granule");
+    assert_eq!(reused.granule.block, b1);
+    assert_eq!(pool.owed(), 2 * GRANULE, "only the genuinely claimed granule pays owed");
+
+    // Complete the move and vacate b2: its 2*GRANULE pays the remaining debt.
+    pool.release(vacating.moves()[0].from, None);
+    assert_eq!(pool.vacated(vacating), 2 * GRANULE);
+    assert_eq!(pool.owed(), 0);
+    assert_eq!(returned(&mut pool), 0);
+    assert_eq!((pool.held_bytes(), tally.held()), (4 * GRANULE, 4 * GRANULE));
+}
+
+/// `block_bytes` completes in `O(MAX_BLOCK_UNITS)` time even for a tiny
+/// granule coprime to a huge granularity, and matches brute-force search on
+/// small inputs.
+#[test]
+fn block_bytes_small_granule_coprime_to_large_granularity() {
+    // 1. Exact multiple within span: granule = 3, granularity = 1 MiB.
+    let exact = block_bytes(BlockSizing {
+        granule: 3,
+        allocations: NativeAllocations { least: 0, granularity: 1 << 20 },
+    })
+    .unwrap();
+    assert_eq!(exact, BlockSize { bytes: 3 * (1 << 20), held: 3 * (1 << 20) });
+
+    // 2. No exact multiple within span: granule = 257 (prime), granularity = 1 GiB.
+    //    `most = 64 * 1 GiB / 257 ≈ 267_386_880`, which previously looped ~267M times.
+    let huge = block_bytes(BlockSizing {
+        granule: 257,
+        allocations: NativeAllocations { least: 0, granularity: 1 << 30 },
+    })
+    .unwrap();
+    assert_eq!(huge.held % (1 << 30), 0);
+    assert!(huge.held >= huge.bytes);
+    assert!(huge.bytes <= MAX_BLOCK_UNITS * (1 << 30));
+    assert!(huge.held - huge.bytes < 257);
+
+    // 3. Cross-check against brute force across varied regimes (coprime,
+    //    least > granularity, granule > granularity, ties).
+    let brute = |sizing: BlockSizing| -> BlockSize {
+        let BlockSizing { granule, allocations: NativeAllocations { least, granularity } } = sizing;
+        let fewest = least.max(granule).div_ceil(granule);
+        let most = (least.max(granularity) * MAX_BLOCK_UNITS / granule).max(fewest);
+        let mut best: Option<BlockSize> = None;
+        for g in fewest..=most {
+            let bytes = g * granule;
+            let held = bytes.next_multiple_of(granularity);
+            let waste = held - bytes;
+            let better = best.is_none_or(|b| {
+                u128::from(waste) * u128::from(b.bytes / granule) < u128::from(b.held - b.bytes) * u128::from(g)
+            });
+            if better {
+                best = Some(BlockSize { bytes, held });
+            }
+            if waste == 0 {
+                break;
+            }
+        }
+        best.unwrap()
+    };
+    for (granule, least, granularity) in [
+        (7, 0, 100),
+        (13, 50, 100),
+        (13, 300, 100),
+        (137, 0, 100),
+        (137, 500, 100),
+        (101, 0, 100),
+        (199, 0, 100),
+        (17, 200, 19),
+    ] {
+        let sizing = BlockSizing { granule, allocations: NativeAllocations { least, granularity } };
+        assert_eq!(block_bytes(sizing).unwrap(), brute(sizing), "mismatch for {sizing:?}");
+    }
 }
