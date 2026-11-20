@@ -875,8 +875,6 @@ impl Device {
     /// host-visible, else by `vkCmdUpdateBuffer` on the queue, waited on,
     /// which takes no staging.
     fn write_tables(&self) -> Result<(), ExecutionError> {
-        /// What one `vkCmdUpdateBuffer` writes at most.
-        const UPDATE_BYTES: usize = 65536;
         let tables = &self.inner.tables;
         let bytes = seismic_lang::source::VULKAN_TABLES;
         if tables.mapped().is_some() {
@@ -895,14 +893,7 @@ impl Device {
                 ),
                 "vkBeginCommandBuffer",
             )?;
-            for (index, chunk) in bytes.chunks(UPDATE_BYTES).enumerate() {
-                device.cmd_update_buffer(
-                    raw,
-                    tables.raw(),
-                    tables.offset() + (index * UPDATE_BYTES) as u64,
-                    chunk,
-                );
-            }
+            cmd_update_buffer(device, raw, tables.raw(), tables.offset(), bytes);
             barrier(
                 device,
                 raw,
@@ -1023,6 +1014,7 @@ impl Device {
 
     /// [`Device::write`] of a range of a block.
     pub(crate) fn write_range(&self, range: &Range, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
+        range.check_span(offset, bytes.len() as u64);
         if range.mapped().is_some() {
             range.write_mapped(offset, bytes);
             return Ok(());
@@ -1055,6 +1047,7 @@ impl Device {
 
     /// [`Device::read`] of a range of a block.
     pub(crate) fn read_range(&self, range: &Range, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
+        range.check_span(offset, into.len() as u64);
         if range.mapped().is_some() {
             range.read_mapped(offset, into);
             return Ok(());
@@ -1500,6 +1493,45 @@ pub(crate) fn heap_budgets(instance: &Instance, physical: vk::PhysicalDevice) ->
             usage: budget.heap_usage[heap],
         })
         .collect()
+}
+
+/// Maximum byte length of a single `vkCmdUpdateBuffer` call
+/// (`VUID-vkCmdUpdateBuffer-dataSize-00036`).
+const UPDATE_BUFFER_MAX_BYTES: usize = 65536;
+
+/// Split `bytes` written at `offset` into `(chunk_offset, chunk)` pieces each
+/// within `vkCmdUpdateBuffer`'s 65536-byte limit.
+fn update_buffer_chunks(offset: u64, bytes: &[u8]) -> impl Iterator<Item = (u64, &[u8])> {
+    assert_eq!(
+        offset % 4,
+        0,
+        "vkCmdUpdateBuffer precondition: dstOffset ({offset}) must be a multiple of 4"
+    );
+    assert_eq!(
+        bytes.len() % 4,
+        0,
+        "vkCmdUpdateBuffer precondition: dataSize ({}) must be a multiple of 4",
+        bytes.len()
+    );
+    bytes
+        .chunks(UPDATE_BUFFER_MAX_BYTES)
+        .enumerate()
+        .map(move |(index, chunk)| (offset + (index * UPDATE_BUFFER_MAX_BYTES) as u64, chunk))
+}
+
+/// Record one or more `vkCmdUpdateBuffer` commands to write `bytes` into
+/// `buffer` starting at `offset`, chunked to the 65536-byte Vulkan limit
+/// (`VUID-vkCmdUpdateBuffer-dataSize-00036`).
+pub(crate) unsafe fn cmd_update_buffer(
+    device: &ash::Device,
+    command: vk::CommandBuffer,
+    buffer: vk::Buffer,
+    offset: u64,
+    bytes: &[u8],
+) {
+    for (chunk_offset, chunk) in update_buffer_chunks(offset, bytes) {
+        device.cmd_update_buffer(command, buffer, chunk_offset, chunk);
+    }
 }
 
 /// One global memory barrier.
@@ -2171,5 +2203,45 @@ mod reconcile_tests {
         let none = trim_to_cap(&mut pool, free_cap(2));
         assert!(none.is_empty());
         assert_eq!(pool, vec![10, 20]);
+    }
+
+    #[test]
+    fn update_buffer_chunks_splits_at_vulkan_64kib_limit() {
+        assert_eq!(update_buffer_chunks(0, &[]).count(), 0);
+
+        let small = vec![0xABu8; 16];
+        let chunks: Vec<_> = update_buffer_chunks(64, &small).collect();
+        assert_eq!(chunks, vec![(64, small.as_slice())]);
+
+        let exact = vec![0xCDu8; UPDATE_BUFFER_MAX_BYTES];
+        let chunks: Vec<_> = update_buffer_chunks(0, &exact).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], (0, exact.as_slice()));
+
+        let large: Vec<u8> = (0..(UPDATE_BUFFER_MAX_BYTES * 2 + 16))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let chunks: Vec<_> = update_buffer_chunks(128, &large).collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].0, 128);
+        assert_eq!(chunks[0].1.len(), UPDATE_BUFFER_MAX_BYTES);
+        assert_eq!(chunks[1].0, 128 + UPDATE_BUFFER_MAX_BYTES as u64);
+        assert_eq!(chunks[1].1.len(), UPDATE_BUFFER_MAX_BYTES);
+        assert_eq!(chunks[2].0, 128 + (UPDATE_BUFFER_MAX_BYTES * 2) as u64);
+        assert_eq!(chunks[2].1.len(), 16);
+        let reassembled: Vec<u8> = chunks.into_iter().flat_map(|(_, c)| c.iter().copied()).collect();
+        assert_eq!(reassembled, large);
+    }
+
+    #[test]
+    #[should_panic(expected = "dataSize")]
+    fn update_buffer_chunks_rejects_unaligned_length() {
+        let _ = update_buffer_chunks(0, &[1, 2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "dstOffset")]
+    fn update_buffer_chunks_rejects_unaligned_offset() {
+        let _ = update_buffer_chunks(2, &[1, 2, 3, 4]);
     }
 }

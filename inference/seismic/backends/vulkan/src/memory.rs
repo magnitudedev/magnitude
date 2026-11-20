@@ -984,15 +984,22 @@ impl Range {
             .then(|| unsafe { self.block.mapped.add(self.offset as usize) })
     }
 
+    /// Verify that `[offset, offset + bytes)` lies within this range without
+    /// overflowing `u64`.
+    pub(crate) fn check_span(&self, offset: u64, bytes: u64) {
+        assert!(
+            offset.checked_add(bytes).is_some_and(|end| end <= self.bytes),
+            "range access [{offset}..+{bytes}) exceeds range length {}",
+            self.bytes,
+        );
+    }
+
     /// Host write of mapped storage: a plain memory write.
     pub(crate) fn write_mapped(&self, offset: u64, bytes: &[u8]) {
         let base = self
             .mapped()
             .expect("write_mapped precondition: the storage is mapped");
-        assert!(
-            offset + bytes.len() as u64 <= self.bytes,
-            "mapped write exceeds its range"
-        );
+        self.check_span(offset, bytes.len() as u64);
         // SAFETY: the bytes lie inside this range of the mapping.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(offset as usize), bytes.len())
@@ -1003,10 +1010,7 @@ impl Range {
         let base = self
             .mapped()
             .expect("read_mapped precondition: the storage is mapped");
-        assert!(
-            offset + into.len() as u64 <= self.bytes,
-            "mapped read exceeds its range"
-        );
+        self.check_span(offset, into.len() as u64);
         // SAFETY: the bytes lie inside this range of the mapping.
         unsafe {
             std::ptr::copy_nonoverlapping(base.add(offset as usize), into.as_mut_ptr(), into.len())
@@ -1217,5 +1221,39 @@ mod tests {
         assert!(pool.give(&reused).is_none());
         assert!(pool.give(&model).is_some());
         assert_eq!(usage(&pool), 0);
+    }
+
+    #[test]
+    fn range_check_span_accepts_in_bounds_spans() {
+        let blk = block(256);
+        let sub = range(&blk, 64);
+        sub.check_span(0, 0);
+        sub.check_span(0, 64);
+        sub.check_span(64, 0);
+        sub.check_span(32, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds range length")]
+    fn range_check_span_rejects_past_end() {
+        let blk = block(256);
+        let sub = range(&blk, 64);
+        sub.check_span(32, 33);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds range length")]
+    fn range_check_span_rejects_offset_past_end() {
+        let blk = block(256);
+        let sub = range(&blk, 64);
+        sub.check_span(65, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds range length")]
+    fn range_check_span_rejects_u64_overflow() {
+        let blk = block(256);
+        let sub = range(&blk, 64);
+        sub.check_span(u64::MAX - 8, 16);
     }
 }
