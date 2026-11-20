@@ -55,5 +55,6 @@ export function OnboardingScreen() {
     setUsOnly={setUsOnly}
     owned={owned}
     onDownload={(_, quant) => { install(quant.key as CatalogFormModelId); recordOnboardingCompleted(true); complete(Option.some(quant.key as CatalogFormModelId)) }}
+    onUse={quant => { recordOnboardingCompleted(true); complete(Option.some(quant.key as CatalogFormModelId)) }}
     onFinish={() => { recordOnboardingCompleted(true); complete(Option.none()) }} />
 }

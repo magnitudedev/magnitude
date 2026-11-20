@@ -66,14 +66,14 @@ function PreparationProgress({ steps }: { steps: readonly PreparationStep[] }) {
 export function OnboardingStarting() {
   return <Onboarding machine={null} discovered={[]} unrunnable={[]} recommendations={[]} roomNote={null} usOnly={false} setUsOnly={() => {}} owned={new Set()}
     preparation={preparationLabels.map((label, index) => ({ label, detail: null, fraction: null, state: index === 0 ? "active" : "pending" }))}
-    onDownload={() => {}} onFinish={() => {}} />
+    onDownload={() => {}} onUse={() => {}} onFinish={() => {}} />
 }
 
 /** First run, in a modal over the app: what's already here, and one recommended model to download. */
-export function Onboarding({ machine, preparation, discovered, unrunnable, recommendations, roomNote, usOnly, setUsOnly, owned, onDownload, onFinish }: {
+export function Onboarding({ machine, preparation, discovered, unrunnable, recommendations, roomNote, usOnly, setUsOnly, owned, onDownload, onUse, onFinish }: {
   machine: MachineView | null; preparation: readonly PreparationStep[] | null; discovered: readonly DiscoveredModel[]; unrunnable: readonly UnrunnableFile[]
   recommendations: readonly Recommendation[]; roomNote: string | null; usOnly: boolean; setUsOnly: (value: boolean) => void; owned: ReadonlySet<string>
-  onDownload: (model: OfferedModel, quant: QuantView) => void; onFinish: () => void
+  onDownload: (model: OfferedModel, quant: QuantView) => void; onUse: (quant: QuantView) => void; onFinish: () => void
 }) {
   const measuring = preparation !== null
   const body = useRef<HTMLDivElement>(null)
@@ -119,8 +119,10 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
     </div>
     <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-6 py-4 dark:border-slate-750">
       {measuring ? <Button disabled><DownloadSimpleIcon />Download</Button> : <>
-        {picked && pickedQuant && (discovered.length > 0 || owned.size > 0) && <Button variant="ghost" onClick={onFinish}>Continue without downloading</Button>}
-        {picked && pickedQuant
+        {picked && pickedQuant && !owned.has(pickedQuant.key) && (discovered.length > 0 || owned.size > 0) && <Button variant="ghost" onClick={onFinish}>Continue without downloading</Button>}
+        {picked && pickedQuant && owned.has(pickedQuant.key)
+          ? <Button onClick={() => onUse(pickedQuant)}>Start chatting</Button>
+          : picked && pickedQuant
           ? <>
             {downloadContents(picked, pickedQuant) && <span className="mr-1 text-xs text-slate-500">{downloadContents(picked, pickedQuant)}</span>}
             <Button disabled={!pickedQuant.fits || pickedQuant.missingDiskBytes > 0} onClick={() => onDownload(picked, pickedQuant)}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
