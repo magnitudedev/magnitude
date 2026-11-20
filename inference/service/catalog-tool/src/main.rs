@@ -3,6 +3,7 @@ mod fixture_header;
 mod gguf_source;
 mod slice;
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -141,8 +142,8 @@ enum Command {
         #[arg(long)]
         list: bool,
         /// Concurrent tensor range reads.
-        #[arg(long, default_value_t = 8)]
-        parallel: usize,
+        #[arg(long, default_value_t = NonZeroUsize::new(8).unwrap())]
+        parallel: NonZeroUsize,
         #[command(subcommand)]
         source: GgufSource,
     },
@@ -425,7 +426,7 @@ async fn build_bundle(output: PathBuf, store: &StoreArgs) -> anyhow::Result<()> 
 
 /// Writes the header export under `output` unless it is current, and returns its directory.
 async fn headers(output: PathBuf, store: &StoreArgs) -> anyhow::Result<PathBuf> {
-    let output = std::path::absolute(&output)?;
+    let output = normalize_output_path(&output)?;
     let bundle = output.join("model-planner-inputs.bundle");
     build_bundle(bundle.clone(), store).await?;
     let exported = output.join("headers");
@@ -537,10 +538,28 @@ fn report_progress(stage: &str, completed: usize, total: usize) {
     }
 }
 
+/// Resolves `path` against the working directory without touching the filesystem, so a bare
+/// relative filename like `slice.gguf` always has a non-empty `parent()`.
+pub(crate) fn normalize_output_path(path: &Path) -> anyhow::Result<PathBuf> {
+    std::path::absolute(path)
+        .with_context(|| format!("failed to resolve output path {}", path.display()))
+}
+
+/// Resolves `output` to an absolute file path and ensures its parent directory exists.
+pub(crate) fn prepare_output_file(output: &Path) -> anyhow::Result<PathBuf> {
+    let output = normalize_output_path(output)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    Ok(output)
+}
+
 /// Write `bytes` at `output` whole, through the store of its directory ([`seismic_io::Store`]): a
 /// reader, or another run writing it at once, finds it as it was or as one run wrote it, never
 /// part written.
 async fn publish(output: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
+    let output = normalize_output_path(output)?;
     let parent = output
         .parent()
         .context("catalog output must have a parent directory")?
@@ -741,5 +760,50 @@ mod tests {
         assert!(!parses(&["slice-record", "--layers", "0,3", "s.gguf"]));
         assert!(parses(&["weight-sample", "--name", "n", "--output-dir", "/w", "local", "m.gguf"]));
         assert!(!parses(&["weight-sample", "--name", "n", "--output-dir", "/w", "ollama", "--model", "q", "--digest", "sha256:0"]));
+    }
+
+    #[test]
+    fn slice_parallel_rejects_zero() {
+        assert!(
+            Cli::try_parse_from([
+                "catalog",
+                "slice",
+                "--parallel",
+                "0",
+                "--output",
+                "s.gguf",
+                "local",
+                "m.gguf",
+            ])
+            .is_err()
+        );
+        let parsed = Cli::try_parse_from([
+            "catalog",
+            "slice",
+            "--parallel",
+            "4",
+            "--output",
+            "s.gguf",
+            "local",
+            "m.gguf",
+        ])
+        .expect("non-zero parallel parses");
+        let Command::Slice { parallel, .. } = parsed.command else {
+            panic!("expected slice command");
+        };
+        assert_eq!(parallel.get(), 4);
+    }
+
+    #[test]
+    fn normalize_output_path_gives_bare_filename_a_parent() {
+        let normalized = normalize_output_path(Path::new("slice.gguf")).expect("normalized");
+        assert!(normalized.is_absolute());
+        assert_eq!(
+            normalized.file_name().and_then(|name| name.to_str()),
+            Some("slice.gguf")
+        );
+        let parent = normalized.parent().expect("bare filename has a parent");
+        assert!(!parent.as_os_str().is_empty());
+        assert_eq!(parent, std::env::current_dir().expect("cwd"));
     }
 }
