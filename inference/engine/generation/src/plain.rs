@@ -1,6 +1,6 @@
 use crate::method::{
-    Method, MethodCheckpoint, MethodCheckpointError, MethodEffects, MethodRequirements,
-    MethodState, Propose, Verification,
+    Method, MethodCheckpoint, MethodCheckpointError, MethodChoice, MethodEffects,
+    MethodRequirements, MethodState, Propose, Verification,
 };
 use magnitude_executor::{
     Demand, FeatureReader, FeatureRef, Operation, Outcome, RequestId, SelectSpec, TokenId,
@@ -12,6 +12,10 @@ pub struct Plain;
 impl Method for Plain {
     fn identity(&self) -> &str {
         "plain"
+    }
+
+    fn capability(&self) -> MethodChoice {
+        MethodChoice::Plain
     }
 
     fn requires(&self) -> MethodRequirements {

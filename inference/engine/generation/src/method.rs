@@ -355,6 +355,8 @@ pub trait Method: Send + Sync {
     /// span's rows are the projector's, under a placeholder token).
     fn embeds_prompt_tokens(&self) -> bool;
     fn identity(&self) -> &str;
+    /// Structured method family and proposal capacity.
+    fn capability(&self) -> MethodChoice;
     fn requires(&self) -> MethodRequirements;
     /// The most proposals one round may draft.
     fn proposals(&self) -> usize;

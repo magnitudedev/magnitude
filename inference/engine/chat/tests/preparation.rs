@@ -12,17 +12,57 @@ use std::collections::BTreeSet;
 
 #[test]
 fn method_policy_is_qualified_against_the_prepared_method() {
-    assert!(MethodPolicy::Plain.validate_method("plain").is_ok());
-    assert!(MethodPolicy::Plain
-        .validate_method("mtp:artifact:3")
-        .is_err());
+    use magnitude_generation::{DFlash, DraftBudget, Mtp, Plain};
+
+    let plain = Plain;
+    let mtp3 = Mtp::new("artifact", 3).unwrap();
+    let mtp3_front = Mtp::new("artifact", 3).unwrap().fronting().unwrap();
+    let mtp3_adaptive = Mtp::new("artifact", 3).unwrap().adaptive();
+    let mtp3_budget = Mtp::new("artifact", 3)
+        .unwrap()
+        .with_budget(DraftBudget {
+            generated: 2,
+            verified: 2,
+        })
+        .unwrap();
+    let mtp3_reading = Mtp::reading_target("artifact", 3).unwrap();
+    let mtp1 = Mtp::new("artifact", 1).unwrap();
+    let dflash4 = DFlash::new("artifact", 4).unwrap();
+    let dflash4_adaptive = DFlash::new("artifact", 4).unwrap().adaptive();
+    let dflash4_budget = DFlash::new("artifact", 4)
+        .unwrap()
+        .with_budget(DraftBudget {
+            generated: 3,
+            verified: 2,
+        })
+        .unwrap();
+
+    assert!(MethodPolicy::Plain.validate_method(&plain).is_ok());
+    assert!(MethodPolicy::Plain.validate_method(&mtp3).is_err());
+    assert!(MethodPolicy::Plain.validate_method(&dflash4).is_err());
+
     let mtp = MethodPolicy::Mtp {
         greedy_proposals: 2,
         sampled_proposals: 1,
     };
-    assert!(mtp.validate_method("mtp:artifact:3").is_ok());
-    assert!(mtp.validate_method("mtp:artifact:1").is_err());
-    assert!(mtp.validate_method("plain").is_err());
+    assert!(mtp.validate_method(&mtp3).is_ok());
+    assert!(mtp.validate_method(&mtp3_front).is_ok());
+    assert!(mtp.validate_method(&mtp3_adaptive).is_ok());
+    assert!(mtp.validate_method(&mtp3_budget).is_ok());
+    assert!(mtp.validate_method(&mtp3_reading).is_ok());
+    assert!(mtp.validate_method(&mtp1).is_err());
+    assert!(mtp.validate_method(&plain).is_err());
+    assert!(mtp.validate_method(&dflash4).is_err());
+
+    let dflash = MethodPolicy::DFlash { proposals: 4 };
+    assert!(dflash.validate_method(&dflash4).is_ok());
+    assert!(dflash.validate_method(&dflash4_adaptive).is_ok());
+    assert!(dflash.validate_method(&dflash4_budget).is_ok());
+    assert!(MethodPolicy::DFlash { proposals: 3 }
+        .validate_method(&dflash4)
+        .is_err());
+    assert!(dflash.validate_method(&mtp3).is_err());
+    assert!(dflash.validate_method(&plain).is_err());
 }
 
 /// Byte pieces 0..=255, `<eos>` 256 and `<bos>` 257.
@@ -141,8 +181,23 @@ fn generation_options_forward_all_sampling_shaping_options() {
     assert_eq!(options.shaping.presence_penalty, -0.3);
     assert_eq!(options.shaping.frequency_penalty, 0.4);
     assert_eq!(options.seed, 9);
-    // Without a requested limit, output is bounded only by the context.
-    assert_eq!(options.max_tokens, 128 - prepared.prompt_tokens() + 1);
+    // Without a requested limit, output is bounded only by the context so
+    // exhausting the context ends with FinishReason::Context rather than Length.
+    assert_eq!(options.max_tokens, i32::MAX as usize);
+
+    // An explicit limit larger than the remaining context is preserved so
+    // hitting context still reports FinishReason::Context.
+    let mut larger = controls(identity_sampling());
+    larger.max_output_tokens = std::num::NonZeroU32::new(500);
+    let larger_options = generation_options(
+        &prepared,
+        prepared.prompt_tokens(),
+        &larger,
+        &tokenizer,
+        &limits(&tokenizer, 128),
+    )
+    .unwrap();
+    assert_eq!(larger_options.max_tokens, 500);
 
     let greedy = generation_options(
         &prepared,

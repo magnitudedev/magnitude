@@ -4,7 +4,7 @@
 use super::{
     request::{ChatInput, OutputFormat},
     schema::JsonSchema,
-    PreparedChat,
+    PreparedChat, ToolChoice,
 };
 use magnitude_templates::{Relaxation, RelaxationSubject};
 use serde_json::Value;
@@ -63,12 +63,14 @@ impl Checked {
 pub struct OutputSchemas {
     tools: BTreeMap<String, Checked>,
     output: Option<Checked>,
+    constrained: bool,
 }
 
 impl OutputSchemas {
     pub fn new(input: &ChatInput, prepared: &PreparedChat) -> Self {
+        let constrained = prepared.constraint().is_some();
         let enforcement = |subject: &RelaxationSubject| {
-            if prepared.constraint().is_none() {
+            if !constrained {
                 return Enforcement::Unconstrained;
             }
             let relaxations = prepared
@@ -85,10 +87,17 @@ impl OutputSchemas {
                 Enforcement::Loosened(relaxations)
             }
         };
+        let offered = |name: &str| match input.tools.choice() {
+            ToolChoice::None => false,
+            ToolChoice::Named(selected) => name == selected,
+            ToolChoice::Allowed { names, .. } => names.iter().any(|allowed| allowed == name),
+            ToolChoice::Auto | ToolChoice::Required => true,
+        };
         let tools = input
             .tools
             .definitions()
             .iter()
+            .filter(|tool| offered(&tool.name))
             .map(|tool| {
                 let checked = Checked {
                     schema: tool.parameters.clone(),
@@ -106,16 +115,28 @@ impl OutputSchemas {
             }),
             OutputFormat::Text | OutputFormat::JsonObject | OutputFormat::Grammar(_) => None,
         };
-        Self { tools, output }
+        Self {
+            tools,
+            output,
+            constrained,
+        }
     }
 
     /// A completed tool call's arguments text against its tool's schema.
     pub fn tool_call(&self, name: &str, arguments: &str) -> Conformance {
         match self.tools.get(name) {
             Some(tool) => tool.check(arguments),
-            None => Conformance::GrammarDefect {
-                violations: vec![format!("no offered tool is named {name}")],
-            },
+            None => {
+                let violations = vec![format!("no offered tool is named {name}")];
+                if self.constrained {
+                    Conformance::GrammarDefect { violations }
+                } else {
+                    Conformance::Unenforced {
+                        violations,
+                        enforcement: Enforcement::Unconstrained,
+                    }
+                }
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 //! Numerical generation options for a prepared chat request, bounded by the
 //! loaded model.
 use super::{ByteBpeTokenizer, ChatError, GenerationControls, PreparedChat};
-use magnitude_generation::{MethodChoice, Options, Sampling, Shaping};
+use magnitude_generation::{Method, MethodChoice, Options, Sampling, Shaping};
 
 /// Host-selected generation method policy. The concrete proposal width is
 /// resolved per request because the qualified defaults differ for greedy and
@@ -19,19 +19,19 @@ pub enum MethodPolicy {
 }
 
 impl MethodPolicy {
-    pub fn validate_method(self, identity: &str) -> Result<(), String> {
-        match self {
-            Self::Plain if identity == "plain" => Ok(()),
-            Self::Plain => Err("plain policy requires the plain generation method".into()),
-            Self::Mtp {
-                greedy_proposals,
-                sampled_proposals,
-            } => {
-                let capacity = identity
-                    .strip_prefix("mtp:")
-                    .and_then(|value| value.rsplit_once(':'))
-                    .and_then(|(_, capacity)| capacity.parse::<u8>().ok())
-                    .ok_or("MTP policy requires a prepared MTP generation method")?;
+    pub fn validate_method(self, method: &dyn Method) -> Result<(), String> {
+        match (self, method.capability()) {
+            (Self::Plain, MethodChoice::Plain) => Ok(()),
+            (Self::Plain, _) => Err("plain policy requires the plain generation method".into()),
+            (
+                Self::Mtp {
+                    greedy_proposals,
+                    sampled_proposals,
+                },
+                MethodChoice::Mtp {
+                    proposals: capacity,
+                },
+            ) => {
                 if greedy_proposals == 0
                     || sampled_proposals == 0
                     || greedy_proposals > capacity
@@ -41,16 +41,22 @@ impl MethodPolicy {
                 }
                 Ok(())
             }
-            Self::DFlash { proposals } => {
-                let prepared = identity
-                    .strip_prefix("dflash:")
-                    .and_then(|value| value.rsplit_once(':'))
-                    .and_then(|(_, proposals)| proposals.parse::<u8>().ok())
-                    .ok_or("DFlash policy requires a prepared DFlash generation method")?;
+            (Self::Mtp { .. }, _) => {
+                Err("MTP policy requires a prepared MTP generation method".into())
+            }
+            (
+                Self::DFlash { proposals },
+                MethodChoice::DFlash {
+                    proposals: prepared,
+                },
+            ) => {
                 if proposals == 0 || proposals != prepared {
                     return Err("DFlash proposal width differs from the prepared draft's".into());
                 }
                 Ok(())
+            }
+            (Self::DFlash { .. }, _) => {
+                Err("DFlash policy requires a prepared DFlash generation method".into())
             }
         }
     }
@@ -120,7 +126,6 @@ pub fn generation_options(
     } else {
         Sampling::Categorical
     };
-    let available = limits.context_tokens - prompt_tokens + 1;
     let reasoning_budget = controls
         .reasoning_budget
         .map(|tokens| chat.reasoning_budget(tokenizer, tokens))
@@ -128,7 +133,9 @@ pub fn generation_options(
     Ok(Options {
         max_tokens: controls
             .max_output_tokens
-            .map_or(available, |limit| (limit.get() as usize).min(available)),
+            .map_or(i32::MAX as usize, |limit| {
+                (limit.get() as usize).min(i32::MAX as usize)
+            }),
         output_capacity: limits.output_capacity,
         context_limit: limits.context_tokens,
         vocabulary: limits.vocabulary,

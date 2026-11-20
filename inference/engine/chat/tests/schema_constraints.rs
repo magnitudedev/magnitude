@@ -698,3 +698,125 @@ fn violations_under_exact_grammars_are_defects() {
         })
     ));
 }
+
+#[test]
+fn output_schemas_filter_tools_by_choice_and_classify_unknown_tools_by_enforcement() {
+    use magnitude_chat::{
+        conformance::{Conformance, Enforcement, OutputSchemas},
+        request::{ChatInput, Conversation, Entry, OutputFormat, ToolDefinition, Tools, UserPart},
+        schema::JsonSchema,
+        ReasoningIntent, TemplateVariant,
+    };
+
+    let tokenizer = tokenizer();
+    let constrained_bundle = bundle(ASSETS[0].1);
+    let unconstrained_bundle = TemplateBundle::new(
+        vec![TemplateVariant {
+            name: "default".into(),
+            source: "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}".into(),
+            provenance: "test".into(),
+        }],
+        "default".into(),
+        Default::default(),
+    )
+    .unwrap();
+
+    let tool = |name: &str| {
+        let Value::Object(schema) = json!({
+            "type": "object",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }) else {
+            unreachable!()
+        };
+        ToolDefinition {
+            name: name.into(),
+            description: Some(format!("tool {name}")),
+            parameters: JsonSchema::new(schema).unwrap(),
+        }
+    };
+
+    let prepare = |bundle: &TemplateBundle, choice: ToolChoice| {
+        let input = ChatInput {
+            conversation: Conversation::new(
+                None,
+                vec![Entry::User(vec![UserPart::Text("Hi".into())])],
+            )
+            .unwrap(),
+            tools: Tools::new(vec![tool("alpha"), tool("beta")], choice, true).unwrap(),
+            reasoning: ReasoningIntent::ModelDefault,
+            output: OutputFormat::Text,
+            template_arguments: Default::default(),
+        };
+        let rendered = input.render(946684800, None).unwrap();
+        let prepared = PreparedChat::prepare(
+            bundle,
+            &tokenizer,
+            &rendered.request,
+            &TemplateSelection::default(),
+        )
+        .unwrap();
+        (OutputSchemas::new(&input, &prepared), prepared)
+    };
+
+    // ToolChoice::Named filters out non-selected tools; under a constrained
+    // template, calling a filtered-out or unknown tool is a GrammarDefect.
+    let (named, prepared) = prepare(&constrained_bundle, ToolChoice::Named("alpha".into()));
+    assert!(prepared.constraint().is_some());
+    assert_eq!(named.tool_call("alpha", r#"{"x": 1}"#), Conformance::Conforms);
+    assert!(matches!(
+        named.tool_call("beta", r#"{"x": 1}"#),
+        Conformance::GrammarDefect { .. }
+    ));
+
+    // ToolChoice::Allowed keeps only the allowed subset.
+    let (allowed, prepared) = prepare(
+        &constrained_bundle,
+        ToolChoice::Allowed {
+            names: vec!["beta".into()],
+            required: true,
+        },
+    );
+    assert!(prepared.constraint().is_some());
+    assert_eq!(allowed.tool_call("beta", r#"{"x": 2}"#), Conformance::Conforms);
+    assert!(matches!(
+        allowed.tool_call("alpha", r#"{"x": 2}"#),
+        Conformance::GrammarDefect { .. }
+    ));
+
+    // ToolChoice::Required retains all offered tools; an unknown tool is a
+    // GrammarDefect when constrained.
+    let (required, prepared) = prepare(&constrained_bundle, ToolChoice::Required);
+    assert!(prepared.constraint().is_some());
+    assert_eq!(required.tool_call("alpha", r#"{"x": 1}"#), Conformance::Conforms);
+    assert_eq!(required.tool_call("beta", r#"{"x": 2}"#), Conformance::Conforms);
+    assert!(matches!(
+        required.tool_call("gamma", r#"{"x": 3}"#),
+        Conformance::GrammarDefect { .. }
+    ));
+
+    // ToolChoice::None removes all tools; when unconstrained, calling any tool
+    // is Unenforced(Unconstrained) rather than GrammarDefect.
+    let (none, prepared) = prepare(&constrained_bundle, ToolChoice::None);
+    assert!(prepared.constraint().is_none());
+    assert!(matches!(
+        none.tool_call("alpha", r#"{"x": 1}"#),
+        Conformance::Unenforced {
+            enforcement: Enforcement::Unconstrained,
+            ..
+        }
+    ));
+
+    // When a request with ToolChoice::Auto is unconstrained, unknown tool names
+    // report Unenforced(Unconstrained) instead of GrammarDefect.
+    let (auto, prepared) = prepare(&unconstrained_bundle, ToolChoice::Auto);
+    assert!(prepared.constraint().is_none());
+    assert_eq!(auto.tool_call("alpha", r#"{"x": 1}"#), Conformance::Conforms);
+    assert!(matches!(
+        auto.tool_call("gamma", r#"{"x": 1}"#),
+        Conformance::Unenforced {
+            enforcement: Enforcement::Unconstrained,
+            ..
+        }
+    ));
+}

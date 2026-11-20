@@ -884,6 +884,9 @@ impl Method for PrimeMethod {
     fn identity(&self) -> &str {
         "mtp:prime-fixture:1"
     }
+    fn capability(&self) -> MethodChoice {
+        MethodChoice::Mtp { proposals: 1 }
+    }
     fn requires(&self) -> MethodRequirements {
         MethodRequirements {
             prefill_demand: Demand::FEATURES,
@@ -1125,6 +1128,46 @@ fn a_reply_that_reaches_the_context_end_owes_no_row_past_it() {
     assert_eq!(generation.accepted_position(), 5);
     assert_eq!(generation.pending_reconciliation(), None);
     assert!(generation.start_reconciliation(4).is_err());
+}
+
+#[test]
+fn unbounded_max_tokens_reports_context_while_explicit_limit_reports_length() {
+    // With max_tokens set to the unbounded sentinel (i32::MAX), exhausting the
+    // served context finishes with FinishReason::Context.
+    let mut unbounded = options();
+    unbounded.context_limit = 4;
+    unbounded.max_tokens = i32::MAX as usize;
+    let generation = resident(
+        Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            unbounded,
+            None,
+        )
+        .unwrap(),
+    );
+    let generation = prefill(generation, 10);
+    let (generation, _) = resolve(start(generation, 4), &[11], None);
+    let (generation, _) = resolve(start(generation, 4), &[12], None);
+    assert_eq!(generation.finish_reason(), Some(FinishReason::Context));
+
+    // With an explicit max_tokens reached before the context ends, it finishes
+    // with FinishReason::Length.
+    let mut bounded = options();
+    bounded.context_limit = 4;
+    bounded.max_tokens = 2;
+    let generation = resident(
+        Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            bounded,
+            None,
+        )
+        .unwrap(),
+    );
+    let generation = prefill(generation, 10);
+    let (generation, _) = resolve(start(generation, 4), &[11], None);
+    assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
 }
 
 #[test]

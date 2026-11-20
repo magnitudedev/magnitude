@@ -34,8 +34,8 @@
 use crate::{
     method::{DraftTail, OpenFeature, PendingRows},
     DraftBudget, DraftCheckpoint, DraftController, DraftLoad, DraftOutlook, Method, MethodCheckpoint,
-    MethodCheckpointError, MethodEffects, MethodRequirements, MethodState, Propose, TimedLaunch,
-    Verification,
+    MethodCheckpointError, MethodChoice, MethodEffects, MethodRequirements, MethodState, Propose,
+    TimedLaunch, Verification,
 };
 use crate::{front::FrontState, DraftHistory, DraftRoundState};
 use magnitude_executor::{
@@ -124,6 +124,11 @@ impl Method for Mtp {
     }
     fn identity(&self) -> &str {
         &self.identity
+    }
+    fn capability(&self) -> MethodChoice {
+        MethodChoice::Mtp {
+            proposals: self.proposals as u8,
+        }
     }
     fn requires(&self) -> MethodRequirements {
         // An embedded head enters every prompt row with its feature; a head
