@@ -94,6 +94,30 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
     arena: &mut ExprArena,
     executable: seismic_ir::execution::ClosedExecutionView<'_, B>,
 ) -> Result<TotalPerformanceModel, ModelLimitation> {
+    type EvidenceCache = std::collections::HashMap<ServiceClassId, std::sync::Arc<FactProvenance>>;
+
+    fn fold_durations(
+        arena: &mut ExprArena,
+        mut durations: Vec<seismic_lang::expr::DurationExpr>,
+    ) -> seismic_lang::expr::DurationExpr {
+        if durations.is_empty() {
+            return arena.duration(&[]);
+        }
+        while durations.len() > 1 {
+            let mut next = Vec::with_capacity(durations.len().div_ceil(2));
+            let mut iter = durations.into_iter();
+            while let Some(left) = iter.next() {
+                if let Some(right) = iter.next() {
+                    next.push(arena.duration_add(left, right));
+                } else {
+                    next.push(left);
+                }
+            }
+            durations = next;
+        }
+        durations.pop().unwrap()
+    }
+
     #[derive(Clone)]
     struct Fragment {
         duration: seismic_lang::expr::DurationExpr,
@@ -101,32 +125,32 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
     }
 
     impl Fragment {
-        fn empty(arena: &mut ExprArena) -> Self {
-            Self {
-                duration: arena.duration(&[]),
-                contributions: Vec::new(),
-            }
-        }
-
         fn service<M: ServiceModel + ?Sized>(
             profile: &M,
             arena: &mut ExprArena,
+            evidence_cache: &mut EvidenceCache,
             service: ServiceClassId,
             units: seismic_lang::expr::NatExpr,
             mode: DemandMode,
             invocation: InvocationProvenance,
-        ) -> Self {
-            let contribution =
-                service_contribution(profile, arena, service, units, mode, invocation);
-            Self {
+        ) -> Result<Self, ModelLimitation> {
+            let evidence = evidence_cache
+                .entry(service)
+                .or_insert_with(|| std::sync::Arc::new(profile.service(service).provenance.clone()))
+                .clone();
+            let contribution = service_contribution_with_evidence(
+                profile,
+                arena,
+                service,
+                units,
+                mode,
+                invocation,
+                evidence,
+            )?;
+            Ok(Self {
                 duration: contribution.duration,
                 contributions: vec![contribution],
-            }
-        }
-
-        fn append(&mut self, arena: &mut ExprArena, other: Self) {
-            self.duration = arena.duration_add(self.duration, other.duration);
-            self.contributions.extend(other.contributions);
+            })
         }
 
         fn guard_evidence(&mut self, arena: &mut ExprArena, guard: seismic_lang::expr::BoolExpr) {
@@ -142,6 +166,7 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
     }
 
     let one = arena.nat(1);
+    let mut evidence_cache = EvidenceCache::new();
     let mut launches = Vec::with_capacity(executable.launches().len());
     for (launch_ordinal, launch, local_layout, kernel) in executable.launches() {
         let emission = profile.emission_layout(kernel);
@@ -151,14 +176,17 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
         let invocation = InvocationProvenance::KernelLaunch {
             ordinal: launch_ordinal as u32,
         };
-        let mut launch_assessment = Fragment::service(
+        let submission = Fragment::service(
             profile,
             arena,
+            &mut evidence_cache,
             CoreService::Submission.class(),
             one,
             DemandMode::DependencyLatency,
             invocation,
-        );
+        )?;
+        let mut durations = vec![submission.duration];
+        let mut contributions = submission.contributions;
         let data = kernel;
         for (block, multiplicity) in data.blocks().iter().zip(data.block_multiplicity()) {
             for op in &block.ops {
@@ -186,51 +214,60 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                     let contribution = Fragment::service(
                         profile,
                         arena,
+                        &mut evidence_cache,
                         demand.class,
                         units,
                         demand.mode,
                         invocation,
-                    );
-                    launch_assessment.append(arena, contribution);
+                    )?;
+                    durations.push(contribution.duration);
+                    contributions.extend(contribution.contributions);
                 }
             }
         }
-        launches.push(launch_assessment);
+        launches.push(Fragment {
+            duration: fold_durations(arena, durations),
+            contributions,
+        });
     }
 
     fn sequence<M: ServiceModel + ?Sized>(
         profile: &M,
         arena: &mut ExprArena,
+        evidence_cache: &mut EvidenceCache,
         launches: &[Fragment],
         steps: &[seismic_ir::schedule::ScheduleStep],
     ) -> Result<Fragment, ModelLimitation> {
         let one = arena.nat(1);
-        let mut result = Fragment::empty(arena);
+        let mut durations = Vec::with_capacity(steps.len());
+        let mut contributions = Vec::new();
         for step in steps {
             let item = match step {
                 seismic_ir::schedule::ScheduleStep::Imported { body, .. } => {
-                    sequence(profile, arena, launches, body)?
+                    sequence(profile, arena, evidence_cache, launches, body)?
                 }
                 seismic_ir::schedule::ScheduleStep::BeginAllocationInstance { .. } => {
                     Fragment::service(
                         profile,
                         arena,
+                        evidence_cache,
                         CoreService::AllocationInstance.class(),
                         one,
                         DemandMode::DependencyLatency,
                         InvocationProvenance::HostSchedule,
-                    )
+                    )?
                 }
                 seismic_ir::schedule::ScheduleStep::PublishTensor { .. }
                 | seismic_ir::schedule::ScheduleStep::BindArgumentTensor { .. } => {
                     Fragment::service(
                         profile,
                         arena,
+                        evidence_cache,
                         CoreService::TensorPublication.class(),
                         one,
                         DemandMode::DependencyLatency,
                         InvocationProvenance::HostSchedule,
-                    )
+                    )?
                 }
                 seismic_ir::schedule::ScheduleStep::Launch(id) => {
                     launches[id.index() as usize].clone()
@@ -238,54 +275,61 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                 seismic_ir::schedule::ScheduleStep::Copy(copy) => Fragment::service(
                     profile,
                     arena,
+                    evidence_cache,
                     CoreService::Copy.class(),
                     copy.bytes,
                     DemandMode::SaturatedCapacity,
                     InvocationProvenance::HostSchedule,
-                ),
+                )?,
                 seismic_ir::schedule::ScheduleStep::Fill(fill) => Fragment::service(
                     profile,
                     arena,
+                    evidence_cache,
                     CoreService::Fill.class(),
                     fill.bytes,
                     DemandMode::SaturatedCapacity,
                     InvocationProvenance::HostSchedule,
-                ),
+                )?,
                 seismic_ir::schedule::ScheduleStep::ScalarRead(_) => Fragment::service(
                     profile,
                     arena,
+                    evidence_cache,
                     CoreService::ScalarRead.class(),
                     one,
                     DemandMode::DependencyLatency,
                     InvocationProvenance::HostSchedule,
-                ),
+                )?,
                 seismic_ir::schedule::ScheduleStep::ScalarMove(_) => Fragment::service(
                     profile,
                     arena,
+                    evidence_cache,
                     CoreService::ScalarMove.class(),
                     one,
                     DemandMode::DependencyLatency,
                     InvocationProvenance::HostSchedule,
-                ),
+                )?,
                 seismic_ir::schedule::ScheduleStep::EvaluateHost(_) => {
                     return Err(ModelLimitation::HostQuantityWidth)
                 }
                 seismic_ir::schedule::ScheduleStep::Check(_) => Fragment::service(
                     profile,
                     arena,
+                    evidence_cache,
                     CoreService::DataCheck.class(),
                     one,
                     DemandMode::DependencyLatency,
                     InvocationProvenance::HostSchedule,
-                ),
+                )?,
                 seismic_ir::schedule::ScheduleStep::If {
                     condition,
                     then_steps,
                     else_steps,
                     ..
                 } => {
-                    let mut then_part = sequence(profile, arena, launches, then_steps)?;
-                    let mut else_part = sequence(profile, arena, launches, else_steps)?;
+                    let mut then_part =
+                        sequence(profile, arena, evidence_cache, launches, then_steps)?;
+                    let mut else_part =
+                        sequence(profile, arena, evidence_cache, launches, else_steps)?;
                     let otherwise = arena.not(*condition);
                     then_part.guard_evidence(arena, *condition);
                     else_part.guard_evidence(arena, otherwise);
@@ -303,10 +347,40 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                     body,
                     ..
                 } => {
-                    let mut body = sequence(profile, arena, launches, body)?;
+                    let mut body = sequence(profile, arena, evidence_cache, launches, body)?;
                     let upper = arena.nat_max(*end, *start);
                     let trips = arena.nat_sub(upper, *start);
+                    let zero = arena.nat(0);
+                    let one = arena.nat(1);
                     for contribution in &mut body.contributions {
+                        let mut invariant_guards = Vec::new();
+                        let mut binder_guards = Vec::new();
+                        for guard in contribution.region.guards.drain(..) {
+                            if arena
+                                .free_symbols(seismic_lang::expr::AnyExpr::Bool(guard))
+                                .contains(symbol)
+                            {
+                                binder_guards.push(guard);
+                            } else {
+                                invariant_guards.push(guard);
+                            }
+                        }
+                        if !binder_guards.is_empty() {
+                            let local_active = arena.all(&binder_guards);
+                            let indicator = arena.nat_select(local_active, one, zero);
+                            let ever = arena.nat_fold_range(
+                                seismic_lang::expr::FoldOp::Max,
+                                *binder,
+                                *start,
+                                trips,
+                                indicator,
+                            );
+                            let ever_active =
+                                arena.nat_cmp(seismic_lang::expr::CmpOp::Gt, ever, zero);
+                            invariant_guards.push(ever_active);
+                        }
+                        contribution.region.guards = invariant_guards;
+
                         if arena
                             .free_symbols(seismic_lang::expr::AnyExpr::Nat(contribution.units))
                             .contains(symbol)
@@ -350,12 +424,22 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                     body
                 }
             };
-            result.append(arena, item);
+            durations.push(item.duration);
+            contributions.extend(item.contributions);
         }
-        Ok(result)
+        Ok(Fragment {
+            duration: fold_durations(arena, durations),
+            contributions,
+        })
     }
 
-    let result = sequence(profile, arena, &launches, executable.schedule().steps())?;
+    let result = sequence(
+        profile,
+        arena,
+        &mut evidence_cache,
+        &launches,
+        executable.schedule().steps(),
+    )?;
     Ok(TotalPerformanceModel {
         estimate: result.duration,
         contributions: result.contributions,
@@ -739,5 +823,117 @@ mod tests {
             duration.lower().numerator(),
             duration.lower().denominator() as u128
         );
+    }
+
+    #[test]
+    fn repeat_quantifies_binder_local_branch_guards() {
+        let model = Model(ServiceDefinition {
+            class: ServiceClassId::new("core.submission"),
+            correlation: ServiceCorrelationId::new("fixture"),
+            qualification: ServiceQualificationDomain {
+                minimum_units: 1,
+                maximum_units: 1,
+                maximum_concurrent_uses: 1,
+            },
+            accuracy: ServiceAccuracyClass::Compute,
+            topology: ResourceTopology {
+                resources: 1,
+                max_concurrency: 1,
+            },
+            dependency_latency: DurationInterval::new(5, 5, 1),
+            saturated_capacity: ServiceCurve {
+                setup: DurationInterval::new(0, 0, 1),
+                regimes: Vec::new(),
+            },
+            provenance: FactProvenance::Derived {
+                rule: "exact fixture",
+                inputs: Box::new([]),
+            },
+        });
+        let mut arena = ExprArena::default();
+        let (_, trips_symbol) = arena.target_constant(seismic_lang::expr::SymbolSort::Nat);
+        let trips_expr = arena.nat_symbol(trips_symbol);
+        let zero = arena.nat(0);
+        let one = arena.nat(1);
+        let two = arena.nat(2);
+        let empty = arena.bool(false);
+
+        let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
+        let vectors = VectorSupport::default();
+        let kernel = construction
+            .portable_kernel(&mut arena, &(), &[], &vectors)
+            .close();
+        let make_launch = |kernel| Launch {
+            kernel,
+            descriptor: (),
+            grid: [one; 3],
+            workgroup: [one; 3],
+            empty,
+            parallel_extent: None,
+            logical_base: None,
+        };
+        let mut schedule = construction.schedule(&mut arena, 0);
+        let then_launch = schedule.launch(make_launch(kernel));
+        let else_launch = schedule.launch(make_launch(kernel));
+        let repeat = construction.begin_value_repeat(
+            &mut arena,
+            0,
+            zero,
+            trips_expr,
+            RepeatVisits::Ordered,
+            Product::Unit,
+        );
+        let iter_index = repeat.binding().index;
+        let condition = arena.nat_cmp(seismic_lang::expr::CmpOp::Eq, iter_index, two);
+        construction.schedule(&mut arena, repeat.body()).branch(
+            condition,
+            |then| {
+                then.step_launch(then_launch);
+            },
+            |otherwise| {
+                otherwise.step_launch(else_launch);
+            },
+        );
+        construction.finish_value_repeat(repeat, Product::Unit);
+        let token = construction.schedule(&mut arena, 0).close();
+        let analyzed = construction
+            .close(token)
+            .normalize_launches(&mut arena, u64::MAX, 64)
+            .unwrap()
+            .analyze_allocations();
+        let planned = analyzed.apply_allocation_plan(&mut arena, AllocationPlan::distinct());
+        let ir = planned.finish();
+        let executable = ir.close_execution(&mut arena, local_policy(), &FixtureAbi);
+        let assessment = estimate(&model, &mut arena, executable.view()).unwrap();
+        assert_eq!(assessment.contributions().len(), 2);
+
+        let then_active = assessment.contributions()[0]
+            .region()
+            .active_predicate(&mut arena);
+        let else_active = assessment.contributions()[1]
+            .region()
+            .active_predicate(&mut arena);
+
+        // Evaluating active_predicate with only the outer trips symbol bound must not fail
+        // with EvalError::Unbound on the repeat's loop-local binder.
+        for (trips, expected_then, expected_else) in [
+            (0_u32, false, false),
+            (2_u32, false, true),
+            (4_u32, true, true),
+        ] {
+            let mut assignment = Assignment::new();
+            assignment.bind(
+                trips_symbol,
+                seismic_lang::expr::SymbolValue::Nat(trips.into()),
+            );
+            assert_eq!(
+                arena.eval_bool(then_active, &assignment).unwrap(),
+                expected_then
+            );
+            assert_eq!(
+                arena.eval_bool(else_active, &assignment).unwrap(),
+                expected_else
+            );
+        }
     }
 }

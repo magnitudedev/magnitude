@@ -1,8 +1,6 @@
 //! Pure Metal demand transfer over the authoritative executable IR.
 //! Device discovery and evidence acquisition belong to the native adapter.
 
-pub mod characterization;
-
 use seismic_estimator::*;
 use seismic_ir::kernel::ops::{ClosedOpView, ClosedPlaceKind, ValueType};
 use seismic_ir::metal::*;
@@ -159,6 +157,44 @@ fn memory_class(kind: ClosedPlaceKind) -> MetalService {
     }
 }
 
+fn scalar_element_type(ty: ValueType) -> ValueType {
+    match ty {
+        ValueType::Vector { dtype, .. } => ValueType::Scalar(dtype),
+        other => other,
+    }
+}
+
+fn cast_classes(from: ValueType, to: ValueType) -> Vec<MetalService> {
+    use MetalService::{
+        Control as CONTROL, F16ToF32 as F16_TO_F32, F32ToBf16 as F32_TO_BF16,
+        F32ToF16 as F32_TO_F16, F32ToInteger as F32_TO_INTEGER, Integer as INTEGER,
+        IntegerToF32 as INTEGER_TO_F32,
+    };
+    let from = scalar_element_type(from);
+    let to = scalar_element_type(to);
+    if from == to {
+        return vec![CONTROL];
+    }
+    match (from, to) {
+        (ValueType::Scalar(DType::F16), ValueType::Scalar(DType::BF16)) => {
+            vec![F16_TO_F32, F32_TO_BF16]
+        }
+        (ValueType::Scalar(DType::BF16), ValueType::Scalar(DType::F16)) => {
+            vec![INTEGER, F32_TO_F16]
+        }
+        (ValueType::Scalar(DType::F32), ValueType::Scalar(DType::U64)) => {
+            vec![F32_TO_INTEGER]
+        }
+        (ValueType::Scalar(DType::U64), ValueType::Scalar(DType::F32)) => {
+            vec![INTEGER_TO_F32]
+        }
+        (from, to) => scalar_conversion_emission_family(&from, &to)
+            .map(emission_class)
+            .into_iter()
+            .collect(),
+    }
+}
+
 macro_rules! cost {
     ($first:expr $(, $rest:expr)* $(,)?) => {
         OperationCost::demands($first, vec![$($rest),*])
@@ -179,10 +215,9 @@ pub fn operation_cost<
     use DemandMode::{DependencyLatency as Latency, SaturatedCapacity as Capacity};
     use MetalService::{
         ApproximateMath as APPROXIMATE_MATH, Atomic as ATOMIC, Barrier as BARRIER,
-        Control as CONTROL, F16ToF32 as F16_TO_F32, F32AddSub as F32_ADD_SUB, F32Fma as F32_FMA,
-        F32ToBf16 as F32_TO_BF16, F32ToF16 as F32_TO_F16, GlobalMemory as GLOBAL_MEMORY,
-        Integer as INTEGER, Matrix as MATRIX, Representation as REPRESENTATION,
-        Subgroup as SUBGROUP, WorkgroupMemory as WORKGROUP_MEMORY,
+        Control as CONTROL, F32AddSub as F32_ADD_SUB, F32Fma as F32_FMA,
+        GlobalMemory as GLOBAL_MEMORY, Integer as INTEGER, Matrix as MATRIX,
+        Representation as REPRESENTATION, Subgroup as SUBGROUP, WorkgroupMemory as WORKGROUP_MEMORY,
     };
     Ok(match op {
         ClosedOpView::Constant { .. } => cost![one(arena, CONTROL, Latency)],
@@ -197,19 +232,8 @@ pub fn operation_cost<
             };
             cost![demand(class, lanes(arena, out.ty), Latency)]
         }
-        ClosedOpView::Cast { out, a, to } => {
-            let classes = match (a.ty, to) {
-                (ValueType::Scalar(DType::F16), ValueType::Scalar(DType::BF16)) => {
-                    vec![F16_TO_F32, F32_TO_BF16]
-                }
-                (ValueType::Scalar(DType::BF16), ValueType::Scalar(DType::F16)) => {
-                    vec![INTEGER, F32_TO_F16]
-                }
-                (from, to) => scalar_conversion_emission_family(&from, &to)
-                    .map(emission_class)
-                    .into_iter()
-                    .collect(),
-            };
+        ClosedOpView::Cast { out, a, to } | ClosedOpView::VectorCast { out, a, to } => {
+            let classes = cast_classes(a.ty, to);
             match classes.as_slice() {
                 [] => cost![demand(
                     arithmetic_class(out.ty),
@@ -249,9 +273,7 @@ pub fn operation_cost<
         | ClosedOpView::VectorLane { out, .. } => {
             cost![demand(CONTROL, lanes(arena, out.ty), Latency)]
         }
-        ClosedOpView::VectorUnary { out, .. }
-        | ClosedOpView::VectorBit { out, .. }
-        | ClosedOpView::VectorCast { out, .. } => {
+        ClosedOpView::VectorUnary { out, .. } | ClosedOpView::VectorBit { out, .. } => {
             let class = if matches!(
                 out.ty,
                 ValueType::Vector {
@@ -265,19 +287,20 @@ pub fn operation_cost<
             };
             cost![demand(class, lanes(arena, out.ty), Latency)]
         }
-        ClosedOpView::VectorReduceAdd { out, .. } => {
+        ClosedOpView::VectorReduceAdd { vector, .. } => {
             let class = if matches!(
-                out.ty,
-                ValueType::Vector {
-                    dtype: DType::F32,
-                    ..
-                }
+                vector.ty,
+                ValueType::Scalar(DType::F32)
+                    | ValueType::Vector {
+                        dtype: DType::F32,
+                        ..
+                    }
             ) {
                 F32_ADD_SUB
             } else {
-                arithmetic_class(out.ty)
+                arithmetic_class(vector.ty)
             };
-            cost![demand(class, lanes(arena, out.ty), Latency)]
+            cost![demand(class, lanes(arena, vector.ty), Latency)]
         }
         ClosedOpView::VectorBinary { op, out, .. } => {
             let class = if matches!(
@@ -636,5 +659,177 @@ mod tests {
                     .all(|d| service_available(false, &BTreeSet::new(), d.class))
             );
         }
+    }
+
+    #[test]
+    fn vector_reduce_add_and_casts_classify_without_panicking() {
+        use seismic_ir::kernel::ops::ClosedValue;
+        use seismic_lang::expr::Assignment;
+
+        let mut arena = ExprArena::default();
+        let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
+        let vectors = VectorSupport::default();
+        let mut builder = construction.portable_kernel(&mut arena, &(), &[], &vectors);
+        let value = builder.index_constant(0).raw();
+        builder.close();
+        let kernel = &construction.kernels()[0];
+
+        let expect_single = |arena: &mut ExprArena,
+                             op: ClosedOpView<'_, Dialect>,
+                             expected_class: MetalService,
+                             expected_units: u64| {
+            let OperationCost::Demands(demands) = operation_cost(arena, kernel, op).unwrap() else {
+                panic!("expected concrete demands");
+            };
+            let demands: Vec<_> = demands.into_iter().collect();
+            assert_eq!(demands.len(), 1);
+            assert!(demands[0].class == expected_class);
+            assert_eq!(
+                arena
+                    .eval_nat_u64(demands[0].units, &Assignment::new())
+                    .unwrap(),
+                expected_units
+            );
+        };
+
+        // VectorReduceAdd on F32 vector must inspect vector.ty (not scalar out.ty) and charge lane count.
+        expect_single(
+            &mut arena,
+            ClosedOpView::VectorReduceAdd {
+                out: ClosedValue {
+                    value,
+                    ty: ValueType::Scalar(DType::F32),
+                },
+                vector: ClosedValue {
+                    value,
+                    ty: ValueType::Vector {
+                        dtype: DType::F32,
+                        lanes: 4,
+                    },
+                },
+            },
+            MetalService::F32AddSub,
+            4,
+        );
+        expect_single(
+            &mut arena,
+            ClosedOpView::VectorReduceAdd {
+                out: ClosedValue {
+                    value,
+                    ty: ValueType::Scalar(DType::I32),
+                },
+                vector: ClosedValue {
+                    value,
+                    ty: ValueType::Vector {
+                        dtype: DType::I32,
+                        lanes: 4,
+                    },
+                },
+            },
+            MetalService::Integer,
+            4,
+        );
+
+        // Scalar Cast U64 -> F32, F32 -> U64, and F32 -> F32 must not panic.
+        expect_single(
+            &mut arena,
+            ClosedOpView::Cast {
+                out: ClosedValue {
+                    value,
+                    ty: ValueType::Scalar(DType::F32),
+                },
+                a: ClosedValue {
+                    value,
+                    ty: ValueType::Scalar(DType::U64),
+                },
+                to: ValueType::Scalar(DType::F32),
+            },
+            MetalService::IntegerToF32,
+            1,
+        );
+        expect_single(
+            &mut arena,
+            ClosedOpView::Cast {
+                out: ClosedValue {
+                    value,
+                    ty: ValueType::Scalar(DType::U64),
+                },
+                a: ClosedValue {
+                    value,
+                    ty: ValueType::Scalar(DType::F32),
+                },
+                to: ValueType::Scalar(DType::U64),
+            },
+            MetalService::F32ToInteger,
+            1,
+        );
+        expect_single(
+            &mut arena,
+            ClosedOpView::Cast {
+                out: ClosedValue {
+                    value,
+                    ty: ValueType::Scalar(DType::F32),
+                },
+                a: ClosedValue {
+                    value,
+                    ty: ValueType::Scalar(DType::F32),
+                },
+                to: ValueType::Scalar(DType::F32),
+            },
+            MetalService::Control,
+            1,
+        );
+
+        // VectorCast must classify by source/target element dtypes rather than routing F32 to Integer.
+        expect_single(
+            &mut arena,
+            ClosedOpView::VectorCast {
+                out: ClosedValue {
+                    value,
+                    ty: ValueType::Vector {
+                        dtype: DType::F32,
+                        lanes: 4,
+                    },
+                },
+                a: ClosedValue {
+                    value,
+                    ty: ValueType::Vector {
+                        dtype: DType::I32,
+                        lanes: 4,
+                    },
+                },
+                to: ValueType::Vector {
+                    dtype: DType::F32,
+                    lanes: 4,
+                },
+            },
+            MetalService::IntegerToF32,
+            4,
+        );
+        expect_single(
+            &mut arena,
+            ClosedOpView::VectorCast {
+                out: ClosedValue {
+                    value,
+                    ty: ValueType::Vector {
+                        dtype: DType::F16,
+                        lanes: 4,
+                    },
+                },
+                a: ClosedValue {
+                    value,
+                    ty: ValueType::Vector {
+                        dtype: DType::F32,
+                        lanes: 4,
+                    },
+                },
+                to: ValueType::Vector {
+                    dtype: DType::F16,
+                    lanes: 4,
+                },
+            },
+            MetalService::F32ToF16,
+            4,
+        );
     }
 }

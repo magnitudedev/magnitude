@@ -3,6 +3,7 @@
 
 use seismic_lang::expr::ExprArena;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 /// Sealed identity of one execution service. Names are stable registry
 /// identities, not display strings or late lookup conventions.
@@ -507,6 +508,18 @@ pub enum ModelLimitation {
         value: seismic_ir::kernel::ops::ErasedValue,
     },
     HostQuantityWidth,
+    InvalidErrorEnvelope {
+        basis_points: u16,
+    },
+    DurationArithmeticOverflow {
+        service: ServiceClassId,
+    },
+    ZeroServiceCapacity {
+        service: ServiceClassId,
+    },
+    InvalidServiceCurve {
+        service: ServiceClassId,
+    },
 }
 
 /// Total cost transfer for one closed operation.
@@ -610,7 +623,7 @@ pub struct ModeledContribution {
     units: seismic_lang::expr::NatExpr,
     mode: DemandMode,
     duration: seismic_lang::expr::DurationExpr,
-    evidence: FactProvenance,
+    evidence: Arc<FactProvenance>,
 }
 
 impl ModeledContribution {
@@ -678,71 +691,92 @@ pub fn service_contribution<M: ServiceModel + ?Sized>(
     units: seismic_lang::expr::NatExpr,
     mode: DemandMode,
     invocation: InvocationProvenance,
-) -> ModeledContribution {
+) -> Result<ModeledContribution, ModelLimitation> {
+    let evidence = Arc::new(profile.service(service).provenance.clone());
+    service_contribution_with_evidence(profile, arena, service, units, mode, invocation, evidence)
+}
+
+pub(crate) fn service_contribution_with_evidence<M: ServiceModel + ?Sized>(
+    profile: &M,
+    arena: &mut ExprArena,
+    service: ServiceClassId,
+    units: seismic_lang::expr::NatExpr,
+    mode: DemandMode,
+    invocation: InvocationProvenance,
+    evidence: Arc<FactProvenance>,
+) -> Result<ModeledContribution, ModelLimitation> {
     let region = ContributionRegion {
         invocation,
         guards: Vec::new(),
     };
     let definition = profile.service(service);
-    let term =
-        |arena: &mut ExprArena, demand: seismic_lang::expr::NatExpr, interval: DurationInterval| {
-            let envelope = u64::from(profile.maximum_relative_error_basis_points());
-            let denominator = interval
-                .denominator
-                .checked_mul(10_000)
-                .expect("duration composition-envelope denominator overflows u64");
-            let lower_numerator = interval
-                .lower_numerator
-                .checked_mul(10_000 - envelope)
-                .expect("duration composition-envelope lower bound overflows u64");
-            let upper_numerator = interval
-                .upper_numerator
-                .checked_mul(10_000 + envelope)
-                .expect("duration composition-envelope upper bound overflows u64");
-            arena.duration(&[DurationTerm {
-                demand,
-                lower_numerator,
-                upper_numerator,
-                denominator,
-            }])
-        };
+    let basis_points = profile.maximum_relative_error_basis_points();
+    let envelope = u64::from(basis_points);
+    let Some(lower_scale) = 10_000_u64.checked_sub(envelope) else {
+        return Err(ModelLimitation::InvalidErrorEnvelope { basis_points });
+    };
+    let upper_scale = 10_000_u64 + envelope;
+    let term = |arena: &mut ExprArena,
+                demand: seismic_lang::expr::NatExpr,
+                interval: DurationInterval|
+     -> Result<seismic_lang::expr::DurationExpr, ModelLimitation> {
+        let denominator = interval
+            .denominator
+            .checked_mul(10_000)
+            .ok_or(ModelLimitation::DurationArithmeticOverflow { service })?;
+        let lower_numerator = interval
+            .lower_numerator
+            .checked_mul(lower_scale)
+            .ok_or(ModelLimitation::DurationArithmeticOverflow { service })?;
+        let upper_numerator = interval
+            .upper_numerator
+            .checked_mul(upper_scale)
+            .ok_or(ModelLimitation::DurationArithmeticOverflow { service })?;
+        Ok(arena.duration(&[DurationTerm {
+            demand,
+            lower_numerator,
+            upper_numerator,
+            denominator,
+        }]))
+    };
     let duration = match mode {
-        DemandMode::DependencyLatency => term(arena, units, definition.dependency_latency),
+        DemandMode::DependencyLatency => term(arena, units, definition.dependency_latency)?,
         DemandMode::SaturatedCapacity => {
             let one = arena.nat(1);
-            let setup = definition.saturated_capacity.setup;
-            let setup = term(arena, one, setup);
+            let setup = term(arena, one, definition.saturated_capacity.setup)?;
             let mut regimes = definition.saturated_capacity.regimes.iter().rev();
             let last = regimes
                 .next()
-                .expect("profile service capacity curve is non-empty");
+                .ok_or(ModelLimitation::InvalidServiceCurve { service })?;
             let capacity = u64::from(definition.topology.resources)
-                .checked_mul(u64::from(definition.topology.max_concurrency))
-                .expect("service topology capacity overflows u64");
+                * u64::from(definition.topology.max_concurrency);
+            if capacity == 0 {
+                return Err(ModelLimitation::ZeroServiceCapacity { service });
+            }
             let capacity = arena.nat(capacity);
             let waves = arena.nat_ceil_div(units, capacity);
-            let mut selected = term(arena, waves, last.per_unit);
+            let mut selected = term(arena, waves, last.per_unit)?;
             for regime in regimes {
                 let maximum = regime
                     .max_units
-                    .expect("only the final capacity regime is unbounded");
+                    .ok_or(ModelLimitation::InvalidServiceCurve { service })?;
                 let maximum = arena.nat(maximum);
                 let condition = arena.nat_cmp(seismic_lang::expr::CmpOp::Le, units, maximum);
-                let branch = term(arena, waves, regime.per_unit);
+                let branch = term(arena, waves, regime.per_unit)?;
                 selected = arena.duration_select(condition, branch, selected);
             }
             arena.duration_add(setup, selected)
         }
     };
-    ModeledContribution {
+    Ok(ModeledContribution {
         region,
         class: definition.class,
         correlation: definition.correlation,
         units,
         mode,
         duration,
-        evidence: definition.provenance.clone(),
-    }
+        evidence,
+    })
 }
 
 mod acquisition;
