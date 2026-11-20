@@ -543,17 +543,21 @@ pub enum ProcessFootprint {
 /// The host RAM footprint of `process` now: macOS's physical footprint
 /// (`proc_pid_rusage`, `ri_phys_footprint`), Linux's resident anonymous
 /// and shared memory (`/proc/<pid>/status` `RssAnon` and `RssShmem`, the
-/// footprint's own terms, file-backed pages left out), Windows' private
-/// commit (`K32GetProcessMemoryInfo`'s `PrivateUsage`); unobserved
-/// elsewhere, or where the process is gone. A device's own memory is in
-/// none of them.
+/// footprint's own terms, file-backed pages left out — plus [`driver_bytes`]
+/// for this process, matching [`ProcessMemory::footprint_now`]), Windows'
+/// private commit (`K32GetProcessMemoryInfo`'s `PrivateUsage`); unobserved
+/// elsewhere, or where the process is gone. A discrete device's own memory
+/// is in none of them.
 pub fn host_footprint(process: ProcessId) -> ProcessFootprint {
     #[cfg(target_os = "macos")]
     let bytes = macos::phys_footprint(process.0);
     #[cfg(target_os = "linux")]
-    let bytes = std::fs::read_to_string(format!("/proc/{}/status", process.0))
-        .ok()
-        .and_then(|status| linux::footprint_of(&status, 0));
+    let bytes = {
+        let driver = if process == ProcessId::current() { driver_bytes() } else { 0 };
+        std::fs::read_to_string(format!("/proc/{}/status", process.0))
+            .ok()
+            .and_then(|status| linux::footprint_of(&status, driver))
+    };
     #[cfg(windows)]
     let bytes = windows::of(process.0).map(|counters| counters.PrivateUsage as u64);
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -640,6 +644,26 @@ mod tests {
         // A device whose context cannot be measured is not counted.
         let other = u128::from_le_bytes(*b"driver-memory-02");
         assert_eq!(count_driver_memory(other, || Err::<u64, _>("unlisted")).unwrap_err(), "unlisted");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_footprint_of_current_process_includes_driver_memory() {
+        let _measuring = MEASURING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ProcessFootprint::Observed(before) = host_footprint(ProcessId::current()) else {
+            panic!("Linux /proc/self/status reports current host footprint");
+        };
+        let key = u128::from_le_bytes(*b"driver-memory-03");
+        let added = 16 << 20;
+        let account = count_driver_memory(key, || Ok::<u64, ()>(added)).unwrap();
+        let ProcessFootprint::Observed(during) = host_footprint(ProcessId::current()) else {
+            panic!("Linux /proc/self/status reports current host footprint");
+        };
+        assert!(
+            during >= before.saturating_add(added / 2),
+            "current host_footprint should reflect driver memory ({before} -> {during}, +{added})"
+        );
+        drop(account);
     }
 
     /// The reading follows the heap: bytes allocated and touched are live

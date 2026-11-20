@@ -63,18 +63,48 @@ pub(crate) fn store_charges(
 
 /// What `process` holds in `store` now, by the figure the system reports of
 /// it there: in host RAM its footprint
-/// ([`seismic_native_target::process::host_footprint`]); in a GPU's own
-/// memory what NVML counts of it ([`seismic_cuda::process_footprint`]).
+/// ([`seismic_native_target::process::host_footprint`], plus any unified-memory
+/// CUDA driver holdings NVML reports for an external process); in a discrete
+/// GPU's own memory what NVML counts of it ([`seismic_cuda::process_footprint`]).
 /// Unobserved in every other store, and wherever the system reports no
 /// figure: no figure is guessed.
 pub fn process_footprint(process: ProcessId, store: &StoreIdentity) -> ProcessFootprint {
     match store {
-        StoreIdentity::HostRam => seismic_native_target::process::host_footprint(process),
+        StoreIdentity::HostRam => {
+            let host = seismic_native_target::process::host_footprint(process);
+            if process == ProcessId::current() {
+                host
+            } else {
+                combine_host_footprint(
+                    host,
+                    seismic_cuda::unified_device_uuids()
+                        .iter()
+                        .map(|uuid| seismic_cuda::process_footprint(process, *uuid)),
+                )
+            }
+        }
         StoreIdentity::DeviceMemory(PhysicalIdentity::Uuid(uuid)) => seismic_cuda::process_footprint(process, *uuid),
         StoreIdentity::DeviceMemory(PhysicalIdentity::Host { .. } | PhysicalIdentity::Registry(_)) | StoreIdentity::Volume(_) => {
             ProcessFootprint::Unobserved
         }
     }
+}
+
+fn combine_host_footprint(
+    host: ProcessFootprint,
+    extra: impl IntoIterator<Item = ProcessFootprint>,
+) -> ProcessFootprint {
+    let ProcessFootprint::Observed(host) = host else {
+        return ProcessFootprint::Unobserved;
+    };
+    let added = extra
+        .into_iter()
+        .filter_map(|footprint| match footprint {
+            ProcessFootprint::Observed(bytes) => Some(bytes),
+            ProcessFootprint::Unobserved => None,
+        })
+        .fold(0u64, u64::saturating_add);
+    ProcessFootprint::Observed(host.saturating_add(added))
 }
 
 /// What a driver grants the process of a device store beyond what it uses
@@ -492,5 +522,29 @@ impl Charges {
         alignment: u64,
     ) -> Result<Arc<crate::driver::Allocation>, ExecutionError> {
         self.device.kind.zeroed(self.allocate_mapped(contract, bytes, alignment)?, bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combine_host_footprint_adds_observed_unified_cuda_and_preserves_unobserved_host() {
+        assert_eq!(
+            combine_host_footprint(
+                ProcessFootprint::Observed(100),
+                [ProcessFootprint::Observed(40), ProcessFootprint::Unobserved, ProcessFootprint::Observed(15)],
+            ),
+            ProcessFootprint::Observed(155),
+        );
+        assert_eq!(
+            combine_host_footprint(ProcessFootprint::Observed(100), [ProcessFootprint::Unobserved]),
+            ProcessFootprint::Observed(100),
+        );
+        assert_eq!(
+            combine_host_footprint(ProcessFootprint::Unobserved, [ProcessFootprint::Observed(40)]),
+            ProcessFootprint::Unobserved,
+        );
     }
 }

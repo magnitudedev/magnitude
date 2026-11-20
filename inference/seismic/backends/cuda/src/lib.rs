@@ -43,6 +43,22 @@ pub fn process_footprint(
     }
 }
 
+/// UUIDs of CUDA devices whose memory is host RAM (unified-memory GPUs such as
+/// Grace Blackwell), enumerated once without creating a CUDA context.
+pub fn unified_device_uuids() -> &'static [[u8; 16]] {
+    static UNIFIED: std::sync::OnceLock<Vec<[u8; 16]>> = std::sync::OnceLock::new();
+    UNIFIED.get_or_init(|| {
+        let Ok(count) = device_count() else {
+            return Vec::new();
+        };
+        (0..count)
+            .filter_map(|ordinal| describe(ordinal).ok())
+            .filter(|descriptor| descriptor.memory_is_host())
+            .map(|descriptor| descriptor.uuid)
+            .collect()
+    })
+}
+
 /// The ledger a test's device and allocations charge: one tally of host
 /// RAM that bounds nothing, which every store and entry of a test is, so a
 /// range carved for a test's entry lies in its block's store.

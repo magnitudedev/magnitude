@@ -114,13 +114,14 @@ impl DirectModule {
         kernels: &[&str],
     ) -> Result<Self, NativeCompilationError> {
         let context = device.context();
-        let first = kernels.first().ok_or_else(|| {
-            NativeCompilationError::MalformedToolchainOutput("native module has no kernels".into())
-        })?;
-        let (module, _) = driver::load_module(context, image, first).map_err(jit_error)?;
-        let mut functions = Vec::with_capacity(kernels.len());
-        for kernel in kernels {
-            let raw = driver::module_function(&module, kernel).map_err(jit_error)?;
+        if kernels.is_empty() {
+            return Err(NativeCompilationError::MalformedToolchainOutput(
+                "native module has no kernels".into(),
+            ));
+        }
+        let (module, raw_functions) = driver::load_module(context, image, kernels).map_err(jit_error)?;
+        let mut functions = Vec::with_capacity(raw_functions.len());
+        for raw in raw_functions {
             let attribute = |key| {
                 driver::function_attribute(context, raw, key)
                     .map_err(driver_failure)
@@ -533,7 +534,6 @@ impl DirectGraphBuilder {
             enabled: self.enabled,
             words: self.words,
             census,
-            scope: seismic_memory::entry::DropScope::default(),
         })
     }
 }
@@ -565,9 +565,6 @@ pub struct DirectGraph {
     census: GraphCensus,
     /// The device whose graph pool holds its driver memory.
     device: Device,
-    /// The change its drop runs in, which ends after every field has
-    /// dropped ([`DropScope`]): last.
-    scope: seismic_memory::entry::DropScope,
 }
 
 impl DirectGraph {
@@ -682,8 +679,7 @@ impl DirectGraph {
 
 impl Drop for DirectGraph {
     fn drop(&mut self) {
-        let change = self.scope.begin(self.device.graphs().entry());
-        self.device.graphs().dropped(change, &self.device, self.census);
+        self.device.graphs().dropped(self.census);
     }
 }
 
