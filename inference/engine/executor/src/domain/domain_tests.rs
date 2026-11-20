@@ -3071,3 +3071,74 @@ fn evicting_or_closing_a_request_reaches_the_expert_bank() {
     domain.release_state(&[evicted]).unwrap();
     domain.close(closed).unwrap();
 }
+
+/// Every reading answered by `MemoryProbe::answer` — including readings taken
+/// beside a running chain (`running_pressure`) — emits a `memory read` trace
+/// record at `MEMORY_TRACE` carrying the exact generation stored in
+/// `answered.generations`.
+#[test]
+fn memory_probe_answer_emits_memory_read_trace_for_every_answered_generation() {
+    use std::sync::{Arc, Mutex};
+
+    struct Capture(Arc<Mutex<Vec<u64>>>);
+
+    struct Visitor {
+        message: Option<String>,
+        generation: Option<u64>,
+    }
+
+    impl tracing::field::Visit for Visitor {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "generation" {
+                self.generation = Some(value);
+            }
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = Some(value.to_owned());
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == crate::MEMORY_TRACE
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() != crate::MEMORY_TRACE {
+                return;
+            }
+            let mut visitor = Visitor { message: None, generation: None };
+            event.record(&mut visitor);
+            if visitor.message.as_deref() == Some("memory read") {
+                if let Some(generation) = visitor.generation {
+                    self.0.lock().unwrap().push(generation);
+                }
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    let (domain, _bindings) = fixture(None);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    tracing::subscriber::with_default(Capture(seen.clone()), || {
+        let probe = domain.memory_probe();
+        assert!(probe.read(None, false));
+        drop(probe.answer(&std::collections::BTreeSet::new(), Vec::new));
+    });
+    let recorded: Vec<u64> = domain.answered.borrow().generations.iter().map(|(_, g)| *g).collect();
+    assert!(!recorded.is_empty());
+    let traced = seen.lock().unwrap().clone();
+    assert_eq!(traced, recorded, "every answered generation must have a matching memory read record");
+}

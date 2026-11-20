@@ -973,19 +973,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         &self,
         bank: &dyn ElasticBank,
     ) -> Result<Vec<crate::experts::derived::DerivedTarget>, DomainError> {
-        let ledgers = self.resources.ledgers();
-        self.derive_bank(bank, |derived| {
-            derived
-                .iter()
-                .map(|(target, slots)| crate::experts::derived::DerivedTarget {
-                    holding: target.holding,
-                    store: ledgers.of(target.tier).store(),
-                    held: target.at,
-                    target: *slots,
-                    block: target.shape.block_bytes(),
-                })
-                .collect()
-        })
+        derived_targets_for(self.resources.ledgers(), bank, self.decode_price()?.as_ref())
     }
 
     /// The device's graph budget (`seismic::Device::graph_budget`) and what
@@ -1285,6 +1273,26 @@ struct StoreAnswer<'d> {
     owed: crate::memory::ledger::Owed,
 }
 
+/// Each of `bank`'s holdings beside its derived target, as the bank follows
+/// it (`experts::derived::derive`).
+fn derived_targets_for(
+    ledgers: &crate::memory::ledger::DeviceLedgers,
+    bank: &dyn ElasticBank,
+    decode_price: Option<&magnitude_cost_model::DecodePrice>,
+) -> Result<Vec<crate::experts::derived::DerivedTarget>, DomainError> {
+    let holdings = bank.targets(decode_price)?;
+    Ok(crate::experts::derived::derive(ledgers, &holdings)
+        .iter()
+        .map(|(target, slots)| crate::experts::derived::DerivedTarget {
+            holding: target.holding,
+            store: ledgers.of(target.tier).store(),
+            held: target.at,
+            target: *slots,
+            block: target.shape.block_bytes(),
+        })
+        .collect())
+}
+
 impl<'d> MemoryProbe<'d> {
     /// The domain's probe, of its parts apart from the program family.
     fn of(memory: &'d RefCell<DeviceReader>, ledgers: &'d crate::memory::ledger::DeviceLedgers, answered: &'d RefCell<Answered>, held: &ResizeHeld) -> Self {
@@ -1304,7 +1312,13 @@ impl<'d> MemoryProbe<'d> {
     /// is the one consumer of the shortage's answer. Its plans preempt none
     /// but `evictable`, the requests the owner can evict now, so the owner
     /// carries out every plan it is owed.
-    fn answer(&self, evictable: &std::collections::BTreeSet<RequestId>) -> Vec<StoreAnswer<'d>> {
+    fn answer(
+        &self,
+        evictable: &std::collections::BTreeSet<RequestId>,
+        targets: impl FnOnce() -> Vec<crate::experts::derived::DerivedTarget>,
+    ) -> Vec<StoreAnswer<'d>> {
+        let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
+        let targets = if traced { targets() } else { Vec::new() };
         let answers = stores(self.ledgers)
             .map(|ledger| {
                 // The reading's generation, before its response moves the
@@ -1338,6 +1352,52 @@ impl<'d> MemoryProbe<'d> {
             owed.admission_waits |= shortage.response.admission_waits;
             owed.relief.extend(shortage.response.relief.clone());
             owed.unload |= shortage.response.unload;
+        }
+        drop(answered);
+        if traced {
+            for StoreAnswer { ledger, generation, shortage, owed } in &answers {
+                let estimate = ledger.estimate();
+                let held = |holding| targets.iter().find(|target| target.holding == holding && target.store == ledger.store());
+                let (experts, host) = (held(BankHolding::Experts), held(BankHolding::Host));
+                tracing::debug!(
+                    target: MEMORY_TRACE,
+                    store = ?ledger.store(),
+                    generation,
+                    budget = estimate.budget(),
+                    supply = estimate.supply(),
+                    committed = estimate.committed(),
+                    cache = estimate.cache(),
+                    bank_cache = estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
+                    other_cache = estimate.cache() - estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
+                    // Zero where no weight cap bounds the store.
+                    cap = estimate.cap().unwrap_or(0),
+                    free = estimate.free(),
+                    others = estimate.others(),
+                    nonresident = estimate.nonresident(),
+                    unobserved_resident = estimate.unobserved_resident(),
+                    unobserved_readings = estimate.unobserved_readings(),
+                    accounting_violations = estimate.accounting_violations(),
+                    pressure_lost = ledger.pressure_lost(),
+                    unwired_shortfall = estimate.unwired_shortfall(),
+                    unwired_readings = estimate.unwired_readings(),
+                    // Zero where no wired ceiling bounds the store.
+                    wired_limit = estimate.wired_limit().unwrap_or(0),
+                    wire_count = estimate.wire_count().unwrap_or(0),
+                    allocated = estimate.allocated(),
+                    guarantee = estimate.guarantee(),
+                    pending = estimate.pending(),
+                    short = shortage.is_some(),
+                    yielded = owed.yielded,
+                    bank_slots = experts.map_or(0, |target| target.held),
+                    bank_target = experts.map_or(0, |target| target.target),
+                    // The least the bank shrinks by; zero where no bank holds
+                    // experts in the store.
+                    bank_block = experts.map_or(0, |target| target.block),
+                    host_slots = host.map_or(0, |target| target.held),
+                    host_target = host.map_or(0, |target| target.target),
+                    "memory read"
+                );
+            }
         }
         answers
     }
@@ -1377,7 +1437,11 @@ impl<'d> MemoryProbe<'d> {
     /// where a change beside the sample deferred the reading (the pressure
     /// stays owed to the next), or where the answer took none of the bank's
     /// cache.
-    fn running_pressure(&self, bank: &dyn ElasticBank) -> Option<RunningPressure> {
+    fn running_pressure(
+        &self,
+        bank: &dyn ElasticBank,
+        decode_price: Option<&magnitude_cost_model::DecodePrice>,
+    ) -> Option<RunningPressure> {
         let reader = self.memory.borrow();
         if self.resizing || !reader.pressured() {
             return None;
@@ -1393,7 +1457,9 @@ impl<'d> MemoryProbe<'d> {
         let before = bank_cache();
         // Beside a running chain the owner evicts nothing: the answer's
         // relief preempts no request.
-        drop(self.answer(&std::collections::BTreeSet::new()));
+        drop(self.answer(&std::collections::BTreeSet::new(), || {
+            derived_targets_for(self.ledgers, bank, decode_price).unwrap_or_default()
+        }));
         match before - bank_cache() {
             0 => None,
             bytes => Some(RunningPressure { bytes }),
@@ -1860,57 +1926,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let cost = began.elapsed();
         let generation = self.memory_generation();
-        let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
-        let targets = match (traced, self.family.expert_bank()) {
+        let targets = match (tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG), self.family.expert_bank()) {
             (true, Some(bank)) => self.derived_targets(bank)?,
             _ => Vec::new(),
         };
-        for StoreAnswer { ledger, generation, shortage, owed } in probe.answer(evictable) {
-            if !traced {
-                continue;
-            }
-            let estimate = ledger.estimate();
-            let held = |holding| targets.iter().find(|target| target.holding == holding && target.store == ledger.store());
-            let (experts, host) = (held(BankHolding::Experts), held(BankHolding::Host));
-            tracing::debug!(
-                target: MEMORY_TRACE,
-                store = ?ledger.store(),
-                generation,
-                budget = estimate.budget(),
-                supply = estimate.supply(),
-                committed = estimate.committed(),
-                cache = estimate.cache(),
-                bank_cache = estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
-                other_cache = estimate.cache() - estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
-                // Zero where no weight cap bounds the store.
-                cap = estimate.cap().unwrap_or(0),
-                free = estimate.free(),
-                others = estimate.others(),
-                nonresident = estimate.nonresident(),
-                unobserved_resident = estimate.unobserved_resident(),
-                unobserved_readings = estimate.unobserved_readings(),
-                accounting_violations = estimate.accounting_violations(),
-                pressure_lost = ledger.pressure_lost(),
-                unwired_shortfall = estimate.unwired_shortfall(),
-                unwired_readings = estimate.unwired_readings(),
-                // Zero where no wired ceiling bounds the store.
-                wired_limit = estimate.wired_limit().unwrap_or(0),
-                wire_count = estimate.wire_count().unwrap_or(0),
-                allocated = estimate.allocated(),
-                guarantee = estimate.guarantee(),
-                pending = estimate.pending(),
-                short = shortage.is_some(),
-                yielded = owed.yielded,
-                bank_slots = experts.map_or(0, |target| target.held),
-                bank_target = experts.map_or(0, |target| target.target),
-                // The least the bank shrinks by; zero where no bank holds
-                // experts in the store.
-                bank_block = experts.map_or(0, |target| target.block),
-                host_slots = host.map_or(0, |target| target.held),
-                host_target = host.map_or(0, |target| target.target),
-                "memory read"
-            );
-        }
+        drop(probe.answer(evictable, || targets));
         let response = self.answered.borrow_mut().owed.take();
         Ok(MemoryReading::Read(MemoryRead { cost, generation, response }))
     }
@@ -2043,8 +2063,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         spare: crate::TargetGraphOutputLease,
     ) -> Result<Chain<F::TargetSubmission>, crate::programs::ChainRefusal> {
         // The family is lent to the chain, so the probe borrows the rest.
+        let decode_price = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG)
+            .then(|| self.decode_price().ok().flatten())
+            .flatten();
         let probe = MemoryProbe::of(&self.memory, self.resources.ledgers(), &self.answered, &self.resize_held);
-        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank));
+        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank, decode_price.as_ref()));
         self.note_running_cut();
         submitted
     }
