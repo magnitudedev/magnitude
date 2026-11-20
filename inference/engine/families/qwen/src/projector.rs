@@ -1,8 +1,8 @@
 //! The Qwen3-VL projector (`qwen3vl_merger`).
 
 use crate::{Error, product};
-use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::{array_elements, projector_type, Tensors};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{ProjectorMetadata, projector_type, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
@@ -11,46 +11,30 @@ use magnitude_family_contracts::{
     WeightDescriptor,
 };
 
+/// Every `clip.*` metadata key the Qwen3-VL projector interprets.
+const KEYS: &[&str] = &[
+    "clip.has_vision_encoder",
+    "clip.projector_type",
+    "clip.vision.projector_type",
+    "clip.use_gelu",
+    "clip.vision.block_count",
+    "clip.vision.embedding_length",
+    "clip.vision.feed_forward_length",
+    "clip.vision.attention.head_count",
+    "clip.vision.attention.layer_norm_epsilon",
+    "clip.vision.patch_size",
+    "clip.vision.spatial_merge_size",
+    "clip.vision.image_size",
+    "clip.vision.projection_dim",
+    "clip.vision.image_mean",
+    "clip.vision.image_std",
+    "clip.vision.image_min_pixels",
+    "clip.vision.image_max_pixels",
+    "clip.vision.is_deepstack_layers",
+];
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::invalid(message)
-}
-
-fn positive(directory: &Directory, key: &str) -> Result<u64, Error> {
-    directory
-        .value(key)
-        .and_then(Value::unsigned)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| invalid(format!("{key} must be a positive integer")))
-}
-
-fn number(directory: &Directory, key: &str) -> Result<f64, Error> {
-    let value = match directory.value(key) {
-        Some(Value::Scalar(Scalar::Float(value))) => *value,
-        Some(Value::Scalar(Scalar::Unsigned(value))) => *value as f64,
-        Some(Value::Scalar(Scalar::Signed(value))) => *value as f64,
-        _ => return Err(invalid(format!("{key} must be numeric"))),
-    };
-    if !value.is_finite() {
-        return Err(invalid(format!("{key} must be finite")));
-    }
-    Ok(value)
-}
-
-fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
-    let Some(Value::Array(values)) = directory.value(key) else {
-        return Err(invalid(format!("{key} must contain three numbers")));
-    };
-    let values = array_elements(key, values)?
-        .iter()
-        .map(|value| match value {
-            Element::Float(value) if value.is_finite() => Some(value),
-            Element::Unsigned(value) => Some(value as f64),
-            Element::Signed(value) => Some(value as f64),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| invalid(format!("{key} must contain three finite numbers")))?;
-    <[f64; 3]>::try_from(values).map_err(|_| invalid(format!("{key} must contain three numbers")))
 }
 
 /// Interpret a validated Qwen3-VL projector inventory for a target of
@@ -60,46 +44,32 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("qwen3vl_merger", ())], target_width)?;
-    let depth = positive(directory, "clip.vision.block_count")?;
-    let hidden = positive(directory, "clip.vision.embedding_length")?;
-    let intermediate = positive(directory, "clip.vision.feed_forward_length")?;
-    let heads = positive(directory, "clip.vision.attention.head_count")?;
-    let patch = positive(directory, "clip.vision.patch_size")?;
-    let merge = positive(directory, "clip.vision.spatial_merge_size")?;
-    let image_size = positive(directory, "clip.vision.image_size")?;
-    let output_hidden = positive(directory, "clip.vision.projection_dim")?;
-    let epsilon = number(directory, "clip.vision.attention.layer_norm_epsilon")?;
-    let mean = triple(directory, "clip.vision.image_mean")?;
-    let std = triple(directory, "clip.vision.image_std")?;
-    let pixel_bound = |key: &str, default: u64| -> Result<u64, Error> {
-        match directory.value(key) {
-            None => Ok(default),
-            Some(value) => value
-                .unsigned()
-                .filter(|bound| *bound > 0)
-                .ok_or_else(|| invalid(format!("{key} must be a positive integer"))),
-        }
-    };
-    let min_pixels = pixel_bound("clip.vision.image_min_pixels", 65_536)?;
-    let max_pixels = pixel_bound("clip.vision.image_max_pixels", 16_777_216)?;
-    if let Some(value) = directory.value("clip.use_gelu") {
-        if !matches!(value, Value::Scalar(Scalar::Bool(_))) {
-            return Err(invalid("clip.use_gelu must be boolean"));
-        }
+    let meta = ProjectorMetadata::new(directory, KEYS)?;
+    let depth = meta.bounded_block_count("clip.vision.block_count")?;
+    let hidden = meta.integer("clip.vision.embedding_length")?;
+    let intermediate = meta.integer("clip.vision.feed_forward_length")?;
+    let heads = meta.integer("clip.vision.attention.head_count")?;
+    let patch = meta.integer("clip.vision.patch_size")?;
+    let merge = meta.integer("clip.vision.spatial_merge_size")?;
+    let image_size = meta.integer("clip.vision.image_size")?;
+    let output_hidden = meta.integer("clip.vision.projection_dim")?;
+    let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
+    let mean = meta.f64_array("clip.vision.image_mean")?;
+    let std = meta.f64_array("clip.vision.image_std")?;
+    let min_pixels = meta
+        .optional_integer("clip.vision.image_min_pixels")?
+        .unwrap_or(65_536);
+    let max_pixels = meta
+        .optional_integer("clip.vision.image_max_pixels")?
+        .unwrap_or(16_777_216);
+    if meta.optional_bool("clip.use_gelu")? == Some(false) {
+        return Err(invalid("Qwen3-VL projector requires GELU (clip.use_gelu)"));
     }
-    let deepstack_key = "clip.vision.is_deepstack_layers";
-    if let Some(deepstack) = directory.value(deepstack_key) {
-        let none = match deepstack {
-            Value::Array(values) if values.len() as u64 == depth => {
-                array_elements(deepstack_key, values)?
-                    .iter()
-                    .all(|value| matches!(value, Element::Bool(false)))
-            }
-            _ => false,
-        };
-        if !none {
-            return Err(invalid("deepstack projector layers are unsupported"));
-        }
+    if meta
+        .optional_bool_array("clip.vision.is_deepstack_layers", depth)?
+        .is_some_and(|layers| layers.into_iter().any(|enabled| enabled))
+    {
+        return Err(invalid("deepstack projector layers are unsupported"));
     }
 
     let mut tensors = Tensors::new(directory);

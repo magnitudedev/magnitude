@@ -17,8 +17,8 @@
 //! patch kernel only.
 
 use crate::Error;
-use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::{array_elements, projector_type, Tensors};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{ProjectorMetadata, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage,
     PositionSampling, VisionActivation, VisionAttention, VisionAttentionScale,
@@ -27,7 +27,7 @@ use magnitude_family_contracts::{
     VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor,
 };
 
-/// Every projector metadata key the family reads, beside `general.*`.
+/// Every `clip.*` metadata key the family reads.
 const KEYS: &[&str] = &[
     "clip.has_vision_encoder",
     "clip.projector_type",
@@ -57,45 +57,15 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 struct Reader<'a> {
-    directory: &'a Directory,
+    meta: ProjectorMetadata<'a>,
     tensors: Tensors<'a>,
     epsilon: f64,
 }
 
 impl Reader<'_> {
-    fn count(&self, key: &str) -> Result<u64, Error> {
-        self.directory
-            .value(key)
-            .and_then(Value::unsigned)
-            .filter(|value| *value > 0)
-            .ok_or_else(|| invalid(format!("{key} must be a positive integer")))
-    }
-
-    fn flag(&self, key: &str) -> Option<bool> {
-        match self.directory.value(key) {
-            Some(Value::Scalar(Scalar::Bool(value))) => Some(*value),
-            _ => None,
-        }
-    }
-
-    fn triple(&self, key: &str) -> Result<[f64; 3], Error> {
-        let Some(Value::Array(values)) = self.directory.value(key) else {
-            return Err(invalid(format!("{key} must contain three numbers")));
-        };
-        array_elements(key, values)?
-            .iter()
-            .map(|value| match value {
-                Element::Float(value) if value.is_finite() => Some(value),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .and_then(|values| values.try_into().ok())
-            .ok_or_else(|| invalid(format!("{key} must contain three finite numbers")))
-    }
-
     /// Image pixel bound `key` as whole patches.
     fn patches(&self, key: &str, patch: u64) -> Result<u64, Error> {
-        let pixels = self.count(key)?;
+        let pixels = self.meta.integer(key)?;
         let area = patch * patch;
         if !pixels.is_multiple_of(area) {
             return Err(invalid(format!("{key} is not a whole number of patches")));
@@ -176,46 +146,29 @@ pub fn describe_projector(
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("nemotron_omni", ())], target_width)
         .map_err(Error::ProjectorIdentity)?;
-    if let Some(entry) = directory
-        .metadata
-        .iter()
-        .find(|entry| !entry.name.starts_with("general.") && !KEYS.contains(&entry.name.as_str()))
-    {
-        return Err(invalid(format!(
-            "unknown projector metadata {:?}",
-            entry.name
-        )));
-    }
-    let epsilon = match directory.value("clip.vision.attention.layer_norm_epsilon") {
-        Some(Value::Scalar(Scalar::Float(value))) if value.is_finite() && *value > 0.0 => *value,
-        _ => return Err(invalid("projector declares no positive layer norm epsilon")),
-    };
+    let meta = ProjectorMetadata::new(directory, KEYS)?;
+    let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
     let mut r = Reader {
-        directory,
+        meta,
         tensors: Tensors::new(directory),
         epsilon,
     };
     // The released tower's feed-forward is the erf GELU.
-    if r.flag("clip.use_gelu") != Some(true) {
+    if !r.meta.bool("clip.use_gelu")? {
         return Err(invalid("the Nemotron tower requires its GELU feed-forward"));
     }
-    if directory.value("clip.vision.nemotron_omni").is_some()
-        && r.flag("clip.vision.nemotron_omni") != Some(true)
-    {
+    if r.meta.optional_bool("clip.vision.nemotron_omni")? == Some(false) {
         return Err(invalid("clip.vision.nemotron_omni must be true"));
     }
-    let hidden = r.count("clip.vision.embedding_length")?;
-    let output_hidden = r.count("clip.vision.projection_dim")?;
-    let intermediate = r.count("clip.vision.feed_forward_length")?;
-    let depth = r.count("clip.vision.block_count")?;
-    let heads = r.count("clip.vision.attention.head_count")?;
-    let patch = r.count("clip.vision.patch_size")?;
-    let merge = r.count("clip.vision.projector.scale_factor")?;
-    r.count("clip.vision.image_size")?;
-    if !hidden.is_multiple_of(heads)
-        || !(hidden / heads).is_multiple_of(4)
-        || depth > directory.tensors.len() as u64
-    {
+    let hidden = r.meta.integer("clip.vision.embedding_length")?;
+    let output_hidden = r.meta.integer("clip.vision.projection_dim")?;
+    let intermediate = r.meta.integer("clip.vision.feed_forward_length")?;
+    let depth = r.meta.bounded_block_count("clip.vision.block_count")?;
+    let heads = r.meta.integer("clip.vision.attention.head_count")?;
+    let patch = r.meta.integer("clip.vision.patch_size")?;
+    let merge = r.meta.integer("clip.vision.projector.scale_factor")?;
+    r.meta.integer("clip.vision.image_size")?;
+    if !hidden.is_multiple_of(heads) || !(hidden / heads).is_multiple_of(4) {
         return Err(invalid("invalid Nemotron tower geometry"));
     }
     let min_patches = r.patches("clip.vision.image_min_pixels", patch)?;
@@ -334,8 +287,8 @@ pub fn describe_projector(
         // the samples unquantized where this one rounds them to 8 bits, at
         // most half an 8-bit step per channel.
         resampling: VisionResampling::Bicubic,
-        mean: r.triple("clip.vision.image_mean")?,
-        std: r.triple("clip.vision.image_std")?,
+        mean: r.meta.f64_array("clip.vision.image_mean")?,
+        std: r.meta.f64_array("clip.vision.image_std")?,
         channels: 3,
         patch,
         merge,

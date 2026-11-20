@@ -5,8 +5,8 @@
 //! cell concatenation into a two-stage GELU projector.
 
 use crate::Error;
-use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::{array_elements, projector_type, Tensors};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{ProjectorMetadata, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage, RmsNorm,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan,
@@ -15,7 +15,7 @@ use magnitude_family_contracts::{
     VisionStem, VisionUp, WeightDescriptor,
 };
 
-/// Every projector metadata key the family reads, beside `general.*`.
+/// Every `clip.*` metadata key the family reads.
 const KEYS: &[&str] = &[
     "clip.has_vision_encoder",
     "clip.use_silu",
@@ -53,29 +53,6 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::invalid(message)
 }
 
-fn positive(directory: &Directory, key: &str) -> Result<u64, Error> {
-    directory
-        .value(key)
-        .and_then(Value::unsigned)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| invalid(format!("{key} must be a positive integer")))
-}
-
-fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
-    let Some(Value::Array(values)) = directory.value(key) else {
-        return Err(invalid(format!("{key} must contain three numbers")));
-    };
-    let values = array_elements(key, values)?
-        .iter()
-        .map(|value| match value {
-            Element::Float(value) if value.is_finite() => Some(value),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| invalid(format!("{key} must contain three finite numbers")))?;
-    <[f64; 3]>::try_from(values).map_err(|_| invalid(format!("{key} must contain three numbers")))
-}
-
 /// Interpret an LFM3-VL projector inventory for a target of `target_width`
 /// without importing it.
 pub fn describe_projector(
@@ -83,42 +60,27 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("lfm3vl", ())], target_width)?;
-    if let Some(entry) = directory
-        .metadata
-        .iter()
-        .find(|entry| !entry.name.starts_with("general.") && !KEYS.contains(&entry.name.as_str()))
-    {
-        return Err(invalid(format!(
-            "unknown projector metadata {:?}",
-            entry.name
-        )));
-    }
+    let meta = ProjectorMetadata::new(directory, KEYS)?;
     // The tower's feed-forward is SwiGLU and its pixels are resampled
     // bicubically; anything else is another projector.
-    if !matches!(directory.value("clip.use_silu"), Some(Value::Scalar(Scalar::Bool(true))))
-        || directory
-            .value("clip.vision.image_resize_algo")
-            .and_then(Value::string)
-            != Some("bicubic")
+    if !meta.bool("clip.use_silu")?
+        || meta.string("clip.vision.image_resize_algo")? != "bicubic"
     {
         return Err(invalid("LFM3-VL projector activation or resampling"));
     }
-    let depth = positive(directory, "clip.vision.block_count")?;
-    let hidden = positive(directory, "clip.vision.embedding_length")?;
-    let intermediate = positive(directory, "clip.vision.feed_forward_length")?;
-    let heads = positive(directory, "clip.vision.attention.head_count")?;
-    let kv_heads = positive(directory, "clip.vision.attention.head_count_kv")?;
-    let patch = positive(directory, "clip.vision.patch_size")?;
-    let merge = positive(directory, "clip.vision.spatial_merge_size")?;
-    let output_hidden = positive(directory, "clip.vision.projection_dim")?;
-    let min_pixels = positive(directory, "clip.vision.image_min_pixels")?;
-    let max_pixels = positive(directory, "clip.vision.image_max_pixels")?;
-    let epsilon = match directory.value("clip.vision.attention.layer_norm_epsilon") {
-        Some(Value::Scalar(Scalar::Float(value))) if value.is_finite() && *value > 0.0 => *value,
-        _ => return Err(invalid("projector declares no positive layer norm epsilon")),
-    };
-    let mean = triple(directory, "clip.vision.image_mean")?;
-    let std = triple(directory, "clip.vision.image_std")?;
+    let depth = meta.bounded_block_count("clip.vision.block_count")?;
+    let hidden = meta.integer("clip.vision.embedding_length")?;
+    let intermediate = meta.integer("clip.vision.feed_forward_length")?;
+    let heads = meta.integer("clip.vision.attention.head_count")?;
+    let kv_heads = meta.integer("clip.vision.attention.head_count_kv")?;
+    let patch = meta.integer("clip.vision.patch_size")?;
+    let merge = meta.integer("clip.vision.spatial_merge_size")?;
+    let output_hidden = meta.integer("clip.vision.projection_dim")?;
+    let min_pixels = meta.integer("clip.vision.image_min_pixels")?;
+    let max_pixels = meta.integer("clip.vision.image_max_pixels")?;
+    let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
+    let mean = meta.f64_array("clip.vision.image_mean")?;
+    let std = meta.f64_array("clip.vision.image_std")?;
     if hidden % heads != 0 || heads % kv_heads != 0 {
         return Err(invalid("projector heads do not group over the tower width"));
     }

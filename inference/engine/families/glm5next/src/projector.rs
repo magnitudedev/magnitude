@@ -20,8 +20,8 @@
 //! ([`VisionResize::PaddedCanvas`]) within the pixel bounds the metadata
 //! states.
 
-use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::{array_elements, projector_type, Tensors};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_family_common::{ProjectorMetadata, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, FamilyError, ImportTransform, MergerStage,
     RmsNorm, VisionActivation, VisionAttention, VisionAttentionScale,
@@ -66,44 +66,6 @@ fn product(dimensions: &[u64]) -> Result<u64, FamilyError> {
     checked_product(dimensions).map_err(|error| invalid(error.to_string()))
 }
 
-struct Reader<'a> {
-    directory: &'a Directory,
-}
-
-impl Reader<'_> {
-    fn count(&self, key: &str) -> Result<u64, FamilyError> {
-        self.directory
-            .value(key)
-            .and_then(Value::unsigned)
-            .filter(|value| *value > 0)
-            .ok_or_else(|| invalid(format!("{key} must be a positive integer")))
-    }
-
-    fn number(&self, key: &str) -> Result<f64, FamilyError> {
-        match self.directory.value(key) {
-            Some(Value::Scalar(Scalar::Float(value))) if value.is_finite() && *value > 0.0 => {
-                Ok(*value)
-            }
-            _ => Err(invalid(format!("{key} must be a positive number"))),
-        }
-    }
-
-    fn triple(&self, key: &str) -> Result<[f64; 3], FamilyError> {
-        let Some(Value::Array(values)) = self.directory.value(key) else {
-            return Err(invalid(format!("{key} must contain three numbers")));
-        };
-        array_elements(key, values)?
-            .iter()
-            .map(|value| match value {
-                Element::Float(value) if value.is_finite() => Some(value),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .and_then(|values| values.try_into().ok())
-            .ok_or_else(|| invalid(format!("{key} must contain three finite numbers")))
-    }
-}
-
 /// The merger's LayerNorm epsilon. The released model builds that norm as
 /// `LayerNorm(out_hidden_size)` with PyTorch's default epsilon, apart from
 /// the RMS norms' `rms_norm_eps` (the file's `layer_norm_epsilon`), so the
@@ -117,40 +79,24 @@ pub fn describe_projector(
     target_width: u64,
 ) -> Result<Box<VisionDescription>, FamilyError> {
     projector_type(directory, &[(PROJECTOR_TYPE, ())], target_width)?;
-    if let Some(entry) = directory
-        .metadata
-        .iter()
-        .find(|entry| !entry.name.starts_with("general.") && !KEYS.contains(&entry.name.as_str()))
-    {
-        return Err(FamilyError::metadata(
-            entry.name.clone(),
-            format!("unknown projector metadata {:?}", entry.name),
-        ));
-    }
-    let r = Reader { directory };
+    let meta = ProjectorMetadata::new(directory, KEYS)?;
     // The tower's feed-forward is SiLU.
-    if !matches!(
-        directory.value("clip.use_silu"),
-        Some(Value::Scalar(Scalar::Bool(true)))
-    ) {
+    if !meta.bool("clip.use_silu")? {
         return Err(invalid("the projector's feed-forward must be SwiGLU (clip.use_silu)"));
     }
-    let depth = r.count("clip.vision.block_count")?;
-    let hidden = r.count("clip.vision.embedding_length")?;
-    let intermediate = r.count("clip.vision.feed_forward_length")?;
-    let heads = r.count("clip.vision.attention.head_count")?;
-    let patch = r.count("clip.vision.patch_size")?;
-    let merge = r.count("clip.vision.spatial_merge_size")?;
-    let output_hidden = r.count("clip.vision.projection_dim")?;
-    r.count("clip.vision.image_size")?;
-    let min_pixels = r.count("clip.vision.image_min_pixels")?;
-    let max_pixels = r.count("clip.vision.image_max_pixels")?;
-    let epsilon = r.number("clip.vision.attention.layer_norm_epsilon")?;
-    let limit = r.number("clip.vision.swiglu_clamp")?;
-    if !hidden.is_multiple_of(heads)
-        || !(hidden / heads).is_multiple_of(4)
-        || depth > directory.tensors.len() as u64
-    {
+    let depth = meta.bounded_block_count("clip.vision.block_count")?;
+    let hidden = meta.integer("clip.vision.embedding_length")?;
+    let intermediate = meta.integer("clip.vision.feed_forward_length")?;
+    let heads = meta.integer("clip.vision.attention.head_count")?;
+    let patch = meta.integer("clip.vision.patch_size")?;
+    let merge = meta.integer("clip.vision.spatial_merge_size")?;
+    let output_hidden = meta.integer("clip.vision.projection_dim")?;
+    meta.integer("clip.vision.image_size")?;
+    let min_pixels = meta.integer("clip.vision.image_min_pixels")?;
+    let max_pixels = meta.integer("clip.vision.image_max_pixels")?;
+    let epsilon = meta.positive_number("clip.vision.attention.layer_norm_epsilon")?;
+    let limit = meta.positive_number("clip.vision.swiglu_clamp")?;
+    if !hidden.is_multiple_of(heads) || !(hidden / heads).is_multiple_of(4) {
         return Err(invalid("projector heads do not split into 2-D rotary heads"));
     }
     let width = hidden / heads;
@@ -314,8 +260,8 @@ pub fn describe_projector(
                 max_pixels,
             },
             resampling: VisionResampling::Bicubic,
-            mean: r.triple("clip.vision.image_mean")?,
-            std: r.triple("clip.vision.image_std")?,
+            mean: meta.f64_array("clip.vision.image_mean")?,
+            std: meta.f64_array("clip.vision.image_std")?,
             channels: 3,
             patch,
             merge,

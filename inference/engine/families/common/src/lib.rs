@@ -16,5 +16,5 @@ mod tensors;
 pub use error::{CompanionForm, HeaderError};
 pub use inputs::TextInput;
 pub use metadata::{Metadata, architecture_keys, array_elements};
-pub use projector::{ProjectorIdentityError, projector_type};
+pub use projector::{ProjectorIdentityError, ProjectorMetadata, projector_type};
 pub use tensors::{Tensors, is_companion_scale};
