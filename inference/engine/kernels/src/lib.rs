@@ -47,13 +47,18 @@ pub fn guess_kind(word: i32, row: usize) -> i32 {
 /// The STEP_GUESSES word of front rows `rows`, each a (row, kind word) of a
 /// front row and the kind of the guess it runs on: what `routed_step` writes
 /// of them. Panics on a row at or past VERIFY_ROWS, row 0 (no front row
-/// precedes its exact row) or a word no guess kind's, which no field holds.
+/// precedes its exact row), a duplicate row, or a word no guess kind's, which
+/// no field holds.
 pub fn step_guesses(rows: impl IntoIterator<Item = (usize, i32)>) -> i32 {
     rows.into_iter().fold(0, |word, (row, kind)| {
         assert!(row > 0 && row < constants::VERIFY_ROWS as usize, "front row {row} is past row 0 and below VERIFY_ROWS");
         assert!(
             [constants::GUESS_CHAINED, constants::GUESS_HEAD].contains(&(kind as u64)),
             "{kind} is no guess kind's word"
+        );
+        assert!(
+            guess_kind(word, row) == 0,
+            "front row {row} appears more than once in step_guesses"
         );
         word | kind << constants::STEP_GUESS_SHIFT(row as u64)
     })
@@ -180,5 +185,28 @@ impl SlotTable {
     pub fn lane(self, step: u64, lane: u64) -> u64 {
         assert!(lane < self.lanes, "lane {lane} of {}", self.lanes);
         ((step % self.slots) * self.lanes + lane) * self.width
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_guesses_packs_distinct_front_rows() {
+        let chained = constants::GUESS_CHAINED as i32;
+        let head = constants::GUESS_HEAD as i32;
+        let word = step_guesses([(1, chained), (2, head)]);
+        assert_eq!(guess_kind(word, 0), 0);
+        assert_eq!(guess_kind(word, 1), chained);
+        assert_eq!(guess_kind(word, 2), head);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than once")]
+    fn step_guesses_panics_on_duplicate_row() {
+        let chained = constants::GUESS_CHAINED as i32;
+        let head = constants::GUESS_HEAD as i32;
+        let _ = step_guesses([(1, chained), (1, head)]);
     }
 }
