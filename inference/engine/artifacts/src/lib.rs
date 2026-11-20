@@ -18,7 +18,7 @@ pub mod support;
 
 pub use error::{Error, SplitError};
 pub use identity::{ArtifactIdentity, PackageIdentity};
-pub use layout::{BoundaryRule, InputLayout, InputSpan};
+pub use layout::{BoundaryRule, InputLayout, InputSpan, PromptCoordinates};
 pub use package::{ComponentFile, ComponentManifest, Package, PackageHeaders, PackageManifest, model_store};
 pub use payload::{TemplatePayload, TemplateSource, TokenizerPayload};
 pub use preprocessing::{

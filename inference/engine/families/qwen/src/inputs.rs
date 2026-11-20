@@ -181,6 +181,7 @@ impl ModelInputAdapter for QwenInputAdapter {
             .checked_mul(merge)
             .ok_or(InputPreparationError::VisionGeometry)?;
         let mut expanded = Vec::with_capacity(tokens.len());
+        let mut source_boundaries = Vec::with_capacity(tokens.len() + 1);
         let (mut source, mut image) = (0usize, 0usize);
         while source < tokens.len() {
             let token = tokens[source];
@@ -198,18 +199,23 @@ impl ModelInputAdapter for QwenInputAdapter {
                     .and_then(|value| value.checked_mul(w))
                     .map(|value| value / merge_area)
                     .ok_or(InputPreparationError::VisionGeometry)?;
+                source_boundaries.push(expanded.len());
                 expanded.push(markers.start);
+                source_boundaries.push(expanded.len());
                 expanded.extend(std::iter::repeat_n(markers.image, count));
+                source_boundaries.push(expanded.len());
                 expanded.push(markers.end);
                 source += 3;
                 image += 1;
             } else if token == markers.image || token == markers.end {
                 return Err(InputPreparationError::InputAlignment);
             } else {
+                source_boundaries.push(expanded.len());
                 expanded.push(token);
                 source += 1;
             }
         }
+        source_boundaries.push(expanded.len());
         if image != sizes.len() || expanded.len() > i32::MAX as usize {
             return Err(InputPreparationError::InputAlignment);
         }
@@ -320,6 +326,7 @@ impl ModelInputAdapter for QwenInputAdapter {
             TokenPlan::new(expanded, layout)?,
             coordinates,
             continuation,
+            source_boundaries,
             vision_inputs,
         )
     }

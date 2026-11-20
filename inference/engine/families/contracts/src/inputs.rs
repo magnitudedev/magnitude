@@ -3,7 +3,7 @@
 use crate::{ModelDefinition, VisionPositions};
 use magnitude_artifacts::{
     media::{DType, PreparedMedia, PreparedTensor},
-    InputLayout, TokenId,
+    InputLayout, PromptCoordinates, TokenId,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error, fmt};
@@ -230,6 +230,7 @@ pub struct PreparedModelInput {
     layout: InputLayout,
     coordinates: Vec<[i32; 3]>,
     continuation: usize,
+    source_boundaries: Vec<usize>,
     vision: BTreeMap<String, PreparedVisionInput>,
 }
 
@@ -252,11 +253,13 @@ impl PreparedModelInput {
             return Err(InputPreparationError::InputAlignment);
         }
         let continuation = tokens.len();
+        let source_boundaries = (0..=tokens.len()).collect();
         Ok(Self {
             tokens,
             layout,
             coordinates,
             continuation,
+            source_boundaries,
             vision: BTreeMap::new(),
         })
     }
@@ -270,6 +273,7 @@ impl PreparedModelInput {
             layout: InputLayout::new(0, Vec::new()).expect("an empty layout is valid"),
             coordinates: Vec::new(),
             continuation: 0,
+            source_boundaries: vec![0],
             vision: BTreeMap::new(),
         }
     }
@@ -279,6 +283,7 @@ impl PreparedModelInput {
         tokens: TokenPlan,
         coordinates: Vec<[i32; 3]>,
         continuation: usize,
+        source_boundaries: Vec<usize>,
         vision: BTreeMap<String, PreparedVisionInput>,
     ) -> Result<Self, InputPreparationError> {
         let (tokens, layout) = tokens.into_parts();
@@ -288,6 +293,11 @@ impl PreparedModelInput {
             || coordinates
                 .iter()
                 .any(|axes| axes.iter().any(|coordinate| *coordinate < 0))
+            || source_boundaries.first() != Some(&0)
+            || source_boundaries.last() != Some(&tokens.len())
+            || source_boundaries
+                .windows(2)
+                .any(|pair| pair[0] > pair[1])
             || spans.iter().any(|span| !vision.contains_key(&span.identity))
             || vision
                 .keys()
@@ -317,6 +327,7 @@ impl PreparedModelInput {
             layout,
             coordinates,
             continuation,
+            source_boundaries,
             vision,
         })
     }
@@ -337,22 +348,26 @@ impl PreparedModelInput {
         self.continuation
     }
 
+    /// The numerical prompt coordinates and continuation origin owned by this
+    /// prepared input, for prefix identity and cache matching.
+    pub fn prompt_coordinates(&self) -> PromptCoordinates {
+        PromptCoordinates::new(self.coordinates.clone(), self.continuation)
+            .expect("prepared input coordinates are validated at construction")
+    }
+
     /// The distinct images, keyed by the identity their spans name.
     pub fn vision(&self) -> &BTreeMap<String, PreparedVisionInput> {
         &self.vision
     }
 
-    /// The input row at prompt token position `position`: prompt tokens
-    /// are rows in order, except that each span's placeholder token expands
-    /// to the span's rows (see [`ModelInputAdapter`]).
-    pub fn prompt_position_row(&self, position: usize) -> usize {
-        self.layout.spans().iter().fold(position, |row, span| {
-            if row > span.start {
-                row + (span.end - span.start) - 1
-            } else {
-                row
-            }
-        })
+    /// The prepared row index at source prompt token boundary `position`,
+    /// recorded directly by the expanding [`ModelInputAdapter`].
+    pub fn prompt_position_row(&self, position: usize) -> Option<usize> {
+        self.source_boundaries.get(position).copied()
+    }
+
+    pub fn source_boundaries(&self) -> &[usize] {
+        &self.source_boundaries
     }
 
     /// Re-establish every construction invariant against `definition`. A
@@ -387,6 +402,7 @@ impl PreparedModelInput {
             TokenPlan::new(self.tokens, self.layout)?,
             self.coordinates,
             self.continuation,
+            self.source_boundaries,
             vision,
         )
     }

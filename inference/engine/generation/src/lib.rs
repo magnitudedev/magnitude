@@ -22,15 +22,15 @@ pub use draft_control::{
 pub use draft_transition::{
     CATCH_UP_ROWS, DraftHeadCall, DraftHistory, DraftRoundState, DraftTargetTransition,
 };
-pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
+pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan, PromptCoordinates};
 pub use magnitude_executor::{
     Demand, FeatureReader, FeatureRef, FrontGrant, LaunchDuration, Operation, Priming, RequestId, Sampling,
     SelectSpec, Shaping, TokenId, WorkKind,
 };
 use magnitude_executor::{AheadVerdict, ChainEntry, Guess, GuessKind, PhysicalDecision, Rows, TwoRowDecode};
 pub use method::{
-    DraftCheckpoint, FrontEntry, Method, MethodCheckpoint, MethodCheckpointError, MethodChoice, MethodEffects,
-    MethodRequirements, MethodState, Propose, Verification,
+    CheckpointCompatibility, DraftCheckpoint, FrontEntry, Method, MethodCheckpoint, MethodCheckpointError,
+    MethodChoice, MethodEffects, MethodRequirements, MethodState, Propose, Verification,
 };
 pub use mtp::{drafted_chain, Mtp};
 pub use plain::Plain;
@@ -114,6 +114,7 @@ pub struct Options {
 pub struct GenerationSeed {
     prompt: Vec<TokenId>,
     layout: InputLayout,
+    coordinates: PromptCoordinates,
     options: Options,
     constraint: Option<Box<dyn Constraint>>,
 }
@@ -125,10 +126,25 @@ impl GenerationSeed {
         options: Options,
         constraint: Option<Box<dyn Constraint>>,
     ) -> Result<Self, String> {
+        let coordinates = PromptCoordinates::linear(prompt.len())?;
+        Self::with_coordinates(prompt, layout, coordinates, options, constraint)
+    }
+
+    pub fn with_coordinates(
+        prompt: Vec<TokenId>,
+        layout: InputLayout,
+        coordinates: PromptCoordinates,
+        options: Options,
+        constraint: Option<Box<dyn Constraint>>,
+    ) -> Result<Self, String> {
         validate_input(&prompt, &layout, &options, constraint.as_deref())?;
+        if coordinates.len() != prompt.len() {
+            return Err("prompt coordinates length must match prompt token count".into());
+        }
         Ok(Self {
             prompt,
             layout,
+            coordinates,
             options,
             constraint,
         })
@@ -144,6 +160,10 @@ impl GenerationSeed {
 
     pub fn layout(&self) -> &InputLayout {
         &self.layout
+    }
+
+    pub fn coordinates(&self) -> &PromptCoordinates {
+        &self.coordinates
     }
 
     pub fn constraint_position(&self) -> Option<usize> {
@@ -288,6 +308,7 @@ impl PreparedGenerationTransition {
 pub struct Generation {
     prompt: Vec<TokenId>,
     layout: InputLayout,
+    coordinates: PromptCoordinates,
     options: Options,
     constraint: Option<Box<dyn Constraint>>,
     generated: Vec<TokenId>,
@@ -351,6 +372,7 @@ impl Generation {
         let GenerationSeed {
             prompt,
             layout,
+            coordinates,
             mut options,
             constraint,
         } = seed;
@@ -385,6 +407,7 @@ impl Generation {
         Ok(Self {
             prompt,
             layout,
+            coordinates,
             options,
             constraint,
             generated: Vec::new(),
@@ -408,6 +431,9 @@ impl Generation {
     }
     pub fn layout(&self) -> &InputLayout {
         &self.layout
+    }
+    pub fn coordinates(&self) -> &PromptCoordinates {
+        &self.coordinates
     }
     pub fn resident_position(&self) -> usize {
         self.resident_position

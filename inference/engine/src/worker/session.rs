@@ -424,7 +424,13 @@ impl Session {
         let seed = self
             .loaded
             .binding
-            .seed(constraint.as_ref(), options, input.tokens(), input.layout())
+            .seed(
+                constraint.as_ref(),
+                options,
+                input.tokens(),
+                input.layout(),
+                input.prompt_coordinates(),
+            )
             .map_err(invalid)?;
         Ok((
             WorkerCommand::Admit(AdmitRequest {

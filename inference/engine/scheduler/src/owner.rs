@@ -1554,6 +1554,15 @@ impl<F: ProgramFamily> Service<F> {
         generation
             .set_prefix_reuse(prefix_cache)
             .map_err(AdmissionError::invariant("admission"))?;
+        if !input.tokens().is_empty()
+            && (input.tokens() != generation.prompt()
+                || input.layout() != generation.layout()
+                || input.prompt_coordinates() != *generation.coordinates())
+        {
+            return Err(AdmissionError::invariant("admission")(
+                "prepared input does not match generation prompt, layout, or coordinates".into(),
+            ));
+        }
         let path = PrefixPath::of(&generation);
         if cache_points
             .iter()

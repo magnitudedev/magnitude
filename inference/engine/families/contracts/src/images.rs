@@ -261,6 +261,7 @@ impl ModelInputAdapter for SequentialImageInput {
             .as_ref()
             .map_or(1, |vision| vision.cell_rows() as usize);
         let mut expanded = Vec::with_capacity(tokens.len());
+        let mut source_boundaries = Vec::with_capacity(tokens.len() + 1);
         let mut spans = Vec::with_capacity(images.len());
         let mut vision_inputs = BTreeMap::new();
         let mut images = images.into_iter();
@@ -277,9 +278,12 @@ impl ModelInputAdapter for SequentialImageInput {
                     }
                     let [t, h, w] = image.grid;
                     let rows = t * h * w / cell_rows;
+                    source_boundaries.push(expanded.len());
                     expanded.push(markers.start);
                     let start = expanded.len();
+                    source_boundaries.push(start);
                     expanded.extend(std::iter::repeat_n(markers.row, rows));
+                    source_boundaries.push(expanded.len());
                     expanded.push(markers.end);
                     let identity = image_crop_identity(&processor, &image);
                     spans.push(InputSpan {
@@ -303,11 +307,13 @@ impl ModelInputAdapter for SequentialImageInput {
                     return Err(InputPreparationError::InputAlignment);
                 }
                 _ => {
+                    source_boundaries.push(expanded.len());
                     expanded.push(token);
                     source += 1;
                 }
             }
         }
+        source_boundaries.push(expanded.len());
         if images.next().is_some() || expanded.len() > i32::MAX as usize {
             return Err(InputPreparationError::InputAlignment);
         }
@@ -321,6 +327,13 @@ impl ModelInputAdapter for SequentialImageInput {
         if vision_inputs.is_empty() {
             return PreparedModelInput::from_text_coordinates(plan, coordinates);
         }
-        PreparedModelInput::new(definition, plan, coordinates, continuation, vision_inputs)
+        PreparedModelInput::new(
+            definition,
+            plan,
+            coordinates,
+            continuation,
+            source_boundaries,
+            vision_inputs,
+        )
     }
 }

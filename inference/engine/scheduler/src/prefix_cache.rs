@@ -23,7 +23,7 @@
 //! eviction releases is Seismic's charge, observed by the memory heap after
 //! the entry's state drops.
 use magnitude_executor::ResourcePlan;
-use magnitude_family_contracts::{InputLayout, TokenId};
+use magnitude_family_contracts::{InputLayout, InputSpan, PromptCoordinates, TokenId};
 use magnitude_generation::{Generation, MethodCheckpoint, MethodChoice};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -78,14 +78,44 @@ impl PrefixCacheCapacity {
     }
 }
 
+/// The exact numerical prefix identity of a retained state: its tokens,
+/// 3-axis rotary coordinates, and every positioned conditioning span before
+/// the entry's boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefixKey {
+    tokens: Vec<TokenId>,
+    coordinates: Vec<[i32; 3]>,
+    conditioning: Vec<InputSpan>,
+}
+
+impl PrefixKey {
+    pub fn position(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Whether `self` is an exact numerical prefix of `longer`.
+    fn is_prefix_of(&self, longer: &Self) -> bool {
+        let position = self.tokens.len();
+        longer.tokens.starts_with(&self.tokens)
+            && longer.coordinates.starts_with(&self.coordinates)
+            && longer
+                .conditioning
+                .iter()
+                .take_while(|span| span.start < position)
+                .eq(self.conditioning.iter())
+    }
+}
+
 /// A request's input path: its prompt, then its accepted output, with the
-/// media identities its layout conditions on, and the method it generates
-/// under. Derived from the generation that owns them, never stored.
+/// numerical rotary coordinates and positioned media conditioning spans owned
+/// by its prepared input, and the method it generates under. Derived from the
+/// generation that owns them, never stored.
 #[derive(Clone, Copy)]
 pub struct PrefixPath<'a> {
     prompt: &'a [TokenId],
     generated: &'a [TokenId],
     layout: &'a InputLayout,
+    coordinates: &'a PromptCoordinates,
     method: MethodChoice,
 }
 
@@ -94,12 +124,14 @@ impl<'a> PrefixPath<'a> {
         prompt: &'a [TokenId],
         generated: &'a [TokenId],
         layout: &'a InputLayout,
+        coordinates: &'a PromptCoordinates,
         method: MethodChoice,
     ) -> Self {
         Self {
             prompt,
             generated,
             layout,
+            coordinates,
             method,
         }
     }
@@ -109,6 +141,7 @@ impl<'a> PrefixPath<'a> {
             generation.prompt(),
             generation.generated(),
             generation.layout(),
+            generation.coordinates(),
             generation.method_choice(),
         )
     }
@@ -121,27 +154,59 @@ impl<'a> PrefixPath<'a> {
         self.prompt.iter().chain(self.generated)
     }
 
+    fn coordinates(&self) -> impl Iterator<Item = [i32; 3]> + 'a {
+        let len = self.len();
+        let coords = self.coordinates;
+        (0..len).map(move |index| {
+            coords
+                .coordinate_at(index)
+                .expect("generation path position lies within logical coordinate range")
+        })
+    }
+
     /// Whether `position` is a legal resume point: at most the path length
     /// and not inside an indivisible media span.
     pub fn exact_boundary(&self, position: usize) -> bool {
         position <= self.len() && self.layout.boundary(position)
     }
 
-    /// The media identities conditioned before an exact boundary.
-    fn conditioning_at(&self, position: usize) -> impl Iterator<Item = &'a str> {
+    /// The positioned conditioning spans before an exact boundary.
+    fn conditioning_at(&self, position: usize) -> impl Iterator<Item = &'a InputSpan> {
         self.layout
             .spans()
             .iter()
             .take_while(move |span| span.start < position)
-            .map(|span| span.identity.as_str())
     }
 
-    /// The deepest exact boundary of this path up to which a held path (its
-    /// tokens and the media identities conditioned on them) is the same
-    /// input. Image content is part of the identity: equal placeholder tokens
-    /// with different media diverge at the image.
-    pub fn shared_boundary(&self, tokens: &[TokenId], conditioning: &[String]) -> usize {
-        self.shared(tokens.iter(), conditioning.iter().map(String::as_str))
+    /// Snapshot the exact numerical prefix identity ending at `position`.
+    fn key(&self, position: usize) -> PrefixKey {
+        PrefixKey {
+            tokens: self.tokens().take(position).copied().collect(),
+            coordinates: self.coordinates().take(position).collect(),
+            conditioning: self.conditioning_at(position).cloned().collect(),
+        }
+    }
+
+    /// The deepest exact boundary of this path up to which a retained prefix
+    /// key (its tokens, rotary coordinates, and positioned conditioning spans)
+    /// is the exact same numerical input.
+    pub fn shared_boundary(&self, key: &PrefixKey) -> usize {
+        self.shared(
+            key.tokens.iter(),
+            key.coordinates.iter().copied(),
+            |position| {
+                key.conditioning
+                    .iter()
+                    .take_while(move |span| span.start < position)
+            },
+            |position| {
+                !key.conditioning.iter().any(|span| {
+                    span.boundaries == magnitude_family_contracts::BoundaryRule::Indivisible
+                        && span.start < position
+                        && position < span.end
+                })
+            },
+        )
     }
 
     /// [`Self::shared_boundary`] with a live request's prompt, the part of
@@ -149,28 +214,43 @@ impl<'a> PrefixPath<'a> {
     pub fn shared_with_prompt_of(&self, live: PrefixPath) -> usize {
         self.shared(
             live.prompt.iter(),
-            live.layout.spans().iter().map(|span| span.identity.as_str()),
+            live.coordinates.coordinates().iter().copied(),
+            |position| {
+                live.layout
+                    .spans()
+                    .iter()
+                    .take_while(move |span| span.start < position)
+            },
+            |position| live.layout.boundary(position),
         )
     }
 
-    fn shared<'b>(
+    fn shared<'b, I>(
         &self,
         tokens: impl Iterator<Item = &'b TokenId>,
-        conditioning: impl Iterator<Item = &'b str> + Clone,
-    ) -> usize {
+        coordinates: impl Iterator<Item = [i32; 3]>,
+        other_conditioning: impl Fn(usize) -> I,
+        other_boundary: impl Fn(usize) -> bool,
+    ) -> usize
+    where
+        I: Iterator<Item = &'b InputSpan>,
+    {
         let common = self
             .tokens()
-            .zip(tokens)
-            .take_while(|(left, right)| left == right)
+            .zip(self.coordinates())
+            .zip(tokens.zip(coordinates))
+            .take_while(|((left_tok, left_coord), (right_tok, right_coord))| {
+                left_tok == right_tok && left_coord == right_coord
+            })
             .count();
         (0..=common)
             .rev()
             .find(|&position| {
-                self.exact_boundary(position) && {
-                    let mut held = conditioning.clone();
-                    self.conditioning_at(position)
-                        .all(|own| held.next().is_some_and(|held| held == own))
-                }
+                self.exact_boundary(position)
+                    && other_boundary(position)
+                    && self
+                        .conditioning_at(position)
+                        .eq(other_conditioning(position))
             })
             .unwrap_or(0)
     }
@@ -211,8 +291,7 @@ pub struct CachedPrefix<S> {
     point: CachePoint,
     state: S,
     method: MethodCheckpoint,
-    tokens: Vec<TokenId>,
-    conditioning: Vec<String>,
+    key: PrefixKey,
     last_use: u64,
     submitted: usize,
     /// The cache's lookups when the entry was retained, and the lookups
@@ -231,7 +310,7 @@ impl<S> CachedPrefix<S> {
     }
 
     pub fn position(&self) -> usize {
-        self.tokens.len()
+        self.key.position()
     }
 }
 
@@ -329,7 +408,7 @@ impl<S> PrefixCache<S> {
             if position < MIN_PREFIX_HIT
                 || position >= bound
                 || !entry.method.resumes(path.method, position, path.tokens().nth(position).copied())
-                || path.shared_boundary(&entry.tokens, &entry.conditioning) != position
+                || path.shared_boundary(&entry.key) != position
             {
                 continue;
             }
@@ -354,13 +433,14 @@ impl<S> PrefixCache<S> {
     pub fn shared_boundary(&self, path: PrefixPath) -> usize {
         self.entries
             .iter()
-            .map(|entry| path.shared_boundary(&entry.tokens, &entry.conditioning))
+            .map(|entry| path.shared_boundary(&entry.key))
             .max()
             .unwrap_or(0)
     }
 
     /// Cache `state` as the prefix of `path` ending at `position`, an exact
-    /// boundary. An identical path already cached is refreshed instead.
+    /// boundary. An identical path already cached with a subsuming method
+    /// compatibility key is refreshed instead.
     /// Least-recently-used entries without submitted uses are evicted until
     /// the entry count fits its bound; returns whether the state was cached.
     pub fn retain(
@@ -377,18 +457,13 @@ impl<S> PrefixCache<S> {
         if self.capacity.max_entries == 0 {
             return Ok(false);
         }
-        let tokens = path.tokens().take(position).copied().collect::<Vec<_>>();
-        let conditioning = path
-            .conditioning_at(position)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let key = path.key(position);
+        let compatibility = method.compatibility();
         if let Some(existing) = self
             .entries
             .iter()
             .position(|entry| {
-                entry.tokens == tokens
-                    && entry.conditioning == conditioning
-                    && std::mem::discriminant(&entry.method) == std::mem::discriminant(&method)
+                entry.key == key && entry.method.compatibility().subsumes(compatibility)
             })
         {
             let last_use = self.tick()?;
@@ -406,8 +481,7 @@ impl<S> PrefixCache<S> {
             point,
             state,
             method,
-            tokens,
-            conditioning,
+            key,
             last_use,
             submitted: 0,
             lookups_at_retain: self.lookups,
@@ -565,8 +639,7 @@ impl<S> PrefixCache<S> {
                     && other.position() >= MIN_PREFIX_HIT
                     && other.position() < entry.position()
                     && std::mem::discriminant(&other.method) == std::mem::discriminant(&entry.method)
-                    && entry.tokens.starts_with(&other.tokens)
-                    && entry.conditioning.starts_with(&other.conditioning)
+                    && other.key.is_prefix_of(&entry.key)
             })
             .map(CachedPrefix::position)
             .max()
@@ -595,8 +668,7 @@ impl<S> PrefixCache<S> {
                 .iter()
                 .filter(|entry| {
                     entry.point == CachePoint::Branch
-                        && path.tokens.starts_with(&entry.tokens)
-                        && path.conditioning.starts_with(&entry.conditioning)
+                        && entry.key.is_prefix_of(&path.key)
                 })
                 .max_by_key(|entry| (entry.position(), entry.id))
         });
@@ -691,11 +763,13 @@ mod tests {
         REFERENCES.with_borrow(|references| references.get(&row).is_some_and(|count| *count > 0))
     }
 
-    /// An owned request path: prompt, accepted output and layout.
+    /// An owned request path: prompt, accepted output, layout, and numerical
+    /// prompt coordinates.
     struct Owned {
         prompt: Vec<TokenId>,
         generated: Vec<TokenId>,
         layout: InputLayout,
+        coordinates: PromptCoordinates,
     }
 
     impl Owned {
@@ -704,7 +778,13 @@ mod tests {
         }
 
         fn under(&self, method: MethodChoice) -> PrefixPath<'_> {
-            PrefixPath::new(&self.prompt, &self.generated, &self.layout, method)
+            PrefixPath::new(
+                &self.prompt,
+                &self.generated,
+                &self.layout,
+                &self.coordinates,
+                method,
+            )
         }
     }
 
@@ -714,6 +794,7 @@ mod tests {
             prompt: tokens.into_iter().map(TokenId).collect(),
             generated: Vec::new(),
             layout: InputLayout::new(count, vec![]).unwrap(),
+            coordinates: PromptCoordinates::linear(count).unwrap(),
         }
     }
 
@@ -867,12 +948,23 @@ mod tests {
                 ],
             )
             .unwrap(),
+            coordinates: PromptCoordinates::linear(10).unwrap(),
         };
         let path = owned.path();
         assert_eq!(path.len(), 11);
         assert_eq!(path.conditioning_at(2).count(), 0);
-        assert_eq!(path.conditioning_at(3).collect::<Vec<_>>(), ["first"]);
-        assert_eq!(path.conditioning_at(11).collect::<Vec<_>>(), ["first", "second"]);
+        assert_eq!(
+            path.conditioning_at(3)
+                .map(|span| span.identity.as_str())
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+        assert_eq!(
+            path.conditioning_at(11)
+                .map(|span| span.identity.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
         assert!(!path.exact_boundary(8));
         assert!(path.exact_boundary(11));
         assert!(!path.exact_boundary(12));
@@ -1022,6 +1114,7 @@ mod tests {
                 }],
             )
             .unwrap(),
+            coordinates: PromptCoordinates::linear(80).unwrap(),
         };
         let source = conditioned("source");
         let mut cache = PrefixCache::new(capacity(8));
@@ -1032,6 +1125,160 @@ mod tests {
         // The same tokens with another image diverge before the image.
         assert_eq!(cache.shared_boundary(changed.path()), 2);
         assert_eq!(cache.shared_boundary(conditioned("source").path()), 80);
+    }
+
+    /// Two inputs with identical tokens and identical positioned media spans
+    /// (e.g. a MiniCPM overview crop) but different 3-axis RoPE coordinates
+    /// (from different detail tilings) must not hit each other's prefix cache
+    /// or share a peer branch point past the diverging coordinate.
+    #[test]
+    fn prefix_cache_rejects_rope_coordinate_mismatch_with_identical_tokens_and_spans() {
+        let with_coords = |coords: Vec<[i32; 3]>| Owned {
+            prompt: (0..80).map(TokenId).collect(),
+            generated: Vec::new(),
+            layout: InputLayout::new(
+                80,
+                vec![InputSpan {
+                    start: 64,
+                    end: 68,
+                    identity: "overview-crop".into(),
+                    boundaries: BoundaryRule::Causal,
+                    language_history: false,
+                }],
+            )
+            .unwrap(),
+            coordinates: PromptCoordinates::new(coords, 80).unwrap(),
+        };
+        let mut unsliced_coords: Vec<[i32; 3]> = (0..80).map(|i| [i as i32; 3]).collect();
+        let mut sliced_coords = unsliced_coords.clone();
+        // Overview rows 64..68: unsliced maps [0..2, 0..2], sliced maps [0..4, 0..4].
+        for (i, &(y, x)) in [(0, 0), (0, 1), (1, 0), (1, 1)].iter().enumerate() {
+            unsliced_coords[64 + i] = [64, 64 + y, 64 + x];
+        }
+        for (i, &(y, x)) in [(0, 0), (0, 3), (3, 0), (3, 3)].iter().enumerate() {
+            sliced_coords[64 + i] = [64, 64 + y, 64 + x];
+        }
+        let unsliced = with_coords(unsliced_coords);
+        let sliced = with_coords(sliced_coords);
+
+        let mut cache = PrefixCache::new(capacity(8));
+        assert!(retain(&mut cache, &unsliced, 68, rows(0..68)));
+        // Row 65 is the first diverging coordinate, so no hit at 68.
+        assert!(lookup_any(&mut cache, &sliced).is_none());
+        assert_eq!(cache.shared_boundary(sliced.path()), 65);
+        assert_eq!(unsliced.path().shared_with_prompt_of(sliced.path()), 65);
+    }
+
+    /// Conditioning comparison is two-sided and offset-sensitive: a text-only
+    /// path cannot hit a conditioned entry with the same placeholder tokens
+    /// (nor vice versa), and identical image identities at different span
+    /// offsets or lengths diverge at the earlier span.
+    #[test]
+    fn prefix_cache_enforces_two_sided_and_positioned_conditioning() {
+        let span_at = |start: usize, end: usize| Owned {
+            prompt: (0..80).map(TokenId).collect(),
+            generated: Vec::new(),
+            layout: InputLayout::new(
+                80,
+                vec![InputSpan {
+                    start,
+                    end,
+                    identity: "same-image".into(),
+                    boundaries: BoundaryRule::Causal,
+                    language_history: false,
+                }],
+            )
+            .unwrap(),
+            coordinates: PromptCoordinates::linear(80).unwrap(),
+        };
+        let plain = tokens((0..80).collect());
+        let at_5_9 = span_at(5, 9);
+        let at_6_10 = span_at(6, 10);
+        let at_5_11 = span_at(5, 11);
+
+        let mut cache = PrefixCache::new(capacity(8));
+        assert!(retain(&mut cache, &at_5_9, 80, rows(0..80)));
+        // Text-only path must NOT hit conditioned entry (was one-sided bug).
+        assert!(lookup_any(&mut cache, &plain).is_none());
+        assert_eq!(cache.shared_boundary(plain.path()), 5);
+        // Same image identity at different offset or length must NOT hit.
+        assert!(lookup_any(&mut cache, &at_6_10).is_none());
+        assert_eq!(cache.shared_boundary(at_6_10.path()), 5);
+        assert!(lookup_any(&mut cache, &at_5_11).is_none());
+        assert_eq!(cache.shared_boundary(at_5_11.path()), 5);
+
+        // Reverse direction: conditioned path must NOT hit text-only entry.
+        let mut text_cache = PrefixCache::new(capacity(8));
+        assert!(retain(&mut text_cache, &plain, 80, rows(0..80)));
+        assert!(lookup_any(&mut text_cache, &at_5_9).is_none());
+        assert_eq!(text_cache.shared_boundary(at_5_9.path()), 5);
+    }
+
+    /// Identical prompt tokens and layout with different continuation origins
+    /// share up to the prompt end but diverge on generated rows.
+    #[test]
+    fn prefix_cache_distinguishes_continuation_coordinates() {
+        let with_continuation = |continuation: usize| Owned {
+            prompt: (0..70).map(TokenId).collect(),
+            generated: (70..80).map(TokenId).collect(),
+            layout: InputLayout::new(70, vec![]).unwrap(),
+            coordinates: PromptCoordinates::new(
+                (0..70).map(|i| [i as i32; 3]).collect(),
+                continuation,
+            )
+            .unwrap(),
+        };
+        let a = with_continuation(70);
+        let b = with_continuation(90);
+        let mut cache = PrefixCache::new(capacity(8));
+        assert!(retain(&mut cache, &a, 80, rows(0..80)));
+        assert!(lookup_any(&mut cache, &b).is_none());
+        assert_eq!(cache.shared_boundary(b.path()), 70);
+    }
+
+    /// Retention deduplication shares the method compatibility key with lookup:
+    /// an entered checkpoint for successor A does not suppress retaining an
+    /// entered checkpoint for B or a trailing checkpoint that serves every
+    /// branch, while a trailing checkpoint subsumes incoming entered ones.
+    #[test]
+    fn retain_deduplicates_by_method_compatibility_not_discriminant_alone() {
+        use magnitude_generation::DraftCheckpoint;
+
+        let mut cache = PrefixCache::new(capacity(8));
+        let branch_a = tokens((0..80).chain([1000]).collect());
+        let branch_b = tokens((0..80).chain([2000]).collect());
+        let mtp = MethodChoice::Mtp { proposals: 2 };
+
+        let entered_a = MethodCheckpoint::Mtp(DraftCheckpoint::entered_at(80, TokenId(1000)));
+        let entered_b = MethodCheckpoint::Mtp(DraftCheckpoint::entered_at(80, TokenId(2000)));
+        let trailing = MethodCheckpoint::Mtp(DraftCheckpoint::trailing_at(80));
+
+        assert!(cache
+            .retain(branch_a.under(mtp), 80, CachePoint::Branch, rows(0..80), entered_a.clone())
+            .unwrap());
+        // Different entered successor must NOT be suppressed by entered_a.
+        assert!(cache
+            .retain(branch_b.under(mtp), 80, CachePoint::Branch, rows(0..80), entered_b)
+            .unwrap());
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.lookup(branch_a.under(mtp), usize::MAX).unwrap().unwrap().position(), 80);
+        assert_eq!(cache.lookup(branch_b.under(mtp), usize::MAX).unwrap().unwrap().position(), 80);
+
+        // A trailing checkpoint serves all branches and must NOT be suppressed
+        // by entered_a or entered_b.
+        assert!(cache
+            .retain(branch_a.under(mtp), 80, CachePoint::Branch, rows(0..80), trailing)
+            .unwrap());
+        assert_eq!(cache.len(), 3);
+        let branch_c = tokens((0..80).chain([3000]).collect());
+        assert_eq!(cache.lookup(branch_c.under(mtp), usize::MAX).unwrap().unwrap().position(), 80);
+
+        // Once trailing is cached, an incoming entered_a is subsumed and
+        // refreshes instead of adding a duplicate.
+        assert!(!cache
+            .retain(branch_a.under(mtp), 80, CachePoint::Branch, rows(0..80), entered_a)
+            .unwrap());
+        assert_eq!(cache.len(), 3);
     }
 
     #[test]

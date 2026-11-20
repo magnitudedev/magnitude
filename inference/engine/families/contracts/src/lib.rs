@@ -8,7 +8,8 @@
 // The closed input contract carries these generic values across the service
 // boundary; consumers need not depend on artifact preparation itself.
 pub use magnitude_artifacts::{
-    ArtifactIdentity, BoundaryRule, InputLayout, InputSpan, PackageIdentity, TokenId,
+    ArtifactIdentity, BoundaryRule, InputLayout, InputSpan, PackageIdentity, PromptCoordinates,
+    TokenId,
 };
 use serde::{Deserialize, Serialize};
 use std::{error, fmt};

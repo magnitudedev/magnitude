@@ -280,8 +280,10 @@ impl ModelInputAdapter for CanvasInput {
             side: side as usize,
             markers: &self.markers,
         };
+        let mut source_boundaries = Vec::with_capacity(plan.tokens().len() + 1);
         let mut position = 0usize;
         for token in plan.tokens() {
+            source_boundaries.push(p.tokens.len());
             if *token != self.markers.row {
                 p.token(*token, coordinate(position, position, position)?);
                 position += 1;
@@ -354,6 +356,7 @@ impl ModelInputAdapter for CanvasInput {
             }
             position = origin + canvas[0].max(canvas[1]) + 1;
         }
+        source_boundaries.push(p.tokens.len());
         if layouts.next().is_some() || crops.next().is_some() || p.tokens.len() > i32::MAX as usize
         {
             return Err(InputPreparationError::InputAlignment);
@@ -364,6 +367,13 @@ impl ModelInputAdapter for CanvasInput {
         if p.images.is_empty() {
             return PreparedModelInput::from_text_coordinates(plan, p.coordinates);
         }
-        PreparedModelInput::new(definition, plan, p.coordinates, position, p.images)
+        PreparedModelInput::new(
+            definition,
+            plan,
+            p.coordinates,
+            position,
+            source_boundaries,
+            p.images,
+        )
     }
 }

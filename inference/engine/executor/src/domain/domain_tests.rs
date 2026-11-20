@@ -1656,6 +1656,7 @@ fn vision_input(placements: &[(usize, &str)], count: usize) -> PreparedModelInpu
         TokenPlan::new(tokens, InputLayout::new(count, spans).unwrap()).unwrap(),
         (0..count as i32).map(|position| [position; 3]).collect(),
         count,
+        (0..=count).collect(),
         placements
             .iter()
             .map(|&(_, identity)| (identity.to_owned(), image()))
