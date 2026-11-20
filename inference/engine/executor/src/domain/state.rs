@@ -723,10 +723,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         let device = self.domain.device().clone();
+        let on_device = self.resources.ledgers().placed(&device, demand).0;
         let bound = held.allocate(&device, |charges| self.family.hold_bound_head(charges, places));
         if let Err(error) = bound {
             self.unbind(super::OptionalComponent::Drafter);
-            return Err(DomainError::invariant(error));
+            return Err(match error {
+                crate::resources::AllocationError::Tensor(error)
+                | crate::resources::AllocationError::Workflow(seismic::WorkflowError::TensorView(error)) => {
+                    growth_failure(error, on_device, "a bound head's stagings")
+                }
+                error => DomainError::invariant(error.to_string()),
+            });
         }
         self.head_binding.extend(held.into_claims());
         Ok(())

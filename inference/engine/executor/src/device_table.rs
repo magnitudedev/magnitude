@@ -466,6 +466,13 @@ impl crate::settle::Owed for DeviceTable {
     }
 }
 
+/// Additional stagings allocated by [`DeviceTable::prepare_places`] and
+/// installed infallibly by [`DeviceTable::install_places`].
+pub struct PreparedStagings {
+    target: usize,
+    grown: Vec<seismic::Tensor>,
+}
+
 impl DeviceTable {
     /// The steps after which a table's rows are kept: a process that ends
     /// without dropping the table still leaves the rows its first steps
@@ -581,17 +588,45 @@ impl DeviceTable {
             reads: Mutex::new(Some(reads)),
             filler: Some(filler),
         };
-        table.hold_places(charges, 1)?;
+        table.hold_places(charges, 1).map_err(|error| failed(&error))?;
         Ok(table)
+    }
+
+    /// Allocate the additional stagings a class of `places` places needs beyond
+    /// those currently held, without mutating the ring yet.
+    pub fn prepare_places(
+        &self,
+        charges: &seismic::Charges,
+        places: usize,
+    ) -> Result<PreparedStagings, seismic::TensorError> {
+        let target = self.flights.stagings(places);
+        let need = target.saturating_sub(self.staging.borrow().len());
+        let mut grown = Vec::with_capacity(need);
+        for _ in 0..need {
+            grown.push(staging(charges, &self.slots, self.stored, self.staging_rows)?);
+        }
+        Ok(PreparedStagings { target, grown })
+    }
+
+    /// Install stagings prepared by [`Self::prepare_places`]. Infallible.
+    pub fn install_places(&self, prepared: PreparedStagings) {
+        let mut grown = prepared.grown.into_iter();
+        self.staging
+            .borrow_mut()
+            .resize(prepared.target, || -> Result<seismic::Tensor, std::convert::Infallible> {
+                Ok(grown.next().expect("prepared stagings cover target"))
+            })
+            .expect("installing prepared stagings is infallible");
     }
 
     /// Hold the stagings a class of `places` places has in flight
     /// (`TableFlights::stagings`): grown for a larger class, the least
     /// recently used released for a smaller once their conversions complete.
-    pub fn hold_places(&self, charges: &seismic::Charges, places: usize) -> Result<(), String> {
-        self.staging
-            .borrow_mut()
-            .resize(self.flights.stagings(places), || staging(charges, &self.slots, self.stored, self.staging_rows))
+    /// Atomic: a failed allocation leaves the ring untouched.
+    pub fn hold_places(&self, charges: &seismic::Charges, places: usize) -> Result<(), seismic::TensorError> {
+        let prepared = self.prepare_places(charges, places)?;
+        self.install_places(prepared);
+        Ok(())
     }
 
     /// The floor's stagings alone held again, a class's released: the
@@ -672,7 +707,8 @@ impl DeviceTable {
         let rows = absent.len() as u64 * tile;
         let mut seeding = match rows {
             0 => return Ok(()),
-            rows => staging(charges, &self.slots, self.stored, rows)?,
+            rows => staging(charges, &self.slots, self.stored, rows)
+                .map_err(|error| format!("device table staging: {error}"))?,
         };
         match self.bring(&absent, &taken, served, &mut seeding)? {
             Some(converted) => converted.wait().map_err(|error| format!("device table: {error}")),
@@ -1101,14 +1137,13 @@ fn staging(
     slots: &seismic::Tensor,
     stored: seismic::Element,
     rows: u64,
-) -> Result<seismic::Tensor, String> {
+) -> Result<seismic::Tensor, seismic::TensorError> {
     let extents = std::iter::once(rows)
         .chain(slots.extents()[1..].iter().copied())
         .collect::<Vec<_>>();
     // SAFETY: a fill writes every row of its staging before the device
     // reads them.
     unsafe { seismic::Tensor::uninitialized(charges, stored, &extents) }
-        .map_err(|error| format!("device table staging: {error}"))
 }
 
 #[cfg(test)]
@@ -1385,5 +1420,45 @@ mod tests {
         assert_eq!(table.indices(&[1, 3, 6, 0]).unwrap(), [0, 1, 2, 3]);
         drop(table);
         std::fs::remove_dir_all(kept).unwrap();
+    }
+
+    #[test]
+    fn hold_places_preserves_capacity_refusal_and_leaves_ring_atomic() {
+        if let Some(requested) = seismic::testing::requested_backend() {
+            if requested != BackendName::Cpu {
+                seismic::testing::record_selected_none(requested);
+                return;
+            }
+        }
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let table = DeviceTable::new(
+            &charges,
+            Element::f32(),
+            Element::f32(),
+            8,
+            &[3],
+            4,
+            2,
+            4,
+            crate::planning::TableFlights { flights: crate::FlightDepth::SERIAL, lanes: 1, fronts: false },
+            DirectoryForm::Dense,
+            Box::new(Rows),
+            None,
+        )
+        .unwrap();
+        let floor_len = table.staging.borrow().len();
+        let one_staging = table.staging_bytes(1).unwrap() / floor_len as u64;
+        // Room for one additional staging, short of the stagings three places add.
+        let tally = seismic::memory::Tally::limited(seismic::StoreIdentity::HostRam, one_staging);
+        let tight = device.charges_in(seismic::Contract::DeviceOnly, Arc::new(tally.clone()));
+        let error = table.hold_places(&tight, 3).expect_err("tight tally refuses staging growth");
+        assert!(
+            matches!(error, seismic::TensorError::Execution(ref execution) if execution.capacity_refusal().is_some()),
+            "capacity refusal must be preserved as TensorError, got: {error}"
+        );
+        assert_eq!(table.staging.borrow().len(), floor_len, "failed growth leaves the floor ring untouched");
+        assert_eq!(tally.held(), 0, "partially allocated stagings are dropped on failure");
     }
 }
