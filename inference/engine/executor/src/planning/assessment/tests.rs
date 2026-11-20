@@ -2552,3 +2552,109 @@ fn glm_mtp_head_qualifies_on_the_selected_device() {
     )
     .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
 }
+
+#[test]
+fn head_family_certificates_cover_non_monotonic_prefill_scratch_across_backends() {
+    let hidden = crate::planning::fixtures::mix_site_hidden();
+    let definition = crate::planning::fixtures::with_mtp_head(
+        crate::planning::fixtures::fixture_definition_of(hidden),
+    );
+    let manifest = crate::planning::fixtures::fixture_manifest(&definition);
+    let method = PlannedMethod::Mtp {
+        greedy_proposals: 1,
+        sampled_proposals: 1,
+        widths: crate::DraftWidths::Adaptive,
+    };
+    let limits = crate::ResourceLimits {
+        max_launch_rows: 512,
+        max_launch_slots: 16,
+        max_selected_rows: 16,
+        max_drafting_slots: 16,
+        exported_logits_rows: 0,
+        max_images_per_request: 1,
+        max_image_cells: 0,
+        lookahead: false,
+        chain_capacity: std::num::NonZeroUsize::MIN,
+        conversations: std::num::NonZeroUsize::MIN,
+    };
+    for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Cpu] {
+        let layout = crate::resident_layout(
+            crate::ExecutionPath::Native,
+            backend,
+        );
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: true,
+                vision: false,
+            },
+            layout,
+            method,
+            limits,
+        )
+        .unwrap();
+        let state = crate::ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            method,
+            KvCodec::Dense,
+            limits,
+            crate::ResourceCapacity {
+                domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+        )
+        .unwrap();
+        let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+        let head = definition.head.as_ref().unwrap();
+        let head_block = crate::operators::CausalHeadBlock::of(head, &head.blocks[0]).unwrap();
+        let geometry = state.head_state().unwrap().head_geometry().unwrap();
+        let classes = crate::programs::native_head::head_graph_classes(
+            limits,
+            geometry,
+            method.draft_rows(),
+            load.fronts(),
+        )
+        .unwrap();
+        assert!(
+            classes.iter().any(|c| c.entry_rows == 32 && c.steps() == 0)
+                && classes.iter().any(|c| c.entry_rows == 512 && c.steps() == 0),
+            "{backend:?}: expected both 32 and 512 prefill entry_rows classes"
+        );
+        crate::programs::native_head::verify_head_family_certificates(
+            backend,
+            &load,
+            &definition.decoder,
+            head_block,
+            plan.head().unwrap().blocks()[0],
+            &classes,
+        )
+        .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        let family = crate::programs::native_head::checked_head_family_storage(
+            backend,
+            &load,
+            &definition.decoder,
+            head_block,
+            plan.head().unwrap().blocks()[0],
+            classes,
+        )
+        .unwrap();
+        let pools = AssessmentGraphResourceBounds::derive(
+            &definition,
+            &load,
+            &state,
+            method,
+            KvCodec::Dense,
+            limits,
+            backend,
+        )
+        .unwrap();
+        assert_eq!(
+            pools.head.unwrap().workspace_bytes,
+            family.storage.workspace,
+            "{backend:?}: assessment head workspace must match certified layout"
+        );
+    }
+}

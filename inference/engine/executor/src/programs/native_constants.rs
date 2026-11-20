@@ -457,10 +457,8 @@ impl GraphConstant {
         }
         let extents = rule.extents(&count);
         let element = rule.element();
-        let port = match class {
-            Some(class) => graph.port_with_class_extent(element, &extents, 0, class)?,
-            None => graph.port(element, &extents)?,
-        };
+        let _ = class;
+        let port = graph.port(element, &extents)?;
         let known = rule
             .try_map(|width| Some(width.fixed()))
             .expect("every dimension is concrete");
@@ -727,27 +725,6 @@ impl GraphConstant {
         Dim: From<C>,
     {
         Self::of_rule(graph, RowRule::Identity, Dim::from(count), false, None)
-    }
-
-    /// Identity constant value for resource accounting without a graph port.
-    pub(crate) fn identity_value(count: u64) -> Result<Self, String> {
-        Ok(Self {
-            port: None,
-            source: ConstantSource::Known { value: Arc::new(RowRule::<u64>::Identity.storage(count)?), rows: None },
-        })
-    }
-
-    /// Rank-1 `i32` range constant `[start, end)` for resource accounting
-    /// without a graph port.
-    pub(crate) fn i32_range_value(start: u64, end: u64) -> Result<Self, String> {
-        let len = end.saturating_sub(start);
-        let bytes = (start..end)
-            .map(|row| i32::try_from(row).map_err(|_| "draft output row exceeds i32".to_owned()))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flat_map(i32::to_le_bytes)
-            .collect();
-        Ok(Self::of(None, Element::i32(), vec![len], ConstantValue::Bytes(bytes)))
     }
 
     /// The row table `0, 1, …, rows - 1` of the class's `rows` rows, its

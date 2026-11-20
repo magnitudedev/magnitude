@@ -574,12 +574,14 @@ __device__ __forceinline__ void step(const typename RowGates::Inputs &rule, u8 *
     seismic_dependents_launch();
 
     const Slot slot = slot_of(in, blockIdx.z);
-    WarpRows<ROWS> state;
-    load_version<ROWS>(in, RowGates{rule}, slot, head, first_row, state);
-    publish_window(in, slot, head * gridDim.y + blockIdx.y, NV * gridDim.y);
-    __shared__ __align__(16) SequentialShared<BLOCK_ROWS, RowGates::DECAYS> shared;
-    advance_rows<ROWS, BLOCK_ROWS>(in, RowGates{rule}, slot, slot.lo, head, block_row, first_row, state, mixed,
-                                   shared);
+    if (slot.lo < slot.hi) {
+        WarpRows<ROWS> state;
+        load_version<ROWS>(in, RowGates{rule}, slot, head, first_row, state);
+        publish_window(in, slot, head * gridDim.y + blockIdx.y, NV * gridDim.y);
+        __shared__ __align__(16) SequentialShared<BLOCK_ROWS, RowGates::DECAYS> shared;
+        advance_rows<ROWS, BLOCK_ROWS>(in, RowGates{rule}, slot, slot.lo, head, block_row, first_row, state, mixed,
+                                       shared);
+    }
 
     __shared__ unsigned last;
     if (!arrive::last(arrivals + head, gridDim.y * gridDim.z, &last)) return;

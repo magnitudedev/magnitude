@@ -9,6 +9,48 @@ pub const SMALL_CLASS_ROWS: usize = 32;
 /// Prefill row classes are multiples of this quantum up to [`MAX_CLASS_ROWS`].
 pub const PREFILL_ROW_QUANTUM: usize = 64;
 
+/// The power-of-two class covering `actual` (used for history segments and
+/// request slots): `None` for zero or overflow.
+pub const fn power_of_two_class(actual: usize) -> Option<usize> {
+    if actual == 0 {
+        return None;
+    }
+    actual.checked_next_power_of_two()
+}
+
+/// Every power-of-two class up to and including `limit`, in ascending order.
+/// Empty when `limit` is zero.
+pub fn power_of_two_classes(limit: usize) -> Vec<usize> {
+    std::iter::successors(Some(1usize).filter(|&v| v <= limit), move |&v| {
+        v.checked_mul(2).filter(|&next| next <= limit)
+    })
+    .collect()
+}
+
+/// The request slot class covering `actual` slots within `limit`: the next
+/// power of two, capped at `limit` so padded slots never exceed the runtime's
+/// slot limit. `None` for zero slots or slots beyond `limit`.
+pub const fn slot_class(actual: usize, limit: usize) -> Option<usize> {
+    if actual == 0 || actual > limit {
+        return None;
+    }
+    match actual.checked_next_power_of_two() {
+        Some(next) if next <= limit => Some(next),
+        _ => Some(limit),
+    }
+}
+
+/// Every request slot class up to and including `limit`, in ascending order:
+/// powers of two up to `limit`, plus `limit` itself when `limit` is not a
+/// power of two. Empty when `limit` is zero.
+pub fn slot_classes(limit: usize) -> Vec<usize> {
+    let mut classes = power_of_two_classes(limit);
+    if limit > 0 && classes.last().copied() != Some(limit) {
+        classes.push(limit);
+    }
+    classes
+}
+
 /// The row class covering `actual` rows: the next power of two up to
 /// [`SMALL_CLASS_ROWS`], otherwise the next multiple of
 /// [`PREFILL_ROW_QUANTUM`]. `None` for zero rows or rows beyond
@@ -45,14 +87,15 @@ pub fn row_classes(limit: usize) -> Vec<usize> {
     classes
 }
 
-/// The launches a runtime prepared graphs for: at most `rows` rows, and at
-/// most `segments` history spans per row (the state store's span limit). No
-/// [`LaunchClass`] beyond either is constructed, so every class names a
-/// sealed graph.
+/// The launches a runtime prepared graphs for: at most `rows` rows, at most
+/// `segments` history spans per row (the state store's span limit), and at
+/// most `slots` request slots. No [`LaunchClass`] or slot table beyond these
+/// bounds is constructed, so every launch names a sealed graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClassLimits {
     pub rows: usize,
     pub segments: usize,
+    pub slots: usize,
 }
 
 /// Physical preparation class shared by native and planned execution paths.
@@ -71,6 +114,7 @@ pub enum ClassError {
     EmptyRows,
     RowsTooLarge { rows: usize, limit: usize },
     SegmentsTooLarge { segments: usize, limit: usize },
+    SlotsTooLarge { slots: usize, limit: usize },
 }
 
 impl fmt::Display for ClassError {
@@ -86,6 +130,10 @@ impl fmt::Display for ClassError {
             Self::SegmentsTooLarge { segments, limit } => write!(
                 f,
                 "launch class requires {segments} history segments but the limit is {limit}"
+            ),
+            Self::SlotsTooLarge { slots, limit } => write!(
+                f,
+                "launch class requires {slots} request slots but the limit is {limit}"
             ),
         }
     }
@@ -119,7 +167,10 @@ impl LaunchClass {
                 limit: limits.segments,
             });
         }
-        let segments = actual_segments.next_power_of_two();
+        let segments = power_of_two_class(actual_segments).ok_or(ClassError::SegmentsTooLarge {
+            segments: actual_segments,
+            limit: limits.segments,
+        })?;
         Ok(Self {
             rows,
             segments,
@@ -157,7 +208,11 @@ mod tests {
     use super::*;
 
     fn limits(rows: usize) -> ClassLimits {
-        ClassLimits { rows, segments: 63 }
+        ClassLimits {
+            rows,
+            segments: 63,
+            slots: rows,
+        }
     }
 
     #[test]
@@ -235,5 +290,26 @@ mod tests {
                 limit: 63
             })
         );
+    }
+
+    #[test]
+    fn slot_classes_cap_at_non_power_of_two_limit() {
+        assert!(slot_classes(0).is_empty());
+        assert_eq!(slot_classes(1), [1]);
+        assert_eq!(slot_classes(6), [1, 2, 4, 6]);
+        assert_eq!(slot_classes(10), [1, 2, 4, 8, 10]);
+        assert_eq!(slot_classes(16), [1, 2, 4, 8, 16]);
+        assert_eq!(slot_classes(128), [1, 2, 4, 8, 16, 32, 64, 128]);
+        assert_eq!(slot_class(0, 10), None);
+        assert_eq!(slot_class(11, 10), None);
+        for limit in [1usize, 6, 10, 16, 128, 192] {
+            let ladder = slot_classes(limit);
+            assert_eq!(ladder.last().copied(), Some(limit));
+            for actual in 1..=limit {
+                let class = slot_class(actual, limit).unwrap();
+                assert!(class >= actual && class <= limit);
+                assert!(ladder.contains(&class));
+            }
+        }
     }
 }

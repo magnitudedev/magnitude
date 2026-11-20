@@ -2693,6 +2693,7 @@ impl TuningInputs<'_, '_> {
         let limits = ClassLimits {
             rows,
             segments: spans.max(1).next_power_of_two(),
+            slots: packed.len().max(1),
         };
         PackedRowTables::pack(&packed, vocabulary, limits).map_err(|error| error.to_string())
     }

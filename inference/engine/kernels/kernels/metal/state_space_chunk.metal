@@ -281,6 +281,7 @@ kernel void state_space_chunk_scan(STATE_SPACE_CHUNK_ARGUMENTS,
         return;
     }
     const versions::Slot slot = versions::slot_of(slots, group.z, seismic_words);
+    if (slot.lo == slot.hi) return;
     if (group.y == 0)
         state_space::publish_window(in, slot, head, thread_index, threadgroup_shape.x);
     state_space::Rows<SSC_LANE_ROWS> rows;

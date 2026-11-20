@@ -38,6 +38,7 @@ kernel void ngram_rows(
     const versions::Slots slots{segments, stop, previous_bank, previous_tape, following_bank};
     if (item >= launch_rows) {
         const versions::Slot slot = versions::slot_of(slots, item - launch_rows, seismic_words);
+        if (slot.lo == slot.hi) return;
         device const uint *source = versions::bank<uint>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
         device uint *target = versions::bank<uint>(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
         const long published = context + versions::tape_rows(slot, long(SEISMIC_DIM_T));

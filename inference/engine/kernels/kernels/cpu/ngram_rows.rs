@@ -33,6 +33,9 @@ fn ngram_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], 
     let stored = |row: usize| tokens.get([row, 0]).wrapping_add(1) as u32;
     if item >= launch_rows {
         let slot = slots.slot(item - launch_rows);
+        if slot.lo == slot.hi {
+            return;
+        }
         for tap in 0..context + slot.recorded(cx.dim_t() as usize) {
             let value = match (slot.stop + tap).checked_sub(context) {
                 None => window.row([slot.source, slot.taped + slot.stop + tap, 0])[0],

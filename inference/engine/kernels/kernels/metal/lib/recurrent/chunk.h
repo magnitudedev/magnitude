@@ -402,6 +402,7 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
     const RchScratch<DECAYS> scratch = rch_scratch<DECAYS>(inputs, seismic_words);
     const recurrent::Slot geometry = versions::slot_of({segments, stop, previous_bank, previous_tape,
         following_bank}, slot, seismic_words);
+    if (geometry.lo == geometry.hi) return;
     const ulong source = geometry.source;
     const ulong target = geometry.target;
     // The first row block publishes this head's window channels (for the

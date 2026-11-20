@@ -6,14 +6,14 @@ use crate::{
     MixerProgramSlot, ModelLoadPlan, ResourceLimits, StateResourcePlan, TargetBlockProgramSlot, TargetProgramPlan,
     native::OutputScales,
     operators::{
-        BlockKeeps, PairedBlock, paired_block,
+        BlockKeeps, paired_block,
         routed::split::{Extents, OnceStage, RunStage, SplitValues, Stage},
     },
     programs::graph::RowForm,
 };
 use magnitude_family_contracts::{Decoder, RoutedFfn, WeightScope};
 use magnitude_state::LayerRef;
-use seismic::{BackendName, Element, NativeGraphClassSlice, OperandForms, OperandRecipe};
+use seismic::{BackendName, Element, OperandForms, OperandRecipe};
 
 /// A block graph's class: (rows, history segments, request slots, the
 /// history row tiles of its launch's rows it lists, 0 for a class that lists
@@ -23,6 +23,68 @@ pub(super) type BlockClass = (u64, u64, u64, u64, u64);
 
 /// A block graph's class and the part of the block it holds (`Stage`).
 pub(super) type StagedClass = (BlockClass, Stage);
+
+/// The class axes a sealed stage actually reads, derived by construction by
+/// probing its concrete build (`probe_block_axes`).
+/// Any axis a stage does not read collapses to its canonical sentinel
+/// (`segments = 1`, `slots = 1`, `listed = 0`, `scored = 0`).
+/// Scoring only applies to stages that read history segments, so `scored`
+/// follows `segments`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(super) struct ClassAxes {
+    pub(super) segments: bool,
+    pub(super) slots: bool,
+    pub(super) listed: bool,
+}
+
+impl ClassAxes {
+    pub(super) const fn union(self, other: Self) -> Self {
+        Self {
+            segments: self.segments || other.segments,
+            slots: self.slots || other.slots,
+            listed: self.listed || other.listed,
+        }
+    }
+
+    pub(super) const fn project(self, (rows, segments, slots, listed, scored): BlockClass) -> BlockClass {
+        (
+            rows,
+            if self.segments { segments } else { 1 },
+            if self.slots { slots } else { 1 },
+            if self.listed { listed } else { 0 },
+            if self.segments { scored } else { 0 },
+        )
+    }
+}
+
+/// Single owner of the per-block `(RowForm, RunStage) -> ClassAxes` map,
+/// derived once at certification and shared by composition, enumeration, run
+/// indexing, and runtime lookup. Missing entries are an invariant violation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct StageAxes {
+    blocks: Vec<std::sync::Arc<std::collections::BTreeMap<(RowForm, RunStage), ClassAxes>>>,
+}
+
+impl StageAxes {
+    pub(super) fn new(
+        blocks: Vec<std::sync::Arc<std::collections::BTreeMap<(RowForm, RunStage), ClassAxes>>>,
+    ) -> Self {
+        Self { blocks }
+    }
+
+    pub(super) fn of(&self, block: usize, form: RowForm, stage: RunStage) -> ClassAxes {
+        *self
+            .blocks
+            .get(block)
+            .unwrap_or_else(|| panic!("invariant violated: stage axes missing block {block}"))
+            .get(&(form, stage))
+            .unwrap_or_else(|| {
+                panic!(
+                    "invariant violated: stage axes missing ({form:?}, {stage:?}) for block {block}"
+                )
+            })
+    }
+}
 
 /// The topology a block graph certifies in: its row form, whether it lists
 /// history row tiles, whether it scores, its stage, and a pass's rows
@@ -160,8 +222,10 @@ fn block_splits(served: &[BlockServed], index: usize, rows: u64) -> bool {
 /// both count a launch's graphs by it.
 pub(super) struct LaunchRuns<'s, T> {
     served: &'s [BlockServed],
-    /// The runs, by their class.
-    runs: std::collections::HashMap<BlockClass, Vec<T>>,
+    /// The runs, keyed by `(stage_axes, projected_class)`.
+    runs: std::collections::HashMap<(ClassAxes, BlockClass), Vec<T>>,
+    /// Distinct `stage_axes` present in `runs` (at most a handful).
+    keys: Vec<ClassAxes>,
     /// The graphs run once a group (per window for a streamed block), by their
     /// block in ascending block order (only blocks with once graphs).
     once: Vec<(usize, Vec<(OnceStage, u64, T)>)>,
@@ -170,12 +234,23 @@ pub(super) struct LaunchRuns<'s, T> {
 impl<'s, T> LaunchRuns<'s, T> {
     /// The index of `graphs`, each its block, its staged class and what it
     /// holds, of blocks served as `served` (`block_served`).
-    pub(super) fn of(served: &'s [BlockServed], graphs: impl IntoIterator<Item = (usize, StagedClass, T)>) -> Self {
-        let mut runs: std::collections::HashMap<BlockClass, Vec<T>> = Default::default();
+    pub(super) fn of(
+        served: &'s [BlockServed],
+        stage_axes: impl Fn(usize, RowForm, RunStage) -> ClassAxes,
+        graphs: impl IntoIterator<Item = (usize, StagedClass, T)>,
+    ) -> Self {
+        let mut runs: std::collections::HashMap<(ClassAxes, BlockClass), Vec<T>> = Default::default();
+        let mut keys: Vec<ClassAxes> = Vec::new();
         let mut once_by_block: Vec<Vec<(OnceStage, u64, T)>> = (0..served.len()).map(|_| Vec::new()).collect();
         for (block, (class, stage), graph) in graphs {
             match stage {
-                Stage::Run(_) => runs.entry(class).or_default().push(graph),
+                Stage::Run(run) => {
+                    let axes = stage_axes(block, RowForm::of(class.0), run);
+                    if !keys.contains(&axes) {
+                        keys.push(axes);
+                    }
+                    runs.entry((axes, class)).or_default().push(graph);
+                }
                 Stage::Once(once) => once_by_block[block].push((once, class.0, graph)),
             }
         }
@@ -184,7 +259,7 @@ impl<'s, T> LaunchRuns<'s, T> {
             .enumerate()
             .filter(|(_, graphs)| !graphs.is_empty())
             .collect();
-        Self { served, runs, once }
+        Self { served, runs, keys, once }
     }
 
     /// The graphs a launch of `class` runs, repeating a streamed block's
@@ -206,7 +281,11 @@ impl<'s, T> LaunchRuns<'s, T> {
                     std::iter::repeat_n(graph, repeat)
                 })
             });
-        self.runs.get(&class).into_iter().flatten().chain(once)
+        self.keys
+            .iter()
+            .filter_map(move |&axes| self.runs.get(&(axes, axes.project(class))))
+            .flatten()
+            .chain(once)
     }
 }
 
@@ -475,11 +554,20 @@ impl LaunchControlLayout {
 }
 
 /// The history segment classes of a launch of at most `max_segments`
-/// segments, ascending: powers of two.
+/// segments, ascending: powers of two (`magnitude_batching::power_of_two_classes`).
 pub(super) fn segment_classes(max_segments: u64) -> impl Iterator<Item = u64> {
-    std::iter::successors(Some(1u64), move |segments| {
-        segments.checked_mul(2).filter(|segments| *segments <= max_segments)
-    })
+    magnitude_batching::power_of_two_classes(max_segments as usize)
+        .into_iter()
+        .map(|v| v as u64)
+}
+
+/// The request slot classes of a launch of at most `max_slots` slots,
+/// ascending: powers of two up to `max_slots` plus `max_slots` itself when not
+/// a power of two (`magnitude_batching::slot_classes`).
+pub(super) fn slot_classes(max_slots: u64) -> impl Iterator<Item = u64> {
+    magnitude_batching::slot_classes(max_slots as usize)
+        .into_iter()
+        .map(|v| v as u64)
 }
 
 /// The upload regions a step's runs of one block take, largest first: at
@@ -700,30 +788,30 @@ pub(super) fn block_classes(
     listings: &BlockListings,
     scores: bool,
 ) -> Vec<BlockClass> {
-    let max_slot = match keeps.bank() {
-        true => rows.min(max_slots),
-        false => 1,
+    let slots: Vec<u64> = match keeps.bank() {
+        true => slot_classes(rows.min(max_slots)).collect(),
+        false => vec![1],
     };
     let mut classes = Vec::new();
     if keeps.history() {
         for segments in segment_classes(max_segments) {
             let lists = listings.segments(segments, max_segments) == segments;
-            for slots in 1..=max_slot {
-                classes.push((rows, segments, slots, 0, 0));
+            for &slot_count in &slots {
+                classes.push((rows, segments, slot_count, 0, 0));
                 if scores {
-                    classes.push((rows, segments, slots, 0, 1));
+                    classes.push((rows, segments, slot_count, 0, 1));
                 }
                 if lists {
                     for &listed in &listings.tiles {
-                        classes.push((rows, segments, slots, listed, 0));
+                        classes.push((rows, segments, slot_count, listed, 0));
                     }
                 }
             }
         }
     } else {
-        classes.reserve(max_slot as usize);
-        for slots in 1..=max_slot {
-            classes.push((rows, 1, slots, 0, 0));
+        classes.reserve(slots.len());
+        for &slot_count in &slots {
+            classes.push((rows, 1, slot_count, 0, 0));
         }
     }
     classes
@@ -751,73 +839,50 @@ pub(super) fn block_class(
     )
 }
 
-/// The class dimensions of a block's slices (`block_class_slice`) that are
-/// numbers of its split, `listed` of a regime that lists history tiles: what
-/// its traces vary per class (`seismic::ClassFact`).
-pub(super) fn block_class_numbers(
-    block: &PairedBlock,
-    listed: bool,
-) -> Vec<(Option<&'static str>, &'static str, super::block::ClassNumber)> {
-    use super::block::ClassNumber;
-    let keeps = block.keeps();
-    [(None, "M", ClassNumber::Rows), (None, "O", ClassNumber::Rows)]
-        .into_iter()
-        .chain(keeps.history().then_some((None, "R", ClassNumber::Segments)))
-        .chain((keeps.history() && listed).then_some((None, "HT", ClassNumber::Listed)))
-        .chain(match keeps {
-            BlockKeeps::History => None,
-            BlockKeeps::Bank => Some((Some(crate::operators::block::RECURRENT_SLOTS), "B", ClassNumber::Slots)),
-            BlockKeeps::HistoryAndBank => Some((Some(crate::operators::ngram::graph::NGRAM_SLOTS), "B", ClassNumber::Slots)),
-        })
-        .collect()
+/// Whether a tapped block (`has_taps`) at `rows` rows has a dedicated untapped
+/// graph (`rows <= untapped_rows`). Single owner shared by certification,
+/// composition, enumeration, sealing, and runtime lookup ([`uses_untapped`]).
+pub(super) const fn has_untapped_graph(has_taps: bool, rows: u64, untapped_rows: u64) -> bool {
+    has_taps && rows <= untapped_rows
 }
 
-/// The admitted classes of one block for a `rows`-row launch, as one slice:
-/// the row count, and every history segment count (attention) or request
-/// slot count (recurrent) that launch can serve: its class facts
-/// (`block_class_numbers`), from which every other dimension follows.
-pub(super) fn block_class_slice(
-    block: &PairedBlock,
+/// Whether runtime lookup for a block with `has_taps` at `rows` rows selects
+/// its untapped graph instead of its tapped graph.
+pub(super) const fn uses_untapped(
+    has_taps: bool,
     rows: u64,
+    untapped_rows: u64,
+    tapped: bool,
+) -> bool {
+    !tapped && has_untapped_graph(has_taps, rows, untapped_rows)
+}
+
+/// The exact concrete [`StagedClass`]es certified for one run task's
+/// `(regime_rows, listed, scored, stage)`, derived from [`block_classes`]
+/// projected through `axes` and deduplicated.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_task_classes(
+    keeps: BlockKeeps,
+    regime_rows: &[u64],
     max_slots: u64,
     max_segments: u64,
-    listed: &[u64],
-) -> NativeGraphClassSlice {
-    let keeps = block.keeps();
-    // The segment and slot counts are those of every listing class.
-    let classes = block_classes(
-        keeps,
-        rows,
-        max_slots,
-        max_segments,
-        &BlockListings::default(),
-        false,
-    );
-    let slice = NativeGraphClassSlice::new()
-        .dimension("M", [rows])
-        .dimension("O", [rows]);
-    let slice = match (keeps.history(), listed.is_empty()) {
-        (false, _) => slice,
-        (true, true) => slice.dimension("R", classes.iter().map(|&(_, segments, ..)| segments)),
-        (true, false) => slice
-            .dimension("R", classes.iter().map(|&(_, segments, ..)| segments))
-            .dimension("HT", listed.iter().copied()),
-    };
-    // A recurrent mixer's slots are its own `B` (`RECURRENT_SLOTS`); an
-    // attention block's are its n-gram input's (`NGRAM_SLOTS`).
-    let slots = classes.iter().map(|&(_, _, slots, ..)| slots);
-    let slice = match keeps {
-        BlockKeeps::History => slice,
-        BlockKeeps::Bank => slice.scoped(crate::operators::block::RECURRENT_SLOTS, "B", slots),
-        BlockKeeps::HistoryAndBank => slice.scoped(crate::operators::ngram::graph::NGRAM_SLOTS, "B", slots),
-    };
-    match block.ngram {
-        Some(ngram) => {
-            let heads = ngram.op.hash.heads().expect("validated n-gram hash heads");
-            slice.scoped("stored_rows", "M", [rows * heads])
+    listings: &BlockListings,
+    listed: bool,
+    scored: bool,
+    stage: RunStage,
+    axes: ClassAxes,
+) -> Vec<StagedClass> {
+    let mut out = Vec::new();
+    for &rows in regime_rows {
+        for class in block_classes(keeps, rows, max_slots, max_segments, listings, scored) {
+            if (class.3 > 0) == listed && (class.4 > 0) == scored {
+                out.push((axes.project(class), Stage::Run(stage)));
+            }
         }
-        None => slice,
     }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// The forms block `block`'s input projection reads its operand in at the
@@ -1302,6 +1367,7 @@ pub(super) fn enumerate_block_graphs(
     state: &StateResourcePlan,
     plan: &TargetProgramPlan,
     scales: BlockOutputScales<'_>,
+    stage_axes: impl Fn(usize, RowForm, RunStage) -> ClassAxes,
 ) -> Result<BlockGraphEnumeration, String> {
     let FamilyOutline { ref row_classes, max_slots, max_segments, ref keeps, ref shapes, .. } = *outline;
     let blocks = plan.blocks();
@@ -1410,7 +1476,7 @@ pub(super) fn enumerate_block_graphs(
             let n = unique_classes[block_row_class_id[index * row_classes.len() + row_idx]].len()
                 * block_sealed_stages(served, index, rows).len();
             run_count += n;
-            if rows <= outline.untapped_rows {
+            if has_untapped_graph(untapped_shared[index].is_some(), rows, outline.untapped_rows) {
                 untapped_count += n;
             }
         }
@@ -1444,10 +1510,22 @@ pub(super) fn enumerate_block_graphs(
                 once_at += 1;
             }
             let stages = block_sealed_stages(served, index, rows);
+            let form = RowForm::of(rows);
+            let axes_per_stage: Vec<ClassAxes> = stages
+                .iter()
+                .map(|&stage| stage_axes(index, form, stage))
+                .collect();
             let classes = &unique_classes[block_row_class_id[index * row_classes.len() + row_idx]];
-            let untapped_entry = if rows <= outline.untapped_rows { untapped_shared[index] } else { None };
+            let untapped_entry = if has_untapped_graph(untapped_shared[index].is_some(), rows, outline.untapped_rows) {
+                untapped_shared[index]
+            } else {
+                None
+            };
             for (class_pos, &class) in classes.iter().enumerate() {
-                for &stage in stages {
+                for (&stage, &axes) in stages.iter().zip(&axes_per_stage) {
+                    if axes.project(class) != class {
+                        continue;
+                    }
                     let staged = (class, Stage::Run(stage));
                     match shared[index] {
                         Some(first) => enumeration.sharing.push((index, staged, first)),

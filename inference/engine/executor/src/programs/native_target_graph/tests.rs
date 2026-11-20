@@ -467,6 +467,7 @@ mod resource_template_tests {
                 &state,
                 plan.target(),
                 BlockOutputScales::Planned(UnreadScales::Distinct),
+                |index, form, stage| tapped.stage_axes.of(index, form, stage),
             )
             .unwrap();
             let mut expected = enumeration
@@ -576,6 +577,11 @@ mod resource_template_tests {
             &state,
             plan.target(),
             BlockOutputScales::Planned(UnreadScales::Equal),
+            |index, _, _| super::super::classes::ClassAxes {
+                segments: outline.keeps[index].history(),
+                slots: outline.keeps[index].bank(),
+                listed: outline.keeps[index].history(),
+            },
         )
         .unwrap();
         assert!(!enumeration.sharing.is_empty());
@@ -718,8 +724,10 @@ mod resource_template_tests {
             )
             .unwrap();
             let layout = &certificate.blocks[index][&class_topology((class, Stage::Run(RunStage::Whole)))].layout;
-            assert_eq!(
-                graph.seal_with_layout(layout).unwrap(),
+            let charged = graph.seal_with_layout(layout).unwrap();
+            assert!(
+                charged.within(layout.storage_bytes()),
+                "charged {charged:?} outside layout {:?}",
                 layout.storage_bytes()
             );
             assert!(layout.storage_bytes().workspace <= family);
@@ -1011,9 +1019,14 @@ mod resource_template_tests {
                 let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
                 let shapes = block_graph_shapes(&load, geometry, &state, &tapped, carries, None).unwrap();
                 let sealed = std::cell::Cell::new((0usize, HostHeap::default()));
-                let seals = |heap: HostHeap| {
-                    let (graphs, held) = sealed.get();
-                    sealed.set((graphs + 1, held.plus(heap).unwrap()));
+                let seen_layouts = std::cell::RefCell::new(std::collections::HashSet::<u64>::new());
+                let seals = |graph: &NativeGraphMetadata, layout: &NativeGraphLayout| {
+                    let (graphs, mut held) = sealed.get();
+                    held = held.plus(graph.plan_heap()).unwrap();
+                    if seen_layouts.borrow_mut().insert(layout.identity()) {
+                        held = held.plus(graph.topology_heap()).unwrap();
+                    }
+                    sealed.set((graphs + 1, held));
                 };
                 let owned = std::cell::Cell::new(HostHeap::default());
                 let shared = FamilyConstants::default();
@@ -1027,13 +1040,23 @@ mod resource_template_tests {
                             "{} {backend:?} {class} plan heap",
                             configuration.model
                         );
+                        assert_eq!(
+                            graph.topology_heap(),
+                            layout.topology_heap(),
+                            "{} {backend:?} {class} topology heap",
+                            configuration.model
+                        );
                         let charged = graph.seal_with_layout(layout).unwrap_or_else(|error| {
                             panic!(
                             "{} {backend:?} {class} cannot seal into its certified layout: {error}",
                             configuration.model
                         )
                         });
-                        assert_eq!(charged, layout.storage_bytes(), "{backend:?} {class}");
+                        assert!(
+                            charged.within(layout.storage_bytes()),
+                            "{backend:?} {class}: charged {charged:?} outside layout {:?}",
+                            layout.storage_bytes()
+                        );
                     };
                 let constants = std::cell::RefCell::new(CheckedGraphFamilyResources::new());
                 let chain_rows = chain_rows(64, limits).unwrap();
@@ -1081,7 +1104,7 @@ mod resource_template_tests {
                         configuration.model
                     );
                     if !(0..index).any(|first| shapes[first] == shapes[index]) {
-                        seals(graph.plan_heap());
+                        seals(&graph, &certified.layout);
                         owned.set(owned.get().plus(block_owned).unwrap());
                     }
                     for constant in &mut block_constants {
@@ -1114,7 +1137,7 @@ mod resource_template_tests {
                         )
                         .unwrap()
                         .graph;
-                        seals(graph.plan_heap());
+                        seals(&graph, &certificate.entries[&source]);
                         fits(
                             graph,
                             &certificate.entries[&source],
@@ -1138,7 +1161,14 @@ mod resource_template_tests {
                             slot_scores(plan.target().blocks()[index]),
                         ) {
                             for &stage in block_stages(&served, index, class.0) {
-                                check(index, (class, Stage::Run(stage)));
+                                let axes = certificate.stage_axes.of(
+                                    index,
+                                    crate::programs::graph::RowForm::of(class.0),
+                                    stage,
+                                );
+                                if axes.project(class) == class {
+                                    check(index, (class, Stage::Run(stage)));
+                                }
                             }
                         }
                     }
@@ -1372,5 +1402,68 @@ mod sinkhorn_graph_tests {
             );
             drop(certified.unwrap_or_else(|error| panic!("{backend:?} beside {tier:?}: {error}")));
         }
+    }
+
+    /// `ClassAxes` is derived by construction from each stage's certified
+    /// symbolic draft: a split block's `Combine` stage reads only `rows` (never
+    /// `segments`, `slots`, `listed`, or `scored`), and recurrent `slot_classes`
+    /// bucket to powers of two.
+    #[test]
+    fn combine_stage_axes_collapse_to_rows_only_and_slots_bucket_power_of_two() {
+        use crate::planning::{HostTier, Parking};
+        let (definition, manifest) = glm_slice_b_fixture();
+        let codec = KvCodec::Dense;
+        let selection = ComponentSelection { head: false, vision: false };
+        let limits = crate::planning::fixtures::LIMITS;
+        let backend = BackendName::Cuda;
+        let layout = resident_layout(ExecutionPath::Native, backend);
+        let resident = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits).unwrap();
+        let substrate = crate::planning::bank_substrate(
+            backend,
+            seismic::NativeAllocations::EXACT,
+            Some(HostTier::Unified(Parking::InKernels)),
+            &definition,
+        )
+        .unwrap();
+        let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
+        let capacity = ResourceCapacity {
+            domain_bytes: 1 << 30,
+            tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
+        };
+        let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
+        let plan = load.program_plan(&definition, codec).unwrap();
+        let certified = certify_target_family::<NativeGraphLayout>(
+            backend,
+            &load,
+            &definition.decoder,
+            &state,
+            plan.target(),
+            limits,
+            crate::PassLaunches::whole_chain(limits),
+        )
+        .unwrap();
+        let mut saw_combine = false;
+        for block in &certified.blocks {
+            for (&(_, _, _, stage, _), graph) in block {
+                if stage == Stage::Run(RunStage::Combine) {
+                    saw_combine = true;
+                    assert_eq!(
+                        graph.axes,
+                        super::super::classes::ClassAxes::default(),
+                        "Combine stage must collapse to rows-only axes"
+                    );
+                }
+            }
+        }
+        assert!(saw_combine, "fixture should include at least one Combine stage");
+        assert_eq!(
+            super::super::classes::slot_classes(10).collect::<Vec<_>>(),
+            vec![1, 2, 4, 8, 10]
+        );
+        assert_eq!(
+            super::super::classes::slot_classes(128).collect::<Vec<_>>(),
+            vec![1, 2, 4, 8, 16, 32, 64, 128]
+        );
     }
 }

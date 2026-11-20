@@ -1771,9 +1771,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The target launches graphs were sealed for: the launch row bound and
     /// the target store's span limit.
     fn target_class_limits(&self) -> crate::batching::ClassLimits {
+        let limits = self.execution.policy().limits();
         crate::batching::ClassLimits {
-            rows: self.execution.policy().limits().max_launch_rows,
+            rows: limits.max_launch_rows,
             segments: self.target_store.max_span_limit(),
+            slots: limits.max_launch_slots,
         }
     }
 
@@ -1788,9 +1790,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None if self.head_reads_target() => &self.target_store,
             None => panic!("invariant violated: a drafter launch on a load without a drafter"),
         };
+        let limits = self.execution.policy().limits();
         crate::batching::ClassLimits {
-            rows: self.execution.policy().limits().max_launch_rows,
+            rows: limits.max_launch_rows,
             segments: store.max_span_limit(),
+            slots: limits.max_launch_slots,
         }
     }
 

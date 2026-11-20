@@ -624,6 +624,7 @@ __device__ __forceinline__ void scan(const typename Rule::Inputs &in, u8 *pieces
     const int warp_row = row0 + 16 * warp;  // this warp's first state row
     auto mixed_at = [&](int row, int state_row) { return recurrent::raw_index(row, head, state_row); };
     const recurrent::Slot slot = recurrent::slot_of(base, slot_index);
+    if (slot.lo == slot.hi) return;
     recurrent::publish_window(base, slot, head * gridDim.x + blockIdx.x, NV * gridDim.x);
     extern __shared__ __align__(16) unsigned char scan_shared[];
     auto &sequential = *reinterpret_cast<recurrent::SequentialShared<ROWS, Rule::DECAYS> *>(scan_shared);

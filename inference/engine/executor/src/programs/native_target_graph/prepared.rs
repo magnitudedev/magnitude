@@ -67,6 +67,12 @@ pub struct PreparedTargetGraphs {
     /// The state each block keeps, which decides the class a launch
     /// selects per block.
     pub(super) keeps: Vec<BlockKeeps>,
+    /// Per block, the class axes each `(RowForm, RunStage)` actually reads
+    /// (`probe_block_axes`), derived once at certification.
+    pub(super) stage_axes: super::classes::StageAxes,
+    /// The row-class bound up to which tapped blocks hold dedicated untapped
+    /// graphs (`FamilyOutline::untapped_rows`).
+    pub(super) untapped_rows: u64,
     /// Per block, its selected read's shape, which decides whether a launch
     /// takes its scoring class.
     selections: Vec<Option<crate::SelectionBinding>>,
@@ -1165,6 +1171,7 @@ impl PreparedTargetGraphs {
         // Blocks whose sealed graph would be identical share one plan per
         // class: the plan names weights by kind only, and each block binds
         // its own resident weights to it.
+        let stage_axes = certificate.stage_axes;
         let BlockGraphEnumeration {
             sealing,
             sharing,
@@ -1181,6 +1188,7 @@ impl PreparedTargetGraphs {
             state,
             plan,
             BlockOutputScales::Read(&scales),
+            |index, form, stage| stage_axes.of(index, form, stage),
         )?;
         let mut held = SealedHeap::default();
         let mut entries = BTreeMap::new();
@@ -1474,6 +1482,7 @@ impl PreparedTargetGraphs {
         let windows = load.expert_bank().map_or(1, crate::ExpertBankPlan::windows);
         let launch_runs = LaunchRuns::of(
             &served,
+            |index, form, stage| stage_axes.of(index, form, stage),
             blocks_by_class.iter().enumerate().flat_map(|(index, graphs)| {
                 // A launch of a class a tapped block's untapped graphs serve
                 // runs either form of the block, as its rows demand
@@ -1571,6 +1580,8 @@ impl PreparedTargetGraphs {
             upload_regions: certificate.upload_regions,
             max_segments: outline.max_segments,
             keeps: outline.keeps,
+            stage_axes,
+            untapped_rows: outline.untapped_rows,
             selections: plan.blocks().iter().copied().map(slot_selection).collect(),
             family,
             max_output_bytes,

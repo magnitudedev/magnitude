@@ -1264,3 +1264,112 @@ fn u64_tensors_round_trip() {
         assert_eq!(tensor.read_to_host().unwrap(), bytes, "{}", device.backend().as_str());
     }
 }
+
+/// Trailing power-of-two padded empty slots (`segments = [actual_rows, actual_rows]`,
+/// `previous = -1`, `following = -1`) leave outputs and windows bit-identical
+/// to an unpadded launch for both `ngram_rows` and `ngram_inject`.
+#[test]
+fn padded_empty_slots_match_unpadded_for_rows_and_inject() {
+    let slots = vec![slot(3, 3, 0, 1), slot(2, 1, 2, 3), slot(1, 1, 4, 5)];
+    let geometry = Geometry {
+        streams: 2,
+        hidden: 16,
+        taps: 3,
+        dilation: 1,
+        banks: 8,
+        tape: 4,
+    };
+    let inject_case = Case::new(geometry, 8, slots.clone(), 91);
+    let rule = RowRule::sample();
+    let tokens = sequence(6, &[1, 4], 92);
+    let rows_case = RowsCase::new(rule.clone(), 4, slots, &tokens, 0);
+    for device in devices() {
+        let backend = device.backend().as_str();
+        let charges = seismic::Charges::tally(&device);
+        // ngram_inject
+        let expected_inject = inject_case.native(&device, false);
+        let mut bound = inject_case.bind(&device, false);
+        bound.slots = SlotTensors::padded(&device, &inject_case.slots, inject_case.rows, 4);
+        let inject_kernel = at_defaults(
+            &device,
+            ngram_inject::native_entry_with(ngram_inject::Elements { NW: Element::f32() }),
+            &geometry.statics(),
+        )
+        .unwrap();
+        let result = inject_kernel
+            .call(&charges, bound.args(inject_case.slab_banks))
+            .unwrap()
+            .value;
+        let actual_result = read(&result);
+        let actual_window = read(&bound.window);
+        let active = 6 * geometry.channels();
+        assert!(
+            same_bits(&actual_result[..active], &expected_inject.result[..active])
+                && same_bits(&actual_window, &expected_inject.window),
+            "{backend}: ngram_inject padded-slot output or window differs"
+        );
+        // ngram_rows
+        let expected_rows = rows_case.native(&device, false);
+        let stored = rows_case.window.iter().map(|v| f32::from_bits(*v)).collect::<Vec<_>>();
+        let (_slabs, mut arenas) = slab_arenas(
+            &device,
+            rows_case.banks,
+            rows_case.slab_banks,
+            &[Arena {
+                element: Element::u32(),
+                bank_shape: vec![rows_case.window_rows() as u64, 1],
+                values: &stored,
+            }],
+            false,
+        );
+        let mut window = arenas.remove(0);
+        let padded_slots = SlotTensors::padded(&device, &rows_case.slots, rows_case.rows(), 4);
+        let words = |values: &[u64]| {
+            Tensor::from_host(
+                &charges,
+                Element::u64(),
+                &[values.len() as u64],
+                &values.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let map = Tensor::from_host(
+            &charges,
+            Element::u32(),
+            &[rule.map.len() as u64],
+            &rule.map.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let boundary = rule.boundary.into_iter().collect::<Vec<_>>();
+        let rows_kernel = at_defaults(&device, ngram_rows::native_entry(), &rule.statics()).unwrap();
+        let rows_out = rows_kernel
+            .call(&charges, ngram_rows::Args {
+                tokens: &ints(&device, &[rows_case.rows() as u64, 2], &rows_case.tokens),
+                multipliers: &words(&rule.multipliers),
+                sizes: &words(&rule.sizes),
+                offsets: &words(&rule.offsets),
+                map: &map,
+                boundary: &ints(&device, &[boundary.len() as u64], &boundary),
+                segments: &padded_slots.segments,
+                stop: &padded_slots.stop,
+                previous_bank: &padded_slots.previous,
+                previous_tape: &padded_slots.previous_tape,
+                following_bank: &padded_slots.following,
+                window: &mut window,
+                fill: rule.fill,
+                slab_banks: rows_case.slab_banks as u32,
+            })
+            .unwrap()
+            .value;
+        assert_eq!(
+            rows_out.read_to_host().unwrap(),
+            expected_rows.rows.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            "{backend}: ngram_rows padded-slot rows differ"
+        );
+        assert_eq!(
+            window.read_to_host().unwrap(),
+            expected_rows.window.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            "{backend}: ngram_rows padded-slot window differs"
+        );
+    }
+}

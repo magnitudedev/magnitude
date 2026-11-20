@@ -78,7 +78,7 @@ fn state_space_rows[M, B, S, NH, P, G, N, C, T](
                             current[head, channel, column] = fma(input,
                                 tape[source, entry, NH * P + group * N + column],
                                 current[head, channel, column] * factor)
-        if publish == lo:
+        if lo < hi and publish == lo:
             for head in 0..NH:
                 for channel in 0..P:
                     for column in 0..N:
@@ -128,13 +128,14 @@ fn state_space_rows[M, B, S, NH, P, G, N, C, T](
                         for channel in 0..P:
                             for column in 0..N:
                                 state[target, head, channel, column] = current[head, channel, column]
-        for tap in 0..C - 1 + T:
-            if tap < C - 1 or publish + tap - (C - 1) < hi:
-                for channel in 0..NH * P + 2 * G * N:
-                    if stop[slot] + tap < C - 1:
-                        window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
-                    else:
-                        window[target, tap, channel] = projection[publish + tap - (C - 1), NH * P + channel]
+        if lo < hi:
+            for tap in 0..C - 1 + T:
+                if tap < C - 1 or publish + tap - (C - 1) < hi:
+                    for channel in 0..NH * P + 2 * G * N:
+                        if stop[slot] + tap < C - 1:
+                            window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
+                        else:
+                            window[target, tap, channel] = projection[publish + tap - (C - 1), NH * P + channel]
     return mixed
 
 

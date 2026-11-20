@@ -42,6 +42,7 @@ extern "C" __global__ void ngram_rows(SEISMIC_KERNEL_PARAMS) {
     const u64 bank_bytes = SEISMIC_WINDOW_STRIDE_0 * 4;
     if (item >= launch_rows) {
         const versions::Slot slot = versions::slot_of(slots, item - launch_rows, seismic_words_value);
+        if (slot.lo == slot.hi) return;
         const u32 *source =
             reinterpret_cast<const u32 *>(versions::bank(window, slot.source, bank_bytes, seismic_words_value));
         u32 *target = reinterpret_cast<u32 *>(versions::bank(window, slot.target, bank_bytes, seismic_words_value));

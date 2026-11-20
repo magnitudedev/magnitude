@@ -30,6 +30,7 @@ __device__ __forceinline__ void publish(const Operands &in, u64 index, u64 chann
     const int taps = static_cast<int>(SEISMIC_DIM_C) - 1;
     const u64 bank_elements = SEISMIC_WINDOW_STRIDE_0;
     const versions::Slot slot = versions::slot_of(in.slots, index, seismic_words_value);
+    if (slot.lo == slot.hi) return;
     const element::Stored<element::F32> source = versions::bank_view(in.window, slot.source, bank_elements, seismic_words_value);
     const element::Out<element::F32> target = versions::bank(in.window, slot.target, bank_elements, seismic_words_value);
     const int published = taps + versions::tape_rows(slot, static_cast<int>(SEISMIC_DIM_T));

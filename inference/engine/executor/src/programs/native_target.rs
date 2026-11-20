@@ -1742,7 +1742,12 @@ impl NativeTargetProgram {
         let first_commit = Instant::now();
         let segments = u64::try_from(batch.class.segments())
             .map_err(|_| invalid("segment class exceeds u64"))?;
-        let slots = u64::try_from(batch.actual_slots)
+        let slots = batch
+            .segments
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| invalid("batch has no terminal segment row"))?;
+        let slots = u64::try_from(slots)
             .map_err(|_| invalid("request slot class exceeds u64"))?;
         let controls = GraphControls::new(
             batch,
@@ -2778,8 +2783,8 @@ impl GraphControls {
             })
             .collect::<Vec<_>>();
         let pairs = |pairs: &[[i32; 2]]| i32_bytes(pairs.as_flattened());
-        let (rows, segments, slots) = (rows as u64, segments as u64, batch.actual_slots as u64);
-        let controls = layout.controls(rows, segments, slots);
+        let (rows, segments, class_slots) = (rows as u64, segments as u64, slots as u64);
+        let controls = layout.controls(rows, segments, class_slots);
         let read = |read: usize| {
             batch
                 .histories
@@ -2812,14 +2817,14 @@ impl GraphControls {
                     LaunchControl::Picks { .. } | LaunchControl::Pool { .. } => {
                         i32_bytes(&vec![-1; extents.iter().product::<u64>() as usize])
                     }
-                    LaunchControl::Segments => pairs(&batch.segments[..=batch.actual_slots]),
-                    LaunchControl::Stop => i32_bytes(&batch.stop[..batch.actual_slots]),
-                    LaunchControl::PreviousBank => i32_bytes(&batch.bank[..batch.actual_slots]),
+                    LaunchControl::Segments => pairs(&batch.segments[..=slots]),
+                    LaunchControl::Stop => i32_bytes(&batch.stop[..slots]),
+                    LaunchControl::PreviousBank => i32_bytes(&batch.bank[..slots]),
                     LaunchControl::PreviousTape => {
-                        i32_bytes(&batch.previous_tape[..batch.actual_slots])
+                        i32_bytes(&batch.previous_tape[..slots])
                     }
                     LaunchControl::FollowingBank => {
-                        i32_bytes(&batch.following_bank[..batch.actual_slots])
+                        i32_bytes(&batch.following_bank[..slots])
                     }
                 })
             })

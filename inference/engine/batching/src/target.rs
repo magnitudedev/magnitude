@@ -215,6 +215,7 @@ mod tests {
             ClassLimits {
                 rows: 8,
                 segments: 63,
+                slots: 8,
             },
         )
         .unwrap();

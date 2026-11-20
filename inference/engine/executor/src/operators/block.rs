@@ -1105,11 +1105,9 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 )
             }
             (MixerTopology::Recurrent(topology), MixerNumbers::Recurrent(numbers), MixerEntries::Recurrent(entries)) => {
-                graph.set_class_scope(Some(RECURRENT_SLOTS));
                 let (mixed, ports, controls) = recurrent(
                     graph, entries, topology, numbers, planned, scope, weights, constants, input, hidden, &join,
                 )?;
-                graph.set_class_scope(None);
                 (mixed, (ports, controls).into())
             }
             (
@@ -1117,17 +1115,13 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 MixerNumbers::StateSpace(numbers),
                 MixerEntries::StateSpace(entries),
             ) => {
-                graph.set_class_scope(Some(RECURRENT_SLOTS));
                 let (mixed, ports, controls) =
                     state_space(graph, entries, topology, numbers, planned, scope, weights, constants, hidden, &join)?;
-                graph.set_class_scope(None);
                 (mixed, (ports, controls).into())
             }
             (MixerTopology::ShortConv(topology), MixerNumbers::ShortConv(numbers), MixerEntries::ShortConv(entries)) => {
-                graph.set_class_scope(Some(RECURRENT_SLOTS));
                 let (mixed, window, controls) =
                     short_conv(graph, entries, topology, numbers, planned, scope, weights, constants, hidden, &join)?;
-                graph.set_class_scope(None);
                 (mixed, BlockState::bank(vec![window], controls))
             }
             _ => return Err("target block mixer and its kernel entries disagree".into()),
@@ -1460,7 +1454,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
             post_norm: weight(graph, planned, scope, WeightKind::PostNorm, weights)?,
         };
         let rows_port =
-            graph.port_with_class_extent(Element::f32(), &[rows.clone(), &numbers.layers * &numbers.width], 0, "M")?;
+            graph.port(Element::f32(), &[rows.clone(), &numbers.layers * &numbers.width])?;
         let out_rows = GraphConstant::row_identity(graph, rows.clone(), Some("M"))?;
         let advanced = per_layer_graph(
             graph,
@@ -1515,8 +1509,3 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         Ok((streams, Some(step)))
     }
 }
-
-/// The class scope of a recurrent mixer's nodes and ports, whose `B` is the
-/// block's request slots: a block's other entries call other dimensions `B`
-/// (a routed feed-forward's expert tiles).
-pub(crate) const RECURRENT_SLOTS: &str = "recurrent_slots";

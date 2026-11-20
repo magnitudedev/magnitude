@@ -52,6 +52,9 @@ fn ngram_inject<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3]
     };
     if item >= rows {
         let slot = slots.slot(item - rows);
+        if slot.lo == slot.hi {
+            return;
+        }
         for tap in 0..reach + slot.recorded(cx.dim_r() as usize - reach) {
             let position = (slot.stop + tap) as isize - reach as isize;
             // SAFETY: each slot's work item writes its own successor bank,

@@ -14,7 +14,7 @@ use crate::{
 use magnitude_kernels::copy_rows;
 use seismic::{
     BackendName, Device, Dim, Element, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphBindings,
-    NativeGraphClassSlice, NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout,
+    NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout,
     NativeGraphOutputs, NativeGraphPlan, NativeGraphStorageBytes, NativePort, Tensor,
 };
 use std::rc::Rc;
@@ -327,6 +327,7 @@ impl PreparedStateCopyGraphs {
             self.variants.capacity(),
             size_of::<PreparedStateCopyGraph>(),
         );
+        let mut seen_topologies = std::collections::HashSet::new();
         for variant in &self.variants {
             heap.hold(variant.class.source_extents.capacity(), size_of::<u64>());
             heap.hold(
@@ -336,6 +337,11 @@ impl PreparedStateCopyGraphs {
             heap = heap
                 .plus(variant.plan.host_heap())
                 .expect("state copy graph heap overflows");
+            if seen_topologies.insert(variant.plan.topology_identity()) {
+                heap = heap
+                    .plus(variant.plan.topology_heap())
+                    .expect("state copy graph heap overflows");
+            }
         }
         heap
     }
@@ -507,12 +513,18 @@ fn copy_family_heap(
 ) -> Result<HostHeap, String> {
     use std::mem::size_of;
     let mut heap = HostHeap::allocation(classes.len(), size_of::<PreparedStateCopyGraph>());
+    let mut seen_layouts = std::collections::HashSet::new();
     for (class, layout) in classes.iter().zip(layouts) {
         heap.hold(class.source_extents.len(), size_of::<u64>());
         heap.hold(class.destination_extents.len(), size_of::<u64>());
         heap = heap
             .plus(layout.plan_heap())
             .ok_or("state copy graph heap overflows")?;
+        if seen_layouts.insert(layout.layout_identity()) {
+            heap = heap
+                .plus(layout.topology_heap())
+                .ok_or("state copy graph heap overflows")?;
+        }
     }
     Ok(heap)
 }
@@ -542,21 +554,20 @@ pub(crate) fn certify_copy_family<L: Certified>(
         }
     }
     for group in groups {
-        let first = &classes[group[0]];
-        let [rows, middle, width, map_rows, slab_rows] = first.numbers().map(Dim::from);
-        let elements = [("A", first.element)];
-        let (graph, ..) = copy_graph_draft(
-            L::new_draft(backend),
-            L::Draft::bind(&elements),
-            first.element,
-            [&rows, &middle, &width],
-            &map_rows,
-            &slab_rows,
-        )?;
-        let layout = L::certify_one(
-            graph,
-            vec![NativeGraphClassSlice::new().dimension("N", group.iter().map(|&index| classes[index].map_rows))],
-        )?;
+        let (layout, _) = L::certify_group(backend, &group, |draft, index| {
+            let class = &classes[index];
+            let [rows, middle, width, map_rows, slab_rows] = class.numbers().map(Dim::from);
+            let elements = [("A", class.element)];
+            let (draft, ..) = copy_graph_draft(
+                draft,
+                L::Draft::bind(&elements),
+                class.element,
+                [&rows, &middle, &width],
+                &map_rows,
+                &slab_rows,
+            )?;
+            Ok((draft, ()))
+        })?;
         let storage = layout.storage_bytes();
         graphs.push(LaunchedGraph { graph: storage.recorded, pinned_runs: 0, runs: 1 });
         match &mut family {

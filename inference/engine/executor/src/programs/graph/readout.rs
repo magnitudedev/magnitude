@@ -37,7 +37,7 @@ use magnitude_kernels::{
 #[cfg(test)]
 use seismic::NativeGraphMetadata;
 use seismic::{
-    Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element, Entry, NativeGraphClassSlice,
+    Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element,
     LaunchGraphs, LaunchedGraph, NativeGraphFamily, NativeGraphLayout, NativeGraphPlan,
     NativeGraphStorageBytes, NativePort, WorkflowTensor, WorkflowTensorMut, WorkflowTensorRef,
     WorkflowTensorView,
@@ -1065,11 +1065,9 @@ fn final_row_ports<G: GraphDraft>(
 ) -> Result<FinalRowPorts, GraphError> {
     let form = InputForm::exit(geometry);
     Ok(FinalRowPorts {
-        hidden: graph.port_with_class_extent(
+        hidden: graph.port(
             Element::f32(),
             &[class.rows, form.parts * geometry.hidden],
-            0,
-            "M",
         )?,
         // An absent norm (`NM = 0`) is an empty port.
         norm: match norm_plan {
@@ -1101,7 +1099,7 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
     let (final_rows, out_rows, features, taps) = match (entries, source) {
         (FeatureEntries::Residual(entry), FeatureSource::Residual { width }) => {
             let port =
-                graph.port_with_class_extent(Element::f32(), &[class.rows, width], 0, "M")?;
+                graph.port(Element::f32(), &[class.rows, width])?;
             let dims = [("M", class.rows), ("O", class.outputs), ("D", width)];
             let out_rows = graph.input_for(entry, "out_rows", &dims)?;
             let features = graph
@@ -1151,7 +1149,7 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
                 magnitude_family_contracts::ActivationDType::F16 => Element::f16(),
                 magnitude_family_contracts::ActivationDType::BF16 => Element::bf16(),
             };
-            let taps = graph.port_with_class_extent(activation, &[class.rows, width], 0, "M")?;
+            let taps = graph.port(activation, &[class.rows, width])?;
             let weight = graph.weight_port(plan.resident, &plan.shape)?;
             // The fusion's resident second-level scale, or an absent scale.
             let scale_extent = plan.scale_extent();
@@ -1853,7 +1851,7 @@ fn head_topology<'a, G: GraphDraft + 'a>(
         None => None,
         Some(entry) => {
             let rows = Dim::from(class.rows);
-            let tokens = graph.port_with_class_extent(Element::i32(), &[class.rows, 2], 0, "M")?;
+            let tokens = graph.port(Element::i32(), &[class.rows, 2])?;
             let mut copied = graph.local_for(entry, "notice", &[("M", &rows)])?;
             graph.enqueue::<selection_notice::Entry>(
                 entry,
@@ -2257,12 +2255,6 @@ type SourcedRegime = (bool, ReadoutRegime);
 /// - [`readout_graphs_by`] still enumerates one [`LaunchedGraph`] per
 ///   [`SourcedRegime`] `(fuses, (kind, selected, chunk))`, reading the
 ///   `selected`-invariant `recorded` census from `(fuses, (kind, chunk))`.
-type ReadoutSizingKey = (ReadoutKind, bool);
-
-fn readout_sizing_key(class: ReadoutClass) -> ReadoutSizingKey {
-    (class.kind, chunk_holds(class.projected))
-}
-
 /// Every regime `load`'s readout certifies, from each of its sources
 /// ([`readout_sources`]), with every class it prepares by its source: the
 /// one account of a load's readout graphs, for the sealer
@@ -2424,88 +2416,17 @@ fn certify_readout_sizing_regimes(
     source_classes: &[ReadoutClass],
     limits: ResourceLimits,
 ) -> Result<(BTreeMap<ReadoutRegime, SizingOutline>, usize), GraphError> {
-    let features_entry = match source.features {
-        FeatureSource::Output => readout_features_rows::Entry::NAME,
-        FeatureSource::Taps { .. } | FeatureSource::Residual { .. } => feature_rows::Entry::NAME,
-    };
-    let projecting: &[&'static str] = match head {
-        HeadPlans::Packed { .. } => &[readout_head_rows::Entry::NAME],
-        HeadPlans::Qualified { .. } => &[readout_planes_rows::Entry::NAME],
-    };
-    let certifying = [
-        readout_top_rows::Entry::NAME,
-        readout_refine_rows::Entry::NAME,
-        readout_exact_rows::Entry::NAME,
-    ];
-    let slice_of = |class: &ReadoutClass| {
-        let slice = NativeGraphClassSlice::new()
-            .dimension("M", [class.rows])
-            .scoped(features_entry, "O", [class.outputs]);
-        let selecting = |slice: NativeGraphClassSlice| {
-            let slice = slice.scoped(sample_rows::Entry::NAME, "M", [class.selected]);
-            match class.kind {
-                ReadoutKind::Selection { shaped: true, .. } => {
-                    slice.scoped(shape_rows::Entry::NAME, "Sx", [class.selected])
-                }
-                _ => slice,
-            }
-        };
-        let scoped = |slice: NativeGraphClassSlice, entries: &[&'static str]| {
-            entries.iter().fold(slice, |slice, entry| {
-                slice.scoped(entry, "O", [class.projected])
-            })
-        };
-        match class.kind {
-            ReadoutKind::Features => slice,
-            ReadoutKind::Logits => scoped(slice, projecting),
-            ReadoutKind::Selection { certified: true, .. } => selecting(scoped(slice, &certifying)),
-            ReadoutKind::Selection { .. } => selecting(scoped(slice, projecting)),
-        }
-    };
-    let mut groups: BTreeMap<ReadoutSizingKey, BTreeMap<ReadoutRegime, Vec<ReadoutClass>>> = BTreeMap::new();
-    for &class in source_classes {
-        groups
-            .entry(readout_sizing_key(class))
-            .or_default()
-            .entry(readout_regime(class))
-            .or_default()
-            .push(class);
-    }
-    let draft_count = groups.len();
-    let mut out = BTreeMap::new();
-    for (_, by_regime) in groups {
-        let first_classes = by_regime.values().next().expect("a group holds a regime");
-        let kind = first_classes[0].kind;
-        let min_selected = first_classes[0].selected;
-        let largest = |field: fn(&ReadoutClass) -> u64| {
-            first_classes.iter().map(field).max().expect("a regime holds a class")
-        };
-        let template = ReadoutClass {
-            rows: largest(|class| class.rows),
-            outputs: largest(|class| class.outputs),
-            projected: largest(|class| class.projected),
-            selected: min_selected,
-            kind,
-        };
-        let regime_keys: Vec<ReadoutRegime> = by_regime.keys().copied().collect();
-        let slice_sets: Vec<Vec<NativeGraphClassSlice>> = by_regime
-            .values()
-            .map(|classes| classes.iter().map(slice_of).collect())
-            .collect();
-        let draft = checked_readout_class_draft(
-            SizingOutline::new_draft(backend),
-            geometry,
-            norm,
-            Some((head, weights)),
-            source.features,
-            template,
-            ReadoutExports { logits: exports_logits(limits), token_rows: source.token_rows },
-        )?;
-        let outlines = draft.certify_each(&slice_sets)?;
-        for (regime, outline) in regime_keys.into_iter().zip(outlines) {
-            out.insert(regime, outline);
-        }
-    }
+    let out = certify_readout_regimes_by::<ReadoutRegime, SizingOutline>(
+        backend,
+        geometry,
+        norm,
+        (head, weights),
+        source,
+        source_classes,
+        limits,
+        readout_regime,
+    )?;
+    let draft_count = out.len();
     Ok((out, draft_count))
 }
 
@@ -2520,94 +2441,29 @@ fn certify_readout_regimes_by<K: Ord, L: Certified>(
     limits: ResourceLimits,
     key: impl Fn(ReadoutClass) -> K,
 ) -> Result<BTreeMap<K, L>, GraphError> {
-    // The entry whose `O` is the class's feature outputs.
-    let features_entry = match source.features {
-        FeatureSource::Output => readout_features_rows::Entry::NAME,
-        FeatureSource::Taps { .. } | FeatureSource::Residual { .. } => feature_rows::Entry::NAME,
-    };
     let mut regimes: BTreeMap<K, Vec<ReadoutClass>> = BTreeMap::new();
-    // The entries whose `O` is the class's projected rows.
-    let projecting: &[&'static str] = match head {
-        HeadPlans::Packed { .. } => &[readout_head_rows::Entry::NAME],
-        HeadPlans::Qualified { .. } => &[readout_planes_rows::Entry::NAME],
-    };
-    let certifying = [
-        readout_top_rows::Entry::NAME,
-        readout_refine_rows::Entry::NAME,
-        readout_exact_rows::Entry::NAME,
-    ];
     for &class in source_classes {
         regimes.entry(key(class)).or_default().push(class);
     }
+    let exports = ReadoutExports {
+        logits: exports_logits(limits),
+        token_rows: source.token_rows,
+    };
     regimes
         .into_iter()
         .map(|(regime, classes)| {
-            let kind = classes[0].kind;
-            // Anchor the template at the group's smallest `selected` so a
-            // collapsed `(kind, chunk)` group drafts the exact same template as
-            // the first `ReadoutRegime` in `BTreeMap` order.
-            let min_selected = classes
-                .iter()
-                .map(|class| class.selected)
-                .min()
-                .expect("a regime holds a class");
-            let largest_in_min = |field: fn(&ReadoutClass) -> u64| {
-                classes
-                    .iter()
-                    .filter(|class| class.selected == min_selected)
-                    .map(field)
-                    .max()
-                    .expect("a regime holds a class with its smallest selected count")
-            };
-            let template = ReadoutClass {
-                rows: largest_in_min(|class| class.rows),
-                outputs: largest_in_min(|class| class.outputs),
-                projected: largest_in_min(|class| class.projected),
-                selected: min_selected,
-                kind,
-            };
-            let slices = classes
-                .iter()
-                .map(|class| {
-                    let slice = NativeGraphClassSlice::new()
-                        .dimension("M", [class.rows])
-                        .scoped(features_entry, "O", [class.outputs]);
-                    // Its selection's rows: the sampler's (`M`) and, when
-                    // shaped, the shaper's (`Sx`).
-                    let selecting = |slice: NativeGraphClassSlice| {
-                        let slice = slice.scoped(sample_rows::Entry::NAME, "M", [class.selected]);
-                        match class.kind {
-                            ReadoutKind::Selection { shaped: true, .. } => {
-                                slice.scoped(shape_rows::Entry::NAME, "Sx", [class.selected])
-                            }
-                            _ => slice,
-                        }
-                    };
-                    let scoped = |slice: NativeGraphClassSlice, entries: &[&'static str]| {
-                        entries.iter().fold(slice, |slice, entry| {
-                            slice.scoped(entry, "O", [class.projected])
-                        })
-                    };
-                    match class.kind {
-                        ReadoutKind::Features => slice,
-                        ReadoutKind::Logits => scoped(slice, projecting),
-                        ReadoutKind::Selection {
-                            certified: true, ..
-                        } => selecting(scoped(slice, &certifying)),
-                        ReadoutKind::Selection { .. } => selecting(scoped(slice, projecting)),
-                    }
-                })
-                .collect::<Vec<_>>();
-            let draft = checked_readout_class_draft(
-                L::new_draft(backend),
-                geometry,
-                norm,
-                Some((head, weights)),
-                source.features,
-                template,
-                ReadoutExports { logits: exports_logits(limits), token_rows: source.token_rows },
-            )?;
-            let layout = L::certify_one(draft, slices)?;
+            let (layout, _) = L::certify_group(backend, &classes, |draft, class| {
+                let draft = checked_readout_class_draft(
+                    draft,
+                    geometry,
+                    norm,
+                    Some((head, weights)),
+                    source.features,
+                    class,
+                    exports,
+                )?;
+                Ok((draft, ()))
+            })?;
             Ok((regime, layout))
         })
         .collect()

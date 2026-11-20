@@ -3048,6 +3048,7 @@ impl AttendCase {
             ClassLimits {
                 rows: 1,
                 segments: 1,
+                slots: 1,
             },
         )
         .map_err(|cause| error(&cause))?;

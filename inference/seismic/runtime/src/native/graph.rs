@@ -167,6 +167,8 @@ pub struct SealedNodeShape {
     words: usize,
     /// Declared launches, active or not.
     launches: usize,
+    /// Total launch conditions declared across all launches.
+    conditions: usize,
     /// Whether a call parks (`CallSchema::parks`), so a park node precedes
     /// it.
     parks: bool,
@@ -186,11 +188,13 @@ impl SealedNodeShape {
             .map(|_| GraphCensus::launch(launch_arguments))
             .try_fold(GraphCensus::default(), GraphCensus::plus)
             .expect("a node's launch census fits u64");
+        let conditions = implementation.launches.iter().map(|l| l.conditions.len()).sum();
         Self {
             buffers: sealed_buffers(schema, implementation),
             arguments,
             words,
             launches: implementation.launches.len(),
+            conditions,
             census,
             parks: schema.parks(),
         }
@@ -1066,16 +1070,55 @@ impl NativeGraphDraft {
         }
         executable.refuse_plain_overlaps()?;
         let shape = PlanShape::of(identity, self.layout.as_deref(), &executable);
+        let (candidate, flat) = SealedTopology::pack(
+            self.ports,
+            executable,
+            results,
+            self.exports,
+            storage.port_placements,
+            storage.placements,
+        );
+        let topology = if let Some(layout) = &self.layout {
+            let mut slot = layout.topology.lock().expect("layout topology lock");
+            match &*slot {
+                Some(cached) => {
+                    assert!(
+                        **cached == candidate,
+                        "invariant violated: plan sealed into layout {} produced a different static topology",
+                        layout.identity
+                    );
+                    Arc::clone(cached)
+                }
+                None => {
+                    let shared = Arc::new(candidate);
+                    *slot = Some(Arc::clone(&shared));
+                    shared
+                }
+            }
+        } else {
+            Arc::new(candidate)
+        };
         Ok(NativeGraphPlan {
             identity,
             shape,
             device: self.device,
-            ports: self.ports,
-            executable,
-            results,
-            exports: self.exports,
-            port_placements: storage.port_placements,
-            placements: storage.placements,
+            topology,
+            kernels: flat.kernels,
+            rounds: flat.rounds,
+            site_bytes: flat.site_bytes,
+            site_offsets: flat.site_offsets,
+            site_records: flat.site_records,
+            port_uses: flat.port_uses,
+            port_byte_lens: flat.port_byte_lens,
+            result_byte_lens: flat.result_byte_lens,
+            extents_and_strides: flat.extents_and_strides,
+            words: flat.words,
+            word_ends: flat.word_ends,
+            launches: flat.launches,
+            launch_ends: flat.launch_ends,
+            conditions: flat.conditions,
+            condition_ends: flat.condition_ends,
+            workspace_records: flat.workspace_records,
             scratch_bytes: storage.scratch_bytes,
             scratch_floor_bytes: storage.scratch_floor_bytes,
             sync_bytes: storage.sync_bytes,
@@ -1126,19 +1169,36 @@ pub struct NativeGraphLayout {
     /// The host heap of a plan sealed into this layout
     /// (`NativeGraphMetadataDraft::plan_heap` of the layout's topology).
     plan_heap: HostHeap,
+    /// The host heap of the shared static [`SealedTopology`] held once per
+    /// layout across every plan sealed into it.
+    topology_heap: HostHeap,
     /// The topology's timeline nodes.
     timelines: usize,
     /// What recording one run of a plan sealed into it takes.
     recorded: GraphCensus,
+    /// Shared static topology for all plans sealed into this layout.
+    topology: Arc<std::sync::Mutex<Option<Arc<SealedTopology>>>>,
 }
 
 impl NativeGraphLayout {
-    /// The host heap of each plan sealed into this layout: every vector of
-    /// a sealed plan has a length the layout's topology fixes, so its
-    /// classes' plans hold the same heap. `NativeGraphPlan::host_heap` is
-    /// what a sealed plan holds.
+    /// Unique identifier of this layout, shared by clones of it and by every
+    /// plan sealed into it.
+    pub fn identity(&self) -> u64 {
+        self.identity
+    }
+
+    /// The host heap of each plan sealed into this layout: every flat slice of
+    /// a sealed plan has a length the layout's topology fixes, so its classes'
+    /// plans hold the same heap. `NativeGraphPlan::host_heap` is what a sealed
+    /// plan holds.
     pub fn plan_heap(&self) -> HostHeap {
         self.plan_heap
+    }
+
+    /// The host heap of the shared static topology held once across all plans
+    /// sealed into this layout (`NativeGraphPlan::topology_heap`).
+    pub fn topology_heap(&self) -> HostHeap {
+        self.topology_heap
     }
 
     /// The host heap of one static binding of a plan sealed into this
@@ -1333,6 +1393,22 @@ impl NativeGraphStorageBytes {
             recorded: self.recorded.most(other.recorded),
         }
     }
+
+    /// Whether `self` (an exact class sealed into a certified layout) fits
+    /// within `certified`: storage capacities (`workspace`, `sync`, `output`,
+    /// `upload`) must match the layout's exactly, while `recorded` may be at
+    /// most the layout's because a layout certified across multiple row
+    /// classes holds the group's maximum active launch census.
+    pub fn within(self, certified: Self) -> bool {
+        self.workspace == certified.workspace
+            && self.sync == certified.sync
+            && self.output == certified.output
+            && self.upload == certified.upload
+            && self.recorded.graphs <= certified.recorded.graphs
+            && self.recorded.launches <= certified.recorded.launches
+            && self.recorded.arguments <= certified.recorded.arguments
+            && self.recorded.largest <= certified.recorded.largest
+    }
 }
 
 /// What a plan's graphs are keyed by beside the storage its runs bind
@@ -1424,55 +1500,134 @@ pub struct PlanHeapNode {
     pub arguments: usize,
     pub words: usize,
     pub launches: usize,
+    pub conditions: usize,
 }
 
-/// The host heap of a plan sealed from a topology of these vector lengths
+/// Element counts of every heap-owning field of [`NativeGraphPlan`].
+/// Both [`plan_heap_of`] and [`NativeGraphPlan::host_heap`] derive their
+/// [`HostHeap`] from this single owner so no field can be missed or diverge.
+struct PlanHeapCounts {
+    nodes: usize,
+    ports: usize,
+    total_sites: usize,
+    total_results: usize,
+    extents_and_strides: usize,
+    total_words: usize,
+    total_launches: usize,
+    total_conditions: usize,
+}
+
+fn plan_heap_from_counts(c: PlanHeapCounts) -> HostHeap {
+    use std::mem::size_of;
+    let mut heap = HostHeap::default();
+    heap.hold(1, SHARED_PLAN_BYTES);
+    heap.hold(c.nodes, size_of::<Arc<NativePrepared>>());
+    heap.hold(c.nodes, size_of::<u64>());
+    heap.hold(c.total_sites, size_of::<u64>());
+    heap.hold(c.total_sites, size_of::<u64>());
+    heap.hold(c.total_sites, size_of::<SiteRecords>());
+    heap.hold(c.ports, size_of::<PortUse>());
+    heap.hold(c.ports, size_of::<u64>());
+    heap.hold(c.total_results, size_of::<u64>());
+    heap.hold(c.extents_and_strides, size_of::<u64>());
+    heap.hold(c.total_words, size_of::<u64>());
+    heap.hold(c.nodes, size_of::<u32>());
+    heap.hold(c.total_launches, size_of::<Option<LaunchGeometry>>());
+    heap.hold(c.nodes, size_of::<u32>());
+    heap.hold(c.total_conditions, size_of::<LaunchCondition>());
+    heap.hold(c.total_launches, size_of::<u32>());
+    heap
+}
+
+/// The per-plan host heap of a plan sealed from a topology of these lengths
 /// (`NativeGraphPlan::host_heap`, single owner shared by
 /// `NativeGraphMetadataDraft::plan_heap` and `SizingDraft`).
 pub fn plan_heap_of(
     port_ranks: &[usize],
     nodes: &[PlanHeapNode],
     result_ranks: &[&[Option<usize>]],
+) -> HostHeap {
+    let port_total_ranks: usize = port_ranks.iter().sum();
+    let result_total_ranks: usize = result_ranks
+        .iter()
+        .flat_map(|row| row.iter().flatten())
+        .sum();
+    plan_heap_from_counts(PlanHeapCounts {
+        nodes: nodes.len(),
+        ports: port_ranks.len(),
+        total_sites: nodes.iter().map(|s| s.buffers).sum(),
+        total_results: result_ranks.iter().map(|row| row.len()).sum(),
+        extents_and_strides: 2 * (port_total_ranks + result_total_ranks),
+        total_words: nodes.iter().map(|s| s.words).sum(),
+        total_launches: nodes.iter().map(|s| s.launches).sum(),
+        total_conditions: nodes.iter().map(|s| s.conditions).sum(),
+    })
+}
+
+/// Element counts of every heap-owning field of [`SealedTopology`].
+/// Both [`topology_heap_of`] and [`SealedTopology::host_heap`] derive their
+/// [`HostHeap`] from this single owner so no field can be missed or diverge.
+struct TopologyHeapCounts {
+    ports: usize,
+    nodes: usize,
+    result_rows: usize,
+    total_results: usize,
+    exports: usize,
+    timelines: usize,
+    marks: usize,
+}
+
+fn topology_heap_from_counts(
+    c: TopologyHeapCounts,
+    node_sites_and_reps: impl IntoIterator<Item = (usize, usize)>,
+) -> HostHeap {
+    use std::mem::size_of;
+    let mut heap = HostHeap::default();
+    heap.hold(1, SHARED_TOPOLOGY_BYTES);
+    heap.hold(c.ports, size_of::<PortMeta>());
+    heap.hold(c.nodes, size_of::<StaticNode>());
+    for (sites, reps) in node_sites_and_reps {
+        heap.hold(sites, size_of::<StaticSite>());
+        heap.hold(reps, size_of::<&'static str>());
+    }
+    heap.hold(c.result_rows, size_of::<std::ops::Range<usize>>());
+    heap.hold(
+        c.total_results,
+        size_of::<Option<(RepresentationId, std::ops::Range<usize>)>>(),
+    );
+    heap.hold(c.exports, size_of::<(u32, u32)>());
+    heap.hold(c.ports, size_of::<Option<Placement>>());
+    heap.hold(c.total_results, size_of::<Placement>());
+    heap.hold(c.ports, size_of::<bool>());
+    heap.hold(c.timelines, size_of::<(usize, TimelineNode)>());
+    heap.hold(c.marks, size_of::<usize>());
+    heap
+}
+
+/// The host heap of one shared [`SealedTopology`] allocation
+/// (`NativeGraphPlan::topology_heap`, held once per [`NativeGraphLayout`]
+/// across every plan sealed into it).
+pub fn topology_heap_of(
+    port_count: usize,
+    nodes: &[PlanHeapNode],
+    result_rows: usize,
+    total_results: usize,
     exports: usize,
     timelines: usize,
     marks: usize,
 ) -> HostHeap {
-    use std::mem::size_of;
-    let mut heap = HostHeap::default();
-    heap.hold(1, SHARED_PLAN_BYTES);
-    heap.hold(port_ranks.len(), size_of::<PortSpec>());
-    for &rank in port_ranks {
-        heap.hold(rank, size_of::<u64>());
-        heap.hold(rank, size_of::<u64>());
-    }
-    heap.hold(nodes.len(), size_of::<SealedNode>());
-    // `Executable::external_writes` and `port_uses`.
-    heap.hold(port_ranks.len(), size_of::<bool>());
-    heap.hold(port_ranks.len(), size_of::<PortUse>());
-    heap.hold(timelines, size_of::<(usize, TimelineNode)>());
-    heap.hold(marks, size_of::<usize>());
-    for shape in nodes {
-        heap.hold(shape.buffers, size_of::<Site>());
-        heap.hold(shape.arguments, size_of::<&'static str>());
-        heap.hold(shape.words, size_of::<u64>());
-        heap.hold(shape.launches, size_of::<Option<LaunchGeometry>>());
-    }
-    heap.hold(
-        result_ranks.len(),
-        size_of::<Vec<Option<NativeTensorSpec>>>(),
-    );
-    heap.hold(result_ranks.len(), size_of::<Vec<Placement>>());
-    for row in result_ranks {
-        heap.hold(row.len(), size_of::<Option<NativeTensorSpec>>());
-        heap.hold(row.len(), size_of::<Placement>());
-        for &rank in row.iter().flatten() {
-            heap.hold(rank, size_of::<u64>());
-            heap.hold(rank, size_of::<u64>());
-        }
-    }
-    heap.hold(exports, size_of::<WorkflowResultRef>());
-    heap.hold(port_ranks.len(), size_of::<Option<Placement>>());
-    heap
+    topology_heap_from_counts(
+        TopologyHeapCounts {
+            ports: port_count,
+            nodes: nodes.len(),
+            result_rows,
+            total_results,
+            exports,
+            timelines,
+            marks,
+        },
+        nodes.iter().map(|s| (s.buffers, s.arguments)),
+    )
 }
 
 fn cuda_recorded_census_sum(
@@ -1573,11 +1728,13 @@ impl NativeGraphMetadataDraft {
         let nodes: Vec<PlanHeapNode> = self
             .shapes
             .iter()
-            .map(|shape| PlanHeapNode {
+            .zip(&self.nodes)
+            .map(|(shape, node)| PlanHeapNode {
                 buffers: shape.buffers,
                 arguments: shape.arguments,
                 words: shape.words,
                 launches: shape.launches,
+                conditions: shape.conditions + if node.condition.is_some() { shape.launches } else { 0 },
             })
             .collect();
         let result_rows: Vec<Vec<Option<usize>>> = self
@@ -1595,10 +1752,30 @@ impl NativeGraphMetadataDraft {
             })
             .collect();
         let result_slices: Vec<&[Option<usize>]> = result_rows.iter().map(Vec::as_slice).collect();
-        plan_heap_of(
-            &port_ranks,
+        plan_heap_of(&port_ranks, &nodes, &result_slices)
+    }
+
+    /// The host heap of one shared [`SealedTopology`] allocation for this
+    /// topology (`NativeGraphPlan::topology_heap`).
+    pub fn topology_heap(&self) -> HostHeap {
+        let nodes: Vec<PlanHeapNode> = self
+            .shapes
+            .iter()
+            .zip(&self.nodes)
+            .map(|(shape, node)| PlanHeapNode {
+                buffers: shape.buffers,
+                arguments: shape.arguments,
+                words: shape.words,
+                launches: shape.launches,
+                conditions: shape.conditions + if node.condition.is_some() { shape.launches } else { 0 },
+            })
+            .collect();
+        let total_results: usize = self.results.iter().map(Vec::len).sum();
+        topology_heap_of(
+            self.ports.len(),
             &nodes,
-            &result_slices,
+            self.results.len(),
+            total_results,
             self.exports.len(),
             self.timelines.len(),
             self.marks.len(),
@@ -1667,7 +1844,8 @@ impl NativeGraphMetadataDraft {
             .collect::<Result<Vec<_>, CallError>>()?;
         let count = u32::try_from(results.len()).expect("native result ordinal exhausted");
         if self.backend == BackendName::Cuda {
-            self.cuda_launches.push(cuda_launches.unwrap_or(shape.launches as u64));
+            let default_mask = if shape.launches >= 64 { u64::MAX } else { (1u64 << shape.launches) - 1 };
+            self.cuda_launches.push(cuda_launches.unwrap_or(default_mask));
         }
         self.nodes.push(PlannedNode { args: Arc::new(args), scratch, activation, condition: None, share: None });
         self.entries.push(entry);
@@ -1771,7 +1949,8 @@ impl NativeGraphMetadataDraft {
         match self.backend {
             BackendName::Cuda => {
                 debug_assert_eq!(self.cuda_launches.len(), self.nodes.len());
-                cuda_recorded_census(self.nodes.len(), &self.cuda_launches, &self.timelines, &self.marks)
+                let counts: Vec<u64> = self.cuda_launches.iter().map(|&m| u64::from(m.count_ones())).collect();
+                cuda_recorded_census(self.nodes.len(), &counts, &self.timelines, &self.marks)
             }
             BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => {
                 recorded_census(self.shapes.iter().map(|shape| shape.census), &self.timelines, self.backend)
@@ -1811,6 +1990,7 @@ impl NativeGraphMetadataDraft {
         Ok(ValidatedMetadataDraft {
             links,
             plan_heap: self.plan_heap(),
+            topology_heap: self.topology_heap(),
             bound_heap: bindings_heap(self.ports.len(), self.timelines.len()),
             census: self.recorded(),
             draft: self,
@@ -1851,6 +2031,7 @@ pub struct ValidatedMetadataDraft {
     /// Its operand links, which its topology decides.
     links: OperandLinks,
     plan_heap: HostHeap,
+    topology_heap: HostHeap,
     bound_heap: HostHeap,
     /// What recording one run of it takes.
     census: GraphCensus,
@@ -1925,6 +2106,94 @@ impl ValidatedMetadataDraft {
         validate_shares(&self.draft.nodes, &results, &self.draft.exports, &self.draft.stores).map_err(CallError::Workflow)
     }
 
+    /// Certify a single [`NativeGraphLayout`] as the element-wise maximum of
+    /// buffer capacities and active launch counts across a non-empty sequence
+    /// of concrete exact-shape drafts sharing one topology.
+    ///
+    /// Every draft must have the exact same topology (backend, entries,
+    /// timelines, marks, scratch structure, and storage signature); any
+    /// divergence is rejected as [`LayoutMismatch::Topology`].
+    pub fn certify_group(
+        drafts: impl IntoIterator<Item = NativeGraphMetadataDraft>,
+    ) -> Result<NativeGraphLayout, WorkflowError> {
+        let topology = || WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology);
+        let mut iter = drafts.into_iter();
+        let first = iter.next().ok_or_else(topology)?;
+        let validated = first.validated()?;
+        let base_sig = storage_signature(
+            &validated.draft.ports,
+            &validated.draft.nodes,
+            &validated.links,
+            &validated.draft.results,
+            &validated.draft.exports,
+            &validated.draft.stores,
+        );
+        let mut ports: Vec<u64> = validated.draft.ports.iter().map(|p| p.byte_len).collect();
+        let mut results: Vec<Vec<u64>> = validated
+            .draft
+            .results
+            .iter()
+            .map(|row| row.iter().map(|r| r.as_ref().map_or(0, |s| s.byte_len)).collect())
+            .collect();
+        let mut scratch: Vec<Vec<ScratchNeed>> = validated
+            .draft
+            .nodes
+            .iter()
+            .map(|node| node.scratch.clone())
+            .collect();
+        let mut cuda_launches: Option<Vec<u64>> = (validated.draft.backend == BackendName::Cuda)
+            .then(|| validated.draft.cuda_launches.clone());
+
+        for draft in iter {
+            let links = draft.validate_topology()?;
+            if draft.backend != validated.draft.backend
+                || draft.entries != validated.draft.entries
+                || draft.timelines != validated.draft.timelines
+                || draft.marks != validated.draft.marks
+                || storage_signature(
+                    &draft.ports,
+                    &draft.nodes,
+                    &links,
+                    &draft.results,
+                    &draft.exports,
+                    &draft.stores,
+                ) != base_sig
+            {
+                return Err(topology());
+            }
+            for (cap, port) in ports.iter_mut().zip(&draft.ports) {
+                *cap = (*cap).max(port.byte_len);
+            }
+            for (row_cap, row) in results.iter_mut().zip(&draft.results) {
+                for (cap, result) in row_cap.iter_mut().zip(row) {
+                    if let Some(spec) = result {
+                        *cap = (*cap).max(spec.byte_len);
+                    }
+                }
+            }
+            for (node_cap, node) in scratch.iter_mut().zip(&draft.nodes) {
+                if node_cap.len() != node.scratch.len() {
+                    return Err(topology());
+                }
+                for (cap, need) in node_cap.iter_mut().zip(&node.scratch) {
+                    if cap.sync != need.sync || cap.operand != need.operand {
+                        return Err(topology());
+                    }
+                    cap.bytes = cap.bytes.max(need.bytes);
+                }
+            }
+            if let Some(launches) = &mut cuda_launches {
+                if launches.len() != draft.cuda_launches.len() {
+                    return Err(topology());
+                }
+                for (cap, &active) in launches.iter_mut().zip(&draft.cuda_launches) {
+                    *cap |= active;
+                }
+            }
+        }
+        validated.capacity_layout(&ports, &results, scratch, cuda_launches.as_deref())
+    }
+
     /// Place this validated topology once with every buffer at its supplied
     /// byte capacity: the largest size it takes in any class the layout is
     /// certified for. Placement reads only sizes, lifetimes and regions, so
@@ -1939,12 +2208,15 @@ impl ValidatedMetadataDraft {
     ) -> Result<NativeGraphLayout, WorkflowError> {
         let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
         let recorded = match cuda_launches {
-            Some(launches) => cuda_recorded_census(
-                self.draft.nodes.len(),
-                launches,
-                &self.draft.timelines,
-                &self.draft.marks,
-            ),
+            Some(masks) => {
+                let counts: Vec<u64> = masks.iter().map(|&m| u64::from(m.count_ones())).collect();
+                cuda_recorded_census(
+                    self.draft.nodes.len(),
+                    &counts,
+                    &self.draft.timelines,
+                    &self.draft.marks,
+                )
+            }
             None => self.census,
         };
         Ok(make_layout(
@@ -1955,6 +2227,7 @@ impl ValidatedMetadataDraft {
             &self.draft.exports,
             &self.draft.stores,
             self.plan_heap,
+            self.topology_heap,
             self.draft.timelines.len(),
             recorded,
         ))
@@ -1973,12 +2246,15 @@ impl ValidatedMetadataDraft {
         let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
         let storage = plan_storage(&ports, &nodes, &self.links, &results, &self.draft.exports, &self.draft.stores);
         let recorded = match cuda_launches {
-            Some(launches) => cuda_recorded_census(
-                self.draft.nodes.len(),
-                launches,
-                &self.draft.timelines,
-                &self.draft.marks,
-            ),
+            Some(masks) => {
+                let counts: Vec<u64> = masks.iter().map(|&m| u64::from(m.count_ones())).collect();
+                cuda_recorded_census(
+                    self.draft.nodes.len(),
+                    &counts,
+                    &self.draft.timelines,
+                    &self.draft.marks,
+                )
+            }
             None => self.census,
         };
         Ok(NativeGraphStorageBytes {
@@ -1994,6 +2270,12 @@ impl ValidatedMetadataDraft {
     /// ([`NativeGraphMetadataDraft::plan_heap`]).
     pub fn plan_heap(&self) -> HostHeap {
         self.plan_heap
+    }
+
+    /// The host heap of the shared static topology for this template
+    /// ([`NativeGraphMetadataDraft::topology_heap`]).
+    pub fn topology_heap(&self) -> HostHeap {
+        self.topology_heap
     }
 
     /// The host heap of one static binding of a plan of this topology
@@ -2080,12 +2362,14 @@ fn make_layout(
     exports: &[WorkflowResultRef],
     stores: &[Store],
     plan_heap: HostHeap,
+    topology_heap: HostHeap,
     timelines: usize,
     recorded: GraphCensus,
 ) -> NativeGraphLayout {
     NativeGraphLayout {
         identity: NEXT_NATIVE_GRAPH.fetch_add(1, Ordering::Relaxed),
         plan_heap,
+        topology_heap,
         timelines,
         recorded,
         storage: plan_storage(ports, nodes, links, results, exports, stores),
@@ -2100,6 +2384,7 @@ fn make_layout(
             })
             .collect(),
         scratch_capacity: nodes.iter().map(|node| node.scratch.clone()).collect(),
+        topology: Arc::new(std::sync::Mutex::new(None)),
     }
 }
 
@@ -2915,7 +3200,7 @@ impl Site {
 
 /// The records a site binds (whole records, checked at seal), through a
 /// table of their addresses.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SiteRecords {
     /// It binds its view: no record port's.
     None,
@@ -2932,7 +3217,7 @@ enum SiteRecords {
 }
 
 /// How a graph's nodes use one external port.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PortUse {
     /// A launch reads its grid from it, so it binds no slab view.
     grid: bool,
@@ -2997,7 +3282,7 @@ struct SealedNode {
 /// one it writes pairs with every site after it, and nothing else does.
 /// Held inline in the node and its sites, so a plan's host heap is what its
 /// topology fixes ([`NativeGraphMetadataDraft::plan_heap`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ExternalPairs {
     /// The next node of the chain.
     next: Option<u32>,
@@ -3079,11 +3364,6 @@ struct Executable {
 }
 
 impl Executable {
-    /// The node positions its timeline nodes sit at.
-    fn bounds(&self) -> impl Iterator<Item = usize> + '_ {
-        self.timelines.iter().map(|&(position, _)| position)
-    }
-
     fn seal_node(
         &mut self,
         kernel: Arc<NativePrepared>,
@@ -4231,15 +4511,261 @@ fn plan_storage(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StaticSite {
+    region: Region,
+    next_external: Option<u32>,
+}
+
+#[derive(PartialEq, Eq)]
+struct StaticNode {
+    sites: Box<[StaticSite]>,
+    representations: Box<[&'static str]>,
+    exclusive: Option<ExternalPairs>,
+    site_base: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PortMeta {
+    representation: RepresentationId,
+    local: bool,
+    owned_input: bool,
+    prewritten: bool,
+    extents: std::ops::Range<usize>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ResultMeta {
+    nodes: Box<[std::ops::Range<usize>]>,
+    entries: Box<[Option<(RepresentationId, std::ops::Range<usize>)>]>,
+}
+
+/// Static structure shared via `Arc` across every `NativeGraphPlan` sealed
+/// into the same `NativeGraphLayout`.
+#[derive(PartialEq, Eq)]
+struct SealedTopology {
+    ports: Box<[PortMeta]>,
+    nodes: Box<[StaticNode]>,
+    results: ResultMeta,
+    exports: Box<[(u32, u32)]>,
+    port_placements: Box<[Option<Placement>]>,
+    placements: Box<[Placement]>,
+    external_writes: Box<[bool]>,
+    upload_written: bool,
+    exclusive: Option<u32>,
+    timelines: Box<[(usize, TimelineNode)]>,
+    marks: Box<[usize]>,
+    total_ranks: usize,
+}
+
+const SHARED_TOPOLOGY_BYTES: usize =
+    std::mem::size_of::<SealedTopology>() + 2 * std::mem::size_of::<usize>();
+
+struct FlatPlanData {
+    kernels: Box<[Arc<NativePrepared>]>,
+    rounds: Box<[u64]>,
+    site_bytes: Box<[u64]>,
+    site_offsets: Box<[u64]>,
+    site_records: Box<[SiteRecords]>,
+    port_uses: Box<[PortUse]>,
+    port_byte_lens: Box<[u64]>,
+    result_byte_lens: Box<[u64]>,
+    extents_and_strides: Box<[u64]>,
+    words: Box<[u64]>,
+    word_ends: Box<[u32]>,
+    launches: Box<[Option<LaunchGeometry>]>,
+    launch_ends: Box<[u32]>,
+    conditions: Box<[LaunchCondition]>,
+    condition_ends: Box<[u32]>,
+    workspace_records: u64,
+}
+
+impl SealedTopology {
+    fn pack(
+        ports: Vec<PortSpec>,
+        executable: Executable,
+        results: Vec<Vec<Option<NativeTensorSpec>>>,
+        exports: Vec<WorkflowResultRef>,
+        port_placements: Vec<Option<Placement>>,
+        placements: Vec<Vec<Placement>>,
+    ) -> (Self, FlatPlanData) {
+        let mut extents = Vec::new();
+        let mut strides = Vec::new();
+        let mut port_meta = Vec::with_capacity(ports.len());
+        let mut port_byte_lens = Vec::with_capacity(ports.len());
+        for port in ports {
+            let start = extents.len();
+            extents.extend_from_slice(&port.extents);
+            strides.extend_from_slice(&port.strides);
+            let end = extents.len();
+            port_byte_lens.push(port.byte_len);
+            port_meta.push(PortMeta {
+                representation: port.representation,
+                local: port.local,
+                owned_input: port.owned_input,
+                prewritten: port.prewritten,
+                extents: start..end,
+            });
+        }
+
+        let mut result_nodes = Vec::with_capacity(results.len());
+        let mut result_entries = Vec::new();
+        let mut result_byte_lens = Vec::new();
+        for row in results {
+            let row_start = result_entries.len();
+            for spec in row {
+                match spec {
+                    Some(spec) => {
+                        let start = extents.len();
+                        extents.extend_from_slice(&spec.extents);
+                        strides.extend_from_slice(&spec.strides);
+                        let end = extents.len();
+                        result_byte_lens.push(spec.byte_len);
+                        result_entries.push(Some((spec.representation, start..end)));
+                    }
+                    None => {
+                        result_byte_lens.push(0);
+                        result_entries.push(None);
+                    }
+                }
+            }
+            result_nodes.push(row_start..result_entries.len());
+        }
+        let total_ranks = extents.len();
+        extents.extend_from_slice(&strides);
+
+        let mut kernels = Vec::with_capacity(executable.nodes.len());
+        let mut rounds = Vec::with_capacity(executable.nodes.len());
+        let mut site_bytes = Vec::new();
+        let mut site_offsets = Vec::new();
+        let mut site_records = Vec::new();
+        let mut words = Vec::new();
+        let mut word_ends = Vec::with_capacity(executable.nodes.len());
+        let mut launches = Vec::new();
+        let mut launch_ends = Vec::with_capacity(executable.nodes.len());
+        let mut conditions = Vec::new();
+        let mut condition_ends = Vec::new();
+        let mut static_nodes = Vec::with_capacity(executable.nodes.len());
+        for node in executable.nodes {
+            kernels.push(node.kernel);
+            rounds.push(node.launches.rounds);
+            let site_base = site_bytes.len();
+            let mut static_sites = Vec::with_capacity(node.sites.len());
+            for site in node.sites {
+                site_bytes.push(site.bytes);
+                site_offsets.push(site.offset);
+                site_records.push(site.records);
+                static_sites.push(StaticSite {
+                    region: site.region,
+                    next_external: site.next_external,
+                });
+            }
+            words.extend_from_slice(&node.words);
+            word_ends.push(u32::try_from(words.len()).expect("plan words fit u32"));
+            launches.extend(node.launches.geometry);
+            launch_ends.push(u32::try_from(launches.len()).expect("plan launches fit u32"));
+            for launch_conditions in node.conditions {
+                conditions.extend(launch_conditions);
+                condition_ends.push(u32::try_from(conditions.len()).expect("plan conditions fit u32"));
+            }
+            static_nodes.push(StaticNode {
+                sites: static_sites.into_boxed_slice(),
+                representations: node.representations.into_boxed_slice(),
+                exclusive: node.exclusive,
+                site_base,
+            });
+        }
+
+        let mut flat_placements = Vec::with_capacity(result_entries.len());
+        for row in placements {
+            flat_placements.extend(row);
+        }
+        debug_assert_eq!(flat_placements.len(), result_entries.len());
+
+        let topology = Self {
+            ports: port_meta.into_boxed_slice(),
+            nodes: static_nodes.into_boxed_slice(),
+            results: ResultMeta {
+                nodes: result_nodes.into_boxed_slice(),
+                entries: result_entries.into_boxed_slice(),
+            },
+            exports: exports
+                .into_iter()
+                .map(|reference| (reference.node, reference.result))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            port_placements: port_placements.into_boxed_slice(),
+            placements: flat_placements.into_boxed_slice(),
+            external_writes: executable.external_writes.into_boxed_slice(),
+            upload_written: executable.upload_written,
+            exclusive: executable.exclusive,
+            timelines: executable.timelines.into_boxed_slice(),
+            marks: executable.marks.into_boxed_slice(),
+            total_ranks,
+        };
+        let flat = FlatPlanData {
+            kernels: kernels.into_boxed_slice(),
+            rounds: rounds.into_boxed_slice(),
+            site_bytes: site_bytes.into_boxed_slice(),
+            site_offsets: site_offsets.into_boxed_slice(),
+            site_records: site_records.into_boxed_slice(),
+            port_uses: executable.port_uses.into_boxed_slice(),
+            port_byte_lens: port_byte_lens.into_boxed_slice(),
+            result_byte_lens: result_byte_lens.into_boxed_slice(),
+            extents_and_strides: extents.into_boxed_slice(),
+            words: words.into_boxed_slice(),
+            word_ends: word_ends.into_boxed_slice(),
+            launches: launches.into_boxed_slice(),
+            launch_ends: launch_ends.into_boxed_slice(),
+            conditions: conditions.into_boxed_slice(),
+            condition_ends: condition_ends.into_boxed_slice(),
+            workspace_records: executable.workspace_records,
+        };
+        (topology, flat)
+    }
+
+    fn bounds(&self) -> impl Iterator<Item = usize> + '_ {
+        self.timelines.iter().map(|&(position, _)| position)
+    }
+
+    fn host_heap(&self) -> HostHeap {
+        topology_heap_from_counts(
+            TopologyHeapCounts {
+                ports: self.ports.len(),
+                nodes: self.nodes.len(),
+                result_rows: self.results.nodes.len(),
+                total_results: self.results.entries.len(),
+                exports: self.exports.len(),
+                timelines: self.timelines.len(),
+                marks: self.marks.len(),
+            },
+            self.nodes
+                .iter()
+                .map(|node| (node.sites.len(), node.representations.len())),
+        )
+    }
+}
+
 pub struct NativeGraphPlan {
     identity: u64,
     device: Arc<DeviceInner>,
-    ports: Vec<PortSpec>,
-    executable: Executable,
-    results: Vec<Vec<Option<NativeTensorSpec>>>,
-    exports: Vec<WorkflowResultRef>,
-    port_placements: Vec<Option<Placement>>,
-    placements: Vec<Vec<Placement>>,
+    topology: Arc<SealedTopology>,
+    kernels: Box<[Arc<NativePrepared>]>,
+    rounds: Box<[u64]>,
+    site_bytes: Box<[u64]>,
+    site_offsets: Box<[u64]>,
+    site_records: Box<[SiteRecords]>,
+    port_uses: Box<[PortUse]>,
+    port_byte_lens: Box<[u64]>,
+    result_byte_lens: Box<[u64]>,
+    extents_and_strides: Box<[u64]>,
+    words: Box<[u64]>,
+    word_ends: Box<[u32]>,
+    launches: Box<[Option<LaunchGeometry>]>,
+    launch_ends: Box<[u32]>,
+    conditions: Box<[LaunchCondition]>,
+    condition_ends: Box<[u32]>,
+    workspace_records: u64,
     scratch_bytes: u64,
     scratch_floor_bytes: u64,
     sync_bytes: u64,
@@ -4260,44 +4786,94 @@ const SHARED_PLAN_BYTES: usize =
 
 impl NativeGraphPlan {
     /// The host heap this plan holds: itself in its shared allocation and
-    /// every vector it owns, at the vector's capacity. Its kernels and its
-    /// device are shared with the prepared programs and are theirs; the
-    /// replays a CUDA or Vulkan device records of a plan's submissions
-    /// belong to the device's queue and exist only once the plan has run.
+    /// its flat per-class slices. Its static topology is shared across all
+    /// plans of one `NativeGraphLayout`.
     pub fn host_heap(&self) -> HostHeap {
-        let mut heap = HostHeap::default();
-        heap.hold(1, SHARED_PLAN_BYTES);
-        heap.hold_vec(&self.ports);
-        for port in &self.ports {
-            heap.hold_vec(&port.extents);
-            heap.hold_vec(&port.strides);
+        plan_heap_from_counts(PlanHeapCounts {
+            nodes: self.kernels.len(),
+            ports: self.port_byte_lens.len(),
+            total_sites: self.site_bytes.len(),
+            total_results: self.result_byte_lens.len(),
+            extents_and_strides: self.extents_and_strides.len(),
+            total_words: self.words.len(),
+            total_launches: self.launches.len(),
+            total_conditions: self.conditions.len(),
+        })
+    }
+
+    fn node_words(&self, node: usize) -> &[u64] {
+        let start = if node == 0 { 0 } else { self.word_ends[node - 1] as usize };
+        let end = self.word_ends[node] as usize;
+        &self.words[start..end]
+    }
+
+    fn node_launch_range(&self, node: usize) -> std::ops::Range<usize> {
+        let start = if node == 0 { 0 } else { self.launch_ends[node - 1] as usize };
+        let end = self.launch_ends[node] as usize;
+        start..end
+    }
+
+    fn node_launches(&self, node: usize) -> &[Option<LaunchGeometry>] {
+        &self.launches[self.node_launch_range(node)]
+    }
+
+    fn launch_conditions(&self, launch: usize) -> &[LaunchCondition] {
+        let start = if launch == 0 { 0 } else { self.condition_ends[launch - 1] as usize };
+        let end = self.condition_ends[launch] as usize;
+        &self.conditions[start..end]
+    }
+
+    fn extents(&self, range: &std::ops::Range<usize>) -> &[u64] {
+        &self.extents_and_strides[range.clone()]
+    }
+
+    fn strides(&self, range: &std::ops::Range<usize>) -> &[u64] {
+        let off = self.topology.total_ranks;
+        &self.extents_and_strides[range.start + off..range.end + off]
+    }
+
+    fn buffer_name(&self, node_idx: usize, buffer: usize) -> String {
+        let kernel = &self.kernels[node_idx];
+        let (schema, implementation) = (kernel.schema(), kernel.implementation());
+        let parameters = schema
+            .parameters()
+            .iter()
+            .filter(|parameter| matches!(parameter.kind, ParameterKind::Tensor { .. }))
+            .count();
+        let scratch = self.topology.nodes[node_idx].sites.len() - implementation.scratch.len();
+        if buffer < parameters {
+            return super::abi::tensor_buffer_name(schema, buffer).to_owned();
         }
-        heap.hold_vec(&self.executable.nodes);
-        for node in &self.executable.nodes {
-            heap.hold_vec(&node.sites);
-            heap.hold_vec(&node.representations);
-            heap.hold_vec(&node.words);
-            heap.hold_vec(&node.launches.geometry);
+        if buffer >= scratch {
+            return format!("scratch {}", implementation.scratch[buffer - scratch].name);
         }
-        heap.hold_vec(&self.executable.external_writes);
-        heap.hold_vec(&self.executable.port_uses);
-        heap.hold_vec(&self.executable.timelines);
-        heap.hold_vec(&self.executable.marks);
-        heap.hold_vec(&self.results);
-        for row in &self.results {
-            heap.hold_vec(row);
-            for spec in row.iter().flatten() {
-                heap.hold_vec(&spec.extents);
-                heap.hold_vec(&spec.strides);
-            }
-        }
-        heap.hold_vec(&self.exports);
-        heap.hold_vec(&self.port_placements);
-        heap.hold_vec(&self.placements);
-        for row in &self.placements {
-            heap.hold_vec(row);
-        }
-        heap
+        let (ordinal, _) = schema
+            .results()
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| matches!(result.kind, ResultKind::Tensor { .. }))
+            .nth(buffer - parameters)
+            .expect("a result buffer is a tensor result's");
+        format!("result {ordinal}")
+    }
+
+    /// Whether `self` and `other` share the same immutable [`SealedTopology`]
+    /// allocation (true for every plan sealed from one [`NativeGraphLayout`]).
+    pub fn shares_topology(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.topology, &other.topology)
+    }
+
+    /// The host heap of the shared immutable [`SealedTopology`] referenced by
+    /// this plan (held once per [`NativeGraphLayout`], or once per standalone
+    /// plan).
+    pub fn topology_heap(&self) -> HostHeap {
+        self.topology.host_heap()
+    }
+
+    /// Address identity of the shared [`SealedTopology`] allocation, equal
+    /// across every plan that shares it (`Self::shares_topology`).
+    pub fn topology_identity(&self) -> usize {
+        Arc::as_ptr(&self.topology) as usize
     }
 
     /// The bytes of `host_heap`.
@@ -4356,14 +4932,14 @@ impl NativeGraphPlan {
     }
     /// Whether a run of the plan waits on or signals a timeline.
     pub(super) fn has_timelines(&self) -> bool {
-        !self.executable.timelines.is_empty()
+        !self.topology.timelines.is_empty()
     }
     pub fn bindings(self: &Arc<Self>) -> NativeGraphBindings {
         NativeGraphBindings {
             plan: self.clone(),
-            inputs: vec![None; self.ports.len()],
-            fixed: vec![false; self.ports.len()],
-            timelines: vec![None; self.executable.timelines.len()],
+            inputs: vec![None; self.topology.ports.len()],
+            fixed: vec![false; self.topology.ports.len()],
+            timelines: vec![None; self.topology.timelines.len()],
         }
     }
     /// Refuse bindings under which two buffers of one node, an exclusive
@@ -4373,11 +4949,10 @@ impl NativeGraphPlan {
     /// port a run binds (checked at attach, when every external port is
     /// bound). Only the pairs chained at seal can
     /// ([`Executable::exclude`], which holds the rest of each node's buffers
-    /// to the rule), and only those are walked
-    /// ([`Executable::external_pairs`]), each in O(1), a bound slab view's
-    /// reach read at most once.
+    /// to the rule), and only those are walked, each in O(1), a bound slab
+    /// view's reach read at most once.
     fn check_disjoint(&self, bindings: &NativeGraphBindings, fixed: bool) -> Result<(), CallError> {
-        if self.executable.exclusive.is_none() {
+        if self.topology.exclusive.is_none() {
             return Ok(());
         }
         let reaching: Vec<Option<Reaching<'_>>> = bindings
@@ -4386,17 +4961,56 @@ impl NativeGraphPlan {
             .map(|bound| bound.as_ref().map(|bound| Reaching::new(&bound.tensor)))
             .collect();
         let tensor = |port: usize| reaching[port].as_ref().expect("every external port of a checked pair is bound");
-        for (node, first, second) in self.executable.external_pairs() {
-            let ((first_port, first_site), (second_port, second_site)) =
-                (external_site(node, first), external_site(node, second));
-            if (first_port == second_port && !meet(&first_site.range(), &second_site.range()))
-                || (bindings.fixed[first_port] && bindings.fixed[second_port]) != fixed
+        let mut cursor = self.topology.exclusive;
+        while let Some(node_ordinal) = cursor {
+            let node_idx = node_ordinal as usize;
+            let node = &self.topology.nodes[node_idx];
+            let pairs = node.exclusive.expect("a node of the exclusive chain holds its external pairs");
+            let kernel = &self.kernels[node_idx];
+            let after = |buffer: u32| {
+                std::iter::successors(node.sites[buffer as usize].next_external, move |&next| {
+                    node.sites[next as usize].next_external
+                })
+            };
+            let first = pairs.first;
+            for written in std::iter::once(first)
+                .chain(after(first))
+                .take_while(|&buffer| kernel.writes(buffer as usize))
             {
-                continue;
+                let first_site = &node.sites[written as usize];
+                let Region::External(first_port) = first_site.region else {
+                    unreachable!("an external chain links external sites");
+                };
+                let first_port = first_port as usize;
+                let first_idx = node.site_base + written as usize;
+                let first_bytes = self.site_bytes[first_idx];
+                let first_offset = self.site_offsets[first_idx];
+                let first_range = first_offset..first_offset + first_bytes;
+                for second in after(written) {
+                    let second_site = &node.sites[second as usize];
+                    let Region::External(second_port) = second_site.region else {
+                        unreachable!("an external chain links external sites");
+                    };
+                    let second_port = second_port as usize;
+                    let second_idx = node.site_base + second as usize;
+                    let second_bytes = self.site_bytes[second_idx];
+                    let second_offset = self.site_offsets[second_idx];
+                    let second_range = second_offset..second_offset + second_bytes;
+                    if (first_port == second_port && !meet(&first_range, &second_range))
+                        || (bindings.fixed[first_port] && bindings.fixed[second_port]) != fixed
+                    {
+                        continue;
+                    }
+                    if tensor(first_port).meets(first_range.clone(), tensor(second_port), second_range) {
+                        let (lo, hi) = (written.min(second) as usize, written.max(second) as usize);
+                        return Err(CallError::Invocation(InvocationError::IllegalAliasing {
+                            first: self.buffer_name(node_idx, lo),
+                            second: self.buffer_name(node_idx, hi),
+                        }));
+                    }
+                }
             }
-            if tensor(first_port).meets(first_site.range(), tensor(second_port), second_site.range()) {
-                return Err(node.aliasing(first.min(second) as usize, first.max(second) as usize));
-            }
+            cursor = pairs.next;
         }
         Ok(())
     }
@@ -4406,19 +5020,25 @@ impl NativeGraphPlan {
     /// condition reads a word of it (checked here, as the graph's bindings
     /// form, so a queued run reads it as it is).
     fn check_binding(&self, port: usize, tensor: &Arc<TensorInner>) -> Result<(), WorkflowError> {
-        if !port_matches(&self.device, &self.ports[port], tensor)
-            || (self.executable.external_writes[port] && tensor.allocation().storage().read_only())
-        {
-            let spec = &self.ports[port];
+        let meta = &self.topology.ports[port];
+        let extents = self.extents(&meta.extents);
+        let strides = self.strides(&meta.extents);
+        let byte_len = self.port_byte_lens[port];
+        let matches = Arc::ptr_eq(tensor.device(), &self.device)
+            && tensor.representation() == meta.representation
+            && tensor.extents() == extents
+            && tensor.strides() == strides
+            && tensor.byte_len() == byte_len;
+        if !matches || (self.topology.external_writes[port] && tensor.allocation().storage().read_only()) {
             return Err(WorkflowError::NativePortBinding {
                 port,
                 expected: format!(
                     "{:?} extents {:?} strides {:?} {} bytes{}",
-                    spec.representation,
-                    spec.extents,
-                    spec.strides,
-                    spec.byte_len,
-                    if self.executable.external_writes[port] { ", written" } else { "" },
+                    meta.representation,
+                    extents,
+                    strides,
+                    byte_len,
+                    if self.topology.external_writes[port] { ", written" } else { "" },
                 ),
                 bound: format!(
                     "{:?} extents {:?} strides {:?} {} bytes{}{}",
@@ -4431,7 +5051,7 @@ impl NativeGraphPlan {
                 ),
             });
         }
-        if self.executable.port_uses[port].condition && tensor.allocation().storage().host_address().is_none() {
+        if self.port_uses[port].condition && tensor.allocation().storage().host_address().is_none() {
             return Err(WorkflowError::UnaddressedCondition { parameter: format!("port {port}") });
         }
         Ok(())
@@ -4476,10 +5096,10 @@ impl NativeGraphPlan {
             BackendName::Cuda => {
                 let launches = form.iter().map(|word| u64::from(word.count_ones())).sum::<u64>();
                 cuda_recorded_census_sum(
-                    self.executable.nodes.len(),
+                    self.topology.nodes.len(),
                     launches,
-                    &self.executable.timelines,
-                    &self.executable.marks,
+                    &self.topology.timelines,
+                    &self.topology.marks,
                 )
             }
             BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => self.recorded,
@@ -4495,9 +5115,9 @@ impl NativeGraphPlan {
         if !self.graphed() {
             return Vec::new();
         }
-        let nodes = self.executable.nodes.len();
-        let divides = |mark: &usize| !self.holds_timelines() && self.executable.bounds().any(|bound| bound == *mark);
-        let held = self.executable.marks.iter().copied().filter(|mark| (1..nodes).contains(mark) && !divides(mark));
+        let nodes = self.topology.nodes.len();
+        let divides = |mark: &usize| !self.holds_timelines() && self.topology.bounds().any(|bound| bound == *mark);
+        let held = self.topology.marks.iter().copied().filter(|mark| (1..nodes).contains(mark) && !divides(mark));
         held.collect()
     }
 
@@ -4570,21 +5190,26 @@ impl NativeGraphPlan {
         charges: &Charges,
         workspace: &Arc<Allocation>,
     ) -> Result<Option<Arc<Allocation>>, TensorError> {
-        if self.executable.workspace_records == 0 {
+        if self.workspace_records == 0 {
             return Ok(None);
         }
         let offsets = self
-            .executable
+            .topology
             .nodes
             .iter()
-            .flat_map(|node| &node.sites)
-            .filter_map(|site| match site.records {
-                SiteRecords::Workspace { records, .. } => Some((site, records.get())),
+            .flat_map(|node| {
+                node.sites.iter().enumerate().map(move |(i, _)| {
+                    let idx = node.site_base + i;
+                    (self.site_offsets[idx], self.site_bytes[idx], self.site_records[idx])
+                })
+            })
+            .filter_map(|(offset, bytes, records)| match records {
+                SiteRecords::Workspace { records, .. } => Some((offset, bytes, records.get())),
                 SiteRecords::None | SiteRecords::Port(_) => None,
             })
-            .flat_map(|(site, records)| {
-                let record = site.bytes / records;
-                (0..records).map(move |index| site.offset + index * record)
+            .flat_map(|(offset, bytes, records)| {
+                let record = bytes / records;
+                (0..records).map(move |index| offset + index * record)
             });
         let table = crate::api::tensor::record_table(charges, workspace, offsets)?;
         workspace.hold_table(&table);
@@ -4617,15 +5242,15 @@ impl NativeGraphPlan {
         allocation: &Arc<Allocation>,
         offset: u64,
     ) -> Arc<TensorInner> {
-        let port = &self.ports[ordinal];
+        let port = &self.topology.ports[ordinal];
         Arc::new(TensorInner::new_view(
             self.device.clone(),
             allocation.clone(),
             offset,
-            port.byte_len,
+            self.port_byte_lens[ordinal],
             port.representation,
-            port.extents.clone(),
-            port.strides.clone(),
+            self.extents(&port.extents).to_vec(),
+            self.strides(&port.extents).to_vec(),
         ))
     }
 
@@ -4634,9 +5259,9 @@ impl NativeGraphPlan {
         arena: Option<Arc<Allocation>>,
         family: Option<Arc<NativeGraphFamily>>,
     ) -> NativeGraphOutputs {
-        let mut locals = Vec::with_capacity(self.ports.len());
-        for ordinal in 0..self.ports.len() {
-            let tensor = if let Some(Placement::Export(offset)) = self.port_placements[ordinal] {
+        let mut locals = Vec::with_capacity(self.topology.ports.len());
+        for ordinal in 0..self.topology.ports.len() {
+            let tensor = if let Some(Placement::Export(offset)) = self.topology.port_placements[ordinal] {
                 Some(self.port_view(
                     ordinal,
                     arena.as_ref().expect("planned output arena absent"),
@@ -4647,15 +5272,15 @@ impl NativeGraphPlan {
             };
             locals.push(tensor);
         }
-        let mut outputs = Vec::with_capacity(self.results.len());
-        for (node, row) in self.results.iter().enumerate() {
-            let mut output_row = Vec::with_capacity(row.len());
-            for (ordinal, result) in row.iter().enumerate() {
-                let Some(spec) = result else {
+        let mut outputs = Vec::with_capacity(self.topology.results.nodes.len());
+        for row_range in &self.topology.results.nodes {
+            let mut output_row = Vec::with_capacity(row_range.len());
+            for flat_idx in row_range.clone() {
+                let Some((representation, ref ext_range)) = self.topology.results.entries[flat_idx] else {
                     output_row.push(None);
                     continue;
                 };
-                let Placement::Export(offset) = self.placements[node][ordinal] else {
+                let Placement::Export(offset) = self.topology.placements[flat_idx] else {
                     output_row.push(None);
                     continue;
                 };
@@ -4663,10 +5288,10 @@ impl NativeGraphPlan {
                     self.device.clone(),
                     arena.as_ref().expect("planned output arena absent").clone(),
                     offset,
-                    spec.byte_len,
-                    spec.representation,
-                    spec.extents.clone(),
-                    spec.strides.clone(),
+                    self.result_byte_lens[flat_idx],
+                    representation,
+                    self.extents(ext_range).to_vec(),
+                    self.strides(ext_range).to_vec(),
                 ))));
             }
             outputs.push(output_row);
@@ -4713,14 +5338,6 @@ pub fn bindings_heap(ports: usize, timelines: usize) -> HostHeap {
     heap.hold(ports, size_of::<bool>());
     heap.hold(timelines, size_of::<Option<TimelineBinding>>());
     heap
-}
-
-fn port_matches(device: &Arc<DeviceInner>, spec: &PortSpec, tensor: &Arc<TensorInner>) -> bool {
-    Arc::ptr_eq(tensor.device(), device)
-        && tensor.representation() == spec.representation
-        && tensor.extents() == spec.extents
-        && tensor.strides() == spec.strides
-        && tensor.byte_len() == spec.byte_len
 }
 
 /// A finite family of sealed exact-shape graphs sharing one reusable scratch
@@ -4816,7 +5433,7 @@ impl NativeGraphFamily {
             // part of the form one graph of the layout serves.
             assert!(
                 super::backend_name(&first.device.kind) != BackendName::Cuda
-                    || graphs.plans.iter().all(|plan| plan.executable.timelines == graphs.plans[0].executable.timelines),
+                    || graphs.plans.iter().all(|plan| plan.topology.timelines == graphs.plans[0].topology.timelines),
                 "a layout's plans hold the same timeline nodes"
             );
             graphs.form = (0..calls)
@@ -5098,7 +5715,7 @@ impl NativeGraphFamily {
         if self
             .plans
             .iter()
-            .any(|plan| plan.ports.iter().any(|port| port.prewritten))
+            .any(|plan| plan.topology.ports.iter().any(|port| port.prewritten))
         {
             return Err(WorkflowError::NativeArenaPrewrittenPort);
         }
@@ -5411,10 +6028,10 @@ impl NativeGraphSlot {
         if port.reference.workflow != self.plan.identity || port.reference.node != INPUT_NODE {
             return None;
         }
-        if !self.plan.ports.get(ordinal)?.prewritten {
+        if !self.plan.topology.ports.get(ordinal)?.prewritten {
             return None;
         }
-        let Some(Placement::Scratch(offset)) = self.plan.port_placements[ordinal] else {
+        let Some(Placement::Scratch(offset)) = self.plan.topology.port_placements[ordinal] else {
             return None;
         };
         let workspace = self
@@ -5439,11 +6056,12 @@ impl NativeGraphSlot {
             && port.reference.node == INPUT_NODE
             && self
                 .plan
+                .topology
                 .ports
                 .get(ordinal)
                 .is_some_and(|spec| spec.owned_input);
         let Some(Placement::Upload(offset)) =
-            owned.then(|| self.plan.port_placements[ordinal]).flatten()
+            owned.then(|| self.plan.topology.port_placements[ordinal]).flatten()
         else {
             return Err(TensorError::Execution(ExecutionError::SubmissionFailed(
                 "write_input requires an owned native graph input port".to_owned(),
@@ -5478,7 +6096,7 @@ impl NativeGraphSlot {
             .flatten()
             .map(|allocation| allocation.identity())
             .collect::<Vec<_>>();
-        for (port, spec) in self.plan.ports.iter().enumerate() {
+        for (port, spec) in self.plan.topology.ports.iter().enumerate() {
             if spec.local {
                 continue;
             }
@@ -5499,7 +6117,7 @@ impl NativeGraphSlot {
         for (node, (bound, &(position, kind))) in bindings
             .timelines
             .into_iter()
-            .zip(&self.plan.executable.timelines)
+            .zip(&self.plan.topology.timelines)
             .enumerate()
         {
             // A port binds only a timeline of its node's role
@@ -5599,7 +6217,13 @@ impl NativeGraphOutputs {
         if self.submitted {
             return Err(WorkflowError::NativeOutputLeaseConsumed);
         }
-        if reference.workflow != self.plan.identity || !self.plan.exports.contains(&reference) {
+        if reference.workflow != self.plan.identity
+            || !self
+                .plan
+                .topology
+                .exports
+                .contains(&(reference.node, reference.result))
+        {
             return Err(WorkflowError::CrossWorkflowResult);
         }
         let tensor = if reference.node == INPUT_NODE {
@@ -5639,7 +6263,11 @@ impl NativeGraphOutputs {
     pub fn exported_tensor(&self, reference: WorkflowResultRef) -> Option<Arc<TensorInner>> {
         if !self.submitted
             || reference.workflow != self.plan.identity
-            || !self.plan.exports.contains(&reference)
+            || !self
+                .plan
+                .topology
+                .exports
+                .contains(&(reference.node, reference.result))
         {
             return None;
         }
@@ -5801,10 +6429,10 @@ impl NativeGraphBindings {
             return Err(WorkflowError::CrossWorkflowResult);
         }
         let ordinal = port.reference.result as usize;
-        if self.plan.ports.get(ordinal).is_none_or(|port| port.local) {
+        if self.plan.topology.ports.get(ordinal).is_none_or(|port| port.local) {
             return Err(WorkflowError::NativePortMismatch { port: ordinal });
         }
-        let uses = &self.plan.executable.port_uses[ordinal];
+        let uses = &self.plan.port_uses[ordinal];
         let value = self
             .inputs
             .get_mut(ordinal)
@@ -5896,7 +6524,7 @@ impl ReadyNativeGraphRun<'_> {
         self,
         sequence: &mut NativeGraphSequence,
     ) -> Result<(NativeGraphOutputs, NativeSpans), CallError> {
-        let spans = NativeSpans::new(&self.slot.plan.device, self.slot.plan.executable.marks.len())?;
+        let spans = NativeSpans::new(&self.slot.plan.device, self.slot.plan.topology.marks.len())?;
         let outputs = self.queue_stamped(sequence, Some(&spans))?;
         Ok((outputs, spans))
     }
@@ -5926,7 +6554,7 @@ impl ReadyNativeGraphRun<'_> {
         sequence.access.extend(
             self.externals
                 .iter()
-                .zip(&plan.executable.external_writes)
+                .zip(&plan.topology.external_writes)
                 .flat_map(|(bound, write)| {
                     bound
                         .iter()
@@ -5963,7 +6591,7 @@ impl ReadyNativeGraphRun<'_> {
                     self.slot
                         .upload
                         .iter()
-                        .map(|allocation| (allocation.clone(), plan.executable.upload_written)),
+                        .map(|allocation| (allocation.clone(), plan.topology.upload_written)),
                 )
                 .chain(
                     self.exports
@@ -5995,7 +6623,7 @@ impl ReadyNativeGraphRun<'_> {
         // Where sampled, each of its plan's marks stamped at its node.
         let stamps = spans
             .into_iter()
-            .flat_map(|spans| plan.executable.marks.iter().copied().zip(spans.stamps()))
+            .flat_map(|spans| plan.topology.marks.iter().copied().zip(spans.stamps()))
             .collect();
         let mut run = QueuedRun {
             plan,
@@ -6021,9 +6649,7 @@ impl ReadyNativeGraphRun<'_> {
             // A park's call is the node after it; a publication's, the one
             // before (`validate_park`: a publication follows a call).
             let call = park.position - usize::from(park.publishes);
-            let encodes = run.plan.executable.nodes[call]
-                .launches
-                .geometry
+            let encodes = run.plan.node_launches(call)
                 .iter()
                 .enumerate()
                 .any(|(ordinal, launch)| launch.is_some() && run.encodes(call, ordinal));
@@ -6130,7 +6756,7 @@ impl NativeGraphSequence {
             .iter()
             .enumerate()
             .flat_map(|(run, queued)| {
-                (0..queued.plan.executable.nodes.len()).map(move |node| (run, node))
+                (0..queued.plan.topology.nodes.len()).map(move |node| (run, node))
             })
             .collect::<Vec<_>>();
         // A run's operation before its node `n` is at the boundary before
@@ -6145,7 +6771,7 @@ impl NativeGraphSequence {
             for (position, stamp) in &run.stamps {
                 stamps[first + position].push(stamp.clone());
             }
-            first += run.plan.executable.nodes.len();
+            first += run.plan.topology.nodes.len();
         }
         let list = SequenceList {
             runs: &self.runs,
@@ -6238,39 +6864,45 @@ impl QueuedRun {
 
     /// Node `node`; the buffers its kernel binds are appended to `buffers`
     /// (`DispatchList::dispatch`).
-    fn dispatch<'s>(&'s self, node: usize, buffers: &mut Vec<(&'s Allocation, u64)>) -> Dispatch<'s> {
+    fn dispatch<'s>(&'s self, node_idx: usize, buffers: &mut Vec<(&'s Allocation, u64)>) -> Dispatch<'s> {
         let run = self;
-        let node = &self.plan.executable.nodes[node];
+        let node = &self.plan.topology.nodes[node_idx];
+        let kernel = &self.plan.kernels[node_idx];
         let region = |region: &'s Option<Arc<Allocation>>| {
             &**region
                 .as_ref()
                 .expect("a planned graph storage region is present")
         };
-        node.kernel.bind(node.sites.iter().map(|site| match (site.region, site.records) {
-            (Region::External(port), SiteRecords::Port(_)) => {
-                let records = run.records(port);
-                let entry = site.offset / records.record;
-                (
-                    &*records.table,
-                    records.table_offset + seismic_lang::registry::record_table_entry(entry),
-                )
+        kernel.bind(node.sites.iter().enumerate().map(|(i, site)| {
+            let idx = node.site_base + i;
+            let offset = self.plan.site_offsets[idx];
+            let records = self.plan.site_records[idx];
+            match (site.region, records) {
+                (Region::External(port), SiteRecords::Port(_)) => {
+                    let records = run.records(port);
+                    let entry = offset / records.record;
+                    (
+                        &*records.table,
+                        records.table_offset + seismic_lang::registry::record_table_entry(entry),
+                    )
+                }
+                (Region::Workspace, SiteRecords::Workspace { table, .. }) => (region(&run.workspace_records), table),
+                (Region::External(port), SiteRecords::None) => {
+                    let external = run.external(port);
+                    (&*external.allocation, external.offset + offset)
+                }
+                (Region::Workspace, SiteRecords::None) => (region(&run.workspace), offset),
+                (Region::Sync, SiteRecords::None) => (region(&run.sync), offset),
+                (Region::Upload, SiteRecords::None) => (region(&run.upload), offset),
+                (Region::Outputs, SiteRecords::None) => (region(&run.outputs), offset),
+                (region, records) => unreachable!("a {records:?} record site in {region:?}"),
             }
-            (Region::Workspace, SiteRecords::Workspace { table, .. }) => (region(&run.workspace_records), table),
-            (Region::External(port), SiteRecords::None) => {
-                let external = run.external(port);
-                (&*external.allocation, external.offset + site.offset)
-            }
-            (Region::Workspace, SiteRecords::None) => (region(&run.workspace), site.offset),
-            (Region::Sync, SiteRecords::None) => (region(&run.sync), site.offset),
-            (Region::Upload, SiteRecords::None) => (region(&run.upload), site.offset),
-            (Region::Outputs, SiteRecords::None) => (region(&run.outputs), site.offset),
-            (region, records) => unreachable!("a {records:?} record site in {region:?}"),
         }), buffers);
         Dispatch {
-            kernel: &node.kernel,
-            words: &node.words,
-            launches: &node.launches.geometry,
-            rounds: node.launches.rounds,
+            kernel,
+            words: self.plan.node_words(node_idx),
+            launches: self.plan.node_launches(node_idx),
+            rounds: self.plan.rounds[node_idx],
             representations: &node.representations,
         }
     }
@@ -6288,17 +6920,12 @@ impl QueuedRun {
             };
             super::condition_holds(allocation, base + condition.offset, condition.encoded)
         };
-        self.plan
-            .executable
-            .nodes
-            .iter()
-            .enumerate()
-            .flat_map(|(node, sealed)| {
-                sealed
-                    .conditions
-                    .iter()
+        (0..self.plan.topology.nodes.len())
+            .flat_map(|node| {
+                self.plan
+                    .node_launch_range(node)
                     .enumerate()
-                    .filter(|(_, conditions)| !conditions.iter().all(holds))
+                    .filter(|&(_, launch)| !self.plan.launch_conditions(launch).iter().all(holds))
                     .map(move |(ordinal, _)| (node, ordinal))
             })
             .collect()
@@ -6370,17 +6997,18 @@ struct PlaceholderRun<'a> {
 
 impl DispatchList for PlaceholderRun<'_> {
     fn count(&self) -> usize {
-        self.plan.executable.nodes.len()
+        self.plan.topology.nodes.len()
     }
 
     fn dispatch<'s>(&'s self, index: usize, buffers: &mut Vec<(&'s Allocation, u64)>) -> Dispatch<'s> {
-        let node = &self.plan.executable.nodes[index];
-        node.kernel.bind(node.sites.iter().map(|_| (self.placeholder, 0)), buffers);
+        let node = &self.plan.topology.nodes[index];
+        let kernel = &self.plan.kernels[index];
+        kernel.bind(node.sites.iter().map(|_| (self.placeholder, 0)), buffers);
         Dispatch {
-            kernel: &node.kernel,
-            words: &node.words,
-            launches: &node.launches.geometry,
-            rounds: node.launches.rounds,
+            kernel,
+            words: self.plan.node_words(index),
+            launches: self.plan.node_launches(index),
+            rounds: self.plan.rounds[index],
             representations: &node.representations,
         }
     }
@@ -6398,7 +7026,7 @@ impl DispatchList for PlaceholderRun<'_> {
             plan: self.plan.identity,
             layout: self.plan.shape.layout,
             calls: 0..self.count(),
-            timelines: self.plan.executable.timelines.clone(),
+            timelines: self.plan.topology.timelines.to_vec(),
             marks: self.plan.held_marks(),
             launched: !self.plan.graphed(),
             holds_timelines: self.plan.holds_timelines(),
@@ -6436,8 +7064,13 @@ impl DispatchList for SequenceList<'_> {
                 .expect("a planned graph storage region is present")
                 .identity()
         };
-        for (buffer, site) in run.plan.executable.nodes[node].sites.iter().enumerate() {
-            let (allocation, offset, bytes) = match (site.region, site.records) {
+        let static_node = &run.plan.topology.nodes[node];
+        for (buffer, site) in static_node.sites.iter().enumerate() {
+            let idx = static_node.site_base + buffer;
+            let site_bytes = run.plan.site_bytes[idx];
+            let site_offset = run.plan.site_offsets[idx];
+            let site_records = run.plan.site_records[idx];
+            let (allocation, offset, bytes) = match (site.region, site_records) {
                 (Region::External(port), SiteRecords::Port(count)) => {
                     let records = run.records(port);
                     match run.slab(port) {
@@ -6447,11 +7080,11 @@ impl DispatchList for SequenceList<'_> {
                             buffer,
                             &records.table,
                             records.table_offset,
-                            site.offset,
+                            site_offset,
                             count * records.record,
                             reaches,
                         ),
-                        None => records.extend(buffer, site.offset / records.record, count, reaches),
+                        None => records.extend(buffer, site_offset / records.record, count, reaches),
                     }
                     continue;
                 }
@@ -6461,8 +7094,8 @@ impl DispatchList for SequenceList<'_> {
                     reaches.push(Reach {
                         buffer,
                         allocation: region(&run.workspace),
-                        offset: site.offset,
-                        bytes: site.bytes,
+                        offset: site_offset,
+                        bytes: site_bytes,
                         through: Through::Slab,
                     });
                     continue;
@@ -6470,15 +7103,15 @@ impl DispatchList for SequenceList<'_> {
                 (Region::External(port), SiteRecords::None) => {
                     let External { allocation, offset: start, .. } = run.external(port);
                     if let Some(slab) = run.slab(port) {
-                        slab.extend(buffer, allocation, *start, site.offset, site.bytes, reaches);
+                        slab.extend(buffer, allocation, *start, site_offset, site_bytes, reaches);
                         continue;
                     }
-                    (allocation.identity(), start + site.offset, site.bytes)
+                    (allocation.identity(), start + site_offset, site_bytes)
                 }
-                (Region::Workspace, SiteRecords::None) => (region(&run.workspace), site.offset, site.bytes),
-                (Region::Sync, SiteRecords::None) => (region(&run.sync), site.offset, site.bytes),
-                (Region::Upload, SiteRecords::None) => (region(&run.upload), site.offset, site.bytes),
-                (Region::Outputs, SiteRecords::None) => (region(&run.outputs), site.offset, site.bytes),
+                (Region::Workspace, SiteRecords::None) => (region(&run.workspace), site_offset, site_bytes),
+                (Region::Sync, SiteRecords::None) => (region(&run.sync), site_offset, site_bytes),
+                (Region::Upload, SiteRecords::None) => (region(&run.upload), site_offset, site_bytes),
+                (Region::Outputs, SiteRecords::None) => (region(&run.outputs), site_offset, site_bytes),
                 (region, records) => unreachable!("a {records:?} record site in {region:?}"),
             };
             reaches.push(Reach {
@@ -6497,14 +7130,14 @@ impl DispatchList for SequenceList<'_> {
             self.runs
                 .iter()
                 .map(|run| {
-                    let calls = first..first + run.plan.executable.nodes.len();
+                    let calls = first..first + run.plan.topology.nodes.len();
                     first = calls.end;
                     let graph = run.hold.layout(run.plan.shape.layout);
                     super::PlanRun {
                         plan: run.plan.identity,
                         layout: run.plan.shape.layout,
                         calls,
-                        timelines: run.plan.executable.timelines.clone(),
+                        timelines: run.plan.topology.timelines.to_vec(),
                         marks: run.plan.held_marks(),
                         launched: !run.plan.graphed(),
                         holds_timelines: run.plan.holds_timelines(),
@@ -6605,7 +7238,7 @@ mod layout_certificate_tests {
         let (ports, nodes, results) = class(16);
         let links = operand_links::<()>(&nodes, &[]).unwrap();
         let certified =
-            make_layout(&ports, &nodes, &links, &results, &[], &[], HostHeap::default(), 0, GraphCensus::default());
+            make_layout(&ports, &nodes, &links, &results, &[], &[], HostHeap::default(), HostHeap::default(), 0, GraphCensus::default());
         let charge = certified.storage_bytes();
         let (ports, nodes, results) = class(8);
         let exact = certified
@@ -6920,7 +7553,7 @@ mod operand_pairing_tests {
         let formed = plan_storage(&ports, &consuming, &uncarried, &results, &[], &[]);
         assert!(storage.scratch_bytes < formed.scratch_bytes, "carried buffers take no workspace");
 
-        let certified = make_layout(&ports, &consuming, &links, &results, &[], &[], HostHeap::default(), 0, GraphCensus::default());
+        let certified = make_layout(&ports, &consuming, &links, &results, &[], &[], HostHeap::default(), HostHeap::default(), 0, GraphCensus::default());
         assert!(certified.storage_for(&ports, &consuming, &links, &results, &[], &[]).is_ok());
         assert_eq!(
             certified.storage_for(&ports, &consuming, &uncarried, &results, &[], &[]).err(),
@@ -7804,14 +8437,16 @@ mod condition_tests {
         let plan = draft.seal().expect("a graph over host-written words seals");
         let word = HostWord::Port(policy.reference.result);
         assert_eq!(
-            plan.executable.nodes[0].conditions,
-            [vec![
+            plan.node_launch_range(0)
+                .map(|launch| plan.launch_conditions(launch).to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![
                 LaunchCondition { word, offset: 8, encoded: Encoded::WhileClear },
                 LaunchCondition { word, offset: 0, encoded: Encoded::WhileSet },
             ]]
         );
-        assert!(plan.executable.port_uses[policy.reference.result as usize].condition);
-        assert!(!plan.executable.port_uses[x.reference.result as usize].condition);
+        assert!(plan.port_uses[policy.reference.result as usize].condition);
+        assert!(!plan.port_uses[x.reference.result as usize].condition);
 
         // The kernel's word in graph storage: a local, which no host writes.
         let mut draft = NativeGraphDraft::new(&device);

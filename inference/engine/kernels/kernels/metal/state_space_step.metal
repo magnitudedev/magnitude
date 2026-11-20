@@ -53,6 +53,7 @@ kernel void state_space_step(
         return;
     }
     const versions::Slot slot = versions::slot_of(slots, group.z, seismic_words);
+    if (slot.lo == slot.hi) return;
     // The successor bank's window is no slot's source, so it is written first.
     if (group.y == 0)
         state_space::publish_window(in, slot, head, thread_index, threadgroup_shape.x);

@@ -52,7 +52,7 @@ kernel void gated_delta_step(
     const recurrent::Slot slot = versions::slot_of({segments, stop, previous_bank, previous_tape, following_bank},
         group.z, seismic_words);
     // The successor bank's window is no slot's source, so it is written first.
-    if (group.y == 0)
+    if (group.y == 0 && slot.lo < slot.hi)
         recurrent::publish_window(projection, window, slot, group.x, thread_index, threadgroup_shape.x,
             seismic_words);
     recurrent::step<RST_LANE_ROWS, RST_BLOCK>(recurrent::Convolving{projection, window, convolution, slot},

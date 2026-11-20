@@ -55,13 +55,14 @@ fn short_conv_rows[M, B, S, CH, C, T](projection: &tensor[M, 2 * CH] f32,
                             value = projection[lo + local + tap - (C - 1), channel]
                         sum = fma(convolution[channel, tap], value, sum)
                     gated[row, channel] = projection[row, CH + channel] * sum
-        for tap in 0..C - 1 + T:
-            if tap < C - 1 or publish + tap - (C - 1) < hi:
-                for channel in 0..CH:
-                    if stop[slot] + tap < C - 1:
-                        window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
-                    else:
-                        window[target, tap, channel] = projection[publish + tap - (C - 1), channel]
+        if lo < hi:
+            for tap in 0..C - 1 + T:
+                if tap < C - 1 or publish + tap - (C - 1) < hi:
+                    for channel in 0..CH:
+                        if stop[slot] + tap < C - 1:
+                            window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
+                        else:
+                            window[target, tap, channel] = projection[publish + tap - (C - 1), channel]
     return gated
 
 # Metal: a thread per (channel, row) for grid y < M; grid y = M + b

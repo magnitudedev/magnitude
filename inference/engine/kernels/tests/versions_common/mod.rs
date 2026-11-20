@@ -158,14 +158,42 @@ pub struct SlotTensors {
 
 impl SlotTensors {
     pub fn new(device: &Device, slots: &[SlotCase], rows: usize) -> Self {
-        let count = slots.len() as u64;
-        let each = |f: fn(&SlotCase) -> usize| slots.iter().map(|slot| f(slot) as i32).collect::<Vec<_>>();
+        Self::padded(device, slots, rows, slots.len())
+    }
+
+    /// Build slot control tensors padded up to `padded_slots` with trailing
+    /// empty slots (`segments = [actual_rows, actual_rows]`, `bank = -1`,
+    /// `following_bank = -1`, `stop = 0`, `previous_tape = 0`), matching
+    /// `PackedRowTables`.
+    pub fn padded(device: &Device, slots: &[SlotCase], rows: usize, padded_slots: usize) -> Self {
+        assert!(padded_slots >= slots.len());
+        let pad = padded_slots - slots.len();
+        let count = padded_slots as u64;
+        let actual_rows: usize = slots.iter().map(|slot| slot.rows).sum();
+        let mut segs = Vec::with_capacity((padded_slots + 1) * 2);
+        let mut row = 0;
+        for slot in slots {
+            segs.extend([row as i32, (row + slot.rows) as i32]);
+            row += slot.rows;
+        }
+        let tail = if pad > 0 { actual_rows as i32 } else { rows as i32 };
+        for _ in 0..=pad {
+            segs.extend([tail, tail]);
+        }
+        let mut stop: Vec<i32> = slots.iter().map(|slot| slot.stop as i32).collect();
+        let mut previous: Vec<i32> = slots.iter().map(|slot| slot.previous as i32).collect();
+        let mut previous_tape: Vec<i32> = slots.iter().map(|slot| slot.taped as i32).collect();
+        let mut following: Vec<i32> = slots.iter().map(|slot| slot.following as i32).collect();
+        stop.resize(padded_slots, 0);
+        previous.resize(padded_slots, -1);
+        previous_tape.resize(padded_slots, 0);
+        following.resize(padded_slots, -1);
         Self {
-            segments: ints(device, &[count + 1, 2], &segments(slots, rows)),
-            stop: ints(device, &[count], &each(|slot| slot.stop)),
-            previous: ints(device, &[count], &each(|slot| slot.previous)),
-            previous_tape: ints(device, &[count], &each(|slot| slot.taped)),
-            following: ints(device, &[count], &each(|slot| slot.following)),
+            segments: ints(device, &[count + 1, 2], &segs),
+            stop: ints(device, &[count], &stop),
+            previous: ints(device, &[count], &previous),
+            previous_tape: ints(device, &[count], &previous_tape),
+            following: ints(device, &[count], &following),
         }
     }
 }

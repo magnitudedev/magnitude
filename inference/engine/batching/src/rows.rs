@@ -433,9 +433,6 @@ impl PackedRowTables {
                 .ok_or(PackError::IntegerOverflow("row count"))
         })?;
         let actual_slots = slots.len();
-        let padded_slots = actual_slots
-            .checked_next_power_of_two()
-            .ok_or(PackError::IntegerOverflow("slot count"))?;
 
         let domains = slots
             .first()
@@ -531,7 +528,20 @@ impl PackedRowTables {
         let class = LaunchClass::covering(actual_rows, max_segments, union, limits)?;
         let m = class.rows();
         let r = class.segments();
-        let m_i32 = i32::try_from(m).map_err(|_| PackError::IntegerOverflow("class rows"))?;
+        if actual_slots > limits.slots {
+            return Err(PackError::Class(ClassError::SlotsTooLarge {
+                slots: actual_slots,
+                limit: limits.slots,
+            }));
+        }
+        let padded_slots = crate::slot_class(actual_slots, m.min(limits.slots)).ok_or(
+            PackError::Class(ClassError::SlotsTooLarge {
+                slots: actual_slots,
+                limit: m.min(limits.slots),
+            }),
+        )?;
+        let actual_rows_i32 =
+            i32::try_from(actual_rows).map_err(|_| PackError::IntegerOverflow("actual rows"))?;
         let b_i32 =
             i32::try_from(padded_slots).map_err(|_| PackError::IntegerOverflow("class slots"))?;
 
@@ -554,7 +564,11 @@ impl PackedRowTables {
             ],
             row_slots: vec![b_i32; m],
             demand: vec![0; m],
-            segments: vec![[m_i32, m_i32]; padded_slots + 1],
+            // Trailing padded slots carry empty [actual_rows, actual_rows]
+            // ranges so `covered_end` (`segments[B - 1, 1]`) equals
+            // `actual_rows` and `slot_index_of_row` binary search stays
+            // monotonic and excludes padded rows.
+            segments: vec![[actual_rows_i32, actual_rows_i32]; padded_slots + 1],
             bank: vec![-1; padded_slots + 1],
             previous_tape: vec![0; padded_slots + 1],
             following_bank: vec![-1; padded_slots + 1],
@@ -574,6 +588,13 @@ impl PackedRowTables {
         for (slot_index, slot) in slots.iter().enumerate() {
             let lo = row_index;
             let hi = lo + slot.rows.len();
+            // Empty slots are rejected above (`PackError::EmptySlot`); every
+            // real slot has `lo < hi`, reserving `lo == hi` exclusively for
+            // trailing padded slots.
+            assert!(
+                hi > lo,
+                "invariant violated: real slot {slot_index} is empty; lo == hi is reserved for padded slots"
+            );
             packed.segments[slot_index] =
                 [as_i32(lo, "segment start")?, as_i32(hi, "segment end")?];
             packed.bank[slot_index] = slot.bank;
@@ -727,6 +748,7 @@ mod tests {
     const LIMITS: ClassLimits = ClassLimits {
         rows: 512,
         segments: 63,
+        slots: 512,
     };
 
     fn row(token: i32, demand: Demand) -> Row {
@@ -796,7 +818,7 @@ mod tests {
         assert_eq!((packed.actual_slots, packed.slots), (3, 4));
         assert_eq!(
             packed.segments,
-            vec![[0, 3], [3, 4], [4, 6], [8, 8], [8, 8]]
+            vec![[0, 3], [3, 4], [4, 6], [6, 6], [6, 6]]
         );
         assert_eq!(packed.bank, vec![7, 9, 11, -1, -1]);
         assert_eq!(packed.previous_tape, vec![2, 0, 0, 0, 0]);
@@ -1108,5 +1130,43 @@ mod tests {
                 Err(PackError::InvalidRecurrentVersion { slot: 0, .. })
             ));
         }
+    }
+
+    #[test]
+    fn padded_slots_never_exceed_non_power_of_two_slot_limit() {
+        let make_slots = |count: usize| -> Vec<Slot> {
+            (0..count)
+                .map(|i| Slot {
+                    rows: vec![row(i as i32 + 1, Demand::NONE)],
+                    bank: (i * 2) as i32,
+                    previous_tape: 0,
+                    following_bank: (i * 2 + 1) as i32,
+                    stop: 1,
+                    front: 0,
+                })
+                .collect()
+        };
+        let limits = ClassLimits {
+            rows: 16,
+            segments: 63,
+            slots: 10,
+        };
+        // 5 -> 8 (power of two below limit)
+        let five = PackedRowTables::pack(&make_slots(5), 32, limits).unwrap();
+        assert_eq!((five.actual_slots, five.slots), (5, 8));
+        // 9 -> 10 (capped at non-power-of-two limit, not 16)
+        let nine = PackedRowTables::pack(&make_slots(9), 32, limits).unwrap();
+        assert_eq!((nine.actual_slots, nine.slots), (9, 10));
+        assert_eq!(nine.segments.len(), 11);
+        assert_eq!(nine.segments[9], [9, 9]);
+        assert_eq!(nine.segments[10], [9, 9]);
+        // 11 -> rejected as SlotsTooLarge
+        assert_eq!(
+            PackedRowTables::pack(&make_slots(11), 32, limits),
+            Err(PackError::Class(ClassError::SlotsTooLarge {
+                slots: 11,
+                limit: 10,
+            }))
+        );
     }
 }

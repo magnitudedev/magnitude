@@ -4,7 +4,7 @@
 //! available device.
 
 use seismic::{
-    BackendName, Element, NativeGraphClassSlice, NativeGraphFamily,
+    BackendName, Element, NativeGraphFamily,
     NativeGraphMetadata, NativeSpecialization, Tensor,
 };
 use seismic_native_tests::scale_rows;
@@ -109,30 +109,25 @@ fn a_templates_classes_seal_their_store_into_its_layout() {
     for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let charges = seismic::Charges::tally(&device);
-        let mut template = NativeGraphMetadata::new_template(backend);
-        let input = template
-            .port_with_class_extent(Element::f32(), &[4, n], 0, "M")
-            .unwrap();
-        let landing = template
-            .port_with_class_extent(Element::f32(), &[4, n], 0, "M")
-            .unwrap();
-        let scaled = template
-            .enqueue::<scale_rows::Entry>(
-                &[],
-                &[("M", 4), ("N", n)],
-                scale_rows::WorkflowArgs {
-                    x: input.tensor().into(),
-                    factor: seismic::Argument::from(2.0),
-                },
-            )
-            .unwrap()
-            .value;
-        template.store(&scaled, &landing).unwrap();
-        let layout = template
-            .seal_template()
-            .unwrap()
-            .certify(&[NativeGraphClassSlice::new().dimension("M", [2, 4])])
-            .unwrap();
+        let layout = NativeGraphMetadata::certify_group([2u64, 4].into_iter().map(|m| {
+            let mut draft = NativeGraphMetadata::new(backend);
+            let input = draft.port(Element::f32(), &[m, n]).unwrap();
+            let landing = draft.port(Element::f32(), &[m, n]).unwrap();
+            let scaled = draft
+                .enqueue::<scale_rows::Entry>(
+                    &[],
+                    &[("M", m), ("N", n)],
+                    scale_rows::WorkflowArgs {
+                        x: input.tensor().into(),
+                        factor: seismic::Argument::from(2.0),
+                    },
+                )
+                .unwrap()
+                .value;
+            draft.store(&scaled, &landing).unwrap();
+            draft
+        }))
+        .unwrap();
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
                 .unwrap();

@@ -310,7 +310,7 @@ impl SplitBuild {
 
 /// A crossed value's port in `graph`, its rows the graph class's.
 fn crossed<G: GraphDraft>(graph: &mut G, (element, extents): &Extents<Dim>) -> Result<NativePort, GraphError> {
-    graph.port_with_class_extent(*element, extents, 0, "M")
+    graph.port(*element, extents)
 }
 
 impl SplitPorts {
@@ -338,7 +338,7 @@ impl SplitPorts {
                 let merged = Merged::at(form, layer, capacity)?;
                 let experts = graph.port(merged.experts.0, &merged.experts.1)?;
                 let (element, selected) = (merged.inverse.0, merged.inverse.1[1].clone());
-                let inverse = graph.port_with_class_extent(element, &[rows.clone(), selected], 0, "M")?;
+                let inverse = graph.port(element, &[rows.clone(), selected])?;
                 Some(SplitBuild::Back(BackPorts { crossing, experts, inverse }, merged.blocks()))
             }
         })

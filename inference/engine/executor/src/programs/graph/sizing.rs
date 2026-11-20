@@ -16,7 +16,7 @@ use super::draft::GraphDraft;
 use crate::assessment::stage_timer;
 use seismic::sizing::{
     argument_reference, bindings_heap, make_timeline_port, plan_heap_of, recorded_census_of,
-    resolve_operand_links, CompiledStoragePlan, EncodedWorkflowArgs, OperandCarrySide,
+    resolve_operand_links, topology_heap_of, CompiledStoragePlan, EncodedWorkflowArgs, OperandCarrySide,
     OperandCarrySpec, OperandNode, PendingWorkflowResults, PlanHeapNode, RepresentationId,
     ScratchNeed, StorageNode, StoragePort, TimelineNode, WorkflowResultRef,
     INPUT_NODE, OPERAND_ACTIVATION,
@@ -25,7 +25,7 @@ use seismic::contract::ScratchConfigs;
 use seismic::{
     BackendName, ContractError, ContractNodeShape, ContractScratchMeta, Dim, Element,
     EntryContract, HostHeap, KernelDomainViolation, KernelRequest, LaunchEncoding,
-    NativeGraphClassSlice, NativeGraphStorageBytes, NativePort, NativeTimelinePort, OperandCarry,
+    NativeGraphStorageBytes, NativePort, NativeTimelinePort, OperandCarry,
     TensorParamSpec, WorkflowTensor,
 };
 use std::cell::RefCell;
@@ -1294,26 +1294,40 @@ pub(crate) struct ReadoutSizingCensus {
     pub decode_calls: Vec<SizedCall>,
 }
 
+static NEXT_SIZING_OUTLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// What a structural regime certifies to under direct contract sizing:
-/// exact `NativeGraphStorageBytes`, `plan_heap`, and `bound_heap` matching
-/// `NativeGraphLayout`, plus the accumulated launch census and kernel set.
+/// exact `NativeGraphStorageBytes`, `plan_heap`, `topology_heap`, and
+/// `bound_heap` matching `NativeGraphLayout`, plus the accumulated launch
+/// census and kernel set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SizingOutline {
+    identity: u64,
     storage: NativeGraphStorageBytes,
     plan_heap: HostHeap,
+    topology_heap: HostHeap,
     bound_heap: HostHeap,
     launches: Arc<[SizedCall]>,
     kernels: Arc<[KernelRequest]>,
     timeline_count: usize,
+    cuda_node_launches: Option<Arc<[u64]>>,
 }
 
 impl SizingOutline {
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
+    }
+
     pub(crate) fn storage_bytes(&self) -> NativeGraphStorageBytes {
         self.storage
     }
 
     pub(crate) fn plan_heap(&self) -> HostHeap {
         self.plan_heap
+    }
+
+    pub(crate) fn topology_heap(&self) -> HostHeap {
+        self.topology_heap
     }
 
     pub(crate) fn bound_heap(&self) -> HostHeap {
@@ -1331,23 +1345,31 @@ impl SizingOutline {
     pub(crate) fn timeline_count(&self) -> usize {
         self.timeline_count
     }
-}
 
-type ParamEvalFn =
-    fn(BackendName, &[(&str, Element)], &str, &[(&str, u64)]) -> Result<TensorParamSpec, ContractError>;
-
-enum PortSource {
-    Direct {
-        class_extent: Option<(usize, &'static str, Option<&'static str>)>,
-    },
-    Checked {
-        entry_name: &'static str,
-        class_scope: Option<&'static str>,
-        parameter: CompactStr,
-        elements: std::ops::Range<usize>,
-        dimensions: std::ops::Range<usize>,
-        eval: ParamEvalFn,
-    },
+    /// Compose the recorded `GraphCensus` for a subset of nodes (by index into
+    /// this outline's node sequence) using this outline's exact per-node
+    /// launch accounting (active CUDA launches on CUDA, static contract
+    /// launches elsewhere).
+    pub(crate) fn compose_recorded(
+        &self,
+        backend: BackendName,
+        nodes: &[(usize, (usize, usize, usize))],
+        timelines: &[TimelineNode],
+    ) -> seismic::GraphCensus {
+        match &self.cuda_node_launches {
+            Some(masks) => {
+                let launches: Vec<u64> = nodes.iter().map(|&(idx, _)| u64::from(masks[idx].count_ones())).collect();
+                let positioned: Vec<(usize, TimelineNode)> =
+                    timelines.iter().copied().map(|t| (1, t)).collect();
+                seismic::cuda_recorded_census(nodes.len(), &launches, &positioned, &[])
+            }
+            None => {
+                let census: Vec<(usize, usize, usize)> =
+                    nodes.iter().map(|&(_, triple)| triple).collect();
+                recorded_census_of(backend, &census, timelines)
+            }
+        }
+    }
 }
 
 struct SizingPort {
@@ -1357,18 +1379,17 @@ struct SizingPort {
     local: bool,
     owned_input: bool,
     is_weight: bool,
-    source: PortSource,
 }
 
 struct SizingNode {
     entry_name: &'static str,
-    class_scope: Option<&'static str>,
     elements: Vec<(String, Element)>,
     dimensions: Vec<(String, u64)>,
     args: EncodedWorkflowArgs,
     activation: Option<RepresentationId>,
     shape: ContractNodeShape,
     scratch_meta: ContractScratchMeta,
+    condition: Option<(u32, u64, LaunchEncoding)>,
     share: Option<(u32, WorkflowResultRef)>,
     timeline_before: usize,
     eval_configs: ScratchConfigsEvalFn,
@@ -1382,10 +1403,7 @@ struct SizingNode {
 pub(crate) struct SizingDraft {
     backend: BackendName,
     identity: u64,
-    class_scope: Option<&'static str>,
     ports: Vec<SizingPort>,
-    checked_elements: Vec<(CompactStr, Element)>,
-    checked_dimensions: Vec<(CompactStr, u64)>,
     nodes: Vec<SizingNode>,
     exports: Vec<WorkflowResultRef>,
     stores: Vec<(WorkflowResultRef, u32)>,
@@ -1433,21 +1451,180 @@ fn scratch_needs_from(meta: ContractScratchMeta) -> Vec<ScratchNeed> {
         .collect()
 }
 
-fn for_each_combination(
-    axes: &[&[u64]],
-    current: &mut Vec<u64>,
-    f: &mut impl FnMut(&[u64]) -> Result<(), GraphError>,
-) -> Result<(), GraphError> {
-    if current.len() == axes.len() {
-        return f(current);
-    }
-    let level = current.len();
-    for &value in axes[level] {
-        current.push(value);
-        for_each_combination(axes, current, f)?;
-        current.pop();
-    }
-    Ok(())
+type ParamEvalFn =
+    fn(BackendName, &[(&str, Element)], &str, &[(&str, u64)]) -> Result<TensorParamSpec, ContractError>;
+
+fn cached_param_spec<E: EntryContract>(
+    backend: BackendName,
+    elements: &[(&str, Element)],
+    parameter: &str,
+    dims: &[(&str, u64)],
+) -> Result<TensorParamSpec, GraphError> {
+    stage_timer::time_stage(
+        |t, ns| t.sd_port_param_spec_ns += ns,
+        || {
+            SCOPED_SCRATCH_CONFIGS.with(|cell| {
+                let eval: ParamEvalFn = E::contract_param_spec;
+                let eval_addr = eval as usize;
+                let mut read_h = FxHasher::default();
+                read_h.write_usize(eval_addr);
+                backend.hash(&mut read_h);
+                hash_str(&mut read_h, parameter);
+                let read_hash = read_h.finish();
+
+                let mut filtered_stack: [(&'static str, u64); 8] = [("", 0u64); 8];
+                let mut filtered_heap: Vec<(&'static str, u64)> = Vec::new();
+
+                enum FastPath {
+                    Inactive,
+                    Hit(Result<TensorParamSpec, ContractError>),
+                    MissNeedProbe,
+                    MissWithFiltered(usize),
+                    MissFullDims,
+                }
+
+                let fast = {
+                    let guard = cell.borrow();
+                    match guard.as_ref().filter(|s| s.depth > 0) {
+                        None => FastPath::Inactive,
+                        Some(state) => match state.param_read_dims.get_with(read_hash, |k| {
+                            k.eval == eval_addr
+                                && k.backend == backend
+                                && k.parameter.as_str() == parameter
+                        }) {
+                            None => FastPath::MissNeedProbe,
+                            Some(Some(used)) => {
+                                let (filtered, tag): (&[(&'static str, u64)], usize) =
+                                    if used.len() <= filtered_stack.len() {
+                                        let mut n = 0;
+                                        for &dim_name in used.iter() {
+                                            if let Some((_, v)) =
+                                                dims.iter().find(|(name, _)| *name == dim_name)
+                                            {
+                                                filtered_stack[n] = (dim_name, *v);
+                                                n += 1;
+                                            }
+                                        }
+                                        (&filtered_stack[..n], n)
+                                    } else {
+                                        for &dim_name in used.iter() {
+                                            if let Some((_, v)) =
+                                                dims.iter().find(|(name, _)| *name == dim_name)
+                                            {
+                                                filtered_heap.push((dim_name, *v));
+                                            }
+                                        }
+                                        (filtered_heap.as_slice(), usize::MAX)
+                                    };
+                                let mut sh =
+                                    param_spec_prefix_hash(eval, backend, parameter, elements);
+                                hash_dims(&mut sh, filtered);
+                                let spec_hash = sh.finish();
+                                if let Some(result) =
+                                    state.param_specs.get_with(spec_hash, |k| {
+                                        k.eval == eval_addr
+                                            && k.backend == backend
+                                            && k.parameter.as_str() == parameter
+                                            && dims_eq(&k.dims, filtered)
+                                            && elements_eq(&k.elements, elements)
+                                    })
+                                {
+                                    FastPath::Hit(result.clone())
+                                } else {
+                                    FastPath::MissWithFiltered(tag)
+                                }
+                            }
+                            Some(None) => {
+                                let mut sh =
+                                    param_spec_prefix_hash(eval, backend, parameter, elements);
+                                hash_dims(&mut sh, dims);
+                                let spec_hash = sh.finish();
+                                if let Some(result) =
+                                    state.param_specs.get_with(spec_hash, |k| {
+                                        k.eval == eval_addr
+                                            && k.backend == backend
+                                            && k.parameter.as_str() == parameter
+                                            && dims_eq(&k.dims, dims)
+                                            && elements_eq(&k.elements, elements)
+                                    })
+                                {
+                                    FastPath::Hit(result.clone())
+                                } else {
+                                    FastPath::MissFullDims
+                                }
+                            }
+                        },
+                    }
+                };
+
+                match fast {
+                    FastPath::Inactive => eval(backend, elements, parameter, dims),
+                    FastPath::Hit(result) => result,
+                    FastPath::MissWithFiltered(tag) => {
+                        let filtered: &[(&str, u64)] = if tag == usize::MAX {
+                            filtered_heap.as_slice()
+                        } else {
+                            &filtered_stack[..tag]
+                        };
+                        eval_and_insert_param_spec(cell, eval, backend, elements, parameter, filtered)
+                    }
+                    FastPath::MissFullDims => {
+                        eval_and_insert_param_spec(cell, eval, backend, elements, parameter, dims)
+                    }
+                    FastPath::MissNeedProbe => {
+                        if let Some(used) = lookup_or_probe_param_read_dims(
+                            Some(cell),
+                            eval,
+                            backend,
+                            elements,
+                            parameter,
+                            |missing| dims.iter().find(|(n, _)| *n == missing).map(|(_, v)| *v),
+                        ) {
+                            let filtered: &[(&str, u64)] = if used.len() <= filtered_stack.len() {
+                                let mut n = 0;
+                                for &dim_name in used.iter() {
+                                    if let Some((_, v)) =
+                                        dims.iter().find(|(name, _)| *name == dim_name)
+                                    {
+                                        filtered_stack[n] = (dim_name, *v);
+                                        n += 1;
+                                    }
+                                }
+                                &filtered_stack[..n]
+                            } else {
+                                for &dim_name in used.iter() {
+                                    if let Some((_, v)) =
+                                        dims.iter().find(|(name, _)| *name == dim_name)
+                                    {
+                                        filtered_heap.push((dim_name, *v));
+                                    }
+                                }
+                                filtered_heap.as_slice()
+                            };
+                            eval_or_lookup_param_spec(
+                                Some(cell),
+                                eval,
+                                backend,
+                                elements,
+                                parameter,
+                                filtered,
+                            )
+                        } else {
+                            eval_or_lookup_param_spec(
+                                Some(cell),
+                                eval,
+                                backend,
+                                elements,
+                                parameter,
+                                dims,
+                            )
+                        }
+                    }
+                }
+            })
+        },
+    )
+    .map_err(|error| contract_error(E::NAME, backend, &[], dims, error))
 }
 
 impl SizingDraft {
@@ -1458,10 +1635,7 @@ impl SizingDraft {
         Self {
             backend,
             identity: NEXT_SIZING_GRAPH.fetch_add(1, Ordering::Relaxed),
-            class_scope: None,
             ports: Vec::new(),
-            checked_elements: Vec::new(),
-            checked_dimensions: Vec::new(),
             nodes: Vec::new(),
             exports: Vec::new(),
             stores: Vec::new(),
@@ -1500,187 +1674,7 @@ impl SizingDraft {
             );
             &heap_dims
         };
-
-        let spec = stage_timer::time_stage(
-            |t, ns| t.sd_port_param_spec_ns += ns,
-            || {
-                SCOPED_SCRATCH_CONFIGS.with(|cell| {
-                    let eval: ParamEvalFn = E::contract_param_spec;
-                    let eval_addr = eval as usize;
-                    let backend = self.backend;
-                    let mut read_h = FxHasher::default();
-                    read_h.write_usize(eval_addr);
-                    backend.hash(&mut read_h);
-                    hash_str(&mut read_h, parameter);
-                    let read_hash = read_h.finish();
-
-                    let mut filtered_stack: [(&'static str, u64); 8] = [("", 0u64); 8];
-                    let mut filtered_heap: Vec<(&'static str, u64)> = Vec::new();
-
-                    enum FastPath {
-                        Inactive,
-                        Hit(Result<TensorParamSpec, ContractError>),
-                        MissNeedProbe,
-                        MissWithFiltered(usize),
-                        MissFullDims,
-                    }
-
-                    let fast = {
-                        let guard = cell.borrow();
-                        match guard.as_ref().filter(|s| s.depth > 0) {
-                            None => FastPath::Inactive,
-                            Some(state) => match state.param_read_dims.get_with(read_hash, |k| {
-                                k.eval == eval_addr
-                                    && k.backend == backend
-                                    && k.parameter.as_str() == parameter
-                            }) {
-                                None => FastPath::MissNeedProbe,
-                                Some(Some(used)) => {
-                                    let (filtered, tag): (&[(&'static str, u64)], usize) =
-                                        if used.len() <= filtered_stack.len() {
-                                            let mut n = 0;
-                                            for &dim_name in used.iter() {
-                                                if let Some((_, v)) =
-                                                    dims.iter().find(|(name, _)| *name == dim_name)
-                                                {
-                                                    filtered_stack[n] = (dim_name, *v);
-                                                    n += 1;
-                                                }
-                                            }
-                                            (&filtered_stack[..n], n)
-                                        } else {
-                                            for &dim_name in used.iter() {
-                                                if let Some((_, v)) =
-                                                    dims.iter().find(|(name, _)| *name == dim_name)
-                                                {
-                                                    filtered_heap.push((dim_name, *v));
-                                                }
-                                            }
-                                            (filtered_heap.as_slice(), usize::MAX)
-                                        };
-                                    let mut sh =
-                                        param_spec_prefix_hash(eval, backend, parameter, elements);
-                                    hash_dims(&mut sh, filtered);
-                                    let spec_hash = sh.finish();
-                                    if let Some(result) =
-                                        state.param_specs.get_with(spec_hash, |k| {
-                                            k.eval == eval_addr
-                                                && k.backend == backend
-                                                && k.parameter.as_str() == parameter
-                                                && dims_eq(&k.dims, filtered)
-                                                && elements_eq(&k.elements, elements)
-                                        })
-                                    {
-                                        FastPath::Hit(result.clone())
-                                    } else {
-                                        FastPath::MissWithFiltered(tag)
-                                    }
-                                }
-                                Some(None) => {
-                                    let mut sh =
-                                        param_spec_prefix_hash(eval, backend, parameter, elements);
-                                    hash_dims(&mut sh, dims);
-                                    let spec_hash = sh.finish();
-                                    if let Some(result) =
-                                        state.param_specs.get_with(spec_hash, |k| {
-                                            k.eval == eval_addr
-                                                && k.backend == backend
-                                                && k.parameter.as_str() == parameter
-                                                && dims_eq(&k.dims, dims)
-                                                && elements_eq(&k.elements, elements)
-                                        })
-                                    {
-                                        FastPath::Hit(result.clone())
-                                    } else {
-                                        FastPath::MissFullDims
-                                    }
-                                }
-                            },
-                        }
-                    };
-
-                    match fast {
-                        FastPath::Inactive => eval(backend, elements, parameter, dims),
-                        FastPath::Hit(result) => result,
-                        FastPath::MissWithFiltered(tag) => {
-                            let filtered: &[(&str, u64)] = if tag == usize::MAX {
-                                filtered_heap.as_slice()
-                            } else {
-                                &filtered_stack[..tag]
-                            };
-                            eval_and_insert_param_spec(
-                                cell, eval, backend, elements, parameter, filtered,
-                            )
-                        }
-                        FastPath::MissFullDims => {
-                            eval_and_insert_param_spec(cell, eval, backend, elements, parameter, dims)
-                        }
-                        FastPath::MissNeedProbe => {
-                            if let Some(used) = lookup_or_probe_param_read_dims(
-                                Some(cell),
-                                eval,
-                                backend,
-                                elements,
-                                parameter,
-                                |missing| dims.iter().find(|(n, _)| *n == missing).map(|(_, v)| *v),
-                            ) {
-                                let filtered: &[(&str, u64)] =
-                                    if used.len() <= filtered_stack.len() {
-                                        let mut n = 0;
-                                        for &dim_name in used.iter() {
-                                            if let Some((_, v)) =
-                                                dims.iter().find(|(name, _)| *name == dim_name)
-                                            {
-                                                filtered_stack[n] = (dim_name, *v);
-                                                n += 1;
-                                            }
-                                        }
-                                        &filtered_stack[..n]
-                                    } else {
-                                        for &dim_name in used.iter() {
-                                            if let Some((_, v)) =
-                                                dims.iter().find(|(name, _)| *name == dim_name)
-                                            {
-                                                filtered_heap.push((dim_name, *v));
-                                            }
-                                        }
-                                        filtered_heap.as_slice()
-                                    };
-                                eval_or_lookup_param_spec(
-                                    Some(cell),
-                                    eval,
-                                    backend,
-                                    elements,
-                                    parameter,
-                                    filtered,
-                                )
-                            } else {
-                                eval_or_lookup_param_spec(
-                                    Some(cell),
-                                    eval,
-                                    backend,
-                                    elements,
-                                    parameter,
-                                    dims,
-                                )
-                            }
-                        }
-                    }
-                })
-            },
-        )
-        .map_err(|error| contract_error(E::NAME, self.backend, &[], dims, error))?;
-
-        let el_start = self.checked_elements.len();
-        self.checked_elements
-            .extend(elements.iter().map(|(name, el)| (CompactStr::new(name), *el)));
-        let el_end = self.checked_elements.len();
-
-        let dim_start = self.checked_dimensions.len();
-        self.checked_dimensions
-            .extend(dims.iter().map(|(name, v)| (CompactStr::new(name), *v)));
-        let dim_end = self.checked_dimensions.len();
-
+        let spec = cached_param_spec::<E>(self.backend, elements, parameter, dims)?;
         Ok(self.push_port(SizingPort {
             element: spec.element,
             extents: spec.extents,
@@ -1688,14 +1682,6 @@ impl SizingDraft {
             local,
             owned_input,
             is_weight: false,
-            source: PortSource::Checked {
-                entry_name: E::NAME,
-                class_scope: self.class_scope,
-                parameter: CompactStr::new(parameter),
-                elements: el_start..el_end,
-                dimensions: dim_start..dim_end,
-                eval: E::contract_param_spec,
-            },
         }))
     }
 
@@ -1704,6 +1690,7 @@ impl SizingDraft {
         elements: &[(&str, Element)],
         dimensions: &[(&str, impl Clone + Into<Dim>)],
         args: E::WorkflowArgs<'_>,
+        condition: Option<(u32, u64, LaunchEncoding)>,
     ) -> Result<E::WorkflowResults, GraphError> {
         stage_timer::time_stage(
             |t, ns| {
@@ -1748,13 +1735,13 @@ impl SizingDraft {
                     .collect();
                 self.nodes.push(SizingNode {
                     entry_name: E::NAME,
-                    class_scope: self.class_scope,
                     elements: owned_elements,
                     dimensions: owned_dims,
                     args: encoded,
                     activation,
                     shape,
                     scratch_meta,
+                    condition,
                     share: None,
                     timeline_before: self.timelines.len(),
                     eval_configs: E::contract_scratch_configs,
@@ -1768,92 +1755,83 @@ impl SizingDraft {
         )
     }
 
-    /// Certify this drafted topology over each slice set in `slice_sets`,
-    /// returning one `SizingOutline` per slice set.
-    pub(crate) fn certify_each(
-        self,
-        slice_sets: &[Vec<NativeGraphClassSlice>],
-    ) -> Result<Vec<SizingOutline>, GraphError> {
-        // 1 & 2. Resolve topology-level invariants once, plus plan heap, bound heap, and recorded GraphCensus.
-        let (base_scratch, links, plan_heap, bound_heap, static_recorded) = stage_timer::time_stage(
-            |t, ns| t.sd_operand_links_ns += ns,
-            || -> Result<_, GraphError> {
-                let base_scratch: Vec<Vec<ScratchNeed>> = self
-                    .nodes
-                    .iter()
-                    .map(|node| scratch_needs_from(node.scratch_meta))
-                    .collect();
-                let operand_nodes: Vec<OperandNode<'_>> = self
-                    .nodes
-                    .iter()
-                    .zip(&base_scratch)
-                    .map(|(node, scratch)| OperandNode {
-                        args: &node.args,
-                        scratch,
-                        activation: node.activation,
-                    })
-                    .collect();
-                let links = resolve_operand_links(&operand_nodes, &self.carries)
-                    .map_err(|error| GraphError::Invalid(error.to_string()))?;
+    /// Initialize concrete-group certification from the first concrete class
+    /// in a group: compiles storage placement once, records the expected
+    /// topology signature, and evaluates the first class's concrete bounds.
+    pub(crate) fn begin_group(self) -> Result<SizingGroup, GraphError> {
+        let (base_scratch, links, plan_heap, topology_heap, bound_heap, static_recorded) =
+            stage_timer::time_stage(
+                |t, ns| t.sd_operand_links_ns += ns,
+                || -> Result<_, GraphError> {
+                    let base_scratch: Vec<Vec<ScratchNeed>> = self
+                        .nodes
+                        .iter()
+                        .map(|node| scratch_needs_from(node.scratch_meta))
+                        .collect();
+                    let operand_nodes: Vec<OperandNode<'_>> = self
+                        .nodes
+                        .iter()
+                        .zip(&base_scratch)
+                        .map(|(node, scratch)| OperandNode {
+                            args: &node.args,
+                            scratch,
+                            activation: node.activation,
+                        })
+                        .collect();
+                    let links = resolve_operand_links(&operand_nodes, &self.carries)
+                        .map_err(|error| GraphError::Invalid(error.to_string()))?;
 
-                let port_ranks: Vec<usize> = self.ports.iter().map(|port| port.extents.len()).collect();
-                let mut disjoint = 0usize;
-                let mut heap_nodes = Vec::with_capacity(self.nodes.len());
-                let mut census_nodes = if self.backend == BackendName::Cuda {
-                    Vec::new()
-                } else {
-                    Vec::with_capacity(self.nodes.len())
-                };
-                let mut result_ranks: Vec<&[Option<usize>]> = Vec::with_capacity(self.nodes.len());
-                for node in &self.nodes {
-                    let external = |ordinal: usize| {
-                        argument_reference(&node.args.arguments()[ordinal])
-                            .filter(|reference| {
-                                reference.node == INPUT_NODE && !self.ports[reference.result as usize].local
-                            })
-                            .map(|reference| reference.result)
-                    };
-                    for &[first, second] in node.shape.disjoint {
-                        if let (Some(first), Some(second)) = (external(first), external(second)) {
-                            if first != second {
-                                disjoint += 1;
-                            }
+                    let port_ranks: Vec<usize> =
+                        self.ports.iter().map(|port| port.extents.len()).collect();
+                    let mut heap_nodes = Vec::with_capacity(self.nodes.len());
+                    let mut census_nodes = Vec::with_capacity(self.nodes.len());
+                    let mut result_ranks: Vec<&[Option<usize>]> =
+                        Vec::with_capacity(self.nodes.len());
+                    for node in &self.nodes {
+                        heap_nodes.push(PlanHeapNode {
+                            buffers: node.shape.buffers,
+                            arguments: node.shape.arguments,
+                            words: node.shape.words,
+                            launches: node.shape.launches,
+                            conditions: node.shape.conditions
+                                + if node.condition.is_some() {
+                                    node.shape.launches
+                                } else {
+                                    0
+                                },
+                        });
+                        if self.backend != BackendName::Cuda {
+                            census_nodes.push((
+                                node.shape.arguments,
+                                node.shape.words,
+                                node.shape.launches,
+                            ));
                         }
+                        result_ranks.push(node.shape.result_ranks);
                     }
-                    heap_nodes.push(PlanHeapNode {
-                        buffers: node.shape.buffers,
-                        arguments: node.shape.arguments,
-                        words: node.shape.words,
-                        launches: node.shape.launches,
-                    });
-                    if self.backend != BackendName::Cuda {
-                        census_nodes.push((node.shape.arguments, node.shape.words, node.shape.launches));
-                    }
-                    result_ranks.push(node.shape.result_ranks);
-                }
-                let _ = disjoint;
-                let plan_heap = plan_heap_of(
-                    &port_ranks,
-                    &heap_nodes,
-                    &result_ranks,
-                    self.exports.len(),
-                    self.timelines.len(),
-                    self.marks.len(),
-                );
-                let bound_heap = bindings_heap(self.ports.len(), self.timelines.len());
-                let static_recorded = if self.backend == BackendName::Cuda {
-                    None
-                } else {
-                    let timeline_nodes: Vec<TimelineNode> =
-                        self.timelines.iter().map(|&(_, node)| node).collect();
-                    Some(recorded_census_of(self.backend, &census_nodes, &timeline_nodes))
-                };
-                Ok((base_scratch, links, plan_heap, bound_heap, static_recorded))
-            },
-        )?;
+                    let plan_heap = plan_heap_of(&port_ranks, &heap_nodes, &result_ranks);
+                    let total_results: usize = result_ranks.iter().map(|row| row.len()).sum();
+                    let topology_heap = topology_heap_of(
+                        port_ranks.len(),
+                        &heap_nodes,
+                        result_ranks.len(),
+                        total_results,
+                        self.exports.len(),
+                        self.timelines.len(),
+                        self.marks.len(),
+                    );
+                    let bound_heap = bindings_heap(self.ports.len(), self.timelines.len());
+                    let static_recorded = if self.backend == BackendName::Cuda {
+                        None
+                    } else {
+                        let timeline_nodes: Vec<TimelineNode> =
+                            self.timelines.iter().map(|&(_, node)| node).collect();
+                        Some(recorded_census_of(self.backend, &census_nodes, &timeline_nodes))
+                    };
+                    Ok((base_scratch, links, plan_heap, topology_heap, bound_heap, static_recorded))
+                },
+            )?;
 
-        let timeline_count = self.timelines.len();
-        // 3. Compile the storage placement topology once (shared across all slice sets).
         let compiled_plan = stage_timer::time_stage(
             |t, ns| t.sd_storage_compile_ns += ns,
             || {
@@ -1901,67 +1879,71 @@ impl SizingDraft {
             },
         );
 
-        // 4. For each slice set, cover buffer capacities across all class points and place storage.
-        if stage_timer::is_recording() {
-            stage_timer::record_stage(|t| t.sd_slice_sets += slice_sets.len() as u64);
-        }
-        let mut storage_per_slice = Vec::with_capacity(slice_sets.len());
-        {
-            let mut scratch_configs_cache: HashMap<ScratchConfigKey<'_>, ScratchConfigs, FxBuildHasher> =
-                HashMap::with_hasher(FxBuildHasher);
-            let mut launch_configs_cache: HashMap<LaunchConfigKey<'_>, Vec<Vec<u64>>, FxBuildHasher> =
-                HashMap::with_hasher(FxBuildHasher);
-            for slices in slice_sets {
-                if slices.is_empty() {
-                    return Err(GraphError::Invalid(
-                        "graph regime has no admitted classes".to_owned(),
-                    ));
-                }
-                let (port_bytes, result_bytes, mut scratch_needs) =
-                    self.cover_capacities(slices, &base_scratch, &mut scratch_configs_cache)?;
-                for (node_idx, needs) in scratch_needs.iter_mut().enumerate() {
-                    links.charge_node_emissions(node_idx, needs);
-                }
-                let planned = stage_timer::time_stage(
-                    |t, ns| t.sd_storage_eval_ns += ns,
-                    || compiled_plan.storage_bytes(&port_bytes, &result_bytes, &scratch_needs),
-                );
-                let recorded = match static_recorded {
-                    Some(recorded) => recorded,
-                    None => {
-                        let node_launches =
-                            self.cuda_node_launches(slices, &mut launch_configs_cache)?;
-                        seismic::cuda_recorded_census(
-                            self.nodes.len(),
-                            &node_launches,
-                            &self.timelines,
-                            &self.marks,
-                        )
-                    }
-                };
-                storage_per_slice.push(NativeGraphStorageBytes {
-                    workspace: planned.workspace,
-                    sync: planned.sync,
-                    output: planned.output,
-                    upload: planned.upload,
-                    recorded,
-                });
-            }
-        }
-        if storage_per_slice.is_empty() {
-            return Ok(Vec::new());
-        }
+        let port_bytes: Vec<u64> = self.ports.iter().map(|p| p.byte_len).collect();
+        let expected_ports: Vec<(bool, bool)> =
+            self.ports.iter().map(|p| (p.local, p.owned_input)).collect();
+        let mut result_bytes: Vec<Vec<Option<u64>>> = Vec::with_capacity(self.nodes.len());
+        let mut scratch_needs: Vec<Vec<ScratchNeed>> = base_scratch;
+        let mut cuda_node_launches: Option<Vec<u64>> = (self.backend == BackendName::Cuda)
+            .then(|| Vec::with_capacity(self.nodes.len()));
+        let mut expected_nodes = Vec::with_capacity(self.nodes.len());
 
-        // 5. Record launch census and deduplicated kernel set for L4, consuming `self.nodes`
-        //    so `elements` and `dimensions` move into `SizedCall` without cloning.
+        let mut launch_configs_cache: HashMap<
+            (usize, Vec<(String, Element)>, Vec<u64>),
+            Vec<Vec<u64>>,
+            FxBuildHasher,
+        > = HashMap::with_hasher(FxBuildHasher);
+
         let mut launches = Vec::with_capacity(self.nodes.len());
-        let mut seen_kernel_sigs: FxCache<(&'static str, Vec<(String, Element)>, Vec<Option<u64>>), ()> =
-            FxCache::new();
+        let mut seen_kernel_sigs: FxCache<
+            (&'static str, Vec<(String, Element)>, Vec<Option<u64>>),
+            (),
+        > = FxCache::new();
         let mut seen_kernels: HashSet<KernelRequest, FxBuildHasher> =
             HashSet::with_hasher(FxBuildHasher);
         let mut kernels = Vec::new();
         let mut static_values: Vec<Option<u64>> = Vec::new();
-        for node in self.nodes {
+
+        for (node_idx, node) in self.nodes.into_iter().enumerate() {
+            let (node_results, node_scratch_bytes, active_launches) = {
+                let els_buf: Vec<(&str, Element)> =
+                    node.elements.iter().map(|(n, e)| (n.as_str(), *e)).collect();
+                let dims_buf: Vec<(&str, u64)> =
+                    node.dimensions.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+                eval_concrete_node(
+                    self.backend,
+                    node.entry_name,
+                    &node.shape,
+                    node.eval_configs,
+                    node.eval_point,
+                    node.eval_launch_configs,
+                    node.eval_launch_mask,
+                    &els_buf,
+                    &dims_buf,
+                    &mut launch_configs_cache,
+                )?
+            };
+            result_bytes.push(node_results);
+            for (need, bytes) in scratch_needs[node_idx].iter_mut().zip(node_scratch_bytes) {
+                need.bytes = bytes;
+            }
+            if let Some(cuda) = &mut cuda_node_launches {
+                cuda.push(active_launches);
+            }
+
+            let arg_refs: Vec<Option<(u32, u32)>> = node
+                .args
+                .arguments()
+                .iter()
+                .map(|arg| argument_reference(arg).map(|r| (r.node, r.result)))
+                .collect();
+            expected_nodes.push(ExpectedNode {
+                entry_name: node.entry_name,
+                arg_refs,
+                condition: node.condition,
+                share: node.share,
+            });
+
             let mut bound_ports = Vec::new();
             for (ordinal, argument) in node.args.arguments().iter().enumerate() {
                 if let Some(reference) = argument_reference(argument) {
@@ -1999,12 +1981,12 @@ impl SizingDraft {
             }
             static_values.hash(&mut h);
             let sig_hash = h.finish();
-            let already_seen = seen_kernel_sigs
+            if seen_kernel_sigs
                 .get_with(sig_hash, |k| {
                     k.0 == node.entry_name && k.2 == static_values && k.1 == node.elements
                 })
-                .is_some();
-            if !already_seen {
+                .is_none()
+            {
                 seen_kernel_sigs.insert_with(
                     sig_hash,
                     (node.entry_name, node.elements.clone(), static_values.clone()),
@@ -2039,1017 +2021,1105 @@ impl SizingDraft {
             });
         }
 
-        let launches: Arc<[SizedCall]> = Arc::from(launches);
-        let kernels: Arc<[KernelRequest]> = Arc::from(kernels);
-        let outlines = storage_per_slice
-            .into_iter()
-            .map(|storage| SizingOutline {
-                storage,
-                plan_heap,
-                bound_heap,
-                launches: Arc::clone(&launches),
-                kernels: Arc::clone(&kernels),
-                timeline_count,
-            })
+        let expected_exports: Vec<(u32, u32)> =
+            self.exports.iter().map(|r| (r.node, r.result)).collect();
+        let expected_stores: Vec<(u32, u32, u32)> = self
+            .stores
+            .iter()
+            .map(|(r, p)| (r.node, r.result, *p))
             .collect();
-        Ok(outlines)
+
+        Ok(SizingGroup {
+            backend: self.backend,
+            identity: self.identity,
+            links,
+            compiled_plan,
+            plan_heap,
+            topology_heap,
+            bound_heap,
+            static_recorded,
+            launches: Arc::from(launches),
+            kernels: Arc::from(kernels),
+            timelines: self.timelines,
+            marks: self.marks,
+            port_bytes,
+            result_bytes,
+            scratch_needs,
+            cuda_node_launches,
+            expected_ports,
+            expected_nodes,
+            expected_exports,
+            expected_stores,
+            launch_configs_cache,
+        })
     }
+}
 
-    fn cuda_node_launches<'a>(
-        &'a self,
-        slices: &[NativeGraphClassSlice],
-        launch_configs_cache: &mut HashMap<LaunchConfigKey<'a>, Vec<Vec<u64>>, FxBuildHasher>,
-    ) -> Result<Vec<u64>, GraphError> {
-        type NodeLaunchCacheKey<'k> =
-            (usize, Option<&'static str>, &'k [(String, Element)], &'k [(String, u64)]);
-        let mut node_cache: HashMap<NodeLaunchCacheKey<'a>, u64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher);
-        let mut node_launches = Vec::with_capacity(self.nodes.len());
-        let mut els: Vec<(&'a str, Element)> = Vec::new();
-        let mut point_dims: Vec<(&'a str, u64)> = Vec::new();
-        let mut varying_slots: Vec<usize> = Vec::new();
-        let mut varying_values: Vec<&[u64]> = Vec::new();
-        let mut axes: Vec<&[u64]> = Vec::new();
-        let mut combo: Vec<u64> = Vec::new();
-        let mut seen_single: HashSet<u64, FxBuildHasher> = HashSet::with_hasher(FxBuildHasher);
-        let mut seen_multi: HashSet<Vec<u64>, FxBuildHasher> = HashSet::with_hasher(FxBuildHasher);
-        let mut or_masks: Vec<u64> = Vec::new();
+struct ExpectedNode {
+    entry_name: &'static str,
+    arg_refs: Vec<Option<(u32, u32)>>,
+    condition: Option<(u32, u64, LaunchEncoding)>,
+    share: Option<(u32, WorkflowResultRef)>,
+}
 
-        for node in &self.nodes {
-            let key: NodeLaunchCacheKey<'a> = (
-                node.eval_launch_mask as usize,
-                node.class_scope,
-                node.elements.as_slice(),
-                node.dimensions.as_slice(),
-            );
-            if let Some(&cached) = node_cache.get(&key) {
-                node_launches.push(cached);
-                continue;
-            }
+/// Evaluate one concrete node's result byte lengths, scratch byte lengths, and
+/// (on CUDA) active launch count, reusing the assessment-scoped config caches.
+#[allow(clippy::too_many_arguments)]
+fn eval_concrete_node(
+    backend: BackendName,
+    entry_name: &'static str,
+    shape: &ContractNodeShape,
+    eval_configs: ScratchConfigsEvalFn,
+    eval_point: SizingPointEvalFn,
+    eval_launch_configs: LaunchConfigsEvalFn,
+    eval_launch_mask: LaunchMaskEvalFn,
+    elements: &[(&str, Element)],
+    dims: &[(&str, u64)],
+    launch_configs_cache: &mut HashMap<
+        (usize, Vec<(String, Element)>, Vec<u64>),
+        Vec<Vec<u64>>,
+        FxBuildHasher,
+    >,
+) -> Result<(Vec<Option<u64>>, Vec<u64>, u64), GraphError> {
+    let point_hash = {
+        let mut h = FxHasher::default();
+        (eval_point as usize).hash(&mut h);
+        backend.hash(&mut h);
+        elements.len().hash(&mut h);
+        for (name, el) in elements {
+            hash_str(&mut h, name);
+            el.hash(&mut h);
+        }
+        hash_dims(&mut h, dims);
+        h.finish()
+    };
 
-            els.clear();
-            els.extend(node.elements.iter().map(|(name, el)| (name.as_str(), *el)));
-            point_dims.clear();
-            point_dims.extend(node.dimensions.iter().map(|(name, v)| (name.as_str(), *v)));
-
-            let config_key: LaunchConfigKey<'a> = (
-                node.eval_launch_configs as usize,
-                node.elements.as_slice(),
-                node.dimensions.as_slice(),
-            );
-            let configs = match launch_configs_cache.entry(config_key) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    let computed = (node.eval_launch_configs)(self.backend, &els, &point_dims)
-                        .map_err(|error| {
-                            contract_error(
-                                node.entry_name,
-                                self.backend,
-                                node.shape.statics,
-                                &point_dims,
-                                error,
-                            )
-                        })?;
-                    slot.insert(computed)
-                }
-            };
-
-            varying_slots.clear();
-            varying_values.clear();
-            if !node.shape.launch_when_dims.is_empty() {
-                for (i, (name, _)) in node.dimensions.iter().enumerate() {
-                    let name_str = name.as_str();
-                    if !node.shape.launch_when_dims.contains(&name_str) {
-                        continue;
-                    }
-                    let Some(first_vals) =
-                        slices[0].values(node.entry_name, node.class_scope, name_str)
-                    else {
-                        continue;
-                    };
-                    varying_slots.push(i);
-                    varying_values.push(first_vals);
-                    for slice in &slices[1..] {
-                        let vals = slice
-                            .values(node.entry_name, node.class_scope, name_str)
-                            .ok_or_else(|| {
-                                GraphError::Invalid(format!(
-                                    "graph regime slice omits `{}` dimension `{name_str}`",
-                                    node.entry_name
-                                ))
-                            })?;
-                        varying_values.push(vals);
-                    }
+    let (result_lens, scratch) = SCOPED_SCRATCH_CONFIGS.with(|cell| {
+        {
+            let guard = cell.borrow();
+            if let Some(state) = guard.as_ref().filter(|s| s.depth > 0) {
+                if let Some(found) = state.points.get_with(point_hash, |k| {
+                    k.eval_point == eval_point as usize
+                        && k.backend == backend
+                        && dims_eq(&k.dims, dims)
+                        && elements_eq(&k.elements, elements)
+                }) {
+                    return found
+                        .clone()
+                        .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error));
                 }
             }
-
-            or_masks.clear();
-            or_masks.resize(configs.len(), 0u64);
-
-            if varying_slots.is_empty() {
-                for (or_mask, cfg) in or_masks.iter_mut().zip(configs.iter()) {
-                    let mask = (node.eval_launch_mask)(self.backend, &els, &point_dims, cfg)
-                        .map_err(|error| {
-                            contract_error(
-                                node.entry_name,
-                                self.backend,
-                                node.shape.statics,
-                                &point_dims,
-                                error,
-                            )
-                        })?;
-                    *or_mask |= mask;
-                }
-            } else if varying_slots.len() == 1 {
-                let slot = varying_slots[0];
-                seen_single.clear();
-                for &vals in &varying_values {
-                    for &v in vals {
-                        if !seen_single.insert(v) {
-                            continue;
-                        }
-                        point_dims[slot].1 = v;
-                        for (or_mask, cfg) in or_masks.iter_mut().zip(configs.iter()) {
-                            let mask =
-                                (node.eval_launch_mask)(self.backend, &els, &point_dims, cfg)
-                                    .map_err(|error| {
-                                        contract_error(
-                                            node.entry_name,
-                                            self.backend,
-                                            node.shape.statics,
-                                            &point_dims,
-                                            error,
-                                        )
-                                    })?;
-                            *or_mask |= mask;
-                        }
-                    }
-                }
-            } else {
-                let n_slices = slices.len();
-                let dedup = n_slices > 1;
-                if dedup {
-                    seen_multi.clear();
-                }
-                for s_idx in 0..n_slices {
-                    axes.clear();
-                    for v_idx in 0..varying_slots.len() {
-                        axes.push(varying_values[v_idx * n_slices + s_idx]);
-                    }
-                    combo.clear();
-                    for_each_combination(&axes, &mut combo, &mut |point| {
-                        if dedup && !seen_multi.insert(point.to_vec()) {
-                            return Ok(());
-                        }
-                        for (&slot, &v) in varying_slots.iter().zip(point) {
-                            point_dims[slot].1 = v;
-                        }
-                        for (or_mask, cfg) in or_masks.iter_mut().zip(configs.iter()) {
-                            let mask =
-                                (node.eval_launch_mask)(self.backend, &els, &point_dims, cfg)
-                                    .map_err(|error| {
-                                        contract_error(
-                                            node.entry_name,
-                                            self.backend,
-                                            node.shape.statics,
-                                            &point_dims,
-                                            error,
-                                        )
-                                    })?;
-                            *or_mask |= mask;
-                        }
-                        Ok(())
-                    })?;
-                }
-            }
-
-            let max_launches = or_masks
-                .iter()
-                .map(|m| u64::from(m.count_ones()))
-                .max()
-                .unwrap_or(0);
-            node_cache.insert(key, max_launches);
-            node_launches.push(max_launches);
         }
 
-        Ok(node_launches)
+        let configs = {
+            let mut h = FxHasher::default();
+            (eval_configs as usize).hash(&mut h);
+            backend.hash(&mut h);
+            elements.len().hash(&mut h);
+            for (name, el) in elements {
+                hash_str(&mut h, name);
+                el.hash(&mut h);
+            }
+            let mut statics_stack = [0u64; 16];
+            let mut statics_heap = Vec::new();
+            let statics: &[u64] = if shape.statics.len() <= statics_stack.len() {
+                for (slot, &name) in statics_stack.iter_mut().zip(shape.statics) {
+                    *slot = dims
+                        .iter()
+                        .find(|(d, _)| *d == name)
+                        .map_or(0, |(_, v)| *v);
+                }
+                &statics_stack[..shape.statics.len()]
+            } else {
+                statics_heap.extend(shape.statics.iter().map(|&name| {
+                    dims.iter()
+                        .find(|(d, _)| *d == name)
+                        .map_or(0, |(_, v)| *v)
+                }));
+                &statics_heap
+            };
+            statics.hash(&mut h);
+            let hash = h.finish();
+
+            let cached_configs = {
+                let guard = cell.borrow();
+                guard.as_ref().filter(|s| s.depth > 0).and_then(|state| {
+                    state
+                        .map
+                        .get_with(hash, |k| {
+                            k.eval_configs == eval_configs as usize
+                                && k.backend == backend
+                                && k.static_values.as_slice() == statics
+                                && elements_eq(&k.elements, elements)
+                        })
+                        .cloned()
+                })
+            };
+            match cached_configs {
+                Some(found) => found
+                    .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))?,
+                None => {
+                    let computed = eval_configs(backend, elements, dims);
+                    {
+                        let mut guard = cell.borrow_mut();
+                        if let Some(state) = guard.as_mut().filter(|s| s.depth > 0) {
+                            state.map.insert_with(
+                                hash,
+                                ScopedScratchConfigKey {
+                                    eval_configs: eval_configs as usize,
+                                    backend,
+                                    elements: elements.iter().map(|(n, e)| (CompactStr::new(n), *e)).collect(),
+                                    static_values: statics.to_vec(),
+                                },
+                                computed.clone(),
+                            );
+                        }
+                    }
+                    computed
+                        .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))?
+                }
+            }
+        };
+
+        let mut result_lens = vec![0u64; shape.result_ranks.len()];
+        let mut scratch = vec![0u64; shape.buffers];
+        let evaluated = eval_point(backend, elements, dims, &configs, &mut result_lens, &mut scratch)
+            .map(|()| (result_lens, scratch));
+        {
+            let mut guard = cell.borrow_mut();
+            if let Some(state) = guard.as_mut().filter(|s| s.depth > 0) {
+                state.points.insert_with(
+                    point_hash,
+                    ScopedSizingPointKey {
+                        eval_point: eval_point as usize,
+                        backend,
+                        elements: elements.iter().map(|(n, e)| (CompactStr::new(n), *e)).collect(),
+                        dims: dims.iter().map(|(n, v)| (CompactStr::new(n), *v)).collect(),
+                    },
+                    evaluated.clone(),
+                );
+            }
+        }
+        evaluated.map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))
+    })?;
+    let results: Vec<Option<u64>> = shape
+        .result_ranks
+        .iter()
+        .zip(result_lens)
+        .map(|(rank, len)| rank.map(|_| len))
+        .collect();
+
+    let active_launches = if backend == BackendName::Cuda {
+        let statics_key: Vec<u64> = shape
+            .statics
+            .iter()
+            .map(|&name| dims.iter().find(|(d, _)| *d == name).map_or(0, |(_, v)| *v))
+            .collect();
+        let lkey = (
+            eval_launch_configs as usize,
+            elements.iter().map(|(n, e)| ((*n).to_owned(), *e)).collect(),
+            statics_key,
+        );
+        let lconfigs = match launch_configs_cache.entry(lkey) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let computed = eval_launch_configs(backend, elements, dims).map_err(|error| {
+                    contract_error(entry_name, backend, shape.statics, dims, error)
+                })?;
+                slot.insert(computed)
+            }
+        };
+        let mut launch_mask = 0u64;
+        for config in lconfigs.iter() {
+            let mask = eval_launch_mask(backend, elements, dims, config)
+                .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))?;
+            launch_mask |= mask;
+        }
+        launch_mask
+    } else {
+        shape.launches as u64
+    };
+
+    Ok((results, scratch, active_launches))
+}
+
+/// Compiled storage topology plus running element-wise maximum capacities
+/// across concrete classes in a group.
+pub(crate) struct SizingGroup {
+    backend: BackendName,
+    identity: u64,
+    links: seismic::sizing::OperandLinks,
+    compiled_plan: CompiledStoragePlan,
+    plan_heap: HostHeap,
+    topology_heap: HostHeap,
+    bound_heap: HostHeap,
+    static_recorded: Option<seismic::GraphCensus>,
+    launches: Arc<[SizedCall]>,
+    kernels: Arc<[KernelRequest]>,
+    timelines: Vec<(usize, TimelineNode)>,
+    marks: Vec<usize>,
+    port_bytes: Vec<u64>,
+    result_bytes: Vec<Vec<Option<u64>>>,
+    scratch_needs: Vec<Vec<ScratchNeed>>,
+    cuda_node_launches: Option<Vec<u64>>,
+    expected_ports: Vec<(bool, bool)>,
+    expected_nodes: Vec<ExpectedNode>,
+    expected_exports: Vec<(u32, u32)>,
+    expected_stores: Vec<(u32, u32, u32)>,
+    launch_configs_cache: HashMap<
+        (usize, Vec<(String, Element)>, Vec<u64>),
+        Vec<Vec<u64>>,
+        FxBuildHasher,
+    >,
+}
+
+impl SizingGroup {
+    pub(crate) fn next_bounds(self) -> SizingBoundsDraft {
+        SizingBoundsDraft {
+            group: self,
+            next_port: 0,
+            next_node: 0,
+            next_export: 0,
+            next_store: 0,
+            next_timeline: 0,
+            next_mark: 0,
+        }
     }
 
-    fn cover_capacities<'a>(
-        &'a self,
-        slices: &[NativeGraphClassSlice],
-        base_scratch: &[Vec<ScratchNeed>],
-        configs_cache: &mut HashMap<ScratchConfigKey<'a>, ScratchConfigs, FxBuildHasher>,
-    ) -> Result<(Vec<u64>, Vec<Vec<Option<u64>>>, Vec<Vec<ScratchNeed>>), GraphError> {
-        type CheckedPortKey<'k> = (
-            usize,
-            Option<&'static str>,
-            &'k str,
-            &'k [(CompactStr, Element)],
-            &'k [(CompactStr, u64)],
+    pub(crate) fn finish(mut self) -> Result<SizingOutline, GraphError> {
+        for (node_idx, needs) in self.scratch_needs.iter_mut().enumerate() {
+            self.links.charge_node_emissions(node_idx, needs);
+        }
+        let planned = stage_timer::time_stage(
+            |t, ns| t.sd_storage_eval_ns += ns,
+            || {
+                self.compiled_plan.storage_bytes(
+                    &self.port_bytes,
+                    &self.result_bytes,
+                    &self.scratch_needs,
+                )
+            },
         );
-        SCOPED_SCRATCH_CONFIGS.with(|cell| {
-            let scoped_cell: ScopedCell<'_> = cell
-                .borrow()
-                .as_ref()
-                .is_some_and(|s| s.depth > 0)
-                .then_some(cell);
-            let mut varying: Vec<usize> = Vec::new();
-            let mut varying_values: Vec<&[u64]> = Vec::new();
-            let mut els: Vec<(&'a str, Element)> = Vec::new();
-            let mut point_dims: Vec<(&'a str, u64)> = Vec::new();
-            let mut axes: Vec<&[u64]> = Vec::new();
-            let mut combo: Vec<u64> = Vec::new();
-            let mut seen_single: Vec<u64> = Vec::new();
-            let mut missed_v: Vec<(u64, u64)> = Vec::new();
-
-            let port_bytes = stage_timer::time_stage(
-                |t, ns| t.sd_cover_ports_ns += ns,
-                || -> Result<Vec<u64>, GraphError> {
-                    let mut port_cache: HashMap<CheckedPortKey<'a>, u64, FxBuildHasher> =
-                        HashMap::with_hasher(FxBuildHasher);
-                    let mut varying_slots: Vec<usize> = Vec::new();
-                    let mut port_bytes = Vec::with_capacity(self.ports.len());
-                    for port in &self.ports {
-                        let max_bytes = match &port.source {
-                            PortSource::Direct { class_extent: None } => port.byte_len,
-                            PortSource::Direct {
-                                class_extent: Some((axis, name, scope)),
-                            } => {
-                                fn lookup_direct<'s>(
-                                    slice: &'s NativeGraphClassSlice,
-                                    scope: Option<&str>,
-                                    name: &str,
-                                ) -> Option<&'s [u64]> {
-                                    scope
-                                        .and_then(|s| slice.class_values(Some(s), name))
-                                        .or_else(|| slice.global(name))
-                                }
-                                let mut first_present = None;
-                                for (s_idx, slice) in slices.iter().enumerate() {
-                                    if let Some(values) = lookup_direct(slice, *scope, name) {
-                                        first_present = Some((s_idx, values));
-                                        break;
-                                    }
-                                }
-                                match first_present {
-                                    None => port.byte_len,
-                                    Some((first_s_idx, _)) if first_s_idx > 0 => {
-                                        return Err(GraphError::Invalid(format!(
-                                            "graph regime slice omits port class dimension `{name}`"
-                                        )));
-                                    }
-                                    Some((_, first_values)) => {
-                                        let mut max_v: Option<u64> = None;
-                                        for &v in first_values {
-                                            max_v = Some(max_v.map_or(v, |prev| prev.max(v)));
-                                        }
-                                        for slice in &slices[1..] {
-                                            let values =
-                                                lookup_direct(slice, *scope, name).ok_or_else(
-                                                    || {
-                                                        GraphError::Invalid(format!(
-                                                            "graph regime slice omits port class dimension `{name}`"
-                                                        ))
-                                                    },
-                                                )?;
-                                            for &v in values {
-                                                max_v = Some(max_v.map_or(v, |prev| prev.max(v)));
-                                            }
-                                        }
-                                        match max_v {
-                                            Some(v) => {
-                                                let mut extents = port.extents.clone();
-                                                extents[*axis] = v;
-                                                port.element
-                                                    .canonical_byte_len(&extents)
-                                                    .map_err(|error| {
-                                                        GraphError::Invalid(error.to_string())
-                                                    })?
-                                            }
-                                            None => 0,
-                                        }
-                                    }
-                                }
-                            }
-                            PortSource::Checked {
-                                entry_name,
-                                class_scope,
-                                parameter,
-                                elements,
-                                dimensions,
-                                eval,
-                            } => {
-                                let port_elements = &self.checked_elements[elements.clone()];
-                                let port_dimensions = &self.checked_dimensions[dimensions.clone()];
-                                let port_key: CheckedPortKey<'a> = (
-                                    *eval as usize,
-                                    *class_scope,
-                                    parameter.as_str(),
-                                    port_elements,
-                                    port_dimensions,
-                                );
-                                if let Some(&cached) = port_cache.get(&port_key) {
-                                    cached
-                                } else {
-                                    let mut read_dims: Option<Option<Arc<[&'static str]>>> = None;
-                                    varying.clear();
-                                    varying_values.clear();
-                                    for (i, (name, _)) in port_dimensions.iter().enumerate() {
-                                        let name_str = name.as_str();
-                                        let mut first_present = None;
-                                        for (s_idx, slice) in slices.iter().enumerate() {
-                                            if let Some(vals) =
-                                                slice.values(entry_name, *class_scope, name_str)
-                                            {
-                                                first_present = Some((s_idx, vals));
-                                                break;
-                                            }
-                                        }
-                                        let Some((first_s_idx, first_vals)) = first_present else {
-                                            continue;
-                                        };
-                                        if first_s_idx > 0 {
-                                            return Err(GraphError::Invalid(format!(
-                                                "graph regime slice omits `{entry_name}.{parameter}` dimension `{name_str}`"
-                                            )));
-                                        }
-                                        let used = read_dims.get_or_insert_with(|| {
-                                            els.clear();
-                                            els.extend(
-                                                port_elements
-                                                    .iter()
-                                                    .map(|(n, el)| (n.as_str(), *el)),
-                                            );
-                                            lookup_or_probe_param_read_dims(
-                                                scoped_cell,
-                                                *eval,
-                                                self.backend,
-                                                &els,
-                                                parameter.as_str(),
-                                                |missing| {
-                                                    port_dimensions
-                                                        .iter()
-                                                        .find(|(n, _)| n.as_str() == missing)
-                                                        .map(|(_, v)| *v)
-                                                },
-                                            )
-                                        });
-                                        let is_read = used
-                                            .as_deref()
-                                            .map_or(true, |u| u.iter().any(|&d| d == name_str));
-                                        if is_read {
-                                            varying.push(i);
-                                            varying_values.push(first_vals);
-                                            for slice in &slices[1..] {
-                                                let vals = slice
-                                                    .values(entry_name, *class_scope, name_str)
-                                                    .ok_or_else(|| {
-                                                        GraphError::Invalid(format!(
-                                                            "graph regime slice omits `{entry_name}.{parameter}` dimension `{name_str}`"
-                                                        ))
-                                                    })?;
-                                                varying_values.push(vals);
-                                            }
-                                        } else {
-                                            for slice in &slices[1..] {
-                                                if slice
-                                                    .values(entry_name, *class_scope, name_str)
-                                                    .is_none()
-                                                {
-                                                    return Err(GraphError::Invalid(format!(
-                                                        "graph regime slice omits `{entry_name}.{parameter}` dimension `{name_str}`"
-                                                    )));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let best = if varying.is_empty() {
-                                        port.byte_len
-                                    } else {
-                                        let read_dims = read_dims.flatten();
-                                        point_dims.clear();
-                                        varying_slots.clear();
-                                        if let Some(used) = read_dims.as_deref() {
-                                            for &dim_name in used {
-                                                if let Some((_, v)) = port_dimensions
-                                                    .iter()
-                                                    .find(|(n, _)| n.as_str() == dim_name)
-                                                {
-                                                    point_dims.push((dim_name, *v));
-                                                }
-                                            }
-                                            for &idx in &varying {
-                                                let name = port_dimensions[idx].0.as_str();
-                                                let slot = point_dims
-                                                    .iter()
-                                                    .position(|(n, _)| *n == name)
-                                                    .expect("varying read dim present in point_dims");
-                                                varying_slots.push(slot);
-                                            }
-                                        } else {
-                                            point_dims.extend(
-                                                port_dimensions
-                                                    .iter()
-                                                    .map(|(name, v)| (name.as_str(), *v)),
-                                            );
-                                            varying_slots.extend_from_slice(&varying);
-                                        }
-                                        let param_prefix = param_spec_prefix_hash(
-                                            *eval,
-                                            self.backend,
-                                            parameter.as_str(),
-                                            &els,
-                                        );
-                                        stage_timer::time_stage(
-                                            |t, ns| t.sd_port_param_spec_ns += ns,
-                                            || -> Result<u64, GraphError> {
-                                                // Every Seismic tensor parameter's `contract_param_spec`
-                                                // evaluates `canonical_bytes(el, &[axis_exprs...])`
-                                                // where each `axis_expr` is monotonically non-decreasing
-                                                // in every dynamic `u64` dimension, enforced at build
-                                                // time by `seismic_build::render_contract::assert_axis_expr_non_decreasing`
-                                                // (the only subtracted dimensions across all entries are
-                                                // static 0/1 flags such as `VK`/`PR`, which never vary
-                                                // across a regime). Thus the maximum byte capacity over
-                                                // any Cartesian slice box is achieved at its upper corner
-                                                // `(max(axis_0), ..., max(axis_k))`.
-                                                if varying.len() == 1 {
-                                                    let slot = varying_slots[0];
-                                                    let max_v = varying_values
-                                                        .iter()
-                                                        .flat_map(|vals| vals.iter().copied())
-                                                        .max();
-                                                    let Some(v) = max_v else {
-                                                        return Ok(0);
-                                                    };
-                                                    point_dims[slot].1 = v;
-                                                    eval_or_lookup_param_bytes(
-                                                        scoped_cell,
-                                                        *eval,
-                                                        self.backend,
-                                                        param_prefix,
-                                                        &els,
-                                                        parameter.as_str(),
-                                                        &point_dims,
-                                                    )
-                                                    .map_err(|error| {
-                                                        contract_error(
-                                                            entry_name,
-                                                            self.backend,
-                                                            &[],
-                                                            &point_dims,
-                                                            error,
-                                                        )
-                                                    })
-                                                } else {
-                                                    let mut best = 0u64;
-                                                    let n_slices = slices.len();
-                                                    let mut prev_corner: Vec<u64> = Vec::new();
-                                                    for s_idx in 0..n_slices {
-                                                        combo.clear();
-                                                        let mut empty = false;
-                                                        for v_idx in 0..varying.len() {
-                                                            let axis = varying_values
-                                                                [v_idx * n_slices + s_idx];
-                                                            let Some(&max_v) = axis.iter().max()
-                                                            else {
-                                                                empty = true;
-                                                                break;
-                                                            };
-                                                            combo.push(max_v);
-                                                        }
-                                                        if empty || combo == prev_corner {
-                                                            continue;
-                                                        }
-                                                        prev_corner.clear();
-                                                        prev_corner.extend_from_slice(&combo);
-                                                        for (&slot, &v) in
-                                                            varying_slots.iter().zip(&combo)
-                                                        {
-                                                            point_dims[slot].1 = v;
-                                                        }
-                                                        let bytes = eval_or_lookup_param_bytes(
-                                                            scoped_cell,
-                                                            *eval,
-                                                            self.backend,
-                                                            param_prefix,
-                                                            &els,
-                                                            parameter.as_str(),
-                                                            &point_dims,
-                                                        )
-                                                        .map_err(|error| {
-                                                            contract_error(
-                                                                entry_name,
-                                                                self.backend,
-                                                                &[],
-                                                                &point_dims,
-                                                                error,
-                                                            )
-                                                        })?;
-                                                        best = best.max(bytes);
-                                                    }
-                                                    Ok(best)
-                                                }
-                                            },
-                                        )?
-                                    };
-                                    port_cache.insert(port_key, best);
-                                    best
-                                }
-                            }
-                        };
-                        port_bytes.push(max_bytes);
-                    }
-                    Ok(port_bytes)
-                },
-            )?;
-
-            // Deduplicate node sizing across identical (eval_point, class_scope, elements, dimensions).
-            type NodeCacheKey<'k> =
-                (usize, Option<&'static str>, &'k [(String, Element)], &'k [(String, u64)]);
-            let mut cache: HashMap<
-                NodeCacheKey<'a>,
-                (Vec<Option<u64>>, Vec<ScratchNeed>),
-                FxBuildHasher,
-            > = HashMap::with_hasher(FxBuildHasher);
-            let mut result_bytes = Vec::with_capacity(self.nodes.len());
-            let mut scratch_needs = Vec::with_capacity(self.nodes.len());
-
-            let mut max_tensor_results: Vec<u64> = Vec::new();
-            let mut max_scratch_bytes: Vec<u64> = Vec::new();
-            let mut point_results: Vec<u64> = Vec::new();
-            let mut point_scratch: Vec<u64> = Vec::new();
-            let mut slice_results: Vec<u64> = Vec::new();
-            let mut slice_scratch: Vec<u64> = Vec::new();
-            let mut mono_varying: Vec<usize> = Vec::new();
-            let mut mono_values: Vec<&[u64]> = Vec::new();
-            let mut prev_corner: Vec<u64> = Vec::new();
-
-            for (node_idx, node) in self.nodes.iter().enumerate() {
-                let key: NodeCacheKey<'a> = (
-                    node.eval_point as usize,
-                    node.class_scope,
-                    node.elements.as_slice(),
-                    node.dimensions.as_slice(),
+        let (recorded, cuda_node_launches) = match self.static_recorded {
+            Some(recorded) => (recorded, None),
+            None => {
+                let node_masks = self
+                    .cuda_node_launches
+                    .expect("CUDA sizing group tracks per-node active launch masks");
+                let node_launches: Vec<u64> = node_masks.iter().map(|&m| u64::from(m.count_ones())).collect();
+                let recorded = seismic::cuda_recorded_census(
+                    self.expected_nodes.len(),
+                    &node_launches,
+                    &self.timelines,
+                    &self.marks,
                 );
-                if let Some((cached_results, cached_scratch)) = cache.get(&key) {
-                    result_bytes.push(cached_results.clone());
-                    scratch_needs.push(cached_scratch.clone());
-                    continue;
-                }
-
-                if let Some(&name) = node.shape.statics.iter().find(|&&name| {
-                    slices.iter().any(|slice| {
-                        slice
-                            .values(node.entry_name, node.class_scope, name)
-                            .is_some()
-                    })
-                }) {
-                    return Err(GraphError::Invalid(format!(
-                        "graph regime classes vary `{}`'s static dimension `{name}`",
-                        node.entry_name
-                    )));
-                }
-
-                mono_varying.clear();
-                mono_values.clear();
-                varying.clear();
-                varying_values.clear();
-                for (i, (name, _)) in node.dimensions.iter().enumerate() {
-                    let name_str = name.as_str();
-                    let mut first_present = None;
-                    for (s_idx, slice) in slices.iter().enumerate() {
-                        if let Some(vals) =
-                            slice.values(node.entry_name, node.class_scope, name_str)
-                        {
-                            first_present = Some((s_idx, vals));
-                            break;
-                        }
-                    }
-                    let Some((first_s_idx, first_vals)) = first_present else {
-                        continue;
-                    };
-                    if first_s_idx > 0 {
-                        return Err(GraphError::Invalid(format!(
-                            "graph regime slice omits `{}` dimension `{name_str}`",
-                            node.entry_name
-                        )));
-                    }
-                    if node.shape.sizing_dims.contains(&name_str) {
-                        let (target_dims, target_vals) =
-                            if node.shape.monotonic_sizing_dims.contains(&name_str) {
-                                (&mut mono_varying, &mut mono_values)
-                            } else {
-                                (&mut varying, &mut varying_values)
-                            };
-                        target_dims.push(i);
-                        target_vals.push(first_vals);
-                        for slice in &slices[1..] {
-                            let vals = slice
-                                .values(node.entry_name, node.class_scope, name_str)
-                                .ok_or_else(|| {
-                                    GraphError::Invalid(format!(
-                                        "graph regime slice omits `{}` dimension `{name_str}`",
-                                        node.entry_name
-                                    ))
-                                })?;
-                            target_vals.push(vals);
-                        }
-                    } else {
-                        for slice in &slices[1..] {
-                            if slice
-                                .values(node.entry_name, node.class_scope, name_str)
-                                .is_none()
-                            {
-                                return Err(GraphError::Invalid(format!(
-                                    "graph regime slice omits `{}` dimension `{name_str}`",
-                                    node.entry_name
-                                )));
-                            }
-                        }
-                    }
-                }
-
-                els.clear();
-                els.extend(node.elements.iter().map(|(name, el)| (name.as_str(), *el)));
-                point_dims.clear();
-                point_dims.extend(node.dimensions.iter().map(|(name, v)| (name.as_str(), *v)));
-                let config_key: ScratchConfigKey<'a> = (
-                    node.eval_configs as usize,
-                    node.elements.as_slice(),
-                    node.dimensions.as_slice(),
-                );
-                let configs = match configs_cache.entry(config_key) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        let computed = eval_or_lookup_scratch_configs(
-                            node.entry_name,
-                            scoped_cell,
-                            node.eval_configs,
-                            self.backend,
-                            &els,
-                            node.shape.statics,
-                            &node.dimensions,
-                            &point_dims,
-                        )
-                        .map_err(|error| {
-                            contract_error(
-                                node.entry_name,
-                                self.backend,
-                                node.shape.statics,
-                                &point_dims,
-                                error,
-                            )
-                        })?;
-                        slot.insert(computed)
-                    }
-                };
-                let point_prefix = sizing_point_prefix_hash(node.eval_point, self.backend, &els);
-                let tensor_result_count = node
-                    .shape
-                    .result_ranks
-                    .iter()
-                    .filter(|r| r.is_some())
-                    .count();
-                max_tensor_results.clear();
-                max_tensor_results.resize(tensor_result_count, 0);
-                max_scratch_bytes.clear();
-                max_scratch_bytes.resize(base_scratch[node_idx].len(), 0);
-                let n_slices = slices.len();
-                if varying.is_empty() && mono_varying.is_empty() {
-                    eval_or_lookup_sizing_point(
-                        node.entry_name,
-                        scoped_cell,
-                        node.eval_point,
-                        self.backend,
-                        point_prefix,
-                        &els,
-                        &point_dims,
-                        configs,
-                        &mut max_tensor_results,
-                        &mut max_scratch_bytes,
-                        &mut point_results,
-                        &mut point_scratch,
-                    )
-                    .map_err(|error| {
-                        contract_error(
-                            node.entry_name,
-                            self.backend,
-                            node.shape.statics,
-                            &point_dims,
-                            error,
-                        )
-                    })?;
-                } else if varying.is_empty() {
-                    // Every varying sizing dimension is proven at build time to be
-                    // monotonically non-decreasing in `contract_sizing_at_point`:
-                    // the maximum over each slice box is achieved at its upper corner.
-                    if mono_varying.len() == 1 {
-                        let slot = mono_varying[0];
-                        if let Some(max_v) =
-                            mono_values.iter().flat_map(|vals| vals.iter().copied()).max()
-                        {
-                            point_dims[slot].1 = max_v;
-                            eval_or_lookup_sizing_point(
-                                node.entry_name,
-                                scoped_cell,
-                                node.eval_point,
-                                self.backend,
-                                point_prefix,
-                                &els,
-                                &point_dims,
-                                configs,
-                                &mut max_tensor_results,
-                                &mut max_scratch_bytes,
-                                &mut point_results,
-                                &mut point_scratch,
-                            )
-                            .map_err(|error| {
-                                contract_error(
-                                    node.entry_name,
-                                    self.backend,
-                                    node.shape.statics,
-                                    &point_dims,
-                                    error,
-                                )
-                            })?;
-                        }
-                    } else {
-                        prev_corner.clear();
-                        for s_idx in 0..n_slices {
-                            combo.clear();
-                            let mut empty = false;
-                            for m_idx in 0..mono_varying.len() {
-                                let Some(&max_v) =
-                                    mono_values[m_idx * n_slices + s_idx].iter().max()
-                                else {
-                                    empty = true;
-                                    break;
-                                };
-                                combo.push(max_v);
-                            }
-                            if empty || combo == prev_corner {
-                                continue;
-                            }
-                            prev_corner.clear();
-                            prev_corner.extend_from_slice(&combo);
-                            for (&idx, &v) in mono_varying.iter().zip(&combo) {
-                                point_dims[idx].1 = v;
-                            }
-                            eval_or_lookup_sizing_point(
-                                node.entry_name,
-                                scoped_cell,
-                                node.eval_point,
-                                self.backend,
-                                point_prefix,
-                                &els,
-                                &point_dims,
-                                configs,
-                                &mut max_tensor_results,
-                                &mut max_scratch_bytes,
-                                &mut point_results,
-                                &mut point_scratch,
-                            )
-                            .map_err(|error| {
-                                contract_error(
-                                    node.entry_name,
-                                    self.backend,
-                                    node.shape.statics,
-                                    &point_dims,
-                                    error,
-                                )
-                            })?;
-                        }
-                    }
-                } else if varying.len() == 1 && mono_varying.is_empty() {
-                    let slot = varying[0];
-                    let values: &[u64] = if varying_values.len() == 1 {
-                        varying_values[0]
-                    } else {
-                        seen_single.clear();
-                        for &vals in &varying_values {
-                            for &v in vals {
-                                if !seen_single.contains(&v) {
-                                    seen_single.push(v);
-                                }
-                            }
-                        }
-                        &seen_single
-                    };
-                    eval_or_lookup_node_cover_points(
-                        node.entry_name,
-                        scoped_cell,
-                        node.eval_point,
-                        self.backend,
-                        point_prefix,
-                        &els,
-                        &mut point_dims,
-                        slot,
-                        values,
-                        configs,
-                        &mut max_tensor_results,
-                        &mut max_scratch_bytes,
-                        &mut point_results,
-                        &mut point_scratch,
-                        &mut missed_v,
-                    )
-                    .map_err(|error| {
-                        contract_error(
-                            node.entry_name,
-                            self.backend,
-                            node.shape.statics,
-                            &point_dims,
-                            error,
-                        )
-                    })?;
-                } else if varying.len() == 1 {
-                    // Single non-monotonic varying dim plus one or more monotonic dims:
-                    // collapse each monotonic dim to its per-slice maximum and cover
-                    // only the non-monotonic axis via `eval_or_lookup_node_cover_points`.
-                    let slot = varying[0];
-                    if n_slices == 1 {
-                        let nm_vals = varying_values[0];
-                        if !nm_vals.is_empty() {
-                            let mut empty = false;
-                            for (m_idx, &mono_slot) in mono_varying.iter().enumerate() {
-                                let Some(&max_v) = mono_values[m_idx].iter().max() else {
-                                    empty = true;
-                                    break;
-                                };
-                                point_dims[mono_slot].1 = max_v;
-                            }
-                            if !empty {
-                                eval_or_lookup_node_cover_points(
-                                    node.entry_name,
-                                    scoped_cell,
-                                    node.eval_point,
-                                    self.backend,
-                                    point_prefix,
-                                    &els,
-                                    &mut point_dims,
-                                    slot,
-                                    nm_vals,
-                                    configs,
-                                    &mut max_tensor_results,
-                                    &mut max_scratch_bytes,
-                                    &mut point_results,
-                                    &mut point_scratch,
-                                    &mut missed_v,
-                                )
-                                .map_err(|error| {
-                                    contract_error(
-                                        node.entry_name,
-                                        self.backend,
-                                        node.shape.statics,
-                                        &point_dims,
-                                        error,
-                                    )
-                                })?;
-                            }
-                        }
-                    } else {
-                        prev_corner.clear();
-                        let mut prev_nm: Option<&[u64]> = None;
-                        for s_idx in 0..n_slices {
-                            let nm_vals = varying_values[s_idx];
-                            if nm_vals.is_empty() {
-                                continue;
-                            }
-                            combo.clear();
-                            let mut empty = false;
-                            for m_idx in 0..mono_varying.len() {
-                                let Some(&max_v) =
-                                    mono_values[m_idx * n_slices + s_idx].iter().max()
-                                else {
-                                    empty = true;
-                                    break;
-                                };
-                                combo.push(max_v);
-                            }
-                            if empty || (combo == prev_corner && prev_nm == Some(nm_vals)) {
-                                continue;
-                            }
-                            prev_corner.clear();
-                            prev_corner.extend_from_slice(&combo);
-                            prev_nm = Some(nm_vals);
-                            for (&mono_slot, &v) in mono_varying.iter().zip(&combo) {
-                                point_dims[mono_slot].1 = v;
-                            }
-                            slice_results.clear();
-                            slice_results.resize(tensor_result_count, 0);
-                            slice_scratch.clear();
-                            slice_scratch.resize(base_scratch[node_idx].len(), 0);
-                            eval_or_lookup_node_cover_points(
-                                node.entry_name,
-                                scoped_cell,
-                                node.eval_point,
-                                self.backend,
-                                point_prefix,
-                                &els,
-                                &mut point_dims,
-                                slot,
-                                nm_vals,
-                                configs,
-                                &mut slice_results,
-                                &mut slice_scratch,
-                                &mut point_results,
-                                &mut point_scratch,
-                                &mut missed_v,
-                            )
-                            .map_err(|error| {
-                                contract_error(
-                                    node.entry_name,
-                                    self.backend,
-                                    node.shape.statics,
-                                    &point_dims,
-                                    error,
-                                )
-                            })?;
-                            for (dst, &src) in max_tensor_results.iter_mut().zip(&slice_results) {
-                                *dst = (*dst).max(src);
-                            }
-                            for (dst, &src) in max_scratch_bytes.iter_mut().zip(&slice_scratch) {
-                                *dst = (*dst).max(src);
-                            }
-                        }
-                    }
-                } else {
-                    for s_idx in 0..n_slices {
-                        let mut empty = false;
-                        for (m_idx, &mono_slot) in mono_varying.iter().enumerate() {
-                            let Some(&max_v) = mono_values[m_idx * n_slices + s_idx].iter().max()
-                            else {
-                                empty = true;
-                                break;
-                            };
-                            point_dims[mono_slot].1 = max_v;
-                        }
-                        if empty {
-                            continue;
-                        }
-                        axes.clear();
-                        for v_idx in 0..varying.len() {
-                            axes.push(varying_values[v_idx * n_slices + s_idx]);
-                        }
-                        combo.clear();
-                        for_each_combination(&axes, &mut combo, &mut |values| {
-                            for (&idx, &v) in varying.iter().zip(values) {
-                                point_dims[idx].1 = v;
-                            }
-                            eval_or_lookup_sizing_point(
-                                node.entry_name,
-                                scoped_cell,
-                                node.eval_point,
-                                self.backend,
-                                point_prefix,
-                                &els,
-                                &point_dims,
-                                configs,
-                                &mut max_tensor_results,
-                                &mut max_scratch_bytes,
-                                &mut point_results,
-                                &mut point_scratch,
-                            )
-                            .map_err(|error| {
-                                contract_error(
-                                    node.entry_name,
-                                    self.backend,
-                                    node.shape.statics,
-                                    &point_dims,
-                                    error,
-                                )
-                            })?;
-                            Ok(())
-                        })?;
-                    }
-                }
-                let mut tensor_iter = max_tensor_results.iter().copied();
-                let node_results: Vec<Option<u64>> = node
-                    .shape
-                    .result_ranks
-                    .iter()
-                    .map(|rank| {
-                        rank.map(|_| {
-                            tensor_iter
-                                .next()
-                                .expect("contract_sizing_at_point results match result_ranks")
-                        })
-                    })
-                    .collect();
-                let node_scratch: Vec<ScratchNeed> = base_scratch[node_idx]
-                    .iter()
-                    .zip(max_scratch_bytes.iter().copied())
-                    .map(|(need, bytes)| ScratchNeed { bytes, ..*need })
-                    .collect();
-
-                cache.insert(key, (node_results.clone(), node_scratch.clone()));
-                result_bytes.push(node_results);
-                scratch_needs.push(node_scratch);
+                (recorded, Some(Arc::from(node_masks)))
             }
-
-            Ok((port_bytes, result_bytes, scratch_needs))
+        };
+        Ok(SizingOutline {
+            identity: NEXT_SIZING_OUTLINE.fetch_add(1, Ordering::Relaxed),
+            storage: NativeGraphStorageBytes {
+                workspace: planned.workspace,
+                sync: planned.sync,
+                output: planned.output,
+                upload: planned.upload,
+                recorded,
+            },
+            plan_heap: self.plan_heap,
+            topology_heap: self.topology_heap,
+            bound_heap: self.bound_heap,
+            launches: self.launches,
+            kernels: self.kernels,
+            timeline_count: self.timelines.len(),
+            cuda_node_launches,
         })
+    }
+}
+
+/// Fast concrete-class bounds updater for `classes[1..]` of a [`SizingGroup`].
+/// Verifies identical topology (ports, nodes, entries, edges, exports, stores,
+/// shares, timelines, marks) on every call and updates element-wise maximums
+/// without recompiling storage placement.
+pub(crate) struct SizingBoundsDraft {
+    group: SizingGroup,
+    next_port: usize,
+    next_node: usize,
+    next_export: usize,
+    next_store: usize,
+    next_timeline: usize,
+    next_mark: usize,
+}
+
+impl SizingBoundsDraft {
+    pub(crate) fn into_group(self) -> Result<SizingGroup, GraphError> {
+        if self.next_port != self.group.expected_ports.len()
+            || self.next_node != self.group.expected_nodes.len()
+            || self.next_export != self.group.expected_exports.len()
+            || self.next_store != self.group.expected_stores.len()
+            || self.next_timeline != self.group.timelines.len()
+            || self.next_mark != self.group.marks.len()
+        {
+            return Err(GraphError::Invalid(format!(
+                "concrete class topology diverged within certified group: \
+                 ports {}/{}, nodes {}/{}, exports {}/{}, stores {}/{}, timelines {}/{}, marks {}/{}",
+                self.next_port,
+                self.group.expected_ports.len(),
+                self.next_node,
+                self.group.expected_nodes.len(),
+                self.next_export,
+                self.group.expected_exports.len(),
+                self.next_store,
+                self.group.expected_stores.len(),
+                self.next_timeline,
+                self.group.timelines.len(),
+                self.next_mark,
+                self.group.marks.len(),
+            )));
+        }
+        Ok(self.group)
+    }
+
+    fn record_port(
+        &mut self,
+        byte_len: u64,
+        local: bool,
+        owned_input: bool,
+    ) -> Result<NativePort, GraphError> {
+        let idx = self.next_port;
+        let expected = self.group.expected_ports.get(idx).copied().ok_or_else(|| {
+            GraphError::Invalid(format!(
+                "concrete class emitted extra port {idx} beyond group's {}",
+                self.group.expected_ports.len()
+            ))
+        })?;
+        if expected != (local, owned_input) {
+            return Err(GraphError::Invalid(format!(
+                "concrete class port {idx} locality/upload diverged within certified group"
+            )));
+        }
+        self.group.port_bytes[idx] = self.group.port_bytes[idx].max(byte_len);
+        self.next_port += 1;
+        Ok(NativePort::from_raw(self.group.identity, idx as u32))
+    }
+
+    fn checked_port<E: EntryContract>(
+        &mut self,
+        elements: &[(&str, Element)],
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        local: bool,
+        owned_input: bool,
+    ) -> Result<NativePort, GraphError> {
+        let mut stack_dims = [("", 0u64); 16];
+        let mut heap_dims: Vec<(&str, u64)> = Vec::new();
+        let dims: &[(&str, u64)] = if dimensions.len() <= stack_dims.len() {
+            for (slot, (name, d)) in stack_dims.iter_mut().zip(dimensions) {
+                *slot = (*name, d.clone().into().fixed());
+            }
+            &stack_dims[..dimensions.len()]
+        } else {
+            heap_dims.extend(
+                dimensions
+                    .iter()
+                    .map(|(name, d)| (*name, d.clone().into().fixed())),
+            );
+            &heap_dims
+        };
+        let spec = cached_param_spec::<E>(self.group.backend, elements, parameter, dims)?;
+        self.record_port(spec.bytes, local, owned_input)
+    }
+
+    fn enqueue_node<E: EntryContract>(
+        &mut self,
+        elements: &[(&str, Element)],
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+        condition: Option<(u32, u64, LaunchEncoding)>,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        let idx = self.next_node;
+        let expected = self.group.expected_nodes.get(idx).ok_or_else(|| {
+            GraphError::Invalid(format!(
+                "concrete class emitted extra node {idx} (`{}`) beyond group's {}",
+                E::NAME,
+                self.group.expected_nodes.len()
+            ))
+        })?;
+        if expected.entry_name != E::NAME || expected.condition != condition {
+            return Err(GraphError::Invalid(format!(
+                "concrete class node {idx} diverged within certified group: got `{}` vs `{}`",
+                E::NAME,
+                expected.entry_name
+            )));
+        }
+        let encoded = E::encode_workflow(args);
+        if encoded.arguments().len() != expected.arg_refs.len()
+            || !encoded
+                .arguments()
+                .iter()
+                .zip(&expected.arg_refs)
+                .all(|(arg, exp)| argument_reference(arg).map(|r| (r.node, r.result)) == *exp)
+        {
+            return Err(GraphError::Invalid(format!(
+                "concrete class node {idx} (`{}`) operand edges diverged within certified group",
+                E::NAME
+            )));
+        }
+
+        let mut stack_dims = [("", 0u64); 16];
+        let mut heap_dims: Vec<(&str, u64)> = Vec::new();
+        let dims: &[(&str, u64)] = if dimensions.len() <= stack_dims.len() {
+            for (slot, (name, d)) in stack_dims.iter_mut().zip(dimensions) {
+                *slot = (*name, d.clone().into().fixed());
+            }
+            &stack_dims[..dimensions.len()]
+        } else {
+            heap_dims.extend(
+                dimensions
+                    .iter()
+                    .map(|(name, d)| (*name, d.clone().into().fixed())),
+            );
+            &heap_dims
+        };
+        let shape = E::contract_node_shape(self.group.backend)
+            .map_err(|error| contract_error(E::NAME, self.group.backend, &[], dims, error))?;
+        let (node_results, node_scratch_bytes, active_launches) = eval_concrete_node(
+            self.group.backend,
+            E::NAME,
+            &shape,
+            E::contract_scratch_configs,
+            E::contract_sizing_at_point,
+            E::contract_launch_configs,
+            E::contract_launch_mask,
+            elements,
+            dims,
+            &mut self.group.launch_configs_cache,
+        )?;
+        for (cap, res) in self.group.result_bytes[idx].iter_mut().zip(node_results) {
+            if let (Some(c), Some(r)) = (cap.as_mut(), res) {
+                *c = (*c).max(r);
+            }
+        }
+        for (need, bytes) in self.group.scratch_needs[idx]
+            .iter_mut()
+            .zip(node_scratch_bytes)
+        {
+            need.bytes = need.bytes.max(bytes);
+        }
+        if let Some(cuda) = &mut self.group.cuda_node_launches {
+            cuda[idx] |= active_launches;
+        }
+        self.next_node += 1;
+        let result_count =
+            u32::try_from(shape.result_ranks.len()).expect("node result count fits u32");
+        let pending = PendingWorkflowResults::new(self.group.identity, idx as u32, result_count);
+        Ok(E::decode_workflow(pending))
+    }
+}
+
+impl GraphDraft for SizingBoundsDraft {
+    type Plan = SizingGroup;
+    type Binding<'a, E: EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Ranged<'a, E: EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Forms = ();
+
+    fn pick<'a, E: EntryContract + 'a>(
+        ranged: Self::Ranged<'a, E>,
+        _rows: &Dim,
+    ) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn first<'a, E: EntryContract + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
+    where
+        Dim: From<D>,
+    {
+        let values: Vec<u64> = extents
+            .iter()
+            .map(|extent| Dim::from(extent.clone()).fixed())
+            .collect();
+        let byte_len = element
+            .canonical_byte_len(&values)
+            .map_err(|error| GraphError::Invalid(error.to_string()))?;
+        self.record_port(byte_len, false, false)
+    }
+
+    fn local_for<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.checked_port::<E>(entry, parameter, dimensions, true, false)
+    }
+
+    fn input_for<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.checked_port::<E>(entry, parameter, dimensions, true, true)
+    }
+
+    fn port_for<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.checked_port::<E>(entry, parameter, dimensions, false, false)
+    }
+
+    fn enqueue<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        self.enqueue_node::<E>(entry, dimensions, args, None)
+    }
+
+    fn enqueue_under<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+        port: &NativePort,
+        index: u64,
+        encoded: LaunchEncoding,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        self.enqueue_node::<E>(entry, dimensions, args, Some((port.ordinal(), index, encoded)))
+    }
+
+    fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
+        let r = result.raw_ref();
+        let pair = (r.node, r.result);
+        if self.group.expected_exports[..self.next_export].contains(&pair) {
+            return Ok(());
+        }
+        let expected = self.group.expected_exports.get(self.next_export).copied();
+        if expected != Some(pair) {
+            return Err(GraphError::Invalid(
+                "concrete class exports diverged within certified group".to_owned(),
+            ));
+        }
+        self.next_export += 1;
+        Ok(())
+    }
+
+    fn share(&mut self, other: &WorkflowTensor, primary: &WorkflowTensor) -> Result<(), GraphError> {
+        let other = other.raw_ref();
+        let primary = primary.raw_ref();
+        let expected = self
+            .group
+            .expected_nodes
+            .get(other.node as usize)
+            .and_then(|n| n.share);
+        if expected != Some((other.result, primary)) {
+            return Err(GraphError::Invalid(
+                "concrete class share diverged within certified group".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError> {
+        let r = result.raw_ref();
+        let triple = (r.node, r.result, port.ordinal());
+        let expected = self.group.expected_stores.get(self.next_store).copied();
+        if expected != Some(triple) {
+            return Err(GraphError::Invalid(
+                "concrete class store diverged within certified group".to_owned(),
+            ));
+        }
+        self.next_store += 1;
+        Ok(())
+    }
+
+    fn operand_carry(
+        &mut self,
+        rows: u64,
+        width: &Dim,
+        activation: Element,
+    ) -> Result<OperandCarry, GraphError> {
+        let [(rows_repr, rows_extents), (quantized_repr, quantized_extents)] =
+            seismic::sizing::operand_carry_ports(self.group.backend, Dim::from(rows), *width);
+        let rows_port = self.port(Element::from_id(rows_repr), &rows_extents)?;
+        let quantized_port = self.port(Element::from_id(quantized_repr), &quantized_extents)?;
+        Ok(OperandCarry::from_ports(
+            rows_port,
+            quantized_port,
+            activation,
+            self.group.backend,
+            [rows, width.fixed()],
+        ))
+    }
+
+    fn carry_out(
+        &mut self,
+        _result: &WorkflowTensor,
+        _carry: &OperandCarry,
+        (): (),
+    ) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn carry_in(
+        &mut self,
+        _hidden: &NativePort,
+        _carry: &OperandCarry,
+        (): (),
+        _norm: &NativePort,
+        _epsilon: f32,
+    ) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn timeline<N: seismic::timeline::TimelineNodeKind>(
+        &mut self,
+        _node: N,
+    ) -> NativeTimelinePort<N::Role> {
+        let idx = self.next_timeline;
+        assert_eq!(
+            self.group.timelines.get(idx).copied(),
+            Some((self.next_node, N::NODE)),
+            "concrete class timeline diverged within certified group"
+        );
+        self.next_timeline += 1;
+        make_timeline_port(self.group.identity, idx as u32)
+    }
+
+    fn span_mark(&mut self) -> usize {
+        let idx = self.next_mark;
+        assert_eq!(
+            self.group.marks.get(idx).copied(),
+            Some(self.next_node),
+            "concrete class span mark diverged within certified group"
+        );
+        self.next_mark += 1;
+        idx
+    }
+
+    fn seal(self) -> Result<Self::Plan, GraphError> {
+        self.into_group()
+    }
+}
+
+/// Unified draft for `SizingOutline::certify_group`: `Full` compiles topology
+/// on the first class, `Bounds` updates concrete maximums on remaining classes.
+pub(crate) enum SizingGroupDraft {
+    Full(SizingDraft),
+    Bounds(SizingBoundsDraft),
+}
+
+impl GraphDraft for SizingGroupDraft {
+    type Plan = ();
+    type Binding<'a, E: EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Ranged<'a, E: EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Forms = ();
+
+    fn pick<'a, E: EntryContract + 'a>(
+        ranged: Self::Ranged<'a, E>,
+        _rows: &Dim,
+    ) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn first<'a, E: EntryContract + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
+    where
+        Dim: From<D>,
+    {
+        match self {
+            Self::Full(d) => d.port(element, extents),
+            Self::Bounds(d) => d.port(element, extents),
+        }
+    }
+
+    fn weight_port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
+    where
+        Dim: From<D>,
+    {
+        match self {
+            Self::Full(d) => d.weight_port(element, extents),
+            Self::Bounds(d) => d.port(element, extents),
+        }
+    }
+
+    fn local_for<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        match self {
+            Self::Full(d) => d.local_for::<E>(entry, parameter, dimensions),
+            Self::Bounds(d) => d.local_for::<E>(entry, parameter, dimensions),
+        }
+    }
+
+    fn input_for<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        match self {
+            Self::Full(d) => d.input_for::<E>(entry, parameter, dimensions),
+            Self::Bounds(d) => d.input_for::<E>(entry, parameter, dimensions),
+        }
+    }
+
+    fn port_for<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        match self {
+            Self::Full(d) => d.port_for::<E>(entry, parameter, dimensions),
+            Self::Bounds(d) => d.port_for::<E>(entry, parameter, dimensions),
+        }
+    }
+
+    fn enqueue<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        match self {
+            Self::Full(d) => d.enqueue::<E>(entry, dimensions, args),
+            Self::Bounds(d) => d.enqueue::<E>(entry, dimensions, args),
+        }
+    }
+
+    fn enqueue_under<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+        port: &NativePort,
+        index: u64,
+        encoded: LaunchEncoding,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        match self {
+            Self::Full(d) => d.enqueue_under::<E>(entry, dimensions, args, port, index, encoded),
+            Self::Bounds(d) => d.enqueue_under::<E>(entry, dimensions, args, port, index, encoded),
+        }
+    }
+
+    fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
+        match self {
+            Self::Full(d) => d.export(result),
+            Self::Bounds(d) => d.export(result),
+        }
+    }
+
+    fn share(&mut self, other: &WorkflowTensor, primary: &WorkflowTensor) -> Result<(), GraphError> {
+        match self {
+            Self::Full(d) => d.share(other, primary),
+            Self::Bounds(d) => d.share(other, primary),
+        }
+    }
+
+    fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError> {
+        match self {
+            Self::Full(d) => d.store(result, port),
+            Self::Bounds(d) => d.store(result, port),
+        }
+    }
+
+    fn operand_carry(
+        &mut self,
+        rows: u64,
+        width: &Dim,
+        activation: Element,
+    ) -> Result<OperandCarry, GraphError> {
+        match self {
+            Self::Full(d) => d.operand_carry(rows, width, activation),
+            Self::Bounds(d) => d.operand_carry(rows, width, activation),
+        }
+    }
+
+    fn carry_out(
+        &mut self,
+        result: &WorkflowTensor,
+        carry: &OperandCarry,
+        (): (),
+    ) -> Result<(), GraphError> {
+        match self {
+            Self::Full(d) => d.carry_out(result, carry, ()),
+            Self::Bounds(d) => d.carry_out(result, carry, ()),
+        }
+    }
+
+    fn carry_in(
+        &mut self,
+        hidden: &NativePort,
+        carry: &OperandCarry,
+        (): (),
+        norm: &NativePort,
+        epsilon: f32,
+    ) -> Result<(), GraphError> {
+        match self {
+            Self::Full(d) => d.carry_in(hidden, carry, (), norm, epsilon),
+            Self::Bounds(d) => d.carry_in(hidden, carry, (), norm, epsilon),
+        }
+    }
+
+    fn timeline<N: seismic::timeline::TimelineNodeKind>(
+        &mut self,
+        node: N,
+    ) -> NativeTimelinePort<N::Role> {
+        match self {
+            Self::Full(d) => d.timeline(node),
+            Self::Bounds(d) => d.timeline(node),
+        }
+    }
+
+    fn span_mark(&mut self) -> usize {
+        match self {
+            Self::Full(d) => d.span_mark(),
+            Self::Bounds(d) => d.span_mark(),
+        }
+    }
+
+    fn seal(self) -> Result<(), GraphError> {
+        Ok(())
+    }
+}
+
+/// Zero-allocation `GraphDraft` that fingerprints every emitted port extent
+/// and node dimension so `ClassAxes` can be derived by probing each axis
+/// against the actual build (flipping min -> max) with zero hand-kept rules.
+pub(crate) struct AxisProbeDraft {
+    backend: BackendName,
+    identity: u64,
+    ports: u32,
+    nodes: u32,
+    timelines: u32,
+    marks: usize,
+    hasher: FxHasher,
+}
+
+impl AxisProbeDraft {
+    pub(crate) fn new(backend: BackendName) -> Self {
+        Self {
+            backend,
+            identity: NEXT_SIZING_GRAPH.fetch_add(1, Ordering::Relaxed),
+            ports: 0,
+            nodes: 0,
+            timelines: 0,
+            marks: 0,
+            hasher: FxHasher::default(),
+        }
+    }
+
+    pub(crate) fn fingerprint(&self) -> u64 {
+        self.hasher.finish()
+    }
+}
+
+impl GraphDraft for AxisProbeDraft {
+    type Plan = u64;
+    type Binding<'a, E: EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Ranged<'a, E: EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Forms = ();
+
+    fn pick<'a, E: EntryContract + 'a>(
+        ranged: Self::Ranged<'a, E>,
+        _rows: &Dim,
+    ) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn first<'a, E: EntryContract + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
+    where
+        Dim: From<D>,
+    {
+        self.hasher.write_u8(b'P');
+        element.hash(&mut self.hasher);
+        self.hasher.write_usize(extents.len());
+        for ext in extents {
+            self.hasher.write_u64(Dim::from(ext.clone()).fixed());
+        }
+        let ord = self.ports;
+        self.ports += 1;
+        Ok(NativePort::from_raw(self.identity, ord))
+    }
+
+    fn local_for<'a, E: EntryContract + 'a>(
+        &mut self,
+        _entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.hasher.write_u8(b'L');
+        hash_str(&mut self.hasher, E::NAME);
+        hash_str(&mut self.hasher, parameter);
+        for (name, d) in dimensions {
+            hash_str(&mut self.hasher, name);
+            self.hasher.write_u64(d.clone().into().fixed());
+        }
+        let ord = self.ports;
+        self.ports += 1;
+        Ok(NativePort::from_raw(self.identity, ord))
+    }
+
+    fn input_for<'a, E: EntryContract + 'a>(
+        &mut self,
+        _entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.hasher.write_u8(b'I');
+        hash_str(&mut self.hasher, E::NAME);
+        hash_str(&mut self.hasher, parameter);
+        for (name, d) in dimensions {
+            hash_str(&mut self.hasher, name);
+            self.hasher.write_u64(d.clone().into().fixed());
+        }
+        let ord = self.ports;
+        self.ports += 1;
+        Ok(NativePort::from_raw(self.identity, ord))
+    }
+
+    fn port_for<'a, E: EntryContract + 'a>(
+        &mut self,
+        _entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.hasher.write_u8(b'F');
+        hash_str(&mut self.hasher, E::NAME);
+        hash_str(&mut self.hasher, parameter);
+        for (name, d) in dimensions {
+            hash_str(&mut self.hasher, name);
+            self.hasher.write_u64(d.clone().into().fixed());
+        }
+        let ord = self.ports;
+        self.ports += 1;
+        Ok(NativePort::from_raw(self.identity, ord))
+    }
+
+    fn enqueue<'a, E: EntryContract + 'a>(
+        &mut self,
+        _entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        _args: E::WorkflowArgs<'_>,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        self.hasher.write_u8(b'N');
+        hash_str(&mut self.hasher, E::NAME);
+        for (name, d) in dimensions {
+            hash_str(&mut self.hasher, name);
+            self.hasher.write_u64(d.clone().into().fixed());
+        }
+        let shape = E::contract_node_shape(self.backend)
+            .map_err(|error| contract_error(E::NAME, self.backend, &[], &[], error))?;
+        let ord = self.nodes;
+        self.nodes += 1;
+        let pending = PendingWorkflowResults::new(
+            self.identity,
+            ord,
+            u32::try_from(shape.result_ranks.len()).expect("node result count fits u32"),
+        );
+        Ok(E::decode_workflow(pending))
+    }
+
+    fn enqueue_under<'a, E: EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+        _port: &NativePort,
+        index: u64,
+        _encoded: LaunchEncoding,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        self.hasher.write_u8(b'U');
+        self.hasher.write_u64(index);
+        self.enqueue::<E>(entry, dimensions, args)
+    }
+
+    fn export(&mut self, _result: &WorkflowTensor) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn share(&mut self, _other: &WorkflowTensor, _primary: &WorkflowTensor) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn store(&mut self, _result: &WorkflowTensor, _port: &NativePort) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn operand_carry(
+        &mut self,
+        rows: u64,
+        width: &Dim,
+        activation: Element,
+    ) -> Result<OperandCarry, GraphError> {
+        let [(rows_repr, rows_extents), (quantized_repr, quantized_extents)] =
+            seismic::sizing::operand_carry_ports(self.backend, Dim::from(rows), *width);
+        let rows_port = self.port(Element::from_id(rows_repr), &rows_extents)?;
+        let quantized_port = self.port(Element::from_id(quantized_repr), &quantized_extents)?;
+        Ok(OperandCarry::from_ports(
+            rows_port,
+            quantized_port,
+            activation,
+            self.backend,
+            [rows, width.fixed()],
+        ))
+    }
+
+    fn carry_out(
+        &mut self,
+        _result: &WorkflowTensor,
+        _carry: &OperandCarry,
+        (): (),
+    ) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn carry_in(
+        &mut self,
+        _hidden: &NativePort,
+        _carry: &OperandCarry,
+        (): (),
+        _norm: &NativePort,
+        _epsilon: f32,
+    ) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn timeline<N: seismic::timeline::TimelineNodeKind>(
+        &mut self,
+        _node: N,
+    ) -> NativeTimelinePort<N::Role> {
+        let ord = self.timelines;
+        self.timelines += 1;
+        make_timeline_port(self.identity, ord)
+    }
+
+    fn span_mark(&mut self) -> usize {
+        let ord = self.marks;
+        self.marks += 1;
+        ord
+    }
+
+    fn seal(self) -> Result<u64, GraphError> {
+        Ok(self.hasher.finish())
     }
 }
 
@@ -3088,7 +3158,6 @@ impl GraphDraft for SizingDraft {
             local: false,
             owned_input: false,
             is_weight: false,
-            source: PortSource::Direct { class_extent: None },
         }))
     }
 
@@ -3110,46 +3179,6 @@ impl GraphDraft for SizingDraft {
             local: false,
             owned_input: false,
             is_weight: true,
-            source: PortSource::Direct { class_extent: None },
-        }))
-    }
-
-    fn set_class_scope(&mut self, scope: Option<&'static str>) {
-        self.class_scope = scope;
-    }
-
-    fn port_with_class_extent<D: Clone>(
-        &mut self,
-        element: Element,
-        extents: &[D],
-        extent_axis: usize,
-        class_dimension: &'static str,
-    ) -> Result<NativePort, GraphError>
-    where
-        Dim: From<D>,
-    {
-        if extent_axis >= extents.len() {
-            return Err(GraphError::Invalid(format!(
-                "graph port extent axis {extent_axis} is absent"
-            )));
-        }
-        let values: Vec<u64> = extents
-            .iter()
-            .map(|extent| Dim::from(extent.clone()).fixed())
-            .collect();
-        let byte_len = element
-            .canonical_byte_len(&values)
-            .map_err(|error| GraphError::Invalid(error.to_string()))?;
-        Ok(self.push_port(SizingPort {
-            element,
-            extents: values,
-            byte_len,
-            local: false,
-            owned_input: false,
-            is_weight: false,
-            source: PortSource::Direct {
-                class_extent: Some((extent_axis, class_dimension, self.class_scope)),
-            },
         }))
     }
 
@@ -3186,7 +3215,7 @@ impl GraphDraft for SizingDraft {
         dimensions: &[(&str, impl Clone + Into<Dim>)],
         args: E::WorkflowArgs<'_>,
     ) -> Result<E::WorkflowResults, GraphError> {
-        self.enqueue_node::<E>(entry, dimensions, args)
+        self.enqueue_node::<E>(entry, dimensions, args, None)
     }
 
     fn enqueue_under<'a, E: EntryContract + 'a>(
@@ -3194,11 +3223,11 @@ impl GraphDraft for SizingDraft {
         entry: Self::Binding<'a, E>,
         dimensions: &[(&str, impl Clone + Into<Dim>)],
         args: E::WorkflowArgs<'_>,
-        _port: &NativePort,
-        _index: u64,
-        _encoded: LaunchEncoding,
+        port: &NativePort,
+        index: u64,
+        encoded: LaunchEncoding,
     ) -> Result<E::WorkflowResults, GraphError> {
-        self.enqueue_node::<E>(entry, dimensions, args)
+        self.enqueue_node::<E>(entry, dimensions, args, Some((port.ordinal(), index, encoded)))
     }
 
     fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
@@ -3297,10 +3326,6 @@ impl GraphDraft for SizingDraft {
     }
 
     fn seal(self) -> Result<Self::Plan, GraphError> {
-        let [outline]: [SizingOutline; 1] = self
-            .certify_each(&[vec![NativeGraphClassSlice::new()]])?
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("one slice set certifies to one outline"));
-        Ok(outline)
+        self.begin_group()?.finish()
     }
 }

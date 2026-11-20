@@ -44,6 +44,7 @@ __device__ __forceinline__ void publish(const Operands &in, u64 index, u64 chann
     const u64 stream = channel / SEISMIC_DIM_H;
     const u64 column = channel % SEISMIC_DIM_H;
     const versions::Slot slot = versions::slot_of(in.slots, index, seismic_words_value);
+    if (slot.lo == slot.hi) return;
     const element::Stored<element::F32> source = versions::bank_view(in.window, slot.source, bank_elements, seismic_words_value);
     const element::Out<element::F32> target = versions::bank(in.window, slot.target, bank_elements, seismic_words_value);
     // The tape holds T = R - reach rows.

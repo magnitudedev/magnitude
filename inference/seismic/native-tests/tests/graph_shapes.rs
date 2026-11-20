@@ -4,7 +4,7 @@
 //! updated to the storage each run binds. Run on every available device.
 
 use seismic::{
-    BackendName, Element, GraphReplays, NativeGraphClassSlice, NativeGraphFamily, NativeGraphMetadata,
+    BackendName, Element, GraphReplays, NativeGraphFamily, NativeGraphMetadata,
     NativeSpecialization, Tensor,
 };
 use seismic_native_tests::{gated_sum, scale_rows};
@@ -230,19 +230,18 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
     for device in seismic_native_tests::every_device() {
         let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
-        let mut template = NativeGraphMetadata::new_template(backend);
-        let input = template.port_with_class_extent(Element::f32(), &[4, n], 0, "M").unwrap();
-        let landing = template.port_with_class_extent(Element::f32(), &[4, n], 0, "M").unwrap();
-        let scaled = template
-            .enqueue::<scale_rows::Entry>(&[], &[("M", 4), ("N", n)], scale_rows::WorkflowArgs { x: input.tensor().into(), factor: seismic::Argument::from(2.0) })
-            .unwrap()
-            .value;
-        template.store(&scaled, &landing).unwrap();
-        let layout = template
-            .seal_template()
-            .unwrap()
-            .certify(&[NativeGraphClassSlice::new().dimension("M", classes)])
-            .unwrap();
+        let layout = NativeGraphMetadata::certify_group(classes.into_iter().map(|m| {
+            let mut draft = NativeGraphMetadata::new(backend);
+            let input = draft.port(Element::f32(), &[m, n]).unwrap();
+            let landing = draft.port(Element::f32(), &[m, n]).unwrap();
+            let scaled = draft
+                .enqueue::<scale_rows::Entry>(&[], &[("M", m), ("N", n)], scale_rows::WorkflowArgs { x: input.tensor().into(), factor: seismic::Argument::from(2.0) })
+                .unwrap()
+                .value;
+            draft.store(&scaled, &landing).unwrap();
+            draft
+        }))
+        .unwrap();
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
         let sealed = classes
@@ -330,18 +329,17 @@ fn a_layouts_classes_making_different_launches_replay_one_graph() {
     for device in seismic_native_tests::every_device() {
         let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
-        let mut template = NativeGraphMetadata::new_template(backend);
-        let input = template.port_with_class_extent(Element::f32(), &[128], 0, "N").unwrap();
-        let sum = template
-            .enqueue::<gated_sum::Entry>(&[], &[("N", 128)], gated_sum::WorkflowArgs { x: input.tensor().into() })
-            .unwrap()
-            .value;
-        template.export(&sum).unwrap();
-        let layout = template
-            .seal_template()
-            .unwrap()
-            .certify(&[NativeGraphClassSlice::new().dimension("N", classes)])
-            .unwrap();
+        let layout = NativeGraphMetadata::certify_group(classes.into_iter().map(|n| {
+            let mut draft = NativeGraphMetadata::new(backend);
+            let input = draft.port(Element::f32(), &[n]).unwrap();
+            let sum = draft
+                .enqueue::<gated_sum::Entry>(&[], &[("N", n)], gated_sum::WorkflowArgs { x: input.tensor().into() })
+                .unwrap()
+                .value;
+            draft.export(&sum).unwrap();
+            draft
+        }))
+        .unwrap();
         let kernel = gated_sum::native_for_device(&device, &NativeSpecialization::new().with_param("SMALL", 64)).unwrap();
         let sealed = classes
             .iter()

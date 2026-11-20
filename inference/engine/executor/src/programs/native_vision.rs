@@ -43,7 +43,7 @@ use magnitude_kernels::{
 use seismic::NativeGraphMetadata;
 use seismic::{
     Argument, BackendName, BoundNativeGraphPlan, ContractNodeShape, Device, Dim, Element,
-    EntryContract, GraphCensus, NativeGraph, NativeGraphClassSlice, NativeGraphFamily,
+    EntryContract, GraphCensus, NativeGraph, NativeGraphFamily,
     NativeGraphFamilySlot, NativeGraphLayout, NativeGraphPlan, NativeGraphStorageBytes,
     NativeKernel, NativePort, Tensor, WorkflowTensor, WorkflowTensorView,
 };
@@ -64,7 +64,6 @@ fn device(error: impl ToString) -> SubmitError {
 
 /// The class scope of the invocations whose rows are merged cells; the
 /// others' rows are patches.
-const CELLS: &str = "vision_cells";
 
 /// The projector's vision program over the planned resident elements.
 fn planned_program(
@@ -490,14 +489,6 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
         }
     }
 
-    /// Scopes the next invocation's class dimensions to its rows.
-    fn scope(&mut self, rows: VisionRows) {
-        self.graph.set_class_scope(match rows {
-            VisionRows::Patches => None,
-            VisionRows::Cells => Some(CELLS),
-        });
-    }
-
     fn weight(&mut self, role: WeightRole, extents: &[Dim]) -> Result<WorkflowTensorView, GraphError> {
         let planned = self.planned.weight(role)?;
         let port = self.graph.port(planned.resident, &planned.shape)?;
@@ -711,7 +702,6 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                     ("NO", statics("NO")?),
                 ];
                 let binding = self.bindings.norm(index)?;
-                self.scope(kind);
                 if *source == VisionValue::Pixels {
                     self.pixels = Some(self.graph.input_for(binding, "source", &dims)?);
                 }
@@ -766,7 +756,6 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                     ("NC", statics("NC")?),
                 ];
                 let binding = self.bindings.linear(index, &m)?;
-                self.scope(*row_kind);
                 let x = self.value(*x, &[m.clone(), k.clone()])?;
                 let weight = self.weight(*weight, &[n.clone(), k])?;
                 let bias = self.rows_of(*bias, &[n.clone()])?;
@@ -821,7 +810,6 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                 let n = self.width(*x)?;
                 let dims = [("M", m.clone()), ("N", n.clone())];
                 let binding = self.bindings.clamp(index)?;
-                self.scope(*row_kind);
                 let x = self.value(*x, &[m, n])?;
                 let minimum = self.weight(*minimum, &[Dim::from(1u64)])?;
                 let maximum = self.weight(*maximum, &[Dim::from(1u64)])?;
@@ -949,7 +937,6 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                     ("NS", statics("NS")?),
                 ];
                 let binding = self.bindings.pool(index)?;
-                self.scope(VisionRows::Cells);
                 let source = self.value(*source, &[cells, g, h.clone()])?;
                 let standard_bias = self.rows_of(standard.map(|(bias, _)| bias), &[h.clone()])?;
                 let standard_scale = self.rows_of(standard.map(|(_, scale)| scale), &[h])?;
@@ -1006,7 +993,6 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                     .value
             }
         };
-        self.graph.set_class_scope(None);
         Ok(result)
     }
 }
@@ -1717,7 +1703,7 @@ fn block_even_crossing_parity(block_ops: &[VisionOp], block_start: usize) -> boo
 fn collapse_vision_program(
     program: &VisionOps,
     load: &ModelLoadPlan,
-) -> Option<(VisionOps, usize)> {
+) -> Option<(VisionOps, usize, Vec<usize>)> {
     let stages = partition_vision_stages(program)?;
     if stages.blocks.len() <= 1 {
         return None;
@@ -1808,9 +1794,13 @@ fn collapse_vision_program(
         VisionValue::PatchRows(idx) if idx + 1 == old_start => VisionValue::PatchRows(prev_out),
         VisionValue::PatchRows(idx) => VisionValue::PatchRows(new_start + (idx - old_start)),
     };
-    for &(_, block_idx) in &collapsed {
+    let mut kind_first_start: Vec<Option<usize>> = vec![None; kind_ids.len()];
+    for &(kind, block_idx) in &collapsed {
         let range = &stages.blocks[block_idx];
         let new_start = ops.len();
+        if kind_first_start[kind].is_none() {
+            kind_first_start[kind] = Some(new_start);
+        }
         for op in &program.ops[range.clone()] {
             let mut cloned = op.clone();
             cloned.operands = remap_operand_values(&op.operands, |v| {
@@ -1828,7 +1818,16 @@ fn collapse_vision_program(
         });
         ops.push(cloned);
     }
-    Some((VisionOps { ops, ..*program }, collapsed.len()))
+    let mut op_to_collapsed = Vec::with_capacity(program.ops.len());
+    op_to_collapsed.extend(0..stages.stem.len());
+    for (block_idx, range) in stages.blocks.iter().enumerate() {
+        let kind = block_kinds[block_idx];
+        let start = kind_first_start[kind].expect("every block kind is kept in collapsed");
+        op_to_collapsed.extend(start..start + range.len());
+    }
+    op_to_collapsed.extend(new_merger_start..new_merger_start + stages.merger.len());
+    debug_assert_eq!(op_to_collapsed.len(), program.ops.len());
+    Some((VisionOps { ops, ..*program }, collapsed.len(), op_to_collapsed))
 }
 
 fn vision_entry_node_shape(
@@ -1851,14 +1850,18 @@ fn vision_entry_node_shape(
     result.map_err(|error| GraphError::Invalid(format!("vision entry {entry:?}: {error}")))
 }
 
-/// Exact `GraphCensus` over every op of the full unrolled vision program.
+/// Exact `GraphCensus` over every op of the full unrolled vision program,
+/// composed through `outline.compose_recorded` so active CUDA launches and
+/// static non-CUDA launches share one backend-agnostic path.
 fn full_recorded_census(
     backend: BackendName,
+    outline: &SizingOutline,
     program: &VisionOps,
+    op_to_collapsed: &[usize],
 ) -> Result<GraphCensus, GraphError> {
     let mut shapes: HashMap<VisionEntry, (usize, usize, usize)> = HashMap::new();
     let mut census_nodes = Vec::with_capacity(program.ops.len());
-    for op in &program.ops {
+    for (op, &collapsed_idx) in program.ops.iter().zip(op_to_collapsed) {
         let entry = op.kernel.entry;
         let triple = match shapes.get(&entry) {
             Some(&triple) => triple,
@@ -1869,9 +1872,9 @@ fn full_recorded_census(
                 triple
             }
         };
-        census_nodes.push(triple);
+        census_nodes.push((collapsed_idx, triple));
     }
-    Ok(seismic::sizing::recorded_census_of(backend, &census_nodes, &[]))
+    Ok(outline.compose_recorded(backend, &census_nodes, &[]))
 }
 
 impl VisionFamilyComposition {
@@ -1881,33 +1884,29 @@ impl VisionFamilyComposition {
         program: &VisionOps,
         patch_rows: &[u64],
     ) -> Result<Self, GraphError> {
-        let collapsed = collapse_vision_program(program, load).map(|(collapsed, _)| collapsed);
-        let sized_program = collapsed.as_ref().unwrap_or(program);
+        let collapsed = collapse_vision_program(program, load);
+        let sized_program = collapsed.as_ref().map_or(program, |(c, _, _)| c);
         let family = VisionFamily::of(backend, load, sized_program, patch_rows)?;
         let (collapsed_storage, classes) = family.certify::<SizingOutline>()?;
         // Sync scratch is allocated disjointly per node across all layers; if
         // any vision kernel ever requests sync scratch while collapsed, size
         // the full unrolled program so `sync` remains exact.
-        let (classes, full_recorded) = if collapsed.is_some() && collapsed_storage.sync != 0 {
+        let (classes, op_to_collapsed) = if collapsed.is_some() && collapsed_storage.sync != 0 {
             let full_family = VisionFamily::of(backend, load, program, patch_rows)?;
             let (_, full_classes) = full_family.certify::<SizingOutline>()?;
             (full_classes, None)
-        } else if collapsed.is_some() {
-            (classes, Some(full_recorded_census(backend, program)?))
         } else {
-            (classes, None)
+            (classes, collapsed.map(|(_, _, map)| map))
         };
 
-        let class_storage: Vec<NativeGraphStorageBytes> = classes
-            .iter()
-            .map(|(outline, _)| {
-                let mut storage = outline.storage_bytes();
-                if let Some(recorded) = full_recorded {
-                    storage.recorded = recorded;
-                }
-                storage
-            })
-            .collect();
+        let mut class_storage = Vec::with_capacity(classes.len());
+        for (outline, _) in &classes {
+            let mut storage = outline.storage_bytes();
+            if let Some(map) = &op_to_collapsed {
+                storage.recorded = full_recorded_census(backend, outline, program, map)?;
+            }
+            class_storage.push(storage);
+        }
         let storage = class_storage
             .iter()
             .copied()
@@ -2017,27 +2016,24 @@ impl VisionFamily {
     fn certify<L: Certified>(
         &self,
     ) -> Result<(NativeGraphStorageBytes, Vec<(L, Vec<GraphConstant>)>), GraphError> {
-        let slice_sets = self
-            .patch_rows
-            .iter()
-            .map(|&patches| {
-                let (rows, cells) = class_rows(self.numbers.registers, self.numbers.cell_rows, patches)?;
-                Ok(vec![NativeGraphClassSlice::new().dimension("M", [rows]).scoped(CELLS, "M", [cells])])
-            })
-            .collect::<Result<Vec<_>, GraphError>>()?;
         let topology = constant_reals(self.topology.clone());
-        let (graph, ports) = vision_graph_draft(
-            L::new_draft(self.topology.backend),
-            &topology,
-            &topology,
-            &constant(self.numbers.clone()),
-            &constant(self.weights.clone()),
-        )?;
-        let certified = L::certify_draft(graph, &slice_sets)?;
-        let layouts: Vec<(L, Vec<GraphConstant>)> = certified
-            .into_iter()
-            .map(|layout| (layout, ports.constants.clone()))
-            .collect();
+        let weights = constant(self.weights.clone());
+        let mut layouts = Vec::with_capacity(self.patch_rows.len());
+        for &patches in &self.patch_rows {
+            let numbers = self.class(patches)?;
+            let (layout, mut all_constants) = L::certify_group(self.topology.backend, &[patches], |draft, _| {
+                let (draft, ports) = vision_graph_draft(
+                    draft,
+                    &topology,
+                    &topology,
+                    &numbers,
+                    &weights,
+                )?;
+                Ok((draft, ports.constants))
+            })?;
+            let constants = all_constants.pop().unwrap_or_default();
+            layouts.push((layout, constants));
+        }
         let storage = layouts
             .iter()
             .map(|(layout, _)| layout.storage_bytes())
@@ -2815,7 +2811,7 @@ mod tests {
             let program = planned_program(&description, &load).unwrap();
 
             // Verify collapsing actually reduced the block count as expected.
-            let (_, kept_blocks) = collapse_vision_program(&program, &load)
+            let (_, kept_blocks, _) = collapse_vision_program(&program, &load)
                 .unwrap_or_else(|| panic!("{label}: expected vision program to collapse"));
             assert_eq!(
                 kept_blocks, expected_collapsed_blocks,

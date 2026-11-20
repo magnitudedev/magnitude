@@ -386,6 +386,7 @@ mod tests {
     const LIMITS: ClassLimits = ClassLimits {
         rows: 64,
         segments: 63,
+        slots: 64,
     };
 
     fn row(token: i32, destination: i32, select: Option<Select>) -> Row {
