@@ -1688,8 +1688,9 @@ impl ResourcePlanner {
                     .unwrap_or(0),
             )
             .ok_or("startup bank slab charge overflows")?;
-        // What the stores' construction commits: their tables and the whole
-        // blocks of the one state pool holding at least the opening
+        // What the stores' construction commits: their tables, the state pool's
+        // absent granule (`block.absent`, allocated when the pool opens), and
+        // the whole blocks of the one state pool holding at least the opening
         // request-slot reservation (max of their first slabs and the opening
         // request slot, which startup claims beside the import window), of
         // which the history's share is the rest beside the banks'.
@@ -1706,14 +1707,16 @@ impl ResourcePlanner {
         let history = target_state
             .slab_charge(startup_slabs)?
             .checked_add(tables)
+            .and_then(|committed| committed.checked_add(target_state.block.absent))
             .and_then(|committed| committed.checked_sub(planned_recurrent))
             .ok_or("startup history slab charge overflows")?;
         // What the standard workload charges of the stores, exactly as
         // assessment does: retained prefixes are held only within it.
         // The page rule's slabs of `conversations` histories at the fit depth
         // (`magnitude_state::state_bytes`, the one state-size estimator), plus
-        // each stored domain's address table, which a slab count leaves out
-        // and `StateStore::new` commits.
+        // each stored domain's address table and the state pool's absent
+        // granule, which a slab count leaves out and opening the pool and
+        // `StateStore::new` commit.
         let fit_depth = context_limit;
         let conversations = limits.conversations.get() as u64;
         let mut workload_slabs = 0u64;
@@ -1728,6 +1731,7 @@ impl ResourcePlanner {
         let workload_state_bytes = target_state
             .slab_charge(workload_slabs)?
             .checked_add(tables)
+            .and_then(|committed| committed.checked_add(target_state.block.absent))
             .ok_or("state fit charge overflows")?;
         let capacity = StateCapacityPlan {
             live_requests: possible_requests,
@@ -2299,7 +2303,7 @@ mod slab_plan_tests {
             // A block of three granules the backend rounds up, as CUDA's and
             // Vulkan's are: the store's slabs are granules of it whatever
             // the block, and the plan agrees with the store.
-            seismic::BlockSize { bytes: 3 * GRANULE, held: 3 * GRANULE + (1 << 20) },
+            seismic::BlockSize { bytes: 3 * GRANULE, held: 3 * GRANULE + (1 << 20), absent: GRANULE },
         )
         .unwrap();
         // Each slab is a granule of the store's pool.
@@ -2399,7 +2403,7 @@ mod slab_plan_tests {
         );
         assert_eq!(
             startup,
-            planned.target_state.slab_charge(planned.request_slot_bytes).unwrap() + tables
+            planned.target_state.slab_charge(planned.request_slot_bytes).unwrap() + tables + planned.target_state.block.absent
         );
         let (_, from_layout_startup) = ResourcePlanner::state_bytes_from_layout(
             &target_history,

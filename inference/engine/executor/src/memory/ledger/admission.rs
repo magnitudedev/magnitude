@@ -198,8 +198,23 @@ impl State {
         }
         let free = self.free(at, bytes);
         let beside = self.free_for(at, Holding::Committed(kind), bytes);
-        let owed = self.give(bytes.saturating_sub(beside), |_| true, Some(Holding::Committed(kind))).saturating_sub(free - beside);
-        Ok(self.insert(Holding::Committed(kind), bytes - owed))
+        let holding = Holding::Committed(kind);
+        let same_pool = |class: PoolClass| holding.pooled() && holding.pool_class() == Some(class);
+        let yieldable: u64 = self
+            .held
+            .values()
+            .filter_map(|entry| match entry.holding {
+                Holding::Cache(_) if entry.bytes > 0 => Some(entry.bytes),
+                Holding::Pool(class) if entry.bytes > 0 && same_pool(class) => Some(entry.bytes),
+                _ => None,
+            })
+            .sum();
+        if free.saturating_add(yieldable) < bytes {
+            return Err(Over { bytes: bytes - free.saturating_add(yieldable) });
+        }
+        let owed = self.give(bytes.saturating_sub(beside), |_| true, Some(holding)).saturating_sub(free - beside);
+        debug_assert_eq!(owed, 0, "yieldable cache check guarantees give covers the shortfall");
+        Ok(self.insert(holding, bytes))
     }
 
     /// Yield up to `bytes` of the cache of the kinds `of` admits, in the one

@@ -2126,3 +2126,22 @@ fn unreturned_pool_bytes_cannot_mint_claim_without_physical_return() {
     assert_eq!(ledger.estimate().allocatable(), 2 * GB);
     drop(claim);
 }
+
+/// A non-pooled committed entry (`CommittedKind::Device`, e.g. `self.own`)
+/// asking for bytes when only unyieldable `Holding::Pool` spare bytes remain
+/// (partial free room + pool spare >= request) must be refused cleanly rather
+/// than taking a partial entry and panicking on `allocated > entry.bytes`.
+#[test]
+fn non_pooled_entry_take_refuses_when_only_pool_spare_remains() {
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 4 * GB, 4 * GB, None);
+    // Allocate 3 GB of spare granules in the records pool, leaving 1 GB free.
+    ledger.change(|_| pools.records.take(&pools.records.change(), 3 * GB, Pageable)).expect("pool spare fits");
+    // A non-pooled Device entry asking for 2 GB cannot take the records pool's
+    // spare bytes: it must return Err(Refused), never panic.
+    let own = seismic::memory::Store::own(&ledger);
+    let result = ledger.change(|_| own.take(&own.change(), 2 * GB, Pageable));
+    assert!(result.is_err(), "non-pooled entry_take must refuse when only pool spare covers the shortfall");
+    ledger.change(|_| pools.records.freed(&pools.records.change(), 3 * GB, Pageable));
+}

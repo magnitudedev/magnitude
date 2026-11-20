@@ -34,16 +34,27 @@ impl LoadPools {
     /// `execution`'s pools on `device`, charged to the pool entries of
     /// `ledgers`' stores (`DeviceLedgers::open_pool`).
     pub fn open(device: &Device, ledgers: &crate::memory::ledger::DeviceLedgers, execution: &crate::planning::ExecutionPlan) -> Result<Self, String> {
+        Self::open_at(device, ledgers, None, execution).map_err(|error| error.to_string())
+    }
+
+    /// `execution`'s pools on `device`, claiming each pool's absent granule at
+    /// `reading` (the load's reading when provided) before opening it.
+    pub fn open_at(
+        device: &Device,
+        ledgers: &crate::memory::ledger::DeviceLedgers,
+        reading: Option<&crate::memory::ledger::DeviceReading>,
+        execution: &crate::planning::ExecutionPlan,
+    ) -> Result<Self, crate::memory::ledger::OpenPoolError> {
         use crate::memory::ledger::PoolClass;
         let granule = execution.resources().target_state().granule;
-        let state = ledgers.open_pool(device, seismic::Contract::DeviceOnly, PoolClass::State, granule)?;
+        let state = ledgers.open_pool_at(reading, device, seismic::Contract::DeviceOnly, PoolClass::State, granule)?;
         let Some(plan) = execution.load().expert_bank() else {
             return Ok(Self { state, records: None, host: None });
         };
-        let records = ledgers.open_pool(device, plan.host().contract(BankTier::Bank), PoolClass::Records, plan.granule())?;
+        let records = ledgers.open_pool_at(reading, device, plan.host().contract(BankTier::Bank), PoolClass::Records, plan.granule())?;
         let host = plan
             .host_granule()
-            .map(|granule| ledgers.open_pool(device, plan.host().contract(BankTier::Host), PoolClass::Records, granule))
+            .map(|granule| ledgers.open_pool_at(reading, device, plan.host().contract(BankTier::Host), PoolClass::Records, granule))
             .transpose()?;
         Ok(Self { state, records: Some(records), host })
     }

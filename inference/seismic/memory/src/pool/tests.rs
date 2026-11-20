@@ -168,7 +168,7 @@ fn a_granule_frees_only_after_its_flight() {
 fn block_sizing_rounds_the_least_allocation_to_granules() {
     let granule = 2u64 << 20;
     let at = |least, granularity| block_bytes(BlockSizing { granule, allocations: NativeAllocations { least, granularity } });
-    let exact = |granules: u64| BlockSize { bytes: granules * granule, held: granules * granule };
+    let exact = |granules: u64| BlockSize { bytes: granules * granule, held: granules * granule, absent: granule };
     assert_eq!(at(21_474_837, 1).unwrap(), exact(11), "the fewest granules holding the least allocation");
     assert_eq!(at(1, 1).unwrap(), exact(1));
     assert_eq!(at(0, 1).unwrap(), exact(1));
@@ -178,19 +178,20 @@ fn block_sizing_rounds_the_least_allocation_to_granules() {
     let record = 1_769_472u64;
     let cuda = NativeAllocations { least: 0, granularity: 2 << 20 };
     let block = block_bytes(BlockSizing { granule: record, allocations: cuda }).unwrap();
-    assert_eq!(block, BlockSize { bytes: 32 * record, held: 27 * (2 << 20) });
+    assert_eq!(block, BlockSize { bytes: 32 * record, held: 27 * (2 << 20), absent: 2 << 20 });
     assert_eq!(block.charge(record, 33), Some(2 * block.held), "granules cost whole blocks");
     // Whole granules fill whole units only far past the span: the block
     // wasting least per granule within it, its rounding held.
     let odd = (2 << 20) + 256;
     let block = block_bytes(BlockSizing { granule: odd, allocations: cuda }).unwrap();
     assert!(block.bytes <= MAX_BLOCK_UNITS * (2 << 20) && block.held % (2 << 20) == 0 && block.held >= block.bytes);
+    assert_eq!(block.absent, 4 << 20);
     // A multi-tens-of-MiB state granule under CUDA's 2 MiB granularity stays
     // bounded by the 64-unit (128 MiB) span rather than scaling the span up
     // by the granule itself.
     let qwen_state = 65_625_472u64;
     let block = block_bytes(BlockSizing { granule: qwen_state, allocations: cuda }).unwrap();
-    assert_eq!(block, BlockSize { bytes: 2 * qwen_state, held: 63 * (2 << 20) });
+    assert_eq!(block, BlockSize { bytes: 2 * qwen_state, held: 63 * (2 << 20), absent: 32 * (2 << 20) });
 }
 
 /// Emptying a block for outside demand copies its live granules into free
@@ -706,7 +707,7 @@ fn block_bytes_small_granule_coprime_to_large_granularity() {
         allocations: NativeAllocations { least: 0, granularity: 1 << 20 },
     })
     .unwrap();
-    assert_eq!(exact, BlockSize { bytes: 3 * (1 << 20), held: 3 * (1 << 20) });
+    assert_eq!(exact, BlockSize { bytes: 3 * (1 << 20), held: 3 * (1 << 20), absent: 1 << 20 });
 
     // 2. No exact multiple within span: granule = 257 (prime), granularity = 1 GiB.
     //    `most = 64 * 1 GiB / 257 ≈ 267_386_880`, which previously looped ~267M times.
@@ -735,7 +736,7 @@ fn block_bytes_small_granule_coprime_to_large_granularity() {
                 u128::from(waste) * u128::from(b.bytes / granule) < u128::from(b.held - b.bytes) * u128::from(g)
             });
             if better {
-                best = Some(BlockSize { bytes, held });
+                best = Some(BlockSize { bytes, held, absent: granule.next_multiple_of(granularity) });
             }
             if waste == 0 {
                 break;

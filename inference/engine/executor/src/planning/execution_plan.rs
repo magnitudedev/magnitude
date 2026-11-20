@@ -3541,8 +3541,8 @@ mod tests {
         assert_eq!(
             (charge.state_bytes, charge.startup_state_bytes),
             (
-                target_state.slab_charge(54 * target_state.granule).unwrap() + target_state.table_bytes().unwrap(),
-                target_state.slab_charge(4 * target_state.granule).unwrap() + target_state.table_bytes().unwrap(),
+                target_state.slab_charge(54 * target_state.granule).unwrap() + target_state.table_bytes().unwrap() + target_state.block.absent,
+                target_state.slab_charge(4 * target_state.granule).unwrap() + target_state.table_bytes().unwrap() + target_state.block.absent,
             ),
             "the KL load's state at the harness's limits"
         );

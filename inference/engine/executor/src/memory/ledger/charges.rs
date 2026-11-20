@@ -182,7 +182,10 @@ impl State {
             Holding::Pool(class) => self.spare_at(class, entry.allocated.checked_add(bytes).expect("a store's bytes fit u64")) - entry.bytes,
             _ => bytes.saturating_sub(entry.bytes - entry.allocated),
         };
-        let refused = |state: &Self| seismic::memory::Refused { required: bytes, available: state.free_for(at, entry.holding, lacks) + state.cache };
+        let refused = |state: &Self| seismic::memory::Refused {
+            required: bytes,
+            available: state.free_for(at, entry.holding, lacks) + state.cache,
+        };
         // The one bound on an allocation: the bytes the budget leaves beside
         // what the process has allocated. A claim holding cache it took in
         // process allocates it only once its holder freed it.
@@ -266,7 +269,10 @@ impl State {
         self.released(released);
         self.allocated -= released;
         self.allocate(id, allocated);
-        if !matches!(entry.holding, Holding::Pool(_)) {
+        // A pool's entry holds spare granules that follow `allocated`; an
+        // import's upload window (`CommittedKind::Upload`) is a reusable peak
+        // reservation across batches, released whole when its holder drops.
+        if !matches!(entry.holding, Holding::Pool(_) | Holding::Committed(CommittedKind::Upload)) {
             self.resize(id, entry.bytes - held);
         }
     }
@@ -303,6 +309,24 @@ impl Ledger {
         let absent = state.insert(Holding::Committed(CommittedKind::Absent(class)), 0);
         drop(state);
         super::store::PoolEntries { blocks: Arc::new(Record::new(self.clone(), entry)), absent: Arc::new(Record::new(self.clone(), absent)) }
+    }
+
+    /// Like [`Self::pool_block`], but using an already-claimed `absent`
+    /// entry (`CommittedKind::Absent(class)`) so opening the pool allocates
+    /// into its pre-claimed bytes at the load's reading.
+    pub(super) fn pool_block_with_absent(
+        &self,
+        class: PoolClass,
+        block: NonZeroU64,
+        absent: super::claims::Claim,
+    ) -> super::store::PoolEntries {
+        assert_eq!(absent.kind(), CommittedKind::Absent(class), "invariant violated: pool absent claim has wrong kind");
+        let mut state = self.state();
+        assert!(state.pools[class.index()].is_none(), "invariant violated: {:?} opens a second {class:?} pool", self.store.identity);
+        let entry = state.insert(Holding::Pool(class), 0);
+        state.pools[class.index()] = Some(Pool { entry, block, reclaimer: None });
+        drop(state);
+        super::store::PoolEntries { blocks: Arc::new(Record::new(self.clone(), entry)), absent: absent.entry() }
     }
 }
 

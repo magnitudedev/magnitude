@@ -176,6 +176,30 @@ impl Charge {
         }
     }
 
+    /// Convert this uncarved block remainder charge paired with `first`
+    /// (already charged to the caller's entry) into a [`CarvableCharge`] of
+    /// `self.bytes() + first.bytes()` total bytes and the pre-carved [`Carved`]
+    /// handle for `first`.
+    pub fn into_carvable_with_first(mut self, mut first: Charge) -> (CarvableCharge, Carved) {
+        assert_eq!(self.entry.store(), first.entry.store(), "invariant violated: first range belongs to another store");
+        assert_eq!(self.wiring, first.wiring, "invariant violated: first range has different wiring");
+        let uncarved = std::mem::take(&mut self.bytes);
+        let first_bytes = std::mem::take(&mut first.bytes);
+        let total = uncarved.checked_add(first_bytes).expect("carvable block bytes overflow");
+        let pool = Arc::new(CarvePool {
+            entry: self.entry.clone(),
+            wiring: self.wiring,
+            total,
+            uncarved: Mutex::new(Some(uncarved)),
+        });
+        let carved = Carved {
+            pool: pool.clone(),
+            entry: first.entry.clone(),
+            bytes: first_bytes,
+        };
+        (CarvableCharge { pool }, carved)
+    }
+
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -383,6 +407,21 @@ impl<T> Backed<T, Charge> {
         Backed {
             parts: Some((native, charge.into_carvable())),
         }
+    }
+
+    /// Allocate a native carvable block whose first range is already charged
+    /// to `first` (the caller's entry) and whose uncarved remainder is charged
+    /// to `own` (the block pool's own entry). If `allocate` fails, both
+    /// charges drop and free cleanly.
+    pub fn allocate_carvable_with_first<E>(
+        own: Charge,
+        first: Charge,
+        allocate: impl FnOnce(u64) -> Result<T, E>,
+    ) -> Result<(Backed<T, CarvableCharge>, Carved), E> {
+        let total = own.bytes().checked_add(first.bytes()).expect("carvable block bytes overflow");
+        let native = allocate(total)?;
+        let (carvable, carved) = own.into_carvable_with_first(first);
+        Ok((Backed { parts: Some((native, carvable)) }, carved))
     }
 }
 

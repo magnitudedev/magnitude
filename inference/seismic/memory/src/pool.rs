@@ -243,6 +243,10 @@ pub struct BlockSize {
     /// up to its granularity. A block is the unit a pool returns to the
     /// OS, so this is what each block costs and each return frees.
     pub held: u64,
+    /// What the backend allocates, and so charges, for the pool's one
+    /// absent granule when the pool opens: one granule rounded up to its
+    /// granularity.
+    pub absent: u64,
 }
 
 impl BlockSize {
@@ -292,8 +296,11 @@ pub fn block_bytes(sizing: BlockSizing) -> Result<BlockSize, SizingError> {
     if granule == 0 || granularity == 0 {
         return Err(SizingError::NoGranule);
     }
+    let absent = granule.checked_next_multiple_of(granularity).ok_or(SizingError::Overflow)?;
     let held = |granules: u64| {
-        granules.checked_mul(granule).and_then(|bytes| Some(BlockSize { bytes, held: bytes.checked_next_multiple_of(granularity)? }))
+        granules
+            .checked_mul(granule)
+            .and_then(|bytes| Some(BlockSize { bytes, held: bytes.checked_next_multiple_of(granularity)?, absent }))
     };
     let fewest = least.max(granule).div_ceil(granule);
     let unit = least.max(granularity);

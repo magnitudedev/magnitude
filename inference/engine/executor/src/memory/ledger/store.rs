@@ -562,15 +562,43 @@ impl DeviceLedgers {
     /// allocations waste least on ([`seismic::block_bytes`],
     /// [`seismic::Device::native_allocations`]), each charged once to that
     /// pool's entry, what the backend allocates for it
-    /// ([`seismic::BlockSize::held`], [`Ledger::pool_block`]). A load opens
-    /// each store's pool of a class once.
+    /// ([`seismic::BlockSize::held`], [`Ledger::pool_block`]), and its absent
+    /// granule claimed first as [`CommittedKind::Absent`]. A load opens each
+    /// store's pool of a class once.
     pub fn open_pool(&self, device: &seismic::Device, contract: seismic::Contract, class: PoolClass, granule: u64) -> Result<seismic::Pool, String> {
+        self.open_pool_at(None, device, contract, class, granule).map_err(|error| error.to_string())
+    }
+
+    /// Like [`Self::open_pool`], claiming the pool's absent granule at
+    /// `reading` (the load's reading when provided, else the store's latest)
+    /// and returning [`OpenPoolError::Short`] if the store lacks room for it.
+    pub fn open_pool_at(
+        &self,
+        reading: Option<&DeviceReading>,
+        device: &seismic::Device,
+        contract: seismic::Contract,
+        class: PoolClass,
+        granule: u64,
+    ) -> Result<seismic::Pool, OpenPoolError> {
         let sizing = seismic::BlockSizing { granule, allocations: device.native_allocations() };
-        let block = seismic::block_bytes(sizing).map_err(|error| format!("the {contract:?} store's {class:?} pool blocks: {error:?}"))?;
+        let block = seismic::block_bytes(sizing)
+            .map_err(|error| OpenPoolError::Internal(format!("the {contract:?} store's {class:?} pool blocks: {error:?}")))?;
         let ledger = self.of_contract(device, contract);
-        let entries = ledger.pool_block(class, NonZeroU64::new(block.held).expect("a block holds a granule"));
+        let held = self
+            .judged(reading)
+            .into_iter()
+            .find_map(|(candidate, estimate)| Arc::ptr_eq(&candidate.store, &ledger.store).then_some(estimate))
+            .flatten();
+        let absent = self
+            .changes()
+            .change(|keeping| ledger.claim_at(&keeping.claims(), held, CommittedKind::Absent(class), block.absent))
+            .map_err(|short| OpenPoolError::Short {
+                purpose: format!("the {contract:?} store's {class:?} pool"),
+                short,
+            })?;
+        let entries = ledger.pool_block_with_absent(class, NonZeroU64::new(block.held).expect("a block holds a granule"), absent);
         let pool = seismic::Pool::open(&entries.charges(device, contract), contract, granule, block.bytes)
-            .map_err(|error| format!("the {contract:?} store's {class:?} pool: {error}"))?;
+            .map_err(|error| OpenPoolError::Internal(format!("the {contract:?} store's {class:?} pool: {error}")))?;
         ledger.register_pool_reclaimer(class, Arc::new(PoolReclaimer(pool.downgrade())));
         Ok(pool)
     }
@@ -668,6 +696,27 @@ impl CacheReclaimer for PoolReclaimer {
         match pool.return_freed_sync(need).map_err(|error| ReclaimError::Invariant(error.to_string()))? {
             0 => Err(ReclaimError::AtFloor),
             freed => Ok(freed),
+        }
+    }
+}
+
+/// Why opening a store's granule pool failed ([`DeviceLedgers::open_pool_at`]).
+#[derive(Debug)]
+pub enum OpenPoolError {
+    /// The pool's store had no room for its absent granule.
+    Short { purpose: String, short: Short },
+    /// Sizing or backend error while opening the pool.
+    Internal(String),
+}
+
+impl std::fmt::Display for OpenPoolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Short { purpose, short } => {
+                let available = short.required.saturating_sub(short.over);
+                write!(formatter, "{purpose}: allocation requires {} bytes; {available} bytes available", short.required)
+            }
+            Self::Internal(reason) => formatter.write_str(reason),
         }
     }
 }

@@ -2141,12 +2141,25 @@ impl ModelLoadPlan {
     }
 
     /// The target's weights as its import claims them, held for the load:
-    /// each target weight allocation in the storage it lies in, and a
-    /// linked host tier backed to its load-time slots past the floor its
-    /// layout commits (`ExpertBank::back_host`), which backs after the
-    /// import ([`Self::host_tier_bytes`]).
+    /// each target weight allocation in the storage it lies in (excluding
+    /// the records pools' absent granules, which `LoadPools::open_at` claims
+    /// and allocates separately as `CommittedKind::Absent`), and a linked
+    /// host tier backed to its load-time slots past the floor its layout
+    /// commits (`ExpertBank::back_host`), which backs after the import
+    /// ([`Self::host_tier_bytes`]).
     pub fn target_weight_demand(&self) -> Result<ClaimDemand, String> {
-        let weights = self.weight_demands()?[0];
+        let mut weights = self.weight_demands()?[0];
+        if let Some(bank) = &self.bank {
+            let absent = bank.absent_demand();
+            weights.device = weights
+                .device
+                .checked_sub(absent.device)
+                .ok_or("target import demand underflows bank absent granule")?;
+            weights.host = weights
+                .host
+                .checked_sub(absent.host)
+                .ok_or("target import demand underflows host absent granule")?;
+        }
         Ok(ClaimDemand { host: weights.host.checked_add(self.host_tier_bytes()?).ok_or("target import demand overflows")?, ..weights })
     }
 

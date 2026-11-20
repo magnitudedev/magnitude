@@ -493,7 +493,7 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
     );
     assert_eq!(
         (held.host - lent(&plan).host) - (bare.host - lent(&without).host),
-        plan.host_charge(0).unwrap()
+        plan.host_charge(0).unwrap() + plan.absent_demand().host
     );
     // Admission charges a site only for the layers it admitted one for,
     // and only where a tier lets the plan hold one; a refusal is kept.
@@ -1098,7 +1098,8 @@ fn a_bank_charges_every_allocation_of_its_layout() {
         .map(|allocation| allocation.charged_bytes(plan.host()).unwrap())
         .sum::<u64>()
         + plan.resident_charge(plan.slots).unwrap()
-        + plan.host_charge(0).unwrap();
+        + plan.host_charge(0).unwrap()
+        + plan.absent_demand().bytes();
     assert_eq!(plan.bytes().unwrap(), total);
     let records = (0..plan.layers().len()).map(|index| plan.banked_bytes(index).unwrap().into_iter().sum::<u64>());
     assert_eq!(plan.charged_beyond_records().unwrap(), total - records.sum::<u64>());
