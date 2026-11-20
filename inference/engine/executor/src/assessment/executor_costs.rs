@@ -460,6 +460,8 @@ pub enum Derived {
     WeightRate(NativeKind, Element),
     /// The activation dtype's matrix throughput.
     ActivationMatrix,
+    /// The decode form's row line (4-row and 8-row GEMV slope and intercept).
+    DecodeLine,
     /// A format's matrix throughput.
     MatrixThroughput(Element),
     /// A history layout's costs at the depths past its last rung read.
@@ -530,6 +532,9 @@ pub struct ExecutorCosts {
     pub routes: Vec<RouteCosts>,
     /// The activation dtype's (bf16) matrix throughput, where read.
     pub activation_matrix: Option<MatrixCosts>,
+    /// The decode form's row line, fitted from 4 and 8 rows of the chain
+    /// format's ([`CHAIN_FORMAT`]) `dense_output` projection, where read.
+    pub decode_line: Option<DecodeLine>,
     /// Each other format's matrix throughput, where it was measured.
     pub matrices: Vec<(Element, MatrixCosts)>,
     /// The dense history's costs.
@@ -712,9 +717,11 @@ impl ExecutorCosts {
             .filter(|history| history.rungs.len() < HISTORY_DEPTHS.len())
             .map(|history| Derived::History(history.layout));
         let unread = self.activation_matrix.is_none().then_some(Derived::ActivationMatrix);
+        let decode_line = self.decode_line.is_none().then_some(Derived::DecodeLine);
         activations
             .chain(rates)
             .chain(unread)
+            .chain(decode_line)
             .chain(histories)
             .chain(matrices)
             .collect()
@@ -776,7 +783,7 @@ impl ExecutorCosts {
             flops: read.iter().map(|&format| (format, self.matrix_flops(element_of(format)))).collect(),
             history,
             launch: self.launch(),
-            decode: Some(DECODE_LINE),
+            decode: self.decode_line,
         }
     }
 
@@ -807,16 +814,6 @@ impl ExecutorCosts {
         }
     }
 }
-
-/// A decode form's row line ([`DecodeLine`]): the dense GEMV's arithmetic
-/// a FLOP of one row, 0.25 ps at no rows and 0.31 ps more per row (0.5 and
-/// 0.62 µs per million weights). Measured on an M4 Pro's Metal from the
-/// slope of `dense_output` 17408 × 5120 over 4 and 8 rows (q4k 0.667,
-/// iq2s 0.578 µs per million weights a row, run fcb870) and of an 8192 ×
-/// 4096 q4g32s projection (0.69), which reproduces q4k's 2 and 4 rows
-/// within 2%. No job measures it yet; a backend whose matrix throughput is
-/// slower prices its rows at that ([`seismic::measure::pricing::Rates::decode_compute`]).
-pub(super) const DECODE_LINE: DecodeLine = DecodeLine { fixed: 0.25e-12, row: 0.31e-12 };
 
 /// Every history codec a load can store.
 const HISTORY_CODECS: [KvCodec; 3] = [KvCodec::Dense, KvCodec::AffineK8V4, KvCodec::RotatedK4V4];
@@ -1041,7 +1038,7 @@ impl<E: Entry> Program<E> {
     }
 
     /// Formed on `device` ([`Formation::form`]).
-    fn form(&self, device: &Device, rows: Option<u64>) -> Result<NativeKernel<E>, ExecutorCostsError> {
+    fn form(&self, device: &Device, rows: Option<(u64, u64)>) -> Result<NativeKernel<E>, ExecutorCostsError> {
         self.formation.form(device, rows)
     }
 }
@@ -1115,15 +1112,15 @@ impl<E: Entry> Formation<E> {
     }
 
     /// Formed on `device` at its default specialization, its calls held to
-    /// `rows` selected rows where given.
+    /// `low..=high` selected rows where given.
     pub(super) fn form(
         &self,
         device: &Device,
-        rows: Option<u64>,
+        rows: Option<(u64, u64)>,
     ) -> Result<NativeKernel<E>, ExecutorCostsError> {
         let specialization = self.default(device)?;
         let specialization = match rows {
-            Some(rows) => specialization.with_range(SELECTED_ROWS, rows, rows),
+            Some((low, high)) => specialization.with_range(SELECTED_ROWS, low, high),
             None => specialization,
         };
         self.prepare(device, &specialization)
@@ -1331,6 +1328,7 @@ impl ProgramSet {
                     .iter()
                     .map(|(format, _, _)| (*format, Pending::new(), Pending::new()))
                     .collect(),
+                decode_line: Pending::new(),
                 output: Pending::new(),
                 dense: Pending::new(),
                 affine: Pending::new(),
@@ -1382,6 +1380,7 @@ impl ProgramSet {
                     Job::Copy,
                     Job::Output,
                     Job::Expand(activation, Rows::Matrix),
+                    Job::DecodeLine,
                 ]);
                 // The chain's format is a backend's resident form of Q4_K,
                 // which may be the activation dtype's.
@@ -1416,18 +1415,23 @@ impl Programs {
             Job::Expand(index, rows) => {
                 let (walk, formed_walk) = (set.walk(), self.walk());
                 let (_, decode, matrix) = &formed_walk.expands[index];
-                let formed = walk.expands[index]
-                    .2
-                    .form(device, Some(rows.count(walk.sizes)));
+                let count = rows.count(walk.sizes);
+                let formed = walk.expands[index].2.form(device, Some((count, count)));
                 match rows {
                     Rows::Decode => decode.set(formed),
                     Rows::Matrix => matrix.set(formed),
                 }
             }
+            Job::DecodeLine => {
+                let [low, high] = DECODE_LINE_ROWS;
+                self.walk()
+                    .decode_line
+                    .set(set.walk().output.form(device, Some((low, high))));
+            }
             Job::Copy => self.walk().copy.set(set.walk().copy.form(device, None)),
             Job::Dense => self.walk().dense.set(set.walk().dense.form(device, None)),
             Job::Affine => self.walk().affine.set(set.walk().affine.form(device, None)),
-            Job::Output => self.walk().output.set(set.walk().output.form(device, Some(1))),
+            Job::Output => self.walk().output.set(set.walk().output.form(device, Some((1, 1)))),
             Job::Convert(index) => {
                 self.converts[index]
                     .1
@@ -1441,6 +1445,7 @@ impl Programs {
 #[derive(Clone, Copy, PartialEq)]
 enum Job {
     Expand(usize, Rows),
+    DecodeLine,
     Copy,
     Dense,
     Affine,
@@ -1475,6 +1480,9 @@ struct FormedWalkPrograms {
         Forming<dense_expand::Entry>,
         Forming<dense_expand::Entry>,
     )>,
+    /// The chain format's `dense_output` formed for the 4-row and 8-row
+    /// decode line points.
+    decode_line: Forming<dense_output::Entry>,
     /// The chain's down projection, for decode.
     output: Forming<dense_output::Entry>,
     dense: Forming<attention_decode::Entry>,
@@ -1663,6 +1671,12 @@ impl Programs {
         }
     }
 
+    /// The chain format's `dense_output` formed for the decode line's
+    /// 4-row and 8-row points.
+    fn decode_line(&self) -> Result<&NativeKernel<dense_output::Entry>, Unformed<ExecutorCostsError>> {
+        self.kernel(&self.walk().decode_line)
+    }
+
     /// A formed kernel for a point, waited for however long it takes to
     /// form, or why it failed to ([`Unformed::Never`]). A point that touches
     /// the host, or any on the host's CPU, is then timed with no compile
@@ -1698,6 +1712,7 @@ impl Programs {
                 decode.abandon(panic);
                 matrix.abandon(panic);
             }
+            walk.decode_line.abandon(panic);
             walk.output.abandon(panic);
             walk.dense.abandon(panic);
             walk.affine.abandon(panic);
@@ -2672,6 +2687,68 @@ impl ExpandCase {
     }
 }
 
+/// The arguments of one `dense_output` call over `rows` rows of F `features`,
+/// its down weight along one route.
+struct OutputCase {
+    residual: Tensor,
+    product: Tensor,
+    down: Tensor,
+    out_rows: Tensor,
+    scale: Tensor,
+    bound: Tensor,
+}
+
+impl OutputCase {
+    /// `sets` argument sets, each with a down weight of its own along `route`;
+    /// the rows and the constants are one set's for all.
+    fn new(
+        charges: &seismic::Charges,
+        backings: &mut Backings,
+        weight: Element,
+        route: &Route,
+        rows: u64,
+        features: u64,
+        sets: u64,
+    ) -> Result<Vec<Self>, ExecutorCostsError> {
+        let [downs] = backings.lay_out(
+            charges,
+            route,
+            [Operand::canonical(weight, &[HIDDEN, features], sets)?],
+        )?;
+        let error = failed("dense_output arguments");
+        let zeros = |element, extents: &[u64]| {
+            Tensor::zeros(charges, element, extents).map_err(|cause| error(&cause))
+        };
+        let residual = zeros(Element::f32(), &[rows, HIDDEN])?;
+        let product = zeros(Element::bf16(), &[rows, features])?;
+        let out_rows = every_row(charges, rows)?;
+        let scale = zeros(Element::f32(), &[0])?;
+        let bound = zeros(Element::f32(), &[bound_extent(weight)])?;
+        Ok(downs
+            .into_iter()
+            .map(|down| Self {
+                residual: residual.clone(),
+                product: product.clone(),
+                down,
+                out_rows: out_rows.clone(),
+                scale: scale.clone(),
+                bound: bound.clone(),
+            })
+            .collect())
+    }
+
+    fn args(&mut self) -> dense_output::Args<'_> {
+        dense_output::Args {
+            residual: &self.residual,
+            product: &self.product,
+            down_weight: &self.down,
+            out_rows: &self.out_rows,
+            down_scale: &self.scale,
+            down_bound: &self.bound,
+        }
+    }
+}
+
 /// The identity row table of `rows` rows: every row advances.
 fn every_row(charges: &seismic::Charges, rows: u64) -> Result<Tensor, ExecutorCostsError> {
     let table = (0..rows as i32)
@@ -3622,6 +3699,8 @@ enum Step {
     Chain,
     /// A format's matrix throughput.
     Matrix(Element),
+    /// The decode form's row line (4-row and 8-row GEMV slope and intercept).
+    DecodeLine,
 }
 
 /// A point of a weight rate: its pilot, its calls over one argument set,
@@ -3669,6 +3748,14 @@ impl Step {
         matches!(self, Self::WeightRate(_, format, Pass::Rate) if format != Element::bf16())
     }
 
+    /// How many timed points this step visits.
+    fn points(self) -> usize {
+        match self {
+            Self::DecodeLine => DECODE_LINE_ROWS.len(),
+            _ => 1,
+        }
+    }
+
     /// The figure this step reads, which the costs price from the others
     /// where it ended ([`Cannot`]); none for the figures the costs require
     /// ([`Required`]), whose ending is the walk's own.
@@ -3679,6 +3766,7 @@ impl Step {
             Self::WeightRate(route, format, _) => Derived::WeightRate(walk.routes[route].route, format),
             Self::Matrix(format) if format == Element::bf16() => Derived::ActivationMatrix,
             Self::Matrix(format) => Derived::MatrixThroughput(format),
+            Self::DecodeLine => Derived::DecodeLine,
             Self::Rung(layout, _) => Derived::History(layout),
             Self::Launch(_) | Self::Chain => return None,
         };
@@ -3698,6 +3786,7 @@ impl fmt::Display for Step {
             }
             Self::Chain => formatter.write_str("the composition chain"),
             Self::Matrix(format) => write!(formatter, "the {} matrix throughput", format.name()),
+            Self::DecodeLine => formatter.write_str("the decode line"),
         }
     }
 }
@@ -3751,6 +3840,7 @@ fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
     steps.extend(first_rungs(KvCodec::Dense));
     steps.push(Step::Chain);
     steps.push(Step::Matrix(activation));
+    steps.push(Step::DecodeLine);
     steps.extend(first_rungs(KvCodec::AffineK8V4));
     steps.extend([GraphTiming::Waited, GraphTiming::Queued].map(Step::Launch));
     steps.extend(
@@ -3818,8 +3908,7 @@ fn walk<T: Times>(
     let (routes, placements) = Route::all(topology, executor)?;
     let routes = routes.iter().collect::<Vec<_>>();
     let mut steps = plan(&routes, formats);
-    // Each step is one point, after the probe.
-    let points = 1 + steps.len();
+    let points = 1 + steps.iter().map(|step| step.points()).sum::<usize>();
     let through = part.through(&steps);
     let walk = Walk {
         copy: programs.walk().copy.identity()?,
@@ -3906,7 +3995,7 @@ pub(super) fn walk_points(topology: &DeviceTopology, executor: &Executor, part: 
     let (routes, _) = Route::all(topology, executor)?;
     let routes = routes.iter().collect::<Vec<_>>();
     let steps = plan(&routes, &measured_formats(executor.backend()));
-    Ok(1 + part.through(&steps))
+    Ok(1 + steps[..part.through(&steps)].iter().map(|step| step.points()).sum::<usize>())
 }
 
 /// How far a job walks the plan ([`plan`]): to its last figure the costs
@@ -3987,6 +4076,7 @@ struct Read {
     affine: Ladder,
     chain: Option<ChainRead>,
     activation_matrix: Option<MatrixCosts>,
+    decode_line: Option<DecodeLine>,
     matrices: Vec<(Element, MatrixCosts)>,
     /// The steps that ended without a figure ([`Unobtainable`]).
     unobtainable: Vec<Unobtainable>,
@@ -4017,6 +4107,7 @@ impl Read {
             affine: Ladder::default(),
             chain: None,
             activation_matrix: None,
+            decode_line: None,
             matrices: Vec::new(),
             unobtainable: Vec::new(),
         }
@@ -4120,6 +4211,7 @@ impl Read {
                 .collect(),
             placements,
             activation_matrix: self.activation_matrix,
+            decode_line: self.decode_line,
             matrices: self.matrices,
             dense: HistoryCosts::new(KvCodec::Dense, self.dense.rungs)?,
             affine: HistoryCosts::new(KvCodec::AffineK8V4, self.affine.rungs)?,
@@ -4170,7 +4262,7 @@ impl Walk<'_> {
                     Ok(Reach::Ends) | Err(_) => None,
                 },
             },
-            Step::WeightRate(..) | Step::Launch(_) => None,
+            Step::WeightRate(..) | Step::Launch(_) | Step::DecodeLine => None,
         }
     }
 
@@ -4324,6 +4416,9 @@ impl Walk<'_> {
                 } else {
                     read.matrices.push((format, matrix));
                 }
+            }
+            Step::DecodeLine => {
+                read.decode_line = Some(decode_line(&self.programs, self.routes[0], times, share)?);
             }
         }
         Ok(())
@@ -4608,6 +4703,115 @@ fn matrix<T: Times>(
         flops: MeasuredCost::rate(flops, &timing),
         features,
     })
+}
+
+/// The two row counts [`Step::DecodeLine`] times on the chain format's
+/// `dense_output` projection to fit its [`DecodeLine`]: the multi-row decode
+/// widths that speculative verification (MTP / n-gram) and front passes run.
+const DECODE_LINE_ROWS: [u64; 2] = [4, 8];
+
+/// Fit a [`DecodeLine`] (`fixed >= 0`, `row >= 0`) from the measured 4-row
+/// (`t4`) and 8-row (`t8`) timings of a projection doing `one_row_flops` FLOPs
+/// per row: `row = (t8.median - t4.median) / (4.0 * one_row_flops)` and
+/// `fixed = t4.median / one_row_flops - 4.0 * row`.
+///
+/// Models the physical regimes:
+/// - Resolved slope (`t8 > t4` and `fixed >= 0`): exact two-point fit.
+/// - Flat / tile-quantized (`t8 <= t4`): the cost is not guaranteed monotone
+///   in rows inside one MMA tile — e.g. on RTX 3090 CUDA `q4k@mma16`, 4 rows
+///   measured 95.744 us [94.208, 97.792] while 8 rows measured 88.064 us
+///   [87.381, 90.453] (disjoint intervals). For `t8 <= t4`, the constrained
+///   least-squares (KKT) solution to `fixed >= 0, row >= 0` is `row = 0`,
+///   `fixed = 0.5 * (t4.median + t8.median) / one_row_flops`.
+/// - Zero intercept within noise (`t8 > t4`, `fixed < 0`, both timings carry
+///   confidence intervals, and `2 * hi4 >= lo8`): `fixed = 0`,
+///   `row = t8.median / (8 * one_row_flops)`. When either timing has no
+///   confidence interval (`None`, e.g. too few samples to bound one), there is
+///   no noise bound and `fixed < 0` returns an error stating that explicitly.
+/// - Super-linear beyond noise (`2 * hi4 < lo8`), or non-finite/non-positive
+///   inputs: returns an error.
+fn fit_decode_line(
+    t4: &Timing,
+    t8: &Timing,
+    one_row_flops: f64,
+) -> Result<DecodeLine, ExecutorCostsError> {
+    let valid_interval = |interval: Option<(f64, f64)>| match interval {
+        Some((lo, hi)) => lo.is_finite() && hi.is_finite() && lo >= 0.0 && hi >= lo,
+        None => true,
+    };
+    if !t4.median.is_finite()
+        || !t8.median.is_finite()
+        || !valid_interval(t4.interval)
+        || !valid_interval(t8.interval)
+        || t4.median <= 0.0
+        || t8.median <= 0.0
+        || !one_row_flops.is_finite()
+        || one_row_flops <= 0.0
+    {
+        return Err(ExecutorCostsError(format!(
+            "decode line inputs are not finite positive numbers (t4={t4:?}, t8={t8:?}, flops={one_row_flops})"
+        )));
+    }
+    if t8.median <= t4.median {
+        return Ok(DecodeLine {
+            fixed: 0.5 * (t4.median + t8.median) / one_row_flops,
+            row: 0.0,
+        });
+    }
+    let row = (t8.median - t4.median) / (4.0 * one_row_flops);
+    let fixed = t4.median / one_row_flops - 4.0 * row;
+    if !row.is_finite() || !fixed.is_finite() {
+        return Err(ExecutorCostsError(format!(
+            "decode line fit is non-finite (fixed={fixed:.6e} s/FLOP, row={row:.6e} s/FLOP)"
+        )));
+    }
+    if fixed >= 0.0 {
+        return Ok(DecodeLine { fixed, row });
+    }
+    match (t4.interval, t8.interval) {
+        (Some((_, hi4)), Some((lo8, _))) if 2.0 * hi4 >= lo8 => Ok(DecodeLine {
+            fixed: 0.0,
+            row: t8.median / (8.0 * one_row_flops),
+        }),
+        (Some((lo4, hi4)), Some((lo8, hi8))) => Err(ExecutorCostsError(format!(
+            "decode line has negative intercept beyond measurement noise (fixed={fixed:.6e} s/FLOP, row={row:.6e} s/FLOP from 4-row [{lo4:.6e}, {hi4:.6e}] s, 8-row [{lo8:.6e}, {hi8:.6e}] s)"
+        ))),
+        _ => Err(ExecutorCostsError(format!(
+            "decode line has negative intercept with no confidence interval to bound measurement noise (fixed={fixed:.6e} s/FLOP, row={row:.6e} s/FLOP from t4={t4:?}, t8={t8:?})"
+        ))),
+    }
+}
+
+/// The decode row line of the chain format's ([`CHAIN_FORMAT`])
+/// `dense_output` projection along `route`, fitted from 4 and 8 rows over one
+/// argument set.
+///
+/// Uses the single-projection `dense_output` kernel on the quantized chain
+/// format (Q4_K) rather than `dense_expand` (which fuses gate + up) or bf16,
+/// reusing the device route's weight backing.
+fn decode_line<T: Times>(
+    programs: &ProgramSet,
+    route: &Route,
+    times: &mut T,
+    share: Share,
+) -> Result<DecodeLine, Stop<T::Missing>> {
+    let format = programs.walk().chain;
+    let (features, _) = programs.expand(format);
+    let identity = programs.walk().output.identity()?;
+    let point = weight_point(features, 1, route);
+    let [r4, r8] = DECODE_LINE_ROWS;
+    let spec = |rows: u64| PointSpec::new(vec![identity.clone()], &[("rows", rows)], &point);
+    let build_for = |rows: u64| {
+        calls::<dense_output::Entry, _>(
+            |formed: &Programs| formed.decode_line(),
+            move |charges, backings| OutputCase::new(charges, backings, format, route, rows, features, 1),
+            OutputCase::args,
+        )
+    };
+    let flops = 2.0 * (features * HIDDEN) as f64;
+    let t4 = times.time(spec(r4), programs, &mut build_for(r4), share)?;
+    let t8 = times.time(spec(r8), programs, &mut build_for(r8), share)?;
+    fit_decode_line(&t4, &t8, flops).map_err(Stop::Point)
 }
 
 impl Walk<'_> {
@@ -5198,6 +5402,7 @@ mod tests {
         let programs = Programs {
             walk: Some(FormedWalkPrograms {
                 expands: vec![(Element::bf16(), Pending::new(), Pending::new())],
+                decode_line: Pending::new(),
                 output: Pending::new(),
                 dense: Pending::new(),
                 affine: Pending::new(),
@@ -5360,7 +5565,7 @@ mod tests {
         let deeper = |layout| (2..HISTORY_DEPTHS.len()).map(move |index| Step::Rung(layout, Rung::Depth(index)));
         let mut expected = vec![Step::Launch(GraphTiming::Device)];
         expected.extend(first(KvCodec::Dense));
-        expected.extend([Step::Chain, Step::Matrix(bf16)]);
+        expected.extend([Step::Chain, Step::Matrix(bf16), Step::DecodeLine]);
         expected.extend(first(KvCodec::AffineK8V4));
         expected.extend([
             Step::Launch(GraphTiming::Waited),
@@ -5479,6 +5684,7 @@ mod tests {
         let derived = costs.derived(seismic::BackendName::Cpu);
         for figure in [
             Derived::ActivationMatrix,
+            Derived::DecodeLine,
             Derived::History(KvCodec::Dense),
             Derived::History(KvCodec::AffineK8V4),
         ] {
@@ -5612,5 +5818,77 @@ mod tests {
                 assert!(!formats[..at].contains(format), "{backend:?} {format:?}");
             }
         }
+    }
+
+    /// Valid 4-row and 8-row timings fit the exact decode line when resolved,
+    /// collapse to a flat least-squares line (`row = 0`) when `t8 <= t4`
+    /// (bandwidth-bound or tile-quantized kernels such as CUDA `q4k@mma16`),
+    /// and collapse to zero intercept when `fixed < 0` within measurement spread.
+    #[test]
+    fn decode_line_fits_exact_fixed_and_row_from_four_and_eight_rows() {
+        let timing = |median, interval| Timing { median, interval, samples: 16 };
+        let flops = 2.0 * (16384 * HIDDEN) as f64;
+        let expected = DecodeLine { fixed: 0.25e-12, row: 0.31e-12 };
+        let t4 = flops * (expected.fixed + 4.0 * expected.row);
+        let t8 = flops * (expected.fixed + 8.0 * expected.row);
+        let fitted = fit_decode_line(&timing(t4, None), &timing(t8, None), flops).unwrap();
+        assert!((fitted.fixed - expected.fixed).abs() < 1e-24, "{fitted:?}");
+        assert!((fitted.row - expected.row).abs() < 1e-24, "{fitted:?}");
+
+        // Equal medians (zero slope, positive intercept) are valid.
+        let flat = fit_decode_line(&timing(1e-3, None), &timing(1e-3, None), flops).unwrap();
+        assert_eq!(flat.row, 0.0);
+        assert!((flat.fixed - 1e-3 / flops).abs() < 1e-24, "{flat:?}");
+
+        // t8 < t4 (memory-bound or tile-quantized, e.g. RTX 3090 CUDA q4k@mma16
+        // 95.7 us vs 88.1 us): row = 0, fixed = 0.5 * (t4 + t8) / flops.
+        let tile_flat = fit_decode_line(
+            &timing(95.744e-6, Some((94.208e-6, 97.792e-6))),
+            &timing(88.064e-6, Some((87.381e-6, 90.453e-6))),
+            flops,
+        )
+        .unwrap();
+        assert_eq!(tile_flat.row, 0.0);
+        assert!(
+            (tile_flat.fixed - 0.5 * (95.744e-6 + 88.064e-6) / flops).abs() < 1e-24,
+            "{tile_flat:?}"
+        );
+
+        // fixed < 0 within measurement noise (2 * hi4 >= lo8): fixed = 0, row = t8 / (8 * flops).
+        let zero_intercept = fit_decode_line(
+            &timing(1.00e-3, Some((0.98e-3, 1.03e-3))),
+            &timing(2.02e-3, Some((1.99e-3, 2.05e-3))),
+            flops,
+        )
+        .unwrap();
+        assert_eq!(zero_intercept.fixed, 0.0);
+        assert!((zero_intercept.row - 2.02e-3 / (8.0 * flops)).abs() < 1e-24, "{zero_intercept:?}");
+    }
+
+    /// Super-linear negative-intercept beyond measurement noise (`2 * hi4 < lo8`)
+    /// and non-finite or non-positive inputs return an error.
+    #[test]
+    fn decode_line_rejects_negative_intercept_and_non_finite() {
+        let timing = |median, interval| Timing { median, interval, samples: 16 };
+        let flops = 1e9;
+        // t8 > 2 * t4 beyond measurement noise (2 * hi4 < lo8)
+        let negative_intercept = fit_decode_line(
+            &timing(1.0e-3, Some((0.98e-3, 1.02e-3))),
+            &timing(2.5e-3, Some((2.45e-3, 2.55e-3))),
+            flops,
+        )
+        .unwrap_err();
+        assert!(negative_intercept.0.contains("beyond measurement noise"), "{negative_intercept}");
+        // t8 > 2 * t4 with missing interval states there is no noise bound
+        let missing_bound = fit_decode_line(&timing(1.0e-3, None), &timing(2.02e-3, None), flops).unwrap_err();
+        assert!(missing_bound.0.contains("no confidence interval"), "{missing_bound}");
+        // Non-finite, non-positive, or inverted-interval inputs
+        assert!(fit_decode_line(&timing(f64::NAN, None), &timing(2.0e-3, None), flops).is_err());
+        assert!(fit_decode_line(&timing(1.0e-3, None), &timing(f64::INFINITY, None), flops).is_err());
+        assert!(fit_decode_line(&timing(0.0, None), &timing(2.0e-3, None), flops).is_err());
+        assert!(fit_decode_line(&timing(-1.0e-3, None), &timing(2.0e-3, None), flops).is_err());
+        assert!(fit_decode_line(&timing(1.0e-3, Some((f64::NAN, 1.1e-3))), &timing(2.0e-3, None), flops).is_err());
+        assert!(fit_decode_line(&timing(1.0e-3, Some((1.2e-3, 0.9e-3))), &timing(2.0e-3, None), flops).is_err());
+        assert!(fit_decode_line(&timing(1.0e-3, None), &timing(2.0e-3, None), 0.0).is_err());
     }
 }

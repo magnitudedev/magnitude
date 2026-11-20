@@ -101,6 +101,10 @@ pub fn costs() -> super::ExecutorCosts {
         },
         routes: Vec::new(),
         activation_matrix: Some(matrix()),
+        decode_line: Some(seismic::measure::pricing::DecodeLine {
+            fixed: 0.25e-12,
+            row: 0.31e-12,
+        }),
         matrices: formats
             .into_iter()
             .map(|format| (format, matrix()))

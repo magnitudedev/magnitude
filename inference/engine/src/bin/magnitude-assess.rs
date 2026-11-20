@@ -638,6 +638,10 @@ fn costs(costs: &ExecutorCosts, backend: seismic::BackendName, pending: bool) ->
             .map(|measured| matrix(Element::bf16(), measured))
             .chain(costs.matrices.iter().map(|(format, measured)| matrix(*format, measured)))
             .collect::<Vec<_>>(),
+        "decodeLine": costs.decode_line.map(|line| json!({
+            "fixedSecondsPerFlop": line.fixed,
+            "rowSecondsPerFlop": line.row,
+        })),
         "history": [history(&costs.dense), history(&costs.affine)],
         "composition": match costs.composition() {
             Ok(composition) => cost(&composition),
@@ -653,6 +657,7 @@ fn costs(costs: &ExecutorCosts, backend: seismic::BackendName, pending: bool) ->
                 json!({ "weightRate": { "route": route, "format": format.name() } })
             }
             Derived::ActivationMatrix => json!("activationMatrix"),
+            Derived::DecodeLine => json!("decodeLine"),
             Derived::MatrixThroughput(format) => {
                 json!({ "matrixThroughput": format.name() })
             }
