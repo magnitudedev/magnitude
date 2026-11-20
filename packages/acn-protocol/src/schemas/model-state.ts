@@ -2035,7 +2035,7 @@ export const LocalModelFamilySchema = Schema.Struct({
 export type LocalModelFamily = typeof LocalModelFamilySchema.Type
 
 /** The decode speed a chosen rung should reach: a long agent conversation stays responsive. */
-export const TARGET_TOKENS_PER_SECOND = 16
+export const TARGET_TOKENS_PER_SECOND = 20
 /** The decode speed below which onboarding recommends no model. */
 export const ONBOARDING_FLOOR_TOKENS_PER_SECOND = 10
 
