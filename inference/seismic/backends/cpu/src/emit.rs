@@ -487,11 +487,17 @@ impl Emitter<'_, '_> {
                         BitOp::And => self.builder.ins().band(a, b),
                         BitOp::Or => self.builder.ins().bor(a, b),
                         BitOp::Xor => self.builder.ins().bxor(a, b),
-                        BitOp::Shl => self.builder.ins().ishl(a, b),
+                        BitOp::Shl => self.map_vector_binary(out.ty, a, b, |this, a, b| {
+                            this.builder.ins().ishl(a, b)
+                        }),
                         BitOp::Shr if vector_dtype(out.ty) == DType::I32 => {
-                            self.builder.ins().sshr(a, b)
+                            self.map_vector_binary(out.ty, a, b, |this, a, b| {
+                                this.builder.ins().sshr(a, b)
+                            })
                         }
-                        BitOp::Shr => self.builder.ins().ushr(a, b),
+                        BitOp::Shr => self.map_vector_binary(out.ty, a, b, |this, a, b| {
+                            this.builder.ins().ushr(a, b)
+                        }),
                     };
                     self.define(out.value, value);
                 }
@@ -1023,8 +1029,13 @@ impl Emitter<'_, '_> {
                     this.builder.ins().select(negative, neg, lane)
                 }),
             }
+        } else if matches!(dtype, DType::U32 | DType::U64) {
+            match op {
+                UnaryOp::Neg => self.builder.ins().ineg(value),
+                UnaryOp::Abs => value,
+            }
         } else {
-            panic!("unsigned vector reached a signed unary operation")
+            panic!("unsupported vector unary dtype {dtype:?}")
         };
         value
     }
@@ -1867,10 +1878,8 @@ impl Emitter<'_, '_> {
         self.builder
             .ins()
             .brif(condition, then_block, &[], else_block, &[]);
-        let parent = self.values.clone();
         self.builder.switch_to_block(then_block);
         self.builder.seal_block(then_block);
-        self.values = parent.clone();
         let then_values = self
             .emit_block(then_id)
             .expect("typed branch arm ends in Yield");
@@ -1881,7 +1890,6 @@ impl Emitter<'_, '_> {
         self.builder.ins().jump(join, &then_args);
         self.builder.switch_to_block(else_block);
         self.builder.seal_block(else_block);
-        self.values = parent.clone();
         let else_values = self
             .emit_block(else_id)
             .expect("typed branch arm ends in Yield");
@@ -1892,7 +1900,6 @@ impl Emitter<'_, '_> {
         self.builder.ins().jump(join, &else_args);
         self.builder.switch_to_block(join);
         self.builder.seal_block(join);
-        self.values = parent;
         let params = self.builder.block_params(join).to_vec();
         for (out, value) in outs.iter().zip(params) {
             self.define(out.value, value);
@@ -1949,10 +1956,9 @@ impl Emitter<'_, '_> {
         );
         self.builder.switch_to_block(body_block);
         self.builder.seal_block(body_block);
-        let parent = self.values.clone();
-        self.values.insert(binder, current);
+        self.define(binder, current);
         for (parameter, value) in carry_params.iter().zip(params.iter().copied().skip(1)) {
-            self.values.insert(parameter.value, value);
+            self.define(parameter.value, value);
         }
         let yielded = self
             .emit_block(body)
@@ -1969,7 +1975,6 @@ impl Emitter<'_, '_> {
         self.builder.seal_block(header);
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
-        self.values = parent;
         let results = self.builder.block_params(done).to_vec();
         for (out, value) in outs.iter().zip(results) {
             self.define(out.value, value);
@@ -2046,6 +2051,10 @@ fn native_type(ty: ValueType) -> ir::Type {
     }
 }
 
+pub(crate) fn native_scalar_bits(dtype: DType) -> u16 {
+    u16::try_from(native_scalar_type(dtype).bits()).expect("native scalar bit width fits in u16")
+}
+
 fn native_scalar_type(dtype: DType) -> ir::Type {
     if dtype == DType::F32 {
         types::F32
@@ -2071,6 +2080,6 @@ fn scalar_zero(builder: &mut FunctionBuilder<'_>, dtype: DType) -> Value {
     if dtype == DType::F32 {
         builder.ins().f32const(0.0)
     } else {
-        builder.ins().iconst(types::I32, 0)
+        builder.ins().iconst(native_scalar_type(dtype), 0)
     }
 }

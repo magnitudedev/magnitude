@@ -2034,12 +2034,7 @@ impl RepackExecutor<'_> {
             self.program.output_starts.len(),
             "an output base per segment"
         );
-        // The value slots' base is the buffer's own pointer (`Vec::as_ptr`):
-        // the references through which the evaluation then writes the slots
-        // derive from it, so reading through it afterwards stays valid.
-        let (rows, slots) = self.inputs.split_at_mut(sources.len());
-        rows.copy_from_slice(sources);
-        slots[0] = self.slots.as_ptr();
+        self.inputs[..sources.len()].copy_from_slice(sources);
         #[cfg(target_arch = "aarch64")]
         // SAFETY: every aarch64 target has NEON, and as this function's.
         unsafe {
@@ -2077,6 +2072,9 @@ impl RepackExecutor<'_> {
                 }
             }
         }
+        // Derive the slots' base pointer only after every `&mut self.slots[..]`
+        // write in the group loop finishes, so no mutable reference invalidates it.
+        *self.inputs.last_mut().expect("slots base slot") = self.slots.as_ptr();
         // SAFETY: as this function's.
         unsafe { program.output.execute(&self.inputs, outputs) };
     }

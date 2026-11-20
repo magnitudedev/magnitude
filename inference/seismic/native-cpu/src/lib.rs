@@ -240,9 +240,9 @@ impl<'a> Weights<'a> {
         } else {
             0
         };
-        let mut view = unsafe { Self::from_raw(base, rows.max(1), k, dense_stride, operand) };
+        let mut view = unsafe { Self::from_raw(base, rows, k, dense_stride, operand) };
         view.geometry.matrix_rows = if rank >= 2 {
-            extents[rank - 2] as usize
+            (extents[rank - 2] as usize).max(1)
         } else {
             1
         };
@@ -396,7 +396,9 @@ impl<'a> Weights<'a> {
     /// alone.
     #[inline(always)]
     pub fn dot_q8(&self, first: usize, x: &[quant::Q8Block], out: &mut [f32]) {
-        let activations = x.len() / quant::blocks(self.k);
+        let blocks = quant::blocks(self.k);
+        assert!(blocks > 0, "dot_q8 requires non-empty rows (k > 0)");
+        let activations = x.len() / blocks;
         assert!(
             activations > 0 && first + out.len() / activations <= self.rows,
             "rows from {first} of {} against {activations} activation rows",
@@ -433,11 +435,32 @@ impl<'a> Weights<'a> {
     /// its row alone, bit for bit.
     #[inline(always)]
     pub fn tile_q8(&self, first: usize, x: &[quant::Q8Tile], m: usize, out: &mut [f32]) {
+        assert!(m > 0, "tile_q8 requires at least one activation row");
         let n = out.len() / m;
-        assert!(m > 0 && n * m == out.len() && first + n <= self.rows, "rows {first}..{} of {} against {m} activation rows", first + n, self.rows);
+        assert!(n * m == out.len() && first + n <= self.rows, "rows {first}..{} of {} against {m} activation rows", first + n, self.rows);
         // SAFETY: the rows lie inside the operand (`from_raw`).
         unsafe {
             self.kernels.tile_q8(self.base.add(first * self.geometry.stride), &self.geometry, n, x, m, self.k, out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_tensor_preserves_zero_rows() {
+        let operand = WeightOperand::of(
+            Tier::detected().expect("host tier"),
+            registry::dense(seismic_lang::types::DType::F32),
+        )
+        .expect("dense f32 weight operand");
+        let sentinel = [0.0f32; 4];
+        let weights = unsafe {
+            Weights::from_tensor(sentinel.as_ptr().cast::<u8>(), &[0, 4], &[4, 1], operand)
+        };
+        assert_eq!(weights.rows(), 0);
+        assert_eq!(weights.k(), 4);
     }
 }

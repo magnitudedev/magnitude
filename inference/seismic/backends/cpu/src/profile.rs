@@ -325,8 +325,8 @@ fn vector_support(specs: &CpuDeviceInfo) -> VectorSupport {
 
     let mut entries = Vec::new();
     for tier in &specs.simd {
-        let lanes = tier.f32_lanes();
         for dtype in DType::ALL {
+            let lanes = tier.bits() / crate::emit::native_scalar_bits(dtype);
             let mut operations = vec![
                 VectorOperationClass::Splat,
                 VectorOperationClass::Lane,
@@ -349,7 +349,11 @@ fn vector_support(specs: &CpuDeviceInfo) -> VectorSupport {
                     }),
             );
             for to in DType::ALL {
-                operations.push(VectorOperationClass::Cast { to });
+                if u32::from(lanes) * u32::from(crate::emit::native_scalar_bits(to))
+                    <= u32::from(tier.bits())
+                {
+                    operations.push(VectorOperationClass::Cast { to });
+                }
             }
             if dtype == DType::Bool {
                 operations.extend([
@@ -440,5 +444,58 @@ fn call_conv_tag(call_conv: cranelift_codegen::isa::CallConv) -> u8 {
         CallConv::AppleAarch64 => 5,
         CallConv::Probestack => 6,
         CallConv::Winch => 7,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_support_respects_native_scalar_widths() {
+        let specs = CpuDeviceInfo {
+            workers: 1,
+            codegen: CodegenPolicy::host().expect("host codegen"),
+            scratch: ScratchPolicy {
+                workgroup_bytes: 0,
+                participant_bytes: 0,
+                alignment: SCRATCH_ALIGNMENT,
+            },
+            simd: vec![SimdTier::Bits128, SimdTier::Bits256, SimdTier::Bits512],
+            simd_fma: vec![SimdTier::Bits128, SimdTier::Bits256, SimdTier::Bits512],
+            math_identity: MATH_IDENTITY,
+            math_version: MATH_VERSION,
+        };
+        let support = vector_support(&specs);
+        let u64_lanes: Vec<u16> = support
+            .entries
+            .iter()
+            .filter(|entry| entry.dtype == DType::U64)
+            .map(|entry| entry.lanes)
+            .collect();
+        assert_eq!(u64_lanes, vec![2, 4, 8]);
+        for entry in &support.entries {
+            let bits =
+                u32::from(entry.lanes) * u32::from(crate::emit::native_scalar_bits(entry.dtype));
+            assert!(
+                bits <= 512,
+                "vector {:?}x{} exceeds 512 bits",
+                entry.dtype,
+                entry.lanes
+            );
+            for op in &entry.operations {
+                if let VectorOperationClass::Cast { to } = op {
+                    let target_bits =
+                        u32::from(entry.lanes) * u32::from(crate::emit::native_scalar_bits(*to));
+                    assert!(
+                        target_bits <= 512,
+                        "cast {:?}x{} -> {:?} exceeds 512 bits",
+                        entry.dtype,
+                        entry.lanes,
+                        to
+                    );
+                }
+            }
+        }
     }
 }

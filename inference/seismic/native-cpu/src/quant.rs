@@ -148,6 +148,9 @@ pub const fn tiles(m: usize, blocks: usize) -> usize {
 /// tiles (`[row group][block]`, [`tiles`] of them), rows past `m` zero.
 pub fn interleave(rows: &[Q8Block], m: usize, blocks: usize, out: &mut [Q8Tile]) {
     assert!(rows.len() == m * blocks && out.len() == tiles(m, blocks), "{m} rows of {blocks} blocks");
+    if blocks == 0 {
+        return;
+    }
     out.fill(Q8Tile::ZERO);
     for (row, blocks_of) in rows.chunks_exact(blocks).enumerate() {
         let group = &mut out[row / TILE_ROWS * blocks..][..blocks];
@@ -447,5 +450,11 @@ pub(crate) mod tests {
         quantize(&x, &mut blocks);
         assert_exact(&x, &blocks);
         assert!(blocks.iter().all(|block| block.d > 0.0 && block.d < f32::MIN_POSITIVE));
+    }
+
+    #[test]
+    fn interleave_zero_blocks_is_noop() {
+        interleave(&[], 0, 0, &mut []);
+        interleave(&[], 4, 0, &mut []);
     }
 }
