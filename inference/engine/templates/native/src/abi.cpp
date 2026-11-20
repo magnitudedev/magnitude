@@ -45,7 +45,7 @@ std::mutex mutex;
 uint64_t next_handle = 1;
 std::unordered_map<uint64_t, std::shared_ptr<const template_state>> templates;
 std::unordered_map<uint64_t, std::shared_ptr<const prepared_state>> requests;
-std::unordered_map<uint64_t, std::unique_ptr<templates_native::output_stream>> streams;
+std::unordered_map<uint64_t, std::shared_ptr<templates_native::output_stream>> streams;
 std::unordered_map<uint64_t, std::unique_ptr<std::string>> buffers;
 
 uint64_t allocate_handle() {
@@ -57,10 +57,32 @@ uint64_t allocate_handle() {
 
 templates_buffer owned(std::string value) {
     auto storage = std::make_unique<std::string>(std::move(value));
+    templates_buffer result{reinterpret_cast<const uint8_t *>(storage->data()), storage->size(), 0};
+    std::lock_guard<std::mutex> lock(mutex);
     auto id = allocate_handle();
-    templates_buffer result{reinterpret_cast<const uint8_t *>(storage->data()), storage->size(), id};
+    result.owner = id;
     buffers.emplace(id, std::move(storage));
     return result;
+}
+
+template<typename Map>
+uint64_t insert_handle(Map & table, typename Map::mapped_type value) {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto id = allocate_handle();
+    table.emplace(id, std::move(value));
+    return id;
+}
+
+template<typename Map>
+void erase_handle(Map & table, uint64_t handle, const char * message) {
+    typename Map::mapped_type removed;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = table.find(handle);
+        if (it == table.end()) { throw abi_error(TEMPLATES_INVALID_HANDLE, message); }
+        removed = std::move(it->second);
+        table.erase(it);
+    }
 }
 
 template<typename F>
@@ -68,7 +90,6 @@ int32_t guarded(templates_buffer * error, F && function) noexcept {
     if (!error) { return TEMPLATES_INVALID_ARGUMENT; }
     *error = {};
     try {
-        std::lock_guard<std::mutex> lock(mutex);
         templates_native::diagnostics.clear();
         templates_native::relaxations.clear();
         templates_native::renders = 0;
@@ -111,29 +132,29 @@ json payload(const uint8_t * input, uint64_t size) {
     return data;
 }
 
-std::shared_ptr<const template_state> get_template_shared(uint64_t handle) {
+std::shared_ptr<const template_state> get_template(uint64_t handle) {
+    std::lock_guard<std::mutex> lock(mutex);
     auto it = templates.find(handle);
     if (it == templates.end()) { throw abi_error(TEMPLATES_INVALID_HANDLE, "Unknown or released template handle"); }
     return it->second;
-}
-
-const template_state & get_template(uint64_t handle) {
-    return *get_template_shared(handle);
 }
 
 void require_output(const void * output) {
     if (!output) { throw std::invalid_argument("Null output pointer"); }
 }
 
-const prepared_state & get_request(uint64_t handle) {
+std::shared_ptr<const prepared_state> get_request(uint64_t handle) {
+    std::lock_guard<std::mutex> lock(mutex);
     auto it = requests.find(handle);
     if (it == requests.end()) { throw abi_error(TEMPLATES_INVALID_HANDLE, "Unknown or released prepared request"); }
-    return *it->second;
+    return it->second;
 }
-templates_native::output_stream & get_stream(uint64_t handle) {
+
+std::shared_ptr<templates_native::output_stream> get_stream(uint64_t handle) {
+    std::lock_guard<std::mutex> lock(mutex);
     auto it = streams.find(handle);
     if (it == streams.end()) { throw abi_error(TEMPLATES_INVALID_HANDLE, "Unknown or released stream"); }
-    return *it->second;
+    return it->second;
 }
 
 void append_json_string(std::string & out, std::string_view s) {
@@ -297,9 +318,16 @@ uint32_t templates_abi_version(void) { return 1; }
 
 int32_t templates_buffer_release(uint64_t owner) {
     try {
-        std::lock_guard<std::mutex> lock(mutex);
         if (!owner) { return TEMPLATES_OK; }
-        return buffers.erase(owner) ? TEMPLATES_OK : TEMPLATES_INVALID_HANDLE;
+        std::unique_ptr<std::string> removed;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = buffers.find(owner);
+            if (it == buffers.end()) { return TEMPLATES_INVALID_HANDLE; }
+            removed = std::move(it->second);
+            buffers.erase(it);
+        }
+        return TEMPLATES_OK;
     } catch (...) { return TEMPLATES_NATIVE_ERROR; }
 }
 
@@ -330,15 +358,13 @@ int32_t templates_template_create(const uint8_t * input, uint64_t size,
             tokens.value("bos_token", std::string()), tokens.value("eos_token", std::string()));
         state->special_tokens = std::move(tokens);
         state->reads_preserve_thinking = common_chat_templates_reads_preserve_thinking(state->compiled.get());
-        auto id = allocate_handle();
-        templates.emplace(id, std::move(state));
-        *output = id;
+        *output = insert_handle(templates, std::move(state));
     });
 }
 
 int32_t templates_template_release(uint64_t handle, templates_buffer * error) {
     return guarded(error, [&] {
-        if (!templates.erase(handle)) { throw abi_error(TEMPLATES_INVALID_HANDLE, "Unknown or released template handle"); }
+        erase_handle(templates, handle, "Unknown or released template handle");
     });
 }
 
@@ -346,12 +372,12 @@ int32_t templates_template_inspect(uint64_t handle, templates_buffer * output, t
     if (output) { *output = {}; }
     return guarded(error, [&] {
         require_output(output);
-        auto & state = get_template(handle);
+        auto state = get_template(handle);
         *output = owned(json({
             {"version", 1},
-            {"capabilities", common_chat_templates_get_caps(state.compiled.get())},
-            {"handler_context_variables", common_chat_templates_handler_context_variables(state.compiled.get())},
-            {"template_reasoning_identifiers", common_chat_templates_reasoning_identifiers(state.compiled.get())}
+            {"capabilities", common_chat_templates_get_caps(state->compiled.get())},
+            {"handler_context_variables", common_chat_templates_handler_context_variables(state->compiled.get())},
+            {"template_reasoning_identifiers", common_chat_templates_reasoning_identifiers(state->compiled.get())}
         }).dump());
     });
 }
@@ -361,16 +387,16 @@ int32_t templates_template_render(uint64_t handle, const uint8_t * input, uint64
     if (output) { *output = {}; }
     return guarded(error, [&] {
         require_output(output);
-        auto & state = get_template(handle);
+        auto state = get_template(handle);
         auto data = payload(input, size);
         auto context = data.at("context");
         if (!context.is_object()) { throw std::invalid_argument("Render context must be an object"); }
-        for (const auto & [key, value] : state.special_tokens.items()) {
+        for (const auto & [key, value] : state->special_tokens.items()) {
             if (context.contains(key)) { throw std::invalid_argument("Context overrides an artifact special token"); }
             context[key] = value;
         }
         auto now = data.at("now").get<int64_t>();
-        const auto & compiled = common_chat_templates_get_default(state.compiled.get());
+        const auto & compiled = common_chat_templates_get_default(state->compiled.get());
         jinja::context ctx(compiled.source());
         ctx.current_time = static_cast<time_t>(now);
         jinja::global_from_json(ctx, context, false);
@@ -383,68 +409,30 @@ int32_t templates_template_render(uint64_t handle, const uint8_t * input, uint64
 int32_t templates_template_probe(uint64_t handle, const uint8_t * input, uint64_t size,
     templates_buffer * output, templates_buffer * error) {
     if (output) { *output = {}; }
-    if (!error) { return TEMPLATES_INVALID_ARGUMENT; }
-    *error = {};
-    auto record_error = [&](const char * message) {
-        std::lock_guard<std::mutex> lock(mutex);
-        *error = owned(message);
-    };
-    try {
-        try {
-            require_output(output);
-            std::shared_ptr<const template_state> state_ptr;
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                state_ptr = get_template_shared(handle);
-            }
-            templates_native::diagnostics.clear();
-            templates_native::relaxations.clear();
-            templates_native::renders = 0;
-            auto prepared = apply_request_payload(*state_ptr, input, size);
-            const auto & params = prepared.parameters;
-            std::string out;
-            out.reserve(params.prompt.size() + params.generation_prompt.size() + params.thinking_start_tag.size() + 256);
-            out.append("{\"prompt\":");
-            append_json_string(out, params.prompt);
-            out.append(",\"generation_prefix\":");
-            append_json_string(out, params.generation_prompt);
-            out.append(",\"parser_hash\":");
-            append_json_hash128(out, params.parser);
-            out.append(",\"grammar_hash\":");
-            append_json_hash128(out, params.grammar);
-            out.append(",\"supports_thinking\":");
-            out.append(params.supports_thinking ? "true" : "false");
-            out.append(",\"thinking_start\":");
-            append_json_string(out, params.thinking_start_tag);
-            out.append(",\"thinking_ends\":");
-            append_json_string_array(out, params.thinking_end_tags);
-            out.push_back('}');
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                *output = owned(std::move(out));
-            }
-            return TEMPLATES_OK;
-        } catch (const abi_error & e) {
-            record_error(e.what());
-            return e.status;
-        } catch (const std::invalid_argument & e) {
-            record_error(e.what());
-            return TEMPLATES_INVALID_ARGUMENT;
-        } catch (const std::bad_alloc &) {
-            throw;
-        } catch (const std::exception & e) {
-            record_error(e.what());
-            return TEMPLATES_NATIVE_ERROR;
-        }
-    } catch (const std::bad_alloc &) {
-        static const std::string_view message = "Native templates allocation failed";
-        *error = {reinterpret_cast<const uint8_t *>(message.data()), message.size(), 0};
-        return TEMPLATES_OUT_OF_MEMORY;
-    } catch (...) {
-        static const std::string_view message = "Unknown native templates failure";
-        *error = {reinterpret_cast<const uint8_t *>(message.data()), message.size(), 0};
-        return TEMPLATES_NATIVE_ERROR;
-    }
+    return guarded(error, [&] {
+        require_output(output);
+        auto state = get_template(handle);
+        auto prepared = apply_request_payload(*state, input, size);
+        const auto & params = prepared.parameters;
+        std::string out;
+        out.reserve(params.prompt.size() + params.generation_prompt.size() + params.thinking_start_tag.size() + 256);
+        out.append("{\"prompt\":");
+        append_json_string(out, params.prompt);
+        out.append(",\"generation_prefix\":");
+        append_json_string(out, params.generation_prompt);
+        out.append(",\"parser_hash\":");
+        append_json_hash128(out, params.parser);
+        out.append(",\"grammar_hash\":");
+        append_json_hash128(out, params.grammar);
+        out.append(",\"supports_thinking\":");
+        out.append(params.supports_thinking ? "true" : "false");
+        out.append(",\"thinking_start\":");
+        append_json_string(out, params.thinking_start_tag);
+        out.append(",\"thinking_ends\":");
+        append_json_string_array(out, params.thinking_end_tags);
+        out.push_back('}');
+        *output = owned(std::move(out));
+    });
 }
 
 int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_t size,
@@ -452,11 +440,9 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
     if (output) { *output = 0; }
     return guarded(error, [&] {
         require_output(output);
-        auto & state = get_template(handle);
-        auto prepared = std::make_shared<prepared_state>(apply_request_payload(state, input, size));
-        auto id = allocate_handle();
-        requests.emplace(id, std::move(prepared));
-        *output = id;
+        auto state = get_template(handle);
+        auto prepared = std::make_shared<prepared_state>(apply_request_payload(*state, input, size));
+        *output = insert_handle(requests, std::move(prepared));
     });
 }
 
@@ -464,8 +450,8 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
     if (output) { *output = {}; }
     return guarded(error, [&] {
         require_output(output);
-        const auto & state = get_request(handle);
-        const auto & params = state.parameters;
+        auto state = get_request(handle);
+        const auto & params = state->parameters;
         std::string out;
         out.reserve(params.prompt.size() + params.generation_prompt.size() + params.parser.size() + params.grammar.size() + 1024);
         out.append("{\"version\":1,\"prompt\":");
@@ -507,10 +493,10 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
         out.append(",\"thinking_ends\":");
         append_json_string_array(out, params.thinking_end_tags);
         out.append(",\"diagnostics\":");
-        append_json_string_array(out, state.diagnostics);
+        append_json_string_array(out, state->diagnostics);
         out.append(",\"relaxations\":[");
         bool first_relaxation = true;
-        for (const auto & [tool, relaxation] : state.relaxations) {
+        for (const auto & [tool, relaxation] : state->relaxations) {
             if (!first_relaxation) {
                 out.push_back(',');
             }
@@ -532,7 +518,7 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
             out.push_back('}');
         }
         out.append("],\"renders\":");
-        out.append(std::to_string(state.renders));
+        out.append(std::to_string(state->renders));
         out.push_back('}');
         *output = owned(std::move(out));
     });
@@ -540,7 +526,7 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
 
 int32_t templates_request_release(uint64_t handle, templates_buffer * error) {
     return guarded(error, [&] {
-        if (!requests.erase(handle)) { throw abi_error(TEMPLATES_INVALID_HANDLE, "Unknown or released prepared request"); }
+        erase_handle(requests, handle, "Unknown or released prepared request");
     });
 }
 
@@ -548,10 +534,9 @@ int32_t templates_stream_create(uint64_t handle, uint64_t limit, uint64_t * outp
     if (output) { *output = 0; }
     return guarded(error, [&] {
         require_output(output);
-        auto stream = std::make_unique<templates_native::output_stream>(get_request(handle).parameters, limit);
-        auto id = allocate_handle();
-        streams.emplace(id, std::move(stream));
-        *output = id;
+        auto request = get_request(handle);
+        auto stream = std::make_shared<templates_native::output_stream>(request->parameters, limit);
+        *output = insert_handle(streams, std::move(stream));
     });
 }
 
@@ -560,7 +545,8 @@ int32_t templates_stream_feed(uint64_t handle, const uint8_t * bytes, uint64_t s
     if (output) { *output = {}; }
     return guarded(error, [&] {
         require_output(output);
-        *output = get_stream(handle).feed(bytes, size);
+        auto stream = get_stream(handle);
+        *output = stream->feed(bytes, size);
     });
 }
 
@@ -569,13 +555,14 @@ int32_t templates_stream_finish(uint64_t handle, uint32_t cause,
     if (output) { *output = {}; }
     return guarded(error, [&] {
         require_output(output);
-        *output = get_stream(handle).finish(cause);
+        auto stream = get_stream(handle);
+        *output = stream->finish(cause);
     });
 }
 
 int32_t templates_stream_release(uint64_t handle, templates_buffer * error) {
     return guarded(error, [&] {
-        if (!streams.erase(handle)) { throw abi_error(TEMPLATES_INVALID_HANDLE, "Unknown or released stream"); }
+        erase_handle(streams, handle, "Unknown or released stream");
     });
 }
 }

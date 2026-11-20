@@ -119,6 +119,15 @@ impl Vocabulary {
                 "a vocabulary needs a model-sized projection and explicit stop tokens".into(),
             ));
         }
+        if table
+            .stop_tokens()
+            .iter()
+            .any(|token| token.0 as usize >= table.len())
+        {
+            return Err(GrammarError::Binding(
+                "a stop token must be within the token table".into(),
+            ));
+        }
         let mut words = Vec::with_capacity(projection);
         let mut usable = vec![0u32; projection.div_ceil(32)];
         for id in 0..table.len() {
@@ -229,16 +238,13 @@ impl Vocabulary {
         if !prefix.is_empty() {
             let ids = prefix.iter().map(|token| token.0).collect::<Vec<_>>();
             let accepted = matcher
-                .validate_tokens(&ids)
+                .try_consume_tokens(&ids)
                 .map_err(|error| GrammarError::Binding(error.to_string()))?;
             if accepted != ids.len() {
                 return Err(GrammarError::Binding(
                     "the grammar rejects its prefix".into(),
                 ));
             }
-            matcher
-                .consume_tokens(&ids)
-                .map_err(|error| GrammarError::Binding(error.to_string()))?;
         }
         let mask = mask(&mut matcher, &self.usable)?;
         let charged = grammar.lark().len() + prefix.len() * 4 + mask.len() * 4;

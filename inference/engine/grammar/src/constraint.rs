@@ -77,22 +77,18 @@ impl GrammarConstraint {
         if !content.is_empty() {
             let ids = content.iter().map(|token| token.0).collect::<Vec<_>>();
             let accepted = matcher
-                .validate_tokens(&ids)
+                .try_consume_tokens(&ids)
                 .map_err(|error| GrammarError::Binding(error.to_string()))?;
             if accepted != ids.len() {
                 return violation("the tokens violate the grammar");
             }
-            matcher
-                .consume_tokens(&ids)
-                .map_err(|error| GrammarError::Binding(error.to_string()))?;
         }
         if terminal {
             let stop = *tokens.last().unwrap();
-            let next = mask(&mut matcher, &self.usable)?;
             let accepting = matcher
                 .is_accepting()
                 .map_err(|error| GrammarError::Binding(error.to_string()))?;
-            if !accepting || !allowed(&next, stop) {
+            if !accepting {
                 return violation("the grammar does not end here");
             }
             // A finite grammar can stop as soon as its last content token is

@@ -542,3 +542,100 @@ fn compiled_grammars_agree_with_the_oracle_on_generated_texts() {
         }
     }
 }
+
+#[test]
+fn vocabulary_rejects_out_of_range_stop_tokens() {
+    struct OutOfRangeStops {
+        bytes: Vec<Vec<u8>>,
+        stops: BTreeSet<TokenId>,
+    }
+    impl TokenTable for OutOfRangeStops {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+        fn bytes(&self, token: TokenId) -> Option<&[u8]> {
+            self.bytes.get(token.0 as usize).map(Vec::as_slice)
+        }
+        fn stop_tokens(&self) -> &BTreeSet<TokenId> {
+            &self.stops
+        }
+        fn encode(&self, text: &str) -> Result<Vec<TokenId>, String> {
+            Ok(text.bytes().map(|byte| TokenId(byte.into())).collect())
+        }
+    }
+    let bytes = (0..=255u8).map(|byte| vec![byte]).collect::<Vec<_>>();
+    // Stop token equals table.len() (within projection 264, but outside table).
+    let table = Arc::new(OutOfRangeStops {
+        bytes,
+        stops: BTreeSet::from([TokenId(256)]),
+    });
+    let err = Vocabulary::new(
+        table,
+        264,
+        CacheLimits {
+            entries: 0,
+            bytes: 0,
+        },
+    )
+    .err()
+    .expect("out-of-range stop token must be rejected");
+    assert!(matches!(err, GrammarError::Binding(_)), "{err:?}");
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn compile_cache_deduplicates_concurrent_misses() {
+    let cache = Arc::new(CompileCache::new(8, 1024 * 1024));
+    let gbnf = r#"root ::= "hello" | "world""#;
+    let results: Vec<Arc<Compiled>> = std::thread::scope(|scope| {
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    cache.compile(gbnf).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for compiled in &results[1..] {
+        assert!(
+            Arc::ptr_eq(&results[0], compiled),
+            "concurrent misses must converge on one cached Arc<Compiled>"
+        );
+    }
+}
+
+#[test]
+fn constraint_advance_handles_terminal_stop_token_acceptance() {
+    let mut vocab = vocabulary();
+    let compiled = compile(r#"root ::= "ab" "c"?"#).unwrap();
+    let state = vocab.bind(&compiled.grammar, &[]).unwrap();
+
+    // Not accepting before "ab" is complete: stop token must be rejected.
+    let after_a = state.advance(&tokens("a")).unwrap();
+    assert!(!after_a.stopped());
+    assert!(matches!(
+        after_a.advance(&[TokenId(256)]),
+        Err(GrammarError::Violation(_))
+    ));
+
+    // Accepting after "ab" (non-stopped parser, optional "c" still possible): stop succeeds.
+    let after_ab = after_a.advance(&tokens("b")).unwrap();
+    assert!(after_ab.accepting().unwrap());
+    let stopped_ab = after_ab.advance(&[TokenId(256)]).unwrap();
+    assert!(stopped_ab.stopped());
+    assert!(matches!(
+        stopped_ab.advance(&tokens("c")),
+        Err(GrammarError::Violation(_))
+    ));
+
+    // Finite completion after "abc" (parser already stopped after last content token): stop succeeds.
+    let stopped_abc = after_ab
+        .advance(&[TokenId(b'c' as u32), TokenId(256)])
+        .unwrap();
+    assert!(stopped_abc.stopped());
+}

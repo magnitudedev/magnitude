@@ -41,8 +41,11 @@ pub fn of_closure(package: &str) -> String {
         match locked.source.as_deref() {
             None => {
                 let directory = &workspace.members[&locked.name].directory;
-                watch(directory);
-                collect(directory, directory, &mut files);
+                let mut watches = Vec::new();
+                walk(directory, &mut files, &mut watches);
+                for path in watches {
+                    println!("cargo:rerun-if-changed={}", path.display());
+                }
             }
             // A registry or git package is fixed by its name, version and source.
             Some(source) => {
@@ -250,7 +253,12 @@ impl Workspace {
                 let builds = list(&package["dependencies"])
                     .iter()
                     .filter(|dependency| dependency["kind"].as_str() != Some("dev"))
-                    .filter(|dependency| dependency["target"].as_str().is_none_or(|platform| target.selects(platform)))
+                    .filter(|dependency| {
+                        dependency["kind"].as_str() == Some("build")
+                            || dependency["target"]
+                                .as_str()
+                                .is_none_or(|platform| target.selects(platform))
+                    })
                     .map(|dependency| text(&dependency["name"]).to_owned())
                     .collect();
                 (text(&package["name"]).to_owned(), Member { directory, builds })
@@ -397,40 +405,44 @@ fn entries(directory: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     entries.into_iter().partition(|path| path.is_dir())
 }
 
-fn collect(package: &Path, directory: &Path, files: &mut Vec<PathBuf>) {
-    let (directories, contents) = entries(directory);
-    files.extend(contents.into_iter().filter(|path| is_build_source(path)));
-    for path in directories {
-        if !excluded(package, &path) {
-            collect(package, &path, files);
-        }
-    }
-}
+/// Walks `package`'s directory once in post-order, collecting its build
+/// sources into `files` and its `cargo:rerun-if-changed` paths into `watches`.
+/// A subtree containing no directory the walk leaves out is watched whole, so
+/// Cargo sees files added to it too; otherwise its build sources one by one
+/// and its subdirectories in turn, so no nested package, development target or
+/// build output reruns the script.
+fn walk(package: &Path, files: &mut Vec<PathBuf>, watches: &mut Vec<PathBuf>) {
+    fn visit(
+        package: &Path,
+        directory: &Path,
+        files: &mut Vec<PathBuf>,
+        watches: &mut Vec<PathBuf>,
+    ) -> bool {
+        let (directories, contents) = entries(directory);
+        let sources: Vec<PathBuf> = contents
+            .into_iter()
+            .filter(|path| is_build_source(path))
+            .collect();
+        files.extend(sources.iter().cloned());
 
-/// Watches `package`'s directory: a subtree containing no directory the walk
-/// leaves out is watched whole, so Cargo sees files added to it too;
-/// otherwise its build sources one by one and its subdirectories in turn, so
-/// no nested package, development target or build output reruns the script.
-fn watch(package: &Path) {
-    fn clean(package: &Path, directory: &Path) -> bool {
-        entries(directory).0.iter().all(|path| !excluded(package, path) && clean(package, path))
-    }
-    fn visit(package: &Path, directory: &Path) {
-        if clean(package, directory) {
-            println!("cargo:rerun-if-changed={}", directory.display());
-            return;
-        }
-        let (directories, files) = entries(directory);
-        for path in files.iter().filter(|path| is_build_source(path)) {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
+        let mut clean = true;
+        let mut child_watches = Vec::new();
         for path in directories {
-            if !excluded(package, &path) {
-                visit(package, &path);
+            if excluded(package, &path) {
+                clean = false;
+            } else if !visit(package, &path, files, &mut child_watches) {
+                clean = false;
             }
         }
+        if clean {
+            watches.push(directory.to_owned());
+        } else {
+            watches.extend(sources);
+            watches.extend(child_watches);
+        }
+        clean
     }
-    visit(package, package);
+    visit(package, package, files, watches);
 }
 
 fn text(value: &Value) -> &str {
@@ -517,8 +529,13 @@ mod tests {
             write(relative);
         }
         let mut files = Vec::new();
-        collect(&package, &package, &mut files);
+        let mut watches = Vec::new();
+        walk(&package, &mut files, &mut watches);
         let found = files
+            .iter()
+            .map(|path| path.strip_prefix(&package).expect("under the package").to_owned())
+            .collect::<BTreeSet<_>>();
+        let watched = watches
             .iter()
             .map(|path| path.strip_prefix(&package).expect("under the package").to_owned())
             .collect::<BTreeSet<_>>();
@@ -527,7 +544,12 @@ mod tests {
             .map(PathBuf::from)
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let expected_watches = ["Cargo.toml", "fixtures", "native-library", "src"]
+            .map(PathBuf::from)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         assert_eq!(found, expected);
+        assert_eq!(watched, expected_watches);
     }
 
     /// The workspace's own manifests and lockfile, read without a registry.

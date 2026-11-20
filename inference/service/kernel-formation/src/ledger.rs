@@ -82,8 +82,7 @@ pub struct Ledger {
 impl Ledger {
     /// The ledger at `path`, empty if there is none.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let directory = path.parent().expect("a ledger lives in a directory");
-        let name = PathBuf::from(path.file_name().expect("a ledger is a file"));
+        let (directory, name) = split_path(path)?;
         let store = seismic_io::Store::open(directory.to_owned(), seismic_io::Privacy::Shared).map_err(std::io::Error::other)?;
         let records = parsed(store.shared().and_then(|shared| shared.read(&name, u64::MAX)).map_err(std::io::Error::other)?);
         Ok(Self {
@@ -163,6 +162,20 @@ impl Ledger {
             Err(error) => eprintln!("formation ledger {}: {error}", self.store.root().join(&self.name).display()),
         }
     }
+}
+
+fn split_path(path: &Path) -> std::io::Result<(&Path, PathBuf)> {
+    let name = PathBuf::from(path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("ledger path has no file name: {}", path.display()),
+        )
+    })?);
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Ok((directory, name))
 }
 
 /// The records of a ledger file's bytes, none if there is no file. A line
@@ -320,5 +333,23 @@ mod tests {
     fn keys_separate_their_parts() {
         assert_ne!(Key::of(&[b"ab", b"c"]), Key::of(&[b"a", b"bc"]));
         assert_eq!(Key::of(&[b"ab", b"c"]), Key::of(&[b"ab", b"c"]));
+    }
+
+    #[test]
+    fn open_rejects_paths_without_file_name_and_maps_bare_filename_to_current_dir() {
+        for invalid in [Path::new("/"), Path::new(""), Path::new("."), Path::new("..")] {
+            let err = Ledger::open(invalid)
+                .err()
+                .expect("path without a file name must fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{invalid:?}");
+        }
+        assert_eq!(
+            split_path(Path::new("cuda.ledger")).unwrap(),
+            (Path::new("."), PathBuf::from("cuda.ledger"))
+        );
+        assert_eq!(
+            split_path(Path::new("/tmp/cuda.ledger")).unwrap(),
+            (Path::new("/tmp"), PathBuf::from("cuda.ledger"))
+        );
     }
 }
