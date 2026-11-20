@@ -1106,8 +1106,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Hold `bytes` of device memory for the service's measurement job
     /// beside the model, in place of any grant before, which is dropped
     /// first: a grant on the device's ledger
-    /// (`memory::ledger::GrantRole::Measurement`), taken of free room and
-    /// the cache worth nothing, never the bank's or the retained prefixes';
+    /// (`memory::ledger::GrantRole::Measurement`), taken of free room beside
+    /// the guarantee and reclaimable cache (synchronously reclaiming bank
+    /// cache in rank order before admitting the grant);
     /// the job's footprint is credited against it once its process is named
     /// ([`Self::attach_measurement_process`]), so the job's growth is never
     /// read as others'. The bank's own traffic is held

@@ -7,7 +7,7 @@ use super::changes::Claiming;
 use super::claims::Claim;
 use super::state::{EntryId, State};
 use super::view::Ledger;
-use super::vocabulary::{CacheKind, CommittedKind, GrantRole, Holding, Need, size};
+use super::vocabulary::{CommittedKind, GrantRole, Holding, Need, size};
 
 /// The footprint of a process in a store at a reading: the one way the
 /// ledger reads a process other than through its own entries. The process's
@@ -56,10 +56,12 @@ pub struct Grant {
 
 impl Ledger {
     /// Hold `bytes` for a process's growth as `role`, in `claiming`, a
-    /// change's claim phase: free room beside the
-    /// guarantee within the boundary, and the cache worth nothing; never
-    /// the bank's or the retained prefixes' (`State::take_beside`). Short,
-    /// nothing is held, and the claim waits for the next reading.
+    /// change's claim phase: free room beside the guarantee within the
+    /// boundary, synchronously reclaiming eligible cache in rank order
+    /// (worth least per byte first, including bank cache) before admitting
+    /// the grant. Refused only where committed memory leaves it short:
+    /// nothing is held and no cache is reclaimed when `bytes` exceeds the
+    /// room committed memory leaves.
     pub fn grant(&self, claiming: &Claiming, role: GrantRole, bytes: u64) -> Result<Grant, Short> {
         claiming.of_scope(&self.store.changes);
         let need = Need::Grant { role, bytes };
@@ -68,7 +70,7 @@ impl Ledger {
             at: None,
             kind,
             bytes,
-            of: |ck: CacheKind| !ck.valued(),
+            of: |_| true,
             within_boundary: true,
             allow_guarantee: false,
         })?;

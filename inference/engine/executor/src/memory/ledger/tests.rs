@@ -2365,3 +2365,91 @@ fn relief_skips_at_floor_pool_and_reclaims_bank_synchronously() {
 
     ledger.change(|_| pools.state.freed(&pools.state.change(), 1 * GB, Pageable));
 }
+
+/// `Ledger::grant(GrantRole::Measurement, ...)` synchronously reclaims backed
+/// `CacheKind::Bank` cache before admitting the grant, leaves `Reclaim::Deferred`
+/// cache untouched, and refuses shortfalls (including a `PAST` room probe)
+/// without spuriously draining the bank.
+#[test]
+fn measurement_grant_reclaims_bank_cache_and_refuses_shortfall_without_draining() {
+    use std::sync::{Mutex, Weak};
+
+    struct FakeBankReclaimer {
+        cached: Mutex<Option<Cached>>,
+        pool: Arc<dyn seismic::memory::Entry>,
+        calls: AtomicU64,
+    }
+    impl CacheReclaimer for FakeBankReclaimer {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut guard = self.cached.lock().unwrap();
+            let Some(cached) = guard.as_mut() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let has = cached.bytes();
+            let free = has.min(need);
+            if free == 0 {
+                return Err(ReclaimError::AtFloor);
+            }
+            if free == has {
+                drop(guard.take());
+            } else {
+                drop(cached.split(free, CacheKind::Bank));
+            }
+            self.pool.freed(&self.pool.change(), free, Pageable);
+            Ok(free)
+        }
+    }
+
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    // 12 GB available: 2 GB committed weights, 2 GB deferred Prefix cache,
+    // 8 GB backed Bank cache (0 free, 0 allocatable).
+    read(&ledger, &mut clock, 64 * GB, 12 * GB, Some(64 * GB));
+    let _weights = commit(&ledger, 2 * GB);
+    let _deferred_prefix = ledger.cached_with(CacheKind::Prefix, 2 * GB, Reclaim::Deferred).expect("prefix fits");
+
+    let reclaimer = Arc::new(FakeBankReclaimer {
+        cached: Mutex::new(None),
+        pool: pools.records.clone(),
+        calls: AtomicU64::new(0),
+    });
+    let bank_cache = ledger
+        .cached_with(CacheKind::Bank, 8 * GB, Reclaim::Backed(Arc::downgrade(&reclaimer) as Weak<dyn CacheReclaimer>))
+        .expect("bank cache fits");
+    *reclaimer.cached.lock().unwrap() = Some(bank_cache);
+    assert_eq!(ledger.estimate().allocatable(), 0, "all 12 GB allocated");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 8 * GB);
+
+    // 1. `PAST` room probe exceeds reclaimable room (8 GB) -> Err(Short) without
+    //    invoking the reclaimer or draining the bank; `PAST - over == 8 GB`.
+    const PAST: u64 = u64::MAX / 4;
+    let probe = ledger
+        .change(|keeping| ledger.grant(&keeping.claims(), GrantRole::Measurement, PAST))
+        .err()
+        .expect("PAST probe must be refused");
+    assert_eq!(PAST - probe.over, 8 * GB, "room equals reclaimable bank cache (deferred prefix excluded)");
+    assert_eq!(reclaimer.calls.load(Ordering::Relaxed), 0, "PAST probe must not drain the bank");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 8 * GB);
+
+    // 2. Requesting 9 GB (exceeds 8 GB reclaimable bank; deferred prefix is not
+    //    reclaimable without freeing backing) -> Err(Short { over: 1 GB }), 0 calls.
+    let short = ledger
+        .change(|keeping| ledger.grant(&keeping.claims(), GrantRole::Measurement, 9 * GB))
+        .err()
+        .expect("exceeds reclaimable room");
+    assert_eq!(short.over, 1 * GB);
+    assert_eq!(reclaimer.calls.load(Ordering::Relaxed), 0, "shortfall must not drain the bank");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Prefix), 2 * GB, "deferred prefix untouched");
+
+    // 3. Requesting 5 GB synchronously reclaims 5 GB of Bank cache before admitting.
+    let grant = ledger
+        .change(|keeping| ledger.grant(&keeping.claims(), GrantRole::Measurement, 5 * GB))
+        .expect("measurement grant reclaims bank cache");
+    assert!(reclaimer.calls.load(Ordering::Relaxed) >= 1, "reclaimer was invoked");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 3 * GB, "bank shrunk by 5 GB");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Prefix), 2 * GB, "deferred prefix untouched");
+    assert_eq!(ledger.estimate().committed(), 7 * GB, "2 GB weights + 5 GB measurement grant");
+    assert!(ledger.estimate().allocatable() >= 5 * GB, "5 GB physically freed for measurement process");
+    drop(grant);
+}
