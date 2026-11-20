@@ -445,7 +445,7 @@ pub use seismic_topology::{
     VolumeId,
 };
 mod measurer;
-pub use measurer::{KernelIdentity, Measurer, PointKey};
+pub use measurer::{KernelIdentity, Measurer, PointKey, PointSubject};
 /// The recorded machines (`fixtures::recorded`), for other crates' tests.
 #[cfg(feature = "fixtures")]
 pub use seismic_topology::fixtures;

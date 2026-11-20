@@ -1034,6 +1034,7 @@ impl<E: Entry> Clone for Formation<E> {
 pub(super) struct Program<E: Entry> {
     formation: Formation<E>,
     backend: seismic::BackendName,
+    tensor_ops: bool,
     identity: std::sync::OnceLock<Result<KernelIdentity, ExecutorCostsError>>,
 }
 
@@ -1042,19 +1043,22 @@ impl<E: Entry> Clone for Program<E> {
         Self {
             formation: self.formation.clone(),
             backend: self.backend,
+            tensor_ops: self.tensor_ops,
             identity: self.identity.clone(),
         }
     }
 }
 
 impl<E: Entry> Program<E> {
-    fn of(formation: Formation<E>, backend: seismic::BackendName) -> Self {
-        Self { formation, backend, identity: std::sync::OnceLock::new() }
+    fn of(formation: Formation<E>, backend: seismic::BackendName, tensor_ops: bool) -> Self {
+        Self { formation, backend, tensor_ops, identity: std::sync::OnceLock::new() }
     }
 
     /// Its source identity on the set's backend ([`Formation::identity`]).
     fn identity(&self) -> Result<KernelIdentity, ExecutorCostsError> {
-        self.identity.get_or_init(|| self.formation.identity(self.backend)).clone()
+        self.identity
+            .get_or_init(|| self.formation.identity(self.backend, self.tensor_ops))
+            .clone()
     }
 
     /// Formed on `device` ([`Formation::form`]).
@@ -1122,12 +1126,13 @@ impl<E: Entry> Formation<E> {
         Ok(statics)
     }
 
-    /// Its source identity on `backend`, formable without a device.
+    /// Its source identity on `backend`, formable without opening a device.
     pub(super) fn identity(
         &self,
         backend: seismic::BackendName,
+        tensor_ops: bool,
     ) -> Result<KernelIdentity, ExecutorCostsError> {
-        KernelIdentity::of(backend, &self.entry, &self.statics(backend)?)
+        KernelIdentity::of(backend, tensor_ops, &self.entry, &self.statics(backend)?)
             .map_err(|error| failed(E::NAME)(&error))
     }
 
@@ -1207,6 +1212,7 @@ impl WalkPrograms {
 
     fn new(
         backend: seismic::BackendName,
+        tensor_ops: bool,
         sizes: Sizes,
         formats: &[Element],
         chain: Element,
@@ -1216,17 +1222,17 @@ impl WalkPrograms {
             .iter()
             .map(|&format| {
                 let features = features(sizes, format, largest)?;
-                Ok((format, features, Program::of(expand(format, features), backend)))
+                Ok((format, features, Program::of(expand(format, features), backend, tensor_ops)))
             })
             .collect::<Result<Vec<_>, ExecutorCostsError>>()?;
         Ok(Self {
             sizes,
-            output: Program::of(output(chain, features(sizes, chain, largest)?), backend),
+            output: Program::of(output(chain, features(sizes, chain, largest)?), backend, tensor_ops),
             expands,
             chain,
-            dense: Program::of(attend::<attention_decode::Entry>(KvCodec::Dense)?, backend),
-            affine: Program::of(attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?, backend),
-            copy: Program::of(copy(), backend),
+            dense: Program::of(attend::<attention_decode::Entry>(KvCodec::Dense)?, backend, tensor_ops),
+            affine: Program::of(attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?, backend, tensor_ops),
+            copy: Program::of(copy(), backend, tensor_ops),
         })
     }
 
@@ -1258,10 +1264,12 @@ impl ProgramSet {
     }
 
     /// A set holding only `converts` (for a job with no cost walk).
-    pub(super) fn converts(backend: seismic::BackendName, converts: &[ConvertForm]) -> Self {
+    pub(super) fn converts(executor: &Executor, converts: &[ConvertForm]) -> Self {
+        let backend = executor.backend();
+        let tensor_ops = executor.forms_tensor_operations();
         let converts = converts
             .iter()
-            .map(|&form| (form, Program::of(form.land(), backend)))
+            .map(|&form| (form, Program::of(form.land(), backend, tensor_ops)))
             .collect();
         Self { walk: None, converts }
     }
@@ -1272,6 +1280,7 @@ impl ProgramSet {
         converts: &[ConvertForm],
     ) -> Result<Self, ExecutorCostsError> {
         let backend = executor.backend();
+        let tensor_ops = executor.forms_tensor_operations();
         let largest = executor.limits().max_allocation.bytes();
         let chain = chain_element(backend).ok_or_else(|| {
             ExecutorCostsError(format!(
@@ -1281,6 +1290,7 @@ impl ProgramSet {
         })?;
         Self::new(
             backend,
+            tensor_ops,
             Sizes::of(backend),
             &measured_formats(backend),
             chain,
@@ -1294,16 +1304,17 @@ impl ProgramSet {
     /// chain in `chain`, plus every convert form `converts` the job measures.
     fn new(
         backend: seismic::BackendName,
+        tensor_ops: bool,
         sizes: Sizes,
         formats: &[Element],
         chain: Element,
         largest: u64,
         converts: &[ConvertForm],
     ) -> Result<Self, ExecutorCostsError> {
-        let walk = WalkPrograms::new(backend, sizes, formats, chain, largest)?;
+        let walk = WalkPrograms::new(backend, tensor_ops, sizes, formats, chain, largest)?;
         let converts = converts
             .iter()
-            .map(|&form| (form, Program::of(form.land(), backend)))
+            .map(|&form| (form, Program::of(form.land(), backend, tensor_ops)))
             .collect();
         Ok(Self { walk: Some(walk), converts })
     }
@@ -1890,7 +1901,7 @@ struct Records<'a> {
 impl Records<'_> {
     fn key(&self, spec: PointSpec) -> PointKey {
         PointKey {
-            executor: self.executor.clone(),
+            subject: seismic::PointSubject::executor(&self.executor),
             kernels: spec.kernels,
             configuration: spec.configuration,
             point: spec.point,
@@ -3920,6 +3931,7 @@ fn walk<T: Times>(
     })?;
     let programs = ProgramSet::new(
         backend,
+        executor.forms_tensor_operations(),
         Sizes::of(backend),
         formats,
         chain,
@@ -5352,6 +5364,7 @@ impl ExecutorCosts {
         let converts = ConvertForm::reference(backend)?.into_iter().collect::<Vec<_>>();
         let programs = ProgramSet::new(
             backend,
+            executor.forms_tensor_operations(),
             Sizes::of(backend),
             &measured_formats(backend),
             chain,
@@ -5610,7 +5623,7 @@ mod tests {
         let backend = seismic::BackendName::Cpu;
         let chain = chain_element(backend).unwrap();
         let programs =
-            ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[])
+            ProgramSet::new(backend, false, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[])
                 .unwrap();
         let (features, _) = programs.expand(chain);
         let depth = HISTORY_DEPTHS[0] as f64;
@@ -5757,6 +5770,7 @@ mod tests {
         for backend in seismic::BackendName::ALL {
             let programs = ProgramSet::new(
                 backend,
+                false,
                 Sizes::of(backend),
                 &measured_formats(backend),
                 chain_element(backend).unwrap(),
@@ -5783,19 +5797,19 @@ mod tests {
     /// derives it once, and no key or record changes.
     #[test]
     fn a_walk_program_keys_by_the_identity_its_formation_derives() {
-        fn same<E: Entry>(program: &Program<E>, backend: seismic::BackendName) {
-            assert_eq!(program.identity(), program.formation.identity(backend), "{backend:?}: {}", E::NAME);
+        fn same<E: Entry>(program: &Program<E>, backend: seismic::BackendName, tensor_ops: bool) {
+            assert_eq!(program.identity(), program.formation.identity(backend, tensor_ops), "{backend:?}: {}", E::NAME);
         }
         for backend in seismic::BackendName::ALL {
             let chain = chain_element(backend).unwrap();
-            let programs = ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[]).unwrap();
+            let programs = ProgramSet::new(backend, false, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34, &[]).unwrap();
             let walk = programs.walk();
-            same(&walk.output, backend);
-            same(&walk.dense, backend);
-            same(&walk.affine, backend);
-            same(&walk.copy, backend);
+            same(&walk.output, backend, false);
+            same(&walk.dense, backend, false);
+            same(&walk.affine, backend, false);
+            same(&walk.copy, backend, false);
             for (_, _, expand) in &walk.expands {
-                same(expand, backend);
+                same(expand, backend, false);
             }
         }
     }

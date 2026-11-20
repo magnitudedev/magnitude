@@ -7235,16 +7235,17 @@ pub fn implementation_digest(
     Ok(crate::telemetry::hex(&digest.finalize()))
 }
 
-/// Digest of an entry's kernel on `backend` without a device: what a
-/// measurement of its kernel is a function of besides the executor (whose
-/// identity carries the device, its driver and the feature macros its
-/// native sources test) and the configuration measured. It covers the
-/// declaration and the module's source texts, the element bindings by
-/// storage name, the static values, the backend, and, for Metal, CUDA and
-/// Vulkan, the source rendered for the defaults at these bindings and
-/// static values with no device feature enabled (the asset and the ABI
-/// prefix this build renders); for CPU, the compiled implementation's
-/// digest. Vulkan is not rendered where it is not built (macOS).
+/// Digest of an entry's kernel on `backend` without an opened device: what a
+/// measurement of its formed default program is a function of besides the
+/// executor (whose identity carries the device and its normalized driver) and
+/// the configuration measured. It covers the formed declaration (excluding
+/// `source_path` and non-default tuning `params` search lists), the element
+/// bindings by storage name, the default specialization's static and parameter
+/// values, the backend, and, for Metal, CUDA and Vulkan, the source rendered
+/// for the defaults at these bindings and static values (with `metal_tensor_ops`
+/// on Metal, so devices with Metal 4 tensor operations digest their actual
+/// rendered source); for CPU, the compiled implementation's digest. Vulkan is
+/// not rendered where it is not built (macOS).
 ///
 /// The toolchain that compiles the source is in the key where nothing else
 /// names it. CUDA's NVRTC is loaded from its own directory
@@ -7253,10 +7254,11 @@ pub fn implementation_digest(
 /// cannot be loaded is an error. Vulkan's shader compiler is built into
 /// this binary, so its release, SPIR-V target and seal passes are digested
 /// (`seismic_vulkan::formation::compiler`). Metal's compiler is the
-/// operating system's, named by the OS build in the executor's identity.
-/// CPU kernels are compiled into the binary, named by their digest.
+/// operating system's, named by the OS major release in the executor's
+/// identity. CPU kernels are compiled into the binary, named by their digest.
 pub fn kernel_digest(
     backend: BackendName,
+    metal_tensor_ops: bool,
     module: &CheckedModule,
     entry: EntryId,
     bindings: &ElementBindings,
@@ -7277,7 +7279,7 @@ pub fn kernel_digest(
                 backend.as_str()
             ))
         })?;
-    // A kernel's identity names a backend, not a device: a declaration
+    // A kernel's identity names a backend, not an opened device: a declaration
     // whose defaults read the device has no device-free default to name.
     // A launch's geometry may read the device; the declaration's digest
     // names it as declared.
@@ -7290,9 +7292,9 @@ pub fn kernel_digest(
         })?
         .map_err(|error| declaration(error.to_string()))?;
     let mut digest = Sha256::new();
-    digest.update(b"kernel-identity-v1");
+    digest.update(b"kernel-identity-v2");
     digest.update(backend.as_str().as_bytes());
-    update_declaration_digest(&mut digest, module, &entry_name, implementation);
+    update_kernel_declaration_digest(&mut digest, &entry_name, implementation);
     for (parameter, representation) in bindings.iter() {
         let storage = seismic_lang::registry::representation_info(representation).name;
         digest.update(format!("{parameter:?}={storage:?};").as_bytes());
@@ -7308,7 +7310,9 @@ pub fn kernel_digest(
             digest.update(kernels.digest.as_bytes());
             None
         }
-        BackendName::Metal => Some(super::abi::Dialect::Metal(Default::default())),
+        BackendName::Metal => Some(super::abi::Dialect::Metal(super::abi::MetalFeatures {
+            tensor_ops: metal_tensor_ops,
+        })),
         BackendName::Cuda => {
             // NVRTC is loaded from a directory of its own and can change
             // without the driver: its release and this build's options
@@ -7360,6 +7364,85 @@ pub fn kernel_digest(
         );
     }
     Ok(crate::telemetry::hex(&digest.finalize()))
+}
+
+/// Digest only the parts of `implementation` that affect the formed default
+/// program: launch geometry, barriers, scratch, record bindings, repeats,
+/// formation, and segment layout. Excludes `declared_in`, `source_path`
+/// (native source content is digested via `render_source`), tuning `params`
+/// search domains (default values are digested via `default`), `constraint`,
+/// `elements`, and tuning-only launch flags (`alike`, `staging`).
+fn update_kernel_declaration_digest(
+    digest: &mut Sha256,
+    entry_name: &str,
+    implementation: &NativeImplementation,
+) {
+    let NativeImplementation {
+        entry: _,
+        backend,
+        declared_in: _,
+        source_path: _,
+        statics,
+        params: _,
+        elements: _,
+        records,
+        launch_records,
+        constraint: _,
+        scratch,
+        launches,
+        repeat,
+        formation,
+        segments,
+        ordered_segments,
+    } = implementation;
+    digest.update(b"kernel-declaration-v1");
+    digest.update(format!("{entry_name:?}").as_bytes());
+    digest.update(format!("{:?}", (backend, statics, records, scratch, repeat)).as_bytes());
+    for launch in launches {
+        let seismic_lang::checked::NativeLaunch {
+            kernel,
+            params: _,
+            reads,
+            alike: _,
+            staging: _,
+            when,
+            groups,
+            grid,
+            conditions,
+            group_extent,
+            shared_bytes,
+            resident,
+        } = launch;
+        digest.update(
+            format!(
+                "{:?}",
+                (
+                    kernel,
+                    reads,
+                    when,
+                    groups,
+                    grid,
+                    conditions,
+                    group_extent,
+                    shared_bytes,
+                    resident,
+                )
+            )
+            .as_bytes(),
+        );
+    }
+    if !launch_records.is_empty() {
+        digest.update(format!("{launch_records:?}").as_bytes());
+    }
+    if let Some(formation) = formation {
+        digest.update(format!("{formation:?}").as_bytes());
+    }
+    if let Some(segments) = segments {
+        digest.update(format!("segments {segments:?}").as_bytes());
+    }
+    if ordered_segments.iter().any(|ordered| *ordered) {
+        digest.update(format!("ordered_segments {ordered_segments:?}").as_bytes());
+    }
 }
 
 /// Checked entry IDs carry a process-local owner. A tuning result names the
@@ -10072,6 +10155,43 @@ mod tests {
             source("[1, 2]").replace("return to_owned(x)", "let y = to_owned(x)\n    return y"),
         );
         assert_ne!(at(&copied), digest(&first, first_entry));
+    }
+
+    #[test]
+    fn kernel_declaration_digest_ignores_source_path_and_tuning_search_domains() {
+        let make = |source_path: &str, top_domain: &str, launch_domain: &str, threads: u64| {
+            let text = format!(
+                "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"{source_path}\":\n    params (SPLIT in {top_domain} default 1)\n    launch scale:\n        params (ROWS in {launch_domain} default 1)\n        threadgroups (ceil_div(N, ROWS), SPLIT, 1)\n        threads_per_threadgroup ({threads}, 1, 1)\n"
+            );
+            seismic_lang::native_source::check_fixture(
+                SourceSet::new(vec![SourceFile {
+                    path: "/build/one/kernels/scale.seismic".into(),
+                    text,
+                }]),
+                &["SPLIT", "ROWS"],
+            )
+            .unwrap()
+        };
+        let digest = |module: &CheckedModule| {
+            use sha2::Digest;
+            let entry = module.entry_named("scale").unwrap();
+            let mut hasher = Sha256::new();
+            update_kernel_declaration_digest(
+                &mut hasher,
+                "scale",
+                module.native_implementation(entry, BackendName::Metal).unwrap(),
+            );
+            hasher.finalize().to_vec()
+        };
+        let base = make("scale.metal", "[1, 2]", "[1, 2]", 32);
+        let moved = make("subdir/renamed_scale.metal", "[1, 2]", "[1, 2]", 32);
+        let wider_top = make("scale.metal", "[1, 2, 4]", "[1, 2]", 32);
+        let wider_launch = make("scale.metal", "[1, 2]", "[1, 2, 4, 8]", 32);
+        let changed_threads = make("scale.metal", "[1, 2]", "[1, 2]", 64);
+        assert_eq!(digest(&base), digest(&moved), "source_path does not affect formed default program");
+        assert_eq!(digest(&base), digest(&wider_top), "top-level tuning domain does not affect formed default program");
+        assert_eq!(digest(&base), digest(&wider_launch), "per-launch tuning domain does not affect formed default program");
+        assert_ne!(digest(&base), digest(&changed_threads), "launch geometry change must invalidate");
     }
 
     #[test]

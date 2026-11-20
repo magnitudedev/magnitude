@@ -196,29 +196,46 @@ impl SiteRequest {
         Self { form: CpuForm::of(binding, form), tier: binding.tier, activation: form.activation, requirement }
     }
 
+    /// Digest of the CPU site arithmetic, its reference math, and the compiled
+    /// CPU kernel library — excluding unrelated GPU kernels, planner, and
+    /// executor changes so CPU site admission is not invalidated by them.
+    fn site_admission_build() -> &'static str {
+        static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        BUILD.get_or_init(|| {
+            crate::kernel_cache::TuningCacheKey::of(&format!(
+                "cpu-site-admission\ncpu-kernels {}\nsite {}\nqualification {}",
+                magnitude_kernels::routed_expand::cpu_native::KERNELS.digest,
+                include_str!("../experts/site.rs"),
+                include_str!("../native/qualification/site.rs"),
+            ))
+            .as_str()
+            .to_owned()
+        })
+    }
+
     /// The precision system's verdict is a function of the request, the
-    /// CPU's architecture and native tier, and the executor build that holds
-    /// the site's arithmetic and the reference; the executor's identity
-    /// names the machine's job.
-    fn key(&self, identity: &Identity) -> PointKey {
+    /// CPU's architecture and native tier, and the CPU site/reference math;
+    /// keyed by the host hardware identity rather than any GPU executor.
+    fn key(&self, topology: &DeviceTopology) -> PointKey {
         let digest = crate::kernel_cache::TuningCacheKey::of(&format!(
-            "site admission\nbuild {}\ncpu {} {:?}\nrows {VERIFY_ROWS}\n{self:?}",
-            crate::EXECUTOR_BUILD,
+            "site admission\nsite_build {}\ncpu {} {:?}\nrows {VERIFY_ROWS}\n{self:?}",
+            Self::site_admission_build(),
             std::env::consts::ARCH,
             seismic::cpu::Tier::detected(),
         ));
         let term = |name: &str| std::collections::BTreeMap::from([(name.to_owned(), 1)]);
-        PointKey { executor: identity.clone(), kernels: Vec::new(), configuration: term("site_admission"), point: term(digest.as_str()) }
+        PointKey {
+            subject: seismic::PointSubject::host(topology),
+            kernels: Vec::new(),
+            configuration: term("site_admission"),
+            point: term(digest.as_str()),
+        }
     }
 
-    /// The verdict `store` records on `executor`: admitted, pending until
-    /// the job has run the site, or unavailable with its refusal.
-    pub fn verdict(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> Priced<()> {
-        let identity = match executor_identity(topology, executor) {
-            Ok(identity) => identity,
-            Err(error) => return Priced::Unavailable(error.to_string()),
-        };
-        match store.load(&self.key(&identity)) {
+    /// The verdict `store` records on `topology`'s host: admitted, pending
+    /// until the job has run the site, or unavailable with its refusal.
+    pub fn verdict(&self, topology: &DeviceTopology, _executor: &Executor, store: &dyn RecordStore<PointKey>) -> Priced<()> {
+        match store.load(&self.key(topology)) {
             Ok(Some(Record::Measured(_))) => Priced::Measured(()),
             Ok(Some(Record::Unobtainable { reason })) => Priced::Unavailable(reason.to_string()),
             Ok(None) => Priced::Pending(PendingPrices::load(PointRequest::Site(self.clone()))),
@@ -253,7 +270,7 @@ impl SiteRequest {
     /// site's pool and lines where none are stored. A pool that fails its
     /// request is no verdict: the job's two-job rule ends it.
     fn measure(&self, walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
-        let key = self.key(&walks.identity());
+        let key = self.key(walks.device().topology());
         walks.record(key, |charges| {
             let began = std::time::Instant::now();
             Ok(match crate::native::admit_site(charges, self)? {
@@ -609,7 +626,7 @@ pub fn measure(
     {
         ProgramSet::with_walk(executor, &converts)?
     } else {
-        ProgramSet::converts(executor.backend(), &converts)
+        ProgramSet::converts(executor, &converts)
     };
     let mut walks = Walks::new(
         measurer,
