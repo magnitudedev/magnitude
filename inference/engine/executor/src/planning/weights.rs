@@ -1179,8 +1179,10 @@ impl AttentionWidths<Dim> {
 }
 
 /// An attention operator's kernel binding. Weights a form lacks (a separate
-/// gate, own keys or values) are empty segments of the projection; they
-/// bind a zero-row view of the query weight and carry its element.
+/// gate, own keys or values) are absent (`None`); their empty segments bind a
+/// zero-row view of the query segment's weight and resolve via
+/// [`Self::gate_segment`], [`Self::key_segment`], and [`Self::value_segment`]
+/// to [`Self::query_segment`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionBinding {
     pub shape: AttentionShape,
@@ -1193,9 +1195,15 @@ pub struct AttentionBinding {
     /// A low-rank query's `qr` row (`QueryProjection::LowRank`); none for a
     /// full query.
     pub low_rank_query: Option<LowRankQueryBinding>,
-    pub gate: Element,
-    pub key: Element,
-    pub value: Element,
+    /// Separate gate projection's element; none when the form has no separate
+    /// gate (`shape.gate_rows() == 0`).
+    gate: Option<Element>,
+    /// Key projection's element; none when the layer projects no keys
+    /// (`shape.key_rows() == 0`).
+    key: Option<Element>,
+    /// Value projection's element; none when the layer projects no values
+    /// (`shape.value_rows() == 0`).
+    value: Option<Element>,
     /// The output projection's (the second, `b`, of a grouped output).
     pub output: Element,
     pub activation: Element,
@@ -1397,11 +1405,122 @@ pub struct AbsorbedQueryShape {
 }
 
 impl AttentionBinding {
+    /// Construct an attention binding, panicking if the presence of `gate`,
+    /// `key`, or `value` disagrees with `shape`'s row counts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        shape: AttentionShape,
+        key_value_only: bool,
+        norm: Element,
+        query: Element,
+        low_rank_query: Option<LowRankQueryBinding>,
+        gate: Option<Element>,
+        key: Option<Element>,
+        value: Option<Element>,
+        output: Element,
+        activation: Element,
+        history: magnitude_state::CodecSpec,
+        tail: SublayerTail,
+        selection: Option<SelectionBinding>,
+        grouped: Option<GroupedOutputBinding>,
+        absorbed: Option<AbsorbedQueryBinding>,
+        picked: Option<PickedBinding>,
+    ) -> Self {
+        assert_eq!(
+            gate.is_some(),
+            shape.gate_rows() > 0,
+            "attention gate element presence must match shape.gate_rows() > 0"
+        );
+        assert_eq!(
+            key.is_some(),
+            shape.key_rows() > 0,
+            "attention key element presence must match shape.key_rows() > 0"
+        );
+        assert_eq!(
+            value.is_some(),
+            shape.value_rows() > 0,
+            "attention value element presence must match shape.value_rows() > 0"
+        );
+        Self {
+            shape,
+            key_value_only,
+            norm,
+            query,
+            low_rank_query,
+            gate,
+            key,
+            value,
+            output,
+            activation,
+            history,
+            tail,
+            selection,
+            grouped,
+            absorbed,
+            picked,
+        }
+    }
+
+    /// A key-value-only copy of this binding with `norm` as its input norm.
+    pub fn as_key_value_only(self, norm: Element) -> Self {
+        Self::new(
+            self.shape,
+            true,
+            norm,
+            self.query,
+            self.low_rank_query,
+            self.gate,
+            self.key,
+            self.value,
+            self.output,
+            self.activation,
+            self.history,
+            self.tail,
+            self.selection,
+            self.grouped,
+            self.absorbed,
+            self.picked,
+        )
+    }
+
+    /// Separate gate projection's element; none when absent.
+    pub fn gate(&self) -> Option<Element> {
+        self.gate
+    }
+
+    /// Key projection's element; none when absent.
+    pub fn key(&self) -> Option<Element> {
+        self.key
+    }
+
+    /// Value projection's element; none when absent.
+    pub fn value(&self) -> Option<Element> {
+        self.value
+    }
+
     /// The weight the projection's query segment reads: the query's, or a
     /// low-rank query's `down`.
     pub fn query_segment(&self) -> Element {
         self.low_rank_query
             .map_or(self.query, |low_rank| low_rank.down)
+    }
+
+    /// The weight the projection's gate segment reads: its own, or the query
+    /// segment's when absent.
+    pub fn gate_segment(&self) -> Element {
+        self.gate.unwrap_or_else(|| self.query_segment())
+    }
+
+    /// The weight the projection's key segment reads: its own, or the query
+    /// segment's when absent.
+    pub fn key_segment(&self) -> Element {
+        self.key.unwrap_or_else(|| self.query_segment())
+    }
+
+    /// The weight the projection's value segment reads: its own, or the query
+    /// segment's when absent.
+    pub fn value_segment(&self) -> Element {
+        self.value.unwrap_or_else(|| self.query_segment())
     }
 
     /// `Q`: the rows its query projection (a low-rank query's up) yields:

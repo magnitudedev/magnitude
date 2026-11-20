@@ -3327,10 +3327,7 @@ impl<'a> Preparation<'a> {
                     .set_invocations(demand.head_prefix.clone(), true);
             }
             let priming_project = self.projection(AttentionProjectTuning {
-                binding: AttentionBinding {
-                    key_value_only: true,
-                    ..b.attention
-                },
+                binding: b.attention.as_key_value_only(b.attention.norm),
                 scopes: attention_layers.scopes(b),
                 epsilon: self.epsilon,
             })?;
