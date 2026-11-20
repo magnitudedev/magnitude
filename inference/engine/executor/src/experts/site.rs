@@ -428,29 +428,27 @@ impl SiteLayer {
     /// after its sequence was acquired. The device writes only well-formed
     /// requests: an entry count, row, tier record or expert beyond the
     /// layer's extents is an invariant violation, and panics.
-    fn entries(&self, step: u64) -> Vec<Requested> {
+    fn entries(&self, step: u64) -> impl Iterator<Item = Requested> + '_ {
         let shape = self.shape;
         let count = self.slots.load(step, 0, constants::SITE_COUNT);
         let count = usize::try_from(count)
             .ok()
             .filter(|&count| count <= shape.rows * shape.choices)
             .unwrap_or_else(|| panic!("a site request of {count} entries"));
-        (0..count)
-            .map(|entry| {
-                let at = constants::SITE_ENTRY(entry as u64);
-                let field = |word| self.slots.load(step, 0, at + word);
-                let (row, record, expert) = (field(constants::SITE_ROW), field(constants::SITE_TIER_RECORD), field(constants::SITE_EXPERT));
-                Requested {
-                    row: usize::try_from(row).ok().filter(|&row| row < shape.rows).unwrap_or_else(|| panic!("a site entry of row {row}")),
-                    record: usize::try_from(record).unwrap_or_else(|_| panic!("a site entry of tier record {record}")),
-                    weight: f32::from_bits(field(constants::SITE_WEIGHT_BITS) as u32),
-                    expert: usize::try_from(expert)
-                        .ok()
-                        .filter(|&expert| expert < shape.experts)
-                        .unwrap_or_else(|| panic!("a site entry of expert {expert} of {}", shape.experts)),
-                }
-            })
-            .collect()
+        (0..count).map(move |entry| {
+            let at = constants::SITE_ENTRY(entry as u64);
+            let field = |word| self.slots.load(step, 0, at + word);
+            let (row, record, expert) = (field(constants::SITE_ROW), field(constants::SITE_TIER_RECORD), field(constants::SITE_EXPERT));
+            Requested {
+                row: usize::try_from(row).ok().filter(|&row| row < shape.rows).unwrap_or_else(|| panic!("a site entry of row {row}")),
+                record: usize::try_from(record).unwrap_or_else(|_| panic!("a site entry of tier record {record}")),
+                weight: f32::from_bits(field(constants::SITE_WEIGHT_BITS) as u32),
+                expert: usize::try_from(expert)
+                    .ok()
+                    .filter(|&expert| expert < shape.experts)
+                    .unwrap_or_else(|| panic!("a site entry of expert {expert} of {}", shape.experts)),
+            }
+        })
     }
 
     /// `step`'s request and its answer, where its slot holds them answered
@@ -464,7 +462,6 @@ impl SiteLayer {
         }
         let entries = self
             .entries(step)
-            .into_iter()
             .map(|Requested { row, weight, expert, .. }| Entry { row, weight, expert, scales: self.scales.of(expert) })
             .collect();
         let len = self.shape.rows * self.shape.hidden;
@@ -474,43 +471,65 @@ impl SiteLayer {
         Some(Answered { entries, rows, output: self.output(slot) })
     }
 
-    /// Slot `slot`'s request for `step`, read after its sequence was
-    /// acquired ([`Self::entries`]), its entries grouped by (tier record,
-    /// expert) into experts (in the order the request first names them).
-    fn work(&self, slot: usize, step: u64, workers: usize) -> Work {
+    /// Populate `work` in place with slot `slot`'s request for `step`, read
+    /// after its sequence was acquired ([`Self::entries`]), its entries
+    /// grouped by (tier record, expert) into experts (in the order the request
+    /// first names them), reusing all buffer capacities held by `work`.
+    fn prepare(&self, slot: usize, step: u64, work: &mut Work) {
         let shape = self.shape;
+        work.slot = slot;
+        work.step = step;
+        // SAFETY: within the rows (`Floats::new`); the device wrote the
+        // slot's rows before its sequence, which was acquired, and writes
+        // them no more while this step runs.
+        work.input = unsafe { self.rows.as_ptr().add(slot * shape.rows * shape.hidden) };
+        work.experts.clear();
+        work.entry_rows.clear();
+        work.requested.clear();
+        work.requested.extend(self.entries(step));
+        if work.requested.is_empty() {
+            return;
+        }
         let tensors = self.tensors.read().expect("site tensors");
-        let mut experts: Vec<Expert> = Vec::new();
-        for Requested { row, record, weight, expert } in self.entries(step) {
-            match experts.iter_mut().find(|named| (named.record, named.expert) == (record, expert)) {
-                Some(named) => named.rows.push((row, weight)),
-                None => experts.push(Expert {
+        for &Requested { record, expert, .. } in &work.requested {
+            match work.experts.iter_mut().find(|named| (named.record, named.expert) == (record, expert)) {
+                Some(named) => named.rows += 1,
+                None => work.experts.push(Expert {
                     record,
                     expert,
                     scales: self.scales.of(expert),
                     gate: tensors.gate.as_ref().map(|records| records.weights(record)),
                     up: tensors.up.weights(record),
                     down: tensors.down.weights(record),
-                    rows: vec![(row, weight)],
                     at: 0,
+                    rows: 1,
                 }),
             }
         }
+        drop(tensors);
         let mut named = 0;
-        for expert in &mut experts {
+        for expert in &mut work.experts {
             expert.at = named;
-            named += expert.rows.len();
+            named += expert.rows;
+            expert.rows = 0;
         }
-        // SAFETY: within the rows (`Floats::new`); the device wrote the
-        // slot's rows before its sequence, which was acquired, and writes
-        // them no more while this step runs.
-        let input = unsafe { self.rows.as_ptr().add(slot * shape.rows * shape.hidden) };
-        Work::new(slot, step, input, experts, shape, workers)
+        work.entry_rows.resize(named, (0, 0.0));
+        for &Requested { row, record, weight, expert } in &work.requested {
+            let entry = work
+                .experts
+                .iter_mut()
+                .find(|named| (named.record, named.expert) == (record, expert))
+                .expect("expert added in first pass");
+            work.entry_rows[entry.at + entry.rows] = (row, weight);
+            entry.rows += 1;
+        }
+        work.ensure_buffers();
     }
 }
 
 /// One entry of a site request as the device wrote it: a row's choice of
 /// the expert its tier record holds, at its routing weight.
+#[derive(Clone, Copy)]
 struct Requested {
     row: usize,
     record: usize,
@@ -690,12 +709,12 @@ struct Expert {
     gate: Option<HeldWeights>,
     up: HeldWeights,
     down: HeldWeights,
-    /// Each row that names it, with its routing weight, in request order.
-    rows: Vec<(usize, f32)>,
     /// Its first row among the request's experts' rows, expert after expert:
-    /// where its rows' activations and products, and their q8 blocks, lie
-    /// in the request's ([`Work`]).
+    /// where its rows' entries, activations and products, and their q8 blocks,
+    /// lie in the request's ([`Work`]).
     at: usize,
+    /// How many rows of the request name it.
+    rows: usize,
 }
 
 /// A request's stages, in order (module docs): gather, expand, join, then
@@ -820,11 +839,11 @@ struct Cell {
     units: [AtomicUsize; STAGES],
     /// The request's step, for the watchdog.
     step: AtomicU64,
-    /// The request, which only a worker holding a claimed unit of it (or
-    /// its publisher) reads: the request is not answered before that unit
-    /// completes, and its slot is not requested again, nor the cell
-    /// rewritten, before it is answered.
-    work: UnsafeCell<Option<Work>>,
+    /// The request and its reusable buffers, which only a worker holding a
+    /// claimed unit of it (or its publisher) reads, and only the noticing
+    /// worker (after `answered == taken`) or publisher (before `answered`)
+    /// mutates.
+    work: UnsafeCell<Work>,
     shares: Box<[Share]>,
     /// When its current request reached each point of its path
     /// (`NOTICED`..`MARKS`), in nanoseconds since the site began: each
@@ -838,13 +857,13 @@ struct Cell {
     took: AtomicU64,
 }
 
-// SAFETY: `work` is written only by the noticing worker as it issues a
-// request into a cell whose last request was answered, and read only under
-// a claimed unit or by the publisher, before the answer (`Cell::work`).
+// SAFETY: `work` is mutated only by the noticing worker as it prepares a
+// request into a cell whose last request was answered, or by its publisher
+// before storing `answered`, and read only under a claimed unit (`Cell::work`).
 unsafe impl Sync for Cell {}
 
 impl Cell {
-    fn new(layer: usize, workers: usize) -> Self {
+    fn new(layer: usize, shape: SiteShape, workers: usize) -> Self {
         Self {
             layer,
             taken: AtomicU64::new(0),
@@ -852,7 +871,7 @@ impl Cell {
             progress: AtomicU64::new(0),
             units: std::array::from_fn(|_| AtomicUsize::new(0)),
             step: AtomicU64::new(0),
-            work: UnsafeCell::new(None),
+            work: UnsafeCell::new(Work::empty(shape, workers)),
             shares: (0..workers).map(|_| Share::new()).collect(),
             marks: std::array::from_fn(|_| AtomicU64::new(0)),
             served: AtomicU64::new(0),
@@ -865,10 +884,10 @@ impl Cell {
     ///
     /// # Safety
     /// The caller holds a claimed unit of issue `issue` it has not
-    /// completed, or is its publisher before the answer.
+    /// completed, or is its issuer/publisher while no unit is in flight.
     unsafe fn work(&self) -> &Work {
         // SAFETY: the caller's contract.
-        unsafe { (*self.work.get()).as_ref().expect("an issued cell holds its request") }
+        unsafe { &*self.work.get() }
     }
 
     /// The stage of issue `issue` not yet finished, and its units, read
@@ -942,32 +961,56 @@ pub(super) enum WorkerTurn {
 }
 
 /// A request served by the pool, its units claimed by any worker (each
-/// worker its own shares first), stage by stage.
+/// worker its own shares first), stage by stage. All buffer capacities are
+/// retained on the cell across requests so steady-state decode allocates
+/// nothing on the hot path.
 struct Work {
     slot: usize,
     step: u64,
     /// The slot's rows `[VERIFY_ROWS, H]`, which the device wrote.
     input: *const f32,
+    /// Scratch buffer for reading a request's entries in [`SiteLayer::prepare`].
+    requested: Vec<Requested>,
     experts: Vec<Expert>,
+    /// Every expert's `(row, routing_weight)` entries laid out contiguously
+    /// (`Expert::at..Expert::at + Expert::rows`).
+    entry_rows: Vec<(usize, f32)>,
     /// Every expert's rows' activations `[rows, H]`, expert after expert
     /// (`Expert::at`), each gathered from the input by its gather unit, and
     /// their q8 blocks (`[rows, blocks(H)]`), as a projection of several
     /// rows reads them (`projection::project_arithmetic`).
-    x: Box<[UnsafeCell<f32>]>,
-    x8: Box<[UnsafeCell<Q8Block>]>,
+    x: Vec<UnsafeCell<f32>>,
+    x8: Vec<UnsafeCell<Q8Block>>,
     /// Every expert's rows' products `[rows, F]`, expert after expert
     /// (`Expert::at`): each whole tile's written by its expand unit, each
     /// split tile's by the join unit of its block.
-    products: Box<[UnsafeCell<f32>]>,
+    products: Vec<UnsafeCell<f32>>,
     /// Each expert's tiles an expand share computed part of (`[experts,
     /// workers, 2]`, its first and its last): their partial gate and up
     /// sums, which the join joins.
-    partials: Box<[UnsafeCell<Partial>]>,
+    partials: Vec<UnsafeCell<Partial>>,
     /// Every expert's rows' products quantized (`[rows, blocks(F)]`), each
     /// block of an expert's rows by its join unit.
-    quantized: Box<[UnsafeCell<Q8Block>]>,
+    quantized: Vec<UnsafeCell<Q8Block>>,
+    /// Reusable per-worker scratch buffers for the `expand` and `project`
+    /// stages (each worker index is claimed by at most one thread per stage,
+    /// and stages never overlap).
+    scratch: Box<[UnsafeCell<WorkerScratch>]>,
     workers: usize,
     shape: SiteShape,
+}
+
+/// Reusable per-worker scratch buffers for `expand` and `project`.
+#[derive(Default)]
+struct WorkerScratch {
+    /// Expand: whole-tile gate sums; Project: output channel sums.
+    a: Vec<f32>,
+    /// Expand: whole-tile up sums; Project: expert down dots.
+    b: Vec<f32>,
+    /// Expand partial tile: packed input activations over the column window.
+    values: Vec<f32>,
+    /// Expand partial tile: packed q8 blocks over the column window.
+    q8: Vec<Q8Block>,
 }
 
 /// A tile's partial sums over some of its columns' storage groups, for
@@ -984,13 +1027,15 @@ struct Partial {
 /// Rows of a unit: an `mma16` tile's (`Weights::row_block`), the largest
 /// component block.
 const TILE: usize = projection::MAX_BLOCK;
+const TILES_PER_BLOCK: usize = quant::Q8_BLOCK / TILE;
 
 const _: () = assert!(quant::Q8_BLOCK % TILE == 0, "a q8 block of products is whole tiles");
 
 // SAFETY: each unit writes cells no other unit writes (a gather unit its
-// row's activations, an expand share its whole tiles and its own partials, a join unit its block's split tiles and
-// quantized block, a project share its channels of the output), and a stage
-// reads the cells of the stages before it only once they are finished,
+// row's activations, an expand share its whole tiles, its own scratch and
+// its own partials, a join unit its block's split tiles and quantized block,
+// a project share its own scratch and its channels of the output), and a
+// stage reads the cells of the stages before it only once they are finished,
 // which their completions release.
 unsafe impl Sync for Work {}
 unsafe impl Send for Work {}
@@ -1015,29 +1060,65 @@ unsafe fn writable<T>(cells: &[UnsafeCell<T>]) -> &mut [T] {
 }
 
 impl Work {
-    fn new(slot: usize, step: u64, input: *const f32, experts: Vec<Expert>, shape: SiteShape, workers: usize) -> Self {
-        let blocks = quant::blocks(shape.features);
-        let rows = experts.iter().map(|expert| expert.rows.len()).sum::<usize>();
+    fn empty(shape: SiteShape, workers: usize) -> Self {
         Self {
-            slot,
-            step,
-            input,
-            x: (0..rows * shape.hidden).map(|_| UnsafeCell::new(0.0)).collect(),
-            x8: (0..rows * quant::blocks(shape.hidden)).map(|_| UnsafeCell::new(Q8Block::ZERO)).collect(),
-            products: (0..rows * shape.features).map(|_| UnsafeCell::new(0.0)).collect(),
-            partials: (0..experts.len() * workers * 2).map(|_| UnsafeCell::default()).collect(),
-            quantized: (0..rows * blocks).map(|_| UnsafeCell::new(Q8Block::ZERO)).collect(),
+            slot: 0,
+            step: 0,
+            input: std::ptr::null(),
+            requested: Vec::new(),
+            experts: Vec::new(),
+            entry_rows: Vec::new(),
+            x: Vec::new(),
+            x8: Vec::new(),
+            products: Vec::new(),
+            partials: Vec::new(),
+            quantized: Vec::new(),
+            scratch: (0..workers).map(|_| UnsafeCell::default()).collect(),
             workers,
-            experts,
             shape,
         }
+    }
+
+    /// Grow reusable buffers to fit the current request and reset active
+    /// partial markers without freeing any buffer capacities.
+    fn ensure_buffers(&mut self) {
+        let rows = self.entry_rows.len();
+        let shape = self.shape;
+        let x_len = rows * shape.hidden;
+        if self.x.len() < x_len {
+            self.x.resize_with(x_len, || UnsafeCell::new(0.0));
+        }
+        let x8_len = rows * quant::blocks(shape.hidden);
+        if self.x8.len() < x8_len {
+            self.x8.resize_with(x8_len, || UnsafeCell::new(Q8Block::ZERO));
+        }
+        let products_len = rows * shape.features;
+        if self.products.len() < products_len {
+            self.products.resize_with(products_len, || UnsafeCell::new(0.0));
+        }
+        let partials_len = self.experts.len() * self.workers * 2;
+        if self.partials.len() < partials_len {
+            self.partials.resize_with(partials_len, UnsafeCell::default);
+        }
+        for partial in &mut self.partials[..partials_len] {
+            partial.get_mut().tile = None;
+        }
+        let quantized_len = rows * quant::blocks(shape.features);
+        if self.quantized.len() < quantized_len {
+            self.quantized.resize_with(quantized_len, || UnsafeCell::new(Q8Block::ZERO));
+        }
+    }
+
+    /// Drop pinned [`HeldWeights`] handles while retaining all buffer
+    /// capacities for the next request.
+    fn release_weights(&mut self) {
+        self.experts.clear();
     }
 
     /// Each stage's units: an expert's row of gather, a share a worker of
     /// expand and project, a q8 block of an expert's products of join.
     fn units(&self) -> [usize; STAGES] {
-        let rows = self.experts.iter().map(|expert| expert.rows.len()).sum();
-        [rows, self.workers, self.experts.len() * quant::blocks(self.shape.features), self.workers]
+        [self.entry_rows.len(), self.workers, self.experts.len() * quant::blocks(self.shape.features), self.workers]
     }
 
     /// Run unit `unit` of stage `stage`, claimed, writing the output at
@@ -1063,8 +1144,7 @@ impl Work {
     fn gather(&self, named: usize) {
         let hidden = self.shape.hidden;
         let blocks = quant::blocks(hidden);
-        let mut rows = self.experts.iter().flat_map(|expert| expert.rows.iter().map(|&(row, _)| row));
-        let row = rows.nth(named).expect("a gather unit is an expert's row");
+        let (row, _) = self.entry_rows[named];
         // SAFETY: the input's rows are the device's, whole for the step.
         let input = unsafe { std::slice::from_raw_parts(self.input.add(row * hidden), hidden) };
         // SAFETY: this row's activations are this unit's alone.
@@ -1083,8 +1163,10 @@ impl Work {
     unsafe fn expand(&self, worker: usize) {
         let (features, hidden) = (self.shape.features, self.shape.hidden);
         let blocks = quant::blocks(hidden);
+        // SAFETY: unit `worker` of EXPAND is claimed by this thread alone.
+        let scratch = unsafe { &mut *self.scratch[worker].get() };
         for (index, expert) in self.experts.iter().enumerate() {
-            let count = expert.rows.len();
+            let count = expert.rows;
             let named = expert.at..expert.at + count;
             // SAFETY: no gather write is in flight (the caller's contract).
             let (values, q8) = unsafe { (values(&self.x[named.start * hidden..named.end * hidden]), values(&self.x8[named.start * blocks..named.end * blocks])) };
@@ -1095,21 +1177,26 @@ impl Work {
             }
             let (first, last) = (units.start / groups, (units.end - 1) / groups);
             let whole = |tile: usize| units.start <= tile * groups && (tile + 1) * groups <= units.end;
-            // Its whole tiles, one call a matrix.
-            let tiles = (first..=last).filter(|&tile| whole(tile)).collect::<Vec<_>>();
-            if let (Some(&from), Some(&to)) = (tiles.first(), tiles.last()) {
-                let range = from * TILE..((to + 1) * TILE).min(features);
+            // Its whole tiles are a contiguous subrange of `first..=last`, one call a matrix.
+            let from = if whole(first) { first } else { first + 1 };
+            let to_excl = if whole(last) { last + 1 } else { last };
+            if from < to_excl {
+                let range = from * TILE..(to_excl * TILE).min(features);
                 let width = range.len();
-                let (mut gate, mut up) = (vec![0.0f32; count * width], vec![0.0f32; count * width]);
+                let len = count * width;
                 if let Some(weights) = &expert.gate {
-                    projection::project_arithmetic(weights, range.start, values, Some(q8), &mut gate);
+                    scratch.a.resize(len, 0.0);
+                    projection::project_arithmetic(weights, range.start, values, Some(q8), &mut scratch.a[..len]);
                 }
-                projection::project_arithmetic(&expert.up, range.start, values, Some(q8), &mut up);
-                for (row, (gate, up)) in gate.chunks_exact(width).zip(up.chunks_exact(width)).enumerate() {
+                scratch.b.resize(len, 0.0);
+                projection::project_arithmetic(&expert.up, range.start, values, Some(q8), &mut scratch.b[..len]);
+                for (row, up) in scratch.b[..len].chunks_exact(width).enumerate() {
                     // SAFETY: these whole tiles of the expert's rows are this
                     // worker's alone.
                     let out = unsafe { writable(&self.products[(expert.at + row) * features + range.start..][..width]) };
-                    out.copy_from_slice(gate);
+                    if expert.gate.is_some() {
+                        out.copy_from_slice(&scratch.a[row * width..(row + 1) * width]);
+                    }
                     self.activate(expert, out, up);
                 }
             }
@@ -1122,19 +1209,26 @@ impl Work {
                 let columns = groups_in.start * quant::Q8_BLOCK..(groups_in.end * quant::Q8_BLOCK).min(expert.up.k());
                 let rows = tile * TILE..((tile + 1) * TILE).min(features);
                 // The expert's rows over these columns, row after row.
-                let values = (0..count).flat_map(|row| &values[row * hidden..][columns.clone()]).copied().collect::<Vec<_>>();
-                let q8 = (0..count).flat_map(|row| &q8[row * blocks..][groups_in.clone()]).cloned().collect::<Vec<_>>();
-                let mut partial = Partial { tile: Some(tile), gate: vec![0.0; count * rows.len()], up: vec![0.0; count * rows.len()] };
-                let sums = |weights: &Weights<'static>, out: &mut [f32]| {
-                    let (_, window) = weights.columns(columns.clone());
-                    projection::project_arithmetic(&window, rows.start, &values, Some(&q8), out);
-                };
-                if let Some(gate) = &expert.gate {
-                    sums(gate, &mut partial.gate);
+                scratch.values.clear();
+                for row in 0..count {
+                    scratch.values.extend_from_slice(&values[row * hidden..][columns.clone()]);
                 }
-                sums(&expert.up, &mut partial.up);
+                scratch.q8.clear();
+                for row in 0..count {
+                    scratch.q8.extend_from_slice(&q8[row * blocks..][groups_in.clone()]);
+                }
                 // SAFETY: this worker's own partial of the expert.
-                unsafe { *self.partials[(index * self.workers + worker) * 2 + side].get() = partial };
+                let partial = unsafe { &mut *self.partials[(index * self.workers + worker) * 2 + side].get() };
+                partial.tile = Some(tile);
+                let partial_len = count * rows.len();
+                if let Some(gate) = &expert.gate {
+                    partial.gate.resize(partial_len, 0.0);
+                    let (_, window) = gate.columns(columns.clone());
+                    projection::project_arithmetic(&window, rows.start, &scratch.values, Some(&scratch.q8), &mut partial.gate[..partial_len]);
+                }
+                partial.up.resize(partial_len, 0.0);
+                let (_, window) = expert.up.columns(columns);
+                projection::project_arithmetic(&window, rows.start, &scratch.values, Some(&scratch.q8), &mut partial.up[..partial_len]);
             }
         }
     }
@@ -1171,23 +1265,15 @@ impl Work {
         let tiles = range.start / TILE..range.end.div_ceil(TILE);
         // SAFETY: no expand write is in flight (the caller's contract).
         let partials = unsafe { values(&self.partials[index * self.workers * 2..(index + 1) * self.workers * 2]) };
-        let mut joined: BTreeMap<usize, Partial> = BTreeMap::new();
+        let mut has_partial = [false; TILES_PER_BLOCK];
+        let mut any_partial = false;
         for partial in partials {
             if let Some(tile) = partial.tile.filter(|tile| tiles.contains(tile)) {
-                let sum = joined.entry(tile).or_insert_with(|| Partial {
-                    tile: Some(tile),
-                    gate: vec![0.0; partial.gate.len()],
-                    up: vec![0.0; partial.up.len()],
-                });
-                for (sum, value) in sum.gate.iter_mut().zip(&partial.gate) {
-                    *sum += value;
-                }
-                for (sum, value) in sum.up.iter_mut().zip(&partial.up) {
-                    *sum += value;
-                }
+                has_partial[tile - tiles.start] = true;
+                any_partial = true;
             }
         }
-        for row in 0..expert.rows.len() {
+        for row in 0..expert.rows {
             let at = expert.at + row;
             // SAFETY: the block's split tiles and quantized block of each of
             // the expert's rows are this unit's alone.
@@ -1197,12 +1283,34 @@ impl Work {
                     writable(&self.quantized[at * quant::blocks(features) + block..][..1]),
                 )
             };
-            for (&tile, sum) in &joined {
-                let rows = tile * TILE..((tile + 1) * TILE).min(features);
-                let sums = row * rows.len()..(row + 1) * rows.len();
-                let out = &mut products[rows.start - range.start..rows.end - range.start];
-                out.copy_from_slice(&sum.gate[sums.clone()]);
-                self.activate(expert, out, &sum.up[sums]);
+            if any_partial {
+                for (offset, tile) in tiles.clone().enumerate() {
+                    if !has_partial[offset] {
+                        continue;
+                    }
+                    let rows = tile * TILE..((tile + 1) * TILE).min(features);
+                    let width = rows.len();
+                    let sums = row * width..(row + 1) * width;
+                    let mut gate = [0.0f32; TILE];
+                    let mut up = [0.0f32; TILE];
+                    for partial in partials {
+                        if partial.tile == Some(tile) {
+                            if expert.gate.is_some() {
+                                for (dst, &src) in gate[..width].iter_mut().zip(&partial.gate[sums.clone()]) {
+                                    *dst += src;
+                                }
+                            }
+                            for (dst, &src) in up[..width].iter_mut().zip(&partial.up[sums.clone()]) {
+                                *dst += src;
+                            }
+                        }
+                    }
+                    let out = &mut products[rows.start - range.start..rows.end - range.start];
+                    if expert.gate.is_some() {
+                        out.copy_from_slice(&gate[..width]);
+                    }
+                    self.activate(expert, out, &up[..width]);
+                }
             }
             quant::quantize(products, quantized);
         }
@@ -1222,12 +1330,15 @@ impl Work {
         }
         let channels = tiles.start * TILE..(tiles.end * TILE).min(hidden);
         let width = channels.len();
-        let mut sums = vec![0.0f32; rows * width];
-        let most = self.experts.iter().map(|expert| expert.rows.len()).max().unwrap_or(0);
-        let mut dots = vec![0.0f32; most * width];
+        // SAFETY: unit `worker` of PROJECT is claimed by this thread alone.
+        let scratch = unsafe { &mut *self.scratch[worker].get() };
+        scratch.a.clear();
+        scratch.a.resize(rows * width, 0.0);
+        let most = self.experts.iter().map(|expert| expert.rows).max().unwrap_or(0);
+        scratch.b.resize(most * width, 0.0);
         let blocks = quant::blocks(features);
         for expert in &self.experts {
-            let named = expert.at..expert.at + expert.rows.len();
+            let named = expert.at..expert.at + expert.rows;
             // SAFETY: no join write is in flight (the caller's contract).
             let (products, quantized) = unsafe {
                 (
@@ -1235,10 +1346,10 @@ impl Work {
                     values(&self.quantized[named.start * blocks..named.end * blocks]),
                 )
             };
-            let dots = &mut dots[..named.len() * width];
+            let dots = &mut scratch.b[..named.len() * width];
             projection::project_arithmetic(&expert.down, channels.start, products, Some(quantized), dots);
-            for (&(row, weight), dots) in expert.rows.iter().zip(dots.chunks_exact(width)) {
-                for (sum, dot) in sums[row * width..(row + 1) * width].iter_mut().zip(dots) {
+            for (&(row, weight), dots) in self.entry_rows[named].iter().zip(dots.chunks_exact(width)) {
+                for (sum, dot) in scratch.a[row * width..(row + 1) * width].iter_mut().zip(dots) {
                     *sum += weight * dot;
                 }
             }
@@ -1247,13 +1358,13 @@ impl Work {
             // SAFETY: this worker alone writes these channels of the slot's
             // output, which no device work reads before the answer.
             let out = unsafe { std::slice::from_raw_parts_mut(output.add((self.slot * rows + row) * hidden + channels.start), width) };
-            out.copy_from_slice(&sums[row * width..(row + 1) * width]);
+            out.copy_from_slice(&scratch.a[row * width..(row + 1) * width]);
         }
     }
 
     /// The rows its entries name.
     fn rows_named(&self) -> BTreeSet<usize> {
-        self.experts.iter().flat_map(|expert| expert.rows.iter().map(|&(row, _)| row)).collect()
+        self.entry_rows.iter().map(|&(row, _)| row).collect()
     }
 }
 
@@ -1354,9 +1465,13 @@ impl Site {
                 order.into()
             })
             .collect();
-        let cells = layers.iter().enumerate().flat_map(|(index, layer)| (0..layer.shape.flight()).map(move |_| index)).collect::<Vec<_>>();
+        let cells = layers
+            .iter()
+            .enumerate()
+            .flat_map(|(index, layer)| (0..layer.shape.flight()).map(move |_| (index, layer.shape)))
+            .collect::<Vec<_>>();
         Ok(Self {
-            cells: cells.iter().map(|&layer| Cell::new(layer, workers)).collect(),
+            cells: cells.iter().map(|&(layer, shape)| Cell::new(layer, shape, workers)).collect(),
             order: cells.iter().map(|_| AtomicUsize::new(0)).collect(),
             layers,
             noticer: AtomicUsize::new(usize::MAX),
@@ -1484,16 +1599,22 @@ impl Site {
             self.cells[cell].took.store(0, Ordering::Relaxed);
             self.cells[cell].taken.store(step, Ordering::Release);
             took = true;
-            let work = layer.work(slot, step, self.workers);
+            // SAFETY: `self.requested` verified `cell.answered == taken`, so no
+            // worker holds a unit of this cell, and only the noticing worker
+            // calls `take`.
+            let work = unsafe { &mut *self.cells[cell].work.get() };
+            layer.prepare(slot, step, work);
             if work.experts.is_empty() {
                 layer.clear(slot);
                 self.cells[cell].answered.store(step, Ordering::Release);
                 self.answer(layer, step, false);
             } else if self.closed.load(Ordering::Acquire) {
+                let rows = work.rows_named();
+                work.release_weights();
                 self.cells[cell].answered.store(step, Ordering::Release);
-                self.fail(index, step, work.rows_named(), "the executor stopped serving".into());
+                self.fail(index, step, rows, "the executor stopped serving".into());
             } else {
-                self.issue(cell, work);
+                self.issue(cell);
             }
         }
         took
@@ -1520,11 +1641,16 @@ impl Site {
         .then_some(step)
     }
 
-    /// Issue `work` into cell `index`, whose last request was answered (its
-    /// slot was requested again), then announce it to every worker.
-    fn issue(&self, index: usize, work: Work) {
+    /// Issue the request already prepared in cell `index`, whose last request
+    /// was answered (its slot was requested again), then announce it to every
+    /// worker.
+    fn issue(&self, index: usize) {
         let cell = &self.cells[index];
         let issue = self.issued.load(Ordering::Relaxed) + 1;
+        // SAFETY: the cell's last request was answered (`Cell::answered`), and
+        // `take` prepared `cell.work` before calling `issue`; no worker reads
+        // it before claiming a unit of this issue, published below.
+        let work = unsafe { cell.work() };
         // A sequence lock's write: no worker reads the cell's units as of
         // another issue.
         cell.progress.store(0, Ordering::Relaxed);
@@ -1533,11 +1659,6 @@ impl Site {
             units.store(count, Ordering::Relaxed);
         }
         cell.step.store(work.step, Ordering::Relaxed);
-        // SAFETY: the cell's last request was answered (`Cell::answered`,
-        // which taking this one waited for: its publisher took it out), so
-        // no worker holds a unit of it, and none reads the request before it
-        // claims a unit of this issue, published below.
-        unsafe { *cell.work.get() = Some(work) };
         cell.progress.store(progress(issue, 0), Ordering::Release);
         self.mark(cell, ISSUED);
         self.order[(issue % self.cells.len() as u64) as usize].store(index, Ordering::Relaxed);
@@ -1613,11 +1734,16 @@ impl Site {
     /// Answer `cell`'s request, every stage of it finished, as its one
     /// publisher: every output is written.
     fn publish(&self, cell: &Cell) {
-        // SAFETY: its publisher, before the answer: no worker holds a unit
-        // of it, so it is taken out whole, and freed only once answered (its
-        // buffers, the workers' partials among them, cost the answer
-        // nothing), the cell left empty for the next issue to fill.
-        let work = unsafe { (*cell.work.get()).take() }.expect("an issued cell holds its request");
+        // SAFETY: its publisher, before the answer: no worker holds a unit of
+        // it, and the noticing worker will not rewrite the cell before
+        // `cell.answered` is stored below.
+        let work = unsafe { &mut *cell.work.get() };
+        let step = work.step;
+        let experts = work.experts.len() as u64;
+        let rows = work.entry_rows.len() as u64;
+        // Drop `HeldWeights` so slab views are unpinned before the cell is
+        // released, while retaining all heap buffer capacities for reuse.
+        work.release_weights();
         let layer = &self.layers[cell.layer];
         // Its path's terms, read before the answer lets the slot be
         // requested again (which rewrites the marks), counted as the answer
@@ -1625,18 +1751,17 @@ impl Site {
         let marks = cell.marks.each_ref().map(|mark| mark.load(Ordering::Relaxed));
         // The experts it served, which its step's completion counts: the
         // slot is not requested again before then.
-        cell.served.store(work.experts.len() as u64, Ordering::Relaxed);
-        cell.rows.store(work.experts.iter().map(|expert| expert.rows.len() as u64).sum(), Ordering::Relaxed);
+        cell.served.store(experts, Ordering::Relaxed);
+        cell.rows.store(rows, Ordering::Relaxed);
         cell.took.store((self.began.elapsed().as_nanos() as u64).saturating_sub(marks[NOTICED]), Ordering::Relaxed);
         // Nothing of the request is read once it is answered: the device may
         // then request the slot again, which rewrites the cell.
         // Out of the cell, the request frees it for the slot's next, which
         // the device makes only after the answer below.
-        cell.answered.store(work.step, Ordering::Release);
-        self.answer(layer, work.step, false);
+        cell.answered.store(step, Ordering::Release);
+        self.answer(layer, step, false);
         self.count(marks);
         self.open.fetch_sub(1, Ordering::AcqRel);
-        drop(work);
     }
 
     /// Mark `cell`'s request at point `point` of its path, now.

@@ -245,7 +245,10 @@ fn a_malformed_request_panics_when_read() {
     let malformed = [(4, (0, RECORDS + 4, 1.0, 0), "tier record"), (6, (1, 0, 1.0, RECORDS), "expert"), (8, (2, 0, 1.0, 0), "row")];
     for (step, entry, named) in malformed {
         layer.request(step, &[entry], &rows());
-        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| layer.work(layer.shape.slot(step), step, 1)));
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut work = Work::empty(layer.shape, 1);
+            layer.prepare(layer.shape.slot(step), step, &mut work);
+        }));
         let why = read.err().unwrap_or_else(|| panic!("step {step}'s request is read"));
         let why = why.downcast_ref::<String>().cloned().unwrap_or_default();
         assert!(why.contains(named), "{why}");
