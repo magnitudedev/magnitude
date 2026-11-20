@@ -82,14 +82,16 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     return yield* Effect.sync(() => process.exit(process.platform === "win32" ? 75 : 1))
   })
   const blocker = servingBlocker(stateDirectory, profile.port).pipe(Effect.provide(native))
-  /** Waits while the desktop app or another Magnitude serves; resolves once this server may start. */
+  /** Waits while the desktop app or another Magnitude serves, or an update installs; resolves once this server may start. */
   const waited = yield* Ref.make(false)
   const retried = yield* Ref.make(false)
   const awaitTurn = Effect.gen(function* () {
     let announced = false
     let recorded = 0
     for (let current = yield* blocker; Option.isSome(current); current = yield* blocker) {
-      if (!announced) yield* notify("Another Magnitude app is serving on this machine; this server will resume when it stops.")
+      if (!announced) yield* notify(current.value === "UpdateInstallation"
+        ? "A Magnitude update is being installed; this server will resume when it finishes."
+        : "Another Magnitude app is serving on this machine; this server will resume when it stops.")
       announced = true
       yield* Ref.set(waited, true)
       if (yield* Deferred.isDone(stopped)) return false
