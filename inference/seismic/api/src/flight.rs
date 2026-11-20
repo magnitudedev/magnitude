@@ -51,11 +51,14 @@ pub struct FlightRing<T, C: FlightCompletion> {
     /// Entries a shrink released while their work was in flight, kept until
     /// it completes so nothing the device reads is freed.
     retiring: Vec<Entry<T, C>>,
+    /// First completion error observed while shrinking or retiring entries,
+    /// surfaced on the next [`Self::retire`] or [`Self::next`].
+    pending_error: Option<C::Error>,
 }
 
 impl<T, C: FlightCompletion> Default for FlightRing<T, C> {
     fn default() -> Self {
-        Self { entries: VecDeque::new(), retiring: Vec::new() }
+        Self { entries: VecDeque::new(), retiring: Vec::new(), pending_error: None }
     }
 }
 
@@ -71,12 +74,17 @@ impl<T, C: FlightCompletion> FlightRing<T, C> {
 
     /// Hold `entries` entries, each new one made by `make`. A shrink releases
     /// the least recently used; one whose work is in flight retires once it
-    /// completes. On a failure the entries made before it are held.
+    /// completes. Completed entries dropped during the shrink observe their
+    /// completion via [`FlightCompletion::finish`], recording any error to be
+    /// surfaced by [`Self::retire`] or [`Self::next`]. On a `make` failure the
+    /// entries made before it are held.
     pub fn resize<E>(&mut self, entries: usize, mut make: impl FnMut() -> Result<T, E>) -> Result<(), E> {
-        self.retire();
+        self.retire_completed();
         while self.entries.len() > entries {
             let released = self.entries.pop_front().expect("a ring longer than its target has an entry");
-            if !released.complete() {
+            if released.complete() {
+                self.record_completion(released);
+            } else {
                 self.retiring.push(released);
             }
         }
@@ -93,7 +101,7 @@ impl<T, C: FlightCompletion> FlightRing<T, C> {
     /// The ring is empty, or the entry's work has not completed: more uses
     /// are in flight than the capacity the ring was sized for.
     pub fn next(&mut self) -> Result<FlightUse<'_, T, C>, C::Error> {
-        self.retire();
+        self.retire()?;
         let mut entry = self.entries.pop_front().expect("FlightRing::next precondition: the ring holds an entry");
         assert!(
             entry.complete(),
@@ -112,9 +120,34 @@ impl<T, C: FlightCompletion> FlightRing<T, C> {
         self.entries.iter().chain(&self.retiring).map(|entry| &entry.value)
     }
 
-    /// Drop the retiring entries whose work has completed.
-    fn retire(&mut self) {
-        self.retiring.retain(|entry| !entry.complete());
+    /// Observe and drop retiring entries whose work has completed, returning
+    /// the first completion error recorded by retiring or shrinking entries.
+    pub fn retire(&mut self) -> Result<(), C::Error> {
+        self.retire_completed();
+        match self.pending_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn record_completion(&mut self, mut entry: Entry<T, C>) {
+        if let Some(last) = entry.last.take() {
+            if let Err(error) = last.finish() {
+                self.pending_error.get_or_insert(error);
+            }
+        }
+    }
+
+    fn retire_completed(&mut self) {
+        let mut i = 0;
+        while i < self.retiring.len() {
+            if self.retiring[i].complete() {
+                let completed = self.retiring.swap_remove(i);
+                self.record_completion(completed);
+            } else {
+                i += 1;
+            }
+        }
     }
 }
 
@@ -224,5 +257,53 @@ mod tests {
         ring.resize::<()>(1, || unreachable!()).unwrap();
         assert!(ring.retiring.is_empty());
         assert_eq!(*ring.next().unwrap().value(), 1);
+    }
+
+    struct FailingWork {
+        done: Rc<Cell<bool>>,
+        error: &'static str,
+    }
+
+    impl FlightCompletion for FailingWork {
+        type Error = &'static str;
+        fn is_complete(&self) -> bool {
+            self.done.get()
+        }
+        fn finish(self) -> Result<(), &'static str> {
+            Err(self.error)
+        }
+    }
+
+    #[test]
+    fn shrink_and_retire_surface_completion_errors() {
+        let mut ring = FlightRing::<usize, FailingWork>::default();
+        let mut made = 0;
+        ring.resize::<()>(2, || {
+            made += 1;
+            Ok(made - 1)
+        })
+        .unwrap();
+
+        // Already-completed failing entry dropped during shrink surfaces its error.
+        let done_now = Rc::new(Cell::new(true));
+        ring.next()
+            .unwrap()
+            .submitted(FailingWork { done: done_now, error: "shrunk fault" });
+        drop(ring.next().unwrap());
+        ring.resize::<()>(1, || unreachable!()).unwrap();
+        assert_eq!(ring.retire(), Err("shrunk fault"));
+
+        // In-flight failing entry retired later surfaces its error on next()/retire().
+        ring.resize::<()>(2, || Ok(2)).unwrap();
+        let done_later = Rc::new(Cell::new(false));
+        ring.next()
+            .unwrap()
+            .submitted(FailingWork { done: done_later.clone(), error: "retired fault" });
+        drop(ring.next().unwrap());
+        ring.resize::<()>(1, || unreachable!()).unwrap();
+        assert_eq!(ring.retiring.len(), 1);
+        done_later.set(true);
+        assert_eq!(ring.next().err(), Some("retired fault"));
+        assert!(ring.retiring.is_empty());
     }
 }

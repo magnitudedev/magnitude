@@ -28,6 +28,7 @@ float16: Element
 bfloat16: Element
 int32: Element
 uint32: Element
+uint64: Element
 bool_: Element
 
 def element(name: str) -> Element: ...

@@ -152,12 +152,11 @@ impl Kernel {
                 "reference and observations exceed memory budget",
             ));
         }
-        let result = match self.call_outcome_limited(&private, Some(memory_bytes - live)) {
-            Ok(v) => v,
-            Err(e) if e.kind == "ResourceLimit" => {
+        let result = match self.call_outcome_limited(&private, Some(memory_bytes - live))? {
+            CallOutcome::Terminated(v) => v,
+            CallOutcome::ResourceLimit(e) => {
                 return Ok(CheckReport::new("resource_limit", e));
             }
-            Err(e) => return Err(e),
         };
         let mut leaves = Vec::new();
         if let SourceTermination::Returned(value) = &result {

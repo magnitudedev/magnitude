@@ -1556,20 +1556,27 @@ impl Transfer {
         let items = items
             .iter()
             .map(|item| match item {
-                TransferItem::Run(run) => native::TransferItem::Run(native::TransferRun {
+                TransferItem::Run(run) => Ok(native::TransferItem::Run(native::TransferRun {
                     source: run.source.inner(),
                     source_offset: run.source_offset,
                     destination: run.destination.inner(),
                     destination_offset: run.destination_offset,
                     bytes: run.bytes,
-                }),
-                TransferItem::Signal { word, index, value } => native::TransferItem::Signal {
-                    word: word.inner(),
-                    offset: index * 4,
-                    value: *value,
-                },
+                })),
+                TransferItem::Signal { word, index, value } => {
+                    let offset = index.checked_mul(4).ok_or_else(|| {
+                        TransferError::Run(format!(
+                            "signal word index {index} overflows byte offset"
+                        ))
+                    })?;
+                    Ok(native::TransferItem::Signal {
+                        word: word.inner(),
+                        offset,
+                        value: *value,
+                    })
+                }
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, TransferError>>()?;
         self.inner.copy(&items)
     }
 
@@ -2136,9 +2143,6 @@ pub struct WorkflowTensor {
 pub struct WorkflowTensorView {
     inner: seismic_runtime::api::kernel::WorkflowResultRef,
     operations: Vec<seismic_runtime::api::kernel::ViewOperation>,
-    /// Each of `operations` with its numbers as expressions over a graph
-    /// trace's facts ([`trace`]); none where no fact reaches any of them.
-    expressions: Option<Arc<[seismic_runtime::native::dimension::ViewExpr]>>,
 }
 
 impl WorkflowTensor {
@@ -2156,7 +2160,6 @@ impl WorkflowTensor {
         WorkflowTensorView {
             inner: self.inner,
             operations: Vec::new(),
-            expressions: None,
         }
         .slice_leading(start, end)
     }
@@ -2169,7 +2172,6 @@ impl WorkflowTensor {
         WorkflowTensorView {
             inner: self.inner,
             operations: Vec::new(),
-            expressions: None,
         }
         .reshape(extents)
     }
@@ -2186,7 +2188,7 @@ impl WorkflowTensorView {
             start: start.recorded(),
             end: end.recorded(),
         });
-        Self { inner: self.inner, operations, expressions: None }
+        Self { inner: self.inner, operations }
     }
     pub fn reshape<D: Clone>(&self, extents: &[D]) -> Self
     where
@@ -2197,7 +2199,7 @@ impl WorkflowTensorView {
         operations.push(seismic_runtime::api::kernel::ViewOperation::Reshape {
             extents: extents.iter().map(Dim::recorded).collect(),
         });
-        Self { inner: self.inner, operations, expressions: None }
+        Self { inner: self.inner, operations }
     }
 }
 
@@ -2932,18 +2934,52 @@ struct CallKey {
     dimensions: Vec<(String, u64)>,
 }
 
+type CheckedCallsCache =
+    std::collections::HashMap<CallKey, Result<Arc<CheckedNode>, NativeGraphMetadataError>>;
+type WalkedConfigsCache =
+    std::collections::HashMap<(usize, Vec<u64>), Arc<Vec<NativeSpecialization>>>;
+
+/// Process-wide graph metadata caches reclaimed together with evaluated entry
+/// shapes by [`forget_evaluated_entry_shapes`].
+static CHECKED_CALLS: std::sync::OnceLock<std::sync::RwLock<CheckedCallsCache>> =
+    std::sync::OnceLock::new();
+static SCRATCH_WALKED: std::sync::OnceLock<std::sync::RwLock<WalkedConfigsCache>> =
+    std::sync::OnceLock::new();
+static LAUNCH_WALKED: std::sync::OnceLock<std::sync::RwLock<WalkedConfigsCache>> =
+    std::sync::OnceLock::new();
+
+fn clear_graph_metadata_caches() {
+    if let Some(calls) = CHECKED_CALLS.get() {
+        calls
+            .write()
+            .expect("checked calls are never poisoned")
+            .clear();
+    }
+    if let Some(walked) = SCRATCH_WALKED.get() {
+        walked
+            .write()
+            .expect("walked configurations are never poisoned")
+            .clear();
+    }
+    if let Some(walked) = LAUNCH_WALKED.get() {
+        walked
+            .write()
+            .expect("walked launch configurations are never poisoned")
+            .clear();
+    }
+}
+
 /// What a call of `checked` (entry `entry` on `backend`) at `dimensions`
-/// checks to ([`check_node`]), refusal included, checked once per process:
-/// every layer of a graph, every recording and every trace's admission at
-/// another model's dimensions repeat the same calls.
+/// checks to ([`check_node`]), refusal included, cached until
+/// [`forget_evaluated_entry_shapes`]: every layer of a graph, every recording
+/// and every trace's admission at another model's dimensions repeat the same
+/// calls.
 fn checked_call(
     checked: &generated::NativeGraphCheckedEntry,
     entry: &'static str,
     backend: BackendName,
     dimensions: &[(String, u64)],
 ) -> Result<Arc<CheckedNode>, NativeGraphMetadataError> {
-    type Calls = std::collections::HashMap<CallKey, Result<Arc<CheckedNode>, NativeGraphMetadataError>>;
-    static CALLS: std::sync::OnceLock<std::sync::RwLock<Calls>> = std::sync::OnceLock::new();
     let key = CallKey {
         contract: checked.identity(),
         implementation: std::ptr::from_ref(checked.implementation()) as usize,
@@ -2951,7 +2987,7 @@ fn checked_call(
         backend,
         dimensions: dimensions.to_vec(),
     };
-    let calls = CALLS.get_or_init(Default::default);
+    let calls = CHECKED_CALLS.get_or_init(Default::default);
     if let Some(call) = calls.read().expect("checked calls are never poisoned").get(&key) {
         return call.clone();
     }
@@ -3485,22 +3521,21 @@ impl NativeGraphMetadata {
 
 /// Each scratch buffer's bound at `dimension`
 /// ([`NativeImplementation::scratch_bound`]), the declaration's admitted
-/// configurations walked once per process for each value of its statics
-/// ([`NativeImplementation::scratch_configurations`]): every point at
-/// statics already walked is each configuration's charges, arithmetic.
+/// configurations cached until [`forget_evaluated_entry_shapes`] for each
+/// value of its statics ([`NativeImplementation::scratch_configurations`]):
+/// every point at statics already walked is each configuration's charges,
+/// arithmetic.
 fn scratch_bound(
     implementation: &'static NativeImplementation,
     dimension: &impl Fn(&str) -> Option<u64>,
 ) -> Result<Vec<u64>, String> {
-    type Walked = std::collections::HashMap<(usize, Vec<u64>), Arc<Vec<NativeSpecialization>>>;
-    static WALKED: std::sync::OnceLock<std::sync::RwLock<Walked>> = std::sync::OnceLock::new();
     let statics = implementation
         .statics
         .iter()
         .map(|name| dimension(name).ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()).to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let key = (std::ptr::from_ref(implementation) as usize, statics);
-    let walked = WALKED.get_or_init(Default::default);
+    let walked = SCRATCH_WALKED.get_or_init(Default::default);
     let known = walked.read().expect("walked configurations are never poisoned").get(&key).cloned();
     let configurations = match known {
         Some(configurations) => configurations,
@@ -3526,21 +3561,19 @@ fn scratch_bound(
 
 /// Active-launch bitmasks per admitted launch-guard configuration at `dimension`
 /// ([`NativeImplementation::launch_masks_over`]), with the declaration's
-/// admitted configurations walked once per process for each value of its statics
-/// ([`NativeImplementation::launch_configurations`]).
+/// admitted configurations cached until [`forget_evaluated_entry_shapes`] for
+/// each value of its statics ([`NativeImplementation::launch_configurations`]).
 fn launch_masks_bound(
     implementation: &'static NativeImplementation,
     dimension: &impl Fn(&str) -> Option<u64>,
 ) -> Result<Vec<u64>, String> {
-    type Walked = std::collections::HashMap<(usize, Vec<u64>), Arc<Vec<NativeSpecialization>>>;
-    static WALKED: std::sync::OnceLock<std::sync::RwLock<Walked>> = std::sync::OnceLock::new();
     let statics = implementation
         .statics
         .iter()
         .map(|name| dimension(name).ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()).to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let key = (std::ptr::from_ref(implementation) as usize, statics);
-    let walked = WALKED.get_or_init(Default::default);
+    let walked = LAUNCH_WALKED.get_or_init(Default::default);
     let known = walked.read().expect("walked launch configurations are never poisoned").get(&key).cloned();
     let configurations = match known {
         Some(configurations) => configurations,
@@ -4846,13 +4879,15 @@ pub mod generated {
         Vec<std::sync::Weak<seismic_lang::entry::CompiledEntryShapes>>,
     > = std::sync::Mutex::new(Vec::new());
 
-    /// Forget the shapes the process's checked entries have evaluated for
-    /// graph metadata, and return how many there were. Checking a graph
-    /// family evaluates each entry's shapes at every class and keeps them,
-    /// so that its classes and the families after it do not evaluate them
-    /// again; once those are built the kept shapes serve nothing until
-    /// another family is checked, which evaluates what it needs anew.
+    /// Forget the shapes and graph metadata caches the process's checked
+    /// entries have evaluated, and return how many evaluated entry shapes
+    /// there were. Checking a graph family evaluates each entry's shapes and
+    /// metadata at every class and keeps them, so that its classes and the
+    /// families after it do not evaluate them again; once those are built the
+    /// kept caches serve nothing until another family is checked, which
+    /// evaluates what it needs anew.
     pub fn forget_evaluated_entry_shapes() -> usize {
+        super::clear_graph_metadata_caches();
         let mut retained = RETAINED_ENTRY_SHAPES
             .lock()
             .expect("retained entry shapes poisoned");
@@ -5074,7 +5109,7 @@ pub mod generated {
                 WorkflowTensorRef::Result(result) => self.inner.push_result_tensor(result.inner),
                 WorkflowTensorRef::View(view) => self
                     .inner
-                    .push_result_tensor_view(view.inner, view.operations.clone(), view.expressions.clone()),
+                    .push_result_tensor_view(view.inner, view.operations.clone(), None),
             }
         }
         pub fn mutable_tensor(&mut self, tensor: WorkflowTensorMut<'_>) {
@@ -5085,7 +5120,7 @@ pub mod generated {
                 WorkflowTensorMut::Result(result) => self.inner.push_result_tensor(result.inner),
                 WorkflowTensorMut::View(view) => self
                     .inner
-                    .push_result_tensor_view(view.inner, view.operations.clone(), view.expressions.clone()),
+                    .push_result_tensor_view(view.inner, view.operations.clone(), None),
             }
         }
         pub fn owned_tensor(&mut self, tensor: WorkflowTensorOwned<'_>) {
@@ -5862,6 +5897,33 @@ pub mod dynamic;
 pub mod precision {
     pub use seismic_compiler::numerics::PolicyIdentity;
     pub use seismic_lang::precision::*;
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn copy_rejects_signal_index_overflow() {
+        let devices = Devices::discover(&[]).expect("devices are discovered");
+        let device = devices
+            .open_backend(BackendName::Cpu)
+            .expect("cpu device opens");
+        let charges = Charges::tally(&device);
+        let word = Tensor::zeros(&charges, Element::i32(), &[1]).expect("signal tensor allocates");
+        let transfer = Transfer::new(&device).expect("cpu transfer opens");
+        let err = transfer
+            .copy(&[TransferItem::Signal {
+                word: &word,
+                index: u64::MAX / 4 + 1,
+                value: 1,
+            }])
+            .expect_err("signal index overflowing byte offset must return TransferError");
+        assert!(
+            matches!(err, TransferError::Run(_)),
+            "expected TransferError::Run, got {err:?}"
+        );
+    }
 }
 
 
