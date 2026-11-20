@@ -1246,3 +1246,86 @@ fn unified_metal_preserves_cold_supply_avoids_spurious_ratchet_and_lifts_cap() {
     assert_eq!(machine.ledger.estimate().cap(), None, "calm restored free supply lifts B");
     drop(pageable);
 }
+
+/// A store with paging (such as `HostRam` on a dedicated GPU) may hold
+/// non-pooled cache (`GraphSlots`, `Drafter`, `Vision`) without ever opening
+/// a granule pool (`PoolClass::State` or `PoolClass::Records`). Readings must
+/// not panic in `State::unit()`, and OS pressure events must lower `cap` by
+/// the largest non-pooled cache entry and relieve it cleanly.
+#[test]
+fn non_pooled_cache_without_open_pool_reads_and_relieves_under_pressure() {
+    let mut os = Os::new();
+    let now = Arc::new(Lock::new(Instant::now()));
+    let clock = now.clone();
+    let scope = Ledgers::scripted(move || *clock.lock().expect("the clock"));
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, super::tests::shape());
+
+    let at = *now.lock().expect("the clock");
+    read(&ledger, &mut os, at);
+
+    let weights = 2 * GB;
+    let load = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, weights)).expect("load fits");
+    ledger.change(|_| { let entry = load.entry(); entry.take(&entry.change(), weights, Wiring::Pageable) }).expect("load allocated");
+    os.grow(at, weights, Wiring::Pageable);
+
+    let graph_bytes = 32 * MB;
+    let drafter_bytes = 64 * MB;
+    let graph_slots = ledger.cached(CacheKind::GraphSlots, graph_bytes).expect("graph slots fit");
+    os.grow(at, graph_bytes, Wiring::Pageable);
+    let drafter = ledger.cached(CacheKind::Drafter, drafter_bytes).expect("drafter fits");
+    os.grow(at, drafter_bytes, Wiring::Pageable);
+
+    // Paging reading with non-pooled cache and no opened granule pools succeeds.
+    *now.lock().expect("the clock") += Duration::from_millis(100);
+    read(&ledger, &mut os, *now.lock().expect("the clock"));
+    assert_eq!(ledger.estimate().cache(), graph_bytes + drafter_bytes);
+    assert!(ledger.estimate().cap().is_none());
+
+    // Pressure lowers B by the largest non-pooled cache entry (64 MB) and
+    // plans cache-only relief for it.
+    os.pressure = seismic::PressureLevel::Warn;
+    ledger.pressure_event();
+    *now.lock().expect("the clock") += Duration::from_millis(100);
+    read(&ledger, &mut os, *now.lock().expect("the clock"));
+    let est = ledger.estimate();
+    let held = weights + graph_bytes + drafter_bytes;
+    assert_eq!(est.cap(), Some(held - drafter_bytes), "pressure lowers B by largest non-pooled cache entry");
+
+    let shortage = ledger.shortage(&std::collections::BTreeSet::new()).expect("pressure is a real shortage");
+    assert!(matches!(shortage.cause, shortage::Cause::Pressure(seismic::PressureLevel::Warn)));
+    let plan = shortage.response.relief.expect("cache covers pressure relief");
+    assert_eq!(plan.covers(), drafter_bytes);
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    assert_eq!(owed.yielded, drafter_bytes);
+    os.release(*now.lock().expect("the clock"), drafter_bytes, Wiring::Pageable);
+
+    // Pressure clears and others release memory -> once the growth step closes
+    // and a calm baseline is established, B lifts cleanly.
+    os.pressure = seismic::PressureLevel::Normal;
+    os.hot = os.hot.saturating_sub(GB);
+    for _ in 0..4 {
+        *now.lock().expect("the clock") += Duration::from_millis(SNAPSHOT_MS);
+        read(&ledger, &mut os, *now.lock().expect("the clock"));
+    }
+    assert_eq!(ledger.estimate().cap(), None, "restored supply lifts B");
+
+    drop((graph_slots, drafter, load));
+}
+
+/// Pooled cache (`CacheKind::Bank`, `Prefix`, `Spare`) held in a store whose
+/// pool of that class never opened is still an invariant violation.
+#[test]
+#[should_panic(expected = "pool never opened")]
+fn pooled_cache_without_open_pool_still_violates_invariant() {
+    let mut os = Os::new();
+    let now = Arc::new(Lock::new(Instant::now()));
+    let clock = now.clone();
+    let scope = Ledgers::scripted(move || *clock.lock().expect("the clock"));
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, super::tests::shape());
+
+    let at = *now.lock().expect("the clock");
+    read(&ledger, &mut os, at);
+    let _bank = ledger.cache(CacheKind::Bank, 32 * MB, super::Reclaim::Unbacked).expect("unbacked bank cache fits");
+    *now.lock().expect("the clock") += Duration::from_millis(100);
+    read(&ledger, &mut os, *now.lock().expect("the clock"));
+}

@@ -210,19 +210,39 @@ impl State {
         Own { allocated: self.allocated, wired: self.wired }
     }
 
-    /// What one pressure event lowers the boundary by: one block of the
-    /// cache, the largest of its pools'.
+    /// What one pressure event lowers the boundary by: the largest shrink unit
+    /// of the cache held in this store — the largest open pool's block where a
+    /// pool is open, or the largest non-pooled cache entry otherwise — capped
+    /// at the cache held.
     ///
     /// # Panics
-    /// Where cache is held in a store no pool of which ever opened.
+    /// Where pooled cache is held in a store whose pool of that class is not
+    /// open.
     pub(super) fn unit(&self) -> u64 {
-        match self.pools.iter().flatten().map(|pool| pool.block.get()).max() {
-            Some(block) => block.min(self.cache),
-            None => {
-                assert_eq!(self.cache, 0, "invariant violated: cache held in a store whose pool never opened");
-                0
+        for kind in CacheKind::ALL {
+            if let Some(class) = Holding::Cache(kind).pool_class() {
+                let bytes = self.cache_of[kind.index()];
+                assert!(
+                    bytes == 0 || self.pools[class.index()].is_some(),
+                    "invariant violated: {kind:?} cache ({bytes} bytes) held in a store whose {class:?} pool never opened"
+                );
             }
         }
+        let unit = self
+            .pools
+            .iter()
+            .flatten()
+            .map(|pool| pool.block.get())
+            .max()
+            .or_else(|| {
+                self.held
+                    .values()
+                    .filter(|entry| matches!(entry.holding, Holding::Cache(_)) && !entry.holding.pooled())
+                    .map(|entry| entry.bytes)
+                    .max()
+            })
+            .unwrap_or(0);
+        unit.min(self.cache)
     }
 
     /// What pooled holdings of `class` hold: the granules the class's
