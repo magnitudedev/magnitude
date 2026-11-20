@@ -667,9 +667,11 @@ pub struct ElementUses {
     pub component_read: bool,
     /// The component additionally requires an interpreted integer code.
     pub integer_code_read: bool,
+    /// A scalar/elementwise write, `tensor[...]` allocation, or writable
+    /// intrinsic operand requiring `ReadWrite` dense float storage.
     pub stored: bool,
-    /// A `&mut` parameter, or a store of whole trailing matrices
-    /// (`registry::record_writable`).
+    /// A `&mut` parameter, a result tensor leaf, or a store of whole trailing
+    /// matrices (`registry::record_writable`).
     pub record_stored: bool,
     pub conversion_source: bool,
     /// `to_owned` of a view selecting part of the packing axis.

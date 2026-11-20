@@ -2239,11 +2239,21 @@ impl<'a> Checker<'a> {
             participant_uniform: self.participant_uniform(),
         };
         let callee_domain = outcome.element_domain.clone();
-        let contract_arguments = elements
+        let mut contract_arguments = elements
             .arguments
             .iter()
             .map(|(name, element)| (name.clone(), element.clone()))
             .collect::<Vec<_>>();
+        // Match `substitute_type`: any result-only element parameter not
+        // unified from input arguments binds by identity to the caller's
+        // element parameter of the same name.
+        for element in super::tensor_elements(&outcome.signature.result) {
+            if let Elem::Param(name) = element {
+                if !contract_arguments.iter().any(|(bound, _)| bound == name) {
+                    contract_arguments.push((name.clone(), Elem::Param(name.clone())));
+                }
+            }
+        }
         self.elements.call(&callee_domain, &contract_arguments);
         let members = &resolved.families[family];
         let mut candidates = Vec::new();

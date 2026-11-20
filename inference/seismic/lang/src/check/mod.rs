@@ -191,7 +191,7 @@ impl<'a> Checker<'a> {
             }
         }
         for element in tensor_elements(&c.sig.result.clone()) {
-            c.elements.stored(element);
+            c.elements.record_stored(element);
         }
         let contract = env.resolved.families[declared.family.index()]
             .contract
