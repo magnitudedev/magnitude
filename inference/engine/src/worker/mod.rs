@@ -410,7 +410,7 @@ fn load(
             .map_err(LoadError::Unsupported)?;
         let chat = ChatIdentity {
             template_fingerprint: gguf_templates(host_package.templates(), host_package.tokenizer())
-                .and_then(|templates| templates.inspect())
+                .and_then(|templates| templates.inspect_cached())
                 .map_err(|detail| LoadError::Unsupported(UnsupportedModel::chat_template(detail)))?
                 .fingerprint,
             modalities: InputModalities::of(family, &definition),

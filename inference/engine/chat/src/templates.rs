@@ -78,9 +78,51 @@ pub struct TemplateVariant {
     pub provenance: String,
 }
 
+struct VariantEntry {
+    variant: TemplateVariant,
+    compiled: OnceLock<Result<Template, String>>,
+}
+
+impl VariantEntry {
+    fn new(variant: TemplateVariant) -> Self {
+        Self {
+            variant,
+            compiled: OnceLock::new(),
+        }
+    }
+
+    fn template(&self, special_tokens: &SpecialTokens) -> Result<&Template, String> {
+        self.compiled
+            .get_or_init(|| {
+                Template::new(&self.variant.source, special_tokens).map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
+
+enum SelectedVariant<'a, 'b> {
+    Declared(&'a VariantEntry),
+    Override(&'b TemplateVariant),
+}
+
+enum SelectedTemplate<'a> {
+    Cached(&'a Template),
+    Owned(Template),
+}
+
+impl SelectedTemplate<'_> {
+    fn as_template(&self) -> &Template {
+        match self {
+            Self::Cached(template) => template,
+            Self::Owned(template) => template,
+        }
+    }
+}
+
 /// Validated artifact template metadata. Selection never invents a default source.
 pub struct TemplateBundle {
-    variants: BTreeMap<String, TemplateVariant>,
+    variants: BTreeMap<String, VariantEntry>,
     default: String,
     special_tokens: SpecialTokens,
     profiles: BoundedOnceCache<(String, Vec<u8>), Result<Arc<super::reasoning::ReasoningProfile>, String>>,
@@ -207,7 +249,10 @@ impl TemplateBundle {
         let mut declared = BTreeMap::new();
         for variant in variants {
             validate_variant(&variant)?;
-            if declared.insert(variant.name.clone(), variant).is_some() {
+            if declared
+                .insert(variant.name.clone(), VariantEntry::new(variant))
+                .is_some()
+            {
                 return Err("duplicate template variant".into());
             }
         }
@@ -230,17 +275,18 @@ impl TemplateBundle {
     pub fn compile_grammar(&self, gbnf: &str) -> Result<Arc<Compiled>, GrammarError> {
         self.grammars.compile(gbnf)
     }
-    pub fn select<'a>(
+
+    fn select_variant<'a, 'b>(
         &'a self,
         tools_offered: bool,
-        selection: &TemplateSelection<'a>,
-    ) -> Result<&'a TemplateVariant, String> {
+        selection: &TemplateSelection<'b>,
+    ) -> Result<SelectedVariant<'a, 'b>, String> {
         if let Some(source) = selection.source_override {
             if selection.variant.is_some() {
                 return Err("configure a source override or a variant, not both".into());
             }
             validate_variant(source)?;
-            return Ok(source);
+            return Ok(SelectedVariant::Override(source));
         }
         let selected = selection.variant.unwrap_or_else(|| {
             if tools_offered && self.variants.contains_key("tool_use") {
@@ -251,7 +297,19 @@ impl TemplateBundle {
         });
         self.variants
             .get(selected)
+            .map(SelectedVariant::Declared)
             .ok_or_else(|| format!("unknown template variant: {selected}"))
+    }
+
+    pub fn select<'a>(
+        &'a self,
+        tools_offered: bool,
+        selection: &TemplateSelection<'a>,
+    ) -> Result<&'a TemplateVariant, String> {
+        match self.select_variant(tools_offered, selection)? {
+            SelectedVariant::Declared(entry) => Ok(&entry.variant),
+            SelectedVariant::Override(source) => Ok(source),
+        }
     }
     /// Resolve effective tools before selecting a variant. Cloning normalization
     /// preserves caller-owned messages and historical tool-call arguments.
@@ -262,19 +320,33 @@ impl TemplateBundle {
         request: &ChatRequest,
         selection: &TemplateSelection<'_>,
     ) -> Result<(PreparedRequest, ResolvedReasoning), ChatError> {
-        self.prepare_native(request, selection, None)
-            .map_err(|error| match error {
-                Prepare::Invalid(message) => ChatError::InvalidRequest(message),
-                Prepare::Reasoning(error) => ChatError::Reasoning(error),
-            })
+        self.prepare_native(request, selection)
+            .map_err(Prepare::into_chat_error)
     }
 
-    fn prepare_native(
+    /// Render only the prompt text for `request`, reusing the bundle's cached
+    /// native template handle without allocating a native request handle or
+    /// materializing grammar/parser descriptions.
+    pub fn render_prompt(
         &self,
         request: &ChatRequest,
         selection: &TemplateSelection<'_>,
-        preparsed: Option<(&str, &Template)>,
-    ) -> Result<(PreparedRequest, ResolvedReasoning), Prepare> {
+    ) -> Result<String, ChatError> {
+        let (native, selected, _, _) = self
+            .normalize_request(request, selection)
+            .map_err(Prepare::into_chat_error)?;
+        let probe = selected
+            .as_template()
+            .prepare_probe(&native)
+            .map_err(|e| ChatError::InvalidRequest(e.to_string()))?;
+        Ok(probe.prompt)
+    }
+
+    fn normalize_request<'a>(
+        &'a self,
+        request: &ChatRequest,
+        selection: &TemplateSelection<'_>,
+    ) -> Result<(NativeRequest, SelectedTemplate<'a>, ResolvedReasoning, bool), Prepare> {
         let choice = &request.tool_choice;
         let intent = &request.reasoning;
         if *intent != ReasoningIntent::ModelDefault
@@ -382,19 +454,18 @@ impl TemplateBundle {
                 }
             }
         }
-        let variant = self.select(!request.tools.is_empty(), selection)?;
-        let owned_template;
-        let template = match preparsed {
-            Some((name, template))
-                if selection.source_override.is_none() && variant.name == name =>
-            {
-                template
-            }
-            _ => {
-                owned_template = Template::new(&variant.source, &self.special_tokens)
-                    .map_err(|e| e.to_string())?;
-                &owned_template
-            }
+        let (source, selected) = match self.select_variant(!request.tools.is_empty(), selection)? {
+            SelectedVariant::Declared(entry) => (
+                entry.variant.source.as_str(),
+                SelectedTemplate::Cached(entry.template(&self.special_tokens)?),
+            ),
+            SelectedVariant::Override(source) => (
+                source.source.as_str(),
+                SelectedTemplate::Owned(
+                    Template::new(&source.source, &self.special_tokens)
+                        .map_err(|e| e.to_string())?,
+                ),
+            ),
         };
         // The default renders with no reasoning arguments, so it
         // needs no inspection; every other intent resolves against the profile.
@@ -410,12 +481,12 @@ impl TemplateBundle {
             .map_err(|error| error.to_string())?;
             let cell = self
                 .profiles
-                .cell((template.identity().to_owned(), arguments_key));
+                .cell((selected.as_template().identity().to_owned(), arguments_key));
             let profile = cell
                 .get_or_init(|| {
                     super::reasoning::inspect_reasoning(
-                        template,
-                        &variant.source,
+                        selected.as_template(),
+                        source,
                         &request.template_arguments,
                     )
                     .map(Arc::new)
@@ -434,7 +505,19 @@ impl TemplateBundle {
                 )));
             }
         }
-        let prepared = template.prepare(&request).map_err(|e| e.to_string())?;
+        Ok((request, selected, reasoning, required))
+    }
+
+    fn prepare_native(
+        &self,
+        request: &ChatRequest,
+        selection: &TemplateSelection<'_>,
+    ) -> Result<(PreparedRequest, ResolvedReasoning), Prepare> {
+        let (request, selected, reasoning, required) = self.normalize_request(request, selection)?;
+        let prepared = selected
+            .as_template()
+            .prepare(&request)
+            .map_err(|e| e.to_string())?;
         if (required || request.json_schema.is_some()) && prepared.description().grammar.is_empty()
         {
             return Err("selected template did not produce required output constraints".into());
@@ -447,6 +530,14 @@ impl TemplateBundle {
 enum Prepare {
     Invalid(String),
     Reasoning(super::reasoning::ReasoningError),
+}
+impl Prepare {
+    fn into_chat_error(self) -> ChatError {
+        match self {
+            Self::Invalid(message) => ChatError::InvalidRequest(message),
+            Self::Reasoning(error) => ChatError::Reasoning(error),
+        }
+    }
 }
 impl From<String> for Prepare {
     fn from(message: String) -> Self {
@@ -502,7 +593,7 @@ impl TemplateBundle {
         let sources = self
             .variants
             .values()
-            .map(|variant| (&variant.name, &variant.source))
+            .map(|entry| (&entry.variant.name, &entry.variant.source))
             .collect::<Vec<_>>();
         let key = serde_json::to_vec(&(&sources, &self.default, &self.special_tokens))
             .map_err(|error| error.to_string())?;
@@ -514,7 +605,13 @@ impl TemplateBundle {
 
     /// The default variant's source text.
     pub fn default_source(&self) -> &str {
-        &self.variants[&self.default].source
+        &self.variants[&self.default].variant.source
+    }
+
+    fn default_entry(&self) -> Result<&VariantEntry, String> {
+        self.variants
+            .get(&self.default)
+            .ok_or_else(|| "template bundle lost its default variant".into())
     }
 
     #[cfg(test)]
@@ -524,8 +621,9 @@ impl TemplateBundle {
 
     /// The native template's capability flags for the default variant.
     pub fn capabilities(&self) -> Result<BTreeMap<String, bool>, String> {
-        Template::new(self.default_source(), &self.special_tokens)
-            .and_then(|template| template.capabilities())
+        self.default_entry()?
+            .template(&self.special_tokens)?
+            .capabilities()
             .map_err(|e| e.to_string())
     }
 
@@ -539,12 +637,8 @@ impl TemplateBundle {
     }
 
     fn inspect_inner(&self, pruned: bool) -> Result<TemplateInspection, String> {
-        let default = self
-            .variants
-            .get(&self.default)
-            .ok_or("template bundle lost its default variant")?;
-        let default_template =
-            Template::new(&default.source, &self.special_tokens).map_err(|e| e.to_string())?;
+        let default = self.default_entry()?;
+        let default_template = default.template(&self.special_tokens)?;
         let question = serde_json::json!({"role":"user","content":"What is the weather in Paris?"});
         let mut tool_request = ChatRequest::new(vec![question.clone()], 946684800);
         tool_request.tools = vec![serde_json::json!({"type":"function","function":{
@@ -558,32 +652,23 @@ impl TemplateBundle {
         }));
         let (reasoning, identities, tools, structured_output) =
             if pruned && self.variants.len() == 1 {
-                let preparsed = Some((default.name.as_str(), &default_template));
                 let (reasoning, (tools, structured_output)) = seismic_threads::pool::join(
                     || {
                         super::reasoning::inspect_reasoning(
-                            &default_template,
-                            &default.source,
+                            default_template,
+                            &default.variant.source,
                             &Default::default(),
                         )
                     },
                     || {
                         seismic_threads::pool::join(
                             || {
-                                self.prepare_native(
-                                    &tool_request,
-                                    &TemplateSelection::default(),
-                                    preparsed,
-                                )
-                                .is_ok()
+                                self.prepare_native(&tool_request, &TemplateSelection::default())
+                                    .is_ok()
                             },
                             || {
-                                self.prepare_native(
-                                    &schema_request,
-                                    &TemplateSelection::default(),
-                                    preparsed,
-                                )
-                                .is_ok()
+                                self.prepare_native(&schema_request, &TemplateSelection::default())
+                                    .is_ok()
                             },
                         )
                     },
@@ -596,20 +681,20 @@ impl TemplateBundle {
                     );
                 }
                 let identities = vec![serde_json::json!({
-                    "name": default.name,
+                    "name": default.variant.name,
                     "identity": default_template.identity(),
                 })];
                 (reasoning, identities, tools, structured_output)
             } else {
                 let reasoning = if pruned {
                     super::reasoning::inspect_reasoning(
-                        &default_template,
-                        &default.source,
+                        default_template,
+                        &default.variant.source,
                         &Default::default(),
                     )?
                 } else {
                     super::reasoning::inspect_reasoning_unpruned(
-                        &default_template,
+                        default_template,
                         &Default::default(),
                     )?
                 };
@@ -619,44 +704,21 @@ impl TemplateBundle {
                             .into(),
                     );
                 }
-                let mut tool_use_template: Option<Template> = None;
                 let identities = self
                     .variants
                     .values()
-                    .map(|variant| {
-                        if pruned && variant.name == self.default {
-                            Ok(serde_json::json!({
-                                "name": variant.name,
-                                "identity": default_template.identity(),
-                            }))
-                        } else {
-                            let template = Template::new(&variant.source, &self.special_tokens)
-                                .map_err(|e| e.to_string())?;
-                            let identity = serde_json::json!({
-                                "name": variant.name,
-                                "identity": template.identity(),
-                            });
-                            if pruned && variant.name == "tool_use" {
-                                tool_use_template = Some(template);
-                            }
-                            Ok(identity)
-                        }
+                    .map(|entry| {
+                        let template = entry.template(&self.special_tokens)?;
+                        Ok(serde_json::json!({
+                            "name": entry.variant.name,
+                            "identity": template.identity(),
+                        }))
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 // A rejected probe is the capability's absence: the engine rejects
                 // every request of that kind for this bundle.
                 let accepted = |request: &ChatRequest| {
-                    let preparsed = if !pruned {
-                        None
-                    } else if !request.tools.is_empty() {
-                        tool_use_template
-                            .as_ref()
-                            .map(|template| ("tool_use", template))
-                            .or(Some((default.name.as_str(), &default_template)))
-                    } else {
-                        Some((default.name.as_str(), &default_template))
-                    };
-                    self.prepare_native(request, &TemplateSelection::default(), preparsed)
+                    self.prepare_native(request, &TemplateSelection::default())
                         .is_ok()
                 };
                 (
@@ -695,6 +757,19 @@ mod tests {
         request
     }
 
+    fn chatml_bundle() -> TemplateBundle {
+        TemplateBundle::new(
+            vec![TemplateVariant {
+                name: "default".into(),
+                source: "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}".into(),
+                provenance: "test".into(),
+            }],
+            "default".into(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn tool_selection_instructions_cover_named_and_required_modes() {
         let original = vec![json!({"role":"user", "content":"weather"})];
@@ -722,5 +797,45 @@ mod tests {
             single.messages[0]["content"],
             "Call one of the supplied tools to answer this request."
         );
+    }
+
+    #[test]
+    fn variant_templates_compile_lazily_and_reuse_cached_handle() {
+        let bundle = chatml_bundle();
+        let entry = bundle.default_entry().unwrap();
+        assert!(entry.compiled.get().is_none());
+
+        let request = ChatRequest::new(vec![json!({"role":"user", "content":"hello"})], 0);
+        let (prepared, _) = bundle
+            .prepare(&request, &TemplateSelection::default())
+            .unwrap();
+        let first_ptr: *const Template = entry.compiled.get().unwrap().as_ref().unwrap();
+
+        let prompt = bundle
+            .render_prompt(&request, &TemplateSelection::default())
+            .unwrap();
+        assert_eq!(prompt, prepared.description().prompt);
+
+        let _ = bundle.capabilities().unwrap();
+        let second_ptr: *const Template = entry.compiled.get().unwrap().as_ref().unwrap();
+        assert_eq!(first_ptr, second_ptr);
+    }
+
+    #[test]
+    fn render_prompt_matches_prepare_with_override() {
+        let bundle = chatml_bundle();
+        let override_variant = TemplateVariant {
+            name: "override".into(),
+            source: "OVERRIDE:{{ messages[0].content }}".into(),
+            provenance: "test".into(),
+        };
+        let selection = TemplateSelection {
+            variant: None,
+            source_override: Some(&override_variant),
+        };
+        let request = ChatRequest::new(vec![json!({"role":"user", "content":"ping"})], 0);
+        let (prepared, _) = bundle.prepare(&request, &selection).unwrap();
+        let prompt = bundle.render_prompt(&request, &selection).unwrap();
+        assert_eq!(prompt, prepared.description().prompt);
     }
 }
