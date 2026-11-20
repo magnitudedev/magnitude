@@ -771,31 +771,54 @@ impl ReservedRound {
                 state: State::Between(generation, Stage::Ready),
             });
         }
-        let bound = match generation.publication_bound(allowance) {
+        let mut allowance = allowance;
+        let mut bound = match generation.publication_bound(allowance) {
             Ok(bound) => bound,
             Err(detail) => return Reservation::Returned(failed(record, generation, detail)),
         };
         if bound != 0 {
             if let Some(sender) = &record.publication {
-                let slots = bound.div_ceil(record.publication_batch_limit);
-                match sender.reserve_outputs(slots) {
-                    Ok(permits) => record.publication_permits.extend(permits),
-                    Err(PublishError::Full) => {
-                        return Reservation::Returned(Request {
-                            record,
-                            state: State::Between(generation, Stage::AwaitingCredit),
-                        });
-                    }
-                    Err(PublishError::ReceiverClosed) => {
-                        let mut generation = generation;
-                        generation.cancel();
-                        generation.discard_output();
-                        record.release_publication();
-                        epoch.advance();
-                        return Reservation::Returned(Request {
-                            record,
-                            state: State::Between(generation, Stage::Ready),
-                        });
+                let capacity = sender.capacity();
+                let max_bound = capacity.saturating_mul(record.publication_batch_limit);
+                if bound > max_bound && max_bound > 0 {
+                    allowance = allowance.min(max_bound);
+                    bound = match generation.publication_bound(allowance) {
+                        Ok(bound) => bound,
+                        Err(detail) => {
+                            return Reservation::Returned(failed(record, generation, detail));
+                        }
+                    };
+                }
+                if bound != 0 {
+                    let slots = bound.div_ceil(record.publication_batch_limit);
+                    match sender.reserve_outputs(slots) {
+                        Ok(permits) => record.publication_permits.extend(permits),
+                        Err(PublishError::Full) => {
+                            return Reservation::Returned(Request {
+                                record,
+                                state: State::Between(generation, Stage::AwaitingCredit),
+                            });
+                        }
+                        Err(PublishError::ExceedsCapacity) => {
+                            return Reservation::Returned(failed(
+                                record,
+                                generation,
+                                format!(
+                                    "round requires {slots} publication slots, exceeding queue capacity {capacity}"
+                                ),
+                            ));
+                        }
+                        Err(PublishError::ReceiverClosed) => {
+                            let mut generation = generation;
+                            generation.cancel();
+                            generation.discard_output();
+                            record.release_publication();
+                            epoch.advance();
+                            return Reservation::Returned(Request {
+                                record,
+                                state: State::Between(generation, Stage::Ready),
+                            });
+                        }
                     }
                 }
             }
@@ -2906,7 +2929,7 @@ impl<F: ProgramFamily> Service<F> {
             Ok(None) => return Ok(Residency::Waiting(generation, Wait { at: self.epoch, on: WaitsOn::Chain })),
             // New work waits for memory a change of ours will free.
             Err(DomainError::Capacity(_))
-                if relieved.pending || self.domain.holds_state_beside(&BTreeSet::from([id])) =>
+                if relieved.pending || self.progressing_state_beside(&BTreeSet::from([id])) =>
             {
                 return Ok(Residency::Waiting(generation, Wait { at: self.epoch, on: WaitsOn::Memory }));
             }
@@ -3803,7 +3826,7 @@ impl<F: ProgramFamily> Service<F> {
             };
             match sender.output_with_permit(tokens, permit) {
                 Ok(()) => {}
-                Err((PublishError::Full, _)) => {
+                Err((PublishError::Full | PublishError::ExceedsCapacity, _)) => {
                     unreachable!("a publication permit owns an exact output slot")
                 }
                 Err((PublishError::ReceiverClosed, _)) => return true,
@@ -3901,9 +3924,9 @@ impl<F: ProgramFamily> Service<F> {
     }
 
     /// An idle owner never holds a request waiting on memory nothing can
-    /// free: with no other request holding state, no reading owed and no
-    /// change under way (a bank resize begun, graph slots releasing), no
-    /// epoch advance can come, so a wait on memory standing then is an
+    /// free: with no other progressing request holding state, no reading owed
+    /// and no change under way (a bank resize begun, graph slots releasing),
+    /// no epoch advance can come, so a wait on memory standing then is an
     /// invariant violation, never a silent park.
     fn check_no_unwakeable_wait(&self) {
         let under_way = self.memory.admission_waits
@@ -3916,21 +3939,40 @@ impl<F: ProgramFamily> Service<F> {
         for (id, request) in &self.requests {
             if let Some(Wait { at, on: WaitsOn::Memory }) = request.state.wait() {
                 assert!(
-                    self.epoch.changed_since(at) || self.domain.holds_state_beside(&BTreeSet::from([*id])),
+                    self.epoch.changed_since(at)
+                        || self.progressing_state_beside(&BTreeSet::from([*id])),
                     "invariant violated: an idle owner holds {id:?} waiting on memory that nothing under way can free"
                 );
             }
         }
     }
 
+    /// Whether a request other than `own` holds state on the device's ledger
+    /// and is not parked on an unexpired memory wait: one in a flight, in
+    /// the current round, or outside it and still able to run, drain, or
+    /// retire to advance `self.epoch` and free memory.
+    fn progressing_state_beside(&self, own: &BTreeSet<RequestId>) -> bool {
+        let mut excluded = own.clone();
+        for (&id, request) in &self.requests {
+            if matches!(
+                request.state.wait(),
+                Some(Wait { at, on: WaitsOn::Memory }) if !self.epoch.changed_since(at)
+            ) {
+                excluded.insert(id);
+            }
+        }
+        self.domain.holds_state_beside(&excluded)
+    }
+
     /// Whether a request outside `group_` holds memory whose release would
-    /// let it in: one holding state, between rounds, in this round or in a
-    /// flight ([`ExecutorDomain::holds_state_beside`]). A claim short
-    /// beside one waits for it to end; with none, nothing of ours can free
-    /// memory for it, and it fails.
+    /// let it in: one holding state that is still progressing, between
+    /// rounds, in this round or in a flight
+    /// ([`Self::progressing_state_beside`]). A claim short beside one waits
+    /// for it to end; with none, nothing of ours can free memory for it, and
+    /// it fails.
     fn others_stand(&self, group_: &OperationGroup) -> bool {
         let own = group_.operations().iter().map(Operation::request).collect::<BTreeSet<_>>();
-        self.domain.holds_state_beside(&own)
+        self.progressing_state_beside(&own)
     }
 
     /// Mark `set`, whose state was just released, evicted: each waits
@@ -5081,6 +5123,100 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
             assert_eq!(received, err, "{label} request must receive the real error, not WorkerClosed");
         }
     }
+
+    #[test]
+    fn progressing_state_beside_excludes_unexpired_memory_waiters() {
+        let (domain, bindings) = fixtures::fixture(None);
+        let vocabulary = fixtures::tiny_definition().decoder.vocabulary as usize;
+        let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+        let (first, _rx1) = owner
+            .admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0)
+            .unwrap();
+        let (second, _rx2) = owner
+            .admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0)
+            .unwrap();
+        let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
+        let service = &mut owner.service;
+        service.memory.owed = false;
+        assert_eq!(residency(service, bindings, first), Some(true));
+        assert_eq!(residency(service, bindings, second), Some(true));
+        let Request { record, state: State::Between(generation, Stage::Ready) } =
+            service.requests.remove(&first).unwrap()
+        else {
+            panic!("resident first request");
+        };
+        let Ok(RoundStart::Target(round)) = generation.start_round(first, 4, FrontGrant::UpTo(0)) else {
+            panic!("prompt target round");
+        };
+        let work = lower_round(&round, first, round.generation().resident_position(), None).unwrap();
+        service.requests.insert(
+            first,
+            Request {
+                record,
+                state: State::Parked(
+                    round,
+                    Work::new(vec![work]).unwrap(),
+                    Some(Wait { at: service.epoch, on: WaitsOn::Memory }),
+                ),
+            },
+        );
+        assert!(
+            !service.progressing_state_beside(&BTreeSet::from([second])),
+            "a peer parked on an unexpired memory wait cannot wake the last progressing request"
+        );
+        assert!(
+            service.progressing_state_beside(&BTreeSet::from([first])),
+            "a ready resident peer can still progress and free memory"
+        );
+        service.check_no_unwakeable_wait();
+        service.epoch.advance();
+        assert!(
+            service.progressing_state_beside(&BTreeSet::from([second])),
+            "once the epoch advances, the parked peer's wait has expired and it can retry"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "waiting on memory that nothing under way can free")]
+    fn check_no_unwakeable_wait_catches_mutual_memory_wait_deadlock() {
+        let (domain, bindings) = fixtures::fixture(None);
+        let vocabulary = fixtures::tiny_definition().decoder.vocabulary as usize;
+        let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+        let (first, _rx1) = owner
+            .admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0)
+            .unwrap();
+        let (second, _rx2) = owner
+            .admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0)
+            .unwrap();
+        let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
+        let service = &mut owner.service;
+        service.memory.owed = false;
+        assert_eq!(residency(service, bindings, first), Some(true));
+        assert_eq!(residency(service, bindings, second), Some(true));
+        for id in [first, second] {
+            let Request { record, state: State::Between(generation, Stage::Ready) } =
+                service.requests.remove(&id).unwrap()
+            else {
+                panic!("resident request");
+            };
+            let Ok(RoundStart::Target(round)) = generation.start_round(id, 4, FrontGrant::UpTo(0)) else {
+                panic!("prompt target round");
+            };
+            let work = lower_round(&round, id, round.generation().resident_position(), None).unwrap();
+            service.requests.insert(
+                id,
+                Request {
+                    record,
+                    state: State::Parked(
+                        round,
+                        Work::new(vec![work]).unwrap(),
+                        Some(Wait { at: service.epoch, on: WaitsOn::Memory }),
+                    ),
+                },
+            );
+        }
+        service.check_no_unwakeable_wait();
+    }
 }
 
 #[cfg(test)]
@@ -5632,5 +5768,29 @@ mod front_rows_tests {
             super::combine_yielded(true, Yielded::Released { released: 128, returned: 64 }),
             Yielded::Released { released: 128, returned: 64 }
         );
+    }
+
+    #[test]
+    fn reserve_clamps_allowance_to_publication_queue_capacity() {
+        let (sender, _receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
+        let record = Record {
+            publication: Some(sender),
+            publication_batch_limit: 1,
+            ..record()
+        };
+        let generation = guessing(RequestId(1), 32);
+        assert!(
+            generation.publication_bound(4).unwrap() > 1,
+            "unclamped allowance would require more slots than queue capacity"
+        );
+        let mut epoch = AvailabilityEpoch::default();
+        match ReservedRound::reserve(record, generation, 4, 1, &mut epoch) {
+            Reservation::Round(reserved) => {
+                assert_eq!(reserved.allowance, 1);
+                assert_eq!(reserved.record.publication_permits.len(), 1);
+            }
+            Reservation::Returned(_) => panic!("must clamp allowance instead of stalling in AwaitingCredit"),
+            Reservation::Composed(..) => panic!("unexpected composed work"),
+        }
     }
 }

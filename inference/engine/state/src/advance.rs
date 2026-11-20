@@ -883,6 +883,11 @@ fn follow(
         let count = committed
             .checked_add(*front)
             .ok_or(LayoutError::ArithmeticOverflow("successor row count"))?;
+        if *committed == 0
+            || count > predecessor.store.context_capacity.saturating_sub(predecessor.end)
+        {
+            return Err(Error::from("successor advance exceeds context capacity"));
+        }
         predecessor.fit(count);
         counts.push(count);
     }
@@ -910,8 +915,9 @@ fn follow(
     });
     slots
         .into_iter()
-        .map(|(predecessor, committed, front, writes)| {
-            OwnedSuccessorAdvance::reserve(predecessor, committed, front, writes, &admission)
+        .zip(counts)
+        .map(|((predecessor, committed, _, writes), count)| {
+            OwnedSuccessorAdvance::reserve(predecessor, committed, count, writes, &admission)
         })
         .collect()
 }
@@ -984,17 +990,11 @@ impl OwnedSuccessorAdvance {
     fn reserve(
         predecessor: Predecessor<'_>,
         committed: usize,
-        front: usize,
+        count: usize,
         writes: Option<BankHandle>,
         admission: &Rc<Admission>,
     ) -> Result<Self, Error> {
         let store = predecessor.store;
-        let count = committed
-            .checked_add(front)
-            .ok_or(LayoutError::ArithmeticOverflow("successor row count"))?;
-        if committed == 0 || count > store.context_capacity.saturating_sub(predecessor.end) {
-            return Err(Error::from("successor advance exceeds context capacity"));
-        }
         let reserved = store.reserve_rows(&predecessor.tails(), &predecessor.counts(count))?;
         let following = match writes {
             Some(bank) => bank,
@@ -1929,5 +1929,29 @@ mod tests {
             panic!("an accepted prefix commits");
         };
         assert_eq!((state.position(), state.tape_rows()), (6, 1));
+    }
+
+    #[test]
+    fn follow_rejects_out_of_context_capacity_successor_before_admitting() {
+        let store = recurrent_store(8, 3);
+        let first = OwnedStateAdvance::begin(store.create().unwrap(), 2)
+            .ok()
+            .unwrap();
+        let occupied = store.occupied_rows(TOKEN);
+        let free_banks = store.available_banks();
+        assert!(matches!(
+            first.successor(0),
+            Err(Error::Request(ref msg)) if msg.contains("context capacity")
+        ));
+        assert!(matches!(
+            first.successor(7),
+            Err(Error::Request(ref msg)) if msg.contains("context capacity")
+        ));
+        assert!(matches!(
+            first.successor(usize::MAX),
+            Err(Error::Request(ref msg)) if msg.contains("context capacity")
+        ));
+        assert_eq!(store.occupied_rows(TOKEN), occupied);
+        assert_eq!(store.available_banks(), free_banks);
     }
 }

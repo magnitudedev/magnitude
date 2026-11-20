@@ -128,6 +128,7 @@ impl PublicationWake {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishError {
     Full,
+    ExceedsCapacity,
     ReceiverClosed,
 }
 
@@ -270,6 +271,10 @@ impl PublicationSender {
         }
     }
 
+    pub fn capacity(&self) -> usize {
+        self.shared.state.lock().unwrap().capacity
+    }
+
     pub fn reserve_outputs(&self, count: usize) -> Result<Vec<PublicationPermit>, PublishError> {
         if count == 0 {
             return Ok(Vec::new());
@@ -277,6 +282,9 @@ impl PublicationSender {
         let mut state = self.shared.state.lock().unwrap();
         if !state.receiver_open || state.terminal.is_some() {
             return Err(PublishError::ReceiverClosed);
+        }
+        if count > state.capacity {
+            return Err(PublishError::ExceedsCapacity);
         }
         let available = state
             .capacity
@@ -795,6 +803,27 @@ mod tests {
         let wake = wakes.lock().unwrap().pop().unwrap();
         assert!(!sender.process_cancelled(wake));
         assert!(!other_sender.receiver_open());
+    }
+
+    #[test]
+    fn reserve_outputs_above_capacity_fails_without_setting_wait() {
+        let wakes = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&wakes);
+        let (sender, _receiver) = PublicationQueue::bounded(2, move |wake| {
+            observed.lock().unwrap().push(wake);
+        })
+        .unwrap();
+        assert_eq!(sender.capacity(), 2);
+        assert!(matches!(
+            sender.reserve_outputs(3),
+            Err(PublishError::ExceedsCapacity)
+        ));
+        let permit = sender.reserve_outputs(1).unwrap().pop().unwrap();
+        drop(permit);
+        assert!(
+            wakes.lock().unwrap().is_empty(),
+            "rejected over-capacity reservation must not arm a credit wake"
+        );
     }
 
     #[test]

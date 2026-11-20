@@ -62,8 +62,7 @@ impl HistoryDomainKind {
     pub fn advance_rows(self, position: usize, count: usize) -> usize {
         match self {
             Self::Block { rate } => {
-                let end = position as u128 + count as u128;
-                (end / rate as u128 - position as u128 / rate as u128) as usize
+                count / rate + usize::from(position % rate >= rate - count % rate)
             }
             Self::Token | Self::Window { .. } | Self::Shared { .. } => count,
         }
@@ -534,4 +533,32 @@ pub(crate) fn validate_domains(
         }
     }
     Ok((stored, bindings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HistoryDomainKind;
+
+    #[test]
+    fn block_advance_rows_does_not_overflow_near_usize_max() {
+        assert_eq!(HistoryDomainKind::Block { rate: 4 }.advance_rows(3, 1), 1);
+        assert_eq!(HistoryDomainKind::Block { rate: 4 }.advance_rows(2, 1), 0);
+        assert_eq!(HistoryDomainKind::Block { rate: 4 }.advance_rows(3, 5), 2);
+        assert_eq!(
+            HistoryDomainKind::Block { rate: 4 }.advance_rows(usize::MAX - 1, usize::MAX),
+            usize::MAX / 4 + 1
+        );
+        assert_eq!(
+            HistoryDomainKind::Block { rate: 1 }.advance_rows(usize::MAX, usize::MAX),
+            usize::MAX
+        );
+        assert_eq!(
+            HistoryDomainKind::Block { rate: usize::MAX }.advance_rows(usize::MAX - 1, 1),
+            1
+        );
+        assert_eq!(
+            HistoryDomainKind::Block { rate: usize::MAX }.advance_rows(usize::MAX - 1, usize::MAX),
+            1
+        );
+    }
 }
