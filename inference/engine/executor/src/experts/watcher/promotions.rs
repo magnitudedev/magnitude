@@ -56,8 +56,9 @@ use crate::experts::horizon::{Hold, Tokens};
 use crate::experts::staging::Staged;
 
 /// What promotions copy with: the device's copy engine. Destination bank
-/// record views are held in `Core::groups[group].bank` (delivered at open and
-/// via `Join::Bank`), so promotions never touch `Stores` or `Pool`.
+/// record views are resolved on demand from `Core::groups[group].bank`
+/// (`Records::pooled`), so idle bank slabs hold no view and the pool can
+/// vacate their blocks on shrink or reclaim.
 pub(in crate::experts) struct Copier {
     pub copies: crate::experts::copies::Copies,
 }

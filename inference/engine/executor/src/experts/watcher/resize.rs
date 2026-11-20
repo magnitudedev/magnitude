@@ -89,11 +89,9 @@ pub(super) enum Ask {
 /// its holding.
 pub(crate) enum Join {
     /// Each group of the bank holds `records` more, beside a host tier
-    /// (holes or past every record), with `views[group][i]` holding each
-    /// routed tensor's view of `records[group][i]`: the directory takes them,
-    /// free, and promotes into them using the delivered views without touching
-    /// `Stores` or `Pool`.
-    Bank { records: Vec<Vec<usize>>, views: Vec<Vec<Vec<seismic::Tensor>>> },
+    /// (holes or past every record): the directory takes them, free, and
+    /// promotions resolve their views on demand via `Group::bank`.
+    Bank { records: Vec<Vec<usize>> },
     /// Each group's records the host lands into (its host tier's, or the
     /// one store's where the host places) hold `records` more, addressed by
     /// `views` (each group's record tensors' records the store holds now):
@@ -318,13 +316,12 @@ struct Published(());
 /// residency has published it as it is released
 /// (`super::residency::Held`): a resize's answer, whose owner reads the
 /// holdings it left, the joins applied, whose holdings follow them, and any
-/// evicted or replaced `Tensor`/`Records` views deferred to drop outside
-/// `residency` and `NoBlockingAllocationGuard` before answering.
+/// replaced `Records` views deferred to drop outside `residency` and
+/// `NoBlockingAllocationGuard` before answering.
 #[derive(Default)]
 pub(super) struct Owed {
     answer: Option<(Answer, Published)>,
     joined: usize,
-    pub(super) deferred_tensors: Vec<seismic::Tensor>,
     pub(super) deferred_records: Vec<crate::experts::source::Records>,
 }
 
@@ -353,11 +350,8 @@ impl Residency {
         let mut coalesced: Vec<Join> = Vec::new();
         for join in joins {
             match (coalesced.last_mut(), join) {
-                (Some(Join::Bank { records: acc, views: acc_views }), Join::Bank { records, views }) => {
+                (Some(Join::Bank { records: acc }), Join::Bank { records }) => {
                     for (dst, src) in acc.iter_mut().zip(records) {
-                        dst.extend(src);
-                    }
-                    for (dst, src) in acc_views.iter_mut().zip(views) {
                         dst.extend(src);
                     }
                 }
@@ -373,11 +367,8 @@ impl Residency {
         }
         for join in coalesced {
             match join {
-                Join::Bank { records, views } => {
-                    let mut views = views.into_iter();
+                Join::Bank { records } => {
                     for (group, records) in records.into_iter().enumerate() {
-                        let group_views = views.next().unwrap_or_default();
-                        self.core.groups[group].join_bank(&records, group_views);
                         self.core.directory.grow(group, records);
                     }
                 }
@@ -531,13 +522,6 @@ impl Residency {
                 // the copy ends: the shrink waits a boundary for it.
                 if !steps.unbegun(|at| directory.evict(&records, last_read, |staged| leaves_first(staged).map_or(at.into(), |first| first.min(at.into())), at)) {
                     return Ok(None);
-                }
-                // Move evicted bank record views out of `Group::bank` to drop
-                // outside `residency` and `NoBlockingAllocationGuard` (in
-                // `Held::drop`, before `Owed::settle` wakes the resize thread
-                // to call `Stores::free`).
-                for (group, records) in evicted.iter().enumerate() {
-                    self.core.groups[group].evict_bank(records, &mut self.owed.deferred_tensors);
                 }
             }
             Evicting::Landed => {

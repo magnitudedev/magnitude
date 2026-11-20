@@ -177,15 +177,13 @@ impl Drop for Held<'_> {
             guard.publish_held();
         }
         let mut owed = std::mem::take(&mut guard.owed);
-        let deferred_tensors = std::mem::take(&mut owed.deferred_tensors);
         let deferred_records = std::mem::take(&mut owed.deferred_records);
         // Release residency and `NoBlockingAllocationGuard` before dropping
-        // evicted or replaced views (whose final `SlabHold`/`Allocation` drop
-        // may touch pool or driver locks), and before `Owed::settle` wakes the
-        // resize thread so `Stores::free` sees no lingering view references.
+        // replaced views (whose final `SlabHold`/`Allocation` drop may touch
+        // pool or driver locks), and before `Owed::settle` wakes the resize
+        // thread so `Stores::free` sees no lingering view references.
         drop(guard);
         drop(self.no_alloc.take());
-        drop(deferred_tensors);
         drop(deferred_records);
         if settle {
             owed.settle(&shared);

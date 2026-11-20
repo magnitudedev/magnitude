@@ -279,62 +279,29 @@ pub(in crate::experts) struct Group {
     /// its host tier's across a link, the bank's own on unified memory (the
     /// one store).
     pub tier: Option<Vec<TierTensor>>,
-    /// Each routed tensor's bank record views (in record order, indexed by
-    /// record slot; holes where unbacked or evicted), beside a host tier
-    /// (`Placer::Tier`). Delivered at open and updated by `Join::Bank` and
-    /// `Evicting::Bank` so promotions never lock `Stores` or `Pool`.
-    pub bank: Vec<Vec<Option<seismic::Tensor>>>,
+    /// Each routed tensor's bank records beside a host tier (`Placer::Tier`),
+    /// resolved on demand from the live slab store (`Records::pooled`) so idle
+    /// bank slabs hold no persistent view and the pool can vacate their blocks
+    /// on shrink or reclaim.
+    pub bank: Vec<Records>,
     /// The bank records the directory places into (none where landings
     /// land into the bank itself).
     pub records: usize,
 }
 
 impl Group {
-    /// The bank record view for routed tensor `tensor` at slot `record`,
-    /// held by residency without locking `Stores` or `Pool`.
+    /// Resolve the bank record view for routed tensor `tensor` at slot
+    /// `record` on demand for the duration of a promotion or write-back copy.
     pub(super) fn bank_view(&self, tensor: usize, record: usize) -> seismic::Tensor {
         self.bank
             .get(tensor)
-            .and_then(|records| records.get(record))
-            .and_then(Option::as_ref)
-            .cloned()
             .unwrap_or_else(|| {
                 panic!(
                     "invariant violated: a promotion copies into record {record} (tensor {tensor}), \
-                     which residency holds no view for"
+                     which residency holds no bank records for"
                 )
             })
-    }
-
-    /// Install newly claimed bank record views delivered via `Join::Bank`.
-    pub(in crate::experts) fn join_bank(&mut self, records: &[usize], views: Vec<Vec<seismic::Tensor>>) {
-        assert_eq!(records.len(), views.len(), "invariant violated: Join::Bank records and views length mismatch");
-        for (&record, tensors) in records.iter().zip(views) {
-            if self.bank.is_empty() {
-                self.bank.resize_with(tensors.len(), Vec::new);
-            }
-            assert_eq!(self.bank.len(), tensors.len(), "invariant violated: Join::Bank tensor count mismatch");
-            for (dst, view) in self.bank.iter_mut().zip(tensors) {
-                if record >= dst.len() {
-                    dst.resize(record + 1, None);
-                }
-                dst[record] = Some(view);
-            }
-        }
-    }
-
-    /// Remove evicted bank record views and push them into `deferred` so their
-    /// `Tensor` / `SlabHold` references drop outside `residency` and
-    /// `NoBlockingAllocationGuard` (before `Owed::settle` wakes the resize
-    /// thread to call `Stores::free`).
-    pub(super) fn evict_bank(&mut self, records: &[u32], deferred: &mut Vec<seismic::Tensor>) {
-        for dst in &mut self.bank {
-            for &record in records {
-                if let Some(view) = dst.get_mut(record as usize).and_then(Option::take) {
-                    deferred.push(view);
-                }
-            }
-        }
+            .tensor(record as u64)
     }
 }
 

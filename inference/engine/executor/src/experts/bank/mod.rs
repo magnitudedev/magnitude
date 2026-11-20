@@ -698,7 +698,7 @@ impl ExpertBank {
     /// guard drops: what the domain holds across one observation of
     /// Seismic's charge and the classification read against it.
     pub fn hold_rises(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.rises.lock().expect("the bank's charge rises")
+        self.stores.rise_gate().hold_priority(&self.rises)
     }
 
     /// What streamed layer `layer`'s CPU site answered of step `step`
