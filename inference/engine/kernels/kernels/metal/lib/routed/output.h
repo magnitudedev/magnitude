@@ -9,9 +9,10 @@
 //
 // The projections meet in threadgroup memory; their join is
 // `lib/routed/output_sum.h`'s. Gathered (`routed_output`'s GATHERED,
-// `routed::project_gathered`), a simdgroup projects each choice of its
-// expert, or row 0's shared expert simdgroup every row, in turn, each as
-// that slot's simdgroup of its row projects it.
+// `routed::output_project_gathered`), each expert's first choice simdgroup
+// projects every choice of that expert in one weight pass, and row 0's shared
+// expert simdgroup projects every row in one weight pass, publishing directly
+// to `published`.
 
 #define KERNEL_W0 SEISMIC_EXPERT_DOWN
 #define KERNEL_W1 SEISMIC_SHARED_DOWN
@@ -83,6 +84,41 @@ inline void output_project(device const uchar *expert_product, device const ucha
         in, uint(SEISMIC_DIM_S), lane);
     project_channels<packets::W1, ROWS, LANES, uint(SEISMIC_DIM_S), output_stage<LANES>()>(x, down, first, rows,
         uint(SEISMIC_DIM_S), projected, lane);
+}
+
+// Gathered decode output projections: `sg < K` projects every choice sharing
+// `(m, sg)`'s expert and source in one weight pass (`project_gathered_expert`);
+// `sg == K` at `m == 0` projects all `m_rows` rows through `shared_down` in
+// one weight pass. Each slot is published directly in A into `published`.
+template <uint ROWS, uint LANES, typename Published>
+inline void output_project_gathered(device const uchar *expert_product, device const uchar *shared_product,
+    device const int *routes, device const int *sources, device const ulong *expert_down,
+    device const ulong *tier_down, device const uchar *shared_down, uint m_rows, uint m, uint first, uint sg,
+    uint lane, threadgroup float *projected, Published published, constant ulong *seismic_words) {
+    constexpr uint K = uint(SEISMIC_DIM_K);
+    constexpr uint SLOTS = K + 1u;
+    constexpr uint H = uint(SEISMIC_DIM_H);
+    if (sg < K) {
+        constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
+        project_gathered_expert<packets::W0, ROWS, LANES, K, SLOTS, uint(SEISMIC_DIM_F), output_stage<LANES>(), H,
+            NVFP4>(expert_product, SEISMIC_EXPERT_PRODUCT_STRIDE_0, SEISMIC_EXPERT_PRODUCT_STRIDE_1,
+            SEISMIC_EXPERT_PRODUCT_STRIDE_2, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, sources,
+            ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, expert_down, tier_down,
+            KERNEL_W0_LAYOUT(SEISMIC_DIM_F), m_rows, m, first, sg, lane, projected, published);
+        return;
+    }
+    if (m == 0 && m_rows > 0) {
+        uint products[SEISMIC_CONST_VERIFY_ROWS];
+        for (uint row = 0; row < m_rows; ++row)
+            products[row] = row * SLOTS + K;
+        const auto in = activation(shared_product, SEISMIC_SHARED_PRODUCT_STRIDE_0, SEISMIC_SHARED_PRODUCT_STRIDE_1,
+            uint(SEISMIC_DIM_S));
+        const auto down = weights<packets::W1>(shared_down, KERNEL_W1_LAYOUT(SEISMIC_DIM_S), 0, SEISMIC_DIM_S);
+        constexpr bool NVFP4 = projection::OperandRecipe<packets::W1_OPERANDS_NVFP4>::NVFP4;
+        PROJECTION_FOR_ROWS(m_rows,
+            (project_channels_published<packets::W1, ROWS, LANES, MAXM, uint(SEISMIC_DIM_S), output_stage<LANES>(), H,
+                NVFP4>(in, down, m_rows, products, first, H, uint(SEISMIC_DIM_S), projected, published, lane)));
+    }
 }
 
 } // namespace routed
