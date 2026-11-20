@@ -3757,22 +3757,29 @@ fn push_weight(
     // f16 matrices or f32 biases to the activation dtype only loses bits.
     // A role its kernel reads in F32 alone (`is_fixed_dense_role`) is F32.
     let stored_dense = source.dtype();
+    let fixed_dense = operators::is_fixed_dense_role(kind);
     let dense_resident = match (role.kind, stored_dense) {
-        (WeightKind::Vision(_), Some(dtype)) if !operators::is_fixed_dense_role(kind) => dtype,
+        (WeightKind::Vision(_), Some(dtype)) if !fixed_dense => dtype,
         _ => resident_dtype(role, form.activation),
     };
-    if operators::is_fixed_dense_role(kind) && stored_dense.is_none() {
-        return Err(format!(
-            "fixed-f32 weight {scope:?}/{kind:?} cannot use packed source encoding {:?}",
-            stored.encoding
-        ));
-    }
-    // Packed projector weights become dense in the activation dtype: the GPU
-    // vision kernels read dense weights only. The host dequantizes them
-    // exactly to F32 and the device rounds once to the activation dtype.
-    let (upload, resident) = match (role.kind, stored_dense) {
-        (WeightKind::Vision(_), None) => (Element::f32(), Element::dense(form.activation)),
-        _ => (
+    // Roles whose kernels read dense weights only (fixed-f32 roles and vision
+    // projector weights) cannot stay packed: the host dequantizes them exactly
+    // to F32 and the device imports that dense F32 tensor into `dense_resident`
+    // (F32 for fixed-f32 roles, or the activation dtype for packed vision
+    // weights).
+    let (upload, resident) = if stored_dense.is_none()
+        && (fixed_dense || matches!(role.kind, WeightKind::Vision(_)))
+    {
+        if value_packets(source).is_none() {
+            return Err(format!(
+                "weight {:?}: {} has no packet representation for host dequantization",
+                descriptor.name,
+                source.name(),
+            ));
+        }
+        (Element::f32(), Element::dense(dense_resident))
+    } else {
+        (
             source,
             resident_storage(
                 source,
@@ -3788,7 +3795,7 @@ fn push_weight(
                     form.layout.as_str()
                 )
             })?,
-        ),
+        )
     };
     // The bytes a tensor of the weight stores: its source's, or under a grid
     // of block scales its codes', one block of its encoding a value; and
@@ -5459,6 +5466,225 @@ mod scale_grid_tests {
             let own = file.read(offset, nbytes as usize).unwrap();
             let uploaded = crate::import_transforms::upload_bytes(&planned, &stored, own).unwrap();
             assert!(uploaded == stack(index), "{name}: the upload differs from the stored bytes");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Fixed-f32 roles (2D matrices like `HyperConnectionFunction`, 1D vectors
+    /// like `QueryNorm`, and fixed-f32 vision norms) stored in packed GGUF
+    /// encodings dequantize on the host to F32 and upload/reside as F32 across
+    /// every backend layout, while non-fixed packed vision weights still target
+    /// the activation dtype.
+    #[test]
+    fn fixed_f32_weights_with_packed_encodings_dequantize_to_f32() {
+        use crate::planning::ImportProgramSlot;
+        use magnitude_family_contracts::VisionWeight;
+
+        let cases: &[(&str, WeightKind, &[u64], Encoding, DType)] = &[
+            (
+                "blk.0.hc_fn.weight",
+                WeightKind::HyperConnectionFunction,
+                &[2, 256],
+                Encoding::Q8_0,
+                DType::F32,
+            ),
+            (
+                "blk.0.hc_fn_q4k.weight",
+                WeightKind::HyperConnectionFunction,
+                &[2, 256],
+                Encoding::Q4K,
+                DType::F32,
+            ),
+            (
+                "blk.0.hc_fn_iq2.weight",
+                WeightKind::HyperConnectionFunction,
+                &[2, 256],
+                Encoding::Iq2Xxs,
+                DType::F32,
+            ),
+            (
+                "blk.0.attn_q_norm.weight",
+                WeightKind::QueryNorm,
+                &[32],
+                Encoding::Q8_0,
+                DType::F32,
+            ),
+            (
+                "v.blk.0.attn_q_norm.weight",
+                WeightKind::Vision(VisionWeight::QueryNorm),
+                &[32],
+                Encoding::Q8_0,
+                DType::F32,
+            ),
+            (
+                "v.position_embd.weight",
+                WeightKind::Vision(VisionWeight::Position),
+                &[2, 32],
+                Encoding::Q8_0,
+                DType::BF16,
+            ),
+        ];
+
+        let inventory: Vec<TensorDescriptor> = cases
+            .iter()
+            .map(|(name, _, shape, encoding, _)| {
+                let count: u64 = shape.iter().product();
+                let nbytes = count / encoding.block_elements() * encoding.block_bytes();
+                TensorDescriptor {
+                    name: (*name).to_owned(),
+                    shape: shape.to_vec(),
+                    encoding: *encoding,
+                    offset: 0,
+                    nbytes,
+                }
+            })
+            .collect();
+        let index = TensorIndex::new(&inventory);
+
+        for backend in BackendName::ALL {
+            let layout = resident_layout(ExecutionPath::Native, backend);
+            let form = ResidentForm {
+                activation: DType::BF16,
+                layout,
+            };
+            for &(name, kind, shape, encoding, expected_resident) in cases {
+                let descriptor = WeightDescriptor {
+                    name: name.to_owned(),
+                    shape: shape.to_vec(),
+                    transforms: Vec::new(),
+                };
+                let mut out = Vec::new();
+                push_weight(
+                    &mut out,
+                    &index,
+                    ArtifactComponent {
+                        kind: ArtifactComponentKind::Target,
+                        identity: ArtifactIdentity([0; 32]),
+                    },
+                    WeightScope::Target,
+                    kind,
+                    &descriptor,
+                    form,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{name} ({encoding:?}, {backend:?}): {error}")
+                });
+                let planned = out.remove(0);
+                let count: u64 = shape.iter().product();
+                assert_eq!(planned.upload, Element::f32(), "{name} ({backend:?})");
+                assert_eq!(
+                    planned.resident,
+                    Element::dense(expected_resident),
+                    "{name} ({backend:?})"
+                );
+                assert!(planned.host_prepared(), "{name} ({backend:?})");
+                assert_eq!(planned.source_bytes, count * 4, "{name} ({backend:?})");
+                assert_eq!(
+                    planned.resident_bytes,
+                    count * u64::from(expected_resident.bytes()),
+                    "{name} ({backend:?})"
+                );
+                assert_eq!(
+                    ImportProgramSlot::of(&planned),
+                    ImportProgramSlot::Dense {
+                        source: DType::F32,
+                        resident: expected_resident,
+                    },
+                    "{name} ({backend:?})"
+                );
+            }
+        }
+    }
+
+    /// Host dequantization of packed `Q8_0` fixed-f32 weights (both 2D
+    /// `HyperConnectionFunction` and 1D `QueryNorm`) through `upload_bytes`
+    /// yields the exact F32 values for every block.
+    #[test]
+    fn fixed_f32_q8_0_upload_bytes_dequantize_exact_f32_values() {
+        // One Q8_0 block: F16 scale = 0.5 (0x3800) followed by 32 signed i8 codes.
+        let q8_block = |scale_f16: u16, offset: i8| -> Vec<u8> {
+            let mut block = Vec::with_capacity(34);
+            block.extend_from_slice(&scale_f16.to_le_bytes());
+            for i in 0..32i8 {
+                block.push((i - 16 + offset) as u8);
+            }
+            block
+        };
+        let hc_bytes: Vec<u8> = [q8_block(0x3800, 0), q8_block(0x3c00, 1)].concat();
+        let norm_bytes = q8_block(0x3c00, 0);
+
+        let header = StoredHeader::new(
+            3,
+            Vec::new(),
+            [
+                ("blk.0.hc_fn.weight".to_owned(), vec![2, 32], Encoding::Q8_0),
+                ("blk.0.attn_q_norm.weight".to_owned(), vec![32], Encoding::Q8_0),
+            ],
+        )
+        .unwrap();
+        let mut bytes = header.encode().unwrap();
+        let data = bytes.len();
+        for (tensor, payload) in header.tensors.iter().zip([&hc_bytes, &norm_bytes]) {
+            bytes.resize(data + tensor.offset as usize, 0);
+            bytes.extend_from_slice(payload);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "magnitude-fixed-f32-q8-{}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let artifact = GgufArtifact::open(&path).unwrap();
+        let index = TensorIndex::new(&artifact.directory().tensors);
+
+        for (name, kind, shape, expected) in [
+            (
+                "blk.0.hc_fn.weight",
+                WeightKind::HyperConnectionFunction,
+                vec![2, 32],
+                (0..32)
+                    .map(|i| 0.5f32 * (i - 16) as f32)
+                    .chain((0..32).map(|i| 1.0f32 * (i - 15) as f32))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "blk.0.attn_q_norm.weight",
+                WeightKind::QueryNorm,
+                vec![32],
+                (0..32).map(|i| 1.0f32 * (i - 16) as f32).collect::<Vec<_>>(),
+            ),
+        ] {
+            let descriptor = WeightDescriptor {
+                name: name.to_owned(),
+                shape,
+                transforms: Vec::new(),
+            };
+            let mut out = Vec::new();
+            push_weight(
+                &mut out,
+                &index,
+                ArtifactComponent {
+                    kind: ArtifactComponentKind::Target,
+                    identity: ArtifactIdentity([0; 32]),
+                },
+                WeightScope::Target,
+                kind,
+                &descriptor,
+                ResidentForm {
+                    activation: DType::BF16,
+                    layout: Layout::Rows8,
+                },
+            )
+            .unwrap();
+            let planned = out.remove(0);
+            let stored = Stored::from_gguf(&artifact, &descriptor).unwrap();
+            let (file, offset, nbytes) = stored.file_range();
+            let raw = file.read(offset, nbytes as usize).unwrap();
+            let uploaded = crate::import_transforms::upload_bytes(&planned, &stored, raw).unwrap();
+            let decoded: Vec<f32> = uploaded
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            assert_eq!(decoded, expected, "{name}");
         }
         std::fs::remove_file(&path).unwrap();
     }
