@@ -191,12 +191,13 @@ pub(crate) struct Link {
     pub(crate) book: Book,
 }
 
-/// A link's bytes in flight, by how their pieces stood when taken.
+/// A link's bytes and pieces in flight, by how their pieces stood when taken.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct InFlight {
     pub(crate) parked: u64,
     pub(crate) streamed: u64,
     pub(crate) ahead: u64,
+    pub(crate) pieces: u64,
 }
 
 impl InFlight {
@@ -206,6 +207,16 @@ impl InFlight {
             Standing::Streamed => &mut self.streamed,
             Standing::Ahead => &mut self.ahead,
         }
+    }
+
+    fn take(&mut self, standing: Standing, bytes: u64) {
+        *self.of(standing) += bytes;
+        self.pieces += 1;
+    }
+
+    fn end(&mut self, standing: Standing, bytes: u64) {
+        *self.of(standing) -= bytes;
+        self.pieces -= 1;
     }
 
     /// Every byte in flight.
@@ -274,7 +285,7 @@ impl Link {
                 if !admits(flight, &request.volume.shape, bytes, standing) {
                     break;
                 }
-                *flight.of(standing) += bytes;
+                flight.take(standing, bytes);
                 fits += 1;
             }
         };
@@ -290,14 +301,19 @@ impl Link {
 }
 
 /// Whether a piece of `bytes`, standing `standing`, may start beside
-/// `flight` by `shape`'s depths ("Order and depth"): a due piece while the
-/// due bytes in flight, parked and streamed, leave it room under the due
-/// depth; a piece read ahead (the caller's to know that nothing parked
-/// is queued) while the parked bytes in flight and those read ahead leave
-/// it room under the knee, so it may start beside parked pieces in flight:
-/// a stream's bytes are its own, at the rate the stream takes. A piece past
-/// its depth starts where nothing it is counted against is in flight.
+/// `flight` by `shape`'s depths ("Order and depth"): never past `shape`'s
+/// queue depth in pieces (matching the per-device worker cap in
+/// `Device::workers`), a due piece while the due bytes in flight, parked
+/// and streamed, leave it room under the due depth; a piece read ahead
+/// (the caller's to know that nothing parked is queued) while the parked
+/// bytes in flight and those read ahead leave it room under the knee, so it
+/// may start beside parked pieces in flight: a stream's bytes are its own,
+/// at the rate the stream takes. A piece past its byte depth starts where
+/// nothing it is counted against is in flight.
 fn admits(flight: InFlight, shape: &Shape, bytes: u64, standing: Standing) -> bool {
+    if flight.pieces >= shape.queue_depth() {
+        return false;
+    }
     let (counted, depth) = match standing {
         Standing::Parked | Standing::Streamed => (flight.parked + flight.streamed, shape.due),
         Standing::Ahead => (flight.parked + flight.ahead, shape.knee),
@@ -378,7 +394,7 @@ impl Queue {
             map.remove(&key);
             self.wants.remove(&key.1);
         }
-        *link.flight.of(standing) += bytes;
+        link.flight.take(standing, bytes);
         link.book.began(standing.due(), now);
         self.waits.get_mut(&key.1).expect("a queued request is waited").taken(standing.due(), &mut link.book, now);
         Some(taken)
@@ -404,7 +420,7 @@ impl Queue {
         need.ended(1);
         let link = self.links.get_mut(&volume).expect("an ended piece was in flight");
         self.taken -= 1;
-        *link.flight.of(standing) -= bytes;
+        link.flight.end(standing, bytes);
         link.book.ended(standing.due(), bytes, at);
         settle(&mut self.waits, id, |wait| wait.ended(&mut link.book, at));
         !(link.requests.is_empty() && link.streamed.is_empty())

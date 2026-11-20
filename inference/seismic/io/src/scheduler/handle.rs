@@ -182,21 +182,21 @@ impl RequestState {
         self.finish(progress, ended);
     }
 
-    /// The request's end, one transition: its outcome is set first, under
-    /// its lock, then every observer is announced: its reader's count of
-    /// requests outstanding, its waiters, and its hook. The only way a
-    /// request ends and the only place a hook registered before the end
-    /// runs, so no observer is announced before the state it would read: a
-    /// hook's wake (an event another thread waits on) finds the request
-    /// ended, as does any `running` it calls.
+    /// The request's end, one transition: its outcome is set and its
+    /// reader's count of requests outstanding is decremented under its lock,
+    /// before releasing the lock and announcing its waiters and its hook.
+    /// The only way a request ends and the only place a hook registered
+    /// before the end runs, so no observer (via `wait`, `wait_until`, or
+    /// `on_end`) can observe the request ended while `outstanding` still
+    /// counts it.
     fn finish(&self, mut progress: std::sync::MutexGuard<'_, Progress>, ended: Ended) {
         if progress.ended.is_some() {
             return;
         }
         progress.ended = Some(ended.clone());
+        self.outstanding.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         let hook = progress.hook.take();
         drop(progress);
-        self.outstanding.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         self.changed.notify_all();
         if let Some(hook) = hook {
             hook(&ended);
@@ -230,4 +230,67 @@ pub(crate) fn first_failures(mut failed: Vec<(usize, Arc<Error>)>) -> Vec<(usize
     failed.sort_by_key(|(index, _)| *index);
     failed.dedup_by_key(|(index, _)| *index);
     failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Ending, RequestState};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    /// Once any observer (`wait`, `wait_until`, or `on_end` before or after
+    /// finish) observes a request as ended, `outstanding` has already been
+    /// decremented.
+    #[test]
+    fn finish_decrements_outstanding_before_observers_see_ended() {
+        // Hook registered before finish sees outstanding == 0.
+        let outstanding = Arc::new(AtomicUsize::new(1));
+        let state = RequestState::new(1, Vec::new(), outstanding.clone(), Vec::new());
+        let ending = Ending(state.clone());
+        let ran = Arc::new(AtomicBool::new(false));
+        let hook_outstanding = outstanding.clone();
+        let hook_ran = ran.clone();
+        ending.on_end(move |_| {
+            assert_eq!(hook_outstanding.load(Ordering::Acquire), 0);
+            hook_ran.store(true, Ordering::Release);
+        });
+        state.pieces_ended(1, [], None);
+        assert!(ran.load(Ordering::Acquire));
+
+        // Concurrent wait, wait_until, and post-finish on_end never see ended
+        // while outstanding still counts the finished request.
+        for _ in 0..2_000 {
+            let outstanding = Arc::new(AtomicUsize::new(1));
+            let state = RequestState::new(1, Vec::new(), outstanding.clone(), Vec::new());
+            let ending = Ending(state.clone());
+            let barrier = Arc::new(Barrier::new(3));
+
+            let b1 = barrier.clone();
+            let e1 = ending.clone();
+            let o1 = outstanding.clone();
+            let waiter = std::thread::spawn(move || {
+                b1.wait();
+                let _ = e1.wait();
+                assert_eq!(o1.load(Ordering::Acquire), 0, "wait observed ended before outstanding decremented");
+            });
+
+            let b2 = barrier.clone();
+            let e2 = ending.clone();
+            let o2 = outstanding.clone();
+            let timed = std::thread::spawn(move || {
+                b2.wait();
+                let _ = e2.wait_until(Instant::now() + Duration::from_secs(5));
+                assert_eq!(o2.load(Ordering::Acquire), 0, "wait_until observed ended before outstanding decremented");
+            });
+
+            barrier.wait();
+            state.pieces_ended(1, [], None);
+            ending.on_end(move |_| {
+                assert_eq!(outstanding.load(Ordering::Acquire), 0, "on_end observed ended before outstanding decremented");
+            });
+            waiter.join().unwrap();
+            timed.join().unwrap();
+        }
+    }
 }
