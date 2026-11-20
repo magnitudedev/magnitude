@@ -18,8 +18,9 @@ use magnitude_engine::assessment::{
     ModelResidency as EngineResidency, Performance, PreparedModelAssessment,
     ProjectorVerdict as EngineProjectorVerdict, SpeculativeMethod as EngineSpeculativeMethod,
     finish_model_assessment, header_refusal, prepare_model_assessment,
+    prepare_model_assessment_from,
 };
-use magnitude_artifacts::gguf::Directory;
+use magnitude_artifacts::gguf::{Directory, HeaderSource};
 use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
@@ -36,7 +37,8 @@ use magnitude_service_contracts::models::{
 use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
 use magnitude_service_models::{
     CachedModelAssessment, HeaderExtent, HeaderVerdicts, ManagedModelStore, ModelDomainResolver,
-    ReleaseCatalog, ServableModelBundleKey, servable_model_bundle_key_for_bundle,
+    ReleaseBundleHeaders, ReleaseCatalog, ServableModelBundleKey,
+    servable_model_bundle_key_for_bundle,
 };
 use sha2::{Digest, Sha256};
 
@@ -62,7 +64,6 @@ pub struct AssessmentWork {
     pub environment: Arc<AssessmentEnvironment>,
     pub profile: ModelAssessmentProfile,
     pub configuration: ModelServingConfiguration,
-    pub preparation: Arc<tokio::sync::OnceCell<PreparationResult>>,
 }
 
 pub type PreparationResult = Result<Arc<PreparedModelAssessment>, ModelFailure>;
@@ -116,6 +117,14 @@ pub struct ModelAssessor {
     release_catalog: Arc<ReleaseCatalog>,
     environment: std::sync::RwLock<Arc<AssessmentEnvironment>>,
     work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// Shared per-(structure, bundle) preparation cache so the assessment pool, candidate drafter
+    /// checks and post-measurement refinishes never prepare the same bundle twice.
+    preparations: std::sync::Mutex<
+        BTreeMap<
+            (Arc<str>, ServableModelBundleKey),
+            Arc<tokio::sync::OnceCell<Arc<PreparedModelAssessment>>>,
+        >,
+    >,
 }
 
 impl ModelAssessor {
@@ -132,6 +141,7 @@ impl ModelAssessor {
             release_catalog,
             environment: std::sync::RwLock::new(environment),
             work_gates: tokio::sync::Mutex::new(BTreeMap::new()),
+            preparations: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -199,7 +209,6 @@ impl ModelAssessor {
         environment: &Arc<AssessmentEnvironment>,
         configuration: ModelServingConfiguration,
         profile: magnitude_service_contracts::models::ServingProfile,
-        preparation: Arc<tokio::sync::OnceCell<PreparationResult>>,
     ) -> AssessmentWork {
         let profile = ModelAssessmentProfile {
             performance_context_tokens: performance_depths(profile.context_length),
@@ -211,20 +220,65 @@ impl ModelAssessor {
             environment: Arc::clone(environment),
             profile,
             configuration,
-            preparation,
         }
+    }
+
+    fn preparation_cell(
+        &self,
+        structure_id: &Arc<str>,
+        bundle_key: &ServableModelBundleKey,
+    ) -> Arc<tokio::sync::OnceCell<Arc<PreparedModelAssessment>>> {
+        let key = (Arc::clone(structure_id), bundle_key.clone());
+        let mut cells = self
+            .preparations
+            .lock()
+            .expect("assessment preparations lock poisoned");
+        Arc::clone(
+            cells
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+        )
+    }
+
+    /// Resolve and prepare `bundle` on `environment`'s structure, reusing any prior preparation for
+    /// `(environment.structure_id, bundle_key)` and deduplicating concurrent work.
+    pub async fn prepare_bundle_cached(
+        &self,
+        environment: &AssessmentEnvironment,
+        bundle: ServableModelBundle,
+    ) -> PreparationResult {
+        let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
+        let cell = self.preparation_cell(&environment.structure_id, &bundle_key);
+        let structure = Arc::clone(&environment.setup.structure);
+        cell.get_or_try_init(|| self.prepare_bundle_uncached(structure, bundle_key, bundle))
+            .await
+            .map(Arc::clone)
     }
 
     /// Resolve and prepare one bundle from its headers on `structure`, all a preparation reads
     /// of its environment.
-    pub async fn prepare_bundle(
+    async fn prepare_bundle_uncached(
         &self,
         structure: Arc<AssessmentStructure>,
-        configuration: ModelServingConfiguration,
+        bundle_key: ServableModelBundleKey,
+        bundle: ServableModelBundle,
     ) -> PreparationResult {
-        let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
+        if let Some(headers) = self
+            .release_catalog
+            .bundle_headers(&bundle)
+            .map_err(assessment_drop_failure)?
+        {
+            let package =
+                engine_release_material(&bundle, &headers).map_err(assessment_drop_failure)?;
+            let prepared = magnitude_service_utils::blocking::run(move || {
+                prepare_model_assessment_from(&package, &headers, &structure)
+            })
+            .await
+            .map_err(preparation_failure)?;
+            return Ok(Arc::new(prepared));
+        }
         let resolved = self
-            .resolve(&bundle_key, configuration.bundle)
+            .resolve(&bundle_key, bundle)
             .await
             .map_err(assessment_drop_failure)?;
         let package = engine_material(&resolved).map_err(assessment_drop_failure)?;
@@ -239,6 +293,45 @@ impl ModelAssessor {
         Ok(Arc::new(prepared))
     }
 
+    /// Prepare `paths` against `headers` on `structure`, also returning the target's training
+    /// context length when the model is unsupported.
+    pub(crate) fn prepare_from_headers(
+        paths: &ModelPackagePaths,
+        headers: &dyn HeaderSource,
+        structure: &AssessmentStructure,
+    ) -> Result<(PreparedModelAssessment, u32), InventoryError> {
+        let prepared =
+            prepare_model_assessment_from(paths, headers, structure).map_err(preparation_error)?;
+        let fallback_context = match &prepared {
+            PreparedModelAssessment::Unsupported { .. } => match headers.header(paths.target()) {
+                Ok(header) => {
+                    magnitude_service_models::gguf::training_context_length(&header.directory)
+                        .unwrap_or_default()
+                }
+                Err(magnitude_artifacts::Error::UnknownTensorTypes { directory, .. }) => {
+                    magnitude_service_models::gguf::training_context_length(&directory)
+                        .unwrap_or_default()
+                }
+                Err(
+                    magnitude_artifacts::Error::Invalid(_)
+                    | magnitude_artifacts::Error::Split(_)
+                    | magnitude_artifacts::Error::Truncated { .. }
+                    | magnitude_artifacts::Error::AmbiguousProjectors(_)
+                    | magnitude_artifacts::Error::ShortPayload
+                    | magnitude_artifacts::Error::TrailingPayload,
+                ) => 0,
+                Err(
+                    error @ (magnitude_artifacts::Error::Io(_)
+                    | magnitude_artifacts::Error::PayloadRead { .. }
+                    | magnitude_artifacts::Error::DamagedPayload { .. }
+                    | magnitude_artifacts::Error::DigestOfNonText),
+                ) => return Err(preparation_error(ModelAssessmentError::Artifact(error))),
+            },
+            PreparedModelAssessment::Planned { .. } => 0,
+        };
+        Ok((prepared, fallback_context))
+    }
+
     /// One attempt at `work`. `Ok` carries the target's terminal disposition; `Err` is an
     /// operational failure the pool records as `Dropped`.
     pub async fn assess(&self, work: AssessmentWork) -> Result<AssessmentOutcome, InventoryError> {
@@ -247,7 +340,6 @@ impl ModelAssessor {
             environment,
             profile,
             configuration,
-            preparation,
         } = work;
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         // The exact work identity is the assessment's identity, so it keys the cache.
@@ -269,15 +361,15 @@ impl ModelAssessor {
                 result: Ok(cached),
             });
         }
-        let prepared = match preparation
-            .get_or_init(|| self.prepare_bundle(Arc::clone(&environment.setup.structure), configuration))
+        let prepared = match self
+            .prepare_bundle_cached(&environment, configuration.bundle)
             .await
         {
-            Ok(prepared) => Arc::clone(prepared),
+            Ok(prepared) => prepared,
             Err(failure) => {
                 return Ok(AssessmentOutcome {
                     key,
-                    result: Err(failure.clone()),
+                    result: Err(failure),
                 });
             }
         };
@@ -319,6 +411,51 @@ impl ModelAssessor {
     }
 }
 
+fn bundle_method(
+    bundle: &ServableModelBundle,
+    has_draft: bool,
+) -> Result<ModelMethod, InventoryError> {
+    match bundle {
+        ServableModelBundle::Standalone { .. } => Ok(ModelMethod::Plain),
+        ServableModelBundle::SpeculativeDecoding {
+            draft_source,
+            method,
+            ..
+        } => match (draft_source, method, has_draft) {
+            (SpeculativeDraftSource::Embedded, SpeculativeMethod::Mtp, false) => {
+                Ok(ModelMethod::Mtp)
+            }
+            (SpeculativeDraftSource::Separate { .. }, method, true) => Ok(match method {
+                SpeculativeMethod::DFlash => ModelMethod::DFlash,
+                SpeculativeMethod::DFlash2 => ModelMethod::DFlash2,
+                SpeculativeMethod::DSpark => ModelMethod::DSpark,
+                SpeculativeMethod::LiLiCorr => ModelMethod::LiLiCorr,
+                SpeculativeMethod::Mtp => ModelMethod::Mtp,
+            }),
+            (SpeculativeDraftSource::Embedded, _, _) => Err(InventoryError::InvalidRequest(
+                "an embedded draft is an MTP head; DFlash, DFlash2, DSpark and LiLiCorr need a separate draft"
+                    .to_owned(),
+            )),
+            (SpeculativeDraftSource::Separate { .. }, _, false) => Err(InventoryError::Integrity(
+                "a separate-draft bundle resolved without its draft".to_owned(),
+            )),
+        },
+    }
+}
+
+fn engine_release_material(
+    bundle: &ServableModelBundle,
+    headers: &ReleaseBundleHeaders,
+) -> Result<ModelPackagePaths, InventoryError> {
+    let method = bundle_method(bundle, headers.draft().is_some())?;
+    Ok(ModelPackagePaths {
+        target_shards: headers.target_shards().to_vec(),
+        projector: headers.projector().map(PathBuf::from),
+        draft: headers.draft().map(PathBuf::from),
+        method,
+    })
+}
+
 /// The components the engine reads: the target GGUF (a split target by its first shard, beside
 /// which the engine finds the others), its projector and a separate draft, with the method the
 /// bundle declares. A standalone package is served plain, even when its file carries MTP heads:
@@ -328,38 +465,16 @@ impl ModelAssessor {
 pub(crate) fn engine_material(
     resolved: &ResolvedServableModelBundle,
 ) -> Result<ModelPackagePaths, InventoryError> {
-    let (method, draft) = match &resolved.bundle {
-        ServableModelBundle::Standalone { .. } => (ModelMethod::Plain, None),
-        ServableModelBundle::SpeculativeDecoding {
-            draft_source,
-            method,
-            ..
-        } => match (draft_source, method, &resolved.draft_model) {
-            (SpeculativeDraftSource::Embedded, SpeculativeMethod::Mtp, None) => {
-                (ModelMethod::Mtp, None)
-            }
-            (SpeculativeDraftSource::Separate { .. }, method, Some(draft)) => {
-                let method = match method {
-                    SpeculativeMethod::DFlash => ModelMethod::DFlash,
-                    SpeculativeMethod::DFlash2 => ModelMethod::DFlash2,
-                    SpeculativeMethod::DSpark => ModelMethod::DSpark,
-                    SpeculativeMethod::LiLiCorr => ModelMethod::LiLiCorr,
-                    SpeculativeMethod::Mtp => ModelMethod::Mtp,
-                };
-                (method, Some(draft_weights(draft)?))
-            }
-            (SpeculativeDraftSource::Embedded, _, _) => {
-                return Err(InventoryError::InvalidRequest(
-                    "an embedded draft is an MTP head; DFlash, DFlash2, DSpark and LiLiCorr need a separate draft"
-                        .to_owned(),
-                ));
-            }
-            (SpeculativeDraftSource::Separate { .. }, _, None) => {
-                return Err(InventoryError::Integrity(
-                    "a separate-draft bundle resolved without its draft".to_owned(),
-                ));
-            }
-        },
+    let method = bundle_method(&resolved.bundle, resolved.draft_model.is_some())?;
+    let draft = match (&resolved.bundle, &resolved.draft_model) {
+        (
+            ServableModelBundle::SpeculativeDecoding {
+                draft_source: SpeculativeDraftSource::Separate { .. },
+                ..
+            },
+            Some(draft),
+        ) => Some(draft_weights(draft)?),
+        _ => None,
     };
     let components = &resolved.target_model.components;
     let mut target_components = components

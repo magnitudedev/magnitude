@@ -152,12 +152,14 @@ impl PackageHeaders {
         require_distinct_files(
             target_shards.iter().map(PathBuf::as_path),
             projector,
+            headers,
             DISTINCT_PROJECTOR,
         )?;
         let target = HeaderComponent::inspect_shards(target_shards, headers)?;
         require_distinct_files(
             target.files.iter().map(|file| file.path.as_path()),
             projector,
+            headers,
             DISTINCT_PROJECTOR,
         )?;
         let projector = projector
@@ -192,7 +194,7 @@ impl PackageHeaders {
     /// [`Self::add_draft`] with the draft's header from `headers`.
     pub fn add_draft_from(&mut self, draft: &Path, headers: &dyn HeaderSource) -> Result<(), Error> {
         let component = HeaderComponent::inspect(draft, headers)?;
-        self.add_preopened_draft(draft, component.directory, component.files)
+        self.add_preopened_draft_with(draft, component.directory, component.files, headers)
     }
 
     /// Attach a previously inspected draft component ([`Self::inspect_component`])
@@ -204,13 +206,23 @@ impl PackageHeaders {
         directory: Directory,
         files: Vec<ComponentFile>,
     ) -> Result<(), Error> {
+        self.add_preopened_draft_with(draft, directory, files, &FileHeaders)
+    }
+
+    fn add_preopened_draft_with(
+        &mut self,
+        draft: &Path,
+        directory: Directory,
+        files: Vec<ComponentFile>,
+        headers: &dyn HeaderSource,
+    ) -> Result<(), Error> {
         let others = self
             .target
             .files
             .iter()
             .chain(self.projector.iter().flat_map(|projector| &projector.files))
             .map(|file| file.path.as_path());
-        require_distinct_files(others, [draft], DISTINCT_DRAFT)?;
+        require_distinct_files(others, [draft], headers, DISTINCT_DRAFT)?;
         self.draft = Some((HeaderComponent { directory, files }, ArtifactIdentity::for_open()));
         Ok(())
     }
@@ -316,6 +328,7 @@ impl Package {
         require_distinct_files(
             target_shards.iter().map(PathBuf::as_path),
             projector,
+            &FileHeaders,
             DISTINCT_PROJECTOR,
         )?;
         let target = GgufArtifact::open_shards(target_shards)?;
@@ -326,6 +339,7 @@ impl Package {
                 .iter()
                 .flat_map(GgufArtifact::sources)
                 .map(|source| source.path()),
+            &FileHeaders,
             DISTINCT_PROJECTOR,
         )?;
         let identity = PackageIdentity {
@@ -421,6 +435,7 @@ impl Package {
         require_distinct_files(
             others,
             draft.sources().map(|source| source.path()),
+            &FileHeaders,
             DISTINCT_DRAFT,
         )?;
         self.draft = Some(draft);
@@ -496,31 +511,30 @@ impl FileIdentity {
     }
 }
 
+pub(crate) fn same_disk_file(left: &Path, right: &Path) -> Result<bool, Error> {
+    if left == right {
+        return Ok(true);
+    }
+    Ok(FileIdentity::of(left)? == FileIdentity::of(right)?)
+}
+
 /// Verify that no file in `left` refers to the same underlying file as any
-/// file in `right`, using the single [`FileIdentity`] mechanism.
+/// file in `right`, using `headers`'s file-identity check.
 fn require_distinct_files<'a>(
     left: impl IntoIterator<Item = &'a Path>,
     right: impl IntoIterator<Item = &'a Path>,
+    headers: &dyn HeaderSource,
     message: &'static str,
 ) -> Result<(), Error> {
-    let mut left = left.into_iter().peekable();
-    if left.peek().is_none() {
-        return Ok(());
-    }
-    let right: Vec<(&Path, FileIdentity)> = right
-        .into_iter()
-        .map(|path| Ok((path, FileIdentity::of(path)?)))
-        .collect::<Result<_, Error>>()?;
+    let right: Vec<&Path> = right.into_iter().collect();
     if right.is_empty() {
         return Ok(());
     }
     for path in left {
-        let id = FileIdentity::of(path)?;
-        if right
-            .iter()
-            .any(|(other, other_id)| *other == path || *other_id == id)
-        {
-            return Err(Error::Invalid(message.into()));
+        for other in &right {
+            if headers.same_file(path, other)? {
+                return Err(Error::Invalid(message.into()));
+            }
         }
     }
     Ok(())

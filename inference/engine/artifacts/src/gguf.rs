@@ -1124,6 +1124,13 @@ pub struct FileHeader {
 /// its aligned tensor-data offset, parsed by [`read_header`].
 pub trait HeaderSource: Sync {
     fn header(&self, path: &Path) -> Result<FileHeader, Error>;
+
+    /// Whether `left` and `right` name the same underlying file in this source.
+    /// Disk-backed sources compare filesystem identity; in-memory sources
+    /// override this without touching the filesystem.
+    fn same_file(&self, left: &Path, right: &Path) -> Result<bool, Error> {
+        crate::package::same_disk_file(left, right)
+    }
 }
 
 /// Headers read from the files they describe.

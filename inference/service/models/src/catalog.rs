@@ -1425,6 +1425,203 @@ impl ReleaseCatalog {
         Ok(components)
     }
 
+    /// The content identity (header digest, SHA-256 and size) of a catalog bundle's separate
+    /// draft, when the release planner bundle carries it.
+    #[must_use]
+    pub fn draft_content(
+        &self,
+        bundle_key: &ServableModelBundleKey,
+    ) -> Option<crate::custom_models::DrafterContent> {
+        let draft = self.planner_inputs.get(bundle_key)?.draft.as_ref()?;
+        let mut weights = draft.components.iter().filter(|component| {
+            matches!(
+                component.component.role,
+                ComponentRole::Weights | ComponentRole::Draft
+            )
+        });
+        let component = weights.next()?;
+        if weights.next().is_some() {
+            return None;
+        }
+        let sha256 = draft
+            .package
+            .files
+            .iter()
+            .find(|file| file.path == component.component.path)
+            .map(|file| file.sha256.clone());
+        Some(crate::custom_models::DrafterContent {
+            header_digest: Some(component.header_digest.clone()),
+            sha256,
+            size_bytes: component.component.size_bytes,
+        })
+    }
+
+    /// Whether a catalog bundle's target GGUF declares built-in NextN / MTP prediction layers,
+    /// when the release planner bundle inspected it.
+    #[must_use]
+    pub fn target_has_embedded_heads(&self, bundle_key: &ServableModelBundleKey) -> Option<bool> {
+        match &self.planner_inputs.get(bundle_key)?.target.properties {
+            InventoryProperties::Inspected {
+                nextn_predict_layers,
+                ..
+            } => Some(nextn_predict_layers.unwrap_or(0) > 0),
+            _ => None,
+        }
+    }
+
+    /// In-memory GGUF headers for `bundle` served directly from the release planner bundle,
+    /// without materializing temporary sparse files on disk. Matches both exact catalog bundles
+    /// and standalone / embedded-head assessments of a catalog target package.
+    pub fn bundle_headers(
+        &self,
+        bundle: &ServableModelBundle,
+    ) -> Result<Option<ReleaseBundleHeaders>, InventoryError> {
+        let (target_pkg, draft_pkg) = match bundle {
+            ServableModelBundle::Standalone { package } => (package, None),
+            ServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source,
+                ..
+            } => (
+                target,
+                match draft_source {
+                    SpeculativeDraftSource::Embedded => None,
+                    SpeculativeDraftSource::Separate { draft } => Some(draft),
+                },
+            ),
+        };
+        let bundle_key = servable_model_bundle_key_for_bundle(bundle);
+        let (target_planner, draft_planner) = if let Some(artifact) =
+            self.planner_inputs.get(&bundle_key)
+        {
+            if draft_pkg.is_some() != artifact.draft.is_some() {
+                return Err(InventoryError::Integrity(
+                    "release planner input draft does not match its bundle".to_owned(),
+                ));
+            }
+            (&artifact.target, artifact.draft.as_ref())
+        } else {
+            let Some(target_planner) = self
+                .planner_inputs
+                .values()
+                .find(|input| input.target.package == *target_pkg)
+                .map(|input| &input.target)
+            else {
+                return Ok(None);
+            };
+            let draft_planner = match draft_pkg {
+                Some(draft) => {
+                    let Some(found) = self
+                        .planner_inputs
+                        .values()
+                        .filter_map(|input| input.draft.as_ref())
+                        .find(|planner| planner.package == *draft)
+                    else {
+                        return Ok(None);
+                    };
+                    Some(found)
+                }
+                None => None,
+            };
+            (target_planner, draft_planner)
+        };
+        let mut files = BTreeMap::new();
+        let mut target_components = target_planner
+            .components
+            .iter()
+            .filter(|component| {
+                matches!(
+                    component.component.role,
+                    ComponentRole::Weights | ComponentRole::Shard
+                )
+            })
+            .collect::<Vec<_>>();
+        target_components.sort_by_key(|component| {
+            (component.component.shard_index.unwrap_or(0), &component.component.path)
+        });
+        let target_shards = target_components
+            .into_iter()
+            .map(|component| Path::new("target").join(&component.component.path))
+            .collect::<Vec<_>>();
+        if target_shards.is_empty() {
+            return Err(InventoryError::NotReady(
+                "model has no runnable weights".to_owned(),
+            ));
+        }
+        let projectors = target_planner
+            .components
+            .iter()
+            .filter(|component| component.component.role == ComponentRole::Projector)
+            .map(|component| Path::new("target").join(&component.component.path))
+            .collect::<Vec<_>>();
+        let projector = match projectors.as_slice() {
+            [] => None,
+            [projector] => Some(projector.clone()),
+            _ => {
+                return Err(InventoryError::InvalidRequest(
+                    "model resolves more than one projector".to_owned(),
+                ));
+            }
+        };
+        for component in &target_planner.components {
+            files.insert(
+                Path::new("target").join(&component.component.path),
+                (
+                    component.header_digest.clone(),
+                    component.header_size_bytes,
+                    component.component.size_bytes,
+                ),
+            );
+        }
+        let draft = match draft_planner {
+            Some(planner) => {
+                let weights = planner
+                    .components
+                    .iter()
+                    .filter(|component| {
+                        matches!(
+                            component.component.role,
+                            ComponentRole::Weights | ComponentRole::Draft
+                        )
+                    })
+                    .map(|component| Path::new("draft").join(&component.component.path))
+                    .collect::<Vec<_>>();
+                let path = match weights.as_slice() {
+                    [path] => path.clone(),
+                    [] => {
+                        return Err(InventoryError::NotReady(
+                            "the draft has no runnable weights".to_owned(),
+                        ));
+                    }
+                    _ => {
+                        return Err(InventoryError::InvalidRequest(
+                            "the draft resolves more than one weights file".to_owned(),
+                        ));
+                    }
+                };
+                for component in &planner.components {
+                    files.insert(
+                        Path::new("draft").join(&component.component.path),
+                        (
+                            component.header_digest.clone(),
+                            component.header_size_bytes,
+                            component.component.size_bytes,
+                        ),
+                    );
+                }
+                Some(path)
+            }
+            None => None,
+        };
+        Ok(Some(ReleaseBundleHeaders {
+            target_shards,
+            projector,
+            draft,
+            files,
+            planner_bundle: Arc::clone(&self.planner_bundle),
+        }))
+    }
+
     pub fn resolve_bundle(
         &self,
         bundle_key: &ServableModelBundleKey,
@@ -1491,6 +1688,69 @@ impl ReleaseCatalog {
     #[must_use]
     pub fn target_weight_sample(&self, bundle_key: &ServableModelBundleKey) -> Option<&WeightSample> {
         self.weight_samples.get(bundle_key)
+    }
+}
+
+/// One catalog bundle's assessment headers served directly from the release planner bundle in
+/// memory, without materializing temporary sparse files on disk.
+pub struct ReleaseBundleHeaders {
+    target_shards: Vec<PathBuf>,
+    projector: Option<PathBuf>,
+    draft: Option<PathBuf>,
+    files: BTreeMap<PathBuf, (String, u64, u64)>,
+    planner_bundle: Arc<PlannerBundle<'static>>,
+}
+
+impl ReleaseBundleHeaders {
+    #[must_use]
+    pub fn target_shards(&self) -> &[PathBuf] {
+        &self.target_shards
+    }
+
+    #[must_use]
+    pub fn projector(&self) -> Option<&Path> {
+        self.projector.as_deref()
+    }
+
+    #[must_use]
+    pub fn draft(&self) -> Option<&Path> {
+        self.draft.as_deref()
+    }
+}
+
+impl magnitude_artifacts::gguf::HeaderSource for ReleaseBundleHeaders {
+    fn header(
+        &self,
+        path: &Path,
+    ) -> Result<magnitude_artifacts::gguf::FileHeader, magnitude_artifacts::Error> {
+        let (digest, expected_header_size, size) = self.files.get(path).ok_or_else(|| {
+            magnitude_artifacts::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("release bundle has no header for {}", path.display()),
+            ))
+        })?;
+        let bytes = self
+            .planner_bundle
+            .input(digest)
+            .map_err(magnitude_artifacts::Error::Invalid)?;
+        if u64::try_from(bytes.len()).ok() != Some(*expected_header_size) {
+            return Err(magnitude_artifacts::Error::Invalid(format!(
+                "planner input for {} has the wrong length",
+                path.display()
+            )));
+        }
+        let directory = magnitude_artifacts::gguf::read_header(bytes)?;
+        Ok(magnitude_artifacts::gguf::FileHeader {
+            directory,
+            size: *size,
+        })
+    }
+
+    fn same_file(&self, left: &Path, right: &Path) -> Result<bool, magnitude_artifacts::Error> {
+        if left == right {
+            return Ok(true);
+        }
+        Ok(std::path::absolute(left)? == std::path::absolute(right)?)
     }
 }
 

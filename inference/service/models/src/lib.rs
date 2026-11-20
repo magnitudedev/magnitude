@@ -48,10 +48,10 @@ pub use cache::{
     CachedModelAssessment, CachedModelPresentation, ModelCache, ModelCacheWorkspace, ModelIndexKind,
 };
 pub use catalog::{
-    CatalogLockAdvance, GeneratedReleaseCatalog, ReleaseCatalog, ReleaseRecommendableCatalog,
-    ResolvingRecommendableCatalog, advance_model_catalog_lock, catalog_lock_digest,
-    catalog_intelligence_check, catalog_source_digest, load_release_catalog, model_catalog_lock,
-    model_developers, IntelligenceCheck,
+    CatalogLockAdvance, GeneratedReleaseCatalog, ReleaseBundleHeaders, ReleaseCatalog,
+    ReleaseRecommendableCatalog, ResolvingRecommendableCatalog, advance_model_catalog_lock,
+    catalog_lock_digest, catalog_intelligence_check, catalog_source_digest, load_release_catalog,
+    model_catalog_lock, model_developers, IntelligenceCheck,
 };
 pub use catalog_acquisition::{AcquiredCatalogModel, AcquiredDrafter, AcquiredFile};
 pub use catalog_installations::ManagedCatalogInstallations;
