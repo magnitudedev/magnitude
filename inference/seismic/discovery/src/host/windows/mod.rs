@@ -202,8 +202,10 @@ impl Sys for LiveSys {
         &self,
         relationship: LOGICAL_PROCESSOR_RELATIONSHIP,
     ) -> Option<topology::ProcessorRecords> {
-        use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
-        use windows_sys::Win32::System::SystemInformation::GetLogicalProcessorInformationEx;
+        use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER};
+        use windows_sys::Win32::System::SystemInformation::{
+            GetLogicalProcessorInformationEx, RelationNumaNodeEx,
+        };
         let mut length = 0u32;
         if unsafe {
             GetLogicalProcessorInformationEx(relationship, std::ptr::null_mut(), &mut length)
@@ -213,6 +215,11 @@ impl Sys for LiveSys {
         }
         let first_err = std::io::Error::last_os_error();
         if first_err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            if relationship == RelationNumaNodeEx
+                && first_err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
+            {
+                return None;
+            }
             return read(format!("GetLogicalProcessorInformationEx({relationship})"), Err(first_err));
         }
         loop {
@@ -263,14 +270,27 @@ impl Sys for LiveSys {
     }
 
     fn process_groups(&self) -> Option<Vec<u16>> {
+        use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
         use windows_sys::Win32::System::Threading::GetProcessGroupAffinity;
         let process = unsafe { GetCurrentProcess() };
         let mut count = 0u16;
-        unsafe { GetProcessGroupAffinity(process, &mut count, std::ptr::null_mut()) };
-        let mut groups = vec![0u16; usize::from(count)];
-        match unsafe { GetProcessGroupAffinity(process, &mut count, groups.as_mut_ptr()) } {
-            0 => last_error("GetProcessGroupAffinity"),
-            _ => Some(groups),
+        if unsafe { GetProcessGroupAffinity(process, &mut count, std::ptr::null_mut()) } != 0 {
+            return Some(Vec::new());
+        }
+        let first_err = std::io::Error::last_os_error();
+        if first_err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return read("GetProcessGroupAffinity", Err(first_err));
+        }
+        loop {
+            let mut groups = vec![0u16; usize::from(count)];
+            if unsafe { GetProcessGroupAffinity(process, &mut count, groups.as_mut_ptr()) } != 0 {
+                groups.truncate(usize::from(count));
+                return Some(groups);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+                return read("GetProcessGroupAffinity", Err(error));
+            }
         }
     }
 
@@ -285,24 +305,36 @@ impl Sys for LiveSys {
 
     fn counters(&self) -> Option<Counters> {
         use windows_sys::Win32::System::Performance::{
-            PdhAddEnglishCounterW, PdhCollectQueryData, PdhGetRawCounterValue, PdhOpenQueryW,
-            PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_RAW_COUNTER,
+            PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetRawCounterValue,
+            PdhOpenQueryW, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_HQUERY,
+            PDH_RAW_COUNTER,
         };
+        struct QueryGuard(PDH_HQUERY);
+        impl Drop for QueryGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: `self.0` was opened by `PdhOpenQueryW` and not yet moved out.
+                    unsafe { PdhCloseQuery(self.0) };
+                }
+            }
+        }
         // Opened once: an account refused the counters stays refused.
         static QUERY: std::sync::OnceLock<Option<std::sync::Mutex<Query>>> =
             std::sync::OnceLock::new();
         let query = QUERY.get_or_init(|| {
-            let mut query = std::ptr::null_mut();
+            let mut raw_query = std::ptr::null_mut();
             pdh("PdhOpenQueryW", unsafe {
-                PdhOpenQueryW(std::ptr::null(), 0, &mut query)
+                PdhOpenQueryW(std::ptr::null(), 0, &mut raw_query)
             })?;
+            let mut guard = QueryGuard(raw_query);
             let mut counters = [std::ptr::null_mut(); 4];
             for (counter, path) in counters.iter_mut().zip(COUNTER_PATHS) {
                 let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
                 pdh(path, unsafe {
-                    PdhAddEnglishCounterW(query, wide.as_ptr(), 0, counter)
+                    PdhAddEnglishCounterW(guard.0, wide.as_ptr(), 0, counter)
                 })?;
             }
+            let query = std::mem::replace(&mut guard.0, std::ptr::null_mut());
             Some(std::sync::Mutex::new(Query { query, counters }))
         });
         // A collector that panicked left the query's handles whole.

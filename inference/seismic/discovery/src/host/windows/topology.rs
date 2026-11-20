@@ -9,8 +9,8 @@ use seismic_topology::{
 use std::collections::BTreeSet;
 use windows_sys::Win32::System::SystemInformation::{
     CACHE_RELATIONSHIP, GROUP_AFFINITY, LOGICAL_PROCESSOR_RELATIONSHIP, NUMA_NODE_RELATIONSHIP,
-    PROCESSOR_RELATIONSHIP, RelationCache, RelationNumaNode, RelationProcessorCore,
-    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    PROCESSOR_RELATIONSHIP, RelationCache, RelationNumaNode, RelationNumaNodeEx,
+    RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 
 /// Aligned, exact-length buffer of `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX`
@@ -95,17 +95,20 @@ impl ProcessorRecords {
         });
     }
 
-    /// Visit every `RelationNumaNode` record, yielding `(node_number, group_masks)`.
+    /// Visit every `RelationNumaNode` / `RelationNumaNodeEx` record, yielding
+    /// `(node_number, group_masks)`.
     fn numa_nodes(&self, mut each: impl FnMut(u32, &[GROUP_AFFINITY])) {
         let union_offset = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
         let masks_offset = union_offset + std::mem::offset_of!(NUMA_NODE_RELATIONSHIP, Anonymous);
         let min_size = union_offset + std::mem::size_of::<NUMA_NODE_RELATIONSHIP>();
         self.each_raw(|relationship, record, size| {
-            if relationship != RelationNumaNode || size < min_size {
+            if (relationship != RelationNumaNode && relationship != RelationNumaNodeEx)
+                || size < min_size
+            {
                 return;
             }
-            // SAFETY: `relationship == RelationNumaNode` and `size` covers the
-            // fixed header of `NUMA_NODE_RELATIONSHIP`.
+            // SAFETY: `relationship` is a NUMA node record and `size` covers
+            // the fixed header of `NUMA_NODE_RELATIONSHIP`.
             let node = unsafe { &*std::ptr::addr_of!((*record).Anonymous.NumaNode) };
             let count = usize::from(node.GroupCount).max(1);
             let masks_end = masks_offset.saturating_add(count.saturating_mul(std::mem::size_of::<GROUP_AFFINITY>()));
@@ -134,14 +137,14 @@ fn group_cpus(masks: &[GROUP_AFFINITY]) -> Vec<usize> {
     cpus
 }
 
-/// Each NUMA node (`RelationNumaNode`), with memory where
-/// `GetNumaAvailableMemoryNodeEx` answers for it (static node memory presence,
-/// independent of momentary free bytes under pressure), its cores
-/// (`RelationProcessorCore`) those whose threads lie in it, each a
-/// performance core of the highest `EfficiencyClass`; the process may run
-/// on the CPUs of its groups (`GetProcessGroupAffinity`), within its
-/// affinity mask where it has one group (`GetProcessAffinityMask`). Where
-/// any of it is unanswered, the flat topology ([`flat_nodes`]) of the
+/// Each NUMA node (`RelationNumaNodeEx`, falling back to `RelationNumaNode` on
+/// older Windows), with memory where `GetNumaAvailableMemoryNodeEx` answers
+/// for it (static node memory presence, independent of momentary free bytes
+/// under pressure), its cores (`RelationProcessorCore`) those whose threads
+/// lie in it, each a performance core of the highest `EfficiencyClass`; the
+/// process may run on the CPUs of its groups (`GetProcessGroupAffinity`),
+/// within its affinity mask where it has one group (`GetProcessAffinityMask`).
+/// Where any of it is unanswered, the flat topology ([`flat_nodes`]) of the
 /// quota's CPUs.
 pub(crate) fn processors(sys: &impl Sys) -> Processors {
     let (nodes, allowed) = resolve(
@@ -166,34 +169,28 @@ fn reported_processors(sys: &impl Sys) -> Option<(Vec<MemoryNode>, BTreeSet<usiz
             cores.push((group_cpus(masks), efficiency_class));
         });
     let fastest = cores.iter().map(|(_, class)| *class).max()?;
+    let numa_records = sys
+        .processor_records(RelationNumaNodeEx)
+        .or_else(|| sys.processor_records(RelationNumaNode))?;
     let mut nodes = Vec::new();
-    let mut unanswered = false;
-    sys.processor_records(RelationNumaNode)?
-        .numa_nodes(|node_number, masks| {
-            let cpus = group_cpus(masks);
-            let number = u16::try_from(node_number)
-                .unwrap_or_else(|_| panic!("invariant violated: NUMA node {node_number}"));
-            if sys.numa_available(number).is_none() {
-                unanswered = true;
-                return;
-            }
-            let cores = cores
-                .iter()
-                .filter(|(threads, _)| threads.first().is_some_and(|first| cpus.contains(first)))
-                .map(|(threads, class)| Core {
-                    threads: threads.clone(),
-                    performance: *class == fastest,
-                })
-                .collect();
-            nodes.push(MemoryNode {
-                id: usize::from(number),
-                memory: true,
-                cores,
-            });
+    numa_records.numa_nodes(|node_number, masks| {
+        let cpus = group_cpus(masks);
+        let number = u16::try_from(node_number)
+            .unwrap_or_else(|_| panic!("invariant violated: NUMA node {node_number}"));
+        let cores = cores
+            .iter()
+            .filter(|(threads, _)| threads.first().is_some_and(|first| cpus.contains(first)))
+            .map(|(threads, class)| Core {
+                threads: threads.clone(),
+                performance: *class == fastest,
+            })
+            .collect();
+        nodes.push(MemoryNode {
+            id: usize::from(number),
+            memory: sys.numa_available(number).is_some(),
+            cores,
         });
-    if unanswered {
-        return None;
-    }
+    });
     let every = cores.iter().flat_map(|(threads, _)| threads.iter().copied());
     let allowed = match sys.process_groups()?.as_slice() {
         [group] => {

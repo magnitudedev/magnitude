@@ -67,6 +67,13 @@ fn lies(kind: &KindReport) -> Lies {
     }
 }
 
+/// Whether `kind` lies in a small host-visible device-local BAR window
+/// (`Lies::Window`), which counts as host RAM rather than the device's own
+/// memory.
+pub(crate) fn is_window(kind: &KindReport) -> bool {
+    lies(kind) == Lies::Window
+}
+
 /// Whether the contract's agents reach `kind`'s bytes as it requires. A
 /// `DeviceOnly` buffer of a device whose memory is its own lies in that
 /// memory.
