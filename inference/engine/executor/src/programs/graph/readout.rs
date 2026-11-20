@@ -2081,8 +2081,8 @@ pub(crate) fn checked_readout_storage_with_census(
 ) -> Result<(NativeGraphStorageBytes, LaunchGraphs, super::sizing::ReadoutSizingCensus), GraphError> {
     let norm = target_readout_norm(load, geometry)?;
     let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
-    let (regimes, classes) = load_readout_sizing_regimes(backend, load, geometry, norm, head, limits)?;
-    summarize_readout_regimes(backend, &regimes, &classes, limits)
+    let (regimes, classes, _) = load_readout_sizing_regimes(backend, load, geometry, norm, head, limits)?;
+    summarize_readout_regimes(&regimes, &classes, limits)
 }
 
 /// Certify `load`'s readout family alongside its drafter-free target readout
@@ -2104,32 +2104,33 @@ pub(crate) fn checked_readout_storage_with_undrafted(
     let norm = target_readout_norm(load, geometry)?;
     let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
     let qualified = qualified_readout_classes(limits, head)?;
-    let (mut regimes, mut classes) = (BTreeMap::new(), Vec::new());
+    let (mut regimes, mut classes): (BTreeMap<SourcedRegime, SizingOutline>, Vec<_>) =
+        (BTreeMap::new(), Vec::new());
     for source in readout_sources(load) {
         let source_classes = source.classes(qualified.clone());
+        let (certified, _) = certify_readout_sizing_regimes(
+            backend,
+            geometry,
+            norm,
+            (head, load),
+            source,
+            &source_classes,
+            limits,
+        )?;
         regimes.extend(
-            certify_readout_regimes_by::<ReadoutSizingKey, SizingOutline>(
-                backend,
-                geometry,
-                norm,
-                (head, load),
-                source,
-                &source_classes,
-                limits,
-                |class| readout_sizing_key(backend, class),
-            )?
-            .into_iter()
-            .map(|(key, outline)| ((source.fuses, key), outline)),
+            certified
+                .into_iter()
+                .map(|(regime, outline)| ((source.fuses, regime), outline)),
         );
         classes.extend(source_classes.into_iter().map(|class| (source, class)));
     }
-    let drafted = summarize_readout_regimes(backend, &regimes, &classes, limits)?;
+    let drafted = summarize_readout_regimes(&regimes, &classes, limits)?;
     let own = ReadoutSource::whole(FeatureSource::of(load), load.fronts());
     let plain_source = ReadoutSource::whole(FeatureSource::Output, false);
     let undrafted = if matches!(own.features, FeatureSource::Output) && !own.token_rows {
         drafted.clone()
     } else if own.fuses && !own.token_rows {
-        let mut plain_regimes: BTreeMap<SourcedSizingKey, SizingOutline> = regimes
+        let mut plain_regimes: BTreeMap<SourcedRegime, SizingOutline> = regimes
             .into_iter()
             .filter(|((fuses, _), _)| !*fuses)
             .collect();
@@ -2139,53 +2140,51 @@ pub(crate) fn checked_readout_storage_with_undrafted(
             .filter(|class| class.kind == ReadoutKind::Features)
             .collect();
         if !features_classes.is_empty() {
+            let (certified, _) = certify_readout_sizing_regimes(
+                backend,
+                geometry,
+                norm,
+                (head, load),
+                plain_source,
+                &features_classes,
+                limits,
+            )?;
             plain_regimes.extend(
-                certify_readout_regimes_by::<ReadoutSizingKey, SizingOutline>(
-                    backend,
-                    geometry,
-                    norm,
-                    (head, load),
-                    plain_source,
-                    &features_classes,
-                    limits,
-                    |class| readout_sizing_key(backend, class),
-                )?
-                .into_iter()
-                .map(|(key, outline)| ((false, key), outline)),
+                certified
+                    .into_iter()
+                    .map(|(regime, outline)| ((false, regime), outline)),
             );
         }
         let plain_classes: Vec<(ReadoutSource<'_>, ReadoutClass)> = qualified
             .into_iter()
             .map(|class| (plain_source, class))
             .collect();
-        summarize_readout_regimes(backend, &plain_regimes, &plain_classes, limits)?
+        summarize_readout_regimes(&plain_regimes, &plain_classes, limits)?
     } else {
-        let plain_regimes: BTreeMap<SourcedSizingKey, SizingOutline> =
-            certify_readout_regimes_by::<ReadoutSizingKey, SizingOutline>(
-                backend,
-                geometry,
-                norm,
-                (head, load),
-                plain_source,
-                &qualified,
-                limits,
-                |class| readout_sizing_key(backend, class),
-            )?
+        let (certified, _) = certify_readout_sizing_regimes(
+            backend,
+            geometry,
+            norm,
+            (head, load),
+            plain_source,
+            &qualified,
+            limits,
+        )?;
+        let plain_regimes: BTreeMap<SourcedRegime, SizingOutline> = certified
             .into_iter()
-            .map(|(key, outline)| ((false, key), outline))
+            .map(|(regime, outline)| ((false, regime), outline))
             .collect();
         let plain_classes: Vec<(ReadoutSource<'_>, ReadoutClass)> = qualified
             .into_iter()
             .map(|class| (plain_source, class))
             .collect();
-        summarize_readout_regimes(backend, &plain_regimes, &plain_classes, limits)?
+        summarize_readout_regimes(&plain_regimes, &plain_classes, limits)?
     };
     Ok((drafted, undrafted))
 }
 
 fn summarize_readout_regimes(
-    backend: BackendName,
-    regimes: &BTreeMap<SourcedSizingKey, SizingOutline>,
+    regimes: &BTreeMap<SourcedRegime, SizingOutline>,
     classes: &[(ReadoutSource<'_>, ReadoutClass)],
     limits: ResourceLimits,
 ) -> Result<(NativeGraphStorageBytes, LaunchGraphs, super::sizing::ReadoutSizingCensus), GraphError> {
@@ -2200,20 +2199,24 @@ fn summarize_readout_regimes(
     // Plain decode readout calls: un-fused, non-chunk, unshaped uncertified selection
     // (the canonical full-projection selection readout: features + head + sample).
     let decode_outline = regimes
-        .get(&(false, (ReadoutKind::Selection { shaped: false, certified: false }, false, 0)))
+        .iter()
+        .find_map(|(&(fuses, (kind, _, chunk)), outline)| {
+            (!fuses
+                && !chunk
+                && kind == ReadoutKind::Selection { shaped: false, certified: false })
+            .then_some(outline)
+        })
         .or_else(|| {
-            regimes.iter().find_map(|(&(fuses, (kind, chunk, _)), outline)| {
+            regimes.iter().find_map(|(&(fuses, (kind, _, chunk)), outline)| {
                 (!fuses && !chunk && matches!(kind, ReadoutKind::Selection { shaped: false, .. }))
                     .then_some(outline)
             })
         })
-        .or_else(|| regimes.get(&(false, (ReadoutKind::Logits, false, 0))));
+        .or_else(|| regimes.get(&(false, (ReadoutKind::Logits, 0, false))));
     if let Some(outline) = decode_outline {
         census.decode_calls = outline.launches().to_vec();
     }
-    let graphs = readout_graphs_by(regimes, classes, limits, false, |(fuses, (kind, selected, chunk))| {
-        (fuses, (kind, chunk, readout_selected_bucket(backend, kind, selected)))
-    })?;
+    let graphs = readout_graphs(regimes, classes, limits, false)?;
     Ok((family, graphs, census))
 }
 
@@ -2254,29 +2257,10 @@ type SourcedRegime = (bool, ReadoutRegime);
 /// - [`readout_graphs_by`] still enumerates one [`LaunchedGraph`] per
 ///   [`SourcedRegime`] `(fuses, (kind, selected, chunk))`, reading the
 ///   `selected`-invariant `recorded` census from `(fuses, (kind, chunk))`.
-type ReadoutSizingKey = (ReadoutKind, bool, u8);
+type ReadoutSizingKey = (ReadoutKind, bool);
 
-/// A collapsed sizing key of one of a load's readout sources: `(fuses, (kind, chunk, selected_bucket))`.
-type SourcedSizingKey = (bool, ReadoutSizingKey);
-
-/// Bucket `selected` on CUDA across readout's conditional launch thresholds
-/// (`O <= VERIFY_ROWS`, `VERIFY_ROWS < O <= 16`, `O > 16` in `readout.seismic`)
-/// so collapsed CUDA `recorded` censuses never OR mutually-exclusive launches.
-fn readout_selected_bucket(backend: BackendName, kind: ReadoutKind, selected: u64) -> u8 {
-    if backend != BackendName::Cuda || !matches!(kind, ReadoutKind::Selection { .. }) {
-        return 0;
-    }
-    if selected <= magnitude_kernels::constants::VERIFY_ROWS {
-        0
-    } else if selected <= 16 {
-        1
-    } else {
-        2
-    }
-}
-
-fn readout_sizing_key(backend: BackendName, class: ReadoutClass) -> ReadoutSizingKey {
-    (class.kind, chunk_holds(class.projected), readout_selected_bucket(backend, class.kind, class.selected))
+fn readout_sizing_key(class: ReadoutClass) -> ReadoutSizingKey {
+    (class.kind, chunk_holds(class.projected))
 }
 
 /// Every regime `load`'s readout certifies, from each of its sources
@@ -2315,7 +2299,9 @@ fn load_readout_regimes<'p, L: Certified>(
 }
 
 /// Collapsed [`SizingOutline`] certification for [`checked_readout_storage_with_census`],
-/// grouping by [`ReadoutSizingKey`] `(kind, chunk)` instead of [`ReadoutRegime`].
+/// drafting one [`SizingDraft`] per [`ReadoutSizingKey`] `(kind, chunk)` and
+/// certifying each distinct [`ReadoutRegime`] within it via `certify_each` so
+/// per-regime launch guards come directly from the compiled contract.
 fn load_readout_sizing_regimes<'p>(
     backend: BackendName,
     load: &'p ModelLoadPlan,
@@ -2323,28 +2309,29 @@ fn load_readout_sizing_regimes<'p>(
     norm: Option<&crate::WeightPlan>,
     head: HeadPlans<'_>,
     limits: ResourceLimits,
-) -> Result<(BTreeMap<SourcedSizingKey, SizingOutline>, Vec<(ReadoutSource<'p>, ReadoutClass)>), GraphError> {
+) -> Result<(BTreeMap<SourcedRegime, SizingOutline>, Vec<(ReadoutSource<'p>, ReadoutClass)>, usize), GraphError> {
     let qualified = qualified_readout_classes(limits, head)?;
-    let (mut regimes, mut classes) = (BTreeMap::new(), Vec::new());
+    let (mut regimes, mut classes, mut drafts) = (BTreeMap::new(), Vec::new(), 0usize);
     for source in readout_sources(load) {
         let source_classes = source.classes(qualified.clone());
+        let (certified, count) = certify_readout_sizing_regimes(
+            backend,
+            geometry,
+            norm,
+            (head, load),
+            source,
+            &source_classes,
+            limits,
+        )?;
+        drafts += count;
         regimes.extend(
-            certify_readout_regimes_by::<ReadoutSizingKey, SizingOutline>(
-                backend,
-                geometry,
-                norm,
-                (head, load),
-                source,
-                &source_classes,
-                limits,
-                |class| readout_sizing_key(backend, class),
-            )?
-            .into_iter()
-            .map(|(key, outline)| ((source.fuses, key), outline)),
+            certified
+                .into_iter()
+                .map(|(regime, outline)| ((source.fuses, regime), outline)),
         );
         classes.extend(source_classes.into_iter().map(|class| (source, class)));
     }
-    Ok((regimes, classes))
+    Ok((regimes, classes, drafts))
 }
 
 /// The structure a readout class selects: its kind; for a selection, the
@@ -2425,6 +2412,101 @@ fn certify_readout_regimes<L: Certified>(
         limits,
         readout_regime,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn certify_readout_sizing_regimes(
+    backend: BackendName,
+    geometry: &Decoder,
+    norm: Option<&crate::WeightPlan>,
+    (head, weights): (HeadPlans<'_>, &(impl PlannedWeights + ?Sized)),
+    source: ReadoutSource<'_>,
+    source_classes: &[ReadoutClass],
+    limits: ResourceLimits,
+) -> Result<(BTreeMap<ReadoutRegime, SizingOutline>, usize), GraphError> {
+    let features_entry = match source.features {
+        FeatureSource::Output => readout_features_rows::Entry::NAME,
+        FeatureSource::Taps { .. } | FeatureSource::Residual { .. } => feature_rows::Entry::NAME,
+    };
+    let projecting: &[&'static str] = match head {
+        HeadPlans::Packed { .. } => &[readout_head_rows::Entry::NAME],
+        HeadPlans::Qualified { .. } => &[readout_planes_rows::Entry::NAME],
+    };
+    let certifying = [
+        readout_top_rows::Entry::NAME,
+        readout_refine_rows::Entry::NAME,
+        readout_exact_rows::Entry::NAME,
+    ];
+    let slice_of = |class: &ReadoutClass| {
+        let slice = NativeGraphClassSlice::new()
+            .dimension("M", [class.rows])
+            .scoped(features_entry, "O", [class.outputs]);
+        let selecting = |slice: NativeGraphClassSlice| {
+            let slice = slice.scoped(sample_rows::Entry::NAME, "M", [class.selected]);
+            match class.kind {
+                ReadoutKind::Selection { shaped: true, .. } => {
+                    slice.scoped(shape_rows::Entry::NAME, "Sx", [class.selected])
+                }
+                _ => slice,
+            }
+        };
+        let scoped = |slice: NativeGraphClassSlice, entries: &[&'static str]| {
+            entries.iter().fold(slice, |slice, entry| {
+                slice.scoped(entry, "O", [class.projected])
+            })
+        };
+        match class.kind {
+            ReadoutKind::Features => slice,
+            ReadoutKind::Logits => scoped(slice, projecting),
+            ReadoutKind::Selection { certified: true, .. } => selecting(scoped(slice, &certifying)),
+            ReadoutKind::Selection { .. } => selecting(scoped(slice, projecting)),
+        }
+    };
+    let mut groups: BTreeMap<ReadoutSizingKey, BTreeMap<ReadoutRegime, Vec<ReadoutClass>>> = BTreeMap::new();
+    for &class in source_classes {
+        groups
+            .entry(readout_sizing_key(class))
+            .or_default()
+            .entry(readout_regime(class))
+            .or_default()
+            .push(class);
+    }
+    let draft_count = groups.len();
+    let mut out = BTreeMap::new();
+    for (_, by_regime) in groups {
+        let first_classes = by_regime.values().next().expect("a group holds a regime");
+        let kind = first_classes[0].kind;
+        let min_selected = first_classes[0].selected;
+        let largest = |field: fn(&ReadoutClass) -> u64| {
+            first_classes.iter().map(field).max().expect("a regime holds a class")
+        };
+        let template = ReadoutClass {
+            rows: largest(|class| class.rows),
+            outputs: largest(|class| class.outputs),
+            projected: largest(|class| class.projected),
+            selected: min_selected,
+            kind,
+        };
+        let regime_keys: Vec<ReadoutRegime> = by_regime.keys().copied().collect();
+        let slice_sets: Vec<Vec<NativeGraphClassSlice>> = by_regime
+            .values()
+            .map(|classes| classes.iter().map(slice_of).collect())
+            .collect();
+        let draft = checked_readout_class_draft(
+            SizingOutline::new_draft(backend),
+            geometry,
+            norm,
+            Some((head, weights)),
+            source.features,
+            template,
+            ReadoutExports { logits: exports_logits(limits), token_rows: source.token_rows },
+        )?;
+        let outlines = draft.certify_each(&slice_sets)?;
+        for (regime, outline) in regime_keys.into_iter().zip(outlines) {
+            out.insert(regime, outline);
+        }
+    }
+    Ok((out, draft_count))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3372,12 +3454,11 @@ mod resource_regime_tests {
             let head =
                 HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)
                     .unwrap();
-            let (collapsed_regimes, _) =
+            let (_, _, draft_count) =
                 load_readout_sizing_regimes(backend, load, geometry, norm, head, limits).unwrap();
             assert!(
-                collapsed_regimes.len() < unrolled_count,
-                "{label} {backend:?}: expected collapsed drafts ({}) < unrolled ({unrolled_count})",
-                collapsed_regimes.len()
+                draft_count < unrolled_count,
+                "{label} {backend:?}: expected collapsed drafts ({draft_count}) < unrolled ({unrolled_count})",
             );
             assert_eq!(storage, unrolled_storage, "{label} {backend:?} storage");
             assert_eq!(graphs, unrolled_graphs, "{label} {backend:?} graphs");
