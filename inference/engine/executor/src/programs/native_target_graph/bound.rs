@@ -270,7 +270,7 @@ pub(crate) struct GroupBuffers {
     split: Option<SplitValues<seismic::Tensor>>,
     blocks: Vec<Option<SplitValues<seismic::Tensor>>>,
     /// Per place, the two operand carries its run alternates between, of a
-    /// load whose decode graphs carry (`PreparedTargetGraphs::operand_carry`):
+    /// load whose decode graphs carry (`GroupExtents::operand_carry`):
     /// a block's graph reads the one the block before wrote and writes the
     /// other, which the next block's reads. A place's graphs run in queue
     /// order, so a carry is rewritten only after its reader.
@@ -310,11 +310,11 @@ impl GroupBuffers {
             None => Vec::new(),
         };
         let allocate = |value: &Option<Extents>| value.as_ref().map(|value| zeros(charges, value)).transpose();
-        let operands = match prepared.operand_carry() {
+        let operands = match &extents.operand_carry {
             None => Vec::new(),
-            Some(carry) => (0..places)
+            Some(([rows, quantized], carry_places)) => (0..*carry_places)
                 .map(|_| {
-                    let pair = || carry.allocate(charges).map_err(AllocationError::Tensor);
+                    let pair = || Ok::<_, AllocationError>([zeros(charges, rows)?, zeros(charges, quantized)?]);
                     Ok::<_, AllocationError>([pair()?, pair()?])
                 })
                 .collect::<Result<_, _>>()?,

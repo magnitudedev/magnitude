@@ -280,7 +280,7 @@ impl CheckedTargetFamily {
             .downcast_ref::<Mutex<FamilyLayouts<SizingOutline>>>()
             .expect("invariant violated: target cache handle is not FamilyLayouts<SizingOutline>");
         let mut guard = mutex.lock().expect("target family layout cache mutex poisoned");
-        if guard.matches_scope(backend, &outline, plan) {
+        if guard.matches_scope(backend, load, &outline, plan) {
             guard.ensure_entries(backend, load, geometry, &outline)?;
             guard.certify_checked(outline, load, geometry, state, plan, limits, pass, Arc::clone(cache))
         } else {
@@ -313,7 +313,7 @@ impl CheckedTargetFamily {
             .downcast_ref::<Mutex<FamilyLayouts<SizingOutline>>>()
             .expect("invariant violated: target cache handle is not FamilyLayouts<SizingOutline>");
         let mut guard = mutex.lock().expect("target family layout cache mutex poisoned");
-        if guard.matches_scope(backend, &outline, plan) {
+        if guard.matches_scope(backend, load, &outline, plan) {
             guard.ensure_entries(backend, load, geometry, &outline)?;
             guard.certify_checked_pair(outline, load, geometry, state, plan, limits, pass, Arc::clone(cache))
         } else {
@@ -427,29 +427,86 @@ enum Included {
 /// its family's resources.
 type ShapeLayouts<L> = BTreeMap<Topology, (CertifiedBlockGraph<L>, Included)>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PerLayerWeightKey {
+    resident: seismic::Element,
+    shape: Vec<u64>,
+    scale_extent: u64,
+    bound: u64,
+}
+
+impl PerLayerWeightKey {
+    fn of(load: &ModelLoadPlan, kind: WeightKind) -> Option<Self> {
+        load.weight_by_role(WeightRole {
+            scope: WeightScope::Target,
+            kind,
+        })
+        .map(|weight| Self {
+            resident: weight.resident,
+            shape: weight.shape.clone(),
+            scale_extent: weight.scale_extent(),
+            bound: weight.bound,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PerLayerScope {
+    binding: crate::PerLayerEntryBinding,
+    projection: Option<PerLayerWeightKey>,
+    norm: Option<PerLayerWeightKey>,
+}
+
+impl PerLayerScope {
+    fn of(load: &ModelLoadPlan, plan: &TargetProgramPlan) -> Option<Self> {
+        plan.per_layer().map(|binding| Self {
+            binding,
+            projection: PerLayerWeightKey::of(load, WeightKind::PerLayerModelProjection),
+            norm: PerLayerWeightKey::of(load, WeightKind::PerLayerProjectionNorm),
+        })
+    }
+}
+
 /// Invariant scope over which cached entry and block layouts in
 /// `FamilyLayouts` are valid.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LayoutsScope {
     backend: BackendName,
     row_classes: Vec<u64>,
     max_slots: u64,
     max_segments: u64,
-    has_per_layer: bool,
+    per_layer: Option<PerLayerScope>,
+}
+
+impl LayoutsScope {
+    fn of(
+        backend: BackendName,
+        load: &ModelLoadPlan,
+        outline: &FamilyOutline,
+        plan: &TargetProgramPlan,
+    ) -> Self {
+        Self {
+            backend,
+            row_classes: outline.row_classes.clone(),
+            max_slots: outline.max_slots,
+            max_segments: outline.max_segments,
+            per_layer: PerLayerScope::of(load, plan),
+        }
+    }
 }
 
 /// Entry-graph properties that depend on the load plan (`fronts`, token-row
-/// copies, and streamed embedding table landing rows). When only this scope
+/// copies, and embedding table shape/elements/holding). When only this scope
 /// changes (e.g., plain -> drafted or banked -> resident), `entries` is
 /// re-certified while `per_layer`, `launches`, `groups`, and `once_layouts`
 /// remain valid.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct EntryScope {
     copies_token_rows: bool,
     notifies_selection: bool,
     keeps_token_rows: bool,
     fronts: bool,
-    target_table: Option<(Vec<u64>, seismic::Element, bool)>,
+    target_table: Option<(Vec<u64>, seismic::Element, seismic::Element, crate::planning::Holding)>,
 }
 
 impl EntryScope {
@@ -462,8 +519,9 @@ impl EntryScope {
             .map(|weight| {
                 (
                     weight.shape.clone(),
+                    weight.source,
                     weight.resident,
-                    matches!(weight.holding, crate::planning::Holding::Streamed(_)),
+                    weight.holding,
                 )
             });
         Self {
@@ -851,13 +909,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             }
             _ => return Err("the per-layer entry's binding and geometry disagree".into()),
         };
-        let scope = LayoutsScope {
-            backend,
-            row_classes: outline.row_classes.clone(),
-            max_slots: outline.max_slots,
-            max_segments: outline.max_segments,
-            has_per_layer: plan.per_layer().is_some(),
-        };
+        let scope = LayoutsScope::of(backend, load, outline, plan);
         let entry_scope = EntryScope::of(load);
         Ok(Self {
             scope,
@@ -921,12 +973,18 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
         id
     }
 
-    fn matches_scope(&self, backend: BackendName, outline: &FamilyOutline, plan: &TargetProgramPlan) -> bool {
+    fn matches_scope(
+        &self,
+        backend: BackendName,
+        load: &ModelLoadPlan,
+        outline: &FamilyOutline,
+        plan: &TargetProgramPlan,
+    ) -> bool {
         self.scope.backend == backend
             && self.scope.row_classes == outline.row_classes
             && self.scope.max_slots == outline.max_slots
             && self.scope.max_segments == outline.max_segments
-            && self.scope.has_per_layer == plan.per_layer().is_some()
+            && self.scope.per_layer == PerLayerScope::of(load, plan)
     }
 
     fn ensure_entries(
@@ -1768,7 +1826,16 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
         // (`PreparedTargetGraphs::binding_constant_bytes`).
         let mut resources = family.finish()?;
         let notice = notice_bytes(notice_rows(load, outline.largest_rows))?;
-        let group_rows = GroupRows::of(load, geometry, plan, outline.tap_width, outline.largest_rows);
+        let carries = outline.carries.iter().any(|c| c.carry_out.is_some());
+        let group_rows = GroupRows::of(
+            outline.backend,
+            load,
+            geometry,
+            plan,
+            outline.tap_width,
+            outline.largest_rows,
+            carries,
+        );
         let floor = group_rows.extents(&served, 1);
         let (group, pass_bytes) = (floor.bytes()?, floor.pass_bytes()?);
         resources.binding_constant_bytes = resources
@@ -2718,4 +2785,113 @@ fn group_pass_rows(
         passes.launches = fits;
     }
     Ok(passes)
+}
+
+#[cfg(test)]
+mod cache_scope_tests {
+    use super::{EntryScope, LayoutsScope, PerLayerScope, PerLayerWeightKey};
+    use crate::planning::Holding;
+    use crate::PerLayerEntryBinding;
+    use seismic::{BackendName, Element};
+
+    #[test]
+    fn entry_scope_distinguishes_holding_and_source_element() {
+        let base = EntryScope {
+            copies_token_rows: false,
+            notifies_selection: false,
+            keeps_token_rows: false,
+            fronts: false,
+            target_table: Some((vec![1024, 256], Element::f16(), Element::bf16(), Holding::Whole)),
+        };
+        let banked_zero = EntryScope {
+            target_table: Some((
+                vec![1024, 256],
+                Element::f16(),
+                Element::bf16(),
+                Holding::Banked { group: 0 },
+            )),
+            ..base.clone()
+        };
+        let banked_one = EntryScope {
+            target_table: Some((
+                vec![1024, 256],
+                Element::f16(),
+                Element::bf16(),
+                Holding::Banked { group: 1 },
+            )),
+            ..base.clone()
+        };
+        let different_source = EntryScope {
+            target_table: Some((vec![1024, 256], Element::bf16(), Element::bf16(), Holding::Whole)),
+            ..base.clone()
+        };
+        assert_eq!(base, base.clone());
+        assert_ne!(base, banked_zero);
+        assert_ne!(banked_zero, banked_one);
+        assert_ne!(base, different_source);
+    }
+
+    #[test]
+    fn layouts_scope_distinguishes_per_layer_binding_and_weights() {
+        let binding_a = PerLayerEntryBinding {
+            hidden: 256,
+            layers: 4,
+            width: 64,
+            table_source: Element::bf16(),
+            table: Element::bf16(),
+            projection: Element::bf16(),
+            norm: Element::f32(),
+            activation: Element::bf16(),
+        };
+        let binding_b = PerLayerEntryBinding {
+            projection: Element::f16(),
+            ..binding_a
+        };
+        let proj_a = PerLayerWeightKey {
+            resident: Element::bf16(),
+            shape: vec![256, 256],
+            scale_extent: 0,
+            bound: 0,
+        };
+        let proj_b = PerLayerWeightKey {
+            shape: vec![512, 256],
+            ..proj_a.clone()
+        };
+        let norm = PerLayerWeightKey {
+            resident: Element::f32(),
+            shape: vec![64],
+            scale_extent: 0,
+            bound: 0,
+        };
+        let base = LayoutsScope {
+            backend: BackendName::Cpu,
+            row_classes: vec![1, 16],
+            max_slots: 1,
+            max_segments: 4,
+            per_layer: Some(PerLayerScope {
+                binding: binding_a,
+                projection: Some(proj_a.clone()),
+                norm: Some(norm.clone()),
+            }),
+        };
+        let different_binding = LayoutsScope {
+            per_layer: Some(PerLayerScope {
+                binding: binding_b,
+                projection: Some(proj_a),
+                norm: Some(norm.clone()),
+            }),
+            ..base.clone()
+        };
+        let different_weight = LayoutsScope {
+            per_layer: Some(PerLayerScope {
+                binding: binding_a,
+                projection: Some(proj_b),
+                norm: Some(norm),
+            }),
+            ..base.clone()
+        };
+        assert_eq!(base, base.clone());
+        assert_ne!(base, different_binding);
+        assert_ne!(base, different_weight);
+    }
 }

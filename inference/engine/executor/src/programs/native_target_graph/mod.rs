@@ -49,9 +49,10 @@ use seismic::Element;
 
 /// The buffers a prompt group holds over its rows, a region per place
 /// (`GroupBuffers`): the draft input rows of a tapped target, the per-layer
-/// rows, the kept token rows and guesses, and its split layers' crossing and merged
+/// rows, the kept token rows and guesses, its split layers' crossing and merged
 /// positions (`SplitValues::at_rows`) in the load's one buffer of each
-/// (`SplitValues::widest`), beside the merged experts and row table of the
+/// (`SplitValues::widest`), and its per-place alternating operand carries
+/// (`GroupBuffers::operands`), beside the merged experts and row table of the
 /// group's pass, which every group shares (`pass_bytes`).
 struct GroupExtents {
     taps: Option<Extents>,
@@ -59,6 +60,9 @@ struct GroupExtents {
     tokens: Option<Extents>,
     guesses: Option<Extents>,
     split: Option<SplitValues<Extents>>,
+    /// The `[rows, quantized]` extents of one operand carry and the group's
+    /// places: each place holds two alternating carries.
+    operand_carry: Option<([Extents; 2], usize)>,
 }
 
 impl GroupExtents {
@@ -78,13 +82,33 @@ impl GroupExtents {
             tokens: tokens.map(|[_, width]| (Element::i32(), vec![rows, width])),
             guesses: guesses.map(|[_, width]| (Element::i32(), vec![rows, width])),
             split: SplitLayers::of(served).map(|layers| layers.at_rows(rows)),
+            operand_carry: None,
         }
+    }
+
+    /// Attach the per-carry `[rows, quantized]` extents for a group of `places`
+    /// places, each holding two alternating carries (`GroupBuffers::operands`).
+    pub(super) fn with_operand_carry(mut self, carry: Option<[(Element, [u64; 2]); 2]>, places: usize) -> Self {
+        self.operand_carry = carry.map(|[(rows_el, rows_ext), (q_el, q_ext)]| {
+            ([(rows_el, rows_ext.to_vec()), (q_el, q_ext.to_vec())], places)
+        });
+        self
     }
 
     /// The group's own buffers.
     fn owned(&self) -> impl Iterator<Item = &Extents> {
         let split = self.split.iter().flat_map(|split| split.crossing.iter().chain([&split.merged.inverse]));
-        self.taps.iter().chain(&self.per_layer).chain(&self.tokens).chain(&self.guesses).chain(split)
+        let operand_carry = self
+            .operand_carry
+            .iter()
+            .flat_map(|(pair, places)| (0..2 * *places).flat_map(move |_| pair.iter()));
+        self.taps
+            .iter()
+            .chain(&self.per_layer)
+            .chain(&self.tokens)
+            .chain(&self.guesses)
+            .chain(split)
+            .chain(operand_carry)
     }
 
     /// Bytes of the group's own buffers.
@@ -102,11 +126,24 @@ impl GroupExtents {
     }
 }
 
+/// The `[rows, quantized]` element and `[rows, cols]` extents of one operand
+/// carry (`seismic::sizing::operand_carry_ports`), the shape every carry of a
+/// load takes (`block::CARRIED_ROWS` by `hidden`).
+fn operand_carry_extents(backend: seismic::BackendName, hidden: u64) -> [(Element, [u64; 2]); 2] {
+    let [(rows_repr, rows_extents), (quantized_repr, quantized_extents)] =
+        seismic::sizing::operand_carry_ports(backend, block::CARRIED_ROWS, hidden);
+    [
+        (Element::from_id(rows_repr), rows_extents),
+        (Element::from_id(quantized_repr), quantized_extents),
+    ]
+}
+
 /// What a load's prompt-group buffers span (`GroupExtents`): a region of
 /// the largest row class per place, of the draft input rows of a tapped
-/// target, the per-layer rows and the kept token rows. The one derivation
-/// the certificate (what a plan charges) and the prepared family (what a
-/// load holds) read.
+/// target, the per-layer rows, the kept token rows and guesses, and the
+/// per-place alternating operand carries. The one derivation the certificate
+/// (what a plan charges), the prepared family (what a load holds), and
+/// `GroupBuffers::new` (what binding allocates) read.
 #[derive(Clone, Copy, Debug)]
 struct GroupRows {
     /// The element and `[rows, taps · hidden]` extents of one region of the
@@ -122,6 +159,9 @@ struct GroupRows {
     /// The `[rows, 2]` I32 extents of one region of the host's guesses a
     /// load that fronts keeps (`PreparedTargetEntryGraph::kept_guesses`).
     guesses: Option<[u64; 2]>,
+    /// The `[rows, quantized]` element and extents of one operand carry, when
+    /// any block of the load carries (`FamilyOutline::carries`).
+    operand_carry: Option<[(Element, [u64; 2]); 2]>,
     /// The rows of one chain region of the launch-row buffers: the largest
     /// row class.
     region_rows: u64,
@@ -129,17 +169,20 @@ struct GroupRows {
 
 impl GroupRows {
     fn of(
+        backend: seismic::BackendName,
         load: &crate::ModelLoadPlan,
         geometry: &magnitude_family_contracts::Decoder,
         plan: &crate::TargetProgramPlan,
         tap_width: Option<u64>,
         largest_rows: u64,
+        carries: bool,
     ) -> Self {
         Self {
             taps: tap_width.map(|width| (activation(geometry), [largest_rows, width])),
             per_layer: prepared::per_layer_rows(plan, largest_rows),
             tokens: entry::token_rows_extents(load, largest_rows),
             guesses: load.fronts().then_some([largest_rows, 2]),
+            operand_carry: carries.then(|| operand_carry_extents(backend, geometry.hidden)),
             region_rows: largest_rows,
         }
     }
@@ -155,6 +198,7 @@ impl GroupRows {
     /// `served`.
     fn extents(&self, served: &[BlockServed], places: usize) -> GroupExtents {
         GroupExtents::of(self.taps, self.per_layer, self.tokens, self.guesses, served, self.region_start(places))
+            .with_operand_carry(self.operand_carry, places)
     }
 
     /// The bytes a group of `places` places' own buffers hold beside the
@@ -197,4 +241,45 @@ fn extents_bytes<'a>(extents: impl IntoIterator<Item = &'a Extents>) -> Result<u
         let bytes = element.canonical_byte_len(extents).map_err(|error| error.to_string())?;
         total.checked_add(bytes).ok_or_else(|| "group buffer bytes overflow".to_owned())
     })
+}
+
+#[cfg(test)]
+mod group_extents_tests {
+    use super::{GroupExtents, GroupRows, operand_carry_extents};
+    use seismic::BackendName;
+
+    #[test]
+    fn group_extents_and_rows_account_for_operand_carry() {
+        let carry = operand_carry_extents(BackendName::Cpu, 256);
+        let pair_bytes = carry[0].0.canonical_byte_len(&carry[0].1).unwrap()
+            + carry[1].0.canonical_byte_len(&carry[1].1).unwrap();
+        assert!(pair_bytes > 0);
+
+        let without = GroupExtents::of(None, None, None, None, &[], 64);
+        assert_eq!(without.bytes().unwrap(), 0);
+        assert_eq!(without.pass_bytes().unwrap(), 0);
+
+        let one_place = GroupExtents::of(None, None, None, None, &[], 64)
+            .with_operand_carry(Some(carry), 1);
+        assert_eq!(one_place.bytes().unwrap(), 2 * pair_bytes);
+        assert_eq!(one_place.pass_bytes().unwrap(), 0);
+
+        let three_places = GroupExtents::of(None, None, None, None, &[], 192)
+            .with_operand_carry(Some(carry), 3);
+        assert_eq!(three_places.bytes().unwrap(), 6 * pair_bytes);
+
+        let rows = GroupRows {
+            taps: None,
+            per_layer: None,
+            tokens: None,
+            guesses: None,
+            operand_carry: Some(carry),
+            region_rows: 64,
+        };
+        // Floor (1 place) is charged in binding_constant_bytes; group_bytes(1) is 0.
+        assert_eq!(rows.extents(&[], 1).bytes().unwrap(), 2 * pair_bytes);
+        assert_eq!(rows.group_bytes(&[], 1).unwrap(), 0);
+        // Multi-place groups charge all places' alternating carries.
+        assert_eq!(rows.group_bytes(&[], 3).unwrap(), 6 * pair_bytes);
+    }
 }

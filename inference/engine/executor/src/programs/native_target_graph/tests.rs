@@ -1178,7 +1178,8 @@ mod resource_template_tests {
                         check(index, once_class(rows, stage));
                     }
                 }
-                let floor = GroupExtents::of(None, None, None, None, &served, 64);
+                let floor = GroupExtents::of(None, None, None, None, &served, 64)
+                    .with_operand_carry(certificate.group.operand_carry, 1);
                 assert_eq!(
                     certificate.resources.binding_constant_bytes,
                     constants.into_inner().finish().unwrap().binding_constant_bytes

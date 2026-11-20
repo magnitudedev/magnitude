@@ -46,7 +46,7 @@ use magnitude_family_contracts::{
     RouteNormalization, RowRounding, SublayerIndex, TapPoint, WeightKind, WeightScope,
 };
 use magnitude_kernels::selection_notice;
-use magnitude_state::{ComponentSpec, LayerRef};
+use magnitude_state::{CodecSpec, ComponentSpec, LayerRef};
 use seismic::{Device, Element, HostHeap, NativeGraphFamily};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Instant};
 
@@ -100,10 +100,6 @@ pub struct PreparedTargetGraphs {
     pub(super) served: Vec<BlockServed>,
     /// The passes a group runs (`group_pass_rows`).
     pub(super) passes: Passes,
-    /// An operand carry of the load's decode graphs (`block_carries`), of
-    /// the one shape every carry takes: what a run's carry tensors are
-    /// allocated as (`OperandCarry::allocate`); none where no block carries.
-    operand: Option<seismic::OperandCarry>,
     seal: SealReport,
 }
 
@@ -151,7 +147,7 @@ impl SealReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BlockStateShape {
     bank: Option<Option<Vec<ComponentSpec>>>,
-    history: Option<(usize, u32)>,
+    history: Option<(usize, u32, u32, usize, CodecSpec)>,
 }
 
 /// Typed equivalent of `PairedBlock::shape_key` (`block_graph_shapes`):
@@ -1024,7 +1020,7 @@ pub(super) fn block_graph_shapes(
                 })
         });
         // Blocks share a plan only over equal bank components, and
-        // within one history domain's rows and slabs.
+        // within one history domain's geometry and codec.
         let keeps = paired.keeps();
         let bank_count = paired.bank_components();
         let bank_state = match keeps.bank() {
@@ -1044,7 +1040,13 @@ pub(super) fn block_graph_shapes(
                     .target_state()
                     .layer_history(LayerRef::Target(block_u32))
                     .ok_or("attention block has no history domain")?;
-                Some((history.store.rows, history.store.slab_rows))
+                Some((
+                    history.store.rows,
+                    history.store.slab_rows,
+                    history.store.page_rows,
+                    history.store.span_limit,
+                    history.component.codec,
+                ))
             }
         };
         let state = BlockStateShape { bank: bank_state, history };
@@ -1423,7 +1425,12 @@ impl PreparedTargetGraphs {
                 }
             }
         }
-        let operand = decodes.iter().flatten().find_map(|graph| graph.operand.as_ref().map(|ports| ports.carry.clone()));
+        let has_carry = decodes.iter().flatten().any(|graph| graph.operand.is_some());
+        assert_eq!(
+            has_carry,
+            certificate_group.operand_carry.is_some(),
+            "invariant violated: sealed decode graphs' operand carries disagree with GroupRows"
+        );
         let storage = block_graph_storage(&class_counts, sealed_counts)?;
         let held_storage = block_graph_storage(
             &blocks_by_class
@@ -1593,16 +1600,8 @@ impl PreparedTargetGraphs {
             group: certificate_group,
             served,
             passes,
-            operand,
             seal,
         })
-    }
-
-    /// An operand carry of the load's decode graphs, of the shape every
-    /// carry takes, which a run's carry tensors are allocated as; none
-    /// where no block carries.
-    pub(super) fn operand_carry(&self) -> Option<&seismic::OperandCarry> {
-        self.operand.as_ref()
     }
 
     /// The stages of block `index`'s graph of a launch of `rows` rows
@@ -1902,4 +1901,48 @@ pub(super) fn chain_rows(largest_rows: u64, limits: ResourceLimits) -> Result<u6
 pub(super) fn per_layer_rows(plan: &TargetProgramPlan, rows: u64) -> Option<[u64; 2]> {
     plan.per_layer()
         .map(|binding| [rows, binding.layers * binding.width])
+}
+
+#[cfg(test)]
+mod state_shape_tests {
+    use super::BlockStateShape;
+    use magnitude_state::{Codec, CodecSpec, HistoryValue};
+    use seismic::DType;
+
+    #[test]
+    fn block_state_shape_distinguishes_page_rows_span_limit_and_codec() {
+        let bf16 = CodecSpec {
+            key: Codec::Dense { dtype: DType::BF16 },
+            key_width: 128,
+            value: HistoryValue::Own {
+                codec: Codec::Dense { dtype: DType::BF16 },
+                width: 128,
+            },
+            packing: 1,
+        };
+        let f16 = CodecSpec {
+            key: Codec::Dense { dtype: DType::F16 },
+            ..bf16
+        };
+        let base = BlockStateShape {
+            bank: None,
+            history: Some((4096, 1024, 256, 18, bf16)),
+        };
+        let different_page_rows = BlockStateShape {
+            bank: None,
+            history: Some((4096, 1024, 512, 18, bf16)),
+        };
+        let different_span_limit = BlockStateShape {
+            bank: None,
+            history: Some((4096, 1024, 256, 32, bf16)),
+        };
+        let different_codec = BlockStateShape {
+            bank: None,
+            history: Some((4096, 1024, 256, 18, f16)),
+        };
+        assert_eq!(base, base.clone());
+        assert_ne!(base, different_page_rows);
+        assert_ne!(base, different_span_limit);
+        assert_ne!(base, different_codec);
+    }
 }
