@@ -4,7 +4,7 @@ import { Effect, Layer, Schema } from "effect"
 import { release } from "node:os"
 import { ApplicationUpdateControlFailed, type ApplicationUpdateAction } from "@magnitudedev/sdk/desktop-host"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
-import { acquireApplicationMaintenance, acquireUpdateInstallationLease, applicationNativeHostPath, nativeHostLayer, resolveInstalledApplicationRuntime,
+import { acquireApplicationMaintenance, acquireUpdateInstallationLease, isUpdateInstallationActive, applicationNativeHostPath, nativeHostLayer, resolveInstalledApplicationRuntime,
   PreparedUpdateStore, UpdatePreferences, standaloneInstallationRoot, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateSource, makeInstalledUpdatePreparation, readPreparedUpdateState, discardPreparedUpdate, runFiniteUpdatePreparation, completeLinuxForegroundUpdate, startMacForegroundInstallation, UpdateHardwareSource, unavailableUpdateHardware,
   completeStandaloneUpdate, nativeStandaloneCodeVerifier } from "@magnitudedev/daemon-management/application-update"
@@ -40,7 +40,13 @@ export const runLocalUpdateMaintenance = (options: {
     const prepare = (action: "check" | "download") => preparation.makeSource.pipe(Effect.provideService(UpdateHardwareSource, unavailableUpdateHardware),
       Effect.flatMap(source => runFiniteUpdatePreparation(action).pipe(Effect.provideService(ApplicationUpdateSource, source))))
     const execute = Effect.gen(function* () {
-      if (options.action === "status") return yield* readPreparedUpdateState
+      if (options.action === "status") {
+        const state = yield* readPreparedUpdateState
+        // While the installer runs, its record already says it was attempted; that is not yet a failure.
+        return (yield* isUpdateInstallationActive(options.stateDirectory))
+          ? { ...state, transfer: { _tag: "Unavailable", kind: "Installing", message: "An update is being installed.\nCheck again when it finishes: magnitude update status" } } as const
+          : state
+      }
       if (options.action === "install") {
         if (standalone) {
           // On demand, a CLI-only installation downloads the newest release first when nothing is prepared.
