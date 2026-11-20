@@ -1026,18 +1026,23 @@ impl ResidencyStore {
             .map_err(|error| invalid(error.to_string()))?;
         // The kept rows are the table's in this artifact file, by where it
         // lies there, in these slots.
-        let kept = self.kept_table_rows.as_ref().map(|directory| {
-            let (source, offset, length) = stored.file_range();
-            KeptRows::of(
-                directory,
-                &format!(
-                    "{}\n{offset}\n{length}\n{:?}\n{:?}",
-                    source.path().display(),
-                    plan.resident,
-                    plan.shape
-                ),
-            )
-        });
+        let kept = self
+            .kept_table_rows
+            .as_ref()
+            .map(|directory| {
+                let (source, offset, length) = stored.file_range();
+                KeptRows::of(
+                    directory,
+                    &format!(
+                        "{}\n{offset}\n{length}\n{:?}\n{:?}",
+                        source.path().display(),
+                        plan.resident,
+                        plan.shape
+                    ),
+                )
+            })
+            .transpose()
+            .map_err(|error| invalid(error.to_string()))?;
         let table = DeviceTable::new(
             charges,
             plan.resident,
@@ -1093,14 +1098,19 @@ impl ResidencyStore {
         )
         .map_err(|error| invalid(format!("stored table {:?}: {error}", plan.descriptor.name)))?;
         // Every range's file, offset and bytes, which the rows kept are of.
-        let kept = self.kept_table_rows.as_ref().map(|directory| {
-            let ranges = tensors
-                .iter()
-                .zip(&bytes)
-                .map(|(tensor, bytes)| format!("{}\n{}\n{bytes}\n", tensor.source.path().display(), tensor.offset))
-                .collect::<String>();
-            KeptRows::of(directory, &format!("{ranges}{:?}\n{:?}", plan.resident, plan.shape))
-        });
+        let kept = self
+            .kept_table_rows
+            .as_ref()
+            .map(|directory| {
+                let ranges = tensors
+                    .iter()
+                    .zip(&bytes)
+                    .map(|(tensor, bytes)| format!("{}\n{}\n{bytes}\n", tensor.source.path().display(), tensor.offset))
+                    .collect::<String>();
+                KeptRows::of(directory, &format!("{ranges}{:?}\n{:?}", plan.resident, plan.shape))
+            })
+            .transpose()
+            .map_err(|error| invalid(error.to_string()))?;
         let [records, record_rows, width] = plan.shape[..] else {
             return Err(invalid(format!("stored table {:?} is not records of rows", plan.descriptor.name)));
         };

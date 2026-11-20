@@ -17,54 +17,43 @@
 //!
 //! **Publication.** A file is written to a temporary file of its own beside
 //! its target, synced where the publication is [`Durability::Durable`], and
-//! renamed over the target in one step: a reader finds the target as it was
-//! or as it now is, never part written. The rename replaces what is there
-//! (`rename(2)`; on Windows `std::fs::rename`, which replaces an existing
-//! file, with POSIX semantics where the volume has them). A temporary name
-//! is the process's id and a counter of the whole process, created
-//! exclusively, so no two writers share one, whichever store, thread or
-//! process they are; one a writer that died left is removed by the store's
-//! next sweep ([`Store::evict`]) once it is [`ABANDONED`]. A directory
+//! renamed over the target in one step under the target's exclusive record
+//! lock: a reader finds the target as it was or as it now is, never part
+//! written. A temporary name is the process's id and a counter of the whole
+//! process, created exclusively, so no two writers share one, whichever store,
+//! thread or process they are; one a writer that died left is removed by the
+//! store's next sweep ([`Store::evict`]) once it is [`ABANDONED`]. A directory
 //! written over many steps is published the same way, from a stage of its
-//! own ([`Staged`]).
+//! own ([`Staged`]), serialized under the target's exclusive record lock.
 //!
-//! **Locks.** Two kinds, both `std::fs::File::lock`, which holds across
-//! threads (each through a file of its own) and processes alike:
+//! **Volume contract.** Opening a store ([`Store::open`]) verifies once that
+//! its volume supports atomic replacement and unlinking of open files (native
+//! on POSIX; NTFS POSIX rename and delete semantics on Windows). Volumes that
+//! do not support both fail [`Store::open`] with
+//! [`StoreError::UnsupportedVolume`]. This lets readers ([`Store::read`],
+//! [`Store::fetch`], [`Shared::read`]) stay lockless on every platform while
+//! writers and removals remain serialized under record locks.
 //!
-//! - The store's lock: held shared ([`Shared`]) to read a consistent set of
-//!   files, exclusively ([`Exclusive`]) to read, write, append and remove
-//!   them, and by eviction from its listing to its last removal. Each such
-//!   hold is brief: no holder keeps it across work of unbounded length.
-//! - A record's lock ([`Record`]), held from the read to the publish of an
-//!   update, and by every write and removal of the record, so no path
-//!   reaches a record unlocked. It is taken under the store's lock held
-//!   shared, which its holder then lets go: no eviction runs while a
-//!   record's lock is being taken, and eviction leaves every file whose
-//!   record's lock is held. A record's removal removes its lock file under
-//!   that lock; a waiter that then takes the removed file finds the name no
-//!   longer its and takes the lock again. A record's readers may hold its
-//!   lock shared ([`Store::try_share_owned`]), refused while an exclusive
-//!   holder holds it, which in turn waits for them or refuses at them
-//!   ([`Store::try_lock`]).
-//! - A lease ([`Lease`]): a record of a process's own among the holders of
-//!   a directory, its lock held for as long as the lease lives, so another
-//!   process tells the live holders from the gone ([`Store::leases`]), and
-//!   each holder from every other, which one shared lock cannot.
+//! **Locks.** Two levels, both `std::fs::File::lock`, which holds across
+//! threads (each through a file of its own) and processes alike, with strict
+//! acquisition order (Level 1 before Level 2):
 //!
-//! No holder waits for the store's lock while it holds it: a record's
-//! holder holds none of it, and eviction never waits for it but passes when
-//! another holds it. Nothing here depends on whether a platform lets a new
-//! shared lock past an exclusive one waiting. A record's holder takes
-//! another record's only where no holder of that one ever takes the first's
-//! (the model store's repositories before the files it keeps beside them).
-//! A lock that cannot be taken is an error of the access that wanted it,
-//! never an absent file.
+//! - Level 1 — the store's lock (`.lock`): held shared ([`Shared`]) to read a
+//!   consistent set of files or to publish under record locks
+//!   ([`Shared::publish`], [`Shared::put_if_absent`]), exclusively
+//!   ([`Exclusive`]) to read, write, append and remove them, and by eviction
+//!   from its listing to its last removal.
+//! - Level 2 — a record's lock (`.locks/<record>`): held exclusively by every
+//!   mutation of that record ([`Record`], [`Shared::publish`],
+//!   [`Shared::put_if_absent`], [`Staged::publish`], [`Store::quarantine`],
+//!   [`Lease::write`]), and shared by readers that must pin the path against
+//!   eviction or removal ([`Store::hold`], [`Store::try_share_owned`]).
 //!
-//! **Files that are never rewritten** (content addresses) need no lock to be
-//! read or written: [`Store::put_if_absent`] writes one once, and
-//! [`Store::hold`] opens one under its own lock held shared, which keeps
-//! eviction from removing it while the handle lives: a platform that opens
-//! the file again by its path (Metal's archives) finds it there.
+//! Lock files under `.locks/` are never unlinked while they can be held or
+//! awaited: [`Record::remove`] and [`Lease`] drop remove only the record file
+//! itself. Orphaned lock files are reclaimed exclusively by [`Store::evict`]
+//! while it holds `.lock` exclusively (so no waiter can be opening or awaiting
+//! any lock file) and only after closing its own probe handle.
 //!
 //! **Eviction** ([`Store::evict`]) removes the least recently used entries
 //! beyond a capacity, as the embedder's [`Layout`] groups the files, under
@@ -80,11 +69,123 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Result, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
+
+/// What a store operation failed with.
+#[derive(Debug)]
+pub enum StoreError {
+    /// A stored file was larger than the caller's read bound.
+    TooLarge { path: PathBuf, len: u64, limit: u64 },
+    /// A stored path was not a regular file.
+    NotAFile { path: PathBuf },
+    /// The volume holding the store does not support atomic replacement and
+    /// unlinking of open files.
+    UnsupportedVolume { path: PathBuf },
+    /// An underlying filesystem operation failed.
+    Io { operation: &'static str, path: PathBuf, source: std::io::Error },
+    /// A staged directory publication failed and restoring the previous
+    /// target also failed.
+    RestoreFailed {
+        target: PathBuf,
+        aside: PathBuf,
+        publish: std::io::Error,
+        restore: std::io::Error,
+    },
+}
+
+impl StoreError {
+    fn io(operation: &'static str, path: &Path, source: std::io::Error) -> Self {
+        Self::Io { operation, path: path.to_owned(), source }
+    }
+
+    /// The underlying I/O error kind, if this failure came from an OS call.
+    pub fn io_kind(&self) -> Option<ErrorKind> {
+        match self {
+            Self::Io { source, .. } => Some(source.kind()),
+            Self::RestoreFailed { publish, .. } => Some(publish.kind()),
+            Self::TooLarge { .. } | Self::NotAFile { .. } | Self::UnsupportedVolume { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { path, len, limit } => {
+                write!(f, "{}: {len} bytes is larger than the {limit} bytes it is read to", path.display())
+            }
+            Self::NotAFile { path } => write!(f, "{}: not a regular file", path.display()),
+            Self::UnsupportedVolume { path } => {
+                write!(f, "{}: volume does not support atomic replace and unlink of open files", path.display())
+            }
+            Self::Io { operation, path, source } => {
+                write!(f, "{operation} {}: {source}", path.display())
+            }
+            Self::RestoreFailed { target, aside, publish, restore } => {
+                write!(
+                    f,
+                    "publish {} failed ({publish}) and restoring {} also failed ({restore})",
+                    target.display(),
+                    aside.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::RestoreFailed { publish, .. } => Some(publish),
+            Self::TooLarge { .. } | Self::NotAFile { .. } | Self::UnsupportedVolume { .. } => None,
+        }
+    }
+}
+
+/// An OS failure classified once at the boundary so callers match on the
+/// outcome instead of re-inspecting `std::io::Error`.
+enum PathError {
+    Absent(std::io::Error),
+    Occupied(std::io::Error),
+    Other(std::io::Error),
+}
+
+impl PathError {
+    fn classify(error: std::io::Error) -> Self {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{
+                ERROR_ALREADY_EXISTS, ERROR_DIR_NOT_EMPTY, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
+                ERROR_PATH_NOT_FOUND,
+            };
+            match error.raw_os_error().map(|code| code as u32) {
+                Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => Self::Absent(error),
+                Some(ERROR_DIR_NOT_EMPTY | ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => Self::Occupied(error),
+                _ => Self::Other(error),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            match error.kind() {
+                ErrorKind::NotFound => Self::Absent(error),
+                ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists | ErrorKind::NotADirectory => Self::Occupied(error),
+                _ => Self::Other(error),
+            }
+        }
+    }
+
+    fn into_io(self) -> std::io::Error {
+        match self {
+            Self::Absent(error) | Self::Occupied(error) | Self::Other(error) => error,
+        }
+    }
+}
 
 /// Whether a publication survives the host's crash once it returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,16 +229,17 @@ impl Privacy {
 
     /// Create the directory at `path` and every one above it, as this
     /// privacy says: each one created, and `path` whether created or not.
-    pub fn directory(self, path: &Path) -> Result<()> {
+    pub fn directory(self, path: &Path) -> Result<(), StoreError> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
         if self == Privacy::Owner {
             use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-            builder.mode(0o700).create(path)?;
-            return fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+            builder.mode(0o700).create(path).map_err(|source| StoreError::io("create_dir", path, source))?;
+            return fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|source| StoreError::io("set_permissions", path, source));
         }
-        builder.create(path)
+        builder.create(path).map_err(|source| StoreError::io("create_dir", path, source))
     }
 }
 
@@ -150,10 +252,6 @@ const UNPUBLISHED: &str = ".tmp";
 const LOCK: &str = ".lock";
 /// The directory under the root of every record's lock.
 const LOCKS: &str = ".locks";
-
-/// How long a refusal to open or name a lock file is taken for the file's
-/// pending deletion, on Windows, before it is reported ([`Pending`]).
-const PENDING: Duration = Duration::from_secs(1);
 
 /// Distinguishes every temporary name of this process.
 static TEMPORARIES: AtomicU64 = AtomicU64::new(0);
@@ -184,9 +282,145 @@ fn parent(path: &Path) -> &Path {
     path.parent().expect("a stored path lives in a directory")
 }
 
+/// Unlink a private temporary file on Windows with NTFS POSIX delete semantics
+/// (`FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`).
+#[cfg(windows)]
+fn dispose_posix(path: &Path) -> Result<(), PathError> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+
+    let file = OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(PathError::classify)?;
+
+    let info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: `file` is a valid handle opened with `DELETE` access, and `info`
+    // is a valid `FILE_DISPOSITION_INFO_EX` matching its byte size.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&raw const info).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(PathError::classify(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Unlink the regular file or symlink at `path`. On Windows, renaming `path`
+/// to a private temporary name before calling [`dispose_posix`] ensures no
+/// lockless reader can ever observe `path` in the window between
+/// `SetFileInformationByHandle` and handle close (`STATUS_DELETE_PENDING`).
+#[cfg(windows)]
+fn unlink_file(path: &Path) -> Result<(), PathError> {
+    let name = path.file_name().unwrap_or_else(|| OsStr::new("unlink"));
+    if unpublished(name) {
+        return dispose_posix(path);
+    }
+    let aside = temporary_name(parent(path), name);
+    fs::rename(path, &aside).map_err(PathError::classify)?;
+    dispose_posix(&aside)
+}
+
+#[cfg(not(windows))]
+fn unlink_file(path: &Path) -> Result<(), PathError> {
+    fs::remove_file(path).map_err(PathError::classify)
+}
+
+/// Verify once per volume root per process that the volume holding `root`
+/// supports atomic POSIX-semantics rename and delete over open lockless
+/// readers.
+#[cfg(windows)]
+fn probe_volume(root: &Path, privacy: Privacy) -> Result<(), StoreError> {
+    use std::collections::HashSet;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::sync::{Mutex, OnceLock};
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+
+    static VERIFIED_VOLUMES: OnceLock<Mutex<HashSet<OsString>>> = OnceLock::new();
+
+    let volume_root = {
+        let wide: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut out = vec![0u16; wide.len().max(260)];
+        // SAFETY: `wide` is NUL-terminated and `out` has capacity `out.len()`.
+        let ok = unsafe { GetVolumePathNameW(wide.as_ptr(), out.as_mut_ptr(), out.len() as u32) };
+        if ok == 0 {
+            return Err(StoreError::io("volume_path", root, std::io::Error::last_os_error()));
+        }
+        let len = out.iter().position(|&c| c == 0).unwrap_or(out.len());
+        OsString::from_wide(&out[..len])
+    };
+
+    let verified = VERIFIED_VOLUMES.get_or_init(|| Mutex::new(HashSet::new()));
+    if verified.lock().expect("verified volumes lock").contains(&volume_root) {
+        return Ok(());
+    }
+
+    let unsupported = |error: &std::io::Error| {
+        matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER)
+        )
+    };
+
+    let (probe_a, file_a) = Temporary::create(root, OsStr::new("volume-probe"), privacy)?;
+    drop(file_a);
+    let (probe_b, file_b) = Temporary::create(root, OsStr::new("volume-probe"), privacy)?;
+    drop(file_b);
+
+    let reader_a = File::open(probe_a.path()).map_err(|source| StoreError::io("open", probe_a.path(), source))?;
+    if let Err(error) = fs::rename(probe_b.path(), probe_a.path()) {
+        drop(reader_a);
+        if unsupported(&error) {
+            return Err(StoreError::UnsupportedVolume { path: root.to_owned() });
+        }
+        return Err(StoreError::io("rename", probe_a.path(), error));
+    }
+    let mut moved_b = std::mem::ManuallyDrop::new(probe_b);
+    drop(std::mem::take(&mut moved_b.path));
+    drop(reader_a);
+
+    let reader_b = File::open(probe_a.path()).map_err(|source| StoreError::io("open", probe_a.path(), source))?;
+    if let Err(error) = unlink_file(probe_a.path()) {
+        drop(reader_b);
+        let io = error.into_io();
+        if unsupported(&io) {
+            return Err(StoreError::UnsupportedVolume { path: root.to_owned() });
+        }
+        return Err(StoreError::io("remove_file", probe_a.path(), io));
+    }
+    let mut unlinked_a = std::mem::ManuallyDrop::new(probe_a);
+    drop(std::mem::take(&mut unlinked_a.path));
+    drop(reader_b);
+
+    verified.lock().expect("verified volumes lock").insert(volume_root);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn probe_volume(_root: &Path, _privacy: Privacy) -> Result<(), StoreError> {
+    Ok(())
+}
+
 /// Set the use time (the modification time) of the file or directory at
 /// `path` to `when`.
-fn touched(path: &Path, when: SystemTime) -> Result<()> {
+fn touched(path: &Path, when: SystemTime) -> Result<(), StoreError> {
     let mut options = OpenOptions::new();
     #[cfg(not(windows))]
     options.read(true);
@@ -195,9 +429,13 @@ fn touched(path: &Path, when: SystemTime) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.access_mode(0x100).custom_flags(0x0200_0000);
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES};
+        options.access_mode(FILE_WRITE_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     }
-    options.open(path)?.set_modified(when)
+    options
+        .open(path)
+        .and_then(|file| file.set_modified(when))
+        .map_err(|source| StoreError::io("set_modified", path, source))
 }
 
 /// Refresh the use time of the file at `path`: a stale one only makes its
@@ -209,31 +447,32 @@ fn used(path: &Path) {
 /// The bytes of the regular file at `path`, none if no file is there. A
 /// file larger than `largest`, or anything at `path` that is no regular
 /// file, is an error.
-fn read_bounded(path: &Path, largest: u64) -> Result<Option<Vec<u8>>> {
-    let metadata = match fs::symlink_metadata(path) {
+fn read_bounded(path: &Path, largest: u64) -> Result<Option<Vec<u8>>, StoreError> {
+    let metadata = match fs::symlink_metadata(path).map_err(PathError::classify) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(PathError::Absent(_)) => return Ok(None),
+        Err(error) => return Err(StoreError::io("metadata", path, error.into_io())),
     };
-    let invalid = |why: String| std::io::Error::new(ErrorKind::InvalidData, format!("{}: {why}", path.display()));
     if !metadata.is_file() {
-        return Err(invalid("not a regular file".into()));
+        return Err(StoreError::NotAFile { path: path.to_owned() });
     }
-    let file = match File::open(path) {
+    let file = match File::open(path).map_err(PathError::classify) {
         Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(PathError::Absent(_)) => return Ok(None),
+        Err(error) => return Err(StoreError::io("open", path, error.into_io())),
     };
     let mut bytes = Vec::new();
-    file.take(largest.saturating_add(1)).read_to_end(&mut bytes)?;
+    file.take(largest.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| StoreError::io("read", path, source))?;
     if bytes.len() as u64 > largest {
-        return Err(invalid(format!("larger than the {largest} bytes it is read to")));
+        return Err(StoreError::TooLarge { path: path.to_owned(), len: bytes.len() as u64, limit: largest });
     }
     Ok(Some(bytes))
 }
 
 /// [`read_bounded`], marking the file used.
-fn read_used(path: &Path, largest: u64) -> Result<Option<Vec<u8>>> {
+fn read_used(path: &Path, largest: u64) -> Result<Option<Vec<u8>>, StoreError> {
     let bytes = read_bounded(path, largest)?;
     if bytes.is_some() {
         used(path);
@@ -242,24 +481,100 @@ fn read_used(path: &Path, largest: u64) -> Result<Option<Vec<u8>>> {
 }
 
 /// Remove the file at `path`, none being there no failure.
-fn removed(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
+fn removed(path: &Path) -> Result<(), StoreError> {
+    match unlink_file(path) {
+        Ok(()) | Err(PathError::Absent(_)) => Ok(()),
+        Err(error) => Err(StoreError::io("remove_file", path, error.into_io())),
     }
 }
 
 /// Sync `directory`, so a rename in it survives a crash.
 #[cfg(unix)]
-fn synced_directory(directory: &Path) -> Result<()> {
-    File::open(directory)?.sync_all()
+fn synced_directory(directory: &Path) -> Result<(), StoreError> {
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| StoreError::io("sync_dir", directory, source))
 }
 
 /// Windows journals a rename with the volume's metadata, and opens no
 /// directory as a file to sync it.
 #[cfg(not(unix))]
-fn synced_directory(_: &Path) -> Result<()> {
+fn synced_directory(_: &Path) -> Result<(), StoreError> {
     Ok(())
+}
+
+/// Open a lock file at `path`, creating parent directories as needed.
+fn open_lock_file(privacy: Privacy, path: &Path) -> Result<File, StoreError> {
+    privacy.directory(parent(path))?;
+    let mut options = privacy.options();
+    options.create(true).truncate(false).read(true).write(true);
+    options.open(path).map_err(|source| StoreError::io("open_lock", path, source))
+}
+
+/// Map a store-relative `record` path to its lock file path under `locks`.
+/// Prefixing directory components with `d.` and the leaf with `f.` makes it
+/// impossible for a lock on a parent path (e.g. a repository) to collide with
+/// a lock on a child path (e.g. a snapshot under that repository).
+fn record_lock_path(locks: &Path, record: &Path) -> PathBuf {
+    let mut path = locks.to_owned();
+    let components: Vec<&OsStr> = record.iter().collect();
+    if let Some((leaf, parents)) = components.split_last() {
+        for dir in parents {
+            let mut name = std::ffi::OsString::from("d.");
+            name.push(dir);
+            path.push(name);
+        }
+        let mut name = std::ffi::OsString::from("f.");
+        name.push(leaf);
+        path.push(name);
+    }
+    path
+}
+
+/// Inverse of [`record_lock_path`]: recover the store-relative record path
+/// from a lock file path under `locks`.
+fn lock_path_to_record(locks: &Path, lock: &Path) -> Option<PathBuf> {
+    let relative = lock.strip_prefix(locks).ok()?;
+    let components: Vec<&OsStr> = relative.iter().collect();
+    let (leaf, parents) = components.split_last()?;
+    let mut record = PathBuf::new();
+    for dir in parents {
+        record.push(dir.to_str()?.strip_prefix("d.")?);
+    }
+    record.push(leaf.to_str()?.strip_prefix("f.")?);
+    Some(record)
+}
+
+/// Acquire `record`'s Level-2 lock under `root`, given that the caller already
+/// holds the Level-1 `.lock` (shared or exclusive).
+fn lock_record_under_store_lock(root: &Path, privacy: Privacy, record: &Path, holding: Holding) -> Result<Option<Locked>, StoreError> {
+    let path = record_lock_path(&root.join(LOCKS), record);
+    let file = open_lock_file(privacy, &path)?;
+    match holding {
+        Holding::Exclusive => file.lock().map_err(|source| StoreError::io("lock", &path, source))?,
+        Holding::Shared => file.lock_shared().map_err(|source| StoreError::io("lock_shared", &path, source))?,
+        Holding::Try => {
+            if !taken(file.try_lock(), &path)? {
+                return Ok(None);
+            }
+        }
+        Holding::TryShared => {
+            if !taken(file.try_lock_shared(), &path)? {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(Locked { record: root.join(record), _file: file }))
+}
+
+/// Acquire `record`'s Level-2 lock by taking the store's Level-1 `.lock`
+/// shared for the duration of acquisition, then releasing Level 1.
+fn lock_record(root: &Path, privacy: Privacy, record: &Path, holding: Holding) -> Result<Option<Locked>, StoreError> {
+    let store_lock = open_lock_file(privacy, &root.join(LOCK))?;
+    store_lock
+        .lock_shared()
+        .map_err(|source| StoreError::io("lock_shared", &root.join(LOCK), source))?;
+    lock_record_under_store_lock(root, privacy, record, holding)
 }
 
 /// A temporary file: under a name no other live temporary holds, which
@@ -272,20 +587,25 @@ pub struct Temporary {
 }
 
 impl Temporary {
-    /// A new empty file in `directory`, named of `stem`, created
-    /// exclusively, as `privacy` says.
-    pub fn create(directory: &Path, stem: &OsStr, privacy: Privacy) -> Result<(Self, File)> {
+    fn create_classified(directory: &Path, stem: &OsStr, privacy: Privacy) -> Result<(Self, File), (PathBuf, PathError)> {
         loop {
             let path = temporary_name(directory, stem);
             let mut options = privacy.options();
             options.read(true).write(true).create_new(true);
             // Only a dead writer of the same process id leaves the name taken.
-            match options.open(&path) {
+            match options.open(&path).map_err(PathError::classify) {
                 Ok(file) => return Ok((Self { path }, file)),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(PathError::Occupied(_)) => continue,
+                Err(error) => return Err((path, error)),
             }
         }
+    }
+
+    /// A new empty file in `directory`, named of `stem`, created
+    /// exclusively, as `privacy` says.
+    pub fn create(directory: &Path, stem: &OsStr, privacy: Privacy) -> Result<(Self, File), StoreError> {
+        Self::create_classified(directory, stem, privacy)
+            .map_err(|(path, error)| StoreError::io("create_temp", &path, error.into_io()))
     }
 
     /// A name in `directory`, of `stem`, that nothing holds yet: for what
@@ -300,8 +620,8 @@ impl Temporary {
     }
 
     /// Rename the file over `target`, which it then is: no longer removed.
-    fn rename(self, target: &Path) -> Result<()> {
-        fs::rename(&self.path, target)?;
+    fn rename(self, target: &Path) -> Result<(), StoreError> {
+        fs::rename(&self.path, target).map_err(|source| StoreError::io("rename", target, source))?;
         let mut renamed = std::mem::ManuallyDrop::new(self);
         drop(std::mem::take(&mut renamed.path));
         Ok(())
@@ -310,7 +630,7 @@ impl Temporary {
 
 impl Drop for Temporary {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = unlink_file(&self.path);
     }
 }
 
@@ -324,10 +644,12 @@ pub struct Store {
 }
 
 impl Store {
-    /// The store at `root`, which is created, with every directory under it,
-    /// as its writes need them.
-    pub fn new(root: PathBuf, privacy: Privacy) -> Self {
-        Self { root, privacy, written: AtomicU64::new(0) }
+    /// Open the store at `root`, creating `root` if absent and verifying once
+    /// that its volume supports atomic replacement and unlinking of open files.
+    pub fn open(root: PathBuf, privacy: Privacy) -> Result<Self, StoreError> {
+        privacy.directory(&root)?;
+        probe_volume(&root, privacy)?;
+        Ok(Self { root, privacy, written: AtomicU64::new(0) })
     }
 
     pub fn root(&self) -> &Path {
@@ -341,27 +663,29 @@ impl Store {
     }
 
     /// Make `path` (absolute, under the root) hold what `write` writes to a
-    /// file, as one atomic step, to `durability`. On any failure `path` is as
-    /// it was and no temporary file is left, unless the failure is syncing
-    /// the rename itself, of a durable publication, after which the new file
-    /// is visible but may not survive a crash.
-    fn published(&self, path: &Path, durability: Durability, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
+    /// file, as one atomic step, to `durability`. Caller holds the exclusive
+    /// lock serializing `path`. On any failure `path` is as it was and no
+    /// temporary file is left, unless the failure is syncing the rename
+    /// itself, of a durable publication, after which the new file is visible
+    /// but may not survive a crash.
+    fn published(&self, path: &Path, durability: Durability, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), StoreError> {
         let directory = parent(path);
         let name = path.file_name().expect("a stored path has a name");
         let (temporary, mut file) = loop {
             self.privacy.directory(directory)?;
-            match Temporary::create(directory, name, self.privacy) {
+            match Temporary::create_classified(directory, name, self.privacy) {
+                Ok(created) => break created,
                 // An eviction removed the directory, emptied, since it was
                 // created: create it again.
-                Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                created => break created?,
+                Err((_, PathError::Absent(_))) => continue,
+                Err((path, error)) => return Err(StoreError::io("create_temp", &path, error.into_io())),
             }
         };
-        write(&mut file)?;
+        write(&mut file).map_err(|source| StoreError::io("write", temporary.path(), source))?;
         if durability == Durability::Durable {
-            file.sync_all()?;
+            file.sync_all().map_err(|source| StoreError::io("sync_all", temporary.path(), source))?;
         }
-        let length = file.metadata()?.len();
+        let length = file.metadata().map_err(|source| StoreError::io("metadata", temporary.path(), source))?.len();
         drop(file);
         temporary.rename(path)?;
         self.written.fetch_add(length, Ordering::Relaxed);
@@ -371,19 +695,14 @@ impl Store {
         }
     }
 
-    /// A lock file at `path` (absolute, under the root), opened.
-    fn lock_file(&self, path: &Path) -> Result<File> {
-        self.privacy.directory(parent(path))?;
-        let mut options = self.privacy.options();
-        options.create(true).truncate(false).read(true).write(true);
-        options.open(path)
-    }
-
     /// The store's lock held shared, waiting until no exclusive holder holds
-    /// it: every file is as one writer left it while it lives.
-    pub fn shared(&self) -> Result<Shared<'_>> {
-        let lock = self.lock_file(&self.root.join(LOCK))?;
-        lock.lock_shared()?;
+    /// it: every file is as one writer left it while it lives, and no eviction
+    /// runs. Also serves as the Level-1 proof required by [`Shared::publish`]
+    /// and [`Shared::put_if_absent`].
+    pub fn shared(&self) -> Result<Shared<'_>, StoreError> {
+        let lock_path = self.root.join(LOCK);
+        let lock = open_lock_file(self.privacy, &lock_path)?;
+        lock.lock_shared().map_err(|source| StoreError::io("lock_shared", &lock_path, source))?;
         Ok(Shared { store: self, _lock: lock })
     }
 
@@ -391,42 +710,38 @@ impl Store {
     /// it: no reader, other writer or eviction is among the files while it
     /// lives, nor is a record's lock being taken. A thread holding the
     /// store's lock takes it again only to wait for itself.
-    pub fn exclusive(&self) -> Result<Exclusive<'_>> {
-        let lock = self.lock_file(&self.root.join(LOCK))?;
-        lock.lock()?;
+    pub fn exclusive(&self) -> Result<Exclusive<'_>, StoreError> {
+        let lock_path = self.root.join(LOCK);
+        let lock = open_lock_file(self.privacy, &lock_path)?;
+        lock.lock().map_err(|source| StoreError::io("lock", &lock_path, source))?;
         Ok(Exclusive { store: self, _lock: lock })
     }
 
-    /// The lock of the record at `record` under the root, held, waiting
-    /// until no other holder holds it: what reads, writes and removes the
-    /// record, which eviction leaves while it is held. The record may be any file the
-    /// store names, or a name for a set of files its holder alone writes (a
-    /// directory). A holder that removes the record removes its lock with it
-    /// ([`Record::remove`]); the lock of a record that is gone otherwise goes
-    /// at the store's next eviction.
-    pub fn lock(&self, record: &Path) -> Result<Record<'_>> {
+    /// The lock of the record at `record` under the root, held exclusively,
+    /// waiting until no other holder holds it: what reads, writes and removes
+    /// the record, which eviction leaves while it is held.
+    pub fn lock(&self, record: &Path) -> Result<Record<'_>, StoreError> {
         Ok(Record { store: self, locked: self.waited(record, Holding::Exclusive)? })
     }
 
     /// [`Store::lock`], none while another holder holds the record, without
-    /// waiting: for a holder that refuses, rather than waits for, the
-    /// record's readers ([`Store::try_share_owned`]).
-    pub fn try_lock(&self, record: &Path) -> Result<Option<Record<'_>>> {
+    /// waiting.
+    pub fn try_lock(&self, record: &Path) -> Result<Option<Record<'_>>, StoreError> {
         Ok(self.locked(record, Holding::Try)?.map(|locked| Record { store: self, locked }))
     }
 
-    /// [`Store::try_lock`], the hold borrowing nothing of its store: for a
-    /// holder that keeps the record across awaits or threads.
-    pub fn try_lock_owned(&self, record: &Path) -> Result<Option<OwnedRecord>> {
+    /// [`Store::try_lock`], the hold borrowing nothing of its store.
+    pub fn try_lock_owned(&self, record: &Path) -> Result<Option<OwnedRecord>, StoreError> {
         Ok(self.locked(record, Holding::Try)?.map(|locked| OwnedRecord { _locked: locked }))
     }
 
     /// A lease of this process among the holders of `directory`: the record
     /// `<directory>/<pid>.<n>`, published empty, which its holder may publish
-    /// again ([`Lease::record`]) and whose lock it holds until the lease is
-    /// dropped, which removes it. [`Store::leases`] finds it meanwhile, from
-    /// whichever process, and removes it once its holder is gone unawares.
-    pub fn lease(&self, directory: &Path) -> Result<Lease> {
+    /// again ([`Lease::write`]) and whose lock it holds until the lease is
+    /// dropped, which removes the record file. [`Store::leases`] finds it
+    /// meanwhile, from whichever process, and removes it once its holder is
+    /// gone unawares.
+    pub fn lease(&self, directory: &Path) -> Result<Lease, StoreError> {
         let record = directory.join(format!("{}.{}", std::process::id(), LEASES.fetch_add(1, Ordering::Relaxed)));
         let locked = self.waited(&record, Holding::Exclusive)?;
         locked.write(self, &[], Durability::Volatile)?;
@@ -436,7 +751,7 @@ impl Store {
     /// The records of the live leases of `directory` ([`Store::lease`]), in
     /// whichever process, this one's among them: each whose lock a holder
     /// holds. A lease no holder holds is a gone holder's, and is removed.
-    pub fn leases(&self, directory: &Path) -> Result<Vec<PathBuf>> {
+    pub fn leases(&self, directory: &Path) -> Result<Vec<PathBuf>, StoreError> {
         let mut live = Vec::new();
         for name in self.list(directory)? {
             let record = directory.join(name);
@@ -448,100 +763,55 @@ impl Store {
         Ok(live)
     }
 
-    /// [`Store::lock`], the hold borrowing nothing of its store: for a holder
-    /// that keeps the record across awaits or threads only to exclude every
-    /// other holder.
-    pub fn lock_owned(&self, record: &Path) -> Result<OwnedRecord> {
+    /// [`Store::lock`], the hold borrowing nothing of its store.
+    pub fn lock_owned(&self, record: &Path) -> Result<OwnedRecord, StoreError> {
         Ok(OwnedRecord { _locked: self.waited(record, Holding::Exclusive)? })
     }
 
     /// The record's lock held shared with its other readers, borrowing
     /// nothing of its store, none while an exclusive holder holds it, without
-    /// waiting: for a reader that refuses, rather than waits for, a removal
-    /// of what the record names, which may hold it for long.
-    pub fn try_share_owned(&self, record: &Path) -> Result<Option<OwnedRecord>> {
+    /// waiting.
+    pub fn try_share_owned(&self, record: &Path) -> Result<Option<OwnedRecord>, StoreError> {
         Ok(self.locked(record, Holding::TryShared)?.map(|locked| OwnedRecord { _locked: locked }))
     }
 
     /// [`Store::locked`] as a waiting `holding`, which always takes it.
-    fn waited(&self, record: &Path, holding: Holding) -> Result<Locked> {
+    fn waited(&self, record: &Path, holding: Holding) -> Result<Locked, StoreError> {
         Ok(self.locked(record, holding)?.expect("a waiting lock is taken once its holders are gone"))
     }
 
     /// The record's lock held as `holding` says, none where it is a try and
-    /// another holder holds it. It is taken under the store's lock held
-    /// shared, which is let go once it is: no eviction is among the record's
-    /// lock files while it is taken, and eviction leaves the record while it
-    /// is held.
-    fn locked(&self, record: &Path, holding: Holding) -> Result<Option<Locked>> {
-        let shared = self.lock_file(&self.root.join(LOCK))?;
-        shared.lock_shared()?;
-        let path = self.root.join(LOCKS).join(record);
-        let mut pending = Pending::default();
-        loop {
-            let file = match self.lock_file(&path) {
-                Ok(file) => file,
-                // A removed lock file a waiter still holds open.
-                Err(error) => {
-                    pending.retry(error)?;
-                    continue;
-                }
-            };
-            match holding {
-                Holding::Exclusive => file.lock()?,
-                Holding::Shared => file.lock_shared()?,
-                Holding::Try => {
-                    if !taken(file.try_lock())? {
-                        return Ok(None);
-                    }
-                }
-                Holding::TryShared => {
-                    if !taken(file.try_lock_shared())? {
-                        return Ok(None);
-                    }
-                }
-            }
-            let held = same_file::Handle::from_file(file)?;
-            // A holder that removed the record removed this lock file after
-            // it was opened: the name is no longer this file's.
-            match same_file::Handle::from_path(&path) {
-                Ok(named) if named == held => {
-                    return Ok(Some(Locked { record: self.root.join(record), lock: path, _held: held }));
-                }
-                Ok(_) => continue,
-                Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                // As above, the file open by this waiter among others.
-                Err(error) => pending.retry(error)?,
-            }
-        }
+    /// another holder holds it.
+    fn locked(&self, record: &Path, holding: Holding) -> Result<Option<Locked>, StoreError> {
+        lock_record(&self.root, self.privacy, record, holding)
     }
 
     /// The bytes of the record at `path` under the root, none if none is
-    /// there, read without a lock: every record is published whole, so a
-    /// reader finds one writer's. Larger than `largest`, or no regular file,
-    /// is an error.
-    pub fn read(&self, path: &Path, largest: u64) -> Result<Option<Vec<u8>>> {
+    /// there, read without a lock: every record is published whole, and the
+    /// volume supports atomic replace and unlink over open readers. Larger
+    /// than `largest`, or no regular file, is an error.
+    pub fn read(&self, path: &Path, largest: u64) -> Result<Option<Vec<u8>>, StoreError> {
         read_bounded(&self.root.join(path), largest)
     }
 
-    /// The bytes of the file at `path` under the root, a content address or
-    /// a file every reader checks whole, none if none is there, read without
-    /// a lock and marked used.
-    pub fn fetch(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+    /// The bytes of the file at `path` under the root, none if none is there,
+    /// read without a lock and marked used.
+    pub fn fetch(&self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
         read_used(&self.root.join(path), u64::MAX)
     }
 
     /// The names of the files in `directory` under the root, none if it is
     /// absent; temporary files and the store's own are none of them.
-    pub fn list(&self, directory: &Path) -> Result<Vec<String>> {
-        let listing = match fs::read_dir(self.root.join(directory)) {
+    pub fn list(&self, directory: &Path) -> Result<Vec<String>, StoreError> {
+        let full = self.root.join(directory);
+        let listing = match fs::read_dir(&full).map_err(PathError::classify) {
             Ok(listing) => listing,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
+            Err(PathError::Absent(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(StoreError::io("read_dir", &full, error.into_io())),
         };
         let mut names = Vec::new();
         for item in listing {
-            let name = item?.file_name();
+            let name = item.map_err(|source| StoreError::io("read_dir", &full, source))?.file_name();
             if !unpublished(&name) && !owned(&name) {
                 names.push(name.to_string_lossy().into_owned());
             }
@@ -549,73 +819,59 @@ impl Store {
         Ok(names)
     }
 
-    /// Publish what `write` writes at `path` under the root, to
-    /// `durability`, without a lock: for a file whose every writer writes
-    /// what every reader checks whole and accepts from any of them (a
-    /// program store's artifacts and pointers, a probe file, a tool's
-    /// outputs). A failure leaves no partial file.
-    pub fn publish(&self, path: &Path, durability: Durability, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
-        self.published(&self.root.join(path), durability, write)
-    }
-
-    /// Publish `bytes` at `path` under the root, a content address, unless a
-    /// file of their length is there already, which is then marked used:
-    /// whether they were written.
-    pub fn put_if_absent(&self, path: &Path, bytes: &[u8], durability: Durability) -> Result<bool> {
-        let path = self.root.join(path);
-        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64) {
-            used(&path);
-            return Ok(false);
-        }
-        self.published(&path, durability, |file| file.write_all(bytes))?;
-        Ok(true)
-    }
-
     /// The file at `path` under the root, a content address, opened and
     /// marked used, held under its own lock shared: eviction keeps it at its
     /// path while the hold lives. None if no file is there.
-    pub fn hold(&self, path: &Path) -> Result<Option<Held>> {
+    pub fn hold(&self, path: &Path) -> Result<Option<Held>, StoreError> {
         let locked = self.waited(path, Holding::Shared)?;
-        match File::open(&locked.record) {
+        match File::open(&locked.record).map_err(PathError::classify) {
             Ok(file) => {
                 used(&locked.record);
                 Ok(Some(Held { file, locked }))
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+            Err(PathError::Absent(_)) => Ok(None),
+            Err(error) => Err(StoreError::io("open", &locked.record, error.into_io())),
         }
     }
 
     /// An empty directory staged for `target` under the root, beside it, as
     /// the store's privacy says, which [`Staged::publish`] renames into place
-    /// whole.
-    pub fn stage(&self, target: &Path) -> Result<Staged> {
-        let target = self.root.join(target);
-        let directory = parent(&target);
-        let name = target.file_name().expect("a staged path has a name").to_owned();
+    /// whole under `target`'s exclusive record lock.
+    pub fn stage(&self, target: &Path) -> Result<Staged, StoreError> {
+        let full = self.root.join(target);
+        let directory = parent(&full);
+        let name = full.file_name().expect("a staged path has a name").to_owned();
         loop {
             self.privacy.directory(directory)?;
             let stage = temporary_name(directory, &name);
-            match fs::create_dir(&stage) {
+            match fs::create_dir(&stage).map_err(PathError::classify) {
                 Ok(()) => {
                     self.privacy.directory(&stage)?;
-                    return Ok(Staged { target, stage, published: false });
+                    return Ok(Staged {
+                        root: self.root.clone(),
+                        privacy: self.privacy,
+                        relative: target.to_owned(),
+                        target: full,
+                        stage,
+                        published: false,
+                    });
                 }
                 // Only a dead writer of the same process id leaves the name
                 // taken; an eviction may have removed the directory, emptied.
-                Err(error) if matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::NotFound) => continue,
-                Err(error) => return Err(error),
+                Err(PathError::Occupied(_) | PathError::Absent(_)) => continue,
+                Err(error) => return Err(StoreError::io("create_dir", &stage, error.into_io())),
             }
         }
     }
 
     /// Set what is at `path` under the root (a file or directory where the
     /// store expects something else) aside, under a temporary name beside
-    /// it, which the store's next eviction removes once abandoned.
-    pub fn quarantine(&self, path: &Path) -> Result<()> {
-        let path = self.root.join(path);
-        let aside = temporary_name(parent(&path), path.file_name().expect("a quarantined path has a name"));
-        fs::rename(&path, &aside)?;
+    /// it, serialized under `path`'s exclusive record lock.
+    pub fn quarantine(&self, path: &Path) -> Result<(), StoreError> {
+        let _held = self.waited(path, Holding::Exclusive)?;
+        let full = self.root.join(path);
+        let aside = temporary_name(parent(&full), full.file_name().expect("a quarantined path has a name"));
+        fs::rename(&full, &aside).map_err(|source| StoreError::io("rename", &full, source))?;
         // Its age is its quarantine's, so eviction keeps it its full span; a
         // link is aged by nothing, never followed to its target.
         if fs::symlink_metadata(&aside).is_ok_and(|metadata| !metadata.file_type().is_symlink()) {
@@ -626,44 +882,31 @@ impl Store {
 
     /// Remove the least recently used entries until the rest fit `capacity`
     /// bytes, as `layout` places each file, the store's lock held
-    /// exclusively from the listing to the last removal. An entry used
-    /// within `grace` stays, counted, whatever the capacity; a file the
-    /// layout keeps or pins is never removed, nor what it references; a
-    /// pinned entry counts against the capacity first; a directory placed
-    /// apart is another store's, never walked. A shared file goes once no
-    /// entry kept or file kept references it, and an unreachable one
-    /// whatever the capacity, each once not used within `grace`.
-    /// With them go temporary files older than [`ABANDONED`], in what the
-    /// layout keeps too, the lock files no holder holds of records that are
-    /// gone, and every directory these removals left empty. A file whose
-    /// lock a holder holds ([`Store::hold`], a record's holder) stays, and
-    /// so does the entry it is part of, counted, and what that references; a
-    /// file that cannot be removed stays for a later eviction. Whether it
-    /// ran: one that finds the store's lock held, by a reader, a writer or a
-    /// record's lock being taken, passes without waiting.
-    pub fn evict(&self, capacity: u64, grace: Duration, layout: &dyn Layout) -> Result<bool> {
+    /// exclusively from the listing to the last removal.
+    pub fn evict(&self, capacity: u64, grace: Duration, layout: &dyn Layout) -> Result<bool, StoreError> {
         // Counted from before the lock is tried: an eviction that passes is
         // begun again only once as much more is written.
         self.written.store(0, Ordering::Relaxed);
-        let lock = self.lock_file(&self.root.join(LOCK))?;
-        if !taken(lock.try_lock())? {
+        let lock_path = self.root.join(LOCK);
+        let lock = open_lock_file(self.privacy, &lock_path)?;
+        if !taken(lock.try_lock(), &lock_path)? {
             return Ok(false);
         }
         let _held = Exclusive { store: self, _lock: lock };
         let locks = self.root.join(LOCKS);
         // Whether a holder holds the lock of the file at `path`: no lock is
         // taken while the store's is held exclusively, so one free now stays
-        // free until the eviction ends.
+        // free until the eviction ends, and the probe handle is dropped before
+        // returning so zero handles remain open when unlinking an orphaned lock.
         let in_use = |path: &Path| {
-            let lock = locks.join(path.strip_prefix(&self.root).expect("eviction walks under its root"));
-            match OpenOptions::new().read(true).write(true).open(lock) {
+            let lock = record_lock_path(&locks, path.strip_prefix(&self.root).expect("eviction walks under its root"));
+            match OpenOptions::new().read(true).write(true).open(&lock).map_err(PathError::classify) {
                 Ok(file) => !matches!(file.try_lock(), Ok(())),
-                Err(error) => error.kind() != ErrorKind::NotFound,
+                Err(PathError::Absent(_)) => false,
+                Err(_) => true,
             }
         };
         let now = SystemTime::now();
-        // Used within the grace; one used after `now` (a clock that steps)
-        // within any grace at all.
         let recent = |used: SystemTime| match now.duration_since(used) {
             Ok(age) => age < grace,
             Err(_) => !grace.is_zero(),
@@ -671,24 +914,19 @@ impl Store {
         let examining = Examining { root: &self.root };
         let relative = |path: &Path| path.strip_prefix(&self.root).expect("eviction walks under its root").to_owned();
         let mut entries = HashMap::<Entry, Listed>::new();
-        // Each shared file's size, use time, and whether a holder holds it.
         let mut shared = BTreeMap::<PathBuf, (u64, SystemTime, bool)>::new();
         let mut referenced = BTreeSet::<PathBuf>::new();
-        // The directories eviction removed something from, which it removes
-        // after if that left them empty.
         let mut emptied = BTreeSet::<PathBuf>::new();
-        let mut remove = |path: &Path, directory: bool| {
-            let removed = match directory {
+        let mut remove = |path: &Path, directory: bool| -> Result<(), std::io::Error> {
+            let result = match directory {
                 true => fs::remove_dir_all(path),
-                false => fs::remove_file(path),
+                false => unlink_file(path).map_err(PathError::into_io),
             };
-            if removed.is_ok() {
+            if result.is_ok() {
                 emptied.insert(parent(path).to_owned());
             }
-            removed
+            result
         };
-        // Each directory to walk, and whether the layout keeps it: a kept
-        // directory holds no entry, and is walked only for abandoned writes.
         let mut directories = vec![(self.root.clone(), false)];
         while let Some((directory, kept)) = directories.pop() {
             let Ok(listing) = fs::read_dir(&directory) else {
@@ -751,7 +989,6 @@ impl Store {
             }
         }
         let mut entries = entries.into_values().collect::<Vec<_>>();
-        // Pinned entries first, then the most recently used.
         entries.sort_by(|left, right| right.pinned.cmp(&left.pinned).then(right.used.cmp(&left.used)));
         let mut held = 0u64;
         for mut entry in entries {
@@ -780,8 +1017,8 @@ impl Store {
             }
         }
         // No record's lock is taken while the store's is held exclusively:
-        // the lock of a record that is gone is no one's once no holder holds
-        // it (a record that names no file, as a lease does, is gone).
+        // the lock of a record that is gone has zero open handles once no
+        // holder holds it, so unlinking it cannot enter pending deletion.
         let mut directories = vec![locks.clone()];
         while let Some(directory) = directories.pop() {
             let Ok(listing) = fs::read_dir(&directory) else {
@@ -792,18 +1029,24 @@ impl Store {
                 if item.file_type().is_ok_and(|kind| kind.is_dir()) {
                     directories.push(path);
                 } else {
-                    let record = self.root.join(path.strip_prefix(&locks).expect("a lock lies under the locks"));
-                    if fs::symlink_metadata(&record).is_err() && !in_use(&record) {
+                    let orphan = match lock_path_to_record(&locks, &path) {
+                        Some(relative_record) => {
+                            let record = self.root.join(relative_record);
+                            fs::symlink_metadata(&record).is_err() && !in_use(&record)
+                        }
+                        // Pre-upgrade lock file without `d.`/`f.` prefixes:
+                        // reclaim once no holder holds it.
+                        None => match OpenOptions::new().read(true).write(true).open(&path).map_err(PathError::classify) {
+                            Ok(file) => matches!(file.try_lock(), Ok(())),
+                            Err(_) => false,
+                        },
+                    };
+                    if orphan {
                         let _ = remove(&path, false);
                     }
                 }
             }
         }
-        // A directory its removals left empty goes, and then the one it lay
-        // in if that left it empty, deepest first: no path under a directory
-        // orders before it. One that holds anything stays (`remove_dir`
-        // refuses it), as do the root and the directory of the locks. A
-        // writer whose directory goes meanwhile creates it again.
         while let Some(directory) = emptied.pop_last() {
             if directory != self.root && directory != locks && fs::remove_dir(&directory).is_ok() {
                 emptied.insert(parent(&directory).to_owned());
@@ -813,8 +1056,10 @@ impl Store {
     }
 }
 
-/// The files of a store, its lock held shared: every file is as one writer
-/// left it until this is dropped.
+/// The store's Level-1 lock held shared: every file is as one writer left it
+/// until this is dropped, no eviction runs, and per-record publications
+/// ([`Shared::publish`], [`Shared::put_if_absent`]) acquire their Level-2
+/// record lock directly under this hold.
 #[must_use = "the files are held only while this lives"]
 #[derive(Debug)]
 pub struct Shared<'a> {
@@ -826,8 +1071,34 @@ impl Shared<'_> {
     /// The file at `path` under the root, none if no file is there,
     /// refreshing its use time. Larger than `largest`, or no regular file,
     /// is an error.
-    pub fn read(&self, path: &Path, largest: u64) -> Result<Option<Vec<u8>>> {
+    pub fn read(&self, path: &Path, largest: u64) -> Result<Option<Vec<u8>>, StoreError> {
         read_used(&self.store.root.join(path), largest)
+    }
+
+    /// Publish what `write` writes at `path` under the root, to `durability`,
+    /// serialized under `path`'s exclusive record lock. A failure leaves no
+    /// partial file.
+    pub fn publish(&self, path: &Path, durability: Durability, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), StoreError> {
+        let _record = lock_record_under_store_lock(&self.store.root, self.store.privacy, path, Holding::Exclusive)?;
+        self.store.published(&self.store.root.join(path), durability, write)
+    }
+
+    /// Publish `bytes` at `path` under the root, a content address, unless a
+    /// file of their length is there already, which is then marked used:
+    /// whether they were written.
+    pub fn put_if_absent(&self, path: &Path, bytes: &[u8], durability: Durability) -> Result<bool, StoreError> {
+        let full = self.store.root.join(path);
+        if fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64) {
+            used(&full);
+            return Ok(false);
+        }
+        let _record = lock_record_under_store_lock(&self.store.root, self.store.privacy, path, Holding::Exclusive)?;
+        if fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64) {
+            used(&full);
+            return Ok(false);
+        }
+        self.store.published(&full, durability, |file| file.write_all(bytes))?;
+        Ok(true)
     }
 }
 
@@ -844,35 +1115,43 @@ impl Exclusive<'_> {
     /// The file at `path` under the root, none if no file is there, its use
     /// time as it was: what maintains the files reads them without using
     /// them. Larger than `largest`, or no regular file, is an error.
-    pub fn examine(&self, path: &Path, largest: u64) -> Result<Option<Vec<u8>>> {
+    pub fn examine(&self, path: &Path, largest: u64) -> Result<Option<Vec<u8>>, StoreError> {
         read_bounded(&self.store.root.join(path), largest)
     }
 
-    /// Publish `bytes` at `path` under the root, to `durability`. A failure
-    /// leaves no partial file.
-    pub fn write(&self, path: &Path, bytes: &[u8], durability: Durability) -> Result<()> {
+    /// Publish `bytes` at `path` under the root, to `durability`, serialized
+    /// under `path`'s exclusive record lock. A failure leaves no partial file.
+    pub fn write(&self, path: &Path, bytes: &[u8], durability: Durability) -> Result<(), StoreError> {
+        let _record = lock_record_under_store_lock(&self.store.root, self.store.privacy, path, Holding::Exclusive)?;
         self.store.published(&self.store.root.join(path), durability, |file| file.write_all(bytes))
     }
 
     /// Append `bytes` to the file at `path` under the root, created if
-    /// absent: every append of every holder lands whole, in turn.
-    pub fn append(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        let path = self.store.root.join(path);
-        self.store.privacy.directory(parent(&path))?;
+    /// absent, serialized under `path`'s exclusive record lock: every append
+    /// of every holder lands whole, in turn.
+    pub fn append(&self, path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+        let _record = lock_record_under_store_lock(&self.store.root, self.store.privacy, path, Holding::Exclusive)?;
+        let full = self.store.root.join(path);
+        self.store.privacy.directory(parent(&full))?;
         let mut options = self.store.privacy.options();
         options.create(true).append(true);
-        options.open(&path)?.write_all(bytes)?;
+        options
+            .open(&full)
+            .and_then(|mut file| file.write_all(bytes))
+            .map_err(|source| StoreError::io("append", &full, source))?;
         self.store.written.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Remove the file at `path` under the root, if one is there.
-    pub fn remove(&self, path: &Path) -> Result<()> {
+    /// Remove the file at `path` under the root, if one is there, serialized
+    /// under `path`'s exclusive record lock.
+    pub fn remove(&self, path: &Path) -> Result<(), StoreError> {
+        let _record = lock_record_under_store_lock(&self.store.root, self.store.privacy, path, Holding::Exclusive)?;
         removed(&self.store.root.join(path))
     }
 
     /// [`Store::list`].
-    pub fn list(&self, directory: &Path) -> Result<Vec<String>> {
+    pub fn list(&self, directory: &Path) -> Result<Vec<String>, StoreError> {
         self.store.list(directory)
     }
 }
@@ -891,11 +1170,11 @@ enum Holding {
 }
 
 /// Whether a try took its lock: not while another holder holds it.
-fn taken(tried: std::result::Result<(), std::fs::TryLockError>) -> Result<bool> {
+fn taken(tried: std::result::Result<(), std::fs::TryLockError>, path: &Path) -> Result<bool, StoreError> {
     match tried {
         Ok(()) => Ok(true),
         Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-        Err(std::fs::TryLockError::Error(error)) => Err(error),
+        Err(std::fs::TryLockError::Error(error)) => Err(StoreError::io("try_lock", path, error)),
     }
 }
 
@@ -904,47 +1183,20 @@ fn taken(tried: std::result::Result<(), std::fs::TryLockError>) -> Result<bool> 
 struct Locked {
     /// The record's path, absolute.
     record: PathBuf,
-    /// Its lock's path, absolute.
-    lock: PathBuf,
-    _held: same_file::Handle,
-}
-
-/// Windows refuses to open or to name a file removed while a holder still
-/// has it open (its deletion pending), with the error it gives a refusal of
-/// access, from which nothing the standard library reports tells it apart.
-/// A refusal is taken for a pending deletion, which lasts only until its
-/// waiter finds the name no longer its own and closes it, for at most
-/// [`PENDING`]; past that, and on every other platform, it is reported.
-#[derive(Default)]
-struct Pending {
-    since: Option<std::time::Instant>,
-}
-
-impl Pending {
-    fn retry(&mut self, error: std::io::Error) -> Result<()> {
-        if !(cfg!(windows) && error.kind() == ErrorKind::PermissionDenied) {
-            return Err(error);
-        }
-        if self.since.get_or_insert_with(std::time::Instant::now).elapsed() > PENDING {
-            return Err(error);
-        }
-        std::thread::sleep(Duration::from_millis(1));
-        Ok(())
-    }
+    _file: File,
 }
 
 impl Locked {
-    fn read(&self, largest: u64) -> Result<Option<Vec<u8>>> {
+    fn read(&self, largest: u64) -> Result<Option<Vec<u8>>, StoreError> {
         read_bounded(&self.record, largest)
     }
 
-    fn write(&self, store: &Store, bytes: &[u8], durability: Durability) -> Result<()> {
+    fn write(&self, store: &Store, bytes: &[u8], durability: Durability) -> Result<(), StoreError> {
         store.published(&self.record, durability, |file| file.write_all(bytes))
     }
 
-    fn remove(self) -> Result<()> {
-        removed(&self.record)?;
-        removed(&self.lock)
+    fn remove(self) -> Result<(), StoreError> {
+        removed(&self.record)
     }
 }
 
@@ -960,19 +1212,19 @@ pub struct Record<'a> {
 impl Record<'_> {
     /// The record's bytes, none if no file is there. Larger than `largest`,
     /// or no regular file, is an error.
-    pub fn read(&self, largest: u64) -> Result<Option<Vec<u8>>> {
+    pub fn read(&self, largest: u64) -> Result<Option<Vec<u8>>, StoreError> {
         self.locked.read(largest)
     }
 
     /// Publish `bytes` as the record, to `durability`. A failure leaves the
     /// record as it was.
-    pub fn write(&self, bytes: &[u8], durability: Durability) -> Result<()> {
+    pub fn write(&self, bytes: &[u8], durability: Durability) -> Result<(), StoreError> {
         self.locked.write(self.store, bytes, durability)
     }
 
-    /// Remove the record, if a file is there, and its lock: a waiter for the
-    /// lock takes it again, under the name's next file.
-    pub fn remove(self) -> Result<()> {
+    /// Remove the record file if one is there. Its lock file stays until
+    /// [`Store::evict`] reclaims it under the store's exclusive lock.
+    pub fn remove(self) -> Result<(), StoreError> {
         self.locked.remove()
     }
 }
@@ -996,9 +1248,16 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// The lease's record under the root, whose file its holder may publish.
+    /// The lease's record under the root.
     pub fn record(&self) -> &Path {
         &self.record
+    }
+
+    /// Publish `bytes` as the lease's record, to `durability`, under the
+    /// exclusive record lock this lease already holds.
+    pub fn write(&self, store: &Store, bytes: &[u8], durability: Durability) -> Result<(), StoreError> {
+        let locked = self.locked.as_ref().expect("a live lease holds its lock");
+        locked.write(store, bytes, durability)
     }
 }
 
@@ -1026,23 +1285,29 @@ impl Held {
     }
 
     /// Its bytes, read from the open file from its start.
-    pub fn bytes(&self) -> Result<Vec<u8>> {
+    pub fn bytes(&self) -> Result<Vec<u8>, StoreError> {
         use std::io::Seek;
         let mut bytes = Vec::new();
-        (&self.file).seek(std::io::SeekFrom::Start(0))?;
-        (&self.file).read_to_end(&mut bytes)?;
+        (&self.file)
+            .seek(std::io::SeekFrom::Start(0))
+            .and_then(|_| (&self.file).read_to_end(&mut bytes))
+            .map_err(|source| StoreError::io("read", &self.locked.record, source))?;
         Ok(bytes)
     }
 }
 
 /// A directory being written beside its target, under a temporary name,
-/// which [`Staged::publish`] renames into place whole: a reader finds the
-/// target as one publication left it, or briefly absent while one replaces
-/// another, never part written. Its writer fills it at [`Staged::path`],
-/// over as many steps as it needs. Dropped unpublished, it is removed.
-/// Nothing of it is synced: a crash may lose it.
+/// which [`Staged::publish`] renames into place whole under the target's
+/// exclusive record lock: a reader finds the target as one publication left
+/// it, or briefly absent while one replaces another, never part written. Its
+/// writer fills it at [`Staged::path`], over as many steps as it needs.
+/// Dropped unpublished, it is removed. Nothing of it is synced: a crash may
+/// lose it.
 #[derive(Debug)]
 pub struct Staged {
+    root: PathBuf,
+    privacy: Privacy,
+    relative: PathBuf,
     target: PathBuf,
     stage: PathBuf,
     published: bool,
@@ -1054,52 +1319,43 @@ impl Staged {
         &self.stage
     }
 
-    /// Rename the stage into place. A directory renames over no non-empty
-    /// one, so what holds the target, another publication's or an earlier
-    /// one's, is first renamed aside under a name of its own and removed
-    /// once this one is in place; publications at once each land whole, and
-    /// the last to land holds the target. A failure removing what was
-    /// replaced is reported after the stage is in place.
-    pub fn publish(mut self) -> Result<()> {
-        let mut replaced = Vec::new();
-        let directory = parent(&self.target).to_owned();
-        let name = self.target.file_name().expect("a staged path has a name").to_owned();
-        loop {
-            let held = match fs::rename(&self.stage, &self.target) {
-                Ok(()) => break,
-                // Something holds the target (another publication's or an
-                // earlier one's; a rename over it fails, with an error kind
-                // each platform names its own way), or held it as the rename
-                // ran and was moved aside since: move aside what holds it,
-                // and again.
-                Err(error)
-                    if fs::symlink_metadata(&self.target).is_ok()
-                        || matches!(error.kind(), ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists) =>
-                {
-                    error
-                }
-                // The rename itself failed: what this publication moved
-                // aside goes back.
-                Err(error) => {
-                    if let Some(last) = replaced.pop() {
-                        let _ = fs::rename(last, &self.target);
-                    }
-                    return Err(error);
-                }
-            };
-            let aside = temporary_name(&directory, &name);
-            match fs::rename(&self.target, &aside) {
-                Ok(()) => replaced.push(aside),
-                // Another publication moved it aside first.
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(_) => return Err(held),
+    /// Rename the stage into place under the target's exclusive record lock.
+    /// A directory renames over no non-empty one, so what holds the target is
+    /// first renamed aside under a temporary name and removed once this stage
+    /// is in place. If renaming the stage fails and restoring the previous
+    /// target also fails, [`StoreError::RestoreFailed`] is returned.
+    pub fn publish(mut self) -> Result<(), StoreError> {
+        let _held = lock_record(&self.root, self.privacy, &self.relative, Holding::Exclusive)?;
+        let directory = parent(&self.target);
+        let name = self.target.file_name().expect("a staged path has a name");
+        let aside = match fs::symlink_metadata(&self.target).map_err(PathError::classify) {
+            Ok(_) => {
+                let aside = temporary_name(directory, name);
+                fs::rename(&self.target, &aside).map_err(|source| StoreError::io("rename", &self.target, source))?;
+                Some(aside)
             }
+            Err(PathError::Absent(_)) => None,
+            Err(error) => return Err(StoreError::io("metadata", &self.target, error.into_io())),
+        };
+        if let Err(publish) = fs::rename(&self.stage, &self.target) {
+            if let Some(aside) = aside {
+                if let Err(restore) = fs::rename(&aside, &self.target) {
+                    return Err(StoreError::RestoreFailed {
+                        target: self.target.clone(),
+                        aside,
+                        publish,
+                        restore,
+                    });
+                }
+            }
+            return Err(StoreError::io("rename", &self.target, publish));
         }
         self.published = true;
-        for aside in replaced {
-            match fs::symlink_metadata(&aside)?.is_dir() {
-                true => fs::remove_dir_all(&aside)?,
-                false => fs::remove_file(&aside)?,
+        if let Some(aside) = aside {
+            let meta = fs::symlink_metadata(&aside).map_err(|source| StoreError::io("metadata", &aside, source))?;
+            match meta.is_dir() {
+                true => fs::remove_dir_all(&aside).map_err(|source| StoreError::io("remove_dir_all", &aside, source))?,
+                false => unlink_file(&aside).map_err(|error| StoreError::io("remove_file", &aside, error.into_io()))?,
             }
         }
         Ok(())
@@ -1172,7 +1428,7 @@ pub struct Examining<'a> {
 impl Examining<'_> {
     /// The file at `path` under the root, none if no file is there. Larger
     /// than `largest`, or no regular file, is an error.
-    pub fn examine(&self, path: &Path, largest: u64) -> Result<Option<Vec<u8>>> {
+    pub fn examine(&self, path: &Path, largest: u64) -> Result<Option<Vec<u8>>, StoreError> {
         read_bounded(&self.root.join(path), largest)
     }
 }
@@ -1230,9 +1486,9 @@ mod tests {
     #[test]
     fn a_publication_replaces_whole_or_leaves_the_target() {
         let root = scratch("publish");
-        let store = Store::new(root.clone(), Privacy::Owner);
+        let store = Store::open(root.clone(), Privacy::Owner).unwrap();
         let path = Path::new("pointer");
-        store.publish(path, Durability::Durable, |file| file.write_all(b"first")).unwrap();
+        store.shared().unwrap().publish(path, Durability::Durable, |file| file.write_all(b"first")).unwrap();
         store.lock(path).unwrap().write(b"second", Durability::Volatile).unwrap();
         let failed = store.published(&root.join(path), Durability::Durable, |file| {
             file.write_all(b"torn")?;
@@ -1255,14 +1511,13 @@ mod tests {
     #[test]
     fn a_taken_name_is_passed_over() {
         let root = scratch("taken");
-        fs::create_dir_all(&root).unwrap();
-        let store = Store::new(root.clone(), Privacy::Shared);
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
         let next = TEMPORARIES.load(Ordering::Relaxed);
         let taken = (next..next + 64).map(|count| root.join(format!(".entry.{}.{count}{UNPUBLISHED}", std::process::id()))).collect::<Vec<_>>();
         for left in &taken {
             fs::write(left, b"abandoned").unwrap();
         }
-        store.publish(Path::new("entry"), Durability::Volatile, |file| file.write_all(b"whole")).unwrap();
+        store.shared().unwrap().publish(Path::new("entry"), Durability::Volatile, |file| file.write_all(b"whole")).unwrap();
         assert_eq!(fs::read(root.join("entry")).unwrap(), b"whole");
         for left in &taken {
             assert_eq!(fs::read(left).unwrap(), b"abandoned");
@@ -1272,18 +1527,20 @@ mod tests {
 
     /// Writers updating one record at once, each a store of its own as
     /// another process holds, each read what the others wrote: every one of
-    /// their additions is kept. A removal removes the record's lock with it,
-    /// and a writer waiting for the lock meanwhile takes it again.
+    /// their additions is kept. Removals never unlink lock files while
+    /// waiters can hold them; eviction reclaims orphaned lock files once the
+    /// record is gone.
     #[test]
     fn updates_of_a_record_through_its_lock_lose_nothing() {
         let root = scratch("updates");
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
         let record = Path::new("counts/sum");
         let (writers, additions) = (4u64, 100u64);
         std::thread::scope(|scope| {
             for writer in 0..writers {
                 let root = root.clone();
                 seismic_threads::spawn_scoped(scope, format!("updating-{writer}"), move || {
-                    let store = Store::new(root, Privacy::Shared);
+                    let store = Store::open(root, Privacy::Shared).unwrap();
                     for _ in 0..additions {
                         let held = store.lock(record).unwrap();
                         let sum = held.read(32).unwrap().map_or(0, |bytes| String::from_utf8(bytes).unwrap().parse::<u64>().unwrap());
@@ -1293,21 +1550,14 @@ mod tests {
                 .unwrap();
             }
         });
-        let store = Store::new(root.clone(), Privacy::Shared);
         assert_eq!(store.read(record, 32).unwrap().unwrap(), (writers * additions).to_string().as_bytes());
-        assert!(root.join(LOCKS).join(record).exists());
-        // Removals interleaved with writers: each writer's lock is the name's
-        // current file, so no two hold the record at once. A waiter that took
-        // a removed lock file and held it beside the holder of the next would
-        // be inside with it, and its addition, read before the other's write,
-        // would be lost: the record would not hold every addition since the
-        // last removal.
+        assert!(record_lock_path(&root.join(LOCKS), record).exists());
         let (inside, since_removal) = (AtomicU64::new(0), AtomicU64::new(0));
         std::thread::scope(|scope| {
             for writer in 0..writers {
                 let (root, inside, since_removal) = (root.clone(), &inside, &since_removal);
                 seismic_threads::spawn_scoped(scope, format!("removing-{writer}"), move || {
-                    let store = Store::new(root, Privacy::Shared);
+                    let store = Store::open(root, Privacy::Shared).unwrap();
                     for addition in 0..additions {
                         let held = store.lock(record).unwrap();
                         assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two holders of the record at once");
@@ -1333,7 +1583,8 @@ mod tests {
         assert_eq!(left, since_removal.load(Ordering::SeqCst), "every addition since the last removal is kept");
         store.lock(record).unwrap().remove().unwrap();
         assert!(store.read(record, 32).unwrap().is_none());
-        assert!(!root.join(LOCKS).join(record).exists(), "a removed record's lock goes with it");
+        assert!(store.evict(u64::MAX, Duration::ZERO, &alone).unwrap());
+        assert!(!record_lock_path(&root.join(LOCKS), record).exists(), "eviction reclaims the removed record's lock");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1343,7 +1594,7 @@ mod tests {
     #[test]
     fn readers_share_a_record_a_try_refuses_while_they_hold_it() {
         let root = scratch("readers");
-        let (store, other) = (Store::new(root.clone(), Privacy::Shared), Store::new(root.clone(), Privacy::Shared));
+        let (store, other) = (Store::open(root.clone(), Privacy::Shared).unwrap(), Store::open(root.clone(), Privacy::Shared).unwrap());
         let record = Path::new("hub/repository/.readers");
         let first = store.try_share_owned(record).unwrap().unwrap();
         let second = other.try_share_owned(record).unwrap().unwrap();
@@ -1364,9 +1615,11 @@ mod tests {
     #[test]
     fn leases_tell_each_live_holder_and_remove_a_gone_ones() {
         let root = scratch("leases");
-        let (store, other) = (Store::new(root.clone(), Privacy::Shared), Store::new(root.clone(), Privacy::Shared));
+        let (store, other) = (Store::open(root.clone(), Privacy::Shared).unwrap(), Store::open(root.clone(), Privacy::Shared).unwrap());
         let directory = Path::new("readers/model");
         let (first, second) = (store.lease(directory).unwrap(), other.lease(directory).unwrap());
+        first.write(&store, b"first-pins", Durability::Volatile).unwrap();
+        assert_eq!(other.read(first.record(), 64).unwrap().unwrap(), b"first-pins");
         let mut live = other.leases(directory).unwrap();
         live.sort();
         let mut expected = vec![first.record().to_owned(), second.record().to_owned()];
@@ -1375,7 +1628,7 @@ mod tests {
         drop(first);
         assert_eq!(store.leases(directory).unwrap(), vec![second.record().to_owned()]);
         let abandoned = directory.join("0.0");
-        store.publish(&abandoned, Durability::Volatile, |_| Ok(())).unwrap();
+        store.shared().unwrap().publish(&abandoned, Durability::Volatile, |_| Ok(())).unwrap();
         assert_eq!(store.leases(directory).unwrap(), vec![second.record().to_owned()], "a gone holder's lease is not live");
         assert!(!root.join(&abandoned).exists(), "and is removed once found");
         drop(second);
@@ -1383,17 +1636,17 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A record larger than it is read to, or no regular file, is an error,
-    /// never an absent record.
+    /// A record larger than it is read to, or no regular file, is a typed
+    /// error, never an absent record.
     #[test]
     fn an_oversized_or_foreign_record_is_an_error() {
         let root = scratch("bounded");
-        let store = Store::new(root.clone(), Privacy::Shared);
-        store.publish(Path::new("big"), Durability::Volatile, |file| file.write_all(&[0; 10])).unwrap();
-        assert!(store.read(Path::new("big"), 9).is_err());
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
+        store.shared().unwrap().publish(Path::new("big"), Durability::Volatile, |file| file.write_all(&[0; 10])).unwrap();
+        assert!(matches!(store.read(Path::new("big"), 9), Err(StoreError::TooLarge { limit: 9, .. })));
         assert_eq!(store.read(Path::new("big"), 10).unwrap().unwrap().len(), 10);
         fs::create_dir_all(root.join("directory")).unwrap();
-        assert!(store.read(Path::new("directory"), 10).is_err());
+        assert!(matches!(store.read(Path::new("directory"), 10), Err(StoreError::NotAFile { .. })));
         assert!(store.read(Path::new("absent"), 10).unwrap().is_none());
         fs::remove_dir_all(root).unwrap();
     }
@@ -1402,11 +1655,12 @@ mod tests {
     #[test]
     fn appends_land_whole() {
         let root = scratch("appends");
+        let _store = Store::open(root.clone(), Privacy::Shared).unwrap();
         std::thread::scope(|scope| {
             for writer in 0..4u8 {
                 let root = root.clone();
                 seismic_threads::spawn_scoped(scope, format!("appending-{writer}"), move || {
-                    let store = Store::new(root, Privacy::Shared);
+                    let store = Store::open(root, Privacy::Shared).unwrap();
                     for _ in 0..50 {
                         store.exclusive().unwrap().append(Path::new("ledger"), format!("line {writer}\n").as_bytes()).unwrap();
                     }
@@ -1445,8 +1699,8 @@ mod tests {
             }
         }
         let root = scratch("evict");
-        let store = Store::new(root.clone(), Privacy::Shared);
-        let write = |path: &str, bytes: &[u8]| store.publish(Path::new(path), Durability::Volatile, |file| file.write_all(bytes)).unwrap();
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
+        let write = |path: &str, bytes: &[u8]| store.shared().unwrap().publish(Path::new(path), Durability::Volatile, |file| file.write_all(bytes)).unwrap();
         write("chunks/a", &[0; 300]);
         write("chunks/b", &[0; 300]);
         write("chunks/c", &[0; 300]);
@@ -1462,6 +1716,9 @@ mod tests {
         fs::write(&theirs, b"").unwrap();
         store.lock(Path::new("recipes/gone")).unwrap().remove().unwrap();
         drop(store.lock(Path::new("recipes/never")).unwrap());
+        let legacy_lock = root.join(LOCKS).join("recipes/legacy");
+        fs::create_dir_all(parent(&legacy_lock)).unwrap();
+        fs::write(&legacy_lock, b"").unwrap();
         let stage = store.stage(Path::new("export")).unwrap();
         fs::write(stage.path().join("file"), b"x").unwrap();
         let abandoned_stage = stage.path().to_owned();
@@ -1475,7 +1732,6 @@ mod tests {
         aged(&abandoned_stage, 2 * ABANDONED.as_secs());
         aged(&theirs, 2 * ABANDONED.as_secs());
         aged(&root.join("foreign/old"), 9000);
-        // Room for the pinned entry, counted first, and one more.
         assert!(store.evict(700, Duration::from_secs(600), &Recipes).unwrap());
         assert!(root.join("foreign/fresh").exists() && !root.join("foreign/old").exists(), "an unreachable file goes once past the grace");
         assert!(theirs.exists(), "a directory placed apart is never walked");
@@ -1484,9 +1740,10 @@ mod tests {
         assert!(root.join("pinned/one").exists() && root.join("chunks/c").exists(), "a pinned entry stays, with what it references");
         assert!(root.join("kept/measured").exists());
         assert!(!abandoned.exists() && !abandoned_stage.exists(), "abandoned temporaries go");
-        assert!(!root.join(LOCKS).join("recipes/never").exists(), "the lock of a record that is gone goes");
+        assert!(!record_lock_path(&root.join(LOCKS), Path::new("recipes/never")).exists(), "the lock of a record that is gone goes");
+        assert!(!record_lock_path(&root.join(LOCKS), Path::new("recipes/gone")).exists(), "the lock of a removed record goes on eviction");
+        assert!(!legacy_lock.exists(), "a pre-upgrade lock file goes on eviction");
         assert!(root.join(LOCK).exists(), "eviction never removes the lock it holds");
-        // Used within the grace, an entry stays whatever the capacity.
         assert!(store.evict(0, Duration::from_secs(600), &Recipes).unwrap());
         assert!(root.join("recipes/new").exists() && root.join("chunks/a").exists());
         assert!(store.evict(0, Duration::ZERO, &alone).unwrap());
@@ -1501,11 +1758,11 @@ mod tests {
     #[test]
     fn eviction_passes_while_the_store_is_held_and_leaves_what_is_held() {
         let root = scratch("holders");
-        let (store, other) = (Store::new(root.clone(), Privacy::Shared), Store::new(root.clone(), Privacy::Shared));
+        let (store, other) = (Store::open(root.clone(), Privacy::Shared).unwrap(), Store::open(root.clone(), Privacy::Shared).unwrap());
         for path in ["artifact", "unused"] {
-            store.publish(Path::new(path), Durability::Volatile, |file| file.write_all(b"compiled")).unwrap();
+            store.shared().unwrap().publish(Path::new(path), Durability::Volatile, |file| file.write_all(b"compiled")).unwrap();
         }
-        assert!(!store.put_if_absent(Path::new("artifact"), b"compiled", Durability::Volatile).unwrap());
+        assert!(!store.shared().unwrap().put_if_absent(Path::new("artifact"), b"compiled", Durability::Volatile).unwrap());
         let reading = other.shared().unwrap();
         assert!(!store.evict(0, Duration::ZERO, &alone).unwrap(), "an eviction passes while the store is held");
         assert!(root.join("unused").exists());
@@ -1516,12 +1773,16 @@ mod tests {
         assert!(store.evict(0, Duration::ZERO, &alone).unwrap());
         assert!(held.path().exists(), "a held file stays while its hold lives");
         assert!(!root.join("unused").exists(), "what no holder holds goes");
-        assert!(root.join(LOCKS).join("readers/model").exists(), "a lease's lock stays while it is held");
+        assert!(record_lock_path(&root.join(LOCKS), Path::new("readers/model")).exists(), "a lease's lock stays while it is held");
         assert!(store.try_lock(Path::new("readers/model")).unwrap().is_none());
         drop((held, lease));
         assert!(store.evict(0, Duration::ZERO, &alone).unwrap());
         assert!(!root.join("artifact").exists());
-        assert!(!root.join(LOCKS).join("readers/model").exists() && !root.join(LOCKS).join("artifact").exists(), "the locks no one holds of what is gone go");
+        assert!(
+            !record_lock_path(&root.join(LOCKS), Path::new("readers/model")).exists()
+                && !record_lock_path(&root.join(LOCKS), Path::new("artifact")).exists(),
+            "the locks no one holds of what is gone go"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1532,7 +1793,7 @@ mod tests {
     #[test]
     fn staged_directories_land_whole() {
         let root = scratch("staged");
-        let store = Store::new(root.clone(), Privacy::Shared);
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
         let target = Path::new("export");
         drop(store.stage(target).unwrap());
         std::thread::scope(|scope| {
@@ -1552,10 +1813,221 @@ mod tests {
         });
         let found = ["a", "b", "c"].map(|file| fs::read(root.join(target).join(file)).unwrap());
         assert!(found.iter().all(|bytes| bytes == &found[0]), "one publication's files, never a mix: {found:?}");
-        assert_eq!(names(&root), ["export"], "no stage or replaced copy remains");
+        assert_eq!(store.list(Path::new("")).unwrap(), ["export"]);
+        assert!(names(&root).iter().all(|name| !unpublished(OsStr::new(name))), "no stage or replaced copy remains");
         store.quarantine(target).unwrap();
         assert_eq!(store.list(Path::new("")).unwrap(), Vec::<String>::new());
-        assert!(names(&root).iter().all(|name| unpublished(OsStr::new(name))));
+        assert!(names(&root).iter().any(|name| unpublished(OsStr::new(name))));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Concurrent publications and lockless reads/fetches over one target
+    /// each land whole without torn bytes or OS contention errors.
+    #[test]
+    fn concurrent_publications_and_reads_land_whole() {
+        let root = scratch("concurrent-publish");
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
+        let path = Path::new("pointer");
+        store.shared().unwrap().publish(path, Durability::Volatile, |file| file.write_all(&[0u8; 64])).unwrap();
+        std::thread::scope(|scope| {
+            for writer in 0..4u8 {
+                let store = &store;
+                seismic_threads::spawn_scoped(scope, format!("publishing-{writer}"), move || {
+                    let payload = [writer; 64];
+                    for _ in 0..40 {
+                        store.shared().unwrap().publish(path, Durability::Volatile, |file| file.write_all(&payload)).unwrap();
+                    }
+                })
+                .unwrap();
+            }
+            for reader in 0..2u8 {
+                let store = &store;
+                seismic_threads::spawn_scoped(scope, format!("reading-{reader}"), move || {
+                    for i in 0..80 {
+                        let bytes = match i % 2 == 0 {
+                            true => store.read(path, 64).unwrap().unwrap(),
+                            false => store.fetch(path).unwrap().unwrap(),
+                        };
+                        assert_eq!(bytes.len(), 64);
+                        assert!(bytes.iter().all(|&byte| byte == bytes[0]), "reader saw torn bytes");
+                    }
+                })
+                .unwrap();
+            }
+        });
+        assert_eq!(store.list(Path::new("")).unwrap(), ["pointer"], "no temporary file remains");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Concurrent `put_if_absent` and lockless reads over a shared content
+    /// address publish cleanly and read whole bytes.
+    #[test]
+    fn concurrent_put_if_absent_and_reads_land_whole() {
+        let root = scratch("concurrent-put-if-absent");
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
+        std::thread::scope(|scope| {
+            for writer in 0..4u8 {
+                let store = &store;
+                seismic_threads::spawn_scoped(scope, format!("put-absent-{writer}"), move || {
+                    let shared = store.shared().unwrap();
+                    for key in 0..20u8 {
+                        let name = PathBuf::from(format!("chunks/{key}"));
+                        let payload = [key; 64];
+                        shared.put_if_absent(&name, &payload, Durability::Volatile).unwrap();
+                    }
+                })
+                .unwrap();
+            }
+            for reader in 0..2u8 {
+                let store = &store;
+                seismic_threads::spawn_scoped(scope, format!("read-absent-{reader}"), move || {
+                    for _ in 0..4 {
+                        for key in 0..20u8 {
+                            let name = PathBuf::from(format!("chunks/{key}"));
+                            if let Some(bytes) = store.read(&name, 64).unwrap() {
+                                assert_eq!(bytes, vec![key; 64]);
+                            }
+                        }
+                    }
+                })
+                .unwrap();
+            }
+        });
+        for key in 0..20u8 {
+            assert_eq!(store.read(&PathBuf::from(format!("chunks/{key}")), 64).unwrap().unwrap(), vec![key; 64]);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Concurrent `Record::write`, `Record::remove`, and lockless `Store::read`
+    /// never fail with pending-deletion errors on Windows NTFS or POSIX.
+    #[test]
+    fn concurrent_record_write_remove_and_lockless_read() {
+        let root = scratch("record-write-remove-read");
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
+        let record = Path::new("state/item");
+        std::thread::scope(|scope| {
+            for writer in 0..3u8 {
+                let store = &store;
+                seismic_threads::spawn_scoped(scope, format!("mutating-{writer}"), move || {
+                    let payload = [writer + 1; 64];
+                    for step in 0..40 {
+                        let held = store.lock(record).unwrap();
+                        if step % 3 == 0 {
+                            held.remove().unwrap();
+                        } else {
+                            held.write(&payload, Durability::Volatile).unwrap();
+                        }
+                    }
+                })
+                .unwrap();
+            }
+            for reader in 0..2u8 {
+                let store = &store;
+                seismic_threads::spawn_scoped(scope, format!("lockless-read-{reader}"), move || {
+                    for _ in 0..120 {
+                        if let Some(bytes) = store.read(record, 64).unwrap() {
+                            assert_eq!(bytes.len(), 64);
+                            assert!(bytes.iter().all(|&byte| byte == bytes[0]), "reader saw torn bytes");
+                        }
+                    }
+                })
+                .unwrap();
+            }
+        });
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Concurrent `quarantine` and `Staged::publish` on the same target
+    /// serialize cleanly without losing directories or failing on contention.
+    #[test]
+    fn concurrent_quarantine_and_staged_publish_serialize() {
+        let root = scratch("quarantine-staged");
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
+        let target = Path::new("export");
+        std::thread::scope(|scope| {
+            for writer in 0..2u8 {
+                let store = &store;
+                seismic_threads::spawn_scoped(scope, format!("q-stage-{writer}"), move || {
+                    for _ in 0..20 {
+                        let staged = store.stage(target).unwrap();
+                        fs::write(staged.path().join("v"), [writer]).unwrap();
+                        staged.publish().unwrap();
+                    }
+                })
+                .unwrap();
+            }
+            for worker in 0..2u8 {
+                let store = &store;
+                seismic_threads::spawn_scoped(scope, format!("quarantine-{worker}"), move || {
+                    for _ in 0..20 {
+                        match store.quarantine(target) {
+                            Ok(()) => {}
+                            Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => {}
+                            Err(error) => panic!("unexpected quarantine failure: {error}"),
+                        }
+                    }
+                })
+                .unwrap();
+            }
+        });
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Concurrent `Record::lock`/`remove`, `Lease::write`/`leases`/`read`,
+    /// `Store::hold`, `Shared`/`Exclusive`, and `Store::evict` serialize
+    /// without deadlocks or delete-pending errors.
+    #[test]
+    fn concurrent_evict_records_leases_holds_and_exclusive() {
+        let root = scratch("evict-race");
+        let store = Store::open(root.clone(), Privacy::Shared).unwrap();
+        let lease_dir = Path::new("leases");
+        let record = Path::new("records/x");
+        let held_path = Path::new("blobs/a");
+        store.shared().unwrap().publish(held_path, Durability::Volatile, |file| file.write_all(b"pinned")).unwrap();
+        std::thread::scope(|scope| {
+            let s = &store;
+            seismic_threads::spawn_scoped(scope, "evictor", move || {
+                for _ in 0..30 {
+                    let _ = s.evict(0, Duration::ZERO, &alone).unwrap();
+                }
+            })
+            .unwrap();
+            seismic_threads::spawn_scoped(scope, "record-churn", move || {
+                for step in 0..30 {
+                    let rec = s.lock(record).unwrap();
+                    if step % 2 == 0 {
+                        rec.write(b"value", Durability::Volatile).unwrap();
+                    } else {
+                        rec.remove().unwrap();
+                    }
+                }
+            })
+            .unwrap();
+            seismic_threads::spawn_scoped(scope, "lease-churn", move || {
+                for step in 0..20 {
+                    let lease = s.lease(lease_dir).unwrap();
+                    lease.write(s, format!("lease-{step}").as_bytes(), Durability::Volatile).unwrap();
+                    let live = s.leases(lease_dir).unwrap();
+                    for path in live {
+                        let _ = s.read(&path, 64).unwrap();
+                    }
+                }
+            })
+            .unwrap();
+            seismic_threads::spawn_scoped(scope, "holder-and-exclusive", move || {
+                for _ in 0..20 {
+                    let _ = s.shared().unwrap().put_if_absent(held_path, b"pinned", Durability::Volatile).unwrap();
+                    if let Some(held) = s.hold(held_path).unwrap() {
+                        assert_eq!(held.bytes().unwrap(), b"pinned");
+                    }
+                    let excl = s.exclusive().unwrap();
+                    excl.append(Path::new("ledger"), b"entry\n").unwrap();
+                    let _ = excl.examine(Path::new("ledger"), 4096).unwrap();
+                }
+            })
+            .unwrap();
+        });
         fs::remove_dir_all(root).unwrap();
     }
 }

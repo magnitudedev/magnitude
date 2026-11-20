@@ -2044,7 +2044,7 @@ mod tests {
                     StoredSlots::Whole { pool: pool.clone(), records: 1, record_rows: 4 },
                     form,
                     ranges(&path),
-                    Some(KeptRows::of(&kept, "table")),
+                    Some(KeptRows::of(&kept, "table").unwrap()),
                 )
                 .unwrap();
                 table.seed().unwrap();

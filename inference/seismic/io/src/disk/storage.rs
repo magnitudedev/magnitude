@@ -60,23 +60,28 @@ impl StorageProbe {
 
     /// Write the probe file: bytes no volume stores as a hole or compresses
     /// (a xorshift stream), published through the directory's store
-    /// ([`Store::publish`]), so a job killed while writing, or two writing at
-    /// once, leave no short probe file, and the temporary file of one killed
-    /// is the store's to sweep.
+    /// ([`crate::Shared::publish`]), so a job killed while writing, or two
+    /// writing at once, leave no short probe file, and the temporary file of
+    /// one killed is the store's to sweep.
     fn write(directory: &Path, path: &Path) -> Result<(), Error> {
-        let store = Store::new(directory.to_owned(), Privacy::Shared);
-        store.publish(Path::new(path.file_name().expect("the probe file has a name")), Durability::Durable, |file| {
-            let mut state = 0x2545_f491_4f6c_dd1du64;
-            let mut chunk = vec![0u8; 8 << 20];
-            for _ in 0..STORAGE_PROBE_BYTES / chunk.len() as u64 {
-                for word in chunk.chunks_exact_mut(8) {
-                    state = next(state);
-                    word.copy_from_slice(&state.to_le_bytes());
-                }
-                file.write_all(&chunk)?;
-            }
-            Ok(())
-        })?;
+        let store = Store::open(directory.to_owned(), Privacy::Shared).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        store
+            .shared()
+            .and_then(|shared| {
+                shared.publish(Path::new(path.file_name().expect("the probe file has a name")), Durability::Durable, |file| {
+                    let mut state = 0x2545_f491_4f6c_dd1du64;
+                    let mut chunk = vec![0u8; 8 << 20];
+                    for _ in 0..STORAGE_PROBE_BYTES / chunk.len() as u64 {
+                        for word in chunk.chunks_exact_mut(8) {
+                            state = next(state);
+                            word.copy_from_slice(&state.to_le_bytes());
+                        }
+                        file.write_all(&chunk)?;
+                    }
+                    Ok(())
+                })
+            })
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         Ok(())
     }
 

@@ -28,7 +28,8 @@ pub trait Stored: Serialize + DeserializeOwned {
 /// most bytes a value of its key can be written as, which its caller states.
 /// A file that cannot be read, or holds no value of its schema, is an error.
 pub struct JsonFileStore {
-    store: seismic_io::Store,
+    directory: PathBuf,
+    store: std::sync::OnceLock<seismic_io::Store>,
 }
 
 fn error(error: impl std::fmt::Display) -> StoreError {
@@ -43,7 +44,16 @@ fn value<V: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<V, StoreError
 impl JsonFileStore {
     /// The values kept in `directory`, created on the first store.
     pub fn new(directory: &Path) -> Self {
-        Self { store: seismic_io::Store::new(directory.to_owned(), seismic_io::Privacy::Shared) }
+        Self { directory: directory.to_owned(), store: std::sync::OnceLock::new() }
+    }
+
+    fn store_handle(&self) -> Result<&seismic_io::Store, StoreError> {
+        if let Some(store) = self.store.get() {
+            return Ok(store);
+        }
+        let opened = seismic_io::Store::open(self.directory.clone(), seismic_io::Privacy::Shared)
+            .map_err(|cause| error(format!("{}: {cause}", self.directory.display())))?;
+        Ok(self.store.get_or_init(|| opened))
     }
 
     /// The directory values of `V` lie in, under the store's.
@@ -64,16 +74,16 @@ impl JsonFileStore {
     }
 
     /// What failed at `path` under the store's directory.
-    fn failed(&self, path: &Path) -> impl Fn(std::io::Error) -> StoreError + '_ {
-        let path = self.store.root().join(path);
+    fn failed(&self, path: &Path) -> impl Fn(seismic_io::StoreError) -> StoreError + '_ {
+        let path = self.directory.join(path);
         move |cause| error(format!("{}: {cause}", path.display()))
     }
 
     /// The value stored under `key`, none when none is.
     pub fn load<V: Stored>(&self, key: &impl Serialize, largest: u64) -> Result<Option<V>, StoreError> {
         let path = self.path::<V>(key)?;
-        let bytes = self.store.read(&path, largest).map_err(self.failed(&path))?;
-        bytes.map(|bytes| value(&self.store.root().join(&path), &bytes)).transpose()
+        let bytes = self.store_handle()?.read(&path, largest).map_err(self.failed(&path))?;
+        bytes.map(|bytes| value(&self.directory.join(&path), &bytes)).transpose()
     }
 
     /// Store `value` under `key`, atomically replacing what was stored
@@ -82,8 +92,8 @@ impl JsonFileStore {
     /// stores nothing.
     pub fn store<V: Stored>(&self, key: &impl Serialize, value: &V, largest: u64) -> Result<(), StoreError> {
         let path = self.path::<V>(key)?;
-        let bytes = Self::encoded(&self.store.root().join(&path), value, largest)?;
-        let record = self.store.lock(&path).map_err(self.failed(&path))?;
+        let bytes = Self::encoded(&self.directory.join(&path), value, largest)?;
+        let record = self.store_handle()?.lock(&path).map_err(self.failed(&path))?;
         record.write(&bytes, seismic_io::Durability::Durable).map_err(self.failed(&path))
     }
 
@@ -106,15 +116,16 @@ impl JsonFileStore {
     /// file that cannot be read, or holds no value, is an error.
     pub fn values<V: Stored>(&self, largest: u64) -> Result<Vec<V>, StoreError> {
         let directory = Self::schema::<V>();
+        let store = self.store_handle()?;
         let mut values = Vec::new();
-        for name in self.store.list(&directory).map_err(self.failed(&directory))? {
+        for name in store.list(&directory).map_err(self.failed(&directory))? {
             if !name.ends_with(".json") {
                 continue;
             }
             let path = directory.join(name);
             // None where it was removed since it was listed.
-            if let Some(bytes) = self.store.read(&path, largest).map_err(self.failed(&path))? {
-                values.push(value(&self.store.root().join(&path), &bytes)?);
+            if let Some(bytes) = store.read(&path, largest).map_err(self.failed(&path))? {
+                values.push(value(&self.directory.join(&path), &bytes)?);
             }
         }
         Ok(values)
@@ -124,7 +135,7 @@ impl JsonFileStore {
     /// where none is stored.
     pub fn remove<V: Stored>(&self, key: &impl Serialize) -> Result<(), StoreError> {
         let path = self.path::<V>(key)?;
-        let record = self.store.lock(&path).map_err(self.failed(&path))?;
+        let record = self.store_handle()?.lock(&path).map_err(self.failed(&path))?;
         record.remove().map_err(self.failed(&path))
     }
 
@@ -144,8 +155,8 @@ impl JsonFileStore {
         update: impl FnOnce(Option<V>) -> Result<Option<V>, E>,
     ) -> Result<Result<(), E>, StoreError> {
         let path = self.path::<V>(key)?;
-        let shown = self.store.root().join(&path);
-        let record = self.store.lock(&path).map_err(self.failed(&path))?;
+        let shown = self.directory.join(&path);
+        let record = self.store_handle()?.lock(&path).map_err(self.failed(&path))?;
         let held = record.read(largest).map_err(self.failed(&path))?.map(|bytes| value(&shown, &bytes)).transpose()?;
         match update(held) {
             Err(refused) => Ok(Err(refused)),
@@ -279,7 +290,6 @@ mod tests {
         assert_eq!(store.load::<Count>(&"sum", 32).unwrap(), Some(Count(writers * additions)));
         assert_eq!(store.update(&"sum", 32, |_: Option<Count>| Ok::<_, ()>(None)).unwrap(), Ok(()));
         assert_eq!(store.load::<Count>(&"sum", 32).unwrap(), None);
-        assert!(!directory.path().join(".locks").join(store.path::<Count>(&"sum").unwrap()).exists(), "a removed value's lock goes with it");
     }
 
     /// A store and a removal of a key wait for an update of it under way:

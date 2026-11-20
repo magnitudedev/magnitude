@@ -5460,7 +5460,7 @@ mod tests {
         /// Holds both repositories' locks, so admitted package work stays queued, as behind other
         /// downloads on a slow link, and never reaches the network.
         fn queue(&self) -> Vec<seismic_io::OwnedRecord> {
-            let store = crate::store_fs::model_store(&self.fixture.store);
+            let store = crate::store_fs::model_store(&self.fixture.store).unwrap();
             ["owner/Model-GGUF", "owner/Model-DFlash-GGUF"]
                 .into_iter()
                 .map(|repository| store.lock_owned(&crate::store_fs::repository_record(repository)).unwrap())

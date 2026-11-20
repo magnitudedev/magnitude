@@ -28,8 +28,8 @@ use magnitude_service_contracts::{InventoryError, InventoryModel, ModelLocation,
 use seismic_io::{Durability, Eviction, Examining, Privacy, Store};
 
 /// The model store at `root`.
-pub(crate) fn model_store(root: &Path) -> Store {
-    Store::new(root.to_owned(), Privacy::Owner)
+pub(crate) fn model_store(root: &Path) -> Result<Store, InventoryError> {
+    Store::open(root.to_owned(), Privacy::Owner).map_err(io_error)
 }
 
 /// The record of the Hugging Face repository `repository`, under the store's root: the folder of
@@ -63,8 +63,9 @@ pub(crate) fn hold_repository(store: &Store, record: &Path, wait: bool) -> Resul
 /// [`hold_repository`] of `repository` in the store at `root`, waiting, across `.await`s: taken
 /// on the blocking pool, as another holder may hold it for a whole download.
 pub(crate) async fn lock_repository(root: &Path, repository: &str) -> Result<seismic_io::OwnedRecord, InventoryError> {
-    let (store, record) = (model_store(root), repository_record(repository));
+    let (root, record) = (root.to_owned(), repository_record(repository));
     magnitude_service_utils::blocking::run(move || {
+        let store = model_store(&root)?;
         Ok(hold_repository(&store, &record, true)?.expect("a waiting hold is taken"))
     })
     .await
@@ -104,7 +105,8 @@ impl Garbage {
         ));
         let bytes = serde_json::to_vec(self).map_err(io_error)?;
         store
-            .publish(&record, Durability::Durable, |file| std::io::Write::write_all(file, &bytes))
+            .shared()
+            .and_then(|shared| shared.publish(&record, Durability::Durable, |file| std::io::Write::write_all(file, &bytes)))
             .map_err(io_error)
     }
 
@@ -312,8 +314,9 @@ impl Readers {
             .iter()
             .map(|component| StoredFile::new(repository, commit, &component.path))
             .collect::<BTreeSet<_>>();
-        let (store, readers, id) = (model_store(root), Arc::clone(self), model.id.0.clone());
+        let (root, readers, id) = (root.to_owned(), Arc::clone(self), model.id.0.clone());
         magnitude_service_utils::blocking::run(move || {
+            let store = model_store(&root)?;
             let mut hold = ReadersHold { readers: Arc::clone(&readers), entries: Vec::new() };
             let mut committed = None;
             for file in &files {
@@ -356,8 +359,9 @@ impl Readers {
         repositories: &BTreeSet<PathBuf>,
         files: &BTreeSet<StoredFile>,
     ) -> Result<Removal, InventoryError> {
-        let (store, readers, repositories, files) = (model_store(root), Arc::clone(self), repositories.clone(), files.clone());
+        let (root, readers, repositories, files) = (root.to_owned(), Arc::clone(self), repositories.clone(), files.clone());
         magnitude_service_utils::blocking::run(move || {
+            let store = model_store(&root)?;
             let mut removal = Removal { readers: Arc::clone(&readers), entries: Vec::new(), _records: Vec::new() };
             for repository in &repositories {
                 let record = hold_repository(&store, repository, false)?;
@@ -447,26 +451,28 @@ impl Drop for Removal {
 
 /// Publish `bytes` as the file at `path` of the model store, synced, its owner's alone: written
 /// beside it under a temporary name, which the store's sweep removes if the writer dies, and
-/// renamed into place. A publication takes no lock and names only the file's directory; its
-/// caller holds the lock of the record the file is of.
+/// renamed into place.
 pub(crate) fn publish_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let (directory, name) = beside(path);
-    Store::new(directory.to_owned(), Privacy::Owner)
-        .publish(Path::new(name), Durability::Durable, |file| std::io::Write::write_all(file, bytes))
+    let (root, relative) = store_path(path);
+    let store = Store::open(root.to_owned(), Privacy::Owner).map_err(std::io::Error::other)?;
+    store
+        .shared()
+        .and_then(|shared| shared.publish(relative, Durability::Durable, |file| std::io::Write::write_all(file, bytes)))
+        .map_err(std::io::Error::other)
 }
 
 /// An empty directory staged beside `target`, a folder of the model store, its owner's alone,
 /// which `Staged::publish` renames into place whole; a stage a dead writer left is the store's
-/// sweep's. Staging names only the target's directory; its caller holds the lock of the record
-/// `target` is of.
+/// sweep's.
 pub(crate) fn stage(target: &Path) -> std::io::Result<seismic_io::Staged> {
-    let (directory, name) = beside(target);
-    Store::new(directory.to_owned(), Privacy::Owner).stage(Path::new(name))
+    let (root, relative) = store_path(target);
+    Store::open(root.to_owned(), Privacy::Owner)
+        .and_then(|store| store.stage(relative))
+        .map_err(std::io::Error::other)
 }
 
 /// Set what is at `path` of the model store aside, under a temporary name beside it, which the
-/// store's sweep removes once abandoned; nothing there is no failure. Its caller holds the lock of
-/// the record `path` is of.
+/// store's sweep removes once abandoned; nothing there is no failure.
 pub(crate) fn quarantine_sync(path: &Path) -> std::io::Result<()> {
     if let Err(error) = path.symlink_metadata() {
         return match error.kind() {
@@ -474,8 +480,10 @@ pub(crate) fn quarantine_sync(path: &Path) -> std::io::Result<()> {
             _ => Err(error),
         };
     }
-    let (directory, name) = beside(path);
-    Store::new(directory.to_owned(), Privacy::Owner).quarantine(Path::new(name))
+    let (root, relative) = store_path(path);
+    Store::open(root.to_owned(), Privacy::Owner)
+        .and_then(|store| store.quarantine(relative))
+        .map_err(std::io::Error::other)
 }
 
 /// [`quarantine_sync`], on the blocking pool.
@@ -484,12 +492,28 @@ pub(crate) async fn quarantine(path: &Path) -> std::io::Result<()> {
     magnitude_service_utils::blocking::run(move || quarantine_sync(&path)).await
 }
 
-/// The directory `path` lies in, and its name there.
-fn beside(path: &Path) -> (&Path, &std::ffi::OsStr) {
-    (
-        path.parent().expect("a model store file lies in a directory"),
-        path.file_name().expect("a model store file has a name"),
-    )
+/// The store root holding `path` and `path`'s relative location under it:
+/// uses the model store's root above `hub/` so `.lock` and `.locks/` live at
+/// the store root rather than inside repository `snapshots/` or `blobs/` dirs.
+fn store_path(path: &Path) -> (&Path, &Path) {
+    let mut cursor = path.parent();
+    while let Some(directory) = cursor {
+        if directory.file_name().is_some_and(|name| name == "hub") {
+            if let Some(root) = directory.parent() {
+                return (root, path.strip_prefix(root).expect("path lies under its ancestor"));
+            }
+        }
+        cursor = directory.parent();
+    }
+    if let Some(parent) = path.parent() {
+        if parent.file_name().is_some_and(|name| name == "snapshots" || name == "blobs") {
+            if let Some(root) = parent.parent() {
+                return (root, path.strip_prefix(root).expect("path lies under its ancestor"));
+            }
+        }
+        return (parent, path.strip_prefix(parent).expect("path lies under its parent"));
+    }
+    panic!("a model store file lies in a directory: {}", path.display())
 }
 
 pub(crate) async fn ensure_store_layout(root: &Path) -> Result<(), InventoryError> {
@@ -507,7 +531,7 @@ pub(crate) async fn ensure_store_layout(root: &Path) -> Result<(), InventoryErro
         Err(error) => return Err(io_error(error)),
     }
     ensure_owned_directory(&root.join("hub")).await?;
-    let committed = model_store(root);
+    let committed = model_store(root)?;
     magnitude_service_utils::blocking::run(move || finish_removals(&committed)).await;
     sweep(root.to_owned());
     Ok(())
@@ -520,7 +544,7 @@ pub(crate) async fn ensure_store_layout(root: &Path) -> Result<(), InventoryErro
 /// load's), and runs beside downloads and loads; one that finds the store held passes, and the
 /// next opening sweeps.
 fn sweep(root: PathBuf) {
-    let swept = move || match model_store(&root).evict(u64::MAX, Duration::ZERO, &legacy) {
+    let swept = move || match model_store(&root).and_then(|store| store.evict(u64::MAX, Duration::ZERO, &legacy).map_err(io_error)) {
         Ok(true) => {}
         Ok(false) => tracing::debug!(root = %root.display(), "the model store is held; its next opening sweeps it"),
         Err(error) => tracing::warn!(root = %root.display(), %error, "the model store is not swept"),
@@ -645,7 +669,7 @@ mod tests {
             fs::read(outside).expect("outside file retained"),
             b"outside"
         );
-        let set_aside = model_store(&root).list(Path::new("")).expect("listing");
+        let set_aside = model_store(&root).unwrap().list(Path::new("")).expect("listing");
         assert_eq!(set_aside, ["hub"], "what held the hub's place is set aside under a temporary name");
     }
 
@@ -657,7 +681,7 @@ mod tests {
     fn a_repositorys_next_holder_finishes_its_committed_garbage_first() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = temporary.path();
-        let store = model_store(root);
+        let store = model_store(root).unwrap();
         let (first, second) = (repository_record("owner/first"), repository_record("owner/second"));
         let mut garbage = Garbage::default();
         for record in [&first, &second] {
@@ -708,7 +732,7 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).expect("folder");
             fs::write(path, b"bytes").expect("file");
         }
-        assert!(model_store(root).evict(u64::MAX, Duration::ZERO, &legacy).expect("swept"));
+        assert!(model_store(root).unwrap().evict(u64::MAX, Duration::ZERO, &legacy).expect("swept"));
         for path in &kept {
             assert!(path.exists(), "{} is kept", path.display());
         }

@@ -107,9 +107,9 @@ impl DirectoryStore {
     /// entries, the embedder's files placed by `layout`; it begins removing
     /// the least recently used beyond them.
     pub fn open(root: PathBuf, capacity: u64, layout: fn(&Path, &Examining<'_>) -> Eviction) -> std::io::Result<Self> {
-        fs::create_dir_all(&root)?;
+        let opened = Store::open(root, Privacy::Shared).map_err(std::io::Error::other)?;
         let store = Self {
-            store: Arc::new(Store::new(root, Privacy::Shared)),
+            store: Arc::new(opened),
             capacity,
             layout,
             eviction: std::sync::Mutex::new(None),
@@ -125,14 +125,14 @@ impl DirectoryStore {
     /// The records, read under the store's lock held shared, waiting until
     /// no writer or eviction holds it.
     pub fn reading(&self) -> std::io::Result<Shared<'_>> {
-        self.store.shared()
+        self.store.shared().map_err(std::io::Error::other)
     }
 
     /// The records, read, written and removed under the store's lock held
     /// exclusively, waiting until no other holder holds it. A thread holding
     /// the lock takes it again only to wait for itself.
     pub fn writing(&self) -> std::io::Result<Writing<'_>> {
-        Ok(Writing { directory: self, held: Some(self.store.exclusive()?) })
+        Ok(Writing { directory: self, held: Some(self.store.exclusive().map_err(std::io::Error::other)?) })
     }
 
     /// Write `bytes` under `key` of `namespace`, synced, as [`ArtifactStore::put`]
@@ -141,12 +141,12 @@ impl DirectoryStore {
         self.put_reported(namespace, key, bytes, Durability::Durable)
     }
 
-    /// Publish an artifact, without the lock, reporting a failure as a
-    /// warning event, which the embedder's subscriber carries to its
-    /// telemetry: a missing artifact costs its compile again.
+    /// Publish an artifact, reporting a failure as a warning event, which the
+    /// embedder's subscriber carries to its telemetry: a missing artifact
+    /// costs its compile again.
     fn put_reported(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8], durability: Durability) -> bool {
         let path = Self::artifact(namespace, key);
-        let published = self.store.publish(&path, durability, |file| file.write_all(bytes));
+        let published = self.store.shared().and_then(|shared| shared.publish(&path, durability, |file| file.write_all(bytes)));
         self.evict_if_outgrown();
         match published {
             Ok(()) => true,

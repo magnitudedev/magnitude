@@ -55,7 +55,11 @@ fn decode(bytes: &[u8]) -> BTreeSet<CatalogPackageAffiliation> {
 
 impl CatalogAffiliations {
     pub(crate) fn load(root: &Path) -> Self {
-        let entries = match crate::store_fs::model_store(root).read(Path::new(FILE_NAME), MAX_FILE_BYTES) {
+        let entries = match crate::store_fs::model_store(root).and_then(|store| {
+            store.read(Path::new(FILE_NAME), MAX_FILE_BYTES).map_err(|error| {
+                magnitude_service_contracts::InventoryError::Io(error.to_string())
+            })
+        }) {
             Ok(Some(bytes)) => decode(&bytes),
             Ok(None) => BTreeSet::new(),
             Err(error) => {
@@ -103,16 +107,16 @@ impl CatalogAffiliations {
         if self.pending == Pending::default() {
             return Ok(());
         }
-        let store = crate::store_fs::model_store(root);
-        let record = store.lock(Path::new(FILE_NAME))?;
-        let mut entries = record.read(MAX_FILE_BYTES)?.map(|bytes| decode(&bytes)).unwrap_or_default();
+        let store = crate::store_fs::model_store(root).map_err(std::io::Error::other)?;
+        let record = store.lock(Path::new(FILE_NAME)).map_err(std::io::Error::other)?;
+        let mut entries = record.read(MAX_FILE_BYTES).map_err(std::io::Error::other)?.map(|bytes| decode(&bytes)).unwrap_or_default();
         entries.retain(|affiliation| !self.pending.forgotten.contains(&affiliation.package_id));
         entries.extend(self.pending.added.iter().cloned());
         let bytes = serde_json::to_vec_pretty(&StoredCatalogAffiliations {
             affiliations: entries.iter().collect(),
         })
         .map_err(std::io::Error::other)?;
-        record.write(&bytes, seismic_io::Durability::Durable)?;
+        record.write(&bytes, seismic_io::Durability::Durable).map_err(std::io::Error::other)?;
         self.entries = entries;
         self.pending = Pending::default();
         Ok(())

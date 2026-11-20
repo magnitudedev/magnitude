@@ -112,7 +112,11 @@ fn decode(bytes: &[u8]) -> Vec<RequestedDownload> {
 
 impl RequestedDownloads {
     pub(crate) fn load(root: &Path) -> Self {
-        let requests = match crate::store_fs::model_store(root).read(Path::new(FILE_NAME), MAX_FILE_BYTES) {
+        let requests = match crate::store_fs::model_store(root).and_then(|store| {
+            store.read(Path::new(FILE_NAME), MAX_FILE_BYTES).map_err(|error| {
+                magnitude_service_contracts::InventoryError::Io(error.to_string())
+            })
+        }) {
             Ok(Some(bytes)) => decode(&bytes),
             Ok(None) => Vec::new(),
             Err(error) => {
@@ -201,9 +205,9 @@ impl RequestedDownloads {
         if self.pending.added.is_empty() && self.pending.ended.is_empty() {
             return Ok(());
         }
-        let store = crate::store_fs::model_store(root);
-        let record = store.lock(Path::new(FILE_NAME))?;
-        let mut requests = record.read(MAX_FILE_BYTES)?.map(|bytes| decode(&bytes)).unwrap_or_default();
+        let store = crate::store_fs::model_store(root).map_err(std::io::Error::other)?;
+        let record = store.lock(Path::new(FILE_NAME)).map_err(std::io::Error::other)?;
+        let mut requests = record.read(MAX_FILE_BYTES).map_err(std::io::Error::other)?.map(|bytes| decode(&bytes)).unwrap_or_default();
         requests.retain(|request| !self.pending.ended.contains(request));
         for added in &self.pending.added {
             if !requests.contains(added) {
@@ -214,7 +218,7 @@ impl RequestedDownloads {
             requests: requests.iter().collect(),
         })
         .map_err(std::io::Error::other)?;
-        record.write(&bytes, seismic_io::Durability::Durable)?;
+        record.write(&bytes, seismic_io::Durability::Durable).map_err(std::io::Error::other)?;
         self.pending = Pending::default();
         Ok(())
     }

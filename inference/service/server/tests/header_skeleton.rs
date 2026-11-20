@@ -125,7 +125,7 @@ fn every_catalog_targets_skeleton_assesses_as_its_whole_header() {
 
         let root = tempfile::tempdir().unwrap();
         let source = Skeletons {
-            cache: ModelCache::new(root.path()),
+            cache: ModelCache::new(root.path()).unwrap(),
             timing: Mutex::new([Duration::ZERO; 2]),
         };
         let skeletal = PackageHeaders::open_from(&file, None, &source)

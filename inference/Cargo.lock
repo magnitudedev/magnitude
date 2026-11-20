@@ -4316,10 +4316,10 @@ name = "seismic-io"
 version = "0.1.0"
 dependencies = [
  "libc",
- "same-file",
  "seismic-threads",
  "serde_json",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

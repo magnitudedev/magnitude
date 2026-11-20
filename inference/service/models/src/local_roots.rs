@@ -1243,7 +1243,7 @@ mod tests {
                 path: root.to_path_buf(),
                 enabled: true,
             }],
-            &ModelCache::new(&temporary.path().join("cache")),
+            &ModelCache::new(&temporary.path().join("cache")).unwrap(),
         );
         assert_eq!(
             unresolved,
@@ -1320,7 +1320,7 @@ mod tests {
             b"hub weights",
         );
 
-        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let cache = ModelCache::new(&temporary.path().join("cache")).unwrap();
         let mut output = LocationScan::default();
         scan_ollama(root, &cache, &mut output).unwrap();
         let names = output
@@ -1357,7 +1357,7 @@ mod tests {
             let mut output = LocationScan::default();
             scan_ollama(
                 root,
-                &ModelCache::new(&temporary.path().join("cache")),
+                &ModelCache::new(&temporary.path().join("cache")).unwrap(),
                 &mut output,
             )
             .unwrap();
@@ -1429,7 +1429,7 @@ mod tests {
         let mut output = LocationScan::default();
         scan_ollama(
             root,
-            &ModelCache::new(&temporary.path().join("cache")),
+            &ModelCache::new(&temporary.path().join("cache")).unwrap(),
             &mut output,
         )
         .unwrap();
@@ -1466,7 +1466,7 @@ mod tests {
     #[test]
     fn an_unreadable_subfolder_never_hides_the_rest_of_its_location() {
         let temporary = tempfile::tempdir().unwrap();
-        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let cache = ModelCache::new(&temporary.path().join("cache")).unwrap();
         let folder = temporary.path().join("models");
         crate::test_gguf::write_model(&folder.join("nested/model.gguf"), "nested");
         crate::test_gguf::write_model(&folder.join("top.gguf"), "top");
@@ -1514,7 +1514,7 @@ mod tests {
                     enabled: true,
                 },
                 &DeclaredProjectors::new(&LocalModelsConfiguration::default()),
-                &ModelCache::new(&temporary.path().join("cache")),
+                &ModelCache::new(&temporary.path().join("cache")).unwrap(),
                 &RecognizedArchitectures::default(),
             )
             .is_err()
@@ -1524,7 +1524,7 @@ mod tests {
     #[test]
     fn an_unreadable_hub_repository_never_hides_the_rest_of_the_cache() {
         let temporary = tempfile::tempdir().unwrap();
-        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let cache = ModelCache::new(&temporary.path().join("cache")).unwrap();
         let hub = temporary.path().join("hub");
         let model = hub.join("models--owner--good/snapshots/abc/model.gguf");
         crate::test_gguf::write_model(&model, "good");

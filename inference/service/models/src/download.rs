@@ -1209,7 +1209,7 @@ async fn publish_package_snapshot(
     for component in components {
         publish_snapshot_link(repo_root, staged.path(), component).await?;
     }
-    magnitude_service_utils::blocking::run(move || staged.publish())
+    magnitude_service_utils::blocking::run(move || staged.publish().map_err(std::io::Error::other))
         .await
         .map_err(download_io)?;
     sync_parent(snapshot).await
@@ -3112,6 +3112,7 @@ mod tests {
 
         // Holding the repository lock keeps fresh work from reaching the network.
         let repository_lock = crate::store_fs::model_store(&manager.config.root)
+            .unwrap()
             .lock_owned(&repository_record("owner/repository"))
             .expect("repository lock");
         start().await.expect("retry");
@@ -3161,6 +3162,7 @@ mod tests {
                 .expect("checkpoint");
             // The operation waits on the repository lock, so it is cancelled before any transfer.
             let repository_lock = crate::store_fs::model_store(&manager.config.root)
+            .unwrap()
                 .lock_owned(&repository_record("owner/repository"))
                 .expect("repository lock");
             let mut stream = manager
@@ -3211,6 +3213,7 @@ mod tests {
             .insert(key.clone(), Arc::clone(&settling));
         // Holding the repository lock keeps the new operation from reaching the network.
         let repository_lock = crate::store_fs::model_store(&manager.config.root)
+            .unwrap()
             .lock_owned(&repository_record("owner/repository"))
             .expect("repository lock");
 

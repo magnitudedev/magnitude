@@ -365,7 +365,7 @@ async fn open_catalog_models(
     // A catalog build reads every header back once it has read them all, so none may be evicted to
     // make room while it runs: on a slow machine the build outlasts the eviction grace.
     config.header_cache_capacity = u64::MAX;
-    let kernels = magnitude_service_models::ModelCache::new(&config.cache_root).kernel_directory();
+    let kernels = magnitude_service_models::ModelCache::new(&config.cache_root)?.kernel_directory();
     let volumes = Arc::new(magnitude_executor::platform::VolumeReserves::new(Some(kernels)));
     let space = Arc::new(volumes.space(config.root.clone()));
     Ok(Arc::new(ManagedModelStore::open(config, space).await?))
@@ -440,7 +440,7 @@ async fn headers(output: PathBuf, store: &StoreArgs) -> anyhow::Result<PathBuf> 
     } else {
         // Staged under a name of its own and published whole (`seismic_io::Store::stage`): a run
         // exporting at once with this one, or reading the export, never finds it part written.
-        let staging = seismic_io::Store::new(output.clone(), seismic_io::Privacy::Shared).stage(Path::new("headers"))?;
+        let staging = seismic_io::Store::open(output.clone(), seismic_io::Privacy::Shared)?.stage(Path::new("headers"))?;
         let components = load_release_catalog(&bundle)?.export_headers(staging.path())?;
         let models = store.open().await?;
         for artifact in &artifacts {
@@ -549,8 +549,9 @@ async fn publish(output: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
         .file_name()
         .context("catalog output must name a file")?
         .to_owned();
-    tokio::task::spawn_blocking(move || {
-        seismic_io::Store::new(parent, seismic_io::Privacy::Shared).publish(Path::new(&name), seismic_io::Durability::Volatile, |file| {
+    tokio::task::spawn_blocking(move || -> Result<(), seismic_io::StoreError> {
+        let store = seismic_io::Store::open(parent, seismic_io::Privacy::Shared)?;
+        store.shared()?.publish(Path::new(&name), seismic_io::Durability::Volatile, |file| {
             std::io::Write::write_all(file, &bytes)
         })
     })

@@ -298,11 +298,11 @@ impl ManagedModelStore {
         .await?;
         release_resident.await?;
         removal.drained().await;
-        let store = model_store(root);
+        let store = model_store(root)?;
         let garbage = magnitude_service_utils::blocking::run(move || garbage.commit(&store).map(|()| garbage)).await?;
         // The commit removed the models: the inventory here takes it in at once, as every scan does.
         self.remove_published_models(ids).await?;
-        let store = model_store(root);
+        let store = model_store(root)?;
         let freed_bytes = magnitude_service_utils::blocking::run(move || {
             garbage.0.keys().fold(0_u64, |freed, repository| match finish(&store, repository) {
                 Ok(bytes) => freed.saturating_add(bytes),

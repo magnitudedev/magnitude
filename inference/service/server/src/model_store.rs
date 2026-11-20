@@ -56,7 +56,7 @@ impl ServedVolumes {
 /// then discover the devices with the paths it serves ([`ManagedModelStore::served_paths`]),
 /// the model store's volume and the kernel cache's tagged with their roles.
 pub async fn open_served_store(config: InventoryConfig) -> anyhow::Result<ServedStore> {
-    let kernels = ModelCache::new(&config.cache_root).kernel_directory();
+    let kernels = ModelCache::new(&config.cache_root)?.kernel_directory();
     let reserves = Arc::new(VolumeReserves::new(Some(kernels)));
     let space = Arc::new(Arc::clone(&reserves).space(config.root.clone()));
     let (model_store, kernel_cache) = (config.root.clone(), config.cache_root.clone());

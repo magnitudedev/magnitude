@@ -130,7 +130,8 @@ fn failed(path: &Path, error: std::io::Error) -> ObservationError {
 /// while timing leaves is a temporary file every store's sweep removes.
 fn write_rate(path: &Path) -> std::io::Result<f64> {
     let block = vec![0xA5_u8; 8 << 20];
-    let (probe, mut file) = seismic_io::Temporary::create(path, std::ffi::OsStr::new("volume-write-probe"), seismic_io::Privacy::Shared)?;
+    let (probe, mut file) = seismic_io::Temporary::create(path, std::ffi::OsStr::new("volume-write-probe"), seismic_io::Privacy::Shared)
+        .map_err(std::io::Error::other)?;
     let started = Instant::now();
     for _ in 0..WRITE_PROBE_BYTES / block.len() {
         file.write_all(&block)?;

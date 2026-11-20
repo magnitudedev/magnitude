@@ -299,7 +299,7 @@ impl HeaderCache {
             }
             // The chunks and the recipe naming them are written under the store's lock held
             // shared, so no eviction falls between a chunk found there and the recipe naming it.
-            let Ok(_writing) = self.store.shared() else {
+            let Ok(writing) = self.store.shared() else {
                 return digest;
             };
             let mut segments = Vec::new();
@@ -316,7 +316,7 @@ impl HeaderCache {
                     let bytes = &header[range];
                     let chunk = sha256(bytes);
                     // Every read verifies a chunk against its name, so a torn one is a miss.
-                    if self.store.put_if_absent(&Self::chunk(&chunk), bytes, Durability::Volatile).unwrap_or(false) {
+                    if writing.put_if_absent(&Self::chunk(&chunk), bytes, Durability::Volatile).unwrap_or(false) {
                         written += bytes.len() as u64;
                     }
                     segments.push(Segment::Chunk {
@@ -333,8 +333,7 @@ impl HeaderCache {
             // Replacing what is there, which did not hold the header (a recipe of another
             // version, or one whose chunks are gone): every writer writes this one encoding.
             let recipe = encode_recipe(&segments, &inline);
-            if self
-                .store
+            if writing
                 .publish(&Self::recipe(&digest), Durability::Volatile, |file| std::io::Write::write_all(file, &recipe))
                 .is_ok()
             {
@@ -459,7 +458,7 @@ impl HeaderCache {
         }
         if let Some(pins) = own.as_mut().filter(|pins| pins.published.as_ref() != Some(&pinned)) {
             let lines = pinned.iter().map(|digest| format!("{digest}\n")).collect::<String>();
-            match self.store.publish(pins.lease.record(), Durability::Volatile, |file| std::io::Write::write_all(file, lines.as_bytes())) {
+            match pins.lease.write(&self.store, lines.as_bytes(), Durability::Volatile) {
                 Ok(()) => pins.published = Some(pinned),
                 Err(error) => tracing::warn!("header cache {}: cannot publish its pins: {error}", self.store.root().display()),
             }
@@ -685,7 +684,7 @@ mod tests {
 
     /// A header cache in a store of its own over `directory`, as another process opens it.
     fn cache(directory: &Path, capacity: u64, grace: Duration) -> HeaderCache {
-        HeaderCache::new(Arc::new(Store::new(directory.to_path_buf(), Privacy::Owner)), capacity, grace)
+        HeaderCache::new(Arc::new(Store::open(directory.to_path_buf(), Privacy::Owner).unwrap()), capacity, grace)
     }
 
     /// The regular files of `directory`: name, path, size and modification time.
