@@ -13,13 +13,17 @@ use magnitude_service_contracts::models::{
     CatalogInstallationRetentionReason, CatalogInstallations, CatalogInstallationsInvalidation,
     CatalogInstallationsResponse, CatalogModelOptimizer, CatalogOptimizationProgress,
     CatalogPackageRemover, CustomModelPart, LoadedPackages, ModelDownload, ModelDownloadId, ModelDownloadState,
-    ModelDownloads, ModelId, ParsedModelId, ServableModelBundle,
+    ModelDownloads, ModelId, ModelPackageId, ParsedModelId, ServableModelBundle,
 };
 
 use crate::ManagedModelDownloads;
 use crate::catalog_models::reject_unavailable;
 use crate::model_domains::ModelDomainResolver;
 use crate::requested_downloads::{RequestedDownload, RequestedPart};
+
+/// Maximum number of completed/failed/cancelled operations retained in memory. Active
+/// operations are always retained regardless of this cap.
+const MAX_RETAINED_TERMINAL_OPERATIONS: usize = 128;
 
 #[derive(Debug, Clone)]
 struct OperationBinding {
@@ -91,6 +95,18 @@ impl ManagedCatalogInstallations {
         }
     }
 
+    fn prune_terminal_operations(&self) {
+        let jobs = self.jobs.lock().expect("catalog installation job lock");
+        let Ok(mut operations) = self.operations.write() else {
+            return;
+        };
+        prune_terminal_bindings(
+            &mut operations,
+            |binding| jobs.contains_key(&binding.operation_id) || binding.optimization.is_some(),
+            MAX_RETAINED_TERMINAL_OPERATIONS,
+        );
+    }
+
     async fn run(self: Arc<Self>, id: CatalogInstallationOperationId, binding: OperationBinding) {
         self.follow(&id, binding).await;
         self.jobs
@@ -98,6 +114,7 @@ impl ManagedCatalogInstallations {
             .expect("catalog installation job lock")
             .remove(&id);
         self.set_optimization(&id, None);
+        self.prune_terminal_operations();
     }
 
     /// Follow the download to its end; a completed download is optimized.
@@ -159,6 +176,7 @@ impl ManagedCatalogInstallations {
             job.ended().await;
         }
         self.set_optimization(id, None);
+        self.prune_terminal_operations();
         Ok(stopped)
     }
 
@@ -193,8 +211,17 @@ impl ManagedCatalogInstallations {
 
     pub(crate) async fn cleanup_model(&self, model_id: &ModelId) -> Result<(), InventoryError> {
         let package_ids = self.resolver.catalog_cleanup_package_ids(model_id)?;
+        self.remove_cleanup_packages(package_ids).await
+    }
+
+    pub(crate) async fn remove_cleanup_packages(
+        &self,
+        package_ids: Vec<ModelPackageId>,
+    ) -> Result<(), InventoryError> {
         if !package_ids.is_empty() {
-            self.remover.remove_catalog_packages(package_ids, LoadedPackages::Keep).await?;
+            self.remover
+                .remove_catalog_packages(package_ids, LoadedPackages::Keep)
+                .await?;
         }
         Ok(())
     }
@@ -241,16 +268,30 @@ impl ManagedCatalogInstallations {
     }
 
     async fn reject_active(&self, id: &ModelId) -> Result<(), InventoryError> {
-        let existing_operation_ids = self
+        let existing_bindings = self
             .operations
             .read()
             .map_err(|_| InventoryError::Internal("catalog installation lock poisoned".to_owned()))?
             .iter()
             .filter(|binding| binding.model_id == *id)
-            .map(|binding| binding.operation_id.clone())
+            .cloned()
             .collect::<Vec<_>>();
-        for operation_id in existing_operation_ids {
-            let operation = self.operation(&operation_id).await?;
+        if existing_bindings.is_empty() {
+            return Ok(());
+        }
+        let mut downloads = self
+            .downloads
+            .list()
+            .await?
+            .downloads
+            .into_iter()
+            .map(|download| (download.id.clone(), download))
+            .collect::<HashMap<_, _>>();
+        for binding in existing_bindings {
+            let Some(download) = downloads.remove(&binding.download_id) else {
+                continue;
+            };
+            let operation = operation_from_download(binding.operation_id.clone(), binding, download);
             if matches!(
                 operation.state,
                 CatalogInstallationOperationState::Pending { .. }
@@ -288,15 +329,26 @@ impl ManagedCatalogInstallations {
             download_id: download.id,
             optimization: None,
         };
-        self.operations
-            .write()
-            .map_err(|_| InventoryError::Internal("catalog installation lock poisoned".to_owned()))?
-            .push(binding.clone());
         let this = self.this.upgrade().expect("catalog installations are alive while in use");
-        // Held across the spawn, so a job that ends at once removes its own entry after it.
+        // Lock `jobs` before `operations` so an active operation is always visible in `jobs`
+        // before it appears in `operations`, and a job that ends at once removes its entry after.
         let mut jobs = self.jobs.lock().expect("catalog installation job lock");
-        let job = magnitude_service_utils::owner::spawn("a catalog installation", this.run(operation_id.clone(), binding));
+        let job = magnitude_service_utils::owner::spawn(
+            "a catalog installation",
+            this.run(operation_id.clone(), binding.clone()),
+        );
         jobs.insert(operation_id.clone(), job);
+        let mut operations = self
+            .operations
+            .write()
+            .map_err(|_| InventoryError::Internal("catalog installation lock poisoned".to_owned()))?;
+        operations.push(binding);
+        prune_terminal_bindings(
+            &mut operations,
+            |binding| jobs.contains_key(&binding.operation_id) || binding.optimization.is_some(),
+            MAX_RETAINED_TERMINAL_OPERATIONS,
+        );
+        drop(operations);
         drop(jobs);
         Ok(CatalogInstallationAdmission::Admitted { operation_id })
     }
@@ -317,8 +369,16 @@ impl ManagedCatalogInstallations {
             .collect::<Vec<_>>();
         for operation_id in operation_ids {
             // An installed model's optimization yields to its removal.
-            self.stop_optimization(&operation_id).await?;
-            let operation = self.operation(&operation_id).await?;
+            match self.stop_optimization(&operation_id).await {
+                Ok(_) => {}
+                Err(InventoryError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            }
+            let operation = match self.operation(&operation_id).await {
+                Ok(operation) => operation,
+                Err(InventoryError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
             if matches!(
                 operation.state,
                 CatalogInstallationOperationState::Pending { .. }
@@ -440,18 +500,31 @@ impl CatalogInstallations for ManagedCatalogInstallations {
         &self,
     ) -> BoxFuture<'_, Result<CatalogInstallationsResponse, InventoryError>> {
         Box::pin(async move {
-            let ids = self
+            let bindings = self
                 .operations
                 .read()
                 .map_err(|_| {
                     InventoryError::Internal("catalog installation lock poisoned".to_owned())
                 })?
-                .iter()
-                .map(|binding| binding.operation_id.clone())
-                .collect::<Vec<_>>();
-            let mut operations = Vec::with_capacity(ids.len());
-            for id in ids {
-                operations.push(self.operation(&id).await?);
+                .clone();
+            let mut downloads = self
+                .downloads
+                .list()
+                .await?
+                .downloads
+                .into_iter()
+                .map(|download| (download.id.clone(), download))
+                .collect::<HashMap<_, _>>();
+            let mut operations = Vec::with_capacity(bindings.len());
+            for binding in bindings {
+                let Some(download) = downloads.remove(&binding.download_id) else {
+                    continue;
+                };
+                operations.push(operation_from_download(
+                    binding.operation_id.clone(),
+                    binding,
+                    download,
+                ));
             }
             Ok(CatalogInstallationsResponse { operations })
         })
@@ -556,5 +629,73 @@ fn operation_from_download(
         operation_id,
         model_id: binding.model_id,
         state,
+    }
+}
+
+fn prune_terminal_bindings(
+    operations: &mut Vec<OperationBinding>,
+    is_active: impl Fn(&OperationBinding) -> bool,
+    max_terminal: usize,
+) {
+    let terminal_count = operations.iter().filter(|binding| !is_active(binding)).count();
+    let Some(mut excess) = terminal_count.checked_sub(max_terminal) else {
+        return;
+    };
+    if excess == 0 {
+        return;
+    }
+    operations.retain(|binding| {
+        if is_active(binding) || excess == 0 {
+            true
+        } else {
+            excess -= 1;
+            false
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn binding(index: usize) -> OperationBinding {
+        let id = format!("op_{index:03}");
+        OperationBinding {
+            operation_id: CatalogInstallationOperationId(id.clone()),
+            model_id: "qwen3.5-4b:gguf:q4".parse().unwrap(),
+            download_id: ModelDownloadId(id),
+            optimization: None,
+        }
+    }
+
+    #[test]
+    fn terminal_operation_retention_caps_terminal_entries_and_preserves_active_ones() {
+        let mut operations = (0..140).map(binding).collect::<Vec<_>>();
+        let active: HashSet<_> = [0, 5, 139]
+            .into_iter()
+            .map(|index| CatalogInstallationOperationId(format!("op_{index:03}")))
+            .collect();
+
+        prune_terminal_bindings(
+            &mut operations,
+            |entry| active.contains(&entry.operation_id),
+            MAX_RETAINED_TERMINAL_OPERATIONS,
+        );
+
+        let retained_ids = operations
+            .iter()
+            .map(|entry| entry.operation_id.0.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_ids.len(), MAX_RETAINED_TERMINAL_OPERATIONS + active.len());
+        // Active entries are always preserved, including the oldest ones.
+        assert!(retained_ids.contains(&"op_000"));
+        assert!(retained_ids.contains(&"op_005"));
+        assert!(retained_ids.contains(&"op_139"));
+        // Oldest 9 terminal entries (1..=4, 6..=10) are pruned; newest 128 (11..=138) remain.
+        assert!(!retained_ids.contains(&"op_001"));
+        assert!(!retained_ids.contains(&"op_010"));
+        assert!(retained_ids.contains(&"op_011"));
+        assert!(retained_ids.contains(&"op_138"));
     }
 }

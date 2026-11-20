@@ -351,9 +351,13 @@ impl HeaderCache {
     /// any repository: references for reading another file's header without fetching that entry
     /// (see `remote_header`). Each is verified against its digest; an evicted one is skipped.
     pub(crate) fn sharing(&self, head: &[u8]) -> Vec<Vec<u8>> {
+        self.sharing_by_key(&hex_sha256(head))
+    }
+
+    fn sharing_by_key(&self, key: &str) -> Vec<Vec<u8>> {
         let Some(list) = self
             .store
-            .read(&Path::new(HEADS).join(hex_sha256(head)), HEADS_INDEX_BYTES)
+            .read(&Path::new(HEADS).join(key), HEADS_INDEX_BYTES)
             .ok()
             .flatten()
         else {
@@ -372,7 +376,12 @@ impl HeaderCache {
     pub(crate) async fn lend_or_claim(&self, head: &[u8]) -> Lending {
         let key = hex_sha256(head);
         loop {
-            let lent = self.sharing(head);
+            let cache = self.clone();
+            let lookup_key = key.clone();
+            let lent = magnitude_service_utils::blocking::run(move || {
+                cache.sharing_by_key(&lookup_key)
+            })
+            .await;
             if !lent.is_empty() {
                 return Lending::Lent(lent);
             }

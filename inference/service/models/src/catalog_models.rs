@@ -22,7 +22,7 @@ use crate::catalog_installations::ManagedCatalogInstallations;
 use crate::custom_models::{CatalogDrafterFit, DrafterContent};
 use crate::inventory::{
     InstalledPackageRecord, InstalledPackagesObserver, catalog_packages, catalog_projector_package,
-    catalog_store_packages, catalog_target,
+    catalog_store_packages, catalog_target, origin_precedence,
 };
 use crate::model_domains::{ModelDomainResolver, domain_changes};
 use crate::model_projection::{
@@ -274,12 +274,10 @@ impl ModelDomainResolver {
     }
 
     pub fn catalog_snapshot(&self) -> Result<CatalogModelsResponse, InventoryError> {
-        let installed = self.inventory.catalog_packages_response()?;
-        let present = installed
-            .packages
-            .iter()
-            .map(|entry| (entry.package.id.clone(), entry))
-            .collect::<BTreeMap<_, _>>();
+        let (revision, reconciliation_complete) = {
+            let response = self.inventory.installed_packages_response()?;
+            (response.revision, response.reconciliation_complete)
+        };
         let affiliations = self
             .inventory
             .catalog_affiliations
@@ -316,35 +314,48 @@ impl ModelDomainResolver {
             .map(|file| file.id.clone())
             .chain(found_drafter_files)
             .collect::<BTreeSet<_>>();
-        let occurrence_origins = records
-            .records
-            .values()
-            .filter(|record| !self.inventory.hidden_occurrence(record))
-            .fold(
-                BTreeMap::<ModelPackageId, InstallationOrigins>::new(),
-                |mut origins, record| {
-                    origins
-                        .entry(record.installed.package.id.clone())
-                        .or_default()
-                        .include(record.installed.origin);
-                    origins
-                },
-            );
-        let mut occurrence_origins = occurrence_origins;
+        let mut present_packages = BTreeMap::<ModelPackageId, InstalledModelPackage>::new();
+        let mut occurrence_origins = BTreeMap::<ModelPackageId, InstallationOrigins>::new();
+        for record in records.records.values() {
+            if self.inventory.hidden_occurrence(record) {
+                continue;
+            }
+            occurrence_origins
+                .entry(record.installed.package.id.clone())
+                .or_default()
+                .include(record.installed.origin);
+            present_packages
+                .entry(record.installed.package.id.clone())
+                .and_modify(|selected| {
+                    if origin_precedence(record.installed.origin)
+                        < origin_precedence(selected.origin)
+                    {
+                        *selected = record.installed.clone();
+                    }
+                })
+                .or_insert_with(|| record.installed.clone());
+        }
         // A composed target's weights are its found copy's; Magnitude's projector beside them doesn't
         // make Magnitude own the model (see `installation`).
         for (composed, weights, _) in self.inventory.composed_catalog_targets(&records) {
             occurrence_origins
-                .entry(composed.package.id)
+                .entry(composed.package.id.clone())
                 .or_default()
                 .include(weights.installed.origin);
+            present_packages
+                .entry(composed.package.id.clone())
+                .or_insert(composed);
         }
         // The installed-package lock is released before anything else runs and never taken
         // again under it: a reader waiting behind a queued writer while holding it deadlocks.
         drop(records);
+        let present = present_packages
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
         Ok(CatalogModelsResponse {
-            revision: installed.revision + self.catalog_changes.generation.load(Ordering::Acquire),
-            reconciliation_complete: installed.reconciliation_complete,
+            revision: revision + self.catalog_changes.generation.load(Ordering::Acquire),
+            reconciliation_complete,
             families: crate::catalog::model_families().to_vec(),
             models: self
                 .catalog
@@ -559,7 +570,6 @@ impl ModelDomainResolver {
         &self,
         id: &ModelId,
     ) -> Result<Vec<ModelPackageId>, InventoryError> {
-        let definition = self.catalog_definition(id)?;
         let installed = self.inventory.catalog_packages_response()?;
         let present = installed
             .packages
@@ -574,14 +584,26 @@ impl ModelDomainResolver {
             .entries()
             .cloned()
             .collect::<Vec<_>>();
+        self.catalog_cleanup_package_ids_in(id, &present, &affiliations)
+    }
+
+    pub(crate) fn catalog_cleanup_package_ids_in(
+        &self,
+        id: &ModelId,
+        present: &BTreeMap<ModelPackageId, &InstalledModelPackage>,
+        affiliations: &[magnitude_service_contracts::models::CatalogPackageAffiliation],
+    ) -> Result<Vec<ModelPackageId>, InventoryError> {
+        let definition = self.catalog_definition(id)?;
         let resolution = catalog_resolution(
             definition,
-            &present,
-            &affiliations,
+            present,
+            affiliations,
             &BTreeSet::new(),
             self.catalog_drafter_fit(id),
         );
-        if !resolution.missing_desired_package_ids.is_empty() {
+        if !resolution.missing_desired_package_ids.is_empty()
+            || resolution.superseded_package_ids.is_empty()
+        {
             return Ok(Vec::new());
         }
         // A package holding a current catalog package's weights or drafter is that package's
@@ -622,6 +644,9 @@ impl ModelDomainResolver {
                 })
             })
             .collect::<BTreeSet<_>>();
+        if superseded.is_empty() {
+            return Ok(Vec::new());
+        }
         let records =
             self.inventory.installed_packages.read().map_err(|_| {
                 InventoryError::Internal("installed package lock poisoned".to_owned())
@@ -687,10 +712,54 @@ impl ManagedCatalogModels {
     async fn run_maintenance(self) {
         loop {
             let observed = self.maintenance_generation.load(Ordering::Acquire);
-            for definition in &self.resolver.catalog.models {
-                let model_id = catalog_id(definition);
-                if let Err(error) = self.installations.cleanup_model(&model_id).await {
-                    tracing::warn!(%model_id, %error, "catalog package cleanup failed");
+            let cleanup_plan = (|| -> Result<Vec<(ModelId, Vec<ModelPackageId>)>, InventoryError> {
+                let installed = self.resolver.inventory.catalog_packages_response()?;
+                let present = installed
+                    .packages
+                    .iter()
+                    .map(|entry| (entry.package.id.clone(), entry))
+                    .collect::<BTreeMap<_, _>>();
+                let affiliations = self
+                    .resolver
+                    .inventory
+                    .catalog_affiliations
+                    .read()
+                    .map_err(|_| {
+                        InventoryError::Internal("catalog affiliation lock poisoned".to_owned())
+                    })?
+                    .entries()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut plan = Vec::new();
+                for definition in &self.resolver.catalog.models {
+                    let model_id = catalog_id(definition);
+                    match self
+                        .resolver
+                        .catalog_cleanup_package_ids_in(&model_id, &present, &affiliations)
+                    {
+                        Ok(package_ids) if !package_ids.is_empty() => {
+                            plan.push((model_id, package_ids));
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(%model_id, %error, "catalog package cleanup failed");
+                        }
+                    }
+                }
+                Ok(plan)
+            })();
+            match cleanup_plan {
+                Ok(plan) => {
+                    for (model_id, package_ids) in plan {
+                        if let Err(error) =
+                            self.installations.remove_cleanup_packages(package_ids).await
+                        {
+                            tracing::warn!(%model_id, %error, "catalog package cleanup failed");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "catalog package cleanup snapshot failed");
                 }
             }
             if self.maintenance_generation.load(Ordering::Acquire) != observed {

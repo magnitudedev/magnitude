@@ -1,6 +1,13 @@
 //! Durable local model inventory, storage, and Hugging Face acquisition.
 
 #![cfg_attr(test, allow(clippy::disallowed_methods, reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::large_stack_frames,
+        reason = "libtest's generated main holds a description of each of the crate's tests in its one frame"
+    )
+)]
 
 mod cache;
 pub mod candidate_files;
