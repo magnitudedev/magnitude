@@ -332,7 +332,7 @@ fn a_streamed_decoder_steps_twice_through_its_bank() {
             tokens
         };
         let resident = selections(Banked::Resident);
-        let streamed = selections(Banked::Streamed { numerator: 1, denominator: 2 });
+        let streamed = selections(Banked::Half);
         assert_eq!(streamed, resident, "{backend:?}: a streamed load selects as the resident one");
     }
     std::fs::remove_dir_all(&directory).ok();
@@ -625,19 +625,33 @@ fn pipelined_two_row_passes_claim_their_successors_and_emit_their_unpipelined_to
             let mut passes = Vec::new();
             // The front rows' record of the load.
             let front = |domain: &ExecutorDomain| domain.expert_costs().expect("a banked load's record").front;
+            let mut queued_passes = 0usize;
+            let mut claimed_passes = 0usize;
             for (index, depth) in DEPTHS.into_iter().enumerate() {
                 let rows = two_row.pass(crate::FrontGrant::UpTo(depth));
                 let guesses = rows.guesses().to_vec();
                 let before = front(&domain);
-                assert_eq!(domain.queued_steps(), usize::from(lookahead && index > 0), "{backend:?} pass {index}: the passes queued behind the one before");
+                let queued = domain.queued_steps();
+                if lookahead && index > 0 {
+                    // The bank's watcher may stage a policy update (e.g. the
+                    // hint gate's first flip after timing) and break the
+                    // lookahead pipeline for one boundary via
+                    // `ElasticBank::wants_gap()` so `write_staged()` can update
+                    // device-visible policy words while no step is in flight.
+                    assert!(queued <= 1, "{backend:?} pass {index}: at most one pass queued behind the one before");
+                    queued_passes += queued;
+                } else {
+                    assert_eq!(queued, 0, "{backend:?} pass {index}: no pass is queued");
+                }
                 let operation = front_pass(request, &rows, exact, 2 + index, crate::batching::Demand::NONE);
                 let (mut pending, next, claimed) = launched(&mut domain, bindings, &[operation], backend);
                 let pending = pending.pop().expect("one pass");
                 assert_eq!(
                     claimed,
-                    lookahead && index > 0 && guesses.is_empty(),
+                    queued == 1 && guesses.is_empty(),
                     "{backend:?} pass {index}: whether it claims the queued pass"
                 );
+                claimed_passes += usize::from(claimed);
                 let Outcome::Forward { rows: results, guesses: chain } = pending.outcome().clone() else {
                     panic!("{backend:?}: a pass's outcome")
                 };
@@ -661,6 +675,14 @@ fn pipelined_two_row_passes_claim_their_successors_and_emit_their_unpipelined_to
                 passes.push((rows, exact, chain.clone()));
                 two_row.guessed(chain);
                 bindings = next;
+            }
+            if lookahead {
+                assert!(
+                    queued_passes >= DEPTHS.len() - 3,
+                    "{backend:?}: lookahead queued most passes ({queued_passes}/{})",
+                    DEPTHS.len() - 1
+                );
+                assert!(claimed_passes > 0, "{backend:?}: at least one exact-only pass claimed its queued successor");
             }
             // The guesses the verdicts judged and those that stood, by kind
             // and by depth.
@@ -1030,7 +1052,7 @@ fn scores(
         match banked {
             Banked::Resident => {}
             Banked::Whole => assert_eq!(whole, Some(true), "{backend:?}: the uncapped load holds every expert in its bank"),
-            Banked::Streamed { .. } | Banked::Half => {
+            Banked::Half => {
                 assert_eq!(whole, Some(false), "{backend:?}: the capped load banks part of its experts")
             }
         }
@@ -1164,7 +1186,7 @@ fn a_streamed_load_runs_its_prompt_groups_then_decodes() {
             steps.iter().filter_map(|(bits, _)| bits.last().and_then(|(_, _, selected)| *selected)).collect::<Vec<_>>()
         };
         let resident = selected(Banked::Resident);
-        let streamed = selected(Banked::Streamed { numerator: 1, denominator: 2 });
+        let streamed = selected(Banked::Half);
         assert_eq!(streamed, resident, "{backend:?}: a streamed load's prompt groups select as the resident load's");
     }
     std::fs::remove_dir_all(&directory).ok();

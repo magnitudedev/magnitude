@@ -420,18 +420,18 @@ pub(crate) fn limits(rows: usize, lookahead: bool, chain_capacity: usize, logits
     }
 }
 
-/// How a load holds its routed experts: resident, streamed through an
-/// expert bank whose weights stay within a share of the resident load's,
-/// in a bank as an uncapped load holds them, or in a bank of about half
-/// the slots.
+/// How a load holds its routed experts: resident, in a bank as an uncapped
+/// load holds them, or in a partial bank of about half the slots.
 #[derive(Clone, Copy)]
 pub(crate) enum Banked {
     Resident,
-    /// The bank's cap as a fraction of the resident load's allocation.
-    Streamed { numerator: u64, denominator: u64 },
     /// No cap.
     Whole,
-    /// Capped at the whole bank's weights less half its slots'.
+    /// Capped at about half the bank's slots, derived from the planner's own
+    /// granule-charged `resident_charge` and bounded below resident weight
+    /// bytes (falling back to the planner's exact `PlanError::WeightBound::needed`
+    /// when below the bank's minimum) so a fitting partial bank never falls
+    /// back to resident placement.
     Half,
 }
 
@@ -572,22 +572,32 @@ impl Banked {
     ) -> crate::ExecutionPlanDraft {
         match self {
             Banked::Resident => draft,
-            Banked::Streamed { numerator, denominator } => {
-                let resident = draft.allocation_bytes(definition).unwrap();
-                draft
-                    .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(resident * numerator / denominator)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
-                    .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
-                    .into_draft()
-            }
             Banked::Whole => draft.with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft(),
             Banked::Half => {
-                let whole = draft.clone().with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft();
-                let bank = whole.load().expert_bank().unwrap_or_else(|| panic!("{backend:?}: the uncapped load banks its experts"));
+                let prices = crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices());
+                let whole = draft
+                    .clone()
+                    .with_bank::<crate::AssessmentMemoryCharge>(definition, None, &prices)
+                    .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
+                    .into_draft();
+                let bank = whole
+                    .load()
+                    .expert_bank()
+                    .unwrap_or_else(|| panic!("{backend:?}: the uncapped load banks its experts"));
+                let whole_bytes = whole.load().weight_bytes().unwrap();
                 let widest = bank.widest().get();
-                let saved = bank.resident_charge(widest).unwrap() - bank.resident_charge(widest / 2).unwrap();
-                let half = whole.load().weight_bytes().unwrap() - saved;
-                let cap = half.min(draft.load().weight_bytes().unwrap() - 1);
-                draft.with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(cap)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft()
+                let whole_charge = bank.resident_charge(widest).unwrap();
+                let target_bytes = whole_bytes - (whole_charge - bank.resident_charge(widest / 2).unwrap());
+                let resident = draft.load().weight_bytes().unwrap();
+                let cap = target_bytes.min(resident.saturating_sub(1));
+                match draft.clone().with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(cap)), &prices) {
+                    Ok(planned) => planned.into_draft(),
+                    Err(crate::PlanError::WeightBound { needed, .. }) => draft
+                        .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(needed)), &prices)
+                        .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
+                        .into_draft(),
+                    Err(error) => panic!("{backend:?}: {error}"),
+                }
             }
         }
     }
