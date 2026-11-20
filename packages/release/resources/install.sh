@@ -417,8 +417,8 @@ absorb_cli_install() {
 }
 
 install_desktop_macos() {
-  printf '\nInstalling Magnitude\nmacOS · %s\n\n' "$arch" >&2
   require_macos
+  printf '\nInstalling Magnitude\nmacOS · %s\n\n' "$arch" >&2
   read_mac_offer mac-zip
   finish_progress "Found Magnitude $version"
   download "$url" "$scratch/magnitude.zip" "$bytes" 'Downloading app' 'Downloaded app'
@@ -444,8 +444,8 @@ install_desktop_macos() {
 }
 
 install_desktop_linux() {
-  printf '\nInstalling Magnitude\nLinux · %s\n\n' "$arch" >&2
   require_glibc
+  printf '\nInstalling Magnitude\nLinux · %s\n\n' "$arch" >&2
   if command -v apt-get >/dev/null 2>&1; then package=deb
   elif command -v dnf >/dev/null 2>&1; then package=rpm
   elif command -v pacman >/dev/null 2>&1; then package=pacman
