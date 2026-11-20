@@ -157,16 +157,34 @@ impl NativeSubmission<Metal> for MetalSubmission {
         self.synchronize()
     }
 
-    fn submit(self) -> Self::Execution {
+    fn submit(mut self) -> Self::Execution {
         MetalExecution {
-            pending: self.pending,
+            pending: std::mem::take(&mut self.pending),
         }
+    }
+}
+
+impl Drop for MetalSubmission {
+    /// Complete any committed commands still in flight if the submission drops
+    /// without being submitted (e.g. error return or unwind), so caller storage
+    /// is never freed while the GPU still reads it.
+    fn drop(&mut self) {
+        let _ = complete_pending(&mut self.pending);
     }
 }
 
 impl NativeExecution for MetalExecution {
     fn complete(&mut self) -> Result<(), ExecutionError> {
         complete_pending(&mut self.pending)
+    }
+}
+
+impl Drop for MetalExecution {
+    /// Complete any committed commands still in flight if the execution drops
+    /// before `complete()` runs, so caller storage is never freed while the
+    /// GPU still reads it.
+    fn drop(&mut self) {
+        let _ = complete_pending(&mut self.pending);
     }
 }
 
@@ -631,6 +649,40 @@ mod completion_tests {
 
         assert_eq!(completed, vec![0, 1, 2, 3]);
         assert_eq!(error, ExecutionError::SynchronizationFailed("first".into()));
+    }
+
+    #[test]
+    fn dropping_submission_or_execution_completes_pending_commands() {
+        let device = metal_device();
+        let pipeline = capture_pipeline(&device);
+        let output = device.allocate_bytes(2 * 8, &crate::test_support::entry()).unwrap();
+        let table = RuntimeBuffer {
+            tensor: None,
+            buffer: MetalBuffer::clone(&device.allocate_bytes(32, &crate::test_support::entry()).unwrap()),
+            base_offset: 0,
+            accessible_bytes: 16,
+        };
+
+        // Dropping MetalSubmission without submit() waits for its pending work.
+        {
+            let mut submission = MetalExecutor::new(device.clone())
+                .begin_submission()
+                .unwrap();
+            capture_words(&mut submission, &pipeline, &table, &output, [0, 42]);
+            assert_eq!(submission.pending.len(), 1);
+        }
+        assert_eq!(captured_words(&device, &output)[0], 42);
+
+        // Dropping MetalExecution without complete() waits for its pending work.
+        {
+            let mut submission = MetalExecutor::new(device.clone())
+                .begin_submission()
+                .unwrap();
+            capture_words(&mut submission, &pipeline, &table, &output, [1, 99]);
+            let execution = submission.submit();
+            assert_eq!(execution.pending.len(), 1);
+        }
+        assert_eq!(captured_words(&device, &output)[1], 99);
     }
 }
 
