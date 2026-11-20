@@ -93,6 +93,33 @@ pub(crate) fn pooled<R>(work: impl FnOnce() -> R) -> R {
     objc2::rc::autoreleasepool(|_| work())
 }
 
+/// Metal requires `setThreadgroupMemoryLength:atIndex:` lengths to be
+/// multiples of 16 bytes.
+pub(crate) const THREADGROUP_MEMORY_ALIGNMENT: u64 = 16;
+
+/// Round a threadgroup memory byte length up to Metal's required 16-byte
+/// multiple (`0` stays `0`). Returns `None` on `u64` overflow.
+pub(crate) fn checked_threadgroup_memory_bytes(bytes: u64) -> Option<u64> {
+    bytes.checked_next_multiple_of(THREADGROUP_MEMORY_ALIGNMENT)
+}
+
+/// Bind dynamic threadgroup memory on `encoder` at `index`, rounding `bytes`
+/// up to Metal's required 16-byte multiple. No-op when `bytes == 0`.
+pub(crate) unsafe fn set_threadgroup_memory_length(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    bytes: u64,
+    index: usize,
+) {
+    use objc2_metal::MTLComputeCommandEncoder;
+    if bytes != 0 {
+        let aligned = checked_threadgroup_memory_bytes(bytes)
+            .expect("validated threadgroup memory length fits u64");
+        let aligned = usize::try_from(aligned)
+            .expect("validated threadgroup memory length fits usize");
+        unsafe { encoder.setThreadgroupMemoryLength_atIndex(aligned, index) };
+    }
+}
+
 /// The Metal backend.
 #[derive(Debug)]
 pub struct Metal;
@@ -311,3 +338,23 @@ mod plane_tests;
 
 #[cfg(test)]
 mod intrinsic_plane_tests;
+
+#[cfg(test)]
+mod threadgroup_memory_tests {
+    use super::checked_threadgroup_memory_bytes;
+
+    #[test]
+    fn rounds_up_to_16_byte_multiple_and_detects_overflow() {
+        assert_eq!(checked_threadgroup_memory_bytes(0), Some(0));
+        assert_eq!(checked_threadgroup_memory_bytes(1), Some(16));
+        assert_eq!(checked_threadgroup_memory_bytes(15), Some(16));
+        assert_eq!(checked_threadgroup_memory_bytes(16), Some(16));
+        assert_eq!(checked_threadgroup_memory_bytes(17), Some(32));
+        assert_eq!(checked_threadgroup_memory_bytes(31), Some(32));
+        assert_eq!(checked_threadgroup_memory_bytes(32), Some(32));
+        let max_aligned = u64::MAX - (u64::MAX % 16);
+        assert_eq!(checked_threadgroup_memory_bytes(max_aligned), Some(max_aligned));
+        assert_eq!(checked_threadgroup_memory_bytes(max_aligned + 1), None);
+        assert_eq!(checked_threadgroup_memory_bytes(u64::MAX), None);
+    }
+}

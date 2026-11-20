@@ -23,6 +23,7 @@
 
 pub mod blocks;
 pub mod candidate_domain;
+pub mod direct_launch;
 pub mod errors;
 pub mod evaluation;
 pub mod executable;

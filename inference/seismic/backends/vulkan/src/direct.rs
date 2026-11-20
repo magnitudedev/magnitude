@@ -15,6 +15,9 @@ use crate::device::{
 use crate::formation::DirectModule;
 use crate::memory::{Buffer, Range};
 use ash::vk::{self, Handle};
+use seismic_compiler::direct_launch::{
+    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch,
+};
 use seismic_compiler::errors::ExecutionError;
 use seismic_native_target::{GateOpening, ParkAnswer};
 use seismic_compiler::graph_cost::GraphCensus;
@@ -55,10 +58,11 @@ impl DirectLaunch<'_> {
         }
     }
 
-    /// Whether the launch does no device work (an empty grid): it is
-    /// recorded as nothing.
+    /// Whether the launch does no device work (an empty direct grid): it is
+    /// recorded as nothing. An indirect launch's grid comes from its GPU
+    /// buffer, so it is never empty on the host.
     pub fn is_empty(&self) -> bool {
-        self.groups.contains(&0)
+        self.grid.is_none() && self.groups.contains(&0)
     }
 
     /// The launch's argument block: each buffer's address, the
@@ -153,6 +157,12 @@ fn push_constants(arguments: u64, tables: u64) -> [u8; 16] {
     bytes
 }
 
+/// How a validated Vulkan direct launch dispatches.
+enum Dispatch<'a> {
+    Direct([u32; 3]),
+    Indirect(&'a Buffer, u64),
+}
+
 /// Record one launch: its barrier after the previous launch's writes, the
 /// pipeline, the argument block and tables addresses, the dispatch.
 unsafe fn record_launch(
@@ -160,7 +170,7 @@ unsafe fn record_launch(
     command: vk::CommandBuffer,
     launch: &DirectLaunch<'_>,
     address: u64,
-    groups: [u32; 3],
+    dispatch: Dispatch<'_>,
     first: bool,
 ) {
     let raw = &device.inner.device;
@@ -179,12 +189,12 @@ unsafe fn record_launch(
         0,
         &push_constants(address, device.tables()),
     );
-    match launch.grid {
-        Some((buffer, offset)) => {
+    match dispatch {
+        Dispatch::Indirect(buffer, offset) => {
             let range = buffer.range();
             raw.cmd_dispatch_indirect(command, range.raw(), range.offset() + offset);
         }
-        None => raw.cmd_dispatch(command, groups[0], groups[1], groups[2]),
+        Dispatch::Direct(groups) => raw.cmd_dispatch(command, groups[0], groups[1], groups[2]),
     }
 }
 
@@ -201,23 +211,39 @@ unsafe fn compute_barrier(raw: &ash::Device, command: vk::CommandBuffer) {
     );
 }
 
-/// The group counts of a non-empty launch, checked against the device.
-fn groups(device: &Device, launch: &DirectLaunch<'_>) -> Result<Option<[u32; 3]>, ExecutionError> {
-    if launch.groups.contains(&0) {
-        return Ok(None);
+/// Validate a launch against the device's limits and return its dispatch mode
+/// (`None` when an empty direct launch should be skipped).
+fn validate_launch<'a>(
+    device: &Device,
+    launch: &DirectLaunch<'a>,
+) -> Result<Option<Dispatch<'a>>, ExecutionError> {
+    let contract = DirectLaunchContract {
+        max_buffer_slots: None,
+        max_grid: device.info().limits.max_group_count,
+        max_group_size: None,
+        max_group_threads: None,
+        max_shared_bytes: None,
+        max_param_bytes: Some(ARGUMENT_CHUNK_BYTES),
+    };
+    let request = DirectLaunchRequest {
+        buffer_slots: 0,
+        grid: match launch.grid {
+            Some(_) => LaunchGrid::Indirect,
+            None => LaunchGrid::Direct(launch.groups),
+        },
+        group: None,
+        static_shared_bytes: 0,
+        dynamic_shared_bytes: 0,
+        param_bytes: argument_block_bytes(launch.buffers.len() as u64, launch.words.len() as u64),
+    };
+    match contract.validate(&request)? {
+        ValidatedLaunch::Empty => Ok(None),
+        ValidatedLaunch::Active { grid, .. } => Ok(Some(match (launch.grid, grid) {
+            (Some((buffer, offset)), None) => Dispatch::Indirect(buffer, offset),
+            (None, Some(groups)) => Dispatch::Direct(groups),
+            _ => unreachable!("DirectLaunchContract matches LaunchGrid variant"),
+        })),
     }
-    let limit = device.info().limits.max_group_count;
-    let mut groups = [0u32; 3];
-    for axis in 0..3 {
-        if launch.groups[axis] > limit[axis] {
-            return Err(ExecutionError::SubmissionFailed(format!(
-                "native launch requests {} groups on axis {axis}; the device allows {}",
-                launch.groups[axis], limit[axis]
-            )));
-        }
-        groups[axis] = launch.groups[axis] as u32;
-    }
-    Ok(Some(groups))
 }
 
 fn begin(
@@ -331,10 +357,10 @@ impl DirectGraphBuilder {
         self.begin_segment()
     }
 
-    /// Append a launch after every launch added before it; an empty grid
-    /// adds nothing.
+    /// Append a launch after every launch added before it; an empty direct
+    /// grid adds nothing.
     pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
-        let Some(groups) = groups(&self.device, launch)? else {
+        let Some(dispatch) = validate_launch(&self.device, launch)? else {
             return Ok(());
         };
         let mut recording = self.device.recording()?;
@@ -346,7 +372,7 @@ impl DirectGraphBuilder {
                 self.command(),
                 launch,
                 address,
-                groups,
+                dispatch,
                 !self.launched,
             )
         };
@@ -943,7 +969,7 @@ impl<T: Timing> DirectBatch<T> {
     }
 
     pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
-        let Some(groups) = groups(&self.device, launch)? else {
+        let Some(dispatch) = validate_launch(&self.device, launch)? else {
             self.skip();
             return Ok(());
         };
@@ -951,7 +977,7 @@ impl<T: Timing> DirectBatch<T> {
         let mut recording = device.recording()?;
         let address = self.arguments.write(&device, &mut recording, launch)?;
         if self.timing.mark(&device.inner.device, self.command, self.launched) {
-            unsafe { record_launch(&device, self.command, launch, address, groups, true) };
+            unsafe { record_launch(&device, self.command, launch, address, dispatch, true) };
         } else {
             unsafe {
                 record_launch(
@@ -959,7 +985,7 @@ impl<T: Timing> DirectBatch<T> {
                     self.command,
                     launch,
                     address,
-                    groups,
+                    dispatch,
                     !self.launched,
                 )
             };

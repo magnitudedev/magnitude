@@ -324,6 +324,12 @@ impl MetalSubmission {
         let result_base_offset = results.base_offset;
         let participant = scratch_buffer(scratch.allocation(LaunchLocalKind::Participant), env);
         let registers = scratch_buffer(scratch.allocation(LaunchLocalKind::Register), env);
+        let threadgroup_bytes =
+            crate::checked_threadgroup_memory_bytes(total_values[0]).ok_or_else(|| {
+                ExecutionError::SubmissionFailed(
+                    "Metal threadgroup memory length overflowed".into(),
+                )
+            })?;
 
         let command = crate::pooled(|| {
             let command = self.device.command_buffer().ok_or_else(|| {
@@ -352,7 +358,7 @@ impl MetalSubmission {
                 );
                 set_optional_buffer(&encoder, participant, first_aux + 2);
                 set_optional_buffer(&encoder, registers, first_aux + 3);
-                encoder.setThreadgroupMemoryLength_atIndex(total_values[0] as usize, 0);
+                crate::set_threadgroup_memory_length(&encoder, threadgroup_bytes, 0);
             }
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {

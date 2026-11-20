@@ -6,6 +6,7 @@ use crate::buffer::Buffer;
 use crate::driver::{self, DriverError, Event, Handle, JitError, Module};
 use crate::executor::Device;
 use crate::nvrtc::NvrtcError;
+use seismic_compiler::direct_launch::{DirectLaunchRequest, LaunchGrid, ValidatedLaunch};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::graph_cost::GraphCensus;
 use seismic_native_target::{NativeCompilationError, ProgramStatistic, StatisticValue};
@@ -286,13 +287,46 @@ impl FormedLaunch {
     /// grid is formed as one block, which the driver requires of any node.
     fn form(device: &Device, launch: &DirectLaunch<'_>, enabled: bool) -> Result<Self, ExecutionError> {
         let function = &launch.module.functions[launch.function];
-        let threads = launch.block.iter().product::<u64>();
-        if threads > function.max_threads {
-            return Err(ExecutionError::SubmissionFailed(format!(
-                "native launch requests {threads} threads per block, but the function allows {}",
-                function.max_threads
-            )));
-        }
+        let grid = match enabled {
+            true => launch.grid,
+            false => launch.grid.map(|blocks| blocks.max(1)),
+        };
+        let block = match enabled {
+            true => launch.block,
+            false => launch.block.map(|threads| threads.max(1)),
+        };
+        // The prefix declares at least one word, so an entry without words
+        // still passes one zeroed word.
+        let words_bytes = if launch.words.is_empty() {
+            8u64
+        } else {
+            launch.words.len() as u64
+        };
+        let param_bytes = (launch.buffers.len() as u64)
+            .checked_add(1)
+            .and_then(|pointers| pointers.checked_mul(8))
+            .and_then(|pointer_bytes| pointer_bytes.checked_add(words_bytes))
+            .ok_or_else(|| {
+                ExecutionError::SubmissionFailed("native launch parameter size overflowed".into())
+            })?;
+        let ValidatedLaunch::Active {
+            grid: Some(grid),
+            group: Some(block),
+        } = device
+            .launch_contract(function.max_threads)
+            .validate(&DirectLaunchRequest {
+                buffer_slots: 0,
+                grid: LaunchGrid::Direct(grid),
+                group: Some(block),
+                static_shared_bytes: function.static_shared,
+                dynamic_shared_bytes: launch.shared_bytes,
+                param_bytes,
+            })?
+        else {
+            return Err(ExecutionError::SubmissionFailed(
+                "native launch has an empty grid or block".into(),
+            ));
+        };
         function.admit_shared(device, launch.shared_bytes)?;
         let mut pointers = Vec::with_capacity(launch.buffers.len() + 1);
         pointers.extend(
@@ -306,36 +340,19 @@ impl FormedLaunch {
                 .scalar_results
                 .map_or(0, |(buffer, offset)| buffer.pointer() + offset),
         );
-        // The prefix declares at least one word, so an entry without words
-        // still passes one zeroed word.
         let words = if launch.words.is_empty() {
             vec![0; 8]
         } else {
             launch.words.to_vec()
         };
-        let dimension = |value: u64| {
-            u32::try_from(value).map_err(|_| {
-                ExecutionError::SubmissionFailed("native launch geometry exceeds driver ABI".into())
-            })
-        };
-        let axes = |values: [u64; 3]| -> Result<[u32; 3], ExecutionError> {
-            Ok([
-                dimension(values[0])?,
-                dimension(values[1])?,
-                dimension(values[2])?,
-            ])
-        };
+        let shared_bytes = u32::try_from(launch.shared_bytes).map_err(|_| {
+            ExecutionError::SubmissionFailed("native launch geometry exceeds driver ABI".into())
+        })?;
         Ok(Self {
             function: function.raw,
-            grid: axes(match enabled {
-                true => launch.grid,
-                false => launch.grid.map(|blocks| blocks.max(1)),
-            })?,
-            block: axes(match enabled {
-                true => launch.block,
-                false => launch.block.map(|threads| threads.max(1)),
-            })?,
-            shared_bytes: dimension(launch.shared_bytes)?,
+            grid,
+            block,
+            shared_bytes,
             pointers,
             words,
             edge: launch.module.edge,

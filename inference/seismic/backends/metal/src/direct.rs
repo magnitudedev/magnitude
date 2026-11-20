@@ -13,6 +13,9 @@ use objc2_metal::{
     MTLDevice, MTLDispatchType, MTLEvent,
     MTLResourceUsage, MTLSharedEvent, MTLSize, MTLStorageMode,
 };
+use seismic_compiler::direct_launch::{
+    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch,
+};
 use seismic_compiler::errors::ExecutionError;
 
 /// Metal's `setBytes` limit, which bounds a direct entry's argument words.
@@ -20,7 +23,7 @@ pub const DIRECT_WORD_BYTES_LIMIT: usize = 4096;
 
 /// Metal's buffer argument table size, which bounds a direct entry's
 /// buffers, argument words and scalar-result slots together.
-pub const DIRECT_BUFFER_SLOTS: usize = 31;
+pub const DIRECT_BUFFER_SLOTS: usize = crate::device_info::ARGUMENT_TABLE_ENTRIES as usize;
 
 /// One kernel function of an authored Metal library, compiled into a
 /// pipeline.
@@ -66,10 +69,12 @@ pub struct DirectLaunch<'a> {
 }
 
 impl DirectLaunch<'_> {
-    /// Whether the launch's grid is empty: it does no device work and
-    /// encodes nothing.
+    /// Whether the launch's grid or threadgroup is empty: it does no device
+    /// work and encodes nothing. An indirect launch's grid comes from its GPU
+    /// buffer, so only an empty threadgroup makes it empty on the host.
     pub fn is_empty(&self) -> bool {
-        self.threadgroups.contains(&0) || self.threads_per_threadgroup.contains(&0)
+        (self.grid.is_none() && self.threadgroups.contains(&0))
+            || self.threads_per_threadgroup.contains(&0)
     }
 }
 
@@ -1070,23 +1075,43 @@ impl DirectBatch {
             self.skip();
             return Ok(());
         }
-        let threads = launch
-            .threads_per_threadgroup
-            .iter()
-            .try_fold(1u64, |product, value| product.checked_mul(*value))
-            .ok_or_else(|| {
-                ExecutionError::SubmissionFailed("native threadgroup size overflowed".into())
+        let dynamic_shared_bytes =
+            crate::checked_threadgroup_memory_bytes(launch.threadgroup_bytes).ok_or_else(|| {
+                ExecutionError::SubmissionFailed(
+                    "native threadgroup memory size overflowed".into(),
+                )
             })?;
-        if threads > launch.pipeline.max_threads_per_threadgroup() {
-            return Err(ExecutionError::SubmissionFailed(format!(
-                "native launch requests {threads} threads per threadgroup, but the pipeline allows {}",
-                launch.pipeline.max_threads_per_threadgroup()
-            )));
-        }
-        if launch.words.len() > DIRECT_WORD_BYTES_LIMIT {
-            return Err(ExecutionError::SubmissionFailed(
-                "native ABI words exceed Metal setBytes limit".into(),
-            ));
+        let raw = self.device.handle().raw();
+        let max_size = raw.maxThreadsPerThreadgroup();
+        let contract = DirectLaunchContract {
+            max_buffer_slots: Some(DIRECT_BUFFER_SLOTS),
+            max_grid: [crate::device_info::MSL_GRID_INDEX_MAX; 3],
+            max_group_size: Some([
+                max_size.width as u64,
+                max_size.height as u64,
+                max_size.depth as u64,
+            ]),
+            max_group_threads: Some(launch.pipeline.max_threads_per_threadgroup()),
+            max_shared_bytes: Some(raw.maxThreadgroupMemoryLength() as u64),
+            max_param_bytes: Some(DIRECT_WORD_BYTES_LIMIT as u64),
+        };
+        let buffer_slots = launch.buffers.len().checked_add(2).ok_or_else(|| {
+            ExecutionError::SubmissionFailed("native buffer slot count overflowed".into())
+        })?;
+        let request = DirectLaunchRequest {
+            buffer_slots,
+            grid: match launch.grid {
+                Some(_) => LaunchGrid::Indirect,
+                None => LaunchGrid::Direct(launch.threadgroups),
+            },
+            group: Some(launch.threads_per_threadgroup),
+            static_shared_bytes: launch.pipeline.static_threadgroup_bytes(),
+            dynamic_shared_bytes,
+            param_bytes: launch.words.len() as u64,
+        };
+        if matches!(contract.validate(&request)?, ValidatedLaunch::Empty) {
+            self.skip();
+            return Ok(());
         }
         if let Encoding::Timed {
             lease: Some(lease), ..
@@ -1243,11 +1268,7 @@ fn encode_launch(
             launch.buffers.len() + 1,
         );
     }
-    if launch.threadgroup_bytes != 0 {
-        // Metal requires threadgroup memory lengths in multiples of 16.
-        let bytes = launch.threadgroup_bytes.div_ceil(16) * 16;
-        unsafe { encoder.setThreadgroupMemoryLength_atIndex(bytes as usize, 0) };
-    }
+    unsafe { crate::set_threadgroup_memory_length(encoder, launch.threadgroup_bytes, 0) };
     let threads = MTLSize {
         width: launch.threads_per_threadgroup[0] as usize,
         height: launch.threads_per_threadgroup[1] as usize,

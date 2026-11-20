@@ -113,6 +113,53 @@ impl KernelAbiModel<Cuda> for CudaKernelAbi {
 const KERNEL_PARAMETER_BYTES_LARGE: u64 = 32_764;
 const KERNEL_PARAMETER_BYTES_CLASSIC: u64 = 4_096;
 
+pub(crate) const fn kernel_parameter_bytes(driver_api: DriverApiVersion) -> u64 {
+    if driver_api.0 >= DriverApiVersion::LARGE_PARAMETERS_MINIMUM.0 {
+        KERNEL_PARAMETER_BYTES_LARGE
+    } else {
+        KERNEL_PARAMETER_BYTES_CLASSIC
+    }
+}
+
+/// Per-device CUDA launch limits queried once from driver attributes, shared
+/// by target discovery and direct launch validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceLaunchLimits {
+    pub(crate) max_grid: [u64; 3],
+    pub(crate) max_block: [u64; 3],
+    pub(crate) max_shared_bytes: u64,
+    pub(crate) max_param_bytes: u64,
+}
+
+impl DeviceLaunchLimits {
+    pub(crate) fn query(driver: &Driver, ordinal: c_int) -> Result<Self, TargetError> {
+        let unsigned = |key: i32| -> Result<u64, TargetError> {
+            let value = driver.attribute(key, ordinal).map_err(unavailable)?;
+            u32::try_from(value).map(u64::from).map_err(|_| {
+                TargetError::UnsupportedDevice(format!("device attribute {key} reports {value}"))
+            })
+        };
+        let version = driver.version().map_err(unavailable)?;
+        let driver_api = DriverApiVersion(u32::try_from(version).map_err(|_| {
+            TargetError::UnsupportedDriver(format!("driver API version {version}"))
+        })?);
+        Ok(Self {
+            max_grid: [
+                unsigned(attr::MAX_GRID_DIM_X)?,
+                unsigned(attr::MAX_GRID_DIM_Y)?,
+                unsigned(attr::MAX_GRID_DIM_Z)?,
+            ],
+            max_block: [
+                unsigned(attr::MAX_BLOCK_DIM_X)?,
+                unsigned(attr::MAX_BLOCK_DIM_Y)?,
+                unsigned(attr::MAX_BLOCK_DIM_Z)?,
+            ],
+            max_shared_bytes: unsigned(attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+            max_param_bytes: kernel_parameter_bytes(driver_api),
+        })
+    }
+}
+
 /// Documented per-thread local memory limit of every supported compute
 /// capability (CUDA programming guide, compute capability 2.x and later).
 const LOCAL_BYTES_PER_THREAD: u64 = 512 * 1024;
@@ -670,11 +717,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         max_registers_per_block: u64::from(unsigned(attr::MAX_REGISTERS_PER_BLOCK)?),
     }, &Default::default())
     .expect("every CUDA property's source is an attribute the driver reports");
-    let kernel_parameter_bytes = if driver_api >= DriverApiVersion::LARGE_PARAMETERS_MINIMUM {
-        KERNEL_PARAMETER_BYTES_LARGE
-    } else {
-        KERNEL_PARAMETER_BYTES_CLASSIC
-    };
+    let kernel_parameter_bytes = kernel_parameter_bytes(driver_api);
     let global_memory_bytes = memory as u64;
     let specs = CudaDeviceInfo {
         device_ordinal: ordinal,
