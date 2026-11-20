@@ -1102,12 +1102,20 @@ impl Generation {
             return Err("only a head transaction reconciles into method state".into());
         };
         if let magnitude_executor::Outcome::Head { proposals, .. } = outcome {
-            if proposals.iter().any(|selected| {
-                selected.status > 2
-                    || (selected.status == 0
-                        && selected.token.0 as usize >= self.options.vocabulary)
-            }) {
-                return Err("head returned an invalid proposal".into());
+            for &selected in proposals {
+                match selected {
+                    magnitude_executor::Selected::Token(token)
+                        if (token.0 as usize) >= self.options.vocabulary =>
+                    {
+                        return Err("head returned an out-of-vocabulary proposal".into());
+                    }
+                    magnitude_executor::Selected::NonFinite => {
+                        return Err("draft sampling distribution is nonfinite".into());
+                    }
+                    magnitude_executor::Selected::Token(_)
+                    | magnitude_executor::Selected::Empty
+                    | magnitude_executor::Selected::Declined => {}
+                }
             }
         }
         let mut method = self.method.fork_transition();
@@ -1119,7 +1127,7 @@ impl Generation {
             (two_row.as_mut(), operation, outcome)
         {
             if !proposals.is_empty() {
-                decode.guessed(drafted_chain(selected));
+                decode.guessed(drafted_chain(selected)?);
             }
         }
         Ok(PreparedMethodTransition {

@@ -246,26 +246,33 @@ pub(crate) struct Drafted {
     pub(crate) confidence: Option<Vec<f32>>,
 }
 
-/// A head transaction's proposal: its selections up to the first it
-/// selected nothing at, since each drafted proposal conditions on the one
-/// before it.
-pub(crate) fn proposal(selected: &[Selected]) -> Vec<TokenId> {
-    selected
+/// A head transaction's proposal: its leading selected tokens up to the
+/// first empty or declined slot, since each drafted proposal conditions on
+/// the one before it. Any nonfinite selection anywhere in the batch fails
+/// explicitly rather than silently truncating speculation.
+pub(crate) fn proposal(selected: &[Selected]) -> Result<Vec<TokenId>, String> {
+    if selected.contains(&Selected::NonFinite) {
+        return Err("draft sampling distribution is nonfinite".into());
+    }
+    Ok(selected
         .iter()
-        .take_while(|selected| selected.status == 0)
-        .map(|selected| selected.token)
-        .collect()
+        .map_while(|selected| match *selected {
+            Selected::Token(token) => Some(token),
+            Selected::Empty | Selected::Declined => None,
+            Selected::NonFinite => unreachable!("checked above"),
+        })
+        .collect())
 }
 
 /// The chain a head transaction drafted for a head decoding in front
 /// passes, from its selections (`Outcome::Head`'s): its proposal, each the
 /// head's guess. The one reading of a drafted chain, generation's and the
 /// evaluation harness's alike.
-pub fn drafted_chain(selected: &[Selected]) -> Vec<Guess> {
-    proposal(selected)
+pub fn drafted_chain(selected: &[Selected]) -> Result<Vec<Guess>, String> {
+    Ok(proposal(selected)?
         .into_iter()
         .map(|token| Guess { token, kind: GuessKind::Head })
-        .collect()
+        .collect())
 }
 
 impl HeadTransaction {
@@ -317,7 +324,7 @@ impl HeadTransaction {
         {
             return Err("head transaction outcome differs from its transaction".into());
         }
-        let proposal = proposal(&selected);
+        let proposal = proposal(&selected)?;
         Ok(Drafted {
             entered: tokens.len(),
             requested: proposals.len(),

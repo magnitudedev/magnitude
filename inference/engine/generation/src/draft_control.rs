@@ -666,9 +666,6 @@ pub struct DraftController {
     calibration: Vec<Calibration>,
     scored: Vec<bool>,
     blocks: Vec<Block>,
-    /// Seconds of decode time set aside for the next look (see
-    /// [`DraftLoad`]).
-    look_seconds: f64,
     /// Rounds in a row whose verified proposals were all accepted, and the
     /// run of them that earns a look. A look that finds its block right
     /// halves that run and one that finds it wrong doubles it, so looks
@@ -721,7 +718,6 @@ impl DraftController {
     pub fn new(widest: usize, load: Arc<DraftLoad>) -> Self {
         let seed = load.depths.lock().expect("draft load acceptance").clone();
         let look_run = load.look_run.lock().expect("draft load looks").unwrap_or(1);
-        let look_seconds = *load.look_seconds.lock().expect("draft load look time");
         let depths = seed
             .filter(|depths| depths.len() == widest)
             .unwrap_or_else(|| vec![DepthMeans::UNSCORED; widest]);
@@ -739,7 +735,6 @@ impl DraftController {
             calibration,
             scored: vec![false; widest],
             blocks: Vec::new(),
-            look_seconds,
             accepted_run: 0,
             look_run,
             run_look: false,
@@ -972,10 +967,11 @@ impl DraftController {
             });
         let generated = match look {
             Some((generated, gain, lost)) => {
-                self.look_seconds += LOOK_SHARE * gain.min(1.0) * costs.round(fastest, verified);
                 self.run_look = false;
-                if self.look_seconds >= lost {
-                    self.look_seconds = 0.0;
+                let mut set_aside = self.load.look_seconds.lock().expect("draft load look time");
+                *set_aside += LOOK_SHARE * gain.min(1.0) * costs.round(fastest, verified);
+                if *set_aside >= lost {
+                    *set_aside = 0.0;
                     generated
                 } else if self.accepted_run >= self.look_run {
                     self.accepted_run = 0;
@@ -1030,7 +1026,6 @@ impl DraftController {
         if !measuring {
             self.chosen = Some(generated > 0);
         }
-        *self.load.look_seconds.lock().expect("draft load look time") = self.look_seconds;
         let choice = RoundChoice {
             generated,
             verified: 0,

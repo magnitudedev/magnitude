@@ -54,7 +54,7 @@ use std::{
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct BranchPlan {
     branches: BTreeSet<usize>,
-    awaited: Option<usize>,
+    awaited: Option<(RequestId, usize)>,
 }
 
 /// Whether retaining a state at `point` is worth a split prefill chunk and a
@@ -232,8 +232,8 @@ fn selection_charge(operations: &[Operation]) -> usize {
 /// form its regime prices ([`FrontRows`]), within a chained launch's rows
 /// (`ExecutorDomain::chained_rows`), so a decode launch takes the selected
 /// requests alike in this with the first.
-fn chained(candidate: &Candidate) -> bool {
-    matches!(candidate, Candidate::Ready(generation) if generation.chains())
+fn chained(state: &State) -> bool {
+    matches!(state, State::Between(generation, Stage::Ready) if generation.chains())
 }
 
 /// A decode launch's guessed rows (front-row decode): front rows, or a
@@ -377,7 +377,7 @@ fn computes_toward(state: &State, position: usize, resumes: impl FnOnce(&Generat
 /// round: numerical state trails its accepted path.
 fn owes_reconciliation(record: &Record, generation: &Generation) -> bool {
     record.prefix_cache
-        && !record.terminal_retained
+        && record.terminal_retention == TerminalRetention::Pending
         && matches!(
             generation.finish_reason(),
             Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
@@ -390,6 +390,16 @@ fn ended(generation: &Generation) -> bool {
         generation.finish_reason(),
         Some(FinishReason::Cancelled | FinishReason::Failed)
     )
+}
+
+/// Whether a finished request's terminal prefix retention is still owed,
+/// completed, or abandoned after a non-fatal failure during post-finish
+/// reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalRetention {
+    Pending,
+    Retained,
+    Abandoned,
 }
 
 /// What stays with a request wherever its state is.
@@ -405,7 +415,7 @@ struct Record {
     /// work derived from it is submitted.
     prefix_source: Option<u64>,
     prefill_retained: bool,
-    terminal_retained: bool,
+    terminal_retention: TerminalRetention,
     /// Planned branch points, in prompt order: where this request diverges
     /// from a path the engine holds, and the cache points its admission
     /// declared. Prefill stops at each so the cache can retain a state every
@@ -508,9 +518,9 @@ enum WaitsOn {
 }
 
 enum Stage {
-    /// Not resident; a live peer is computing the prefix through this
-    /// position, and this request will resume from it.
-    AwaitingPrefix { through: usize },
+    /// Not resident; a live peer (`producer`) is computing the prefix through
+    /// `through`, and this request will resume from it.
+    AwaitingPrefix { producer: RequestId, through: usize },
     /// Not resident. Selection makes it resident.
     NonResident(Option<Wait>),
     /// Resident; selection starts a round. A finished request waits here for
@@ -628,21 +638,24 @@ enum Candidate {
 }
 
 impl Candidate {
+    fn from_state(state: State) -> Self {
+        match state {
+            State::Between(generation, Stage::Ready) => Self::Ready(generation),
+            State::Between(generation, Stage::NonResident(_)) => Self::NonResident(generation),
+            State::Between(generation, Stage::Pending(work, _)) => Self::Pending(generation, work),
+            State::Parked(round, work, _) => Self::Parked(round, work),
+            State::Between(_, Stage::AwaitingPrefix { .. } | Stage::AwaitingCredit) => {
+                unreachable!("unselectable state reached reservation")
+            }
+        }
+    }
+
     /// The operations already composed for this candidate, which join a
     /// round as they are.
     fn composed(&self) -> Option<&[Operation]> {
         match self {
             Self::Pending(_, work) | Self::Parked(_, work) => Some(&work.0),
             Self::NonResident(_) | Self::Ready(_) => None,
-        }
-    }
-
-    fn generation(&self) -> &Generation {
-        match self {
-            Self::NonResident(generation) | Self::Ready(generation) | Self::Pending(generation, _) => {
-                generation
-            }
-            Self::Parked(round, _) => round.generation(),
         }
     }
 
@@ -665,6 +678,17 @@ enum Start {
 }
 
 fn fail_generation(record: &mut Record, generation: &mut Generation, error: RequestError) {
+    // A request that already reached a normal completion only ran a
+    // post-finish reconciliation round for prefix retention. Failing that
+    // round abandons terminal retention without turning the accepted
+    // completion into a request failure.
+    if matches!(
+        generation.finish_reason(),
+        Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
+    ) {
+        record.terminal_retention = TerminalRetention::Abandoned;
+        return;
+    }
     // Accepted output still precedes the terminal failure on this
     // request's stream. Its reserved permits must survive until that
     // output has drained.
@@ -1588,7 +1612,7 @@ impl<F: ProgramFamily> Service<F> {
             BranchPlan::default()
         };
         let stage = match plan.awaited {
-            Some(through) => Stage::AwaitingPrefix { through },
+            Some((producer, through)) => Stage::AwaitingPrefix { producer, through },
             None => Stage::NonResident(None),
         };
         if self.memory.settled.is_some() {
@@ -1606,7 +1630,7 @@ impl<F: ProgramFamily> Service<F> {
                     prefix_cache,
                     prefix_source: None,
                     prefill_retained: false,
-                    terminal_retained: false,
+                    terminal_retention: TerminalRetention::Pending,
                     branches: plan.branches,
                     publication: Some(sender),
                     retirement: receiver.retirement(),
@@ -1642,22 +1666,22 @@ impl<F: ProgramFamily> Service<F> {
         }
         let mut deepest = self.prefix_cache.shared_boundary(path);
         // The deepest shared prefix a live peer is still prefilling toward
-        // and will cache at its branch point.
-        let mut in_flight = 0;
+        // and will cache at its branch point, with that peer's identity.
+        let mut in_flight: Option<(RequestId, usize)> = None;
         let live = self
             .requests
-            .values_mut()
-            .map(|request| {
-                (&mut request.record, request.state.generation(), Some(&request.state))
+            .iter_mut()
+            .map(|(&id, request)| {
+                (id, &mut request.record, request.state.generation(), Some(&request.state))
             })
             .chain(
                 members
                     .into_iter()
-                    .flat_map(|members| members.values_mut())
-                    .map(|member| (&mut member.record, member.state.generation(), None)),
+                    .flat_map(|members| members.iter_mut())
+                    .map(|(&id, member)| (id, &mut member.record, member.state.generation(), None)),
             )
-            .filter(|(record, ..)| record.prefix_cache);
-        for (record, generation, outside) in live {
+            .filter(|(_, record, ..)| record.prefix_cache);
+        for (peer_id, record, generation, outside) in live {
             let shared = path.shared_with_prompt_of(PrefixPath::of(generation));
             deepest = deepest.max(shared);
             plan_branch(
@@ -1676,8 +1700,8 @@ impl<F: ProgramFamily> Service<F> {
                     }),
                     None => prefilling_toward(generation, stop),
                 };
-                if computes {
-                    in_flight = in_flight.max(stop);
+                if computes && in_flight.is_none_or(|(_, best)| stop > best) {
+                    in_flight = Some((peer_id, stop));
                 }
             }
         }
@@ -1687,11 +1711,13 @@ impl<F: ProgramFamily> Service<F> {
                 awaited: None,
             };
         }
-        if let Some(through) = awaited_prefix(in_flight, deepest, resumed, path.len()) {
+        if let Some((producer, through)) = in_flight.and_then(|(producer, stop)| {
+            awaited_prefix(stop, deepest, resumed, path.len()).map(|through| (producer, through))
+        }) {
             // A peer computes this prefix now: wait for it to be cached.
             return BranchPlan {
                 branches,
-                awaited: Some(through),
+                awaited: Some((producer, through)),
             };
         }
         plan_branch(&mut branches, deepest, resumed, path.len());
@@ -1727,18 +1753,18 @@ impl<F: ProgramFamily> Service<F> {
             .collect()
     }
 
-    /// Whether a live request other than `except` is still prefilling toward
-    /// a planned branch point at `position`.
-    fn prefix_pending(&self, position: usize, except: RequestId) -> bool {
-        self.requests.iter().any(|(&id, request)| {
-            id != except
-                && request.record.prefix_cache
-                && request.record.branches.contains(&position)
-                && computes_toward(&request.state, position, |generation| {
-                    self.prefix_cache
-                        .deepest(PrefixPath::of(generation), generation.resume_bound())
-                })
-        })
+    /// Whether `peer` is a live, prefix-compatible producer still computing
+    /// toward a planned branch point at `through` for `waiter`.
+    fn is_prefix_producer(&self, waiter: &Generation, peer: &Request, through: usize) -> bool {
+        peer.record.prefix_cache
+            && peer.record.branches.contains(&through)
+            && PrefixPath::of(waiter)
+                .shared_with_prompt_of(PrefixPath::of(peer.state.generation()))
+                >= through
+            && computes_toward(&peer.state, through, |generation| {
+                self.prefix_cache
+                    .deepest(PrefixPath::of(generation), generation.resume_bound())
+            })
     }
 
     fn status(&self, request: &Request) -> Status {
@@ -2458,82 +2484,105 @@ impl<F: ProgramFamily> Service<F> {
             && matches!(&request.state, State::Between(_, Stage::NonResident(Some(Wait { on: WaitsOn::Memory, .. }))))
     }
 
-    /// End the waits that have ended, then take the requests selection can
-    /// start out of the map.
-    fn candidates(&mut self) -> BTreeMap<RequestId, (Record, Candidate)> {
+    /// End the waits that have ended in place, then report the requests
+    /// selection can start while keeping every record owner-held in
+    /// `self.requests`.
+    fn selectable_requests(&mut self) -> BTreeSet<RequestId> {
         let epoch = self.epoch;
-        let ended_wait = |wait: Option<Wait>| wait.is_none_or(|wait| epoch.changed_since(wait.at));
         let awaiting = self
             .requests
             .iter()
             .filter_map(|(&id, request)| match request.state {
-                State::Between(_, Stage::AwaitingPrefix { through }) => Some((id, through)),
+                State::Between(_, Stage::AwaitingPrefix { producer, through }) => {
+                    Some((id, producer, through))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
-        for (id, through) in awaiting {
-            let generation = self.requests[&id].state.generation();
+        for (id, producer, through) in awaiting {
+            let waiter = self.requests[&id].state.generation();
             let cached = self
                 .prefix_cache
-                .deepest(PrefixPath::of(generation), generation.resume_bound())
+                .deepest(PrefixPath::of(waiter), waiter.resume_bound())
                 >= through;
-            if cached || !self.prefix_pending(through, id) {
+            if cached {
                 if let State::Between(_, stage) = &mut self.requests.get_mut(&id).unwrap().state {
                     *stage = Stage::NonResident(None);
                 }
+                continue;
+            }
+            if self
+                .requests
+                .get(&producer)
+                .is_some_and(|peer| self.is_prefix_producer(waiter, peer, through))
+            {
+                continue;
+            }
+            let replacement = self
+                .requests
+                .iter()
+                .find(|(&peer_id, peer)| {
+                    peer_id != id && self.is_prefix_producer(waiter, peer, through)
+                })
+                .map(|(&peer_id, _)| peer_id);
+            if let State::Between(_, stage) = &mut self.requests.get_mut(&id).unwrap().state {
+                *stage = match replacement {
+                    Some(producer) => Stage::AwaitingPrefix { producer, through },
+                    None => Stage::NonResident(None),
+                };
             }
         }
-        let selectable = self
-            .requests
-            .iter()
-            .filter(|(_, request)| match &request.state {
+        let mut selectable = BTreeSet::new();
+        for (&id, request) in &mut self.requests {
+            match &mut request.state {
+                State::Between(_, Stage::NonResident(wait) | Stage::Pending(_, wait))
+                | State::Parked(_, _, wait) => {
+                    if wait.is_some_and(|wait| epoch.changed_since(wait.at)) {
+                        *wait = None;
+                    }
+                }
+                State::Between(_, Stage::Ready | Stage::AwaitingPrefix { .. } | Stage::AwaitingCredit) => {}
+            }
+            let ready = match &request.state {
                 State::Between(generation, Stage::Ready) => {
                     generation.finish_reason().is_none()
                         || owes_reconciliation(&request.record, generation)
                 }
-                State::Between(_, Stage::NonResident(wait) | Stage::Pending(_, wait))
-                | State::Parked(_, _, wait) => ended_wait(*wait),
-                State::Between(_, Stage::AwaitingPrefix { .. } | Stage::AwaitingCredit) => false,
-            })
-            .map(|(&id, _)| id)
-            .collect::<Vec<_>>();
+                State::Between(_, Stage::NonResident(None) | Stage::Pending(_, None))
+                | State::Parked(_, _, None) => true,
+                State::Between(
+                    _,
+                    Stage::NonResident(Some(_))
+                    | Stage::Pending(_, Some(_))
+                    | Stage::AwaitingPrefix { .. }
+                    | Stage::AwaitingCredit,
+                )
+                | State::Parked(_, _, Some(_)) => false,
+            };
+            if ready {
+                selectable.insert(id);
+            }
+        }
         selectable
-            .into_iter()
-            .map(|id| {
-                let Request { record, state } = self.requests.remove(&id).expect("selectable");
-                let candidate = match state {
-                    State::Between(generation, Stage::Ready) => Candidate::Ready(generation),
-                    State::Between(generation, Stage::NonResident(_)) => {
-                        Candidate::NonResident(generation)
-                    }
-                    State::Between(generation, Stage::Pending(work, _)) => {
-                        Candidate::Pending(generation, work)
-                    }
-                    State::Parked(round, work, _) => Candidate::Parked(round, work),
-                    State::Between(_, Stage::AwaitingPrefix { .. } | Stage::AwaitingCredit) => {
-                        unreachable!("filtered above")
-                    }
-                };
-                (id, (record, candidate))
-            })
-            .collect()
     }
 
     fn select(&mut self, bindings: &mut StateBindings) -> Result<Selected, Fatal> {
-        let mut candidates = self.candidates();
+        let selectable = self.selectable_requests();
         let mut holder = self.domain.chain_holder();
         // A holder that is no longer scheduled ended mid-chain: its chain
         // concludes, its state the one its reconciled chunks reached.
-        if holder.is_some_and(|holder| !candidates.contains_key(&holder)) {
+        if holder.is_some_and(|holder| !selectable.contains(&holder)) {
             self.domain
                 .conclude_chain()
                 .map_err(|error| (None, classify_domain_error(error)))?;
             holder = None;
         }
-        let operations = candidates
+        let operations = selectable
             .iter()
-            .map(|(&id, (record, candidate))| {
-                let generation = candidate.generation();
+            .map(|&id| {
+                let request = &self.requests[&id];
+                let record = &request.record;
+                let generation = request.state.generation();
                 let reconciliation = owes_reconciliation(record, generation);
                 let prefill = !reconciliation
                     && (!generation.is_resident()
@@ -2560,7 +2609,6 @@ impl<F: ProgramFamily> Service<F> {
         // ledger's cache: they are freed only as it takes them
         // (`ExecutorDomain::release_yielded`), never apart from it.
         let Some(mut selection) = selection else {
-            self.return_candidates(candidates);
             return Ok(Selected::Empty);
         };
         // A decode launch's forwards chain all or none ([`chained`]): it
@@ -2570,12 +2618,18 @@ impl<F: ProgramFamily> Service<F> {
         // out of the selection, uncharged, so its wait carries it ahead of
         // those the launch serves, and it leads a launch of its own kind.
         let chaining = matches!(selection.phase(), Phase::Decode)
-            && selection.requests().first().is_some_and(|id| chained(&candidates[id].1));
+            && selection
+                .requests()
+                .first()
+                .is_some_and(|id| chained(&self.requests[id].state));
         let requests = selection
             .requests()
             .iter()
             .copied()
-            .filter(|id| !matches!(selection.phase(), Phase::Decode) || chained(&candidates[id].1) == chaining)
+            .filter(|id| {
+                !matches!(selection.phase(), Phase::Decode)
+                    || chained(&self.requests[id].state) == chaining
+            })
             .collect::<Vec<_>>();
         // Requests take rows from one phase-wide token budget in selection
         // order. Additional ready requests wait for the next round.
@@ -2603,7 +2657,7 @@ impl<F: ProgramFamily> Service<F> {
         // whichever request drafted them.
         let drafted = requests
             .iter()
-            .filter_map(|id| Some((*id, candidates[id].1.generation().draft_outlook()?)))
+            .filter_map(|id| Some((*id, self.requests[id].state.generation().draft_outlook()?)))
             .collect::<Vec<_>>();
         let outlooks = drafted
             .iter()
@@ -2644,14 +2698,14 @@ impl<F: ProgramFamily> Service<F> {
                     .min(remaining_rows)
             };
             attempted += 1;
-            let (record, candidate) = candidates.remove(&id).expect("selected candidate");
+            let Request { record, state } = self.requests.remove(&id).expect("selected request");
+            let candidate = Candidate::from_state(state);
             // On a fatal error every selected request, started or not, goes
             // back where the owner terminates it with that error: one held
             // here would be dropped without its outcome.
             let reservation = match self.reserve(id, record, candidate, allowance, launch.selections, bindings) {
                 Ok(reservation) => reservation,
                 Err((_, error)) => {
-                    self.return_candidates(candidates);
                     self.return_reserved(reserved);
                     return Err((Some(launch.members), error));
                 }
@@ -2671,11 +2725,9 @@ impl<F: ProgramFamily> Service<F> {
                 }
             };
             if let Err(error) = launch.join(id, start, &mut self.requests) {
-                self.return_candidates(candidates);
                 return Err((Some(launch.members), error));
             }
         }
-        self.return_candidates(candidates);
         if chaining {
             let passes = reserved.iter().map(|(id, round)| (*id, round.front_guess()));
             let fronts = FrontRows::of(passes, budget, |requests, fronted| self.domain.front_pass(requests, fronted));
@@ -2694,9 +2746,9 @@ impl<F: ProgramFamily> Service<F> {
                 return Err((Some(launch.members), error));
             }
         }
-        selection
-            .retain(&requests[..attempted])
-            .map_err(|error| (None, invariant("scheduler")(error)))?;
+        if let Err(error) = selection.retain(&requests[..attempted]) {
+            return Err((Some(launch.members), invariant("scheduler")(error)));
+        }
         if launch.operations.is_empty() {
             self.scheduler.completed(selection, 0);
             return Ok(Selected::Retry);
@@ -2707,18 +2759,6 @@ impl<F: ProgramFamily> Service<F> {
             members: launch.members,
             groups: group(&self.domain, launch.operations).into_iter().collect(),
         }))
-    }
-
-    fn return_candidates(&mut self, candidates: BTreeMap<RequestId, (Record, Candidate)>) {
-        for (id, (record, candidate)) in candidates {
-            self.requests.insert(
-                id,
-                Request {
-                    record,
-                    state: candidate.into_state(),
-                },
-            );
-        }
     }
 
     /// Requests reserved for a launch that then failed go back as they were
@@ -3118,29 +3158,49 @@ impl<F: ProgramFamily> Service<F> {
         self.epoch.advance();
     }
 
-    /// Take `requests` out of `round`, their work in its later groups with
-    /// them, each between rounds and ready, its started round abandoned to
-    /// run again: so a request that stands beside a claim only as a round
-    /// member can be evicted for it.
+    /// Take `requests` out of `round`, preserving any work queued for them in
+    /// its later groups (without a memory wait) so a peer that is not evicted
+    /// resumes that work on the next round, while one that is evicted drops it
+    /// with its state.
     fn withdraw(&mut self, round: &mut Round, requests: &BTreeSet<RequestId>) {
-        // Their work queued in the round's later groups leaves with them.
-        let kept = std::mem::take(&mut round.groups)
-            .into_iter()
-            .flat_map(OperationGroup::into_operations)
-            .filter(|operation| !requests.contains(&operation.request()))
-            .collect();
+        let mut withdrawn = Vec::new();
+        let mut kept = Vec::new();
+        for queued in std::mem::take(&mut round.groups) {
+            let (theirs, others): (Vec<_>, Vec<_>) = queued
+                .into_operations()
+                .into_iter()
+                .partition(|operation| requests.contains(&operation.request()));
+            withdrawn.extend(theirs);
+            kept.extend(others);
+        }
         round.groups = group(&self.domain, kept).into_iter().collect();
         for &request in requests {
             let Some(Member { record, state }) = round.members.remove(&request) else { continue };
-            let generation = match state {
-                Membership::Started(started) => started.abandon(),
-                Membership::Generation(generation) => generation,
+            let theirs = withdrawn
+                .iter()
+                .filter(|operation| operation.request() == request)
+                .cloned()
+                .collect::<Vec<_>>();
+            let state = match Work::new(theirs) {
+                Some(work) => match state {
+                    Membership::Started(started) => State::Parked(started, work, None),
+                    Membership::Generation(generation) => {
+                        State::Between(generation, Stage::Pending(work, None))
+                    }
+                },
+                None => {
+                    let generation = match state {
+                        Membership::Started(started) => started.abandon(),
+                        Membership::Generation(generation) => generation,
+                    };
+                    let stage = match generation.is_resident() {
+                        true => Stage::Ready,
+                        false => Stage::NonResident(None),
+                    };
+                    State::Between(generation, stage)
+                }
             };
-            let stage = match generation.is_resident() {
-                true => Stage::Ready,
-                false => Stage::NonResident(None),
-            };
-            self.requests.insert(request, Request { record, state: State::Between(generation, stage) });
+            self.requests.insert(request, Request { record, state });
         }
     }
 
@@ -3645,7 +3705,10 @@ impl<F: ProgramFamily> Service<F> {
         let Some((record, generation)) = self.between(id) else {
             return Ok(());
         };
-        if record.terminal_retained || !record.prefix_cache || !generation.is_resident() {
+        if record.terminal_retention != TerminalRetention::Pending
+            || !record.prefix_cache
+            || !generation.is_resident()
+        {
             return Ok(());
         }
         match generation.finish_reason() {
@@ -3676,7 +3739,7 @@ impl<F: ProgramFamily> Service<F> {
             _ => return Ok(()),
         }
         self.cache_prefix(id, CachePoint::Terminal)?;
-        self.requests.get_mut(&id).unwrap().record.terminal_retained = true;
+        self.requests.get_mut(&id).unwrap().record.terminal_retention = TerminalRetention::Retained;
         Ok(())
     }
 
@@ -4186,7 +4249,7 @@ mod timing_tests {
         assert!(competes(&request(Stage::NonResident(None)), Status::Runnable));
         assert!(competes(&request(Stage::Ready), Status::Runnable));
         assert!(!competes(
-            &request(Stage::AwaitingPrefix { through: 1 }),
+            &request(Stage::AwaitingPrefix { producer: RequestId(99), through: 1 }),
             Status::Runnable
         ));
         assert!(!competes(
@@ -4210,7 +4273,7 @@ mod timing_tests {
         assert!(!computes_toward(&admitted(), 1, |_| 1));
         assert!(!computes_toward(&admitted(), 1, |_| 2));
         assert!(!computes_toward(
-            &State::Between(generation(), Stage::AwaitingPrefix { through: 1 }),
+            &State::Between(generation(), Stage::AwaitingPrefix { producer: RequestId(99), through: 1 }),
             1,
             |_| 0
         ));
@@ -4340,7 +4403,7 @@ mod pending_retention_tests {
         let state = State::Between(generation, Stage::NonResident(Some(Wait { at: AvailabilityEpoch::default(), on: WaitsOn::Memory })));
         assert!(state.settled().is_some());
         let State::Between(generation, _) = state else { unreachable!() };
-        let state = State::Between(generation, Stage::AwaitingPrefix { through: 1 });
+        let state = State::Between(generation, Stage::AwaitingPrefix { producer: RequestId(99), through: 1 });
         assert!(state.settled().is_some());
     }
 }
@@ -4738,6 +4801,286 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         let ids = admitted.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "unique and in admission order across loads: {ids:?}");
     }
+
+    /// Withdrawing a peer that still has a queued MTP head operation in the
+    /// round preserves that operation as `Stage::Pending(_, None)` so it stays
+    /// evictable if relief needs its slot and otherwise re-enters the next
+    /// round unchanged.
+    #[test]
+    fn withdrawing_a_peer_with_pending_head_work_preserves_and_reselects_it() {
+        let (domain, bindings) = fixtures::fixture(None);
+        let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+        let [peer, grower] = admit(&mut owner, 2)[..] else { unreachable!() };
+        let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
+        let service = &mut owner.service;
+        assert_eq!(residency(service, bindings, peer), Some(true));
+        assert_eq!(residency(service, bindings, grower), Some(true));
+        let head_op = Operation::Head {
+            request: peer,
+            phase: magnitude_executor::HeadPhase::Priming { draft_from: 5 },
+            tokens: vec![TokenId(4)],
+            conditioning: magnitude_executor::FeatureRows::new(vec![0u8; 4].into(), 1).unwrap(),
+            position: 3,
+            proposals: Vec::new(),
+            form: magnitude_executor::DraftForm::Chained,
+        };
+        head_op.validate().unwrap();
+        let Request { record: peer_record, state: State::Between(peer_gen, Stage::Ready) } =
+            service.requests.remove(&peer).unwrap()
+        else {
+            panic!("resident peer");
+        };
+        let Request { record: grower_record, state: State::Between(grower_gen, Stage::Ready) } =
+            service.requests.remove(&grower).unwrap()
+        else {
+            panic!("resident grower");
+        };
+        let Ok(RoundStart::Target(grower_round)) = grower_gen.start_round(grower, 2, FrontGrant::UpTo(0)) else {
+            panic!("grower target round");
+        };
+        let grower_op = lower_round(&grower_round, grower, grower_round.generation().resident_position(), None).unwrap();
+        let selection = service
+            .scheduler
+            .select(
+                &[
+                    ScheduledOperation {
+                        identity: peer,
+                        phase: Phase::Decode,
+                        active: false,
+                        resident: true,
+                        waiting_since_ns: 0,
+                        service_ns: 0,
+                        preemption_debt: 0,
+                        holds_chain: false,
+                    },
+                    ScheduledOperation {
+                        identity: grower,
+                        phase: Phase::Decode,
+                        active: false,
+                        resident: true,
+                        waiting_since_ns: 0,
+                        service_ns: 0,
+                        preemption_debt: 0,
+                        holds_chain: false,
+                    },
+                ],
+                0,
+            )
+            .unwrap()
+            .unwrap();
+        let mut round = Round {
+            selection,
+            started: 0,
+            members: BTreeMap::from([
+                (peer, Member { record: peer_record, state: Membership::Generation(peer_gen) }),
+                (grower, Member { record: grower_record, state: Membership::Started(grower_round) }),
+            ]),
+            groups: group(&service.domain, vec![grower_op, head_op.clone()]).into_iter().collect(),
+        };
+        service.withdraw(&mut round, &BTreeSet::from([peer]));
+        assert!(!round.members.contains_key(&peer));
+        assert!(round.groups.iter().flat_map(|g| g.operations()).all(|op| op.request() == grower));
+        assert!(service.evictable().contains(&peer), "withdrawn peer with pending head work stays evictable");
+        assert!(matches!(
+            &service.requests[&peer].state,
+            State::Between(_, Stage::Pending(work, None)) if work.0 == [head_op.clone()]
+        ));
+        service.scheduler.completed(round.selection, 0);
+        let Ok(Selected::Round(next)) = service.select(bindings) else {
+            panic!("withdrawn peer is re-selected");
+        };
+        let ops = next.groups.iter().flat_map(|g| g.operations()).cloned().collect::<Vec<_>>();
+        assert_eq!(ops, vec![head_op], "withdrawn pending head op is preserved into the next round");
+    }
+
+    /// Failing a post-stop reconciliation round with `WeightRead` abandons
+    /// terminal prefix retention without overwriting the accepted `Stop`
+    /// completion: the owner publishes one `Completed { finish: Stop }`
+    /// outcome, retires the resident slot, and does not retry reconciliation.
+    #[test]
+    fn failed_post_stop_reconciliation_completes_once_and_retires_slot() {
+        use std::task::{Context, Poll, Waker};
+        struct NoFeatures;
+        impl magnitude_executor::FeatureReader for NoFeatures {
+            fn read(&mut self, _: &magnitude_executor::FeatureSpan) -> Result<magnitude_executor::FeatureRows, String> {
+                panic!("plain generation reads no features")
+            }
+        }
+        let (domain, bindings) = fixtures::fixture(None);
+        let vocabulary = fixtures::tiny_definition().decoder.vocabulary as usize;
+        let stop = TokenId((vocabulary - 1) as u32);
+        let capacity = PrefixCacheCapacity { max_entries: 4, workload_state_bytes: u64::MAX };
+        let mut owner = Owner::with_prefix_cache_capacity(domain, bindings, limits(), capacity, Arc::new(NoWakes)).unwrap();
+        let options = Options {
+            max_tokens: 4,
+            output_capacity: 4,
+            context_limit: 8,
+            vocabulary,
+            stop_tokens: BTreeSet::from([stop]),
+            suppressed_tokens: BTreeSet::new(),
+            sampling: Sampling::Greedy,
+            shaping: Shaping { temperature: 0.0, ..Default::default() },
+            seed: 0,
+            forced_quantum: 0,
+            method: MethodChoice::Plain,
+            end_of_generation: EndOfGeneration::Stop,
+            reasoning_budget: None,
+        };
+        let generation = Generation::new(vec![TokenId(1), TokenId(2)], InputLayout::new(2, vec![]).unwrap(), options, None).unwrap();
+        let (id, mut receiver) = owner
+            .admit(generation, PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new() }, 4, 0)
+            .unwrap();
+        let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
+        let service = &mut owner.service;
+        assert_eq!(residency(service, bindings, id), Some(true));
+        let Request { mut record, state: State::Between(generation, Stage::Ready) } =
+            service.requests.remove(&id).unwrap()
+        else {
+            panic!("resident request");
+        };
+        record.clock.serve(Instant::now());
+        let permits = record.publication.as_ref().unwrap().reserve_outputs(1).unwrap();
+        record.publication_permits.extend(permits);
+        let Ok(RoundStart::Target(round)) = generation.start_round(id, 4, FrontGrant::UpTo(0)) else {
+            panic!("prompt target round");
+        };
+        let transition = round.prepare_round_transition(id, &[stop], Vec::new(), None, &mut NoFeatures).unwrap();
+        let (generation, _) = round.commit(transition);
+        assert_eq!(generation.finish_reason(), Some(FinishReason::Stop));
+        assert!(owes_reconciliation(&record, &generation), "post-stop request owes reconciliation");
+        service.requests.insert(id, Request { record, state: State::Between(generation, Stage::Ready) });
+        service.publish_ready().unwrap();
+        assert!(service.requests.contains_key(&id), "blocked on reconciliation before failure");
+        let Ok(Selected::Round(mut round)) = service.select(bindings) else {
+            panic!("reconciliation round is selected");
+        };
+        let group_ = round.groups.pop_front().expect("reconciliation group");
+        service.refuse(
+            &mut round,
+            &group_,
+            RequestError::WeightRead(magnitude_executor::WeightReadError {
+                detail: "simulated weight read failure".into(),
+            }),
+        );
+        service.finish_round(round).unwrap();
+        assert!(!service.requests.contains_key(&id), "request retired after abandoned reconciliation");
+        assert!(!service.domain.holds_state_beside(&BTreeSet::new()), "resident slot released");
+        let mut publications = Vec::new();
+        while let Poll::Ready(Some(publication)) = receiver.poll_next(&mut Context::from_waker(Waker::noop())) {
+            publications.push(publication);
+        }
+        let terminals = publications
+            .iter()
+            .filter(|publication| !matches!(publication, Publication::Output(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1, "exactly one terminal publication: {publications:?}");
+        assert!(
+            matches!(terminals[0], Publication::Completed { finish: FinishReason::Stop, .. }),
+            "completed with Stop, not Failed: {:?}",
+            terminals[0]
+        );
+        assert!(matches!(
+            receiver.poll_next(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(None)
+        ));
+        assert!(matches!(service.select(bindings), Ok(Selected::Empty)), "no reconciliation retry");
+    }
+
+    /// When a waiter's real prefix producer exits while an unrelated prompt
+    /// happens to plan a branch at the same offset `through`, the waiter
+    /// releases immediately instead of remaining stuck in `AwaitingPrefix`.
+    #[test]
+    fn waiter_releases_when_real_prefix_producer_exits_despite_unrelated_branch() {
+        const THROUGH: usize = MIN_BRANCH_GAIN;
+        const PROMPT: usize = THROUGH + 32;
+        let mut definition = fixtures::tiny_definition();
+        definition.decoder.context_limit = 512;
+        let vocabulary = definition.decoder.vocabulary as usize;
+        let (domain, bindings) = fixtures::fixture_of(
+            definition,
+            fixtures::limits(2, 1, false),
+            None,
+            false,
+            magnitude_executor::platform::DeviceRequest::Automatic,
+        );
+        let capacity = PrefixCacheCapacity { max_entries: 4, workload_state_bytes: u64::MAX };
+        let mut owner = Owner::with_prefix_cache_capacity(domain, bindings, limits(), capacity, Arc::new(NoWakes)).unwrap();
+        let make_gen = |tokens: Vec<TokenId>| {
+            let options = Options {
+                max_tokens: 2,
+                output_capacity: 4,
+                context_limit: 512,
+                vocabulary,
+                stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
+                sampling: Sampling::Greedy,
+                shaping: Shaping { temperature: 0.0, ..Default::default() },
+                seed: 0,
+                forced_quantum: 0,
+                method: MethodChoice::Plain,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: None,
+            };
+            Generation::new(tokens, InputLayout::new(PROMPT, vec![]).unwrap(), options, None).unwrap()
+        };
+        let mut producer_tokens = vec![TokenId(1); THROUGH];
+        producer_tokens.resize(PROMPT, TokenId(2));
+        let mut waiter_tokens = vec![TokenId(1); THROUGH];
+        waiter_tokens.resize(PROMPT, TokenId(3));
+        let unrelated_tokens = vec![TokenId(4); PROMPT];
+        let (producer, _rx_producer) = owner
+            .admit(make_gen(producer_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new() }, 4, 0)
+            .unwrap();
+        let (waiter, _rx_waiter) = owner
+            .admit(make_gen(waiter_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new() }, 4, 0)
+            .unwrap();
+        assert!(matches!(
+            owner.service.requests[&waiter].state,
+            State::Between(_, Stage::AwaitingPrefix { producer: p, through }) if p == producer && through == THROUGH
+        ));
+        let (unrelated, _rx_unrelated) = owner
+            .admit(make_gen(unrelated_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: vec![THROUGH] }, 4, 0)
+            .unwrap();
+        assert!(owner.service.requests[&unrelated].record.branches.contains(&THROUGH));
+        owner.cancel(producer);
+        owner.service.publish_ready().unwrap();
+        assert!(!owner.service.requests.contains_key(&producer));
+        let selectable = owner.service.selectable_requests();
+        assert!(selectable.contains(&waiter), "waiter releases immediately when its real producer exits");
+        assert!(matches!(owner.service.requests[&waiter].state, State::Between(_, Stage::NonResident(None))));
+        assert!(selectable.contains(&unrelated));
+    }
+
+    /// When a pre-reservation handoff inside `Service::select` fails, every
+    /// selectable request remains owner-held in `self.requests` so
+    /// `Owner::run` delivers the real error rather than dropping its
+    /// `PublicationSender` (`RequestError::WorkerClosed`).
+    #[test]
+    fn select_failure_delivers_real_error_to_queued_requests() {
+        use std::task::{Context, Poll, Waker};
+        let (domain, bindings) = fixtures::fixture(None);
+        let vocabulary = fixtures::tiny_definition().decoder.vocabulary as usize;
+        let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+        let (first, mut rx1) = owner
+            .admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0)
+            .unwrap();
+        let (_second, mut rx2) = owner
+            .admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0)
+            .unwrap();
+        // A waiting timestamp past `now` causes `scheduler.select` to fail
+        // before the reservation loop.
+        owner.service.requests.get_mut(&first).unwrap().record.waiting_since = 100;
+        let err = owner.run(10).err().expect("select fails with scheduler invariant error");
+        assert!(matches!(err, RequestError::Invariant(ref inv) if inv.context == "scheduler"));
+        for (label, rx) in [("first", &mut rx1), ("second", &mut rx2)] {
+            let Poll::Ready(Some(Publication::Failed(received))) =
+                rx.poll_next(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("{label} request did not receive terminal failure");
+            };
+            assert_eq!(received, err, "{label} request must receive the real error, not WorkerClosed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4820,7 +5163,7 @@ mod front_rows_tests {
         Record {
             waiting_since: 0, service_ns: 0, clock: RequestClock::Waiting, error: None, preemption_debt: 0,
             prefix_cache: false, prefix_source: None,
-            prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
+            prefill_retained: false, terminal_retention: TerminalRetention::Pending, branches: BTreeSet::new(),
             retirement: PublicationQueue::bounded(1, |_| {}).unwrap().1.retirement(),
             publication: None, publication_batch_limit: 4, pending_publication: None,
             publication_permits: VecDeque::new(),
@@ -5261,19 +5604,19 @@ mod front_rows_tests {
     /// does not, so its rows are never held beside chained ones.
     #[test]
     fn only_a_front_pass_chains() {
-        assert!(chained(&Candidate::Ready(guessing(RequestId(1), 32))), "a front-decoding request's decode");
+        assert!(chained(&State::Between(guessing(RequestId(1), 32), Stage::Ready)), "a front-decoding request's decode");
         let layout = || magnitude_generation::InputLayout::new(2, vec![]).unwrap();
         let mut plain = Generation::new(vec![TokenId(1), TokenId(2)], layout(), super::termination_tests::options(8, magnitude_generation::MethodChoice::Plain), None).unwrap();
         plain.resume_at(None).unwrap();
         let plain = commit(RequestId(2), started(RequestId(2), plain, 4, FrontGrant::UpTo(0)), &[TokenId(3)], Vec::new());
-        assert!(!chained(&Candidate::Ready(plain)), "a plain request's decode");
+        assert!(!chained(&State::Between(plain, Stage::Ready)), "a plain request's decode");
         let options = || super::termination_tests::options(8, magnitude_generation::MethodChoice::Mtp { proposals: 2 });
         let drafting = Generation::new_with_method(vec![TokenId(1), TokenId(2)], layout(), options(), None, Arc::new(magnitude_generation::Mtp::new("fixture", 2).unwrap())).unwrap();
         assert!(!drafting.chains(), "a drafting request");
         let fronting = Arc::new(magnitude_generation::Mtp::new("fixture", 2).unwrap().fronting().unwrap());
         let mut prompting = Generation::new_with_method(vec![TokenId(1), TokenId(2)], layout(), options(), None, fronting).unwrap();
         prompting.resume_at(None).unwrap();
-        assert!(!chained(&Candidate::Ready(prompting)), "a front-decoding request's prompt chunk");
+        assert!(!chained(&State::Between(prompting, Stage::Ready)), "a front-decoding request's prompt chunk");
     }
 
     #[test]

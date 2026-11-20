@@ -172,7 +172,7 @@ mod tests {
     }
 
     fn selected(token: u32) -> Selected {
-        Selected { token: TokenId(token), status: 0 }
+        Selected::Token(TokenId(token))
     }
 
     #[test]

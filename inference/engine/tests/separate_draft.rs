@@ -27,7 +27,7 @@ use magnitude_executor::{
     AssessmentGraphResourceBounds, AssessmentMemoryTerms, Demand, DraftForm, ExecutionPath,
     ExecutorDomain, FeatureReader, FeatureRows, FeatureSpan, Operation, Outcome, PhysicalDecision,
     RequestId, ReservedResources, ResourceCapacity, ResourcePlanner, ResumeState, Sampling,
-    SelectSpec, Shaping, StateBindings, TokenId, WorkKind,
+    SelectSpec, Selected, Shaping, StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
 use std::path::PathBuf;
@@ -194,7 +194,7 @@ fn transact(
     conditioning: FeatureRows,
     position: usize,
     proposals: usize,
-) -> (Vec<(u32, u8)>, StateBindings) {
+) -> (Vec<Selected>, StateBindings) {
     let entered = tokens.len();
     let operation = Operation::Head {
         request,
@@ -228,10 +228,7 @@ fn transact(
         let Outcome::Head { proposals, .. } = pending.outcome().clone() else {
             panic!("a draft transaction returns proposals")
         };
-        selected = proposals
-            .iter()
-            .map(|proposal| (proposal.token.0, proposal.status))
-            .collect();
+        selected = proposals;
         domain
             .reconcile(
                 pending,
@@ -273,7 +270,7 @@ fn draft(
     tokens: &[TokenId],
     features: &FeatureRows,
     proposals: usize,
-) -> (Vec<(u32, u8)>, StateBindings) {
+) -> (Vec<Selected>, StateBindings) {
     let committed = tokens.len() - 1;
     transact(
         domain,

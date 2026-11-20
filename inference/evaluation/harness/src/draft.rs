@@ -16,7 +16,7 @@ use magnitude_executor::{
     Demand, DraftForm, FeatureReader, FeatureSpan, HeadPhase, Operation, Outcome,
     ReservedResources, Rows, Sampling, Shaping, TokenId, WorkKind,
 };
-use magnitude_generation::RoundState;
+use magnitude_generation::{RoundState, drafted_chain};
 use magnitude_family_contracts::HeadHistory;
 use seismic::{TraceDetail, host_seconds};
 use serde_json::{Value, json};
@@ -264,9 +264,9 @@ fn draft_at(
     let Outcome::Head { proposals, .. } = engine.head(operation, 1)? else {
         return Err("a draft returns proposals".into());
     };
-    let proposals = proposals
-        .iter()
-        .map(|selected| selected.token)
+    let proposals = drafted_chain(&proposals)?
+        .into_iter()
+        .map(|guess| guess.token)
         .collect::<Vec<_>>();
     let draft_phase = phase(draft_start)?;
     // The target verifies the anchor and the proposals greedily, in the

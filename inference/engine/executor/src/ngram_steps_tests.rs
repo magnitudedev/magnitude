@@ -124,17 +124,19 @@ fn an_ngram_decoder_steps_on_host_and_selected_tokens() {
         let Outcome::Forward { rows, .. } = outcome else {
             panic!("{backend:?}: a decode step has a forward outcome");
         };
-        let selected = rows
+        let crate::Selected::Token(selected) = rows
             .last()
             .and_then(|row| row.selected)
-            .unwrap_or_else(|| panic!("{backend:?}: the decode step selects a token"));
-        assert_eq!(selected.status, 0, "{backend:?}");
+            .unwrap_or_else(|| panic!("{backend:?}: the decode step selects a token"))
+        else {
+            panic!("{backend:?}: the decode step selects a token");
+        };
         // The device's selection is the next step's token: it claims the
         // lookahead queued behind the decode step.
         let (_, returned) = run(
             &mut domain,
             returned,
-            forward(request, WorkKind::Decode, &[selected.token.0], 3, true),
+            forward(request, WorkKind::Decode, &[selected.0], 3, true),
             true,
             backend,
         );
@@ -498,7 +500,13 @@ fn run_fronting_prompt(
 ) -> (TokenId, Vec<crate::Guess>, crate::StateBindings) {
     let (outcome, bindings) = run(domain, bindings, fronting_prompt(request, &[5, 1]), false, backend);
     let Outcome::Forward { rows, guesses } = outcome else { panic!("{backend:?}: a prompt's outcome") };
-    let selected = rows.last().and_then(|row| row.selected).expect("the closing chunk selects").token;
+    let crate::Selected::Token(selected) = rows
+        .last()
+        .and_then(|row| row.selected)
+        .expect("the closing chunk selects")
+    else {
+        panic!("{backend:?}: the closing chunk selects a token");
+    };
     assert!(
         matches!(guesses.as_slice(), [crate::Guess { kind: crate::GuessKind::Head, .. }]),
         "{backend:?}: the closing chunk's chain is the head's guess alone: {guesses:?}"
@@ -656,7 +664,10 @@ fn pipelined_two_row_passes_claim_their_successors_and_emit_their_unpipelined_to
                     panic!("{backend:?}: a pass's outcome")
                 };
                 assert_eq!(results.len(), 1, "{backend:?} pass {index}: its exact row");
-                exact = results[0].selected.expect("an exact row selects").token;
+                let crate::Selected::Token(token) = results[0].selected.expect("an exact row selects") else {
+                    panic!("{backend:?} pass {index}: an exact row selects a token");
+                };
+                exact = token;
                 let kinds = chain.iter().map(|guess| guess.kind).collect::<Vec<_>>();
                 let (head, chained) = kinds.split_last().unwrap_or_else(|| panic!("{backend:?} pass {index}: the head guesses behind every pass"));
                 assert!(
@@ -1157,12 +1168,14 @@ fn selected_token(outcome: &Outcome, backend: seismic::BackendName) -> u32 {
     let Outcome::Forward { rows, .. } = outcome else {
         panic!("{backend:?}: a forward step has a forward outcome");
     };
-    let selected = rows
+    let crate::Selected::Token(selected) = rows
         .last()
         .and_then(|row| row.selected)
-        .unwrap_or_else(|| panic!("{backend:?}: the step selects a token"));
-    assert_eq!(selected.status, 0, "{backend:?}");
-    selected.token.0
+        .unwrap_or_else(|| panic!("{backend:?}: the step selects a token"))
+    else {
+        panic!("{backend:?}: the step selects a token");
+    };
+    selected.0
 }
 
 /// On Metal and CPU, a streamed load's prompt groups at the kl's shape (a
@@ -1879,7 +1892,10 @@ fn shrunk_bank_scores_as_resident(
                 }
             }
             let token = match lookahead {
-                true => steps.last().and_then(|bits| bits.last()).and_then(|(_, _, selected)| *selected).expect("a step selects").0,
+                true => match steps.last().and_then(|bits| bits.last()).and_then(|(_, _, selected)| *selected) {
+                    Some(crate::Selected::Token(token)) => token.0,
+                    other => panic!("a step selects a token, got {other:?}"),
+                },
                 false => (position * 37 % 256) as u32,
             };
             let (outcome, next, _) = step(&mut domain, bindings, scored(forward(request, WorkKind::Decode, &[token], position, true)), backend);
@@ -1954,7 +1970,7 @@ fn prompt_chunk(request: RequestId, chunk: usize, chunks: usize, rows: usize) ->
 
 /// A step's outputs as bits: per row, its features, its logits and its
 /// selection.
-type StepBits = Vec<(Option<Vec<u32>>, Option<Vec<u32>>, Option<(u32, u8)>)>;
+type StepBits = Vec<(Option<Vec<u32>>, Option<Vec<u32>>, Option<crate::Selected>)>;
 
 fn step_bits(outcome: &Outcome) -> StepBits {
     let Outcome::Forward { rows, .. } = outcome else {
@@ -1970,7 +1986,7 @@ fn step_bits(outcome: &Outcome) -> StepBits {
                 row.logits
                     .as_ref()
                     .map(|logits| bits(logits.read_to_host().unwrap())),
-                row.selected.map(|selected| (selected.token.0, selected.status)),
+                row.selected,
             )
         })
         .collect()
@@ -2049,7 +2065,10 @@ fn chained_prompts(
         selected.push(steps.last().and_then(|(bits, _)| bits.last()).and_then(|(_, _, selected)| *selected));
     }
     for (&request, token) in requests.iter().zip(selected) {
-        let mut token = token.expect("the prompt's last chunk selects the decoded token").0;
+        let mut token = match token {
+            Some(crate::Selected::Token(token)) => token.0,
+            other => panic!("the prompt's last chunk selects the decoded token, got {other:?}"),
+        };
         for offset in 0..2 {
             let mut decode = forward(
                 request,
@@ -2064,11 +2083,10 @@ fn chained_prompts(
             let (outcome, returned) = run(&mut domain, bindings, decode, false, backend);
             bindings = returned;
             let bits = step_bits(&outcome);
-            token = bits
-                .last()
-                .and_then(|(_, _, selected)| *selected)
-                .expect("a decode step selects the next token")
-                .0;
+            token = match bits.last().and_then(|(_, _, selected)| *selected) {
+                Some(crate::Selected::Token(token)) => token.0,
+                other => panic!("a decode step selects the next token, got {other:?}"),
+            };
             steps.push((bits, Some(domain.resume_state(request).unwrap().position())));
         }
     }
@@ -2829,12 +2847,14 @@ fn prompt_then_decode(
 
 /// The token the last of `steps` selected.
 fn selected_token_of(steps: &[StepBits], backend: seismic::BackendName) -> u32 {
-    steps
+    match steps
         .last()
         .and_then(|bits| bits.last())
         .and_then(|(_, _, selected)| *selected)
-        .unwrap_or_else(|| panic!("{backend:?}: the step selects a token"))
-        .0
+    {
+        Some(crate::Selected::Token(token)) => token.0,
+        other => panic!("{backend:?}: the step selects a token, got {other:?}"),
+    }
 }
 
 /// The Sinkhorn fixture's streams, hidden width and numerics

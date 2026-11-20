@@ -363,17 +363,16 @@ pub(super) fn decode_selected(bytes: &[u8]) -> Result<Vec<Selected>, String> {
         .map(|row| {
             let token = i32::from_le_bytes(row[0..4].try_into().expect("four token bytes"));
             let status = i32::from_le_bytes(row[4..8].try_into().expect("four status bytes"));
-            // 3: a draft declined its proposal (`draft_confidence`).
-            let status = u8::try_from(status)
-                .ok()
-                .filter(|value| *value <= 3)
-                .ok_or("selection status is invalid")?;
-            let token = if status == 0 {
-                crate::TokenId(u32::try_from(token).map_err(|_| "selected token is negative")?)
-            } else {
-                crate::TokenId(0)
-            };
-            Ok(Selected { token, status })
+            match status {
+                0 => Ok(Selected::Token(crate::TokenId(
+                    u32::try_from(token).map_err(|_| "selected token is negative")?,
+                ))),
+                1 => Ok(Selected::Empty),
+                2 => Ok(Selected::NonFinite),
+                // 3: a draft declined its proposal (`draft_confidence`).
+                3 => Ok(Selected::Declined),
+                _ => Err("selection status is invalid"),
+            }
         })
         .collect::<Result<Vec<_>, &str>>()
         .map_err(str::to_owned)

@@ -538,9 +538,12 @@ fn reconcile_confident_head(
     let outcome = Outcome::Head {
         proposals: proposals
             .iter()
-            .map(|&(token, status)| Selected {
-                token: TokenId(token),
-                status,
+            .map(|&(token, status)| match status {
+                0 => Selected::Token(TokenId(token)),
+                1 => Selected::Empty,
+                2 => Selected::NonFinite,
+                3 => Selected::Declined,
+                other => panic!("invalid test selection status {other}"),
             })
             .collect(),
         confidence,
@@ -739,6 +742,63 @@ fn proposals_stop_at_a_failed_selection_or_a_stop_token() {
         start(failed, 4).round_forward().tokens,
         [TokenId(10), TokenId(11)]
     );
+}
+
+#[test]
+fn nonfinite_draft_selection_fails_while_empty_and_declined_truncate() {
+    // Empty and Declined truncate proposals normally.
+    for terminator in [Selected::Empty, Selected::Declined] {
+        let (mut generation, first) = mtp_drafting(3);
+        let outcome = Outcome::Head {
+            proposals: vec![
+                Selected::Token(TokenId(11)),
+                terminator,
+                Selected::Token(TokenId(13)),
+            ],
+            confidence: None,
+        };
+        let transition = generation
+            .prepare_method_transition(&first, &outcome)
+            .expect("empty and declined terminate speculation cleanly");
+        generation.commit_method_transition(transition);
+        assert_eq!(
+            start(generation, 4).round_forward().tokens,
+            [TokenId(10), TokenId(11)]
+        );
+    }
+
+    // NonFinite at position 0 or after an earlier Empty/Declined slot returns Err.
+    for proposals in [
+        vec![
+            Selected::NonFinite,
+            Selected::Token(TokenId(12)),
+            Selected::Token(TokenId(13)),
+        ],
+        vec![
+            Selected::Token(TokenId(11)),
+            Selected::Declined,
+            Selected::NonFinite,
+        ],
+        vec![
+            Selected::Token(TokenId(11)),
+            Selected::Empty,
+            Selected::NonFinite,
+        ],
+    ] {
+        let (generation, first) = mtp_drafting(3);
+        let outcome = Outcome::Head {
+            proposals: proposals.clone(),
+            confidence: None,
+        };
+        assert!(
+            generation.prepare_method_transition(&first, &outcome).is_err(),
+            "nonfinite draft selection must fail: {proposals:?}"
+        );
+        assert!(
+            magnitude_generation::drafted_chain(&proposals).is_err(),
+            "drafted_chain must reject nonfinite selection: {proposals:?}"
+        );
+    }
 }
 
 #[test]
@@ -2294,7 +2354,7 @@ fn mtp_on_a_fronting_load_verifies_its_chain_and_drafts_the_next_on_the_host() {
         panic!("one head transaction from the head's position: {operations:?}");
     };
     assert_eq!((entered.clone(), row_ids(conditioning), proposals.len()), (tokens(&[12, 13, 14]), vec![(1, 0), (1, 1), (1, 2)], 2));
-    let selected = |token| Selected { token: TokenId(token), status: 0 };
+    let selected = |token| Selected::Token(TokenId(token));
     let outcome = Outcome::Head { proposals: vec![selected(15), selected(16)], confidence: None };
     let transition = generation.prepare_method_transition(operation, &outcome).unwrap();
     assert_eq!(transition.decision().accepted_rows, 3, "it commits the pairs it entered");
