@@ -2131,12 +2131,9 @@ trait MemoryStep: MemoryHost + Sized {
             self.unload();
             return Ok(Observed { unload: true, reread: Reread::Settled });
         }
-        // Each store's plan is carried out whole; a request two stores'
-        // plans name is evicted once.
-        let mut preempt = BTreeSet::new();
-        for plan in response.relief.iter().cloned() {
-            preempt.extend(self.domain().execute_relief(plan).preempt);
-        }
+        // Each store's relief plan already shed its cache in `read_memory`;
+        // a request two stores' plans name is evicted once.
+        let preempt: BTreeSet<_> = response.preempt.into_iter().collect();
         let preempted = !preempt.is_empty();
         if preempted {
             let preempt = preempt.into_iter().collect::<Vec<_>>();

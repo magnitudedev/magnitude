@@ -1342,16 +1342,16 @@ impl<'d> MemoryProbe<'d> {
         targets: impl FnOnce() -> Vec<crate::experts::derived::DerivedTarget>,
     ) -> Vec<StoreAnswer<'d>> {
         let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
-        let targets = if traced { targets() } else { Vec::new() };
         let answers = stores(self.ledgers)
             .map(|ledger| {
                 // The reading's generation, before its response moves the
                 // ledger: what a resize that follows its target names.
                 let generation = ledger.generation();
                 let mut shortage = ledger.shortage(evictable);
-                // A plan of cache alone is carried out at once; one naming
-                // requests, each evictable now, is the owner's.
-                let owed = match shortage.as_mut().and_then(|shortage| shortage.response.relief.take_if(|plan| plan.preempt().is_empty())) {
+                // Carry out every relief plan's cache yields synchronously now;
+                // any requests it names are in `evictable` and are preempted by
+                // the owner on return.
+                let owed = match shortage.as_mut().and_then(|shortage| shortage.response.relief.take()) {
                     Some(plan) => ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)),
                     None => crate::memory::ledger::Owed::default(),
                 };
@@ -1368,17 +1368,20 @@ impl<'d> MemoryProbe<'d> {
                 cause = ?shortage.cause,
                 yielded = relieved.yielded,
                 admission_waits = shortage.response.admission_waits,
-                preempt = shortage.response.relief.as_ref().map_or(0, |plan| plan.preempt().len()),
+                preempt = relieved.preempt.len(),
                 unload = shortage.response.unload,
                 "a real memory shortage"
             );
             let owed = answered.owed.get_or_insert_with(MemoryResponse::default);
             owed.admission_waits |= shortage.response.admission_waits;
-            owed.relief.extend(shortage.response.relief.clone());
+            owed.preempt.extend(relieved.preempt.iter().copied());
             owed.unload |= shortage.response.unload;
         }
         drop(answered);
         if traced {
+            // Derive bank targets after synchronous relief has executed so
+            // `bank_slots` and `bank_target` match the post-relief estimate.
+            let targets = targets();
             for StoreAnswer { ledger, generation, shortage, owed } in &answers {
                 let estimate = ledger.estimate();
                 let held = |holding| targets.iter().find(|target| target.holding == holding && target.store == ledger.store());
@@ -1627,14 +1630,13 @@ impl SizingTerms {
 /// the rest, in order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryResponse {
-    /// New work waits: committed memory or others' rise is short, or no
-    /// relief covers the shortage.
+    /// New work waits once cache is exhausted: no relief covers the shortage,
+    /// requests must be preempted, or a floor/rise shortfall exhausts all cache.
     pub admission_waits: bool,
-    /// Relief naming requests to preempt, the lowest value first: the
-    /// owner carries each out whole, its cache shed and its requests
-    /// evicted, only where it can evict every one of them now
-    /// (`ExecutorDomain::execute_relief`); otherwise none of it.
-    pub relief: Vec<crate::memory::ledger::ReliefPlan>,
+    /// Requests named for preemption by relief plans already executed in
+    /// [`ExecutorDomain::read_memory`], lowest value first; each is in
+    /// `evictable` so the owner evicts them now.
+    pub preempt: Vec<RequestId>,
     /// A floor shortfall persists with nothing to give and nothing of ours
     /// pending: the model unloads.
     pub unload: bool,
@@ -1950,11 +1952,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let cost = began.elapsed();
         let generation = self.memory_generation();
-        let targets = match (tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG), self.family.expert_bank()) {
-            (true, Some(bank)) => self.derived_targets(bank)?,
-            _ => Vec::new(),
-        };
-        drop(probe.answer(evictable, || targets));
+        let mut target_error = None;
+        drop(probe.answer(evictable, || match self.family.expert_bank() {
+            Some(bank) => match self.derived_targets(bank) {
+                Ok(targets) => targets,
+                Err(error) => {
+                    target_error = Some(error);
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        }));
+        if let Some(error) = target_error {
+            return Err(error);
+        }
         let response = self.answered.borrow_mut().owed.take();
         Ok(MemoryReading::Read(MemoryRead { cost, generation, response }))
     }

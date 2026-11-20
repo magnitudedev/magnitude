@@ -606,6 +606,86 @@ fn a_shortage_is_answered_once_per_reading() {
     assert_eq!(ledger.standing(), None);
 }
 
+/// A rise shortfall covered by cache with cache remaining above floor yields
+/// only the shortfall and never holds admission back (§4.5).
+#[test]
+fn a_rise_shortfall_covered_by_cache_above_floor_does_not_wait_admission() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 4 * GB);
+    let bank = ledger.cached(CacheKind::Bank, 8 * GB).expect("free room");
+    // Baseline: others hold 38 GB, supply 14 GB (budget 26 GB).
+    read(&ledger, &mut clock, 64 * GB, 14 * GB, None);
+    // Others rise by 13 GB -> supply 1 GB, budget 13 GB, guarantee 13 GB.
+    // committed (4 GB) + guarantee (13 GB) - budget (13 GB) = 4 GB < bank (8 GB).
+    read(&ledger, &mut clock, 64 * GB, GB, None);
+    let shortage = ledger.shortage(&std::collections::BTreeSet::new()).expect("rise shortfall");
+    assert_eq!(shortage.cause, shortage::Cause::RiseShort { over: 4 * GB });
+    assert!(!shortage.response.admission_waits, "cache covers the shortfall with 4 GB remaining above floor");
+    assert!(!shortage.response.unload);
+    let plan = shortage.response.relief.expect("cache covers the rise shortfall");
+    assert!(plan.preempt().is_empty());
+    assert_eq!(plan.covers(), 4 * GB);
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    assert_eq!(owed.yielded, 4 * GB);
+    assert_eq!(bank.bytes(), 4 * GB, "bank remains above floor after covering the shortfall");
+}
+
+/// A rise shortfall exceeding cache with no evictable requests still drains
+/// all remaining cache to floor (Step 1 of §4.5) alongside waiting admission.
+#[test]
+fn a_rise_shortfall_past_cache_drains_cache_before_waiting_admission() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 4 * GB);
+    let bank = ledger.cached(CacheKind::Bank, 8 * GB).expect("free room");
+    // Baseline: others hold 32 GB, supply 20 GB (budget 32 GB).
+    read(&ledger, &mut clock, 64 * GB, 20 * GB, None);
+    // Others rise by 19 GB -> supply 1 GB, budget 13 GB, guarantee 19 GB.
+    // committed (4 GB) + guarantee (19 GB) - budget (13 GB) = 10 GB > bank (8 GB).
+    read(&ledger, &mut clock, 64 * GB, GB, None);
+    let shortage = ledger.shortage(&std::collections::BTreeSet::new()).expect("rise shortfall past cache");
+    assert_eq!(shortage.cause, shortage::Cause::RiseShort { over: 10 * GB });
+    assert!(shortage.response.admission_waits, "bank drains to floor and cannot cover the full rise");
+    assert!(!shortage.response.unload);
+    let plan = shortage.response.relief.expect("remaining cache drains to floor");
+    assert!(plan.preempt().is_empty());
+    assert_eq!(plan.covers(), 8 * GB);
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    assert_eq!(owed.yielded, 8 * GB);
+    assert_eq!(bank.bytes(), 0, "bank reached its floor");
+}
+
+/// A floor shortfall larger than remaining cache drains cache to floor first
+/// (never unloading on a reading that yielded cache), and unloads only on a
+/// subsequent reading past λ once cache is empty.
+#[test]
+fn a_floor_shortfall_with_cache_drains_cache_before_unloading() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = held(&ledger, 50 * GB).expect("room");
+    let bank = ledger.cached(CacheKind::Bank, 4 * GB).expect("free room");
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    // Drop supply to 40 GB -> budget = 4 GB (cached) + 40 GB = 44 GB (FloorShort over 6 GB > bank 4 GB).
+    read(&ledger, &mut clock, 64 * GB, 40 * GB, None);
+    let first = ledger.shortage(&std::collections::BTreeSet::new()).expect("floor shortfall");
+    assert_eq!(first.cause, shortage::Cause::FloorShort { over: 6 * GB });
+    assert!(first.response.admission_waits);
+    assert!(!first.response.unload, "must drain cache before unloading");
+    let plan = first.response.relief.expect("remaining cache drains to floor");
+    assert_eq!(plan.covers(), 4 * GB);
+    ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    assert_eq!(bank.bytes(), 0);
+    // Next reading past λ with cache empty: now unloads.
+    read(&ledger, &mut clock, 64 * GB, 40 * GB, None);
+    let second = ledger.shortage(&std::collections::BTreeSet::new()).expect("floor shortfall persists");
+    assert!(second.response.relief.is_none());
+    assert!(second.response.unload, "past λ with cache at floor: unload");
+}
+
 /// The same squeeze beside a later request: relief has its reservation to
 /// take, so the plan preempts it and nothing unloads.
 #[test]

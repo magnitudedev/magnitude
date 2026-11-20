@@ -241,7 +241,20 @@ impl Ledger {
         }
         state.answered = Some(estimate.at());
         let cause = shortage::cause(&estimate, state.boundary.harmed(), state.boundary.pressed())?;
-        let relief = state.plan_relief(&self.store.identity, shortage::lacks(&estimate, cause), shortage::allows(cause, evictable), super::admission::Frees::Room);
+        let need = shortage::lacks(&estimate, cause);
+        let relief = state
+            .plan_relief(&self.store.identity, need, shortage::allows(cause, evictable), super::admission::Frees::Room)
+            .or_else(|| {
+                // Step 1 of §4.5: when cache + evictable requests cannot cover
+                // `need` whole, drain remaining cache down to floor before any
+                // costlier response (admission_waits / unload) takes effect.
+                let cache = estimate.cache();
+                (cache > 0).then(|| {
+                    state
+                        .plan_relief(&self.store.identity, need.min(cache), super::relief::Relief::CacheOnly, super::admission::Frees::Room)
+                        .expect("invariant violated: store cache covers need.min(cache)")
+                })
+            });
         Some(shortage::respond(&estimate, cause, relief, &state.persistence))
     }
 
