@@ -24,7 +24,7 @@ pub(crate) use linux::Tree;
 
 use seismic_topology::{CacheSize, Firmware, HostNode, PciLocation, Processors, Reported};
 use std::fmt;
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(target_os = "macos", test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -356,11 +356,9 @@ pub enum WiredLimit {
 ///   descendant; in a cgroup shared with any other process, an ancestor's,
 ///   or without a cgroup v2 memory controller, there is no share, and no
 ///   harm.
-/// - Windows: hard faults, each resolved by one paging read: the machine's
-///   paging reads (`\Memory\Page Reads/sec`'s count) and the process's
-///   `HardFaultCount`. Windows counts no process's pages brought in
-///   (`\Memory\Pages Input/sec` has no per-process count), so the unit
-///   is a read, of at least one page.
+/// - Windows: none. Windows has no unprivileged counter that separates
+///   reclaimed-page refaults from cold file, DLL, or memory-mapped reads
+///   (`\Memory\Page Reads/sec` and `HardFaultCount` count all hard faults).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Harm {
     pub machine: u64,
@@ -401,10 +399,10 @@ pub struct Lag {
 /// A 32-bit cumulative OS count widened to 64 bits across its wraps: every
 /// reading of the count goes through one, so no wrap is missed while a
 /// reading is taken more often than the count can wrap (4.3 billion events).
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct Widened(Mutex<Option<(u32, u64)>>);
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(target_os = "macos", test))]
 impl Widened {
     pub(crate) const fn new() -> Self {
         Self(Mutex::new(None))

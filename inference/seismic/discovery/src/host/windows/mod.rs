@@ -13,7 +13,6 @@ use memory::{Counters, Query, COUNTER_PATHS};
 use seismic_topology::{CacheSize, Reported, ReportedBy};
 use std::num::NonZeroUsize;
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
-use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
 use windows_sys::Win32::System::JobObjects::{
     IsProcessInJob, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -59,9 +58,6 @@ pub(crate) trait Sys {
     fn affinity_mask(&self) -> Option<usize>;
     /// The memory performance counters, collected together.
     fn counters(&self) -> Option<Counters>;
-    /// This process's hard faults since it started: its
-    /// `SYSTEM_PROCESS_INFORMATION` entry's `HardFaultCount`.
-    fn hard_faults(&self) -> Option<u32>;
     /// `K32GetProcessMemoryInfo` of this process: its working set and its
     /// private commit (`PagefileUsage`, the same figure as `PrivateUsage`).
     fn memory_counters(&self) -> PROCESS_MEMORY_COUNTERS;
@@ -283,7 +279,7 @@ impl Sys for LiveSys {
             pdh("PdhOpenQueryW", unsafe {
                 PdhOpenQueryW(std::ptr::null(), 0, &mut query)
             })?;
-            let mut counters = [std::ptr::null_mut(); 5];
+            let mut counters = [std::ptr::null_mut(); 4];
             for (counter, path) in counters.iter_mut().zip(COUNTER_PATHS) {
                 let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
                 pdh(path, unsafe {
@@ -300,7 +296,7 @@ impl Sys for LiveSys {
         pdh("PdhCollectQueryData", unsafe {
             PdhCollectQueryData(query.query)
         })?;
-        let mut values = [0u64; 5];
+        let mut values = [0u64; 4];
         for ((value, counter), path) in values.iter_mut().zip(query.counters).zip(COUNTER_PATHS) {
             let mut raw: PDH_RAW_COUNTER = unsafe { std::mem::zeroed() };
             pdh(path, unsafe {
@@ -312,77 +308,11 @@ impl Sys for LiveSys {
             *value = u64::try_from(raw.FirstValue)
                 .unwrap_or_else(|_| panic!("invariant violated: {path} reads {}", raw.FirstValue));
         }
-        let [free_zero, core, normal, reserve, reads] = values;
-        // `Page Reads/sec` counts in 32 bits (`PERF_COUNTER_COUNTER`).
+        let [free_zero, core, normal, reserve] = values;
         Some(Counters {
             free_zero,
             standby: core + normal + reserve,
-            page_reads: reads as u32,
         })
-    }
-
-    /// `HardFaultCount` at offset 0x10 on x64, `UniqueProcessId` at 0x50,
-    /// the one per-process count of them.
-    ///
-    /// # Panics
-    /// Where the table the OS wrote is cut short or lists no entry for this
-    /// process.
-    fn hard_faults(&self) -> Option<u32> {
-        use windows_sys::Wdk::System::SystemInformation::{
-            NtQuerySystemInformation, SystemProcessInformation,
-        };
-        use windows_sys::Win32::Foundation::STATUS_INFO_LENGTH_MISMATCH;
-        let mut buffer = vec![0u64; 1 << 16];
-        loop {
-            let bytes = u32::try_from(buffer.len() * 8).unwrap_or_else(|_| {
-                panic!("invariant violated: the process table outgrows u32 bytes")
-            });
-            let mut returned = 0u32;
-            let status = unsafe {
-                NtQuerySystemInformation(
-                    SystemProcessInformation,
-                    buffer.as_mut_ptr().cast(),
-                    bytes,
-                    &mut returned,
-                )
-            };
-            if status == STATUS_INFO_LENGTH_MISMATCH {
-                buffer.resize((returned as usize).div_ceil(8) * 2, 0);
-                continue;
-            }
-            if status < 0 {
-                let error = std::io::Error::from_raw_os_error(
-                    unsafe { RtlNtStatusToDosError(status) } as i32,
-                );
-                return read(
-                    "NtQuerySystemInformation(SystemProcessInformation)",
-                    Err(error),
-                );
-            }
-            break;
-        }
-        // SAFETY: the buffer's bytes, as the OS wrote them.
-        let table: &[u8] =
-            unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast(), buffer.len() * 8) };
-        let field = |at: usize, width: usize| -> u64 {
-            let bytes = table
-                .get(at..at + width)
-                .unwrap_or_else(|| panic!("invariant violated: the process table is cut short"));
-            let mut value = [0u8; 8];
-            value[..width].copy_from_slice(bytes);
-            u64::from_le_bytes(value)
-        };
-        let here = u64::from(std::process::id());
-        let mut at = 0usize;
-        loop {
-            if field(at + 0x50, 8) == here {
-                return Some(field(at + 0x10, 4) as u32);
-            }
-            match field(at, 4) {
-                0 => panic!("invariant violated: the process table lists no entry for this process"),
-                next => at += next as usize,
-            }
-        }
     }
 
     fn memory_counters(&self) -> PROCESS_MEMORY_COUNTERS {

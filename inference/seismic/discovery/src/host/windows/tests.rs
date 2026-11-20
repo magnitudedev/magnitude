@@ -37,7 +37,6 @@ impl Machine {
             counters: Some(Counters {
                 free_zero: 10 * GB,
                 standby: 30 * GB,
-                page_reads: 7,
             }),
             nodes: vec![Some(6 * GB), Some(4 * GB)],
             job: None,
@@ -101,9 +100,6 @@ impl Sys for Machine {
     fn counters(&self) -> Option<Counters> {
         self.counters
     }
-    fn hard_faults(&self) -> Option<u32> {
-        Some(3)
-    }
     fn memory_counters(&self) -> PROCESS_MEMORY_COUNTERS {
         self.process
     }
@@ -135,23 +131,24 @@ fn supply(free: u64, clean: u64) -> Supply {
     }
 }
 
-/// The performance counters split the available lists, and count the
-/// machine's page reads beside this process's hard faults.
+/// The performance counters split the available lists; Windows reports no
+/// harm because no unprivileged counter separates reclaimed-page refaults
+/// from cold file reads.
 #[test]
 fn the_counters_split_free_from_standby() {
     let sample = sample(&Machine::new());
     assert_eq!(
-        (sample.total, sample.supply, sample.cold),
+        (sample.total, sample.supply, sample.cold, sample.harm),
         (
             64 * GB,
             supply(10 * GB, 30 * GB),
             ColdPages {
                 machine: 0,
                 own: None
-            }
+            },
+            None,
         )
     );
-    assert!(sample.harm.is_some());
 }
 
 /// Without the performance counters (an account outside Performance

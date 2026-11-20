@@ -39,7 +39,6 @@ seismic-topology = { workspace = true, features = ["fixtures"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
-  "Wdk_System_SystemInformation",
   "Wdk_System_SystemServices",
   "Win32_Foundation",
   "Win32_Storage_FileSystem",
