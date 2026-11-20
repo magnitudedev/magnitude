@@ -833,23 +833,19 @@ impl ExpertBankPlan {
 
     /// Staging records only demand takes. Every earlier request's records
     /// are free once the device makes a request (it is past their
-    /// landings), so a request always finds these, and its misses past them
-    /// are read as each record frees: by its own landings' ends, a host
-    /// landing's or, on unified memory, the device's DONE of each entry its
-    /// landing launch converts (`experts::landing`), which the host sees
-    /// while the launch runs where the device parks in its kernels: a row's
-    /// choices (`K`), the misses a one-row request may name. Where it parks
-    /// at submission boundaries ([`Parking::AtBoundaries`], Vulkan) the
-    /// device's DONE is the host's only once the launch's submission ends,
-    /// past its park, which waits for every entry: a request's misses there
-    /// hold their staging all at once, so the reserve holds the widest
-    /// request's distinct misses (its decode set, [`decode_set`]), and no
-    /// miss waits on its own request's landings.
+    /// landings), so a request always finds these. A single multi-row
+    /// verify or front decode pass (up to `VERIFY_ROWS` rows, each
+    /// selecting `K` experts) can miss up to `decode_set(K, widest)`
+    /// distinct experts at a layer (at most `widest`, the widest streamed
+    /// layer's experts). Sizing the demand reserve to
+    /// `decode_set(K, widest)` on every host tier lets every miss of a
+    /// widest decode request stage at once without waiting on its own
+    /// earlier landings (`Decode::waiting` wave serialization), keeps
+    /// [`Self::hint_records`] unstarved beyond the reserve for cross-layer
+    /// hints (`l + 1`, `l + 2`), and remains equal to `K` when
+    /// `widest <= K` (including `widest == 1`).
     pub fn demand_records(&self) -> u64 {
-        match self.host() {
-            HostTier::Unified(Parking::AtBoundaries) => decode_set(self.selected(), self.widest().get()),
-            HostTier::Unified(Parking::InKernels) | HostTier::Linked => self.selected(),
-        }
+        decode_set(self.selected(), self.widest().get())
     }
 
     /// The stored bytes of the least move its model store's path makes: an

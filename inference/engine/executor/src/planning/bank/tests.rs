@@ -510,19 +510,19 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
     assert!(plan.with_sites(vec![LayerSite::Served]).is_err(), "an admission names every layer");
 }
 
-/// The demand reserve holds a row's choices (`K`) where the device parks
-/// in its kernels, whose DONE frees each record as its entry converts, and
-/// the widest request's distinct misses where it parks at submission
-/// boundaries, whose DONE the host sees only past the request's own park:
-/// 64 of `VERIFY_ROWS · 8` on layers of 256 experts. Every layer has its
-/// own landing list and each round's, of a request's choices and a round's
+/// The demand reserve holds the widest decode request's distinct misses
+/// (`decode_set(K, widest) = (VERIFY_ROWS · K).min(widest)`) on every host
+/// tier (unified in-kernel, unified at-boundaries, and linked): 64 of
+/// `VERIFY_ROWS · 8` on layers of 256 experts. Every layer has its own
+/// landing list and each round's, of a request's choices and a round's
 /// records.
 #[test]
-fn the_demand_reserve_follows_where_the_device_parks() {
+fn the_demand_reserve_holds_the_widest_decode_set() {
+    let expected = (VERIFY_ROWS * 8).min(256);
     let parked = |parking| beside(bank(&[37, 3], 1), HostTier::Unified(parking));
     let (kernels, boundaries) = (parked(Parking::InKernels), parked(Parking::AtBoundaries));
-    assert_eq!((kernels.demand_records(), boundaries.demand_records()), (8, (VERIFY_ROWS * 8).min(256)));
-    assert_eq!(beside(bank(&[37, 3], 0), HostTier::Linked).demand_records(), 8);
+    assert_eq!((kernels.demand_records(), boundaries.demand_records()), (expected, expected));
+    assert_eq!(beside(bank(&[37, 3], 0), HostTier::Linked).demand_records(), expected);
     let words = |(_, extents): (seismic::Element, Vec<u64>)| extents.iter().product::<u64>();
     for layer in [0, 39] {
         assert_eq!(words(kernels.part_shape(layer, BankPart::LandingList).unwrap()), magnitude_kernels::constants::LANDING_ENTRY(kernels.choices()));
@@ -530,6 +530,33 @@ fn the_demand_reserve_follows_where_the_device_parks() {
             let list = kernels.part_shape(layer, BankPart::RoundList { round: round as u8 }).unwrap();
             assert_eq!(words(list), magnitude_kernels::constants::LANDING_ENTRY(kernels.round_records()));
         }
+    }
+}
+
+/// `demand_records()` equals `K` when `widest == 1` (so `K == 1`) and
+/// `decode_set(K, widest)` for `widest > 1` on both
+/// `HostTier::Unified(Parking::InKernels)` and `HostTier::Linked`, while
+/// `staging_records()` leaves `hint_records()` free beyond the reserve.
+#[test]
+fn demand_records_sizes_for_single_and_multi_row_decode() {
+    let with_shape = |selected: u64, widest: u64, host: HostTier| {
+        let mut plan = bank_of(&[2], 1, |_| widest, RecordForm::Gated);
+        let (_, _, groups, layers) = plan.structured.into_parts();
+        plan.structured = conveyor::Structured::new(selected, host, groups, layers, None).unwrap();
+        plan
+    };
+    for host in [HostTier::Unified(Parking::InKernels), HostTier::Linked] {
+        let single = with_shape(1, 1, host);
+        assert_eq!(single.demand_records(), 1, "{host:?} widest == 1");
+        assert_eq!(single.staging_records() - single.demand_records(), single.hint_records(), "{host:?} widest == 1");
+
+        let capped = with_shape(8, 24, host);
+        assert_eq!(capped.demand_records(), (VERIFY_ROWS * 8).min(24), "{host:?} widest == 24");
+        assert_eq!(capped.staging_records() - capped.demand_records(), capped.hint_records(), "{host:?} widest == 24");
+
+        let wide = with_shape(8, 256, host);
+        assert_eq!(wide.demand_records(), (VERIFY_ROWS * 8).min(256), "{host:?} widest == 256");
+        assert_eq!(wide.staging_records() - wide.demand_records(), wide.hint_records(), "{host:?} widest == 256");
     }
 }
 
@@ -1196,7 +1223,7 @@ fn every_byte_the_bank_demands_has_its_owner() {
 #[test]
 fn scratch_rounds_deliver_every_expert() {
     let plan = bank(&[4], 64);
-    assert_eq!(plan.staging_records(), 8 + PATHS.ahead);
+    assert_eq!(plan.staging_records(), (VERIFY_ROWS * 8).min(256) + PATHS.ahead);
     assert_eq!(plan.round_records(), 32);
     assert_eq!(plan.rounds(), 8);
     let table = plan.binding(0).unwrap().words.scratch();
