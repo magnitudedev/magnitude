@@ -185,11 +185,21 @@ pub struct HistoryLadder {
 
 impl HistoryLadder {
     /// The ladder of `per_token` bytes a token whose rungs read `rungs`,
-    /// `(depth, seconds)` ascending in depth.
+    /// `(depth, seconds)` strictly ascending in positive depth.
     pub fn new(per_token: u64, rungs: impl IntoIterator<Item = (u64, f64)>) -> Self {
+        assert!(
+            per_token > 0,
+            "invariant violated: history ladder per_token must be positive"
+        );
+        let mut prev_depth = 0u64;
         let rungs = rungs
             .into_iter()
             .scan(0f64, |slowest, (depth, seconds)| {
+                assert!(
+                    depth > prev_depth,
+                    "invariant violated: history ladder depths must be positive and strictly ascending ({depth} after {prev_depth})"
+                );
+                prev_depth = depth;
                 *slowest = slowest.max(seconds);
                 Some((depth as f64, *slowest))
             })
@@ -233,6 +243,11 @@ pub struct HistoryFigure {
 impl HistoryFigure {
     /// A call's line over `tokens` of the layout's history.
     pub fn line(&self, tokens: f64) -> HistoryLine {
+        assert!(
+            self.slowdown.is_finite() && self.slowdown > 0.0,
+            "invariant violated: history figure slowdown must be finite and positive, got {}",
+            self.slowdown
+        );
         let line = self.ladder.line(tokens, self.along);
         HistoryLine { seconds_per_byte: line.seconds_per_byte / self.slowdown, ..line }
     }
@@ -428,6 +443,10 @@ pub fn expert_union(experts: u64, selected: u64, rows: u64) -> f64 {
 /// to a row: E · (1 − (1 − k/E)^(picks/k)), the union of `picks/k` rows'
 /// choices, whole rows' or not.
 fn picked_union(experts: u64, selected: u64, picks: u64) -> f64 {
+    assert!(
+        selected > 0 && selected <= experts,
+        "invariant violated: selected experts ({selected}) must satisfy 0 < selected <= experts ({experts})"
+    );
     let experts_f = experts as f64;
     let missed = 1.0 - selected as f64 / experts_f;
     experts_f * (1.0 - missed.powf(picks as f64 / selected as f64))

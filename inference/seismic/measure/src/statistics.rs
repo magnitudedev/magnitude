@@ -58,15 +58,25 @@ pub fn median(samples: &[f64]) -> f64 {
     median_of(samples.to_vec())
 }
 
-/// The median of `values`; the mean of the middle two for an even count.
+/// The median of `sorted`, already in ascending order; the mean of the
+/// middle two for an even count, and `NaN` when empty.
+pub(crate) fn median_sorted(sorted: &[f64]) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    }
+}
+
+/// The median of `values`; the mean of the middle two for an even count,
+/// and `NaN` when empty.
 pub fn median_of(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    if values.len() % 2 == 0 {
-        (values[middle - 1] + values[middle]) / 2.0
-    } else {
-        values[middle]
-    }
+    median_sorted(&values)
 }
 
 /// What the rounds of one comparison have shown: how many there were, and
@@ -138,12 +148,32 @@ pub fn median_interval(samples: &[f64], rate: f64) -> Option<(f64, f64)> {
 /// the median at error rate `rate` ([`median_interval`]); none while no
 /// count of them does.
 fn resolving(samples: u32, rate: f64) -> Option<u32> {
-    (0..=samples).find(|&favourable| wealth(samples, favourable) * rate / 2. >= 1.)
+    if !(0.0 < rate && rate <= 1.0) || samples == 0 {
+        return None;
+    }
+    let mut lo = samples / 2 + 1;
+    let mut hi = samples;
+    if !(wealth(samples, hi) * rate / 2. >= 1.) {
+        return None;
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if wealth(samples, mid) * rate / 2. >= 1. {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(lo)
 }
 
 /// The fewest samples [`median_interval`] bounds the median of at error
 /// rate `rate`: below them no sampling is resolved, whatever it read.
 pub fn fewest_bounding(rate: f64) -> usize {
+    assert!(
+        0.0 < rate && rate <= 1.0,
+        "error rate must be in (0, 1], got {rate}"
+    );
     // All of `n` samples favourable multiply the mixture by a factor that
     // tends to two each, so some count resolves.
     (1..)
@@ -182,6 +212,10 @@ impl Tally {
     /// The fewest further rounds in which the comparison can resolve as a
     /// lead: all of them ahead. Zero once it has.
     pub fn fewest(&self, rate: f64) -> u32 {
+        assert!(
+            0.0 < rate && rate <= 1.0,
+            "error rate must be in (0, 1], got {rate}"
+        );
         // Each round ahead multiplies the mixture by a factor that tends to
         // two, so the threshold is reached.
         (0..)
@@ -352,11 +386,31 @@ mod tests {
         );
     }
 
-    /// The even-count median is the mean of the middle two.
+    /// The even-count median is the mean of the middle two; empty is NaN.
     #[test]
     fn an_even_count_median_is_the_mean_of_the_middle_two() {
         assert_eq!(median(&[4., 1., 3., 2.]), 2.5);
         assert_eq!(median(&[3., 1., 2.]), 2.);
+        assert!(median(&[]).is_nan());
+    }
+
+    /// Binary search in `resolving` matches a linear scan over all counts.
+    #[test]
+    fn resolving_binary_search_matches_linear_scan() {
+        for rate in [0.001, 0.01, 0.05, 0.25, 0.5, 1.0] {
+            for samples in (0..=64).chain([100, 250, 500]) {
+                let linear =
+                    (0..=samples).find(|&favourable| wealth(samples, favourable) * rate / 2. >= 1.);
+                assert_eq!(
+                    resolving(samples, rate),
+                    linear,
+                    "samples={samples} rate={rate}"
+                );
+            }
+        }
+        for invalid in [0.0, -0.05, f64::NAN, 1.5] {
+            assert_eq!(resolving(32, invalid), None);
+        }
     }
 
     /// The stopping rule is read at every count to 32 and then at counts

@@ -99,11 +99,27 @@ use crate::statistics::{
 use crate::work::{Pending, Work};
 use std::time::{Duration, Instant};
 
+/// Validate a timing reading at the [`Pending::seconds`] boundary: must be
+/// finite and non-negative so `NaN` or negative timings cannot cause
+/// infinite loops or poison reference bounds.
+pub(crate) fn valid_seconds(seconds: f64) -> f64 {
+    assert!(
+        seconds.is_finite() && seconds >= 0.0,
+        "invariant violated: timing reading must be finite and non-negative, got {seconds}"
+    );
+    seconds
+}
+
 /// The passes of work whose pass takes `pass_seconds` that cover at least
 /// `length` seconds: at least one, and one where a pass read no time.
 pub(crate) fn passes_covering(length: f64, pass_seconds: f64) -> usize {
-    if pass_seconds > 0. {
-        ((length / pass_seconds).ceil() as usize).max(1)
+    if length.is_finite() && length > 0. && pass_seconds.is_finite() && pass_seconds > 0. {
+        let ratio = (length / pass_seconds).ceil();
+        if ratio >= usize::MAX as f64 {
+            usize::MAX
+        } else {
+            (ratio as usize).max(1)
+        }
     } else {
         1
     }
@@ -147,7 +163,7 @@ struct PendingSample<W: Work> {
 impl<W: Work> PendingSample<W> {
     /// Seconds per call, once the sample completes.
     fn seconds(self) -> Result<f64, W::Error> {
-        Ok(self.pending.seconds()? / self.calls as f64)
+        Ok(valid_seconds(self.pending.seconds()?) / self.calls as f64)
     }
 
     /// Wait for the submission without timing it: a lead, or what is
@@ -236,7 +252,7 @@ impl<W: Work> Slot<W> {
     fn calls(&self, passes: Passes) -> usize {
         match passes {
             Passes::Alone => self.work.calls_per_pass(),
-            Passes::Cold(passes) => passes * self.work.cold_calls_per_pass(),
+            Passes::Cold(passes) => passes.saturating_mul(self.work.cold_calls_per_pass()),
         }
     }
 
@@ -247,9 +263,11 @@ impl<W: Work> Slot<W> {
         deadline: Deadline,
     ) -> Result<PendingSample<W>, WorkError<W::Error>> {
         let calls = self.calls(passes);
-        deadline.check(Duration::from_secs_f64(
+        let forecast = Duration::try_from_secs_f64(
             self.call_seconds.unwrap_or(0.) * calls as f64,
-        ))?;
+        )
+        .unwrap_or(Duration::MAX);
+        deadline.check(forecast)?;
         let pending = match passes {
             Passes::Alone => self.work.submit(1)?,
             Passes::Cold(passes) => self.work.submit_cold(passes)?,
@@ -305,12 +323,13 @@ impl<W: Work> Slot<W> {
     ) -> Result<Calibration, WorkError<W::Error>> {
         let per_call = self.submit(Passes::Alone, deadline)?.seconds()?;
         let pass = per_call * self.work.calls_per_pass() as f64;
+        let cold_calls = self.work.cold_calls_per_pass().max(1);
         let passes = match passes_covering(min_sample_seconds, pass) {
             1 => Passes::Alone,
-            _ => Passes::Cold(passes_covering(
-                min_sample_seconds,
-                per_call * self.work.cold_calls_per_pass() as f64,
-            )),
+            _ => Passes::Cold(
+                passes_covering(min_sample_seconds, per_call * cold_calls as f64)
+                    .min(usize::MAX / cold_calls),
+            ),
         };
         Ok(Calibration { per_call, passes })
     }
@@ -338,7 +357,7 @@ impl<W: Work> Slot<W> {
             // A challenger can inherit the incumbent's passes, but not its
             // latency. Price the already submitted lead before admitting
             // that first repeated batch.
-            self.call_seconds = Some(lead.pending.seconds()? / lead.calls as f64);
+            self.call_seconds = Some(valid_seconds(lead.pending.seconds()?) / lead.calls as f64);
         }
         let (passes, evicting) = match self.passes {
             Some(passes) => (passes, None),
