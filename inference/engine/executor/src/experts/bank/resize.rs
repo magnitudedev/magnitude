@@ -131,9 +131,10 @@ impl Stores {
     }
 
     /// Record `record` of group `group`'s region `region`, while it is
-    /// held.
+    /// held. Safe inside a no-blocking-allocation scope: `Stores::groups`
+    /// holds no outer mutex and `SlabTensor::slab_region` acquires only the
+    /// `Slots::slabs` leaf lock (never held across allocation or submission).
     pub(super) fn view(&self, group: usize, region: usize, record: usize) -> Option<Tensor> {
-        seismic::memory::assert_blocking_allocation_allowed("Stores::view");
         self.group(group).slab_region(record, region).expect("a record and region lie in their group's store")
     }
 
@@ -156,24 +157,41 @@ impl Stores {
             .collect()
     }
 
-    /// Each group's routed tensors' records the host addresses, as held
-    /// now, through the last held: holes where none is.
-    pub(super) fn records(&self) -> Result<Vec<Vec<Records>>, String> {
-        seismic::memory::assert_blocking_allocation_allowed("Stores::records");
-        (0..self.groups.len())
+    /// Each group's routed tensors' records the host addresses, resolved on
+    /// demand from the live slab store so idle slabs hold no view and the
+    /// pool can vacate their blocks on a shrink.
+    pub(super) fn records(self: &Arc<Self>) -> Result<Vec<Vec<Records>>, String> {
+        Ok((0..self.groups.len())
             .map(|group| {
-                let store = self.group(group);
-                let held = store.backed().last().map_or(0, |record| record + 1);
-                (0..store.region_count())
+                let regions = self.group(group).region_count();
+                (0..regions)
                     .map(|region| {
-                        let views = (0..held)
-                            .map(|record| store.slab_region(record, region).expect("a record and region lie in their group's store"))
-                            .collect();
-                        Records::new(views, self.record_bytes[group][region])
+                        Records::pooled(
+                            Arc::new(StoreRegion { stores: self.clone(), group, region }),
+                            self.record_bytes[group][region],
+                        )
                     })
                     .collect()
             })
-            .collect()
+            .collect())
+    }
+}
+
+/// On-demand record resolver for one `(group, region)` of [`Stores`].
+struct StoreRegion {
+    stores: Arc<Stores>,
+    group: usize,
+    region: usize,
+}
+
+impl crate::experts::source::RecordStore for StoreRegion {
+    fn view(&self, record: u64) -> Option<Tensor> {
+        let record = usize::try_from(record).ok()?;
+        self.stores.view(self.group, self.region, record)
+    }
+
+    fn count(&self) -> u64 {
+        self.stores.group(self.group).backed().last().map_or(0, |record| record + 1) as u64
     }
 }
 
@@ -327,7 +345,7 @@ pub(super) type RecordsAt = Arc<dyn Fn(usize, u64) -> u64 + Send + Sync>;
 /// held, `watcher::Shared::backing_slot`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn grow_by_slots<S>(
-    stores: &Stores,
+    stores: &Arc<Stores>,
     (from, to): (u64, u64),
     records: &RecordsAt,
     joining: Joining,
@@ -341,9 +359,9 @@ pub(super) fn grow_by_slots<S>(
     let mut reached = from;
     let mut joined: Option<(Instant, Instant)> = None;
     let mut spent = Spent::default();
-    // The views of the records the host lands into, which each slot's join
-    // carries as they are then.
-    let mut views = match joining {
+    // Pooled records resolve newly claimed slabs on demand, holding no
+    // persistent views.
+    let views = match joining {
         Joining::Bank => None,
         Joining::Landed => match stores.records() {
             Ok(views) => Some(views),
@@ -385,7 +403,7 @@ pub(super) fn grow_by_slots<S>(
         };
         let joining_at = Instant::now();
         spent.claim += joining_at - claiming;
-        let join = match &mut views {
+        let join = match &views {
             None => {
                 let bank_views = claimed
                     .iter()
@@ -395,21 +413,13 @@ pub(super) fn grow_by_slots<S>(
                 Join::Bank { records: claimed, views: bank_views }
             }
             Some(views) => {
-                let formed = claimed.iter().enumerate().try_for_each(|(group, records)| {
-                    for &record in records {
-                        for (region, view) in views[group].iter_mut().enumerate() {
-                            *view = view.with(record as u64, stores.view(group, region, record))?;
-                        }
-                    }
-                    Ok::<_, String>(())
-                });
                 let records = claimed
                     .iter()
                     .map(|records| {
                         records.iter().map(|&record| u32::try_from(record).map_err(|_| "landed records exceed u32".to_owned())).collect::<Result<Vec<_>, _>>()
                     })
                     .collect::<Result<Vec<_>, _>>();
-                match formed.and(records) {
+                match records {
                     Ok(records) => Join::Landed { records, views: views.clone() },
                     Err(reason) => return Grown { at: reached, joined, cut: Cut::Unjoined(reason), spent },
                 }
@@ -647,7 +657,15 @@ impl ExpertBank {
         if let Some(stopped) = tier.commitment.stopped_growth.take() {
             return Ok(Some((stopped, true)));
         }
-        if let Some(shrunk) = tier.commitment.shrunk.take() {
+        if let Some(mut shrunk) = tier.commitment.shrunk.take() {
+            if let BankResized::Shrunk { returned, .. } = &mut shrunk {
+                *returned += self
+                    .cache
+                    .changes()
+                    .clone()
+                    .change(|_| tier.stores.return_freed(0))
+                    .map_err(|error| DomainError::invariant(format!("the host tier's pool could not return a shrink's blocks: {error}")))?;
+            }
             return Ok(Some((shrunk, true)));
         }
         let Resize::Growing(growing) = &tier.commitment.resize else {
@@ -812,7 +830,15 @@ impl ExpertBank {
                 }
             }
         }
-        if let Some(shrunk) = commitment.shrunk.take() {
+        if let Some(mut shrunk) = commitment.shrunk.take() {
+            if let BankResized::Shrunk { returned, .. } = &mut shrunk {
+                *returned += self
+                    .cache
+                    .changes()
+                    .clone()
+                    .change(|_| self.stores.return_freed(0))
+                    .map_err(|error| DomainError::invariant(format!("the expert bank's pool could not return a shrink's blocks: {error}")))?;
+            }
             return Ok(Some(shrunk));
         }
         let Resize::Growing(growing) = &commitment.resize else {

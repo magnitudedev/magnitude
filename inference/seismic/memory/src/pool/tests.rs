@@ -548,3 +548,63 @@ fn single_flight_growth_wakes_waiters_on_error_and_panic() {
     assert!(waiter2.unwrap().join().unwrap(), "waiter wakes after grower panics");
     assert!(matches!(gate.enter_or_wait(), GrowTurn::Grow(_)), "gate is usable after panic");
 }
+
+/// A block that holds both held granules and fenced (recently released)
+/// granules can be vacated into free granules elsewhere: only the held
+/// granules move, and the block returns once both the pre-existing fenced
+/// flight and the copy's flight complete.
+#[test]
+fn a_block_with_fenced_granules_vacates_and_returns_behind_all_flights() {
+    let (mut pool, _, tally) = pool(4);
+    let older = grow(&mut pool, &tally).unwrap();
+    let newer = grow(&mut pool, &tally).unwrap();
+    let held = (0..8).map(|slot| pool.take(Holder::Bank(slot)).unwrap()).collect::<Vec<_>>();
+    // Free 2 granules in the older block (immediately free) and 2 in the newer
+    // block behind an in-flight read.
+    pool.release(held[0].granule, None);
+    pool.release(held[1].granule, None);
+    let read = flight();
+    pool.release(held[4].granule, Some(read.clone()));
+    pool.release(held[5].granule, Some(read.clone()));
+    pool.owe(4 * GRANULE);
+
+    assert_eq!(pool.emptiest(), Some(newer), "newer has 2 held granules and 2 free elsewhere");
+    let vacating = pool.vacate(newer).expect("fenced granules in newer do not block vacation");
+    assert_eq!(vacating.moves.len(), 2, "only held granules move; fenced ones stay fenced");
+    assert!(vacating.moves.iter().all(|m| m.from.block == newer && m.to.block == older));
+    let copy = flight();
+    for moved in &vacating.moves {
+        pool.release(moved.from, Some(copy.clone()));
+    }
+    assert_eq!(pool.vacated(newer), 4 * GRANULE);
+    assert_eq!(pool.owed(), 0);
+    assert_eq!(pool.awaited().map(|fences| fences.len()), Some(4), "awaits both read and copy fences");
+
+    read.complete();
+    assert_eq!(returned(&mut pool), 0, "still waiting on copy flight");
+    assert_eq!(tally.held(), 8 * GRANULE);
+
+    copy.complete();
+    assert_eq!(returned(&mut pool), 0, "block returns, its bytes already reported by vacated");
+    assert_eq!((pool.held_bytes(), tally.held()), (4 * GRANULE, 4 * GRANULE));
+}
+
+/// `emptiest_excluding` skips blocks in the exclusion set so callers can
+/// move past a temporarily pinned block and vacate another.
+#[test]
+fn emptiest_excluding_skips_blocked_blocks() {
+    let (mut pool, _, tally) = pool(2);
+    let first = grow(&mut pool, &tally).unwrap();
+    let second = grow(&mut pool, &tally).unwrap();
+    let third = grow(&mut pool, &tally).unwrap();
+    let held = (0..6).map(|slot| pool.take(Holder::Bank(slot)).unwrap()).collect::<Vec<_>>();
+    // Free one granule in each block: each has 1 held and 2 free elsewhere.
+    for index in [0, 2, 4] {
+        pool.release(held[index].granule, None);
+    }
+    assert_eq!(pool.emptiest(), Some(third), "newest tied block first");
+    let skip: BTreeSet<_> = [third].into_iter().collect();
+    assert_eq!(pool.emptiest_excluding(&skip), Some(second), "skips third and picks second");
+    let skip: BTreeSet<_> = [third, second].into_iter().collect();
+    assert_eq!(pool.emptiest_excluding(&skip), Some(first), "skips third and second and picks first");
+}

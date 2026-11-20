@@ -114,20 +114,23 @@ impl SiteRecords {
     }
 
     /// Record `record` as a weight operand of the CPU's components, read
-    /// where it lies in the device's row layout.
-    fn weights(&self, record: usize) -> Weights<'static> {
+    /// where it lies in the device's row layout, holding its slab view for
+    /// the operand's life.
+    fn weights(&self, record: usize) -> HeldWeights {
         assert!(record < self.count(), "a site entry names tier record {record} of {}", self.count());
+        let hold = self.records.hold(record as u64);
         // SAFETY: the device named the record for this step, so its bytes are
         // whole and nothing writes or moves them until the step completes;
-        // the request holding the operand is served within the step.
-        unsafe {
+        // `hold` keeps the slab view alive for the life of `HeldWeights`.
+        let weights = unsafe {
             Weights::from_tensor(
-                self.records.record(record as u64, self.records.bytes()).as_ptr(),
+                hold.as_ptr(),
                 &[self.rows as u64, self.columns as u64],
                 &[self.columns as u64, 1],
                 self.operand,
             )
-        }
+        };
+        HeldWeights { _hold: hold, weights }
     }
 
     /// Record `record`'s values, `[rows, columns]` in row order, as the
@@ -663,6 +666,20 @@ pub(crate) fn reference(function: i32, limit: Option<GluLimit>, x: &[f32], exper
 
 /// One expert of a request: the layer's expert a tier record holds, which
 /// the CPU computes whole, once over every row that names it.
+/// A weight operand paired with its [`HeldRecord`] so the slab view stays
+/// pinned while the CPU site reads it and drops as soon as the work ends.
+struct HeldWeights {
+    _hold: crate::experts::source::HeldRecord,
+    weights: Weights<'static>,
+}
+
+impl std::ops::Deref for HeldWeights {
+    type Target = Weights<'static>;
+    fn deref(&self) -> &Self::Target {
+        &self.weights
+    }
+}
+
 struct Expert {
     /// Its tier record, which fixes each worker's share of it.
     record: usize,
@@ -670,9 +687,9 @@ struct Expert {
     expert: usize,
     /// Its gate's and up's second-level scales.
     scales: (f32, f32),
-    gate: Option<Weights<'static>>,
-    up: Weights<'static>,
-    down: Weights<'static>,
+    gate: Option<HeldWeights>,
+    up: HeldWeights,
+    down: HeldWeights,
     /// Each row that names it, with its routing weight, in request order.
     rows: Vec<(usize, f32)>,
     /// Its first row among the request's experts' rows, expert after expert:

@@ -375,7 +375,8 @@ impl LandedRecord {
         // SAFETY: the caller's; the pieces' ranges are disjoint, so this one
         // alone writes `to`.
         assert!(to.end as u64 <= records.bytes(), "a piece past its tier record");
-        let into = unsafe { std::slice::from_raw_parts_mut(records.address(0).as_ptr().add(to.start), to.len()) };
+        let held = records.hold(0);
+        let into = unsafe { std::slice::from_raw_parts_mut(held.address().as_ptr().add(to.start), to.len()) };
         match *conversion {
             Conversion::Stored => into.copy_from_slice(&stored[from]),
             Conversion::Rows { conversion, rows, k } => {
@@ -585,7 +586,8 @@ impl super::compute::Job for Converting {
         // its range.
         let started = std::time::Instant::now();
         self.began.get_or_init(|| started);
-        unsafe { tier.convert(staging.record(*staged, *bytes), piece) };
+        let held = staging.hold(*staged);
+        unsafe { tier.convert(held.as_slice(*bytes), piece) };
         LandingAccount::add(&self.worked, started.elapsed());
     }
 

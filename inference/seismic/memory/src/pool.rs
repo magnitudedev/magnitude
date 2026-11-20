@@ -483,30 +483,40 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         }
     }
 
-    /// The held block with the fewest live granules, where it has fewer than
-    /// the free granules elsewhere: the cheapest to empty for outside
-    /// demand ([`Self::vacate`]). None where no block can be emptied.
+    /// The held block with the fewest held granules, where it has no more
+    /// held granules than the free granules elsewhere: the cheapest to empty
+    /// for outside demand ([`Self::vacate`]). None where no block can be
+    /// emptied.
     pub fn emptiest(&mut self) -> Option<BlockId> {
+        self.emptiest_excluding(&BTreeSet::new())
+    }
+
+    /// [`Self::emptiest`], skipping any block in `skip` (e.g. blocks whose
+    /// live granules are currently pinned by an active view).
+    pub fn emptiest_excluding(&mut self, skip: &BTreeSet<BlockId>) -> Option<BlockId> {
         self.settle();
         let free = self.free.len();
         self.held
             .iter()
-            .filter(|(_, block)| !block.vacating)
+            .filter(|(id, block)| !block.vacating && !skip.contains(id))
             .map(|(&id, block)| {
-                let live = block.granules.iter().filter(|state| !matches!(state, Granule::Free { .. })).count();
-                let own_free = block.granules.len() - live;
-                (live, id, free - own_free)
+                let held = block.granules.iter().filter(|state| matches!(state, Granule::Held(_))).count();
+                let own_free = block.granules.iter().filter(|state| matches!(state, Granule::Free { .. })).count();
+                (held, id, free - own_free)
             })
-            .filter(|&(live, _, elsewhere)| live <= elsewhere)
-            .min_by_key(|&(live, id, _)| (live, std::cmp::Reverse(id)))
+            .filter(|&(held, _, elsewhere)| held <= elsewhere)
+            .min_by_key(|&(held, id, _)| (held, std::cmp::Reverse(id)))
             .map(|(_, id, _)| id)
     }
 
     /// Begin emptying `block` for outside demand: each live granule gets a
     /// free granule in another block to be copied into, held by its holder
-    /// from now, and the block's granules take no claims. None where a
-    /// granule of it awaits a flight or too few are free elsewhere; the
-    /// block is then unchanged.
+    /// from now, and the block's granules take no claims. Granules already
+    /// awaiting a flight (`Granule::Fenced`) stay fenced and need no copy:
+    /// once the moved granules are released and [`Self::vacated`] marks the
+    /// block returning, it returns as every fenced granule's flight
+    /// completes. None where too few granules are free elsewhere; the block
+    /// is then unchanged.
     ///
     /// # Panics
     /// Where `block` is not held or already vacating.
@@ -514,9 +524,6 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         self.settle();
         let of = self.held_block(block);
         assert!(!of.vacating, "invariant violated: block {block:?} is already vacating");
-        if of.granules.iter().any(|state| matches!(state, Granule::Fenced)) {
-            return None;
-        }
         let live = of
             .granules
             .iter()
