@@ -3533,3 +3533,61 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
 
     std::fs::remove_dir_all(&directory).ok();
 }
+
+/// A prompt chunk resumed level with its head (a turn continuing a prefix
+/// decoded in front passes, whose last pass's head launch entered its
+/// selection: the prefix cache's resumed state, or a request continuing in
+/// place) primes the head with its pairs past its first token, at its own
+/// position (`Priming::pairs_previous` false). It reads no boundary
+/// feature, and launches though the decoded prefix holds none: a decode
+/// pass keeps no boundary feature. On every backend experts stream on, the
+/// closing chunk of such a turn runs and its head launch makes the head's
+/// guess.
+#[test]
+fn a_prompt_chunk_resumed_level_with_its_head_primes_without_a_boundary_feature() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (directory, definition, package) = fronting_fixture("resumed-priming");
+    let request = RequestId(1);
+    for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
+        let (mut domain, mut bindings) = load_fronting(&catalog, &definition, &package, backend, false, 1, Banked::Whole);
+        domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+        domain.open_served(&mut bindings, request, None).unwrap();
+        // The first turn: its prompt at 0..2, then one front pass at 2 that
+        // leaves the head level with the target at 3.
+        let (pending, _, returned) = run_fronting_prompt(&mut domain, bindings, request, backend);
+        let rows = crate::Rows::front(Vec::new(), 0);
+        let operation = front_pass(request, &rows, pending, 2, crate::batching::Demand::NONE);
+        let (mut outcomes, returned, _) = launched(&mut domain, returned, &[operation], backend);
+        let outcome = outcomes.pop().expect("one pass");
+        let selected = TokenId(selected_token(outcome.outcome(), backend));
+        let decision = PhysicalDecision { accepted_rows: 1, ahead: crate::AheadVerdict::new(&rows, &[selected]) };
+        domain.reconcile(outcome, decision).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        // The next turn's closing chunk at 3, its first token the pass's
+        // selection, which the head entered already.
+        let tokens = vec![selected, TokenId(7), TokenId(9)];
+        let prime = crate::Priming { boundary: true, tokens: tokens[1..].to_vec(), position: 3, draft_from: 6 };
+        assert!(!prime.pairs_previous(tokens.len()));
+        let chunk = Operation::Forward {
+            request,
+            kind: WorkKind::Prefill,
+            select: vec![greedy(5)],
+            committed: tokens.len(),
+            chain: Some(crate::ChainEntry { position: prime.position + prime.tokens.len() }),
+            prime: Some(prime),
+            tokens,
+            position: 3,
+            conditioning: None,
+            demand: crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES,
+            front: Vec::new(),
+        };
+        domain.requirements(std::slice::from_ref(&chunk)).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        let (outcome, _) = run(&mut domain, returned, chunk, false, backend);
+        let Outcome::Forward { guesses, .. } = outcome else { panic!("{backend:?}: a prompt's outcome") };
+        assert!(
+            matches!(guesses.as_slice(), [crate::Guess { kind: crate::GuessKind::Head, .. }]),
+            "{backend:?}: the closing chunk's chain is the head's guess alone: {guesses:?}"
+        );
+    }
+    std::fs::remove_dir_all(&directory).ok();
+}

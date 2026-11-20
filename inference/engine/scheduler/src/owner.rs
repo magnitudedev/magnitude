@@ -228,7 +228,7 @@ fn selection_charge(operations: &[Operation]) -> usize {
 /// Whether `candidate`'s next round is a pass in the form its launch grants
 /// (`Generation::chains`): a front pass, entering the MTP head behind it,
 /// or a verify pass, entering nothing. A launch's forwards chain all or
-/// none (`ExecutorDomain::requirements`), and its passes are of the one
+/// none (`ExecutorDomain::shares_launch`), and its passes are of the one
 /// form its regime prices ([`FrontRows`]), within a chained launch's rows
 /// (`ExecutorDomain::chained_rows`), so a decode launch takes the selected
 /// requests alike in this with the first.

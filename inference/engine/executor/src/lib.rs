@@ -132,7 +132,7 @@ pub use native::{
 };
 pub use operation::{
     AheadVerdict, ChainEntry, CommittedClass, DraftForm, DraftShape, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, FrontKind, FrontRow, FrontRows, Guess, GuessKind,
-    GroupKey, HeadPhase, Operation, OperationError, Outcome, Priming, ProgramIdentity, RequestId,
+    HeadPhase, Operation, OperationError, Outcome, Priming, RequestId,
     ResourceDomainId, RowResult, Rows, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };
 pub use two_row::{BuiltForm, CHAINED_ROWS, FrontGrant, FrontPass, TwoRowDecode, fronted_requests};

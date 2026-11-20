@@ -4,9 +4,6 @@ pub use magnitude_artifacts::TokenId;
 use std::{fmt, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProgramIdentity(Arc<str>);
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceDomainId(Arc<str>);
 
 macro_rules! identity {
@@ -33,7 +30,6 @@ macro_rules! identity {
     };
 }
 
-identity!(ProgramIdentity);
 identity!(ResourceDomainId);
 
 /// Engine-wide identity of an admitted request: unique in the process, and
@@ -683,14 +679,6 @@ pub enum ExecutableKind {
 pub enum CommittedClass {
     AllCommitted,
     HasTentative,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GroupKey {
-    pub program_identity: ProgramIdentity,
-    pub executable: ExecutableKind,
-    pub commitment: CommittedClass,
-    pub draft: Option<DraftShape>,
 }
 
 impl Operation {

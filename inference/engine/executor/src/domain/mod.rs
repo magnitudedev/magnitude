@@ -11,9 +11,9 @@ use crate::programs::{Chain, ProgramSubmission};
 use crate::programs::graph::readout;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader, ExecutionPlan,
-    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey, Guess, HeadConditioning,
+    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Guess, HeadConditioning,
     HeadLaunchInputs, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
-    Outcome, PoolClass, Priming, ProgramIdentity, RequestId, ResidentHead, ResidentVision,
+    Outcome, PoolClass, Priming, RequestId, ResidentHead, ResidentVision,
     ResourceDomain, ResourceDomainId, ResourceKind, RowResult, SelectSpec, Selected,
     StateLaunchInputs, StateWork, TargetLaunchInputs, TargetTokens, TokenId, ValidatedHeadLaunch,
     ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchInputs,
@@ -719,8 +719,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     queue: queue::Queue<F>,
     head: BTreeMap<RequestId, SequenceState>,
     input: BTreeMap<RequestId, RequestInput>,
-    /// Group identities of the target, head and encoder executables.
-    lane_identities: [ProgramIdentity; 3],
     /// When the last target selection was read to the host.
     selection_read: Option<Instant>,
     target_timing: Option<TargetHostTiming>,
@@ -2211,20 +2209,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut head_launches = 0usize;
         let mut head_demand = Vec::new();
         let mut head_banks = 0usize;
-        // A step whose forwards chain runs one front head launch behind it,
-        // whose entry rows are the forwards' selected rows
-        // (`Operation::entry_rows`, `HeadPasses::Front`): every forward
-        // chains or none, within a front head launch's rows.
-        let chained = operations.iter().filter(|operation| operation.chain().is_some()).count();
-        if chained > 0 {
+        if let Some(index) = (0..operations.len()).find(|&index| !self.shares_launch(&operations[..index], &operations[index])) {
+            return Err(DomainError::Input(format!(
+                "operation {index} of a launch may not share it (`ExecutorDomain::shares_launch`)"
+            )));
+        }
+        // A step whose forwards chain (all of them, `Self::shares_launch`)
+        // runs one front head launch behind it.
+        if first.chain().is_some() {
             if !self.fronts() {
                 return Err(DomainError::Input("a chained forward on a load that does not front".into()));
-            }
-            let entries = operations.iter().map(Operation::entry_rows).sum::<usize>();
-            if chained != operations.len() || entries > self.chained_rows() {
-                return Err(DomainError::Input(
-                    "a launch of chained forwards chains every forward within a chained launch's rows".into(),
-                ));
             }
             head_launches += 1;
         }
@@ -2242,17 +2236,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             if let Operation::Forward {
                 request,
+                tokens,
                 prime: Some(prime),
                 ..
             } = operation
             {
                 if self.head_reads_target() {
                     panic!("invariant violated: a head reading target history keeps no history to prime");
-                }
-                if operations.len() != 1 {
-                    return Err(DomainError::Input(
-                        "a primed prompt chunk launches alone".into(),
-                    ));
                 }
                 let state = self.head.get(request).ok_or_else(|| {
                     DomainError::Input("a primed prompt chunk's drafter is not idle".into())
@@ -2262,25 +2252,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         "drafter entry position differs from accepted drafter state".into(),
                     ));
                 }
-                // A successor-dependent entry's pairs are its chunk's
-                // (`Operation::validate`); the domain holds the boundary
-                // feature of every accepted target prefix, which an entry
-                // pairing its first token across it reads.
-                if prime.boundary {
-                    let Operation::Forward { position, .. } = operation else {
-                        unreachable!()
-                    };
-                    if self
-                        .input
-                        .get(request)
-                        .and_then(|input| input.boundary.as_ref())
-                        .is_some()
-                        != (*position > 0)
-                    {
-                        return Err(DomainError::Input(
-                            "boundary priming differs from the accepted target prefix".into(),
-                        ));
-                    }
+                // An entry pairing its chunk's first token across the
+                // chunk's boundary reads the boundary feature of the accepted
+                // target prefix (`Priming::pairs_previous`); one entering
+                // only pairs inside the chunk reads none, whatever the
+                // prefix holds: the first chunk, or one resumed past rows a
+                // pass's entry already paired.
+                if prime.pairs_previous(tokens.len())
+                    && self.input.get(request).and_then(|input| input.boundary.as_ref()).is_none()
+                {
+                    return Err(DomainError::Input(
+                        "a drafter entry pairs across its chunk's boundary with no boundary feature".into(),
+                    ));
                 }
                 // The closing chunk's front head launch enters its row right
                 // past the drafter entry's.
@@ -2961,10 +2944,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // (`Self::open_group`).
         let arena = recorded.claim_arena(resources.ledgers().device());
         let id = resources.domain().clone();
-        let lane_identities = ["target", "head", "vision"].map(|lane| {
-            ProgramIdentity::new(format!("{id}:{lane}"))
-                .expect("a lane identity names its lane and is never empty")
-        });
         let domain = Box::new(Self {
             execution,
             definition,
@@ -2988,7 +2967,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             queue: queue::Queue::Empty,
             head: BTreeMap::new(),
             input: BTreeMap::new(),
-            lane_identities,
             selection_read: None,
             target_timing: None,
             trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
@@ -3040,21 +3018,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.resources.ledgers().measurement(self.domain.device())
     }
 
-    /// The compatibility key of an operation. Keying does not validate;
-    /// reservation validates every operation at the domain boundary.
-    pub fn group_key(&self, operation: &Operation) -> GroupKey {
-        let executable = operation.executable();
-        let lane = match executable {
-            crate::ExecutableKind::Target => 0,
-            crate::ExecutableKind::Head => 1,
-            crate::ExecutableKind::Encoder => 2,
+    /// Whether `operation` may join `launch`, the operations of one launch
+    /// so far (none: whether it may launch at all): the one owner of which operations share a launch, which
+    /// [`Self::requirements`] holds every launch to. A launch runs one
+    /// executable, its operations alike in commitment and draft shape, one
+    /// operation a request. An image's encoding and a primed prompt chunk
+    /// (whose drafter entry reads the chunk's own features) launch alone. A
+    /// step whose forwards chain runs one front head launch behind it, whose
+    /// entry rows are the forwards' selected rows (`Operation::entry_rows`,
+    /// `HeadPasses::Front`): every forward chains or none, within a chained
+    /// launch's rows ([`Self::chained_rows`]).
+    pub fn shares_launch(&self, launch: &[Operation], operation: &Operation) -> bool {
+        let rows = launch.iter().chain([operation]).map(Operation::entry_rows).sum::<usize>() <= self.chained_rows();
+        let Some(first) = launch.first() else {
+            return rows;
         };
-        GroupKey {
-            program_identity: self.lane_identities[lane].clone(),
-            executable,
-            commitment: operation.commitment(),
-            draft: operation.draft_shape(),
-        }
+        let alone = |operation: &Operation| {
+            matches!(operation, Operation::Encode { .. } | Operation::Forward { prime: Some(_), .. })
+        };
+        first.executable() == operation.executable()
+            && first.commitment() == operation.commitment()
+            && first.draft_shape() == operation.draft_shape()
+            && !alone(first)
+            && !alone(operation)
+            && launch.iter().all(|item| item.request() != operation.request())
+            && first.chain().is_some() == operation.chain().is_some()
+            && rows
     }
 
     /// Host timing of the most recently finished target step.

@@ -2881,9 +2881,9 @@ fn causal_heads_launch_apart_from_chained_drafts() {
         proposals: vec![select.clone(); proposals],
         form: crate::DraftForm::Chained,
     };
-    assert_ne!(domain.group_key(&head(1, 0)), domain.group_key(&head(2, 2)));
-    assert_eq!(domain.group_key(&head(1, 0)), domain.group_key(&head(2, 0)));
-    assert_eq!(domain.group_key(&head(1, 1)), domain.group_key(&head(2, 3)));
+    assert!(!domain.shares_launch(&[head(1, 0)], &head(2, 2)));
+    assert!(domain.shares_launch(&[head(1, 0)], &head(2, 0)));
+    assert!(domain.shares_launch(&[head(1, 1)], &head(2, 3)));
 }
 
 /// V4.1's compressed layer forms (`attention::tests::selected::compressed`:
@@ -3141,4 +3141,54 @@ fn memory_probe_answer_emits_memory_read_trace_for_every_answered_generation() {
     assert!(!recorded.is_empty());
     let traced = seen.lock().unwrap().clone();
     assert_eq!(traced, recorded, "every answered generation must have a matching memory read record");
+}
+
+/// Which operations share a launch has one owner
+/// ([`ExecutorDomain::shares_launch`]), the scheduler's grouping and every
+/// reservation alike. A chained decode pass (as one parked on memory, which
+/// rejoins a later round whatever that round's passes are) never joins an
+/// unchained one, nor a chained launch at its rows; a launch that holds
+/// either is refused as input before anything is reserved.
+#[test]
+fn a_chained_pass_shares_a_launch_only_with_chained_passes_within_their_rows() {
+    let (domain, _) = fixture(None);
+    let pass = |id: u64, chained: bool| Operation::Forward {
+        request: RequestId(id),
+        kind: WorkKind::Decode,
+        tokens: vec![crate::TokenId(1)],
+        position: 1,
+        conditioning: None,
+        demand: if chained {
+            crate::batching::Demand::SELECT | crate::batching::Demand::DEVICE_FEATURES
+        } else {
+            crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES
+        },
+        select: vec![crate::SelectSpec {
+            sampling: crate::Sampling::Greedy,
+            seed: 0,
+            position: 1,
+            domain: 0,
+            mask: None,
+            shaping: crate::Shaping::default(),
+            history: None,
+        }],
+        committed: 1,
+        prime: None,
+        front: Vec::new(),
+        chain: chained.then_some(crate::ChainEntry { position: 1 }),
+    };
+    assert!(domain.shares_launch(&[pass(1, false)], &pass(2, false)));
+    assert!(!domain.shares_launch(&[pass(1, false)], &pass(2, true)));
+    assert!(!domain.shares_launch(&[pass(1, true)], &pass(2, false)));
+    assert!(!domain.shares_launch(&[pass(1, false)], &pass(1, false)), "one operation a request");
+    // Each chained pass enters its one selected row.
+    let rows = domain.chained_rows();
+    let chained = (0..=rows as u64).map(|id| pass(id, true)).collect::<Vec<_>>();
+    for index in 1..rows {
+        assert!(domain.shares_launch(&chained[..index], &chained[index]), "pass {index} of {rows}");
+    }
+    assert!(!domain.shares_launch(&chained[..rows], &chained[rows]), "a chained launch's rows are {rows}");
+    for launch in [vec![pass(1, false), pass(2, true)], vec![pass(1, true), pass(2, false)], chained] {
+        assert!(matches!(domain.requirements(&launch), Err(DomainError::Input(_))), "{launch:?}");
+    }
 }
