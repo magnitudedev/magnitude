@@ -80,10 +80,10 @@ export function OfferedModelsSkeleton({ count = 3, firstOpened = false, footer =
 export function ModelsSkeleton({ startingService = false }: { startingService?: boolean }) {
   return <div>
     {startingService && <span role="status" className="sr-only">Starting Magnitude…</span>}
-    <LoadingRegion label="Loading your models" className={cn(cardClass, "px-4 py-3.5")}>
-      <SkeletonLine className="h-[1.5em] text-[13px]" width="22rem" />
+    <LoadingRegion label="Loading your models">
+      <SkeletonLine className="h-5 text-sm" width="22rem" />
     </LoadingRegion>
-    <Section title="Recommended for your machine" aside={<Skeleton className="h-4 w-48" />}>
+    <Section title="Recommended for your machine" className="mt-6" aside={<Skeleton className="h-4 w-48" />}>
       <OfferedModelsSkeleton firstOpened footer />
     </Section>
   </div>

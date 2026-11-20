@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react"
 import { Skeleton } from "../ui/skeleton"
 import { ActionTooltip } from "../ui/tooltip"
-import { ArrowSquareOutIcon, CheckIcon, CubeIcon, GraphicsCardIcon, HardDrivesIcon, InfoIcon, MemoryIcon } from "@phosphor-icons/react"
+import { ArrowSquareOutIcon, CheckIcon, CircleNotchIcon, CubeIcon, DesktopTowerIcon, GraphicsCardIcon, HardDrivesIcon, InfoIcon, LaptopIcon, MemoryIcon, MonitorIcon } from "@phosphor-icons/react"
 import { formatContext, formatMemoryCapacity, formatStorageSize } from "@magnitudedev/client-common"
 import { cn } from "@/lib/utils"
 import { modelLabs, type ModelLab } from "../model-logo"
@@ -98,23 +98,68 @@ export function PlacementBar({ quant }: { quant: QuantView }) {
   </div>
 }
 
-/** Rungs side by side, smallest to largest: bits, source, then the two numbers that decide it. */
+const MAX_LADDER_RUNGS = 4
+
+/**
+ * At most `max` rungs around the recommended choice (up to two faster below it and one smarter above, since anything
+ * above the pick is already below the speed target), keeping any owned or currently selected rung in view.
+ */
+export function visibleLadderRungs(
+  quants: readonly QuantView[],
+  recommended: string | null,
+  owned: ReadonlySet<string>,
+  selected: string | null = null,
+  max = MAX_LADDER_RUNGS,
+): readonly QuantView[] {
+  if (quants.length <= max) return quants
+  const recommendedIndex = recommended === null ? -1 : quants.findIndex(quant => quant.key === recommended)
+  const center = recommendedIndex === -1 ? 0 : recommendedIndex
+  const start = Math.max(0, Math.min(center - 2, quants.length - max))
+  const picked = new Set(Array.from({ length: max }, (_, offset) => start + offset))
+  const pinned = new Set<number>([center])
+  const selectedIndex = selected === null ? -1 : quants.findIndex(quant => quant.key === selected)
+  if (selectedIndex !== -1) pinned.add(selectedIndex)
+  quants.forEach((quant, index) => { if (owned.has(quant.key)) pinned.add(index) })
+  for (const mustKeep of pinned) {
+    if (picked.has(mustKeep)) continue
+    let drop: number | null = null
+    for (const candidate of picked) {
+      if (pinned.has(candidate)) continue
+      if (drop === null) { drop = candidate; continue }
+      const candidateDistance = Math.abs(candidate - center)
+      const dropDistance = Math.abs(drop - center)
+      if (candidateDistance > dropDistance || (candidateDistance === dropDistance && candidate > drop)) drop = candidate
+    }
+    if (drop === null) break
+    picked.delete(drop)
+    picked.add(mustKeep)
+  }
+  return [...picked].sort((left, right) => left - right).map(index => quants[index]!)
+}
+
+/** Rungs side by side, smallest to largest: at most four around the pick, with bits, source, speed and size. */
 export function QuantLadder({ quants, selected, recommended, owned, limit, onSelect }: {
   quants: readonly QuantView[]; selected: string | null; recommended: string | null; owned: ReadonlySet<string>; limit: number | null; onSelect: (key: string) => void
 }) {
-  return <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${quants.length}, minmax(0, 1fr))` }}>
-    {quants.map(quant => {
+  const visible = visibleLadderRungs(quants, recommended, owned, selected)
+  return <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${visible.length}, minmax(0, 1fr))` }}>
+    {visible.map(quant => {
       const active = selected === quant.key
       const noRoom = quant.missingDiskBytes > 0
+      const metric = noRoom
+        ? `Needs ${formatStorageSize(quant.missingDiskBytes)} more disk`
+        : quant.measuring
+          ? <span aria-label="Measuring" title="Measuring speed on this computer" className="inline-flex items-center gap-1.5 text-slate-400 dark:text-slate-500"><CircleNotchIcon className="size-3.5 motion-safe:animate-spin" /></span>
+          : quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)
       return <button key={quant.key} type="button" disabled={!quant.fits || quant.measuring || noRoom} onClick={() => onSelect(quant.key)} title={quant.quality ?? undefined}
-        className={cn("flex flex-col items-start rounded-lg border px-3 py-2.5 text-left", ((!quant.fits && !quant.measuring) || noRoom) && "opacity-40", active ? "border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30 dark:border-blue-400 dark:bg-slate-800" : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-750 dark:bg-slate-850")}>
-        <span className="flex w-full items-center justify-between gap-1 text-[13px] font-medium">{quant.bits}-bit
+        className={cn("flex min-w-0 flex-col items-start rounded-lg border px-3 py-2.5 text-left", ((!quant.fits && !quant.measuring) || noRoom) && "opacity-40", active ? "border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30 dark:border-blue-400 dark:bg-slate-800" : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-750 dark:bg-slate-850")}>
+        <span className="flex w-full items-center justify-between gap-1 whitespace-nowrap text-[13px] font-medium"><span>{quant.bits}-bit</span>
           {owned.has(quant.key) ? <Badge>Downloaded</Badge> : recommended === quant.key && <Badge tone="blue">Best</Badge>}</span>
         <span className="w-full truncate text-[11px] text-slate-500">{quantSource(quant)}</span>
-        {quant.fits && quant.servedContext !== null && limit !== null && quant.servedContext < limit && <span className="text-[11px] text-orange-700 dark:text-orange-300">{formatContext(quant.servedContext)} context</span>}
+        {quant.fits && quant.servedContext !== null && limit !== null && quant.servedContext < limit && <span className="w-full truncate text-[11px] text-orange-700 dark:text-orange-300">{formatContext(quant.servedContext)} context</span>}
         <span className="mt-2.5 flex w-full items-baseline justify-between gap-2 tabular-nums">
-          <span className={cn("text-[13px] font-medium", (quant.measuring || noRoom) && "font-normal text-slate-500")}>{noRoom ? `Needs ${formatStorageSize(quant.missingDiskBytes)} more disk` : quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)}</span>
-          <span className="text-xs text-slate-500">{formatStorageSize(quant.sizeBytes)}</span>
+          <span className={cn("whitespace-nowrap text-[13px] font-medium", (quant.measuring || noRoom) && "font-normal text-slate-500", noRoom && "truncate text-[11px]")}>{metric}</span>
+          <span className="whitespace-nowrap text-xs text-slate-500">{formatStorageSize(quant.sizeBytes)}</span>
         </span>
       </button>
     })}
@@ -171,6 +216,32 @@ function MachinePhoto({ photo }: { photo: NonNullable<MachineView["photo"]> }) {
     <svg role="img" aria-label={photo.subject} viewBox={`${frame.x} ${frame.y} ${frame.width} ${frame.height}`} className={cn("h-full w-full", state === "loading" && "invisible")} preserveAspectRatio="xMidYMid meet">
       <image href={photo.src} width={frame.sourceWidth} height={frame.sourceHeight} onLoad={() => setState("loaded")} onError={() => setState("failed")} />
     </svg>
+  </div>
+}
+
+/** Single-line summary of the machine for the Models page: name, memory tiers and free disk, separated by spacing. */
+export function MachineStrip({ machine, formFactor }: { machine: MachineView; formFactor?: string }) {
+  const gpu = machine.gpus[machine.servingGpu]
+  const several = machine.gpus.length > 1
+  const DeviceIcon = formFactor === "Laptop" ? LaptopIcon : formFactor === "Server" ? HardDrivesIcon : formFactor === "Desktop" ? DesktopTowerIcon : MonitorIcon
+  const specs = [
+    ...(machine.unifiedMemoryBytes !== null ? [{ icon: MemoryIcon, value: formatMemoryCapacity(machine.unifiedMemoryBytes), label: "memory" }] : []),
+    ...(machine.unifiedMemoryBytes === null && gpu ? [{ icon: GraphicsCardIcon, value: formatMemoryCapacity(gpu.memoryBytes), label: several ? `GPU ${machine.servingGpu + 1}` : "GPU" }] : []),
+    ...(machine.unifiedMemoryBytes === null ? [{ icon: MemoryIcon, value: formatMemoryCapacity(machine.ramBytes), label: "RAM" }] : []),
+    ...(machine.freeDiskBytes !== null ? [{ icon: HardDrivesIcon, value: formatStorageSize(machine.freeDiskBytes), label: "free disk" }] : []),
+  ]
+  return <div aria-label={`Your machine: ${machine.name}`} className="mb-5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs text-slate-500">
+    <span className="inline-flex min-w-0 items-center gap-1.5">
+      <DeviceIcon aria-hidden="true" className="size-3.5 shrink-0 text-slate-400 dark:text-slate-500" />
+      <span>Your machine:</span>
+      <span className="truncate font-medium text-slate-700 dark:text-slate-200">{machine.name}</span>
+      {(several || machine.chip) && <span className="truncate text-slate-500">{several ? `${machine.gpus.length} GPUs` : machine.chip}</span>}
+    </span>
+    {specs.map(spec => <span key={spec.label} className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
+      <spec.icon aria-hidden="true" className="size-3.5 shrink-0 text-slate-400 dark:text-slate-500" />
+      <span className="font-medium text-slate-700 dark:text-slate-200">{spec.value}</span>
+      <span>{spec.label}</span>
+    </span>)}
   </div>
 }
 
